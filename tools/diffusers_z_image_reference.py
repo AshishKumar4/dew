@@ -34,7 +34,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import perturb, recording, saved_pipeline, tiny_qwen3_encoder
+from diffusers_reference_helpers import (
+    on_bfloat16_grid,
+    perturb,
+    recording,
+    saved_pipeline,
+    tiny_qwen3_encoder,
+)
 from diffusers_wan_reference import float64_scheduler
 from reference_releases import RELEASES
 
@@ -82,10 +88,8 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     torch.manual_seed(SEED)
     model = ZImageTransformer2DModel(**config).eval()
     generator = torch.Generator().manual_seed(SEED + 1)
-    with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
-            parameter.copy_(parameter.to(torch.bfloat16).float())
+    perturb(generator, 0.1, model)
+    on_bfloat16_grid(model)
     directory = root / name / "transformer"
     model.save_pretrained(directory, safe_serialization=True)
     height, width = case.size

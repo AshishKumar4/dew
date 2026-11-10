@@ -95,3 +95,17 @@ def published_mtp_logits(model, encoded):
     admitted = mask[:, :-1] & mask[:, 1:]
     depth = model.mtp(hidden[:, :-1], embeddings[:, 1:], positions[..., 1:], admitted)
     return main, model.lm_head(depth), admitted, (hidden, embeddings, positions)
+
+
+def published_mtp_loss(encoded, main, depth, admitted):
+    """The prediction-depth training loss over `encoded`'s tokens from `published_mtp_logits`' main and
+    depth logits and admitted pairs: the main next-token cross entropy over the admitted pairs, and 0.2 of the
+    depth's over each three consecutive real tokens, both over the admitted pairs' count."""
+    valid = encoded["attention_mask"].bool()
+    main_ce = torch.nn.functional.cross_entropy(main[:, :-1].reshape(-1, main.shape[-1]),
+                                                encoded["input_ids"][:, 1:].reshape(-1), reduction="none")
+    depth_ce = torch.nn.functional.cross_entropy(depth[:, :-1].reshape(-1, main.shape[-1]),
+                                                 encoded["input_ids"][:, 2:].reshape(-1), reduction="none")
+    depth_valid = valid[:, :-2] & valid[:, 1:-1] & valid[:, 2:]
+    return ((main_ce.reshape(admitted.shape) * admitted).sum()
+            + 0.2 * (depth_ce.reshape(depth_valid.shape) * depth_valid).sum()) / admitted.sum()

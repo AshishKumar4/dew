@@ -32,7 +32,7 @@ from dew.registry import models
 from dew.training import MeshSpec, Trainer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from benchmark_cases import small_cases
+from benchmark_cases import small_cases, token_rows
 
 _CASE = next(case for case in small_cases('bfloat16') if case.architecture == 'causal_transformer')
 CONFIG = _CASE.config
@@ -59,11 +59,7 @@ def run(config: dict[str, object], batch: int, seq: int, steps: int,
     state, _, _ = trainer.place()
 
     # The benchmark's fixed batch, byte for byte the same on both sides.
-    generator = np.random.default_rng(0)
-    vocab = config["vocab_size"]
-    if not isinstance(vocab, int):
-        raise ValueError("the decoder preset needs an integer vocabulary size")
-    tokens = generator.integers(0, vocab, size=(batch, seq + 1)).astype(np.int32)
+    tokens = token_rows(np.random.default_rng(0), config["vocab_size"], batch, seq + 1)
     data = {TEXT_KEY: jnp.asarray(tokens)}
 
     step = trainer.compile(state, data)

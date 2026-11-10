@@ -45,7 +45,13 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from diffusers_reference_helpers import recording, restore_transformers_names
+from diffusers_reference_helpers import (
+    on_bfloat16_grid,
+    perturb,
+    recording,
+    restore_transformers_names,
+    saved_pipeline,
+)
 from reference_releases import RELEASES
 
 from _dew_torch.precision import default_dtype, float64, float64_twin, widened
@@ -135,10 +141,8 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     torch.manual_seed(SEED)
     model = WanTransformer3DModel(**config).eval()
     generator = torch.Generator().manual_seed(SEED + 1)
-    with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
-            parameter.copy_(parameter.to(torch.bfloat16).float())
+    perturb(generator, 0.1, model)
+    on_bfloat16_grid(model)
     model.save_pretrained(root / name / "transformer", safe_serialization=True)
     batch = len(case.times)
     inputs = {"latents": torch.randn((batch, config["in_channels"], *case.size), generator=generator),
@@ -189,18 +193,6 @@ PROMPTS = ["a red cat on a mat", "  tiny \u201cboat\u201d <&amp;amp;>   sea\n"]
 FRAMES, HEIGHT, WIDTH, STEPS, GUIDANCE = 9, 32, 48, 4, 5.0
 
 
-def tokenizer():
-    """A T5 tokenizer over single characters: the release's umt5 vocabulary
-    is 256k pieces, and every character here is one."""
-    import string
-
-    from transformers import T5Tokenizer
-
-    pieces = ["<pad>", "</s>", "<unk>", "\u2581", *string.ascii_lowercase, *string.digits,
-              *string.punctuation]
-    return T5Tokenizer(vocab=[(piece, 0.0) for piece in pieces], extra_ids=0)
-
-
 def text_encoder(vocab: int):
     """The published UMT5 config, narrowed and two layers deep, as
     `UMT5EncoderModel`, which saves as the release is stored."""
@@ -214,17 +206,18 @@ def text_encoder(vocab: int):
                   relative_attention_max_distance=32)
     torch.manual_seed(SEED + 5)
     model = UMT5EncoderModel(UMT5Config(**config)).eval()
-    generator = torch.Generator().manual_seed(SEED + 6)
-    with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
+    perturb(torch.Generator().manual_seed(SEED + 6), 0.05, model)
     return model
 
 
 def build_pipeline(root: Path):
     from diffusers import AutoencoderKLWan, UniPCMultistepScheduler, WanPipeline, WanTransformer3DModel
 
-    tok = tokenizer()
+    # A T5 tokenizer over single characters (`t5_reference.tiny_tokenizer`): the release's umt5
+    # vocabulary is 256k pieces, and every character here is one.
+    from t5_reference import tiny_tokenizer
+
+    tok = tiny_tokenizer()
     encoder = text_encoder(len(tok))
     published = json.loads((SOURCE / "vae" / "config.json").read_text())
     vae_config = {key: value for key, value in published.items() if not key.startswith("_")}
@@ -242,13 +235,7 @@ def build_pipeline(root: Path):
     scheduler = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
     pipe = WanPipeline(tokenizer=tok, text_encoder=encoder, transformer=transformer, vae=vae,
                        scheduler=UniPCMultistepScheduler.from_config(scheduler))
-    directory = root / "pipeline"
-    pipe.save_pretrained(directory, safe_serialization=True)
-    pipe.set_progress_bar_config(disable=True)
-    index = json.loads((directory / "model_index.json").read_text())
-    index.update(dew_frames=FRAMES, dew_height=HEIGHT, dew_width=WIDTH)
-    (directory / "model_index.json").write_text(json.dumps(index, indent=2))
-    return pipe
+    return saved_pipeline(pipe, root / "pipeline", HEIGHT, WIDTH, frames=FRAMES)
 
 
 REPLAY_STEPS = (10, 50)

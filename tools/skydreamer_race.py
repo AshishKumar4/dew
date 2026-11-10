@@ -45,6 +45,7 @@ from pathlib import Path
 import jax
 import numpy as np
 
+from dew._files import write_atomically
 from dew.checkpoints import Checkpoints, Keep
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig
@@ -268,10 +269,8 @@ def trained(out: Path, assets: Path, steps: int, every: int, setting: Setting = 
                 print(json.dumps({"untrained": level, name: at[name]}), flush=True)
 
     def written() -> None:
-        # Written aside and moved over, so a stop mid-write leaves the last report whole.
-        aside = path.with_suffix(".json.part")
-        aside.write_text(json.dumps(report, indent=1))
-        aside.replace(path)
+        # Published whole, so a stop mid-write leaves the last report whole.
+        write_atomically(path, json.dumps(report, indent=1))
 
     baseline()
     written()

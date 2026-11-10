@@ -116,15 +116,12 @@ def weights(module, betas: np.ndarray, mean: str, options: dict, exact: bool) ->
     """The authors' weight at every step of `betas`, read off `terms["mse"]`, at its own dtype."""
     import torch
 
-    from _dew_torch.precision import replaced
+    from _dew_torch.precision import float_scoped, replaced
 
-    def keep_float64(array, timesteps, shape):
-        result = torch.from_numpy(array)[timesteps]
-        while result.dim() < len(shape):
-            result = result[..., None]
-        return result.expand(shape)
-
-    with replaced(*[(module, "_extract_into_tensor", keep_float64)] if exact else []):
+    # The authors' table read at the run's precision: its `.float()` float64 for the exact weight.
+    published = module._extract_into_tensor
+    scoped = float_scoped(published, torch.float64)
+    with replaced(*[(module, "_extract_into_tensor", scoped)] if exact else []):
         diffusion = module.GaussianDiffusion(
             betas=betas, model_mean_type=module.ModelMeanType[mean],
             model_var_type=module.ModelVarType.FIXED_SMALL, loss_type=module.LossType.MSE, **options)

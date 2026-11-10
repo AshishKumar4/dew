@@ -56,19 +56,14 @@ from dew.diffusion.presets import EDM
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "flaxdiff_pipeline" / "reference.npz"
-COMMIT = "3e3497e924fe58ade3fbb4e3e67c5a33d5f6623a"
 ARCHIVE_SHA256 = "93535e536346b5112751cd581fc6d94ba041fcf46365a81abbeaf572ff3682fd"
-MODEL = {"output_channels": 4, "patch_size": 2, "emb_features": 32, "num_layers": 4,
-         "num_heads": 4, "mlp_ratio": 4, "dropout_rate": 0.1, "norm_groups": 0,
-         "use_hilbert": False, "use_flash_attention": False,
-         "activation": "jax._src.nn.functions.silu", "dtype": "jax.numpy.float32",
-         "precision": "DEFAULT"}
 PROMPTS = ("a red cat", "two blue birds")
 IMAGE, STEPS, KEY, SEED = 32, 200, 3, 0
 
 
 def fetch() -> Path:
     """The pinned source, fetched once and checked against its SHA-256."""
+    from tools.flaxdiff_reference import COMMIT
     from tools.reference_source import CACHE, verified
 
     unpacked = CACHE / "AshishKumar4" / "FlaxDiff" / COMMIT
@@ -102,6 +97,7 @@ def towers(root: Path) -> tuple[Path, Path]:
 def run_config(input_config: dict, clip: Path, vae: Path) -> dict:
     """The record FlaxDiff's training.py logs for the run, the CLIP and VAE
     named by their local directories."""
+    from tools.flaxdiff_reference import MODEL
     conditions = copy.deepcopy(input_config["conditions"])
     for condition in conditions:
         condition["encoder"]["modelname"] = str(clip)
@@ -191,7 +187,10 @@ def flaxdiff_samples(weights, clip: Path, vae: Path, unit, noise, *, towers: str
     from flaxdiff.models.simple_vit import SimpleUDiT
     from flaxdiff.predictors import KarrasPredictionTransform
     from flaxdiff.schedulers import KarrasVENoiseScheduler
+    from recorded_draws import JaxDraws, Tape
     from transformers import AutoTokenizer
+
+    from tools.flaxdiff_reference import MODEL
 
     dtype = jnp.float64 if wide else jnp.float32
     model = SimpleUDiT(**{key: value for key, value in MODEL.items()
@@ -207,12 +206,11 @@ def flaxdiff_samples(weights, clip: Path, vae: Path, unit, noise, *, towers: str
         model_output_transform=KarrasPredictionTransform(sigma_data=0.5), input_config=input_config,
         autoencoder=autoencoder, guidance_scale=3.0)
 
-    steps = iter(noise)
-    initial = types.SimpleNamespace(**{**vars(jax), "random": types.SimpleNamespace(
-        **{**vars(jax.random), "normal": lambda key, shape, *_, **__: jnp.asarray(unit, dtype)})})
-    stepped = types.SimpleNamespace(**{**vars(jax), "random": types.SimpleNamespace(
-        **{**vars(jax.random), "normal": lambda key, shape, *_, **__: jnp.asarray(next(steps), dtype)})})
-    common.jax, euler.jax = initial, stepped
+    # The initial noise and each ancestral step's, Dew's draws in their order (`recorded_draws`): the
+    # sampler's module reads the first, the walk's the rest.
+    tapes = Tape([unit]), Tape(noise)
+    common.jax, euler.jax = (types.SimpleNamespace(**{**vars(jax), "random": JaxDraws(tape, dtype)})
+                             for tape in tapes)
     try:
         params = {"params": jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), weights)}
         samples = sampler.generate_samples(
@@ -220,7 +218,8 @@ def flaxdiff_samples(weights, clip: Path, vae: Path, unit, noise, *, towers: str
             start_step=1000, end_step=0, priors=None, model_conditioning_inputs=(encoder(list(PROMPTS)),))
     finally:
         common.jax, euler.jax = jax, jax
-    assert next(steps, None) is None, "FlaxDiff took fewer ancestral steps than Dew"
+    for tape in tapes:
+        tape.spent()
     return np.asarray(samples, np.float64 if wide else np.float32)
 
 
@@ -262,6 +261,8 @@ def seeded() -> None:
     from test_flaxdiff import flaxdiff_tasks, sampled_pair
 
     imported()
+    from tools.flaxdiff_reference import COMMIT
+
     meta, weights, _ = recorded()
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -300,6 +301,8 @@ def main() -> None:
     from flaxdiff.inputs import CLIPTextEncoder, DiffusionInputConfig
     from flaxdiff.models.simple_vit import SimpleUDiT
     from transformers import AutoTokenizer, CLIPTextConfig
+
+    from tools.flaxdiff_reference import COMMIT, MODEL
 
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

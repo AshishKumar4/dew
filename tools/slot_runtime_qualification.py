@@ -467,11 +467,13 @@ class Partial:
     def write(self, seed, values, spent):
         import numpy as np
 
+        from dew._files import replacing
+
         record = self.directory / f"{seed}.npz"
-        partial = record.with_name(f"{seed}.partial.npz")
-        np.savez(partial, **values)
-        record.with_suffix(".json").write_text(json.dumps(spent) + "\n")
-        partial.replace(record)
+        # The sidecar lands before the record is published whole (`replacing`).
+        with replacing(record) as staged, open(staged, "wb") as handle:
+            np.savez(handle, **values)
+            record.with_suffix(".json").write_text(json.dumps(spent) + "\n")
 
 
 def precision():

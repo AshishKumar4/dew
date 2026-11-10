@@ -6,7 +6,7 @@ an environment holding the release's transformers (4.56.2) and torch (2.8.0, CPU
     python tools/kimi_k3_vision_worker.py SITE    `IN OUT` lines on stdin, each answered `done`
 
 IN holds cases `<case>.<kind>`, each kind's patches `[t*h*w, 3, 14, 14]` of its grid in
-tests/test_kimi_k3_vision.py's `GRIDS`; OUT gets `<case>.reference.<kind>` and `<case>.truth.<kind>`, the
+tools/kimi_k3_vision_cases.py's `GRIDS`; OUT gets `<case>.reference.<kind>` and `<case>.truth.<kind>`, the
 item's projected merge blocks `[h*w/4 * (t if an image), text width]`, the tower's frames pooled
 (`sd2_tpool`). The release's vision definitions run as they are written, selected from the file without
 the language model it imports (`KimiLinearForCausalLM`, whose kernels need fla on a CUDA device), its
@@ -34,6 +34,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from kimi_k3_vision_cases import GRIDS
 from reference_source import ran, selected
 from reference_worker import drawn, serve
 
@@ -41,8 +42,6 @@ from _dew_torch.precision import dtype_widened, float64, replaced
 
 REPO, REVISION = "moonshotai/Kimi-K3", "f831ab66814297da540d832a5235f8e904f29d06"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf" / "kimi-k3-tiny"
-GRIDS = {"image": (1, 4, 6), "video": (2, 4, 4)}
-"""Each drawn item's `(t, h, w)` grid in 14-pixel patches, as tests/test_kimi_k3_vision.py draws it."""
 VISION = {"eager_attention", "multihead_attention", "VL_VISION_ATTENTION_FUNCTIONS",
           "_apply_rope_input_validation", "get_rope_shape_decorate", "get_rope_shape", "apply_rope",
           "get_1d_sincos_pos_embed_from_grid", "get_1d_sincos_pos_embed",

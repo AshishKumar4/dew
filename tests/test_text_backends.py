@@ -11,12 +11,11 @@ import pytest
 from dew.data import Loading, Memory, from_grain, presets, text
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
+from tools.datasets.passages import PASSAGES
 
 LOADING = Loading(workers=0, threads=1, read_buffer=1)
 CHAT = Path(__file__).parent / "fixtures" / "tokenizers" / "tiny-chat"
 FIXTURE = Path(__file__).parent / "fixtures" / "tfds" / "dew_passages" / "1.0.0"
-PASSAGES = [f"passage {index}: " + "the quick brown fox jumps over the lazy dog " * (1 + index % 4)
-            for index in range(24)]
 
 
 def stored(backend: str, tmp_path: Path):

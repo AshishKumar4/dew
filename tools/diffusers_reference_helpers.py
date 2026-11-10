@@ -77,6 +77,16 @@ def recording(destination: str, cohort: str) -> Path:
     return root
 
 
+def scheduler_module(name: str) -> ModuleType:
+    """The module that defines Diffusers' exported scheduler class `name` (its `__module__`), which a
+    reference patches (`fed_noise`) and widens (`float64_scheduler`) where its steps read their names."""
+    import importlib
+
+    import diffusers
+
+    return importlib.import_module(getattr(diffusers, name).__module__)
+
+
 def perturb(generator: torch.Generator, scale: float, *modules: torch.nn.Module) -> None:
     """Move every parameter of `modules` off its initialization by `scale`
     times a standard normal draw from `generator`, in order."""
@@ -86,14 +96,25 @@ def perturb(generator: torch.Generator, scale: float, *modules: torch.nn.Module)
                 parameter.add_(scale * torch.randn(parameter.shape, generator=generator))
 
 
-def saved_pipeline(pipe, directory: Path, height: int, width: int):
+def on_bfloat16_grid(*modules: torch.nn.Module) -> None:
+    """Round every parameter of `modules` to bfloat16's grid in place, kept in float32, so a bfloat16 run
+    reads each exactly."""
+    with torch.no_grad():
+        for module in modules:
+            for parameter in module.parameters():
+                parameter.copy_(parameter.to(torch.bfloat16).float())
+
+
+def saved_pipeline(pipe, directory: Path, height: int, width: int, frames: int | None = None):
     """`pipe` saved to `directory` as safetensors, its progress bar off, and
-    the geometry it is read at declared in its model_index.json (`dew_height`,
-    `dew_width`), which the pipeline classes do not declare."""
+    the geometry it is read at declared in its model_index.json (`dew_frames`
+    for a video pipeline's `frames`, `dew_height`, `dew_width`), which the
+    pipeline classes do not declare."""
     pipe.save_pretrained(directory, safe_serialization=True)
     pipe.set_progress_bar_config(disable=True)
     index = json.loads((directory / "model_index.json").read_text())
-    index.update(dew_height=height, dew_width=width)
+    geometry = {} if frames is None else {"dew_frames": frames}
+    index.update({**geometry, "dew_height": height, "dew_width": width})
     (directory / "model_index.json").write_text(json.dumps(index, indent=2))
     return pipe
 
@@ -113,7 +134,7 @@ def drawn_wan_vae(model_class, config: dict, seed: int, directory: Path):
         for name, parameter in model.named_parameters():
             if name.endswith(("gamma", "bias")):
                 parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
-            parameter.copy_(parameter.to(torch.bfloat16).float())
+    on_bfloat16_grid(model)
     model.save_pretrained(directory, safe_serialization=True)
     return model, generator
 

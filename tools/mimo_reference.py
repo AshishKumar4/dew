@@ -35,6 +35,7 @@ fixture's tokenizer.
 
 import argparse
 import json
+import runpy
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -43,8 +44,10 @@ import torch
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 AUDIO_FIXTURE = FIXTURES / "mimo-audio-tiny"
-MIMO_REPO = "XiaomiMiMo/MiMo-V2.6-Pro-MOPD"
-MIMO_REVISION = "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8"
+# The family's own pin (dew.interop.release_pins), read by its path as tools/remote_code_reference.py
+# reads it: the release's environment need not hold Dew's.
+MIMO_REPO, MIMO_REVISION = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src" / "dew" / "interop"
+                                               / "release_pins.py"))["MIMO_V2"][:2]
 
 MIMO_VISION = dict(
     depth=4, hidden_size=32, intermediate_size=48, num_heads=4, num_key_value_heads=2, qk_channels=8,

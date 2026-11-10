@@ -63,7 +63,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from diffusers_reference_helpers import on_bfloat16_grid
 from reference_releases import RELEASES, require
+from reference_vjp import recorded_vjp
 
 DIFFUSERS, TRANSFORMERS = RELEASES["rae"]["diffusers"], RELEASES["rae"]["transformers"]
 DECODER = {"decoder_hidden_size": 64, "decoder_num_hidden_layers": 2, "decoder_num_attention_heads": 4,
@@ -100,7 +102,7 @@ def build(name: str, root: Path) -> dict[str, np.ndarray]:
         for key, parameter in model.named_parameters():
             if key.endswith(("bias", "lambda1", "_token", "tokens")) or "norm" in key:
                 parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
-            parameter.copy_(parameter.to(torch.bfloat16).float())
+    on_bfloat16_grid(model)
     model.save_pretrained(root, safe_serialization=True)
     decoder = [(key, value) for key, value in model.named_parameters() if key.startswith("decoder.")]
     for _, value in decoder:
@@ -109,22 +111,15 @@ def build(name: str, root: Path) -> dict[str, np.ndarray]:
     size = grid * config["patch_size"]
     image = torch.rand((BATCH[name], 3, size, size), generator=generator).requires_grad_()
     latent = model.encode(image).latent
-    probe_latent = torch.randn(latent.shape, generator=generator)
-    (grad_image,) = torch.autograd.grad((latent * probe_latent).sum(), [image])
+    encoded = recorded_vjp("encode", {"probe_latent": latent}, {"image": image}, [], generator,
+                           reached=True)
 
     code = torch.randn(latent.shape, generator=generator).requires_grad_()
     pixels = model.decode(code).sample
-    probe = torch.randn(pixels.shape, generator=generator)
-    decoded = torch.autograd.grad((pixels * probe).sum(), [code] + [value for _, value in decoder])
+    decoded = recorded_vjp("decode", {"probe": pixels}, {"code": code}, decoder, generator, reached=True)
 
-    arrays = {
-        "image": image.detach().numpy(), "latent": latent.detach().numpy(),
-        "probe_latent": probe_latent.numpy(), "encode.grad_image": grad_image.numpy(),
-        "code": code.detach().numpy(), "pixels": pixels.detach().numpy(), "probe": probe.numpy(),
-        "decode.grad_code": decoded[0].numpy(),
-    }
-    for (key, _), gradient in zip(decoder, decoded[1:], strict=True):
-        arrays[f"decode.grad.{key}"] = gradient.numpy()
+    arrays = {"image": image.detach().numpy(), "latent": latent.detach().numpy(), **encoded,
+              "code": code.detach().numpy(), "pixels": pixels.detach().numpy(), **decoded}
     print(f"{name}: parameters {sum(value.numel() for value in model.parameters())}; latent {tuple(latent.shape)}; "
           f"pixels {tuple(pixels.shape)}; |latent| <= {np.abs(arrays['latent']).max():.3g}")
     return arrays
@@ -231,7 +226,7 @@ def build_plain(root: Path) -> dict[str, np.ndarray]:
         for key, parameter in model.named_parameters():
             if key.endswith(("bias", "lambda1", "token")) or "norm" in key:
                 parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
-            parameter.copy_(parameter.to(torch.bfloat16).float())
+    on_bfloat16_grid(model)
     model.save_pretrained(root, safe_serialization=True)
     pixels = torch.randn((1, 3, PLAIN_INPUT, PLAIN_INPUT), generator=generator).requires_grad_()
     tokens = model(pixels).last_hidden_state[:, 1:]

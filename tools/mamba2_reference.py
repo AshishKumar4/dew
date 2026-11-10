@@ -167,13 +167,6 @@ def write_mamba2_tiny(name: str = "mamba2-tiny") -> None:
     print(f"{directory}: source.json written")
 
 
-def _stepped(forward, length: int, prefill: int) -> np.ndarray:
-    """`model_support.stepped_outputs` in NumPy, a float64 run's outputs kept wide: `forward(n)` over the
-    first `n` positions, a prefill of `prefill` positions, then one position a step."""
-    calls = [(0, prefill), *((position, position + 1) for position in range(prefill, length))]
-    return np.concatenate([forward(hi)[:, lo:hi] for lo, hi in calls], axis=1)
-
-
 def _layer_config() -> Mamba2Config:
     """One `Mamba2Mixer` at the layer fixture's geometry (`ssd_support.LAYER_GEOMETRY`)."""
     from ssd_support import LAYER_GEOMETRY as g
@@ -237,6 +230,7 @@ def layer_reference(site, inputs, dtype, layer=None) -> dict[str, np.ndarray]:
     its JVP along the drawn direction (`torch.func.jvp`); over `layer` where it is built already (`_mixer`),
     as a rounding scale runs the computation alone."""
     import ssd_support as support
+    from model_support import stepped_outputs
 
     # The bf16 site's narrow run in bfloat16 end to end; its truth, as every site's, in `dtype` (float64).
     dtype = torch.bfloat16 if site == "layer_bf16" and dtype == torch.float32 else dtype
@@ -249,7 +243,8 @@ def layer_reference(site, inputs, dtype, layer=None) -> dict[str, np.ndarray]:
     if site in ("layer", "layer_bf16"):
         return {"output": layer(hidden).double().numpy()}
     if site == "decoded":
-        return {"output": _stepped(lambda length: on(hidden[:, :length]), hidden.shape[1], support.PREFILL)}
+        return {"output": stepped_outputs(lambda length: on(hidden[:, :length]), hidden.shape[1],
+                                          support.PREFILL, xp=np)}
     if site == "padded":
         second = hidden[1, :12][torch.from_numpy(support.PAUSED[1])][None]
         return {"first": on(hidden[:1, :12])[0], "second": on(second)[0]}
@@ -267,6 +262,7 @@ def model_reference(site, inputs, dtype) -> dict[str, np.ndarray]:
     document of the padded row alone over its real tokens, the scored row's first 12; 'model_decoded' the
     logits at a cached decode's widths, from the fourth."""
     import ssd_support as support
+    from model_support import stepped_outputs
 
     tensors = support.mamba2_model().export(support.mamba2_model_variables(inputs))
     model = Mamba2ForCausalLM(Mamba2Config.from_pretrained(support.HF_TINY)).eval()
@@ -277,7 +273,7 @@ def model_reference(site, inputs, dtype) -> dict[str, np.ndarray]:
         def logits(length):
             return model(ids[:, :length]).logits.double().numpy()
 
-        return {"logits": _stepped(logits, 12, 4)[:, 3:]}
+        return {"logits": stepped_outputs(logits, 12, 4, xp=np)[:, 3:]}
     length = {"model_padded": 16, "model_scored": 17}[site]
     valid, segments = support.padded_layout(length)
     real, closed = ids[:1, :length][:, torch.from_numpy(valid[0])], segments[:, valid[0]]

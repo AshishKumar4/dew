@@ -49,6 +49,7 @@ from absl import flags
 
 from dew.data import Loading
 from dew.data.dataset import Forwarding
+from dew.data.storage import EXPORT_MANIFEST, object_info
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from receipt_paths import named, recorded
@@ -206,9 +207,9 @@ class Worker:
 
 
 def file_fact(path: Path) -> dict:
+    """`path`'s size and SHA-256 (`dew.data.storage.object_info`), beside its path."""
     with path.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    return {"path": str(path), "bytes": path.stat().st_size, "sha256": digest}
+        return {"path": str(path), **object_info(stream)}
 
 
 def write_images(paths: list[Path], count: int) -> None:
@@ -256,13 +257,9 @@ def synthetic_inputs(config: Matrix) -> dict:
     Files(str(image), format="array_record").provision()
     return {
         "image": {**file_fact(path), "rows": 4096, "source": str(image)},
-        "text": {**file_fact(text / MANIFEST), "rows": len(documents),
+        "text": {**file_fact(text / EXPORT_MANIFEST), "rows": len(documents),
                  "tokens": int(sum(lengths)), "source": str(text)},
     }
-
-
-MANIFEST = "_dew_manifest.json"
-"""A committed export's manifest, which names its shards and their length indexes."""
 
 
 def inputs_of(source: Path, workload: str) -> tuple[str, ...]:
@@ -270,8 +267,9 @@ def inputs_of(source: Path, workload: str) -> tuple[str, ...]:
     beside them: the image records, or the token export's manifest and the files it names."""
     if workload == "image":
         return ("images.array_record",)
-    files = json.loads((source / MANIFEST).read_text())["files"]
-    return (MANIFEST, *(entry["path"] for entry in files), *(entry["lengths"]["path"] for entry in files))
+    files = json.loads((source / EXPORT_MANIFEST).read_text())["files"]
+    return (EXPORT_MANIFEST, *(entry["path"] for entry in files),
+            *(entry["lengths"]["path"] for entry in files))
 
 
 def evicted_copy(source: Path, workload: str, into: Path) -> Path:

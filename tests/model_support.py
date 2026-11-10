@@ -62,15 +62,21 @@ def with_logit_cotangent(draw, vocab: int, salt: int):
     return drawn
 
 
+def allocated_cache(model, variables, rows: int):
+    """`model`'s zeroed decode cache for `rows` sequences under `variables` (`CausalTransformer.init_cache`,
+    whose dummy token writes nothing)."""
+    _, made = model.apply(variables, rows, method=CausalTransformer.init_cache, mutable=['cache'])
+    return made['cache']
+
+
 @functools.cache
 def decode_steps(model, compiled=jax.jit):
     """`model`'s decode cache made for a count of rows, and its decode step from a cache, each one
     program `compiled` compiles (`jax.jit`, or the gate's `without_ynn` for a check between two Dew
-    arms): `made(variables, rows)` the cache, `step(variables, cache, ids)` the logits and the cache
-    after them."""
+    arms): `made(variables, rows)` the cache (`allocated_cache`), `step(variables, cache, ids)` the logits
+    and the cache after them."""
     def made(variables, rows):
-        _, made = model.apply(variables, rows, method=CausalTransformer.init_cache, mutable=['cache'])
-        return made['cache']
+        return allocated_cache(model, variables, rows)
 
     def step(variables, cache, ids):
         logits, mutated = model.apply({**variables, 'cache': cache}, ids, decode=True, mutable=['cache'])
@@ -160,23 +166,25 @@ def decode_through(module: nn.Module, variables, hidden, prefill: int):
     return jnp.concatenate(outputs, axis=1), allocated["cache"], cache["cache"]
 
 
-def called_outputs(forward: Callable[[int], jax.Array], calls: Sequence[tuple[int, int]]) -> jax.Array:
+def called_outputs(forward: Callable[[int], jax.Array], calls: Sequence[tuple[int, int]], *,
+                   xp=jnp) -> jax.Array:
     """A sequence's outputs at the shapes a cached rollout's `calls` compute them, each `(lo, hi)` a call
     over positions `lo` to `hi`, `forward(n)` a forward over the sequence's first `n` positions: each
     call's positions from a forward of its own over the sequence up to the call's last, at the width
     the call reads (ledger 1543, the gate's ruling: a call's reference at the shapes the call computes,
     where one forward over the whole sequence would compute every call's products at one row count,
     which a GPU's kernel rounds apart by row count). Joined along the sequence, as one forward over it
-    would be; a float64 truth, whose products round alike at every shape, reads that one forward."""
-    return jnp.concatenate([forward(hi)[:, lo:hi] for lo, hi in calls], axis=1)
+    would be; a float64 truth, whose products round alike at every shape, reads that one forward. Joined
+    by `xp`'s concatenation: NumPy's for a reference's float64 arrays, which JAX would narrow outside x64."""
+    return xp.concatenate([forward(hi)[:, lo:hi] for lo, hi in calls], axis=1)
 
 
-def stepped_outputs(forward: Callable[[int], jax.Array], length: int, prefill: int) -> jax.Array:
-    """A sequence's outputs `[B, length, ...]` at the shapes a cached decode computes them (`called_outputs`),
-    `forward(n)` a forward over its first `n` positions: a prefill of its first `prefill` positions, then
-    one position a step."""
+def stepped_outputs(forward: Callable[[int], jax.Array], length: int, prefill: int, *, xp=jnp) -> jax.Array:
+    """A sequence's outputs `[B, length, ...]` at the shapes a cached decode computes them (`called_outputs`,
+    joined by `xp`), `forward(n)` a forward over its first `n` positions: a prefill of its first `prefill`
+    positions, then one position a step."""
     return called_outputs(forward, [(0, prefill), *((position, position + 1)
-                                                     for position in range(prefill, length))])
+                                                     for position in range(prefill, length))], xp=xp)
 
 
 def as_stepped(forward: Callable[[jax.Array], jax.Array], sequence: jax.Array, prefill: int) -> jax.Array:
@@ -362,10 +370,9 @@ def prediction_logits(model, variables, tokens):
 
 
 def stepped_decode(model, variables, ids):
-    """`ids` decoded a token a call through the cache one token's call allocates, the calls one program
-    under a scan: the steps' logits `[B, S, V]` and the cache they leave."""
-    cache = nn.unbox(model.init(jax.random.key(0), ids[:, :1], decode=True))["cache"]
-    return steps_from(model, variables, cache, ids)
+    """`ids` decoded a token a call through the cache `variables` allocate (`allocated_cache`), the calls
+    one program under a scan: the steps' logits `[B, S, V]` and the cache they leave."""
+    return steps_from(model, variables, allocated_cache(model, variables, ids.shape[0]), ids)
 
 
 def steps_from(model, variables, cache, ids):

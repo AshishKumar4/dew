@@ -95,9 +95,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     torch.manual_seed(SEED)
     model = Flux2Transformer2DModel(**config).eval()
     generator = torch.Generator().manual_seed(SEED + 1)
-    with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
+    perturb(generator, 0.1, model)
     model.save_pretrained(root / name / "transformer", safe_serialization=True)
     rows, columns = case.grid
     batch = len(case.guidance)
@@ -145,9 +143,8 @@ def build_vae(name: str, root: Path) -> dict[str, np.ndarray]:
     torch.manual_seed(SEED)
     model = AutoencoderKLFlux2(**VAE, **VAES[name]).eval()
     generator = torch.Generator().manual_seed(SEED + 2)
+    perturb(generator, 0.05, model)
     with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.add_(0.05 * torch.randn(parameter.shape, generator=generator))
         model.bn.running_mean.copy_(0.3 * torch.randn(model.bn.running_mean.shape, generator=generator))
         model.bn.running_var.copy_(torch.rand(model.bn.running_var.shape, generator=generator) + 0.2)
     model.save_pretrained(root / name / "vae", safe_serialization=True)
@@ -348,10 +345,7 @@ def build_mistral3(root: Path) -> dict[str, np.ndarray]:
     config["image_token_index"] = tok.convert_tokens_to_ids("[IMG]")
     torch.manual_seed(SEED + 10)
     model = AutoModelForImageTextToText.from_config(Mistral3Config(**config)).eval()
-    generator = torch.Generator().manual_seed(SEED + 11)
-    with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
+    perturb(torch.Generator().manual_seed(SEED + 11), 0.05, model)
     model.save_pretrained(root / "mistral3" / "text_encoder", safe_serialization=True)
     tok.save_pretrained(root / "mistral3" / "tokenizer")
 

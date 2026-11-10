@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import tensorflow_datasets as tfds
+from passages import PASSAGES
 
 
 class DewImages(tfds.core.GeneratorBasedBuilder):
@@ -40,11 +41,6 @@ class DewImages(tfds.core.GeneratorBasedBuilder):
         for index in range(start, stop):
             yield index, {"image": np.full((8, 8, 3), index + 10, np.uint8),
                           "label": index % 2}
-
-
-PASSAGES = [f"passage {index}: " + "the quick brown fox jumps over the lazy dog " * (1 + index % 4)
-            for index in range(24)]
-"""The passages tests/test_text_backends.py reads from every store."""
 
 
 class DewPassages(tfds.core.GeneratorBasedBuilder):

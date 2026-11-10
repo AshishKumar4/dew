@@ -39,6 +39,7 @@ What lands:
 
 import argparse
 import json
+import runpy
 from pathlib import Path
 
 import numpy as np
@@ -57,7 +58,8 @@ HF = FIXTURES / "hf"
 LINEAR = FIXTURES / "linear_attention"
 TINY = "qwen35-tiny"
 REAL_MODEL = "Qwen/Qwen3.5-0.8B"
-BATCH, LENGTH = 2, 12
+PROBE = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src" / "dew" / "interop" / "probe.py"))
+"""Dew's verification probe (`dew.interop.probe`), read by its path: this environment holds no Dew."""
 
 # Small enough to live in git, shaped so every gap the family opens is
 # exercised: value heads outnumbering key heads, key and value dims apart,
@@ -208,7 +210,7 @@ def write_tiny(model: Qwen3_5ForCausalLM) -> None:
     directory = HF / TINY
     directory.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(directory, safe_serialization=True)
-    ids = np.random.RandomState(7).randint(0, CONFIG["vocab_size"], (BATCH, LENGTH)).astype(np.int32)
+    ids = PROBE["probe_ids"](CONFIG["vocab_size"])
     np.save(directory / "input_ids.npy", ids)
     model.set_attn_implementation("eager")
     with torch.no_grad():

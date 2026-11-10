@@ -576,6 +576,12 @@ Witnessed = dict[str, dict[int, Any]]
 each example, by the example's place among the update's examples (`Step.example_index`)."""
 
 
+DRAWN_ARRAYS: dict[str, tuple[type, ...]] = {"gradient": (str,), "record": (str, int)}
+"""`Drawn`'s fields that hold arrays, in the order a cached file stores them, each by the keys its arrays sit
+under: a gradient leaf by its name, a witnessed value by its name and its example's place. A file names an
+array `<field>/<key>/...`, its last keys split from the right (a name may hold a slash)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Drawn:
     """One arm's first step on one draw: its loss, the gradient it handed the optimizer by leaf name,
@@ -583,6 +589,33 @@ class Drawn:
     loss: float
     gradient: dict[str, NDArray]
     record: Witnessed
+
+    def arrays(self) -> dict[str, NDArray]:
+        """Every array the draw holds by one flat name (`DRAWN_ARRAYS`), as its cached file stores them."""
+        def flat(tree, depth: int) -> list[tuple[str, NDArray]]:
+            if depth == 0:
+                return [("", tree)]
+            return [(f"/{key}{rest}", value) for key, held in tree.items()
+                    for rest, value in flat(held, depth - 1)]
+
+        return {f"{field}{name}": value for field, keys in DRAWN_ARRAYS.items()
+                for name, value in flat(getattr(self, field), len(keys))}
+
+    @classmethod
+    def of(cls, loss: float, arrays: dict[str, NDArray]) -> Drawn:
+        """`arrays`' inverse (`DRAWN_ARRAYS`): the draw whose loss is `loss` and whose flat arrays are
+        `arrays`."""
+        fields: dict[str, dict] = {field: {} for field in DRAWN_ARRAYS}
+        for name, value in arrays.items():
+            field, _, rest = name.partition("/")
+            keys = DRAWN_ARRAYS[field]
+            parts = rest.rsplit("/", len(keys) - 1)
+            *path, last = (kind(part) for kind, part in zip(keys, parts, strict=True))
+            node = fields[field]
+            for key in path:
+                node = node.setdefault(key, {})
+            node[last] = value
+        return cls(loss, **fields)
 
     def leaves(self) -> dict[str, NDArray]:
         """What check 1 judges of the step: every gradient leaf and the loss."""
@@ -1132,9 +1165,7 @@ def _write(path: Path, drawn: Drawn, meta: dict[str, Any]) -> None:
 
     from dew._files import replacing
 
-    arrays = {f"gradient/{name}": value for name, value in drawn.gradient.items()}
-    arrays |= {f"record/{name}/{place}": value for name, examples in drawn.record.items()
-               for place, value in examples.items()}
+    arrays = drawn.arrays()
     path.parent.mkdir(parents=True, exist_ok=True)
     with replacing(path) as partial, partial.open("wb") as file:
         # Stored as arr_0 (the metadata), arr_1, ... in the names' order.
@@ -1148,13 +1179,7 @@ def _read(path: Path) -> Drawn:
     with np.load(path) as stored:
         meta = json.loads(str(stored["arr_0"]))
         arrays = {name: stored[f"arr_{index}"] for index, name in enumerate(meta["names"], start=1)}
-    record: Witnessed = {}
-    for name, value in arrays.items():
-        if name.startswith("record/"):
-            kept, place = name.removeprefix("record/").rsplit("/", 1)
-            record.setdefault(kept, {})[int(place)] = value
-    return Drawn(meta["loss"], {name.removeprefix("gradient/"): value for name, value in arrays.items()
-                                if name.startswith("gradient/")}, record)
+    return Drawn.of(meta["loss"], arrays)
 
 
 @dataclasses.dataclass(frozen=True)

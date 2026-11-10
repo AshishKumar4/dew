@@ -30,6 +30,8 @@ import torch
 from beta_schedule_reference import SOURCES
 from reference_source import package, published_files
 
+from _dew_torch.precision import float_scoped
+
 ROOT = Path(__file__).resolve().parents[1]
 REPO, COMMIT, PATH = SOURCES["diffusion_lm"]
 FILES = {
@@ -70,15 +72,9 @@ def main() -> None:
     landed = {**arrays, "indices": indices}
     published_read = gd._extract_into_tensor
 
-    def widened(arr, timesteps, broadcast_shape):
-        """`_extract_into_tensor` as published but for its `.float()`."""
-        res = torch.from_numpy(arr).to(device=timesteps.device)[timesteps]
-        while len(res.shape) < len(broadcast_shape):
-            res = res[..., None]
-        return res.expand(broadcast_shape)
-
     for dtype, suffix in ((torch.float32, ""), (torch.float64, "_f64")):
-        gd._extract_into_tensor = widened if dtype == torch.float64 else published_read
+        # The published table read at the run's precision: its `.float()` the run's dtype.
+        gd._extract_into_tensor = float_scoped(published_read, dtype)
         a, c = (torch.tensor(arrays[name], dtype=dtype) for name in ("a", "c"))
         offset = torch.zeros(SHAPE, dtype=dtype, requires_grad=True)
 

@@ -59,6 +59,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import torch
+from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_source import definitions
 from torch.nn.utils.spectral_norm import SpectralNorm
 
@@ -157,26 +158,15 @@ def flax_gradient(head) -> dict:
 
 
 def flatten(tree: dict, prefix: str) -> dict[str, np.ndarray]:
-    out = {}
-    for key, value in tree.items():
-        if isinstance(value, dict):
-            out.update(flatten(value, f"{prefix}/{key}"))
-        else:
-            out[f"{prefix}/{key}"] = np.asarray(value)
-    return out
+    """`tree`'s leaves as arrays keyed by their slash-separated paths under `prefix` (Flax's
+    `flatten_dict`)."""
+    return {f"{prefix}/{key}": np.asarray(value) for key, value in flatten_dict(tree, sep="/").items()}
 
 
 def nested(arrays: dict[str, np.ndarray], prefix: str) -> dict:
-    """`flatten`'s inverse: the arrays under `prefix/` as a tree."""
-    tree: dict = {}
-    for key, value in arrays.items():
-        if key.startswith(prefix + "/"):
-            *path, leaf = key[len(prefix) + 1:].split("/")
-            node = tree
-            for name in path:
-                node = node.setdefault(name, {})
-            node[leaf] = value
-    return tree
+    """`flatten`'s inverse: the arrays under `prefix/` as a tree (Flax's `unflatten_dict`)."""
+    return unflatten_dict({key[len(prefix) + 1:]: value for key, value in arrays.items()
+                           if key.startswith(prefix + "/")}, sep="/")
 
 
 def published() -> dict:

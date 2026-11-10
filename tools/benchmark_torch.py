@@ -73,7 +73,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from benchmark_cases import TEXT_FEATURES, TEXT_TOKENS, Case, parity_case
+from benchmark_cases import TEXT_FEATURES, TEXT_TOKENS, Case, parity_case, token_rows
 from reference_runs.common import WorkloadWork, peak_flops, trace
 from trace_window import kernel_category, kernel_totals
 
@@ -662,10 +662,7 @@ def build(case: Case, args):
 def make_batch(case: Case, seed=0):
     rng = np.random.default_rng(seed)
     if case.seq_len:
-        vocab = case.config['vocab_size']
-        if not isinstance(vocab, int):
-            raise ValueError('the decoder preset needs an integer vocabulary size')
-        text = rng.integers(0, vocab, size=(case.batch_size, case.seq_len + 1)).astype(np.int32)
+        text = token_rows(rng, case.config['vocab_size'], case.batch_size, case.seq_len + 1)
         return {'text': torch.from_numpy(text)}
     shape = (case.batch_size, case.image_size, case.image_size, 3)
     image = rng.integers(0, 256, size=shape).astype(np.float32)

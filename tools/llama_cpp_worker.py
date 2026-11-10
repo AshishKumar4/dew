@@ -39,17 +39,21 @@ def prepared() -> tuple[Path, Path, torch.nn.Module]:
 
 def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's logits from libllama, and transformers' float64 truth."""
+    from reference_worker import drawn
+
     from _dew_torch.precision import float64
     from tools.llama_cpp_reference import llama_logits
 
     program, gguf, model = prepared()
-    out = {}
-    for name in sorted({key.split(".", 1)[0] for key in cases}):
-        ids = np.asarray(cases[f"{name}.ids"], np.int32)
-        out[f"{name}.reference.logits"] = llama_logits(program, gguf, ids)
+
+    def evaluated(inputs):
+        ids = np.asarray(inputs["ids"], np.int32)
+        reference = {"logits": llama_logits(program, gguf, ids)}
         with float64(), torch.no_grad():
-            out[f"{name}.truth.logits"] = model(torch.from_numpy(ids).long()).logits.numpy()
-    return out
+            truth = {"logits": model(torch.from_numpy(ids).long()).logits.numpy()}
+        return reference, truth
+
+    return drawn(cases, evaluated)
 
 
 if __name__ == "__main__":

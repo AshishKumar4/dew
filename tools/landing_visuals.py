@@ -245,11 +245,15 @@ def call_settings(config):
 
 
 def single_call_noise(pipe, seeds, steps):
-    """The starting noise `pipe([prompt], key=seed)` draws, one row per seed."""
+    """The starting noise `pipe([prompt], key=seed)` draws, one row per seed: each its one-row call's
+    first row's key (`RowPlan.keys`)."""
     import jax
 
+    from dew.nn.inputs import RowPlan
+
     process, _ = pipe.prepared_process(steps)
-    keys = jax.numpy.stack([jax.random.fold_in(jax.random.key(int(seed)), 0) for seed in seeds])
+    alone = RowPlan.over(None, 1)
+    keys = jax.numpy.stack([alone.keys(jax.random.key(int(seed)))[0] for seed in seeds])
     return jax.vmap(lambda key: process.noise(key, pipe.latent_shape))(keys)
 
 

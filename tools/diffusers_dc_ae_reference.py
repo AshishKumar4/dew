@@ -40,6 +40,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from diffusers_reference_helpers import on_bfloat16_grid
 from reference_releases import RELEASES, require
 from reference_vjp import recorded_vjp
 
@@ -83,7 +84,7 @@ def build(config: dict, root: Path) -> dict[str, np.ndarray]:
         for name, parameter in model.named_parameters():
             if "norm" in name:
                 parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
-            parameter.copy_(parameter.to(torch.bfloat16).float())
+    on_bfloat16_grid(model)
     model.save_pretrained(root, safe_serialization=True)
     named = list(model.named_parameters())
 

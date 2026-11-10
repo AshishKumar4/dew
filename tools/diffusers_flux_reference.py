@@ -66,17 +66,10 @@ CASES: dict[str, Case] = {
 }
 
 
-def image_ids(rows: int, columns: int) -> torch.Tensor:
-    """`FluxPipeline._prepare_latent_image_ids` over a packed grid."""
-    ids = torch.zeros(rows, columns, 3)
-    ids[..., 1] = ids[..., 1] + torch.arange(rows)[:, None]
-    ids[..., 2] = ids[..., 2] + torch.arange(columns)[None, :]
-    return ids.reshape(rows * columns, 3)
-
-
 def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     """The case's saved transformer and its walk in float32 and in float64
     (`fp64.`), the same weights and inputs widened."""
+    from diffusers import FluxPipeline
     from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
 
     config = {**BASE, **case.config}
@@ -106,7 +99,8 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
                        pooled_projections=inputs[2], timestep=times.to(dtype) / 1000,
                        guidance=None if guidance is None else guidance.to(dtype),
                        txt_ids=torch.zeros(TOKENS, 3, dtype=dtype),
-                       img_ids=image_ids(rows, columns).to(dtype), return_dict=False)[0]
+                       img_ids=FluxPipeline._prepare_latent_image_ids(1, rows, columns, "cpu", dtype),
+                       return_dict=False)[0]
         gradients = torch.autograd.grad((output * probe.to(dtype)).sum(),
                                         inputs + [value for _, value in named])
         return {"output": output.detach().numpy(), "grad_packed": gradients[0].numpy(),
@@ -152,7 +146,8 @@ def reload(directory: str, recorded: str) -> None:
                        timestep=torch.from_numpy(arrays["times"]) / 1000,
                        guidance=torch.from_numpy(arrays["guidance"]),
                        txt_ids=torch.zeros(arrays["context"].shape[1], 3),
-                       img_ids=image_ids(rows, rows), return_dict=False)[0]
+                       img_ids=FluxPipeline._prepare_latent_image_ids(1, rows, rows, "cpu", torch.float32),
+                       return_dict=False)[0]
     native = arrays["native"]
     gap = float(np.abs(output.numpy() - native).max() / max(1.0, float(np.abs(native).max())))
     trained = float(np.abs(model.proj_out.weight.detach().numpy().T - arrays["proj_out"]).max())
