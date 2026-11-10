@@ -1240,9 +1240,8 @@ def template_quantized(query, key, value, table, lengths, key_scale, value_scale
 
 def _rows_ordered(scale: jax.Array, table: jax.Array) -> jax.Array:
     """A paged pool's scales `[KV, P, page]` at each row's pages of `table` `[rows, pages a row]`, in the
-    row's key order: `[rows, KV, keys]`."""
-    (rows, pages), (kv_heads, _, page) = table.shape, scale.shape
-    return jnp.moveaxis(scale[:, table], 1, 0).reshape(rows, kv_heads, pages * page)
+    row's key order, heads first: `[rows, KV, keys]`, the paged read's (`_gather_pages`) heads moved."""
+    return jnp.swapaxes(_gather_pages(scale, table, 1), 1, 2)
 
 
 @functools.cache
