@@ -2379,12 +2379,13 @@ class DecisionInputs:
     @classmethod
     def collate(cls, rows: Sequence[Encoded], pad: int, *, questions: int | None = None,
                 options: int | None = None, option_slots: int | None = None,
-                context_length: int | None = None,
+                context_length: int | None = None, width: int | None = None,
                 attention: "tuple[tuple[tuple[int, ...], ...], int] | None" = None) -> "DecisionInputs":
         """Right-pad `rows` into one batch (`pad_token_rows`), one row a window, its question
         and option slots to the widest.
 
-        `questions` and `options` widen those slots further, to shapes a caller
+        `questions` and `options` widen those slots further, and `width` the
+        tokens (`pad_token_rows`, which no row may exceed), to shapes a caller
         keeps fixed. `option_slots` is the real options a row may hold, a shape
         a caller keeps fixed too (`compacted`); without it, the batch's most,
         rounded up to `OPTION_TILE`, where that is fewer than the grid's slots.
@@ -2418,7 +2419,7 @@ class DecisionInputs:
         if forked:
             fields["forked"] = [row.forked or () for row in rows]
         tokens, padded = pad_token_rows([row.tokens for row in rows], pad_id=pad, padding_side="right",
-                                        fields=fields or None)
+                                        fields=fields or None, width=width)
         valid = padded.get(VALIDITY_FIELD, np.ones(tokens.shape, bool))
         count = max(questions or 1, *(len(row.questions) for row in rows))
         documents, parents, depth, joint = None, None, 1, False
