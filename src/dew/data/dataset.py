@@ -1185,30 +1185,28 @@ def take_rows(column, indices: np.ndarray):
 
 
 def take_batch(batch: Batch, indices: int | slice | np.ndarray) -> Batch:
-    """Rows selected along array axes and opaque lists of object records (`take_rows`)."""
-    return jax.tree.map(
-        lambda column: take_rows(column, indices) if isinstance(indices, np.ndarray) else column[indices],
-        batch, is_leaf=lambda column: isinstance(column, list),
-    )
+    """`batch`'s rows at `indices` in the fields that hold one value a row (`row_field`: arrays along their
+    leading axis, opaque lists of object records, `take_rows`), and every other field, one the whole step
+    holds, as it is."""
+    rows = rows_of(batch)
+
+    def taken(column):
+        if not row_field(column, rows):
+            return column
+        return take_rows(column, indices) if isinstance(indices, np.ndarray) else column[indices]
+
+    return jax.tree.map(taken, batch, is_leaf=lambda column: isinstance(column, list))
 
 
 def row_field(column, rows: int) -> bool:
     """Whether a batch's field `column` holds one value a row of its `rows` (`rows_of`): a list or tuple of
     that many, an array along its leading axis; any other field holds one value for the whole step (a
     step-wide array, a shared conditioning row, a host count, `dew.batch.ConsumedCount`). The one test of
-    it, which `take_row_fields`, `Objective.scored_tokens` and `dew.distributed.batches.shared_host_fields`
+    it, which `take_batch`, `Objective.scored_tokens` and `dew.distributed.batches.shared_host_fields`
     read."""
     if isinstance(column, list | tuple):
         return len(column) == rows
     return np.shape(column)[:1] == (rows,)
-
-
-def take_row_fields(batch: Batch, indices: np.ndarray) -> Batch:
-    """`batch`'s rows at `indices` in the fields that hold one value a row (`row_field`), and every other
-    field as it is."""
-    rows = rows_of(batch)
-    return jax.tree.map(lambda column: take_rows(column, indices) if row_field(column, rows) else column,
-                        batch, is_leaf=lambda column: isinstance(column, list | tuple))
 
 
 class Unstacked(ValueError):
@@ -1763,7 +1761,12 @@ def _joined(kept: Batch, new: Batch) -> Batch:
         kept, new = (batch if VALID_ROWS in batch else {**batch, VALID_ROWS: np.ones(rows_of(batch), bool)}
                      for batch in (kept, new))
 
-    def join(held: list | np.ndarray, read: list | np.ndarray) -> list | np.ndarray:
+    rows = rows_of(kept)
+
+    def join(held, read):
+        # A field the whole step holds (`row_field`), a batch function's shared value, is the stream's own.
+        if not row_field(held, rows):
+            return held
         return held + read if isinstance(held, list) else np.concatenate([held, read])
 
     return jax.tree.map(join, kept, new, is_leaf=lambda column: isinstance(column, list))

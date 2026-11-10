@@ -906,9 +906,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         commits. By default every real input, each row's `real_lengths` summed; an objective that
         scores fewer, a language model its shifted targets, counts those. The FLOP count reads the
         inputs (`real_lengths`)."""
-        from dew.data.dataset import rows_of, take_row_fields
+        from dew.data.dataset import rows_of, take_batch
 
-        return np.asarray([np.sum(self.real_lengths(take_row_fields(batch, np.array([index]))))
+        return np.asarray([np.sum(self.real_lengths(take_batch(batch, np.array([index]))))
                            for index in range(rows_of(batch))], np.int64)
 
     def scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, jax.Array] | None:
