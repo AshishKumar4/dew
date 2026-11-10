@@ -1397,7 +1397,8 @@ def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
 
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                        natural: bool = False, params: tuple = (), width: int | None = None,
-                       parts: int = 1, scaled: bool = False, codes: bool = False) -> int:
+                       parts: int = 1, scaled: bool = False, codes: bool = False, positions: int = 0,
+                       per_span: int = 1) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -1484,6 +1485,12 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
             # forward at width 64 needed 208 at 64 x 64 on one consumer, et-sneedbf16).
             step += [accumulator] * 3
     phases = [step]
+    if family.operands_in_registers:
+        # Its weights relaid as the values' product's left operand (`MmaIssuer._left`), a copy in each warp
+        # along the columns (`Family.lhs_copies`), beside the step's logits, where `_products` holds a
+        # register left operand no fragment: unpriced, three of an sm103's narrow bounded walks priced 225
+        # and 241 spilled 12 and 444 bytes at 255; priced, 257 (narrow-replication-grid).
+        phases.append([logits, (block_q, block_k * family.lhs_copies, dtype)])
     if natural:
         # The exponential's terms (`algebra.natural_exp`); a scaled walk's raise its small weights within its
         # step (`algebra.raised_weights`), beside the step's own tiles and its weights at the scale, before
@@ -1492,13 +1499,8 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
         if residuals:
             phases.append([logits, weights, weights, bits, bits])
     if scopes_products(family):
-        # Its products read back from tensor memory in its layout and converted to the walk's, both live
-        # at once (tcgen05's chunks, `Tcgen05ChunksIssuer.summed`): the logits a second time in each phase
-        # holding them, and the weighted values' product beside the sums it adds into (a B200's 64 x 64
-        # forward on three consumers, width 64, priced 126 of 160 and spilled 20 bytes; 64 x 128 132 and
-        # 184, et-h1need).
-        phases = [[*phase, logits] for phase in phases]
-        phases.append([(block_q, value_width, jnp.float32)] * 2)
+        sums = (block_q, value_width, jnp.float32)
+        phases = _read_back(phases, logits, sums, parted=parts > 1 and not scaled)
     depth = value_width if width is None else width
     products = _products(family, dtype, (block_q, depth, block_k, [logits], False, True),
                          (block_q, block_k, value_width, [weights], True, False), narrow=tiles.narrow,
@@ -1509,8 +1511,31 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
         phases += _converted(block_k, value_width if width is None else width, value_width)
     # A training walk's per-query rows (`TRAINING_ROWS`), in the accumulator's row layout.
     rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
-    return max(resources.live_registers(family, carried, *phases, *products), scored) + rows + (
+    walked = max(resources.live_registers(family, carried, *phases, *products), scored) + rows + (
         family.product_control)
+    return max(walked, _reach_registers(family, block_q, positions, per_span)) if positions else walked
+
+
+def _read_back(phases: list[list[tuple]], logits: tuple, sums: tuple, *, parted: bool) -> list[list[tuple]]:
+    """A forward's `phases` where its products are read back from tensor memory in their layout and converted
+    to the walk's, both live at once (tcgen05's chunks, `Tcgen05ChunksIssuer.summed`): the `logits` a second
+    time in each phase holding them, and the weighted values' product beside the `sums` it adds into (a B200's
+    64 x 64 forward on three consumers, width 64, priced 126 of 160 and spilled 20 bytes; 64 x 128 132 and
+    184, et-h1need). An unscaled fp32 call's (`parted`) parts each read back from a fresh accumulator into
+    the walk's registers beside its step: an sm103's 64 x 64 decode priced 188 spilled 60 bytes at 248, so
+    252 (bounded-removal)."""
+    phases = [[*phase, logits] for phase in phases]
+    if parted:
+        phases[0] += [sums] * 2
+    return [*phases, [sums] * 2]
+
+
+def _reach_registers(family: mosaic.Family, block_q: int, positions: int, per_span: int) -> int:
+    """The registers a packed-spans walk's reach holds before its walk (`_Program._positions`, a call of
+    `positions` intervals of `per_span` queries each): two 64-bit addresses of its bounds a position its block
+    holds rows of, every one loaded at once (bounded-ptxlive2: 260 address words at 128 rows, 132 at 64; an
+    sm103's 128 x 64 spilled 1192 bytes, its reach alone removed needing 248, its 64 rows 184)."""
+    return family.scalar_registers() + 4 * min(positions, block_q // per_span + 1)
 
 
 def peaks_registers(family: mosaic.Family, tiles: Tiles, dtype, *, params: tuple, width: int) -> int:
@@ -1546,8 +1571,10 @@ class ForwardRegisters:
     operands' dtype (an fp32 call's, whose launches walk its 16-bit `parts`), its query and value heads'
     widths, whether it keeps a training walk's split sums (`residuals`), whether its logits stay natural
     (`natural`, beside a config's own natural form), its score hook's parameters' kinds and kept dtypes,
-    and whether its walk scales in its kernel (`scaled`, `MosaicForward.scales_in_kernel`) and converts its
-    keys' and values' quantized codes (`codes`, `attention_mosaic_forward._Codes`)."""
+    whether its walk scales in its kernel (`scaled`, `MosaicForward.scales_in_kernel`), converts its keys'
+    and values' quantized codes (`codes`, `attention_mosaic_forward._Codes`), and a packed call's intervals
+    and their queries each (`positions`, `per_span`; none unpacked), whose reach its walk reads first
+    (`_reach_registers`)."""
     dtype: Any
     width: int
     value_width: int
@@ -1557,6 +1584,8 @@ class ForwardRegisters:
     parts: int
     scaled: bool
     codes: bool = False
+    positions: int = 0
+    per_span: int = 1
 
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
            columns: int | None = None) -> int | None:
@@ -1571,7 +1600,8 @@ class ForwardRegisters:
         value_width = columns or tiles.columns or _width(self.value_width, family, self.dtype)
         return forward_registers(family, tiles, value_width, self.dtype, self.residuals,
                                  natural=tiles.natural_form or self.natural, params=self.params,
-                                 width=width, parts=self.parts, scaled=self.scaled, codes=self.codes)
+                                 width=width, parts=self.parts, scaled=self.scaled, codes=self.codes,
+                                 positions=self.positions, per_span=self.per_span)
 
 
 DQ_ROWS = 7

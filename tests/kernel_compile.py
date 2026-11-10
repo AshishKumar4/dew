@@ -161,10 +161,6 @@ def reports(estimates: dict[str, str], binaries: list[report.Binary],
     return found_reports
 
 
-KERNEL = re.compile(r"kCustomKernel \[[^\]]*\] (\S+) .*? shared_memory: (\d+) bytes")
-"""A custom kernel's line in XLA's thunk sequence, with its name and the shared bytes it launches with: a
-Triton call's, or one of XLA's own fusions XLA emits so (`loop_multiply_fusion`)."""
-
 UNIQUIFIED = re.compile(r"__\d+$")
 """The suffix XLA gives a kernel name's later launches in a program (`recurrence_cumulated__1`)."""
 
@@ -248,34 +244,33 @@ def compile_kernels(cases, generation: str) -> list[dict]:
     kernels launch with (the most of any; those XLA refused, where it refused one), or the error.
 
     A cheap first filter: a kernel that does not compile or takes more shared memory than its GPU's
-    block holds fails here as it would there, before a GPU is paid for. A program whose thunk sequence
-    launches no Triton kernel fails too: nothing states its kernel's shared bytes."""
+    block holds fails here as it would there, before a GPU is paid for. A program whose executable carries
+    no Triton kernel fails too: nothing states its kernel's shared bytes (`triton_evidence`)."""
     found: list[dict] = []
     for case in cases:
         record: dict = {"name": case.name, "generation": generation,
                         "limit": gpu_target(generation).shared_limit}
         found.append(record)
-        sequences = _compiled(case, generation, record)
-        if sequences is None:
+        compiled = _compiled(case, generation, record)
+        if compiled is None:
             continue
-        thunks, calls = sequences
-        record.update(triton_evidence(calls, thunks))
+        launched, calls = compiled
+        record.update(triton_evidence(calls, launched))
     return found
 
 
-def triton_evidence(calls: dict[str, int], thunks: list[str]) -> dict:
-    """What XLA's thunk sequences (`thunks`) say of a program's Triton kernels, its calls by name with the
+def triton_evidence(calls: dict[str, int], launched: list[tuple[str, int]]) -> dict:
+    """What a program's executable says of its Triton kernels (`launched`, `report.launched_kernels`: each
+    custom kernel it launches by name, with the shared bytes its launch asks), its calls by name with the
     call sites of each (`calls`, the lowering reader's `triton_kernels`, which owns the inventory): the
-    largest shared bytes a call launches with, or why they say nothing. Each Triton call states its shared
-    bytes in a launch line of its own, named as the call is, XLA numbering a name's later calls
-    (recurrence_cumulated__1): XLA's own fusions launch as custom kernels too, and one kernel's name can
-    begin another's (attention_forward, attention_forward_headroom). A call with no launch line of its
-    own, or a program that calls no Triton kernel, is no evidence its kernel compiled within its block
-    (row 1381)."""
+    largest shared bytes a call launches with, or why it says nothing. Each Triton call launches a kernel of
+    its own, named as the call is, XLA numbering a name's later calls (recurrence_cumulated__1); a call with
+    no such launch, or a program that calls no Triton kernel, is no evidence its kernel compiled within its
+    block (row 1381). The executable's, not XLA's dumped thunk sequence, which a GPU host's run omitted
+    (IG-FINAL3: every Triton decode compile cell)."""
     launches: dict[str, list[int]] = {}
-    for text in thunks:
-        for name, size in KERNEL.findall(text):
-            launches.setdefault(UNIQUIFIED.sub("", name), []).append(int(size))
+    for name, shared in launched:
+        launches.setdefault(UNIQUIFIED.sub("", name), []).append(shared)
     if not calls:
         return {"error": "XLA's program calls no Triton kernel"}
     unlaunched = sorted(name for name, count in calls.items() if len(launches.get(name, ())) < count)
@@ -285,9 +280,10 @@ def triton_evidence(calls: dict[str, int], thunks: list[str]) -> dict:
 
 
 def _compiled(case, generation: str, record: dict,
-              directory: str | None = None) -> tuple[list[str], dict[str, int]] | None:
+              directory: str | None = None) -> tuple[list[tuple[str, int]], dict[str, int]] | None:
     """`case` lowered as on the CUDA `generation` (`lowered_for`) and compiled by XLA for a
-    compile-only device of it: XLA's thunk sequences and the lowered program's Triton calls by name
+    compile-only device of it: the custom kernels its executable launches (`report.launched_kernels`) and
+    the lowered program's Triton calls by name
     (`triton_kernels`), or None, `record` holding why: the error, or the shared bytes of a block XLA
     refused. Given a `directory`, its Mosaic GPU kernels' evidence too (`_printed`): `record['estimates']`
     each one's resource estimate Pallas prints as it lowers, `record['binaries']` each one's binary
@@ -316,24 +312,23 @@ def _compiled(case, generation: str, record: dict,
     # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
     # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
     printing = _printed(MOSAIC_GPU_DUMP_PTX="1") if directory else contextlib.nullcontext([])
-    with tempfile.TemporaryDirectory(prefix="dew-compile-") as dump:
-        try:
-            with printing as printed:
-                executable = lowered.compile(compiler_options={"xla_dump_to": dump})
-        except jax.errors.JaxRuntimeError as error:
-            asked = report.shared_asked(error)
-            if asked is None:
-                record["error"] = f"XLA does not compile it: {str(error)[-800:]}"
-            else:
-                record["shared"] = asked
-            return None
-        if directory is not None:
-            record["binaries"] = [dataclasses.asdict(found)
-                                  for found in report.binaries(executable, decoded=True)]
-            write_modules("".join(printed), directory)
-        if expected is not None:
-            record["route"] = _route(lowered, executable, _device(generation, expected.axes))
-        return [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")], triton_kernels(lowered)
+    try:
+        with printing as printed:
+            executable = lowered.compile()
+    except jax.errors.JaxRuntimeError as error:
+        asked = report.shared_asked(error)
+        if asked is None:
+            record["error"] = f"XLA does not compile it: {str(error)[-800:]}"
+        else:
+            record["shared"] = asked
+        return None
+    if directory is not None:
+        record["binaries"] = [dataclasses.asdict(found)
+                              for found in report.binaries(executable, decoded=True)]
+        write_modules("".join(printed), directory)
+    if expected is not None:
+        record["route"] = _route(lowered, executable, _device(generation, expected.axes))
+    return report.launched_kernels(executable), triton_kernels(lowered)
 
 
 def kernel_modules(calls: list) -> dict[str, str]:

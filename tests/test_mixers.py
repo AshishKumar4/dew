@@ -23,7 +23,7 @@ import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
 from port_support import row_names_port
-from reference_error import assert_as_exact, widened, with_gradients
+from reference_error import assert_as_exact, logits_operands, widened, with_gradients
 from residual_orders import orders, permuted, residual_width
 
 from dew.batch import coordinates
@@ -479,7 +479,10 @@ def test_every_attention_mixer_computes_or_refuses_each_policy_it_is_asked(kind,
     gives another output than the block not asked over the same weights where both hold them, a bias or a
     sink the policy adds set off zero, trained where the policy reads training (attention dropout) and in
     bfloat16 where it changes a narrow input's arithmetic (`POLICY_DTYPES`), and its gradient is finite,
-    reaching every weight the policy adds. A parallel layer computes it in its branch that attends."""
+    reaching every weight the policy adds. A parallel layer computes it in its branch that attends. Wide
+    logits show in the program alone, as no CPU output shows them: its attention's logits multiplied from a
+    query and keys widened to fp32 or wider over bfloat16 inputs, the block not asked's from 16-bit ones
+    (`logits_operands`)."""
     dtype = POLICY_DTYPES.get(policy, jnp.float32)
     # The test decoder's geometry (`TINY`), which each kind's fields are sized for (`KIND_FIELDS`).
     context = MixerContext(emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32,
@@ -508,8 +511,20 @@ def test_every_attention_mixer_computes_or_refuses_each_policy_it_is_asked(kind,
     def output(block, variables):
         return block.apply(variables, x, train=train, rngs=rngs)
 
-    assert not np.array_equal(np.asarray(output(asked_block, variables), np.float32),
-                              np.asarray(output(plain_block, weights), np.float32))
+    if policy == "wide_logits":
+        # Six tokens, so the values' product contracts six keys, not the heads' 8-wide axis the logits' does
+        # (the projections contract the 32 features).
+        tokens = jax.random.normal(jax.random.key(1), (2, 6, 32), dtype)
+
+        def logits(block, held):
+            return logits_operands(lambda held: block.apply(held, tokens), held, width=context.head_dim)
+
+        wide, narrow = logits(asked_block, variables), logits(plain_block, weights)
+        assert wide and all(jnp.finfo(found).bits >= 32 for found in wide)
+        assert narrow and all(jnp.finfo(found).bits == 16 for found in narrow)
+    else:
+        assert not np.array_equal(np.asarray(output(asked_block, variables), np.float32),
+                                  np.asarray(output(plain_block, weights), np.float32))
     gradient = jax.grad(lambda held: jnp.sum(jnp.square(output(asked_block, held).astype(jnp.float32))))(
         variables)
     leaves = dict(jax.tree_util.tree_leaves_with_path(gradient))

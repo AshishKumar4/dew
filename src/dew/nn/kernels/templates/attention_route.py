@@ -196,13 +196,15 @@ by name (`selection.select`); each pass reports its route, so the kernel-route a
 leaves the Mosaic template, with Mosaic's own reason."""
 
 
-def _mainloop(declined: selection.Refusal | None, spans: KeySpans, hooks: Hooks, unfitted) -> str:
+def _mainloop(declined: selection.Refusal | None, spans: KeySpans, hooks: Hooks, unfitted, *,
+              interpret: bool = False) -> str:
     """The mainloop a pass runs, reported (`MAINLOOP`), from Mosaic's reason it `declined` the pass and the
     Triton mainloop's refusal of its spans and hooks (`attention_triton.refused`: a dropping call's) or of
-    the call, no config of whose launch fits the GPU (`unfitted()`, its own fitting)."""
-    on_gpu = _on_gpu()
+    the call, no config of whose launch fits the GPU (`unfitted()`, its own fitting); the GPU in effect's
+    mainloops where `interpret` runs them on the CPU."""
+    on_gpu = _on_gpu() or interpret
     triton = (attention_triton.refused(spans, hooks) or unfitted()) if on_gpu else None
-    return selection.select(MAINLOOP, _Pass(on_gpu, _on_mosaic(), declined, triton)).kernel
+    return selection.select(MAINLOOP, _Pass(on_gpu, _on_mosaic() or interpret, declined, triton)).kernel
 
 
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
@@ -250,7 +252,9 @@ def _attend_backward(config: _Config, saved: tuple, dout: jax.Array) -> tuple:
     """The cotangents of the query, key, value and hooks, from the residuals, each in its primal's dtype;
     the spans take none."""
     query, key, value, spans, hooks, residuals = saved
-    grads = _backward(*config.narrowed(query, key, value), spans, hooks, dout, residuals, config)
+    grads = backward(*config.narrowed(query, key, value), spans, hooks, dout, residuals=residuals,
+                     scale=config.scale, natural=config.natural, accurate=config.accurate,
+                     rounded=config.operand_dtype is None)
     return (grads.query.astype(query.dtype), grads.key.astype(key.dtype), grads.value.astype(value.dtype),
             None, _hooks_cotangent(hooks, grads))
 
@@ -261,38 +265,47 @@ _attend = contracted("test_a_fused_attention_kernel_holds_its_reverse_orders")(
 """A template call, differentiated by its own backward: one declared derivative of a kernel's glue."""
 
 
-def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
-              dout: jax.Array, residuals: Residuals, config: _Config) -> Gradients:
-    """The backward from the forward's residuals on its mainloop (`_mainloop`); its key's and value's
-    gradients unrounded where the call narrowed them (`_Config.operand_dtype`)."""
+def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
+             dout: jax.Array, *, residuals: Residuals, scale: float | None = None, natural: bool = NATURAL,
+             accurate: bool = ACCURATE, rounded: bool = True, interpret: bool = False) -> Gradients:
+    """The template's backward from the forward's `residuals` on the mainloop that takes it (`_mainloop`):
+    the Mosaic mainloop's, else the Pallas-Triton one's, which takes what the Mosaic one declines for its
+    resources, else the plain-JAX one's; its key's and value's gradients unrounded where the call narrowed
+    them (`rounded` False, `_Config.operand_dtype`). `interpret` runs the GPU mainloops on the CPU, as the
+    device in effect's (`generation.assumed`'s `interpreted`), where an interpreted call is chosen for."""
     call = (query, key, value, spans, hooks, dout)
-    form = {"scale": config.scale, "natural": config.natural, "accurate": config.accurate}
-    rounded = config.operand_dtype is None
-    declined = (attention_mosaic.backward_declined(*call, residuals=residuals, **form) if _on_mosaic()
-                else None)
+    form = {"scale": scale, "natural": natural, "accurate": accurate}
+    declined = (attention_mosaic.backward_declined(*call, residuals=residuals, **form)
+                if _on_mosaic() or interpret else None)
     mainloop = _mainloop(declined, spans, hooks, functools.partial(
-        attention_triton.backward_unfitted, *call, residuals=residuals, scale=config.scale,
-        natural=config.natural, accurate=config.accurate))
+        attention_triton.backward_unfitted, *call, residuals=residuals, **form), interpret=interpret)
     if mainloop == 'mosaic':
-        return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, **form)
+        return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, interpret=interpret,
+                                         **form)
     if mainloop == 'triton':
         grads = attention_triton.backward(query, key, value, spans, _spread(hooks, query), dout,
-                                          residuals=residuals, rounded=rounded, **form)
+                                          residuals=residuals, rounded=rounded, interpret=interpret, **form)
         return dataclasses.replace(grads, score_params=tuple(
-            shared_sum(grad, param) for grad, param in zip(grads.score_params, hooks.score_params,
-                                                           strict=True)))
+            shared_sum(grad, param) if param.kind in SPREAD else grad
+            for grad, param in zip(grads.score_params, hooks.score_params, strict=True)))
     return attention_portable.backward(PLAIN, *call, residuals=residuals, rounded=rounded, **form)
+
+
+SPREAD = (Kind.QUERY, Kind.KEY, Kind.TILE)
+"""The parameter kinds `[B or 1, H or 1, ...]` the Pallas-Triton mainloop reads a batch row and head of
+apiece (`_spread`), whose gradients the route sums back over the rows and heads they share (`shared_sum`);
+a head's parameter `[H]` it reads as it is."""
 
 
 def _spread(hooks: Hooks, query: jax.Array) -> Hooks:
     """`hooks` with each query, key or tile parameter spread over the batch rows and query heads it shares
-    (`template.shared_place`), as the Pallas-Triton mainloop indexes them; the other mainloops read them
-    shared."""
+    (`template.shared_place`, `SPREAD`), as the Pallas-Triton mainloop indexes them; the other mainloops read
+    them shared."""
     batch, heads = query.shape[0], query.shape[2]
     return dataclasses.replace(hooks, score_params=tuple(
         dataclasses.replace(param, value=jnp.broadcast_to(param.value,
                                                           (batch, heads, *param.value.shape[2:])))
-        if param.kind in (Kind.QUERY, Kind.KEY, Kind.TILE) else param for param in hooks.score_params))
+        if param.kind in SPREAD else param for param in hooks.score_params))
 
 
 def _hooks_cotangent(hooks: Hooks, grads: Gradients) -> Hooks:

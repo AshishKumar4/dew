@@ -23,14 +23,16 @@ references, its multi-query and sequence-minor layouts, its dynamic masks, its f
 saved residuals and manual sharding spec are left out; its long functions are cut into named parts and
 its style moved to this tree's lint, every operation and its order as upstream's.
 
-One change of logic, marked `# Dew:`: the backward's delta (D, the row sums the softmax's derivative
+Two changes of logic, marked `# Dew:`. The backward's delta (D, the row sums the softmax's derivative
 subtracts) is each query's sum_k p * dp, taken in a pass of the dQ kernel's own before the dQ and dK/dV
 kernels from the same weights and products the dQ kernel forms, where upstream takes rowsum(o * do). The
 two are equal in exact arithmetic; only the first cancels exactly where a query's weight is all on one key
 (a causal first query, a document of one token), so that query's dQ is exactly zero, as the softmax's
 derivative has it (1.2e-6 from a causal first query on a TPU v5e upstream's way). It reads each logits
 block three times where upstream's fused kernel reads it once. It was Dew's JAX build's commit e963f3739,
-whose `BlockSizes.delta_from_weights` it carries.
+whose `BlockSizes.delta_from_weights` it carries. And the backward's weights are exp(s - m) over the
+query's denominator, the forward's maximum and denominator saved apart (`_weights`), where upstream's are
+exp(s - lse) of their log-sum-exp.
 """
 
 from __future__ import annotations
@@ -487,7 +489,7 @@ def _forward_kernel(
     mask_ref,
     q_sequence_ref,
     o_ref,
-    logsumexp_ref,
+    statistics_ref,
     m_scratch_ref,
     l_scratch_ref,
     o_scratch_ref,
@@ -499,7 +501,7 @@ def _forward_kernel(
     **step,
 ):
     """The forward over a (head, query block, key block) grid: the running state from the sinks or empty,
-    each key block's compute blocks (`_forward_step`), then the output normalized and the log-sum-exp."""
+    each key block's compute blocks (`_forward_step`), then the output normalized and its statistics."""
     h, i, j = pl.program_id(0), pl.program_id(1), pl.program_id(2)
 
     @pl.when(j == 0)
@@ -549,9 +551,11 @@ def _forward_kernel(
         total = l_scratch_ref[...]
         l_inv = jnp.tile(1.0 / total, (1, pl.cdiv(head_dim_v, NUM_LANES)))[..., : o_scratch_ref.shape[-1]]
         o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
-        if logsumexp_ref is not None:
-            assert logsumexp_ref.shape == (step["bq"], NUM_LANES)
-            logsumexp_ref[...] = (jnp.log(total) + m_scratch_ref[...]).astype(logsumexp_ref.dtype)
+        if statistics_ref is not None:
+            assert statistics_ref.shape == (step["bq"], NUM_LANES)
+            # Dew: each query's maximum in lane 0 and its denominator in lane 1, not their log-sum-exp.
+            lanes = lax.broadcasted_iota(jnp.int32, statistics_ref.shape, 1)
+            statistics_ref[...] = jnp.where(lanes == 0, m_scratch_ref[...], total)
 
 
 class _Call(NamedTuple):
@@ -574,8 +578,9 @@ def _forward(
     blocks: BlockSizes,
     call: _Call,
     residuals: bool,
-) -> tuple[jax.Array, jax.Array | None]:
-    """The forward kernel's output `[H, Q, Dv]`, and with `residuals` each query's log-sum-exp `[H, Q]`."""
+) -> tuple[jax.Array, jax.Array | None, jax.Array | None]:
+    """The forward kernel's output `[H, Q, Dv]`, and with `residuals` each query's maximum and denominator
+    `[H, Q]` each (None each without)."""
     num_q_heads, q_seq_len, head_dim_qk = q.shape
     head_dim_v = v.shape[-1]
     bq, bkv, bkv_compute = blocks.block_q, blocks.block_kv, blocks.block_kv_compute
@@ -643,7 +648,7 @@ def _forward(
         interpret=bool(call.interpret),
     )
     with jax.named_scope(name):
-        out, logsumexp = launches.pallas_call(
+        out, statistics = launches.pallas_call(
             kernel,
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=3,
@@ -668,7 +673,9 @@ def _forward(
             mask_blocks,
             q_sequence,
         )
-    return out, (logsumexp[..., 0] if residuals else None)
+    if not residuals:
+        return out, None, None
+    return out, statistics[..., 0], statistics[..., 1]
 
 
 def _dq_kernel(
@@ -681,7 +688,8 @@ def _dq_kernel(
     q_segment_ids_ref,
     kv_segment_ids_ref,
     sinks_ref,
-    logsumexp_ref,
+    peak_ref,
+    inverse_ref,
     do_ref,
     di_ref,
     mask_ref,
@@ -713,7 +721,7 @@ def _dq_kernel(
     @pl.when(should_run)
     def run():
         k, v = k_ref[...], v_ref[...]
-        logsumexp = jnp.expand_dims(logsumexp_ref[0], -1)
+        peak, inverse = jnp.expand_dims(peak_ref[0], -1), jnp.expand_dims(inverse_ref[0], -1)
         do = do_ref[...]
         qk_uncapped = _dot(q_ref[...], k, NT_DIM_NUMBERS, _precision(q_ref.dtype, k.dtype),
                            interpret=interpret)
@@ -733,7 +741,7 @@ def _dq_kernel(
             bq=bq,
             mask_function=mask_function,
         )
-        p = jnp.exp(qk - logsumexp)
+        p = _weights(qk, peak, inverse)
         dp = _dot(do.astype(v.dtype), v, NT_DIM_NUMBERS, _precision(v.dtype), interpret=interpret)
         if delta:
             # Dew: the block's share of the query's delta, sum_k p * dp, lane-broadcast.
@@ -756,7 +764,8 @@ def _dq(
     v: jax.Array,
     segment_ids: SegmentIds | None,
     sinks: jax.Array | None,
-    logsumexp: jax.Array,
+    peak: jax.Array,
+    inverse: jax.Array,
     do: jax.Array,
     di: jax.Array | None,
     *,
@@ -786,7 +795,7 @@ def _dq(
         heads=heads,
         keys_in_lanes=True,
     )
-    logsumexp = jnp.expand_dims(logsumexp, axis=-2)
+    peak, inverse = jnp.expand_dims(peak, axis=-2), jnp.expand_dims(inverse, axis=-2)
     stats_spec = pl.BlockSpec((None, 1, bq), maps.stats)
     di_spec = None if di is None else stats_spec
     di = None if di is None else jnp.expand_dims(di, axis=-2)
@@ -795,6 +804,7 @@ def _dq(
         pl.BlockSpec((None, bkv, head_dim_qk), maps.key),
         pl.BlockSpec((None, bkv, head_dim_v), maps.key),
         *specs,
+        stats_spec,
         stats_spec,
         pl.BlockSpec((None, bq, head_dim_v), maps.query),
         di_spec,
@@ -844,7 +854,8 @@ def _dq(
             k,
             v,
             *arrays,
-            logsumexp,
+            peak,
+            inverse,
             do,
             di,
             mask_blocks,
@@ -868,15 +879,16 @@ def _dkv_step(
     mask_function: MaskFunction | None,
     interpret: bool,
 ):
-    """One key compute block of the dK/dV kernel: its logits, keys along its sublanes, its weights from the
-    log-sum-exp, and dV's and dK's products added into their running sums."""
+    """One key compute block of the dK/dV kernel: its logits, keys along its sublanes, its weights
+    (`_weights`), and dV's and dK's products added into their running sums."""
     (
         q_ref,
         k_ref,
         v_ref,
         q_segment_ids_ref,
         kv_segment_ids_ref,
-        logsumexp_ref,
+        peak_ref,
+        inverse_ref,
         do_ref,
         di_ref,
         mask_ref,
@@ -887,7 +899,7 @@ def _dkv_step(
     slice_k = pl.ds(i * bkv_compute, bkv_compute)
     q = q_ref[...]
     k, v = k_ref[slice_k, :], v_ref[slice_k, :]
-    logsumexp = logsumexp_ref[:1, :]
+    peak, inverse = peak_ref[:1, :], inverse_ref[:1, :]
     do = do_ref[...]
     di = di_ref[:1, :]
     qk_uncapped = _dot(k, q, NT_DIM_NUMBERS, _precision(k.dtype, q.dtype), interpret=interpret)
@@ -907,7 +919,7 @@ def _dkv_step(
         k_in_lanes=False,
         mask_function=mask_function,
     )
-    p = jnp.exp(qk - logsumexp)
+    p = _weights(qk, peak, inverse)
     dv = _dot(p.astype(do.dtype), do, NN_DIM_NUMBERS, _precision(do.dtype), interpret=interpret)
     dv_scratch_ref[slice_k, :] = dv.astype(dv_scratch_ref.dtype) + dv_scratch_ref[slice_k, :]
     dp = _dot(v, do, NT_DIM_NUMBERS, _precision(v.dtype, do.dtype), interpret=interpret)
@@ -926,7 +938,8 @@ def _dkv_kernel(
     q_segment_ids_ref,
     kv_segment_ids_ref,
     sinks_ref,
-    logsumexp_ref,
+    peak_ref,
+    inverse_ref,
     do_ref,
     di_ref,
     mask_ref,
@@ -968,7 +981,8 @@ def _dkv_kernel(
         v_ref,
         q_segment_ids_ref,
         kv_segment_ids_ref,
-        logsumexp_ref,
+        peak_ref,
+        inverse_ref,
         do_ref,
         di_ref,
         mask_ref,
@@ -1006,7 +1020,8 @@ def _dkv(
     v: jax.Array,
     segment_ids: SegmentIds | None,
     sinks: jax.Array | None,
-    logsumexp: jax.Array,
+    peak: jax.Array,
+    inverse: jax.Array,
     do: jax.Array,
     di: jax.Array,
     *,
@@ -1036,17 +1051,18 @@ def _dkv(
         heads=heads,
         keys_in_lanes=False,
     )
-    assert logsumexp.shape == di.shape == (num_q_heads, q_seq_len)
+    assert peak.shape == inverse.shape == di.shape == (num_q_heads, q_seq_len)
     # Expanded across the sublanes until Mosaic has every retiling (upstream's).
     stats_shape = (num_q_heads, NUM_SUBLANES, q_seq_len)
-    logsumexp = jnp.broadcast_to(jnp.expand_dims(logsumexp, -2), stats_shape)
-    di = jnp.broadcast_to(jnp.expand_dims(di, -2), stats_shape)
+    peak, inverse, di = (jnp.broadcast_to(jnp.expand_dims(stat, -2), stats_shape)
+                         for stat in (peak, inverse, di))
     stats_spec = pl.BlockSpec((None, NUM_SUBLANES, bq), maps.stats)
     in_specs = [
         pl.BlockSpec((None, bq, head_dim_qk), maps.query),
         pl.BlockSpec((None, bkv, head_dim_qk), maps.key),
         pl.BlockSpec((None, bkv, head_dim_v), maps.key),
         *specs,
+        stats_spec,
         stats_spec,
         pl.BlockSpec((None, bq, head_dim_v), maps.query),
         stats_spec,
@@ -1099,7 +1115,8 @@ def _dkv(
             k,
             v,
             *arrays,
-            logsumexp,
+            peak,
+            inverse,
             do,
             di,
             mask_blocks,
@@ -1109,6 +1126,14 @@ def _dkv(
 
 
 _NONDIFF = ("blocks", "call")
+
+
+def _weights(logits: jax.Array, peak: jax.Array, inverse: jax.Array) -> jax.Array:
+    """Dew: the backward's weights of `logits`, exp(s - m) over the query's denominator (`inverse`, 1 / l),
+    from the forward's maximum and denominator, as the template's backward takes them
+    (`attention_gradient.normalized`). Upstream's exp(s - lse) carried its log-sum-exp's rounding, a few of
+    its ulps, into every weight of the query alike."""
+    return jnp.exp(logits - peak) * inverse
 
 
 def _precision(*dtypes) -> lax.Precision | None:
@@ -1151,31 +1176,34 @@ def _attending(
 def _attention_fwd(
     fwd_mask_info, dq_mask_info, dkv_mask_info, q, k, v, segment_ids, sinks, blocks: BlockSizes, call: _Call
 ):
-    out, logsumexp = _forward(
+    out, peak, total = _forward(
         fwd_mask_info, q, k, v, segment_ids, sinks, blocks=blocks, call=call, residuals=True
     )
     # Dew: no output among the residuals; the backward's D is its own (`_attention_bwd`).
-    return out, (q, k, v, segment_ids, sinks, logsumexp, dq_mask_info, dkv_mask_info)
+    return out, (q, k, v, segment_ids, sinks, peak, total, dq_mask_info, dkv_mask_info)
 
 
 def _attention_bwd(blocks: BlockSizes, call: _Call, residuals: tuple, do: jax.Array):
     """dQ, dK and dV from the delta pass, the dK/dV kernel and the dQ kernel; the sinks' gradient."""
-    q, k, v, segment_ids, sinks, logsumexp, dq_mask_info, dkv_mask_info = residuals
+    q, k, v, segment_ids, sinks, peak, total, dq_mask_info, dkv_mask_info = residuals
+    inverse = 1.0 / total
     # Dew: di is each query's sum_k p * dp from the dQ kernel's own pass, not rowsum(o * do).
     di = _dq(
-        q, k, v, segment_ids, sinks, logsumexp, do, None, blocks=blocks, mask_info=dq_mask_info, call=call
+        q, k, v, segment_ids, sinks, peak, inverse, do, None, blocks=blocks, mask_info=dq_mask_info, call=call
     )
     dk, dv = _dkv(
-        q, k, v, segment_ids, sinks, logsumexp, do, di, blocks=blocks, mask_info=dkv_mask_info, call=call
+        q, k, v, segment_ids, sinks, peak, inverse, do, di, blocks=blocks, mask_info=dkv_mask_info, call=call
     )
-    dq = _dq(q, k, v, segment_ids, sinks, logsumexp, do, di, blocks=blocks, mask_info=dq_mask_info, call=call)
+    dq = _dq(
+        q, k, v, segment_ids, sinks, peak, inverse, do, di, blocks=blocks, mask_info=dq_mask_info, call=call
+    )
     dsinks = None
     if sinks is not None:
         # Dew: each query's D is di, the dQ kernel's own sum_k p * dp, not the rounded output's
         # rowsum(o * do).
         # Dew: summed over its queries once rounded (`compensated_sum`), as the reference's softmax VJP
         # sums them closer than one float32 reduction (row 1331).
-        sinks_exp = -jnp.exp(sinks[..., None].astype(jnp.float32) - logsumexp.astype(jnp.float32))
+        sinks_exp = -_weights(sinks[..., None].astype(jnp.float32), peak, inverse)
         dsinks = compensated_sum(sinks_exp * di, (sinks_exp.ndim - 1,)).astype(sinks.dtype)
     return None, None, None, dq, dk, dv, None, dsinks
 

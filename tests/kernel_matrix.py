@@ -178,6 +178,10 @@ SEEDED: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] = {
     "attention": (
         (3522, ("sm90", "256", "gqa-8-4", "causal", "plain", "two", "float32", "fast")),
     ),
+    "decode": (
+        (5268, ("sm90", "dense", "mha-8", "plain", "float32", "64", "decode")),
+        (5404, ("sm80", "dense", "gqa-16-8", "softcap", "float32", "128", "template")),
+    ),
 }
 """Each family's cases a ledger row names, by the row, its axis values in `AXES`' order: its cells take them
 whatever the covering takes besides (`covering`), so the row's own case proves it closed."""

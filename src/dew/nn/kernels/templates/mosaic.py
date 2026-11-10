@@ -1520,8 +1520,12 @@ class Issuer[Accumulator](abc.ABC):
         so the vector is in a column's layout (`column`, a logits tile's keys'), as
         `attention_algebra.weighed_reach` reads it; no pass over the values outside the launch. In the values'
         own dtype until the reduction is done (a magnitude's maximum is exact in any), so the tile holds half
-        an fp32 tile's registers."""
-        values = plgpu.load(tile.transpose((1, 0)), layout=self.layout, optimized=False)
+        an fp32 tile's registers. A value narrower than the accumulator layout's rows is read in four warps of
+        a quarter of its rows each, whose column vector is the accumulator's (`swizzling.rows_read`): a
+        32-wide value is no 64-row tile of an H100's mma.sync, wgmma or tcgen05 layout (IG-FINAL3-h100's
+        cast)."""
+        layout = swizzling.rows_read(self.layout, tile.shape[1])
+        values = plgpu.load(tile.transpose((1, 0)), layout=layout, optimized=False)
         return jnp.max(jnp.abs(values), axis=0).astype(jnp.float32)
 
     column_scratch: int

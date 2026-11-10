@@ -28,6 +28,7 @@ from dew.nn.precision import (
     _rounded_significand,
     compensated_add,
     compensated_difference,
+    exact_products,
     fp32_result_dot_general,
     two_product,
     two_sum,
@@ -691,7 +692,9 @@ def test_a_projection_factory_keeps_the_contraction_its_caller_gives():
 def test_xla_attention_multiplies_at_jax_s_configured_precision_or_a_stated_one(dtype, precision):
     """'xla' attention multiplies at JAX's configured precision where the caller states none, float32
     queries as bf16 ones, and every product at HIGHEST where it states that, on whichever path
-    computes it."""
+    computes it: at HIGHEST, or at the dot algorithm of its 16-bit operands' own exact products with fp32
+    sums (jax.nn's BF16_BF16_F32 for a bf16 query's logits), which computes HIGHEST for them
+    (`exact_products`)."""
     query, key, value = (part.astype(dtype) for part in
                          jax.random.normal(jax.random.key(1), (3, *BF16_QKV), jnp.float32))
     precisions = dot_precisions(lambda q, k, v: scaled_dot_product_attention(
@@ -699,7 +702,9 @@ def test_xla_attention_multiplies_at_jax_s_configured_precision_or_a_stated_one(
     if precision is None:
         assert_configured_products(precisions)
     else:
-        assert precisions and all(stated == HIGHEST for stated, _, _ in precisions)
+        assert precisions and all(stated == HIGHEST or (isinstance(stated, jax.lax.DotAlgorithmPreset)
+                                                        and exact_products(stated, operands))
+                                  for stated, operands, _ in precisions)
 
 
 @pytest.mark.parametrize("tied", [True, False])

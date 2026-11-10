@@ -551,6 +551,48 @@ def test_a_programs_spilling_triton_launch_is_recorded_with_no_mosaic_kernel_bes
     assert missed == [("dew_softmax", True)]
 
 
+class TwiceUncounted(Uncounted):
+    """`Uncounted`, its widest tiles its only ones until a compile has refused two of its configs: a launch
+    whose model misses at two configs in turn."""
+
+    def candidate(self, ba, config, target):
+        return grouped_matmul.MosaicGmm.candidate(self, ba, config, target) and (
+            config.block_n == 256 or len(report.refused_launches()) >= 2)
+
+
+@lowers("sm90")
+def test_a_launch_spilling_at_two_configs_steps_down_alone_and_its_program_compiles_whole_once_more():
+    """A program of one launch whose kernel spills at its first two configs, compiled for a compile-only H100
+    (`report.compiled`): each config is refused as the launch compiles alone (`report.compiled_alone`), and
+    the program compiles whole twice, its first compile and once after its launch's steps, where each step
+    compiled it whole (row 5359: about 18 s of a step-down's 30 on an sm100 step); the program kept spills
+    nothing, as the launch's last step alone did not: a kernel's code alone is its code in the program, the
+    fact the step-down rests on."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training.ahead import compile_only_gpus
+
+    devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
+    operands = [jax.ShapeDtypeStruct(shape, jnp.bfloat16, sharding=NamedSharding(devices, PartitionSpec()))
+                for shape in ((ROWS, FEATURES), (EXPERTS, FEATURES, WIDTH), (EXPERTS, FEATURES, WIDTH))]
+
+    def lowered():
+        def stepped(x, gate, up):
+            sizes = jnp.full((EXPERTS,), ROWS // EXPERTS, jnp.int32)
+            return TwiceUncounted()(x, gate, sizes, paired=up, out_dtype="bfloat16", trans_rhs=False,
+                                    hooks=grouped_matmul.Hooks(epilogue=lambda g, u: jax.nn.silu(g) * u),
+                                    interpret=False)
+        return jax.jit(stepped).trace(*operands).lower()
+
+    with (report.refusals(), generation.assumed("sm90"), Compiles("stepped") as compiles,
+          jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
+        report.compiled(lowered(), relower=lowered)
+        misses = report.misses()
+    assert [miss.stepped for miss in misses] == [True, True], misses
+    assert len({miss.config for miss in misses}) == 2 and all(miss.frame for miss in misses), misses
+    assert compiles.count == 2
+
+
 @lowers("sm90")
 @pytest.mark.parametrize("constant", [False, True], ids=["no-constant", "a-constant"])
 def test_an_executable_carries_each_mosaic_and_triton_kernels_binary_once(constant):

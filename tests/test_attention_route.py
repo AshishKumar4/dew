@@ -512,6 +512,30 @@ def _documents(rows: int, queries: int) -> jax.Array:
     return jnp.asarray(np.broadcast_to(ids, (rows, queries)))
 
 
+def _filled_terms(documents: jax.Array, fill: float | None, *, sinks: bool):
+    """The float64 terms of a causal call over `documents` (`_documents`) whose masked logits are `fill`
+    (`mask_fill`), its sinks' gradient's last where `sinks` (`attention_terms`): every key kept, a masked
+    logit the fill (`attention_terms`' `score`, whose slope there is zero), exact for a finite fill; with
+    None (-inf) the keys it sees alone. A function of a draw `(query, key, value, sinks, dout)`, its
+    output's and gradients' terms, so a query that keeps one key (each document's first) is sized by what
+    it sums: the fast form's dQ there is its products' rounding (`attention_mosaic_scores._scores`), where
+    float64's is zero."""
+    ids = np.asarray(documents)
+    order = np.arange(ids.shape[1])
+    visible = ((ids[:, :, None] == ids[:, None, :]) & (ids[:, :, None] != 0)
+               & (order[:, None] >= order[None, :]))[:, None]
+
+    def terms(query, key, value, sink_logits, dout):
+        if fill is None:
+            return tuple(attention_terms(query, key, value, dout, visible))
+        found = attention_terms(query, key, value, dout, np.ones_like(visible),
+                                sinks=sink_logits if sinks else None,
+                                score=lambda raw: jnp.where(visible, raw, fill))
+        return tuple(found)
+
+    return terms
+
+
 @pytest.mark.parametrize("sinks", [False, True], ids=["plain", "sinks"])
 @pytest.mark.parametrize("fill", [JAX_NN_FILL, -2.0], ids=["jax-nn", "within-reach"])
 def test_a_template_call_filling_its_masked_logits_is_on_par_with_the_portable_path(fill, sinks):
@@ -536,7 +560,7 @@ def test_a_template_call_filling_its_masked_logits_is_on_par_with_the_portable_p
 
     assert_as_exact(jax.jit(call("template")), jax.jit(call("reference")),
                     drawing(QUERIES, QUERIES, jnp.bfloat16, sinks=True), f"template filled {fill:g}",
-                    seeds=SEEDS)
+                    seeds=SEEDS, terms=_filled_terms(documents, fill, sinks=sinks))
 
 
 def test_a_row_that_sees_no_key_weighs_each_value_before_summing_them():
@@ -593,8 +617,9 @@ def test_a_template_call_filling_with_minus_infinity_reads_nan_where_a_row_sees_
 
         return run
 
+    seen_terms = _filled_terms(documents, None, sinks=False)
     assert_as_exact(jax.jit(finite("template")), jax.jit(finite("reference")), draw, "template filled -inf",
-                    seeds=SEEDS)
+                    seeds=SEEDS, terms=lambda *draw: seen_terms(*draw)[:3])
 
 
 @pytest.mark.parametrize("implementation", ["reference", "template"])
@@ -615,10 +640,11 @@ def test_a_call_scaling_its_logits_after_the_product_is_on_par_with_flaxs_form(d
 
         return run
 
+    causal = _terms({"causal": True})
     assert_as_exact(jax.jit(call(implementation, scale_logits=True)),
                     jax.jit(call("reference", scale_logits=False)),
                     drawing(QUERIES, KEYS, dtype, sinks=False), f"logits scaled after {implementation}",
-                    seeds=SEEDS)
+                    seeds=SEEDS, terms=lambda *draw: causal(*draw)[:4])
 
 
 @pytest.mark.parametrize("name", ["block-causal-documents-window", "valid-documents-window-places"])

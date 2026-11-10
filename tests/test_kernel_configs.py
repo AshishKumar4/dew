@@ -1141,9 +1141,9 @@ def test_a_blackwells_nvfp4_product_runs_the_template_named_for_it():
 
 def test_each_triton_call_needs_a_launch_of_its_own():
     """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
-    A100: with every launch line XLA writes, the gate reads their shared bytes; without one of the two
-    `probe` launches, or without `probe_headroom`'s, it has no evidence (row 1381), where matching a launch
-    by a name's prefix took one launch for both calls."""
+    A100: with every custom kernel its executable launches (`report.launched_kernels`), the gate reads their
+    shared bytes; without one of the two `probe` launches, or without `probe_headroom`'s, it has no evidence
+    (row 1381), where matching a launch by a name's prefix took one launch for both calls."""
     from jax.experimental import pallas as pl
     from kernel_compile import _compiled, triton_evidence
 
@@ -1160,13 +1160,12 @@ def test_each_triton_call_needs_a_launch_of_its_own():
     operand = jax.ShapeDtypeStruct((16, 128), jnp.float32)
     compiled = _compiled(support.KernelCase("probe", lambda: (program, (operand,))), "sm80", {})
     assert compiled is not None
-    thunks, calls = compiled
+    launched, calls = compiled
     assert calls == {"probe": 2, "probe_headroom": 1}
-    assert "shared" in triton_evidence(calls, thunks)
-    for missing, said in ((" probe grid", "probe"), (" probe_headroom grid", "probe_headroom")):
-        lines = "\n".join(thunks).splitlines()
-        dropped = next(index for index, line in enumerate(lines) if missing in line)
-        without = ["\n".join(lines[:dropped] + lines[dropped + 1:])]
+    assert "shared" in triton_evidence(calls, launched)
+    for said in ("probe", "probe_headroom"):
+        dropped = next(index for index, (name, _) in enumerate(launched) if name == said)
+        without = launched[:dropped] + launched[dropped + 1:]
         evidence = triton_evidence(calls, without)
         # Refused, naming the call whose launch is gone, and no other.
         assert "shared" not in evidence and said in evidence["error"].split()

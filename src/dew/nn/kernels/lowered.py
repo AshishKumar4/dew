@@ -303,14 +303,17 @@ def kernel_launches(lowered: jax.stages.Lowered, *, unrun: bool = False) -> list
     """Each of `kernel_calls`, once, with the times it runs a call of the program (`_read`): from every
     layer that calls a kernel lowered once, and every trip of a loop around it; infinite where a loop
     around it states no static count."""
-    def read(target: str, operation: ir.Operation) -> KernelCall | None:
-        kind = custom_call_kind(target)
-        if kind == "no_matmul":
-            return None
-        called = _kernel_call(kind, target, operation)
-        return dataclasses.replace(called, operands=_shapes(operation.operands))
+    return _read_calls(lowered, kernel_call, unrun=unrun)
 
-    return _read_calls(lowered, read, unrun=unrun)
+
+def kernel_call(target: str, operation: ir.Operation) -> KernelCall | None:
+    """The `KernelCall` of a custom call `operation` to `target`, None for one that runs no matmul
+    (`instrumentation.custom_call_kind`): `kernel_calls`' each, and each a compile compiles alone
+    (`report.compiled_alone`)."""
+    kind = custom_call_kind(target)
+    if kind == "no_matmul":
+        return None
+    return dataclasses.replace(_kernel_call(kind, target, operation), operands=_shapes(operation.operands))
 
 
 def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> KernelCall:

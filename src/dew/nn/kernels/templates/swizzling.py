@@ -1,8 +1,9 @@
 """A shared-memory block's layout as the Mosaic GPU templates stage it: its swizzle, the bytes a row of it
 spans before the pattern repeats (`SWIZZLE_BYTES` at widest, `swizzle_for` a block's contractions), its tiles
 (`swizzle_transforms`), plain where a step reads it a row at a time (`UNSWIZZLED`, `plain`), declared on a
-block (`staged`) and read back from a ref (`swizzle_of`); and the copies between shared memory and registers
-or global memory that read that layout (`copied`, `coalesced`, `copied_swizzle`)."""
+block (`staged`) and read back from a ref (`swizzle_of`); the copies between shared memory and registers
+or global memory that read that layout (`copied`, `coalesced`, `copied_swizzle`); and a narrow tile's read
+into an accumulator's column vector (`rows_read`)."""
 
 import math
 from collections.abc import Callable
@@ -167,3 +168,37 @@ def copied_swizzle(shape: tuple[int, ...], dtype) -> int:
     narrower = (swizzle for swizzle in (widest, widest // 2, widest // 4)
                 if swizzle >= NARROWEST_SWIZZLE_BYTES)
     return next((swizzle for swizzle in narrower if copy_tiles(shape, dtype, swizzle)), widest)
+
+
+def rows_read(layout: plgpu_core.SomeLayout, rows: int) -> plgpu_core.SomeLayout:
+    """`layout`, an accumulator's whose warps lie along its rows, for a tile of `rows` rows: itself where
+    they fill its row tile, else its warps each a share of `rows` where a share is whole lane tiles, else
+    every warp all of them, in its lane tile and vector, whose column vector is the accumulator's own
+    (`reduce(0)`), so a reduction over a narrow tile's rows reads as a wide one's: a 32-wide value read
+    transposed in a 64-row accumulator's four warps, eight rows each; a 16-column block (a B200's fp32
+    decode, `Tiles.columns`) in every warp. None such where `rows` is no whole lane tile."""
+    wide = layout.to_mgpu()
+    if not isinstance(wide, mgpu_fragments.TiledLayout):
+        raise NotImplementedError(f"{wide} is no tiled accumulator layout a tile of {rows} rows reads into")
+    planar = [tile for tile in wide.tiling.tiles if len(tile) == 2]
+    vector = tuple(tile for tile in wide.tiling.tiles if len(tile) == 1)
+    if rows % planar[0][0] == 0:
+        return layout
+    warps, lane = planar[0][0] // planar[1][0], planar[-1]
+    share = rows // warps
+    if rows % lane[0] or wide.warp_dims != (-(2 * len(planar) + 1),):
+        raise NotImplementedError(f"no tile of {rows} rows reads into the column vector of {wide}")
+    if rows % warps == 0 and share % lane[0] == 0:
+        # Its warps along its rows, a share each.
+        tiles = ((rows, planar[0][1]), *(((share, planar[1][1]),) if share != lane[0] else ()), lane, *vector)
+        warp_dims = (-(2 * sum(len(tile) == 2 for tile in tiles) + 1),)
+    else:
+        # Fewer rows than a lane tile a warp: every warp holds them all.
+        tiles = ((rows, planar[0][1]), lane, *vector)
+        warp_dims = (mgpu_fragments.Replicated(warps),)
+    narrow = mgpu_fragments.TiledLayout(mgpu_fragments.Tiling(tiles), warp_dims=warp_dims,
+                                        lane_dims=wide.lane_dims, vector_dim=wide.vector_dim)
+    if narrow.reduce((0,)) != wide.reduce((0,)):
+        raise NotImplementedError(f"no tile of {rows} rows reads into the column vector of {wide}")
+    return plgpu.Layout.TILED(narrow.tiling, warp_dims=narrow.warp_dims, lane_dims=narrow.lane_dims,
+                              vector_dim=narrow.vector_dim)

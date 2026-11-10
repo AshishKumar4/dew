@@ -196,17 +196,73 @@ def test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block(acc
     assert not failed, "\n".join(failed)
 
 
-DECODE_GATE = [(generation_name, width, stored) for generation_name in GATED for width in (64, 128)
+def staged_widths(generation_name: str, dtype) -> tuple[int, ...]:
+    """The head widths the mainloop stages for operands of `dtype` on a GPU of `generation_name`, every
+    bundle of its taking them (`bundles.layouts`, `attention_mosaic_program.refused`): each power of two a
+    call's width rounds up to, in whole swizzled rows (`attention_mosaic_program._width`), up to the widest
+    a bundle copies; the widths the route takes and stages, each a distinct launch."""
+    from dew.nn.kernels.templates.attention_mosaic_program import _width, refused
+
+    with generation.assumed(generation_name):
+        families = bundles.layouts(generation_name, dtype, 1, scoped=True)
+        return tuple(sorted({_width(2 ** power, family, dtype) for family in families for power in range(3, 9)
+                             if refused(dtype, 2 ** power, 2 ** power, None, backward=False, family=family)
+                             is None}))
+
+
+WORK_LISTS = (("decode", 1, 32, 8), ("prefill", 100, 4, 2))
+"""The work list's calls the gate lowers: a decode step's one position over 32 query heads of 8 key heads,
+and an inference call of 100 causal positions over 4 of 2, which the template route serves as the work list
+where its packed rows stream (`attention_decode.serves`; IG-FINAL3-h100's 32-wide call, no case of a
+decode-only gate)."""
+
+
+def _served(generation_name: str, positions: int, heads: int, kv_heads: int, width: int, stored: str) -> bool:
+    """Whether the template route runs a call of `positions` causal positions over `heads` query heads of
+    `kv_heads`, `width` wide, its cache `stored`, as the work list on a GPU of `generation_name`: the Mosaic
+    forward takes it (`attention_mosaic.forward_declined`), the work list serves it
+    (`attention_decode.serves`), the route's own declarations (`attention_route`), whose walks derive a plan
+    wherever it serves a 16-bit or fp32 cache; an int8 cache's codes and scales served where its walks
+    derive the plan they launch, as its selector asks (`attention_decode.planned`,
+    `dew.nn.kv_cache._template_tiles`)."""
+    from dew.nn.kernels.templates import attention_decode
+
+    rows, keys = 2, 4096 if positions == 1 else positions
+    dtype = jnp.float32 if stored == "float32" else jnp.bfloat16
+    query = jnp.zeros((rows, positions, heads, width), dtype)
+    key = jnp.zeros((rows, keys, kv_heads, width), dtype)
+    cache = jnp.zeros(key.shape, jnp.dtype(stored))
+    scale = jnp.zeros((rows, kv_heads, keys), jnp.float32)
+    scales = (scale, scale) if stored == "int8" else None
+    spans = template.spans(positions, keys, rows, causal=positions > 1)
+    with generation.assumed(generation_name):
+        return (attention_mosaic.forward_declined(query, key, key, spans) is None
+                and attention_decode.serves(query, key, None, natural=False, target=generation.gpu_target())
+                and (scales is None or attention_decode.planned(query, cache, cache, spans, template.Hooks(),
+                                                                scales=scales)[0] is not None))
+
+
+WORK_LIST_GPUS = tuple(name for name in generation.TARGETS if staged_widths(name, jnp.bfloat16))
+"""Every GPU generation whose bundles stage a head for the Mosaic mainloop (`generation.TARGETS`,
+`staged_widths`), each the work list's gate compiles for."""
+
+
+DECODE_GATE = [(generation_name, width, stored, call) for generation_name in WORK_LIST_GPUS
+               for width in staged_widths(generation_name, jnp.bfloat16)
                for stored in ("bfloat16", "int8", "float32")
-               if stored != "float32" or bundles.of(generation_name, jnp.bfloat16).copies_in_pieces]
-"""The decode gate's cases: each GPU whose family the mainloop qualifies, both widths, each cache; a float32
-query's parts where its family loads a block in pieces (`mosaic.Transport.copies_in_pieces`: not cp.async's,
-where an fp32 decode takes XLA by legality)."""
+               for call, positions, heads, kv_heads in WORK_LISTS
+               if (stored == "bfloat16" or call == "decode")
+               and _served(generation_name, positions, heads, kv_heads, width, stored)]
+"""The work list gate's cases: each GPU the route serves the work list on (`WORK_LIST_GPUS`), each width its
+bundles stage (`staged_widths`, the declarations the route's legality reads: a 32-wide call's mma.sync launch
+was no case of the gate's 64 and 128, and its magnitudes' transposed load failed on an H100, IG-FINAL3), each
+cache of a decode step (bf16, int8 codes, an fp32 query's parts) and a bf16 inference call, wherever the route
+serves the call as the work list (`_served`)."""
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize(("generation_name", "width", "stored"), DECODE_GATE)
-def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, width, stored):
+@pytest.mark.parametrize(("generation_name", "width", "stored", "call"), DECODE_GATE)
+def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, width, stored, call):
     """A decode step (`attention_decode.attend`: its plain launch at the plan's streaming key tile and
     slices, `MosaicForward.streaming`, and its masked rewalk's launches), 32 query heads over 8 key heads
     `width` wide, two rows of 4096 keys, its cache bf16, int8 codes with their scales (each slot converted
@@ -219,12 +275,15 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
 
     from dew.nn.kernels.templates import attention_decode
 
-    rows, keys = 2, 4096
-    query = jax.ShapeDtypeStruct((rows, 1, 32, width), jnp.float32 if stored == "float32" else jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((rows, keys, 8, width), jnp.dtype(stored))
-    scale = jax.ShapeDtypeStruct((rows, 8, keys), jnp.float32)
+    positions, heads, kv_heads = next(shape for name, *shape in WORK_LISTS if name == call)
+    rows, keys = 2, 4096 if positions == 1 else positions
+    query = jax.ShapeDtypeStruct((rows, positions, heads, width),
+                                 jnp.float32 if stored == "float32" else jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, keys, kv_heads, width), jnp.dtype(stored))
+    scale = jax.ShapeDtypeStruct((rows, kv_heads, keys), jnp.float32)
     quantized = stored == "int8"
-    spans = template.spans(1, keys, rows, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
+    spans = (template.spans(1, keys, rows, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
+             if positions == 1 else template.spans(positions, keys, rows, causal=True))
 
     def decode(query, key, value, *scales):
         return attention_decode.attend(query, key, value, spans, scales=scales or None)

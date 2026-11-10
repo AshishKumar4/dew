@@ -160,24 +160,25 @@ def _drawn(case: dict[str, str]):
 
 
 CASES = (
-    ('sm90', 'dense', 'gqa-16-8', 'sinks', 'bfloat16', '64', 'decode'),
-    ('sm90', 'paged', 'mha-8', 'plain', 'float16', '128', 'template'),
-    ('sm80', 'dense', 'gqa-16-8', 'softcap', 'float32', '128', 'template'),
-    ('v5e', 'paged', 'mha-8', 'softcap', 'bfloat16', '64', 'tpu'),
-    ('sm80', 'dense', 'mha-8', 'plain', 'float16', '64', 'cudnn'),
-    ('sm80', 'paged', 'gqa-16-8', 'sinks', 'bfloat16', '128', 'triton'),
-    ('v5e', 'paged', 'gqa-16-8', 'plain', 'bfloat16', '128', 'tpu'),
     ('sm90', 'dense', 'mha-8', 'plain', 'float32', '64', 'decode'),
-    ('sm90', 'dense', 'gqa-16-8', 'softcap', 'float16', '128', 'decode'),
-    ('sm90', 'dense', 'mha-8', 'sinks', 'bfloat16', '64', 'template'),
-    ('sm90', 'paged', 'mha-8', 'plain', 'bfloat16', '64', 'triton'),
-    ('sm90', 'dense', 'mha-8', 'plain', 'bfloat16', '128', 'cudnn'),
-    ('sm80', 'dense', 'gqa-16-8', 'sinks', 'float16', '64', 'decode'),
+    ('sm80', 'dense', 'gqa-16-8', 'softcap', 'float32', '128', 'template'),
+    ('sm90', 'paged', 'gqa-16-8', 'sinks', 'bfloat16', '64', 'triton'),
+    ('v5e', 'paged', 'mha-8', 'plain', 'bfloat16', '128', 'tpu'),
+    ('sm80', 'paged', 'mha-8', 'sinks', 'float16', '64', 'template'),
+    ('sm90', 'dense', 'gqa-16-8', 'sinks', 'float16', '128', 'decode'),
+    ('sm80', 'dense', 'mha-8', 'plain', 'bfloat16', '64', 'cudnn'),
+    ('v5e', 'paged', 'gqa-16-8', 'softcap', 'bfloat16', '64', 'tpu'),
+    ('sm90', 'paged', 'mha-8', 'softcap', 'bfloat16', '128', 'triton'),
+    ('sm90', 'dense', 'mha-8', 'plain', 'float16', '128', 'cudnn'),
+    ('sm90', 'paged', 'gqa-16-8', 'plain', 'bfloat16', '64', 'template'),
+    ('sm80', 'dense', 'gqa-16-8', 'softcap', 'bfloat16', '64', 'decode'),
+    ('sm80', 'paged', 'gqa-16-8', 'plain', 'bfloat16', '64', 'triton'),
     ('sm90', 'dense', 'gqa-16-8', 'sinks', 'float32', '64', 'decode'),
-    ('sm90', 'paged', 'gqa-16-8', 'softcap', 'bfloat16', '64', 'triton'),
+    ('sm90', 'dense', 'gqa-16-8', 'softcap', 'float16', '64', 'decode'),
 )
-"""The cells' cases, each its axis values in `AXES`' order: every pair of axis values the choices serve
-(`kernel_matrix.covering("decode")`, regenerated where the axes or the selectors' support change)."""
+"""The cells' cases, each its axis values in `AXES`' order: the cases a ledger row names
+(`kernel_matrix.SEEDED`) and every pair of axis values the choices serve (`kernel_matrix.covering("decode")`,
+regenerated where the axes or the selectors' support change)."""
 
 
 @cell("decode", covers=lambda case: dict(zip(AXES["decode"], case, strict=True)))
