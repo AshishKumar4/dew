@@ -303,9 +303,12 @@ def test_a_sharded_weighed_site_judges_its_weighed_check_from_its_own_map_tasks(
 def test_the_rounding_scale_knows_an_operation_by_its_object():
     """The rounding scale reads each operation's rule by JAX's primitive object: a user's primitive named
     `add`, which doubles its operand, has no rule and is refused, where its name's rule weighed it as one
-    rounding of JAX's sum."""
+    rounding of JAX's sum; a correctly rounded division (`dew.nn.precision.divided`) rounds once, as JAX's
+    own quotient does, an element's scale the same under either."""
     from jax.extend import core
     from jax.interpreters import mlir
+
+    from dew.nn.precision import divided
 
     doubling = core.Primitive("add")
     doubling.def_impl(lambda value: value * 2)
@@ -314,3 +317,6 @@ def test_the_rounding_scale_knows_an_operation_by_its_object():
     x = jnp.asarray(np.random.default_rng(5371).uniform(0.5, 2.0, (16,)), jnp.float32)
     with pytest.raises(ValueError):
         rounding_scale(lambda x: doubling.bind(x) * x, x)
+    _, rounded_once = rounding_scale(lambda x: divided(x * x, x + 1), x)
+    _, quotient = rounding_scale(lambda x: (x * x) / (x + 1), x)
+    np.testing.assert_array_equal(rounded_once, quotient)

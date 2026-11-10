@@ -17,6 +17,7 @@ from arm_arithmetic import unrewritten
 from jax.extend.core import primitives
 
 from dew.nn import programs
+from dew.nn.precision import correctly_rounded_divide_p
 
 SUMS = frozenset({jax.lax.dot_general_p, primitives.ragged_dot_general_p, jax.lax.reduce_sum_p,
     jax.lax.conv_general_dilated_p, jax.lax.cumsum_p, jax.lax.scatter_add_p})
@@ -40,9 +41,9 @@ A product or quotient of a sum by a value that is none carries them too,
 scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
 `s_i x_ik`; a product of two sums ends them."""
 
-SCALING = (jax.lax.mul_p, jax.lax.div_p)
-"""A product, and a quotient by a value that is no sum, which scale a sum's terms element by element
-(`_applied`)."""
+SCALING = (jax.lax.mul_p, jax.lax.div_p, correctly_rounded_divide_p)
+"""A product, and a quotient by a value that is no sum (JAX's and Dew's correctly rounded one), which scale
+a sum's terms element by element (`_applied`)."""
 
 
 def float32_values(jaxpr) -> int:

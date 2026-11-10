@@ -36,7 +36,7 @@ from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
 from dew.nn import programs
-from dew.nn.precision import compensated_add
+from dew.nn.precision import compensated_add, correctly_rounded_divide_p
 
 EXACT = frozenset({jax.lax.neg_p, jax.lax.abs_p, jax.lax.max_p, jax.lax.min_p, jax.lax.select_n_p,
     jax.lax.copy_p, jax.lax.iota_p, jax.lax.sign_p, jax.lax.floor_p, jax.lax.ceil_p, jax.lax.round_p,
@@ -68,8 +68,9 @@ COLLECTED = {jax.lax.psum_p: "axes", primitives.psum_invariant_p: "axes",
 those axes, bounded as any sum is (`_weight`)."""
 
 ONCE = frozenset({jax.lax.add_p, primitives.add_jaxvals_p, jax.lax.sub_p, jax.lax.mul_p, jax.lax.div_p,
-                  jax.lax.sqrt_p, jax.lax.square_p, jax.lax.reduce_precision_p})
-"""IEEE 754's correctly rounded operations: one rounding, at most u times the result."""
+                  jax.lax.sqrt_p, jax.lax.square_p, jax.lax.reduce_precision_p, correctly_rounded_divide_p})
+"""IEEE 754's correctly rounded operations, Dew's correctly rounded division among them: one rounding, at
+most u times the result."""
 
 FUNCTIONS = {getattr(jax.lax, f"{name}_p"): bound for name, bound in ULPS.items()}
 """Each elementary function's error bound (`ULPS`, by the function's name in JAX and torch alike), by JAX's
@@ -288,6 +289,9 @@ def _bound(equation, params, operands) -> list:
     """`equation`'s primitive applied to `operands`, widened past its program's dtypes, with `params`: a
     scatter's combining computation, traced for its program's dtype, built again for theirs (`SCATTERS`)."""
     primitive = equation.primitive
+    if primitive is correctly_rounded_divide_p:
+        # Its float32 rounding is what it is weighed for (`ONCE`): the replay's quotient is float64's.
+        return [operands[0] / operands[1]]
     if primitive is jax.lax.reduce_p:
         # Its combining computation, traced for its program's dtypes, is called again on theirs.
         count = len(operands) // 2

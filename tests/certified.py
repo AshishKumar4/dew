@@ -459,6 +459,14 @@ def _rounding(name: str, integral):
     return contract
 
 
+def _correctly_divided(params, operands, result, fmt):
+    """Dew's correctly rounded division's contract (`dew.nn.precision.correctly_rounded_divide_p`): its exact
+    quotient rounded to nearest, whatever the lane's own division reaches, a subnormal operand read as the
+    lane's division reads it and a subnormal quotient kept, which it never flushes."""
+    hi, lo = _quotient(*_floats(operands, lane().flushes_in("div", fmt)))
+    return _same(np.asarray(result, np.float64), rounded_on_lane(hi, lo, fmt, flushes=False))
+
+
 BROADCAST = " broadcast"
 """A division's form whose divisor is broadcast along a size-1 axis within the one equation (lax's implicit
 broadcast), its reach measured apart (`lane`): XLA on the CPU computes it as a multiply by the divisor's
@@ -977,6 +985,7 @@ CONTRACTS = {
     "mul": _rounding("mul", _wrapping(np.multiply)),
     "square": _rounding("square", _wrapping(lambda a: a * a)),
     "div": _rounding("div", _truncated),
+    "correctly_rounded_divide": _correctly_divided,
     # A remainder (C's, the dividend's sign) is exact in IEEE arithmetic and in integers, and a sign is a
     # sign operation, each kept zero's sign: bit for bit.
     "rem": _moved(lambda params, a, b: _remainder(a, b)),

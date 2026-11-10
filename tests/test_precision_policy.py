@@ -557,6 +557,34 @@ def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
     np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
 
 
+def test_a_correctly_rounded_divisions_derivatives_divide_as_ieee_division():
+    """The derivatives of a correctly rounded division divide correctly rounded too, as PyTorch's backward
+    divides: a cotangent or a tangent over a constant divisor is its IEEE quotient, where XLA's own division
+    by a constant multiplies by the constant's rounded reciprocal (an ulp off on a third of entries, row
+    5277), and the gradient in the denominator is `-g * ((n / d) / d)`, each quotient rounded once."""
+    from dew.nn.precision import divided
+
+    rng = np.random.default_rng(5277)
+    numerator, weights = (rng.uniform(-8, 8, (4096,)).astype(np.float32) for _ in range(2))
+    denominator = rng.uniform(0.5, 8, (4096,)).astype(np.float32)
+    six = np.float32(6)
+    gradient = jax.jit(jax.grad(lambda x: jnp.sum(divided(x, 6.0) * weights)))(numerator)
+    tangent = jax.jit(lambda x, direction: jax.jvp(lambda x: divided(x, 6.0), (x,), (direction,))[1])(
+        numerator, weights)
+    np.testing.assert_array_equal(np.asarray(gradient), weights / six)
+    np.testing.assert_array_equal(np.asarray(tangent), weights / six)
+    pulled = jax.jit(jax.grad(lambda d: jnp.sum(divided(numerator, d) * weights)))(denominator)
+    np.testing.assert_array_equal(np.asarray(pulled), -(weights * ((numerator / denominator) / denominator)))
+    batched = jax.jit(jax.vmap(jax.grad(lambda x, w: jnp.sum(divided(x, 6.0) * w))))(
+        numerator.reshape(64, 64), weights.reshape(64, 64))
+    np.testing.assert_array_equal(np.asarray(batched).reshape(-1), weights / six)
+    # A divisor batched beside a numerator that is not: the division broadcasts the one over the other, and
+    # the numerator's gradient is the sum of the cotangent's quotients over the divisors (two, one rounding).
+    first, second = denominator[:2]
+    over_both = jax.jit(jax.grad(lambda x: jnp.sum(jax.vmap(lambda d: divided(x, d))(denominator[:2]))))(six)
+    np.testing.assert_array_equal(np.asarray(over_both), np.float32(1) / first + np.float32(1) / second)
+
+
 HIGHEST = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
 
 

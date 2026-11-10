@@ -48,6 +48,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
+from jax.interpreters import ad, batching, mlir
 from jax.typing import DTypeLike
 
 from dew.nn.derivatives import (
@@ -1265,10 +1266,9 @@ def _correctly_rounded_divide(numerator: jax.typing.ArrayLike,
     residual settling a scaled significand that lands on a half, and the
     integer is the result's bits, which no flush to zero reaches. Past the
     largest float the quotient is infinite. A zero, infinite or NaN operand,
-    or a subnormal one, which XLA:CPU reads as zero, is the division's. Its
-    derivative is the division's, as JAX differentiates `a / b`: a protected
-    span (`correctly_rounded_divide`, `dew.nn.derivatives.declared_tangent`),
-    whose error-free steps the algebra pass must not reassociate.
+    or a subnormal one, which XLA:CPU reads as zero, is the division's. It is
+    the lowering of a primitive of its own (`correctly_rounded_divide`), so no
+    pass sees its error-free steps to reassociate them.
     """
     numerator, denominator = jnp.broadcast_arrays(jnp.asarray(numerator, jnp.float32),
                                                   jnp.asarray(denominator, jnp.float32))
@@ -1333,13 +1333,58 @@ def _rounded_significand(numerator: jax.Array, denominator: jax.Array) -> tuple[
     return rounded, jnp.sign((numerator - product) - error)
 
 
-def _divide_jvp(primals, tangents):
-    """The rounding is a selection among neighbours, so the quotient's tangent is the division's."""
-    return correctly_rounded_divide(*primals), jax.jvp(jnp.divide, primals, tangents)[1]
+correctly_rounded_divide_p = core.Primitive("correctly_rounded_divide")
+"""The correctly rounded fp32 division of two arrays (`correctly_rounded_divide`), an operation of its own so
+that its derivatives divide as it does. Its operands broadcast as a binary operation's do: the function
+gives it two of one shape, and a batching of one of them leaves the other a scalar or of unit axes
+(`batching.defbroadcasting`). Its rounding is a selection among neighbours, so its
+tangent is the division's, each quotient in it correctly rounded: `g / d` in the numerator and
+`-g * (n / d) / d` in the denominator, the order PyTorch's backward divides in, and its transpose in the
+numerator `ct / d`. As `jnp.divide`'s, they divided as XLA does: by the divisor's rounded reciprocal where it
+is a constant or a broadcast on a CPU (openxla/xla#51148) and off IEEE on 30 to 50% of quotients on a GPU, so
+a quantizer's scale or a rate's gradient left the reference's by an ulp on a third of its entries (row
+5277). It is entrywise (`Primitive.elementwise`), which the analyses of a program's entries read."""
+correctly_rounded_divide_p.def_impl(_correctly_rounded_divide)
+correctly_rounded_divide_p.def_abstract_eval(lambda numerator, denominator: jax.core.ShapedArray(
+    jnp.broadcast_shapes(numerator.shape, denominator.shape), jnp.float32))
+mlir.register_lowering(correctly_rounded_divide_p,
+                       mlir.lower_fun(_correctly_rounded_divide, multiple_results=False))
+batching.defbroadcasting(correctly_rounded_divide_p)
+correctly_rounded_divide_p.elementwise = True
 
 
-correctly_rounded_divide = contracted("test_the_precision_seams_hold_every_order")(
-    declared_tangent(Protected(), _correctly_rounded_divide, _divide_jvp))
+@contracted("test_the_precision_seams_hold_every_order")
+def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike) -> jax.Array:
+    """The correctly rounded fp32 quotient `numerator / denominator` (`_correctly_rounded_divide`), IEEE
+    division's on every backend, differentiable at every order, each of its derivatives' divisions
+    correctly rounded too (`correctly_rounded_divide_p`)."""
+    numerator, denominator = jnp.broadcast_arrays(jnp.asarray(numerator, jnp.float32),
+                                                  jnp.asarray(denominator, jnp.float32))
+    return correctly_rounded_divide_p.bind(numerator, denominator)
+
+
+def _divide_transpose(cotangent, numerator, denominator):
+    """The division's transpose in its numerator, the one operand it is linear in: the cotangent over the
+    denominator."""
+    if not ad.is_undefined_primal(numerator) or ad.is_undefined_primal(denominator):
+        raise TypeError("a correctly rounded division is linear in its numerator alone")
+    if type(cotangent) is ad.Zero:
+        return [ad.Zero(numerator.aval), None]
+    quotient = correctly_rounded_divide_p.bind(cotangent, denominator)
+    # A numerator the division broadcast (a scalar's, or along a unit axis) takes the sum of the quotients
+    # it was broadcast to.
+    shape = numerator.aval.shape
+    leading = quotient.ndim - len(shape)
+    widened = (*range(leading), *(leading + axis for axis, size in enumerate(shape)
+                                  if size != quotient.shape[leading + axis]))
+    return [jnp.reshape(jnp.sum(quotient, axis=widened), shape) if widened else quotient, None]
+
+
+ad.defjvp2(correctly_rounded_divide_p,
+           lambda tangent, quotient, numerator, denominator: correctly_rounded_divide(tangent, denominator),
+           lambda tangent, quotient, numerator, denominator: -tangent * correctly_rounded_divide(
+               quotient, denominator))
+ad.primitive_transposes[correctly_rounded_divide_p] = _divide_transpose
 
 
 def divided(numerator, rate):
