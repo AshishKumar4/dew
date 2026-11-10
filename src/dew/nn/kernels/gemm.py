@@ -371,7 +371,10 @@ class NvFp4:
         order."""
         words = jnp.swapaxes(self.words, -1, -2)
         staged = functools.partial(_codes, staged=True)
-        return jax.vmap(staged)(words) if words.ndim == 3 else staged(words)
+        # Each matrix's own, over every leading axis: a bank's groups, a stack of banks' layers before them.
+        for _ in range(words.ndim - 2):
+            staged = jax.vmap(staged)
+        return staged(words)
 
     def decoded(self) -> jax.Array:
         """Its values over `bits.NVFP4_OWED` and the tensor scale, exactly, in bfloat16 (`[..., depth,
