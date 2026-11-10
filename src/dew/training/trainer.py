@@ -980,7 +980,7 @@ class Trainer(Generic[Loss, Effects]):
         # from the plan's first read of the data on.
         with signal_wake():
             plan = self._fit_plan(dataset, **asked)
-            run = FitRun(time.perf_counter())
+            run = FitRun(time.perf_counter(), plan.startup)
             # A display of this fit's own: one before it may have run other steps.
             self._display = TrainingDisplay()
             profile, checkpoints, profiler = self.profile, self.checkpoints, owned_capture(self.profile)
@@ -1038,10 +1038,10 @@ class Trainer(Generic[Loss, Effects]):
         and read (`run_data`, `reading`), its optimizer built for its updates (`scheduled`), and its
         cadences, scores and policies (`FitPlan`). Its defaults are `fit`'s, stated here alone, which a run
         compiled ahead plans its evaluations by too (`dew.training.ahead.fit_plan`)."""
-        self._startup = Startup()
+        startup = Startup()
         loader, held, tokens, steps, examples = run_data(
             self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
-            examples=examples, accumulation=self.accumulation, startup=self._startup)
+            examples=examples, accumulation=self.accumulation, startup=startup)
         self.reading(loader, device_prefetch, examples=examples, steps=steps)
         self.scheduled(None if steps is None else steps // self.accumulation)
         # Its cadences resolved against the run's length, its scores declared, its best and stop policies,
@@ -1062,7 +1062,7 @@ class Trainer(Generic[Loss, Effects]):
             metrics=metrics, preview=preview and self.tracker is not None, best=selection, stop=plateau,
             suites=suites, pause=pause, scored_to=None if scored_to is None else os.fspath(scored_to),
             held_best=restore_best and self.checkpoints is None, restore_best=restore_best, observe=observe,
-            summaries=tuple(summaries),
+            summaries=tuple(summaries), startup=startup,
             declared=declared, branches=() if cooldowns is None else cooldowns.branches(
                 steps, tokens, self.accumulation, self._shape.examples),
         )
@@ -1117,7 +1117,7 @@ class Trainer(Generic[Loss, Effects]):
                 # The first read restores the stream's position and opens its reader on the prefetch
                 # worker, and a stream that may run out can on any read: a process whose read failed stops
                 # its peers before they compile or step without it.
-                read = read_batch(run, interval, state, self.rollout, self.device_mesh, self._marked,
+                read = read_batch(run, interval, state, self.rollout, self.device_mesh, run.marked,
                                   self._shape.examples, agree=run.agrees(first=not seen))
                 if read is None:
                     self._display.note(f"The training data ran out at step {run.current}")
@@ -1130,14 +1130,14 @@ class Trainer(Generic[Loss, Effects]):
                     # declares, a later ramp's or schedule's stage as the first; a rollout writes its own.
                     check_inputs(self, device)
                 known, began = len(compiled), time.perf_counter()
-                with self._startup.phase("compile", "compiling the step", when=not known):
+                with run.startup.phase("compile", "compiling the step", when=not known):
                     train_step, measured_flops, state = self._compiled_for(compiled, state, device, run)
                 if len(compiled) > known and self.executable is not None and not self.host_master:
                     signature = batch_signature(device)
                     run.reads[signature] = step_reads(self.executable, signature)
                 interval.compiles = len(compiled)
                 if len(compiled) > known:
-                    with self._startup.phase("warm", "warming the evaluations", when=not known), run.held():
+                    with run.startup.phase("warm", "warming the evaluations", when=not known), run.held():
                         self._evaluator().warm(plan, state, shardings, self._compiler.links(self.device_mesh),
                                                first=not known)
                 if not known:
@@ -1412,11 +1412,11 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("training data", lambda: (
                 f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
         run.opened(source, self._shape.examples)
-        self._marked = marked(run.partition, self._counted_batch)
-        prepare = self._marked if self.rollout is None else functools.partial(
+        run.marked = marked(run.partition, self._counted_batch)
+        prepare = run.marked if self.rollout is None else functools.partial(
             consumption_counted, clocked=self._shape.examples is not None, marks_rows=False)
         if run.pooled:
-            run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), self._marked,
+            run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), run.marked,
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))
         return DevicePrefetchIterator(source, self.device_mesh, self._shape.prefetch, source_state=position,
                                       reads=run.reads, prepare=prepare)
@@ -1557,8 +1557,8 @@ class Trainer(Generic[Loss, Effects]):
         reading, run.ahead = run.train is not None, None
         if run.train is not None:
             run.train.close()
-        branched = FitRun(run.started, current=run.current, partition=run.partition, reads=run.reads,
-                          compiled=run.compiled)
+        branched = FitRun(run.started, run.startup, current=run.current, partition=run.partition,
+                          reads=run.reads, compiled=run.compiled, marked=run.marked)
         # The branch's own clock of committed tokens, from the run's, which a schedule's stages end at
         # as the run's do (`_scheduled`), read off the devices where its steps may have reached what it
         # reads next (`FitPlan.committed`); the stages it begins are its own, the run's kept as they were.
@@ -1579,7 +1579,7 @@ class Trainer(Generic[Loss, Effects]):
                     if schedule_ended(ends, lambda: branched.clock.read) or (cut := run.notice.reached()):
                         break
                     self._scheduled(plan, branched)
-                    read = read_batch(branched, counted, cooled, self.rollout, self.device_mesh, self._marked,
+                    read = read_batch(branched, counted, cooled, self.rollout, self.device_mesh, run.marked,
                                       self._shape.examples, agree=branched.agrees(first=not done),
                                       phase="cooldown read", branch=True)
                     if read is None:
@@ -1921,7 +1921,7 @@ class Trainer(Generic[Loss, Effects]):
         taken, run.taken = run.taken, None
         if taken is not None:
             run.writer.submit(functools.partial(self._read_log, run, taken),
-                              functools.partial(self._written, taken), taken.ready)
+                              functools.partial(self._written, run, taken), taken.ready)
         elif not (wait and run.writer.unchecked):
             return
         check = functools.partial(run.writer.raise_failure, wait=wait, ready_only=not agree)
@@ -1937,14 +1937,14 @@ class Trainer(Generic[Loss, Effects]):
         read, elapsed, run.writer.since = taken.read(self._display, run.writer.since)
         return read, elapsed
 
-    def _written(self, taken: Taken, reading: tuple[Reading, float]) -> None:
+    def _written(self, run: FitRun, taken: Taken, reading: tuple[Reading, float]) -> None:
         """Report `taken`'s interval's scalars (`logged_scalars`) on rank zero, on the writer's reporter
         thread (`_read_taken`); every other rank has nothing to report."""
         if jax.process_index() != 0:
             return
         read, elapsed = reading
         scalars = {**logged_scalars(read, taken.counts, elapsed, self.device_mesh.devices.size,
-                                    rollout=self.rollout is not None), **self._startup.scalars()}
+                                    rollout=self.rollout is not None), **run.startup.scalars()}
         self._display.interval(taken.step, scalars)
         if self.tracker is not None:
             self.tracker.log(scalars, taken.step)
@@ -1967,7 +1967,7 @@ class Trainer(Generic[Loss, Effects]):
                 if jax.process_index() == 0:
                     wall = time.perf_counter() - run.started
                     # A run that logged no step reports its start here (`Startup.scalars`).
-                    scalars = {**goodput(wall, run.first_step, run.other), **self._startup.scalars()}
+                    scalars = {**goodput(wall, run.first_step, run.other), **run.startup.scalars()}
                     self._display.summary(run.current, wall, scalars,
                                           None if run.loss is None else float(jax.device_get(run.loss)))
                     if self.tracker is not None:

@@ -14,7 +14,7 @@ import os
 import time
 import types
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-from typing import TypedDict
+from typing import TYPE_CHECKING, TypedDict
 
 import grain.python as pygrain
 import jax
@@ -61,6 +61,9 @@ from dew.training.profiling import ProfileWindow, start_capture, stop_capture
 from dew.training.rollout import Rollout, rolled_out
 from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
+
+if TYPE_CHECKING:
+    from dew.training.startup import Startup
 
 _log = logging.getLogger(__name__)
 
@@ -126,6 +129,8 @@ class FitPlan:
     local_every: Cadence
     metrics: Sequence[Metric]
     preview: bool
+    startup: Startup
+    """The run's startup phases, timed from its plan's first read of its data on (`run_data`)."""
     scored_to: str | None = None
     """Where each evaluation writes every validation batch's scoring artifacts (`Evaluation.run`)."""
     best: tuple[Best, ...] = ()
@@ -329,6 +334,8 @@ class FitRun:
     to step and what its cleanup reads however the run ends."""
 
     started: float
+    startup: Startup
+    """Its startup phases, as its plan timed them (`FitPlan.startup`)."""
     current: int = 0
     loss: jax.Array | None = None
     evaluation: Evaluation | None = None
@@ -364,6 +371,8 @@ class FitRun:
     ends: Ends = "apart"
     """Where the training stream ends (`stream_ends`)."""
     taken: Taken | None = None
+    marked: Callable[[Batch], Batch] | None = None
+    """How its reader marks each batch it reads with the rows it counts (`marked`), once it is open."""
     writer: LogWriter = dataclasses.field(default_factory=LogWriter)
     """Where the logs the loop takes are read and reported, off the loop (`Trainer._read_taken`)."""
     scored: frozenset[str] = frozenset()

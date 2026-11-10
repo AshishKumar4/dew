@@ -2437,6 +2437,22 @@ def test_a_mesh_without_stages_takes_its_one_microbatch_asked_for():
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
 
 
+def test_a_run_placing_its_held_tree_copies_it_by_transfer_and_compiles_no_copy_program():
+    """A run placing the objective's held tree takes a copy of each held array the state takes over, its
+    own buffers, which a step may donate while the objective's stay alive, and makes it by the transfer that
+    places it: no program compiles for it, so a run handed its programs compiled ahead compiles nothing to
+    place its weights (row 4779: each held array's `copy()` compiled a program of its own)."""
+    from dew.telemetry.compiles import Compiles
+
+    trainer, objective, _ = held_lm_trainer()
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    with Compiles(None) as compiles:
+        state, _, _ = trainer.place()
+    assert "copy" not in [program.name for program in compiles.programs if program.kind == "compiled"]
+    held = {leaf.unsafe_buffer_pointer() for leaf in jax.tree.leaves(objective.variables)}
+    assert not held & {leaf.unsafe_buffer_pointer() for leaf in jax.tree.leaves(state.variables)}
+
+
 def test_a_state_built_from_a_held_tree_steps_without_freeing_the_tree():
     """A state the trainer builds eagerly from the objective's held tree (`Trainer.initial_state`),
     stepped on one device, whose step takes its arguments' shardings and donates them: the objective's
