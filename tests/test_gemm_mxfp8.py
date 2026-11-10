@@ -28,6 +28,23 @@ def test_an_mxfp8_operand_holds_each_blocks_largest_code_in_its_scales_binade():
     np.testing.assert_array_equal(np.asarray(again.decoded()), np.asarray(operand.decoded()))
 
 
+def test_an_mxfp8_scale_reads_the_exponent_of_a_magnitude_just_under_a_power_of_two():
+    """A block whose largest magnitude is one float32 ulp under 2^100 takes OCP MX's scale for it, 2 to its
+    exponent (99) less E4M3's largest's (8), its code saturating at 448, where a float32 `log2` rounds the
+    magnitude's logarithm up onto 100 (2^92, code 256); a float64 run of the same values quantizes to the
+    same operand."""
+    under = np.nextafter(np.float32(2.0 ** 100), np.float32(0))
+    block = jnp.full((1, gemm.MX_BLOCK), under, jnp.float32)
+    operand = gemm.MxFp8.quantized(block)
+    assert float(operand.scales[0, 0].astype(jnp.float32)) == 2.0 ** 91
+    assert float(operand.codes[0, 0].astype(jnp.float32)) == 448.0
+    with jax.enable_x64(new_val=True):
+        wide = gemm.MxFp8.quantized(jnp.asarray(block, jnp.float64))
+    for field in ("codes", "scales"):
+        np.testing.assert_array_equal(np.asarray(getattr(wide, field)).view(np.uint8),
+                                      np.asarray(getattr(operand, field)).view(np.uint8))
+
+
 GROUP_BLOCKS = (1, 0, 2, 1)
 """Each group's 128-row blocks: a one-block group, an empty one, two blocks, one."""
 
@@ -52,7 +69,7 @@ def test_an_mxfp8_grouped_product_is_its_decoded_values_product(kernel):
                                       out_dtype=jnp.float32, interpret_on_cpu=kernel == "mosaic")
 
     def decoded(x, w, wide=jnp.float32):
-        x, w = gemm.MxFp8.quantized(x).decoded(), gemm.MxFp8.quantized(w).decoded()
+        x, w = mx_matrix.mx_values(x), mx_matrix.mx_values(w)
         return jax.lax.ragged_dot(x.astype(wide), jnp.swapaxes(w, 1, 2).astype(wide), sizes,
                                   precision=jax.lax.Precision.HIGHEST, preferred_element_type=wide)
 

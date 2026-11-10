@@ -14,7 +14,7 @@ import ml_dtypes
 import numpy as np
 from flax import linen as nn
 
-from dew.nn.precision import correctly_rounded_divide
+from dew.nn.precision import at_least_fp32, correctly_rounded_divide
 
 E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
 """Each E2M1 code's value in code order (ml_dtypes' float4_e2m1fn): 0 to 6
@@ -102,7 +102,7 @@ def straight_through(x, rounded):
 def fp8_scaled_blocks(x, block: int):
     """`x` in fp32 blocks of `block` channels and each block's power-of-two scale (act_quant with scale_fmt
     ue8m0, kernel.py:40-124): amax floored at 1e-4, the scale the ceiling power of two of amax / 448."""
-    blocks = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, block)
+    blocks = x.astype(at_least_fp32(x.dtype)).reshape(*x.shape[:-1], -1, block)
     amax = jnp.maximum(jnp.max(jnp.abs(blocks), -1, keepdims=True), 1e-4)
     return blocks, _power_of_two_ceil(amax * jnp.float32(1 / _E4M3_MAX))
 
