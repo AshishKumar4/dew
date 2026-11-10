@@ -74,22 +74,12 @@ def earlier_option_text(record: Mapping[str, object]) -> Mapping[str, object]:
     return {**record, "fields": {**named[1], "option_text": "named"}}
 
 
-DECISION_OBJECTIVE = "dew.decision.objective:DecisionObjective"
-"""The decision objective's import path, as a saved run's record names its objective
-(`ObjectiveConfig.name`)."""
-
-CAUSAL_TOKENIZER = "dew.objectives.world_model:CausalTokenizer"
-"""Dreamer 4's tokenizer's import path, as a saved run's record names its model (`ModelConfig.name`)."""
-
-DYNAMICS = "dew.objectives.world_model:Dynamics"
-"""Dreamer 4's dynamics model's import path, as a saved run's record names its model (`ModelConfig.name`)."""
-
-
-def _earlier_default(record: Mapping[str, object], field: str, kinds: registry.Aliases, path: str,
+def _earlier_default(record: Mapping[str, object], field: str, kinds: registry.Aliases, kind: type,
                      argument: str, earlier: JSON) -> Mapping[str, object]:
-    """A saved run's record whose `field` (its objective, its model), a `path` class of `kinds`, states
-    `argument` neither in its fields nor in the defaults it recorded: saved before the class took it, it
-    trained as `earlier` computes, which its defaults read now; a run saved since records its own."""
+    """A saved run's record whose `field` (its objective, its model), named in `kinds` as whatever alias or
+    import path it saved, the class `kind`, states `argument` neither in its fields nor in the defaults it
+    recorded: saved before the class took it, it trained as `earlier` computes, which its defaults read
+    now; a run saved since records its own."""
     named = registry.class_record(record)
     if named is None:
         return record
@@ -98,7 +88,7 @@ def _earlier_default(record: Mapping[str, object], field: str, kinds: registry.A
     if not isinstance(held, Mapping) or not isinstance(held.get("name"), str):
         return record
     stated, defaulted = held.get("fields", {}), held.get("defaults", {})
-    if (registry.import_path(kinds[held["name"]]) != path or not isinstance(stated, Mapping)
+    if (kinds[held["name"]] is not kind or not isinstance(stated, Mapping)
             or not isinstance(defaulted, Mapping) or argument in {*stated, *defaulted}):
         return record
     return {**record, "fields": {**fields, field: {**held, "defaults": {**defaulted, argument: earlier}}}}
@@ -109,7 +99,9 @@ def earlier_none_of_the_above(record: Mapping[str, object]) -> Mapping[str, obje
     above" on (`none_of_the_above_options`) neither in its fields nor in the defaults it recorded: saved
     before the argument, its rows drew it on every choice, a yes or a no among them, so it reads 0, as
     they drew (`_earlier_default`; row 2938: the default became 3). Carried to 1.0 (ledger 1552)."""
-    return _earlier_default(record, "objective", objectives, DECISION_OBJECTIVE, "none_of_the_above_options",
+    from dew.decision.objective import DecisionObjective
+
+    return _earlier_default(record, "objective", objectives, DecisionObjective, "none_of_the_above_options",
                             0)
 
 
@@ -118,7 +110,9 @@ def earlier_tokenizer_positions(record: Mapping[str, object]) -> Mapping[str, ob
     nowhere: saved before rotary positions, its tokens knew their places by learned vectors alone, so it
     reads "learned", as it trained (`_earlier_default`; row 4669: the default became "rotary"). Carried to
     1.0 (ledger 1552)."""
-    return _earlier_default(record, "model", models, CAUSAL_TOKENIZER, "positions", "learned")
+    from dew.objectives.world_model import CausalTokenizer
+
+    return _earlier_default(record, "model", models, CausalTokenizer, "positions", "learned")
 
 
 def earlier_dynamics_positions(record: Mapping[str, object]) -> Mapping[str, object]:
@@ -126,7 +120,9 @@ def earlier_dynamics_positions(record: Mapping[str, object]) -> Mapping[str, obj
     saved before rotary positions, its tokens knew their frame and place by learned vectors alone, so it
     reads "learned", as it trained (`_earlier_default`; row 4802: the default became "rotary"). Carried
     to 1.0 (ledger 1552)."""
-    return _earlier_default(record, "model", models, DYNAMICS, "positions", "learned")
+    from dew.objectives.world_model import Dynamics
+
+    return _earlier_default(record, "model", models, Dynamics, "positions", "learned")
 
 
 def earlier_option_writing(record: Mapping[str, object], checkpoints: Checkpoints) -> Mapping[str, object]:

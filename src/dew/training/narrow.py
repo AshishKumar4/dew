@@ -40,6 +40,7 @@ from jax.core import ShapedArray
 from jax.extend import core
 
 from dew.batch import FROZEN, Variables, merge, select
+from dew.nn.kernels.options import OuterProgram, owned_program
 from dew.nn.programs import called, own_derivative, scan_body
 
 
@@ -174,3 +175,10 @@ def narrow_copies(state, traced: core.ClosedJaxpr) -> dict:
         return {}
     variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
     return cast_paths(traced, variables, ("params",))
+
+
+def narrowing(copies: dict[tuple[str, ...], jnp.dtype], towers: tuple, out_shardings) -> OuterProgram:
+    """The program a step's state runs to make its narrowed copies of its weights (`narrowed`), placed by
+    `out_shardings`, compiled under the options of the objective's `towers`: the one program a run's first
+    step runs and a run compiled ahead compiles for it (`dew.training.ahead.started`)."""
+    return owned_program(lambda variables: narrowed(variables, copies), *towers, out_shardings=out_shardings)

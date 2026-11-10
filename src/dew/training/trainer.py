@@ -177,7 +177,7 @@ from dew.training.model_flops import (
     prepare_counts,
     uncounted,
 )
-from dew.training.narrow import narrowed
+from dew.training.narrow import narrowing
 from dew.training.observe import Observe
 from dew.training.phase_passes import PhasePasses
 from dew.training.planning import (
@@ -1145,11 +1145,10 @@ class Trainer(Generic[Loss, Effects]):
                 if not candidate.copies:
                     current = dataclasses.replace(current, compute=None)
                 elif current.compute is None:
-                    narrowing = owned_program(lambda variables: narrowed(variables, candidate.copies),
-                                              *self.objective.towers(),
-                                              out_shardings=candidate.shardings.compute)
-                    with self._taking():
-                        current = dataclasses.replace(current, compute=narrowing(current.variables))
+                    # A run handed a step compiled ahead runs the program compiled with it: `fit` runs its
+                    # steps within the hand (`_taking`).
+                    copies = narrowing(candidate.copies, self.objective.towers(), candidate.shardings.compute)
+                    current = dataclasses.replace(current, compute=copies(current.variables))
                 if self._builds_window(current, candidate, window):
                     # The window, and with it the split, is the state's from here on.
                     current = dataclasses.replace(self._window_of(current, candidate, window),

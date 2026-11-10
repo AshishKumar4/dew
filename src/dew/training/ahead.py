@@ -309,7 +309,7 @@ class AheadOfTime:
     lowers (`FitSearch`), so its derivations step down as the compile's did and it lowers this program."""
     starts: dict[str, Executable] = dataclasses.field(default_factory=dict)
     """The programs a run builds its fresh state with before its first step and that step's own copies of
-    its weights (`dew.training.distributed.start_lowered`, the narrowed copies), compiled for the target
+    its weights (`dew.training.distributed.start_compiled`, the narrowed copies), compiled for the target
     beside the step, by their programs' digests (`program_digest`): a run handed the step runs each of
     these as compiled here (`taking`), so its devices compile nothing before and at its first step, its
     placement included (Main, 11-07: an attention step compiled ahead still compiled its placement on the
@@ -876,7 +876,7 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
 def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,
                              plan: FitPlan | None = None) -> dict[str, Executable]:
     """The programs a run of `trainer` compiles besides its step, compiled for the target over their
-    arguments' shapes (`AheadOfTime.starts`): its fresh state's build and placement (`start_lowered`), for
+    arguments' shapes (`AheadOfTime.starts`): its fresh state's build and placement (`start_compiled`), for
     a run that starts afresh, the first step's narrowed copies of its weights where the plan reads some
     (`narrowed`), and what its steps run on their results, each called as the run calls it, over the
     step's results' shapes (`collecting`): an accumulating window's first allocation (`Trainer._window_of`),
@@ -885,37 +885,24 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
     of its `fit` (`plan`), what its evaluations' warming pass compiles before they run
     (`Trainer._warmed_ahead`; row 4752). Each by its program's digest, through the kernel templates'
     reports as every compile is."""
-    from dew.training.distributed import start_lowered
-    from dew.training.narrow import narrowed
+    from dew.training.distributed import start_compiled
+    from dew.training.narrow import narrowing
 
-    lowerings: list[Callable[[], jax.stages.Lowered]] = []
-    if start.resume is None and not trainer.host_master:
-        key = jax.ShapeDtypeStruct(start.key.shape, start.key.dtype)
-        lowerings.append(lambda: start_lowered(trainer._staged_start, start.initializer, key, start.abstract,
-                                               start.shardings, start.through, trainer.device_mesh))
     candidate = planned.candidate
-    if candidate.copies:
-        # The variables as the run's first step holds them, placed as its start placed them.
-        variables = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
-                                                                             sharding=sharding),
-                                 start.abstract.variables, start.shardings.variables)
-        lowerings.append(lambda: owned_program(lambda variables: narrowed(variables, candidate.copies),
-                                               *trainer.objective.towers(),
-                                               out_shardings=candidate.shardings.compute).lower(variables))
-
-    def kept(lower: Callable[[], jax.stages.Lowered]) -> tuple[str, Executable]:
-        # A program a refused launch's config relowers is keyed by the program it compiled, as the run's
-        # compile point lowers it past the refusals the step carries (`OuterProgram.compiled`).
-        lowered = [lower()]
-
-        def relower() -> jax.stages.Lowered:
-            lowered.append(lower())
-            return lowered[-1]
-        executable = report.compiled(lowered[0], relower=relower)
-        return program_digest(lowered[-1]), Executable.of(executable)
-    collected = _results_programs(trainer, start, planned, plan)
-    return {**dict(map(kept, lowerings)), **{digest: Executable.of(executable)
-                                             for digest, executable in collected.items()}}
+    with collecting() as collected:
+        if start.resume is None and not trainer.host_master:
+            start_compiled(trainer._staged_start, start.initializer,
+                           jax.ShapeDtypeStruct(start.key.shape, start.key.dtype), start.abstract,
+                           start.shardings, start.through, trainer.device_mesh)
+        if candidate.copies:
+            # The variables as the run's first step holds them, placed as its start placed them.
+            variables = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype,
+                                                                                 sharding=sharding),
+                                     start.abstract.variables, start.shardings.variables)
+            narrowing(candidate.copies, trainer.objective.towers(), candidate.shardings.compute).compiled(
+                variables)
+    collected.update(_results_programs(trainer, start, planned, plan))
+    return {digest: Executable.of(executable) for digest, executable in collected.items()}
 
 
 def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,
