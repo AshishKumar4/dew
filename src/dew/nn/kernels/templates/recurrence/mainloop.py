@@ -69,6 +69,7 @@ from dew.nn.kernels.templates.recurrence.table import (
     table_stored,
     taken_by,
 )
+from dew.nn.kernels.templates.resources import largest_live_set
 
 
 def bundle_dtype(dtype) -> jnp.dtype:
@@ -536,11 +537,6 @@ def product_fragments(call: Call, lhs: tuple, rhs: tuple, *, rhs_transposed: boo
                                        lhs_staged=lhs_staged, rhs_staged=rhs_staged)
 
 
-def widest(*tiles: list) -> list:
-    """The largest of `tiles`' live sets by their words: of products issued in turn, one's fragments."""
-    return resources.largest_live_set(*tiles)
-
-
 @dataclasses.dataclass(frozen=True)
 class Launch:
     """A launch as planned (`template.planned`): its name (`recurrence_states`, ...), its programs
@@ -928,8 +924,9 @@ def _solved_resources(call: Call, *, keeps: bool, applies: bool, narrow: bool) -
     # in turn (`algebra.weighted`'s 'apply_u', 'apply_w').
     keyed = product_fragments(call, (call.given, chunk, call.block), (call.given, call.block, chunk),
                               rhs_transposed=True)
-    applied = widest(product_fragments(call, (held, chunk, chunk), (held, chunk, call.value_block)),
-                     product_fragments(call, (held, chunk, chunk), (held, chunk, call.block)))
+    applied = largest_live_set(
+        product_fragments(call, (held, chunk, chunk), (held, chunk, call.value_block)),
+        product_fragments(call, (held, chunk, chunk), (held, chunk, call.block)))
     held_tiles = Held(phases=(
         [f32(chunk, chunk)] * 2 + keyed,
         _doubling_held(call),
@@ -1565,9 +1562,10 @@ def _weighted_held(call: Call, block: int) -> Held:
         held_tile(held, chunk, chunk) + [f32(chunk, call.block)] * 2
         + held_tile(call.given, chunk, call.block) + [f32(chunk, block)] * 5 * call.per_key
         # The inverse against the scaled values and keys in turn, the delta rule's alone (`algebra.weighted`).
-        + (widest(product_fragments(call, (held, chunk, chunk), (held, chunk, call.value_block)),
-                  product_fragments(call, (held, chunk, chunk),
-                                    (held, chunk, block if call.per_key else call.block)))
+        + (largest_live_set(
+            product_fragments(call, (held, chunk, chunk), (held, chunk, call.value_block)),
+            product_fragments(call, (held, chunk, chunk),
+                              (held, chunk, block if call.per_key else call.block)))
            if call.delta else []),))
 
 
@@ -2019,7 +2017,9 @@ def _states_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
     # In turn: the weighted keys against the memory slice, the delta rule's (`algebra.corrected`); the keys
     # read transposed against the corrected values (`algebra.carried`'s 'write').
     written = product_fragments(call, (keys, call.block, chunk), (held, chunk, bv))
-    products = (widest(product_fragments(call, (held, chunk, call.block), (held, call.block, bv)), written)
+    products = (largest_live_set(
+        product_fragments(call, (held, chunk, call.block), (held, call.block, bv)),
+        written)
                 if call.delta else written)
     phase = ([f32(chunk, bv)] * 2 + held_tile(values, chunk, bv) + held_tile(held, call.block, bv)
              + products
@@ -2216,7 +2216,7 @@ def _scan_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
     scores = [f32(chunk, chunk)] * 2 + masks(chunk, chunk) + columns
     narrowed = ([f32(chunk, chunk)] * 2 + held_tile(held, chunk, chunk) + columns
                 if held.parts > 1 else [])
-    products = widest(
+    products = largest_live_set(
         product_fragments(call, (given, chunk, call.block), (given, call.block, chunk), rhs_transposed=True),
         product_fragments(call, (given, chunk, call.block), (call.memories, call.block, bv)),
         product_fragments(call, (held, chunk, chunk), (held, chunk, bv)))

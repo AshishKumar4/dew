@@ -29,8 +29,8 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     stream_blocks,
     stream_tile,
     stream_views,
-    widest,
 )
+from dew.nn.kernels.templates.resources import largest_live_set
 
 
 def _output_streams(call: Call, bv: int) -> tuple[dict, tuple]:
@@ -91,8 +91,9 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     and its queries widened, staged for every step (`algebra.key_gated`)."""
     chunk = call.chunk
     held, memories, given, family = call.held, call.memories, call.given, call.family
-    products = widest(product_fragments(call, (given, chunk, call.block), (memories, call.block, bv)),
-                      product_fragments(call, (held, chunk, chunk), (held, chunk, bv)))
+    products = largest_live_set(
+        product_fragments(call, (given, chunk, call.block), (memories, call.block, bv)),
+        product_fragments(call, (held, chunk, chunk), (held, chunk, bv)))
     if call.per_key:
         # One accumulator for every product (`Issuer.summed`) beside the values, the intra launch's scores
         # in fp32 and their masked narrow form; apart from it, at the first step, the key blocks' gated
@@ -128,7 +129,7 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
     # One product's fragments at a time where both phases hold at once, the products issuing in turn: each
     # phase's own beside the other stated an A100's fp32 call at 288 registers a 16-wide output block, where
     # ptxas needed 248 (tf32-fp32c at 9f82d62c4).
-    return Held(carried=prefixes, phases=(values + scores + widest(products, scored),))
+    return Held(carried=prefixes, phases=(values + scores + largest_live_set(products, scored),))
 
 
 @lowered_once

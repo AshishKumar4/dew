@@ -58,9 +58,9 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     vector_views,
     walk_stores,
     whole_blocks,
-    widest,
 )
 from dew.nn.kernels.templates.recurrence.table import Table, returned_by, table_landing, table_returned
+from dew.nn.kernels.templates.resources import largest_live_set
 from dew.nn.precision import compensated_sum
 
 
@@ -434,10 +434,10 @@ def _reverse_products(call: Call, bv: int) -> list:
     keyed = held if call.per_key else call.given
     read = (call.given if call.per_key
             else Operand(call.rows, 2 if held.parts == 1 else held.parts, jnp.dtype(jnp.float32)))
-    return widest(product_fragments(call, (keyed, chunk, call.block), (held, call.block, bv)),
-                  product_fragments(call, (keyed, call.block, chunk), (read, chunk, bv)),
-                  *([product_fragments(call, (held, call.block, chunk), (held, chunk, bv))]
-                    if call.delta else []))
+    return largest_live_set(
+        product_fragments(call, (keyed, chunk, call.block), (held, call.block, bv)),
+        product_fragments(call, (keyed, call.block, chunk), (read, chunk, bv)),
+        *([product_fragments(call, (held, call.block, chunk), (held, chunk, bv))] if call.delta else []))
 
 
 def _reverse_views(call: Call, q_ref, k_ref, w_ref, do_ref, local_ref, v_ref, h, walked, walked_width: int
@@ -1012,6 +1012,36 @@ def _score_grads(call: Call) -> Operand:
 
 
 @lowered_once
+def _scores_back_held(call: Call, grads: Operand, group: int) -> Held:
+    """What `_scores_back`'s consumer thread holds: the scores' gradient fp32 and narrow, the pairs'
+    decays, the scores and the pair terms, the masks, and the pairs' sum's product: three fp32 tiles at
+    once, the decays taken before the scores' product and each block sum into one accumulator
+    (`algebra.scores_gradient`; an accumulator a block, four, and an H100's need was 232 in a bf16 call, 192
+    in one, back-need-one-32 at 9482e4d26). Where the scores' gradient leaves in parts (an fp32 call's), the
+    remainder each part after the first is formed from (`product.formed`): without it the model stated 232
+    registers where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22). Where a key head's
+    value heads are summed (`group`), a phase after their pair reduction."""
+    chunk, given, held = call.chunk, call.given, dataclasses.replace(call.held, rows=call.rows)
+    phases = ([f32(chunk, chunk)] * (3 + (grads.parts > 1))
+              + held_tile(grads, chunk, chunk)
+              + masks(chunk, chunk)
+              # In turn: the queries against the keys read transposed ('local_t'); the output's gradient
+              # against the corrected values read transposed ('values_ds'); the pairs' sum's three fp32
+              # parts against the exact bf16 triangle (`algebra.scores_gradient`).
+              + largest_live_set(
+                  product_fragments(call, (given, chunk, call.block), (given, call.block, chunk),
+                                    rhs_transposed=True),
+                  product_fragments(call, (given, chunk, call.value_block), (held, call.value_block, chunk),
+                                    rhs_transposed=True),
+                  product_fragments(call, (Operand(call.rows, 3, jnp.dtype(jnp.float32)), chunk, chunk),
+                                    (Operand(call.rows, 1, jnp.dtype(jnp.bfloat16)), chunk, chunk))),)
+    if group > 1:
+        # After the pair reduction, no scores, masks or operand fragments remain: the incoming ds,
+        # the running pair and TwoSum's temporaries peak at six fp32 tiles.
+        phases += ([f32(chunk, chunk)] * 6,)
+    return Held(phases=phases)
+
+
 def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale: float):
     """`(ds in `_score_grads`' form, decay [HV, R] fp32)`: each chunk and value head's scores' gradient and
     the decay's gradient from its pair terms (`algebra.scores_gradient`, `algebra.summed_pairs`), fla's
@@ -1103,30 +1133,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
     # The scores' gradient, the scores and the pairs' sums, each value head's.
     work = Work(flops=2 * chunk * chunk * (value_width + width + chunk) * group, span=group,
                 exponentials=chunk * chunk * group)
-    # The scores' gradient fp32 and narrow, the pairs' decays, the scores and the pair terms, the masks, and
-    # the pairs' sum's product: three fp32 tiles at once, the decays taken before the scores' product and
-    # each block sum into one accumulator (`algebra.scores_gradient`; an accumulator a block, four, and an
-    # H100's need was 232 in a bf16 call, 192 in one, back-need-one-32 at 9482e4d26). Where the scores'
-    # gradient leaves in parts (an fp32 call's), the remainder each
-    # part after the first is formed from (`product.formed`): without it the model stated 232 registers
-    # where ptxas spilled 32 bytes past 255 on an H100 (back-need2 at 170dd3a22).
-    phases = ([f32(chunk, chunk)] * (3 + (grads.parts > 1))
-              + held_tile(grads, chunk, chunk)
-              + masks(chunk, chunk)
-              # In turn: the queries against the keys read transposed ('local_t'); the output's gradient
-              # against the corrected values read transposed ('values_ds'); the pairs' sum's three fp32
-              # parts against the exact bf16 triangle (`algebra.scores_gradient`).
-              + widest(product_fragments(call, (given, chunk, call.block), (given, call.block, chunk),
-                                         rhs_transposed=True),
-                       product_fragments(call, (given, chunk, call.value_block),
-                                         (held, call.value_block, chunk), rhs_transposed=True),
-                       product_fragments(call, (Operand(call.rows, 3, jnp.dtype(jnp.float32)), chunk, chunk),
-                                         (Operand(call.rows, 1, jnp.dtype(jnp.bfloat16)), chunk, chunk))),)
-    if group > 1:
-        # After the pair reduction, no scores, masks or operand fragments remain: the incoming ds,
-        # the running pair and TwoSum's temporaries peak at six fp32 tiles.
-        phases += ([f32(chunk, chunk)] * 6,)
-    held_tiles = Held(phases=phases)
+    held_tiles = _scores_back_held(call, grads, group)
     summing = summing_staging(call) + ((plgpu.SMEM((chunk, chunk), jnp.float32),) * 2 if group > 1 else ())
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads // group),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(8),
@@ -1195,14 +1202,16 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: Call):
         # ('inverse_dx', 'inverse_du'); then the masked gradient against the inverse read transposed and the
         # inverse read transposed against its product ('inverse_l', 'inverse_t'; `algebra.system_gradient`).
         [f32(chunk, chunk), f32(chunk, call.block),
-         *widest(product_fragments(call, (held, chunk, call.block), (held, call.block, chunk),
-                                   rhs_transposed=True, rhs_staged=True),
-                 product_fragments(call, (held, chunk, call.value_block), (held, call.value_block, chunk),
-                                   rhs_transposed=True, rhs_staged=True))],
+         *largest_live_set(
+             product_fragments(call, (held, chunk, call.block), (held, call.block, chunk),
+                               rhs_transposed=True, rhs_staged=True),
+             product_fragments(call, (held, chunk, call.value_block), (held, call.value_block, chunk),
+                               rhs_transposed=True, rhs_staged=True))],
         [f32(chunk, chunk)] * 4 + masks(chunk, chunk)
-        + widest(product_fragments(call, (held, chunk, chunk), (held, chunk, chunk),
-                                   rhs_transposed=True, lhs_staged=True),
-                 product_fragments(call, (held, chunk, chunk), (held, chunk, chunk), rhs_staged=True))))
+        + largest_live_set(
+            product_fragments(call, (held, chunk, chunk), (held, chunk, chunk), rhs_transposed=True,
+                              lhs_staged=True),
+            product_fragments(call, (held, chunk, chunk), (held, chunk, chunk), rhs_staged=True))))
     return launch_kernel(program, call, out_type=held.shape(call.heads * chunk),
                          grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(10),
@@ -1336,8 +1345,9 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
     # forms); then its keys' own pairs, the pair terms, and the pairs' sums' masks and product.
     # In turn (`algebra.keys_gradient`): the inverse read transposed against the weights' gradient
     # ('inverse_t'), the system's gradient and its transpose against the keys ('keys_dl', 'keys_dlt').
-    keyed = widest(product_fragments(call, (held, chunk, chunk), (held, chunk, call.block)),
-                   product_fragments(call, (held, chunk, chunk), (given, chunk, call.block)))
+    keyed = largest_live_set(
+        product_fragments(call, (held, chunk, chunk), (held, chunk, call.block)),
+        product_fragments(call, (held, chunk, chunk), (given, chunk, call.block)))
     held_tiles = Held(phases=(
         held_tile(held, chunk, chunk) * 2 + [f32(chunk, call.block)] * 4
         + keyed,

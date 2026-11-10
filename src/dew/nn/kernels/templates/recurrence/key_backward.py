@@ -44,8 +44,8 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     stream_blocks,
     stream_tile,
     stream_views,
-    widest,
 )
+from dew.nn.kernels.templates.resources import largest_live_set
 
 
 def _parted(call: Call) -> Operand:
@@ -311,13 +311,15 @@ def _key_values_held(call: Call) -> Held:
     # transposed, the inverse (read transposed) against their product ('system_merge').
     return Held(phases=(
         [f32(chunk, chunk)] * 2 + [f32(chunk, vb)] * 3
-        + widest(product_fragments(call, (held, chunk, chunk), (held, chunk, vb)),
-                 product_fragments(call, (held, chunk, vb), (held, vb, chunk),
-                                   rhs_transposed=True, rhs_staged=True)),
+        + largest_live_set(
+            product_fragments(call, (held, chunk, chunk), (held, chunk, vb)),
+            product_fragments(call, (held, chunk, vb), (held, vb, chunk), rhs_transposed=True,
+                              rhs_staged=True)),
         [f32(chunk, chunk)] * 3 + masks(chunk, chunk)
-        + widest(product_fragments(call, (held, chunk, chunk), (held, chunk, chunk),
-                                   rhs_transposed=True, lhs_staged=True),
-                 product_fragments(call, (held, chunk, chunk), (held, chunk, chunk), rhs_staged=True))))
+        + largest_live_set(
+            product_fragments(call, (held, chunk, chunk), (held, chunk, chunk), rhs_transposed=True,
+                              lhs_staged=True),
+            product_fragments(call, (held, chunk, chunk), (held, chunk, chunk), rhs_staged=True))))
 
 
 def _key_memory_held(call: Call, keys: int) -> Held:
@@ -337,10 +339,12 @@ def _key_memory_held(call: Call, keys: int) -> Held:
     # and leaving, read transposed ('memory_dq', 'memory_dk', 'memory_dw'); then the inverse (read
     # transposed) against the weights' gradient, that against the gated keys read transposed
     # ('weights_merge', `algebra.key_memory_block`).
-    memory = widest(*(product_fragments(call, (operand, chunk, vb), (memories, vb, keys), rhs_transposed=True)
-                      for operand in (given, held, _value_grads(call))))
-    merging = widest(product_fragments(call, (held, chunk, chunk), (held, chunk, keys)),
-                     product_fragments(call, (held, chunk, keys), (held, keys, chunk), rhs_transposed=True))
+    memory = largest_live_set(
+        *(product_fragments(call, (operand, chunk, vb), (memories, vb, keys), rhs_transposed=True)
+          for operand in (given, held, _value_grads(call))))
+    merging = largest_live_set(
+        product_fragments(call, (held, chunk, chunk), (held, chunk, keys)),
+        product_fragments(call, (held, chunk, keys), (held, keys, chunk), rhs_transposed=True))
     return Held(carried=[f32(chunk, chunk), f32(chunk, 1)], phases=(
         [f32(chunk, keys)] * 3 + memory,
         [f32(chunk, keys)] * 7 + held_tile(held, chunk, keys) * 2 + [f32(chunk, chunk)] * merged + merging))
@@ -490,8 +494,9 @@ def _key_pairs_held(call: Call, keys: int) -> Held:
                                         lhs_parts=0, rhs_parts=parted.parts)
     return Held(carried=[f32(chunk, 1)], phases=(
         [f32(chunk, keys)] * 9 + masks(chunk, keys) * 2 + held_tile(parted, chunk, keys)
-        + widest(product_fragments(call, (parted, chunk, chunk), (parted, chunk, keys)),
-                 product_fragments(call, (parted, chunk, algebra.SUB), (parted, algebra.SUB, keys)))
+        + largest_live_set(
+            product_fragments(call, (parted, chunk, chunk), (parted, chunk, keys)),
+            product_fragments(call, (parted, chunk, algebra.SUB), (parted, algebra.SUB, keys)))
         + ahead,))
 
 

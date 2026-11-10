@@ -606,6 +606,26 @@ def laid_chunks(length: int, starts, max_segments: int | None, chunk: int) -> np
     return np.stack([chunks.start[kept], chunks.taken[kept]], axis=1)
 
 
+def call_form(family, *, wide: bool, delta: bool, rounded: bool) -> tuple[int, int, str]:
+    """The parts a call's operands and passed values take (`chunk_forward.prepared`'s `given` and `held`):
+    one of a 16-bit value; an fp32 one's three, or under the fast forms its `family`'s
+    (`mainloop._fast_parts`); and what its walk writes (`Run.write`)."""
+    fast = 1 if family.takes_tf32 and family.transposes_tf32 else mainloop.FAST_PARTS
+    given = (fast if rounded else product.EXACT_PARTS) if wide else 1
+    held = given if delta or rounded else product.EXACT_PARTS
+    return given, held, "delta" if delta else ("keys" if held == 1 else "values")
+
+
+def tf32_conversion(family) -> Literal["plain", "rna", "read"]:
+    """How `family`'s products take a one-part fp32 operand (`Lane.tf32`): as itself where the launches
+    are interpreted, else rounded first where the family rounds (`Family.rounds_tf32`), else read."""
+    from dew.nn.kernels import generation
+
+    if generation.backend() != "gpu":
+        return "plain"
+    return "rna" if family.rounds_tf32 else "read"
+
+
 def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = None,
              carried: bool = True, delta: bool = True,
              rounded: bool | None = None, walked: bool = False) -> Run:
@@ -638,13 +658,8 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     if rounded is None:
         rounded = route_rounding(delta, dtype)
     family = mainloop.issued(dtype)[0]
-    # The parts its operands and passed values take (`chunk_forward.prepared`'s `given` and `held`): one of a
-    # 16-bit value; an fp32 one's three, or under the fast forms its family's (`mainloop._fast_parts`).
     wide = jnp.dtype(dtype) == jnp.float32
-    fast = 1 if family.takes_tf32 and family.transposes_tf32 else mainloop.FAST_PARTS
-    given = (fast if rounded else product.EXACT_PARTS) if wide else 1
-    held = given if delta or rounded else product.EXACT_PARTS
-    write = "delta" if delta else ("keys" if held == 1 else "values")
+    given, held, write = call_form(family, wide=wide, delta=delta, rounded=rounded)
 
     def route(*x):
         if not delta:
@@ -728,7 +743,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     return Run(**hosted_operands, a=chunked(a, chunk), w=chunked(w, key_width), h=memories, scale=scale,
                write=write, held=held, given=given, wide=bool(wide), walked=walked,
                pairing=mainloop.pairing_parts(family, held),
-               tf32=("plain" if generation.backend() != "gpu" else "rna" if family.rounds_tf32 else "read"),
+               tf32=tf32_conversion(family),
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
