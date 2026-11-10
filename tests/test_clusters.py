@@ -123,3 +123,20 @@ def test_a_pool_joins_through_a_scheduler_of_the_users_own():
     assert [rank.returncode for rank in ranks] == [0, 0], outputs
     pools = sorted(line for written in outputs for line in written.splitlines() if line.startswith("pool"))
     assert pools == ["pool 2 0", "pool 2 1"], outputs
+
+
+def test_detecting_the_environment_counts_tpu_chips_as_jax_does_and_imports_no_jax():
+    """The launcher's detection reads the TPU chips on the bus by JAX's own walk
+    (`hardware_utils.num_available_tpu_chips_and_device_id`), read from its file, and leaves `jax`
+    unimported: a process is prepared before JAX loads (`dew launch`)."""
+    probe = ("import sys\n"
+             "from dew.clusters import _tpu_chips, detected_environment\n"
+             "detected_environment({'TPU_SKIP_MDS_QUERY': '1'})\n"
+             "chips = _tpu_chips()\n"
+             "print(chips, 'jax' in sys.modules)\n")
+    environment = {**outside_any_cluster(os.environ), "PYTHONPATH": str(REPO_ROOT / "src")}
+    chips, imported = output(owned([sys.executable, "-c", probe], environment), timeout=120).split()
+    assert imported == "False"
+    counted = ("from jax._src import hardware_utils as h\n"
+               "print(h.num_available_tpu_chips_and_device_id()[0])\n")
+    assert chips == output(owned([sys.executable, "-c", counted], environment), timeout=120).strip()

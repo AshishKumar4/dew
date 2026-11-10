@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import glob
 import importlib.util
 import os
 from collections.abc import Callable, Mapping, Sequence
@@ -186,21 +185,21 @@ class Slurm:
         return _ranked(_environ(self.environ), "SLURM_NTASKS", "SLURM_PROCID", "SLURM_LOCALID")
 
 
-_GOOGLE_PCI_VENDOR = "0x1ae0"
-_TPU_PCI_DEVICES = frozenset({"0x0027", "0x0056", "0x005e", "0x0062", "0x0063", "0x006f", "0x0076", "0x0083",
-                              "0x007c"})
-"""The PCI device ids of Google's TPU chips, v3 through TPU8, as JAX's hardware detection lists them
-(jax/_src/hardware_utils.py `_TPU_PCI_DEVICE_IDS`, Apache-2.0, jax-ml/jax 19a48d1de)."""
-
-
-def _tpu_chips(devices: str = "/sys/bus/pci/devices") -> int:
-    """How many TPU chips this host's PCI bus holds."""
-    found = 0
-    for vendor in glob.glob(f"{devices}/*/vendor"):
-        device = Path(vendor).with_name("device")
-        if Path(vendor).read_text().strip() == _GOOGLE_PCI_VENDOR and device.exists():
-            found += device.read_text().strip() in _TPU_PCI_DEVICES
-    return found
+def _tpu_chips() -> int:
+    """How many TPU chips this host's PCI bus holds, as JAX's startup counts them
+    (`jax._src.hardware_utils.num_available_tpu_chips_and_device_id`): JAX's own module, read from its file
+    without importing `jax`, so the launcher imports nothing beyond the standard library before the
+    process is prepared. That module imports the standard library alone."""
+    found = importlib.util.find_spec("jax")
+    if found is None or found.submodule_search_locations is None:
+        return 0
+    path = Path(next(iter(found.submodule_search_locations))) / "_src" / "hardware_utils.py"
+    spec = importlib.util.spec_from_file_location("dew_jax_hardware_utils", path)
+    assert spec is not None and spec.loader is not None, f"no module at {path}"
+    hardware = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(hardware)
+    chips, _ = hardware.num_available_tpu_chips_and_device_id()
+    return chips
 
 
 def _in_cloud_tpu_vm(environ: Mapping[str, str]) -> bool:
