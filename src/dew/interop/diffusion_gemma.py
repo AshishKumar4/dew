@@ -49,6 +49,9 @@ from dew.nn.vision.gemma4 import Gemma4Projector, Gemma4Vision
 from dew.registry import from_record, projectors, towers
 
 if TYPE_CHECKING:
+    from flax import linen as nn
+
+    from dew.interop.layouts import SourceLayout, Unwritable
     from dew.nn.attention import AttentionImpl
 
 VISION_PREFIX = "model.encoder.vision_tower."
@@ -302,11 +305,35 @@ def published_config(model: DiffusionGemma) -> Mapping[str, object]:
     return config
 
 
-def publishable(model: DiffusionGemma) -> bool:
-    """Whether transformers' DiffusionGemmaForBlockDiffusion can build the config `model` publishes
-    (`_unbuildable`): a block decoder with none of what it requires exports as its run's native release
+def release_layout(block: DiffusionGemma, model: nn.Module,
+                   config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
+    """The layout a DiffusionGemma `block` (`model` itself, or the adapter over it whose factors its export
+    merges) is written in (`dew.interop.layouts.source_layout`): transformers'
+    DiffusionGemmaForBlockDiffusion's, its config the one `published_config` writes (or `config`, a loaded
+    source's own) and its tensors the bundle's own export (`export_weights`), where that class builds what
+    the model publishes; else what it cannot hold: a field it would rebuild otherwise, or a part it builds
+    that the model has none of (`_unbuildable`), which exports as the run's native release
     (`dew.interop.releases.native_plan`)."""
-    return not _unbuildable(published_config(model))
+    from dew.interop.layouts import SourceLayout, Unwritable
+
+    try:
+        published = published_config(block)
+    except ValueError as error:
+        return Unwritable(f"transformers' DiffusionGemmaForBlockDiffusion does not hold this DiffusionGemma: "
+                          f"{error}")
+    missing = _unbuildable(published)
+    if missing:
+        return Unwritable(_unreadable(missing))
+
+    def tensors(variables: Mapping[str, object]) -> Mapping[str, np.ndarray]:
+        # The bundle's own export: its storage read as layers, the factors merged, the published writer.
+        from dew.interop.pretrained import PretrainedBlockDecoder
+
+        bundle = PretrainedBlockDecoder(block, variables, None, published, None, {},
+                                        export_adapter=export_weights)
+        return bundle.bound(model, variables).export()
+
+    return SourceLayout(published if config is None else config, {}, tensors)
 
 
 def _unbuildable(config: Mapping[str, object]) -> list[str]:
@@ -320,15 +347,19 @@ def _unbuildable(config: Mapping[str, object]) -> list[str]:
         ("vision_config", config.get("vision_config"))) if not present]
 
 
+def _unreadable(missing: Sequence[str]) -> str:
+    """Why transformers' class cannot read an export of a DiffusionGemma that has none of `missing`."""
+    return (f"this DiffusionGemma has no {' or '.join(missing)}, and transformers' "
+            "DiffusionGemmaForBlockDiffusion, the implementation its checkpoint layout is for, builds "
+            "both, so it cannot read an export of it; keep training it from the run's checkpoint "
+            "(dew.checkpoints) rather than a published directory")
+
+
 def _refuse_unreadable(config: Mapping[str, object]) -> None:
     """Refuse a config transformers' class cannot build (`_unbuildable`)."""
     missing = _unbuildable(config)
     if missing:
-        raise ValueError(
-            f"this DiffusionGemma has no {' or '.join(missing)}, and transformers' "
-            "DiffusionGemmaForBlockDiffusion, the implementation its checkpoint layout is for, builds "
-            "both, so it cannot read an export of it; keep training it from the run's checkpoint "
-            "(dew.checkpoints) rather than a published directory")
+        raise ValueError(_unreadable(missing))
 
 
 def export_weights(

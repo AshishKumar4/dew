@@ -741,7 +741,7 @@ def source_layout(model: nn.Module, *,
     try:
         decoder = from_record(CausalTransformer, unadapted(model))
     except ValueError as error:
-        return Unwritable(f"no family writes a {type(model).__name__}: {error}")
+        return _wrapper_layout(model, config, error)
     if decoder.cross_attention is not None:
         return Unwritable(CROSSING_UNWRITTEN)
     # A differential extension is folded into each layer's output projection and an adapter's factors
@@ -760,6 +760,23 @@ def source_layout(model: nn.Module, *,
         return PretrainedDecoder.from_model(decoder, variables).bound(model, variables).export()
 
     return SourceLayout(held if config is None else config, {}, tensors, hf_decoders.release_code(base))
+
+
+def _wrapper_layout(model: nn.Module, config: Mapping[str, object] | None,
+                    error: ValueError) -> SourceLayout | Unwritable:
+    """The layout of a model no plain decoder's record reads (`source_layout`, `error` saying why): a block
+    decoder's (`DiffusionGemma`), its published family's (`diffusion_gemma.release_layout`); none
+    otherwise."""
+    from dew.interop.diffusion_gemma import release_layout
+    from dew.lora import unadapted
+    from dew.nn.diffusion_gemma import DiffusionGemma
+    from dew.registry import from_record
+
+    try:
+        block = from_record(DiffusionGemma, unadapted(model))
+    except ValueError:
+        return Unwritable(f"no family writes a {type(model).__name__}: {error}")
+    return release_layout(block, model, config)
 
 
 def _decoder_layout(decoder: CausalTransformer) -> Mapping[str, object] | Unwritable:
