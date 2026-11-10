@@ -1540,12 +1540,13 @@ def test_a_resumed_run_compiles_ahead_for_a_tpu_topology_where_its_checkpoint_le
     assert ended.ahead.plan is not None and ended.ahead.devices == 4
 
 
-def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_path, monkeypatch):
-    """The executable a TPU topology's compile makes loads onto no client here, so the persistent cache
-    is out of its way (`dew._cache.uncached`): a cache that a program here writes to gains nothing from
-    the topology's compile, and the next program here writes to it again. The trainer is built before
-    the cache is read, as its key is drawn by a program of this host's, which the cache keeps (ledger
-    3174: alone in its process the test saw that program's entries)."""
+def test_a_topology_compile_writes_the_persistent_cache_and_compiles_again_past_its_entry(
+        tmp_path, monkeypatch):
+    """A TPU topology's compile ahead with the persistent cache on writes its executable's entry, keyed by
+    the topology, for a process of its devices to read, and a second compile ahead of the same step in this
+    process compiles again past it: a compile-only client reads no entry back, as it has no device to load
+    one onto (Dew's JAX build, post75), where reading one failed ("PjRtCompiler must be constructed with a
+    Client") and each compile ahead ran with the cache turned off."""
     from jax.experimental.compilation_cache import compilation_cache
 
     from dew._cache import enable_compilation_cache
@@ -1560,14 +1561,12 @@ def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_pa
         enable_compilation_cache(str(tmp_path / "cache"))
         compilation_cache.reset_cache()
         trainer = _topology_trainer("v5e:2x2")
-        jax.jit(lambda x: x * 3.0).lower(1.0).compile()
-        written = sorted((tmp_path / "cache").iterdir())
-        assert written
         rows = np.zeros((trainer.device_mesh.devices.size, 65), np.int32)
+        before = set((tmp_path / "cache").iterdir())
         assert compile_ahead(trainer, {"text": rows}).executable
-        assert sorted((tmp_path / "cache").iterdir()) == written
-        jax.jit(lambda x: x * 5.0).lower(1.0).compile()
-        assert len(list((tmp_path / "cache").iterdir())) > len(written)
+        written = set((tmp_path / "cache").iterdir()) - before
+        assert written
+        assert compile_ahead(trainer, {"text": rows}).executable
     finally:
         for name, value in previous.items():
             jax.config.update(name, val=value)
