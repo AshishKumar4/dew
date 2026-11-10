@@ -1045,7 +1045,7 @@ def test_a_pass_the_mosaic_mainloop_declines_reports_its_reason_under_its_row():
         assert route.kernel != "mosaic"
         assert (route.refusal.code, route.refusal.detail, route.refusal.row) == (
             "registers", declined.detail, requirement.row)
-    [refused] = attention_route.MAINLOOP.kernel("triton").failed(
+    refused = attention_route.MAINLOOP.kernel("triton").refused(
         attention_route._Pass(on_gpu=True, on_mosaic=True, mosaic=None, triton=spans))
     assert (refused.code, refused.row) == ("dropout", generation.INHERENT)
 
