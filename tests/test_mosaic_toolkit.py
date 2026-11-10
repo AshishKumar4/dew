@@ -367,6 +367,33 @@ def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_conf
     assert pair in bundles.groups("sm100", jnp.bfloat16, stated=True)[0]
     assert pair not in [family for group in bundles.groups("sm90", jnp.bfloat16, stated=True)
                         for family in group]
+def test_a_kernel_named_with_its_register_model_states_it_on_its_launch():
+    """A kernel named with its register model (`report.named`'s `model`) records it on the launch tracing it
+    (`report.Launch.kernels`), by its name less the launch's suffix, where the compile point reads it before a
+    case's model for that name (`kernel_compile._declared`), which still serves a kernel its launch stated
+    none for; named outside any launch, it states nothing."""
+    import kernel_compile
+
+    from dew.nn.kernels.templates import attention, report, resources
+    from dew.nn.kernels.templates.attention_mosaic import MosaicForward, Tiles
+    from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
+
+    op = MosaicForward()
+    q = jax.ShapeDtypeStruct((1, 16, 1, 16), jnp.bfloat16)
+    starts = jax.ShapeDtypeStruct((1, 16), jnp.int32)
+    bound = op.bind(q, q, q, starts, starts, None, None, (), (), None, residuals=attention.Kept.NONE,
+                    interpret=True)
+    with generation.assumed("sm90"):
+        stated, declared = (resources.register_model(WGMMA, 2, registers) for registers in (168, 128))
+        with report.launching(op, bound, Tiles(16, 16, 2, 1, family="wgmma")):
+            name = report.named("attention", model=stated)
+        kernel, launch = report.kernel_of(name)
+        assert report.traced(launch).kernels == {"attention": stated}
+        assert kernel_compile._declared({"kernel": kernel, "launch": launch},
+                                        {"attention": declared}) is stated
+        assert kernel_compile._declared({"kernel": "epilogue", "launch": launch},
+                                        {"epilogue": declared}) is declared
+        assert report.named("attention", model=stated) == "attention"
 
 
 def test_a_handoffs_barriers_count_the_arrivals_of_its_roles():
