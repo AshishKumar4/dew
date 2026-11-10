@@ -301,6 +301,7 @@ def test_every_registered_solver_samples_its_processes_and_refuses_the_rest(name
             generate(*build(), solver, shape=shape)
 
 
+@pytest.mark.mesh(devices=2)
 def test_a_walk_over_rows_an_explicit_mesh_splits_keeps_its_solver_state_there():
     """A jitted walk whose rows an Explicit axis splits over two devices builds its solver's state from its
     rows (`MultiStepDPM`'s history, `zeros_like` of the sample) under the caller's mesh, which keeps the

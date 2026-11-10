@@ -300,6 +300,9 @@ def requested(task) -> object:
     from dew.inference.images import TextToImage
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 
+    if isinstance(task, TextGeneration) and task.processor is None:
+        # A run of token ids alone (preference pairs) recorded no tokenizer: its task continues ids.
+        return task([[1, 2, 3]], max_new_tokens=2, key=0)
     if isinstance(task, TextGeneration):
         return task("ab", max_new_tokens=2, key=0)
     if isinstance(task, MaskedGeneration | BlockGeneration):
