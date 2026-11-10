@@ -1657,7 +1657,8 @@ class Transport[Allocated, Opened](abc.ABC):
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                ahead: Callable | None = None, settled: tuple[int, ...] = (),
-               prefetched: Callable | None = None, registers: int | None = None) -> Callable:
+               prefetched: Callable | None = None, registers: int | None = None,
+               producer: int | None = None) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own,
         `resident` programs a multiprocessor at once (its plan's, `resources.LaunchPlan.programs`: its
         compile fits its registers to them, `compiler_params`, and its roles raise to their share), with
@@ -1672,8 +1673,9 @@ class Transport[Allocated, Opened](abc.ABC):
         from global memory and a TPU from its scalar memory; its `settled` operands (indices) read `ahead`
         of the program's wait for the launch before it, and its `prefetched` views prefetched into L2
         before it, where given (`dependent`); its consumer thread's `registers`, where the launch states
-        them, its register decision recorded on the launch tracing it (`resources.register_model`,
-        `report.Launch.kernels`), which the compile point checks its kernel against."""
+        them, its register decision recorded on the launch tracing it (`resources.register_model`, its
+        producer lowered to `producer` where the family has one, `roles`; `report.Launch.kernels`), which the
+        compile point checks its kernel against."""
 
     def scoped(self, body, *allocations, streams, after_walks: tuple = ()):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
@@ -2163,7 +2165,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                ahead: Callable | None = None, settled: tuple[int, ...] = (),
-               prefetched: Callable | None = None, registers: int | None = None) -> Callable:
+               prefetched: Callable | None = None, registers: int | None = None,
+               producer: int | None = None) -> Callable:
         # Its programs read a table from global memory as any operand.
         del scalars
         if cluster > self.cluster:
@@ -2174,7 +2177,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                       model_flops=model_flops, resident=resident, ahead=ahead, settled=settled,
                       prefetched=prefetched,
                       model=(None if registers is None
-                             else resources.register_model(self, consumers, registers)),
+                             else resources.register_model(self, consumers, registers, producer=producer)),
                       # The issuer's own reductions across warps (mma.sync's column sums take the kernel's
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
                       reduction_scratch=(self.reduction_scratch
