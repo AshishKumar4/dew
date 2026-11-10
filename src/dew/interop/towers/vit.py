@@ -4,10 +4,11 @@ ways (`translate_vit_weights`), for the towers whose patch embedding is a convol
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from dew.interop.unread import Stored, held
 from dew.interop.weights import Tree, checkpoint_array, insert, placed
+from dew.nn.vision.common import TowerBase
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -15,6 +16,27 @@ if TYPE_CHECKING:
 PATCH_CONVOLUTION = "patch_embed.proj.weight"
 """Where the Qwen-style towers keep their patch map: a `[out, in, time, h, w]` convolution, or MoonViT's
 `[out, in, h, w]`."""
+
+
+@runtime_checkable
+class PatchedTower(Protocol):
+    """A tower whose release stores its patch map as a `[width, channels, time, patch, patch]` convolution
+    (`patch_convolution`)."""
+
+    hidden_size: int
+    in_channels: int
+    temporal_patch_size: int
+    patch_size: int
+
+
+def patch_convolution(tower: TowerBase) -> Mapping[str, tuple[int, ...]]:
+    """The patch map as a Qwen-style release stores it (`PATCH_CONVOLUTION`), the convolution
+    `translate_vit_weights` folds into the tower's Dense map: `[width, channels, time, patch, patch]`, a
+    tower's `TowerLayout.shapes`."""
+    if not isinstance(tower, PatchedTower):
+        raise TypeError(f"{type(tower).__name__} states no patch convolution's geometry")
+    return {PATCH_CONVOLUTION: (tower.hidden_size, tower.in_channels, tower.temporal_patch_size,
+                                tower.patch_size, tower.patch_size)}
 
 
 def translate_vit_weights(hf_tensors: Mapping[str, Stored],

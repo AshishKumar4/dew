@@ -14,7 +14,6 @@ from dew.registry import Record
 
 from .common import (
     ProjectorLayout,
-    TowerBase,
     TowerLayout,
     _vision_section,
     activation_field,
@@ -24,7 +23,7 @@ from .common import (
     tensor_routes,
     unplaced,
 )
-from .vit import PATCH_CONVOLUTION, translate_vit_weights
+from .vit import patch_convolution, translate_vit_weights
 
 _QWEN35_VISION_TENSORS = {
     "patch_embed.proj.weight": ("patch_embed", "kernel"),
@@ -55,13 +54,6 @@ def _vision_types() -> frozenset[str]:
     kinds = [name for name, kind in WRAPPERS.items() if kind.qwen35]
     declared = (CONFIG_MAPPING[name].sub_configs["vision_config"].model_type for name in kinds)
     return frozenset({*kinds, *declared})
-
-def _patch_convolution(tower: TowerBase) -> Mapping[str, tuple[int, ...]]:
-    """The patch map as the release stores it, a `[width, channels, time, patch, patch]` convolution."""
-    assert isinstance(tower, Qwen35Vision)
-    return {PATCH_CONVOLUTION: (tower.hidden_size, tower.in_channels, tower.temporal_patch_size,
-                                tower.patch_size, tower.patch_size)}
-
 
 def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Record:
     """A Qwen3_5VisionConfig into a Qwen35Vision value's fields.
@@ -100,7 +92,7 @@ def translate_qwen35_projector_config(hf_config: Mapping[str, object],
 
 
 QWEN35_VISION = TowerLayout("visual.", _QWEN35_ROUTES, read=translate_vit_weights,
-                                      shapes=_patch_convolution, config=_QWEN35_CONFIG,
+                                      shapes=patch_convolution, config=_QWEN35_CONFIG,
                                       model_type="qwen3_5_vision")
 
 
