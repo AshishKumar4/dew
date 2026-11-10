@@ -45,9 +45,8 @@ EXACT = frozenset({jax.lax.neg_p, jax.lax.abs_p, jax.lax.max_p, jax.lax.min_p, j
 """Operations whose float results are their operands' values selected, or exact: no rounding. An operation
 that only moves entries is exact too (`dew.nn.programs.rearranges`, read beside these, `rounds_nothing`).
 An integer result rounds nothing either, nor does an array made to be written over (`empty2`); a collective
-that moves blocks between devices (a gather, an all-to-all, a permutation) is a move too. The one list of
-them: the rounding model reads it (tests/rounding_bound.py), and the truth rule
-(`reference_error._narrow_values`)."""
+that moves blocks between devices (a gather, an all-to-all, a permutation) is a move too. The rounding
+model reads it (tests/rounding_bound.py)."""
 
 
 def rounds_nothing(primitive) -> bool:
@@ -59,8 +58,7 @@ FORMATTED = frozenset({jax.lax.bitcast_convert_type_p, jax.lax.nextafter_p, jax.
 """The operations whose meaning is a float format's own, whatever width a program computes in: a value's
 bits read as another type, its neighbour on its format's grid, its rounding to a format's digits. JAX states
 no such fact of a primitive, so they are named here, once, by their objects: the float64 replay runs them at
-the traced dtypes (tests/float64_replay.py), and a float64 truth may hold their narrow results
-(`reference_error._narrow_values`)."""
+the traced dtypes (tests/float64_replay.py)."""
 
 
 def float64_held(tree):
@@ -117,17 +115,16 @@ class Unrewritten:
 
     def __getattr__(self, name):
         found = getattr(self.wrapped, name)
-        if name not in ("lower", "trace"):
+        if name != "lower":
             return found
 
-        # A compiled arm's trace and lowering, under the switch its calls run under; an arm of neither has
-        # none.
-        def staged(*inputs, **options):
+        # A compiled arm's lowering, under the switch its calls run under; an arm of no lowering has none.
+        def lower(*inputs, **options):
             from dew.algebra import passes
 
             with passes(on=False):
                 return found(*inputs, **options)
-        return staged
+        return lower
 
 
 class Truth:
@@ -143,8 +140,3 @@ class Truth:
 
     def __call__(self, *inputs):
         return self.run(*inputs)
-
-    @property
-    def trace(self):
-        """Its program's trace (JAX's `jit(...).trace`), the one its calls run."""
-        return self.run.trace
