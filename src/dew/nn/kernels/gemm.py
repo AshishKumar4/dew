@@ -695,11 +695,11 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     per = kernel.shape[1] // column_scales.shape[-1]
     # A column scale covers each column, or whole weight blocks of them, which a column tile falls within.
     tile = (_planned(launch, launch.bind(*_abstract(lhs, kernel, sizes), **call.keywords,
-                                         step_scales=_abstract(row_scales, column_scales)))
+                                         scales=_abstract(row_scales, column_scales)))
             if per == 1 or per % SCALE_DEPTH == 0 else None)
     if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
-        summed = call(lhs, kernel, sizes, step_scales=(row_scales, column_scales))
+        summed = call(lhs, kernel, sizes, scales=(row_scales, column_scales))
     else:
         # Each product of two FP8 values is exact in bfloat16's range and in fp32.
         matrices = jnp.swapaxes(kernel, 1, 2).astype(jnp.bfloat16)
@@ -1029,10 +1029,10 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
     scales = (_scales_tiled(lhs.scales if gather is None else lhs.scales[gather]),
               _scales_tiled(matrices.scales))
     call = functools.partial(launch, lhs.codes, matrices.codes, sizes, (), (), None, None, *tables,
-                             out_dtype='float32', trans_rhs=True, interpret=interpret, mx_scales=scales)
+                             out_dtype='float32', trans_rhs=True, interpret=interpret, scales=scales)
     tile = _planned(launch, launch.bind(*_abstract(*call.args[:3]), (), (), None, None,
                                         *_abstract(*tables), **{**call.keywords,
-                                                                'mx_scales': _abstract(*scales)}))
+                                                                'scales': _abstract(*scales)}))
     if selection.select(op, MxCase(tile)).kernel != 'mosaic':
         values = lhs.decoded() if gather is None else lhs.decoded()[gather]
         return grouped_matmul.xla_ragged_dot(values, jnp.swapaxes(matrices.decoded(), 1, 2), sizes,

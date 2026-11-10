@@ -190,6 +190,13 @@ def vectorized(a: jax.Array, b: jax.Array) -> jax.Array:
     return sums[0]
 
 
+def _integer_gradients(product, *operands):
+    """`product`'s value and its operands' gradients under a cotangent of small integers drawn from the
+    value (each sum exact where the operands are small integers too)."""
+    value, pull = jax.vjp(product, *operands)
+    return value, *pull(jnp.round(4 * jnp.cos(value)))
+
+
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize(("rows_shape", "matrix_shape"), [((12, 4), (4, 3)), ((4, 3, 4), (4, 2, 3))],
                          ids=["rows", "batched-rows-headed-columns"])
@@ -206,17 +213,13 @@ def test_a_pairwise_product_on_an_explicit_data_split_sums_each_devices_share(ro
     numbers = (((len(rows_shape) - 1,), (0,)), ((), ()))
     product = functools.partial(pairwise.pairwise_dot_general, dimension_numbers=numbers)
 
-    def gradients(product, rows, matrix):
-        value, pull = jax.vjp(product, rows, matrix)
-        return value, *pull(jnp.round(4 * jnp.cos(value)))
-
     mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
     with pytest.MonkeyPatch.context() as patched, jax.set_mesh(mesh):
         # Two-row blocks: a device's six rows its matrix's gradient sums as three blocks.
         patched.setattr(pairwise, "contraction_block", lambda depth, lanes=None: min(depth, 2))
         split = jax.device_put(rows, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
-        summed = jax.jit(functools.partial(gradients, product))(split, matrix)
-        plain = jax.jit(functools.partial(gradients, functools.partial(
+        summed = jax.jit(functools.partial(_integer_gradients, product))(split, matrix)
+        plain = jax.jit(functools.partial(_integer_gradients, functools.partial(
             jax.lax.dot_general, dimension_numbers=numbers)))(split, matrix)
     for got, want in zip(summed, plain, strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
@@ -245,15 +248,11 @@ def test_a_headed_projection_on_an_explicit_data_split_trains_in_a_users_process
     def plain(kernel, inputs):
         return jnp.einsum("btd,dhk->bthk", inputs, kernel)
 
-    def gradients(product, kernel, inputs):
-        value, pull = jax.vjp(product, kernel, inputs)
-        return value, *pull(jnp.round(4 * jnp.cos(value)))
-
     mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
     with jax.set_mesh(mesh):
         split = jax.device_put(inputs, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
-        summed = jax.jit(functools.partial(gradients, projected))(kernel, split)
-        want = jax.jit(functools.partial(gradients, plain))(kernel, split)
+        summed = jax.jit(functools.partial(_integer_gradients, projected))(kernel, split)
+        want = jax.jit(functools.partial(_integer_gradients, plain))(kernel, split)
     for got, wanted in zip(summed, want, strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
         assert jax.typeof(got).sharding.spec == jax.typeof(wanted).sharding.spec

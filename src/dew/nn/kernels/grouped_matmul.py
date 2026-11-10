@@ -1596,7 +1596,27 @@ def _cutlass_registered() -> None:
 
 
 @dataclasses.dataclass(frozen=True)
-class MosaicStepScaledGmm(MosaicGmm):
+class _ScaledGmm(MosaicGmm):
+    """`MosaicGmm` of a product whose rows' and matrix's scales its binding takes as one operand (`scales`),
+    reaching the mainloop as the keyword of `mosaic_gpu.gmm`'s its subclass names (`SCALES`)."""
+
+    SCALES: ClassVar[str]
+
+    def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array, prologue_operands: tuple = (),
+             epilogue_operands: tuple = (), paired: jax.Array | None = None, first: jax.Array | None = None,
+             gather: jax.Array | None = None, scatter: jax.Array | None = None, *, out_dtype: str,
+             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
+             dense: bool = False, scales: tuple = (), config: mosaic_gpu.Tiles,
+             return_residuals: bool = False):
+        del return_residuals
+        return self._forward(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
+                             gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret,
+                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config,
+                             formats={self.SCALES: tuple(scales)})
+
+
+@dataclasses.dataclass(frozen=True)
+class MosaicStepScaledGmm(_ScaledGmm):
     """`MosaicGmm` of a blockwise-scaled FP8 product (`gemm.blockwise_fp8_product`, row 4518), planned on the
     call it is: each exactly summed `SCALE_DEPTH`-deep step's partial times its rows' and
     columns' scales before its add (`mosaic_gpu.gmm`'s `step_scales`), its rows' scales streamed beside its
@@ -1605,19 +1625,7 @@ class MosaicStepScaledGmm(MosaicGmm):
 
     STEPS: ClassVar[tuple[int, ...] | None] = (SCALE_DEPTH,)
     STEP_SCALED: ClassVar[bool] = True
-
-    def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array, prologue_operands: tuple = (),
-             epilogue_operands: tuple = (), paired: jax.Array | None = None, first: jax.Array | None = None,
-             gather: jax.Array | None = None, scatter: jax.Array | None = None, *, out_dtype: str,
-             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
-             dense: bool = False, step_scales: tuple = (), config: mosaic_gpu.Tiles,
-             return_residuals: bool = False):
-        # Its rows' and its matrix's scales, the binding's operand, reach the mainloop as its `step_scales`.
-        del return_residuals
-        return self._forward(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                             gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret,
-                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config,
-                             formats={'step_scales': tuple(step_scales)})
+    SCALES: ClassVar[str] = 'step_scales'
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         within = SCALE_DEPTH % config.block_n == 0
@@ -1633,7 +1641,7 @@ class MosaicStepScaledGmm(MosaicGmm):
 
 
 @dataclasses.dataclass(frozen=True)
-class MosaicMxGmm(MosaicGmm):
+class MosaicMxGmm(_ScaledGmm):
     """`MosaicGmm` of a block-scaled product (`gemm.mxfp8_product`, `gemm.nvfp4_block_product`, row 4519),
     planned on the call it is: FP8 or E2M1 rows times a K-major matrix of theirs, each block of each scaled
     by its scale in the products (`mosaic_gpu.block_format`)
@@ -1642,20 +1650,7 @@ class MosaicMxGmm(MosaicGmm):
     whole 128s of rows, columns and depth, and no split, swap, hook or exact sums."""
 
     BLOCK_SCALED: ClassVar[bool] = True
-
-    def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array, prologue_operands: tuple = (),
-             epilogue_operands: tuple = (), paired: jax.Array | None = None, first: jax.Array | None = None,
-             gather: jax.Array | None = None, scatter: jax.Array | None = None, *, out_dtype: str,
-             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
-             dense: bool = False, mx_scales: tuple = (), config: mosaic_gpu.Tiles,
-             return_residuals: bool = False):
-        # Its rows' and its matrix's block scales, the binding's operand in the products' tiles, reach the
-        # mainloop as its `mx_scales`.
-        del return_residuals
-        return self._forward(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                             gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret,
-                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config,
-                             formats={'mx_scales': tuple(mx_scales)})
+    SCALES: ClassVar[str] = 'mx_scales'
 
     def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
         # Its products scale each block in the instruction, which sums in fp32 itself: no step promoted. Its
