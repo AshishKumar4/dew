@@ -310,7 +310,7 @@ Calling the server with a batch submits every prompt, steps until they all finis
 | `admission` | Prompts one step prefills; default the largest multiple of the mesh's row-group count up to eight, times `decode_steps`. |
 | `kv_cache` | A `KVCache` layout replacing the model's own. |
 | `chunk` | Prefill a long prompt in pieces of at most this many tokens, one piece a step. Needs a paged cache. |
-| `prefix_cache` | Share the full prompt pages of an earlier request that began with the same tokens. Needs a paged cache. |
+| `prefix_cache` | Share the full prompt pages of an earlier request that began with the same tokens, and a finished request's whole history (its prompt and every draw its cache holds) with a later prompt that continues it and declares it (`shared`). Needs a paged cache. None, the default, keeps it wherever the layout pages and the server can reuse a prefix (row-wise sampling, no separate prefill mesh, a model that computes a split prompt as a whole one); a request draws what it draws without it. |
 | `prefill_mesh` | Prefill the admitted prompts on a mesh of their own, as disaggregated serving does: the server keeps a copy of its weights there and moves each admission's prefilled rows to the decoding mesh, where they decode. Each prompt prefills whole over a dense cache. |
 | `host_pages` | Keep that many more prefix pages in host memory: a cached page the pool reclaims is copied to the host first, and a request that shares it reads it back into a fresh page before its prefill. Needs `prefix_cache`. A model whose rows keep a state beside their pages sends a state that gives way to the host too, as many states as the bytes of `host_pages` pages hold. |
 | `decode_steps` | Decode iterations per device call (default 1). |

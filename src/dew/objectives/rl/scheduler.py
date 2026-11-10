@@ -714,8 +714,10 @@ class RolloutScheduler:
         at the run's progress at its updates (`LMObjective.policy`). The proximal policy is rescored
         under the trainer's weights, so a `max_lag` above 0 needs `objective.behavior_importance`. A
         reward-side reference penalty (`GRPOObjective.reward_kl`) is `objective`'s own, as `sampled`'s.
-        With `page_size` the server pages its cache in pages of that many slots and shares prompt pages,
-        so a group's samples of one prompt prefill it once (`dew.inference.pages.Pages.waits`). A run over
+        With `page_size` the server pages its cache in pages of that many slots and shares prompt pages
+        where the model admits it, as a paged server does by default (`Server.from_task`'s
+        `prefix_cache`), so a group's samples of one prompt prefill it once
+        (`dew.inference.pages.Pages.waits`). A run over
         several processes serves from one server over its mesh, each process's rows seated on its own
         devices, which every process steps together as it admits each call's groups and reloads at each
         push (`NativeRolloutServer.waited`): its draws run between the trainer's steps, not beside them."""
@@ -735,7 +737,8 @@ class RolloutScheduler:
                 return Server.from_task(policy, slots=slots, capacity=width)
             # The policy's own cache layout, its format kept, in pages.
             declared = policy.model.kv_cache if isinstance(policy.model, Layered) else KVCache()
-            return Server.from_task(policy, slots=slots, capacity=width, prefix_cache=True,
+            # Its prefix cache as the server keeps one by default, wherever the model admits it.
+            return Server.from_task(policy, slots=slots, capacity=width,
                                     kv_cache=dataclasses.replace(declared, page_size=page_size))
 
         server = NativeRolloutServer.deferred(built, drawing)
