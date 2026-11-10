@@ -10,6 +10,9 @@ through each scope's bindings and the file's functions, never by its name.
 from __future__ import annotations
 
 import ast
+import functools
+import importlib
+import inspect
 import re
 from collections.abc import Callable, Iterable, Iterator, Mapping, Set
 from dataclasses import dataclass, field
@@ -24,26 +27,42 @@ class Calls(Protocol):
     def reached(self, scope: ast.AST, call: ast.Call) -> Iterable[ast.AST]: ...
 
 
-TOLERANT: dict[str, dict[str, tuple[int | None, float]] | None] = {
-    "numpy.testing.assert_allclose": {"rtol": (2, 1e-7), "atol": (3, 0)},
-    "numpy.allclose": {"rtol": (2, 1e-5), "atol": (3, 1e-8)},
-    "numpy.isclose": {"rtol": (2, 1e-5), "atol": (3, 1e-8)},
-    "jax.numpy.allclose": {"rtol": (2, 1e-5), "atol": (3, 1e-8)},
-    "jax.numpy.isclose": {"rtol": (2, 1e-5), "atol": (3, 1e-8)},
-    "torch.allclose": {"rtol": (2, 1e-5), "atol": (3, 1e-8)},
-    "torch.isclose": {"rtol": (2, 1e-5), "atol": (3, 1e-8)},
-    "math.isclose": {"rel_tol": (None, 1e-9), "abs_tol": (None, 0)},
-    "torch.testing.assert_close": {"rtol": (None, 1.3e-6), "atol": (None, 1e-5)},
-    "pytest.approx": {"rel": (1, 1e-6), "abs": (2, 1e-12)},
+TOLERANT: dict[str, tuple[str, ...] | None] = {
+    "numpy.testing.assert_allclose": ("rtol", "atol"), "numpy.allclose": ("rtol", "atol"),
+    "numpy.isclose": ("rtol", "atol"), "jax.numpy.allclose": ("rtol", "atol"),
+    "jax.numpy.isclose": ("rtol", "atol"), "torch.allclose": ("rtol", "atol"),
+    "torch.isclose": ("rtol", "atol"), "math.isclose": ("rel_tol", "abs_tol"),
+    "torch.testing.assert_close": ("rtol", "atol"), "pytest.approx": ("rel", "abs"),
     "numpy.testing.assert_almost_equal": None, "numpy.testing.assert_array_almost_equal": None,
     "numpy.testing.assert_approx_equal": None, "numpy.testing.assert_array_max_ulp": None,
     "numpy.testing.assert_array_almost_equal_nulp": None, "dew._accuracy.within": None,
     "chex.assert_trees_all_close": None, "chex.assert_trees_all_equal_comparator": None,
 }
 """The APIs that compare floats within a tolerance, as their imports resolve them (lint_scopes), however
-they are imported: each with its tolerances, their positional places (None: keyword only) and defaults,
-where a call can name them all zero and compare exactly (`_exact`), or None where it cannot.
+they are imported: each with the names of its tolerances, whose places and defaults the API itself states
+(`_declared`), where a call can name them all zero and compare exactly (`_exact`), or None where it cannot.
 `assert_array_equal` and `==` compare exactly, and stay."""
+UNSIGNED = {name: {"rtol": (2, 1e-5), "atol": (3, 1e-8)} for name in ("torch.allclose", "torch.isclose")}
+"""The tolerances' places and defaults of torch's builtins, which carry no signature `inspect` reads, as
+torch's documentation states them: `allclose(input, other, rtol=1e-05, atol=1e-08, equal_nan=False)`."""
+
+
+@functools.cache
+def _declared(api: str) -> dict[str, tuple[int | None, object]]:
+    """Each of `api`'s tolerances (`TOLERANT`) by its positional place (None: keyword only) and default, as
+    the API's own signature states them (`UNSIGNED` where it has none)."""
+    if api in UNSIGNED:
+        return UNSIGNED[api]
+    module, _, name = api.rpartition(".")
+    signature = inspect.signature(getattr(importlib.import_module(module), name))
+    parameters = list(signature.parameters.values())
+    positional = (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+    places = {parameter.name: index for index, parameter in enumerate(parameters)
+              if parameter.kind in positional}
+    return {tolerance: (places.get(tolerance), signature.parameters[tolerance].default)
+            for tolerance in TOLERANT[api] or ()}
+
+
 TOLERANT_METHODS = frozenset({"assertAlmostEqual", "assertNotAlmostEqual"})
 """unittest's, on whatever test case calls them."""
 BOUNDED = frozenset({"numpy.testing.assert_array_less"})
@@ -429,25 +448,29 @@ def _read_scope(scope_node: ast.AST, reading: _Reading) -> _Scope:
 
 
 def _exact(node: ast.Call, called: str) -> bool:
-    """A tolerance call that compares exactly: each of its API's tolerances a literal zero, given by
-    keyword or position, or zero by default, and none passed in a pack."""
-    declared = TOLERANT.get(called)
-    # A packed argument (`*args`, `**options`) may carry any tolerance: not provably exact.
-    packed = any(isinstance(argument, ast.Starred) for argument in node.args) or any(
-        keyword.arg is None for keyword in node.keywords)
-    if declared is None or packed:
+    """A tolerance call that compares exactly: each of its API's tolerances (`_declared`) a literal zero,
+    given by keyword or position, or zero by default, and none passed in a pack. pytest's approx given an
+    `abs` and no `rel` holds that tolerance alone, its relative default unused: its own rule
+    (_pytest/python_api.py, `ApproxScalar.tolerance`), stated here as this lint may not call approx, a
+    tolerance comparison itself (SLOP020)."""
+    if TOLERANT.get(called) is None:
         return False
-    named = {keyword.arg for keyword in node.keywords}
-    for name, (place, default) in declared.items():
-        # pytest's approx given only `abs` holds that tolerance alone, its relative one unused.
-        if called == "pytest.approx" and name == "rel" and "abs" in named and "rel" not in named \
-                and len(node.args) <= place:
-            continue
+    # A packed argument (`*args`, `**options`) may carry any tolerance: not provably exact.
+    if any(isinstance(argument, ast.Starred) for argument in node.args) or any(
+            keyword.arg is None for keyword in node.keywords):
+        return False
+    written: dict[str, ast.expr] = {}
+    for name, (place, _) in _declared(called).items():
         given = next((keyword.value for keyword in node.keywords if keyword.arg == name), None)
         if given is None and place is not None and len(node.args) > place:
             given = node.args[place]
+        if given is not None:
+            written[name] = given
+    unused = {"rel"} if called == "pytest.approx" and "abs" in written and "rel" not in written else set()
+    for name, (_, default) in _declared(called).items():
+        given = written.get(name)
         value = given.value if isinstance(given, ast.Constant) else (default if given is None else None)
-        if value != 0:
+        if name not in unused and value != 0:
             return False
     return True
 
