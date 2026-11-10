@@ -1011,7 +1011,6 @@ def _score_grads(call: Call) -> Operand:
     return held if call.delta else dataclasses.replace(call.given, rows=call.rows)
 
 
-@lowered_once
 def _scores_back_held(call: Call, grads: Operand, group: int) -> Held:
     """What `_scores_back`'s consumer thread holds: the scores' gradient fp32 and narrow, the pairs'
     decays, the scores and the pair terms, the masks, and the pairs' sum's product: three fp32 tiles at
@@ -1042,6 +1041,7 @@ def _scores_back_held(call: Call, grads: Operand, group: int) -> Held:
     return Held(phases=phases)
 
 
+@lowered_once
 def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale: float):
     """`(ds in `_score_grads`' form, decay [HV, R] fp32)`: each chunk and value head's scores' gradient and
     the decay's gradient from its pair terms (`algebra.scores_gradient`, `algebra.summed_pairs`), fla's
