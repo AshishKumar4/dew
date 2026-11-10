@@ -336,10 +336,10 @@ def masked_attention(mask):
 
 def jax_nn_written(*, mask=None, bias=None, scale=1, causal=False, window=None):
     """`jax.nn.dot_product_attention` under those arguments, written out at its operands' width: its logits
-    scaled (`scale` times the default), biased, then filled with jax.nn's large negative (`JAX_FILL`) wherever the mask of the inputs,
-    causality or a local window of `window` keys back drops a key. jax.nn's own runs its softmax in
-    float32 whatever its operands' (`_dot_product_attention_core`), so on float64 operands it is a second
-    fp32 run and no truth of itself; this is the function it computes."""
+    scaled (`scale` times the default), biased, then filled with jax.nn's large negative (`JAX_FILL`)
+    wherever the mask of the inputs, causality or a local window of `window` keys back drops a key. jax.nn's
+    own runs its softmax in float32 whatever its operands' (`_dot_product_attention_core`), so on float64
+    operands it is a second fp32 run and no truth of itself; this is the function it computes."""
     def attend(q, k, v):
         logits = jnp.einsum("bqhd,bkhd->bhqk", q, k, preferred_element_type=_wide(q))
         logits = logits * q.shape[-1] ** -0.5 * scale
