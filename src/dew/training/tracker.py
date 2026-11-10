@@ -671,14 +671,11 @@ class TensorBoardTracker(_OwnedTracker):
 
 
 def _text(tag: str, payload: str) -> Summary.Value:
-    """A text-plugin summary value: the one-string tensor a text tab reads, its metadata and tensor
-    built as TensorBoard's own TensorFlow-free `text_pb` builds them."""
-    from tensorboard.compat.proto.summary_pb2 import Summary
-    from tensorboard.plugins.text.metadata import create_summary_metadata
-    from tensorboard.util.tensor_util import make_tensor_proto
+    """A text-plugin summary value: the one-string tensor a text tab reads, built by TensorBoard's own
+    TensorFlow-free `text_pb`."""
+    from tensorboard.plugins.text.summary_v2 import text_pb
 
-    return Summary.Value(tag=tag, metadata=create_summary_metadata(display_name=None, description=None),
-                         tensor=make_tensor_proto([payload], dtype=np.object_))
+    return text_pb(tag, [payload]).value[0]
 
 
 def _picture(tag: str, encoded: bytes, frame: np.ndarray) -> Summary.Value:
