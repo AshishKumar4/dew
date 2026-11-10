@@ -199,7 +199,7 @@ def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> S
     chunks its N sequences can split `batch * length` tokens into."""
     # The rows' own spans are constants; a traced `cu_seqlens` takes the same arithmetic in XLA.
     xp = np if cu_seqlens is None else jnp
-    packed = cu_seqlens is not None
+    documents = cu_seqlens is not None
     if cu_seqlens is None:
         cu_seqlens = np.arange(batch + 1, dtype=np.int32) * length
         count = batch * -(-length // chunk)
@@ -212,7 +212,7 @@ def sequences(batch: int, length: int, cu_seqlens=None, *, chunk: int = 64) -> S
     # before it, less each non-empty sequence's first.
     base = offsets[:-1] - xp.cumsum(lengths > 0)
     # A memory's slots follow the passing ones, and the zeros theirs.
-    passing = _passing(batch, length, chunk, packed)
+    passing = _passing(batch, length, chunk, documents)
     row = first // length
     memory, takes, gives = row, first % length == 0, (first + lengths) % length == 0
     zeros = passing + batch
