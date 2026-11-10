@@ -940,16 +940,15 @@ class _Branch:
         if selection.select(gemm.LOW_RANK, None).kernel != "fused":
             return None
         a, b = (meta.unbox(module.get_variable("params", factor)) for factor in LOW_RANK_FACTORS)
-        # Promoted as the layer promotes its operands, and the adapter its factors (`_low_rank`).
-        x, kernel, a, b = promote_dtype(x, kernel, a, b, dtype=module.dtype)
+        bias = meta.unbox(module.get_variable("params", "bias")) if module.use_bias else None
+        # Promoted as the layer promotes its operands and bias, and the adapter its factors (`_low_rank`).
+        x, kernel, a, b, bias = promote_dtype(x, kernel, a, b, bias, dtype=module.dtype)
         rows = x.reshape(-1, x.shape[-1])
         out = gemm.low_rank(rows, kernel, a, b, _scale(target, self.rslora), out_dtype=x.dtype,
                             precision=module.precision)
         out = out.reshape(*x.shape[:-1], kernel.shape[1])
-        if module.use_bias:
-            # The bias added as the layer adds it (`dense._biased`).
-            out = biased(out, meta.unbox(module.get_variable("params", "bias")))
-        return out
+        # The bias added as the layer adds it (`dense._biased`).
+        return out if bias is None else biased(out, bias)
 
     def _selected(self, module: nn.Module, x: jax.Array) -> tuple[jax.Array, jax.Array]:
         """An adapter set's rows at `module` (`AdapterSet`), as the call names them (`_selected_rows`), and
