@@ -25,6 +25,7 @@ over its own contraction (`pairwise_dot_general`'s reverse pass). On another pla
 """
 
 import functools
+import itertools
 import math
 import os
 import platform
@@ -167,22 +168,32 @@ def pairwise_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, prec
 
     def laid(left, right):
         # Each operand as `[batch, free, contracted]` and `[batch, contracted, free]`.
-        sizes = [math.prod(shape(lhs, axes)) for axes in (batched, free, contracted_axes)]
-        sizes_rhs = [math.prod(shape(rhs, axes)) for axes in (batched_rhs, against, free_rhs)]
-        return jnp.transpose(left, order).reshape(sizes), jnp.transpose(right, order_rhs).reshape(sizes_rhs)
+        groups, groups_rhs = (batched, free, contracted_axes), (batched_rhs, against, free_rhs)
+        return (jax.lax.reshape(jnp.transpose(left, order), [math.prod(shape(lhs, axes)) for axes in groups],
+                                out_sharding=_placed((left, groups))),
+                jax.lax.reshape(jnp.transpose(right, order_rhs),
+                                [math.prod(shape(rhs, axes)) for axes in groups_rhs],
+                                out_sharding=_placed((right, groups_rhs))))
 
     def summed(left, right):
         out = _summed(*laid(left, right), precision)
-        return out.reshape(*shape(lhs, batched + free), *shape(rhs, free_rhs))
+        return jax.lax.reshape(out, (*shape(lhs, batched + free), *shape(rhs, free_rhs)),
+                               out_sharding=_placed((left, _each(batched + free)), (right, _each(free_rhs))))
 
     def pulled(saved, operands, cotangent, live):
         left, right = laid(*operands)
-        flat = cotangent.reshape(left.shape[0], left.shape[1], right.shape[2])
+        # The cotangent's dimensions are the result's: the batch's, `lhs`'s free ones, `rhs`'s.
+        ends = itertools.accumulate((0, len(batched), len(free), len(free_rhs)))
+        groups = tuple(tuple(range(start, stop)) for start, stop in itertools.pairwise(ends))
+        flat = jax.lax.reshape(cotangent, (left.shape[0], left.shape[1], right.shape[2]),
+                               out_sharding=_placed((cotangent, groups)))
         gradients = {
-            0: lambda: jnp.transpose(_summed(flat, jnp.swapaxes(right, 1, 2), precision).reshape(
-                shape(lhs, order)), _inverse(order)),
-            1: lambda: jnp.transpose(_summed(jnp.swapaxes(left, 1, 2), flat, precision).reshape(
-                shape(rhs, order_rhs)), _inverse(order_rhs)),
+            0: lambda: jnp.transpose(jax.lax.reshape(
+                _summed(flat, jnp.swapaxes(right, 1, 2), precision), shape(lhs, order),
+                out_sharding=_placed((operands[0], _each(order)))), _inverse(order)),
+            1: lambda: jnp.transpose(jax.lax.reshape(
+                _summed(jnp.swapaxes(left, 1, 2), flat, precision), shape(rhs, order_rhs),
+                out_sharding=_placed((operands[1], _each(order_rhs)))), _inverse(order_rhs)),
         }
         return tuple(gradients[index]() for index in live)
 
@@ -190,6 +201,36 @@ def pairwise_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, prec
         linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True,
                        kind=Protected()))
     return product(lhs, rhs)
+
+
+def _placed(*parts: tuple[jax.Array, tuple[tuple[int, ...], ...]]) -> jax.sharding.NamedSharding | None:
+    """The placement of a reshape whose dimensions are `parts`' groups of dimensions, each part an operand
+    and its groups in order, a group's dimensions merged into one, where an Explicit axis splits an
+    operand: each dimension split by the mesh axes that split its group's, where those are its leading
+    ones (a split dimension merged with whole minor ones, or split off alone), else whole. JAX does not
+    place a reshape that splits a split dimension, or merges one into a new shape (row 5422), which takes
+    it as its `out_sharding` (`sharding.explicit_spec`); None where no Explicit axis splits an operand."""
+    from dew.mesh import mesh_axes
+    from dew.nn.sharding import explicit_spec
+
+    placed = [(explicit_spec(array), groups) for array, groups in parts]
+    mesh = next((found.mesh for found, _ in placed if found is not None), None)
+    if mesh is None:
+        return None
+    entries = []
+    for found, groups in placed:
+        for axes in groups:
+            specs = [None if found is None else found.spec[axis] for axis in axes]
+            split = [entry for entry in specs if entry is not None]
+            names = tuple(name for entry in split for name in mesh_axes(entry))
+            leading = all(entry is not None for entry in specs[:len(split)])
+            entries.append((names[0] if len(names) == 1 else names) if names and leading else None)
+    return jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(*entries))
+
+
+def _each(axes: tuple[int, ...]) -> tuple[tuple[int, ...], ...]:
+    """`axes`, each a group of its own (`_placed`): a reshape that keeps them apart."""
+    return tuple((axis,) for axis in axes)
 
 
 def _inverse(permutation: tuple) -> tuple:
