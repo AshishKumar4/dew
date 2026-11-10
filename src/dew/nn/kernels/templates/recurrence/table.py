@@ -244,15 +244,3 @@ def table_landing(call: "Call", keeps: bool, bv: int) -> dict:
     """A walk's tile its table's memories land through (`Family.kept`), a key slice `[block, bv]` fp32, where
     it `keeps` any (a forward's stored slots, a reverse walk's taken gradients)."""
     return {"table": ((call.block, bv), jnp.float32)} if keeps else {}
-
-
-def tabled_step(stepped, table) -> Callable:
-    """A walk's step `stepped` between its role's `table`'s reads and writes (`Taking`, `Returning`), the
-    table opened as the walk begins."""
-    table.opened()
-
-    def step(n, slots, carry, accumulators, *loaded):
-        carry, accumulators = stepped(n, slots, table.before(n, carry), accumulators, *loaded)
-        return table.after(n, carry), accumulators
-
-    return step

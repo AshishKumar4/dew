@@ -65,7 +65,6 @@ from dew.nn.kernels.templates.recurrence.table import (
     program_refs,
     table_landing,
     table_stored,
-    tabled_step,
     taken_by,
 )
 
@@ -1786,13 +1785,30 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
         mosaic.per_role(wg, walkers, walk)
 
     def walk(role, wg):
-        role_step = step(role) if table is None else tabled_step(step(role), table(role))
-        walked_step = role_step
+        stepped, tabled = step(role), None if table is None else table(role)
+        if tabled is not None:
+            tabled.opened()
+
+        def taken_up(n, state):
+            return state if tabled is None else tabled.before(n, state)
+
+        def role_step(n, slots, state, accumulators, *loaded):
+            state, accumulators = stepped(n, slots, state, accumulators, *loaded)
+            return (state if tabled is None else tabled.after(n, state)), accumulators
+
+        def walked_step(n, slots, state, accumulators):
+            return role_step(n, slots, taken_up(n, state), accumulators)
+
         if (fetch := prefetch) is not None:
             last = start + count - 1
 
             def walked_step(n, slots, carry, accumulators):
                 state, loaded = carry
+                # The memory a chunk takes up from its table before the next chunk's prefix is fetched, so
+                # the fetched vectors live across the step alone: fetched first, they lived across the
+                # table's reads too, and a B200's forked SSD forward spilled 60 bytes, none after (armada
+                # 20261110175554-35d90e35, row 5376).
+                state = taken_up(n, state)
                 ahead = fetch(jnp.minimum(n + 1, last))
                 state, accumulators = role_step(n, slots, state, accumulators, loaded)
                 return (state, ahead), accumulators
