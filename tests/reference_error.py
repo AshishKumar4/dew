@@ -714,10 +714,12 @@ def _of_float64(label: str, truth_fn, inputs, truth) -> None:
     programs of its own traces none here, and is held by its leaves alone."""
     paths = _leaf_paths(truth)
     for path, leaf in zip(paths, jax.tree.leaves(truth), strict=True):
-        if _below_float64(jnp.result_type(leaf)):
-            raise NarrowTruth(path, f"{label}: the float64 truth's leaf {path or 'itself'} is "
-                              f"{jnp.result_type(leaf)}: a truth computes in float64 (a float64 clone of "
-                              f"the model over its variables widened, `float64_held`)")
+        # The leaf's own dtype: JAX's reading of a host float64 outside x64 would narrow it.
+        dtype = np.asarray(leaf).dtype if not hasattr(leaf, "dtype") else leaf.dtype
+        if _below_float64(dtype):
+            raise NarrowTruth(path, f"{label}: the float64 truth's leaf {path or 'itself'} is {dtype}: a "
+                              f"truth computes in float64 (a float64 clone of the model over its variables "
+                              f"widened, `float64_held`)")
     windowed = any(isinstance(layer, _Windowed) for layer in _layers(truth_fn))
     trace = None if _given(truth_fn) else getattr(next(
         layer for layer in _layers(truth_fn) if not isinstance(layer, _RunToRun | _Windowed)), "trace", None)
