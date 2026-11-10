@@ -7,13 +7,12 @@ import jax
 import jax.numpy as jnp
 
 from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
-from dew.decision.head import Head
+from dew.decision.head import Head, answer_states
 from dew.decision.inputs import DecisionInputs
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import TokenModel, VocabularyRows
-from dew.nn.scatter import gather_positions
 from dew.nn.visibility import block_ends, block_starts
 from dew.nn.wrapping import HeadedModel
 from dew.objectives.base import joined
@@ -229,9 +228,7 @@ class DecisionModel(HeadedModel):
         """The backbone's own logits `[B, Q, K, V]` at each label's ids of each question's answer
         state (`DecisionInputs.readout`), its first `K` labels as many as its option slots
         (`HeadedModel.label_logits`)."""
-        if inputs.readout is None:
-            raise ValueError("a readout of labels reads rows whose options stand under labels (Labels)")
-        answers = gather_positions(states, inputs.readout)
+        answers = answer_states(states, inputs)
         return self.label_logits(variables, answers, labels)[:, :, :inputs.options.shape[-1]]
 
 
