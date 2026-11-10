@@ -64,6 +64,7 @@ from dew.nn.inputs import (
 from dew.nn.kernels.options import program
 from dew.nn.protocols import ShiftsLogits, TokenModel, forward_method
 from dew.nn.sharding import explicit_spec
+from dew.sampling.decoding import top_k_kept
 
 MDLM_STEPS = 128
 """Reveal steps `generate` takes by default, MDLM's `sampling.steps` (configs/config.yaml)."""
@@ -470,8 +471,7 @@ class Confident:
     def _reveal(self, x, log_probs, masked, index, steps, size, drawn):
         scores = log_probs
         if self.top_k is not None:
-            cutoff = jax.lax.top_k(scores, min(self.top_k, scores.shape[-1]))[0][..., -1:]
-            scores = jnp.where(scores < cutoff, -jnp.inf, scores)
+            scores = top_k_kept(scores, self.top_k)
         if self.temperature not in (0.0, 1.0):
             scores = scores / self.temperature
         scores = categorical.log_probs(scores)

@@ -259,6 +259,14 @@ class Temperature(_Numerical):
         return logits / value
 
 
+def top_k_kept(scores: jax.Array, k: int) -> jax.Array:
+    """`scores` over their last axis with all but the `k` highest removed (`FILTER`), every score tied at
+    the cutoff kept and `k` past the axis's width keeping all, as `TopKLogitsWarper`: the one filter a
+    sampler's `TopK` and a masked diffusion's reveal (`dew.diffusion.discrete.Confident`) read."""
+    cutoff = lax.top_k(scores, min(k, scores.shape[-1]))[0][..., -1:]
+    return jnp.where(scores < cutoff, FILTER, scores)
+
+
 @struct.dataclass
 class TopK:
     """Keeps the `k` highest scores, as `TopKLogitsWarper`."""
@@ -269,9 +277,7 @@ class TopK:
         positive_size("top_k", self.k)
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        keep = min(self.k, logits.shape[-1])
-        cutoff = lax.top_k(logits, keep)[0][..., -1:]
-        return jnp.where(logits < cutoff, FILTER, logits)
+        return top_k_kept(logits, self.k)
 
 
 @struct.dataclass
