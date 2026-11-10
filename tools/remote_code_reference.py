@@ -23,7 +23,7 @@ reads), so run it there:
       --index-url https://download.pytorch.org/whl/cpu
   uv pip install --python /tmp/remote/bin/python transformers==4.46.3 \
       safetensors numpy huggingface_hub
-  /tmp/remote/bin/python tools/remote_code_reference.py
+  PYTHONPATH=src /tmp/remote/bin/python tools/remote_code_reference.py
 
 MiMo-V2.6's code reads transformers 5's masking and rotary utilities, calling
 `create_causal_mask(input_embeds=...)`, which 5.2.0 renamed (its config records
@@ -39,7 +39,7 @@ untrained, under the fixture's config with its pad id stated, left out and
 null (`reference_source.record_padding`), as padding.json beside it. It reads
 the release's code and config alone, under each release's transformers as
 above:
-  /tmp/remote/bin/python tools/remote_code_reference.py --padding llada-tiny dream-tiny
+  PYTHONPATH=src /tmp/remote/bin/python tools/remote_code_reference.py --padding llada-tiny dream-tiny
 
 LFM3's code (lfm3-tiny, lfm3-biased-tiny) runs under transformers 5.18.0 on
 (tests/fixtures/hf/lfm3-tiny/source.json), and LFM3-VL's (lfm3-vl-tiny), the same LFM3 decoder beside
@@ -74,8 +74,6 @@ import transformers
 from huggingface_hub import hf_hub_download
 from reference_source import config_lookups, record_padding
 from safetensors.torch import load_file, save_file
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from transformers import AutoConfig
 
 from _dew_torch.precision import float64, float64_twin

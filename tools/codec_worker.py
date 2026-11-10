@@ -20,8 +20,6 @@ import numpy as np
 import torch
 from reference_worker import drawn, serve
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 CODECS = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs"
 FAMILIES = ("storage", "nvfp4_qdq")
 """The checkpoint families the worker runs: weight-only storage, and NVFP4 with input QDQ."""

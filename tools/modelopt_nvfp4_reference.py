@@ -41,8 +41,6 @@ import numpy as np
 import requests
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 # CUDA torch must load before the pinned transformers environment's CPU
 # torch can appear on sys.path. The same kernel then serves both references.
 sys.path.insert(0, str(Path.home() / ".cache/dew/reference-venvs/nvfp4-storage/lib/python3.12/site-packages"))

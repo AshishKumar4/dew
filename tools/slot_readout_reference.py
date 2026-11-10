@@ -31,7 +31,6 @@ from block_override_reference import (
 from fetched_fixtures import save
 from reference_source import git_head
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import float64_twin
 
 ROOT = Path(__file__).resolve().parents[1]

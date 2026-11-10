@@ -21,13 +21,10 @@ import importlib
 import json
 import sys
 from collections.abc import Callable
-from pathlib import Path
 
 import numpy as np
 import torch
 from reference_worker import drawn, serve
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 STEPPED_PREFILL = 40
 """The prefill of the cached decode whose shapes `stepped` is scored at, which tests/kimi_support.py's

@@ -17,8 +17,6 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 RELEASED = ("openai/gpt-oss-20b", "6cee5e81ee83917806bbde320786a8fb61efebee")
 """The released GPT OSS 20B and the commit both sides read."""
 PROMPT = "The Cascade Range runs from northern California through Oregon"

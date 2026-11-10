@@ -12,7 +12,7 @@ Set up the venv once (torch CPU, transformers, safetensors):
         safetensors numpy \
         --index-url https://download.pytorch.org/whl/cpu \
         --extra-index-url https://pypi.org/simple
-    /tmp/t5ref/bin/python tools/t5_reference.py
+    PYTHONPATH=src /tmp/t5ref/bin/python tools/t5_reference.py
 
 --out DIR writes the fixtures somewhere other than tests/fixtures/t5.
 
@@ -38,20 +38,17 @@ the reference's fp32 last hidden state and its float64 truth on each seed's
 drawn ids (tests/test_t5_encoders.py's `t5_draw`), kept as the evidence check
 1 reads (`summary`), the count planned on Dew's own encoder:
 
-    /tmp/t5ref/bin/python tools/t5_reference.py seeds
+    PYTHONPATH=src /tmp/t5ref/bin/python tools/t5_reference.py seeds
 """
 
 import argparse
 import json
 import string
-import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from transformers import T5Config, T5EncoderModel, T5Tokenizer, UMT5Config, UMT5EncoderModel
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "t5"
 

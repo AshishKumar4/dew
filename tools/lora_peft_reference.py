@@ -36,9 +36,9 @@ the committed adapter (`masks`, in Dew's environment); the PEFT run (the
 those masks:
 
     PYTHONPATH=src python tools/lora_peft_reference.py masks
-    ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_peft_reference.py
+    PYTHONPATH=src ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_peft_reference.py
     PYTHONPATH=src python tools/lora_peft_reference.py write-orders <dir>
-    ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_peft_reference.py orders <dir>
+    PYTHONPATH=src ~/.cache/dew/reference-venvs/peft/bin/python tools/lora_peft_reference.py orders <dir>
 """
 
 from __future__ import annotations
@@ -51,7 +51,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import float64, float64_twin
 
 ROOT = Path(__file__).resolve().parents[1]

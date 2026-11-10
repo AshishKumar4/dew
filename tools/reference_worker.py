@@ -218,15 +218,22 @@ class Session:
             return dict(answer)
 
 
+SOURCE = Path(__file__).resolve().parents[1] / "src"
+"""This checkout's src, the one place a worker reads `_dew_torch` from (the float64 twin's arithmetic,
+which a reference's own environment, holding no Dew, does not install): `session` puts it on every
+worker's path, as a reference tool run by hand is given it (`PYTHONPATH=src`)."""
+
+
 @contextlib.contextmanager
 def session(command: Sequence[str], *, env: Mapping[str, str] | None = None) -> Iterator[Session]:
     """`command`, `[python, script, *arguments]`, started as a worker (`serve`): its script run under this
     file (`bootstrap`) as a group its recorder owns (dew._cleanup's `owned_group`), whose lifeline kills it
     if the recorder dies without unwinding, and `ask`ed through the `Session` the block holds. `env` is its
-    environment, the recorder's where none is given, but for TMPDIR: the worker's temporary files are the
-    session's, in a directory removed after the worker's group is stopped. However the block ends, an error
-    among them, the group is stopped and reaped, its pipes closed and the directory removed, each step
-    attempted whichever fail, the block's own error the one raised."""
+    environment, the recorder's where none is given, but for TMPDIR and this checkout's src ahead on its
+    PYTHONPATH (`SOURCE`): the worker's temporary files are the session's, in a directory removed after the
+    worker's group is stopped. However the block ends, an error among them, the group is stopped and
+    reaped, its pipes closed and the directory removed, each step attempted whichever fail, the block's
+    own error the one raised."""
     from dew._cleanup import attempted, owned_group
 
     python, script, *arguments = command
@@ -234,7 +241,9 @@ def session(command: Sequence[str], *, env: Mapping[str, str] | None = None) -> 
     try:
         (root / "io").mkdir()
         (root / "tmp").mkdir()
-        environment = {**(os.environ if env is None else env), "TMPDIR": str(root / "tmp")}
+        held = os.environ if env is None else env
+        path = os.pathsep.join(filter(None, (str(SOURCE), held.get("PYTHONPATH"))))
+        environment = {**held, "TMPDIR": str(root / "tmp"), "PYTHONPATH": path}
         started = [python, __file__, script, *arguments]
         with owned_group(started, stdin=subprocess.PIPE, stdout=subprocess.PIPE, env=environment) as process:
             yield Session(process, script, root / "io")

@@ -65,8 +65,6 @@ import torch
 from reference_source import config_lookups, hub_modules, record_padding
 from safetensors.torch import save_file
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 REPO = "moonshotai/Kimi-K3"
 REVISION = "f831ab66814297da540d832a5235f8e904f29d06"
 REMOTE = ("configuration_kimi_k3.py", "modeling_kimi_k3.py", "modeling_kimi_linear.py")

@@ -23,7 +23,7 @@ Every path's float64 top-2 margin, over the scores transformers chose
 from, is checked against fp32 rounding as tools/numerics_reference.py
 checks its greedy path, so the path is the model's and not a rounding.
 
-    PYTHONPATH=tools ~/.cache/dew/reference-venvs/numerics/bin/python \
+    PYTHONPATH=src:tools ~/.cache/dew/reference-venvs/numerics/bin/python \
         tools/stopping_reference.py
 """
 

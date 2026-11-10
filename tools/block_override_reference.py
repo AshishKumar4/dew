@@ -25,7 +25,6 @@ import torch
 from fetched_fixtures import save
 from reference_source import CACHE, git_head, package, published_files, verified
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import default_dtype, dtype_widened, float_as, replaced, widened_to
 
 ROOT = Path(__file__).resolve().parents[1]
