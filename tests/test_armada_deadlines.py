@@ -112,6 +112,16 @@ def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, 
     assert f"{stalled} (test_stalls.py:" in record.read_text() and "cpu.max" in record.read_text()
 
 
+def test_each_stall_of_a_tasks_runs_of_the_same_rows_keeps_its_own_record(ci, tmp_path):
+    """A task's two runs of the same rows past their deadlines (a rerun after a deadline) each keep their own
+    stall record (`stalls.kept`), neither the other's."""
+    first, second = (ci.stalls.kept(tmp_path, "3.12-same", f"stacks of run {run}", time.time(), "host")
+                     for run in (1, 2))
+    assert first != second
+    assert first.read_text().startswith("stacks of run 1")
+    assert second.read_text().startswith("stacks of run 2")
+
+
 def test_a_task_within_its_deadline_writes_no_stacks(ci, tmp_path):
     """A run that ends within its deadline is never dumped, however close to it it ends: the stacks are the
     deadline's alone, never a timer's before it, which could kill a healthy multithreaded run mid-dump and
