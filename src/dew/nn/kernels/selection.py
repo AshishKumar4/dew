@@ -157,7 +157,7 @@ class Op[C]:
     hosted: Callable[[str], str] = lambda kernel: kernel
     declared: Mapping[tuple[str | None, str], tuple[str, str]] = dataclasses.field(
         default_factory=dict, compare=False, hash=False)
-    named_from: Mapping[tuple[str, str], str] = dataclasses.field(
+    named_from: Mapping[tuple[Choice, str], str] = dataclasses.field(
         default_factory=dict, compare=False, hash=False)
     """Another op's named choice that names this one's kernel, unless this call or op names its own.
     Entries are ordered, as the op's requirements and candidates are."""
