@@ -33,6 +33,7 @@ from dew.nn.blocks import IMAGENET_MEAN, IMAGENET_STD, torch_bicubic_resize
 from dew.nn.dense import Dense
 from dew.nn.norms import LayerNorm
 from dew.nn.precision import float32_dot_general
+from dew.nn.scan_orders import unpatchify
 from dew.nn.text_encoders import clip_layer
 from dew.nn.vision.vit import LearnedPositions, SpecialTokens, VisionTransformer, ViTLayout
 
@@ -148,9 +149,8 @@ class _Decoder(nn.Module):
                         dot_general=float32_dot_general)(
             tokens[:, 1:]
         )
-        patches = patches.reshape(batch, self.grid, self.grid, self.patch, self.patch, self.channels)
-        return patches.transpose(0, 1, 3, 2, 4, 5).reshape(
-            batch, self.grid * self.patch, self.grid * self.patch, self.channels)
+        side = self.grid * self.patch
+        return unpatchify(patches, self.patch, side, side, self.channels)
 
 
 class RAE(nn.Module):
