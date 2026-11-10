@@ -16,23 +16,18 @@ DETERMINISTIC_OPS = "--xla_gpu_deterministic_ops=true"
 """Under it a process keeps no picks (`dew._cache.keeps_picks`) and Dew's fused kernels take their ordered
 schedules (`dew._devices.deterministic_ops_requested`)."""
 
-REPEATABLE_GPU_FLAGS = (DETERMINISTIC_OPS, "--xla_gpu_autotune_level=0", "--xla_gpu_enable_triton_gemm=false")
+REPEATABLE_GPU_FLAGS = (DETERMINISTIC_OPS, "--xla_gpu_autotune_level=0")
 """The cuda lane's flags for steps repeatable across processes. Deterministic
 ops order the reductions; autotuning off leaves every cuBLAS and cuDNN call
 the configuration it was emitted with, so no process chooses one; and such
 a run keeps no stored picks (`dew._cache.keeps_picks`), which XLA and Dew's
-kernels would take instead. Deterministic ops take Triton out of the GEMM
-configurations (`GetEnabledBackends` in
-xla/service/gpu/autotuning/config_assigner_pass.cc) while XLA still fuses
-dots for Triton, and the mean-flow hybrid DiT's jvp dot over a
-concatenation then had no configuration ("No supported config found");
-with Triton GEMMs off every dot is a cuBLAS call from the start. With
-Triton GEMMs off and autotuning on, eight processes sharing the H100 failed
-five tests that pass alone (a cuDNN engine index refused, a reload's logits
-not bitwise), which reads as configurations chosen under contention; it was
-not proven. Autotuning off leaves an fp8 convolution's emitted
-configuration, which cuDNN refuses on an H100, so that test compiles in its
-own process without it (tests/test_quantization.py)."""
+kernels would take instead. The lane states nothing of XLA's Triton GEMM
+fusions: which backend runs a dot is XLA's choice under these flags, and
+Dew's own options for those fusions (`dew.nn.kernels.options`) apply as in
+a user's process, which a flag of the lane's would override. Autotuning off
+leaves an fp8 convolution's emitted configuration,
+which cuDNN refuses on an H100, so that test compiles in its own process
+without it (tests/test_quantization.py)."""
 
 
 def without_flags(flags: str, *names: str) -> str:
