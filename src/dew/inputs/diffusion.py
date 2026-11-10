@@ -716,6 +716,14 @@ class CLIPImageTransform:
 
     @classmethod
     def from_config(cls, config):
+        """The transform a `preprocessor_config.json` states, each field it leaves out the PIL processor's
+        default: OpenAI's mean and std as transformers states them (`transformers.utils.constants`, a
+        package the pipeline's tokenizers already load); a 224 shortest edge and center crop, bicubic
+        resampling (3) and a 1/255 rescale as `CLIPImageProcessorPil` declares them (transformers 5.17,
+        models/clip/image_processing_pil_clip.py and `BaseImageProcessor.rescale_factor`), whose module
+        this path does not import (it would load transformers' image processing for four constants)."""
+        from transformers.utils.constants import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
+
         if config.get("resample", 3) != 3:
             raise ValueError("Only bicubic CLIP preprocessing is implemented")
         size = config.get("size", {"shortest_edge": 224})
@@ -726,9 +734,9 @@ class CLIPImageTransform:
         return cls(
             size,
             crop,
-            tuple(config.get("image_mean", (0.48145466, 0.4578275, 0.40821073))),
-            tuple(config.get("image_std", (0.26862954, 0.26130258, 0.27577711))),
-            config.get("rescale_factor", 1 / 255) if config.get("do_rescale", True) else 1.0,
+            tuple(config.get("image_mean", OPENAI_CLIP_MEAN)),
+            tuple(config.get("image_std", OPENAI_CLIP_STD)),
+            config.get("rescale_factor", cls.rescale) if config.get("do_rescale", True) else 1.0,
             config.get("do_resize", True),
             config.get("do_center_crop", True),
             config.get("do_normalize", True),
