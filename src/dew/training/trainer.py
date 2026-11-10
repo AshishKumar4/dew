@@ -1305,16 +1305,17 @@ class Trainer(Generic[Loss, Effects]):
         (`dew.training.runtime.ready_process`), as `prepare_process` readies it: a program that never called
         that gets Dew's log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
-        plan = self._fit_plan(dataset, **asked)
-        run = FitRun(time.perf_counter())
-        # A display of this fit's own: one before it may have run other steps.
-        self._display = TrainingDisplay()
-        profile, checkpoints, profiler = self.profile, self.checkpoints, owned_capture(self.profile)
-        # One boundary lookup at setup: the prefetch worker and the step scopes share whichever profiler
-        # owns the capture.
-        tracer = profiler if profiler is not None else telemetry_profile.active_profile()
-        # The main thread's waits on the data's workers take a signal however it lands (`signal_wake`).
+        # The main thread's waits on the data's workers take a signal however it lands (`signal_wake`),
+        # from the plan's first read of the data on.
         with signal_wake():
+            plan = self._fit_plan(dataset, **asked)
+            run = FitRun(time.perf_counter())
+            # A display of this fit's own: one before it may have run other steps.
+            self._display = TrainingDisplay()
+            profile, checkpoints, profiler = self.profile, self.checkpoints, owned_capture(self.profile)
+            # One boundary lookup at setup: the prefetch worker and the step scopes share whichever profiler
+            # owns the capture.
+            tracer = profiler if profiler is not None else telemetry_profile.active_profile()
             try:
                 # A run handed a step compiled ahead runs every program compiled with it as compiled
                 # (`_taking`).
