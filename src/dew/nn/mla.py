@@ -825,18 +825,12 @@ class MultiHeadLatentAttention(LinearProducts):
         if selecting and (self.sliding_window is not None or self.attention_chunk is not None):
             raise ValueError("an indexed mla layer selects its candidates among every key before it; "
                              "a window or chunk narrows a dense layer's keys")
-        own = None if metadata is None else [
-            name for name, given in (("pairwise_mask", metadata.pairwise_mask),
-                                     ("key_runs", metadata.key_runs),
-                                     ("forks", metadata.forks),
-                                     ("key_valid", metadata.key_valid),
-                                     ("key_positions", metadata.key_positions),
-                                     ("position_bias", metadata.position_bias)) if given is not None]
+        own = call.given(self.reads)
         if own and selecting:
             raise ValueError(f"an indexed mla layer selects among every key before each query, and reads "
                              f"none of {', '.join(own)}")
         # A cached call's keys are its cache's, whose validity it holds (`cached_validity`).
-        uncached = [name for name in own or () if name in ("position_bias", "key_valid")]
+        uncached = [name for name in own if name in ("position_bias", "key_valid")]
         if uncached and call.decode:
             raise ValueError(f"an mla layer reads {', '.join(uncached)} on a dense layer's uncached call, "
                              "its keys the call's own")

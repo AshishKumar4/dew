@@ -734,10 +734,17 @@ class MixerCall:
 
     def unread(self, reads: frozenset[str]) -> tuple[str, ...]:
         """The `MIXING` fields this call sets that a mixer reading `reads` does not read."""
+        return tuple(name for name in self._set() if name not in reads)
+
+    def given(self, reads: frozenset[str]) -> tuple[str, ...]:
+        """The `MIXING` fields this call sets that a mixer reading `reads` reads (`unread`'s others)."""
+        return tuple(name for name in self._set() if name in reads)
+
+    def _set(self) -> tuple[str, ...]:
+        """The `MIXING` fields this call's metadata sets, in `MIXING`'s order."""
         if self.metadata is None:
             return ()
-        return tuple(name for name in MIXING
-                     if name not in reads and getattr(self.metadata, name) is not None)
+        return tuple(name for name in MIXING if getattr(self.metadata, name) is not None)
 
 
 PLAIN_CALL = MixerCall()
