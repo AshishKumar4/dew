@@ -5,7 +5,7 @@ import functools
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
 import jax
 import jax.numpy as jnp
@@ -79,6 +79,49 @@ def reads_blocks(config: Mapping[str, object], overrides: Mapping[str, object] |
                                         else {}, "text_config.modeling_overrides"))
     stated = _attention(_records.record(built.get("modeling_overrides", {}), "modeling_overrides"))
     return "block_bidirectional" in {**nested, **stated}.values()
+
+
+@dataclasses.dataclass(frozen=True)
+class Readout:
+    """A slot release's `readout.json`, one record its writer (`SlotSource.head_files`) and its reader
+    (`SlotSource.describe`) both derive from: the readout (`slot_lm`, the tied label readout, or `head`, the
+    slot-and-pointer head), its head's dimension, its slot count and its attention, written only where it
+    is noncausal. A release may state all but its attention in its config's `modeling_overrides`
+    (`RELEASED`) in place of the file."""
+
+    readout: str = "slot_lm"
+    head_dim: int = 256
+    n_slots: int = 256
+    attention: str = "causal"
+
+    def __post_init__(self):
+        if self.readout not in ("slot_lm", "head"):
+            raise ValueError(f"unknown readout {self.readout!r}; a slot release reads slot_lm or head")
+        if self.n_slots < 1 or self.head_dim < 1:
+            raise ValueError("a slot readout has a positive slot count and head dimension")
+        if self.attention not in ("causal", "noncausal"):
+            raise ValueError("a slot readout's attention is causal or noncausal")
+
+    def written(self) -> str:
+        """The file as the release holds it."""
+        fields = {field.name: getattr(self, field.name) for field in dataclasses.fields(self)
+                  if field.name != "attention" or self.attention != "causal"}
+        return json.dumps(fields, indent=2) + "\n"
+
+    @classmethod
+    def read(cls, fields: Mapping[str, object]) -> Self:
+        """The readout `fields` state, from the file or the config (`RELEASED`), each read as its field
+        declares it and each it leaves out its default."""
+        declared = {field.name: field.type for field in dataclasses.fields(cls)}
+        unknown = set(fields) - set(declared)
+        if unknown:
+            raise ValueError(f"unknown readout fields {sorted(unknown)}")
+        readers = {int: _records.integer, str: _records.text}
+        return cls(**{name: readers[declared[name]](value, name) for name, value in fields.items()})
+
+
+RELEASED = tuple(field.name for field in dataclasses.fields(Readout) if field.name != "attention")
+"""The readout's fields a release may state in its config's `modeling_overrides` in place of its file."""
 
 
 def _full_attention(overrides: Mapping[str, object]) -> str:
@@ -192,15 +235,15 @@ class SlotSource(SourceKind):
                   else tuple((_records.integer(value, "label_ids"),) for value in ids))
         if actual != picked:
             raise ValueError("the slot readout reads the labels its layout writes, in the layout's order")
-        readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": len(ids)}
         # The release's attention field states its full attention as the config its backbone's layout
         # writes does: the bundle's own, the load's overrides over the release's. The rows' blocks may serve
         # another kind as well.
-        if _full_attention(_records.record(bundle.config.get("modeling_overrides", {}),
-                                           "modeling_overrides")) == "block_bidirectional":
-            readout["attention"] = "noncausal"
+        bidirectional = _full_attention(_records.record(bundle.config.get("modeling_overrides", {}),
+                                                        "modeling_overrides")) == "block_bidirectional"
+        readout = Readout(mode, _records.integer(fields.get("head_dim", Readout.head_dim), "head_dim"),
+                          len(ids), "noncausal" if bidirectional else "causal")
         tensors = SlotSource.readout(bundle)
-        written = json.dumps(readout, indent=2) + "\n"
+        written = readout.written()
         files = {"readout.json": lambda path: write_atomically(str(path), written)}
         if mode == "head":
             files["readout_head.pt"] = functools.partial(_torch_readout, tensors)
@@ -271,28 +314,17 @@ class SlotSource(SourceKind):
         path = directory / "readout.json"
         if not path.is_file() and "readout" not in released:
             return None
-        fields = ({key: released[key] for key in ("readout", "head_dim", "n_slots") if key in released}
+        fields = ({key: released[key] for key in RELEASED if key in released}
                   if not path.is_file() else _records.record(json.loads(path.read_text()), "readout.json"))
-        unknown = set(fields) - {"readout", "head_dim", "n_slots", "attention"}
-        if unknown:
-            raise ValueError(f"unknown readout fields {sorted(unknown)}")
-        mode = fields.get("readout", "slot_lm")
-        if mode not in ("slot_lm", "head"):
-            raise ValueError(f"unknown readout {mode!r}; a slot release reads slot_lm or head")
-        count = _records.integer(fields.get("n_slots", 256), "n_slots")
-        dimension = _records.integer(fields.get("head_dim", 256), "head_dim")
-        if count < 1 or dimension < 1:
-            raise ValueError("a slot readout has a positive slot count and head dimension")
-        attention = fields.get("attention", "causal")
-        if attention not in ("causal", "noncausal"):
-            raise ValueError("a slot readout's attention is causal or noncausal")
+        readout = Readout.read(fields)
+        mode, count, dimension = readout.readout, readout.n_slots, readout.head_dim
+        attention = readout.attention
         if "attention" in released:
             declared = "noncausal" if _full_attention(released) == "block_bidirectional" else "causal"
             if "attention" in fields and attention != declared:
                 raise ValueError("readout.json and config.json declare different attention policies")
             attention = declared
-        native = {key: value for key, value in released.items()
-                  if key not in ("readout", "head_dim", "n_slots")}
+        native = {key: value for key, value in released.items() if key not in RELEASED}
         if attention == "noncausal" and "attention" not in native:
             native["attention"] = {"full_attention": "block_bidirectional"}
         config = {key: value for key, value in config.items() if key != "modeling_overrides"}
