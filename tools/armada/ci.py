@@ -2103,7 +2103,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     # without a word, and its run out of memory read as the test's).
     short = {name: f"admitted at {budget / 2 ** 30:.1f} GiB, below its measured need of "
                    f"{need / 2 ** 30:.1f} GiB"
-             for name in tests if (need := gpu_needs(measures[name], math.inf)[1]) > budget}
+             for name in tests
+             if math.isfinite(need := gpu_needs(measures[name], math.inf)[1]) and need > budget}
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = lane_inputs(python)
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
