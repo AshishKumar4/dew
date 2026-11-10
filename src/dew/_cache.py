@@ -11,7 +11,6 @@ import functools
 import hashlib
 import importlib.metadata
 import os
-import re
 import sys
 import threading
 from collections.abc import Callable, Iterator
@@ -257,27 +256,28 @@ def plugin_builds() -> str:
                    for build in sorted(cuda_builds()))
 
 
-LINKED_LIBRARIES = ("cublas", "cudnn", "nvjitlink")
-"""The CUDA libraries a GPU compile writes state of into its executable, so a process holding another
-version of one runs it otherwise or not at all: cuBLAS's (the GEMM algorithms XLA's autotuner picked for
-that version), cuDNN's (its graphs, serialized at compile) and nvJitLink's (the kernels it linked). Each is
-named by the stem every CUDA build's distribution of it carries (`nvidia-cudnn-cu12`, CUDA 13's
-`nvidia-cublas`), as the plugins require them; the other libraries a plugin requires are called at run
-time, holding nothing of a compile."""
+def cuda_libraries() -> tuple[tuple[str, int | None], ...]:
+    """The versions of cuBLAS and cuDNN this process's CUDA plugin loads, as JAX's plugin reads them for its
+    own check (`jax._src.lib.cuda_versions`), at the precision NVIDIA promises compatibility at and JAX
+    checks them at: the major and minor version, a patch ignored. They are the libraries whose state a GPU
+    compile writes into its executable for a loader to read again: the GEMM algorithms XLA's autotuner picked
+    for that cuBLAS, the cuDNN graphs it serialized. A library the plugin cannot load is None: a compile here
+    writes none of its state. Empty where no CUDA plugin is installed."""
+    from jax._src.lib import cuda_versions
 
+    if cuda_versions is None:
+        return ()
 
-def linked_libraries() -> tuple[tuple[str, str], ...]:
-    """Each library of `LINKED_LIBRARIES` an installed CUDA plugin requires (`jax-cuda1x-plugin`'s own
-    requirements), with its installed version, sorted by name: what a compile here linked. A requirement no
-    distribution here installs is left out (a plugin installed without its `with-cuda` extra, over the
-    system's libraries, which no distribution states)."""
-    installed = {each.metadata["Name"].lower(): each.version for each in importlib.metadata.distributions()}
-    # A requirement's name runs up to the first character no distribution's name holds (PEP 508).
-    required = {re.split(r"[^A-Za-z0-9._-]", requirement, maxsplit=1)[0].lower()
-                for build in cuda_builds()
-                for requirement in importlib.metadata.requires(f"jax-{build}-plugin") or ()}
-    return tuple(sorted((name, installed[name]) for name in required
-                        if name in installed and any(library in name for library in LINKED_LIBRARIES)))
+    def loaded(read: Callable[[], int]) -> int | None:
+        # JAX's own reader raises where the library does not load, as JAX's plugin check takes it
+        # (jax_plugins/cuda: `_version_check`).
+        try:
+            return read() // 100
+        except RuntimeError:
+            return None
+
+    return (("cublas", loaded(cuda_versions.cublas_get_version)),
+            ("cudnn", loaded(cuda_versions.cudnn_get_version)))
 
 
 def topology_digest(serialized: bytes) -> str:

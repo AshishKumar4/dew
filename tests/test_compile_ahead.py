@@ -1135,18 +1135,21 @@ def test_a_build_holds_a_call_to_the_memory_it_states_else_to_its_least_part_and
 
 
 def test_a_build_binds_its_loader_to_its_plugin_and_linked_libraries_and_not_to_its_topology():
-    """Programs compiled ahead carry the CUDA plugin that compiled them and the libraries it linked (a cuDNN
-    graph is serialized at compile), so a process of another plugin build or another version of one is
-    refused them, naming which; the topology they were compiled over names the compile alone, and a host's
-    own GPUs run what a generation's canonical ones built."""
+    """Programs compiled ahead carry the CUDA plugin that compiled them and the cuBLAS and cuDNN they loaded
+    (a cuDNN graph is serialized at compile), so a process of another plugin build, or of another version
+    of a library the compile loaded, is refused them, naming which; a library the compile could not load
+    wrote none of its state and binds no loader. The topology they were compiled over names the compile
+    alone: a host's own GPUs run what a generation's canonical ones built."""
     from dew.training.ahead import BuildTarget
 
     build = BuildTarget("sm90", 132, 1, "0", "0", (), "x86_64", plugin="-cuda12-0.12.0.1.post73",
-                        libraries=(("nvidia-cudnn-cu12", "9.27.0.42"),), topology=None)
+                        libraries=(("cublas", 1209), ("cudnn", 927)), topology=None)
     plugin = dataclasses.replace(build, plugin="-cuda13-0.12.0.1.post73")
-    cudnn = dataclasses.replace(build, libraries=(("nvidia-cudnn-cu12", "9.28.0.1"),))
+    cudnn = dataclasses.replace(build, libraries=(("cublas", 1209), ("cudnn", 928)))
     assert [line.split()[0] for line in build.differences(plugin)] == ["plugin"]
-    assert [line.split()[0] for line in build.differences(cudnn)] == ["libraries"]
+    assert [line.split()[:2] for line in build.differences(cudnn)] == [["libraries", "cudnn"]]
+    unloaded = dataclasses.replace(build, libraries=(("cublas", 1209), ("cudnn", None)))
+    assert not unloaded.differences(cudnn)
     assert not build.differences(dataclasses.replace(build, topology="0" * 64))
 
 

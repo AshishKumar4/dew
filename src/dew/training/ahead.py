@@ -58,7 +58,7 @@ import numpy as np
 from jax.experimental import serialize_executable
 
 from dew import communicators
-from dew._cache import linked_libraries, plugin_builds, topology_digest, uncached
+from dew._cache import cuda_libraries, plugin_builds, topology_digest, uncached
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.nn.kernels import options
@@ -444,9 +444,10 @@ class BuildTarget:
     multiprocessors times its programs (tail.py:62-66, gemm/mosaic_gpu.py:597), and the program starting a
     tile waits on later programs' partials (mosaic.py:1875-1888), so a grid past the GPU's residency can
     wait on a program that never starts. A GPU whose multiprocessors are shared (MPS limits, MIG) holds
-    fewer than it states, and runs none of them. The CUDA plugin that compiled them and the libraries the
-    compile linked are part of it (`plugin`, `libraries`): JAX's own persistent-cache key holds the
-    plugin's build, and a cuDNN graph is serialized at compile, so a program carries both. One run of sm90
+    fewer than it states, and runs none of them. For a CUDA GPU, the plugin that compiled them and the cuBLAS
+    and cuDNN the compile loaded are part of it (`plugin`, `libraries`): JAX's own persistent-cache key
+    holds the plugin's build, and a compile writes its GEMM algorithms for that cuBLAS and serializes its
+    cuDNN graphs, so a program carries both. One run of sm90
     programs a CUDA 12 plugin built, under a CUDA 13 plugin, matched the jitted programs bit for bit
     (2026-11-02, GS-compileahead-pilot-h100), which one program's run does not extend to every graph a
     library serializes. The topology a compile was placed on (`topology`) names the compile, and the
@@ -471,10 +472,10 @@ class BuildTarget:
     a CPU host that states no processor, which programs kept by their calls refuse (`cpu_stated`)."""
     plugin: str = ""
     """The build of each CUDA PJRT plugin installed where they were compiled (`dew._cache.plugin_builds`),
-    empty where none is."""
-    libraries: tuple[tuple[str, str], ...] = ()
-    """The CUDA libraries the compile linked, each by its distribution and version
-    (`dew._cache.linked_libraries`)."""
+    empty for a target of no CUDA GPU, a CPU's or a TPU's, whose programs no CUDA plugin compiles."""
+    libraries: tuple[tuple[str, int | None], ...] = ()
+    """The cuBLAS and cuDNN versions the compile loaded (`dew._cache.cuda_libraries`), None for one it
+    could not load, which then wrote none of its state; empty for a target of no CUDA GPU."""
     topology: str | None = None
     """The digest of the GPU topology the programs were compiled over (`dew._cache.topology_digest`): a
     host's own GPUs, serialized (`host_gpus`, or the GPUs attached), None for a generation's canonical
@@ -486,12 +487,14 @@ class BuildTarget:
               topology: bytes | None = None) -> BuildTarget:
         """The build for `devices` devices of the GPU `target` (its generation and multiprocessors), each
         holding the `memory` its plan states, over the serialized `topology` of a host's own GPUs where it
-        was given one, under this process's JAX, jaxlib, computing XLA flags, host, CUDA plugin and linked
-        libraries: the one place a build's environment is read."""
+        was given one, under this process's JAX, jaxlib, computing XLA flags and host, and for a CUDA GPU
+        (one of a compute capability) its CUDA plugin and libraries: the one place a build's environment is
+        read."""
+        cuda = capability(target.generation) is not None
         return BuildTarget(target.generation, target.multiprocessors, devices,
                            importlib.metadata.version("jax"), importlib.metadata.version("jaxlib"),
-                           computation_flags(), platform.machine(), memory, plugin=plugin_builds(),
-                           libraries=linked_libraries(),
+                           computation_flags(), platform.machine(), memory,
+                           plugin=plugin_builds() if cuda else "", libraries=cuda_libraries() if cuda else (),
                            topology=None if topology is None else topology_digest(topology))
 
     @staticmethod
@@ -506,21 +509,26 @@ class BuildTarget:
                              "compiled ahead load onto devices of one")
         limits = [stats["bytes_limit"] for device in devices
                   if "bytes_limit" in (stats := device.memory_stats() or {})]
-        # Attached GPUs are their client's topology, as a host serializes it for a prepare (`host_gpus`).
-        attached = (topologies.get_attached_topology("cuda").serialize() if devices[0].platform == "gpu"
-                    else None)
-        built = BuildTarget.built(device_target(devices[0]), len(devices), min(limits, default=None),
-                                  topology=attached)
+        own = device_target(devices[0])
+        # Attached CUDA GPUs are their client's topology, as a host serializes it for a prepare (`host_gpus`).
+        attached = (topologies.get_attached_topology("cuda").serialize()
+                    if devices[0].platform == "gpu" and capability(own.generation) is not None else None)
+        built = BuildTarget.built(own, len(devices), min(limits, default=None), topology=attached)
         # A CPU's program is its host's code (`cpu`).
         return dataclasses.replace(built, cpu=host_cpu()) if devices[0].platform == "cpu" else built
 
     def differences(self, other: BuildTarget) -> list[str]:
         """Each field `other` holds otherwise, said as this one's and other's: memory where other's is
-        known and below this one's (a device holding more than a build planned for runs it), and never the
-        topology, which names the compile and binds no loader."""
-        named = [field.name for field in dataclasses.fields(self) if field.name not in ("memory", "topology")]
+        known and below this one's (a device holding more than a build planned for runs it), a library
+        where this build loaded it and other's version is another (a build that loaded none wrote none of
+        its state), and never the topology, which names the compile and binds no loader."""
+        named = [field.name for field in dataclasses.fields(self)
+                 if field.name not in ("memory", "topology", "libraries")]
         found = [f"{name} {getattr(self, name)!r}, not {getattr(other, name)!r}" for name in named
                  if getattr(self, name) != getattr(other, name)]
+        theirs = dict(other.libraries)
+        found += [f"libraries {name} {version}, not {theirs.get(name)}" for name, version in self.libraries
+                  if version is not None and theirs.get(name) != version]
         if self.memory is not None and other.memory is not None and other.memory < self.memory:
             found.append(f"memory {self.memory} bytes, not {other.memory}")
         return found
