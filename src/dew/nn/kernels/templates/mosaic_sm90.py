@@ -54,17 +54,6 @@ class WgmmaLayout:
         # at the four core words alone).
         return self.held_registers + resources.addresses(addressed)
 
-    def column_registers(self, columns: int, dtype) -> int:
-        # The column layout repeats a vector over the warpgroup's four warps and eight lanes of each, so a
-        # thread holds a quarter of its columns: FS-K01-CAUSE-VECTOR, an fp32 column vector's epilogue at
-        # 128 and 256 columns needs 104 and 200 against a row vector's 96 and 160.
-        return -(-columns * jnp.dtype(dtype).itemsize // 16)
-
-    def row_registers(self, rows: int, dtype) -> int:
-        # Each warp's 16 rows of an MMA, a thread two of them, so a thread holds a 32nd of a consumer's rows:
-        # the fast attention backward's dQ consumer carries seven fp32 row vectors, 4 registers each at 128
-        # rows (DQROWPROOF64: 260 against ptxas's 255 and 512 bytes spilled; DQROWPROOF128: 184 at 64 rows).
-        return -(-rows * jnp.dtype(dtype).itemsize // 128)
 
 
 class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):

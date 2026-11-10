@@ -897,15 +897,18 @@ class Issuer[Accumulator](abc.ABC):
 
     def column_registers(self, columns: int, dtype) -> int:
         """The registers a consumer thread holds for a vector of `columns` entries of `dtype` in the
-        accumulator's column layout (`column`), broadcast over its rows: a family whose register model
-        prices such a vector (a hook's, a template's per-row statistics) states it."""
-        raise NotImplementedError(f"{self.name}'s register model takes no column vector")
+        accumulator's column layout (`column`), broadcast over its rows: its share as JAX lays the vector
+        out (`resources.vector_registers`), which a register model prices (a hook's, a template's per-row
+        statistics; ptxas held an fp32 column vector's epilogue at 128 and 256 columns at 104 and 200
+        registers against a row vector's 96 and 160, FS-K01-CAUSE-VECTOR)."""
+        return resources.vector_registers(self.column, columns, dtype)
 
     def row_registers(self, rows: int, dtype) -> int:
         """The registers a consumer thread holds for a vector of `rows` entries of `dtype` in the
-        accumulator's row layout (`row`), broadcast over its columns: a family whose register model prices
-        such a vector (a template's per-row statistics) states it."""
-        raise NotImplementedError(f"{self.name}'s register model takes no row vector")
+        accumulator's row layout (`row`), broadcast over its columns: its share as JAX lays the vector out
+        (`resources.vector_registers`; the fast attention backward's dQ consumer's seven fp32 row vectors,
+        4 registers each at 128 rows on wgmma, DQROWPROOF64)."""
+        return resources.vector_registers(self.row, rows, dtype)
 
     def narrowest_columns(self, dtype) -> int:
         """The fewest columns a staged operand block of `dtype` takes: a row of the narrowest swizzle
