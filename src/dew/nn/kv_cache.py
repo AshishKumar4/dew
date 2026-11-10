@@ -124,6 +124,35 @@ def row_axis(path: tuple[jax.tree_util.KeyEntry, ...]) -> int:
     return int(banked)
 
 
+def continued_rows(held: Mapping[str, object], fresh: Mapping[str, object], cursors: jax.Array, *,
+                   tables: jax.Array | None = None,
+                   rows: Callable[[tuple[jax.tree_util.KeyEntry, ...], jax.Array], jax.Array] | None = None
+                   ) -> Mapping[str, object]:
+    """A decode cache whose rows continue what `held` holds of them, the one way a row resumes from the
+    tokens its cache holds (a prompt's next piece, a prefix its pages share): each row's next slot its
+    cursor `cursors` (the count of tokens it holds; 0 starts it), its page table `tables` where its layout
+    pages, the pooled leaves `held`'s (the pages and slots every row reads, `POOLED`), and its own leaves (a
+    recurrent mixer's memory, its documents' records) `held`'s where it continues and `fresh`'s, as the
+    model allocates them, where it starts. `rows` reads a leaf's rows of `held` where the caller seats them
+    elsewhere (a server's slots); the rows in place where None."""
+    continues = cursors > 0
+
+    def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array, new: jax.Array) -> jax.Array:
+        name = leaf_name(path)
+        if name == TABLE and tables is not None:
+            return jnp.broadcast_to(tables, new.shape)
+        if name in ROW_CURSORS:
+            # A text row's next position is its count of tokens (`POSITION`).
+            return jnp.broadcast_to(cursors, new.shape)
+        if name in POOLED:
+            return leaf
+        axis = row_axis(path)
+        kept = leaf if rows is None else rows(path, leaf)
+        return jnp.where(continues.reshape(cursors.shape[0], *(1,) * (kept.ndim - axis - 1)), kept, new)
+
+    return jax.tree_util.tree_map_with_path(view, held, fresh)
+
+
 def with_rounding_keys(cache: Mapping[str, object], keys: jax.Array) -> Mapping[str, object]:
     """`cache` with every `ROUNDING_KEYS` leaf holding `keys`, each row's key data, every layer's under a
     run's bank (`row_axis`)."""

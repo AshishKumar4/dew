@@ -44,6 +44,7 @@ from dew.nn.kv_cache import (
     ROW_CURSORS,
     TABLE,
     as_words,
+    continued_rows,
     from_words,
     grouped,
     is_paged,
@@ -353,24 +354,11 @@ class Paged:
             model.apply(params, rows, method="init_cache", mutable=["cache"],
                         **adapter_field(adapters))[1]["cache"],
             rounding_keys(jax.random.wrap_key_data(admission.keys, impl=self.prng)))
-        continues = admission.cursors > 0
-
-        def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array, fresh: jax.Array) -> jax.Array:
-            name = leaf_name(path)
-            # The rows' tables and cursors, every layer's alike under a run's bank, its layers first
-            # (`row_axis`).
-            if name == TABLE:
-                return jnp.broadcast_to(admission.tables, fresh.shape)
-            if name in ROW_CURSORS:
-                # A text row's next position is its count of tokens (`dew.nn.kv_cache.POSITION`).
-                return jnp.broadcast_to(admission.cursors, fresh.shape)
-            if name in POOLED:
-                return leaf
-            axis = row_axis(path)
-            held = _taken(leaf, admission.slots, self.groups, axis)
-            return jnp.where(continues.reshape(rows, *(1,) * (held.ndim - axis - 1)), held, fresh)
-
-        cache = jax.tree_util.tree_map_with_path(view, state.decoder.cache, allocated)
+        # Each row continues its slot's state at its cursor, over the pool's pages its table names
+        # (`continued_rows`).
+        cache = continued_rows(
+            state.decoder.cache, allocated, admission.cursors, tables=admission.tables,
+            rows=lambda path, leaf: _taken(leaf, admission.slots, self.groups, row_axis(path)))
         ops = decode_ops(model, params, pad_id, drafting_depths(model, self.plan), progress)
         fresh, real = prefill_state(model, params, admission.prompts, ops, cache=cache, progress=progress,
                                     adapters=adapters)
