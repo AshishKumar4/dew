@@ -80,7 +80,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                 "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal", "dew.nn.cross_attention",
                 "dew.nn.dex", "dew.nn.progress", "dew.nn.memory", "dew.nn.ngpt", "dew.nn.hyper_connections",
                 "dew.nn.engram",
-                "dew.nn.autoencoders", "dew.nn.vision", "dew.nn.categorical", "dew.nn.inputs", "dew.nn.flops", "dew.nn.mixers.attention", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.algebra", "dew.nn.sharding", "dew.kernels",
+                "dew.nn.autoencoders", "dew.nn.vision", "dew.nn.categorical", "dew.nn.inputs", "dew.nn.flops", "dew.nn.mixers.attention", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.algebra", "dew.nn.sharding",
                 "dew.nn.wrapping", "dew.nn.scatter", "dew.nn.precision", "dew.nn.derivatives", "dew.nn.nested",
                 "dew.lora", "dew.nn.norms", "dew.kernels"]),
     ("Diffusion and sampling", ["dew.diffusion", "dew.diffusion.process", "dew.diffusion.schedules",
@@ -157,6 +157,13 @@ class Package:
     def method(self, name: str) -> bool:
         """Whether a class's method `name` is documented."""
         return not name.startswith("_") or name in self.special
+
+    def __post_init__(self) -> None:
+        """A module is one page in one group: one listed twice is refused, as its page and its sidebar entry would
+        be made twice."""
+        listed = [module for _, modules in self.groups for module in modules]
+        if twice := sorted({module for module in listed if listed.count(module) > 1}):
+            raise SystemExit(f"{self.package}'s API groups list {', '.join(twice)} more than once")
 
     @property
     def pages(self) -> list[str]:
