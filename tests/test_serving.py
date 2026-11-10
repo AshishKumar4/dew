@@ -490,6 +490,33 @@ def test_a_request_of_several_continuations_draws_each_as_the_task_does():
         np.testing.assert_array_equal(gathered.host().tokens[:1], alone.host().tokens)
 
 
+def test_a_request_of_several_continuations_keeps_its_tickets_contract():
+    """A request drawing three continuations on one slot is one ticket, as any request's is: claimed when
+    its first continuation is seated, so it can no longer be cancelled though two still wait; its
+    admission and first token stamped when they happen, so each read of its streamed tokens sees its
+    first token's time; settled once, with every continuation's row. A request cancelled while all its
+    continuations wait never takes the slot."""
+    from dataclasses import replace
+
+    bound = replace(task(Sampling(temperature=1.0, top_k=5, eos_token_ids=EOS)), n=3)
+    server = Server.from_task(bound, slots=1, capacity=128)
+    seen = []
+    ticket = server.submit(PROMPTS[0], 4, key=0)
+    ticket.add_tokens_callback(lambda held: seen.append(held.first is not None))
+    waiting = server.submit(PROMPTS[1], 4, key=1)
+    server.step()
+    assert ticket.admitted is not None
+    assert not ticket.cancel()
+    assert waiting.cancel()
+    for _ in range(64):
+        if not (server.queued or server.occupancy):
+            break
+        server.step()
+    assert seen and all(seen)
+    assert ticket.result().host().tokens.shape[0] == 3
+    assert waiting.cancelled()
+
+
 def test_submission_keeps_device_keys_on_device_until_admission():
     """A request can queue its key without waiting for a copy to the host.
 
