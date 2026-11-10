@@ -1577,10 +1577,13 @@ class Server:
         waiting = self._waiting.failed(failure, *self._rows.values())
         self._rows.clear()
         self._gathering.clear()
+        # A request cancelled while it waited whose first dropped continuation told its ticket so is done;
+        # one never seated is told now (`settled`), each ticket once, its continuations sharing it.
+        told = set(self._dropped)
         self._dropped.clear()
-        # A request's continuations share its ticket, settled once.
         for ticket in dict.fromkeys(row.ticket for row in waiting):
-            settled(ticket, failure)
+            if ticket not in told:
+                settled(ticket, failure)
 
     def _finish(self, row: _Row, *, terminated: bool) -> None:
         budget = row.budget
