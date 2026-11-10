@@ -97,7 +97,9 @@ Analysis boundaries, stated the way anti-slop states its own: this reads one
 file's AST, with no imported definitions and no inference across calls, but
 for SLOP010, which reads the whole package's imports, re-exports, aliases and
 class bases, and Flax's Module from its installed source (never importing
-it), to know which classes are models. It sees what Python spells, not what
+it), to know which classes are models, and for SLOP014, which reads the body
+of a package function a mixer's call hands what it was called with, one call
+deep, for the fields it loads (`_handed`). It sees what Python spells, not what
 dynamic dispatch reaches; behaviour across models is the capability matrix's
 proof (tests/test_capability_matrix.py).
 SLOP011 and SLOP012 read each name through the imports of its own lexical
@@ -1031,12 +1033,83 @@ def _declared_reads(value: ast.expr | None) -> frozenset[str] | str | None:
     return None
 
 
+def _handed(module: Module, function: ast.FunctionDef, tables: Mapping[int, Mapping[str, str]]) -> set[str]:
+    """The attributes the package's functions load that a mixer's call (`function`) hands what it was
+    called with: a call made in it with an argument read from `call`, or from a name its body binds from
+    one (`tokens = coordinates_of(call.metadata, ...)`), to a top-level function of a module of the package
+    it imports (`held_scan(..., coordinates=tokens)`), whose body's attribute loads are what it reads. The
+    call's own scope alone (`scopes.nodes_of`): a name a nested scope binds is that scope's, and a name
+    counts as bound only where it is stored (a tuple's names), not an attribute's receiver or a subscript's
+    container."""
+    nodes = scopes.nodes_of(function.body)
+    assignments = [node for node in nodes if isinstance(node, ast.Assign | ast.AnnAssign)
+                   and node.value is not None]
+    derived = {"call"}
+    grown = True
+    while grown:
+        grown = False
+        for node in assignments:
+            assert node.value is not None
+            if not _reads_names(node.value, derived):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            bound = {name.id for target in targets for name in _stored(target)}
+            grown |= not bound <= derived
+            derived |= bound
+    handed: set[str] = set()
+    for node in nodes:
+        handed_on = (*node.args, *(keyword.value for keyword in node.keywords)) if isinstance(
+            node, ast.Call) else ()
+        if not any(_reads_names(argument, derived) for argument in handed_on):
+            continue
+        assert isinstance(node, ast.Call)
+        path = scopes.resolved(node.func, tables.get(id(node.func), {}))
+        if path.split(".")[0] == module.package:
+            handed |= _package_loads(module.path.parents[len(Path(module.relative).parents) - 1], path)
+    return handed
+
+
+def _stored(target: ast.expr) -> Iterator[ast.Name]:
+    """The names an assignment's `target` binds: itself, or a tuple's or list's, starred or not."""
+    if isinstance(target, ast.Name):
+        yield target
+    elif isinstance(target, ast.Tuple | ast.List):
+        for item in target.elts:
+            yield from _stored(item)
+    elif isinstance(target, ast.Starred):
+        yield from _stored(target.value)
+
+
+def _reads_names(node: ast.AST, names: set[str]) -> bool:
+    """Whether `node` loads any of `names`."""
+    return any(isinstance(inner, ast.Name) and isinstance(inner.ctx, ast.Load) and inner.id in names
+               for inner in ast.walk(node))
+
+
+@functools.cache
+def _package_loads(root: Path, path: str) -> frozenset[str]:
+    """The attributes the top-level function `path` (`dew.nn.linear.held_scan`) loads in its body, read
+    from its module's source under `root`'s `src`; none where `path` names no such function."""
+    module, _, name = path.rpartition(".")
+    source = root / "src" / Path(*module.split("."))
+    for candidate in (source.with_suffix(".py"), source / "__init__.py"):
+        if candidate.is_file():
+            for node in ast.parse(candidate.read_text()).body:
+                if isinstance(node, ast.FunctionDef) and node.name == name:
+                    return frozenset(inner.attr for inner in ast.walk(node)
+                                     if isinstance(inner, ast.Attribute) and isinstance(inner.ctx, ast.Load))
+    return frozenset()
+
+
 def calls(module: Module) -> Iterator[Finding]:
     """SLOP014: a layer's call that drops what its block hands it, and a mixer
-    (a class whose call takes a `call`) whose `reads` is not what it reads."""
+    (a class whose call takes a `call`) whose `reads` is not what it reads: what
+    the module loads, or a package function its call hands its call's fields to
+    (`_handed`)."""
     mixing = _mixing(module)
     loaded = {node.attr for node in ast.walk(module.tree)
               if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)}
+    tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
     for cls in (node for node in ast.walk(module.tree) if isinstance(node, ast.ClassDef)):
         called = [function for function in cls.body
                   if isinstance(function, ast.FunctionDef) and function.name == "__call__"]
@@ -1069,7 +1142,10 @@ def calls(module: Module) -> Iterator[Finding]:
         if declared == "tokenwise":
             extra, unread, unknown = read, set(), set()
         else:
-            extra, unread, unknown = read - declared, (declared & mixing) - loaded, declared - mixing
+            unread = (declared & mixing) - loaded
+            if unread:
+                unread -= _handed(module, function, tables)
+            extra, unknown = read - declared, declared - mixing
         line, col = where.lineno, where.col_offset + 1
         for name in sorted(extra):
             yield Finding(module.relative, line, col, "SLOP014",
