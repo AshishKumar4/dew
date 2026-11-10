@@ -518,7 +518,8 @@ def masks(rows: int, columns: int) -> list:
 
 
 def product_fragments(call: Call, lhs: tuple, rhs: tuple, *, rhs_transposed: bool = False,
-             rhs_swizzle: int | None = None) -> list:
+             rhs_swizzle: int | None = None, lhs_staged: bool = False,
+             rhs_staged: bool = False) -> list:
     """The operand fragments one product `[rows, depth] @ [depth, columns]` holds at once where the family's
     products read registers (`Family.operands_in_registers`), its left operand `lhs` `(operand, rows,
     depth)` a step deep and its right one `rhs` `(operand, depth, columns)` a sub-step
@@ -526,25 +527,18 @@ def product_fragments(call: Call, lhs: tuple, rhs: tuple, *, rhs_transposed: boo
     columns, a key tile's in `Q Kᵀ`) a whole swizzle of its depth (`rhs_swizzle` bytes, the widest its rows
     fill where None), as its load takes it (`Family.rhs_fragment_depth`), each in the warps replicating it
     (`lhs_copies`, `rhs_copies`): the GEMM's own rule (`resources.operand_fragments`, each operand's parts);
-    none where they read shared memory."""
+    none where they read shared memory. A register operand staged for this product states that source
+    (`lhs_staged`, `rhs_staged`): its value dies before the reload, so their live sets are separate."""
     (left, rows, depth), (right, _, columns) = lhs, rhs
     return resources.operand_fragments(call.family, rows, depth, columns, left.stored, right.stored,
                                        lhs_parts=left.parts, rhs_parts=right.parts,
-                                       rhs_transposed=rhs_transposed, rhs_swizzle=rhs_swizzle)
+                                       rhs_transposed=rhs_transposed, rhs_swizzle=rhs_swizzle,
+                                       lhs_staged=lhs_staged, rhs_staged=rhs_staged)
 
 
 def widest(*tiles: list) -> list:
     """The largest of `tiles`' live sets by their words: of products issued in turn, one's fragments."""
-    return max(tiles, key=lambda held: sum(r * c * jnp.dtype(d).itemsize for r, c, d in held))
-
-
-def fragments(call: Call, *tiles) -> list:
-    """The operand tiles `(operand, rows, columns)` a product reads from registers where the family's
-    products read them there (`Family.operands_in_registers`, mma.sync's), none where they read shared
-    memory (wgmma's)."""
-    if not call.family.operands_in_registers:
-        return []
-    return [tile for operand, rows, columns in tiles for tile in held_tile(operand, rows, columns)]
+    return resources.largest_live_set(*tiles)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -930,12 +924,17 @@ def _solved_resources(call: Call, *, keeps: bool, applies: bool, narrow: bool) -
     # The keys' products' sum and the system's pairs; then the doubling's inverse, power and product, beside
     # the masks (an fp32 call's merges split the inverse and the power into their parts); then the inverse
     # held beside a block's product, its decay and its keys or values.
+    # The keys' products `k kᵀ` (the keys read transposed); the inverse against the scaled values and keys,
+    # in turn (`algebra.weighted`'s 'apply_u', 'apply_w').
+    keyed = product_fragments(call, (call.given, chunk, call.block), (call.given, call.block, chunk),
+                              rhs_transposed=True)
+    applied = widest(product_fragments(call, (held, chunk, chunk), (held, chunk, call.value_block)),
+                     product_fragments(call, (held, chunk, chunk), (held, chunk, call.block)))
     held_tiles = Held(phases=(
-        [f32(chunk, chunk)] * 2 + fragments(call, (call.given, chunk, call.block), (call.given, chunk,
-                                                                                         call.block)),
+        [f32(chunk, chunk)] * 2 + keyed,
         _doubling_held(call),
         *([[f32(chunk, chunk)] + [f32(chunk, call.block)] * 2 + held_tile(call.given, chunk, call.block)
-           + fragments(call, (held, chunk, chunk), (call.given, chunk, call.block))] if applies else [])))
+           + applied] if applies else [])))
     # The inverse's application stages in the doubling's merge tiles where they are its form (an fp32 call's
     # bf16 parts, a block a chunk wide), done by then: apart, an fp32 call's launch took 242864 bytes of
     # shared memory, past an H100's block (SE-family-h100-e0de17766).
@@ -1139,13 +1138,16 @@ def _intra_held(call: Call, block: int, outputs: int = 1) -> Held:
     product's columns put into a tile read whole once (`_placed`)."""
     chunk = call.chunk
     pairing = _pairing_operand(call)
+    # A gated row block against the keys gated up, read transposed (`algebra.key_block_pairs`' 'pairs').
+    paired = product_fragments(call, (pairing, chunk, block), (pairing, block, _pairs_right(call)),
+                               rhs_transposed=True)
     if outputs == 1:
         # A lone output's sum carried in registers across the key blocks, as its launch held it before the
         # walks merged (M-JS-17's A100 parent), beside one gated output's factors.
         return Held(carried=[f32(chunk, chunk)], phases=(
             [f32(chunk, block)] * 5,
             [f32(chunk, block)] * 9 + [f32(chunk, _pairs_right(call))] + masks(chunk, block) * 2
-            + fragments(call, (pairing, chunk, block), (pairing, _pairs_right(call), block))))
+            + paired))
     # Live at once: the prefix halves and their separated pair, the rows' grid, the keys and the queries as
     # read, one output's rows and their gated form, the keys gated up, the gate down, a sub-chunk's middle
     # factor and the masked keys; the output's pairs and its sum read back. Its sums held in registers across
@@ -1154,8 +1156,7 @@ def _intra_held(call: Call, block: int, outputs: int = 1) -> Held:
     return Held(carried=[], phases=(
         [f32(chunk, block)] * 5,
         [f32(chunk, block)] * 9 + [f32(chunk, _pairs_right(call))] + [f32(chunk, chunk)] * 2
-        + masks(chunk, block) * 2
-        + fragments(call, (pairing, chunk, block), (pairing, _pairs_right(call), block))))
+        + masks(chunk, block) * 2 + paired))
 
 
 def _doubling_held(call: Call) -> list:
@@ -1563,7 +1564,11 @@ def _weighted_held(call: Call, block: int) -> Held:
     return Held(phases=(
         held_tile(held, chunk, chunk) + [f32(chunk, call.block)] * 2
         + held_tile(call.given, chunk, call.block) + [f32(chunk, block)] * 5 * call.per_key
-        + fragments(call, (held, chunk, chunk), (call.given, chunk, call.block)),))
+        # The inverse against the scaled values and keys in turn, the delta rule's alone (`algebra.weighted`).
+        + (widest(product_fragments(call, (held, chunk, chunk), (held, chunk, call.value_block)),
+                  product_fragments(call, (held, chunk, chunk),
+                                    (held, chunk, block if call.per_key else call.block)))
+           if call.delta else []),))
 
 
 @lowered_once
@@ -1732,7 +1737,7 @@ def _weighted_values_held(call: Call) -> Held:
     chunk = call.chunk
     held, vb = dataclasses.replace(call.held, rows=call.rows), call.value_block
     products = held_tile(held, chunk, chunk) + held_tile(call.given, chunk, vb) + [f32(chunk, vb)] * 2
-    return Held(phases=(products + fragments(call, (held, chunk, chunk), (call.given, chunk, vb)),))
+    return Held(phases=(products + product_fragments(call, (held, chunk, chunk), (held, chunk, vb)),))
 
 
 @lowered_once
@@ -2002,7 +2007,8 @@ def _states_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
         return Held(carried=carried, phases=([
             f32(chunk, call.block), f32(call.block, bv), *held_tile(held, chunk, call.block),
             *held_tile(values, chunk, bv),
-            *fragments(call, (held, chunk, call.block), (values, chunk, bv))],))
+            # The gated keys read transposed against the values (`algebra.keys_gated_carried`'s 'write').
+            *product_fragments(call, (held, call.block, chunk), (values, chunk, bv))],))
     # As the lowered peak counts it (jsf-states-held): the corrected and written values, the values' block,
     # a memory slice for the product, its fragments, the product's sums (a key block's, every block's where
     # a family's products overlap), and in parts (an fp32 call's) the split's remainder, the peeled last
@@ -2010,8 +2016,13 @@ def _states_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
     # unstated, 63 registers against an H100's need of 96 on Nemotron-H 4B's fp32 forward.
     rows = 0 if call.per_key else (2 if call.delta else 3)
     carried = [f32(call.width, bv)] + [f32(chunk, 4)] * rows
+    # In turn: the weighted keys against the memory slice, the delta rule's (`algebra.corrected`); the keys
+    # read transposed against the corrected values (`algebra.carried`'s 'write').
+    written = product_fragments(call, (keys, call.block, chunk), (held, chunk, bv))
+    products = (widest(product_fragments(call, (held, chunk, call.block), (held, call.block, bv)), written)
+                if call.delta else written)
     phase = ([f32(chunk, bv)] * 2 + held_tile(values, chunk, bv) + held_tile(held, call.block, bv)
-             + fragments(call, (held, chunk, call.block), (keys, chunk, call.block))
+             + products
              + [f32(call.block, bv)] * (1 if call.per_key or not call.family.products_overlap
                                         else call.width // call.block))
     if held.parts > 1:

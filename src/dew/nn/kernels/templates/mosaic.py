@@ -816,21 +816,32 @@ class Issuer[Accumulator](abc.ABC):
         replicated."""
         return 1
 
+    def for_dtype(self, dtype) -> Self:
+        """The issuer its products use for operands of `dtype`, whose instruction depths their model reads."""
+        del dtype
+        return self
+
+    operand_steps_ahead: int = 0
+    """The instruction slices loaded before the slice being consumed finishes."""
+
+    def operand_live_depth(self, depth: int, loaded: int, *, retained: bool = False) -> int:
+        """An operand's live depth: a retained value keeps its loaded granule and instruction lookahead;
+        otherwise only its consumed slices within that granule stay live."""
+        consumed = (1 + self.operand_steps_ahead) * self.fragment_depth(depth)
+        return min(depth, max(loaded, consumed)) if retained else min(loaded, consumed)
+
     def fragment_depth(self, depth: int) -> int:
-        """The depth of a step's right operand fragments a consumer holds at once, where its products read
-        registers (`operands_in_registers`): the step's, unless the family loads them a sub-step at a
-        time (the left operand's it holds a step deep)."""
+        """The depth consumed by one instruction: the step's where its issuer does not split products."""
         return depth
 
     def rhs_fragment_depth(self, depth: int, *, transposed: bool = False, swizzle: int | None = None) -> int:
-        """The right operand's depth held in registers, by its storage orientation and its stage's swizzle
-        (bytes; the family's default staging where None)."""
+        """The right operand's loaded depth at its storage orientation and swizzle (bytes). The model's
+        `operand_live_depth` reads which slices of that granule stay live."""
         del transposed, swizzle
         return self.fragment_depth(depth)
 
     def lhs_fragment_depth(self, depth: int, *, swizzle: int | None = None) -> int:
-        """The left operand's depth held in registers by a product, by its stage's swizzle (bytes; the
-        family's default staging where None)."""
+        """The left operand's load granule at its stage's swizzle (bytes; the family's default where None)."""
         del swizzle
         return depth
 

@@ -11,7 +11,7 @@ import contextvars
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Hashable, Iterator
 from typing import TYPE_CHECKING
 
 import jax
@@ -87,6 +87,15 @@ def allocated(*sizes: int) -> int:
     return sum(-(-size // SMEM_ALIGNMENT) * SMEM_ALIGNMENT for size in sizes)
 
 
+def _register_words(tiles) -> float:
+    return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
+
+
+def largest_live_set(*phases):
+    """The largest of disjoint register live sets, by their 32-bit words."""
+    return max(phases, key=_register_words)
+
+
 def live_registers(family: "Family", carried, *phases, addressed=()) -> int:
     """The registers a consumer thread of `family` holds over a live set: the tiles it carries across its
     walk (`carried`, each `(rows, columns, dtype)`: its accumulators, a running statistic) and the largest
@@ -96,33 +105,74 @@ def live_registers(family: "Family", carried, *phases, addressed=()) -> int:
     `Family.scalar_registers`) and the issuer's product state (`Family.product_control`).
     The one register estimate every Mosaic template's launches state (`base.Template.registers`), which
     a legal config holds within a thread's budget (`base.Template.legal`)."""
-    def words(tiles) -> float:
-        return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
-
-    phase = max((words(tiles) for tiles in phases), default=0.0)
+    phase = max((_register_words(tiles) for tiles in phases), default=0.0)
     return (family.scalar_registers(addressed) + family.product_control
-            + int(-(-(words(carried) + phase) // THREADS)))
+            + int(-(-(_register_words(carried) + phase) // THREADS)))
 
 
 def operand_fragments(family: "Family", rows: int, depth: int, columns: int, lhs, rhs, *, lhs_parts: int = 1,
                       rhs_parts: int = 1, rhs_transposed: bool = False, lhs_swizzle: int | None = None,
-                      rhs_swizzle: int | None = None) -> list:
-    """The operand fragments a product `[rows, depth] @ [depth, columns]` holds at once where its family's
-    products read registers (`Family.operands_in_registers`), none where they read shared memory: each
-    operand's loaded depth at its stage's swizzle (`Family.lhs_fragment_depth`, `Family.rhs_fragment_depth`;
-    `lhs_swizzle`, `rhs_swizzle` bytes, the family's default where None), each in the warps
-    replicating it (`lhs_copies`, `rhs_copies`) and its dtype (`lhs`, `rhs`), repeated for its parts (an
-    fp32 operand split into 16-bit parts): GEMM's, recurrence's and attention's products'."""
+                      rhs_swizzle: int | None = None, lhs_retained: bool = False,
+                      rhs_retained: bool = False, lhs_staged: bool = False,
+                      rhs_staged: bool = False) -> list:
+    """The register live set of a product's operands: their issuer at the operand dtype, the slices
+    consumed and loaded ahead within a stage's granule, and each operand's replicating warps and parts.
+    An operand retained across products keeps its whole loaded granule. A value staged for its product dies
+    before the product reloads its fragments: those are separate phases, whose larger set is returned.
+    Where products read shared memory, only that staging phase holds registers."""
+    staged = ([(rows, depth, lhs)] * lhs_parts if lhs_staged else [])
+    staged += ([(depth, columns, rhs)] * rhs_parts if rhs_staged else [])
+    if not family.operands_in_registers:
+        return staged
+    left_issuer, right_issuer = family.for_dtype(lhs), family.for_dtype(rhs)
+    left_depth = left_issuer.operand_live_depth(
+        depth, left_issuer.lhs_fragment_depth(depth, swizzle=lhs_swizzle), retained=lhs_retained)
+    right_depth = right_issuer.operand_live_depth(
+        depth, right_issuer.rhs_fragment_depth(depth, transposed=rhs_transposed, swizzle=rhs_swizzle),
+        retained=rhs_retained)
+    left = (rows * family.lhs_copies, left_depth, lhs)
+    fragments = ([left] * lhs_parts
+                 + [(right_depth, columns * family.rhs_copies, rhs)] * rhs_parts)
+    # A value staged into shared memory dies before its product loads the fragments back.
+    return largest_live_set(staged, fragments) if staged else fragments
+
+
+def product_phases(family: "Family", dtype, *products, lhs_swizzle: int | None = None,
+                   rhs_swizzle: int | None = None,
+                   rhs_sources: tuple[Hashable | None, ...] | None = None) -> list:
+    """Products' operand live sets beside their register tiles. Each product states its rows, depth,
+    columns, the tiles beside it, whether its left value is already held, and its right storage orientation.
+    Equal right-source identifiers retain that operand from its first reader through its last, including
+    intervening products. The largest of its readers' register representations bounds that shared value."""
     if not family.operands_in_registers:
         return []
-    left = (rows * family.lhs_copies, family.lhs_fragment_depth(depth, swizzle=lhs_swizzle), lhs)
-    return ([left] * lhs_parts
-            + [(family.rhs_fragment_depth(depth, transposed=rhs_transposed, swizzle=rhs_swizzle),
-                columns * family.rhs_copies, rhs)] * rhs_parts)
+    sources = (None,) * len(products) if rhs_sources is None else rhs_sources
+    retained = {}
+    for source in dict.fromkeys(source for source in sources
+                                if source is not None and sources.count(source) > 1):
+        readers = [i for i, own in enumerate(sources) if own == source]
+        forms = []
+        for i in readers:
+            rows, depth, columns, _, _, transposed = products[i]
+            forms.append(operand_fragments(family, rows, depth, columns, dtype, dtype,
+                                           lhs_parts=0, rhs_retained=True, rhs_transposed=transposed,
+                                           rhs_swizzle=rhs_swizzle))
+        retained[source] = (readers[0], readers[-1], largest_live_set(*forms))
+    phases = []
+    for i, ((rows, depth, columns, beside, held, transposed), source) in enumerate(
+            zip(products, sources, strict=True)):
+        fragments = operand_fragments(family, rows, depth, columns, dtype, dtype,
+                                       lhs_parts=0 if held else 1,
+                                       rhs_parts=0 if source in retained else 1,
+                                       rhs_transposed=transposed, lhs_swizzle=lhs_swizzle,
+                                       rhs_swizzle=rhs_swizzle)
+        live = [tile for first, last, tiles in retained.values() if first <= i <= last for tile in tiles]
+        phases.append([*beside, *fragments, *live])
+    return phases
 
 
 def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype, *,
-                   stored=(), rhs_transposed: bool = False) -> int:
+                   stored=(), rhs_transposed: bool = False, lhs_retained: bool = False) -> int:
     """The registers a consumer thread holds at a `(rows, columns, depth)` GEMM tile of `consumers` roles
     of `family` (`live_registers`): its share of the fp32 accumulator carried, and a step's operand
     fragments where its products read registers (`Family.operands_in_registers`; the right operand's in
@@ -133,7 +183,7 @@ def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int]
     rows, columns, depth = block
     share = rows // consumers
     fragments = operand_fragments(family, share, depth, columns, dtype, dtype,
-                                 rhs_transposed=rhs_transposed)
+                                 rhs_transposed=rhs_transposed, lhs_retained=lhs_retained)
     # The accumulator's columns its consumer holds at once: all of them, or an epilogue's chunk of one held
     # in tensor memory (`Issuer.chunk_columns`).
     accumulator = (share, family.chunk_columns(columns), jnp.float32)

@@ -16,7 +16,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra, tables
-from dew.nn.kernels.templates import mosaic, product, swizzling
+from dew.nn.kernels.templates import mosaic, product, resources, swizzling
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import own_pairs
@@ -32,18 +32,19 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     column_tile,
     f32,
     fp32_operand,
-    fragments,
     held_tile,
     key_block,
     launch_kernel,
     lowered_once,
     masks,
+    product_fragments,
     product_results,
     staged_parts,
     staging_tiles,
     stream_blocks,
     stream_tile,
     stream_views,
+    widest,
 )
 
 
@@ -110,10 +111,13 @@ def _key_scores_back(scores, do, corrected, taken, call: Call):
     # (jsf-three-back: 90 registers against an H100's need of 112), a tensor memory read's beside them, and
     # mma.sync's two (one stated, an A100 claimed 3 programs at 152 registers, whose cap spilled, jsf-owncap).
     accumulators = {"fragments": 2, "registers": 2, "tensor": 3}[product_results(call)]
+    # The output's gradient against the corrected values read transposed ('values_ds'); then the scores
+    # (read transposed) against it ('local_dv', `algebra.key_scores_back`).
     held_tiles = Held(carried=[f32(chunk, chunk)], phases=(
-        masks(chunk, chunk) + fragments(call, (given, chunk, vb), (held, chunk, vb)),
+        masks(chunk, chunk)
+        + product_fragments(call, (given, chunk, vb), (held, vb, chunk), rhs_transposed=True),
         [f32(chunk, vb)] * accumulators + held_tile(grads, chunk, vb)
-        + fragments(call, (held, chunk, chunk), (given, chunk, vb))))
+        + product_fragments(call, (held, chunk, chunk), (given, chunk, vb))))
     return launch_kernel(program, call,
                          out_type=(square.shape(call.heads * chunk), grads.shape(call.heads * value_width)),
                          grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=tiles,
@@ -302,11 +306,18 @@ def _key_values_held(call: Call) -> Held:
     (`algebra.key_system_back`)."""
     chunk, vb = call.chunk, call.value_block
     held = dataclasses.replace(call.held, rows=call.rows)
+    # In turn: the inverse (read transposed) against a value block's gradient, that gradient against the
+    # gated values read transposed ('values_merge'); then the system's gradient against the inverse read
+    # transposed, the inverse (read transposed) against their product ('system_merge').
     return Held(phases=(
-        [f32(chunk, chunk)] * 2 + [f32(chunk, vb)] * 3 + held_tile(held, chunk, vb)
-        + fragments(call, (held, chunk, chunk), (held, chunk, vb)),
-        [f32(chunk, chunk)] * 3 + masks(chunk, chunk) + held_tile(held, chunk, chunk)
-        + fragments(call, (held, chunk, chunk), (held, chunk, chunk))))
+        [f32(chunk, chunk)] * 2 + [f32(chunk, vb)] * 3
+        + widest(product_fragments(call, (held, chunk, chunk), (held, chunk, vb)),
+                 product_fragments(call, (held, chunk, vb), (held, vb, chunk),
+                                   rhs_transposed=True, rhs_staged=True)),
+        [f32(chunk, chunk)] * 3 + masks(chunk, chunk)
+        + widest(product_fragments(call, (held, chunk, chunk), (held, chunk, chunk),
+                                   rhs_transposed=True, lhs_staged=True),
+                 product_fragments(call, (held, chunk, chunk), (held, chunk, chunk), rhs_staged=True))))
 
 
 def _key_memory_held(call: Call, keys: int) -> Held:
@@ -319,11 +330,20 @@ def _key_memory_held(call: Call, keys: int) -> Held:
     # The system's update a second square around the merge where warpgroup accumulators hold it
     # (jsf-three-back: 208 registers against an H100's need of 240).
     merged = 2 if product_results(call) == "registers" else 1
+    from dew.nn.kernels.templates.recurrence.mainloop_backward import _value_grads
+
+    vb = call.value_block
+    # In turn: the output's gradient, the corrected values and their gradient against the memories entered
+    # and leaving, read transposed ('memory_dq', 'memory_dk', 'memory_dw'); then the inverse (read
+    # transposed) against the weights' gradient, that against the gated keys read transposed
+    # ('weights_merge', `algebra.key_memory_block`).
+    memory = widest(*(product_fragments(call, (operand, chunk, vb), (memories, vb, keys), rhs_transposed=True)
+                      for operand in (given, held, _value_grads(call))))
+    merging = widest(product_fragments(call, (held, chunk, chunk), (held, chunk, keys)),
+                     product_fragments(call, (held, chunk, keys), (held, keys, chunk), rhs_transposed=True))
     return Held(carried=[f32(chunk, chunk), f32(chunk, 1)], phases=(
-        [f32(chunk, keys)] * 3
-        + fragments(call, (given, chunk, call.value_block), (memories, keys, call.value_block)),
-        [f32(chunk, keys)] * 7 + held_tile(held, chunk, keys) * 2 + [f32(chunk, chunk)] * merged
-        + fragments(call, (held, chunk, chunk), (held, chunk, keys))))
+        [f32(chunk, keys)] * 3 + memory,
+        [f32(chunk, keys)] * 7 + held_tile(held, chunk, keys) * 2 + [f32(chunk, chunk)] * merged + merging))
 
 
 def _square_landing(call: Call, keys: int) -> str:
@@ -464,9 +484,15 @@ def _key_pairs_held(call: Call, keys: int) -> Held:
     parted = _parted(call)
     # As an sm100's lowered peak counts it (row 5298, jsf-sm100-backward): nine tiles a block, their masks,
     # the rows' parts, and a product's fragments with mma.sync's right operand loaded ahead.
+    # In turn: a pair's gradient against the keys raised; a sub-chunk's (read transposed) against its gated
+    # rows (`algebra.key_decayed_pairs_back`); with the first's right operand loaded ahead.
+    ahead = resources.operand_fragments(call.family, chunk, chunk, keys, parted.stored, parted.stored,
+                                        lhs_parts=0, rhs_parts=parted.parts)
     return Held(carried=[f32(chunk, 1)], phases=(
         [f32(chunk, keys)] * 9 + masks(chunk, keys) * 2 + held_tile(parted, chunk, keys)
-        + fragments(call, (parted, chunk, chunk), (parted, chunk, keys), (parted, chunk, keys)),))
+        + widest(product_fragments(call, (parted, chunk, chunk), (parted, chunk, keys)),
+                 product_fragments(call, (parted, chunk, algebra.SUB), (parted, algebra.SUB, keys)))
+        + ahead,))
 
 
 class KeyKept(NamedTuple):

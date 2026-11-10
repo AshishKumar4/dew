@@ -200,12 +200,19 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         return resources.THREADS // 4
 
     products_overlap = False
+    operand_steps_ahead = 1
+    """`products` loads the following instruction's slices before issuing the current instruction."""
 
     takes_tf32 = True
 
     transposes_tf32 = True
 
     rounds_tf32 = True
+
+    def for_dtype(self, dtype) -> Self:
+        """The operand's issuer: fp32 products issue TF32 at its own depths, beside 16-bit products."""
+        dtype = jnp.dtype(dtype)
+        return self if self.dtype == dtype else dataclasses.replace(self, dtype=dtype)
 
     def specialized(self, rows: int, columns: int) -> Self:
         # Its warps split `m_warps` along a warpgroup's `rows` and the rest along its `columns` (`MMALayouts`;
@@ -370,7 +377,7 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         if jnp.dtype(lhs.dtype) != self.dtype:
             # Another dtype's operands (fp32's, as TF32) by that dtype's issuer: its fragments' layouts and
             # depths are its own, its accumulator's the same.
-            return dataclasses.replace(self, dtype=jnp.dtype(lhs.dtype)).products(acc, lhs, rhs)
+            return self.for_dtype(lhs.dtype).products(acc, lhs, rhs)
         if interpret:
             # mma has no rule on a CPU: its sum, in fp32.
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)

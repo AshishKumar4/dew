@@ -292,8 +292,8 @@ def _width(width: int, family: mosaic.Family, dtype) -> int:
     return whole(power_of_two(width), family.column_unit(dtype))
 
 
-def _products(family: mosaic.Family, dtype, *products, narrow: bool = False, lhs_swizzle: int | None = None
-              ) -> list:
+def _products(family: mosaic.Family, dtype, *products, narrow: bool = False, lhs_swizzle: int | None = None,
+              rhs_sources: tuple[str | None, ...] | None = None) -> list:
     """The phases a step's products hold where its family's read their operands from registers
     (`resources.operand_fragments`; none where they read shared memory, wgmma's): each product
     `(rows, depth, columns, beside, register_lhs, rhs_transposed)` its operands' fragments beside the tiles
@@ -303,15 +303,11 @@ def _products(family: mosaic.Family, dtype, *products, narrow: bool = False, lhs
     stage's swizzle granule (`Family.rhs_fragment_depth`; mma.sync: ET-CENSUS80, a 64 x 192 forward's keys'
     fragments 162 of its 291 registers at its peak, uncounted), the narrowest where its launch stages them
     `narrow` (`Tiles.narrow`); a left operand in shared memory loaded at its stage's (`lhs_swizzle`: a
-    forward's query block, `query_swizzle`; the family's own where None)."""
-    if not family.operands_in_registers:
-        return []
+    forward's query block, `query_swizzle`; the family's own where None). Equal `rhs_sources` name a staged
+    operand reused across products, live through the intervening products too."""
     narrowest = swizzling.NARROWEST_SWIZZLE_BYTES if narrow else None
-    return [list(beside) + resources.operand_fragments(family, rows, depth, columns, dtype, dtype,
-                                                       lhs_parts=0 if register_lhs else 1,
-                                                       rhs_transposed=transposed, lhs_swizzle=lhs_swizzle,
-                                                       rhs_swizzle=narrowest if transposed else None)
-            for rows, depth, columns, beside, register_lhs, transposed in products]
+    return resources.product_phases(family, dtype, *products, lhs_swizzle=lhs_swizzle,
+                                     rhs_swizzle=narrowest, rhs_sources=rhs_sources)
 
 
 def stagings(family: mosaic.Family) -> tuple[bool, ...]:
@@ -1645,11 +1641,12 @@ def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, valu
     # (DQROWPROOF64/128: seven rows, D64 at 128 queries past the budget).
     rows = DQ_ROWS * family.row_registers(block_q, jnp.float32)
     # Its products' fragments where they read registers (`_products`): the logits', the output
-    # cotangents' beside them, and dQ's of the score cotangents in registers.
+    # cotangents' beside them, and dQ's of the score cotangents in registers. The keys are read by the
+    # logits and dQ, so stay live while the intervening product reads the values.
     fragments = _products(family, dtype, (block_q, width, block_k, [logits], False, True),
                           (block_q, value_width, block_k, [logits] * 2, False, True),
                           (block_q, block_k, width // config.columns, cotangents[1:], True, False),
-                          narrow=config.narrow)
+                          narrow=config.narrow, rhs_sources=("keys", "values", "keys"))
     # A score hook's slopes and parameters live until its pullback takes them (`gradient.pulled`).
     hooked = [logits] * slopes + held
     if accurate and family.operands_in_registers:
@@ -1658,8 +1655,9 @@ def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, valu
         # beside the cotangents, the keyed sums' weights fp32 and the part (an A100's dQ at 64 x 64:
         # one LDSM's registers read by four HMMAs over three parts, 218 to 221 live at its peak), and a
         # hook's pullback beside them (an A100's at 64 x 64 and width 128 under alibi spilled 16 bytes).
-        right = (2 * family.fragment_depth(block_k), width // config.columns * family.rhs_copies, dtype)
-        fragments.append([cotangents[0], (block_q, block_k, jnp.float32), cotangents[1], right, *hooked])
+        right = resources.operand_fragments(family, block_q, block_k, width // config.columns, dtype, dtype,
+                                            lhs_parts=0, rhs_retained=True)
+        fragments.append([cotangents[0], (block_q, block_k, jnp.float32), cotangents[1], *right, *hooked])
     if jnp.dtype(dtype) == jnp.dtype(jnp.float16):
         # fp16's parts scaled (`product.Scaled`): each part's product its own accumulator, restored and
         # added into dQ's (`operands.Issuer.summed`), beside the cotangents and both parts, formed first.

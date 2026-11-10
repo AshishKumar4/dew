@@ -26,6 +26,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Operand,
     Tiles,
     Walked,
+    addressed,
     block_stored,
     chunk_liveness,
     column_tile,
@@ -33,13 +34,13 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     f32,
     final_memory_landing,
     fitting_block,
-    fragments,
     held_tile,
     launch_kernel,
     lowered_once,
     masks,
     memory_landing,
     prefix_reader,
+    product_fragments,
     product_results,
     role_tiles,
     sequence_live,
@@ -57,6 +58,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     vector_views,
     walk_stores,
     whole_blocks,
+    widest,
 )
 from dew.nn.kernels.templates.recurrence.table import Table, returned_by, table_landing, table_returned
 from dew.nn.precision import compensated_sum
@@ -294,11 +296,14 @@ def _local_back_held(call: Call, vb: int) -> Held:
     ptxas needed 136, an A100's 280 against 160."""
     chunk = call.chunk
     held, given = dataclasses.replace(call.held, rows=call.rows), call.given
+    # The keys against the queries read transposed (`algebra.local_gradient`'s 'local_t'); then the narrow
+    # scores against a block of the output's gradient ('local_dv').
     return Held(phases=(
         [f32(chunk, chunk)] * 2 + masks(chunk, chunk)
-        + fragments(call, (given, chunk, call.block), (given, chunk, call.block)),
+        + product_fragments(call, (given, chunk, call.block), (given, call.block, chunk),
+                            rhs_transposed=True),
         [*held_tile(held, chunk, chunk), f32(chunk, vb), *held_tile(_value_grads(call), chunk, vb),
-         *fragments(call, (held, chunk, chunk), (given, chunk, vb))]))
+         *product_fragments(call, (held, chunk, chunk), (given, chunk, vb))]))
 
 
 def _local_back_staged(call: Call, vb: int) -> tuple:
@@ -416,7 +421,23 @@ def _reverse_held(call: Call, bv: int, *, gates: bool, skips: bool = False) -> H
         + held_tile(given, chunk, bv) * (1 + gates)
         + held_tile(held, call.block, bv) + held_tile(call.memories, call.block, bv)
         + held_tile(_reverse_values(call, gates=gates), chunk, bv)
-        + fragments(call, (given, chunk, call.block), (held, chunk, call.block)),))
+        + _reverse_products(call, bv),))
+
+
+def _reverse_products(call: Call, bv: int) -> list:
+    """The fragments of `_reverse`'s step's products, issued in turn (`algebra.reverse_carried`): the keys
+    against the memory's gradient staged ('values_dv'); the queries read transposed against the output's
+    gradient read (`reads`: decayed in fp32 and staged in two parts under a decay a head, a value
+    tile's own parts where it holds more, the gradient as given under a decay a key dimension); and with the
+    delta rule the weights read transposed against the corrected values' gradient ('weights_dv')."""
+    chunk, held = call.chunk, dataclasses.replace(call.held, rows=call.rows)
+    keyed = held if call.per_key else call.given
+    read = (call.given if call.per_key
+            else Operand(call.rows, 2 if held.parts == 1 else held.parts, jnp.dtype(jnp.float32)))
+    return widest(product_fragments(call, (keyed, chunk, call.block), (held, call.block, bv)),
+                  product_fragments(call, (keyed, call.block, chunk), (read, chunk, bv)),
+                  *([product_fragments(call, (held, call.block, chunk), (held, chunk, bv))]
+                    if call.delta else []))
 
 
 def _reverse_views(call: Call, q_ref, k_ref, w_ref, do_ref, local_ref, v_ref, h, walked, walked_width: int
@@ -737,7 +758,8 @@ def _query_key_split(call: Call) -> int:
     """`_query_key`'s value columns a program takes of each value head: the widest whole number of value
     tiles (`Call.value_block`) dividing the value width whose streams (each step's values, output gradient
     and corrected values' gradient `[C, vq]`, its memories `[block, vq]`, the queries', keys' and scores'
-    gradient's blocks) fit the block's shared memory (`generation.shared_budget`), a tile where none does:
+    gradient's blocks) fit the block's shared memory (`generation.shared_budget`) and their live registers
+    (`_query_key_held`), a tile where none does:
     an fp32 call's two parts at Qwen3.5-27B's widths took 237824 bytes and a 256-wide value row's 215040 on
     an A100, past its 166912 (fp32-plan-sm90 at cdcd620ef, wide-backward). Halved instead, 192 columns took
     96, a block and a half, and the split's programs read no column past their first block's. Each split's
@@ -746,17 +768,19 @@ def _query_key_split(call: Call) -> int:
     from its accumulator, because CUDA 12.9's ptxas folded the read's sign flip (an xor) so that the
     product's HGMMA wrote the zero register, not the split (row 4346: the JAX fork's float-sign-ops
     lowering, post66; M-JS-22q native as interpreted)."""
-    def streamed(vq: int) -> int:
+    def fits(vq: int) -> bool:
         tiles, _ = _query_key_launched(call, vq)
-        _, scope, _, _ = shared_allocation(call, tiles, (), _query_key_landing(call, call.value_width // vq))
-        return resources.shared_bytes(call.family, scope(1))
+        landing = _query_key_landing(call, call.value_width // vq)
+        _, scope, _, _ = shared_allocation(call, tiles, (), landing)
+        registers = _query_key_held(call, vq).registers(call.family, addressed((), landing))
+        return (resources.shared_bytes(call.family, scope(1)) <= generation.shared_budget(call.target)
+                and registers <= call.family.registers(1))
 
-    budget = generation.shared_budget(call.target)
-    return next((vq for vq in whole_blocks(call.value_width, call.value_block) if streamed(vq) <= budget),
+    return next((vq for vq in whole_blocks(call.value_width, call.value_block) if fits(vq)),
                 call.value_block)
 
 
-def _query_key_held(call: Call) -> Held:
+def _query_key_held(call: Call, vq: int) -> Held:
     """What `_query_key`'s consumer thread holds (`algebra.memory_gradients`): a block's gradient's fp32 sum
     (one accumulator over the value blocks), that sum gated, its scores' product, and a block's queries or
     keys in fp32 for the range terms; then `sum(S dS)` (`_memory_sum`): the memories' product and its
@@ -765,16 +789,29 @@ def _query_key_held(call: Call) -> Held:
     registers (gateqk at c2808ebbe)."""
     chunk, vb = call.chunk, call.value_block
     held, memories, given = call.held, call.memories, call.given
-    block = (memories, call.block, vb)
-    summed = ([f32(call.block, call.block), *masks(call.block, call.block), *fragments(call, block, block)]
+
+    def read(rows: int, lhs, rhs_parts: int, *, retained: bool = False) -> list:
+        # A product of `lhs` `[rows, vb]` and the memories read transposed, their fragments `rhs_parts` times.
+        return resources.operand_fragments(call.family, rows, vb, call.block, lhs.stored, memories.stored,
+                                           lhs_parts=lhs.parts, rhs_parts=rhs_parts, rhs_transposed=True,
+                                           lhs_retained=retained, rhs_retained=retained)
+
+    # The output's gradient and the corrected values against the memories entered and leaving, read
+    # transposed ('memory_dq', 'memory_dk'); then the memories against themselves (`_memory_sum`).
+    # The unscored head segment reads each memory in its gradients and again in its trace, with no
+    # weights store between them: its staged operands remain live across those products. Each value block
+    # has its own operands. A scored head or a weights store ends that phase.
+    retained = not call.delta and call.group > 1
+    trace_operands = [tile for _ in range(vq // vb if retained else 1)
+                      for tile in read(call.block, memories, memories.parts, retained=retained)]
+    summed = ([f32(call.block, call.block), *masks(call.block, call.block), *trace_operands]
               if call.family.operands_in_registers else [f32(call.block, vb)] * 2)
     # An fp32 call's products overlapping (warpgroup MMA's) keep its row results `after` and `leaving`
     # beside them: unstated, Qwen3.5's fp32 training claimed 3 programs an H100 at 136 registers, whose cap
     # spilled 36 bytes (jsf-owncap).
     rows = [f32(chunk, 4)] * 2 if call.family.products_overlap and held.parts > 1 else []
     return Held(phases=(
-        [f32(chunk, call.block)] * 4 + rows
-        + fragments(call, (given, chunk, vb), (held, chunk, vb), (memories, call.block, vb)),
+        [f32(chunk, call.block)] * 4 + rows + read(chunk, given, memories.parts) + read(chunk, held, 0),
         summed))
 
 
@@ -921,7 +958,7 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta, call: Ca
         program, call, out_type=out_type,
         grid=(splits, width // call.block, call.chunks, call.heads // group),
         grid_names=("values", "blocks", "chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(10),
-        work=work, held=_query_key_held(call), landing=_query_key_landing(call, splits))(
+        work=work, held=_query_key_held(call, vq), landing=_query_key_landing(call, splits))(
         q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, beta)
     # The splits' own sums added (one split's, as they are, where a program takes every value column).
     if splits > 1:
@@ -1076,7 +1113,15 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
     phases = ([f32(chunk, chunk)] * (3 + (grads.parts > 1))
               + held_tile(grads, chunk, chunk)
               + masks(chunk, chunk)
-              + fragments(call, (given, chunk, call.block), (given, chunk, call.block)),)
+              # In turn: the queries against the keys read transposed ('local_t'); the output's gradient
+              # against the corrected values read transposed ('values_ds'); the pairs' sum's three fp32
+              # parts against the exact bf16 triangle (`algebra.scores_gradient`).
+              + widest(product_fragments(call, (given, chunk, call.block), (given, call.block, chunk),
+                                         rhs_transposed=True),
+                       product_fragments(call, (given, chunk, call.value_block),
+                                         (held, call.value_block, chunk), rhs_transposed=True),
+                       product_fragments(call, (Operand(call.rows, 3, jnp.dtype(jnp.float32)), chunk, chunk),
+                                         (Operand(call.rows, 1, jnp.dtype(jnp.bfloat16)), chunk, chunk))),)
     if group > 1:
         # After the pair reduction, no scores, masks or operand fragments remain: the incoming ds,
         # the running pair and TwoSum's temporaries peak at six fp32 tiles.
@@ -1146,10 +1191,18 @@ def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: Call):
     # A block's keys or values scaled, narrow, beside the inverse's gradient; then it masked, its products
     # through the inverse and the pairs' decays with their masks (`algebra.system_gradient`).
     held_tiles = Held(phases=(
-        [f32(chunk, chunk), f32(chunk, call.block), *held_tile(held, chunk, call.block),
-         *fragments(call, (held, chunk, call.block), (held, chunk, call.block))],
-        [f32(chunk, chunk)] * 4 + held_tile(held, chunk, chunk) + masks(chunk, chunk)
-        + fragments(call, (held, chunk, chunk), (held, chunk, chunk))))
+        # In turn: the weights' and the values' gradients against the scaled keys and values read transposed
+        # ('inverse_dx', 'inverse_du'); then the masked gradient against the inverse read transposed and the
+        # inverse read transposed against its product ('inverse_l', 'inverse_t'; `algebra.system_gradient`).
+        [f32(chunk, chunk), f32(chunk, call.block),
+         *widest(product_fragments(call, (held, chunk, call.block), (held, call.block, chunk),
+                                   rhs_transposed=True, rhs_staged=True),
+                 product_fragments(call, (held, chunk, call.value_block), (held, call.value_block, chunk),
+                                   rhs_transposed=True, rhs_staged=True))],
+        [f32(chunk, chunk)] * 4 + masks(chunk, chunk)
+        + widest(product_fragments(call, (held, chunk, chunk), (held, chunk, chunk),
+                                   rhs_transposed=True, lhs_staged=True),
+                 product_fragments(call, (held, chunk, chunk), (held, chunk, chunk), rhs_staged=True))))
     return launch_kernel(program, call, out_type=held.shape(call.heads * chunk),
                          grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(10),
@@ -1207,7 +1260,9 @@ def _values_back(a, v, du, beta, taken, call: Call):
                    if call.family.products_overlap else [])
     held_tiles = Held(phases=(
         [f32(chunk, vb)] * 3 + held_tile(held, chunk, vb) + overlapping
-        + fragments(call, (held, chunk, chunk), (held, chunk, vb)),))
+        # The inverse read transposed against a value block's gradient ('inverse_t',
+        # `algebra.values_gradient`).
+        + product_fragments(call, (held, chunk, chunk), (held, chunk, vb)),))
     return launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                          grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=chunk_liveness(4),
                          work=work,
@@ -1279,9 +1334,13 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
     # The system's gradient narrow and scaled by beta beside the key block's terms: through `w`, the keys in
     # fp32, the product being issued and the sum it joins (`algebra.keys_gradient`: each term dies as the next
     # forms); then its keys' own pairs, the pair terms, and the pairs' sums' masks and product.
+    # In turn (`algebra.keys_gradient`): the inverse read transposed against the weights' gradient
+    # ('inverse_t'), the system's gradient and its transpose against the keys ('keys_dl', 'keys_dlt').
+    keyed = widest(product_fragments(call, (held, chunk, chunk), (held, chunk, call.block)),
+                   product_fragments(call, (held, chunk, chunk), (given, chunk, call.block)))
     held_tiles = Held(phases=(
         held_tile(held, chunk, chunk) * 2 + [f32(chunk, call.block)] * 4
-        + fragments(call, (held, chunk, chunk), (given, chunk, call.block), (held, chunk, call.block)),
+        + keyed,
         held_tile(held, chunk, chunk) + [f32(chunk, chunk)] * 4 + masks(chunk, chunk)))
     if held.parts > 1 and product_results(call) == "registers":
         # An fp32 call's on warpgroup MMA (jsf-three-back: 211 registers against an H100's need of 248): its
@@ -1290,7 +1349,7 @@ def _keys_back(a, k, dw, dl, hi, lo, beta, taken, call: Call):
         rows = f32(chunk, 4)
         held_tiles = Held(phases=(
             held_tile(held, chunk, chunk) * 2 + [f32(chunk, call.block)] * 4 + [rows] * 4
-            + fragments(call, (held, chunk, chunk), (given, chunk, call.block), (held, chunk, call.block)),
+            + keyed,
             held_tile(Operand(call.rows, 3, jnp.dtype(jnp.float32)), chunk, chunk)
             + held_tile(Operand(call.rows, 1, jnp.dtype(jnp.bfloat16)), chunk, chunk)
             + [f32(chunk, chunk)] * 4 + masks(chunk, chunk) + [rows] * 2))
