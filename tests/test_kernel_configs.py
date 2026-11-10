@@ -20,7 +20,7 @@ import pytest
 from fla_gdn_support import CONV_SHAPES, conv_training_cases, kda_training_cases
 from generation_support import COMPILES_FOR_TPU, generations, lowers
 from jax.sharding import PartitionSpec
-from kernel_compile import Uncounted, compile_kernels, failures
+from kernel_compile import Uncounted, compile_kernels, failures, gate_generations
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
 from dew.nn.kernels.templates import bundles, report, resources
@@ -154,7 +154,7 @@ def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_g
     assert not failures(found), "\n".join(failures(found))
 
 
-@pytest.mark.parametrize("target", ["sm80", "sm90"])
+@pytest.mark.parametrize("target", gate_generations(scoped=True))
 def test_the_short_convs_kernels_compile_within_each_gpus_resources(target):
     """Each of the short conv's training cases (the recurrence template's conv, `templates.recurrence.conv`)
     lowered as on the GPU and compiled by Mosaic for a compile-only device on this CPU through ptxas
@@ -645,7 +645,7 @@ def _emitted_forms(family) -> set[str]:
 
 
 @pytest.mark.parametrize("shape", GEMM_SHAPES)
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"))
+@pytest.mark.parametrize("generation_name", generations(*gate_generations(stated=True)))
 def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
     """Every GEMM Mosaic GPU launch form a generation emits derives a tile at every real projection
     (`_gemm_mainloop_cases`), each on the most capable issuer whose bundle takes it (`bundles.groups`, its
@@ -688,7 +688,7 @@ def _gated(names: tuple[str, ...], cases: Callable[[str], list]) -> list:
 
 
 @pytest.mark.parametrize(("generation_name", "index"),
-                         _gated(("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"), _gate_cases))
+                         _gated(gate_generations(stated=True), _gate_cases))
 def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, index):
     """Every distinct GEMM Mosaic GPU kernel a generation runs at a real projection (`_gate_cases`), a test
     each, at the tile its launch derives from the generation's facts and at each tile the derivation refused
@@ -729,7 +729,7 @@ def _family_cases(generation_name: str) -> list:
     return [case for case in _contract_cases(generation_name) if _kernel_of(case.name) not in held]
 
 
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+@pytest.mark.parametrize("generation_name", generations(*gate_generations()))
 def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_name):
     """The whole contract a Mosaic GPU Family bundle offers its templates is present: every launch form it
     emits (`_emitted_forms`: plain and transposed right operands, 16-bit and fp32 stores, fixed and streamed
@@ -744,7 +744,7 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
     assert got == expected, (sorted(expected - got), sorted(got - expected))
 
 
-@pytest.mark.parametrize(("generation_name", "index"), _gated(("sm80", "sm90"), _family_cases))
+@pytest.mark.parametrize(("generation_name", "index"), _gated(gate_generations(), _family_cases))
 def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name, index):
     """Each launch of the contract a Mosaic GPU Family bundle offers its templates that the compile gate
     does not hold (`_family_cases`), a test each, compiled through ptxas for a compile-only GPU of the

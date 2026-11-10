@@ -22,6 +22,7 @@ import numpy as np
 import pytest
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU, lowers
+from kernel_compile import gate_generations
 from reference_error import assert_as_exact
 from test_recurrence_chunk import (
     FORMED,
@@ -474,7 +475,8 @@ def test_an_output_launch_lowers_at_a_value_block_narrower_than_its_keys(key_wid
 
 
 @lowers('sm80')
-@pytest.mark.parametrize('target', ['sm80', 'sm86'])
+@pytest.mark.parametrize('target', gate_generations(
+    scoped=True, needs=lambda family, architecture: not architecture.tma))
 def test_a_narrow_key_dimensions_gradient_lowers_its_copies_for_an_ampere_gpu(target):
     """A decay a key dimension 16 wide over values 8 wide (the recurrence stability sites' geometry), its
     gradient through the template lowered for an Ampere GPU: the key memory backward copies the entered
@@ -1291,7 +1293,7 @@ def _gated(target: str, group: tuple):
     return pytest.param(target, group, id=label)
 
 
-@pytest.mark.parametrize('target, group', [_gated(gpu, group) for gpu in ('sm80', 'sm86', 'sm90', 'sm100')
+@pytest.mark.parametrize('target, group', [_gated(target, group) for target in gate_generations(scoped=True)
                                            for group in GATE_GROUPS])
 def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides(target, group):
     """The mainloop's launches (`compiled_cases`), compiled by Mosaic for a compile-only A100, A10, H100 and

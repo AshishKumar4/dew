@@ -14,6 +14,7 @@ from generation_support import INTERPRETS
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
+from kernel_compile import gate_generations
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import across, handoffs, mosaic, rings, swizzling
@@ -298,7 +299,8 @@ def test_a_schedules_roles_share_the_launch_pool_by_weight(weights, programs):
             or pool - sum(held) < step * sum(weight for weight, _ in raised))
 
 
-@pytest.mark.parametrize("generation_name", ["sm90", "sm100"])
+@pytest.mark.parametrize("generation_name", gate_generations(
+    needs=lambda family, architecture: architecture.multiprocessor.register_raises is not None))
 def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_consumers_hold_the_rest(
         generation_name):
     """A launch stating its producer's registers (a producer whose issue loop holds more than setmaxnreg's
@@ -321,7 +323,8 @@ def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_c
             assert handoffs.Schedule(WGMMA.roles(consumers).roles, floor=stated).registers() == roles
 
 
-@pytest.mark.parametrize("generation_name", ["sm90", "sm100"])
+@pytest.mark.parametrize("generation_name", gate_generations(
+    needs=lambda family, architecture: architecture.multiprocessor.register_raises is not None))
 def test_a_planned_launch_at_its_producers_registers_holds_the_programs_and_budget_its_schedule_runs(
         generation_name):
     """A launch planned at its producer's stated registers (`resources.Launch.producer`, as the sm100 states
@@ -779,7 +782,7 @@ def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_i
 
 
 @pytest.mark.parametrize("rows", [4, 8, 16, 24, 32])
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
+@pytest.mark.parametrize("generation_name", gate_generations())
 def test_a_few_rows_lower_on_every_bundle_their_device_issues(generation_name, rows):
     """A launch of a decode step's few rows lowers on each bundle its device composes for them
     (`bundles.layouts`' `rows`: mma.sync's on cp.async on an A100; on an H100 wgmma's two layouts and
@@ -1301,7 +1304,7 @@ def _codes(dtype):
 
 @pytest.mark.parametrize("scaled", [True, False], ids=["scaled", "unscaled"])
 @pytest.mark.parametrize("dtype", [jnp.int8, jnp.float8_e4m3fn])
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("generation_name", gate_generations())
 def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_name, dtype, scaled):
     """Int8 and e4m3 codes in shared memory converted into a bf16 tile, each row scaled in fp32: exactly
     `codes * scale` interpreted (on a CPU) or on a GPU of the generation, and lowered for one on any host;

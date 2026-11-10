@@ -9,20 +9,26 @@ import jax
 import jax.numpy as jnp
 import pytest
 from generation_support import COMPILES_ON_CPU, INTERPRETS
+from kernel_compile import gate_generations
 from test_attention_mosaic import BACKWARD_HOOKS, SHAPES, _check_backward, _residuals
 from test_attention_triton import SCORE_HOOKS, score_hooks
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_mosaic, bundles
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_mosaic,
+    attention_mosaic_program,
+    bundles,
+)
 
 pytestmark = pytest.mark.kernel
 
 
-GATED = ("sm90", "sm80")
-"""The GPUs whose launches the resource gates compile (`attention_mosaic_program.qualified`, a family whose
-consumers issue their products): an H100's wgmma and an A100's mma.sync staged by cp.async. Consumer
-Blackwell's mma.sync fed by TMA (`bundles.MmaFed`) runs the mainloop too, but derives no tile within its
-99 KB block yet (every sm120 case None at 3569816c26, lean1b)."""
+GATED = gate_generations(scoped=True, tpu=True,
+                         needs=lambda family, architecture: attention_mosaic_program.qualified(family))
+"""The GPUs whose launches the resource gates compile: one of each architecture whose bundle the mainloop
+runs on (`kernel_compile.gate_generations`, its launches' flags, the bundle qualified for it,
+`attention_mosaic_program.qualified`: a family whose consumers issue their products)."""
 
 BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in GATED
                  for width in (64, 128, 256) for accurate in (False, True)]
@@ -363,7 +369,7 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [64, 128])
-@pytest.mark.parametrize("generation_name", ["sm90"])
+@pytest.mark.parametrize("generation_name", GATED)
 def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_name, width):
     """An fp32 call's inference forward (`MosaicForward.parts`: its operands bf16 parts) at its derived tiles
     of a causal call `width` wide, lowered and compiled by ptxas for `generation_name` on this CPU: every
