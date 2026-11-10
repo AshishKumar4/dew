@@ -1133,11 +1133,6 @@ class Issuer[Accumulator](abc.ABC):
     """Whether its register model counts what a template's hooks hold (side operands' tiles), so a hooked
     call derives a tile that spills nothing; where not (mma.sync's), such a call is not its launch's."""
 
-    counts_sums: bool = True
-    """Whether its register model counts an exactly summed call's running sum (a second fp32 accumulator
-    beside the first and each step's product), so such a call derives a tile that spills nothing: every
-    family's, an fp32 output of 16-bit products being exactly summed (`templates.product.promoted`)."""
-
     accumulator_rows: int | None = None
     """The rows of a consumer's accumulator its products issue into, where the family fixes them (tcgen05's
     M on one CTA); None where a tile takes any whole roles of rows."""
@@ -1324,10 +1319,10 @@ class Issuer[Accumulator](abc.ABC):
                 loop.then()
         return both
 
-    @abc.abstractmethod
     def held(self, ref: Ref) -> Operand:
-        """An operand every step reads (`ref`, in shared memory) where the family keeps it: shared memory,
-        or registers."""
+        """An operand every step reads (`ref`, in shared memory) where the family keeps it: in shared memory,
+        which its products read, not beside every loop carry."""
+        return ref
 
     @abc.abstractmethod
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:

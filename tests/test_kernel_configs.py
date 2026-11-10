@@ -415,8 +415,8 @@ FP8_FORMS = ("forward fp8",)
 
 EXACT_FORMS = ("kernel gradient exact fp32", "forward exact fp32", "input gradient exact fp32",
                "dense kernel gradient exact fp32")
-"""The exactly summed forms a family whose model counts a running sum emits (`Family.counts_sums`): an fp32
-output of 16-bit products (`templates.product.promoted`)."""
+"""The exactly summed forms every family emits: an fp32 output of 16-bit products
+(`templates.product.promoted`)."""
 
 HOOKED_FORMS = ("normed biased forward", "normed biased input gradient",
                 "normed kernel gradient", "exact normed kernel gradient", "fp16 normed biased forward",
@@ -615,8 +615,8 @@ def _derived_and_refused(launch, ba, target) -> tuple:
 
 def _emitted_forms(family) -> set[str]:
     """The forms a family's GEMM launches emit (`PLAIN_FORMS`, `EXACT_FORMS`, `HOOKED_FORMS`, `FP8_FORMS`):
-    none without a bundle, the exactly summed ones where its register model counts a running sum
-    (`Family.counts_sums`), the hooked ones where it counts what they hold (`Family.counts_hooks`), the
+    none without a bundle, the exactly summed ones (every family's model counts a running sum), the hooked
+    ones where it counts what they hold (`Family.counts_hooks`), the
     paired ones where its launches take a pair whole (`Family.takes_pairs`), the FP8 ones where its products
     take FP8 (`Family.takes_fp8`); where its consumers do not issue their products, none whose step prepares
     them (`Family.issues_in_consumers`: a kernel gradient's consumer zeroes its stage's neighbouring rows
@@ -625,7 +625,7 @@ def _emitted_forms(family) -> set[str]:
     if family is None:
         return set()
     paired = family.takes_pairs and (family.counts_hooks or not family.feeds_itself)
-    forms = {*PLAIN_FORMS, *(PAIRED_FORMS if paired else ()), *(EXACT_FORMS if family.counts_sums else ()),
+    forms = {*PLAIN_FORMS, *(PAIRED_FORMS if paired else ()), *EXACT_FORMS,
              *(HOOKED_FORMS if family.counts_hooks else ()),
              *(FP8_FORMS if family.takes_fp8 else ())}
     if not family.issues_in_consumers:

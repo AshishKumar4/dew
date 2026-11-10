@@ -176,9 +176,6 @@ class MxuIssuer(mosaic.Issuer[jax.Array]):
         # Its products are synchronous: none is pending.
         del pending
 
-    def held(self, ref):
-        return ref
-
     def added_into(self, acc: jax.Array, value: jax.Array, interpret: bool) -> jax.Array:
         del interpret
         return acc + value.astype(jnp.float32)
