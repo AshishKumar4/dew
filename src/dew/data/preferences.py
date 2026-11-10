@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 import grain.python as grain
 import numpy as np
 
-from dew._records import record
+from dew._records import ADDED, record
 from dew.batch import token_ids
 from dew.data.facts import shaped, unshaped
 from dew.data.forked_rows import window_forks
@@ -67,8 +67,8 @@ def window_shape(seq_len: int, *, pairs: int = 1, segments: int | None = None) -
     """A window's inputs and its finals, the tail of its halves' final ids (`dew.batch.Coordinates.finals`),
     for `pairs` pairs a window whose halves take at most `seq_len` ids: room for the pairs' ids, less the
     two finals the fewest pairs hold (one pair's two halves of `seq_len - 1` inputs each, a pair a window),
-    and two finals a pair; with `segments=1` (a model that reads one document a row), one half's, its ids
-    shifting by one (`PairWindows`)."""
+    and two finals a pair; with `segments=1` (a model that reads one document a row), one half's row, its
+    ids shifting by one (`PreferencePair`'s pair a row)."""
     if segments == 1:
         return seq_len - 1, 1
     return 2 * pairs * seq_len - 2, 2 * pairs
@@ -132,23 +132,32 @@ def pair_document(chosen: Sequence[int], rejected: Sequence[int], chosen_mask: S
 
 @dataclasses.dataclass(frozen=True)
 class PreferencePair(grain.MapTransform):
-    """A chosen and a rejected completion's ids and loss masks laid out as one document a window packs
-    (`pair_document`), each half at most `seq_len` ids, which the facts state (`seq_len`, a run's DPO row
-    width); with `share`, the prompt they begin with once."""
+    """A chosen and a rejected completion's ids and loss masks, each half at most `seq_len` ids, which the
+    facts state (`seq_len`, a run's DPO row width): a pair a row, its halves two rows of `seq_len` ids
+    padded with `pad_id` (`[2, seq_len]` ids, completion marks and real marks), what a model that reads one
+    document a row takes (`segments=1`); or, `packed`, one document a window packs (`pair_document`), with
+    `share` the prompt they begin with once."""
 
     seq_len: int = 256
     _: dataclasses.KW_ONLY
-    share: bool = True
+    pad_id: int = 0
+    packed: bool = dataclasses.field(default=False, repr=False, metadata={ADDED: True})
+    share: bool = dataclasses.field(default=True, repr=False, metadata={ADDED: True})
 
     def __post_init__(self) -> None:
         if self.seq_len < 1:
             raise ValueError("preference seq_len must be positive")
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        """A pair's document in place of its completions, one entry a token of its fields."""
+        """A pair's document in place of its completions, one entry a token of its fields, or its two rows
+        of `seq_len` ids and their marks."""
         rows = unshaped(facts, *FIELDS)
-        for key in TOKEN_FIELDS:
-            rows = shaped(rows, key, [None])
+        if self.packed:
+            for key in TOKEN_FIELDS:
+                rows = shaped(rows, key, [None])
+        else:
+            for key in (IDS_KEY, MASK_KEY, REAL_KEY):
+                rows = shaped(rows, key, [2, self.seq_len])
         return {**rows, "seq_len": self.seq_len}
 
     def map(self, element: Batch) -> Batch:
@@ -166,42 +175,14 @@ class PreferencePair(grain.MapTransform):
             halves[name] = (tokens, completion)
         kept = {key: value for key, value in element.items() if key not in FIELDS}
         (chosen, chosen_mask), (rejected, rejected_mask) = halves["chosen"], halves["rejected"]
-        return {**kept, **pair_document(chosen, rejected, chosen_mask, rejected_mask, share=self.share)}
-
-
-@dataclasses.dataclass(frozen=True)
-class PairWindows(grain.MapTransform):
-    """A pair's document (`PreferencePair`, its halves whole) as its two halves each in a window of `width`
-    of its own, the chosen first, on an axis of the pair's (`[2, width]` each key, `window`): what a model
-    that reads one document a row takes (`segments=1`), every row dealer keeping a pair whole."""
-
-    width: int
-
-    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        """A pair's two windows' keys in place of its document."""
-        rows = unshaped(facts, *TOKEN_FIELDS)
-        for key in (IDS_KEY, MASK_KEY, REAL_KEY, PAIRS_KEY, HALVES_KEY, POSITIONS_KEY):
-            rows = shaped(rows, key, [2, self.width])
-        return {**rows, "seq_len": self.width}
-
-    def map(self, element: Batch) -> Batch:
-        if np.any(np.asarray(element["pair_parents"]) > 0):
-            raise ValueError("a pair whose halves share their prompt is one document; lay its halves whole "
-                             "(share=False) to read them a row each")
-        whole = {name: np.asarray(element[name]) for name in TOKEN_FIELDS}
-        documents = whole["pair_documents"]
-        halves = []
-        for number in (1, 2):
-            taken = documents == number
-            size = int(taken.sum())
-            if size > self.width:
-                raise ValueError(f"a half of {size} tokens past its window of {self.width}")
-            fields = {name: np.zeros(self.width, values.dtype) for name, values in whole.items()}
-            for name, values in whole.items():
-                fields[name][:size] = values[taken]
-            halves.append(window(fields, (np.arange(self.width) < size).astype(np.int32), 1, share=False))
-        kept = {key: value for key, value in element.items() if key not in TOKEN_FIELDS}
-        return {**kept, **{key: np.stack([half[key] for half in halves]) for key in halves[0]}}
+        if self.packed:
+            return {**kept, **pair_document(chosen, rejected, chosen_mask, rejected_mask, share=self.share)}
+        ids = np.full((2, self.seq_len), self.pad_id, np.int32)
+        mask, real = np.zeros((2, self.seq_len), np.int32), np.zeros((2, self.seq_len), np.int32)
+        for row, (tokens, completion) in enumerate((halves["chosen"], halves["rejected"])):
+            ids[row, :len(tokens)], mask[row, :len(tokens)] = tokens, completion
+            real[row, :len(tokens)] = 1
+        return {**kept, IDS_KEY: ids, MASK_KEY: mask, REAL_KEY: real}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -216,6 +197,8 @@ class PreferenceWindows(grain.MapTransform):
     finals: int
     documents: int
     share: bool = True
+    pad_id: int = 0
+    """The id the model reads at a window's slots its pairs leave empty."""
 
     @property
     def width(self) -> int:
@@ -236,7 +219,8 @@ class PreferenceWindows(grain.MapTransform):
     def map(self, element: Batch) -> Batch:
         # The packed window's keys in its packed order, then each half's final moved to the tail.
         packed = window({name: np.asarray(element[name]) for name in TOKEN_FIELDS},
-                        np.asarray(element["text_segment_ids"]), self.documents, share=self.share)
+                        np.asarray(element["text_segment_ids"]), self.documents, share=self.share,
+                        pad_id=self.pad_id)
         documents = packed[DOCUMENTS_KEY]
         continued = set(np.asarray(packed.get(PARENTS_KEY, ())).tolist())
         # Each leaf document's last slot, a document no other continues: its half's final.
@@ -253,12 +237,13 @@ class PreferenceWindows(grain.MapTransform):
         order = np.concatenate([inputs, finals])
         slots = np.concatenate([np.arange(len(inputs)), self.inputs + np.arange(len(finals))])
 
-        def moved(values):
-            laid = np.zeros(self.width, values.dtype)
+        def moved(values, empty=0):
+            laid = np.full(self.width, empty, values.dtype)
             laid[slots] = values[order]
             return laid
 
-        laid = {key: value if key == PARENTS_KEY else moved(value) for key, value in packed.items()}
+        laid = {key: value if key == PARENTS_KEY else moved(value, self.pad_id if key == IDS_KEY else 0)
+                for key, value in packed.items()}
         kept = {key: value for key, value in element.items()
                 if key not in TOKEN_FIELDS and not key.endswith(("_segment_ids", "_positions"))}
         return {**kept, **laid}
@@ -272,16 +257,16 @@ def pack_of(inputs: int, finals: int, *, bins: int = PACK_BINS) -> Pack:
 
 
 def window(fields: Mapping[str, np.ndarray], pairs: np.ndarray, documents: int, *,
-           share: bool = True) -> dict[str, np.ndarray]:
+           share: bool = True, pad_id: int = 0) -> dict[str, np.ndarray]:
     """A window's batch keys from its pairs' packed `fields` (`TOKEN_FIELDS`, one entry a slot) and each
-    slot's pair (`pairs`, from 1, 0 on padding): the one layout `PreferenceWindows` and `windows` write,
-    its documents (`DOCUMENTS_KEY`) only where a window holds several, and their parents (`PARENTS_KEY`)
-    only where the pairs share their prompts."""
+    slot's pair (`pairs`, from 1, 0 on padding, whose ids are `pad_id`): the one layout `PreferenceWindows`
+    and `windows` write, its documents (`DOCUMENTS_KEY`) only where a window holds several, and their
+    parents (`PARENTS_KEY`) only where the pairs share their prompts."""
     pairs = np.asarray(pairs, np.int32)
     real = pairs > 0
     laid, parents = window_forks(pairs, np.where(real, fields["pair_documents"], 0),
                                  np.where(real, fields["pair_parents"], 0), documents)
-    keys = {IDS_KEY: np.where(real, fields["text"], 0).astype(np.int32),
+    keys = {IDS_KEY: np.where(real, fields["text"], pad_id).astype(np.int32),
             MASK_KEY: np.where(real, fields[MASK_KEY], 0).astype(np.int32),
             REAL_KEY: real.astype(np.int32), PAIRS_KEY: pairs,
             HALVES_KEY: np.where(real, fields[HALVES_KEY], 0).astype(np.int32),
@@ -293,7 +278,7 @@ def window(fields: Mapping[str, np.ndarray], pairs: np.ndarray, documents: int, 
 
 def windows(pairs: Sequence[Mapping[str, object]], seq_len: int, *, share: bool = True,
             segments: int | None = None, count: int | None = None, pairs_a_window: int = 1,
-            inputs: int | None = None, bins: int = PACK_BINS) -> Batch:
+            inputs: int | None = None, pad_id: int = 0, bins: int = PACK_BINS) -> Batch:
     """Preference records (`PreferencePair`'s, halves of at most `seq_len` ids) laid out as the
     `preferences` preset lays them, run on the host for a caller holding its pairs, stacked as a batch:
     packed first-fit with `bins` open windows, in their order, `pairs_a_window` at most a window, into
@@ -301,17 +286,17 @@ def windows(pairs: Sequence[Mapping[str, object]], seq_len: int, *, share: bool 
     with room for `pairs_a_window` of its longest pair's ids, its shared prompt once and its halves' rests,
     less the two finals in its tail
     (`window_shape`, the stream's packer, `first_fit_windows`); with `segments=1`, a pair a record, its
-    halves each in a window of `seq_len` (`PairWindows`), `count` pairs."""
-    share = share and segments != 1
-    step = PreferencePair(seq_len, share=share)
-    documents = [step.map(dict(pair)) for pair in pairs]
+    halves two rows of `seq_len` (`PreferencePair`), `count` pairs; every window's padding `pad_id`."""
     if segments == 1:
-        laid = [PairWindows(seq_len).map(document) for document in documents]
+        laid = [PreferencePair(seq_len, pad_id=pad_id).map(dict(pair)) for pair in pairs]
         held = len(laid) if count is None else count
         if held < len(laid):
             raise ValueError(f"{len(laid)} pairs, more than the {count} asked for")
-        laid += [{key: np.zeros_like(value) for key, value in laid[0].items()}] * (held - len(laid))
+        empty = {key: np.full_like(value, pad_id if key == IDS_KEY else 0) for key, value in laid[0].items()}
+        laid += [empty] * (held - len(laid))
     else:
+        step = PreferencePair(seq_len, packed=True, share=share)
+        documents = [step.map(dict(pair)) for pair in pairs]
         _, finals = window_shape(seq_len, pairs=pairs_a_window)
         if inputs is None:
             # Room for a window's pairs of the longest, their prompts once: their ids, less one pair's finals.
@@ -323,7 +308,7 @@ def windows(pairs: Sequence[Mapping[str, object]], seq_len: int, *, share: bool 
         if held < len(packed):
             raise ValueError(f"the pairs need {len(packed)} windows, more than the {count} asked for")
         empty = {name: np.zeros_like(value) for name, value in packed[0].items()}
-        laying = PreferenceWindows(inputs, finals, window_documents(pairs=pairs_a_window), share)
+        laying = PreferenceWindows(inputs, finals, window_documents(pairs=pairs_a_window), share, pad_id)
         laid = [laying.map(each) for each in packed + [empty] * (held - len(packed))]
     return {key: np.stack([each[key] for each in laid]) for key in laid[0]}
 

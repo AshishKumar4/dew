@@ -600,6 +600,36 @@ def test_an_adapted_products_fused_form_holds_check_1(generation_name, frozen):
 
 
 @INTERPRETS
+def test_an_adapted_products_fp32_cotangent_reaches_its_wide_gradients_unrounded():
+    """An adapted product into fp32 (`gemm.low_rank`) of bf16 rows, an fp32 master kernel and fp32 factors:
+    both operands' depths extended alike (at the rows' step, where the matrix's own fp32 step left them
+    unequal and no product took them), and its fp32 cotangent, 1 + 2^-12 everywhere (no bf16 holds it),
+    reaching the kernel's and the factors' gradients at its own precision, as the plain product's kernel
+    gradient takes it (`_kernel_gradient`): over ones, every sum exact, the rows' gradient zero (the kernel
+    and the first factor zero), the kernel's 128 (1 + 2^-12) and the first factor's 256 (1 + 2^-12), where
+    the cotangent narrowed to the rows' bf16 gave 128 and 256; the first factor's through the second factor
+    as the forward multiplied it, rounded to bf16."""
+    rows, depth, width, rank, scale = 128, 128, 256, 16, 2.0
+    x = jnp.ones((rows, depth), jnp.bfloat16)
+    w, a = jnp.zeros((depth, width), jnp.float32), jnp.zeros((depth, rank), jnp.float32)
+    # A master factor no bf16 holds (2^-8 (1 + 2^-9)), which the forward multiplies rounded to the rows'
+    # bf16, 2^-8, as its pullback must.
+    b = jnp.full((rank, width), 2.0 ** -8 * (1 + 2.0 ** -9), jnp.float32)
+    cotangent = jnp.full((rows, width), 1 + 2.0 ** -12, jnp.float32)
+
+    def fused(x, w, a, b):
+        return gemm.low_rank(x, w, a, b, scale, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    with generation.assumed("sm90"):
+        _, pull = jax.vjp(fused, x, w, a, b)
+        d_x, d_w, d_a, _ = pull(cotangent)
+    np.testing.assert_array_equal(np.asarray(d_x, np.float32), np.zeros((rows, depth), np.float32))
+    wide = 1 + 2.0 ** -12
+    np.testing.assert_array_equal(np.asarray(d_w), np.full((depth, width), rows * wide, np.float32))
+    np.testing.assert_array_equal(np.asarray(d_a), np.full((depth, rank), rows * scale * wide, np.float32))
+
+
+@INTERPRETS
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 @pytest.mark.parametrize("transpose_rhs", [False, True])
 def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_name, transpose_rhs):
@@ -657,7 +687,7 @@ def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs)
         # The derived tile, and the swapped one split in two where the family takes it, whichever the
         # derivation picks (row 4491).
         pinned = dataclasses.replace(tile, swapped=True, splits=2)
-        plain = dataclasses.replace(tile, swapped=False, splits=1, raster=0)
+        plain = dataclasses.replace(tile, swapped=False, splits=1)
         for config in {tile, *(each for each in (pinned, plain) if launch.legal(bound, each, target))}:
             jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
@@ -892,19 +922,29 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
 
 
-def test_a_band_that_reaches_every_column_tile_takes_them_all():
-    """`resources.band`: a wave spanning each group's row tiles whole reads a band as wide as the columns
-    allow, and where that reaches every column tile it takes them all, three or six of them, so no last
-    band walks the rows again (row 4053: the H100 grouped forward read its tokens twice, M-NS-3); below
-    them, and on a dense walk, a power of two."""
-    # Qwen3-30B-A3B's gate forward on an H100: 132 multiprocessors in pairs, 256-row cluster tiles, about
-    # two a group (65,536 rows over 128 experts).
-    for columns in (3, 6):
-        assert resources.band(132, 128, 128, columns, 2, cluster=2) == columns
-    assert resources.band(132, 128, 128, 64, 2, cluster=2) == 32
-    assert resources.band(132, 128, 128, 64) == 8
-    # A dense walk's three column tiles stay a power of two.
-    assert resources.band(132, 128, 256, 3) == 2
+@pytest.mark.parametrize("columns", [1, 3, 5, 6, 8, 64])
+@pytest.mark.parametrize("group_row_tiles", [None, 1, 2, 4], ids=["dense", "1", "2", "4"])
+def test_a_band_walks_every_tile_once_and_reads_a_groups_rows_once_where_a_wave_holds_them(columns,
+                                                                                           group_row_tiles):
+    """`resources.band` over Qwen3-30B-A3B's H100 gate forward's facts (132 multiprocessors in pairs, 256-row
+    cluster tiles, 128 x 128 tiles), whatever band it derives: the band is one to every column tile, and the
+    planar snake at it walks every output tile once; a dense walk's band is a power of two (its snake's
+    division by another count spilled a 128 x 256 kernel gradient, NS4053-1); and where a wave's programs
+    hold every column tile of a group's row tiles, its band takes them all, so the walk reads each group's
+    rows once and no last band walks them again (row 4053: the H100 grouped forward's three or six column
+    tiles read its tokens twice, M-NS-3)."""
+    multiprocessors, cluster = 132, 2
+    band = resources.band(multiprocessors, 128, 128, columns, group_row_tiles, cluster=cluster)
+    assert 1 <= band <= columns, band
+    if group_row_tiles is None:
+        assert band & (band - 1) == 0, band
+    elif multiprocessors // cluster >= group_row_tiles * columns:
+        assert -(-columns // band) == 1, band
+    rows = 2 * (group_row_tiles or 3)
+    walk = jax.vmap(lambda index: tail.planar_snake(index, (rows, columns), 1, band))(
+        jnp.arange(rows * columns, dtype=jnp.int32))
+    assert sorted(zip(*(np.asarray(side).tolist() for side in walk), strict=True)) == [
+        (row, column) for row in range(rows) for column in range(columns)]
 
 
 @pytest.mark.parametrize("dynamic", [False, True], ids=["static", "traced"])
@@ -1025,6 +1065,32 @@ def test_a_dense_forwards_balanced_tail_holds_check_1_through_its_hooks(rows, de
 
 
 @INTERPRETS
+def test_a_dense_depth_split_whose_last_wave_would_balance_walks_its_runs():
+    """A dense product split in two (`Tiles.splits`) on the Hopper part of 8 multiprocessors whose last wave
+    of 11 output tiles a balanced tail takes unsplit (`mosaic_gpu.balanced_tail`, its hand-off unmeasured):
+    the split walks its runs, each into its own slice of the partials (no tail beside it, which left the
+    runs unscheduled and stored a run's slices through a 2-D store), and over small integers sums bitwise
+    the unsplit launch's."""
+    rows, depth, width = 1408, 128, 128
+    target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
+    grid = (-(-rows // COOPERATIVE.block_m), width // COOPERATIVE.block_n)
+    assert mosaic_gpu.balanced_tail(COOPERATIVE, grid, depth // COOPERATIVE.block_k, (2, 2), target,
+                                    8) is not None
+    keys = jax.random.split(jax.random.key(6))
+    x = jax.random.randint(keys[0], (rows, depth), -3, 4).astype(jnp.bfloat16)
+    w = jax.random.randint(keys[1], (depth, width), -3, 4).astype(jnp.bfloat16)
+
+    def dew(splits):
+        return mosaic_gpu.gmm(x, w[None], jnp.asarray([rows], jnp.int32),
+                              tiles=dataclasses.replace(COOPERATIVE, splits=splits), transpose_rhs=False,
+                              out_dtype=jnp.bfloat16, multiprocessors=8, interpret=grouped_matmul.INTERPRETED,
+                              dense=True)
+
+    with generation.assumed(target):
+        np.testing.assert_array_equal(np.asarray(dew(2), np.float32), np.asarray(dew(1), np.float32))
+
+
+@INTERPRETS
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 @pytest.mark.parametrize("transpose_rhs", [False, True])
 def test_a_dense_products_depth_split_sums_its_partials_once(generation_name, transpose_rhs):
@@ -1056,52 +1122,6 @@ def test_a_dense_products_depth_split_sums_its_partials_once(generation_name, tr
         for refused in ({"splits": 2, "epilogue": lambda acc: acc * 2}, {"splits": 4}):
             with pytest.raises(ValueError):
                 dew(refused.pop("splits"), **refused)
-
-
-@INTERPRETS
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
-def test_a_met_dense_walk_sums_as_its_walk_apart(generation_name):
-    """A dense product whose programs meet along the depth each two steps (`Tiles.raster`, M-FS-6's K-chunked
-    raster) walks its tiles in persistent rounds, each tile's steps in their order: over small integers,
-    bitwise the walk apart's, over two rounds (the last short) on each family; a met walk of exact sums is
-    refused."""
-    rows, depth, width = 264, 320, 256
-    keys = jax.random.split(jax.random.key(5))
-    x = jax.random.randint(keys[0], (rows, depth), -3, 4).astype(jnp.bfloat16)
-    w = jax.random.randint(keys[1], (depth, width), -3, 4).astype(jnp.bfloat16)
-    tiles = (COOPERATIVE if generation_name == "sm90"
-             else mosaic_gpu.Tiles(128, 128, 64, 3, 1, family="mma.sync"))
-
-    def dew(raster, **options):
-        return mosaic_gpu.gmm(x, w[None], jnp.asarray([rows], jnp.int32),
-                              tiles=dataclasses.replace(tiles, raster=raster), transpose_rhs=False,
-                              out_dtype=jnp.bfloat16, multiprocessors=4, interpret=grouped_matmul.INTERPRETED,
-                              dense=True, **options)
-
-    with generation.assumed(generation_name):
-        np.testing.assert_array_equal(np.asarray(dew(2), np.float32), np.asarray(dew(0), np.float32))
-        with pytest.raises(ValueError):
-            dew(2, exact_sums=True)
-
-
-@pytest.mark.parametrize("generation_name", ["sm90"])
-def test_a_met_dense_walk_lowers_for_cuda(generation_name):
-    """A dense product's derived tile made met (`Tiles.raster`: its programs signalling and waiting on a
-    GPU-scope semaphore a round each chunk of steps, `mosaic_gpu._met`) lowers for CUDA on the CPU on a family
-    whose programs meet across programs (`Family.fixes_up`)."""
-    rows, depth, width = 2048, 4096, 2048
-    launch = grouped_matmul.MosaicGmm()
-    args = (jax.ShapeDtypeStruct((rows, depth), jnp.bfloat16),
-            jax.ShapeDtypeStruct((1, depth, width), jnp.bfloat16), jax.ShapeDtypeStruct((1,), jnp.int32))
-    options = {"out_dtype": "bfloat16", "trans_rhs": False, "interpret": False, "dense": True}
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
-    with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
-        bound, target = launch.bind(*args, **options), generation.gpu_target()
-        tile = launch.derived(bound, target)
-        met = dataclasses.replace(tile, raster=8, cluster=1)
-        assert launch.legal(bound, met, target), met
-        jax.jit(functools.partial(launch.replace(config=met), **options)).trace(*args).lower(
-            lowering_platforms=("cuda",))
 
 
 def a_dense_products_exact_sums_survive_one_row_tile():

@@ -7,14 +7,12 @@
 #include <cuda_runtime.h>
 
 #include <string>
+#include <utility>
 
 #include "grouped.h"
 #include "xla/ffi/api/ffi.h"
 
 namespace ffi = xla::ffi;
-
-// The CUDA architectures the library holds grouped kernels for, CMake's list joined by commas ("90a-real").
-extern "C" const char* dew_cutlass_architectures() { return DEW_CUTLASS_ARCHITECTURES; }
 
 namespace dew_cutlass {
 namespace {
@@ -105,6 +103,30 @@ void zero_empty_groups(void* out, int64_t block_bytes, const int32_t* group_size
 }
 
 }  // namespace dew_cutlass
+
+// The kernels the library instantiates, one an architecture and output dtype (dew_cutlass.KERNELS), each as
+// its file's instantiated types state it (`Instantiated`): "architecture,dtype,rows,columns,depth,stages,
+// consumers,cluster,instructions" entries joined by semicolons.
+extern "C" const char* dew_cutlass_kernels() {
+  static const std::string described = [] {
+    std::string entries;
+    const auto add = [&entries](const char* architecture, const char* dtype,
+                                const dew_cutlass::Instantiated& kernel) {
+      entries += std::string(entries.empty() ? "" : ";") + architecture + "," + dtype + "," +
+                 std::to_string(kernel.rows) + "," + std::to_string(kernel.columns) + "," +
+                 std::to_string(kernel.depth) + "," + std::to_string(kernel.stages) + "," +
+                 std::to_string(kernel.consumers) + "," + std::to_string(kernel.cluster) + "," +
+                 kernel.instructions;
+    };
+    for (const auto& [result, dtype] : {std::pair{dew_cutlass::Dtype::kBF16, "bfloat16"},
+                                        std::pair{dew_cutlass::Dtype::kF32, "float32"}}) {
+      add("sm80", dtype, dew_cutlass::sm80_kernel(result));
+      add("sm90", dtype, dew_cutlass::sm90_kernel(result));
+    }
+    return entries;
+  }();
+  return described.c_str();
+}
 
 namespace {
 

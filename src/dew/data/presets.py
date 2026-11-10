@@ -281,7 +281,7 @@ def _rendered_prompts(dataset: Dataset, tokenizer: str | SavedTokenizer, max_pro
 
 
 def preferences(dataset: Dataset, *, seq_len: int, batch: int | None, share: bool = True,
-                segments: int | None = None, pairs: int = 1, bins: int = PACK_BINS,
+                segments: int | None = None, pairs: int = 1, pad_id: int = 0, bins: int = PACK_BINS,
                 cache: str | Cached | None = None, records: int | None = None,
                 host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Preference pairs of token ids, chosen and rejected, each half at most `seq_len` tokens with its
@@ -293,10 +293,11 @@ def preferences(dataset: Dataset, *, seq_len: int, batch: int | None, share: boo
     `host` and `cache` as `images` takes them). A run whose model draws dropout in training lays its
     halves whole (`share=False`, `TokenScorer.shares_prefixes`). `segments=1`, for a model that reads one
     document a row, lays each pair a record, its halves each in a window of `seq_len` on an axis of the
-    pair's (`preferences.PairWindows`), so whatever deals a batch's rows deals whole pairs, in batches of
-    `batch` pairs. No tokenizer: a pair of raw text is tokenized by a step before it."""
+    pair's (`preferences.PreferencePair`, main's pair a row), so whatever deals a batch's rows deals whole
+    pairs, in batches of
+    `batch` pairs. Every window's padding is `pad_id`, the id the model reads where its pairs leave slots
+    empty. No tokenizer: a pair of raw text is tokenized by a step before it."""
     from dew.data.preferences import (
-        PairWindows,
         PreferencePair,
         PreferenceWindows,
         pack_of,
@@ -304,13 +305,14 @@ def preferences(dataset: Dataset, *, seq_len: int, batch: int | None, share: boo
         window_shape,
     )
 
-    shared = share and segments != 1
-    laid = _cached(dataset.map(PreferencePair(seq_len, share=shared)), cache)
     if segments == 1:
-        return _finished(laid.map(PairWindows(seq_len)), batch=batch, records=records, host=host)
+        laid = _cached(dataset.map(PreferencePair(seq_len, pad_id=pad_id)), cache)
+        return _finished(laid, batch=batch, records=records, host=host)
+    laid = _cached(dataset.map(PreferencePair(seq_len, packed=True, share=share)), cache)
     inputs, finals = window_shape(seq_len, pairs=pairs)
     packed = laid._then(pack_of(inputs, finals, bins=bins))
-    return _finished(packed.map(PreferenceWindows(inputs, finals, window_documents(pairs=pairs), shared)),
+    return _finished(packed.map(PreferenceWindows(inputs, finals, window_documents(pairs=pairs), share,
+                                                  pad_id)),
                      batch=batch, records=records, host=host)
 
 

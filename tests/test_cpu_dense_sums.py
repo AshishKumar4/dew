@@ -238,6 +238,23 @@ def test_a_grouped_gemms_float32_products_on_a_cpu_sum_each_groups_as_its_dense_
                                       np.asarray(pairwise.pairwise_dot_general(x.T, dy, numbers)))
 
 
+def test_a_grouped_float32_product_of_no_rows_is_the_empty_product():
+    """A grouped float32 projection of no rows over two groups on a CPU in fixed float32 sums (`gemm.gemm`,
+    `gemm.gemm_t`, their pairwise sums): its output and input gradient no rows, and its kernel gradient, each
+    group's contraction over no rows, zero for every group, the empty product XLA's own ragged dot gives."""
+    tokens, cotangent = jnp.zeros((0, 40), jnp.float32), jnp.zeros((0, 16), jnp.float32)
+    kernel = jnp.asarray(np.random.default_rng(5194).integers(-3, 4, size=(2, 40, 16)), jnp.float32)
+    sizes = jnp.zeros((2,), jnp.int32)
+    with jax.default_matmul_precision(precision.FP32_SUMS):
+        out, pull = jax.vjp(lambda t, k: gemm.gemm(t, k, sizes, out_dtype=jnp.float32), tokens, kernel)
+        pulled_tokens, pulled_kernel = pull(cotangent)
+        gradient = jax.jit(lambda t, c: gemm.gemm_t(t, c, sizes, out_dtype=jnp.float32))(tokens, cotangent)
+    for got, want in ((out, cotangent), (pulled_tokens, tokens), (pulled_kernel, jnp.zeros_like(kernel)),
+                      (gradient, jnp.zeros_like(kernel))):
+        assert got.dtype == want.dtype
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_grouped_float32_projection_on_an_explicit_data_split_traces_and_places_as_xlas():
     """A float32 grouped projection, its input gradient and its kernel gradient (`gemm.gemm`, `gemm.gemm_t`,

@@ -3,6 +3,7 @@
 // a prepare kernel writes from the group sizes (GroupScheduleMode::kDeviceOnly), so a call never reads the
 // group sizes on the host.
 #include "grouped.h"
+#include "groups.cuh"
 
 #include "cutlass/cutlass.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
@@ -55,20 +56,6 @@ struct Kernel {
   };
 };
 
-// The groups' first rows, a serial scan in shared memory by one thread: a call's groups are few (a model's
-// experts), and the prepare kernel runs once a call.
-__device__ void scanned(const int32_t* group_sizes, int groups, int64_t* starts) {
-  if (threadIdx.x == 0) {
-    int64_t start = 0;
-    for (int i = 0; i < groups; ++i) {
-      starts[i] = start;
-      start += group_sizes[i];
-    }
-    starts[groups] = start;
-  }
-  __syncthreads();
-}
-
 // The forward's (and dx's) groups: group i is rows starts[i] to starts[i + 1] of x and out, times w[i]
 // (k x n row-major, or under `transpose_w` its [n, k] transpose, column-major with leading dimension k).
 template <class K>
@@ -109,14 +96,6 @@ __global__ void prepare_grouped_k(typename K::Arrays arrays, const typename K::A
   }
 }
 
-template <class T>
-T* carved(char*& cursor, int count) {
-  // Each array 128-byte aligned, as the kernel's vectorized loads want.
-  T* array = reinterpret_cast<T*>(cursor);
-  cursor += (sizeof(T) * count + 127) / 128 * 128;
-  return array;
-}
-
 // One call of kernel K: the group arrays carved from scratch, written by `prepare` on the stream, then the
 // GEMM over as many programs as the device's multiprocessors hold at once, each walking the groups' tiles in
 // turn (CUTLASS's device-side problem visitor).
@@ -124,8 +103,9 @@ template <class K, class Prepare>
 const char* run(Prepare prepare, const void* lhs, const void* rhs, void* out, const int32_t* group_sizes,
                 int groups, int k, int n, bool transpose_w, cudaStream_t stream, const Allocate& allocate,
                 int multiprocessors) {
-  const std::size_t bytes =
-      7 * 128 + groups * (sizeof(GemmCoord) + 3 * sizeof(void*) + 3 * sizeof(typename K::Index));
+  const std::size_t bytes = carved_bytes<GemmCoord>(groups) + carved_bytes<typename K::A*>(groups) +
+                            carved_bytes<typename K::B*>(groups) + carved_bytes<typename K::D*>(groups) +
+                            3 * carved_bytes<typename K::Index>(groups);
   char* cursor = static_cast<char*>(allocate(bytes));
   if (cursor == nullptr) return "the scratch allocator has no room for the groups' arrays";
   typename K::Arrays arrays{carved<GemmCoord>(cursor, groups), carved<typename K::A*>(cursor, groups),
@@ -176,7 +156,23 @@ const char* grouped_k_typed(const GroupedK& call, cudaStream_t stream, const All
                 static_cast<int>(call.k), static_cast<int>(call.n), false, stream, allocate, multiprocessors);
 }
 
+// Its instantiation's geometry (`Instantiated`): the threadblock's MMA's tile and stages, the warps of its
+// threadblock, one block a cluster.
+template <class K>
+Instantiated instantiated() {
+  using Mma = typename K::GemmKernel::Mma;
+  return {Mma::Shape::kM, Mma::Shape::kN, Mma::Shape::kK, Mma::kStages, K::GemmKernel::kThreadCount, 1,
+          "mma.sync"};
+}
+
 }  // namespace
+
+Instantiated sm80_kernel(Dtype result) {
+  // Every layout of a result's kernel instantiates the same tile, stages and warps.
+  using BF16 = cutlass::bfloat16_t;
+  return result == Dtype::kF32 ? instantiated<Kernel<BF16, float, RowMajor, RowMajor>>()
+                               : instantiated<Kernel<BF16, BF16, RowMajor, RowMajor>>();
+}
 
 const char* sm80_grouped(const Grouped& call, cudaStream_t stream, const Allocate& allocate, int device,
                          int multiprocessors) {

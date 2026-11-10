@@ -142,6 +142,21 @@ def test_a_module_that_declares_all_needs_its_own_page(gen_api, documented):
     assert (gen_api.Why.EXPORTER_WITHOUT_PAGE, page, page, "") in found(gen_api, without)
 
 
+def test_a_module_listed_in_two_groups_is_refused(gen_api, tmp_path):
+    """A module is one page in one group: a package listing one twice, in one group or two, is refused, as the
+    page and the sidebar would carry it twice (review: `dew.kernels` was twice among Models)."""
+    with pytest.raises(SystemExit):
+        gen_api.Package("example", tmp_path, "https://example.org/",
+                        [("A", ["example", "example.twice"]), ("B", ["example.twice"])])
+    with pytest.raises(SystemExit):
+        gen_api.Package("example", tmp_path, "https://example.org/",
+                        [("A", ["example.twice", "example.twice"])])
+    # Listed once each, it is a package.
+    groups = [("A", ["example"]), ("B", ["example.two"])]
+    package = gen_api.Package("example", tmp_path, "https://example.org/", groups)
+    assert package.pages == ["example", "example.two"]
+
+
 @pytest.fixture
 def reference_package(gen_api, tmp_path, monkeypatch):
     source = tmp_path / "src" / "example"

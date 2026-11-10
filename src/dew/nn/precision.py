@@ -60,7 +60,7 @@ from dew.nn.derivatives import (
     surrogate,
 )
 from dew.nn.nested import nested
-from dew.nn.programs import equations
+from dew.nn.programs import equations, purely_called
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -743,9 +743,11 @@ def _summed_pairwise(product: Callable, preferred_element_type, *operands) -> ja
 
 
 def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
-    """`jaxpr` evaluated on `operands`, each `dot_general` in it, a jit's program's included (`jnp.einsum`'s),
-    and each grouped GEMM's `ragged_dot_general`, the product `projection_product` takes where it takes it: a
-    CPU's vectorized-dot sum of float32 operands into float32."""
+    """`jaxpr` evaluated on `operands`, each `dot_general` in it, a call's program's included where the
+    call does nothing but run it (`dew.nn.programs.purely_called`: `jnp.einsum`'s jit), and each grouped
+    GEMM's `ragged_dot_general`, the product `projection_product` takes where it takes it: a CPU's
+    vectorized-dot sum of float32 operands into float32. A call that does more than its program (a custom
+    batching rule's, a checkpoint's, in a product's own callback) is bound as it is, its rule kept."""
     values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, operands, strict=True))
 
     def read(atom):
@@ -754,9 +756,8 @@ def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
     for equation in jaxpr.eqns:
         given = [read(atom) for atom in equation.invars]
         params = equation.params
-        inner = params.get("jaxpr")
         product = functools.partial(jax.lax.dot_general, out_sharding=params.get("out_sharding"))
-        made = None
+        made, body = None, purely_called(equation)
         if equation.primitive is jax.lax.dot_general_p:
             made = projection_product(product, given[0], given[1], params["dimension_numbers"],
                                       params["precision"], params["preferred_element_type"])
@@ -767,9 +768,8 @@ def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
                 params["preferred_element_type"], group_sizes=given[2])
         if made is not None:
             outputs = [made]
-        elif equation.primitive.name in ("jit", "pjit") and isinstance(inner, core.Jaxpr):
-            # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).
-            outputs = _paired(inner, inner.consts, *given)
+        elif body is not None:
+            outputs = _paired(body, body.consts, *given)
         else:
             # As JAX evaluates an equation (`jax.core.eval_jaxpr`): its context, its bind's parameters.
             with equation.ctx.manager:

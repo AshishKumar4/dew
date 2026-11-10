@@ -242,7 +242,9 @@ def fork_key_places(metadata: AttentionMetadata, rotary_positions, first: jax.Ar
     rotary position, and the row's cached tokens before them counted back from the place of the call's
     roots, the least of its tokens' (the cache's last document continuing into them, one token a place)."""
     positions = jnp.broadcast_to(jnp.asarray(rotary_positions, jnp.int32), (batch, queries))
-    real = jnp.asarray(coordinates_of(metadata, batch, queries).valid, bool)
+    valid = coordinates_of(metadata, batch, queries).valid
+    # A call that states no validity holds real tokens alone (`fork_runs`).
+    real = jnp.ones((batch, queries), bool) if valid is None else jnp.asarray(valid, bool)
     slots = jnp.arange(keys, dtype=jnp.int32)[None, :]
     root = jnp.min(jnp.where(real, positions, jnp.iinfo(jnp.int32).max), axis=-1, keepdims=True)
     written = first[:, None] + jnp.cumsum(real, axis=-1, dtype=jnp.int32) - 1

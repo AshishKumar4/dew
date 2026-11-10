@@ -72,10 +72,6 @@ from dew.nn.linear import (
     DepthwiseConv1d,
     decode_kernel,
     decode_step,
-    fork_cache,
-    fork_start,
-    forked_conv,
-    forked_scan,
     fused_token,
     held_scan,
     over_sequence,
@@ -394,22 +390,7 @@ class Mamba2(nn.Module):
             state_size=self.state_size, chunk_size=self.chunk_size,
             time_step_limit=self.time_step_limit)
         shards = sequence_shards()
-        if tokens.forks is not None:
-            if shards > 1:
-                raise LayoutRefused("documents that continue another are read whole in their rows; a "
-                                    "sequence axis splits them")
-
-            def forked_rule(convolved, *, valid, starts, state, entered):
-                return scan(convolved, dt, heads, starts=starts, valid=valid, held=state, entered=entered)
-
-            history, held = fork_cache(self, 'ssm_state') if decode else (None, None)
-            convolved = forked_conv(mixed, taps, tokens, history=history, bias=bias, dtype=compute)
-            out = forked_scan(convolved, forked_rule, tokens,
-                              fork_start(held, (batch, self.num_heads, self.state_size, self.head_dim), wide))
-            if valid is not None:
-                out = jnp.where(valid[:, :, None], out, 0)
-            return self.out_proj(self._gated(out, gate))
-        if shards > 1:
+        if shards > 1 and tokens.forks is None:
             if decode:
                 raise LayoutRefused(
                     f"mamba2 under a sequence axis of {shards} runs whole training sequences; a decode "
@@ -423,9 +404,9 @@ class Mamba2(nn.Module):
             return self.out_proj(self._gated(out, gate))
         state = (self.num_heads, self.state_size, self.head_dim)
         token = None
-        if decode and length == 1 and decode_kernel(jax.ShapeDtypeStruct((batch, *state), wide),
-                                                    groups=self.n_groups, fuses=True,
-                                                    normed=False) == 'fused':
+        if decode and length == 1 and tokens.forks is None and decode_kernel(
+                jax.ShapeDtypeStruct((batch, *state), wide), groups=self.n_groups, fuses=True,
+                normed=False) == 'fused':
             token = self._fused_token(taps, bias, dt, valid, tokens.starts)
         out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads), state,
                         decode=decode, coordinates=tokens, state_dtype=wide, conv_dtype=wide,

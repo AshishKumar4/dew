@@ -84,6 +84,7 @@ from dew.mesh import logical_spec
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 from dew.nn.kernels import launches
 
+from .. import programs
 from ..precision import (
     activation_and_slope,
     at_least_fp32,
@@ -302,7 +303,8 @@ def elementwise(function, shape: tuple[int, ...]) -> bool:
                     or any(not isinstance(aval, ShapedArray) or aval.shape not in (tuple(shape), ())
                            for aval in avals)):
                 return False
-            if not all(mapped(inner) for inner in equation.params.values() if isinstance(inner, core.Jaxpr)):
+            # Every program it runs within it, a call's or a branch's (`programs.bodies`), mapped too.
+            if not all(mapped(inner) for inner in programs.bodies(equation)):
                 return False
         return True
 
@@ -365,19 +367,20 @@ def _on_tile(jaxpr: core.Jaxpr, consts, logical: tuple, tile: tuple, *args) -> l
     def read(atom):
         return atom.val if isinstance(atom, core.Literal) else values[atom]
 
-    def retargeted(value):
-        if isinstance(value, tuple) and tuple(value) == logical:
-            return tuple(tile)
-        if isinstance(value, core.Jaxpr):
-            avals = [jax.ShapeDtypeStruct(tile if aval.shape == logical else aval.shape, aval.dtype)
-                     for aval in value.in_avals if isinstance(aval, ShapedArray)]
-            return jax.make_jaxpr(
-                lambda *operands: _on_tile(value, value.consts, logical, tile, *operands))(*avals)
-        return value
+    def shaped(value):
+        return tuple(tile) if isinstance(value, tuple) and tuple(value) == logical else value
+
+    def retraced(program: core.Jaxpr):
+        avals = [jax.ShapeDtypeStruct(tile if aval.shape == logical else aval.shape, aval.dtype)
+                 for aval in program.in_avals if isinstance(aval, ShapedArray)]
+        return jax.make_jaxpr(
+            lambda *operands: _on_tile(program, program.consts, logical, tile, *operands))(*avals)
 
     for equation in jaxpr.eqns:
         given = [read(atom) for atom in equation.invars]
-        params = {key: retargeted(value) for key, value in equation.params.items()}
+        # Each program it runs within it, a call's or each branch's (`programs.with_bodies`), retraced.
+        params = programs.with_bodies({key: shaped(value) for key, value in equation.params.items()},
+                                      retraced)
         with equation.ctx.manager:
             made = equation.primitive.bind(*given, **equation.primitive.get_bind_params(params))
         outputs = made if equation.primitive.multiple_results else [made]
