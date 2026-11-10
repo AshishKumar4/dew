@@ -46,6 +46,7 @@ from transformers.models.mamba2.modeling_mamba2 import (
 )
 
 from _dew_torch.precision import float64
+from _dew_torch.rounding import rounding_scale
 
 SSD = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mamba2"
 SEED = 2024
@@ -231,16 +232,17 @@ def scan_reference(site, inputs, dtype) -> dict[str, np.ndarray]:
     return {"output": torch.cat(outputs).numpy(), "final": torch.cat(finals).numpy()}
 
 
-def layer_reference(site, inputs, dtype) -> dict[str, np.ndarray]:
+def layer_reference(site, inputs, dtype, layer=None) -> dict[str, np.ndarray]:
     """Transformers' mixer on a drawn layer as each site compares it (`ssd_support.mamba2_layer_site_run`'s
     shapes): 'layer' the mixer over the hidden states, 'layer_bf16' with its weights cast too, 'decoded' its
     forwards at a cached decode's widths, 'padded' each row closed, 'packed' each document alone, 'tangent'
-    its JVP along the drawn direction (`torch.func.jvp`)."""
+    its JVP along the drawn direction (`torch.func.jvp`); over `layer` where it is built already (`_mixer`),
+    as a rounding scale runs the computation alone."""
     import ssd_support as support
 
     # The bf16 site's narrow run in bfloat16 end to end; its truth, as every site's, in `dtype` (float64).
     dtype = torch.bfloat16 if site == "layer_bf16" and dtype == torch.float32 else dtype
-    layer = _mixer(inputs, dtype)
+    layer = _mixer(inputs, dtype) if layer is None else layer
     hidden = torch.from_numpy(inputs["hidden"]).to(dtype)
 
     def on(x):
@@ -297,29 +299,25 @@ c868cbbc6), the tangent's 24 tokens of one row and the tiny model's (eight wide)
 
 WEIGHED = frozenset({"tangent"})
 """The sites that declare check 1's weighed check (`assert_as_exact`'s `conditioning`), recorded whole with
-its own seeds past the unweighted check's, their rounding scale read from transformers' computation
-transcribed in JAX (`ssd_support.transformers_tangent`): the tangent's SSD scan output cancels on some
-tokens, which every arm's rounding amplifies unevenly, so its unweighted pool stays heavy-tailed at any
-count (row 5287)."""
+its own seeds and each draw's rounding scale, transformers' own computation's (its float64 twin with every
+operation tapped, `_dew_torch.rounding.rounding_scale`): the tangent's SSD scan output cancels on
+some tokens, which every arm's rounding amplifies unevenly, so its unweighted pool stays heavy-tailed at
+any count (row 5287)."""
 
 
 def _recorded(site, draw, twin, reference) -> dict[str, np.ndarray]:
     """A site's recording (`record_case`): `reference(site, inputs, dtype)` in fp32 and in torch float64 on
     each draw, Dew's float64 `twin(site, inputs)` held to the latter at every seed (the test's truth, Dew's
     float64 path, `indexed_recording`'s `truth_fn`); sized paired with Dew's arm at `PAIRED`'s sites; at
-    `WEIGHED`'s, recorded whole with the weighed check's seeds, transformers' transcribed computation held
-    to its float64 run at every seed too."""
+    `WEIGHED`'s, recorded whole with the weighed check's seeds and each draw's rounding scale, the
+    reference's float64 run with every operation tapped (`rounding_scale`) in float32's unit."""
     import jax
-    import ssd_support as support
     from recorded_references import record_case
     from reference_error import assert_computes_the_oracle, chain_roundings, widened
 
     exact_run = jax.jit(lambda inputs: twin(site, inputs))
-    transcribed = jax.jit(support.transformers_tangent) if site in WEIGHED else None
     with jax.enable_x64(new_val=True):
         roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(draw(0))))
-        copied_roundings = (None if transcribed is None
-                            else chain_roundings(jax.make_jaxpr(transcribed)(widened(draw(0)))))
 
     def evaluate(inputs):
         with torch.no_grad():
@@ -331,17 +329,18 @@ def _recorded(site, draw, twin, reference) -> dict[str, np.ndarray]:
         for name, value in exact.items():
             assert_computes_the_oracle(found[name], value, f"transformers float64 {site} {name}",
                                        roundings=roundings)
-            if transcribed is not None:
-                with jax.enable_x64(new_val=True):
-                    copied = np.asarray(transcribed(widened(inputs))[name])
-                assert_computes_the_oracle(copied, value, f"transformers {site} {name} transcribed",
-                                           roundings=copied_roundings)
         return narrow, exact
+
+    def scale(inputs, seed):
+        # The mixer built first: its construction's initializers are no step of the computation weighed.
+        unit = np.finfo(np.float32).eps / 2
+        with torch.no_grad(), float64():
+            built = _mixer(inputs, torch.float64)
+            return rounding_scale(lambda: layer_reference(site, inputs, torch.float64, built), unit, seed)[1]
 
     if site in WEIGHED:
         return record_case(site, draw, evaluate, store_inputs=False,
-                           dew=jax.jit(lambda inputs: twin(site, inputs)),
-                           conditioning_program=lambda index, inputs: support.transformers_tangent(inputs))
+                           dew=jax.jit(lambda inputs: twin(site, inputs)), scale=scale)
     if site in PAIRED:
         return record_case(site, draw, evaluate, store_inputs=False, summary=True,
                            dew=jax.jit(lambda inputs: twin(site, inputs)))
