@@ -179,22 +179,6 @@ def _hooks_lower(ba, dtype, rules) -> bool:
                         tiles('epilogue_operands', hooks.epilogue_axes), rules))
 
 
-def _evaluates_exponential(ba) -> bool:
-    """Whether the launch's epilogue evaluates a function of the special-function units
-    (`dew.algebra.cost.EXPONENTIALS`), traced on 128-wide tiles as `_hooks_lower` traces it."""
-    from dew.algebra.cost import EXPONENTIALS
-
-    hooks = ba.arguments['hooks']
-    if hooks.epilogue is None:
-        return False
-    sides = [jax.ShapeDtypeStruct((128,) * len(axes), side.dtype)
-             for side, axes in zip(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes,
-                                   strict=True)]
-    accumulators = (jax.ShapeDtypeStruct((128, 128), jnp.float32),) * hooks.accumulators
-    return any(equation.primitive.name in EXPONENTIALS
-               for equation in equations(jax.make_jaxpr(hooks.after())(*accumulators, *sides).jaxpr))
-
-
 def _output_bytes(ba) -> int:
     """The bytes of one output element of each of the launch's outputs, together."""
     return sum(jnp.dtype(dtype).itemsize
@@ -772,13 +756,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         tiles = sum(len(held_axes(axes)) > 1 for axes in hooks.epilogue_axes) * accumulator
         held = sum(-(-accumulator * jnp.dtype(dtype).itemsize // 4)
                    for dtype in (hooks.out_dtypes or ())[:-1])
-        # An exponential the epilogue evaluates over the chunk (`dew.algebra.cost.EXPONENTIALS`) holds the
-        # values its exact lowering keeps live at its peak (`resources.EXACT_EXPONENTIAL_LIVE`), the kernels
-        # compiling without approximate math: a paired SwiGLU's sigmoid over its 128 x 128 epilogue spilled
-        # 96 bytes beside a model without them (FS-SWIGLU-BEFORE2).
-        exponential = resources.EXACT_EXPONENTIAL_LIVE * accumulator if _evaluates_exponential(ba) else 0
         stage = max(staging, resources.CONTROL_REGISTERS) + vectors
-        return max(0, stage - family.held_registers) + tiles + held + exponential
+        return max(0, stage - family.held_registers) + tiles + held
 
     def register_budget(self, config: mosaic_gpu.Tiles) -> int:
         # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`); none on a
