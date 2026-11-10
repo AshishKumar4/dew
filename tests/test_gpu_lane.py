@@ -321,12 +321,16 @@ def test_a_tier_cut_group_is_admitted_on_its_files_whole_measure_and_no_need_is_
             stored[at] = json.dumps({"key": None, "depends": ["tests/test_long.py"], "row": {}, "reads": [],
                                      "peak": peak, "shares": 0, "pools": 0}).encode()
 
+    out = tmp_path / "verdict.json"
+    # Measured on no class: given the whole share, as every such file is, and no need said, as none is known.
+    assert ci.gpu_lane("3.12", ["tests/test_long.py#1/2"], out, cache="on", processes=1, deadline=600.0) == 0
+    [row] = json.loads(out.read_text())["rows"]
+    assert float(lane_runs(tmp_path, "test_long")[-1][0]) == 0.5 and "admitted at" not in row["output"]
     # Its group 1/2 measured small under an earlier cut; the whole file at 8 GiB.
     measured("3.12:tests/test_long.py#1/2", gib // 4)
     measured("3.12:tests/test_long.py", 8 * gib)
-    out = tmp_path / "verdict.json"
     assert ci.gpu_lane("3.12", ["tests/test_long.py#1/2"], out, cache="on", processes=1, deadline=600.0) == 0
-    [[share, *_]] = lane_runs(tmp_path, "test_long")[:1]
+    [share, *_] = lane_runs(tmp_path, "test_long")[-1]
     assert float(share) * total == 8 * gib * 1.25 + gib, "the file's whole measure, not the group's"
     # Measured past the lane's 40 GiB: given all 40, its row saying its need was more.
     measured("3.12:tests/test_long.py", 48 * gib)
