@@ -69,8 +69,21 @@ def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False) ->
         value = Assumption(generation.generation, generation, _facts(generation), interpreted)
     else:
         value = None if generation is None else Assumption(generation, interpreted=interpreted)
-    with _cache.KERNEL_ASSUMED(value):
+    with _cache.KERNEL_ASSUMED(value), _cross_compiled(value):
         yield
+
+
+def _cross_compiled(value: Assumption | None) -> contextlib.AbstractContextManager:
+    """tokamax's kernels lowered for an assumed GPU on any host: tokamax checks the device a kernel runs on
+    against this host's (its Triton attention raised "Not supported on cpu" for a step traced for a
+    compile-only sm90 on a CPU, which with its check of the host set aside, `tokamax.config.cross_compile`,
+    lowered and compiled for that GPU, FS-HOSTED). Nothing where no GPU is assumed or its kernels run
+    interpreted on this host's platform."""
+    if value is None or value.interpreted or capability(value.generation) is None:
+        return contextlib.nullcontext()
+    import tokamax
+
+    return tokamax.config.cross_compile(value=True)
 
 
 def _facts(value: Hashable | Mapping | list) -> Hashable:
