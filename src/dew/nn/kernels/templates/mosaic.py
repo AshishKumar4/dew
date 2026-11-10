@@ -113,12 +113,12 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
            approx_math: bool = False, cluster: int = 1, cost: pl.CostEstimate | None = None,
            model_flops: int | None = None, reduction_scratch: int = 0, resident: int = 1,
            ahead: Callable | None = None, settled: tuple[int, ...] = (),
-           prefetched: Callable | None = None) -> Callable:
+           prefetched: Callable | None = None, model: resources.RegisterModel | None = None) -> Callable:
     """Build a per-shard launch with the same reporting and interpreter semantics for every family, each call
     checked against the mesh it runs in (`launches.kernel`), named as the launch tracing it reports `name`
-    (`report.named`), a launch lowered once for every call of its facts (`tuning.lowered_once`), its `cost`
-    the hardware's work and `model_flops` the model's share of it, and its `settled` operands those its
-    programs read `ahead` of their wait (`dependent`, `checked`)."""
+    with its register `model` where given (`report.named`), a launch lowered once for every call of its
+    facts (`tuning.lowered_once`), its `cost` the hardware's work and `model_flops` the model's share of it,
+    and its `settled` operands those its programs read `ahead` of their wait (`dependent`, `checked`)."""
     clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
     launched = bodies.dependent(entry, interpret, ahead=ahead, settled=settled, scratch=len(scratch),
                          prefetched=prefetched)
@@ -128,7 +128,7 @@ def kernel(entry, *, out_type, grid: tuple, grid_names: tuple, warpgroups: int,
                             compiler_params=compiler_params(approx_math=approx_math, resident=resident,
                                                             reduction_scratch=reduction_scratch),
                             interpret=bodies.interpreted(interpret),
-                            kernel_name=report.named(name), cost_estimate=cost, **clustered)
+                            kernel_name=report.named(name, model=model), cost_estimate=cost, **clustered)
     # Its settled operands are checked where its programs read them before their wait (`waits`): a launch
     # that does not wait is ordered after the one before it, whatever it reads first.
     return checked(built, name or family, resident, model_flops, settled if bodies.waits(interpret) else ())
@@ -1657,7 +1657,7 @@ class Transport[Allocated, Opened](abc.ABC):
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                ahead: Callable | None = None, settled: tuple[int, ...] = (),
-               prefetched: Callable | None = None) -> Callable:
+               prefetched: Callable | None = None, registers: int | None = None) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own,
         `resident` programs a multiprocessor at once (its plan's, `resources.LaunchPlan.programs`: its
         compile fits its registers to them, `compiler_params`, and its roles raise to their share), with
@@ -1671,7 +1671,9 @@ class Transport[Allocated, Opened](abc.ABC):
         tables of integers its programs read an element at a time (a grouped schedule's), which a GPU reads
         from global memory and a TPU from its scalar memory; its `settled` operands (indices) read `ahead`
         of the program's wait for the launch before it, and its `prefetched` views prefetched into L2
-        before it, where given (`dependent`)."""
+        before it, where given (`dependent`); its consumer thread's `registers`, where the launch states
+        them, its register decision recorded on the launch tracing it (`resources.register_model`,
+        `report.Launch.kernels`), which the compile point checks its kernel against."""
 
     def scoped(self, body, *allocations, streams, after_walks: tuple = ()):
         """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
@@ -2161,7 +2163,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                cluster: int = 1, cost: pl.CostEstimate | None = None, model_flops: int | None = None,
                reducing_warpgroups: int = 0, resident: int = 1, scalars: int = 0,
                ahead: Callable | None = None, settled: tuple[int, ...] = (),
-               prefetched: Callable | None = None) -> Callable:
+               prefetched: Callable | None = None, registers: int | None = None) -> Callable:
         # Its programs read a table from global memory as any operand.
         del scalars
         if cluster > self.cluster:
@@ -2171,6 +2173,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                       name=name, approx_math=approx_math, cluster=cluster, cost=cost,
                       model_flops=model_flops, resident=resident, ahead=ahead, settled=settled,
                       prefetched=prefetched,
+                      model=(None if registers is None
+                             else resources.register_model(self, consumers, registers)),
                       # The issuer's own reductions across warps (mma.sync's column sums take the kernel's
                       # scratch, `reduction_scratch`), and each implicitly reducing warpgroup's share.
                       reduction_scratch=(self.reduction_scratch
