@@ -256,6 +256,27 @@ def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(
     assert not compiled_while_serving(server)
 
 
+def test_a_server_handed_the_programs_an_earlier_one_kept_traces_none_and_answers_the_same(tmp_path):
+    """A scoring server started with the programs an earlier process of its task kept
+    (`dew.training.ahead.keeping`, `ScoringServer.from_task(programs=...)`) loads each pass's program in
+    place of tracing and compiling it: in a fresh process it needs no trace and no compile of the
+    forward, before its first pass or while it serves, and answers each request exactly as the server
+    that compiled them did. Every program the first server compiled up front is kept, none refused, and
+    each is the program its call lowers to in the process that takes it (`kept`'s `verify`: the identity
+    a program is kept by covers what its trace reads, for Dew's own scoring programs) (row 5265: a warm
+    server paid 31 s a program in traces with every program a cache hit)."""
+    import process_support
+
+    worker = Path(__file__).with_name("kept_scoring_worker.py")
+    path = str(tmp_path / "scoring.dew-aot")
+    kept = process_support.fresh(worker, "keep", path)
+    assert kept["refused"] == [] and kept["kept"] == kept["programs"] > 1
+    taken = process_support.fresh(worker, "take", path)
+    assert taken["needed"] == [] and taken["programs"] == kept["programs"]
+    assert taken["responses"] == kept["responses"]
+    assert process_support.fresh(worker, "verify", path)["responses"] == kept["responses"]
+
+
 def test_a_budget_names_the_lengths_and_window_counts_its_passes_compile(decide):
     """A budget names the shapes a server compiles (`Budget.lengths`, `Budget.counts`): by default the
     layout's window and three halvings, each at one window, the powers of 8 and the most its tokens and
