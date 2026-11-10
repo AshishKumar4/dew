@@ -2,6 +2,7 @@
 (tools/armada/ci.py) run on small test files written into a checkout of their own."""
 
 import json
+import os
 import re
 import sys
 from collections.abc import Callable
@@ -128,3 +129,54 @@ def cached_checkout(ci, root: Path, monkeypatch, cache_worker) -> Path:
     cached(monkeypatch, url)
     (root / ".verdict").mkdir()
     return root / ".verdict/verdict.json"
+
+
+def fetcher(root: Path, *, due: bool = False) -> Path:
+    """A stand-in tools/fetched_fixtures.py under `root`: its fetch records that it ran, and with `due`
+    refuses as the real one does a pin whose upload is due."""
+    (root / "tools").mkdir(exist_ok=True)
+    (root / "tools/fetched_fixtures.py").write_text(
+        "import sys, time\nfrom pathlib import Path\n"
+        "assert sys.argv[1:] == ['fetch']\n"
+        "Path('fetched').write_text(str(time.monotonic()))\n"
+        + ("raise SystemExit('x.npz: pinned with no revision: its upload is due')\n" if due else ""))
+    return root / "fetched"
+
+
+def gpu_driver(root: Path, monkeypatch) -> None:
+    """nvidia-smi as the driver answers it for an 80 GiB GPU, first on PATH."""
+    tools = root / "bin"
+    tools.mkdir()
+    (tools / "nvidia-smi").write_text("#!/bin/sh\necho 81920\n")
+    (tools / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
+
+
+LANE_TEST = ("import os, subprocess, sys, time\n"
+             "from pathlib import Path\n"
+             "def test_runs():\n"
+             "    began = time.monotonic()\n"
+             "    time.sleep(1)\n"
+             "    share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
+             "    grown = os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE', 'true')\n"
+             "    threads = os.environ.get('OMP_NUM_THREADS', 'all')\n"
+             "    Path(f'threads-{Path(__file__).stem}').write_text(threads)\n"
+             "    ran = Path(f'ran-{Path(__file__).stem}-{os.getpid()}')\n"
+             "    ran.write_text(f'{share} {began} {time.monotonic()} {grown}')\n")
+"""A GPU lane's test file standing in: it records the share it was given, when it ran and whether its pool
+grows."""
+
+
+def gpu_lane_at(root: Path, monkeypatch, url: str, files: int) -> list[str]:
+    """A GPU lane's machine at `root`: the test cache at `url`, half of one 80 GiB GPU, its session growing
+    every job's pool as a GPU node's does (dewops' settings), and `files` test files of `LANE_TEST`. Their
+    names."""
+    cached(monkeypatch, url)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+    gpu_driver(root, monkeypatch)
+    names = [f"tests/test_file_{index}.py" for index in range(files)]
+    for name in names:
+        (root / name).write_text(LANE_TEST)
+    return names
