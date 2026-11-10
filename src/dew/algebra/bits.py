@@ -695,14 +695,23 @@ def nvfp4_decoded(words: jax.Array, scales: jax.Array) -> jax.Array:
 
 
 def _restored(decoded: jax.Array) -> jax.Array:
-    """A decode's bfloat16 values (`NVFP4_BFLOAT16_FORM.values`, each `code 2^-126`) times 2^126, in float32,
-    by integer arithmetic: a subnormal (a code of 0 or 0.5) as its mantissa's integer times 2^-7, every other
-    value's exponent raised by 126, so no lane that flushes subnormals (XLA:CPU's) zeroes a code of 0.5."""
-    bits = jax.lax.bitcast_convert_type(decoded, jnp.uint16).astype(jnp.uint32)
-    raised = jax.lax.bitcast_convert_type(((bits + (126 << 7)) & 0xFFFF).astype(jnp.uint16), jnp.bfloat16)
-    mantissa = (bits & 0x7F).astype(jnp.float32) * np.float32(2.0 ** -7)
-    subnormal = jnp.where(bits & 0x8000 != 0, -mantissa, mantissa)
-    return jnp.where(bits & 0x7F80 == 0, subnormal, raised.astype(jnp.float32))
+    """A decode's bfloat16 values (`NVFP4_BFLOAT16_FORM.values`, each `code 2^-126`) times 2^126, in float32
+    (`restored`)."""
+    return restored(jax.lax.bitcast_convert_type(decoded, jnp.uint16).astype(jnp.uint32))
+
+
+def restored(pattern: jax.Array) -> jax.Array:
+    """The NVFP4 form's decoded value (`NVFP4_BFLOAT16_FORM`: each code times 2^-126 as a bfloat16) of each of
+    `pattern` (uint32, a bfloat16's 16 bits in its low half), restored to the code in float32 by integer
+    arithmetic: a subnormal (a code of 0 or 0.5) as its mantissa's integer times 2^-7 with its sign, every
+    other value's exponent raised by 126 (its bits moved to a float32's high half), so no lane that flushes
+    subnormals (XLA:CPU's, a GPU's) zeroes a code of 0.5. The one definition of the decoded value: the
+    portable decode's (`nvfp4_decoded`) and the native staged decode's, whatever lanes each extracts."""
+    sign = pattern & jnp.uint32(0x8000)
+    normal = jax.lax.bitcast_convert_type((pattern << jnp.uint32(16)) + jnp.uint32(126 << 23), jnp.float32)
+    mantissa = (pattern & jnp.uint32(0x7F)).astype(jnp.float32) * jnp.float32(2.0 ** -7)
+    subnormal = jnp.where(sign != 0, -mantissa, mantissa)
+    return jnp.where(pattern & jnp.uint32(0x7F80) == 0, subnormal, normal)
 
 
 class Minifloat(NamedTuple):

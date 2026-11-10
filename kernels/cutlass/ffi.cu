@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <string>
+#include <string_view>
 #include <utility>
 
 #include "grouped.h"
@@ -89,6 +90,16 @@ ffi::Error failed(const char* target, const std::string& why) {
 
 }  // namespace
 
+// The generation of the kernels a device of `capability` (10 * major + minor) runs, as KERNELS names them:
+// Ampere's sm80 kernels on every 8.x, whose plain SASS each later minor of its major runs (CUDA's binary
+// compatibility); Hopper's sm90a kernels, of its arch-specific instructions, on 9.0 alone; nullptr on any
+// other device. The one statement of the library's dispatch: both targets' and dew_cutlass.architecture's.
+const char* architecture_for(int capability) {
+  if (capability / 10 == 8) return "sm80";
+  if (capability == 90) return "sm90";
+  return nullptr;
+}
+
 void zero_unrouted_rows(void* out, int64_t m, int64_t row_bytes, const int32_t* group_sizes, int groups,
                         cudaStream_t stream) {
   if (m == 0) return;
@@ -103,6 +114,12 @@ void zero_empty_groups(void* out, int64_t block_bytes, const int32_t* group_size
 }
 
 }  // namespace dew_cutlass
+
+// The generation of the kernels a device of compute capability `major`.`minor` runs (`architecture_for`),
+// null on a device the library runs none on (dew_cutlass.architecture).
+extern "C" const char* dew_cutlass_architecture(int major, int minor) {
+  return dew_cutlass::architecture_for(10 * major + minor);
+}
 
 // The kernels the library instantiates, one an architecture and output dtype (dew_cutlass.KERNELS), each as
 // its file's instantiated types state it (`Instantiated`): "architecture,dtype,rows,columns,depth,stages,
@@ -159,10 +176,12 @@ ffi::Error GroupedGemm(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi::
                                   out->untyped_data(), m, k, n, static_cast<int>(w_dims[0]), transpose_w,
                                   *operands, *result};
   const char* why = "no kernel is built for this device's compute capability";
-  if (device->capability / 10 == 8) {
+  const char* const built = dew_cutlass::architecture_for(device->capability);
+  const std::string_view architecture = built == nullptr ? "" : built;
+  if (architecture == "sm80") {
     why = dew_cutlass::sm80_grouped(call, stream, dew_cutlass::allocator(scratch), device->index,
                                     device->multiprocessors);
-  } else if (device->capability == 90) {
+  } else if (architecture == "sm90") {
     why = dew_cutlass::sm90_grouped(call, stream, dew_cutlass::allocator(scratch), device->index,
                                     device->multiprocessors);
   }
@@ -199,10 +218,12 @@ ffi::Error GroupedGemmK(cudaStream_t stream, ffi::ScratchAllocator scratch, ffi:
                                    out->untyped_data(), m, k, n, static_cast<int>(out_dims[0]), *operands,
                                    *result};
   const char* why = "no kernel is built for this device's compute capability";
-  if (device->capability / 10 == 8) {
+  const char* const built = dew_cutlass::architecture_for(device->capability);
+  const std::string_view architecture = built == nullptr ? "" : built;
+  if (architecture == "sm80") {
     why = dew_cutlass::sm80_grouped_k(call, stream, dew_cutlass::allocator(scratch), device->index,
                                       device->multiprocessors);
-  } else if (device->capability == 90) {
+  } else if (architecture == "sm90") {
     why = dew_cutlass::sm90_grouped_k(call, stream, dew_cutlass::allocator(scratch), device->index,
                                       device->multiprocessors);
   }
