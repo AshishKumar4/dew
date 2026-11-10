@@ -111,6 +111,8 @@ __all__ = [
     "head_dot_general",
     "head_product",
     "iteration_dtype",
+    "l2_squares",
+    "l2_unit",
     "l2norm",
     "numerics_of",
     "operand_precision",
@@ -857,8 +859,19 @@ def l2norm(x: jax.Array, eps: float = L2NORM_EPS) -> jax.Array:
     once to `x`'s dtype: the normalization of FLA's `l2norm` (the linear attentions' queries and
     keys, modeling_qwen3_next.py:368-371) and of nGPT's `justnorm` (its residual stream and
     weights)."""
+    return l2_unit(*l2_squares(x), x.dtype, eps)
+
+
+def l2_squares(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`x` in at least fp32 and its rows' sums of squares: `l2norm`'s reduction, which a reverse that keeps
+    them reads (nGPT's join, `dew.nn.ngpt`)."""
     wide = x.astype(at_least_fp32(x.dtype))
-    return (wide * jax.lax.rsqrt(jnp.sum(jnp.square(wide), axis=-1, keepdims=True) + eps)).astype(x.dtype)
+    return wide, jnp.sum(jnp.square(wide), axis=-1, keepdims=True)
+
+
+def l2_unit(wide: jax.Array, squares: jax.Array, dtype, eps: float = L2NORM_EPS) -> jax.Array:
+    """`l2norm` of the rows `wide` from their sums of squares (`l2_squares`), rounded once to `dtype`."""
+    return (wide * jax.lax.rsqrt(squares + eps)).astype(dtype)
 
 
 def float32_dot_general(lhs, rhs, dimension_numbers, precision: jax.lax.PrecisionLike = None,
