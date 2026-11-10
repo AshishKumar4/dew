@@ -21,6 +21,10 @@ import test_codec_checkpoints
 import test_run_options
 from lane_environment import users_process
 from process_support import relayed
+from tool_support import load
+
+session = load("session", "tools/armada")
+"""CI's pytest session: what a task's pytest never inherits (`UNKEYED`), and its deadline."""
 
 FLOWS = (
     # A command-line run of each kind: the algebra pass reads the programs a library process builds.
@@ -42,16 +46,19 @@ def test_a_flow_holds_in_a_process_that_computes_as_a_users_does(flow, tmp_path)
     """`flow`, a test of the suite, run by pytest in a child process on the CPU with a user's arithmetic:
     every case of it ran and passed, none skipped, each in a process that reports no wide CPU arithmetic, no
     matmul precision of the suite's and the suite's devices (the JUnit property `users_arithmetic`,
-    tests/conftest.py)."""
+    tests/conftest.py), and the child ended clean."""
     tests = Path(__file__).resolve().parent
     report = tmp_path / "flow.xml"
-    relayed([sys.executable, "-m", "pytest", f"{tests.name}/{flow.__module__}.py::{flow.__name__}", "-q",
-             "--no-header", "-p", "no:cacheprovider", f"--junitxml={report}"], users_process(os.environ),
-            timeout=FLOW_SECONDS)
+    # The flow whole: what a supervisor's environment would have pytest select or load is no part of it.
+    environment = {name: value for name, value in users_process(os.environ).items()
+                   if name not in session.UNKEYED}
+    target = f"{tests.name}/{flow.__module__}.py::{flow.__name__}"
+    ran = relayed([sys.executable, "-m", "pytest", target, "-q", "--no-header", "-p", "no:cacheprovider",
+                   f"--junitxml={report}"], environment, timeout=FLOW_SECONDS)
     cases = list(ElementTree.parse(report).iter("testcase"))
     ended = {case.get("name"): [child.tag for child in case if child.tag != "properties"] for case in cases}
     computed = [json.loads(node.get("value")) for case in cases for node in case.iter("property")
                 if node.get("name") == "users_arithmetic"]
-    assert cases and not any(ended.values()), ended
+    assert ran.returncode == 0 and cases and not any(ended.values()), (ran.returncode, ended)
     assert computed == len(cases) * [{"wide_cpu_arithmetic": False, "matmul_precision": None,
                                       "devices": jax.device_count()}]

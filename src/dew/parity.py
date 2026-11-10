@@ -1209,8 +1209,10 @@ def _at_parity(draws: _Draws, index: int, leaf: str, tails: tuple[float, float],
     """Check 1's rule for a leaf's pooled ratio (`_judgement`'s `ratio_rule`): its finding where the leaf
     is over PARITY (`_status`) or its draws leave it inconclusive, none where it passes; with `typical` (a
     final verdict), a leaf its pooled ratio leaves inconclusive passed by its typical draw where that
-    decides (`_typical_status`)."""
+    decides (`_typical_status`). A leaf both hold exactly on every seed has no ratio and passes."""
     a, b, count = draws.mine[:, index], draws.theirs[:, index], len(draws.mine)
+    if np.sum(b) == 0:
+        return None
     ratio, low, high = _judged(draws, index, tails)
     status = _status(ratio, low, high, contained=contained)
     # The ratio's log from its sums' logs, finite where a sum or the ratio itself would overflow.
@@ -1241,8 +1243,14 @@ def _below_one(draws: _Draws, index: int, leaf: str, tails: tuple[float, float],
     (`_judged`, taken to hold the ratio) wholly under one; a "pooled" finding where it lies wholly at or over
     one; else the leaf is inconclusive, as a ratio or an end that is not a number is. Below is certified by
     the whole interval at either stage: no interval is resolved by its width and no typical draw passes a
-    leaf, as check 1's parity allows (`contained`, `typical`)."""
+    leaf, as check 1's parity allows (`contained`, `typical`). A leaf both hold exactly on every seed has
+    nothing to be below and fails with no measure, a form at parity being check 1's to hold: a finding as
+    any other, so a first stage of exact seeds draws the second before it is the verdict."""
     a, b, count = draws.mine[:, index], draws.theirs[:, index], len(draws.mine)
+    if np.sum(b) == 0:
+        return Finding(leaf, "no measure", 0.0, f"{leaf}: dew and the named arm both equal float64 on "
+                       f"every one of {count} seeds, so nothing is below; a form at parity holds check 1 "
+                       f"(`assert_as_exact`)")
     ratio, low, high = _judged(draws, index, tails)
     measure = (_log_sum(a) - _log_sum(b)) / 2
     found = (f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the named arm's over {count} seeds, "
@@ -1274,12 +1282,11 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
             over.append(Finding(leaf, "not finite", nonfinite,
                                 f"{leaf}: a value is not finite on {nonfinite} of {count} seeds"))
             continue
-        if np.sum(b) == 0:
+        if np.sum(b) == 0 and np.sum(a) > 0:
             # No ratio to judge, but rows over an orbit's other orders still are; Dew's own RMS error is
             # what a change can make worse.
-            if np.sum(a) > 0:
-                over.append(Finding(leaf, "exact reference", _root_mean(a),
-                                    f"{leaf}: the reference equals float64 on every seed and dew does not"))
+            over.append(Finding(leaf, "exact reference", _root_mean(a),
+                                f"{leaf}: the reference equals float64 on every seed and dew does not"))
         else:
             found = ratio_rule(draws, index, leaf, tails, contained=contained, typical=typical)
             if found is not None:

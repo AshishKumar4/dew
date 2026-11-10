@@ -35,6 +35,26 @@ def _whole(seed: int) -> tuple:
     return rows, matrix, jnp.asarray(2.0 ** rng.integers(-1, 2, size=WIDTH), jnp.float32)
 
 
+def _unit(seed: int) -> tuple:
+    """FP8 codes of -1, 0 and 1 under power-of-two scales: a product bfloat16's eight bits hold too."""
+    rng = np.random.default_rng(seed)
+    rows, matrix = (jnp.asarray(rng.integers(-1, 2, size=(count, DEPTH)), jnp.float8_e4m3fn)
+                    for count in (ROWS, WIDTH))
+    return rows, matrix, jnp.asarray(2.0 ** rng.integers(-1, 2, size=WIDTH), jnp.float32)
+
+
+def _cancelling(seed: int) -> tuple:
+    """`_codes`, its first row and its matrix laid out so that row's products cancel in pairs exactly (3 by
+    5m beside -15 by m, m a power of two), under the scales `_codes` draws."""
+    rng = np.random.default_rng([seed, 1])
+    rows, _, scales = _codes(seed)
+    powers = 2.0 ** rng.integers(-2, 3, size=(WIDTH, DEPTH // 2))
+    matrix = np.stack([5 * powers, powers], axis=-1).reshape(WIDTH, DEPTH)
+    rows = np.asarray(rows, np.float32)
+    rows[0] = np.tile([3.0, -15.0], DEPTH // 2)
+    return jnp.asarray(rows, jnp.float8_e4m3fn), jnp.asarray(matrix, jnp.float8_e4m3fn), scales
+
+
 def _dequantized(rows, matrix, scales):
     """The scaled product of the codes' values, summed in the scales' type: fp32 as an arm, float64 as the
     truth."""
@@ -84,6 +104,25 @@ def test_a_named_arm_that_is_exact_leaves_nothing_to_be_below():
         with pytest.raises(GateFailure) as failed:
             _judged(form, _dequantized, _whole)
         assert rule in [finding.rule for finding in failed.value.findings]
+
+
+def test_a_first_stage_of_exact_seeds_draws_the_second_before_it_is_the_verdict():
+    """A site whose first seeds every arm holds exactly has nothing to be below yet, a finding as any other:
+    the second stage is drawn, and a form below the named arm over its seeds holds."""
+    _judged(_dequantized, _narrow, lambda seed: _unit(seed) if seed < 8 else _codes(seed))
+
+
+def test_a_row_that_cancels_is_sized_by_its_terms():
+    """A row whose products cancel exactly in float64 is judged at the size of what it sums, as check 1
+    judges it: a form that folds the scales into the matrix leaves a rounding's residue on it, the named arm
+    by its exact pairs none, and the form, far below that arm everywhere, holds; held to the named arm's
+    residue on that row, it could not."""
+    def folded(rows, matrix, scales):
+        return rows.astype(jnp.float32) @ (matrix.astype(jnp.float32) * scales[:, None]).T
+
+    residue, exact = (np.asarray(arm(*_cancelling(0)))[0] for arm in (folded, _narrow))
+    assert np.any(residue != 0) and not np.any(exact)
+    _judged(folded, _narrow, _cancelling)
 
 
 @pytest.mark.parametrize("draw", [

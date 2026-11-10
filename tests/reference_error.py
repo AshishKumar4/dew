@@ -1248,9 +1248,10 @@ def assert_fp8_below(dew_fn, named_fn, draw, label: str, *, seeds: int, named: s
     under one (`dew.parity._below_one`), where check 1 allows PARITY. A leaf the named arm holds exactly
     has nothing to be below: Dew off float64 there fails as under check 1, and Dew exact there fails too,
     as a form at parity holds check 1 itself. `truth_fn` is the float64 product of the operands as
-    quantized, and `reference_fn` the dequantized product with fp32 sums, check 1's reference for an FP8
-    product: it runs beside the two on the same draws and Dew's ratio to it is recorded with the verdict's
-    (`BELOW`), never judged.
+    quantized, a row that cancels sized by its terms as check 1 sizes it (`_site_terms`), and
+    `reference_fn` the dequantized product with fp32 sums, check 1's reference for an FP8 product: it runs
+    beside the two on the same draws and Dew's ratio to it is recorded with the verdict's (`BELOW`), never
+    judged.
 
     Only an FP8 product's site takes this contract: `codes(*inputs)` gives the product's multiplicands of a
     draw's inputs, and each must hold an FP8 format's codes (`_fp8_codes`: not a narrower format's, nor an
@@ -1264,14 +1265,15 @@ def assert_fp8_below(dew_fn, named_fn, draw, label: str, *, seeds: int, named: s
                         f"(docs/design/testing.md), and this site holds check 1 (`assert_as_exact`)")
     _refuse_numpy_arms(draw, dew_fn, named_fn, reference_fn)
     dew_fn, named_fn, (reference_fn,) = _arms_with(dew_fn, named_fn, [reference_fn], label)
-    truth_fn = _truth_program(truth_fn)
+    truth_program = _truth_program(truth_fn)
+    terms_fn = _site_terms(None, None, draw, truth_fn, truth_program)
     arms = [dew_fn, named_fn, reference_fn]
     # Each range's draws against the named arm and against the reference, Dew and the truth run once.
     ranges: dict[tuple[int, int], list[_Draws]] = {}
 
     def drawn(start, stop):
-        ranges[start, stop] = _drawn(dew_fn, named_fn, draw, range(start, stop), truth_fn,
-                                     also=[reference_fn], label=label)
+        ranges[start, stop] = _drawn(dew_fn, named_fn, draw, range(start, stop), truth_program,
+                                     also=[reference_fn], terms_fn=terms_fn, label=label)
         return ranges[start, stop][0]
 
     held = f"{label}, against {named}"
@@ -1282,11 +1284,6 @@ def assert_fp8_below(dew_fn, named_fn, draw, label: str, *, seeds: int, named: s
         BELOW.append({"leaf": held + name, "named": named, "seeds": len(against.mine), "ratio": ratio,
                       "interval": [low, high],
                       "reference_ratio": _pooled(parity.mine[:, index], parity.theirs[:, index])})
-        if against.finite[:, index].all() and not np.sum(against.mine[:, index]) and not np.sum(
-                against.theirs[:, index]):
-            over.append(Finding(held + name, "no measure", 0.0, f"{held}{name}: dew and {named} both equal "
-                                f"float64 on every seed, so nothing is below; a form at parity holds check "
-                                f"1 (`assert_as_exact`)"))
     _logged(held, stage, _verdict(over, unresolved), _narrow(against), _mode_of(arms))
     if over:
         raise GateFailure(_with_mode(over + unresolved, arms))
