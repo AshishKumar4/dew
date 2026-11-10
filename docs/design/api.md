@@ -338,6 +338,10 @@ weights. It lays a request out as rows at submission (`admit`, refusing one alon
 which rows one pass holds (`fits`), runs a pass over the weights the server hands it (`forward`), and
 reads a request's answer off its rows' outputs (`answer`). The server runs one pass a step over the
 waiting rows oldest first, so a request whose rows outrun a pass carries the rest to the next turn.
+`ScoringServer.from_task` compiles every program its passes run before the first; with `programs=`,
+a file an earlier process of the task kept them in (`dew.training.ahead.keeping`), it loads each in
+place of tracing and compiling it, and refuses a file kept under another target, code or settings
+([training.md §6](training.md#6-compilation)).
 It binds each request to the (task, weights) pair that admitted it, so a reload swaps both at once
 for what is submitted after. `Decide.scoring()` gives a decision task as such a task, and
 `Decide.systemone` over a list of bodies is served by the same server. `TextToImage.scoring()` gives

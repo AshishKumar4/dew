@@ -36,6 +36,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.nn.derivatives import Protected, contracted
+from dew.nn.kernels.generation import traced_fact
 from dew.nn.programs import RaggedLayout, ragged_layout
 
 FMA_LATENCY = 4
@@ -45,6 +46,7 @@ software optimization guides): the FMAs a dot keeps in flight to issue one a cyc
 partial sums of its own."""
 
 
+@traced_fact
 @functools.cache
 def vector_lanes() -> int:
     """The float32 lanes of this CPU's widest vector register: 16 with AVX-512 (`avx512f` among its flags),
@@ -78,6 +80,7 @@ def contraction_block(depth: int, lanes: int | None = None) -> int:
     return block
 
 
+@traced_fact
 @functools.cache
 def workspace_bytes() -> int:
     """The bytes a product's blocks' sums may hold at once (`_blocked`): a 64th of this machine's memory,
