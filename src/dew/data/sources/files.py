@@ -474,8 +474,10 @@ class Files(Dataset):
         """`paths` whose names end in one of `suffixes`, all of them where it names none."""
         if self.suffixes is None:
             return tuple(paths)
-        wanted = {"." + suffix.lower().removeprefix(".") for suffix in self.suffixes}
-        return tuple(path for path in paths if PurePosixPath(path).suffix.lower() in wanted)
+        # A name's whole end, as every suffix here is read (`kind_of`): a compressed format's two parts
+        # (`jsonl.gz`) included.
+        wanted = tuple("." + suffix.lower().removeprefix(".") for suffix in self.suffixes)
+        return tuple(path for path in paths if path.lower().endswith(wanted))
 
     @cached_property
     def _listed(self) -> tuple[str, ...]:
