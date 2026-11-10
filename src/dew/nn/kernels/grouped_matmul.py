@@ -1469,16 +1469,40 @@ class MosaicTgmm(_Mosaic):
                  _side_dims(ba.arguments['prologue_operands'], hooks.prologue_axes, {'depth': 'depth'}))]
 
     def derived(self, ba, target) -> mosaic_gpu.Tiles | None:
-        # The derived tile, its contraction split where its output tiles underfill a wave
-        # (`mosaic_gpu.split_count`) at the tile the split's own call, writing fp32 partials, derives. An
-        # exact sum splits too, its runs summed exactly and their partials by IEEE adds (`mosaic_gpu.tgmm`):
-        # unsplit, Qwen3.5-4B's key kernel gradient ran 2.03-2.06x the tensor cores' split sums on a GH200
+        # The derived tile, split where its output tiles underfill a wave (`_split_tile`). An exact sum splits
+        # too, its runs summed exactly and their partials by IEEE adds (`mosaic_gpu.tgmm`): unsplit,
+        # Qwen3.5-4B's key kernel gradient ran 2.03-2.06x the tensor cores' split sums on a GH200
         # (W123-gh200, W124-gh200).
-        tile = super().derived(ba, target)
+        tile = self._split_tile(ba, target)
+        # A call whose programs fill less than a wave (its output tiles, each split as deep as its ring
+        # allows) takes as long as its busiest program's walk, not its reads a FLOP, which the derived width
+        # balances for a full wave: its width narrows while that walk, its partials' passes and their sum's
+        # launch take less (`mosaic_gpu.SplitWalk`). An A100's 64 x 256 gradient over 4096 rows split 16
+        # ways at 64 x 128 ran 1.06x its time at 64 x 64 split 11 ways, and four groups' 200 x 100 ones over
+        # 1024 rows a group 1.10x unsplit at 64 x 128 against 64 x 64 split 3 ways (M-JS-88-gemm-picks-a100).
+        while tile is not None and not self._balances(ba, tile, target):
+            walk = self._walk(ba, tile, target)
+            if walk is None or not walk.underfills(tile.splits):
+                break
+            narrower = self._split_tile(ba, target, below=tile.block_n)
+            if narrower is None:
+                break
+            walked = self._walk(ba, narrower, target)
+            if walked is None or walked.seconds(narrower.splits) >= walk.seconds(tile.splits):
+                break
+            tile = narrower
+        return tile
+
+    def _split_tile(self, ba, target, below: int | None = None) -> mosaic_gpu.Tiles | None:
+        """The derived tile (narrower than `below` columns where given), its contraction split where its
+        output tiles underfill a wave (`mosaic_gpu.split_count`) at the tile the split's own call, writing
+        fp32 partials, derives."""
+        admits = None if below is None else (lambda tile: tile.block_n < below)
+        tile = self._derived(ba, target, admits)
         if tile is None or self._balances(ba, tile, target) or self._splits(ba, tile, target) == 1:
             return tile
         partials = self._partials(ba)
-        sliced = super().derived(partials, target)
+        sliced = self._derived(partials, target, admits)
         if sliced is None or (splits := self._splits(partials, sliced, target)) == 1:
             return tile
         split = dataclasses.replace(sliced, splits=splits)
@@ -1491,6 +1515,7 @@ class MosaicTgmm(_Mosaic):
         partials added by IEEE adds, `mosaic_gpu.tgmm`), its tail balanced."""
         if not (ba.arguments['dense'] and mosaic_gpu.fixes_up(tile, ba.arguments['tokens'].dtype)):
             return False
+        ba = self._aligned(ba)
         depth, _, width = self._generated_extents(ba)
         tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
         steps = -(-tokens.shape[0] // tile.block_k)
@@ -1499,14 +1524,26 @@ class MosaicTgmm(_Mosaic):
                                         _multiprocessors(target) * tile.programs) is not None
 
     def _splits(self, ba, tile: mosaic_gpu.Tiles, target) -> int:
+        return mosaic_gpu.split_count(tile, **self._contraction(ba, tile, target))
+
+    def _walk(self, ba, tile: mosaic_gpu.Tiles, target) -> mosaic_gpu.SplitWalk | None:
+        """The walk `tile` runs the call in (`mosaic_gpu.split_walk`): a split tile's over the partials' call
+        its slices run (`_partials`)."""
+        call = ba if tile.splits == 1 else self._partials(ba)
+        return mosaic_gpu.split_walk(tile, **self._contraction(call, tile, target))
+
+    def _contraction(self, ba, tile: mosaic_gpu.Tiles, target) -> dict:
+        """The call's contraction as the split prices it at `tile` (`mosaic_gpu.split_walk`'s facts): the call
+        as the launch runs it (`_aligned`), its depth and width padded to whole tiles (a 100-wide gradient's
+        128 columns)."""
+        ba = self._aligned(ba)
         depth, _, width = self._generated_extents(ba)
         tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
-        return mosaic_gpu.split_count(tile, groups=ba.arguments['sizes'].shape[0],
-                                      rows=_rows_of(_TGMMS, ba.args), depth=depth, width=width,
-                                      itemsizes=(tokens.dtype.itemsize, cotangent.dtype.itemsize),
-                                      multiprocessors=_multiprocessors(target),
-                                      step_seconds=mosaic_gpu.step_seconds(tile, target),
-                                      bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
+        return {'groups': ba.arguments['sizes'].shape[0], 'rows': _rows_of(_TGMMS, ba.args), 'depth': depth,
+                'width': width, 'itemsizes': (tokens.dtype.itemsize, cotangent.dtype.itemsize),
+                'multiprocessors': _multiprocessors(target),
+                'step_seconds': mosaic_gpu.step_seconds(tile, target), 'bandwidth': target.memory_rate,
+                'launch_seconds': target.launch_seconds}
 
     def _partials(self, ba):
         """The call `ba` writing fp32 partials, as a split's slices do (`mosaic_gpu.tgmm`): each slice a group

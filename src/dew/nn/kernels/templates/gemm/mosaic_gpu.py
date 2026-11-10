@@ -2270,31 +2270,20 @@ def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int,
     an H100 splits in three, 2 x 128 steps against 384. Its steps priced at their MMA alone, a decode
     product's few tiles walked unsplit: an A100's 2048 x 2048 input gradient at 1-32 rows ran 12 programs on
     108 multiprocessors, 2.8-3.0x XLA's 128 (M-NS-12, row 483), where its matrix's stream is the walk."""
-    wave = multiprocessors * tiles.programs
-    output = groups * -(-depth // tiles.block_m) * (width // tiles.block_n)
-    steps = -(-rows // max(groups, 1) // tiles.block_k)
-    if step_seconds is None or bandwidth is None or output == 0:
-        return 1
-    operand_bytes = rows * (depth * itemsizes[0] + width * itemsizes[1])
-    held = groups * depth if partial_rows is None else partial_rows
-    passes = held * width * 4 / bandwidth / step_seconds
-
-    def walk(splits: int) -> float:
-        programs = output * splits
-        waves = -(-programs // wave)
-        busiest = waves * -(-steps // splits)
-        # A program's share of the operands, at its share of the memory's rate.
-        rate = bandwidth * min(programs, multiprocessors) / multiprocessors / min(programs, wave)
-        stream = waves * operand_bytes / programs / rate / step_seconds
-        return max(busiest, stream)
-
     # At s = kP / O slices, k whole waves, the busiest program walks the wave's share of every tile's steps,
     # W O / P, and its last wave idles half a tile's slices on average, W O^2 / 2kP^2; the partials' passes
     # add 2ps = 2pkP / O. Their sum is least at k = (O / P)^1.5 sqrt(W / 4p), and k holds two slices of every
     # tile at least; the slices fill every multiprocessor, so the operands stream at the whole rate too.
     # Each slice keeps at least the ring's stages and one more steps (`deepest` slices): where that bounds
     # the count, the most whole waves within it, or the bound itself where a wave holds two slices of none.
-    waves = max(-(-2 * output // wave), round((output / wave) ** 1.5 * math.sqrt(walk(1) / (4 * passes))))
+    walk = split_walk(tiles, groups=groups, rows=rows, depth=depth, width=width, itemsizes=itemsizes,
+                      multiprocessors=multiprocessors, step_seconds=step_seconds, bandwidth=bandwidth,
+                      launch_seconds=launch_seconds, partial_rows=partial_rows)
+    if walk is None:
+        return 1
+    output, wave, steps, passes = walk.output, walk.wave, walk.steps, walk.passes
+    least = round((output / wave) ** 1.5 * math.sqrt(walk.walk(1) / (4 * passes)))
+    waves = max(-(-2 * output // wave), least)
     deepest = steps // (tiles.stages + 1)
     splits = waves * wave // output
     if splits > deepest:
@@ -2304,9 +2293,65 @@ def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int,
         return 1
     # Its runs share the steps whole: as many runs as a share's ceil(steps / s) steps cover.
     splits = -(-steps // -(-steps // splits))
-    launch = 0.0 if launch_seconds is None else launch_seconds / step_seconds
-    saved = walk(1) - walk(splits)
-    return splits if saved > (2 * splits + 1) * passes + launch else 1
+    return splits if walk.seconds(splits) < walk.seconds(1) else 1
+
+
+@dataclasses.dataclass(frozen=True)
+class SplitWalk:
+    """Dew: a contraction's walk at a tile as `split_count` prices it (`split_walk`): its `output` tiles
+    over a wave of `wave` programs (`multiprocessors` x the tile's programs), `steps` MMA steps a tile, each
+    `step_seconds` long, its operands' `operand_bytes` streamed once at `bandwidth`, and, split, its fp32
+    partials' passes over the output (`passes` steps each) and their sum's `launch` (in steps)."""
+
+    output: int
+    wave: int
+    steps: int
+    multiprocessors: int
+    operand_bytes: float
+    bandwidth: float
+    step_seconds: float
+    passes: float
+    launch: float
+
+    def walk(self, splits: int) -> float:
+        """The busiest program's walk at `splits` slices a tile, in steps: its waves' share of every tile's
+        slices, or its share of the operands' stream where that is longer."""
+        programs = self.output * splits
+        waves = -(-programs // self.wave)
+        busiest = waves * -(-self.steps // splits)
+        # A program's share of the operands, at its share of the memory's rate.
+        rate = (self.bandwidth * min(programs, self.multiprocessors) / self.multiprocessors
+                / min(programs, self.wave))
+        stream = waves * self.operand_bytes / programs / rate / self.step_seconds
+        return max(busiest, stream)
+
+    def seconds(self, splits: int) -> float:
+        """The call's time at `splits` slices a tile: its busiest program's walk and, split, its partials'
+        2s + 1 passes over the output and their sum's launch."""
+        added = (2 * splits + 1) * self.passes + self.launch if splits > 1 else 0.0
+        return (self.walk(splits) + added) * self.step_seconds
+
+    def underfills(self, splits: int) -> bool:
+        """Whether the call's programs at `splits` slices a tile fill less than one wave, so its time is its
+        busiest program's walk, not its tiles' reads a FLOP, which `derived` balances for a full one."""
+        return self.output * splits < self.wave
+
+
+def split_walk(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int, itemsizes: tuple[int, int],
+               multiprocessors: int, step_seconds: float | None, bandwidth: float | None,
+               launch_seconds: float | None, partial_rows: int | None = None) -> SplitWalk | None:
+    """Dew: the walk `split_count` prices at `tiles` (its arguments'), None where the device states no rate
+    or the call has no whole tile."""
+    output = groups * -(-depth // tiles.block_m) * (width // tiles.block_n)
+    steps = -(-rows // max(groups, 1) // tiles.block_k)
+    if step_seconds is None or bandwidth is None or output == 0:
+        return None
+    held = groups * depth if partial_rows is None else partial_rows
+    return SplitWalk(output, multiprocessors * tiles.programs, steps, multiprocessors,
+                     rows * (depth * itemsizes[0] + width * itemsizes[1]), bandwidth, step_seconds,
+                     held * width * 4 / bandwidth / step_seconds,
+                     0.0 if launch_seconds is None else launch_seconds / step_seconds)
+
 
 
 def _sliced(group_sizes: jax.Array, block_k: int, splits: int) -> jax.Array:
