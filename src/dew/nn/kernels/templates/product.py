@@ -7,9 +7,11 @@ import dataclasses
 import functools
 import itertools
 from collections.abc import Callable, Iterator
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.precision import accumulated, asks_default_precision, exact_products, float64_sum, products_dtype
@@ -35,6 +37,28 @@ class Product:
     compute: jnp.dtype
     promoted: bool
     refusal: str | None
+
+
+class BlockFormat(NamedTuple):
+    """A block-scaled product's operand format (row 4519): its scales' dtype and the depths one scale
+    covers, which its operands' quantization, their values and the native products' scale streams all read
+    (`gemm.MxFp8`, `gemm.NvFp4Block`, `gemm.mosaic_gpu.gmm`'s `mx_scales`)."""
+
+    scale: np.dtype
+    depth: int
+
+
+MXFP8 = BlockFormat(np.dtype(jnp.float8_e8m0fnu), 32)
+"""OCP MX's FP8: an E8M0 scale every 32 depths (tcgen05's block-scaled MMA's `scale_vec::1X`)."""
+
+NVFP4 = BlockFormat(np.dtype(jnp.float8_e4m3fn), 16)
+"""NVFP4: an E4M3 scale every 16 depths (tcgen05's `scale_vec::4X`, `kind::mxf4nvf4`)."""
+
+
+def block_format(dtype) -> BlockFormat:
+    """The block format of a block-scaled product of `dtype` operands: NVFP4's for 4-bit floats (E2M1),
+    MXFP8's for 8-bit ones."""
+    return NVFP4 if jnp.finfo(dtype).bits == 4 else MXFP8
 
 
 SCALE_DEPTH = 128

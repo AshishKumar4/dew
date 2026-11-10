@@ -48,7 +48,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
-from typing import Any
+from typing import Any, NamedTuple
 
 import jax
 from jax import lax, numpy as jnp
@@ -57,20 +57,21 @@ from jax.experimental.mosaic.gpu import utils as mgpu_utils
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.algebra import bits
-from dew.nn.kernels import generation, tuning
+from dew.nn.kernels import generation, tables, tuning
 from dew.nn.kernels.templates import (
     axes,
     bodies,
     bundles,
     cost as unit_cost,
     mosaic,
+    product as product_formats,
     resources,
     rings,
     swizzling,
     tail as tail_of,
 )
 from dew.nn.kernels.templates.gemm import rows_extended, rows_padded, scattered, sides_extended, sides_padded
-from dew.nn.kernels.templates.product import SCALE_DEPTH
+from dew.nn.kernels.templates.product import SCALE_DEPTH, block_format
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
@@ -338,6 +339,20 @@ def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, pr
                  programs=programs)
 
 
+class TileGroup(NamedTuple):
+    """Dew: a row tile's entry in a grouped call's tile table (`_grouped_table`, `tables.packed`): its group
+    (the lengths' index), the tile's first row, its group's first and past-last row, and the matrix it
+    multiplies (its group's, the unrouted rows' the last's, or a stack's from `first`); a tile no group
+    reaches, zeros. Its one declaration, which the table's writer and its reader (`GroupInfo.create`) take
+    their columns from."""
+
+    group: tables.Column
+    block_start: tables.Column
+    group_start: tables.Column
+    group_end: tables.Column
+    matrix: tables.Column
+
+
 @dataclasses.dataclass(frozen=True)
 class GroupInfo:
     """Information regarding the group being processed in a block."""
@@ -348,27 +363,25 @@ class GroupInfo:
     actual_end: jax.Array
     start_within_block: jax.Array
     actual_size: jax.Array
-    matrix: jax.Array | None = None
-    """Dew: the matrix of a stack the group reads, where a table's fifth column states it (`gmm`'s
-    `first`); None where the group reads its own."""
+    matrix: jax.Array
+    """Dew: the matrix the tile multiplies (`TileGroup.matrix`)."""
 
     @classmethod
     def create(cls, table, tile, tid, unit: int = 8):
-        """Dew: the group info of row tile `tid`, read from `tile_groups`' table (its group, its first row,
-        its group's first and past-last row, and where `gmm` states one, its matrix of a stack) rather than
+        """Dew: the group info of row tile `tid`, read from its call's tile table (`TileGroup`) rather than
         walked over every group's length in each tile."""
         tile = jnp.int32(tile)
-        group, block_start, group_start, group_end = (table[tid, column] for column in range(4))
+        entry = tables.unpacked(TileGroup, lambda column: table[tid, column])
         # Mosaic's copies and stores read a slice's start as a multiple of the rows its tiling takes
         # (`row_unit`).
-        block_start = pl.multiple_of(block_start, unit)
-        actual_start = jnp.maximum(group_start, block_start)
-        actual_end = jnp.minimum(group_end, block_start + tile)
+        block_start = pl.multiple_of(entry.block_start, unit)
+        actual_start = jnp.maximum(entry.group_start, block_start)
+        actual_end = jnp.minimum(entry.group_end, block_start + tile)
         start_within_block = actual_start - block_start
         actual_size = actual_end - actual_start
-        return cls(group_id=group, block_start=block_start, actual_start=actual_start,
+        return cls(group_id=entry.group, block_start=block_start, actual_start=actual_start,
                    actual_end=actual_end, start_within_block=start_within_block, actual_size=actual_size,
-                   matrix=table[tid, 4] if table.shape[1] > 4 else None)
+                   matrix=entry.matrix)
 
     @classmethod
     def dense(cls, tile: int, tid, rows: int):
@@ -376,18 +389,21 @@ class GroupInfo:
         start = pl.multiple_of(tid * tile, TMA_ROWS)
         size = jnp.minimum(tile, rows - start)
         return cls(group_id=jnp.int32(0), block_start=start, actual_start=start,
-                   actual_end=start + size, start_within_block=jnp.int32(0), actual_size=size)
+                   actual_end=start + size, start_within_block=jnp.int32(0), actual_size=size,
+                   matrix=jnp.int32(0))
 
 
-def tile_groups(lengths: jax.Array, tile: int, tiles: int, unit: int = 8) -> jax.Array:
-    """Dew: each row tile's group info for `GroupInfo.create`, in XLA before the launch: of tiles `0` to
-    `tiles`, the group (`lengths`' index), the tile's first row, and its group's first and past-last row,
-    int32 `[tiles, 4]`; a tile no group reaches, zeros. A group's tiles start at its first row (rounded
-    down to the `unit` rows its family's copies start at, `row_unit`), whole tiles after it, as CUTLASS's
-    grouped GEMM tiles each group: a group of up to a tile's rows reads its matrix once, where tiles on the
-    product's own row grid read it once a tile the group touches (two for most of Kimi Linear's
-    128-row experts at 128-row tiles). The tiles number at most `cdiv(rows, tile)` plus the groups less
-    one (a ceiling's sum exceeds the sum's ceiling by at most one a part). Upstream's
+def tile_groups(lengths: jax.Array, tile: int, tiles: int, unit: int = 8,
+                first: jax.Array | None = None) -> TileGroup:
+    """Dew: each row tile's group info for `GroupInfo.create`, in XLA before the launch (`TileGroup`, packed
+    by `_grouped_table`): of tiles `0` to `tiles`, the group (`lengths`' index), the tile's first row, its
+    group's first and past-last row, and its matrix (its group's, the last group's for the rows past the
+    routed ones `lengths` ends with, or from `first` a stack's); a tile no group reaches, zeros. A group's
+    tiles start at its first row (rounded down to the `unit` rows its family's copies start at, `row_unit`),
+    whole tiles after it, as CUTLASS's grouped GEMM tiles each group: a group of up to a tile's rows reads its
+    matrix once, where tiles on the product's own row grid read it once a tile the group touches (two for most
+    of Kimi Linear's 128-row experts at 128-row tiles). The tiles number at most `cdiv(rows, tile)` plus the
+    groups less one (a ceiling's sum exceeds the sum's ceiling by at most one a part). Upstream's
     `GroupInfo.create` walked every group's length in every tile, unrolled: at 129 groups (Qwen3's 128
     experts and the unrouted rows) two thirds of a down projection's instructions, and its global loads a
     third of its stalls (NCU-full)."""
@@ -403,8 +419,9 @@ def tile_groups(lengths: jax.Array, tile: int, tiles: int, unit: int = 8) -> jax
     group = jnp.argmax(ours, axis=1).astype(jnp.int32)
     found = jnp.any(ours, axis=1)
     block_start = first_rows[group] + (tids[:, 0] - firsts[group]) * rows
-    columns = (group, block_start, starts[group], ends[group])
-    return jnp.stack([jnp.where(found, column, 0) for column in columns], axis=1)
+    matrix = jnp.minimum(group, lengths.shape[0] - 2) + (0 if first is None else first)
+    return TileGroup(*(jnp.where(found, column, 0)
+                       for column in (group, block_start, starts[group], ends[group], matrix)))
 
 
 def _prefix_sums(values: jax.Array) -> jax.Array:
@@ -500,7 +517,7 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
               **({'paired': (rhs_block, rhs_dtype)} if paired else {}),
               **(_scale_blocks(block_m, block_n) if step_scaled else {}),
               # A block-scaled product's rows' and matrix's scales, a step's tiles of each (`gmm`'s
-              # `mx_scales`), four scales a tile's row (`block_format`).
+              # `mx_scales`), four scales a tile's row (`product.block_format`).
               **(_scale_tiles(block_m, block_n, block_k, dtype) if block_scaled else {}),
               **{f'side_{i}': (axes.named(axes.held(prologue_axes[i]), extent), prologue_dtypes[i])
                  for i in stepped}}
@@ -518,20 +535,11 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
                        tuple((part, jnp.dtype(out)) for out in dtypes))
 
 
-def block_format(dtype) -> tuple[jnp.dtype, int]:
-    """Dew: a block-scaled product's scale dtype and the depths one scale covers, by its operands' `dtype`
-    (`gmm`'s `mx_scales`): NVFP4's (E2M1 operands) an E4M3 scale every 16 (tcgen05's `scale_vec::4X`,
-    `kind::mxf4nvf4`); MXFP8's (FP8 operands) an E8M0 scale every 32 (OCP MX, `scale_vec::1X`)."""
-    if jnp.dtype(dtype) == jnp.dtype(jnp.float4_e2m1fn):
-        return jnp.dtype(jnp.float8_e4m3fn), 16
-    return jnp.dtype(jnp.float8_e8m0fnu), 32
-
-
 def _scale_tiles(block_m: int, block_n: int, block_k: int, dtype) -> dict:
     """Dew: a block-scaled step's scale streams (`gmm_allocations`'): its rows' and its matrix's columns'
     scales in `tcgen05.scales_layout`'s tiles, `[128-row tiles, scale tiles, 32, 16]`, a tile four scales of
     each of 128 rows, so a step of `block_k` depths takes `block_k` over four blocks' depths of them
-    (`block_format`)."""
+    (`product.block_format`)."""
     scale, per = block_format(dtype)
     depth_tiles = block_k // (4 * per)
     return {'a_scales': ((block_m // 128, depth_tiles, 32, 16), scale),
@@ -704,6 +712,19 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         outs = tuple(total.astype(dtype) for dtype in dtypes)
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
+
+
+NVFP4_GROUP = 128
+"""Dew: the depths an NVFP4 matrix's staged order groups (`nvfp4_staged_depth`): a group's sixteen word rows
+decode, code by code, into its eight sixteen-depth slices."""
+
+
+def nvfp4_staged_depth(group, word, code):
+    """Dew: the depth the staged order (`gemm.staged_rows`, the stage decode's `_stage_decoded`) gives word
+    `word`'s code `code` of group `group`: each code's sixteen-depth slice (an NVFP4 block's,
+    `product.NVFP4`) holds the group's words in order, the one layout the packer writes and the decode
+    reads."""
+    return NVFP4_GROUP * group + product_formats.NVFP4.depth * code + word
 
 
 NVFP4_STEP = 256
@@ -1076,15 +1097,14 @@ def _gmm_allocated(tiles: Tiles, family: mosaic.Family, operands: tuple, hooks: 
 
 def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs: bool, plain: bool) -> None:
     """Dew: `gmm`'s refusal of a block-scaled product (`mx_scales`: the rows' and the matrices' scales, one
-    every block of depths, `block_format`'s, tiled as `tcgen05.scales_layout` lays them out, `[rows / 128,
-    scale tiles, 32, 16]` and `[groups, width / 128, scale tiles, 32, 16]`, the rows' in the product's row
-    order, a gathered product's its tokens' at the table (the caller's gather, `gemm._block_scaled`, row
-    4851); FP8 or E2M1 rows times a K-major
-    matrix of theirs, each block of each scaled in the products, `mosaic.Issuer.scaled_products`) it does
-    not take: but on a family whose
-    products take block scales, its matrix K-major, with no hook, pair, packed matrix, step scales,
-    transposed rows, exact sums or split, its tile whole 128s of rows, columns and depth (the scales'
-    tiles), each group's rows whole 128-row tiles (the caller's)."""
+    every block of depths, `product.block_format`'s, tiled as `tcgen05.scales_layout` lays them out, `[rows /
+    128, scale tiles, 32, 16]` and `[groups, width / 128, scale tiles, 32, 16]`, the rows' in the product's
+    row order, a gathered product's its tokens' at the table (the caller's gather, `gemm._block_scaled`, row
+    4851); FP8 or E2M1 rows times a K-major matrix of theirs, each block of each scaled in the products,
+    `mosaic.Issuer.scaled_products`) it does not take: but on a family whose products take block scales, its
+    matrix K-major, with no hook, pair, packed matrix, step scales, transposed rows, exact sums or split, its
+    tile whole 128s of rows, columns and depth (the scales' tiles), each group's rows whole 128-row tiles (the
+    caller's)."""
     if mx_scales is None:
         return
     if not (family.takes_block_scales and transpose_rhs and plain and tiles.splits == 1
@@ -1141,12 +1161,9 @@ def _grouped_table(group_sizes: jax.Array, m: int, row_tile: int, first: jax.Arr
     g = group_sizes.shape[0]
     lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
-    table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g, unit)
-    if first is None:
-        return table
-    # Each tile's matrix, its group's of the stack from `first` (`GroupInfo.matrix`): the group itself stays
-    # the call's, which its validity and its side operands read.
-    return jnp.concatenate([table, jnp.minimum(table[:, :1], g - 1) + first], axis=1)
+    # Each tile's matrix is its group's, of the stack from `first` where given (`TileGroup.matrix`): the
+    # group itself stays the call's, which its validity and its side operands read.
+    return tables.packed(tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g, unit, first))
 
 
 def _walked_rows(lhs, gather, scatter, tiles: Tiles, *, transpose_lhs: bool, dense: bool,
@@ -1273,12 +1290,6 @@ def _step_scaled_takes(step_scales: tuple, tiles: Tiles, depth: int, width: int,
             and (per == 1 or (per > 0 and per % tiles.block_n == 0)))
 
 
-def _matrix_of(group, groups: int):
-    """Dew: the matrix a `gmm` tile of `group` multiplies: its group's, the unrouted rows' the last's, or the
-    stack's from `first` (`GroupInfo.matrix`)."""
-    return jnp.minimum(group.group_id, groups - 1) if group.matrix is None else group.matrix
-
-
 def _unrolled(prologue, exact_sums: bool) -> bool:
     """Dew: whether a `gmm` walk takes a rotation of its ring a trip (`mosaic.stepping`): where its step is
     its products and its waits, small enough that a rotation unrolled takes fewer instructions an HGMMA;
@@ -1390,7 +1401,7 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
         pair_rows = pl.ds(group.block_start, tiles.block_m * tiles.cluster)
         columns = tile_columns(tiles, family)
         return {'rows': (lhs_gmem.at[pair_rows], lambda j: rings.Paired((0, first + j), 0)),
-                **{name: (_matrix_columns(gmem.at[_matrix_of(group, groups)], column_tile, block_n=columns,
+                **{name: (_matrix_columns(gmem.at[group.matrix], column_tile, block_n=columns,
                                           transpose_rhs=transpose_rhs),
                           lambda j: rings.Paired(rhs_index(first + j), 0 if transpose_rhs else 1))
                    for name, gmem in matrix_gmems.items()}}
@@ -1398,10 +1409,9 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
                 else (lhs_gmem.at[rows], lambda j: (0, first + j)) if gather_gmem is None
                 # A gathered product's rows each where its table says (`rings.Rows`, a row a run).
                 else (lhs_gmem, lambda j: rings.Rows(gather_gmem, row_start, (first + j,), 1)))
-    matrix = _matrix_of(group, groups)
     # Each stream's view and its step's block index (`(row, column)` of a matrix, four of a scale tile's).
     matrices: dict[str, tuple[object, Callable[..., tuple]]] = {
-        name: (_matrix_columns(gmem.at[matrix], column_tile, block_n=tiles.block_n,
+        name: (_matrix_columns(gmem.at[group.matrix], column_tile, block_n=tiles.block_n,
                                transpose_rhs=transpose_rhs),
                lambda j: rhs_index(first + j)) for name, gmem in matrix_gmems.items()}
     if 'scales' in matrix_gmems:
@@ -1417,14 +1427,14 @@ def _gmm_views(lhs_gmem, matrix_gmems: dict, prologue_gmems, group, row_start, c
         row_scales, column_scales = scale_gmems
         block, _ = _column_block(column_tile, tiles.block_n, scale_per)
         matrices['row_scales'] = (row_scales.at[:, rows], lambda j: (first + j, 0))
-        matrices['column_scales'] = (column_scales.at[matrix], lambda j: (first + j, block))
+        matrices['column_scales'] = (column_scales.at[group.matrix], lambda j: (first + j, block))
     if mx_gmems is not None:
         # An MX product's scale tiles at step j: its rows' 128-row tiles from the tile's (whole tiles: a
         # group's rows are whole 128s) and its matrix's at the tile's columns.
         row_scales, matrix_scales = mx_gmems
         matrices['a_scales'] = (row_scales.at[pl.ds(row_start // 128, tiles.block_m // 128)],
                                 lambda j: (0, first + j, 0, 0))
-        matrices['b_scales'] = (matrix_scales.at[matrix, pl.ds(column_tile * (tiles.block_n // 128),
+        matrices['b_scales'] = (matrix_scales.at[group.matrix, pl.ds(column_tile * (tiles.block_n // 128),
                                                                 tiles.block_n // 128)],
                                 lambda j: (0, first + j, 0, 0))
     # A side operand by group at the tile's group (`axes.at_group`), its groups' axis indexed away.
@@ -1571,7 +1581,7 @@ class _Decoding:
         """The consumers' meeting once each has decoded and published its share: a named barrier of all
         their threads (`DECODE_BARRIER`), none where one consumer decodes its own."""
         if self.consumers > 1:
-            threads = self.consumers * WARPGROUP_THREADS
+            threads = self.consumers * resources.THREADS
             plgpu.inline_mgpu()(lambda ctx: mgpu_utils.inline_ptx(
                 f"bar.sync {DECODE_BARRIER}, {threads};", has_side_effects=True))()
 
@@ -1579,9 +1589,6 @@ class _Decoding:
 DECODE_BARRIER = 15
 """Dew: the named barrier a packed matrix's consumers meet at (`_Decoding.met`): the last of a block's 16,
 past Mosaic GPU's own (0, the block's; 1 on, a warpgroup's)."""
-
-WARPGROUP_THREADS = 128
-"""Dew: a warpgroup's threads."""
 
 
 def _stage_decoded(words, scales, out, interpret: bool) -> None:
@@ -1604,22 +1611,15 @@ def _stage_decoded(words, scales, out, interpret: bool) -> None:
             # The block's scale a column: its group's code-th, picked from the loaded row by a mask (a
             # column slice of a register tile has no layout).
             scale = jnp.sum(jnp.where(which == 8 * group + code, owed, 0.0), axis=1)
-            out[:, pl.ds(128 * group + 16 * code, 16)] = (lane * scale[:, None]).astype(jnp.bfloat16)
+            depths = pl.ds(nvfp4_staged_depth(group, 0, code), product_formats.NVFP4.depth)
+            out[:, depths] = (lane * scale[:, None]).astype(jnp.bfloat16)
 
 
 def _e4m3_values(codes: jax.Array) -> jax.Array:
-    """Dew: E4M3 codes (float8_e4m3fn) as float32 by integer arithmetic, exactly: a normal code's exponent
-    (rebiased, 7 to 127) and mantissa moved into an fp32 pattern, a subnormal code's mantissa times 2^-9,
-    its sign kept. No FP8 conversion, which takes sm89's `cvt ... .e4m3x2`: an A100's ptxas refused the
-    packed NVFP4 kernel's scales cast so (W8-a100, M-NS-8). The NaN code (no block scale holds it) reads
-    as 480."""
-    word = jax.lax.bitcast_convert_type(codes, jnp.uint8).astype(jnp.uint32)
-    exponent, mantissa = (word >> jnp.uint32(3)) & jnp.uint32(0xF), word & jnp.uint32(0x7)
-    sign = (word & jnp.uint32(0x80)) << jnp.uint32(24)
-    normal = jax.lax.bitcast_convert_type(
-        sign | ((exponent + jnp.uint32(120)) << jnp.uint32(23)) | (mantissa << jnp.uint32(20)), jnp.float32)
-    subnormal = mantissa.astype(jnp.float32) * jnp.float32(2.0 ** -9)
-    return jnp.where(exponent == 0, jnp.where(sign != 0, -subnormal, subnormal), normal)
+    """Dew: E4M3 codes (float8_e4m3fn) as float32 by the format's integer decode (`bits.decoded`), exactly,
+    with no FP8 conversion: an A100's ptxas refused the packed NVFP4 kernel's scales cast so (W8-a100,
+    M-NS-8). The NaN code (no block scale holds it) reads as 480."""
+    return bits.decoded(jax.lax.bitcast_convert_type(codes, jnp.uint8).astype(jnp.uint32), bits.E4M3)
 
 
 def _nvfp4_lanes(words: jax.Array) -> list[jax.Array]:
@@ -1782,10 +1782,11 @@ def rows_unstaged(*, dense: bool, prologue, tabled: bool) -> bool:
     return dense and prologue is None and not tabled
 
 
-def _rewrites(family: mosaic.Family, k_major: bool, tables: tuple, unstaged: bool) -> bool:
+def rewrites(family: mosaic.Family, k_major: bool, tables: tuple, unstaged: bool) -> bool:
     """Dew: whether `tgmm`'s stage is rewritten by its family's own role (`mosaic.Family.rewrites_in_persist`,
     a role beside its consumers): its loads' rows, never rows its tables gather, a k-major launch's whole
-    steps of one group, nor a stage read as loaded (`rows_unstaged`; `grouped_matmul._Mosaic.rewritten`)."""
+    steps of one group, nor a stage read as loaded (`rows_unstaged`). The one decision: the kernel's role
+    and its planning's (`grouped_matmul._Mosaic.rewritten`)."""
     return (family.rewrites_in_persist and not k_major and all(table is None for table in tables)
             and not unstaged)
 
@@ -1811,7 +1812,7 @@ def _whole_stages(slots: dict, mine_depth) -> tuple:
 
 
 def _stage_rewrite(rewrites: bool, family: mosaic.Family, starts_gmem, ends_gmem, block_k: int) -> dict:
-    """Dew: `tgmm`'s persist argument where its family rewrites its stage (`_rewrites`): each step's
+    """Dew: `tgmm`'s persist argument where its family rewrites its stage (`rewrites`): each step's
     neighbouring groups' rows zeroed by the family's own role (`_rewritten_stage`); none elsewhere."""
     if not rewrites:
         return {}
@@ -1862,7 +1863,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     `operands` are padded, then each one's gather table (or None); `groups` `_group_blocks`' (`tgmm`)."""
     lhs, rhs, tables = operands[0], operands[1], tuple(operands[2:])
     family = family_of(tiles, lhs.dtype)
-    rewrites = _rewrites(family, k_major, tables, unstaged)
+    rewritten = rewrites(family, k_major, tables, unstaged)
     k, m, n, g = shape
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     consumers = tiles.warpgroups
@@ -1918,8 +1919,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                 def staged_at(index, slots):
                     # The step of its group's the program walks, from its first (`start`).
                     index = index + start
-                    if rewrites or k_major:
-                        return _whole_stages(slots, None if rewrites else mine_depth)
+                    if rewritten or k_major:
+                        return _whole_stages(slots, None if rewritten else mine_depth)
                     if unstaged:
                         return slots['ring_0'].at[:, mine_depth].transpose((1, 0)), slots['ring_1']
                     # A vector read from global memory at the step's row block (`read`).
@@ -1941,7 +1942,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=unrolled, accumulators=(part,),
                            **_summed(family, tiles, exact_sums),
-                           **_stage_rewrite(rewrites, family, starts_gmem, ends_gmem, block_k))
+                           **_stage_rewrite(rewritten, family, starts_gmem, ends_gmem, block_k))
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
@@ -1951,7 +1952,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     out_type = jax.ShapeDtypeStruct((g, m, n), out_dtype)
     kernel = family.kernel(body, out_type=out_type,
                            grid=(1 if interpret else multiprocessors,), grid_names=("programs",),
-                           consumers=consumers + rewrites, interpret=interpret, approx_math=False,
+                           consumers=consumers + rewritten, interpret=interpret, approx_math=False,
                            name="dew_tgmm",
                            resident=tiles.programs, scalars=len(groups),
                            cost=unit_cost.estimate(2 * k * m * n, lhs, rhs, *prologue_operands, out_type))

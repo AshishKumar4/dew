@@ -645,6 +645,14 @@ def test_the_template_takes_an_fp32_cotangent_at_the_highest_precision_as_its_bf
                     seeds=8, truth_fn=with_gradients(product(jnp.float64)))
 
 
+def _highest_on_h100(kernel: str, rows, matrices, group_sizes):
+    """A grouped product's fp32 output at the highest precision through `kernel`, interpreted as an H100's."""
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
+          jax.default_matmul_precision("highest")):
+        return np.asarray(jax.jit(lambda x, w: gemm.gemm(x, w, group_sizes, out_dtype=jnp.float32,
+                                                         interpret_on_cpu=True))(rows, matrices))
+
+
 @INTERPRETS
 def test_an_fp32_products_parts_keep_a_nonfinite_operand_whole():
     """An fp32 grouped product at the highest precision with the template named, interpreted as an H100's,
@@ -655,13 +663,7 @@ def test_an_fp32_products_parts_keep_a_nonfinite_operand_whole():
     rows = jnp.ones((128, 128), jnp.float32).at[3, 5].set(jnp.inf)
     matrices = jnp.full((2, 128, 128), 2.0 ** -100, jnp.float32).at[0, 5, 7].set(0.0)
 
-    def product(kernel):
-        with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
-              jax.default_matmul_precision("highest")):
-            return np.asarray(jax.jit(lambda x, w: gemm.gemm(x, w, group_sizes, out_dtype=jnp.float32,
-                                                             interpret_on_cpu=True))(rows, matrices))
-
-    parted, whole = product("mosaic"), product("xla")
+    parted, whole = (_highest_on_h100(kernel, rows, matrices, group_sizes) for kernel in ("mosaic", "xla"))
     np.testing.assert_array_equal(np.isinf(parted), np.isinf(whole))
     np.testing.assert_array_equal(np.isnan(parted), np.isnan(whole))
     assert np.isinf(parted[3]).sum() == 127 and np.isnan(parted[3, 7])
@@ -676,14 +678,9 @@ def test_bf16_rows_multiply_an_fp16_matrix_rounded_to_bf16_at_the_highest_precis
     rows = jnp.ones((128, 128), jnp.bfloat16)
     matrices = jnp.full((2, 128, 128), 1 + 2.0 ** -10, jnp.float16)
 
-    def product(kernel):
-        with (generation.assumed("sm90"), generation.chosen(grouped_matmul=kernel),
-              jax.default_matmul_precision("highest")):
-            return np.asarray(jax.jit(lambda x, w: gemm.gemm(x, w, group_sizes, out_dtype=jnp.float32,
-                                                             interpret_on_cpu=True))(rows, matrices))
-
-    np.testing.assert_array_equal(product("mosaic"), np.full((128, 128), 128.0, np.float32))
-    np.testing.assert_array_equal(product("xla"), np.full((128, 128), 128.0, np.float32))
+    for kernel in ("mosaic", "xla"):
+        np.testing.assert_array_equal(_highest_on_h100(kernel, rows, matrices, group_sizes),
+                                      np.full((128, 128), 128.0, np.float32))
 
 
 @INTERPRETS
@@ -909,9 +906,9 @@ def test_no_row_tile_reads_past_its_operands_allocation(sizes, row_tile):
     tiles read rows 120 to 183 of a 128-row lhs)."""
     rows = -(-sum(sizes) // mosaic_gpu.TMA_ROWS) * mosaic_gpu.TMA_ROWS
     lengths = jnp.asarray([*sizes, rows - sum(sizes)], jnp.int32)
-    table = np.asarray(mosaic_gpu.tile_groups(lengths, row_tile, -(-rows // row_tile) + len(sizes)))
-    used = table[:, 3] > table[:, 2]
-    reads = int((table[used, 1] + row_tile).max())
+    table = mosaic_gpu.tile_groups(lengths, row_tile, -(-rows // row_tile) + len(sizes))
+    used = np.asarray(table.group_end > table.group_start)
+    reads = int((np.asarray(table.block_start)[used] + row_tile).max())
     assert reads <= mosaic_gpu.row_extent(rows, row_tile)
     if sizes == [120, 8]:
         assert reads > -(-rows // row_tile) * row_tile  # past the row-tile padding that held before
