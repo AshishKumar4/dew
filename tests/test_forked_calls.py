@@ -560,7 +560,7 @@ def test_a_forked_conv_reads_each_documents_real_tokens_past_its_holes():
     compact[0, :len(order)] = segments[0, order]
     moved = jnp.zeros_like(x).at[0, :len(order)].set(x[0, order])
     expected = np.asarray(forked_conv(moved, kernel, laid(compact, compact > 0)))
-    np.testing.assert_allclose(found[0, order], expected[0, :len(order)], rtol=1e-6, atol=1e-6)
+    np.testing.assert_array_equal(found[0, order], expected[0, :len(order)])
     assert np.all(found[0, ~held[0]] == 0)
 
 
