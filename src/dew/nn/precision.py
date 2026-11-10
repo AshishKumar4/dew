@@ -592,13 +592,14 @@ def accumulated(product: Callable[..., jax.Array], *operands,
         if _sums_in_float64(*multiplied):
             return _summed_wide(product, preferred_element_type, *operands, counts=1)
         if (all(isinstance(operand, jax.Array | np.ndarray) for operand in multiplied)
-                and products_dtype(*multiplied) == jnp.dtype(jnp.float32)):
+                and products_dtype(*multiplied) == jnp.dtype(jnp.float32)
+                and _whole_on_one_device(*multiplied)):
             return _summed_pairwise(product, preferred_element_type, *operands)
         return product(*operands, preferred_element_type=preferred_element_type)
     if not _sums_in_float64(*operands):
         if ((key := _contraction(product, preferred_element_type)) is not None
                 and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
-                and products_dtype(*operands) == jnp.dtype(jnp.float32)):
+                and products_dtype(*operands) == jnp.dtype(jnp.float32) and _whole_on_one_device(*operands)):
             return _traced_once(key, _summed_pairwise)(*operands)
         return product(*operands, preferred_element_type=preferred_element_type)
     if (key := _contraction(product, preferred_element_type)) is not None:
@@ -614,6 +615,17 @@ def _ragged(product: Callable) -> bool:
     return product is jax.lax.ragged_dot_general
 
 
+def _whole_on_one_device(*operands) -> bool:
+    """Whether a product runs whole on one device, where a CPU sums its float32 products as a vectorized dot
+    does (`pairwise`, row 4863): no mesh of more than one device in the trace's context (`jax.set_mesh`, as
+    Dew's runs, its server and its tasks set it) nor in its operands' types. Under a multi-device mesh the
+    product is JAX's own `dot_general`, which the partitioner places as it places any (row 5427: a blocked
+    form's layout and its blocks' axis moved the placement a dot keeps); its sums there are XLA's."""
+    meshes = [jax.sharding.get_abstract_mesh(),
+              *(jax.typeof(operand).sharding.mesh for operand in operands if isinstance(operand, jax.Array))]
+    return all(mesh.empty or mesh.size == 1 for mesh in meshes)
+
+
 def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision,
                        preferred_element_type, group_sizes=None) -> jax.Array | None:
     """A layer's projection (`product`, its own `jax.lax.dot_general`, as `gemm.dot_general` takes a layer's
@@ -622,13 +634,15 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
     None where `product` is the CPU's sum already (Dew's wide test arithmetic, `_sums_in_float64`), a
     quantized model's rule matching its module owns it (`products_quantized`; a module the rules leave alone
     sums as the plain model's), its declared algorithm narrows the operands (`exact_products`: its own
-    product keeps the declaration), or its dtypes are others. Every float32 contraction `accumulated` sums
+    product keeps the declaration), it runs under a multi-device mesh (`_whole_on_one_device`), or its
+    dtypes are others. Every float32 contraction `accumulated` sums
     takes it too (`_paired`). With `group_sizes`, `product` is a ragged dot (`jax.lax.ragged_dot_general`, its
     `dimension_numbers` the ragged ones) of a grouped GEMM's form (`pairwise.ragged_form`), summed so by
     `pairwise.pairwise_ragged_dot_general`; None for any other form."""
     from dew.nn import pairwise
 
     if (_sums_in_float64(lhs, rhs) or products_quantized() or not exact_products(precision, jnp.float32)
+            or not _whole_on_one_device(lhs, rhs)
             or jnp.dtype(preferred_element_type or jnp.float32) != jnp.float32
             or not all(isinstance(operand, jax.Array | np.ndarray) and operand.dtype == jnp.float32
                        for operand in (lhs, rhs))
@@ -640,11 +654,8 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
             return product(lhs, rhs, sizes, dimension_numbers, precision=precision,
                            preferred_element_type=preferred_element_type)
 
-        # Placed where the ragged product is (its `out_sharding`, a mesh with Explicit axes stating it).
-        placement = product.keywords.get('out_sharding') if isinstance(product, functools.partial) else None
-        blocked_grouped = functools.partial(pairwise.pairwise_ragged_dot_general,
-                                            ragged_dot_dimension_numbers=dimension_numbers,
-                                            precision=precision, out_sharding=placement)
+        blocked_grouped = functools.partial(pairwise.pairwise_ragged_dot_general, precision=precision,
+                                            ragged_dot_dimension_numbers=dimension_numbers)
         return jax.lax.platform_dependent(lhs, rhs, group_sizes, cpu=blocked_grouped, default=plain_grouped)
 
     def plain(lhs, rhs):
