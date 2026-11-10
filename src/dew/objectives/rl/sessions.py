@@ -78,8 +78,10 @@ SEGMENT_IDS_KEY = "text_segment_ids"
 POSITIONS_KEY = "text_positions"
 """Each token's position inside its chain, from 0."""
 FORK_PARENTS_KEY = "fork_parents"
-"""`[rows, documents]`: the document each of a row's documents continues, 0 for none (`dew.batch.Forks`);
-present where `pack` shares its chains' prompts."""
+"""`[rows, documents]`: the document each of a row's documents continues, 0 for none (`dew.batch.Forks`), its
+`documents` the most a row holds; present wherever `pack` shares its chains' prompts (`share`), whether or
+not its rows share one, so every share of a rollout packs one schema, its documents the pool's agreed most
+(`agreed_records`)."""
 VERSIONS_KEY = "versions"
 """On a sampled id, the policy version its call was submitted under; -1 elsewhere."""
 SESSION_INDEX_KEY = "session_index"
@@ -813,11 +815,8 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
         trainable[chain.session] += sum(1 for call in chain.calls if call >= 0)
     if built:
         chained, carried = _chain_rows(built, _routed(built))
-        needed = ForkedRows.needed(chained, width, share=share, fields=carried)
-        if rows is not None and needed > rows:
-            raise ValueError(f"the chains need {needed} rows of {width} ids, more than the {rows} asked for")
-        laid = ForkedRows.pack(chained, width, windows=max(needed if rows is None else rows, 1), share=share,
-                               fields=carried)
+        # Planned once: the rows the chains need, or refused past `rows` (`ForkedRows.pack`).
+        laid = ForkedRows.pack(chained, width, windows=rows, share=share, fields=carried)
         shape = (int(laid.tokens.shape[0]), int(laid.tokens.shape[1]))
     else:
         laid, shape = None, (max(rows or 1, 1), width)
@@ -860,8 +859,12 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
         ADVANTAGES_KEY: advantage, TOKEN_REWARDS_KEY: token_rewards, SESSION_WEIGHTS_KEY: weights,
         **_engine_records(laid, built, slots, shape, support_capacity),
     }
-    if laid is not None and laid.coordinates.forks is not None:
-        packed[FORK_PARENTS_KEY] = np.asarray(laid.coordinates.forks.parents, np.int32)
+    if share:
+        # The parents of a pack that shares no prompt are none, of as many documents as its rows hold.
+        forks = None if laid is None else laid.coordinates.forks
+        documents = 1 if laid is None else laid.coordinates.max_segments
+        packed[FORK_PARENTS_KEY] = (np.zeros((shape[0], documents), np.int32) if forks is None
+                                    else np.asarray(forks.parents, np.int32))
     return packed
 
 
@@ -1006,7 +1009,9 @@ def agreed_records(packed: dict[str, np.ndarray], support_capacity: int | None) 
     false over expert ids of zero, and supports of -1, which the trainer
     reads as no record. The routing's `[layers, top_k]` and dtype, a routed
     site's each where the records are keyed by site, come from the processes
-    that packed it, which must agree. A process that packed
+    that packed it, which must agree. A shared pack's parents
+    (`FORK_PARENTS_KEY`) are padded with documents of no parent to the most
+    any process's rows hold. A process that packed
     nothing, a share's later reader, keeps nothing. Every process calls
     this, in the order of its other coordination rounds.
     """
@@ -1014,7 +1019,9 @@ def agreed_records(packed: dict[str, np.ndarray], support_capacity: int | None) 
 
     routed = {name: [*map(int, value.shape[2:]), value.dtype.name] for name, value in packed.items()
               if name == ROUTED_EXPERTS_KEY or name.startswith(f"{ROUTED_EXPERTS_KEY}/")}
-    pool = from_every_process({"routing": routed or None, "support": SUPPORT_KEY in packed})
+    documents = int(np.shape(packed[FORK_PARENTS_KEY])[1]) if FORK_PARENTS_KEY in packed else None
+    pool = from_every_process({"routing": routed or None, "support": SUPPORT_KEY in packed,
+                               "documents": documents})
     layouts = [share["routing"] for share in pool if share["routing"] is not None]
     if any(layout != layouts[0] for layout in layouts[1:]):
         raise ValueError(f"the pool's routed_experts disagree on their sites, [layers, top_k] or dtype: "
@@ -1029,6 +1036,10 @@ def agreed_records(packed: dict[str, np.ndarray], support_capacity: int | None) 
     if any(share["support"] for share in pool) and SUPPORT_KEY not in packed:
         assert support_capacity is not None, "a peer packed supports, which need a support_capacity"
         filled.update(_empty_support(shape[0], support_capacity))
+    most = max((share["documents"] for share in pool if share["documents"] is not None), default=None)
+    if most is not None:
+        parents = np.asarray(packed.get(FORK_PARENTS_KEY, np.zeros((shape[0], 0), np.int32)), np.int32)
+        filled[FORK_PARENTS_KEY] = np.pad(parents, ((0, 0), (0, most - parents.shape[1])))
     return filled
 
 
