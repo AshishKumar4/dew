@@ -58,7 +58,8 @@ def _hooks(case: dict[str, str], sinks):
 def supported(case: dict[str, str]) -> bool:
     """Whether its choice's selector serves `case` on its GPU at its kernel (tests/kernel_matrix.py): the
     decode selector takes a dense step (`decodes`), the paged selector a paged one, each by the kernel named
-    (`selection.select`), which takes it."""
+    (`selection.select`), which takes it; one this host does not lower for the GPU (`selection.Unlowerable`:
+    cuDNN where it loads no cuDNN library) served by that decision there, its cell native alone."""
     heads, kv_heads, width, dtype = head_shapes(case, HEADS)
     with generation.assumed(case["generation"]):
         if case["layout"] == "dense":
@@ -81,6 +82,8 @@ def supported(case: dict[str, str]) -> bool:
             return selection.select(op, called, case["kernel"]).kernel == case["kernel"]
         except selection.KernelRefused:
             return False
+        except selection.Unlowerable as unlowered:
+            return unlowered.kernel == case["kernel"]
 
 
 class _Paged(nn.Module):

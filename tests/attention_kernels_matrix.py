@@ -88,13 +88,15 @@ def supported(case: dict[str, str]) -> bool:
     """Whether the op serves `case` on its kernel (tests/kernel_matrix.py): on its generation's device
     (`native`), its training step, traced for its shapes as that generation (a GPU's within an abstract mesh
     of one of its devices) with the kernel named, is not refused by the kernel's requirements
-    (`selection.KernelRefused`) and reports that kernel."""
+    (`selection.KernelRefused`) and reports that kernel, or decides it where this host does not lower it for
+    the GPU (`selection.Unlowerable`: cuDNN where it loads no cuDNN library), served there, its cell native
+    alone."""
     with generation.assumed(case["generation"]):
         if not native(case["kernel"]):
             return False
     mesh = (generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), case["generation"])
             if case["generation"].startswith("sm") else None)
-    refused = None
+    refused = unlowered = None
     with generation.assumed(case["generation"]), generation.routes() as routes:
         try:
             if mesh is None:
@@ -104,7 +106,11 @@ def supported(case: dict[str, str]) -> bool:
                     jax.eval_shape(_step(case, case["kernel"]), *_spec(case))
         except selection.KernelRefused as refusal:
             refused = refusal
+        except selection.Unlowerable as error:
+            unlowered = error
     kernels = {route.kernel for route in routes if route.choice == CHOICE}
+    if unlowered is not None and unlowered.choice == CHOICE:
+        kernels.add(unlowered.kernel)
     return refused is None and kernels == {case["kernel"]}
 
 
