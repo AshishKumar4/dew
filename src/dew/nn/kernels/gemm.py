@@ -1374,7 +1374,8 @@ def _recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype
 def _launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: PrecisionLike) -> bool:
     """Whether a launch takes any of the dense product `rows @ matrix`'s products on the call's target
     (`grouped_matmul.GROUPED`): its forward, its input gradient or its kernel gradient, as `gemm` and
-    its reverse mode make them. Where none does, each one's route is reported, as XLA runs them. Decided
+    its reverse mode make them, each read without its report (`selection.selected`). Where none does, the
+    forward's route is reported, as XLA runs it. Decided
     once a key (`_DECIDED`: the operands' shapes and dtypes, the product, the target and the kernels a
     block names or pins), its routes reported again at every call: a model's projections ask the same
     question at every layer's trace (row 3213: a warm start spent 10.9 of its 75.6 seconds selecting)."""
@@ -1412,8 +1413,9 @@ def _launched_once(rows: jax.Array, matrix: jax.Array, out_dtype, product, whole
     cases = [grouped_matmul.grouped_case(*call, product=product, whole=whole) for call in calls]
     if any(selection.selected(grouped_matmul.GROUPED, case).name != 'xla' for case in cases):
         return True
-    for case in cases:
-        selection.select(grouped_matmul.GROUPED, case)
+    # No launch takes any of them: the product is XLA's dot, its forward reported here; its gradients are
+    # XLA's own where a reverse pass runs (a decode's trace derives no plan for one it never takes).
+    selection.select(grouped_matmul.GROUPED, cases[0])
     return False
 
 
