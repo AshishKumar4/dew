@@ -6,6 +6,7 @@ through global memory by the walk itself (`mosaic.Family.kept`); its reverse wal
 gradient and sums a stored slot's (`Returning`)."""
 
 import dataclasses
+import functools
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -52,17 +53,22 @@ class Memories:
     column: jax.Array
     bv: int
 
-    def views(self, ref, base) -> list:
+    def view(self, ref, base, i):
+        """Key slice `i` of the memory at `base` of `ref`."""
         call = self.call
-        return [ref.at[pl.ds((base * call.heads + self.head) * call.width + i * call.block, call.block),
-                       pl.ds(self.column, self.bv)] for i in range(call.width // call.block)]
+        return ref.at[pl.ds((base * call.heads + self.head) * call.width + i * call.block, call.block),
+                      pl.ds(self.column, self.bv)]
 
-    def read(self, ref, base) -> list:
-        """The memory at `base` of `ref`, in the walk's registers (`Family.tile_of`)."""
-        return [self.call.family.tile_of(view) for view in self.views(ref, base)]
+    def views(self, ref, base) -> list:
+        return [self.view(ref, base, i) for i in range(self.call.width // self.call.block)]
 
-    def zeros(self) -> list:
-        return [self.call.family.zeros((self.call.block, self.bv))] * (self.call.width // self.call.block)
+    def read(self, ref, base, i):
+        """Key slice `i` of the memory at `base` of `ref`, in the walk's registers (`Family.tile_of`): a
+        walk reads a memory a slice at a time, each beside the slices it carries alone."""
+        return self.call.family.tile_of(self.view(ref, base, i))
+
+    def zero(self):
+        return self.call.family.zeros((self.call.block, self.bv))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,21 +101,20 @@ class Taking:
         given, loads, _, entries = self.refs
         load = loads[n]
 
-        def taken():
+        def taken(i):
             def from_given():
-                return lax.cond(load > 0, lambda: self.slots.read(given, self.row * self.count + load - 1),
-                                self.slots.zeros)
+                return lax.cond(load > 0, lambda: self.slots.read(given, self.row * self.count + load - 1, i),
+                                self.slots.zero)
 
             def from_stored():
-                return self.slots.read(self.stored, self.row * self.held + load - self.count - 1)
+                return self.slots.read(self.stored, self.row * self.held + load - self.count - 1, i)
 
             memory = lax.cond(load > self.count, from_stored, from_given) if self.held else from_given()
-            if entries is not None:
-                written = self.slots.read(entries, n)
-                memory = [part + entry for part, entry in zip(memory, written, strict=True)]
-            return memory
+            return memory if entries is None else memory + self.slots.read(entries, n, i)
 
-        return lax.cond(load >= 0, taken, lambda: list(state))
+        # A slice at a time: each taken up beside the slices carried, the one it replaces dead after it.
+        return [lax.cond(load >= 0, functools.partial(taken, i), lambda part=part: part)
+                for i, part in enumerate(state)]
 
     def after(self, n, state):
         if not self.held:
@@ -148,8 +153,9 @@ class Returning:
     def opened(self) -> None:
         """The row's stored slots' gradients zeroed for the walk's sums."""
         call = self.slots.call
+        zeros = [self.slots.zero()] * (call.width // call.block)
         for slot in range(self.held):
-            call.family.kept(self.slots.zeros(), self.slots.views(self.returned, self.row * self.held + slot),
+            call.family.kept(zeros, self.slots.views(self.returned, self.row * self.held + slot),
                              call.interpret, smem=self.smem)
 
     def before(self, f, grad):
@@ -157,11 +163,11 @@ class Returning:
             return grad
         slot = self.stores[self.chunks - 1 - f]
 
-        def stored():
-            gathered = self.slots.read(self.returned, self.row * self.held + slot - 1)
-            return [part + more for part, more in zip(grad, gathered, strict=True)]
+        def stored(i, part):
+            return part + self.slots.read(self.returned, self.row * self.held + slot - 1, i)
 
-        return lax.cond(slot > 0, stored, lambda: list(grad))
+        return [lax.cond(slot > 0, functools.partial(stored, i, part), lambda part=part: part)
+                for i, part in enumerate(grad)]
 
     def after(self, f, grad):
         n = self.chunks - 1 - f
@@ -174,11 +180,11 @@ class Returning:
                 @pl.when(load > self.count)
                 def _():
                     base = self.row * self.held + load - self.count - 1
-                    summed = [part + more for part, more in zip(grad, self.slots.read(self.returned, base),
-                                                                strict=True)]
+                    # A slice at a time: each summed beside the gradient's slices, then kept.
+                    summed = [part + self.slots.read(self.returned, base, i) for i, part in enumerate(grad)]
                     call.family.kept(summed, self.slots.views(self.returned, base), call.interpret,
                                      smem=self.smem)
-            return self.slots.zeros()
+            return [self.slots.zero()] * len(grad)
 
         return lax.cond(load >= 0, taken, lambda: list(grad))
 

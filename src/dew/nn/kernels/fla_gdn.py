@@ -107,8 +107,11 @@ def _dot(a, b, *, exact: bool, ieee: bool = False):
     if jnp.dtype(a.dtype) != jnp.dtype(b.dtype):
         raise TypeError(f"Pallas dot operands must have the same dtype, got {a.dtype} and {b.dtype}")
     if exact:
-        product = Product(jnp.dtype(a.dtype), promoted=ieee, refusal=None)
-        return interpreted(product, a, b, (((a.ndim - 1,), (0,)), ((), ())))
+        # A 16-bit product's terms exact in fp32, its operands widened first: XLA's CPU dot takes no bf16
+        # operands into an fp32 result (`DotThunk`).
+        product = Product(jnp.dtype(jnp.float32), promoted=ieee, refusal=None)
+        return interpreted(product, a.astype(jnp.float32), b.astype(jnp.float32),
+                           (((a.ndim - 1,), (0,)), ((), ())))
     wide = jnp.dtype(a.dtype) == jnp.float32
     precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT) if wide else None
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)

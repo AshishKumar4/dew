@@ -939,7 +939,7 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
         ((1, 64, 2), jnp.float32), ((1, 64, 2), jnp.bfloat16))]
     # The run's call as the chunked op's route makes it (`recurrence_chunk.chunk`'s options).
     options = {'max_segments': None, 'scale': None, 'delta': True, 'wide': False, 'bound': 1.0,
-               'rounded': True}
+               'rounded': True, 'between': mainloop.Between.GIVEN}
 
     def loss(*given):
         out, final = recurrence_chunk.template_rule(*given, **options)
@@ -1340,7 +1340,8 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
     and two stored slots (`chunked_launch.Forked`), the gated delta net's with an entry write, at the
     template's derived tiles on `target`, its forward or training pass as a gate case (`KernelCase`): its
     operands laid from the chunks' edges and its table as the walks take it (`template.forked_laid`). Returns
-    the case, the bound call and its tiles."""
+    the case (None where the template derives no tiles), the bound call, its tiles and the same call
+    unforked, bound."""
     from fla_gdn_support import KernelCase
 
     facts = generation.gpu_target(target)
@@ -1354,12 +1355,13 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
         jax.ShapeDtypeStruct((1, 3, v.shape[2]), jnp.float32))
     forked = chunked_launch.Forked(slots, slots, slots, entry, 2)
     skip = list(_skipped(name, jnp.bfloat16).values())
-    bound = template.MOSAIC.bind(q, k, v, g, beta, given, None, forked=forked,
-                                 bound=None if name in RATED else 1.0, **_form(name, jnp.bfloat16),
-                                 **_skipped(name, jnp.bfloat16))
+    bind = functools.partial(template.MOSAIC.bind, bound=None if name in RATED else 1.0,
+                             **_form(name, jnp.bfloat16), **_skipped(name, jnp.bfloat16))
+    bound, unforked = bind(q, k, v, g, beta, given, None, forked=forked), bind(q, k, v, g, beta, h0, None)
     with generation.assumed(facts):
         tiles = template.MOSAIC.derived(bound, facts)
-    assert tiles is not None, f"{name} on {target}: the template derives no tiles for a forked call"
+    if tiles is None:
+        return None, bound, tiles, unforked
     laid, table = jax.eval_shape(lambda *x: template.forked_laid(*x, tiles.chunk)[:2], q, k, v, g, beta,
                                  given, forked)
     formed = {key: value for key, value in _form(name, jnp.bfloat16).items() if key != 'wide' or not training}
@@ -1381,7 +1383,7 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
         return fn, (*laid, *tabled, *cotangents, *skip)
 
     label = f"{name} bfloat16 {'training' if training else 'forward'} forked {tiles}"
-    return KernelCase(label, call), bound, tiles
+    return KernelCase(label, call), bound, tiles, unforked
 
 
 @COMPILES_ON_CPU
@@ -1392,12 +1394,19 @@ def test_a_forked_calls_walks_keep_its_table_spilling_none(target, name, trainin
     `table.Returning`; ledger 5376) lower, every kernel spilling none and every report read
     (`kernel_compile.mosaic_failures`), at the tiles a run settles on: a launch spilling at its derived tiles
     refused and the call derived again, as a run's compile steps it down (`report.refuse_launch`,
-    `stepped_down`; such a spill the register model's miss, row 5357)."""
+    `stepped_down`; such a spill the register model's miss, row 5357). A call whose table walk the template
+    derives no tiles for is one it derives none for unforked, the template ineligible for it alike: the
+    table's slice a step holds no call out the walk takes otherwise."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     facts, stepped = generation.gpu_target(target), set()
     while True:
-        case, bound, tiles = forked_case(target, name, training)
+        case, bound, tiles, unforked = forked_case(target, name, training)
+        if case is None:
+            with generation.assumed(facts):
+                assert template.MOSAIC.derived(unforked, facts) is None, f"{name}: forked alone derives none"
+                assert not template.MOSAIC.eligible(bound, facts)
+            return
         found = compile_mosaic_kernels([case], target)
         spilling = {kernel["kernel"] for record in found for kernel in record.get("kernels", ())
                     if kernel.get("spilled")}

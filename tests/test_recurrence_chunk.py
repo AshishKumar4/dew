@@ -575,8 +575,8 @@ def rated_draw(seed: int) -> tuple:
     return token, sequence
 
 
-def decayed(hooks, token: dict, sequence: dict) -> tuple:
-    """`hooks`' decode token on the launch and on its reference, and its chunked sequence on the portable
+def decayed(hooks, token: dict, sequence: dict, launch=recurrence.step) -> tuple:
+    """`hooks`' decode token on the `launch` and on its reference, and its chunked sequence on the portable
     math, `rated_draw`'s operands read as `hooks` reads them: a rated decay's rate, or that rate times the
     write gate given whole as the log decay."""
     def operands(given: dict, leading) -> dict:
@@ -585,7 +585,7 @@ def decayed(hooks, token: dict, sequence: dict) -> tuple:
         return given | ({'rate': rate} if hooks.rated else {'log_decay': rate[leading] * given['beta']})
 
     stepped = [step(hooks, recurrence.Step(**operands(token, (None, slice(None)))))[::2]
-               for step in (recurrence.step, recurrence.step_reference)]
+               for step in (launch, recurrence.step_reference)]
     chunked = chunk_on('xla', hooks, Chunk(**operands(sequence, (None, None, slice(None)))), chunk_size=CHUNK)
     return (*stepped, chunked)
 
@@ -593,9 +593,12 @@ def decayed(hooks, token: dict, sequence: dict) -> tuple:
 def test_a_rated_decay_is_its_log_decay():
     """A rated decay (`rate` times the write gate) steps a decode token, on the launch and on its reference,
     and a chunked sequence on the portable math as the same log decay given whole: on par with the whole
-    decay's from float64 over the site's seeds (check 1)."""
+    decay's from float64 over the site's seeds (check 1), whose truth is the reference's arithmetic in
+    float64: the launch takes no float64 operands (interpreted under x64, its key sums' loop failed to
+    lower, i32 against i64, once the interpreter joined two halves as a GPU does)."""
     assert_as_exact(functools.partial(decayed, RATED), functools.partial(decayed, WHOLE), rated_draw,
-                    'a rated decay against its log decay', seeds=RATED_SEEDS)
+                    'a rated decay against its log decay', seeds=RATED_SEEDS,
+                    truth_fn=functools.partial(decayed, WHOLE, launch=recurrence.step_reference))
 
 
 def test_the_operands_are_checked_as_the_decode_steps():

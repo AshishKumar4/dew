@@ -1763,11 +1763,11 @@ def _weighted_values(v, a, beta, taken, call: Call):
 
 def table_held(held: Held, call: Call, table: Table | None, bv: int) -> Held:
     """`held` (a walk's `Held`) with its table's phase where it walks a forked call's (`Taking`, `Returning`):
-    beside the memory carried, the memory it takes up and the entry write it adds, or the gradient a stored
-    slot gathered and its sum."""
+    beside the memory carried, a key slice of the memory it takes up and of the entry write it adds, or of
+    the gradient a stored slot gathered and its sum, the walk taking them a slice at a time."""
     if table is None:
         return held
-    return dataclasses.replace(held, phases=(*held.phases, [f32(call.width, bv)] * 2))
+    return dataclasses.replace(held, phases=(*held.phases, [f32(call.block, bv)] * 2))
 
 
 def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walked: tuple, step, start,

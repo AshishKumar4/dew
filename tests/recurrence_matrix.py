@@ -231,13 +231,10 @@ CASES = (
     ('sm90', 'kimi delta attention', 'xla', 'float32', 'one'),
     ('sm80', 'write gate', 'xla', 'float32', 'packed'),
     ('sm80', 'kimi delta attention', 'mosaic_gpu', 'bfloat16', 'packed'),
-    ('sm90', 'gated delta net', 'fla', 'float32', 'one'),
     ('sm90', 'write gate', 'xla', 'bfloat16', 'one'),
-    ('sm90', 'rated scan', 'mosaic_gpu', 'float32', 'one'),
-    ('sm90', 'gated delta net', 'xla', 'bfloat16', 'one'),
     ('sm90', 'kimi delta attention', 'fla', 'bfloat16', 'one'),
-    ('sm90', 'rated scan', 'xla', 'bfloat16', 'one'),
-    ('sm90', 'rated scan', 'pallas', 'float32', 'one'),
+    ('sm90', 'gated delta net', 'xla', 'float32', 'one'),
+    ('sm90', 'rated scan', 'xla', 'float32', 'one'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("recurrence")`, regenerated where the axes or the route's support change), under
@@ -253,13 +250,10 @@ SEEDS = {
     ('sm90', 'kimi delta attention', 'xla', 'float32', 'one'): 128,
     ('sm80', 'write gate', 'xla', 'float32', 'packed'): 64,
     ('sm80', 'kimi delta attention', 'mosaic_gpu', 'bfloat16', 'packed'): 8,
-    ('sm90', 'gated delta net', 'fla', 'float32', 'one'): 64,
     ('sm90', 'write gate', 'xla', 'bfloat16', 'one'): 64,
-    ('sm90', 'rated scan', 'mosaic_gpu', 'float32', 'one'): 64,
-    ('sm90', 'gated delta net', 'xla', 'bfloat16', 'one'): 256,
     ('sm90', 'kimi delta attention', 'fla', 'bfloat16', 'one'): 8,
-    ('sm90', 'rated scan', 'xla', 'bfloat16', 'one'): 512,
-    ('sm90', 'rated scan', 'pallas', 'float32', 'one'): 64,
+    ('sm90', 'gated delta net', 'xla', 'float32', 'one'): 256,
+    ('sm90', 'rated scan', 'xla', 'float32', 'one'): 512,
 }
 """Each cell's declared seeds, sized by `seeds_for` on its own GPU, paired against its oracle (`_reference`,
 the upstream run live or the token recurrence; an H100 and an A100, M-JS-75d at b44df0fea0e, and the fp32
