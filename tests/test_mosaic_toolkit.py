@@ -344,6 +344,31 @@ def test_a_planned_launch_at_its_producers_registers_holds_the_programs_and_budg
         assert (model.budget, model.producer) == (budget, stated)
 
 
+def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_configs():
+    """A pair's step (`mosaic.Paired` indices) is the pair's block, the slot's twice along the axis its CTAs
+    split, at the indices in the pair's blocks (`viewed`'s `Split`), where a plain step is the slot's block;
+    and the pair's bundle (`mosaic_sm100.PAIR`, its products over a cluster of two, each CTA a half of
+    tcgen05's widest product's columns) is composed for a Blackwell launch stating its accumulators and
+    reached by a config's name, where a device without tcgen05 composes none."""
+    from dew.nn.kernels.templates import bundles, mosaic_sm100
+
+    ref = jax.new_ref(jnp.arange(256 * 512, dtype=jnp.float32).reshape(256, 512))
+    block = (64, 128)
+    split = mosaic.viewed((ref, lambda step: mosaic.Paired((1, step), along=0)), block, 2)
+    assert isinstance(split, mosaic.Split) and split.along == 0 and split.ref.shape == (128, 128)
+    np.testing.assert_array_equal(np.asarray(split.ref[...]), np.asarray(ref[128:256, 256:384]))
+    plain = mosaic.viewed((ref, lambda step: (1, step)), block, 2)
+    np.testing.assert_array_equal(np.asarray(plain[...]), np.asarray(ref[64:128, 256:384]))
+
+    pair = mosaic_sm100.PAIR
+    assert (pair.cluster, pair.pairs_product, pair.widest_product) == (2, True, 128)
+    assert (mosaic_sm100.RINGS.cluster, mosaic_sm100.RINGS.pairs_product) == (1, False)
+    assert bundles.named("tcgen05.pair", jnp.bfloat16) is pair
+    assert pair in bundles.groups("sm100", jnp.bfloat16, stated=True)[0]
+    assert pair not in [family for group in bundles.groups("sm90", jnp.bfloat16, stated=True)
+                        for family in group]
+
+
 def test_a_handoffs_barriers_count_the_arrivals_of_its_roles():
     """A hand-off's barriers (`Schedule.scratch`) count the arrivals of the roles that fill and give it
     back: a signal two softmax warpgroups fill counts two, and an accumulator ring the product warp fills

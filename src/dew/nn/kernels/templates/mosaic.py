@@ -328,6 +328,25 @@ class Rows:
 
 
 @dataclasses.dataclass(frozen=True)
+class Paired:
+    """A step's block indices in a pair's view, which the two CTAs of a pair (`Family.pairs_product`) load
+    between them: `indices` in the pair's blocks, its block the slot's twice along `along` (`viewed`), each
+    CTA loading its half of it into its own slot (`Split`)."""
+
+    indices: tuple
+    along: int
+
+
+@dataclasses.dataclass(frozen=True)
+class Split:
+    """A pair's step block (`Paired`, `viewed`): `ref`, the pair's block, which each CTA of the pair loads
+    its half of along `along`."""
+
+    ref: Any
+    along: int
+
+
+@dataclasses.dataclass(frozen=True)
 class Scattered:
     """An output whose row `i` lands at row `table[i]` of `ref` (a product's rows written where a
     permutation says, `staged_rows`: a mixture of experts' slots in token order, row 1376), `table` an int32
@@ -342,8 +361,10 @@ class Scattered:
 def viewed(view: tuple, block: tuple, step):
     """Step `step`'s tile of a stream's view `(ref, index_map)` (`Family.opened`): the `block`-shaped tile of
     `ref` at the block indices `index_map(step)` gives, as a `BlockSpec`'s index map does; where it gives
-    `Rows`, each run's view at its table's entry; where `ref` is `Pieces` of refs (an fp32 operand's bf16
-    parts, each its own array's), each one's tile at the indices, its share of the block's rows, in order."""
+    `Rows`, each run's view at its table's entry; where it gives `Paired`, the pair's block (`block` twice
+    along its axis) as a `Split`, each CTA's half its own; where `ref` is `Pieces` of refs (an fp32 operand's
+    bf16 parts, each its own array's), each one's tile at the indices, its share of the block's rows, in
+    order."""
     ref, index_map = view
     indices = index_map(step)
     if isinstance(ref, Pieces):
@@ -354,6 +375,9 @@ def viewed(view: tuple, block: tuple, step):
         return ref.at[tuple(pl.ds(index * extent, extent)
                             for index, extent in zip(indices, block, strict=True))]
 
+    if isinstance(indices, Paired):
+        pair = tuple(extent * 2 if axis == indices.along else extent for axis, extent in enumerate(block))
+        return Split(at(indices.indices, pair), indices.along)
     if isinstance(indices, Rows):
         run = (indices.rows, *block[1:])
         return Pieces(at((indices.table[indices.start + each], *indices.rest), run)
@@ -1573,10 +1597,18 @@ class Transport[Allocated, Opened](abc.ABC):
     staged for the program's stores alone may be scoped after its walks (`scoped`'s `after_walks`)."""
 
     cluster: int = 1
-    """The programs a cluster of the family's launch takes where they read a block in common (`kernel`'s
-    `cluster`), each loading its share of the block multicast into every one's shared memory (`streams`'
-    `multicast`): TMA multicast's pair; 1 where a load reaches its own program's shared memory alone
-    (cp.async's)."""
+    """The programs a cluster of the family's launch takes where they share a block or a product (`kernel`'s
+    `cluster`): each loading its share of a block multicast into every one's shared memory (`streams`'
+    `multicast`, TMA multicast's pair), or, where the family's products span the pair (`pairs_product`),
+    each loading its half of every step's blocks; 1 where a load reaches its own program's shared memory
+    alone (cp.async's)."""
+
+    pairs_product: bool = False
+    """Whether a cluster's two programs share each product over both's rows and columns (tcgen05's two-CTA
+    form, `mosaic_sm100.PAIR`): a pair's tile is twice a program's rows and columns, each program holds its
+    rows' accumulators, every stream's step is the pair's block (`Paired`), and one program issues the
+    products. Where not, a cluster's programs share a stream's loads (`cluster`'s multicast), each its own
+    products."""
 
     walks_scoped: bool = False
     """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
