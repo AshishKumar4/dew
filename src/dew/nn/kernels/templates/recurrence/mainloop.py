@@ -46,6 +46,7 @@ The fast backward's launches and the plan of a call's launches, forward and back
 
 import contextvars
 import dataclasses
+import enum
 import functools
 import math
 from collections.abc import Callable, Sequence
@@ -151,6 +152,19 @@ def per_key_refusal(dtype) -> str | None:
     if jnp.dtype(dtype) == jnp.float32:
         return "an fp32 call's decay a key dimension is the portable math's"
     return None
+
+
+class Between(enum.Enum):
+    """The form a call's launches pass their values between them in (`Call.held`), its op's declaration:
+    `GIVEN`, the operands' own, an upstream's 16-bit intermediates (the delta rule's, fla's, which its values
+    take whatever this says; the SSD's under the fast forms, mamba_ssm's); `WIDE`, fp32 in the run's forms'
+    parts, two bf16 ones under the fast forms (`FAST_PARTS`), three under the accurate (`PARTS`), a form no
+    upstream rounds: a write gate without the delta rule, whose values passed in bf16 put its final memory
+    2.1e4 times the portable math's distance from float64 under aligned keys (row 184), its forward in two
+    parts on par with it (jsf-a5-write at 7a6f3faa18f)."""
+
+    GIVEN = enum.auto()
+    WIDE = enum.auto()
 
 
 FAST_PARTS = 2

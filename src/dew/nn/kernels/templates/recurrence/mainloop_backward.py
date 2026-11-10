@@ -20,6 +20,7 @@ from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import key_backward
 from dew.nn.kernels.templates.recurrence.chunk_forward import ForkedTable, prepared, zero_padded
 from dew.nn.kernels.templates.recurrence.mainloop import (
+    Between,
     Call,
     Held,
     Operand,
@@ -63,10 +64,12 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
 from dew.nn.precision import compensated_sum
 
 
-def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False) -> bool:
+def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = False,
+                       between: Between = Between.WIDE) -> bool:
     """Whether the fast backward takes a call's form: the delta rule, fla's DAG at fla's rounding, a decay a
     head's or a key dimension's (fla_kda's, `key_backward`); or a bf16 `rounded` call without it and a decay a
-    head (the SSD's under the run's fast forms, its route's), the same DAG without the delta rule's at
+    head passing its values as given (`between`; the SSD's under the run's fast forms, its route's), the same
+    DAG without the delta rule's at
     mamba_ssm's rounding (`prepared`), held to recorded mamba_ssm's bf16 case; either in fp32 under the run's
     fast forms (`rounded`), its operands in two bf16 parts (`mainloop.FAST_PARTS`). An fp16 call without the
     delta rule, which no recording holds, a decay a key dimension without it, and an fp32 call's three parts
@@ -77,7 +80,8 @@ def fast_backward_form(delta: bool, rounded: bool, dtype, *, per_key: bool = Fal
         return False
     if per_key:
         return delta
-    return delta or (rounded and jnp.dtype(dtype) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)))
+    return delta or (rounded and between is Between.GIVEN
+                     and jnp.dtype(dtype) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)))
 
 
 class Kept(NamedTuple):
@@ -129,8 +133,8 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
                   family: mosaic.Family | None = None, interpret: bool = False,
                   inverse=None, kept=None, delta: bool = True,
                   rounded: bool = False, ranged: bool = False,
-                  skip=None,
-                  forked: ForkedTable | None = None) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
+                  skip=None, forked: ForkedTable | None = None,
+                  between: Between = Between.WIDE) -> tuple[tuple, "Kept | key_backward.KeyKept"]:
     """The fast backward of the gated delta rule, a decay a head (`forward`'s, `g` `[B, T, HV]`), in a 16-bit
     call, or of a `rounded` call without it (the SSD's under the run's fast forms, `fast_backward_form`):
     `(dq, dk, dv, dg, dbeta, dh0, dskip, dentries)` for the output's and final memory's gradients `do`,
@@ -149,12 +153,12 @@ def kept_backward(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None
     `key_backward.KeyKept`), the forward's `kept_forward` beside it. A `forked` call's
     (`chunk_forward.ForkedTable`) `dh0` is its given memories' and `dentries` its entry write's
     (`_tabled_gradients`, `_entered_gradient`), None for another."""
-    if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v), per_key=g.ndim == 4):
+    if not fast_backward_form(delta, rounded, jnp.result_type(q, k, v), per_key=g.ndim == 4, between=between):
         raise NotImplementedError("the fast backward takes the delta rule, or a rounded call without it "
                                   "under the run's fast forms, an fp32 call's under them alone")
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, inverse=inverse, kept=kept,
-                   firsts=firsts, rounded=rounded, ranged=ranged, forked=forked)
+                   firsts=firsts, rounded=rounded, ranged=ranged, forked=forked, between=between)
     call = run.call
     rows, heads, width, columns = call.rows, call.heads, call.width, call.value_width
     laid_do = call.given.split(run.laid(zero_padded(do.astype(run.dtype), 3, columns)).reshape(rows, -1))

@@ -224,19 +224,20 @@ def supported(case: dict[str, str]) -> bool:
 
 CASES = (
     ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'one'),
-    ('sm90', 'kimi delta attention', 'xla', 'float32', 'packed'),
-    ('sm80', 'rated scan', 'pallas', 'bfloat16', 'packed'),
-    ('sm80', 'gated delta net', 'fla', 'float32', 'one'),
-    ('sm80', 'write gate', 'xla', 'bfloat16', 'one'),
-    ('sm90', 'rated scan', 'pallas', 'float32', 'one'),
-    ('sm90', 'kimi delta attention', 'fla', 'bfloat16', 'one'),
+    ('sm90', 'rated scan', 'pallas', 'bfloat16', 'packed'),
+    ('sm80', 'gated delta net', 'fla', 'bfloat16', 'packed'),
+    ('sm80', 'rated scan', 'pallas', 'bfloat16', 'one'),
+    ('sm80', 'rated scan', 'mosaic_gpu', 'bfloat16', 'one'),
+    ('sm90', 'kimi delta attention', 'xla', 'float32', 'one'),
+    ('sm80', 'write gate', 'xla', 'float32', 'packed'),
     ('sm80', 'kimi delta attention', 'mosaic_gpu', 'bfloat16', 'packed'),
-    ('sm90', 'write gate', 'xla', 'float32', 'packed'),
-    ('sm90', 'gated delta net', 'mosaic_gpu', 'float32', 'packed'),
+    ('sm90', 'gated delta net', 'fla', 'float32', 'one'),
+    ('sm90', 'write gate', 'xla', 'bfloat16', 'one'),
+    ('sm90', 'rated scan', 'mosaic_gpu', 'float32', 'one'),
     ('sm90', 'gated delta net', 'xla', 'bfloat16', 'one'),
-    ('sm90', 'gated delta net', 'fla', 'bfloat16', 'packed'),
-    ('sm90', 'rated scan', 'mosaic_gpu', 'bfloat16', 'one'),
+    ('sm90', 'kimi delta attention', 'fla', 'bfloat16', 'one'),
     ('sm90', 'rated scan', 'xla', 'bfloat16', 'one'),
+    ('sm90', 'rated scan', 'pallas', 'float32', 'one'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("recurrence")`, regenerated where the axes or the route's support change), under
@@ -245,23 +246,25 @@ the reference."""
 
 SEEDS = {
     ('sm90', 'gated delta net', 'mosaic_gpu', 'bfloat16', 'one'): 256,
-    ('sm80', 'rated scan', 'pallas', 'bfloat16', 'packed'): 8,
-    ('sm80', 'gated delta net', 'fla', 'float32', 'one'): 64,
-    ('sm90', 'kimi delta attention', 'xla', 'float32', 'packed'): 128,
-    ('sm90', 'rated scan', 'pallas', 'float32', 'one'): 64,
-    ('sm90', 'write gate', 'xla', 'float32', 'packed'): 64,
-    ('sm90', 'gated delta net', 'mosaic_gpu', 'float32', 'packed'): 128,
-    ('sm80', 'write gate', 'xla', 'bfloat16', 'one'): 64,
-    ('sm90', 'kimi delta attention', 'fla', 'bfloat16', 'one'): 8,
+    ('sm90', 'rated scan', 'pallas', 'bfloat16', 'packed'): 8,
+    ('sm80', 'gated delta net', 'fla', 'bfloat16', 'packed'): 64,
+    ('sm80', 'rated scan', 'pallas', 'bfloat16', 'one'): 8,
+    ('sm80', 'rated scan', 'mosaic_gpu', 'bfloat16', 'one'): 64,
+    ('sm90', 'kimi delta attention', 'xla', 'float32', 'one'): 128,
+    ('sm80', 'write gate', 'xla', 'float32', 'packed'): 64,
     ('sm80', 'kimi delta attention', 'mosaic_gpu', 'bfloat16', 'packed'): 8,
+    ('sm90', 'gated delta net', 'fla', 'float32', 'one'): 64,
+    ('sm90', 'write gate', 'xla', 'bfloat16', 'one'): 64,
+    ('sm90', 'rated scan', 'mosaic_gpu', 'float32', 'one'): 64,
     ('sm90', 'gated delta net', 'xla', 'bfloat16', 'one'): 256,
-    ('sm90', 'gated delta net', 'fla', 'bfloat16', 'packed'): 64,
-    ('sm90', 'rated scan', 'mosaic_gpu', 'bfloat16', 'one'): 64,
+    ('sm90', 'kimi delta attention', 'fla', 'bfloat16', 'one'): 8,
     ('sm90', 'rated scan', 'xla', 'bfloat16', 'one'): 512,
+    ('sm90', 'rated scan', 'pallas', 'float32', 'one'): 64,
 }
 """Each cell's declared seeds, sized by `seeds_for` on its own GPU, paired against its oracle (`_reference`,
 the upstream run live or the token recurrence; an H100 and an A100, M-JS-75d at b44df0fea0e, and the fp32
-cells over `FP32_HEADS` on an A100 and a GH200, M-JS-77 and M-JS-77b at 89af07e0eda)."""
+cells over `FP32_HEADS` on an A100 and a GH200, M-JS-77 and M-JS-77b at 89af07e0eda); a cell the covering
+took for its red row at fdb49a44d0a its form, kernel and dtype's sized cell's until its own GPU sizes it."""
 
 TPU_CASES = (
     ('v6e', 'rated scan', 'tpu', 'bfloat16', 'one'),

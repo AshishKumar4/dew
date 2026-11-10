@@ -197,9 +197,10 @@ def template_call(given: Chunk, hooks: recurrence.Hooks):
     query, key = given.query, given.key
     dtype = jnp.result_type(query, key, given.value)
     rounded = fast_rounding(dtype) if hooks.rated else chunk_rounding(hooks.delta, dtype)
+    between = mainloop.Between.GIVEN if hooks.delta or (hooks.rated and rounded) else mainloop.Between.WIDE
     return template.MOSAIC.bind(query, key, given.value, g, beta, given.state, given.starts,
                                 delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
-                                bound=hooks.inverse_bound, rounded=rounded)
+                                bound=hooks.inverse_bound, rounded=rounded, between=between)
 
 
 def refuses_its_gradient(fn, *drawn) -> None:
@@ -1031,7 +1032,8 @@ def _form(name: str, dtype) -> dict:
     """A resource case's call form beside its operands under the run's fast forms (`rounded`, `fast_rounding`,
     an fp32 call's operands in two parts), as its route gives it: a rated scan's without the delta rule and
     wide for its skip."""
-    return {'delta': False, 'wide': True, 'rounded': True} if name in RATED else {'rounded': True}
+    rated = {'delta': False, 'wide': True, 'rounded': True, 'between': mainloop.Between.GIVEN}
+    return rated if name in RATED else {'rounded': True}
 
 
 def _skipped(name: str, dtype) -> dict:

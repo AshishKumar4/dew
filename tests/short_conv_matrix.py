@@ -86,12 +86,12 @@ def supported(case: dict[str, str]) -> bool:
 
 
 CASES = (
-    ('sm90', '0.8b', 'bfloat16', 'one'),
-    ('sm90', '9b', 'float32', 'packed'),
     ('sm80', '0.8b', 'bfloat16', 'packed'),
-    ('sm80', '9b', 'float32', 'one'),
+    ('sm90', '0.8b', 'bfloat16', 'one'),
     ('sm90', '0.8b', 'float32', 'one'),
     ('sm90', '9b', 'bfloat16', 'one'),
+    ('sm80', '9b', 'float32', 'one'),
+    ('sm90', '9b', 'float32', 'packed'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the selector serves
 (`kernel_matrix.covering("short_conv")`, regenerated where the axes or the selector's support change)."""

@@ -48,6 +48,7 @@ from .generation import INHERENT, Choice, triton_runs
 from .selection import Kernel, KernelRefused, Op, Refusal, Requirement, select, selected
 from .ssd import _chunk_scan, ssd_kernel_platform
 from .templates import base, scan as block_scan
+from .templates.recurrence.mainloop import Between
 
 CHUNK_SIZE = 64
 """Tokens per chunk of the chunked form, the reference's default
@@ -222,7 +223,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             if kernel == 'mosaic_gpu':
                 return template_rule(query, key, value, g, beta, state, starts, firsts, forked=carried,
                                      max_segments=max_segments, scale=scale, delta=hooks.delta, wide=wide,
-                                     bound=hooks.inverse_bound, rounded=rounded)
+                                     bound=hooks.inverse_bound, rounded=rounded,
+                                     between=Between.GIVEN if hooks.delta else Between.WIDE)
             if kernel == 'fla':
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
                                 scale=scale, wide=wide, firsts=firsts)
@@ -838,7 +840,9 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
                      max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound,
                      rounded=chunk_rounding(delta, jnp.result_type(query, key, value)),
-                     recomputed=recomputed_memory(), forked=forked)
+                     recomputed=recomputed_memory(), forked=forked,
+                     # The delta rule's values pass as fla rounds them; a form without it (no upstream) wide.
+                     between=Between.GIVEN if delta else Between.WIDE)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
@@ -1193,7 +1197,7 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
             out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
                                        skip=skip if fused else None, forked=forked,
                                        max_segments=max_segments, scale=1.0, delta=False, wide=not narrow,
-                                       rounded=fast)
+                                       rounded=fast, between=Between.GIVEN if fast else Between.WIDE)
             out = out.astype(work)
             return (out if fused else recurrence.skipped(hooks, out, value, {'skip': skip}, work)), final
         operand = jnp.result_type(query, key, value)
@@ -1370,16 +1374,15 @@ def fast_rounding(dtype) -> bool:
 
 def chunk_rounding(delta: bool, dtype) -> bool:
     """Whether a call of `dtype` on the delta rule's route (`chunk`, `port_kernel`) takes the run's fast
-    forms' numbers (`fast_rounding`): the delta rule's alone, whose bar is fla's (TF32 products in an fp32
-    call). A form without the delta rule has no port, its bar the portable math at full fp32: an fp32 call's
-    two bf16 parts put its training step 30 to 69 times the portable math's distance from float64 on every
-    leaf, interpreted and on a GH200 alike (row 184's write gate cell, jsf-cellcpu, M-JS-9), and its forward
-    57 to 77 times (test_recurrence_mosaic's hooks7, hooks12 and hooks26 and the step-gated packed cell), so
-    it takes three; a 16-bit call's rounded numbers are mamba_ssm's, the SSD's, which its scan's route alone
-    asks (`_rated_scan`). Rounded there, a write gate without the delta rule passed its values between
-    launches in bf16, its final memory 2.1e4 times the portable math's distance from float64 under aligned
-    keys (interpreted at 2b595ff93, 9593 to 46978 times on an H100, gpuflow-a-abfff38d9)."""
-    return fast_rounding(dtype) and delta
+    forms' numbers (`fast_rounding`): a 16-bit call's under the run's fast forms, the delta rule's whose bar
+    is fla's (TF32 products in an fp32 call) and a form without it alike, which passes its values between
+    launches wide (`mainloop.Between`). A form without the delta rule has no port, its bar the portable math
+    at full fp32: an fp32 call's two bf16 parts put its training step 30 to 69 times the portable math's
+    distance from float64 on every leaf, interpreted and on a GH200 alike (row 184's write gate cell,
+    jsf-cellcpu, M-JS-9), and its forward 57 to 77 times (test_recurrence_mosaic's hooks7, hooks12 and
+    hooks26 and the step-gated packed cell), so an fp32 one takes three."""
+    return fast_rounding(dtype) and (delta or jnp.dtype(dtype).itemsize == 2)
+
 
 
 def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_size: int,
@@ -1395,7 +1398,10 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
                      max_segments=max_segments, scale=1.0, delta=False, wide=wide,
                      rounded=fast_rounding(jnp.result_type(query, key, value)),
-                     skip=skip, recomputed=recomputed_memory(), forked=forked)
+                     skip=skip, recomputed=recomputed_memory(), forked=forked,
+                     # Under the fast forms the SSD's values pass as mamba_ssm rounds them, else wide.
+                     between=(Between.GIVEN if fast_rounding(jnp.result_type(query, key, value))
+                              else Between.WIDE))
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product,
                      forked=forked is not None)
     return select(SCAN, case).kernel
