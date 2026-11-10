@@ -406,8 +406,9 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     def samples(self) -> int:
         """The number of samples every waveform is cut or padded to."""
         from dew.data.processors import sampling_rate
+        from dew.data.sources.av_utils import sample_count
 
-        return round(self.seconds * sampling_rate(self.extractor))
+        return sample_count(self.seconds, sampling_rate(self.extractor))
 
     def waveform(self, row: AudioRow) -> np.ndarray:
         """Return one row as a float32 waveform `samples` long.
