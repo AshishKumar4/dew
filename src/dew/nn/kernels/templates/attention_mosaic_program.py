@@ -40,6 +40,7 @@ from dew.nn.kernels.templates.attention import (
     differentiable,
     floating_params,
     kept_dtype,
+    key_tiles,
     power_of_two,
     shared_place,
     whole,
@@ -1061,11 +1062,11 @@ class _Program[T: (Tiles, BackwardTiles)]:
 
     def walked(self, first):
         """The key tiles a query block from `first` reads: those holding the call's keys (none wholly past
-        them, `algebra.seen`), up to its diagonal where causal."""
-        held = min(-(-self.keys // self.tiles.block_k), self.steps)
-        if not self.causal:
-            return jnp.int32(held)
-        return jnp.minimum(pl.cdiv(first + self.tiles.block_q, self.tiles.block_k), held)
+        them, `algebra.seen`), up to its diagonal where causal (`attention.key_tiles`), and no more than the
+        call's (`steps`)."""
+        _, hi = key_tiles("causal" if self.causal else "full", first, self.tiles.block_q, self.tiles.block_k,
+                          self.keys)
+        return jnp.minimum(hi, self.steps).astype(jnp.int32)
 
     def whole(self, first, walked):
         """The tiles every query of the block from `first` sees whole: those wholly within the call's keys

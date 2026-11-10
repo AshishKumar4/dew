@@ -42,7 +42,7 @@ def _banded(x, before=None):
 
 
 def local_attention(query, key, value, *, window: int | None = None, chunk: int | None = None,
-                    places=None, segment_ids=None, max_segments=None, valid=None,
+                    places=None, segment_ids=None, max_segments=None, valid=None, key_valid=None,
                     right_padded: bool = False, dtype=None, precision=None, force_fp32_for_softmax=True,
                     implementation: AttentionImpl = 'auto', sinks=None, softcap=None):
     """Causal self-attention in which each query reads only nearby keys, in
@@ -57,8 +57,10 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     None for the row index), `segment_ids` keeps packed documents apart (0 is
     padding), at most `max_segments` a row (`Coordinates.max_segments`), and
     `valid` `[B, S]` drops the keys it marks False, its tokens counted
-    without them; `right_padded` says each row's valid slots come first
-    (`AttentionMetadata.right_padded`).
+    without them; `key_valid` `[B, S]` hides the keys it marks False from every
+    query, its tokens counted and attending all the same
+    (`AttentionMetadata.key_valid`); `right_padded` says each row's valid slots
+    come first (`AttentionMetadata.right_padded`).
 
     No `[S, S]` array is built above two spans. A call the attention template
     takes runs whole as its spans, which it walks tile by tile: the window, or
@@ -95,14 +97,18 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         places = jnp.asarray(places)
         places = places.astype(jnp.promote_types(places.dtype, jnp.int32))
     if valid is not None and not right_padded:
-        return compacted(attend, query, key, value, places, segment_ids, valid)
-    return attend(query, key, value, places=places, segment_ids=segment_ids, valid=valid)
+        return compacted(attend, query, key, value, places, segment_ids, valid, key_valid=key_valid)
+    return attend(query, key, value, places=places, segment_ids=segment_ids, valid=valid, key_valid=key_valid)
 
 
 def _local_attention(query, key, value, *, window, chunk, places, segment_ids, max_segments, valid,
-                     dtype, precision, force_fp32_for_softmax, implementation, sinks, softcap):
+                     dtype, precision, force_fp32_for_softmax, implementation, sinks, softcap,
+                     key_valid=None):
     """`local_attention` over rows whose real tokens come first, each token's chunk place given
-    (`places`, None for the row index)."""
+    (`places`, None for the row index): its keys the real ones (`valid`, which number the documents too)
+    the call does not hide (`key_valid`)."""
+    keys = valid if key_valid is None else (
+        jnp.asarray(key_valid, bool) if valid is None else jnp.asarray(valid, bool) & key_valid)
     length = query.shape[1]
     span = window if window is not None else chunk
     assert span is not None
@@ -120,8 +126,8 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
         runs = (None if chunk is None
                 else chunk_runs(places, segment_ids, valid, query.shape[0], length, chunk))
         return whole(implementation=implementation, causal=True, sliding_window=window,
-                     segment_ids=segment_ids, max_segments=max_segments, key_valid=valid, key_runs=runs)
-    if window is not None and valid is None:
+                     segment_ids=segment_ids, max_segments=max_segments, key_valid=keys, key_runs=runs)
+    if window is not None and keys is None:
         # An explicit 'tpu' at a length splash cannot tile would reach the
         # flash kernel, whose default 128-row blocks must divide the length
         # (flash_attention.py:113-128, 1707-1715), so it would raise there.
@@ -150,19 +156,19 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
         # they are where its kernel takes them, else as the mask they mean (`visibility_mask`).
         return whole(implementation=implementation if implementation == 'auto' else masked, causal=True,
                      sliding_window=window, segment_ids=segment_ids, max_segments=max_segments,
-                     key_valid=valid)
+                     key_valid=keys)
     if length <= 2 * span or not halo:
         # A mask pairs every query with every key, which an Explicit axis splitting both sides of it
         # would place twice, so the `[B, S]` fields it is built from are each device's whole.
-        segment_ids, valid, places = (None if x is None else rows_like(jnp.asarray(x), jnp.asarray(x))
-                                      for x in (segment_ids, valid, places))
+        segment_ids, keys, places = (None if x is None else rows_like(jnp.asarray(x), jnp.asarray(x))
+                                     for x in (segment_ids, keys, places))
         chunked = jnp.arange(length) if places is None else places
         mask = (None if chunk is None or (places is None and length <= chunk)
                 else chunk_mask(chunked, chunked, chunk))
         if segment_ids is not None:
             mask = with_documents(mask, segment_ids)
-        if valid is not None:
-            live = jnp.asarray(valid, bool)[:, None, None, :]
+        if keys is not None:
+            live = jnp.asarray(keys, bool)[:, None, None, :]
             mask = live if mask is None else mask & live
         if mask is None:
             return whole(implementation=implementation, causal=True, sliding_window=window)
@@ -174,12 +180,12 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     if shards > 1:
         out = _local_over_sequence(
             kernel, query, key, value, shards, window=window, chunk=chunk, places=places,
-            segment_ids=segment_ids, valid=valid, sinks=sinks, implementation=implementation,
+            segment_ids=segment_ids, valid=keys, sinks=sinks, implementation=implementation,
             masked=masked)
     else:
         out = _local_blocks(functools.partial(kernel, sinks=sinks), query, key, value,
                             window=window, chunk=chunk, places=places,
-                            segment_ids=segment_ids, valid=valid,
+                            segment_ids=segment_ids, valid=keys,
                             implementation=implementation, masked=masked)
     return checkpoint_name(out, 'attention_output')
 
@@ -202,7 +208,7 @@ def chunk_runs(places, segment_ids, valid, rows: int, length: int, chunk: int) -
     return jnp.stack([spans.start, spans.end], axis=-1)[:, :, None, :]
 
 
-def compacted(attend, query, key, value, places, segment_ids, valid):
+def compacted(attend, query, key, value, places, segment_ids, valid, key_valid=None):
     """`attend` over each row's real tokens moved to its front in order, their
     places and documents with them, and its outputs moved back to their slots:
     the one move every attention over rows with padding among their tokens
@@ -221,7 +227,7 @@ def compacted(attend, query, key, value, places, segment_ids, valid):
     refuses over an Explicit axis that splits it, so each operand is moved
     with its sequence whole and placed back as it came (`_whole_sequence`):
     a sequence axis still runs the band on its own slices, its halo of
-    compacted tokens."""
+    compacted tokens. The keys' validity a call states (`key_valid`) moves with its tokens where given."""
     batch, length = valid.shape
     real = _whole_sequence(jnp.asarray(valid, bool))
     order, count = valid_order(real)
@@ -236,10 +242,11 @@ def compacted(attend, query, key, value, places, segment_ids, valid):
         placed = explicit_spec(x)
         return taken if placed is None else jax.sharding.reshard(taken, placed)
 
+    hidden = {} if key_valid is None else {"key_valid": moved(jnp.asarray(key_valid, bool), order)}
     out = attend(*(moved(x, order) for x in (query, key, value)),
                  places=None if places is None else moved(jnp.broadcast_to(places, (batch, length)), order),
                  segment_ids=None if segment_ids is None else moved(segment_ids, order),
-                 valid=moved(jnp.asarray(valid, bool), order))
+                 valid=moved(jnp.asarray(valid, bool), order), **hidden)
     return moved(out, column)
 
 

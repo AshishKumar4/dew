@@ -26,7 +26,7 @@ from dew.nn.kernels.templates.attention import (
 )
 from dew.nn.kernels.templates.attention_mosaic_coop import _coop_launch
 from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_launch
-from dew.nn.kernels.templates.attention_mosaic_dq import _dq_launch
+from dew.nn.kernels.templates.attention_mosaic_dq import _dq_launch, dq_sums
 from dew.nn.kernels.templates.attention_mosaic_fused import _fused_launch
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardRegisters,
@@ -122,12 +122,10 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     # The dQ program reads its queries for their logits alone.
     dq_sum, keyed, rows = _dq_launch(scaled, key, value, dout, maximum, forward_total,
                                      anchor, delta, chosen, spans, score_params, drop, walk=walk)
-    count = sum(walk.summed)
     dq_swapped = jnp.swapaxes(dq_sum, 1, 2)
     # The fast form's keyed sums are never read (`dq_finish`): a placeholder there.
     keyed = jnp.zeros_like(dq_swapped) if keyed is None else jnp.swapaxes(keyed, 1, 2)
-    sums = gradient.DqSums(dq_swapped, rows[0], rows[1], tuple(rows[4:4 + count]), tuple(rows[4 + count:]),
-                          keyed, rows[2], rows[3])
+    sums = dq_sums(dq_swapped, keyed, rows, sum(walk.summed))
     dq, refined, denominator, mass, dq_grads = gradient.dq_finish(sums, forward_total, state_total, peak0,
                                                                   (total0, initial_term), maximum, anchor,
                                                                   delta, accurate=accurate)

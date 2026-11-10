@@ -471,11 +471,13 @@ class MosaicForward(_Mainloop[Tiles]):
 
     def resident(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The programs of its launch at `config` a multiprocessor holds at once: its family's residency at
-        its registers (`Family.programs`) and its shared memory's."""
+        its registers (`Family.programs`) and its shared memory's, each program's reservation its own
+        (`resources.shared_programs`); one at the least, a legal config's."""
         family = bundle_of(config, ba.arguments["query"].dtype)
         resident = family.programs(config.consumers, self.registers(ba, config))
         if target.shared_limit:
-            resident = min(resident, max(1, target.shared_limit // self.staged_bytes(ba, config, target)))
+            staged = self.staged_bytes(ba, config, target)
+            resident = max(1, resources.shared_programs(resident, staged, target.shared_limit))
         return resident
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:

@@ -74,8 +74,14 @@ def _call(name: str, results):
     return jax.ffi.ffi_call(name, results)
 
 
-def _round(x: int, multiple: int) -> int:
-    return -(-x // multiple) * multiple
+def _scratch(export: str, ranks: tuple[int, int], *sizes: int) -> tuple[jax.ShapeDtypeStruct, ...]:
+    """The two fp32 scratch buffers of `ranks` a FlashAttention-2 handler addresses, at the extents its
+    library states for a call of `sizes` (`export`): the handler's rounding of the rows and the head size its
+    own (the port's `dew_rounded_rows` and `dew_rounded_head`)."""
+    extents = (ctypes.c_int64 * sum(ranks))()
+    getattr(_library, export)(*map(ctypes.c_int64, sizes), extents)
+    return (jax.ShapeDtypeStruct(tuple(extents[:ranks[0]]), jnp.float32),
+            jax.ShapeDtypeStruct(tuple(extents[ranks[0]:]), jnp.float32))
 
 
 _stated: list = [None]
@@ -193,8 +199,7 @@ def _forward2(query, key, value, scale, causal, window):
     out, lse, _, _ = _call("dew_flash_mha_fwd", (
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32),
-        jax.ShapeDtypeStruct((splits, batch, queries, heads, _round(width, 32)), jnp.float32),
-        jax.ShapeDtypeStruct((splits, batch, heads, queries), jnp.float32),
+        *_scratch("dew_flash_mha_fwd_scratch", (5, 4), splits, batch, queries, heads, q.shape[-1]),
     ))(q, k, v, **_attributes(scale, causal, window))
     return out[..., :width], lse
 
@@ -208,8 +213,7 @@ def _backward2(grad, query, key, value, out, lse, scale, causal, window):
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct((batch, keys, heads, padded), q.dtype),
         jax.ShapeDtypeStruct((batch, keys, heads, padded), q.dtype),
-        jax.ShapeDtypeStruct((batch, heads, _round(queries, 128)), jnp.float32),
-        jax.ShapeDtypeStruct((batch, _round(queries, 128), heads, _round(padded, 32)), jnp.float32),
+        *_scratch("dew_flash_mha_bwd_scratch", (3, 4), batch, queries, heads, padded),
     ))(g, q, k, v, o, lse, **_attributes(scale, causal, window), deterministic=False)
     # The kernel writes a key gradient for each query head; a group of them shares a key head.
     group = heads // key_heads
@@ -245,8 +249,7 @@ def _packed_backward2(grad, query, key, value, out, lse, starts, longest, scale,
         jax.ShapeDtypeStruct(q.shape, q.dtype),
         jax.ShapeDtypeStruct((key.shape[0], heads, padded), q.dtype),
         jax.ShapeDtypeStruct((key.shape[0], heads, padded), q.dtype),
-        jax.ShapeDtypeStruct((sequences, heads, _round(longest[0], 128)), jnp.float32),
-        jax.ShapeDtypeStruct((total + 128 * sequences, heads, _round(padded, 32)), jnp.float32),
+        *_scratch("dew_flash_mha_varlen_bwd_scratch", (3, 3), total, sequences, heads, longest[0], padded),
     ))(g, q, k, v, o, lse, *starts, max_seqlen_q=np.int64(longest[0]), max_seqlen_k=np.int64(longest[1]),
        zero_tensors=False, deterministic=False, **attributes)
     group = heads // key_heads

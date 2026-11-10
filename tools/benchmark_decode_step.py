@@ -22,7 +22,7 @@ from benchmark_recurrence_mosaic import measured
 from dew.nn.inputs import MixerCall
 from dew.nn.kernels import generation
 from dew.nn.kernels.options import program
-from dew.nn.linear import GatedDeltaNet
+from dew.nn.linear import DELTA_DECODE, GatedDeltaNet
 
 SHAPES = {
     'qwen3.5-27b-gdn': {'emb_features': 5120, 'num_k_heads': 16, 'num_v_heads': 48, 'head_k_dim': 128,
@@ -32,8 +32,8 @@ SHAPES = {
 }
 """The gated delta nets of Qwen3.5-27B and Qwen3-Next, as the scoreboard's prefill shapes have them."""
 
-KERNELS = ('fused', 'step', 'xla')
-"""The decode selector's kernels (`linear.DELTA_DECODE`)."""
+KERNELS = tuple(kernel.name for kernel in DELTA_DECODE.kernels)
+"""The decode selector's kernels, as it declares them (`linear.DELTA_DECODE`)."""
 
 ROWS = (1, 8, 32, 128)
 """The rows a decode step serves (row 1424's)."""

@@ -36,6 +36,25 @@ from dew.nn.kernels.templates.attention_mosaic_scores import (
     _scores,
 )
 
+DQ_ROWS = ("residual", "mass", "keyed_mass", "keyed_shift")
+"""The row sums a dQ launch writes (`gradient.DqSums`' fields, `[B, H, Qp]` fp32 each, in the order of its
+rows array), after them each summed dQ parameter's gradient (`DqSums.grads`) and then its weights' pullback
+(`DqSums.weighed`): `dq_rows` lays a pass's sums out so, `dq_sums` reads them back."""
+
+
+def dq_rows(named: dict, grads: tuple, weighed: tuple) -> tuple:
+    """A dQ pass's rows in the order its launch writes them (`DQ_ROWS`): its `named` rows, then its summed
+    parameters' gradients and pullbacks."""
+    return (*(named[name] for name in DQ_ROWS), *grads, *weighed)
+
+
+def dq_sums(dq: jax.Array, keyed: jax.Array, rows, count: int) -> gradient.DqSums:
+    """A dQ launch's sums from its dQ, its keyed sums and its `rows` (`dq_rows`' order), of `count` summed
+    parameters."""
+    named = dict(zip(DQ_ROWS, rows[:len(DQ_ROWS)], strict=True))
+    params = tuple(rows[len(DQ_ROWS):])
+    return gradient.DqSums(dq=dq, keyed=keyed, grads=params[:count], weighed=params[count:], **named)
+
 
 def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
                     stages: int) -> tuple[list, dict, list]:
@@ -145,10 +164,9 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
                 score_params: tuple, drop: Dropout | None, *, walk: _Backward, share: tuple[int, int],
                 name: str):
     """The dQ program's sums over its key tiles (`gradient.dq_issued`), unfinished: dQ's and, in the accurate
-    form, the keys' product with the weights (`DqSums.keyed`), `[B, Qp, H, D]` fp32 each; and the rows
-    `[4 + 2n, B, H, Qp]` fp32 (n the dQ parameters, `walk.summed`): the cotangents' and weights' row sums, the
-    keyed sums' mass and exponent, then each dQ parameter's gradient and its weights' pullback, which
-    `dq_finish` takes past the launch. Each query block of a pair is a consumer's, the key and value tiles
+    form, the keys' product with the weights (`DqSums.keyed`), `[B, Qp, H, D]` fp32 each; and its rows
+    (`DQ_ROWS`, `walk.summed`'s parameters after them), `[rows, B, H, Qp]` fp32, which `dq_finish` takes past
+    the launch. Each query block of a pair is a consumer's, the key and value tiles
     streamed through a ring each. Its sums are its `share` of their columns (`(first, count)`). Returns dQ,
     the keyed sums (None in the fast form) and the rows."""
     batch, queries, heads, width = query.shape
@@ -158,7 +176,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
     block_q, block_k = program.tiles.block_q, program.tiles.block_k
     pair = consumers * block_q
     summed = walk.summed
-    rows_count = 4 + 2 * sum(summed)
+    rows_count = len(DQ_ROWS) + 2 * sum(summed)
     leaves, treedef = jax.tree.flatten((spans, score_params, drop))
 
     def body(*refs, streams, after=None):
@@ -209,7 +227,8 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
             # Each row in a row's layout whatever its own (a call without a hook's keyed mass is a constant).
             summed_grads = tuple(part for part, on in zip(grads, summed, strict=True) if on)
             summed_weighed = tuple(part for part, on in zip(weighed, summed, strict=True) if on)
-            parts = (residual, mass, keyed_mass, keyed_shift, *summed_grads, *summed_weighed)
+            parts = dq_rows({"residual": residual, "mass": mass, "keyed_mass": keyed_mass,
+                             "keyed_shift": keyed_shift}, summed_grads, summed_weighed)
             family.stored(tuple(family.as_row(part) for part in parts),
                           tuple(rows_ref.at[place, row, head, pl.ds(first, block_q)]
                                 for place in range(rows_count)),

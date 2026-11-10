@@ -155,6 +155,12 @@ def program_shared(block: int, programs: int) -> int:
     return (block + reserved) // programs - reserved
 
 
+def shared_programs(most: int, shared: int, block: int) -> int:
+    """The most programs, of `most`, a multiprocessor holds at once whose each stages `shared` bytes on a GPU
+    whose block holds `block` (`program_shared`'s reservations): 0 where none fits."""
+    return next((count for count in range(most, 0, -1) if shared <= program_shared(block, count)), 0)
+
+
 def held_area(family: "Family", consumers: int) -> int:
     """The fp32 accumulator elements `consumers` consumers of `family` hold beside what they hold besides
     (`Family.held_registers`): a derived tile's rows times columns at most (`held_rows` at any columns); a
@@ -501,8 +507,7 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
     most = family.programs(consumers, registers, producer)
     if target is not None:
         if shared is not None:
-            block = generation.shared_budget(target)
-            most = next((count for count in range(most, 0, -1) if shared <= program_shared(block, count)), 0)
+            most = shared_programs(most, shared, generation.shared_budget(target))
         if tmem:
             most = min(most, (target.tmem_columns or 0) // tmem)
     return RegisterModel(registers, family.registers(consumers, producer=producer), consumers, most,

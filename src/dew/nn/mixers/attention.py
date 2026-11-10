@@ -9,7 +9,8 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from types import MappingProxyType
 from typing import ClassVar, Literal, NamedTuple
 
 import jax
@@ -33,6 +34,7 @@ from dew.nn.attention_masks import (
     chunk_mask,
     key_spans,
     max_attention_logits,
+    repeat_kv_heads,
     visibility_mask,
 )
 from dew.nn.blocks import normal_kernel
@@ -101,11 +103,8 @@ def exclusive_self_attention(attention: jax.Array, value: jax.Array) -> jax.Arra
     there; here it leaves the output unchanged, which is the limit of the
     projection onto a vanishing direction's span being empty.
     """
-    heads, kv_heads = attention.shape[-2], value.shape[-2]
-    if heads % kv_heads:
-        raise ValueError(f"{heads} query heads do not group over {kv_heads} value heads")
     dtype = at_least_fp32(jnp.result_type(attention, value))
-    value = jnp.repeat(value.astype(dtype), heads // kv_heads, axis=-2)
+    value = repeat_kv_heads(value.astype(dtype), attention.shape[-2])
     work = attention.astype(dtype)
     norm = jnp.sum(value * value, axis=-1, keepdims=True)
     along = jnp.sum(work * value, axis=-1, keepdims=True) / jnp.where(norm > 0, norm, 1)
@@ -370,6 +369,14 @@ class CausalSelfAttention(nn.Module):
     """Every `MIXING` field of its call (`dew.nn.inputs.MixerCall`): it masks by a pairwise mask or key
     runs, places keys, adds a position bias and runs a server's mixed step; forks it reads as each
     token's ancestors' keys and its own (`call_visibility`)."""
+
+    honours: ClassVar[Mapping[str, frozenset[str]]] = MappingProxyType({
+        "mixed": frozenset({"admitted"}), "local": frozenset({"key_valid", "key_positions"}),
+        "general": reads - {"admitted"}})
+    """The fields of `reads` each route of a call honours (`_unhonoured`): a server's mixed step its rows'
+    caches alone, `local_attention` the keys' validity (and key positions, which only a call's mask or runs
+    read), the general kernel every other. A route given one it does not honour refuses it by name, or
+    leaves the call to the general kernel (`_runs_local`)."""
 
     ctx: MixerContext
     """The layer's geometry and attention policies, as the backbone resolves
@@ -952,11 +959,15 @@ class CausalSelfAttention(nn.Module):
                 segment_ids=segment_ids,
                 max_segments=None if segment_ids is None else tokens.max_segments,
                 valid=tokens.valid, right_padded=tokens.right_padded,
+                key_valid=self._keys_valid(attention_metadata, B, S),
                 dtype=self.ctx.dtype, precision=self.ctx.precision,
                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
                 implementation=self.ctx.attention_impl, sinks=sinks,
                 softcap=self.ctx.attn_logit_softcap), 'context')
             return self._output(attention, gate, B, S, own_value, progress)
+        refused = self._unhonoured(attention_metadata, "general")
+        if refused:
+            raise ValueError(f"{self.name}: only a serving step's decode reads {', '.join(refused)}")
         masking = self._masking(query, key, value, positions, counted, held, rotary_positions, append,
                                 prefix, kv_len, kv_store, segment_ids, attention_metadata, decode)
         if self.qsa is not None:
@@ -1287,7 +1298,7 @@ class CausalSelfAttention(nn.Module):
             # visibility (row 4771): a mask's keys taken from it (a decode step's or a prefix's, read by the
             # masked kernel), else read by the kernel beside the rest.
             mask, valid, implementation = self._key_validity(
-                attention_metadata.key_valid, mask, valid, implementation, masked, B, key.shape[-3])
+                self._keys_valid(attention_metadata, B, key.shape[-3]), mask, valid, implementation, masked)
         if self.ctx.attention_chunk is not None:
             mask = self._chunked(mask, documents, causal, window, valid, runs, groups, places, key_places, S,
                                  key.shape[-3])
@@ -1330,15 +1341,23 @@ class CausalSelfAttention(nn.Module):
             kv_store[self.ctx.kv_store_key] = (key, value, positions, key_places, history)
         return query, key, value, history, key_places, mask, starts, cursor, documents, causal, window
 
-    def _key_validity(self, key_valid, mask, valid, implementation: AttentionImpl,
-                      masked: Callable[[], AttentionImpl], batch: int, keys: int):
-        """A call's keys' validity `key_valid` `[B, keys]` (`AttentionMetadata.key_valid`) beside the layer's
-        own visibility: the `mask` its keys are taken from where it has one (its kernel the masked one,
-        `masked()`), else joined to the `valid` keys the kernel reads, each only where both are. Returns the
-        mask, the validity and the kernel."""
-        key_valid = jnp.asarray(key_valid)
+    @staticmethod
+    def _keys_valid(metadata: AttentionMetadata | None, batch: int, keys: int) -> jax.Array | None:
+        """The call's keys' validity `[B, keys]` (`AttentionMetadata.key_valid`), None where it states
+        none."""
+        if metadata is None or metadata.key_valid is None:
+            return None
+        key_valid = jnp.asarray(metadata.key_valid)
         if key_valid.shape != (batch, keys) or key_valid.dtype != jnp.bool_:
             raise ValueError("attention_key_valid must be boolean [B, keys]")
+        return key_valid
+
+    def _key_validity(self, key_valid, mask, valid, implementation: AttentionImpl,
+                      masked: Callable[[], AttentionImpl]):
+        """A call's keys' validity `key_valid` `[B, keys]` (`_keys_valid`) beside the layer's own
+        visibility: the `mask` its keys are taken from where it has one (its kernel the masked one,
+        `masked()`), else joined to the `valid` keys the kernel reads, each only where both are. Returns the
+        mask, the validity and the kernel."""
         if mask is not None:
             return mask & key_valid[:, None, None, :], valid, masked()
         return None, key_valid if valid is None else jnp.asarray(valid, bool) & key_valid, implementation
@@ -1503,15 +1522,12 @@ class CausalSelfAttention(nn.Module):
         into its row of the cache, then each decoding row's query reads its
         row as a decode step does, and each prompt's queries read their row
         up to their own slot. Its rows' caches are its whole visibility, so a
-        call that also carries a pairwise mask, key runs, key positions or a
-        position bias is refused by name rather than run without them."""
-        carried = [name for name, given in (("a pairwise mask", metadata.pairwise_mask),
-                                            ("key runs", metadata.key_runs),
-                                            ("key positions", metadata.key_positions),
-                                            ("a position bias", metadata.position_bias)) if given is not None]
+        call that also carries a field of its own visibility (`honours`) is
+        refused by name rather than run without it."""
+        carried = self._unhonoured(metadata, "mixed")
         if carried:
             raise ValueError(f"{self.name}: a serving step's mixed call reads each row's cache as a decode "
-                             f"step does, and takes no {' or '.join(carried)}")
+                             f"step does, and takes no {', '.join(carried)}")
         admitted = metadata.admitted
         assert admitted is not None
         index = self.variable("cache", "cache_index", jnp.zeros, (0,), jnp.int32)
@@ -1752,10 +1768,16 @@ class CausalSelfAttention(nn.Module):
             return False
         if self.alibi or decode or (not self.is_initializing() and self.is_mutable_collection("qk")):
             return False
-        return metadata is None or (
-            metadata.pairwise_mask is None and metadata.key_runs is None and metadata.position_bias is None
-            and metadata.forks is None
-            and all(getattr(metadata, name) is None for name in self._group_fields()))
+        return metadata is None or (not self._unhonoured(metadata, "local") and all(
+            getattr(metadata, name) is None for name in self._group_fields()))
+
+    def _unhonoured(self, metadata: AttentionMetadata | None, route: str) -> tuple[str, ...]:
+        """The fields the layer reads (`reads`) that `metadata` sets and `route` does not honour
+        (`honours`)."""
+        if metadata is None:
+            return ()
+        return tuple(name for name in sorted(self.reads - self.honours[route])
+                     if getattr(metadata, name) is not None)
 
     def _output(self, attention, gate, batch: int, length: int, own_value, progress):
         """Take the differential on the chosen heads where the layer carries DEX (`dew.nn.dex`), its lambda

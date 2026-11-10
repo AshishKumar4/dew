@@ -519,9 +519,11 @@ def _param_staged(kind: Kind, rows: int, keys: int, stages: int, *, tensor_memor
 
 
 def _small_parts(dtype) -> int:
-    """The parts a scaled walk's small weights take for their product with values of `dtype`
-    (`algebra.small_parts`): fp32's one, a 16-bit dtype's three."""
-    return 1 if jnp.dtype(dtype) == jnp.dtype(jnp.float32) else 3
+    """The parts a scaled walk's small weights take for their product with values of `dtype`, as the algebra
+    forms them (`algebra.small_parts`, traced for its count)."""
+    held = jax.eval_shape(lambda small: algebra.small_parts(small, dtype),
+                          jax.ShapeDtypeStruct((8, 8), jnp.float32))
+    return len(held)
 
 
 def _kept(residuals: bool | Kept | None) -> Kept:
