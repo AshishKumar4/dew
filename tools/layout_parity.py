@@ -755,8 +755,9 @@ def _unrounded() -> frozenset:
 
 def _rounds(eqn) -> bool:
     """Whether an equation can round a floating value: not one of `_unrounded`, nor a move of entries, nor a
-    call, nor Dew's identity barrier (`dew.nn.conv`'s), nor a conversion between equal dtypes or of a boolean, nor a product with or
-    quotient by the literal one, nor a sum with the literal zero. An operation it does not know rounds."""
+    call, nor Dew's identity barrier (`dew.nn.conv`'s), nor a conversion between equal dtypes or of a
+    boolean, nor a product with or quotient by the literal one, nor a sum with the literal zero. An
+    operation it does not know rounds."""
     import jax
     import numpy as np
     from jax.extend import core
