@@ -51,12 +51,16 @@ if TYPE_CHECKING:
 
 EXECUTION_TIMEOUT = "30m"
 """How long one device execution of a process pool may run before XLA ends
-its process.
+its process: the stated bound on a rank that stalls alive.
 
 A rank that stalls without failing, blocked on a read or on a compile that
 waits for peers, leaves the other ranks inside a collective or a
-communicator's setup. No GPU backend times that out and no process reports it,
-so the pool would hang for ever with every process alive. XLA's execution
+communicator's setup. The coordination service knows a process that died (its
+heartbeats, `end_pool_on_failure`), not one that is alive and stalled, whose
+agent heartbeats on; no GPU backend times that out and no process reports it,
+so the pool would hang for ever with every process alive. Each source of such
+a stall failing on its own is the cause's fix (row 5402); a data read's
+already does (`dew.data.storage.IDLE_SECONDS`). XLA's execution
 watchdog ends a process whose execution runs past this, and `dew launch`,
 srun or the scheduler then stops the rest. An execution is a whole step or
 sampling loop, which can run for minutes, so the bound is generous;
@@ -347,22 +351,28 @@ class SignalWake:
         os.set_blocking(self._read, False)
         os.set_blocking(self._write, False)
         self._previous = signal.set_wakeup_fd(self._write, warn_on_full_buffer=False)
+        self._waiting = False
 
     def notify(self) -> None:
-        """Wake the main thread's wait (`wait`). A full pipe already holds a byte that wakes it."""
-        with contextlib.suppress(BlockingIOError):
-            os.write(self._write, b"\0")
+        """Wake the main thread's wait (`wait`), called holding the condition it waits on: a byte only while
+        it waits, so notices never fill the pipe a signal's byte needs room in. A full pipe already holds a
+        byte that wakes it."""
+        if self._waiting:
+            with contextlib.suppress(BlockingIOError):
+                os.write(self._write, b"\0")
 
     def wait(self, condition: threading.Condition, ready: Callable[[], object]) -> None:
         """Wait, holding `condition`, until `ready()` holds, woken by a notice (`notify`) or a signal, whose
         handler then runs here and may raise."""
         while not ready():
+            self._waiting = True
             condition.release()
             try:
                 select.select([self._read], [], [])
                 self._drained()
             finally:
                 condition.acquire()
+                self._waiting = False
 
     def _drained(self) -> None:
         """Empty the pipe, each signal's byte forwarded to the wakeup fd set before this one, as CPython's

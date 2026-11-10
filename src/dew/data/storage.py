@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, NamedTuple, Protocol, TypedDict, runtime_checkable
 
+import aiohttp
 import fsspec
 from filelock import FileLock, Timeout
 from fsspec.implementations.cached import CachingFileSystem, WholeFileCacheFileSystem
@@ -58,6 +59,13 @@ success response to your write request" (cloud.google.com/storage/docs/consisten
 not a public cache, as gcsfs reads); this host's disk and memory. The Hugging Face Hub's documentation
 states none, nor does a store of a `ConditionalWrites` of its own: their objects are read again
 (`retries`)."""
+
+IDLE_SECONDS = 60
+"""How long a remote store's connection or read may go without a byte before its transfer fails: what a
+store that is gone produces, so a close that waits out its transfers ends (`dew.data.cache`). It is the
+bound botocore already holds every S3 transfer to (its connect and read timeouts, 60 s each, botocore's
+`Config`), so every store fails a silent peer alike: gcsfs, which bounds no request of its own
+(`requests_timeout=None`), is opened with it (`Store.resolve`)."""
 
 STORED = {"s3": "etag", "gs": "generation", "gcs": "generation"}
 """The version each remote store names an object it holds by and changes as it is replaced
@@ -596,6 +604,15 @@ class Store:
         for cache in ("dewcache", "filecache", "simplecache", "blockcache"):
             if cache not in layers[:-1]:
                 options.pop(cache, None)
+        scheme = layers[-1].split("://", 1)[0] if "://" in layers[-1] else "file"
+        if scheme in ("gs", "gcs"):
+            # A GCS request idle past `IDLE_SECONDS` fails, as every S3 request does, unless its options
+            # bound it otherwise.
+            idle = aiohttp.ClientTimeout(sock_connect=IDLE_SECONDS, sock_read=IDLE_SECONDS)
+            if len(layers) == 1:
+                options.setdefault("requests_timeout", idle)
+            else:
+                options[scheme] = {"requests_timeout": idle, **options.get(scheme, {})}
         return fsspec.core.url_to_fs(self.url, **options)
 
     def readable(self) -> Readable:
