@@ -46,7 +46,7 @@ from etils import epath
 
 import dew.io
 from dew import _records, registry, training
-from dew._cache import dew_cache_dir
+from dew._builds import dew_cache_dir
 from dew._cleanup import attempted
 from dew._coordination import agree_process_phase, agreed, agreed_same
 from dew._files import write_atomically

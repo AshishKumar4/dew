@@ -48,7 +48,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from jaxlib.xla_client import LoadedExecutable
 
 from dew import _pool
-from dew._cache import dew_cache_dir, package_digest
+from dew._builds import dew_cache_dir
+from dew._cache import package_digest
 from dew._devices import (
     backend_open,
     cuda_driver_version,

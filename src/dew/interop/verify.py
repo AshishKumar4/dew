@@ -1104,7 +1104,7 @@ def _record_key(hf_config: Mapping[str, object], source: ModelSource) -> str:
 
 
 def _recorded(key: str) -> VerifiedMapping | None:
-    from dew._cache import dew_cache_dir
+    from dew._builds import dew_cache_dir
 
     path = Path(dew_cache_dir()) / _VERIFIED / key / 'mapping.json'
     if not path.is_file():
@@ -1118,7 +1118,7 @@ def _recorded(key: str) -> VerifiedMapping | None:
 
 def _record(key: str, verified: VerifiedMapping) -> None:
     from dew import _files
-    from dew._cache import dew_cache_dir
+    from dew._builds import dew_cache_dir
 
     directory = Path(dew_cache_dir()) / _VERIFIED / key
     with _files.staged(directory) as staging:

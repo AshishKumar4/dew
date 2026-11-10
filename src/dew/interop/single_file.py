@@ -45,7 +45,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dew._cache import dew_cache_dir
+from dew._builds import dew_cache_dir
 from dew._files import staged, stat_identity
 from dew._records import JSON
 from dew.interop import sources

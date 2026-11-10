@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dew._cache import dew_cache_dir
+from dew._builds import dew_cache_dir
 from dew._files import write_atomically
 from dew._records import boolean, json_value, record
 from dew.batch import Batch

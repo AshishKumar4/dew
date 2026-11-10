@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING
 import ml_dtypes
 import numpy as np
 
-from dew._cache import dew_cache_dir
+from dew._builds import dew_cache_dir
 from dew._files import staged, stat_identity
 from dew.interop.safetensors_io import WEIGHTS_FILE, own, write_file, write_index
 

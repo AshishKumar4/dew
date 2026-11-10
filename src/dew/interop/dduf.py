@@ -16,7 +16,7 @@ import hashlib
 import os
 from pathlib import Path, PurePosixPath
 
-from dew._cache import dew_cache_dir
+from dew._builds import dew_cache_dir
 from dew._files import staged, stat_identity
 
 _CHUNK = 1 << 24

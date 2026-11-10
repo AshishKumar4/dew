@@ -399,7 +399,7 @@ def tokenizer_name(tokenizer: str | SavedTokenizer) -> str:
     import shutil
     import tempfile
 
-    from dew._cache import dew_cache_dir
+    from dew._builds import dew_cache_dir
 
     root = Path(dew_cache_dir(), "tokenizers")
     root.mkdir(parents=True, exist_ok=True)
