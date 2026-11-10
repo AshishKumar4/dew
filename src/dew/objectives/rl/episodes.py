@@ -28,6 +28,7 @@ from dew._coordination import (
     agreed_same,
     broadcast_from_process_zero,
 )
+from dew._records import JSON, integer, integers, text
 from dew.batch import Variables, token_id
 from dew.data.dataset import DataPartition
 from dew.inference.rollouts import Draw
@@ -67,6 +68,12 @@ class EpisodeId:
     seed: tuple[int, ...]
     branch: str | None = None
 
+    def __post_init__(self) -> None:
+        integer(self.task, "task"), integer(self.attempt, "attempt"), integer(self.sample, "sample")
+        object.__setattr__(self, "seed", integers(self.seed, "seed"))
+        if self.branch is not None:
+            text(self.branch, "branch")
+
 
 @dataclass(frozen=True)
 class Observation:
@@ -95,13 +102,16 @@ class Observation:
     status: EpisodeStatus = EpisodeStatus.RUNNING
     detail: str = ""
     reward: float | None = None
-    messages: tuple[Mapping[str, object], ...] = ()
+    messages: tuple[Mapping[str, JSON], ...] = ()
     compacted: bool = False
-    request: Mapping[str, object] | None = None
+    request: Mapping[str, JSON] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.status, EpisodeStatus):
             raise TypeError("observation status must be an EpisodeStatus")
+        text(self.detail, "an observation's detail")
+        if not isinstance(self.compacted, bool):
+            raise TypeError("an observation's compacted is a bool")
         if self.reward is not None:
             object.__setattr__(self, "reward", finite_reward(self.reward))
         object.__setattr__(self, "messages", json_objects(self.messages, "an observation's messages"))
@@ -145,6 +155,14 @@ class Episode:
     # Exclude the origin from value equality so replayed numerical records
     # remain comparable; the journal checks it before resuming a cohort.
     _binding_id: str = field(default="", repr=False, compare=False, kw_only=True)
+
+    def __post_init__(self) -> None:
+        integer(self.policy_step, "policy_step")
+        if not isinstance(self.status, EpisodeStatus):
+            raise TypeError("episode status must be an EpisodeStatus")
+        text(self.detail, "an episode's detail"), text(self._binding_id, "_binding_id")
+        if self.reward is not None:
+            object.__setattr__(self, "reward", finite_reward(self.reward))
 
 
 class Environment(Protocol):

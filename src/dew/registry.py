@@ -653,12 +653,18 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     """
     if dtypes and name == "dtype":
         return resolve_dtype(value)
+    if annotation is JSON:
+        # Data a record holds as written, whatever it spells (a chat message's `{"function": ...}`).
+        return configured(value)
     annotation = resolve_alias(annotation)
+    if isinstance(annotation, type) and issubclass(annotation, Enum):
+        # An enum's member is recorded as its value, an IntEnum's its int (`to_record`).
+        return annotation(value)
     if (isinstance(value, Mapping) and set(value) == {"function"} and isinstance(value["function"], str)
             and _admits_function(annotation)):
         return imported(value["function"])
     if (isinstance(value, Mapping) and annotation not in (None, object)
-            and typing.get_origin(annotation) not in _MAPPINGS and _sharing(value) is not None):
+            and typing.get_origin(_unwrapped(annotation)) not in _MAPPINGS and _sharing(value) is not None):
         return _shared(annotation, value, dtypes=dtypes)
     if typing.get_origin(annotation) in (Union, types.UnionType):
         if value is None:

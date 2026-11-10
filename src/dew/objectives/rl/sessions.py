@@ -48,7 +48,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.typing import ArrayLike
 
-from dew._records import finite, json_value, record as section
+from dew._records import JSON, finite, json_value, record as section
 from dew.batch import Coordinates, Forks, Variables, coordinates
 from dew.data.forked_rows import ForkedRows, token_keys, windows_needed
 from dew.inference.rollouts import Draw, Routing, routing_rows
@@ -214,12 +214,20 @@ class Transcript:
             object.__setattr__(self, "response", json_objects((self.response,), "a transcript's response")[0])
 
 
-def json_objects(values: object, name: str) -> tuple[Mapping[str, object], ...]:
-    """`values`, a tuple of JSON objects in any `Mapping`, as plain JSON trees (`json_value`), which
-    journals copy and write as they are; ValueError for anything else."""
-    if not isinstance(values, tuple) or not all(isinstance(value, Mapping) for value in values):
+def json_object(value: JSON | Mapping[str, object], name: str) -> Mapping[str, JSON]:
+    """`value`, a JSON object in any `Mapping`, as a plain JSON tree (`json_value`), which journals copy
+    and write as it is; ValueError for anything else."""
+    held = json_value(section(value, name), name)
+    if not isinstance(held, dict):
+        raise ValueError(f"{name} is a JSON object")
+    return held
+
+
+def json_objects(values: object, name: str) -> tuple[Mapping[str, JSON], ...]:
+    """`values`, a tuple of JSON objects (`json_object`); ValueError for anything else."""
+    if not isinstance(values, tuple):
         raise ValueError(f"{name} are a tuple of JSON objects")
-    return tuple(section(json_value(value, name), name) for value in values)
+    return tuple(json_object(value, name) for value in values)
 
 
 @dataclass(frozen=True)
