@@ -55,6 +55,15 @@ def producer_floor() -> int:
 THREADS = 128
 """The threads of a role: a warpgroup's, each family's compute and producer roles alike."""
 
+EXACT_EXPONENTIAL_LIVE = 4
+"""The fp32 values a Mosaic GPU exponential without `approx` keeps live at once for each element it
+computes (Dew's JAX build from post75, `fragmented_array._exact_exp_f32` and `_exact_exp2_f32`): its
+argument, which its NaN check reads last, the nearest integer power of two, the reduced argument and the
+series' accumulator, so a hook's `exp` or `exp2` over a fragment holds four of it at its peak (a paired
+SwiGLU GEMM's sigmoid over its 128 x 128 epilogue spilled 96 bytes at post75, none with the hardware's
+`ex2.approx` it ran before, FS-SWIGLU-BEFORE2). A fact of the fork's lowering, stated here until the fork
+states it."""
+
 COPIED_REGISTERS = 32
 """The registers a thread holds for one copy of an output's rows out through registers (no TMA store before
 Hopper: `templates.swizzling.copied`), which bounds its rows (`copied_rows`): a whole 128 x 128 fp32
