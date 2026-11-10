@@ -28,14 +28,23 @@ def dumped(pid: Path, spy: Path) -> str:
 
 
 def kept(artifacts: Path, name: str, dump: str, began: float, host: str) -> Path:
-    """A pytest past its deadline kept whole under the task's `artifacts`, `stalls/<name>.txt`: every thread's
-    stacks as `dumped` read them, Python and native, whole, when the task began (`began`, epoch seconds) and
-    stalled, and the `host` it stood on (host.py's `state`). A row keeps a stall's first 12,000 characters
-    and a reader of armada's tail fewer, which held the main thread's first frames alone (rows 5452,
-    5454)."""
+    """A pytest past its deadline kept whole under the task's `artifacts`, `stalls/<name>-<n>.txt`, `n` the
+    first ordinal no record of the name holds yet (made exclusively, so a task's runs of the same rows each
+    keep their own): every thread's stacks as `dumped` read them, Python and native, whole, when the task
+    began (`began`, epoch seconds) and stalled, and the `host` it stood on (host.py's `state`). A row keeps a
+    stall's first 12,000 characters and a reader of armada's tail fewer, which held the main thread's first
+    frames alone (rows 5452, 5454)."""
     stamp = "%Y-%m-%dT%H:%M:%SZ"
-    record = artifacts / "stalls" / f"{re.sub(r'[^A-Za-z0-9._-]+', '_', name)}.txt"
-    record.parent.mkdir(parents=True, exist_ok=True)
-    record.write_text(f"{dump}\n\ntask began {time.strftime(stamp, time.gmtime(began))}, stalled "
-                      f"{time.strftime(stamp, time.gmtime())}\n{host}")
-    return record
+    held = artifacts / "stalls"
+    held.mkdir(parents=True, exist_ok=True)
+    named = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    ordinal = 0
+    while True:
+        record = held / f"{named}-{ordinal}.txt"
+        try:
+            with record.open("x") as out:
+                out.write(f"{dump}\n\ntask began {time.strftime(stamp, time.gmtime(began))}, stalled "
+                          f"{time.strftime(stamp, time.gmtime())}\n{host}")
+            return record
+        except FileExistsError:
+            ordinal += 1
