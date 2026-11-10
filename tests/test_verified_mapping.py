@@ -493,10 +493,17 @@ def test_a_first_verification_says_it_runs_and_a_recorded_one_does_not(tmp_path,
     source = tmp_path / "source"
     write_tiny(source, "cwm", sliding_window=4)
     config = json.loads((source / "config.json").read_text())
+
+    def announced() -> list[object]:
+        # The model type each of the verifier's warnings names, its first argument.
+        return [record.args[0] for record in caplog.records
+                if record.name == "dew.interop.verify" and record.levelno == logging.WARNING
+                and isinstance(record.args, tuple)]
+
     with caplog.at_level(logging.WARNING, logger="dew.interop.verify"):
         verify_mapping(config)
-    assert any("tier 2: model_type 'cwm'" in record.getMessage() for record in caplog.records)
+    assert announced() == ["cwm"]
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="dew.interop.verify"):
         verify_mapping(config)
-    assert not [record for record in caplog.records if "tier 2: model_type" in record.getMessage()]
+    assert announced() == []

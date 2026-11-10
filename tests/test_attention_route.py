@@ -539,6 +539,26 @@ def test_a_template_call_filling_its_masked_logits_is_on_par_with_the_portable_p
                     seeds=SEEDS)
 
 
+def test_a_row_that_sees_no_key_weighs_each_value_before_summing_them():
+    """A causal call on the template over packed documents under jax.nn's finite masked logit, every value
+    2^122: its padding rows, 3 and 7, which see no key, weigh each of the call's 100 values before summing
+    them, as the portable path's value product weighs them, so they read the portable path's finite mean
+    where the values' sum (2^128.6) overflows; no row is infinite (a document's 60 values sum within fp32)."""
+    documents = _documents(ROWS, QUERIES)
+    query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
+    key = jnp.zeros((ROWS, QUERIES, KV_HEADS, WIDTH), jnp.bfloat16)
+    value = jnp.full((ROWS, QUERIES, KV_HEADS, WIDTH), 2.0 ** 122, jnp.bfloat16)
+
+    def attend(implementation: str) -> np.ndarray:
+        return np.asarray(jax.jit(lambda query, key, value: scaled_dot_product_attention(
+            query, key, value, causal=True, segment_ids=documents, mask_fill=JAX_NN_FILL,
+            implementation=implementation))(query, key, value), np.float32)
+
+    ours, theirs = attend("template"), attend("reference")
+    assert np.isfinite(ours).all()
+    np.testing.assert_array_equal(ours[:, [3, 7]], theirs[:, [3, 7]])
+
+
 def test_a_template_call_filling_with_minus_infinity_reads_nan_where_a_row_sees_no_key():
     """A causal call on the template over packed documents with -inf for a masked logit: its padding rows,
     3 and 7, which see no key, NaN, as the portable path's, and every value's gradient NaN with them (the

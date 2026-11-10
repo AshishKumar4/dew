@@ -95,6 +95,29 @@ def test_a_grouped_output_projection_takes_the_recipe_group_by_group():
                                     np.abs(dequantized) @ np.abs(matrices[group]), WIDTH)
 
 
+def test_a_retained_jitted_projection_traces_again_under_another_role():
+    """A projection jitted once and called under one role, then another, at the same shapes, traces again
+    (`projection_role` is a context JAX keys its trace caches on): under the 'fp8' numerics an MLP's call
+    takes the recipe and a router's, after it, keeps the run's dtypes, each the output a fresh trace under
+    its role gives."""
+    from dew.nn.dense import Dense
+    from dew.nn.precision import projection_role
+
+    layer = Dense(WIDTH, use_bias=False, dtype=jnp.float32)
+    x = jnp.asarray(np.random.default_rng(2).normal(size=(4, WIDTH)), jnp.float32)
+    params = layer.init(jax.random.key(0), x)
+    retained = jax.jit(layer.apply)
+    outputs = {}
+    with generation.run_precision(FP8):
+        for role in ("mlp", "router"):
+            with projection_role(role):
+                fresh = jax.jit(lambda params, x: layer.apply(params, x))
+                outputs[role] = (np.asarray(retained(params, x)), np.asarray(fresh(params, x)))
+    for role, (kept, own) in outputs.items():
+        np.testing.assert_array_equal(kept, own, err_msg=role)
+    assert not np.array_equal(outputs["mlp"][1], outputs["router"][1])
+
+
 def test_a_projection_the_recipe_takes_under_a_product_wrapper_is_refused():
     """A projection the 'fp8' numerics take by role whose product a wrapper holds (an adapter's or a
     quantizer's interception) would train unquantized, silently: refused, and a role the recipe keeps is

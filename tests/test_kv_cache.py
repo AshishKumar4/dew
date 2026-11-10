@@ -20,6 +20,8 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import generation
 from dew.nn.kv_cache import (
+    BOUND,
+    TABLE,
     KVCache,
     KVStore,
     _gather_pages,
@@ -423,6 +425,55 @@ def test_a_paged_write_past_its_rows_pages_drops_and_leaves_their_slots(mixed):
     read, _ = writer.apply(mutated, later, later, past, mixed, mutable=["cache"])
     for after, before in zip(read, held, strict=True):
         np.testing.assert_array_equal(after, before)
+
+
+def _bounds_by_slot(cache, layout: KVCache) -> np.ndarray:
+    """The cache's value bound (`BOUND`) at each row's slots, `[rows, capacity, heads]`: a dense cache's
+    head-major leaf transposed, a pool's read through each row's pages."""
+    bound = np.asarray(cache[BOUND])
+    if layout.page_size is None:
+        return np.swapaxes(bound, 1, 2)
+    table = np.asarray(cache[TABLE])
+    heads, (rows, pages) = bound.shape[0], table.shape
+    return np.moveaxis(bound[:, table].reshape(heads, rows, pages * layout.page_size), 0, 2)
+
+
+@pytest.mark.parametrize("layout", [KVCache(), KVCache(page_size=4), KVCache(quantized="float8_e4m3fn"),
+                                    KVCache(quantized="int8"), KVCache(page_size=4, quantized="int8")],
+                         ids=["dense", "paged", "float8", "int8", "paged-int8"])
+@pytest.mark.parametrize("mixed", [False, True], ids=["rectangular", "mixed"])
+def test_a_caches_value_bound_is_its_written_values_largest_as_it_reads_them(layout, mixed):
+    """Each written token's and key head's bound (`BOUND`) is the largest magnitude of its values as the
+    cache reads them back, a quantized cache's dequantized, in the rectangular append and the mixed call
+    alike; an unwritten slot's is 0."""
+    capacity = 8
+    writer = Writer(layout, capacity)
+    keys, values = (jax.random.normal(stream, (2, 3, 2, 8)) * 5 for stream in jax.random.split(
+        jax.random.key(0), 2))
+    positions = jnp.asarray([[0, 1, 2], [4, 5, 6]], jnp.int32)
+    cache = writer.init(jax.random.key(0), keys, values, positions)["cache"]
+    if mixed:
+        # The mixed call writes one token a row, as a serving step's decoding rows do.
+        keys, values, positions = keys[:, :1], values[:, :1], positions[:, :1]
+    (_, read), held = writer.apply({"cache": cache}, keys, values, positions, mixed, mutable=["cache"])
+    bounds = _bounds_by_slot(held["cache"], layout)
+    written = np.zeros((2, capacity), bool)
+    written[np.arange(2)[:, None], np.asarray(positions)] = True
+    largest = np.max(np.abs(np.asarray(read, np.float32)), axis=-1)
+    np.testing.assert_array_equal(bounds[written], largest[written])
+    np.testing.assert_array_equal(bounds[~written], 0)
+
+
+@pytest.mark.parametrize("layout", [KVCache(), KVCache(page_size=4), KVCache(quantized="float8_e4m3fn")],
+                         ids=["dense", "paged", "float8"])
+def test_a_head_kept_as_keys_and_values_bounds_the_keys_it_reads_as_values(layout):
+    """A cache keeping its keys as its values (`keys_as_values`) bounds the keys it reads as them."""
+    keys = jax.random.normal(jax.random.key(0), (2, 4, 2, 8)) * 3
+    holder = Holder(layout, keys_as_values=True)
+    cache = holder.init(jax.random.key(0), keys, keys)["cache"]
+    (read, _), held = holder.apply({"cache": cache}, keys, keys, mutable=["cache"])
+    np.testing.assert_array_equal(_bounds_by_slot(held["cache"], layout),
+                                  np.max(np.abs(np.asarray(read, np.float32)), axis=-1))
 
 
 def test_a_cursor_past_capacity_marks_the_row_whose_appends_overflowed():
