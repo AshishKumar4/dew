@@ -7,7 +7,9 @@ import contextlib
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.extend.core import primitives
 
+from dew.nn import programs
 from dew.nn.precision import FP32_SUMS
 
 
@@ -24,6 +26,33 @@ def widened(tree):
         return np.asarray(leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype)
 
     return jax.tree.map(wide, tree)
+
+
+EXACT = frozenset({jax.lax.neg_p, jax.lax.abs_p, jax.lax.max_p, jax.lax.min_p, jax.lax.select_n_p,
+    jax.lax.copy_p, jax.lax.iota_p, jax.lax.sign_p, jax.lax.floor_p, jax.lax.ceil_p, jax.lax.round_p,
+    jax.lax.reduce_max_p, jax.lax.reduce_min_p, jax.lax.argmax_p, jax.lax.argmin_p, jax.lax.eq_p,
+    jax.lax.ne_p, jax.lax.lt_p, jax.lax.le_p, jax.lax.gt_p, jax.lax.ge_p, jax.lax.and_p, jax.lax.or_p,
+    jax.lax.not_p, jax.lax.xor_p, jax.lax.clamp_p, jax.lax.is_finite_p, jax.lax.stop_gradient_p,
+    jax.lax.optimization_barrier_p, jax.lax.cummax_p, jax.lax.cummin_p, jax.lax.sort_p, jax.lax.top_k_p,
+    jax.lax.shift_left_p,
+    jax.lax.shift_right_logical_p, jax.lax.shift_right_arithmetic_p, jax.lax.population_count_p,
+    jax.lax.rem_p, primitives.name_p, jax.lax.nextafter_p, primitives.random_bits_p, primitives.random_seed_p,
+    primitives.random_wrap_p, primitives.random_unwrap_p, primitives.threefry2x32_p, jax.lax.scatter_p,
+    jax.lax.stack_p, jax.lax.unstack_p, jax.lax.bitcast_convert_type_p, jax.lax.device_put_p,
+    jax.lax.sharding_constraint_p, primitives.pvary_p, primitives.reshard_p, jax.lax.reduce_and_p,
+    jax.lax.reduce_or_p, primitives.empty2_p, jax.lax.all_gather_p, primitives.all_gather_invariant_p,
+    jax.lax.all_to_all_p, jax.lax.ppermute_p, primitives.pbroadcast_p, jax.lax.axis_index_p})
+"""Operations whose float results are their operands' values selected, or exact: no rounding. An operation
+that only moves entries is exact too (`dew.nn.programs.rearranges`, read beside these, `rounds_nothing`).
+An integer result rounds nothing either, nor does an array made to be written over (`empty2`); a collective
+that moves blocks between devices (a gather, an all-to-all, a permutation) is a move too. The one list of
+them: the rounding model reads it (tests/rounding_bound.py), and the truth rule
+(`reference_error._narrow_values`)."""
+
+
+def rounds_nothing(primitive) -> bool:
+    """Whether `primitive` rounds nothing: a move of entries, or one of `EXACT`."""
+    return programs.rearranges(primitive) or primitive in EXACT
 
 
 FORMATTED = frozenset({jax.lax.bitcast_convert_type_p, jax.lax.nextafter_p, jax.lax.reduce_precision_p})

@@ -30,37 +30,12 @@ import weakref
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import unrewritten
+from arm_arithmetic import rounds_nothing, unrewritten
 from float64_terms import SUMS, _static, _target, evaluated_on, walked
 from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
-from dew.nn import programs
 from dew.nn.precision import compensated_add, correctly_rounded_divide_p
-
-EXACT = frozenset({jax.lax.neg_p, jax.lax.abs_p, jax.lax.max_p, jax.lax.min_p, jax.lax.select_n_p,
-    jax.lax.copy_p, jax.lax.iota_p, jax.lax.sign_p, jax.lax.floor_p, jax.lax.ceil_p, jax.lax.round_p,
-    jax.lax.reduce_max_p, jax.lax.reduce_min_p, jax.lax.argmax_p, jax.lax.argmin_p, jax.lax.eq_p,
-    jax.lax.ne_p, jax.lax.lt_p, jax.lax.le_p, jax.lax.gt_p, jax.lax.ge_p, jax.lax.and_p, jax.lax.or_p,
-    jax.lax.not_p, jax.lax.xor_p, jax.lax.clamp_p, jax.lax.is_finite_p, jax.lax.stop_gradient_p,
-    jax.lax.optimization_barrier_p, jax.lax.cummax_p, jax.lax.cummin_p, jax.lax.sort_p, jax.lax.shift_left_p,
-    jax.lax.shift_right_logical_p, jax.lax.shift_right_arithmetic_p, jax.lax.population_count_p,
-    jax.lax.rem_p, primitives.name_p, jax.lax.nextafter_p, primitives.random_bits_p, primitives.random_seed_p,
-    primitives.random_wrap_p, primitives.random_unwrap_p, primitives.threefry2x32_p, jax.lax.scatter_p,
-    jax.lax.stack_p, jax.lax.unstack_p, jax.lax.bitcast_convert_type_p, jax.lax.device_put_p,
-    jax.lax.sharding_constraint_p, primitives.pvary_p, primitives.reshard_p, jax.lax.reduce_and_p,
-    jax.lax.reduce_or_p, primitives.empty2_p, jax.lax.all_gather_p, primitives.all_gather_invariant_p,
-    jax.lax.all_to_all_p, jax.lax.ppermute_p, primitives.pbroadcast_p, jax.lax.axis_index_p})
-"""Operations whose float results are their operands' values selected, or exact: no rounding. An operation
-that only moves entries is exact too (`dew.nn.programs.rearranges`, read beside these, `_exact`). An integer
-result rounds nothing either, nor does an array made to be written over (`empty2`); a collective that moves
-blocks between devices (a gather, an all-to-all, a permutation) is a move too."""
-
-
-def _exact(primitive) -> bool:
-    """Whether `primitive` rounds nothing: a move of entries, or one of `EXACT`."""
-    return programs.rearranges(primitive) or primitive in EXACT
-
 
 COLLECTED = {jax.lax.psum_p: "axes", primitives.psum_invariant_p: "axes",
              primitives.reduce_scatter_p: "axis_name"}
@@ -118,7 +93,7 @@ class TapRule:
         # A reduce_precision's float64 evaluation keeps its value, the rounding it is weighed.
         rounded_to = primitive is jax.lax.reduce_precision_p
         outputs = list(operands) if rounded_to else _bound(equation, params, operands)
-        if _exact(primitive):
+        if rounds_nothing(primitive):
             return outputs
         tapped = []
         for index, (var, value) in enumerate(zip(equation.outvars, outputs, strict=True)):

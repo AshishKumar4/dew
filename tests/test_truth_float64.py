@@ -3,6 +3,7 @@ way a truth has been a second fp32 run, injected."""
 
 import json
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -35,6 +36,13 @@ def closing(x):
 def rounded(x, weight):
     """A product that states its rounding: stored bfloat16, read at its operands' dtype."""
     return (x @ weight).astype(jnp.bfloat16).astype(x.dtype)
+
+
+def selected(x, weight):
+    """The two largest sizes of a product stored bfloat16, negated: its rounding stated once, what is
+    selected and negated of it exact."""
+    stored = jnp.abs((x @ weight).astype(jnp.bfloat16))
+    return (-jax.lax.top_k(stored, 2)[0]).astype(x.dtype)
 
 
 def with_a_dropped_value(x, weight):
@@ -80,6 +88,7 @@ NULL = {
     "parameters left float32, read exactly": (closing, held, None),
     "a leaf of no entries in float32": (with_no_history, drawn, None),
     "a stated rounding": (rounded, drawn, None),
+    "a stated rounding's entries selected and negated": (selected, drawn, None),
     "an fp32 value no output reads": (product, drawn, with_a_dropped_value),
     "an integer leaf beside": (with_its_place, drawn, None),
     "a NumPy truth in float64": (product, drawn, as_given(in_numpy(np.float64))),
@@ -101,9 +110,9 @@ INJECTED = {
 @pytest.mark.parametrize("name", NULL)
 def test_a_truth_that_computes_in_float64_is_judged(name):
     """The null control: a site whose truth is float64's (the reference on widened inputs, a formula of its
-    own, parameters held in float64 or left float32 and read exactly, a stated rounding, a dead fp32 value,
-    an integer leaf, a float32 leaf of no entries, a float64 NumPy truth) is judged as before, its arm on
-    par with itself."""
+    own, parameters held in float64 or left float32 and read exactly, a stated rounding and what is selected
+    of it, a dead fp32 value, an integer leaf, a float32 leaf of no entries, a float64 NumPy truth) is
+    judged as before, its arm on par with itself."""
     arm, draw, truth = NULL[name]
     assert_as_exact(arm, arm, draw, name, seeds=8, truth_fn=truth)
 

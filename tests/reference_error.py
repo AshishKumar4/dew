@@ -74,7 +74,7 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import FORMATTED, Truth, summed_as_run, unrewritten, widened
+from arm_arithmetic import FORMATTED, Truth, rounds_nothing, summed_as_run, unrewritten, widened
 from arm_forms import (
     _layers,
     _one_draws_program,
@@ -88,8 +88,7 @@ from arm_forms import (
     windows as windows,
 )
 from check1_wire import CENSUS, DRAWS, STAGES
-from float64_terms import float64_terms
-from jax.extend import core as jcore
+from float64_terms import evaluated_on, float64_terms
 from jax.interpreters import partial_eval as pe
 from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
@@ -661,27 +660,23 @@ def _below_float64(dtype) -> bool:
 
 
 def _programs_within(equation, lowering: str) -> list:
-    """The programs `equation` runs within it, each with the constants it closes over: a call's, a loop's, a
-    checkpoint's, every branch of a conditional, and of a platform's choice the branch a program lowered for
-    `lowering` keeps (`programs.platform_branch`). A native kernel's body is none (`programs.opaque`)."""
-    if programs.opaque(equation):
-        return []
+    """The programs `equation` runs within it (`programs.bodies`), of a platform's choice the branch alone
+    that a program lowered for `lowering` keeps (`programs.platform_branch`)."""
     chosen = equation.params.get("branches_platforms")
     if chosen is not None:
         return [programs.branches(equation)[programs.platform_branch(chosen, lowering)]]
-    return [each for value in equation.params.values()
-            for each in (value if isinstance(value, tuple | list) else (value,))
-            if isinstance(each, jcore.ClosedJaxpr | jcore.Jaxpr)]
+    return programs.bodies(equation)
 
 
 def _narrow_values(program, lowering: str) -> Iterator[str]:
     """Each result of `program`, a float64 truth's traced program with what no output reads removed, that an
-    operation computes narrower than float64, in the program or in one within it (`_programs_within`). A
+    operation rounds narrower than float64, in the program or in one within it (`_programs_within`). A
     narrow result is a format's own, and kept, where its operation rounds to a stated format (a cast,
-    FORMATTED) or only moves entries (`programs.rearranges`): a truth that states a rounding (a quantized
-    weight, a bf16 output) keeps it, and one that computes in fp32 does not. A constant or a literal is its
-    exact value whatever its format, as JAX promotes it where a float64 operation reads it: a parameter
-    left float32 under a float64 run is no rounding."""
+    FORMATTED) or rounds nothing (`arm_arithmetic.rounds_nothing`: a move of entries, a selection, a
+    negation): a truth that states a rounding (a quantized weight, a bf16 output) keeps it and what it
+    selects of it, and one that computes in fp32 does not. A constant or a literal is its exact value
+    whatever its format, as JAX promotes it where a float64 operation reads it: a parameter left float32
+    under a float64 run is no rounding."""
     for equation in getattr(program, "jaxpr", program).eqns:
         primitive = equation.primitive
         within = _programs_within(equation, lowering)
@@ -689,7 +684,7 @@ def _narrow_values(program, lowering: str) -> Iterator[str]:
             yield from _narrow_values(inner, lowering)
         made = [var.aval for var in equation.outvars if _below_float64(getattr(var.aval, "dtype", None))]
         formats = (primitive is jax.lax.convert_element_type_p or primitive in FORMATTED
-                   or programs.rearranges(primitive))
+                   or rounds_nothing(primitive))
         if made and not within and not formats:
             yield (f"`{primitive.name}` computed in {made[0].str_short()} in "
                    f"{equation.source_info.name_stack or 'the truth itself'}")
@@ -722,9 +717,10 @@ def _of_float64(label: str, truth_fn, inputs, truth) -> None:
         return
     # A window loop's truth is traced on a window, as its loop calls it.
     wide = widened(jax.tree.map(lambda leaf: leaf[0], inputs) if windowed else inputs)
-    with jax.enable_x64(new_val=True):
+    # The branch of a platform's choice that the truth's run keeps: on the device its evaluation runs on.
+    with jax.enable_x64(new_val=True), evaluated_on(jax.tree.leaves(wide)) as device:
         closed = trace(*wide).jaxpr
-    program, lowering = getattr(closed, "jaxpr", closed), lowering_platform(jax.devices()[0])
+    program, lowering = getattr(closed, "jaxpr", closed), lowering_platform(device)
     count = len(program.outvars)
 
     def narrow(used: list[bool]) -> list[str]:
@@ -1243,7 +1239,8 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     if pooled is not None:
         drawn_for = pooled
         narrow_leaves[:] = _narrow(drawn_for(0)(0, 1))
-    _verdicts(drawn_for, seeds, [label, *(f"{label}, against {name}" for name in also)], narrow_leaves, arms)
+    _verdicts(drawn_for, seeds, [label, *(f"{label}, against {name}" for name in also)], narrow_leaves, arms,
+              library=library_fn is not None)
 
 
 def _site_terms(terms_fn, terms, draw, truth, truth_program):
@@ -1264,15 +1261,17 @@ def _narrow(draws: _Draws) -> list[str]:
     return [name for name, width in zip(draws.names, draws.widths, strict=True) if width in NARROW_FACTORS]
 
 
-def _verdicts(drawn_for, seeds: int, labels: list[str], narrow_leaves: list[str], arms) -> None:
+def _verdicts(drawn_for, seeds: int, labels: list[str], narrow_leaves: list[str], arms, *,
+              library: bool = False) -> None:
     """Each reference's check 1 over its draws (`_staged`, `drawn_for(index)` the draws against reference
-    `index`, judged under `labels[index]`), each logged (STAGES_LOG); a GateFailure where any leaf is
-    over, else an Inconclusive where any is left unresolved."""
+    `index`, judged under `labels[index]`), each logged (STAGES_LOG) with whether its reference equalled
+    the truth on every first-stage seed, unknown (None) for the first where a `library` arm's error stands
+    in for its reference's on some leaves; a GateFailure where any leaf is over, else an Inconclusive where
+    any is left unresolved."""
     overs, unresolveds = [], []
     for index, named in enumerate(labels):
         over, unresolved, stage = _staged(drawn_for(index), seeds, named)
-        # Whether the reference equals the truth bit for bit on every first-stage seed and leaf.
-        exact = not np.any(drawn_for(index)(0, seeds).theirs)
+        exact = None if library and not index else not np.any(drawn_for(index)(0, seeds).theirs)
         _logged(named, stage, _verdict(over, unresolved), narrow_leaves, _mode_of(arms), exact)
         overs += over
         unresolveds += unresolved

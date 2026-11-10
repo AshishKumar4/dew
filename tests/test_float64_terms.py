@@ -68,22 +68,23 @@ def test_a_sum_of_one_sign_has_its_own_size_and_an_update_its_steps_terms():
 
 
 def test_a_sums_magnitudes_are_its_terms_sizes_summed_beside_their_root_sum_of_squares():
-    """One program read both ways, each reading its own: a product of rows that cancel, scaled after its sum,
-    has for magnitudes the sizes of its products summed and scaled (the most any partial sum of them
-    reaches, far above the value where they cancel) and for terms their root sum of squares, read before
-    the magnitudes and again after them."""
+    """One program read both ways, each reading its own: a product of rows that cancel, scaled after its sum
+    and a bias added, has for magnitudes the sizes of its products summed and scaled, and the bias's own
+    (the most any partial sum reaches, far above the value where they cancel), and for terms the products'
+    root sum of squares, to which a bias no sum made adds none, read before the magnitudes and again after
+    them."""
     rng = np.random.default_rng(5426)
-    rows, weights = rng.normal(size=(4, 16)), rng.normal(size=(16, 3))
+    rows, weights, bias = rng.normal(size=(4, 16)), rng.normal(size=(16, 3)), 8 * rng.normal(size=3)
 
     def scaled(rows, weights):
-        return (rows @ weights) * 0.25
+        return (rows @ weights) * 0.25 + bias
 
     with jax.enable_x64(new_val=True):
         value, terms = float64_terms(scaled, rows, weights)
         _, magnitudes = float64_magnitudes(scaled, rows, weights)
         _, again = float64_terms(scaled, rows, weights)
     products = rows[:, :, None] * weights[None, :, :]
-    np.testing.assert_allclose(magnitudes, 0.25 * np.abs(products).sum(axis=1), rtol=1e-12)
+    np.testing.assert_allclose(magnitudes, 0.25 * np.abs(products).sum(axis=1) + np.abs(bias), rtol=1e-12)
     np.testing.assert_allclose(terms, 0.25 * np.sqrt((products**2).sum(axis=1)), rtol=1e-12)
     np.testing.assert_array_equal(again, terms)
     assert np.all(np.abs(np.asarray(value)) <= magnitudes) and np.all(terms <= magnitudes)

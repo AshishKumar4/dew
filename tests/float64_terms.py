@@ -114,7 +114,8 @@ def float64_magnitudes(fn, *args):
     partial sum reaching the leaf through sums, products, scalings and moves is larger, in any order: a
     leaf whose magnitudes lie inside a format's range overflows in no order of those sums, which the
     derivative contracts hold a value finite by (tests/contract_support.py). A value any other operation
-    makes is its own size."""
+    makes is its own size, and is added at it where a sum's terms meet it (a bias added to a sum, a
+    carry's start)."""
     tree, values, sizes = _termed(fn, args, power=1)
     return tree.unflatten(values), tree.unflatten(sizes)
 
@@ -588,7 +589,9 @@ def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rul
         return outputs, [given[index] * scale if primitive is jax.lax.mul_p else given[index] / scale]
     if all(given[index] is None for index in carried):
         return outputs, [None] * len(outputs)
-    operands = [_or_zero(given[index], value) if index in carried else value
+    # An operand no sum made adds no terms to the squares; a partial sum reaches its size too (`POWER`).
+    untracked = _or_zero if POWER.get() == 2 else _or_own
+    operands = [untracked(given[index], value) if index in carried else value
                 for index, value in enumerate(inputs)]
     made = (jax.lax.add_p.bind(*operands) if primitive is jax.lax.sub_p else
             operands[0] if primitive is jax.lax.neg_p else
@@ -775,6 +778,11 @@ def _mapped(equation, inputs, given, rule=None):
 
 def _or_zero(energy, value):
     return jnp.zeros_like(value) if energy is None else energy
+
+
+def _or_own(energy, value):
+    """A carried operand's magnitudes, its own size where no sum made it."""
+    return _sized(value) if energy is None else energy
 
 
 def _or_size(energy, value):

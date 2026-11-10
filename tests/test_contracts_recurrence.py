@@ -114,12 +114,6 @@ in one case took 127 to 156 s near float32's largest, each order's program compi
 4433)."""
 
 
-PACKED_OVERFLOW_ORDERS = tuple(name for orders in ORDER_SETS.values() for name in orders
-                               if name != "grad of grad")
-"""A packed row at 2^63 holds every order but reverse over reverse, the remaining overflow-only difference
-the owner's decision accepts (ledger 2470)."""
-
-
 def outside(taken: str) -> tuple[str, ...]:
     """The orders outside `taken`'s set (`ORDER_SETS`), which its case leaves to the others."""
     return tuple(name for orders in ORDER_SETS.values() for name in orders if name not in ORDER_SETS[taken])
@@ -173,8 +167,7 @@ def test_the_chunked_delta_rule_holds_every_order(packed, edge, taken):
     # Each order one program (`jax.jit`): run op by op, an order's eager dispatch compiled 2,570 programs of
     # one or two ops, 109 of the case's 156 s near float32's largest (cProfile on armada, row 4433).
     assert_contract(jax.jit(rule), primals, direction, cotangent, f"the chunked delta rule {edge}",
-                    truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain), without=outside(taken),
-                    held=PACKED_OVERFLOW_ORDERS if packed and edge == "near the largest" else None)
+                    truth_fn=jax.jit(recurrence), plain_fn=jax.jit(plain), without=outside(taken))
 
 
 def plain_delta_rule(query, key, value, g, beta, state, scale):

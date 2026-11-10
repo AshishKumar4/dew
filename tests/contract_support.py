@@ -117,7 +117,7 @@ def ran(order, label: str, name: str):
 
 
 def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=None, plain_fn=None,
-                    held: tuple[str, ...] | None = None, without: tuple[str, ...] = ()) -> None:
+                    without: tuple[str, ...] = ()) -> None:
     """Every order of `fn` runs at the draw, and each leaf is finite at every position the contract holds:
     where the same order of its float64 run is a normal float32; where, given `plain_fn` (the plain float32
     formula, JAX's own derivatives of it), the plain formula's is finite; and where no order of summation
@@ -127,10 +127,8 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     it back), and a sum whose terms float32 can overflow in one order and not another is held to neither
     order (row 5426: Dew's blocked sum and XLA's chain each overflow partials the other does not). The
     float64 run is `fn`'s own, or `truth_fn`'s, the plain float64 formula, where `fn` computes in a fixed
-    precision whatever its inputs' (a declared dot algorithm). `held`, where given, names the orders a
-    decision its caller cites holds the call to: each order it drops must break, so the exemption ends when
-    the call holds it. `without` names orders the contract does not take yet, each joining with its row's
-    fix (a row's head brings its own test)."""
+    precision whatever its inputs' (a declared dot algorithm). `without` names orders the contract does not
+    take yet, each joining with its row's fix (a row's head brings its own test)."""
 
     def orders_of(f, *drawn):
         return {name: order for name, order in orders(f, *drawn).items() if name not in without}
@@ -164,10 +162,7 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
         broken = [f"{label}, {name}, leaf {index}: {int(where.sum())} values not finite where float64's are "
                   f"normal float32s and no order of their sums overflows, e.g. {values[index][where][:3]}"
                   for index, where in lost.items() if where.any()]
-        if held is not None and name not in held:
-            if not broken:
-                raise AssertionError(f"{label}, {name}: holds, so the exemption that drops it is over")
-        elif broken:
+        if broken:
             raise LessFinite(broken[0])
 
 
