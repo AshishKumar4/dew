@@ -28,7 +28,6 @@ from dew.data import Loading, Rejected, from_grain, mix
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, mapped
 from dew.data.readers import _Host
-from dew.data.storage import mirror_metrics
 from dew.distributed.batches import DevicePrefetchIterator, batch_signature, shard_batch
 from dew.telemetry.records import FitEnded
 from dew.training import Checkpoints, MeshSpec, Trainer
@@ -217,15 +216,13 @@ def test_chain_statistics_publish_without_reading_the_workers_live_iterator(host
             np.testing.assert_array_equal(np.asarray(next(stream)["i"]), kept[:batch])
             assert source.entered.wait(5)
             states = tuple(source.states)
-            # Beside the corpus's counts, what this process's mirrors did, which a run logs with its data
-            # metrics whichever pipeline read through them (`mirror_metrics`, row 4299): none where the
-            # process opened none, an earlier test's where one did.
+            # The corpus's counts and no mirror's: the run reads through none, whatever an earlier reader of
+            # its process read through (`Mirrored`, rows 5220, 5258).
             logged = {
                 "data/rows/observed": batch,
                 "data/rejected/observed/third": attempted - batch,
                 "data/truncated/observed": 0.0,
                 "data/chunks_per_record/observed": 0.0,
-                **mirror_metrics(),
             }
             for _ in range(3):
                 assert data.statistics() == logged
