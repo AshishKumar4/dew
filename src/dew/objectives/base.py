@@ -433,9 +433,15 @@ class Step:
         if self.tape is not None and name in self.tape:
             like = jax.eval_shape(drawn, jax.random.key(0))
             return self._taped(self.tape[name], name, examples, like.shape).astype(like.dtype)
-        key = jax.random.fold_in(counter_key(self.key if self.example_key is None else self.example_key),
-                                 stream(name))
+        key = self.update_key(name)
         return jax.vmap(lambda example: drawn(jax.random.fold_in(key, example)))(examples)
+
+    def update_key(self, name: str) -> jax.Array:
+        """The key of the update's draws `name` names, the same for every microbatch the update pools: the
+        examples' key where the step carries one (`example_key`), else the step's, through its counter and
+        folded with the name's stream. Each example's draw folds its place into it (`sample`)."""
+        return jax.random.fold_in(counter_key(self.key if self.example_key is None else self.example_key),
+                                  stream(name))
 
     def boundary(self, name: str, value: jax.Array) -> jax.Array:
         """`value`, one row an example, where the model's computation starts from it (a noised input,
