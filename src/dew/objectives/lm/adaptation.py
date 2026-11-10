@@ -250,18 +250,33 @@ def _where(choice: jax.Array, first, second):
                         first, second)
 
 
-_SUMS, _MOST = 4, 5
-"""What each slot adds to its window's damping (`_slot_terms`): its weighted |x|^2, |f|^2, |f| |x| and |x|,
-summed over the window; beside them its head norm's input's spread (`HeadTerms.spread`), least over the
+_TERMS = (("squares", "sum"), ("inputs", "sum"), ("crossed", "sum"), ("lengths", "sum"), ("least", "min"),
+          ("fed", "max"), ("longest", "max"), ("norm", "max"), ("after", "max"), ("bent", "max"))
+"""What each slot adds to its window's damping (`_slot_terms`), by name in the order a term array holds
+them, each with how a window reduces it over its slots (`_gathered`, `_joined`): its weighted |x|^2,
+|f|^2, |f| |x| and |x|, summed; its head norm's input's spread (`HeadTerms.spread`), least over the
 window's slots that weigh anything; and its |f|, |x|, the norm of the kernel `up` it read, and the
-Jacobian and second-derivative bounds of the levels after it (`LevelTerms.jacobian`, `bend`), largest
-over them (`_gathered`)."""
+Jacobian and second-derivative bounds of the levels after it (`LevelTerms.jacobian`, `bend`), largest.
+The one declaration of the layout, which every writer and reader of a term array reads."""
 
-_WIDTH = _SUMS + 1 + _MOST
+_NAMES = tuple(name for name, _ in _TERMS)
+_WIDTH = len(_TERMS)
+
+_EMPTY = {"sum": 0.0, "min": jnp.inf, "max": 0.0}
+"""What a term reduces from where a slot weighs nothing: nothing to a sum or a largest, everything to a
+least."""
+
+_REDUCED = {"sum": (jnp.sum, jnp.add), "min": (jnp.min, jnp.minimum), "max": (jnp.max, jnp.maximum)}
+"""Each reduction over a window's slots, and over two parts' windows."""
+
+
+def _named(terms: jax.Array) -> dict[str, jax.Array]:
+    """A term array's `[..., _WIDTH]` terms by name (`_TERMS`)."""
+    return {name: terms[..., index] for index, name in enumerate(_NAMES)}
 
 
 def _slot_terms(read: list, spread: jax.Array, weights: jax.Array) -> list:
-    """Each level's slots' terms `[B, W, _WIDTH]` (`_SUMS`), `read` each level's `LevelTerms` at the states
+    """Each level's slots' terms `[B, W, _WIDTH]` (`_TERMS`), `read` each level's `LevelTerms` at the states
     and versions its slots read, in the chain's order, `spread` the head's at the slots' final states and
     `weights` their targets'. The levels after a level compose: through `g` after `h`, a Jacobian of at
     most J_g J_h and a second derivative of at most H_g J_h^2 + J_g H_h. A slot that weighs nothing bounds
@@ -271,11 +286,13 @@ def _slot_terms(read: list, spread: jax.Array, weights: jax.Array) -> list:
     terms = []
     for level in reversed(read):
         lengths, fed = jnp.sqrt(level.squares), jnp.sqrt(level.inputs)
-        terms.append(jnp.stack([
-            *(weights * term for term in (level.squares, level.inputs, fed * lengths, lengths)),
-            jnp.where(counted, spread, jnp.inf),
-            *(jnp.where(counted, term, 0) for term in (fed, lengths, jnp.broadcast_to(level.up, spread.shape),
-                                                      after, bent))], axis=-1))
+        named = {"squares": weights * level.squares, "inputs": weights * level.inputs,
+                 "crossed": weights * fed * lengths, "lengths": weights * lengths,
+                 "least": jnp.where(counted, spread, jnp.inf),
+                 **{name: jnp.where(counted, term, 0) for name, term in (
+                     ("fed", fed), ("longest", lengths), ("norm", jnp.broadcast_to(level.up, spread.shape)),
+                     ("after", after), ("bent", bent))}}
+        terms.append(jnp.stack([named[name] for name in _NAMES], axis=-1))
         jacobian, bend = jnp.broadcast_to(level.jacobian(), spread.shape), jnp.broadcast_to(level.bend(),
                                                                                              spread.shape)
         after, bent = after * jacobian, bent * jnp.square(jacobian) + after * bend
@@ -283,19 +300,16 @@ def _slot_terms(read: list, spread: jax.Array, weights: jax.Array) -> list:
 
 
 def _gathered(mask: jax.Array, terms: jax.Array) -> jax.Array:
-    """A window's terms `[B, _WIDTH]` over the slots of `terms` `[B, W, _WIDTH]` that `mask` holds
-    (`_SUMS`): the sums, the least spread and the largest of the rest."""
-    sums = jnp.sum(jnp.where(mask[..., None], terms[..., :_SUMS], 0), axis=1)
-    least = jnp.min(jnp.where(mask, terms[..., _SUMS], jnp.inf), axis=1)
-    most = jnp.max(jnp.where(mask[..., None], terms[..., _SUMS + 1:], 0), axis=1)
-    return jnp.concatenate([sums, least[:, None], most], axis=-1)
+    """A window's terms `[B, _WIDTH]` over the slots of `terms` `[B, W, _WIDTH]` that `mask` holds, each
+    reduced as `_TERMS` declares: the sums, the least spread and the largest of the rest."""
+    return jnp.stack([_REDUCED[reduction][0](jnp.where(mask, terms[..., index], _EMPTY[reduction]), axis=1)
+                      for index, (_, reduction) in enumerate(_TERMS)], axis=-1)
 
 
 def _joined(one: jax.Array, other: jax.Array) -> jax.Array:
-    """Two parts' window terms `[B, _WIDTH]` as one window's (`_gathered`)."""
-    return jnp.concatenate([one[:, :_SUMS] + other[:, :_SUMS],
-                            jnp.minimum(one[:, _SUMS:_SUMS + 1], other[:, _SUMS:_SUMS + 1]),
-                            jnp.maximum(one[:, _SUMS + 1:], other[:, _SUMS + 1:])], axis=-1)
+    """Two parts' window terms `[B, _WIDTH]` as one window's, each reduced as `_TERMS` declares."""
+    return jnp.stack([_REDUCED[reduction][1](one[:, index], other[:, index])
+                      for index, (_, reduction) in enumerate(_TERMS)], axis=-1)
 
 
 def _arrays(applied) -> tuple[jax.Array, ...]:
@@ -330,8 +344,10 @@ def _step_rate(rate: float, parts: tuple[str, ...], head: HeadTerms, level: Leve
     `_SETTLINGS` rounds of T(T) rise toward d* from below, each continuous in what the bound reads, so
     the rate moves with its inputs' rounding by as much as they do. The rate is a constant of the step, as
     its bound is: the outer gradient flows through the step's gradient, not through the bound it reads."""
-    squares, inputs, crossed, lengths = (sums[:, index] for index in range(_SUMS))
-    least, fed, longest, norm, after, bent = (sums[:, index] for index in range(_SUMS, _WIDTH))
+    named = _named(sums)
+    squares, inputs, crossed, lengths = (named[name] for name in ("squares", "inputs", "crossed", "lengths"))
+    least, fed, longest, norm, after, bent = (
+        named[name] for name in ("least", "fed", "longest", "norm", "after", "bent"))
     p1, p2, growth = level.p1, level.p2, level.up_growth
     steps = {part: jnp.sqrt(jnp.sum(jnp.square(gradient[part]["kernel"].astype(jnp.float32)),
                                     axis=tuple(range(1, gradient[part]["kernel"].ndim))))
