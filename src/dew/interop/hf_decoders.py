@@ -911,12 +911,13 @@ def language_model_quantization(hf_config: Mapping[str, object], record: Wrapper
         layers = {str(module): entry for module, entry in
                   _records.record(quantization["quantized_layers"], "quantized_layers").items()}
 
-        # Each of the wrapper's weights takes the longest key naming its module or a container of it, as
-        # the codec reads the table (`_modelopt_algo`), keyed by its text name.
+        # Each of the wrapper's weights takes the key the codec reads it by (`codecs.governing_layer`),
+        # keyed by its text name.
+        from dew.interop.codecs import governing_layer
+
         table: dict[str, object] = {}
         for module in wrapper_weights():
-            key = max((key for key in layers if module == key or module.startswith(key + ".")), key=len,
-                      default=None)
+            key = governing_layer(module, layers)
             if key is not None and (name := renamed(module)) is not None:
                 table[name] = layers[key]
         if not table:

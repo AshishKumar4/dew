@@ -1682,15 +1682,24 @@ _MODELOPT_FP8_WEIGHTS = {
 """ModelOpt's tensor-scaled FP8 weights use the existing compressed-tensors FP8 codec."""
 
 
-def _modelopt_algo(name: str, method: str, layers: Mapping[str, str]) -> str:
-    stem = name.removesuffix('.weight')
-    if method != 'MIXED_PRECISION':
-        return method
+def governing_layer(module: str, layers: Collection[str]) -> str | None:
+    """The key of ModelOpt's `quantized_layers` table (`layers`) that governs `module`'s weights: the
+    nearest dotted ancestor of it naming one, itself included; None where none does."""
+    stem = module
     while stem:
         if stem in layers:
-            return layers[stem]
+            return stem
         stem = stem.rsplit('.', 1)[0] if '.' in stem else ''
-    raise ValueError(f"{name} has no algorithm in ModelOpt quantized_layers")
+    return None
+
+
+def _modelopt_algo(name: str, method: str, layers: Mapping[str, str]) -> str:
+    if method != 'MIXED_PRECISION':
+        return method
+    key = governing_layer(name.removesuffix('.weight'), layers)
+    if key is None:
+        raise ValueError(f"{name} has no algorithm in ModelOpt quantized_layers")
+    return layers[key]
 
 
 def _modelopt_input_kind(name: str, method: str,
