@@ -705,6 +705,35 @@ def test_a_mixed_kernel_gradients_prologue_reads_and_rounds_the_rows_in_their_dt
     np.testing.assert_array_equal(gradient("xla"), np.full((1, 128, 128), 128.0, np.float32))
 
 
+@INTERPRETS
+@pytest.mark.parametrize("kernel", ["triton", "mosaic"])
+def test_a_row_scales_gradient_reads_the_accumulator_summed_at_its_own_width(kernel):
+    """A grouped product with a row-scale epilogue (an fp32 scale a row), interpreted as an A100's at the
+    highest precision with `kernel` named: the scale's gradient sums the recomputed fp32 accumulator times
+    the cotangent, and that accumulator is summed as an fp32 output's (`product.promoted`) whatever the
+    product's own output, so a float16 output's scale gradient is the float32 output's, bit for bit, under a
+    cotangent both hold exactly: one recomputation program for both. An fp16 output's recomputation summed as
+    its own output, unpromoted, put an A100's scale gradient at 1.37 times XLA's error (row 5406, M-EM-14)."""
+    group_sizes = jnp.asarray([100, 0, 156], jnp.int32)
+    rng = np.random.default_rng(5406)
+    x = jnp.asarray(rng.standard_normal((256, 512)), jnp.float16)
+    w = jnp.asarray(rng.standard_normal((3, 512, 128)) / np.sqrt(512), jnp.float16)
+    scale = jnp.asarray(rng.uniform(0.5, 2.0, size=(256,)), jnp.float32)
+    cotangent = jnp.asarray(rng.integers(-4, 5, size=(256, 128)), jnp.float32)
+
+    def scale_gradient(out_dtype):
+        def product(scale):
+            return gemm.gemm(x, w, group_sizes, epilogue=lambda acc, s: acc * s[:, None],
+                             epilogue_operands=((scale, ("rows",)),), out_dtype=out_dtype,
+                             interpret_on_cpu=True)
+
+        with generation.assumed("sm80"), generation.chosen(grouped_matmul=kernel):
+            _, pull = jax.vjp(product, scale)
+            return np.asarray(jax.jit(pull)(cotangent.astype(out_dtype))[0])
+
+    np.testing.assert_array_equal(scale_gradient(jnp.float16), scale_gradient(jnp.float32))
+
+
 def test_a_kernel_gradient_of_no_rows_on_a_hopper_is_its_groups_zeros():
     """A kernel gradient contracting no rows on an H100 (a step whose experts received no tokens): its
     selection derives no split of an empty contraction (`mosaic_gpu.split_count`, which took the least of

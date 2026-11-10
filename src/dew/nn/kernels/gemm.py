@@ -264,21 +264,30 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         # each operand's values its own dtype's.
         counts = _part_counts(lhs.dtype, rhs.dtype, precision)
         parted = declared(jnp.bfloat16, precision, outputs=(jnp.float32,))
-        if counts is not None and prologue is None and _parts_launched(
-                grouped_matmul.tgmm_call(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), group_sizes, (),
-                                         tables if tabled else None, out_dtype=jnp.float32,
-                                         interpret=interpret, promoted=parted.promoted, dense=dense),
-                parted, whole=seen_whole(lhs) and seen_whole(rhs)):
-            def part(left, right, epilogue, prior, axes, dtypes):
-                # A kernel gradient takes no epilogue: the earlier parts' sum is added after.
+        sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
+        # A prologue rewrites the rows as they are, so the rows run whole, one part: their own 16 bits.
+        hooked = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast,
+                                      prologue_dtypes=_dtypes(prologue, lhs.astype(jnp.bfloat16), sides))
+        if (counts is not None and (prologue is None or counts[0] == 1) and _parts_launched(
+                grouped_matmul.tgmm_call(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), group_sizes,
+                                         sides, tables if tabled else None, out_dtype=jnp.float32,
+                                         hooks=hooked, interpret=interpret, promoted=parted.promoted,
+                                         dense=dense),
+                parted, whole=seen_whole(lhs) and seen_whole(rhs))):
+            def part(left, right, finite, epilogue, prior, axes, dtypes):
+                # A kernel gradient takes no epilogue: the earlier parts' sum is added after. The rows' finite
+                # values are read after their prologue, which rewrites them.
                 del epilogue, axes, dtypes
-                out = _gemm_t(left, right, None if dense else group_sizes, None, (), (),
-                              out_dtype=jnp.float32, precision=precision, interpret_on_cpu=interpret_on_cpu,
-                              gather=tables if tabled else None)
+                rewrite = (prologue if not finite[0] or prologue is None
+                           else functools.partial(_finite_after, prologue))
+                left = _finite(left) if finite[0] and prologue is None else left
+                right = _finite(right) if finite[1] else right
+                out = _gemm_t(left, right, None if dense else group_sizes, rewrite, prologue_arrays,
+                              prologue_axes, out_dtype=jnp.float32, precision=precision,
+                              interpret_on_cpu=interpret_on_cpu, gather=tables if tabled else None)
                 return out + prior[0] if prior else out
             wide = (jnp.dtype(jnp.float32),)
             return _in_parts(part, lhs, rhs, counts, None, (), (), wide).astype(out_dtype)
-        sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
         # The rows widen to the product's dtype after the prologue, which reads and rounds them in their own
         # (as the portable program's: `prologue(lhs).astype(lhs.dtype)`, then the product).
         rewrite = (prologue if prologue is None or compute == jnp.dtype(lhs.dtype)
@@ -1489,7 +1498,9 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
                     epilogue_arrays, epilogue_axes, dtypes, several=False, transpose_rhs=transpose_rhs,
                     interpret=interpret, precision=precision, dense=dense, paired=None, first=first,
                     gather=gather, scatter=None, summed_as=summed_as), whole=whole)):
-            def part(left, right, epilogue, epilogue_arrays, epilogue_axes, dtypes):
+            def part(left, right, finite, epilogue, epilogue_arrays, epilogue_axes, dtypes):
+                left, right = (_finite(x) if each else x
+                               for x, each in zip((left, right), finite, strict=True))
                 return _gemm(left, right, group_sizes, None, (), (), epilogue, epilogue_arrays, epilogue_axes,
                              dtypes, several=False, transpose_rhs=transpose_rhs,
                              interpret_on_cpu=interpret_on_cpu, precision=precision, dense=dense, first=first,
@@ -1558,20 +1569,25 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
     """Each accumulator's cotangent (one a matrix of `matrices`: the product's, and its `paired`'s), the
     epilogue side operands' and whether each accumulator's passes an output's through in `compute`'s dtype
     (`_passes_cotangent`): the outputs' own without an epilogue, else through the epilogue's VJP at the
-    accumulators recomputed as the outputs (`dtypes`) summed them, where the VJP reads them (from `lhs`'s
-    rows at `plain`'s `gather`, a gathered product's)."""
+    accumulators recomputed at their own width, where the VJP reads them (from `lhs`'s rows at `plain`'s
+    `gather`, a gathered product's)."""
     count = len(matrices)
     if epilogue is None:
         d_accs = tuple(cotangents[:count])
         return d_accs, (), tuple(jnp.promote_types(d.dtype, compute) == compute for d in d_accs)
     rows = functools.partial(_rows, axes_of=epilogue_axes, group_sizes=group_sizes, rows=acc_shape[0])
     sides = jax.eval_shape(rows, epilogue_arrays)
-    # The accumulator the products sum in: fp32, an fp64 product's fp64 (`xla_mainloop`).
+    # The accumulator the products sum in: fp32, an fp64 product's fp64 (`xla_mainloop`). The epilogue's
+    # derivative reads it at that width (a row scale's gradient sums it times the cotangent), so it is
+    # summed as an output of its own dtype sums (`product.promoted`: exactly at a precision above the
+    # default), not as the forward's narrower outputs, whose rounding hid the tensor cores' sums within a
+    # step (row 5406: an A100's fp16 row-scaled product's scale gradient 1.72 times XLA's error).
     acc = jax.ShapeDtypeStruct(acc_shape, at_least_fp32(compute))
     if _reads_accumulators(epilogue, count, acc, sides):
         accs = _as_tuple(_gemm(lhs, matrices[0], group_sizes, prologue, prologue_arrays, prologue_axes, None,
                                (), (), (acc.dtype,) * count, several=count > 1,
-                               paired=matrices[1] if count > 1 else None, summed_as=dtypes, **plain))
+                               paired=matrices[1] if count > 1 else None, summed_as=(acc.dtype,) * count,
+                               **plain))
     else:
         accs = (jnp.zeros(acc.shape, acc.dtype),) * count
 
@@ -1711,27 +1727,36 @@ def _parts_launched(call: tuple, product, *, whole: bool) -> bool:
 
 
 def _in_parts(product, lhs, rhs, counts: tuple[int, int], epilogue, epilogue_arrays, epilogue_axes, dtypes):
-    """`product(left, right, epilogue, epilogue_arrays, epilogue_axes, dtypes)` of `lhs` and `rhs` as their
-    bf16 parts (`counts` of them, `product.formed`): each pair of parts a product issues (`product.terms`,
+    """`product(left, right, finite, epilogue, epilogue_arrays, epilogue_axes, dtypes)` of `lhs` and `rhs` as
+    their bf16 parts (`counts` of them, `product.formed`), `finite` whether each part is read with its values
+    that are not finite zeroed (`_finite`): each pair of parts a product issues (`product.terms`,
     smallest first, those under fp32's significand), each exact, the earlier ones' fp32 sum added in the
     next one's epilogue (`_added`), the last one's epilogue `epilogue` on the whole sum; as exact as the fp32
     product whole, its sums fp32's (an exactly split operand's parts sum to it, row 5405)."""
     left, right = _bf16_parts(lhs, counts[0]), _bf16_parts(rhs, counts[1])
+
+    def operands(i: int, j: int):
+        # A value that is not finite meets the other operand's leading part alone, as the whole product
+        # meets it once: a leading part times the other's later parts reads its finite values alone
+        # (`product`'s `finite`; an infinity times a later part's zero would add a NaN the whole product has
+        # not).
+        return left[i], right[j], (i == 0 and j > 0, j == 0 and i > 0)
+
     pairs = terms(*counts)
     wide = (jnp.dtype(jnp.float32),)
     total = None
     for index, (i, j) in enumerate(pairs):
         last = index == len(pairs) - 1
         if total is None and not last:
-            total = product(left[i], right[j], None, (), (), wide)
+            total = product(*operands(i, j), None, (), (), wide)
             continue
         if not last:
-            total = product(left[i], right[j], _added, (total,), (('rows', 'columns'),), wide)
+            total = product(*operands(i, j), _added, (total,), (('rows', 'columns'),), wide)
             continue
         if total is None:
-            return product(left[i], right[j], epilogue, epilogue_arrays, epilogue_axes, dtypes)
+            return product(*operands(i, j), epilogue, epilogue_arrays, epilogue_axes, dtypes)
         whole = (functools.partial(_summed_then, epilogue) if epilogue is not None else _added)
-        return product(left[i], right[j], whole, (total, *epilogue_arrays),
+        return product(*operands(i, j), whole, (total, *epilogue_arrays),
                        (('rows', 'columns'), *epilogue_axes), dtypes)
     raise AssertionError("a product has a pair of parts")
 
@@ -1747,6 +1772,16 @@ def _bf16_parts(x, count: int) -> tuple[jax.Array, ...]:
     finite = jnp.isfinite(wide)
     leading, *rest = formed(jnp.where(finite, wide, 0), count)
     return jnp.where(finite, leading, wide.astype(jnp.bfloat16)), *rest
+
+
+def _finite_after(prologue, rows, *sides):
+    """`prologue`'s rows with their values that are not finite zeroed (`_finite`)."""
+    return _finite(prologue(rows, *sides))
+
+
+def _finite(x):
+    """`x` with its values that are not finite zeroed (`_in_parts`' cross terms)."""
+    return jnp.where(jnp.isfinite(x), x, 0).astype(x.dtype)
 
 
 def _summed_then(epilogue, acc, prior, *sides):
