@@ -595,18 +595,27 @@ class KVStore:
 
     def write(self, key: jax.Array, value: jax.Array, positions: jax.Array) -> None:
         """Store `key` and `value` at `positions`, `value` once where it is the keys (`payloads`)."""
-        rotation = self.rotation
-        if rotation is not None:
-            key = rotated(key, rotation)
-        for (name, scale_name), incoming in zip(self.payloads, (key, value), strict=False):
-            if self.layout.quantized is None:
-                stored, scale = incoming.astype(self.layout.storage(self.dtype)), None
-            else:
-                stored, scale = quantize(incoming, self.layout.quantized)
+        for (name, scale_name), stored, scale in self._encoded(key, value):
             self._write(name, functools.partial(self._written, values=stored, positions=positions))
             if scale is not None:
                 self._write(scale_name, functools.partial(self._scales_written, values=scale,
                                                           positions=positions))
+
+    def _encoded(self, key: jax.Array, value: jax.Array
+                 ) -> list[tuple[tuple[str, str], jax.Array, jax.Array | None]]:
+        """Each payload of `key` and `value` (`payloads`: `value` none where it is the keys) as the cache
+        stores it, whichever write places it: its leaf's and its scales' names, the keys in the cache's
+        rotation, its values in the storage dtype or a quantized cache's codes, and their scales (None
+        unquantized)."""
+        if self.rotation is not None:
+            key = rotated(key, self.rotation)
+        encoded = []
+        for names, incoming in zip(self.payloads, (key, value), strict=False):
+            if self.layout.quantized is None:
+                encoded.append((names, incoming.astype(self.layout.storage(self.dtype)), None))
+            else:
+                encoded.append((names, *quantize(incoming, self.layout.quantized)))
+        return encoded
 
     def _scales_written(self, buffer: jax.Array, layer: jax.Array | int | None, *, values: jax.Array,
                         positions: jax.Array) -> jax.Array:
@@ -668,8 +677,8 @@ class KVStore:
         return keys if self.rotation is None else rotated(keys, self.rotation.T)
 
     def read(self) -> tuple[jax.Array, jax.Array]:
-        keys = self._read("cached_key", "key_scale")
-        return keys, keys if self.keys_as_values else self._read("cached_value", "value_scale")
+        keys = self._read(*self.payloads[0])
+        return keys, keys if self.keys_as_values else self._read(*self.payloads[-1])
 
     def write_slots(self, name: str, values: jax.Array, positions: jax.Array) -> None:
         """Keep the tokens' `values` `[rows, tokens]` of the one-head leaf `name` (`PLACES`, `DOCUMENTS`,
@@ -701,17 +710,9 @@ class KVStore:
         quantized cache's codes and scales, as `write` stores them; a paged
         pool must have one group, as the mixed call requires.
         """
-        rotation = self.rotation
-        if rotation is not None:
-            key = rotated(key, rotation)
-        leaves, scales = [], []
-        for (name, scale_name), incoming in zip(self.payloads, (key, value), strict=False):
-            if self.layout.quantized is None:
-                leaves.append((name, incoming))
-            else:
-                codes, scale = quantize(incoming, self.layout.quantized)
-                leaves.append((name, codes))
-                scales.append((scale_name, scale))
+        encoded = self._encoded(key, value)
+        leaves = [(name, stored) for (name, _), stored, _ in encoded]
+        scales = [(scale_name, scale) for (_, scale_name), _, scale in encoded if scale is not None]
         leaves += [(GROUPS[field], held[:, None].astype(jnp.int32)) for field, held in (groups or {}).items()]
         # Each token continues its row's last document (`Append.documents`; a serving row holds one), its
         # row's largest kept, the row's first 1: a reduction a row, no slot of it a token.
@@ -734,30 +735,24 @@ class KVStore:
     def read_rows(self, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Return what `read` returns for only `rows`, `[len(rows), capacity, kv_heads, head_dim]`: a
         quantized cache's dequantized, its keys in the cache's rotation as `read`'s."""
-        def rows_of(name: str, scale_name: str) -> jax.Array:
-            stored = self._get(name)
-            scale = None if self.layout.quantized is None else self._get(scale_name)
-            if self.layout.page_size is not None:
-                table = self._get(TABLE)[rows]
-                stored = _gather_pages(stored, table, 1)
-                scale = None if scale is None else _gather_pages(scale, table, 1)
-            else:
-                stored = stored[rows]
-                scale = None if scale is None else jnp.swapaxes(scale[rows], 1, 2)
-            return stored.astype(self.dtype) if scale is None else dequantize(stored, scale, self.dtype)
+        keys = self._read(*self.payloads[0], rows=rows)
+        return keys, keys if self.keys_as_values else self._read(*self.payloads[-1], rows=rows)
 
-        keys = rows_of(*self.payloads[0])
-        return keys, keys if self.keys_as_values else rows_of(*self.payloads[-1])
-
-    def _read(self, name: str, scale_name: str) -> jax.Array:
+    def _read(self, name: str, scale_name: str, rows: jax.Array | None = None) -> jax.Array:
+        """Payload leaf `name` read back `[rows, capacity, heads, dim]` in the cache's dtype, a quantized
+        cache's codes dequantized by its scales `scale_name`: every row, or `rows` alone (a mixed call's,
+        whose pool holds one group of pages, `write_tokens`), a paged pool's through their tables."""
         stored = self._get(name)
         scale = None if self.layout.quantized is None else self._get(scale_name)
         if self.layout.page_size is not None:
-            stored = self._gathered(stored)
-            scale = None if scale is None else self._gathered(scale)
-        elif scale is not None:
+            table = self._get(TABLE)
+            table, groups = (table, self.layout.groups) if rows is None else (table[rows], 1)
+            stored = _gather_pages(stored, table, groups)
+            scale = None if scale is None else _gather_pages(scale, table, groups)
+        else:
+            stored = stored if rows is None else stored[rows]
             # Head-major, `[rows, heads, capacity]` (`scale_shape`): the codes' `[rows, capacity, heads]`.
-            scale = jnp.swapaxes(scale, 1, 2)
+            scale = None if scale is None else jnp.swapaxes(scale if rows is None else scale[rows], 1, 2)
         return stored.astype(self.dtype) if scale is None else dequantize(stored, scale, self.dtype)
 
     def attends_rows(self, query: jax.Array, softcap: float | None) -> bool:
