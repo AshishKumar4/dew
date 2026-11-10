@@ -56,7 +56,6 @@ import numpy as np
 from jax.experimental import serialize_executable
 
 from dew import communicators
-from dew._cache import uncached
 from dew._records import JSON, record
 from dew.batch import Batch
 from dew.nn.kernels.generation import (
@@ -556,8 +555,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
         lowerings.append((lowered(), None, lowered))
     # Through Dew's compile point, as a run compiles them, at once (`report.compiled_at_once`): a launch
     # whose kernel spills there is derived again at its next config.
-    with uncached():
-        executables = report.compiled_at_once(lowerings)
+    executables = report.compiled_at_once(lowerings)
     built = {}
     for name, compiled in zip(programs, executables, strict=True):
         try:
@@ -807,13 +805,11 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     if start.resume is not None and trainer.checkpoints is not None:
         # A resumed run's step compiles at the rung its checkpoint records, as its resume would.
         trainer._resume_rung(trainer.checkpoints.rung(start.resume))
-    # A TPU topology's executable loads onto no client here: the persistent cache neither reads an entry
-    # for it nor writes one (`dew._cache.uncached`).
     on = generation if stated is None else stated
     # A canonical target's devices stand for any GPU of the generation; a host's own topology's, for its own.
     portable = not on_tpus and not set(trainer.device_mesh.devices.flat) <= _HOSTS_GPUS
     try:
-        with assumed(on, portable=portable), uncached() if on_tpus else contextlib.nullcontext():
+        with assumed(on, portable=portable):
             target = gpu_target()
             planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity,
                                              frontier)
