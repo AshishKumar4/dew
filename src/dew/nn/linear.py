@@ -40,7 +40,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
-from dew.batch import Coordinates, Forks, document_ranks, prefix_sum, valid_order
+from dew.batch import Coordinates, Forks, document_ranks, prefix_sum, real_bounds, valid_order
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
@@ -293,10 +293,8 @@ def document_tails(x, valid, documents, width: int, count: int):
     convolves after (`entered_conv1d`)."""
     batch, length, _ = x.shape
     real = jnp.asarray(valid, bool) & (documents > 0)
-    slots = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
     rows = jnp.arange(batch)[:, None]
-    ends = jnp.full((batch, count), -1, jnp.int32).at[rows, jnp.maximum(documents - 1, 0)].max(
-        jnp.where(real, slots, -1))
+    _, ends = real_bounds(documents, real, count)
     places = ends[:, :, None] - width + 1 + jnp.arange(width)[None, None, :]
     inside = jnp.clip(places, 0, length - 1)
     owner = documents[rows[:, :, None], inside]
@@ -551,8 +549,7 @@ def forked_scan(convolved, rule, coordinates: Coordinates, start):
     number = jnp.maximum(documents - 1, 0)
     slots_of = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
     # Each document's first real slot, `length` for one holding none.
-    firsts = jnp.full((batch, count), length, jnp.int32).at[rows, number].min(
-        jnp.where(real, slots_of, length))
+    firsts, _ = real_bounds(documents, real, count)
     holding = firsts < length
     begins = real & (slots_of == jnp.take_along_axis(firsts, number, axis=1))
     # Each document's source: its parent, or past a parent holding no token the memory that one passes on.

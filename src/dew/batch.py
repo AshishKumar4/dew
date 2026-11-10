@@ -185,6 +185,14 @@ def document_spans(segments, count: int, *, xp=jnp):
     return first, xp.where(end > 0, end, length)
 
 
+def real_bounds(segments, real, count: int, *, xp=jnp):
+    """Each of a row's `count` documents' first and last real slot `[B, D]` (`document_spans` over
+    `segments` kept where `real` `[B, S]` marks a token), `S` and -1 for one holding no real token."""
+    held = xp.asarray(real, bool) & (xp.asarray(segments) > 0)
+    first, end = document_spans(xp.where(held, xp.asarray(segments, np.int32), 0), count, xp=xp)
+    return first, xp.where(first < held.shape[1], end - 1, -1)
+
+
 @struct.dataclass
 class Forks:
     """A row's documents of which some continue another: a forest of shared prefixes. `parents` `[B, D]`

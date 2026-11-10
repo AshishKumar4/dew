@@ -33,7 +33,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax import lax
 from jax.ad_checkpoint import checkpoint_name
 
-from dew.batch import document_firsts
+from dew.batch import document_firsts, real_bounds
 from dew.mesh import LayoutRefused
 from dew.nn import rope
 from dew.nn.blocks import normal_kernel
@@ -263,9 +263,7 @@ def entered_mamba3(x, dt, A, B, C, lam, theta, carried: Carried, forked, starts,
     delta = (1 - lam) * dt
     following, _ = _trapezoid(delta, real, resets)
     # Each document's first and last real tokens, `length` and -1 where it holds none.
-    first = jnp.full((batch, documents), length, jnp.int32).at[rows, number].min(
-        jnp.where(real, slots, length))
-    last = jnp.full((batch, documents), -1, jnp.int32).at[rows, number].max(jnp.where(real, slots, -1))
+    first, last = real_bounds(number + 1, real, documents)
     holding = first < length
     ended = jnp.maximum(last, 0)
     # Each document's angles' offset, its source's last angle: the documents in the row's order, a parent
