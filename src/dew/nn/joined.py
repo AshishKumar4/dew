@@ -20,7 +20,7 @@ from dew.nn.dense import _plain_dense, intercepted
 from dew.nn.precision import biased, float32_dot_general
 
 from .kernels import gemm
-from .kernels.generation import INHERENT, device_generation
+from .kernels.generation import INHERENT, Choice, device_generation
 from .kernels.selection import Kernel, Op, Requirement, select
 
 
@@ -95,8 +95,8 @@ JOINED_FASTER = {
 them, which each join's selector reads and thresh's declared-set seam registers (.thresh/thresh.cue)."""
 
 
-def _join(choice: str) -> Op[JoinCase]:
-    """The join's selector for `choice` ('gate_up', 'delta_gates'): the projections apart, but joined where
+def _join(choice: Choice) -> Op[JoinCase]:
+    """The join's selector for `choice` (`CHOICES`): the projections apart, but joined where
     the join measured faster (`JOINED_FASTER`) and its requirements hold."""
     return Op(choice, (Kernel('joined', JOIN_SUPPORTS), Kernel('apart', (), generic=True)),
               lambda case: 'apart',
@@ -104,7 +104,7 @@ def _join(choice: str) -> Op[JoinCase]:
                         for (join, device), receipt in JOINED_FASTER.items() if join == choice})
 
 
-CHOICES = ('gate_up', 'delta_gates')
+CHOICES = (Choice.GATE_UP, Choice.DELTA_GATES)
 """The joins layers ask for (`joins`): named apart from their cells, so a join whose every cell is retired
 keeps its selector and runs its projections apart."""
 
@@ -112,7 +112,7 @@ JOINS = {choice: _join(choice) for choice in CHOICES}
 """The join's selector of each choice a layer joins projections for."""
 
 
-def joins(choice: str, projections: Sequence[nn.Module]) -> bool:
+def joins(choice: Choice, projections: Sequence[nn.Module]) -> bool:
     """Whether `projections` run as one GEMM (`joined_dense`), as the join's selector for `choice`
     reports it (`JOINS`): where the join measured faster on the device and their calls take nothing the
     join does not reproduce. Initialization creates each projection's parameters through

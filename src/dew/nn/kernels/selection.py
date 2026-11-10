@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from .generation import Route
+    from .generation import Choice, Route
 
 
 @dataclasses.dataclass(frozen=True)
@@ -151,7 +151,7 @@ class Op[C]:
     that kernel and the receipt. A declared cell runs its kernel where it takes the call; any other call,
     and a declared one its kernel cannot run, the op's order."""
 
-    choice: str
+    choice: Choice
     kernels: tuple[Kernel[C], ...]
     preferred: Callable[[C], str] | None = None
     hosted: Callable[[str], str] = lambda kernel: kernel
@@ -161,12 +161,6 @@ class Op[C]:
         default_factory=dict, compare=False, hash=False)
     """Another op's named choice that names this one's kernel, unless this call or op names its own.
     Entries are ordered, as the op's requirements and candidates are."""
-
-    def __post_init__(self):
-        from . import generation
-
-        # The op's choice is one of the vocabulary `chosen` reads: none is served it does not name.
-        generation.known_choices((self.choice,))
 
     def kernel(self, name: str) -> Kernel[C]:
         for kernel in self.kernels:
@@ -202,7 +196,7 @@ class KernelRefused(ValueError):
         self.choice, self.kernel, self.refusals = choice, kernel, refusals
 
 
-def forced(choice: str) -> str | None:
+def forced(choice: Choice) -> str | None:
     """The kernel `generation.chosen` names for `choice` within its block, or None."""
     from dew import _cache
 

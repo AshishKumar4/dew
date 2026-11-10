@@ -174,7 +174,7 @@ _ON_GPU = selection.Requirement[_Pass]('off_gpu', lambda case: case.on_gpu, "the
                                        generation.INHERENT)
 _ON_MOSAIC = selection.Requirement[_Pass]('off_mosaic', lambda case: case.on_mosaic,
                                           "the call runs on neither a GPU nor a TPU", generation.INHERENT)
-MAINLOOP = selection.Op[_Pass]('attention_mainloop', (
+MAINLOOP = selection.Op[_Pass](generation.Choice.ATTENTION_MAINLOOP, (
     selection.Kernel[_Pass]('mosaic', (_ON_MOSAIC, selection.analysed(
         'declined', lambda case: case.mosaic, 'roadmap: the Mosaic template takes every call'))),
     selection.Kernel[_Pass]('triton', (_ON_GPU, selection.analysed(
