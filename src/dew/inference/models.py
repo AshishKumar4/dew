@@ -31,7 +31,7 @@ from flax import linen as nn
 from dew._records import integer, record as named_fields, text
 from dew.batch import PARAMETER_ROOTS, Variables, under_roots
 from dew.inference.tasks import SavedRun, SavedRunTask, saved_model, saved_settings
-from dew.interop.safetensors_io import MAX_SHARD_SIZE, read_weights, unflatten
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, read_specs, read_weights, unflatten
 from dew.nn.precision import Numerics
 
 if TYPE_CHECKING:
@@ -140,6 +140,9 @@ class ReleasedRun(SavedRun):
     unstated: str = ""
     """Why no family's layout writes its model, as its export found (`dew.interop.layouts.source_layout`);
     empty where its export asked none (a model's own native release)."""
+    shapes: bool = False
+    """Whether `variables` gives its tensors' shapes and dtypes alone, read from the files' headers and
+    placed nowhere, as a load that asks no weights takes them (`Pretrained.load(weights=False)`)."""
 
     @classmethod
     def of(cls, directory: str | Path, trust: Sequence[str] = ()) -> Self:
@@ -178,21 +181,26 @@ class ReleasedRun(SavedRun):
                   parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS) -> Variables:
         """The release's variables, placed on `mesh` under `layout`, the collections `parameter_roots` names
         stored in `param_dtype` where given and the others as written, as a run's load stores them
-        (`Checkpoints.materialized`). It holds the one average its export chose: an `ema` asked is
-        refused."""
+        (`Checkpoints.materialized`), or, where it holds their `shapes` alone, each a `jax.ShapeDtypeStruct`
+        placed nowhere. It holds the one average its export chose: an `ema` asked is refused."""
         from dew.inference.loading import place
         from dew.registry import resolve_dtype
 
         if ema is not None:
             raise ValueError("a release holds the weights its export chose (`dew export --ema`); load the "
                              "run itself to choose its average")
-        variables = unflatten(read_weights(self.directory))
+        variables = (unflatten(read_specs(self.directory)) if self.shapes
+                     else unflatten(read_weights(self.directory)))
         if param_dtype is not None:
             stored = jnp.dtype(resolve_dtype(param_dtype))
-            variables = jax.tree_util.tree_map_with_path(
-                lambda path, leaf: leaf.astype(stored) if jnp.issubdtype(leaf.dtype, jnp.floating)
-                and under_roots(path, parameter_roots) else leaf, variables)
-        return place(variables, mesh, layout)
+
+            def stored_as(path, leaf):
+                if not (jnp.issubdtype(leaf.dtype, jnp.floating) and under_roots(path, parameter_roots)):
+                    return leaf
+                return jax.ShapeDtypeStruct(leaf.shape, stored) if self.shapes else leaf.astype(stored)
+
+            variables = jax.tree_util.tree_map_with_path(stored_as, variables)
+        return variables if self.shapes else place(variables, mesh, layout)
 
 
 class ReleasesModel:

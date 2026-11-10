@@ -28,7 +28,7 @@ from dew._files import replacing, write_atomically
 from dew._records import JSON
 from dew.batch import unboxed
 from dew.interop.unread import Stored, Unread
-from dew.interop.weights import ParamTree, insert
+from dew.interop.weights import ParamTree, Tree, insert
 
 SEPARATOR = "/"
 WEIGHTS_FILE = "model.safetensors"
@@ -167,8 +167,9 @@ def flatten(params) -> dict[str, np.ndarray]:
     return {_leaf_name(path): leaf for path, leaf in leaves}
 
 
-def unflatten(tensors: Mapping[str, np.ndarray]) -> ParamTree:
-    tree: ParamTree = {}
+def unflatten[LeafT: (np.ndarray, jax.ShapeDtypeStruct)](tensors: Mapping[str, LeafT]) -> Tree[LeafT]:
+    """`tensors` nested by their '/'-joined names: arrays, or their shapes alone (`read_specs`)."""
+    tree: Tree[LeafT] = {}
     for name, tensor in tensors.items():
         insert(tree, tuple(name.split(SEPARATOR)), tensor, name)
     return tree
@@ -266,6 +267,24 @@ def read_weights(folder) -> dict[str, np.ndarray]:
         own(owner, values, shard, folder)
         tensors.update(values)
     return tensors
+
+
+def read_specs(folder) -> dict[str, jax.ShapeDtypeStruct]:
+    """One checkpoint folder's weights' shapes and stored dtypes, as `read_weights` selects and refuses
+    them, read from each shard's header alone (`header_specs`): no tensor's bytes are read."""
+    folder = Path(folder)
+    selected = folder_weights(folder)
+    if not selected:
+        raise FileNotFoundError(
+            f"no safetensors weights in {folder}: expected "
+            + " or ".join(f"{stem}.safetensors (or its .index.json)" for stem in WEIGHT_STEMS))
+    specs: dict[str, jax.ShapeDtypeStruct] = {}
+    owner: dict[str, str] = {}
+    for shard in selected:
+        held = header_specs(folder / shard)
+        own(owner, held, shard, folder)
+        specs.update(held)
+    return specs
 
 
 def own(owner: dict[str, str], names: Iterable[str], shard: str, where: Path) -> None:

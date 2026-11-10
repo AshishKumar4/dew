@@ -64,7 +64,7 @@ from dew.interop.generation_config import (
     source_cache,
     source_decoding,
 )
-from dew.interop.layouts import CROSSING_UNWRITTEN, Unwritable
+from dew.interop.layouts import CROSSING_UNWRITTEN, SourceLayout, Unwritable
 from dew.interop.pipeline_assembly import (
     SourceTask,
     assemble_pipeline,
@@ -372,9 +372,13 @@ class Pretrained:
 
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
-                   layout: Layout | None = None) -> Self:
+                   layout: Layout | None = None, dtype: DTypeLike | None = None,
+                   param_dtype: DTypeLike | None = None) -> Self:
         """Return the pinned checkpoint `run` (`SavedRun.pinned`), rebuilt from the run's own inference
-        record, in the layout of the architecture the record names."""
+        record, in the layout of the architecture the record names, computing in `dtype` and stored in
+        `param_dtype` where given. A decoder no family's layout writes (`dew.interop.layouts.source_layout`)
+        is held in its native layout: the bundle a run starts from, whose `export` refuses with the
+        layout's reason (row 4785)."""
         from dew.inference.tasks import (
             BlockSettings,
             MaskedSettings,
@@ -385,10 +389,10 @@ class Pretrained:
         )
         from dew.registry import models
 
-        model_config = saved_model(run.record, None)
+        model_config = saved_model(run.record, dtype)
         model = model_config.build()
         # Restored where `mesh` and `layout` place them, sharded as a run's own load is.
-        variables = run.variables(ema=ema, mesh=mesh, layout=layout)
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         # The run's task as its loader reads it (`saved_settings`): its policy, budget, pad and
         # end-of-sequence ids and process, which the export writes in the format its readers read.
         held = None if run.objective.settings is None else saved_settings(run.record, run.objective.settings)
@@ -407,14 +411,27 @@ class Pretrained:
                           if isinstance(held, MaskedSettings) else
                           generation_config_of(held.sampling, budget) if isinstance(held, TextSettings)
                           else None)
+            from dew.interop.layouts import source_layout
+
             if isinstance(model, MediaWrapper):
                 bundle = PretrainedDecoder.from_model(model, variables, tokenizer=tokenizer,
                                                       generation_config=generation)
             else:
                 decoder = from_record(CausalTransformer, model)
-                source = PretrainedDecoder.from_model(decoder.with_cross_attention(None), variables,
-                                                      tokenizer=tokenizer, generation_config=generation)
-                bundle = replace(source, model=decoder)
+                stated = source_layout(decoder.with_cross_attention(None))
+                if isinstance(stated, Unwritable):
+                    # No family's layout writes it: the run's own model, in Dew's layout, which a run
+                    # starts from and whose export states the layout's reason.
+                    bundle = PretrainedDecoder(decoder, variables, None, {}, None, model_config.fields,
+                                               dict(decoders.GENERATION_DEFAULTS) if generation is None
+                                               else generation,
+                                               export_adapter=_unwritten(stated), tokenizer=tokenizer)
+                else:
+                    # Resolved once: the bundle is written in the layout just found.
+                    source = PretrainedDecoder.from_model(decoder.with_cross_attention(None), variables,
+                                                          tokenizer=tokenizer, generation_config=generation,
+                                                          layout=stated)
+                    bundle = replace(source, model=decoder)
             bundle = replace(bundle, processor=processor)
             if isinstance(held, MaskedSettings):
                 # A masked run's model is a decoder: no wrapper denoises.
@@ -563,13 +580,13 @@ class Pretrained:
         if native_release(name_or_dir):
             # A run's native release builds the model its run recorded (`saved_sources.native_source`).
             return native_source(cls, name_or_dir, mesh=mesh, layout=layout, dtype=dtype,
-                                 param_dtype=param_dtype, on_host=on_host, building={
-                "attention_impl": attention_impl != "auto", "max_seq_len": max_seq_len, "revision": revision,
-                "subfolder": subfolder, "gguf_file": gguf_file, "single_file": single_file,
-                "dduf_file": dduf_file, "fallback": fallback, "text_only": text_only,
-                "modeling_overrides": modeling_overrides or None, "prediction_depths": prediction_depths,
-                "dex": dex, "precision": precision, "scan_layers": scan_layers,
-                "packed_experts": packed_experts})
+                                 param_dtype=param_dtype, on_host=on_host, weights=weights,
+                                 attention_impl=attention_impl, max_seq_len=max_seq_len, building={
+                "revision": revision, "subfolder": subfolder, "gguf_file": gguf_file,
+                "single_file": single_file, "dduf_file": dduf_file, "fallback": fallback,
+                "text_only": text_only, "modeling_overrides": modeling_overrides or None,
+                "prediction_depths": prediction_depths, "dex": dex, "precision": precision,
+                "scan_layers": scan_layers, "packed_experts": packed_experts})
         return cls._from_family(
             name_or_dir, trust_remote_code, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len, revision=revision, subfolder=subfolder,
@@ -879,7 +896,8 @@ class PretrainedDecoder(Pretrained):
     @classmethod
     def from_model(cls, model: nn.Module, variables: Variables, *,
                    tokenizer: str | decoders.ExportTokenizer | None = None,
-                   generation_config: Mapping[str, object] | None = None) -> PretrainedDecoder:
+                   generation_config: Mapping[str, object] | None = None,
+                   layout: SourceLayout | None = None) -> PretrainedDecoder:
         """Wrap a model trained in Dew as a bundle that `save` writes in its family's Hugging Face layout.
 
         The layout is the one every writer asks (`layouts.source_layout`): a wrapper's family's release
@@ -894,14 +912,22 @@ class PretrainedDecoder(Pretrained):
         by name. `save` writes its files next to the weights, so the directory that
         `Pretrained.load` reads back includes its processor. `generation_config` is
         what generation_config.json records; None uses the native defaults with
-        the exported model's cache mode.
+        the exported model's cache mode. `layout` is the model's layout where the caller has resolved it
+        already (`Pretrained.from_saved`), so it is resolved once.
         """
         from dew.interop.layouts import source_layout
 
-        layout = source_layout(model)
-        if isinstance(layout, Unwritable):
+        resolved = source_layout(model) if layout is None else layout
+        if isinstance(resolved, Unwritable):
             raise decoder_parts.ExportRefused(
-                f"{type(model).__name__} has no Hugging Face layout Dew writes: {layout.reason}")
+                f"{type(model).__name__} has no Hugging Face layout Dew writes: {resolved.reason}")
+        return cls._of_layout(model, variables, resolved, tokenizer, generation_config)
+
+    @classmethod
+    def _of_layout(cls, model: nn.Module, variables: Variables, layout: SourceLayout,
+                   tokenizer: str | decoders.ExportTokenizer | None,
+                   generation_config: Mapping[str, object] | None) -> PretrainedDecoder:
+        """`from_model`'s bundle of `model` written in `layout`, its writable layout."""
         if isinstance(model, MediaWrapper):
             wrapper = from_record(MultimodalTransformer, model)
             return cls(wrapper, variables, None, layout.config, None,
@@ -1992,6 +2018,16 @@ def _extended[Loaded: Pretrained](loaded: Loaded, dex: DifferentialExtension | N
     if not isinstance(extended.model, Scanning):
         raise TypeError(f"scan_layers scans a decoder's layers; a {type(extended.model).__name__} has none")
     return replace(extended, model=extended.model.with_scanned_layers())
+
+
+def _unwritten(layout: Unwritable) -> Callable[..., Mapping[str, np.ndarray]]:
+    """The export of a source held in Dew's own layout because no family's writes it (`layout`): refused,
+    stating why, as a bundle of it is refused at once where one is built to be written
+    (`PretrainedDecoder.from_model`)."""
+    def refused(*_) -> Mapping[str, np.ndarray]:
+        raise decoder_parts.ExportRefused(
+            f"no Hugging Face layout Dew writes holds this model: {layout.reason}")
+    return refused
 
 
 def _within(name: str, layers: frozenset[int]) -> bool:
