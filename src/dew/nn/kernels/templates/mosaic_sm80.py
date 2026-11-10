@@ -275,19 +275,6 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
         # layouts"; written unoptimized it lowers at 8 to 64 rows, FS-T1-ROWS3), as its own stores take it.
         plgpu.store(smem, value.astype(smem.dtype), optimized=False)
 
-    def column_registers(self, columns: int, dtype) -> int:
-        # The accumulator's tiles are `m_warps * 16` rows by `n_warps * 8` columns, each warp's 16 x 8 a
-        # thread's two columns a row (jax/experimental/mosaic/gpu/mma.py:63, `MMALayouts`' accumulator
-        # tiling), so a column vector broadcast over the rows holds two entries a thread in each of the
-        # vector's `columns / (n_warps * 8)` tiles: a quarter of its columns at four row warps, as
-        # warpgroup MMA's, an eighth at two, a sixteenth at one.
-        per_thread = -(-columns * 2 // (4 // self.m_warps * 8))
-        return -(-per_thread * jnp.dtype(dtype).itemsize // 4)
-
-    def row_registers(self, rows: int, dtype) -> int:
-        # Each of the `m_warps` row warps' 16-row tiles a thread's two rows (`MMALayouts`' accumulator
-        # tiling), so a thread holds two of each `m_warps * 16` rows.
-        return -(-rows * 2 * jnp.dtype(dtype).itemsize // (self.m_warps * 16 * 4))
 
     @property
     def layout(self):

@@ -327,6 +327,17 @@ def _semaphore(leaf) -> bool:
     return jnp.issubdtype(leaf.dtype, jax.dtypes.extended)
 
 
+def vector_registers(layout, length: int, dtype) -> int:
+    """The 32-bit registers a thread holds for a vector of `length` entries of `dtype` in `layout` (a family's
+    `row` or `column`, Pallas' reduction of its accumulator's layout): its share of the vector's entries as
+    JAX lays them out (`registers_shape` times `vector_length`), the vector padded to whole tiles of the
+    layout, packed `dtype` entries sharing a register."""
+    tiled = layout.to_mgpu()
+    tile = tiled.tiling.tiles[0][0]
+    entries = math.prod(tiled.registers_shape((-(-length // tile) * tile,))) * tiled.vector_length
+    return -(-entries * jax.dtypes.itemsize_bits(dtype) // 32)
+
+
 def stored_bytes(shape: tuple, dtype) -> int:
     """The bytes an array of `shape` and `dtype` takes in memory, a packed dtype's two elements a byte."""
     return math.prod(shape) * jax.dtypes.itemsize_bits(dtype) // 8

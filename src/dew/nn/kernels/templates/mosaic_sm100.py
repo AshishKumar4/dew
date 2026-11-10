@@ -406,13 +406,8 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
         return min(columns, CHUNK_COLUMNS)
 
     def column_registers(self, columns: int, dtype) -> int:
-        # An epilogue chunk's columns of a vector in the epilogue's layout (`STORED`, `TCGEN05_COL_LAYOUT`:
-        # warpgroup MMA's column layout, two of each eight columns a thread), so a quarter of the chunk's.
-        return -(-self.chunk_columns(columns) * jnp.dtype(dtype).itemsize // 16)
-
-    def row_registers(self, rows: int, dtype) -> int:
-        # Each warp's 32 rows over its eight row lanes (`TCGEN05_ROW_LAYOUT`), a thread four of them.
-        return -(-rows * jnp.dtype(dtype).itemsize // 128)
+        # An epilogue chunk's columns of the vector held at once (`chunk_columns`), in the epilogue's layout.
+        return super().column_registers(self.chunk_columns(columns), dtype)
 
     def chunks(self, accumulators: tuple) -> Iterator[tuple[int, tuple]]:
         # Each chunk's columns read from each accumulator's tensor memory (`read`) as its consumer asks for
