@@ -2,25 +2,36 @@
 (tools/saved_runs_reference.py) trains: every run kind, an LM run whose decoder its source's model nests,
 and each variant a run serializes apart (row 2640): a decision row of its own segments and option lines,
 a lettered one, a block-diffusion run over a nested decoder, a run on the examples clock, fresh runs in
-bfloat16 and in float16 (whose loss a dynamic scale scales), and a run over a source stored as it states."""
+bfloat16 and in float16 (whose loss a dynamic scale scales), a run over a source stored as it states, a
+decision run whose rows ask a request's questions over one copy of its state, and a run of preference
+pairs.
+
+The last two were added after the mains the corpus first recorded, so their generation
+(tests/fixtures/saved_runs/8a7909b0f068) was written by main 5c88c5b688e5's source with two test files
+added to it, the commit its `source.json` names: this module with the two kinds, and a driver that ran
+tools/saved_runs_reference.py for them. No source file of that main differs: what it saved of them,
+which it held no kind to record."""
 
 import dataclasses
+import json
 from pathlib import Path
 
 import numpy as np
 import process_support
 import run_kinds
-from run_kinds import KINDS, decision, lm, masked, read, requested
+from run_kinds import KINDS, MostlyKept, decision, lm, masked, read, requested
 from test_lm_recipe import SEQ, write_token_files
 
-from dew.config import RunConfig, SourceOptions, TrainerConfig
-from dew.data import presets
+from dew.config import ObjectiveConfig, RunConfig, SourceOptions, TrainerConfig
+from dew.data import Files, Loading, Memory, presets
 from dew.data.sources.tokens import TokenFiles
+from dew.decision import Choice, decisions
 from dew.decision.config import Letters
 from dew.decision.layout import AnswerCue, Instructions, Labels, OptionLines, State, Text, built_in
 from dew.decision.task import Decide
 from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
+from dew.lora import LoRA
 from dew.nn.precision import numerics_of
 from dew.registry import ModelConfig
 from dew.training.budget import Pause
@@ -28,6 +39,9 @@ from dew.training.budget import Pause
 MULTIMODAL = "tests/fixtures/hf/gemma3-tiny-mm"
 """A multimodal source whose decoder its model nests (`MultimodalTransformer.language_model`), by its
 path in the repo, which a record keeps and a later checkout reads where it sits."""
+
+GEMMA = "tests/fixtures/hf/gemma3-native-tiny"
+"""A tiny source whose every layer attends, which rows over one state read, by its path in the repo."""
 
 QWEN = "tests/fixtures/hf/qwen38-dense-tiny"
 """A tiny causal source a fresh decision head and an LM run read, by its path in the repo."""
@@ -79,6 +93,53 @@ def lettered_in_context(root: Path, drawn: bool) -> RunConfig:
                 AnswerCue(template="\nAnswer:", many="\nAnswer:"))
     return dataclasses.replace(lettered(root, drawn), segments=segments, context_layers=(0,),
                                head=Letters(labels=labels, count=4))
+
+
+def shared(root: Path, drawn: bool) -> RunConfig:
+    """`run_kinds.shared`'s decision run of a letter readout that states its `shared_state`, over requests
+    of two questions each, so its rows ask both over one copy of their state: the layout a main from
+    before rows forked a state laid in streams, which a later main reads on as that main wrote it (the
+    promotion's final review: the corpus held no run that shared)."""
+    asked = {"team": Choice("Which team handles it?", ["billing", "technical", "sales"]),
+             "urgent": Choice("Is it urgent?", ["yes", "no"])}
+    tickets = [("charged twice for March", "billing", "yes"), ("the site is down", "technical", "yes"),
+               ("how much is the pro plan", "sales", "no"), ("refund my last invoice", "billing", "no")]
+    path = root / "requests.jsonl"
+    # Each request its own text, so the held-out split, cut by a row's content, holds some of each.
+    path.write_text("".join(
+        json.dumps({"state": f"{text}, ticket {index}",
+                    "questions": {name: question.wire() for name, question in asked.items()},
+                    "answers": {"team": team, "urgent": urgent}}) + "\n"
+        for index in range(8) for text, team, urgent in tickets))
+    train, held = Files(str(path), format="jsonl").holdout(0.25)
+
+    def rows(chain, *, drawn: bool):
+        read_rows = chain.pipe(decisions).read("memory")
+        kept = read_rows.random_filter_map(MostlyKept()) if drawn else read_rows
+        return kept.batch(8).loading(Loading(workers=0))
+    # An adapter beside the fresh head, its optimizer's state the adapter's: the run is small enough for
+    # the corpus to hold in the repository.
+    return dataclasses.replace(run_kinds.shared(root, drawn), pretrained=GEMMA,
+                               lora=LoRA(rank=2, modules=("q_proj",)),
+                               data=rows(train, drawn=drawn), validation=rows(held, drawn=False))
+
+
+def preferred(root: Path, drawn: bool) -> RunConfig:
+    """A run of preference pairs (`presets.preferences`, the DPO objective) over a fresh tiny causal model,
+    its chain the preset's call as a record holds it: a main from before pairs packed into windows laid a
+    pair a row, which a later main reads on by (the promotion's final review: the corpus held no run of
+    pairs)."""
+    del root, drawn
+    pairs = [{"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5], "chosen_mask": [0, 0, 1, 1],
+              "rejected_mask": [0, 0, 1]},
+             {"chosen": [2, 3, 4, 1], "rejected": [2, 3, 6], "chosen_mask": [0, 0, 1, 1],
+              "rejected_mask": [0, 0, 1]}] * 8
+    data = read(Memory(pairs).pipe(presets.preferences, seq_len=4, batch=8))
+    # A run that names its objective, built around its whole model on its data (`RunConfig.build_run`).
+    return RunConfig(model=ModelConfig("causal_transformer", {"vocab_size": 8, "emb_features": 16,
+                                                              "num_layers": 1, "num_heads": 2,
+                                                              "dtype": "float32"}),
+                     objective=ObjectiveConfig("dpo", {"seq_len": 3}), data=data, validation=None)
 
 
 def blockwise(root: Path, drawn: bool) -> RunConfig:
@@ -138,11 +199,15 @@ def computed(directory: Path | str, step: int | None = None) -> dict[str, dict[s
 
 def answered(task) -> None:
     """One request of a loaded task, as its kind's users make it (`run_kinds.requested`), and its answer:
-    a language model continues a prompt through the tokenizer its run recorded, a block or masked
+    a language model continues a prompt through the tokenizer its run recorded, or ids where it recorded
+    none, a block or masked
     generation steps its decoder past the prompt, a decision answers a question about a state with one
     of its options, and a text-to-image run draws an image."""
     answer = requested(task)
-    if isinstance(task, TextGeneration):
+    if isinstance(task, TextGeneration) and task.processor is None:
+        # A run of token ids alone (preference pairs) recorded no tokenizer: its task continued ids.
+        assert (np.asarray(answer.host().lengths) > 0).all()
+    elif isinstance(task, TextGeneration):
         assert task.decode(answer)
     elif isinstance(task, MaskedGeneration | BlockGeneration):
         # A response of at least one token past the prompt, its decoder having stepped.
@@ -158,7 +223,8 @@ def answered(task) -> None:
 SAVED_KINDS = {**KINDS, "multimodal": multimodal, "decision-segments": segmented,
                "decision-lettered": lettered, "decision-lettered-context": lettered_in_context,
                "block-diffusion": blockwise, "masked-diffusion": masked, "lm-examples": clocked,
-               "lm-bf16": fresh, "lm-float16": scaled, "lm-scaled": chosen_scale, "lm-stored": stored}
+               "lm-bf16": fresh, "lm-float16": scaled, "lm-scaled": chosen_scale, "lm-stored": stored,
+               "decision-shared": shared, "dpo": preferred}
 """Each kind the corpus saves a run of: every run kind (`run_kinds.KINDS`), an LM run whose decoder
 its source's model nests, a run of every task a registered objective saves its runs as, and each
 serialized variant beside them, a lettered question read in context among them."""

@@ -1,8 +1,10 @@
 """The prompt, preference, chat-canvas and clip presets, each the public steps written out."""
 
 import dataclasses
+import functools
 from pathlib import Path
 
+import jax
 import numpy as np
 import pytest
 from test_text_presets import same_batches
@@ -30,6 +32,98 @@ def test_the_preferences_preset_lays_out_pairs_as_its_step_written_out():
                       read="indexed", loading=LOADING)
     chain = pairs.shuffle(0).repeat().pipe(presets.preferences, seq_len=6, batch=4)
     same_batches(written, compile(chain, read="indexed", loading=LOADING), 3)
+
+
+def held_batches(loader) -> list:
+    """Every batch of a loader's held-out split, in order."""
+    reader = loader.val(DataPartition())
+    try:
+        return list(reader)
+    finally:
+        close = getattr(reader, "close", None)
+        if close is not None:
+            close()
+
+
+def test_a_chain_compiled_under_an_earlier_plan_lays_its_pairs_a_row_in_each_split():
+    """The preferences preset called with no `segments`, then split, compiled under a data plan from
+    before pairs packed into windows (`dew.data.plan.PAIR_WINDOWS`): each split reads the batches the same
+    chain reads with `segments=1` stated, a pair a row, its own records and no other's, in training and
+    held out (`Pipeline.at`, the preset's `earlier`). The call is made again where it stands in the chain
+    as it is now, over each split's own source: made on the chain as it stood when it was called, both
+    splits read every record. A call that states its `segments` reads as it states under either plan,
+    and under this Dew's plan the unstated call packs its pairs into windows."""
+    from dew.data.plan import IN_ORDER
+
+    # Twelve pairs, each its own ids, so a split that read another's records reads other batches.
+    pairs = Memory([{"chosen": [*[1, 2, 3, 4][: 2 + index % 3], index % 7],
+                     "rejected": [1, 2, 5][: 2 + index % 2],
+                     "chosen_mask": [*[0, 0, 1, 1][: 2 + index % 3], 1],
+                     "rejected_mask": [0, 0, 1][: 2 + index % 2]}
+                    for index in range(12)])
+
+    def loader(version=None, **stated):
+        train, held = pairs.pipe(presets.preferences, seq_len=6, batch=2, **stated).holdout(records=4)
+        options = {} if version is None else {"plan_version": version}
+        return compile(train, validation=held, read="indexed", loading=LOADING, **options)
+
+    rows = loader(segments=1)
+    for read in (loader(IN_ORDER), loader(IN_ORDER, segments=1)):
+        same_batches(rows, read, 4)
+        for expected, held in zip(held_batches(rows), held_batches(read), strict=True):
+            assert expected.keys() == held.keys()
+            jax.tree.map(np.testing.assert_array_equal, held, expected)
+    assert sum(len(batch["input_ids"]) for batch in held_batches(rows)) == 4
+    first = [next(iter(each.train(DataPartition())))["input_ids"] for each in (rows, loader())]
+    assert [np.ndim(ids) for ids in first] == [3, 2]
+
+
+@dataclasses.dataclass
+class Raised:
+    """A callable chains are piped through that is no function and does not hash (a dataclass compares
+    by value): each record's `id` raised by `by`."""
+
+    by: int
+
+    def __call__(self, dataset):
+        return dataset.map(functools.partial(raised, by=self.by))
+
+
+def raised(record, by: int):
+    return {**record, "id": record["id"] + by}
+
+
+def all_but_one(dataset):
+    """A call that makes another store of its input: its records but the one it holds out."""
+    return dataset.holdout(records=1)[0]
+
+
+def test_a_chain_piped_through_many_calls_and_an_unhashable_callable_compiles():
+    """A chain piped thirty times through a callable object that does not hash compiles, and reads each
+    record through every call; so does one piped thirty times through a call that makes another store
+    of its input, which reads the records thirty such calls leave. Every compile reads its chain's calls
+    at its plan's version (`Pipeline.at`), each chain once and by no hash of a callable (a read that
+    followed each call's input chain again visited two to the thirtieth of them, and one keyed by the
+    callable raised TypeError before any reader opened)."""
+    chain = Memory([{"id": np.int32(index)} for index in range(8)])
+    for _ in range(30):
+        chain = chain.pipe(Raised(1))
+    reader = compile(chain.repeat().batch(4), read="indexed", loading=LOADING).train(DataPartition())
+    try:
+        np.testing.assert_array_equal(next(reader)["id"], np.arange(4) + 30)
+    finally:
+        reader.close()
+    left = Memory([{"id": np.int32(index)} for index in range(40)])
+    for _ in range(30):
+        left = left.pipe(all_but_one)
+    # One pass: a training reader with no repeat of its own reads its records again without end.
+    reader = compile(left.repeat(1).batch(2), read="indexed", loading=LOADING).train(DataPartition())
+    try:
+        left_ids = [int(number) for batch in reader for number in batch["id"]]
+    finally:
+        reader.close()
+    # Each of the thirty calls held one record out: ten of the forty are left, each read once.
+    assert len(left_ids) == len(set(left_ids)) == 10 and set(left_ids) <= set(range(40))
 
 
 def test_the_canvas_preset_lays_out_turns_as_its_steps_written_out():

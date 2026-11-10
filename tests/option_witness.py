@@ -351,11 +351,13 @@ of its own (`dew.inference.models.ModelSettings`)."""
 
 
 def witnessed(settings: type, base=None) -> dict[str, list[object]]:
-    """Each field of `settings` that declares alternatives (`alternatives`), with them: about `base`'s
-    value of it, the settings a run saved, where given."""
+    """Each field of `settings` its record holds that declares alternatives (`alternatives`), with them:
+    about `base`'s value of it, the settings a run saved, where given."""
     hints = typing.get_type_hints(settings)
+    # A field its class's record holds none of (`metadata={"record": False}`) is no option a saved task
+    # is built with: no save states it (a question layout's reading under an earlier data plan).
     declared = {field.name: alternatives(hints[field.name], getattr(base, field.name, None))
-                for field in dataclasses.fields(settings)}
+                for field in dataclasses.fields(settings) if field.metadata.get("record", True)}
     return {name: values for name, values in declared.items() if len(values) > 1}
 
 

@@ -36,6 +36,7 @@ from dew.decision.rows import Encoding, Fit
 from dew.decision.shared_state import fork_depth
 from dew.decision.task import laid_out
 from dew.nn.attention_masks import visibility_mask
+from dew.objectives.base import Step
 
 pytestmark = pytest.mark.mesh
 
@@ -196,15 +197,16 @@ def scored(objective, windows, variables) -> dict[str, np.ndarray]:
         held = np.asarray(forward(variables, inputs))
         options, owners = np.asarray(batch["options"]), np.asarray(batch["question_rows"])
         tokens, segments = np.asarray(batch["tokens"]), np.asarray(batch["segments"])
-        forked = "documents" in batch
-        documents = np.asarray(batch["documents"]) if forked else np.zeros_like(tokens)
+        # Each token's part of its row: its document, or its stream where its rows stand in streams.
+        marked = next((name for name in ("documents", "streams") if name in batch), None)
+        parts = np.zeros_like(tokens) if marked is None else np.asarray(batch[marked])
         for window, owner in enumerate(owners):
             for row in range(1, int(segments[window].max()) + 1):
                 own = segments[window] == row
-                held_documents = np.unique(documents[window][own])
+                held_parts = np.unique(parts[window][own])
                 for number, slot in enumerate(np.flatnonzero(owner == row), start=1):
-                    part = own & (np.isin(documents[window], held_documents[[0, number]])
-                                  if forked else True)
+                    part = own & (np.isin(parts[window], held_parts[[0, number]])
+                                  if marked is not None else True)
                     key = bytes(tokens[window][part].astype(np.uint8)).decode(errors="replace")
                     logits[key] = held[window][slot][options[window][slot]]
     return dict(sorted(logits.items()))
@@ -236,6 +238,114 @@ def test_a_row_over_one_state_decides_each_question_as_its_own_row_does():
                     as_given(lambda variables: scored(alone, windows["alone"], variables)),
                     lambda seed: (initialized(jax.random.key(seed)),), "rows over one state",
                     seeds=STATE_ONCE_SEEDS, truth_fn=truth)
+
+
+def test_a_stated_shared_layout_read_by_an_earlier_plan_lays_its_rows_in_streams_and_decides_alike():
+    """A layout that states its `shared_state`, read by a data plan from before rows forked a state
+    (`dew.data.plan.SHARED_STATE`), lays its rows as that plan's runs wrote them: each window's rows in
+    streams at their own rows' positions and no documents, the same rows and tokens this Dew's plan packs,
+    so a run saved under such a plan rebuilds the data plan it saved (`DecisionObjective.data`,
+    `QuestionLayout.streamed`); and the objective bound to that plan (`bind_plan`) decides each question
+    through those rows as its own row does (check 1, float64 truth). The earlier plan's rows were laid as
+    documents continuing a shared part, another plan's steps, and its checkpoint was refused (the
+    promotion's final review, finding 2)."""
+    from dew.data.plan import IN_ORDER
+
+    shared = in_streams(SHARED, segments=2)
+    shared.bind_plan(IN_ORDER)
+    alone = in_streams(OWN, segments=1)
+    rows = examples()
+    earlier = windows_of(shared, rows, count=8, plan_version=IN_ORDER)
+    latest = windows_of(in_streams(SHARED, segments=2), rows, count=8)
+    assert len(earlier) == len(latest) > 1
+    for written, forked in zip(earlier, latest, strict=True):
+        assert {"streams", "positions"} <= written.keys() and not {"documents", "parents"} & written.keys()
+        for field in ("tokens", "segments", "positions"):
+            np.testing.assert_array_equal(written[field], forked[field])
+    windows = {"shared": earlier, "alone": windows_of(alone, rows, count=24)}
+    initialized = jax.jit(lambda key: unboxed(shared.init(key, variables={})))
+    wide = copy.copy(alone)
+    wide.model = DecisionModel(alone.model.backbone.clone(dtype=jnp.float64),
+                               alone.model.head.clone(dtype=jnp.float64), alone.model.context_encoder)
+
+    @as_given
+    def truth(variables):
+        with jax.enable_x64(new_val=True):
+            return scored(wide, windows["alone"], widened(variables))
+
+    assert_as_exact(as_given(lambda variables: scored(shared, windows["shared"], variables)),
+                    as_given(lambda variables: scored(alone, windows["alone"], variables)),
+                    lambda seed: (initialized(jax.random.key(seed)),), "rows in streams over one state",
+                    seeds=STATE_ONCE_SEEDS, truth_fn=truth)
+
+
+def shared_parts(batch) -> list[str]:
+    """What each row of a window writes before its question, as text: its shared document where its rows
+    ask over one state, the row whole otherwise (its own row, which opens with it)."""
+    [tokens], [segments] = np.asarray(batch["tokens"]), np.asarray(batch["segments"])
+    documents = np.asarray(batch["documents"])[0] if "documents" in batch else None
+    parts = []
+    for row in range(1, int(segments.max()) + 1):
+        own = segments == row
+        if documents is not None:
+            own &= documents == documents[own].min()
+        parts.append(bytes(tokens[own].astype(np.uint8)).decode(errors="replace"))
+    return parts
+
+
+def input_terms(objective, windows, variables, requests: list[list[str]]) -> tuple[np.ndarray, int]:
+    """The rows' own next-token term (`input_lm`, an evaluation's read) over `windows`, summed by the group
+    of `requests` (each group the shared parts of some requests) its rows' requests are of, and the
+    targets it counts in all."""
+    step = Step(jnp.asarray(0), jax.random.key(1), None, training=False)
+    term = without_ynn(lambda variables, batch: objective.loss(variables, batch, step)[0].terms[-1])
+    totals, mass = np.zeros(len(requests), np.float64), 0.0
+    for batch in windows:
+        scored_window = term(variables, batch)
+        [group] = {index for index, shared in enumerate(requests)
+                   for row in shared_parts(batch) if any(row.startswith(part) for part in shared)}
+        totals[group] += float(np.asarray(scored_window.total, np.float64))
+        mass += float(np.asarray(scored_window.mass))
+    return totals, int(mass)
+
+
+def test_rows_over_one_state_score_the_input_term_each_questions_own_row_scores():
+    """With `input_lm`, rows asking a request's questions over one state score the term the same questions'
+    own rows score: each question's tokens from the shared part and its own part before them, never
+    another question's, and the shared part's targets once for each question asked over it; so the
+    targets counted are the own rows', to the token, and each window's summed cross entropy its requests'
+    own rows' (check 1, over drawn parameters, float64 truth). A merged row read as one causal document
+    conditioned each question after its row's first on the one before it and counted the shared part once
+    (the promotion's final review, finding 5: sharing is derived for a letter readout, whose input term
+    then changed)."""
+    shared = in_streams(SHARED, segments=2, input_lm=0.5)
+    alone = in_streams(OWN, segments=1, input_lm=0.5)
+    # Three requests of each state, told apart by their texts, so a window's term is a value of many.
+    rows = [Example(f"{example.state} ({mark})", example.questions, example.answers)
+            for mark in "abc" for example in examples()]
+    windows = {"shared": windows_of(shared, rows, count=len(rows)),
+               "alone": windows_of(alone, rows, count=len(rows) * len(QUESTIONS))}
+    assert all("documents" in batch for batch in windows["shared"]), "a window shares no state"
+    requests = [shared_parts(batch) for batch in windows["shared"]]
+    assert sum(map(len, requests)) == len(rows)
+    initialized = jax.jit(lambda key: unboxed(shared.init(key, variables={})))
+    wide = copy.copy(alone)
+    wide.model = DecisionModel(alone.model.backbone.clone(dtype=jnp.float64),
+                               alone.model.head.clone(dtype=jnp.float64), alone.model.context_encoder)
+    drawn = initialized(jax.random.key(0))
+    assert (input_terms(shared, windows["shared"], drawn, requests)[1]
+            == input_terms(alone, windows["alone"], drawn, requests)[1])
+
+    @as_given
+    def truth(variables):
+        with jax.enable_x64(new_val=True):
+            return input_terms(wide, windows["alone"], widened(variables), requests)[0]
+
+    assert_as_exact(
+        as_given(lambda variables: input_terms(shared, windows["shared"], variables, requests)[0]),
+        as_given(lambda variables: input_terms(alone, windows["alone"], variables, requests)[0]),
+        lambda seed: (initialized(jax.random.key(seed)),), "the input term of rows over one state",
+        seeds=STATE_ONCE_SEEDS, truth_fn=truth)
 
 
 def test_a_run_over_one_state_trains_and_its_task_asks_a_requests_questions_in_one_row(tmp_path):
