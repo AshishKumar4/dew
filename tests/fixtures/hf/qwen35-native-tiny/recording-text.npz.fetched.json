@@ -1,9 +1,9 @@
 {
- "bytes": 1448992,
+ "bytes": 2048899211,
  "license": "Apache-2.0",
- "path": "recordings/264f2b394f41c9e65ec3b8c679c7ed9ed45785a07e23e8cbd28ca2bd21210ee5.npz",
+ "path": "recordings/89c1fc44b4e6e14155df2728eb4287917383d5f78cab2822b3b292dd4e5f0ad8.npz",
  "reference": "huggingface/transformers 5.16.1",
  "repo": "dewml/fixtures",
- "revision": "9eeb350ac2eb8c83ec56051b16249f8150ebc3f0",
- "sha256": "264f2b394f41c9e65ec3b8c679c7ed9ed45785a07e23e8cbd28ca2bd21210ee5"
+ "revision": "5f61a145b0c5f22febc858484cb11a8ab99a2fee",
+ "sha256": "89c1fc44b4e6e14155df2728eb4287917383d5f78cab2822b3b292dd4e5f0ad8"
 }
