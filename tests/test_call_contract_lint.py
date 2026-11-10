@@ -100,8 +100,13 @@ def held_scan(x, *, coordinates):
 
 def plain_scan(x, *, coordinates):
     return x if coordinates.segments is None else -x
+
+
+def handed_scan(x, *, coordinates):
+    return held_scan(x, coordinates=coordinates)
 """
-"""A package module of scans a mixer hands its coordinates to: one reads the call's forks, one never does."""
+"""A package module of scans a mixer hands its coordinates to: one reads the call's forks, one never does,
+and one hands them to the one that does."""
 
 HANDED_INPUTS = textwrap.dedent("""
     class AttentionMetadata:
@@ -158,6 +163,54 @@ HANDED = {
                 tokens = None
                 return held_scan(x, coordinates=tokens)
         """, True),
+    "its coordinates handed to a package function that hands them to one that reads the field": ("""
+        from dew.nn.scans import handed_scan
+
+        class Mixer:
+            reads = frozenset({"forks"})
+
+            def __call__(self, x, call):
+                return handed_scan(x, coordinates=coordinates_of(call.metadata))
+        """, False),
+    "its coordinates handed through its own method to a package function that reads the field": ("""
+        from dew.nn.scans import held_scan
+
+        class Mixer:
+            reads = frozenset({"forks"})
+
+            def __call__(self, x, call):
+                return self._scanned(x, metadata=call.metadata)
+
+            def _scanned(self, x, metadata):
+                return self._held(coordinates_of(metadata), x)
+
+            def _held(self, tokens, x):
+                return held_scan(x, coordinates=tokens) if tokens is not None else self._held(None, x)
+        """, False),
+    "its coordinates handed through its own method to a package function that never reads the field": ("""
+        from dew.nn.scans import plain_scan
+
+        class Mixer:
+            reads = frozenset({"forks"})
+
+            def __call__(self, x, call):
+                return self._scanned(x, call.metadata)
+
+            def _scanned(self, x, metadata):
+                return plain_scan(x, coordinates=coordinates_of(metadata))
+        """, True),
+    "a package function that reads the field, in its own method handed nothing of the call": ("""
+        from dew.nn.scans import held_scan
+
+        class Mixer:
+            reads = frozenset({"forks"})
+
+            def __call__(self, x, call):
+                return self._scanned(x, None) if call.decode else x
+
+            def _scanned(self, x, metadata):
+                return held_scan(x, coordinates=None)
+        """, True),
     "a package function that reads the field, handed nothing of the call": ("""
         from dew.nn.scans import held_scan
 
@@ -174,7 +227,9 @@ HANDED = {
 def test_a_field_counts_as_read_where_the_call_hands_it_to_a_package_function_that_reads_it(lint, case,
                                                                                            tmp_path):
     """A mixer that hands its call's coordinates to a function of its package reads what that function
-    reads of them (Mamba's `forks`, read by `held_scan`); handed to one that reads no such field, or a
+    reads of them (Mamba's `forks`, read by `held_scan`), directly, through another package function it
+    hands them to (`call_visibility`'s `fork_runs`) or through a method of its own class (MLA's
+    visibility, a method that calls itself read once); handed to one that reads no such field, or a
     function handed nothing of the call, it still declares a field it never reads."""
     body, reported = HANDED[case]
     (tmp_path / "src" / "dew" / "nn").mkdir(parents=True)
