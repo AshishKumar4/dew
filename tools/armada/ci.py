@@ -1003,12 +1003,10 @@ class Cost:
 
     def fitting(self, declared: int, target: float) -> int:
         """The most units a task draws within `target` past its setup, at most `declared`, at least one; where
-        its setup alone passes the target, the declared cut, as a finer one pays the setup again for nothing
-        but holding each task's draws within the target."""
-        if not self.unit:
+        its setup alone fills the target, the declared cut, as every finer task pays the setup again."""
+        if not self.unit or self.setup >= target:
             return declared
-        room = target - self.setup if self.seconds(1) <= target else target
-        return max(1, min(declared, int(room // self.unit)))
+        return max(1, min(declared, int((target - self.setup) // self.unit)))
 
 
 def cut_draws(mark: Mark, rates: Mapping[bool, Cost | None], target: float) -> list[tuple[int, int]]:
