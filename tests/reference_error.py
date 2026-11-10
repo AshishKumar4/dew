@@ -539,6 +539,13 @@ def _floating(dtype) -> bool:
     return jnp.issubdtype(dtype, jnp.floating)
 
 
+def _platform_branch(equation, platform: str | None):
+    """The branch of a platform's choice (`jax.lax.platform_dependent`) that a program lowered for
+    `platform` keeps; None for any other equation, or for no platform."""
+    chosen = equation.params.get("branches_platforms") if platform is not None else None
+    return None if chosen is None else programs.branches(equation)[programs.platform_branch(chosen, platform)]
+
+
 def equations(graph, *, platform: str | None = None):
     """Every equation of a jaxpr, its sub-jaxprs' (scan, cond, custom rules) in turn. With `platform`
     (a lowering platform's name: 'cpu', 'cuda', 'tpu'), a platform-dependent cond
@@ -546,12 +553,8 @@ def equations(graph, *, platform: str | None = None):
     if hasattr(graph, "eqns"):
         for equation in graph.eqns:
             yield equation
-            chosen = equation.params.get("branches_platforms") if platform is not None else None
-            if chosen is None:
-                yield from equations(equation.params, platform=platform)
-                continue
-            taken = programs.platform_branch(chosen, platform)
-            yield from equations(programs.branches(equation)[taken], platform=platform)
+            kept = _platform_branch(equation, platform)
+            yield from equations(equation.params if kept is None else kept, platform=platform)
     elif hasattr(graph, "jaxpr"):
         yield from equations(graph.jaxpr, platform=platform)
     elif isinstance(graph, dict):
@@ -660,23 +663,45 @@ def _below_float64(dtype) -> bool:
     return dtype is not None and jnp.issubdtype(dtype, jnp.inexact) and jnp.finfo(dtype).bits < 64
 
 
+def _inexact(var) -> bool:
+    """Whether `var` holds floats or complex numbers."""
+    dtype = getattr(var.aval, "dtype", None)
+    return dtype is not None and jnp.issubdtype(dtype, jnp.inexact)
+
+
 def _narrow_values(program, lowering: str) -> Iterator[str]:
     """Each result of `program`, a float64 truth's traced program with what no output reads removed, that an
-    operation rounds narrower than float64, in the program or in one within it (`equations`: of a platform's
-    choice, the branch a program lowered for `lowering` keeps). A
-    narrow result is a format's own, and kept, where its operation rounds to a stated format (a cast,
+    operation rounds narrower than float64 and a float output reads through floats, in the program or in
+    one within it (of a platform's choice, the branch a program lowered for `lowering` keeps).
+
+    A result is read through floats where a chain of float values runs from it to a float output. One read
+    only by a comparison or as an integer (a dropout's float32 uniform against its rate, a code's index) is
+    a decision of the program's, the same in every arm and in the truth, and no rounding of an output's
+    value. A call that feeds an output has its body read whole.
+
+    A narrow result is a format's own, and kept, where its operation rounds to a stated format (a cast,
     FORMATTED) or rounds nothing (`arm_arithmetic.rounds_nothing`: a move of entries, a selection, a
     negation): a truth that states a rounding (a quantized weight, a bf16 output) keeps it and what it
     selects of it, and one that computes in fp32 does not. A constant or a literal is its exact value
     whatever its format, as JAX promotes it where a float64 operation reads it: a parameter left float32
     under a float64 run is no rounding."""
-    for equation in equations(program, platform=lowering):
+    jaxpr = getattr(program, "jaxpr", program)
+    feeding = {var for var in jaxpr.outvars if programs.computed(var) and _inexact(var)}
+    for equation in reversed(jaxpr.eqns):
+        fed = [var for var in equation.outvars if var in feeding]
+        if not fed:
+            continue
+        feeding.update(var for var in equation.invars if programs.computed(var) and _inexact(var))
+        kept = _platform_branch(equation, lowering)
+        within = programs.bodies(equation) if kept is None else [kept]
+        for inner in within:
+            yield from _narrow_values(inner, lowering)
         primitive = equation.primitive
-        made = [var.aval for var in equation.outvars if _below_float64(getattr(var.aval, "dtype", None))]
+        made = [var.aval for var in fed if _below_float64(var.aval.dtype)]
         formats = (primitive is jax.lax.convert_element_type_p or primitive in FORMATTED
                    or rounds_nothing(primitive))
         # A call's results are its body's, read there.
-        if made and not formats and not programs.bodies(equation):
+        if made and not formats and not within:
             yield (f"`{primitive.name}` computed in {made[0].str_short()} in "
                    f"{equation.source_info.name_stack or 'the truth itself'}")
 
@@ -684,10 +709,11 @@ def _narrow_values(program, lowering: str) -> Iterator[str]:
 def _of_float64(label: str, truth_fn, inputs, truth) -> None:
     """Raise unless a site's truth is float64's: `truth`, its value on the site's first draw, holds no float
     leaf narrower than float64, and the program `truth_fn`'s own calls trace on those `inputs` widened
-    computes no narrower result that an output reads (`_narrow_values`, by JAX's dead-code pass and its
-    primitives' facts), a stated rounding apart. A model of a fixed float32 dtype run on widened inputs
-    computes in fp32, or rounds its answer to it: a second fp32 run, which equals the reference bit for bit
-    and judges Dew against a truth no better than itself (a forked call's cells; row 5430). A leaf of no
+    computes no narrower result that a float output reads through floats (`_narrow_values`, by JAX's
+    dead-code pass and its primitives' facts), a stated rounding apart. A model of a fixed float32 dtype
+    run on widened inputs computes in fp32, or rounds its answer to it: a second fp32 run, which equals
+    the reference bit for bit and judges Dew against a truth no better than itself (a forked call's cells;
+    row 5430). A leaf of no
     entries holds no value and is not read. A truth the gate runs as given (NumPy, torch, a recording) or
     that runs programs of its own traces none here, and is held by its leaves alone. The gate cannot tell a
     cast the arms share (a bf16 output's rounding) from one the truth alone takes (a round trip through

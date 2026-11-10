@@ -55,6 +55,13 @@ def dequantized_declared(x, weight):
     return stored_as(x / 3, jnp.float32) @ weight
 
 
+def dropped_out(x, weight):
+    """The product with the entries a float32 uniform draw keeps, as a dropout draws its mask in float32 in
+    every mode: the draw's arithmetic decides, and rounds no value an output reads."""
+    kept = jax.random.uniform(jax.random.key(5430), (16, 8), jnp.float32) < 0.75
+    return jnp.where(kept, x @ weight, 0)
+
+
 def with_a_dropped_value(x, weight):
     """The float64 product beside an fp32 one nothing reads."""
     jnp.tanh(x.astype(jnp.float32) @ weight.astype(jnp.float32))
@@ -100,6 +107,7 @@ NULL = {
     "a stated rounding": (rounded, drawn, None),
     "a stated rounding's entries selected and negated": (selected, drawn, None),
     "a format's own division, declared": (dequantized, drawn, dequantized_declared),
+    "a decision drawn in float32": (dropped_out, drawn, None),
     "an fp32 value no output reads": (product, drawn, with_a_dropped_value),
     "an integer leaf beside": (with_its_place, drawn, None),
     "a NumPy truth in float64": (product, drawn, as_given(in_numpy(np.float64))),
@@ -113,6 +121,8 @@ INJECTED = {
     "one leaf of two computed in fp32": (two_leaves(product), drawn, two_leaves(computed_narrow),
                                          "['other']"),
     "one leaf of two left float32": (two_leaves(product), drawn, two_leaves(fixed_float32), "['other']"),
+    "a weight drawn and applied in fp32": (product, drawn, lambda x, weight: (x @ weight) * (
+        1 + jax.random.uniform(jax.random.key(5430), (16, 8), jnp.float32) * 0).astype(jnp.float64), ""),
     "a NumPy truth in float32": (product, drawn, as_given(in_numpy(np.float32)), ""),
 }
 """Truths that are a second fp32 run, each with the leaf its refusal names."""
@@ -122,8 +132,9 @@ INJECTED = {
 def test_a_truth_that_computes_in_float64_is_judged(name):
     """The null control: a site whose truth is float64's (the reference on widened inputs, a formula of its
     own, parameters held in float64 or left float32 and read exactly, a stated rounding and what is selected
-    of it, a format's own division declared (`stored_as`), a dead fp32 value, an integer leaf, a float32
-    leaf of no entries, a float64 NumPy truth) is judged as before, its arm on par with itself."""
+    of it, a format's own division declared (`stored_as`), a float32 draw read only by a comparison, a dead
+    fp32 value, an integer leaf, a float32 leaf of no entries, a float64 NumPy truth) is judged as before,
+    its arm on par with itself."""
     arm, draw, truth = NULL[name]
     assert_as_exact(arm, arm, draw, name, seeds=8, truth_fn=truth)
 
@@ -131,8 +142,9 @@ def test_a_truth_that_computes_in_float64_is_judged(name):
 @pytest.mark.parametrize("name", INJECTED)
 def test_a_truth_that_is_a_second_fp32_run_is_refused_by_its_leaf(name):
     """The injected faults: a truth that computes in fp32 (a model of a fixed dtype, an fp32 product
-    widened at the end, a float32 leaf, a float32 NumPy truth) is refused before any verdict, naming the
-    leaf, where an arm on par with itself would otherwise pass against it."""
+    widened at the end, a float32 leaf, the same float32 draw read as a value, a float32 NumPy truth) is
+    refused before any verdict, naming the leaf, where an arm on par with itself would otherwise pass
+    against it."""
     arm, draw, truth, leaf = INJECTED[name]
     with pytest.raises(NarrowTruth) as refused:
         assert_as_exact(arm, arm, draw, name, seeds=8, truth_fn=truth)
