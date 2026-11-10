@@ -12,8 +12,10 @@ There is one wheel for each CUDA major of your jax, for Linux x86_64 and aarch64
 The wheel ships no CUDA runtime: it needs a CUDA build of JAX of the same major in the same environment
 (`jax[cuda12]` or `jax[cuda13]`), whose libcudart it loads. It holds code for sm80 (every compute capability
 8.x: CUTLASS 2's grouped kernel, cp.async and mma.sync) and sm90a (H100, H200: CUTLASS 3's pointer-array
-warp-specialized kernel); `dew_cutlass.ARCHITECTURES` names what the installed build holds, and a call on any
-other GPU answers an error naming its capability.
+warp-specialized kernel); `dew_cutlass.ARCHITECTURES` names what the installed build holds,
+`dew_cutlass.KERNELS` states each kernel it instantiates (tile, stages, consumer threads, cluster and
+instruction family, read from the compiled types), and a call on any other GPU answers an error naming its
+capability.
 
 Two FFI targets, each dispatching on the device's compute capability:
 
