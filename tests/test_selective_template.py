@@ -34,7 +34,7 @@ from upstream_support import upstream_arm
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import generation, recurrence_chunk
-from dew.nn.kernels.templates import bundles, mosaic_sm90, report
+from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm90, report
 from dew.nn.kernels.templates.recurrence import selective
 from dew.nn.mixers.mamba import Mamba, selective_scan as portable
 from dew.parity import MOST_SEEDS
@@ -118,14 +118,21 @@ def held_to(portable_arm, draws, starts, label: str, template_arm):
                         most=8 * MOST_SEEDS, keyed=lambda *args: args[:-1])
 
 
+def taken_family(dtype) -> mosaic.Family:
+    """The bundle the template takes here (`Selective._fwd`'s): the interpreted target's off a GPU, the
+    device's on one, so no launch runs a family the host's multiprocessor does not (an A100 interpreting
+    wgmma's raised its consumers' registers past what it takes, the promotion tier's row 5413)."""
+    return bundles.of(generation.interpreted_target().generation if INTERPRETED
+                      else generation.device_generation(), dtype)
+
+
 def the_template_is_as_exact_as_its_reference(case: str, packed: bool, dtype=jnp.bfloat16,
                                               tiles: selective.Tiles | None = None):
     """`case`'s output and every input's gradient through the template, at `tiles` where given (else the
     device's plan), on par from float64 with its reference's (`held_to`: mamba_ssm's on a GPU, the portable
     scan's interpreted), over check 1's fewest draws."""
     shape = SHAPES[case]
-    family = bundles.of(generation.interpreted_target().generation if INTERPRETED
-                        else generation.device_generation(), dtype)
+    family = taken_family(dtype)
     planned = {} if tiles is None else {"chunk": tiles.chunk, "plan": (tiles.positions, tiles.resident)}
     template = functools.partial(selective.selective_scan, family=family, interpret=INTERPRETED, **planned)
 
@@ -171,9 +178,8 @@ def test_the_template_holds_its_hardest_regimes_interpreted(regime):
     at every chunk (`selective.PARTIALS`), which no CPU test held once the regime cases went to the GPU flow
     alone (row 3133)."""
     shape = SHAPES["interpreted"]
-    family = bundles.of(generation.interpreted_target().generation if INTERPRETED
-                        else generation.device_generation(), jnp.float32)
-    template = functools.partial(selective.selective_scan, family=family, interpret=INTERPRETED)
+    template = functools.partial(selective.selective_scan, family=taken_family(jnp.float32),
+                                 interpret=INTERPRETED)
 
     def draws(seed):
         inputs, _, dy = regime_draw(regime, jnp.float32, seed, *shape)
@@ -253,7 +259,8 @@ def test_the_training_forward_keeps_a_state_a_backward_block():
         jax.ShapeDtypeStruct((channels, states), jnp.float32),
         *(jax.ShapeDtypeStruct((rows, length, states), jnp.bfloat16),) * 2,
         jax.ShapeDtypeStruct((channels,), jnp.float32))
-    template = functools.partial(selective.selective_scan, family=mosaic_sm90.WGMMA, interpret=True)
+    template = functools.partial(selective.selective_scan, family=taken_family(jnp.bfloat16),
+                                 interpret=INTERPRETED)
     kept = jax.eval_shape(lambda *operands: jax.vjp(template, *operands)[1], *operands)
     beyond = sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(kept)) - sum(
         operand.size * operand.dtype.itemsize for operand in operands)
