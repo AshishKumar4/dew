@@ -8,6 +8,7 @@ likelihoods; observations are inputs to later calls and never loss targets.
 from __future__ import annotations
 
 import hashlib
+import logging
 from asyncio import CancelledError as AsyncCancelledError
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import CancelledError
@@ -28,7 +29,7 @@ from dew._coordination import (
     agreed_same,
     broadcast_from_process_zero,
 )
-from dew.batch import Variables, token_id
+from dew.batch import Variables, token_id, token_validity
 from dew.data.dataset import DataPartition
 from dew.inference.rollouts import Draw
 from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows
@@ -38,7 +39,12 @@ from dew.sampling.text import Generation, Sampling
 from .sessions import Call, Session, Snapshot, Status, Task, Transcript, finite_reward, json_objects
 
 if TYPE_CHECKING:
+    from dew.inference.serving import Server
+    from dew.nn.kv_cache import KVCache
+
     from .journal import EpisodeJournal, JournalRun
+
+_log = logging.getLogger(__name__)
 
 class EpisodeStatus(IntEnum):
     RUNNING = 0
@@ -372,6 +378,15 @@ class EpisodeCollector:
     sampling: Sampling
     record: EpisodeRecorder | None = None
     journal: EpisodeJournal | None = None
+    kv_cache: KVCache | None = None
+    """A paged cache layout (`dew.nn.kv_cache.KVCache` with a `page_size`) the cohort's turns are served over:
+    its `TextGeneration` policy, bound to the snapshot, becomes a `dew.inference.serving.Server` in process,
+    one a cohort, whose prefix cache keeps each row's history, so a turn whose context continues its row's
+    last prefills only what follows it, a group's shared prompt once, and a row whose context does not
+    continue its last prefills it whole, saying so (a warning naming the row); its pages and states are the
+    server's, released when the cohort's collection returns. None draws each turn from the policy whole. A
+    served turn draws what the policy's draws: every row's tokens and likelihoods, the key folded by its
+    global row."""
 
     def __post_init__(self) -> None:
         for name in ("max_prompt_tokens", "max_new_tokens", "max_turns"):
@@ -654,6 +669,8 @@ class EpisodeCollector:
             ids = np.asarray([int(task.id) for task in tasks], np.int64)
             # The policy the step's loss reads, at the updates the run committed (`Objective.progress`).
             policy = self.policy.bind(snapshot.variables, Progress(jnp.asarray(snapshot.updates, jnp.int32)))
+            if self.kv_cache is not None:
+                policy = _ServedTurns.over(policy, self, rows=ids.size * samples)
             key_words = tuple(np.asarray(jax.random.key_data(snapshot.key)).tolist())
             signature = (ids.size, samples, self.max_turns, self.max_prompt_tokens, self.max_new_tokens,
                          self.sampling, snapshot.step, snapshot.updates, key_words, self.journal is not None)
@@ -723,3 +740,78 @@ def session_of(episode: Episode, *, group: str) -> Session:
     identity = episode.identity
     return Session(str(identity.task), group, identity.sample, identity.attempt, tuple(calls), status,
                    episode.reward, detail=episode.detail)
+
+
+class _ServedTurns:
+    """A cohort's turns served in process (`EpisodeCollector.kv_cache`): its bound `TextGeneration` as a
+    `dew.inference.serving.Server` over the paged layout, each turn a call of every row, row `i` folding the
+    turn's key by its global row as the policy's own call folds it, and declaring the history its last turn
+    left as its shared segment where its context continues it, so the server reads that history's pages
+    and state and prefills only the rest; a row whose context does not continue it is prefilled whole, the
+    reset logged as a warning naming the row and turn."""
+
+    def __init__(self, server: Server, collector: EpisodeCollector, first: int) -> None:
+        self.server, self.collector, self.first = server, collector, first
+        self.histories: dict[int, np.ndarray] = {}
+
+    @classmethod
+    def over(cls, policy: EpisodeInference, collector: EpisodeCollector, *, rows: int) -> _ServedTurns:
+        """`policy`, a bound `TextGeneration`, served for a cohort of `rows` rows of this process: a slot a
+        row, each holding the cohort's whole allowed context and draw, its pool's pages the layout's."""
+        from dataclasses import replace
+
+        from dew.inference.serving import Server
+        from dew.inference.tasks import TextGeneration
+
+        if not isinstance(policy, TextGeneration):
+            raise TypeError(f"a served cohort serves a TextGeneration policy, not a {type(policy).__name__}")
+        task = replace(policy, sampling=collector.sampling)
+        server = Server.from_task(task, slots=rows, capacity=collector.max_prompt_tokens
+                                  + collector.max_new_tokens, kv_cache=collector.kv_cache)
+        # A pool's rows fold by their global row, this process's from its rank's first on.
+        first = jax.process_index() * rows if server.pooled else 0
+        return cls(server, collector, first)
+
+    def bind(self, variables: Variables, /, progress: Progress | None = None) -> EpisodeInference:
+        raise TypeError("a served cohort is bound to its snapshot when it is made; bind the policy instead")
+
+    def __call__(self, inputs: ModelInputs | Sequence[Sequence[int]], max_new_tokens: int, /,
+                 *, key: jax.Array, sampling: Sampling) -> Generation:
+        if sampling != self.collector.sampling:
+            raise ValueError("a served cohort draws under the collector's sampling, which its server was "
+                             "made with")
+        held = inputs if isinstance(inputs, ModelInputs) else ModelInputs.from_value(inputs)
+        tokens = np.asarray(held.tokens)
+        validity = token_validity(held.token_fields)
+        valid = np.ones(tokens.shape, bool) if validity is None else np.asarray(validity) != 0
+        contexts = [tokens[row][valid[row]] for row in range(tokens.shape[0])]
+        shared = []
+        for row, context in enumerate(contexts):
+            history = self.histories.get(row)
+            continues = (history is not None and 0 < len(history) < len(context)
+                         and np.array_equal(context[:len(history)], history))
+            # A finished slot's stand-in, one padding id (`EpisodeCollector._inputs`), continues nothing.
+            standing = len(context) == 1 and int(context[0]) == sampling.pad
+            if history is not None and not continues and not standing:
+                _log.warning("served episode row %d's context does not continue its last turn's history; "
+                             "it is prefilled whole", row)
+            shared.append(len(history) if continues and history is not None else None)
+        drawn = self.server(held, max_new_tokens, key=key, first=self.first, shared=shared)
+        out = np.full((len(drawn), max_new_tokens), sampling.pad, np.int32)
+        behavior = np.zeros((len(drawn), max_new_tokens), np.float32)
+        raw = np.zeros((len(drawn), max_new_tokens), np.float32)
+        lengths = np.zeros(len(drawn), np.int32)
+        ended = np.zeros(len(drawn), bool)
+        for row, generation in enumerate(drawn):
+            count = int(np.asarray(generation.lengths)[0])
+            response = np.asarray(generation.tokens)[0, -np.asarray(generation.raw_log_probs).shape[1]:]
+            out[row, :count] = response[:count]
+            behavior[row, :count] = np.asarray(generation.behavior_log_probs)[0, :count]
+            raw[row, :count] = np.asarray(generation.raw_log_probs)[0, :count]
+            lengths[row], ended[row] = count, bool(np.asarray(generation.terminated)[0])
+            # The history the server named: the prompt and every draw its cache holds, all but the last.
+            if not (len(contexts[row]) == 1 and int(contexts[row][0]) == sampling.pad):
+                self.histories[row] = np.concatenate([contexts[row], response[:max(count - 1, 0)]])
+        return Generation(*(jnp.asarray(value) for value in (
+            np.concatenate([tokens.astype(np.int32), out], axis=1), lengths, ended, behavior, raw)),
+            rows=len(drawn))

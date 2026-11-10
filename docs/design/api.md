@@ -316,13 +316,23 @@ the run, its step and Dew's code (`released_run`), so every load option applies 
 release: `Pretrained.load(run_dir, step=..., ema=...)` is the Python form. A diffusion run, which Dew
 writes no diffusers layout of, starts from the run's own sampling task (`load_diffusion_source`,
 `TextToImage.from_saved`) at the run's dtypes, placement, attention kernel and data size. A step or
-EMA choice beside a source that is no saved run is refused, as it selects nothing.
+EMA choice beside a source that is no saved run is refused, as it selects nothing. A run whose model
+no family's layout writes is released natively (`run_plan`), and that release is the source a run
+starts from as any other: its task's bundle where its task declares one (a decision task's), else its
+model's in Dew's own layout (`Pretrained.from_saved`), the load's attention implementation and
+context its recorded model's own fields (`ModelConfig.with_declared`); that bundle's own export
+refuses, stating the layout's reason.
 
 Serving is one engine of kinds (`dew.inference.Engine`). A kind (`Kind`) admits waiting requests
 within its own bounds, runs them with one bounded device call a `step`, and settles each request's
 `Timed` future. The engine steps each busy kind once a turn from one thread, so a long queue of one
 kind never holds another back, and it orders a kind's weight reload with its steps. Two kinds ship:
-autoregressive generation's `Server`, a slot scheduler over a resident cache, and `ScoringServer`, a
+autoregressive generation's `Server`, a slot scheduler over a resident cache, its prefix cache on by
+default wherever its layout pages (`Server.from_task`'s `prefix_cache` None), a finished request's
+history (its prompt and every draw its cache holds) named for a later prompt that continues it,
+`server(prompts, max_new_tokens, key=..., first=0, shared=None)` folding row `i`'s key by `first + i`
+and declaring each row's shared segment; an episode cohort's turns run through it in process
+(`EpisodeCollector(kv_cache=KVCache(page_size=...))`); and `ScoringServer`, a
 task answered by forward passes over its requests' rows. A scoring task (`Scoring`) holds no
 weights. It lays a request out as rows at submission (`admit`, refusing one alone, a ValueError), says
 which rows one pass holds (`fits`), runs a pass over the weights the server hands it (`forward`), and
