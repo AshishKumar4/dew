@@ -67,7 +67,7 @@ def _stated(name: str) -> Format:
     return Format(name, stated.nmant + 1, stated.minexp, stated.maxexp - 1)
 
 
-FLOAT32, BFLOAT16, FLOAT16 = (_stated(name) for name in DTYPES)
+FLOAT32, BFLOAT16, FLOAT16 = _stated("float32"), _stated("bfloat16"), _stated("float16")
 """fp32 and bf16, the formats whose lanes the certifier measures (`FORMATS`), and fp16, a 16-bit product's
 operand beside bf16 (the recurrence inverse's merges), which is none of them."""
 FORMATS = {"float32": FLOAT32, "bfloat16": BFLOAT16}

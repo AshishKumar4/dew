@@ -1619,7 +1619,7 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     verdict, pilot = ({kind: tree(prefix + kind) for kind in kinds} for prefix in ("", "pilot."))
     mse, worst, finite, sketch, zero_offsets = (verdict[kind] for kind in
                                                 ("mse", "worst", "finite", "sketch", "zero_offsets"))
-    shapes, dtypes = (tree(kind) for kind in recorded_kinds("whole"))
+    shapes, dtypes = tree("shape"), tree("dtype")
     if truth_fn is None or inputs_of is None:
         raise AssertionError(f"{site}: a recording of the reference's evidence alone takes `truth_fn`, "
                              f"Dew's float64 path, and `inputs_of`, its inputs drawn again")
