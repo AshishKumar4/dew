@@ -888,7 +888,8 @@ class ProjectionGroup:
         """The members' outputs from the packed projection's `out`, in member order: a traced array's or a
         host array's (a served checkpoint's stored projection, `dew.checkpoints.served`), each its slice."""
         ends = np.cumsum(self.widths)
-        return tuple(out[..., int(end - width):int(end)] for end, width in zip(ends, self.widths, strict=True))
+        return tuple(out[..., int(end - width):int(end)]
+                     for end, width in zip(ends, self.widths, strict=True))
 
     def held(self, params: Mapping) -> bool:
         """Whether `params`, the parameters at `path`, hold the group packed or every member."""
