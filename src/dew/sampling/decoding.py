@@ -855,6 +855,42 @@ class MaxLength(_Numerical, Truncates):
         return state.total() >= length
 
 
+@dataclasses.dataclass(frozen=True)
+class _StopLayout:
+    """A stop-string table's row (`_stop_string_tables`, `StopStrings`): for each of its `strings`, the
+    `positions` places a token's piece can sit inside it; then for each, the `ends` lengths of its end the
+    piece's start can cover; then the piece's own length. Its writer and its reader both read it."""
+
+    strings: int
+    positions: int
+    ends: int
+
+    @property
+    def width(self) -> int:
+        return self.strings * (self.positions + self.ends) + 1
+
+    @property
+    def inside(self) -> slice:
+        """Every string's places, string by string."""
+        return slice(0, self.strings * self.positions)
+
+    @property
+    def ending(self) -> slice:
+        """Every string's end lengths, string by string."""
+        return slice(self.strings * self.positions, self.strings * (self.positions + self.ends))
+
+    LENGTH = -1
+    """The piece's own length's column."""
+
+    def inside_of(self, order: int) -> int:
+        """Where string `order`'s places start."""
+        return self.positions * order
+
+    def ending_of(self, order: int) -> int:
+        """Where string `order`'s end lengths start."""
+        return self.strings * self.positions + self.ends * order
+
+
 @struct.dataclass
 class StopStrings:
     """Finishes a row whose text ends with one of the compiled stop strings.
@@ -878,12 +914,11 @@ class StopStrings:
         flipped = jnp.flip(_suffix(history, lengths, self.span), axis=1)
         rows, span = flipped.shape
         strings = self.targets.shape[0]
+        layout = _StopLayout(strings, self.positions, self.ends)
         embedded = jnp.take(self.table, jnp.where(flipped < 0, self.table.shape[0] - 1, flipped), axis=0)
-        valid_positions = embedded[:, 1:, :self.positions * strings].reshape(
-            (rows, span - 1, strings, self.positions))
-        end_lengths = embedded[:, :1, self.positions * strings:-1].reshape(
-            (rows, 1, strings, self.ends))
-        widths = jnp.broadcast_to(embedded[:, 1:, None, -1:], (rows, span - 1, strings, self.ends))
+        valid_positions = embedded[:, 1:, layout.inside].reshape((rows, span - 1, strings, self.positions))
+        end_lengths = embedded[:, :1, layout.ending].reshape((rows, 1, strings, self.ends))
+        widths = jnp.broadcast_to(embedded[:, 1:, None, layout.LENGTH:], (rows, span - 1, strings, self.ends))
         cumulative = jnp.cumsum(jnp.concatenate([end_lengths, widths], axis=1), axis=1)
         later = jnp.any(cumulative[:, :-1, :, None, :] == valid_positions[..., None], axis=-2)
         matched = jnp.concatenate([end_lengths > 0, later], axis=1)
@@ -941,16 +976,15 @@ def _stop_string_tables(pieces: Sequence[str | bytes], ids: Sequence[int],
         raise ValueError("no token in the vocabulary can end any of the stop strings")
     positions = max((len(entry) for row in valid for entry in row.values()), default=1)
     ends = max(len(entry) for row in overlaps for entry in row.values())
-    width = len(strings) * (positions + ends) + 1
-    table = np.full((max(rows, max(ids) + 2), width), -1, np.int32)
+    layout = _StopLayout(len(strings), positions, ends)
+    table = np.full((max(rows, max(ids) + 2), layout.width), -1, np.int32)
     for order, (inside, ending) in enumerate(zip(valid, overlaps, strict=True)):
         for index, entries in inside.items():
-            table[index, positions * order:positions * order + len(entries)] = entries
+            table[index, layout.inside_of(order):layout.inside_of(order) + len(entries)] = entries
         for index, entries in ending.items():
-            start = positions * len(strings) + ends * order
-            table[index, start:start + len(entries)] = entries
+            table[index, layout.ending_of(order):layout.ending_of(order) + len(entries)] = entries
     for piece, index in zip(pieces, ids, strict=True):
-        table[index, -1] = len(piece)
+        table[index, layout.LENGTH] = len(piece)
     return StopStrings(jnp.asarray(table), jnp.asarray([len(value) for value in strings], jnp.int32),
                        positions, ends, max(len(value) for value in strings))
 
