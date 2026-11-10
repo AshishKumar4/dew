@@ -572,13 +572,11 @@ the second it is (2**23 + 2**22's exponent and mantissa: Family.converted's inte
 
 def converts(dtype) -> bool:
     """Whether the current device converts quantized codes of `dtype` to 16 bits in registers
-    (`Family.converted`): integer codes on any, FP8 codes where its tensor instructions take 8-bit operands
-    (`generation.Architecture.tensor_rates`' '8bit', sm_89 on), as PTX's e4m3x2 and e5m2x2 conversions
-    require (an A100's ptxas refused them, dd-quant4's q3)."""
-    if jnp.issubdtype(dtype, jnp.integer):
-        return True
-    architecture = generation.architecture(generation.gpu_target().generation)
-    return architecture is not None and "8bit" in architecture.tensor_rates
+    (`Family.converted`): integer codes on any, FP8 codes where its tensor instructions multiply FP8
+    (`generation.fp8_tensor_cores`, sm_89 on), as PTX's e4m3x2 and e5m2x2 conversions require (an A100's
+    ptxas refused them, dd-quant4's q3)."""
+    return (jnp.issubdtype(dtype, jnp.integer)
+            or generation.fp8_tensor_cores(generation.gpu_target().generation))
 
 
 class WholeSlots:
