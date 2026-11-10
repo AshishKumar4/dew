@@ -112,7 +112,7 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     resolved = resolve_implementation(
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
-        causal=True, sliding_window=window, segment_ids=segment_ids, max_segments=max_segments).ran
+        causal=True, sliding_window=window, segment_ids=segment_ids, max_segments=max_segments).kernel
     if resolved == 'template':
         # The template walks only the key tiles its spans reach, in memory linear in the sequence, so it
         # takes the whole call: the window, or each query's run of its chunk's keys (`chunk_runs`), with

@@ -589,12 +589,11 @@ trainer = Trainer(LMObjective(model, 512), optax.adam(1e-3), key=jax.random.key(
                   layout=Layout(min_shard=256))
 with routes() as taken:
     ahead = compile_ahead(trainer, token_rows(1024, 8, 513), capacity=2**35)
-print(json.dumps({"substituted": list(ahead.substituted),
-                  "kernels": sorted({(route.choice, route.kernel) for route in taken})}))
+print(json.dumps({"kernels": sorted({(route.choice, route.kernel) for route in taken})}))
 """
 """A hybrid MoE decoder whose step runs every template, compiled ahead for two compile-only GPUs of a
-generation, in a process of its own: its checkout and the generation are its arguments; it prints what the
-step substituted and every kernel its routes took."""
+generation, in a process of its own: its checkout and the generation are its arguments; it prints every
+kernel its routes took."""
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90", "sm100"])
@@ -604,7 +603,7 @@ def test_a_step_running_every_template_compiles_ahead_over_two_compile_only_gpus
     gradient's last wave balances (`tail.balanced`), compiled ahead for two compile-only GPUs of
     `generation` over an FSDP mesh: every template it runs (the attention template's mainloop, the gated
     delta rule's Mosaic GPU recurrence, the grouped matmul's Mosaic GPU mainloop) derives, lowers and
-    compiles there with no kernel lowered in another's place. A derivation, a selector or a rewrite that
+    compiles there. A derivation, a selector or a rewrite that
     computes a constant eagerly under the step's mesh places it on devices that run nothing here and fails
     the compile ("'Executable' has no 'local_devices'": the balanced tail's walk, 6be12fce5b1; the
     algebra's masks, b520fda9c59). Its own process, as Mosaic compiles for one capability a process."""
@@ -617,7 +616,6 @@ def test_a_step_running_every_template_compiles_ahead_over_two_compile_only_gpus
                          text=True, timeout=1500, check=False)
     assert ran.returncode == 0, ran.stderr[-3000:]
     found = json.loads(ran.stdout.strip().splitlines()[-1])
-    assert not found["substituted"], found["substituted"]
     kernels = {tuple(kernel) for kernel in found["kernels"]}
     assert {("attention", "template"), ("gated_delta_rule", "mosaic_gpu"),
             ("grouped_matmul", "mosaic")} <= kernels, kernels
@@ -644,7 +642,7 @@ def test_tokamaxs_triton_attention_compiles_ahead_for_a_gpu_with_none_attached(g
 
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh.abstract_mesh), routes() as taken:
         lowered = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2))).trace(*shapes).lower()
-    assert {(route.kernel, route.ran) for route in taken} == {("triton", "triton")}
+    assert {route.kernel for route in taken} == {"triton"}
     assert 'custom_call_target="__gpu$xla.gpu.triton"' in lowered.as_text("hlo")
     lowered.compile()
 
@@ -656,8 +654,9 @@ def test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_r
     """A training step compiled ahead for a compile-only GPU of `generation` on this host, which has no GPU
     attached: its attention the route the GPU takes ('auto': FlashAttention where the cell declares it, its
     FFI targets lowered for the target the wheel is told, `attention_kernels.flash_target`; the template
-    where named), so no kernel lowers in another's place (`AheadOfTime.substituted`, row 4616: every
-    compile ahead's attention ran as XLA's, and each GPU job compiled its own step at run time)."""
+    where named), lowered here, where a kernel this host could not lower would refuse the step
+    (`selection.Unlowerable`; row 4616: every compile ahead's attention once ran as XLA's, and each GPU job
+    compiled its own step at run time)."""
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2,
@@ -665,8 +664,39 @@ def test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_r
     trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
                       mesh=MeshSpec().build(compile_only_gpus(generation, 1)),
                       layout=Layout(min_shard=TINY_SHARD))
-    built = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
-    assert not built.substituted, built.substituted
+    from dew.nn.kernels.generation import routes
+
+    with routes() as taken:
+        compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+    if implementation == "template":
+        assert {route.kernel for route in taken if route.choice == "attention"} == {"template"}
+
+
+@pytest.mark.parametrize(("kernel", "why"), [("cudnn", "holds to its GPU's model alone"),
+                                             ("flash", "holds no code for the target")])
+def test_a_program_holding_a_kernel_this_host_cannot_lower_is_refused_ahead_naming_it(monkeypatch, kernel,
+                                                                                     why):
+    """A program whose attention names a CUDA library kernel this host cannot lower for the target, compiled
+    ahead for a canonical sm90: refused, the kernel, why and the program named, never compiled with another
+    kernel in its place (row 4616). cuDNN's plan holds to its GPU's model, so no canonical target takes it
+    (`generation.Assumption.portable`); FlashAttention without its wheel's code for the target (here its
+    wheel read as holding none, `attention_kernels.flash_lowered`)."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.kernels.selection import Unlowerable
+    from dew.training.ahead import compile_programs
+
+    monkeypatch.setattr(attention_kernels, "flash_lowered", lambda: False)
+
+    def attended(query, key, value):
+        return scaled_dot_product_attention(query, key, value, causal=True, implementation=kernel)
+
+    shapes = [jax.ShapeDtypeStruct(shape, jnp.bfloat16)
+              for shape in ((2, 256, 4, 64), (2, 256, 2, 64), (2, 256, 2, 64))]
+    with pytest.raises(Unlowerable, match=why) as refused:
+        compile_programs({"attention": (attended, shapes)}, "sm90")
+    assert refused.value.kernel == kernel
+    assert any("'attention'" in note for note in refused.value.__notes__)
 
 
 @pytest.mark.parametrize("generation", ["sm90", "sm100", "sm120"])

@@ -44,9 +44,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_a_kernel_report_keeps_distinct_refusals_with_the_same_message():
     first = Route("ssd", "xla", "pallas", Refusal("width", "unsupported", "workspace"),
-                  "xla", "sm90", "training", forced="pallas")
+                  "sm90", "training", forced="pallas")
     second = Route("ssd", "xla", "pallas", Refusal("dtype", "unsupported", "arithmetic"),
-                   "xla", "sm90", "training")
+                   "sm90", "training")
     counted = {}
     for entry in KernelReport((first, second, first), ()).record()["routes"]:
         count = entry.pop("count")
@@ -1297,20 +1297,20 @@ def test_a_choice_no_dispatch_reads_is_refused_by_name():
 def test_a_route_records_the_targets_decision_where_its_dispatch_reports_it():
     """`route` records a dispatch's decision in every `routes` block open, an inner block's in the
     outer's too, as the target decides it: its generation within `assumed`, the kernel `chosen` prefers
-    (else the one it ran), a refusal's stable code and the row that tracks it, what the host ran, and the
-    reporting function."""
-    def dispatch(kernel, refusal=None, ran=None):
-        return route("ssd", kernel=kernel, refusal=refusal, ran=ran)
+    (else the one it ran), a refusal's stable code and the row that tracks it, and the reporting
+    function."""
+    def dispatch(kernel, refusal=None):
+        return route("ssd", kernel=kernel, refusal=refusal)
 
     with assumed("sm90"), routes() as outer:
         assert dispatch("pallas").kernel == "pallas"
         head_dim = Refusal("head_dim", "a 320-wide head", "inherent")
         with kernel_choices(ssd="pallas"), routes() as inner:
-            dispatch("xla", head_dim, ran="xla")
+            dispatch("xla", head_dim)
     test = test_a_route_records_the_targets_decision_where_its_dispatch_reports_it
     site = f"{__name__}:{test.__qualname__}.<locals>.dispatch"
-    assert inner == [Route("ssd", "xla", "pallas", head_dim, "xla", "sm90", site)]
-    assert outer == [Route("ssd", "pallas", "pallas", None, "pallas", "sm90", site), *inner]
+    assert inner == [Route("ssd", "xla", "pallas", head_dim, "sm90", site)]
+    assert outer == [Route("ssd", "pallas", "pallas", None, "sm90", site), *inner]
 
 
 def test_a_route_off_its_preferred_kernel_is_logged_once_at_info_and_one_on_it_not_at_all():

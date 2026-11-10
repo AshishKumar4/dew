@@ -66,10 +66,10 @@ from dew.nn.kernels.generation import (
     capability,
     device_target,
     gpu_target,
-    routes,
     tpu,
 )
 from dew.nn.kernels.options import collecting, owned_program, program_digest, shapes_of, taking
+from dew.nn.kernels.selection import Unlowerable
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, compiled_memory, step_flops
@@ -158,6 +158,11 @@ def _compile_only_gpus(generation: str, count: int, capacity: int | None,
     return tuple(topology.devices[:count])
 
 
+_HOSTS_GPUS: set = set()
+"""The compile-only GPUs of hosts' own topologies (`host_gpus`): a step compiled over them is that host's
+GPUs' program (`compile_ahead`'s `portable` where its mesh holds others)."""
+
+
 def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
     """`count` compile-only devices of the CUDA `generation`'s GPUs a host serialized its own topology of
     (`jax.experimental.topologies.get_attached_topology("cuda").serialize()`, written to `topology`), none
@@ -170,6 +175,7 @@ def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
     # compile-only GPUs initialize it: with no client and no GPU.
     compile_only_gpus(generation, 1)
     devices = topologies.TopologyDescription.deserialize(Path(topology).read_bytes()).devices
+    _HOSTS_GPUS.update(devices)
     if len(devices) < count:
         raise ValueError(f"the topology at {topology} holds {len(devices)} GPUs, not {count}")
     held = gpu_target(devices[0].device_kind).generation
@@ -281,10 +287,6 @@ class AheadOfTime:
     """The kernel launch configs its compiles found spilling and refused
     (`dew.nn.kernels.templates.report.refused_launches`), which a run handed the step refuses before it
     lowers (`FitSearch`), so its derivations step down as the compile's did and it lowers this program."""
-    substituted: tuple[str, ...] = ()
-    """Each kernel its routes lowered another in place of, as this host lowers no such kernel (`substituted`:
-    FlashAttention without its wheel, cuDNN with no GPU attached): where any, the program is not the one the
-    target's GPU runs, which a measure of the target's compile reads as unsupported (tools/perf_gate.py)."""
     starts: dict[str, Executable] = dataclasses.field(default_factory=dict)
     """The programs a run builds its fresh state with before its first step and that step's own copies of
     its weights (`dew.training.distributed.start_lowered`, the narrowed copies), compiled for the target
@@ -522,14 +524,6 @@ def _current(path: str | Path, what: str, held: Sequence[object]) -> None:
                          "load: compile them ahead again")
 
 
-def substituted(taken: Sequence) -> list[str]:
-    """Each kernel a compile ahead's routes `taken` (`generation.routes`) lowered another in place of, as this
-    host lowers no such kernel (`Route.ran`: FlashAttention without its wheel, cuDNN with no GPU attached),
-    named once: the compiled program is not the one the target's GPU runs."""
-    return sorted({f"{route.choice}: {route.kernel} ran as {route.ran} at {route.site}" for route in taken
-                   if route.ran != route.kernel})
-
-
 def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDtypeStruct]]],
                      generation: str, multiprocessors: int | None = None) -> AheadPrograms:
     """`programs`, each a function and the shapes and dtypes of its arguments, by its name, compiled ahead for
@@ -539,23 +533,26 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
     only loads and runs (`AheadPrograms.loaded`, ledger 2716). Arguments and results are placed whole on that
     GPU, whatever the function reads. A function takes and returns arrays (a backward is a program of its own
     over its residuals); one whose program holds arrays it closed over is refused, named, as no executable
-    serializes them. Each is lowered in turn and all compile at once (`report.compiled_at_once`)."""
+    serializes them, as is one holding a kernel this host cannot lower for any GPU of the generation
+    (`selection.Unlowerable`: cuDNN's, whose plan holds to its GPU's model). Each is lowered in turn and all
+    compile at once (`report.compiled_at_once`)."""
     target = built_target(generation, multiprocessors)
     devices = compile_only_gpus(generation, multiprocessors=multiprocessors)
     mesh = jax.sharding.Mesh(np.asarray(devices), ("devices",))
     placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-    lowerings, taken = [], {}
+    lowerings = []
     for name, (function, arguments) in programs.items():
         shapes = tuple(jax.ShapeDtypeStruct(argument.shape, argument.dtype, sharding=placed)
                        for argument in arguments)
 
         def lowered(function=function, shapes=shapes, name=name) -> jax.stages.Lowered:
             """The program lowered for the target, afresh at each call (a relowering's, past a spill)."""
-            with (assumed(target), jax.sharding.use_abstract_mesh(mesh.abstract_mesh),
-                  routes() as routed):
-                program = owned_program(function, out_shardings=placed).lower(*shapes)
-            taken[name] = routed
-            return program
+            try:
+                with assumed(target, portable=True), jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+                    return owned_program(function, out_shardings=placed).lower(*shapes)
+            except Unlowerable as refused:
+                refused.add_note(f"program {name!r} cannot be compiled ahead for {generation} on this host")
+                raise
         lowerings.append((lowered(), None, lowered))
     # Through Dew's compile point, as a run compiles them, at once (`report.compiled_at_once`): a launch
     # whose kernel spills there is derived again at its next config.
@@ -563,9 +560,6 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
         executables = report.compiled_at_once(lowerings)
     built = {}
     for name, compiled in zip(programs, executables, strict=True):
-        if missing := substituted(taken[name]):
-            _log.warning("program %r compiled ahead for %s with kernels this host cannot lower: %s", name,
-                         generation, "; ".join(missing))
         try:
             built[name] = Executable.of(compiled)
         except (NotImplementedError, ValueError) as refused:
@@ -816,13 +810,17 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     # A TPU topology's executable loads onto no client here: the persistent cache neither reads an entry
     # for it nor writes one (`dew._cache.uncached`).
     on = generation if stated is None else stated
-    with assumed(on), uncached() if on_tpus else contextlib.nullcontext(), routes() as taken:
-        target = gpu_target()
-        planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity, frontier)
-        starts = started(trainer, start, planned)
-    if missing := substituted(taken):
-        _log.warning("the step compiled ahead for %s holds kernels this host cannot lower: %s", generation,
-                     "; ".join(missing))
+    # A canonical target's devices stand for any GPU of the generation; a host's own topology's, for its own.
+    portable = not on_tpus and not set(trainer.device_mesh.devices.flat) <= _HOSTS_GPUS
+    try:
+        with assumed(on, portable=portable), uncached() if on_tpus else contextlib.nullcontext():
+            target = gpu_target()
+            planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity,
+                                             frontier)
+            starts = started(trainer, start, planned)
+    except Unlowerable as refused:
+        refused.add_note(f"the step cannot be compiled ahead for {generation} on this host")
+        raise
     # The sampled step as the search compiled it, its program what it lowered then.
     sampled = None if planned.sampled is None else AheadProgram.of(*planned.sampled)
     seconds = time.perf_counter() - began
@@ -838,7 +836,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
         temp_bytes=memory.temp, code_bytes=memory.generated_code, plan=trainer.plan, planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
         built=BuildTarget.built(target, len(devices), capacity),
-        refusals=report.refused_launches(), sampled=sampled, substituted=tuple(missing), starts=starts)
+        refusals=report.refused_launches(), sampled=sampled, starts=starts)
 
 
 def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned

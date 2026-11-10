@@ -330,8 +330,8 @@ GPU takes, FlashAttention's custom call or the template, lowers on no compile-on
 attention)`, is the step's compile without its attention kernel's, the same program in every arm, until
 that route lowers without a device. Its row is the planner's seconds, every compile included, for the
 unchanged step, whatever plan each arm selects; each arm's selected configuration (its split, rows,
-rematerialization and head tiling) stays beside the verdict. A step whose program still substituted a
-kernel this host cannot lower (cuDNN with no GPU attached) is *unsupported*, never judged. The
+rematerialization and head tiling) stays beside the verdict. A step whose program holds a kernel this
+host cannot lower is refused at its compile (`selection.Unlowerable`), a row it did not run. The
 battery runs once for each release candidate on a Colab A100, and as an A/B, base against head, for
 a deliberate change to a hot path (a kernel, the trainer's step, the input pipeline); a promotion
 to main does not run it. Each table is kept in `tools/measurements/perf_gate/<head>-vs-<base>.md`:

@@ -34,13 +34,15 @@ _log = logging.getLogger(__name__)
 @dataclasses.dataclass(frozen=True)
 class Assumption:
     """The device `assumed` stands in for the default device's: its generation, its facts (`target`)
-    where it was given them, and whether its kernels are `interpreted` on this process's platform. Equal
-    wherever the generation, every fact and the mode are (`_facts`), as JAX's trace key reads it, not by a
-    target's identity or its partial hash."""
+    where it was given them, whether its kernels are `interpreted` on this process's platform, and whether
+    the program is compiled for any GPU of its generation (`portable`). Equal wherever the generation,
+    every fact and the modes are (`_facts`), as JAX's trace key reads it, not by a target's identity or
+    its partial hash."""
     generation: str
     target: GpuTarget | None = dataclasses.field(default=None, compare=False, hash=False)
     facts: Hashable = None
     interpreted: bool = False
+    portable: bool = False
 
 
 def assumption() -> Assumption | None:
@@ -52,7 +54,8 @@ def assumption() -> Assumption | None:
 
 
 @contextlib.contextmanager
-def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False) -> Iterator[None]:
+def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False,
+            portable: bool = False) -> Iterator[None]:
     """Within the block, choose kernels as on a device of `generation` ('sm80'), whatever device this
     process has: `device_generation`, `bf16_dot_runs` and `triton_runs` answer for it, so every
     kernel choice and refusal acts as on that GPU while a step traces and lowers for one on
@@ -60,15 +63,19 @@ def assumed(generation: str | GpuTarget | None, *, interpreted: bool = False) ->
     shared memory, clock and bandwidth its own), `gpu_target` answers with them, so every launch is sized
     and costed by them alone. `interpreted`, the kernels run where the process places them (`backend` the
     placed platform's) by the device's own bundles and facts, which Mosaic GPU's interpreter runs
-    (`interpreted_target`): an interpreted check of that device's route on a CPU. None assumes nothing.
-    JAX keys its trace and compile caches on the device assumed (`dew._cache.KERNEL_ASSUMED`), so a
-    function jitted for one traces again for another."""
+    (`interpreted_target`): an interpreted check of that device's route on a CPU. `portable`, the program
+    is compiled for any GPU of the generation (a canonical target's compile-only devices,
+    `dew.training.ahead.compile_only_gpus`), not one host's own: a kernel whose compiled plan holds to its
+    GPU's model alone (cuDNN's) does not lower in it. None assumes nothing. JAX keys its trace and compile
+    caches on the device assumed (`dew._cache.KERNEL_ASSUMED`), so a function jitted for one traces again
+    for another."""
     from dew import _cache
 
     if isinstance(generation, GpuTarget):
-        value = Assumption(generation.generation, generation, _facts(generation), interpreted)
+        value = Assumption(generation.generation, generation, _facts(generation), interpreted, portable)
     else:
-        value = None if generation is None else Assumption(generation, interpreted=interpreted)
+        value = None if generation is None else Assumption(generation, interpreted=interpreted,
+                                                           portable=portable)
     with _cache.KERNEL_ASSUMED(value), _cross_compiled(value):
         yield
 
@@ -1034,15 +1041,14 @@ class Route:
     and dtypes, the binary's architectures), never the host's placement: `kernel` is what the target
     runs for `choice` at `site` (module:function), `preferred` what it runs where nothing refuses (`chosen`,
     or its selector's preference), `refusal` why `preferred` did not take the
-    call, and `ran` what this host executed, `kernel` but where the host cannot run it (cuDNN within
-    `assumed` on a CPU), and `forced` the kernel the call named or `chosen` named, which forced the choice
-    (None where the selector chose). A route is generic exactly where `kernel != preferred`."""
+    call, and `forced` the kernel the call named or `chosen` named, which forced the choice (None where the
+    selector chose). A route is generic exactly where `kernel != preferred`. The host runs `kernel` or
+    refuses the call (`selection.Unlowerable`): no kernel lowers in another's place."""
 
     choice: Choice
     kernel: str
     preferred: str
     refusal: Refusal | None
-    ran: str
     target: str
     site: str
     forced: str | None = None
@@ -1084,17 +1090,17 @@ _logged: set[tuple[str, str, str]] = set()
 
 
 def route(choice: Choice, *, kernel: str, preferred: str | None = None, refusal: Refusal | None = None,
-          ran: str | None = None, forced: str | None = None) -> Route:
+          forced: str | None = None) -> Route:
     """Report the dispatch of `choice` to `kernel`, the one call every dispatch site makes once it has
     decided (`dew.nn.kernels.selection.select`): `preferred` defaults to the kernel `chosen` names, else
-    `kernel`; `ran` is what this host executes, `kernel` by default. Every `routes` block open records it.
+    `kernel`. Every `routes` block open records it.
     A call off its preferred kernel is logged once a process for each kernel and refusal at INFO, naming
     both and the refusal's reason; one that runs the preferred kernel logs nothing."""
     from dew import _cache
 
     generation = device_generation()
     preferred = preferred or dict(_cache.KERNEL_CHOICES.value).get(choice) or kernel
-    found = Route(choice, kernel, preferred, refusal, ran or kernel, generation, _site(), forced)
+    found = Route(choice, kernel, preferred, refusal, generation, _site(), forced)
     for collected in _cache.KERNEL_ROUTES.value:
         collected.found.append(found)
     detail = '' if refusal is None else refusal.detail
