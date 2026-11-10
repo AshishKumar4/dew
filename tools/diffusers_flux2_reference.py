@@ -41,7 +41,6 @@ import torch
 from diffusers_reference_helpers import flux2_ids, perturb, recording, saved_pipeline, tiny_qwen3_encoder
 from reference_releases import RELEASES
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import float64, float64_twin
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]

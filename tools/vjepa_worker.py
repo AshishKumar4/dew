@@ -20,14 +20,11 @@ run is under `_dew_torch.precision.widened`, under which the sincos tables are g
 import importlib
 import sys
 from functools import cache, partial
-from pathlib import Path
 
 import numpy as np
 import torch
 from reference_source import package, published_files
 from reference_worker import drawn, serve
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 REPO, COMMIT = "facebookresearch/jepa", "51c59d518fc63c08464af6de585f78ac0c7ed4d5"
 FILES = {

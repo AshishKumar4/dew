@@ -25,7 +25,6 @@ transformers 5.16.1, compressed-tensors 0.17.1, diffusers 0.34.0. Run:
         tools/nvfp4_storage_reference.py
 """
 
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -37,8 +36,6 @@ from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 from compressed_tensors.quantization.lifecycle.forward import dequantize, set_forward_quantized
 from compressed_tensors.quantization.utils.helpers import calculate_qparams, generate_gparam
 from safetensors.torch import save_file
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
 from _dew_torch.precision import float64, float64_twin

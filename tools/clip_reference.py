@@ -13,7 +13,7 @@ Set up the venv and run it:
         --index-url https://download.pytorch.org/whl/cpu
     uv pip install --python /tmp/clipref/bin/python transformers safetensors \
         numpy pillow
-    HF_HOME=/tmp/clipref-hf /tmp/clipref/bin/python tools/clip_reference.py
+    HF_HOME=/tmp/clipref-hf PYTHONPATH=src /tmp/clipref/bin/python tools/clip_reference.py
 
 What lands in tests/fixtures/clip:
 
@@ -61,8 +61,6 @@ from transformers import (
     CLIPTokenizer,
     CLIPVisionConfig,
 )
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reference_source import recipe_images

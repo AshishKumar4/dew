@@ -54,7 +54,6 @@ import numpy as np
 import torch
 from diffusers_reference_helpers import perturb, recording, saved_pipeline
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import float64, float64_twin
 
 ROOT = Path(__file__).resolve().parents[1]

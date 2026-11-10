@@ -25,8 +25,6 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from reference_worker import drawn, serve
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from transformers import AutoModelForCausalLM
 
 from _dew_torch.precision import float64

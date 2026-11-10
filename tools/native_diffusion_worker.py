@@ -44,8 +44,6 @@ from unittest.mock import patch
 import numpy as np
 from reference_worker import drawn, serve
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 FIXTURE = Path(__file__).resolve().parents[1] / "tests/fixtures/tiny_diffusers.tar.xz"
 FLAX = ("sd", "xl", "img2img", "inpaint")
 TASKS = (*FLAX, "xl-img2img", "xl-inpaint", "refiner", "safety")

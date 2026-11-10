@@ -68,8 +68,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import deepseek_v41_reference as v41
 from decoder_export_reference import lower_index_ties

@@ -37,7 +37,6 @@ import torch
 from reference_source import ran, selected
 from reference_worker import drawn, serve
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import dtype_widened, float64, replaced
 
 REPO, REVISION = "moonshotai/Kimi-K3", "f831ab66814297da540d832a5235f8e904f29d06"

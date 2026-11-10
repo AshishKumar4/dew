@@ -70,8 +70,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 ROOT = Path(__file__).resolve().parents[1]
 BACKBONE = ROOT / "tests" / "fixtures" / "hf" / "qwen38-dense-tiny"
 OUT = ROOT / "tests" / "fixtures" / "joint_checkpoint" / "tiny"

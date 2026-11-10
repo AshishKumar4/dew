@@ -21,15 +21,12 @@ float32 and float64.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import jax
 import numpy as np
 import torch
 import transformers
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from transformers.generation.utils import _speculative_sampling
 
 from _dew_torch.precision import replaced

@@ -37,8 +37,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 LAYA_COMMIT = "a4a8921afebfd852bba0000475cfb6ab737a124c"
 LAYA_REPO = "convaiinnovations/laya"
 LAYA_REVISION = "7b928d828b7b0e022f929d9bd2e44165aa270148"

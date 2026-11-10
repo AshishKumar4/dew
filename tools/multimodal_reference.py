@@ -31,7 +31,6 @@ from transformers import (
 )
 from transformers.models.gemma3.image_processing_pil_gemma3 import Gemma3ImageProcessorPil
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 from multimodal_families import DRAWN, FAMILIES, LEARNING_RATE
 

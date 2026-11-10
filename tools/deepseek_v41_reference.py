@@ -11,12 +11,12 @@ Run it in its own environment, never the project's:
     uv venv ~/.cache/dew/reference-venvs/deepseek-v41 --python 3.12
     VIRTUAL_ENV=... uv pip install torch==2.10.0 numpy ml_dtypes safetensors sympy \
         tokenizers transformers huggingface_hub tilelang==0.1.8
-    PYTHONPATH=. ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
+    PYTHONPATH=src:. ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
         tools/deepseek_v41_reference.py [--search N | --kernels | --vision | --fp64]
 
     PYTHONPATH=src python tools/rounding_orders.py \
         tests/fixtures/hf/deepseek-v41-tiny <drawn> 52 0
-    PYTHONPATH=. ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
+    PYTHONPATH=src:. ~/.cache/dew/reference-venvs/deepseek-v41/bin/python \
         tools/deepseek_v41_reference.py orders <drawn>
 
 `--kernels` runs the release's tilelang kernels on a CUDA GPU and writes
@@ -82,8 +82,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from reference_source import loaded, record_padding, saved_fixture
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash"
 DEEPSEEK_V41_REVISION = "dba1be0a40aa45a94ad051997016db3960a90277"
@@ -1036,7 +1034,7 @@ def write_recording(seed: int):
               **record_case("deepseek v41 plain walk", draw, evaluated(PROMPT - 1), summary=True)}
     written = save(FIXTURE / "recording.npz", {**arrays, "provenance": provenance(
         "deepseek-ai/DeepSeek-V4.1-Flash", DEEPSEEK_V41_REVISION, "cpu",
-        "PYTHONPATH=.:tests:tools <release python> tools/deepseek_v41_reference.py --record",
+        "PYTHONPATH=src:.:tests:tools <release python> tools/deepseek_v41_reference.py --record",
         torch=torch.__version__)}, reference=f"deepseek-ai/DeepSeek-V4.1-Flash@{DEEPSEEK_V41_REVISION}",
         license="mit")
     # The rows each seed drew, which the test reads its inputs from (`recorded_rows`): its own draw would

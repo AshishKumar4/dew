@@ -25,8 +25,6 @@ import numpy as np
 import torch
 from reference_worker import drawn, serve
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 ARCHIVE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "wan_transformer.tar.xz"
 
 

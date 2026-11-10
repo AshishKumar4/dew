@@ -65,8 +65,6 @@ import numpy as np
 import torch
 from reference_releases import RELEASES, require
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
 DIFFUSERS, TRANSFORMERS = RELEASES["rae"]["diffusers"], RELEASES["rae"]["transformers"]
 DECODER = {"decoder_hidden_size": 64, "decoder_num_hidden_layers": 2, "decoder_num_attention_heads": 4,
            "decoder_intermediate_size": 128}

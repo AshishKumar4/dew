@@ -24,14 +24,11 @@ weight of every expert, its chosen experts' weights scattered by their ids, zero
 import contextlib
 import sys
 import types
-from pathlib import Path
 
 import numpy as np
 import torch
 from reference_source import github, ran, selected
 from reference_worker import drawn, serve
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 REPO, COMMIT = "vllm-project/vllm", "ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 PATH = "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py"

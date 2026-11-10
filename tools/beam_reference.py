@@ -25,23 +25,20 @@ sequences (pad after EOS), their scores in float32 and float64
 (`sequences_scores`, the summed log probability over the generated length
 raised to the penalty), and the settings.
 
-    PYTHONPATH=tools ~/.cache/dew/reference-venvs/numerics/bin/python \
+    PYTHONPATH=src:tools ~/.cache/dew/reference-venvs/numerics/bin/python \
         tools/beam_reference.py
 """
 
 from __future__ import annotations
 
 import json
-import sys
 import types
-from pathlib import Path
 
 import numpy as np
 import torch
 import transformers.generation.utils as generation
 from numerics_reference import FIXTURES, decoder, prompts
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from _dew_torch.precision import float64, float64_twin
 
 FAMILIES = ("llama-tiny", "qwen3-tiny")

@@ -14,12 +14,9 @@ inputs drawn again by tests/test_flow_grpo.py (`transition_inputs`):
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 REPO, COMMIT = "yifan123/flow_grpo", "879042cf5707f8b90daa98d147d7deac2317c5da"
 SOURCE = "flow_grpo/diffusers_patch/sd3_sde_with_logprob.py"

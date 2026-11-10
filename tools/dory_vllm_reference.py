@@ -12,7 +12,7 @@ build installs exactly its tree: the checkout over the precompiled wheel of its 
     VIRTUAL_ENV=vllm-env VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_LOCATION=<WHEEL> \
         uv pip install -e vllm-pr ninja
     for stage in record probe upstream orders model_orders sums invariance; do
-        PYTHONPATH=tools vllm-env/bin/python tools/dory_vllm_reference.py $stage DIR
+        PYTHONPATH=src:tools vllm-env/bin/python tools/dory_vllm_reference.py $stage DIR
     done
     PYTHONPATH=src:tests:tools .venv/bin/python tools/dory_vllm_reference.py summary DIR
 
@@ -51,8 +51,6 @@ import sys
 from pathlib import Path
 
 import numpy as np
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 FIXTURE = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf' / 'dory-1.0-4b'
 PULL = 'vllm-project/vllm#60149 at shan18/vllm 55076950b6c155f384d6766d63563c3bc20a0e3f'

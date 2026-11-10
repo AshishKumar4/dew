@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
-import sys
 from collections import namedtuple
 from pathlib import Path
 
@@ -36,8 +35,6 @@ import numpy as np
 import torch
 from lpips_weights import drawn_weights
 from reference_source import definitions, verified
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from torchvision import models
 
 from _dew_torch.precision import float64, float64_twin

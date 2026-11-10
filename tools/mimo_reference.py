@@ -35,14 +35,11 @@ fixture's tokenizer.
 
 import argparse
 import json
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 AUDIO_FIXTURE = FIXTURES / "mimo-audio-tiny"
