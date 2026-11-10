@@ -112,7 +112,7 @@ def main() -> None:
         Asynchronous(ScriptedSource(drawn), Published(), objective, width=8, rows=partition.rows(TASKS),
                      max_lag=1, ahead=1),
         groups=2, support_capacity=16 if args.records else None, estimator=args.estimator,
-        share=args.truncate and objective.shares_prefixes(train=True))
+        scorer=objective if args.truncate else None)
     data = scheduler.tasks(Loader(train=share, val=None, records=TASKS, batch=TASKS))
     final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
     rows = multihost_utils.process_allgather({name: trained[0][name] for name in PACKED})

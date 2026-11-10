@@ -20,7 +20,7 @@ from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
-from dew.nn.protocols import HiddenStates
+from dew.nn.protocols import ForkedCalls, HiddenStates
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -72,6 +72,14 @@ class ValueHead(nn.Module):
     """
 
     backbone: HiddenStates
+
+    @nn.nowrap
+    def fork_refusal(self, train: bool = False) -> str | None:
+        """Why its backbone would not read a call over forks as each document's own row (`ForkedCalls`):
+        its own reason, or that it states none."""
+        if not isinstance(self.backbone, ForkedCalls):
+            return "the critic's backbone states no reading of a call over forks"
+        return self.backbone.fork_refusal(train)
 
     @nn.nowrap
     def projected(self, params: Variables, *, updated: bool) -> Variables:
@@ -215,6 +223,17 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         critic = projected_draw(self.critic, self.critic.init(jax.random.fold_in(key, 1),
                                                               jnp.zeros((1, self.seq_len), jnp.int32)))
         return joined({"policy": self.actor.init(key, variables), "critic": critic})
+
+    def bind_plan(self, version: int) -> None:
+        """Take the run's data plan version, as its actor's (`TokenScorer.bind_plan`)."""
+        self.actor.bind_plan(version)
+
+    def shares_prefixes(self, train: bool = False) -> bool:
+        """Whether its rows are packed over one copy of the prompt a group's chains begin with: where its
+        actor shares (`TokenScorer.shares_prefixes`) and its critic reads a call over forks as each chain's
+        own row (`ForkedCalls`)."""
+        return (self.actor.shares_prefixes(train) and isinstance(self.critic, ForkedCalls)
+                and self.critic.fork_refusal(train) is None)
 
     def policy(self, variables: Variables) -> EpisodeInference:
         """Return the actor's episode inference task, whose `bind` reads only a tree's `policy` subtree."""
@@ -379,7 +398,7 @@ class PPORollout:
         if self.objective.seq_len != self.episodes.width - 1:
             raise ValueError("PPO objective and episode token budgets must agree")
         object.__setattr__(self, "rollout", RolloutScheduler(Synchronous(self.episodes), groups=self.groups,
-                                                             log=self.log))
+                                                             log=self.log, scorer=self.objective))
 
     @property
     def metrics(self) -> Mapping[str, float]:
