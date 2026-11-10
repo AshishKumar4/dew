@@ -316,7 +316,7 @@ def test_each_shape_a_run_meets_starts_at_the_run_s_own_head_fusion():
     state, _, _ = trainer.place()
     trainer.compile(state, BATCH)
     trainer.compile(state, {"text": BATCH["text"][: ROWS // 2]})
-    rung = trainer._checkpoint_rung()
+    rung = trainer._compiler.checkpoint_rung()
     assert [shaped["head_fused"] for shaped in rung["shapes"].values()] == [False, False], rung
     assert rung["head_tile"] is not None and not rung["head_fused"]
 

@@ -157,7 +157,7 @@ def test_a_runs_evaluations_called_over_its_first_states_shapes_are_the_programs
     start = ahead._started()
     with collecting() as collected:
         ahead._evaluator().warmed_ahead(plan, placed_shapes(start.abstract, start.shardings), start.shardings,
-                                        ahead._links(ahead.device_mesh))
+                                        ahead._compiler.links(ahead.device_mesh))
     served: set[str] = set()
 
     def serving(digest, executable):

@@ -841,14 +841,16 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
     start = trainer._started()
     if start.resume is not None and trainer.checkpoints is not None:
         # A resumed run's step compiles at the rung its checkpoint records, as its resume would.
-        trainer._resume_rung(trainer.checkpoints.rung(start.resume))
+        trainer._compiler.resume_rung(trainer.checkpoints.rung(start.resume))
+    # A TPU topology's executable loads onto no client here: the persistent cache neither reads an entry
+    # for it nor writes one (`dew._cache.uncached`).
     on = generation if stated is None else stated
     # A canonical target's devices stand for any GPU of the generation; a host's own topology's, for its own.
     portable = not on_tpus and not set(trainer.device_mesh.devices.flat) <= _HOSTS_GPUS
     # The first step's pass count, the phase its batch was read in (`Trainer`'s `phase_passes`).
     trainer.phase_passes.at(batch)
     try:
-        with assumed(on, portable=portable), trainer.phase_passes.scoped(trainer):
+        with assumed(on, portable=portable), trainer.phase_passes.scoped(trainer, trainer._compiler):
             target = gpu_target()
             planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity,
                                              frontier)
@@ -937,5 +939,5 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
             copied(together(moving, frozen))
         if plan is not None:
             trainer._evaluator().warmed_ahead(plan, placed, start.shardings,
-                                              trainer._links(trainer.device_mesh))
+                                              trainer._compiler.links(trainer.device_mesh))
     return collected

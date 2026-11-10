@@ -254,7 +254,7 @@ def objective_gradient(objective, variables, batch, step):
 def as_a_step(trainer, variables, micro, gradient):
     """`gradient` jitted with the compiler options `trainer`'s step of a `micro` microbatch takes over
     its mesh, its devices and row shards (`dew.training.memory.step_compiler_options`, as
-    `Trainer._planned` derives them), so a check of that step against it compiles both arms alike: on
+    `StepCompiler._planned` derives them), so a check of that step against it compiles both arms alike: on
     a GPU the step keeps dots that share an input apart, where XLA's default merges them into one
     GEMM, which rounds otherwise."""
     from dew.batch import FROZEN

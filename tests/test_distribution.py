@@ -703,12 +703,12 @@ def test_a_link_figure_is_kept_for_its_placement_and_carried_by_a_checkpoint(tmp
                        mesh=MeshSpec(tensor=2))
 
     saved = trainer()
-    saved._bandwidths[paired, "tensor"] = first
-    rung = saved._checkpoint_rung()
+    saved._compiler._bandwidths[paired, "tensor"] = first
+    rung = saved._compiler.checkpoint_rung()
     assert rung["links"] == {link_topology(paired, "tensor"): first}
     resumed = trainer()
-    resumed._resume_rung(rung)
-    assert resumed._resumed_links == {link_topology(paired, "tensor"): first}
+    resumed._compiler.resume_rung(rung)
+    assert resumed._compiler._resumed_links == {link_topology(paired, "tensor"): first}
 
 
 @pytest.mark.mesh(devices=2)

@@ -2,7 +2,7 @@
 once for its shapes and the narrow copies it reads (`prepared_for`), the state its window of microbatches
 pools, its program over one microbatch (`step_program`), lowered or traced for its footprint, with what the
 fit check holds beside it (`candidate_for`), and the same step lowered for a GPU this process lacks
-(`lowered_for`). The trainer reads each one's (`Trainer._planned`)."""
+(`lowered_for`). The trainer reads each one's (`StepCompiler._planned`)."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from dew.batch import CLOSES_WINDOW, Batch
 from dew.data.dataset import Stage
 from dew.data.pipeline import DeviceStep
 from dew.distributed.batches import PREFETCH_DEPTH, batch_shardings, prefetched_bytes
-from dew.distributed.placement import Placement, placed_bytes, placed_shapes
+from dew.distributed.placement import Placement, Validation, placed_bytes, placed_shapes
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, gpu_mesh
 from dew.nn.kernels.options import owned_program, trace_context
@@ -75,8 +75,9 @@ class StepSettings[LossT, EffectsT]:
     """What a run states of the step it compiles, as its trainer holds it when it compiles
     (`Trainer._settings`): its objective, its optimizer once built (`optimizer`), its layout and device
     mesh, the steps a commit pools (`accumulation`), a custom step, its loss scaler, DiLoCo, whether it
-    tunes its kernels, its inspection, the microbatches a pipelined step feeds and whether its steps record
-    what they read."""
+    tunes its kernels, its inspection, the microbatches a pipelined step feeds, whether its steps record
+    what they read, the CUDA generation its first step lowers for in place of compiling it (`lower_for`) and
+    where a CPU-owned run keeps its state (`state_mesh`, the device mesh otherwise)."""
 
     objective: Objective[LossT, EffectsT]
     built_optimizer: optax.GradientTransformation | None
@@ -90,6 +91,8 @@ class StepSettings[LossT, EffectsT]:
     inspection: Inspection | None
     microbatches: int
     record: bool
+    lower_for: str | None
+    state_mesh: Mesh
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -112,8 +115,9 @@ class Stepping[LossT, EffectsT]:
     where its step keeps
     a pipelined run (`staging`), its window's accumulation (`initialize_accumulation`), its model's batch
     and its shapes (`model_batch`, `model_shapes`), its step's body (`step_body`) and the fields it fetches
-    (`fetched`), the mesh it traces on (`traced_on`), and how its batches are cut and counted (`shape`):
-    read here, none off the trainer itself (row 4555)."""
+    (`fetched`), the mesh it traces on (`traced_on`), how its batches are cut and counted (`shape`), how
+    the layout validates a state it holds between steps (`validation`) and whether and how a step lays out
+    its window (`builds_window`, `window_of`): read here, none off the trainer itself (row 4555)."""
 
     settings: StepSettings[LossT, EffectsT]
     step_key: Hashable | None
@@ -127,6 +131,9 @@ class Stepping[LossT, EffectsT]:
     fetched: Callable[..., TrainState]
     traced_on: Callable[[Mesh | AbstractMesh], contextlib.AbstractContextManager[Schedule]]
     shape: RunShape
+    validation: Callable[[TrainState], Validation]
+    builds_window: Callable[[TrainState, Candidate, int], bool]
+    window_of: Callable[[TrainState, Candidate, int], TrainState]
 
 
 KEPT_CANDIDATES = 4
@@ -366,7 +373,7 @@ def lowered_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tra
     """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for one
     (`dew.training._lowering`) on this process's devices. It traces on an abstract mesh of that GPU's
     devices, from which JAX's Pallas lowering reads the GPU, at the base rung its trainer put the
-    objective at (`Trainer._at_base_rung`), its narrow copies where that rung keeps them (`narrow`), and
+    objective at (`StepCompiler.at_base_rung`), its narrow copies where that rung keeps them (`narrow`), and
     the plan's first split: a run that does not fit splits its batch or recomputes more, no other kernel.
     A CPU-owned state's step realizes its parameters on the host as it runs, and is not lowered."""
     settings = stepping.settings

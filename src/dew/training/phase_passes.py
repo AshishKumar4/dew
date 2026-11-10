@@ -23,7 +23,8 @@ from dew.objectives.base import Objective
 
 
 class Holding(Protocol):
-    """What holds the objective a step is built from: a `Trainer`."""
+    """What holds the objective a step is built from: a `Trainer`, and the `StepCompiler` that compiles
+    it."""
 
     objective: Objective[Any, Any]
 
@@ -106,15 +107,17 @@ class PhasePasses[L, E]:
             self.run(objective, self.current)
 
     @contextlib.contextmanager
-    def scoped(self, trainer: Holding) -> Iterator[None]:
-        """`trainer`'s objective at the step's count while a step is built (`objective_for`), the one the
-        step and its host runner hold; the run's own again after."""
-        base = trainer.objective
-        trainer.objective = self.objective_for(base)
+    def scoped(self, *holders: Holding) -> Iterator[None]:
+        """Each of `holders`' objective at the step's count while a step is built (`objective_for`), the one
+        the step and its host runner hold; each's own again after."""
+        bases = [holder.objective for holder in holders]
+        for holder, base in zip(holders, bases, strict=True):
+            holder.objective = self.objective_for(base)
         try:
             yield
         finally:
-            trainer.objective = base
+            for holder, base in zip(holders, bases, strict=True):
+                holder.objective = base
 
     def objective_for(self, base: Objective[L, E]) -> Objective[L, E]:
         """`base`, the run's objective at the last phase's count, at the step's count (`current`): a copy of

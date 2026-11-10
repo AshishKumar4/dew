@@ -122,7 +122,7 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
 
 
 def link_figures(bandwidths: Mapping[tuple[Mesh, str], float | None]) -> dict[str, JSON]:
-    """The link figures a checkpoint's rung keeps (`Trainer._checkpoint_rung`): each figure of
+    """The link figures a checkpoint's rung keeps (`StepCompiler.checkpoint_rung`): each figure of
     `bandwidths` a step traced with, by mesh and axis, under the placement it was taken on
     (`link_topology`), None where a step compiled ahead took none (`AheadOfTime.links`)."""
     return {link_topology(mesh, axis): figure for (mesh, axis), figure in bandwidths.items()}
@@ -390,9 +390,9 @@ def start_program[Held, Result](function: Callable[[Held, jax.Array], Result], s
                                 like: Held) -> OuterProgram:
     """The program `taking_over` runs, over the held tree's two trees as their leaves (`_held_leaves`) and
     the key, the tree rebuilt within it in the structure of `like`, either of the two: one program
-    whichever arrays or shapes it is called or compiled over (`start_compiled`), whose arguments' structure holds none
-    of the held tree's own, which an initializer's functions may be part of, so a start compiled ahead
-    saves whole (`AheadOfTime.starts`)."""
+    whichever arrays or shapes it is called or compiled over (`start_compiled`), whose arguments' structure
+    holds none of the held tree's own, which an initializer's functions may be part of, so a start compiled
+    ahead saves whole (`AheadOfTime.starts`)."""
     structure = jax.tree.structure(like, is_leaf=lambda leaf: leaf is None)
 
     def joined(taken: list, kept: list, key: jax.Array) -> Result:
