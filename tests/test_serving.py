@@ -1114,12 +1114,15 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
 
 
-@pytest.mark.parametrize("fields", [{"mixture": Mixture(experts=4, top_k=2, hash_layers=(0,))}],
-                         ids=["hash-routing"])
-def test_a_decoder_reading_each_tokens_id_serves_in_the_mixed_step(fields):
-    """Hash routing reads each token's id, which the mixed admitting step's one row of every slot's tokens
-    carries per token: the server takes that step (`mixed_refusal` None) and each request draws what the
-    lone task draws, its likelihoods on par with a full forward's from the float64 twin (check 1)."""
+@pytest.mark.parametrize("fields", [{"position_embedding": "learned"},
+                                    {"mixture": Mixture(experts=4, top_k=2, hash_layers=(0,))}],
+                         ids=["learned-positions", "hash-routing"])
+def test_a_decoder_reading_each_tokens_place_or_id_serves_in_the_mixed_step(fields):
+    """A learned position embedding reads each token's place in its row, which the mixed admitting
+    step's one row of every slot's tokens counts per row as attention does (`DecodeCursor`'s
+    `mixed_positions`), and hash routing reads each token's id, which it carries per token: the server
+    takes that step (`mixed_refusal` None) and each request draws what the lone task draws, its
+    likelihoods on par with a full forward's from the float64 twin (check 1; row 5428)."""
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
                               max_seq_len=64, dtype="float32", **fields)
     bound = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
