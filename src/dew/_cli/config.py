@@ -40,16 +40,25 @@ UNITS_PER_WORKER = 8
 
 @dataclasses.dataclass(frozen=True)
 class TpuConfig:
-    """The defaults every dew tpu command falls back to."""
+    """The defaults every dew tpu command falls back to, each with the flag `dew tpu init` sets it by: its
+    metavar and help, and whether it is given as a comma-separated list (`listed`)."""
 
-    project: str = ""
-    zones: tuple[str, ...] = DEFAULT_ZONES
-    accelerator_type: str = "v5e-8"
-    runtime_version: str = "auto"
-    ssh_user: str = ""
-    gcs_bucket: str = ""
-    data_disk: str = ""
-    python_version: str = "3.12"
+    project: str = dataclasses.field(default="", metadata={
+        "metavar": "PROJECT", "help": "Google Cloud project that owns the TPUs."})
+    zones: tuple[str, ...] = dataclasses.field(default=DEFAULT_ZONES, metadata={
+        "metavar": "ZONES", "help": "Zones to search, in order, comma separated.", "listed": True})
+    accelerator_type: str = dataclasses.field(default="v5e-8", metadata={
+        "metavar": "TYPE", "help": "Default accelerator type, for example v5e-8."})
+    runtime_version: str = dataclasses.field(default="auto", metadata={
+        "metavar": "VERSION", "help": "Runtime version, or auto to pick it from the accelerator generation."})
+    ssh_user: str = dataclasses.field(default="", metadata={
+        "metavar": "USER", "help": "User to log in as. Empty lets gcloud choose."})
+    gcs_bucket: str = dataclasses.field(default="", metadata={
+        "metavar": "BUCKET", "help": "Bucket to mount with gcsfuse during setup."})
+    data_disk: str = dataclasses.field(default="", metadata={
+        "metavar": "DISK", "help": "Persistent disk to attach on create."})
+    python_version: str = dataclasses.field(default="3.12", metadata={
+        "metavar": "X.Y", "help": "Python version of the venv on the workers."})
 
 
 def config_path() -> Path:
