@@ -14,7 +14,11 @@ from armada_support import interpreter, loaded, written
 
 @pytest.fixture
 def ci(tmp_path, monkeypatch):
-    return loaded(tmp_path, monkeypatch)
+    loaded_ci = loaded(tmp_path, monkeypatch)
+    # Each test's task keeps its artifacts (a stall's record, `stalls.kept`) under its own directory, never
+    # an enclosing CI task's.
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(tmp_path / "artifacts"))
+    return loaded_ci
 
 
 def test_a_task_past_its_deadline_is_interrupted_its_hung_file_red_and_the_rest_run_again(ci, tmp_path):
@@ -86,8 +90,7 @@ def wheel(root: Path) -> Path:
 
 @pytest.mark.parametrize("launched", [False, True], ids=["pytest", "a release check's"])
 @pytest.mark.parametrize("stall", STALLS)
-def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, tmp_path, monkeypatch, stall,
-                                                                           launched):
+def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, tmp_path, stall, launched):
     """A task interrupted at its deadline reports its pytest's every thread as it stood then, its Python
     frames and the native ones under them, a stall before any test ran included, which pytest's own report
     of an interrupt cannot give (2026-11-03: a group stalled 28 minutes in a read with no deadline during
@@ -98,7 +101,6 @@ def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, 
     artifacts (`stalls.kept`), its stacks and the host's cgroup quota beside them (rows 5452, 5454)."""
     source, stalled = STALLS[stall]
     artifacts = tmp_path / "artifacts"
-    monkeypatch.setenv("ARMADA_ARTIFACTS", str(artifacts))
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_stalls.py": f"{source}\n\ndef test_never():\n    pass\n"})
     ci.task("3.12", ["tests/test_stalls.py"], "", tmp_path / "rows.json", 10.0 if launched else 3.0,
