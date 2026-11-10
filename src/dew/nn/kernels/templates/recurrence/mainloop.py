@@ -2162,12 +2162,10 @@ def stated_producer(call: Call, registers: int) -> int | None:
 
 def _scan_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
     """What `_scan`'s consumer thread holds: `_states`' memory and prefix vectors carried (`_states_held`),
-    beside the chunk's prefix as a column's vectors and its write gates; its step's phase; the chunk's own
-    pairs' scores, their decays' two terms and their masks (an fp32 call's split into parts), staged before
-    the output's products issue; and the output's phase beside the memory: the corrected values and the
-    output's fp32 sum, one product's fragments at a time, the memory's and the local one's issuing in turn.
-    Stated in one phase with the output's, the scores held a B200's unrounded write gate cell at 256 registers
-    a 32-column block, no program, where the walk compiles spilling none (224 apart; row 5355)."""
+    beside the chunk's prefix as a column's vectors and its write gates; its step's phase; and the output's
+    phase beside the memory: the corrected values and the output's fp32 sum, the chunk's own pairs' scores,
+    their decays' two terms and their masks (an fp32 call's split into parts), and one product's fragments
+    at a time, the scores', the memory's and the local one's issuing in turn."""
     chunk = call.chunk
     held, given = call.held, call.given
     states = _states_held(call, values, keys, bv)
@@ -2181,7 +2179,7 @@ def _scan_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
     # the inverse's product.
     applied = [f32(chunk, bv)] * 2 + products if call.delta else []
     return Held(carried=[*states.carried, f32(chunk, 1)],
-                phases=(*states.phases, applied, scores + products, [f32(chunk, bv)] * 2 + products))
+                phases=(*states.phases, applied, [f32(chunk, bv)] * 2 + scores + products))
 
 
 @lowered_once
