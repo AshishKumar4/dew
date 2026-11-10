@@ -169,6 +169,9 @@ def test_a_task_past_its_deadline_times_the_file_it_stopped_in_at_the_least_it_n
     assert (never["unobserved"], never["seconds"], never["timings"]) == (
         True, 0.0, {"3.12:tests/test_never.py": 0.0})
     assert "unobserved" not in first and "unobserved" not in stuck
+    # The stall's record among this task's own artifacts (`stalls.kept`), never an enclosing task's.
+    [kept] = stuck["artifacts"]
+    assert (tmp_path / "artifacts" / kept).is_file()
 
 
 def test_a_pytest_that_never_began_runs_again_and_one_a_signal_ended_is_red_with_its_signal(ci, tmp_path):
