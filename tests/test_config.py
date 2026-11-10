@@ -470,7 +470,7 @@ def test_every_run_profiles_a_short_window_of_its_own_steps_kept_with_its_record
     holds the process's one profiling session, a run's own window yields where one naming its directory
     refuses (row 4112)."""
     import dew
-    from dew.config import local_records
+    from dew.config.trainer import local_records
     from dew.training import ProfileWindow
 
     def trained(name: str, **fields) -> Path:
