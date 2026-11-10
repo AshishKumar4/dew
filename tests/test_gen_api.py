@@ -144,7 +144,7 @@ def test_a_module_that_declares_all_needs_its_own_page(gen_api, documented):
 
 def test_a_module_listed_in_two_groups_is_refused(gen_api, tmp_path):
     """A module is one page in one group: a package listing one twice, in one group or two, is refused naming
-    it, as the page and the sidebar would carry it twice (review: `dew.kernels` sat twice among the Models)."""
+    it, as the page and the sidebar would carry it twice (review: `dew.kernels` was twice among Models)."""
     with pytest.raises(SystemExit, match=r"example\.twice"):
         gen_api.Package("example", tmp_path, "https://example.org/",
                         [("A", ["example", "example.twice"]), ("B", ["example.twice"])])
