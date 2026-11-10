@@ -58,9 +58,9 @@ def supported(case: dict[str, str]) -> bool:
 
 
 CASES = (
+    ('sm80', '128', '256', 'bfloat16'),
     ('sm90', '128', '256', 'float32'),
     ('sm90', '256', '512', 'bfloat16'),
-    ('sm80', '128', '256', 'bfloat16'),
     ('sm80', '256', '512', 'float32'),
     ('sm90', '128', '512', 'float32'),
     ('sm90', '256', '256', 'float32'),

@@ -238,22 +238,22 @@ def supported(case: dict[str, str]) -> bool:
 
 
 CASES = (
+    ('sm80', 'triton', 'grouped', 'n-major', 'row-scale', 'float16'),
     ('sm90', 'mosaic', 'dense', 'n-major', 'plain', 'bfloat16'),
-    ('sm90', 'triton', 'grouped', 'k-major', 'bias', 'float16'),
-    ('sm80', 'mosaic', 'dense', 'k-major', 'row-scale', 'float16'),
-    ('sm80', 'triton', 'grouped', 'n-major', 'row-scale', 'bfloat16'),
-    ('v5e', 'mosaic', 'grouped', 'k-major', 'paired', 'bfloat16'),
+    ('v5e', 'mosaic', 'grouped', 'k-major', 'bias', 'bfloat16'),
+    ('sm90', 'triton', 'dense', 'k-major', 'bias', 'float16'),
     ('sm90', 'cutlass', 'grouped', 'k-major', 'plain', 'bfloat16'),
-    ('v5e', 'mosaic', 'dense', 'n-major', 'bias', 'bfloat16'),
-    ('sm80', 'triton', 'dense', 'n-major', 'plain', 'float16'),
-    ('sm90', 'mosaic', 'grouped', 'n-major', 'paired', 'float16'),
+    ('sm80', 'mosaic', 'dense', 'k-major', 'row-scale', 'bfloat16'),
+    ('v5e', 'mosaic', 'dense', 'n-major', 'paired', 'bfloat16'),
+    ('sm90', 'mosaic', 'grouped', 'k-major', 'paired', 'float16'),
+    ('sm80', 'triton', 'dense', 'n-major', 'plain', 'bfloat16'),
+    ('sm80', 'mosaic', 'dense', 'n-major', 'bias', 'bfloat16'),
+    ('sm90', 'mosaic', 'dense', 'n-major', 'plain', 'float16'),
     ('sm90', 'mosaic', 'dense', 'n-major', 'row-scale', 'bfloat16'),
     ('sm90', 'cutlass', 'grouped', 'n-major', 'plain', 'bfloat16'),
-    ('sm80', 'mosaic', 'dense', 'n-major', 'bias', 'bfloat16'),
     ('sm80', 'mosaic', 'grouped', 'n-major', 'paired', 'bfloat16'),
     ('v5e', 'mosaic', 'dense', 'n-major', 'plain', 'bfloat16'),
     ('v5e', 'mosaic', 'dense', 'n-major', 'row-scale', 'bfloat16'),
-    ('v5e', 'mosaic', 'dense', 'n-major', 'paired', 'bfloat16'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("gemm")`, regenerated where the axes or the route's support change)."""
