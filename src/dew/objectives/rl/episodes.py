@@ -577,11 +577,7 @@ class EpisodeCollector:
             raise ValueError("inference must record raw and behavior likelihoods for every output slot")
         if ended.shape != lengths.shape or ended.dtype != np.bool_:
             raise ValueError("inference must record a boolean EOS termination flag")
-        count = int(lengths[row])
-        actions = tuple(int(value) for value in tokens[width:width + count])
-        return Draw(context, actions, tuple(float(value) for value in behavior[:count]),
-                    "stop" if bool(ended[row]) else "length", policy_step,
-                    tuple(float(value) for value in raw[:count])).checked(self.sampling)
+        return Draw.generated(context, generation, row, policy_step).checked(self.sampling)
 
     def _slots(self, tasks: np.ndarray, samples: int, snapshot: Snapshot,
                rank: int) -> list[EpisodeProgress]:
