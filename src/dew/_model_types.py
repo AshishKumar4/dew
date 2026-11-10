@@ -4,6 +4,7 @@ Vision translation reads these without importing the interop package, whose
 public entry point imports the vision classes itself.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 
@@ -47,10 +48,14 @@ WRAPPERS: dict[str, Wrapper] = {
 _PLAIN = Wrapper()
 
 
-def wrapper(model_type: object) -> Wrapper:
-    """The kind of wrapper `model_type`, a config's field as read, is (`WRAPPERS`), a plain one where it names
-    none."""
-    return next((kind for name, kind in WRAPPERS.items() if name == model_type), _PLAIN)
+def wrapper(model_type: str | None) -> Wrapper:
+    """The kind of wrapper `model_type` is (`WRAPPERS`), a plain one where it names none."""
+    return WRAPPERS.get(model_type or '', _PLAIN)
+
+
+def config_wrapper(config: Mapping[str, object]) -> Wrapper:
+    """The kind of wrapper a config's `model_type` names (`wrapper`), as the config holds it."""
+    return next((kind for name, kind in WRAPPERS.items() if name == config.get('model_type')), _PLAIN)
 
 SANDWICH_NORMS = {
     'input_layernorm': 'input_layernorm',

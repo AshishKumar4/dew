@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import _records
-from dew._model_types import WRAPPERS, wrapper
+from dew._model_types import WRAPPERS, config_wrapper
 from dew._records import JSON
 from dew.batch import POSITIONS_FIELD, VALIDITY_FIELD
 from dew.interop.sources import SourceReference
@@ -548,7 +548,7 @@ class Processor:
         token_fields = {POSITIONS_FIELD: jnp.asarray(positions)}
         if not valid.all():
             token_fields[VALIDITY_FIELD] = jnp.asarray(valid)
-        kind = wrapper(self.config.get("model_type"))
+        kind = config_wrapper(self.config)
         if kind.gemma4:
             for pixels, coordinates in (("pixel_values", "image_position_ids"),
                                          ("pixel_values_videos", "video_position_ids")):
@@ -579,7 +579,7 @@ class Processor:
                                  f"({', '.join(videos)}), not {self.config.get('model_type')}'s")
             image_fields, conditioning = self._images(values, tokens)
             token_fields.update(image_fields)
-            if wrapper(self.config.get("model_type")).qwen35:
+            if config_wrapper(self.config).qwen35:
                 token_fields["rotary_positions"] = self._image_rotary_positions(
                     tokens, valid, image_fields["image_groups"], conditioning["image_grid_thw"])
         if ("input_features" in values) != ("input_features_mask" in values):
@@ -617,7 +617,7 @@ class Processor:
         Glimmer's packed patch runs, a per-patch position stream, and a fixed
         tokens-per-image grid.
         """
-        kind = wrapper(self.config.get("model_type"))
+        kind = config_wrapper(self.config)
         qwen, packed, gemma = kind.qwen35, kind.packed_media, kind.gemma4
         image_id, video_id = _media_token_ids(self.record)
         pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))

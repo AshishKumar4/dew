@@ -39,7 +39,7 @@ import numpy as np
 
 from dew import _records
 from dew._files import write_atomically
-from dew._model_types import WRAPPERS, wrapper
+from dew._model_types import WRAPPERS, config_wrapper, wrapper
 from dew.batch import Variables
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_families import ENTRIES
@@ -286,7 +286,7 @@ def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
         # Transformers ties by the wrapper config's own field (modeling_utils' tie_weights reads
         # `getattr(config, "tie_word_embeddings", False)`), which Qwen 3.5's and Muse Glimmer's
         # configs leave unset.
-        default_tied = wrapper(hf_config.get("model_type")).head_tied_by_default
+        default_tied = config_wrapper(hf_config).head_tied_by_default
         tied = hf_config.get("tie_word_embeddings", default_tied)
         if tied is not None and not isinstance(tied, bool):
             refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
