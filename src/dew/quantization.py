@@ -736,18 +736,33 @@ def fp8_input_qdq(x: jax.Array, spec: InputQuantizer) -> jax.Array:
     the scale's last bits to the author's fake quantizer. Backward is Dew's STE.
     """
     qwix = _qwix()
-    values = jax.lax.stop_gradient(x).astype(jnp.float32)
-    amax = jnp.asarray(spec.scale, jnp.float32) * jnp.float32(448)
-    safe = jnp.where(amax <= jnp.float32(2 ** -24), 1, amax)
+    # In float32 at least, x's own width where wider (a float64 truth's): each value the format defines (the
+    # scale's arithmetic over the stored float32 scale, the dequantized product) declared float32 by a
+    # cast pair, the reference's own float32 result bit for bit (one sum, product or quotient of float32
+    # values rounds once to float32 from float64 as it does in float32); a no-op at float32.
+    wide = jnp.promote_types(x.dtype, jnp.float32)
+
+    def declared(value):
+        return value.astype(jnp.float32).astype(wide)
+
+    def reciprocal(value):
+        # Correctly rounded in float32 on every backend (`correctly_rounded_divide`); a wider division
+        # declared float32 rounds alike.
+        return (correctly_rounded_divide(jnp.float32(1), value) if wide == jnp.float32
+                else declared(jnp.asarray(1, wide) / value))
+
+    values = jax.lax.stop_gradient(x).astype(wide)
+    amax = declared(jnp.asarray(spec.scale, jnp.float32).astype(wide) * 448)
+    safe = jnp.where(amax <= 2 ** -24, jnp.asarray(1, wide), amax)
     # torch's scalar/tensor reverse divide is reciprocal then multiply.
-    multiplier = correctly_rounded_divide(jnp.float32(1), safe) * jnp.float32(448)
-    scale = correctly_rounded_divide(jnp.float32(1), multiplier)
+    multiplier = declared(reciprocal(safe) * 448)
+    scale = reciprocal(multiplier)
     # The composed GPU forward must round this product before the FP8 cast.
     quotients = jax.lax.optimization_barrier(values * multiplier)
     broadcast_shape = (1,) * values.ndim
     quantized = _cast(qwix, quotients, jnp.float8_e4m3fn)
     quantized = quantized.replace(scale=scale.reshape(broadcast_shape))
-    rounded = qwix.dequantize(quantized)
+    rounded = declared(qwix.dequantize(quantized))
     return straight_through(x, rounded)
 
 
