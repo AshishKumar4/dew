@@ -520,16 +520,16 @@ def test_the_servers_compiles_are_measured_cold_in_every_arm_and_round(gate, tmp
 
 
 @pytest.mark.parametrize(("kind", "gib"), [("h100", 80), ("gh200", 96)])
-def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round_and_refuses_a_substituted_program(
-        gate, tmp_path, monkeypatch, kind, gib):
+def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round(gate, tmp_path, monkeypatch, kind, gib):
     """`compile` plans and compiles each of a kind's steps ahead of its run for one compile-only GPU of the
     kind's generation and memory (Hopper's as an H100 or the GH200 dew-ops measures Hopper on), its
     attention XLA's in every arm and named so in the row (ledger 4616: the GPU's attention route lowers on
     no compile-only GPU), in each tree's environment of the lock the GPU run used, three arms a round in an
     order kept, every sample a process of its own with an empty compile cache: a head whose
-    planning takes half as long again regresses past COMPILE_FLOOR, and a step whose program substituted a
-    kernel is unsupported, failing the gate as the gate's own; each sample's selected plan is kept. A step
-    sized for another device is not compiled for this kind."""
+    planning takes half as long again regresses past COMPILE_FLOOR, and a step whose compile is refused (a
+    kernel this host cannot lower, `selection.Unlowerable`) is a round not run, failing the gate as the
+    gate's own; each sample's selected plan is kept. A step sized for another device is not compiled for
+    this kind."""
     from types import SimpleNamespace
 
     built, _ = standing_in_environments(gate, monkeypatch)
@@ -541,13 +541,15 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round_and_refuses_a_
             return building(command, **kwargs)
         case, cache = json.loads(command[2]), Path(kwargs["env"]["JAX_COMPILATION_CACHE_DIR"])
         compiled.append((Path(kwargs["cwd"]).name, command[3:], cache, cache.exists()))
-        substituted = ["attention: flash ran as xla at site"] if case["config"] == gate.LM_MOE else []
+        if case["config"] == gate.LM_MOE:
+            refused = "Unlowerable: attention kernel 'flash' does not lower on this host"
+            return subprocess.CompletedProcess(command, 1, "", refused)
         head = Path(kwargs["cwd"]).name == "head"
         # Each field the compile names (its last argument), its own JSON value: the head tiles its LM head and
         # remats by a structured policy.
         plan = {"split": 1, "rows": 4, "remat": {"policy": "dots_saveable"} if head else None,
                 "head_tile": [1024, 2] if head else None}
-        printed = json.dumps({"seconds": 48.0 if head else 32.0, "substituted": substituted,
+        printed = json.dumps({"seconds": 48.0 if head else 32.0,
                               "plan": {key: plan.get(key) for key in command[-1].split(",")}})
         return subprocess.CompletedProcess(command, 0, f"compiling\n{printed}\n", "")
 
@@ -573,7 +575,7 @@ def test_compile_plans_each_step_ahead_cold_in_each_arm_and_round_and_refuses_a_
     verdicts = tmp_path / "verdicts.json"
     assert gate.report(SimpleNamespace(results=out, table=None, claim=False, verdicts=str(verdicts))) == 1
     judged = json.loads(verdicts.read_text())["rows"]
-    assert {name: row["state"] for name, row in judged.items()} == {dense: "regressed", moe: "unsupported"}
+    assert {name: row["state"] for name, row in judged.items()} == {dense: "regressed", moe: "incomplete"}
     # Each arm's selected configurations beside the verdict, structured values kept: why its planning moved.
     tiled = {"split": 1, "rows": 4, "remat": {"policy": "dots_saveable"}, "head_tile": [1024, 2],
              "head_fused": None, "xla_defaults": None, "narrow": None}
@@ -600,10 +602,8 @@ def test_a_step_compiled_ahead_for_an_absent_gpu_is_a_sample_of_its_planners_sec
     """The compile ahead's own process (`COMPILED`), run as `compile` runs it, outside the suite's settings as
     a node's prepare runs it: a decoder's step planned and compiled for one compile-only sm90 GPU of a stated
     memory, here with no GPU attached, with the gate's XLA attention (`AHEAD_ATTENTION`, which lowers here:
-    ledger 4616): its planner's seconds are its sample, nothing substituted, and every selected field of its
-    plan keeps its own value. A substitution comes only from a route Dew derives (a kernel named outright is
-    refused on a host with no GPU), so the gate's reading of one is tested at the process boundary
-    (`compile`'s test), never by asserting the route."""
+    ledger 4616): its planner's seconds are its sample, and every selected field of its plan keeps its own
+    value."""
     import os
 
     from lane_environment import outside_suite
@@ -611,7 +611,7 @@ def test_a_step_compiled_ahead_for_an_absent_gpu_is_a_sample_of_its_planners_sec
     script = gate._script(tmp_path / "compiled.json", gate.COMPILED)
     environ = {**outside_suite(os.environ), "PYTHONPATH": f"{ROOT / 'src'}:{ROOT / 'tools'}"}
 
-    def compiled(attention: str) -> tuple[float | str, dict]:
+    def compiled(attention: str) -> tuple[float, dict]:
         argv = [str(script), json.dumps(TINY), "sm90", str(1 << 30), attention, ",".join(gate.SELECTED)]
         done = subprocess.run([sys.executable, *argv], cwd=ROOT, env=environ, capture_output=True, text=True,
                               timeout=900, check=False)

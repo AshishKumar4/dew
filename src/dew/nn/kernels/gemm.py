@@ -1391,7 +1391,7 @@ def _launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: Precisio
     else:
         for route in decided[1]:
             generation.route(route.choice, kernel=route.kernel, preferred=route.preferred,
-                             refusal=route.refusal, ran=route.ran, forced=route.forced)
+                             refusal=route.refusal, forced=route.forced)
     return decided[0]
 
 

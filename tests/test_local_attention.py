@@ -251,7 +251,7 @@ def test_a_chosen_reference_kernel_runs_a_window_band_on_the_reference_path(monk
                          for seed in range(3))
     with chosen(attention="reference"), generation.routes() as found:
         jax.jit(lambda q, k, v: local_attention(q, k, v, window=8)).trace(query, key, value)
-    ran = {route.ran for route in found if route.choice == "attention"}
+    ran = {route.kernel for route in found if route.choice == "attention"}
     assert ran == {"reference"}, ran
 
 

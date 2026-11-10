@@ -69,7 +69,7 @@ PASSING = ("level", "faster", "different, below floor")
 """The states that pass a row and move a runner's baseline on: no change past its floor, judged."""
 FAILING = ("regressed", "broken")
 """The states that fail a head: a change past its floor for the worse, or a row the head cannot run."""
-UNQUALIFIED = ("incomplete", "partial", "unjudged", "unsupported")
+UNQUALIFIED = ("incomplete", "partial", "unjudged")
 """The states that judge nothing and fail the gate: the gate's own (Platform's), never a head's."""
 
 # FLUX.2 and Wan 2.1 1.3B at their head width over a few of their blocks: the
@@ -512,9 +512,6 @@ AHEAD_ATTENTION = "xla"
 custom call, the template) lowers on no compile-only GPU (ledger 4616), so each offline row is the step's
 compile with XLA's attention in place of its attention kernel, the same in every arm and named so in the
 row (`compile_battery`), until that route lowers without a device (Main, 2026-11-06)."""
-UNSUPPORTED = "unsupported: "
-"""A compile's sample whose program is not the target's: a kernel this host cannot lower ran as another
-(`AheadOfTime.substituted`), so the row is not judged (`verdict`)."""
 COMPILED = """
 import json, sys
 from benchmark_cases import Case
@@ -522,26 +519,22 @@ from benchmark_models import ahead_of
 case = Case(**json.loads(sys.argv[1]))
 generation, capacity, attention = sys.argv[2], int(sys.argv[3]), sys.argv[4]
 ahead = ahead_of(case, generation, capacity, attention)
-print(json.dumps({"seconds": ahead.planned_seconds, "substituted": list(ahead.substituted),
+print(json.dumps({"seconds": ahead.planned_seconds,
                   "plan": {key: (ahead.plan or {}).get(key) for key in sys.argv[5].split(",")}}))
 """
 """A step's planning and compile ahead of its run, for compile-only GPUs of a generation (`compile`): the
-seconds the planner took, its derivations and every compile (`AheadOfTime.planned_seconds`), the kernels it
-lowered in place of the target's, and the configuration it selected (`SELECTED`), a diagnostic beside the
-row."""
+seconds the planner took, its derivations and every compile (`AheadOfTime.planned_seconds`), and the
+configuration it selected (`SELECTED`), a diagnostic beside the row."""
 SELECTED = ("split", "rows", "remat", "head_tile", "head_fused", "xla_defaults", "narrow")
 """The fields of a compiled plan that name the configuration its planner selected (dew.training.planning's
 admitted record), kept with their own values beside each compile's seconds: a head that plans otherwise shows
 it."""
 
 
-def compiled_sample(printed: str) -> tuple[float | str, dict]:
-    """A compile ahead's printed result (`COMPILED`) as a row's sample and its plan: the planner's seconds,
-    or, where it lowered a kernel in place of the target's, why the row is unsupported (`verdict`)."""
+def compiled_sample(printed: str) -> tuple[float, dict]:
+    """A compile ahead's printed result (`COMPILED`) as a row's sample and its plan: the planner's seconds."""
     compiled = json.loads(printed.strip().splitlines()[-1])
-    substituted = compiled["substituted"]
-    sample = f"{UNSUPPORTED}{'; '.join(substituted)}" if substituted else float(compiled["seconds"])
-    return sample, compiled["plan"]
+    return float(compiled["seconds"]), compiled["plan"]
 
 
 def ahead_battery(args: argparse.Namespace) -> int:
@@ -577,9 +570,9 @@ def compile_battery(args: argparse.Namespace) -> int:
     every arm's every round a process of its own with an empty compile cache: each sample a cold plan and
     compile, which the GPU's rounds load from their caches. Each tree compiles in the environment of
     `--lock`, the lock of the GPU run it stands beside (its `lock`), whose compiler the GPU run's programs
-    come from. A sample whose program substituted a kernel is unsupported; each sample's selected plan is
-    kept (`plans`), so a head that plans otherwise shows it beside its time, which is judged all the same:
-    the planner's own work is what a run spends."""
+    come from. A step holding a kernel this host cannot lower is refused at its compile, a round it did not
+    run; each sample's selected plan is kept (`plans`), so a head that plans otherwise shows it beside its
+    time, which is judged all the same: the planner's own work is what a run spends."""
     if "xla_gpu_autotune_level" in os.environ.get("XLA_FLAGS", ""):
         raise SystemExit("compile: XLA_FLAGS sets the autotuning level, which planning ahead keeps off; a "
                          "gate compiles as a run does with no GPU attached, so unset it")
@@ -680,9 +673,6 @@ def verdict(row: Row, base: list, head: list, alone: list) -> tuple[str, dict]:
     if row.hardware and any(isinstance(x, str) and x.startswith("not measured on this hardware")
                             for x in [*base, *head, *alone]):
         return "not measured on this hardware", {}
-    if unsupported := next((x for x in [*base, *head, *alone] if isinstance(x, str)
-                            and x.startswith(UNSUPPORTED)), None):
-        return "unsupported", {"why": unsupported}
     if not any(measured(x) for x in base) and not any(measured(x) for x in head):
         return "incomplete", {}
     if not any(measured(x) for x in base):

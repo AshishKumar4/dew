@@ -926,7 +926,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         segment_ids=segment_ids, max_segments=max_segments, key_value_seq_lengths=lengths,
         key_value_seq_starts=starts, block_groups=block_groups, image_groups=image_groups,
         key_valid=key_valid, key_runs=key_runs, places=places, dropout=dropout_seed is not None,
-        dropout_places=dropout_places, wide_logits=wide_logits).ran
+        dropout_places=dropout_places, wide_logits=wide_logits).kernel
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
@@ -1027,8 +1027,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     softcap and packed segment ids itself, flash takes the ids as its packed sequences given
     `max_segments`, and the template reads the ids (`CrossDocuments` included) as its spans;
     elsewhere segment ids become the document mask, and sinks and a softcap run
-    `reference_attention`, since `jax.nn.dot_product_attention` has neither (a fused route this
-    host runs as xla included, `_hosted`). The rest goes to `_fused_attention`. Key lengths reach
+    `reference_attention`, since `jax.nn.dot_product_attention` has neither. The rest goes to
+    `_fused_attention`. Key lengths reach
     cudnn, xla and the template as they are and every other path as the mask they mean, which
     splash cannot describe, so 'auto' never picks 'tpu' for them. Key starts reach the decode
     kernel and the template as they are and every other path as the mask they mean. Block and image
@@ -1181,16 +1181,15 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
                            image_groups=None, key_valid=None, key_runs=None, places=None,
                            dropout: bool = False, dropout_places: template.DropPlaces | None = None,
                            wide_logits: bool = False) -> Route:
-    """The route an `AttentionImpl` takes for this call on this host (`Route.ran` its kernel,
-    `Route.forced` what forced it), as the attention selector
+    """The route an `AttentionImpl` takes for this call (`Route.kernel`, `Route.forced` what forced it),
+    as the attention selector
     reports it (`select`, over `attention_case`): 'auto' takes the kernel the target's row measured
     fastest for the call where it takes it, else the first that does; a named kernel is forced, and
     raises where it does not take the call (xla handing what it cannot honour to the reference path).
     A call of few positions over key lengths is the decode selector's (`DECODE`), whose decode kernel
     runs as 'decode' (`_fused_attention`); a named xla lowers it there too, as jax.nn's own lowering
-    of a decode step, unless `generation.chosen(decode='xla')` names the folded attention. What runs
-    is what this host runs (`_hosted`): xla for a CUDA kernel a step traced for an assumed GPU on a
-    CPU reports."""
+    of a decode step, unless `generation.chosen(decode='xla')` names the folded attention. A kernel this
+    host cannot lower for an assumed GPU raises (`selection.Unlowerable`)."""
     attention_implementation(implementation)
     case = attention_case(query, key, dtype=dtype, precision=precision,
                           force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
@@ -1292,5 +1291,4 @@ def _masked_kernel(implementation: AttentionImpl, named: str | None, query, key,
                        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap,
                        sinks=True if sinks else None, wide_logits=wide_logits, named=implementation),
         folds=False, **form)
-    return attention_implementation(ATTENTION.hosted(selected(ATTENTION, case, named,
-                                                              preference=preference).name))
+    return attention_implementation(selected(ATTENTION, case, named, preference=preference).name)

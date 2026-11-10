@@ -76,6 +76,7 @@ from dew._pool import joins_pool
 from dew.clusters import detected_environment
 from dew.nn.attention import AttentionImpl
 from dew.nn.flops import MissingFlopsCount
+from dew.nn.kernels.selection import Unlowerable
 from dew.registry import models
 from dew.telemetry.benchmark import carried
 from dew.telemetry.profile import Profiler
@@ -221,8 +222,8 @@ class BenchmarkConfig:
     compile_ahead: str | None = None
     """Compile each case's step ahead of its run into this directory, for one compile-only GPU of
     `generation` holding `capacity_gib` (`benchmark_models.ahead_of`), and measure nothing: a GPU node's
-    prepare, on its CPU, for its run's `ahead`. A step that substituted a kernel this host cannot lower
-    is not saved: it is not the GPU's program."""
+    prepare, on its CPU, for its run's `ahead`. A step holding a kernel this host cannot lower is refused
+    (`selection.Unlowerable`), so none is saved and the run compiles its own on the GPU."""
     generation: str | None = None
     """The CUDA generation `compile_ahead` compiles for (sm80, sm90)."""
     capacity_gib: int | None = None
@@ -598,14 +599,12 @@ def main(config: BenchmarkConfig) -> list[Row]:
             raise SystemExit("--compile-ahead names the GPU it compiles for: --generation and --capacity-gib")
         Path(config.compile_ahead).mkdir(parents=True, exist_ok=True)
         for case in build_cases(config):
-            ahead = ahead_of(case, config.generation, config.capacity_gib << 30, config.attention_impl)
-            # A step a kernel this host cannot lower ran in (`AheadOfTime.substituted`) is not the GPU's
-            # program: none is saved, and the run compiles its own on the GPU.
-            if ahead.substituted:
-                print(f"{ahead_name(case)} ({case.architecture}): not compiled ahead, as "
-                      f"{'; '.join(ahead.substituted)}", flush=True)
-            else:
-                ahead.save(Path(config.compile_ahead) / ahead_name(case))
+            try:
+                ahead = ahead_of(case, config.generation, config.capacity_gib << 30, config.attention_impl)
+            except Unlowerable as refused:
+                print(f"{ahead_name(case)} ({case.architecture}): not compiled ahead: {refused}", flush=True)
+                continue
+            ahead.save(Path(config.compile_ahead) / ahead_name(case))
         return []
     if not config.peak_run and not jax.config.jax_compilation_cache_dir:
         # Run alone, a step's compile seconds are a cold compile's, which no cached executable stands in for.

@@ -13,13 +13,12 @@ own compile of the lowered step, and Triton's of each kernel, still need the
 GPU.
 
 A choice keyed on the platform reads `generation.backend()`, the assumed
-generation's platform, and takes the GPU's path here. Two read
-`generation.gpu_placed()`, this process's own GPU, which an assumed one never
-is, so the dry run cannot see their GPU path: attention's cuDNN and
-FlashAttention calls (`attention_kernels._hosted`), CUDA kernels and not Pallas ones,
-whose trace asks the CUDA plugin for versions and libraries a CPU host lacks
-and whose lowering asks for devices an abstract mesh lacks, even on a GPU
-host, so attention traces its XLA path.
+generation's platform, and takes the GPU's path here. Attention's cuDNN and
+FlashAttention calls are CUDA libraries, not Pallas kernels: their trace asks
+this host for the library (cuDNN's, the FlashAttention wheel's code for the
+target), and a host without it refuses the step (`selection.Unlowerable`,
+`attention_kernels._unlowered`) rather than lowering another kernel in their
+place, which would not be the GPU's program.
 """
 
 from __future__ import annotations
