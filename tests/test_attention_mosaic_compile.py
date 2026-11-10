@@ -4,7 +4,6 @@ CUDA backend for a compile-only A100 and H100 on the CPU (tests/kernel_compile.p
 registers as its model states them and spill-free; and an A100's launches counting the shared memory their
 lowering asks for. The mainloop's values are tests/test_attention_mosaic.py's."""
 
-import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -14,13 +13,7 @@ from test_attention_mosaic import BACKWARD_HOOKS, SHAPES, _check_backward, _resi
 from test_attention_triton import SCORE_HOOKS, score_hooks
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import (
-    attention as template,
-    attention_mosaic,
-    attention_mosaic_program,
-    bundles,
-    resources,
-)
+from dew.nn.kernels.templates import attention as template, attention_mosaic, bundles
 
 pytestmark = pytest.mark.kernel
 
@@ -191,7 +184,6 @@ def test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block(acc
     consumer's tile (`_relay_tiles`): the fast form's logits' queries staged a step, the accurate form's sums
     in two column halves, within the A100's block as its model sizes it, spilling nothing, every launch's
     model ptxas's, lowered and compiled for an sm80 on this CPU."""
-    import kernel_compile
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -199,41 +191,15 @@ def test_an_a100_backward_256_wide_compiles_on_32_row_tiles_within_its_block(acc
     with generation.assumed("sm80"):
         target = generation.gpu_target()
         assert op.staged_bytes(ba, config, target) <= target.shared_limit
-        models = _backward_models(op, ba, config)
-        found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config), models)],
-                                       "sm80")
+        found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config))], "sm80")
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-    assert set(models) <= kernel_compile.compiled_kernels(found[0]), (set(models), found[0].get("kernels"))
+    assert not _unmodelled(found[0])
 
 
-def _forward_kernels(op, ba, config) -> dict:
-    """The forward's register model by each name a launch of it takes (`attention_mosaic_forward._launch`:
-    `attention_{forward, training, peaks}`, then `_natural`, `_scaled`, `_kept`, `_columns{width}` and
-    `_split` where it is so), each the op's (`MosaicForward.registers`) at its config: a scaled launch's the
-    scaled op's at the config it derives (`MosaicForward.scaled`, its own registers and shared memory), a
-    cache's walk's its own (`MosaicForward.cached`, scaled in its kernel), a peak walk's its own, a natural
-    launch's at its own tiles (`Tiles.relaunch`), a launch over a block of the values' columns at that
-    block's width."""
-    if op.scales_in_kernel(ba):
-        # A cache's walk scales in its own kernel at its own config (`MosaicForward.cached`).
-        variants = (("_scaled", op, config),)
-    else:
-        scaled_op = dataclasses.replace(op, scaled=True)
-        variants = (("", op, config), ("_scaled", scaled_op, scaled_op.derived(ba, generation.gpu_target())))
-    found = {}
-    for scaled, of, at in variants:
-        if at is None:
-            continue
-        family = attention_mosaic_program.bundle_of(at, jnp.bfloat16)
-        for natural, tiles in (("", at), ("_natural", at.relaunch)):
-            for kind in ("forward", "training", "peaks"):
-                for columns in (None, 16, 32, 64, 128, 256):
-                    registers = of.registers(ba, tiles, peaks=kind == "peaks", columns=columns)
-                    model = resources.register_model(family, tiles.consumers, registers)
-                    named = "" if columns is None else f"_columns{columns}"
-                    found.update({f"attention_{kind}{natural}{scaled}{kept}{named}{split}": model
-                                  for kept in ("", "_kept") for split in ("", "_split")})
-    return found
+def _unmodelled(record: dict) -> list[str]:
+    """The kernels `record` compiled whose launch stated no register model as it lowered
+    (`report.Launch.kernels`, `Family.kernel`'s `registers`), which the gate compares with none."""
+    return [row["case_id"] for row in record.get("evidence", ()) if row.get("kind") == "unmodelled"]
 
 
 DECODE_GATE = [(generation_name, width, stored) for generation_name in GATED for width in (64, 128)
@@ -271,20 +237,9 @@ def test_a_decode_step_compiles_spill_free_at_its_plans_tiles(generation_name, w
 
     operands = (query, key, key, *((scale, scale) if quantized else ()))
     with generation.assumed(generation_name):
-        # The plan's op over the packed rows, its launches' models (`_forward_kernels`).
-        zeros = [jnp.zeros(array.shape, array.dtype) for array in operands]
-        scales = tuple(zeros[3:]) or None
-        rows, row_spans, _ = attention_decode.packed(zeros[0], spans, key.shape[2])
-        op, args = attention_mosaic._forward_call(rows, *zeros[1:3], row_spans, None, scale=None,
-                                                  natural=False, out_dtype=jnp.float32, masked=True,
-                                                  scales=scales)
-        ba = op.bind(*args, residuals=template.Kept.OUTPUT, interpret=False)
-        config = attention_decode.plan(rows, *zeros[1:3], row_spans, None, scale=None,
-                                       target=generation.gpu_target(), scales=scales).config
-        found = compile_mosaic_kernels(
-            [KernelCase("decode", lambda: (decode, operands), _forward_kernels(op, ba, config))],
-            generation_name)
+        found = compile_mosaic_kernels([KernelCase("decode", lambda: (decode, operands))], generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    assert not _unmodelled(found[0])
 
 
 @COMPILES_ON_CPU
@@ -314,19 +269,10 @@ def test_a_paged_decode_step_compiles_spill_free_at_its_plans_tiles(generation_n
         return attention_decode.attend(query, key, value, spans, table=table)
 
     with generation.assumed(generation_name):
-        # The plan's op over the packed rows, its launches' models (`_forward_kernels`).
-        zeros = [jnp.zeros(array.shape, array.dtype) for array in (query, pool, table)]
-        rows_of, row_spans, _ = attention_decode.packed(zeros[0], spans, pool.shape[0])
-        op, args = attention_mosaic._forward_call(rows_of, zeros[1], zeros[1], row_spans, None, scale=None,
-                                                  natural=False, out_dtype=jnp.float32, masked=True,
-                                                  table=zeros[2])
-        ba = op.bind(*args, residuals=template.Kept.OUTPUT, interpret=False)
-        config = attention_decode.plan(rows_of, zeros[1], zeros[1], row_spans, None, scale=None,
-                                       target=generation.gpu_target(), table=zeros[2]).config
-        case = KernelCase("paged decode", lambda: (decode, (query, pool, pool, table)),
-                          _forward_kernels(op, ba, config))
+        case = KernelCase("paged decode", lambda: (decode, (query, pool, pool, table)))
         found = compile_mosaic_kernels([case], generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    assert not _unmodelled(found[0])
 
 
 @COMPILES_ON_CPU
@@ -356,10 +302,10 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
         ba = op.bind(*args, residuals=training, interpret=False)
         config = op.derived(ba, generation.gpu_target())
         assert config is not None, f"the Mosaic forward derives no config {width} wide"
-        found = compile_mosaic_kernels(
-            [KernelCase("forward", lambda: (forward, (query, key, key)), _forward_kernels(op, ba, config))],
-            generation_name)
+        found = compile_mosaic_kernels([KernelCase("forward", lambda: (forward, (query, key, key)))],
+                                       generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    assert not _unmodelled(found[0])
 
 
 @COMPILES_ON_CPU
@@ -387,10 +333,10 @@ def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_nam
         ba = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
         config = op.derived(ba, generation.gpu_target())
         assert config is not None, f"the Mosaic forward derives no fp32 config {width} wide"
-        found = compile_mosaic_kernels(
-            [KernelCase("forward", lambda: (forward, (query, key, key)), _forward_kernels(op, ba, config))],
-            generation_name)
+        found = compile_mosaic_kernels([KernelCase("forward", lambda: (forward, (query, key, key)))],
+                                       generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    assert not _unmodelled(found[0])
 
 
 @INTERPRETS
@@ -443,7 +389,6 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
     (tests/kernel_compile.py): every launch within its shared memory, spilling nothing, and its register
     model's decision ptxas's (`mosaic_failures`, each launch's model `resources.register_model` at its own
     layout and consumers, `MosaicBackward._launch_registers`)."""
-    import kernel_compile
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
@@ -460,39 +405,17 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
                                           accurate=accurate)
         return grads.query, grads.key, grads.value
 
-    op, ba, config = _gated_backward(generation_name, width, accurate, hooks)
+    config = _gated_backward(generation_name, width, accurate, hooks)[2]
     if config is None and accurate and hooks != "none":
         pytest.skip(f"the accurate form under {hooks} derives no tile {width} wide on {generation_name}: "
                     "its registers hold none, and the Pallas-Triton mainloop takes the call")
     assert config is not None, f"the Mosaic backward derives no config {width} wide on {generation_name}"
     with generation.assumed(generation_name):
-        models = _backward_models(op, ba, config)
         shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)
         found = compile_mosaic_kernels(
-            [KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)), models)],
-            generation_name)
+            [KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)))], generation_name)
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
-    # Every launch's model names a kernel it compiled: a launch renamed past its model is compared with none.
-    assert set(models) <= kernel_compile.compiled_kernels(found[0]), (set(models), found[0].get("kernels"))
-
-
-def _backward_models(op, ba, config) -> dict:
-    """Each backward launch's register model by its kernel's name (`attention_dq`, `attention_dkv`, a width
-    share's `_columnsN`, the one launch's `attention_dkv_fused`, or `attention_dkv_shared` over shared
-    keys), at its own layout and consumers (`BackwardTiles.dkv`)."""
-    dq, dkv = op._launch_registers(ba, config)
-    if config.fused:
-        family = attention_mosaic_program.bundle_of(config, jnp.bfloat16)
-        name = "attention_dkv_shared" if config.shared_keys else "attention_dkv_fused"
-        return {name: resources.register_model(family, config.consumers, dkv)}
-    models = {}
-    for kind, tiles, registers in (("dq", config, dq), ("dkv", config.dkv, dkv)):
-        family = attention_mosaic_program.bundle_of(tiles, jnp.bfloat16)
-        model = resources.register_model(family, tiles.consumers, registers)
-        names = ([f"attention_{kind}"] if config.columns == 1
-                 else [f"attention_{kind}_columns{share}" for share in range(config.columns)])
-        models.update(dict.fromkeys(names, model))
-    return models
+    assert not _unmodelled(found[0])
 
 
 @COMPILES_ON_CPU
@@ -507,6 +430,6 @@ def test_an_fp16_backward_compiles_spill_free_as_its_model_decides(width):
 
     op, ba, config = _gated_backward("sm90", width, accurate=False, dtype=jnp.float16)
     with generation.assumed("sm90"):
-        found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config),
-                                                   _backward_models(op, ba, config))], "sm90")
+        found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, config))], "sm90")
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+    assert not _unmodelled(found[0])

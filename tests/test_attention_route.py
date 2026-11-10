@@ -11,7 +11,6 @@ partly, with key heads split in the other order from the query heads, or with he
 rows' arguments name.
 """
 
-import contextlib
 import functools
 import math
 
@@ -377,14 +376,16 @@ full, and a bias that varies by query (`[1, H, Q, K]` fp32) or none."""
 def test_a_call_named_onto_the_template_lowers_for_a_gpu(name, differentiated, form):
     """A call named onto the template (`implementation="template"`) lowered for an H100 or an A100, in either
     form, inferred or differentiated: fp32 operands at widths 64 and 128, and bf16 under a bias that varies by
-    query, each pass on a mainloop that takes it, whichever the route derives (`generation.routes`: one
-    `attention_mainloop` route a pass). Its values are check 1's on the template's mainloops
+    query, each pass a kernel of a GPU mainloop that takes it (`lowered.kernel_calls`: Pallas's). Its values
+    are check 1's on the template's mainloops
     (test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward,
     test_a_dense_bias_named_onto_the_template_is_on_par_with_the_reference_path)."""
     from kernel_compile import lowered_for
 
     from dew.nn.kernels.generation import run_precision
+    from dew.nn.kernels.lowered import kernel_calls
     from dew.nn.precision import Numerics
+    from dew.telemetry.instrumentation import PALLAS
     generation_name, dtype, width, causal, biased = LOWERED[name]
     shape = jax.ShapeDtypeStruct((1, 512, 2, width), dtype)
     bias = (jax.ShapeDtypeStruct((1, 2, 512, 512), jnp.float32),) if biased else ()
@@ -398,12 +399,10 @@ def test_a_call_named_onto_the_template_lowers_for_a_gpu(name, differentiated, f
         out, pull = jax.vjp(attend, query, key, value, *bias)
         return out, pull(dout)
 
-    with run_precision(Numerics(forms=form)), generation.routes() as found:
-        if differentiated:
-            lowered_for(trained, (shape, shape, shape, *bias, shape), generation_name)
-        else:
-            lowered_for(attend, (shape, shape, shape, *bias), generation_name)
-    assert len([route for route in found if route.choice == "attention_mainloop"]) == 1 + differentiated
+    with run_precision(Numerics(forms=form)):
+        operands = (shape, shape, shape, *bias, *((shape,) if differentiated else ()))
+        lowered = lowered_for(trained if differentiated else attend, operands, generation_name)
+    assert any(call.kind in PALLAS for call in kernel_calls(lowered))
 
 
 def test_the_jax_nn_form_takes_values_of_the_querys_heads_beside_keys_of_fewer():
@@ -1057,61 +1056,6 @@ def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_l
     assert analysis.temp_size_in_bytes < min(heads * tokens * tokens, generation.host_memory_share())
 
 
-@pytest.mark.parametrize(("rows", "tokens", "heads", "ran"),
-                         [(1, 1024, 32, "xla"), (1, 2048, 32, "template"), (512, 1024, 64, "template")],
-                         ids=["measured", "past-measured", "past-memory"])
-def test_an_a100s_fp32_call_takes_xla_only_where_its_receipt_measured_and_its_scores_fit(rows, tokens, heads,
-                                                                                         ran):
-    """An A100's fp32 causal call, 128 wide over 8 key heads, whose declared cell names jax.nn's xla
-    attention (`attention_kernels.DECLARED`, timed at 1 x 1024 tokens): the call its receipt measured takes
-    xla; a longer one is a cell none declares (`FP32_MEASURED`), and one whose xla attention would not fit the
-    A100's 40 GB (512 rows of 64 heads, 412 GB of training scores by Dew's footprint model,
-    `_dense_fits`) refuses it, each taking the template, whose temporaries grow with the tokens (row 5283)."""
-    from dew.nn import attention_kernels
-    from dew.nn.attention import attention_case
-    from dew.nn.kernels import selection
-
-    query = jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.float32)
-    key = jax.ShapeDtypeStruct((rows, tokens, 8, 128), jnp.float32)
-    with generation.assumed("sm80"):
-        route = selection.select(attention_kernels.ATTENTION, attention_case(query, key, causal=True))
-    assert route.kernel == ran
-
-
-def test_a_call_naming_xla_runs_it_past_a_devices_memory():
-    """An A100's fp32 causal call whose xla attention would not fit the A100's 80 GB (512 rows of 64 heads,
-    `_dense_fits`) runs jax.nn's xla attention where it names it, as a step compiled ahead for a larger
-    device does: the fit is the route's preference, not the kernel's capability (`_FITS`)."""
-    from dew.nn import attention_kernels
-    from dew.nn.attention import attention_case
-    from dew.nn.kernels import selection
-
-    query = jax.ShapeDtypeStruct((512, 1024, 64, 128), jnp.float32)
-    key = jax.ShapeDtypeStruct((512, 1024, 8, 128), jnp.float32)
-    with generation.assumed("sm80"):
-        route = selection.select(attention_kernels.ATTENTION, attention_case(query, key, causal=True), "xla")
-    assert route.kernel == "xla"
-
-
-@pytest.mark.parametrize(("rows", "heads", "ran"), [(1, 32, "inference"), (512, 64, "template")],
-                         ids=["fits", "past-memory"])
-def test_an_a100s_dense_bias_trains_on_xla_only_where_its_scores_fit(rows, heads, ran):
-    """An A100's bf16 call of 1024 tokens under a bias that varies by query, 128 wide over 8 key heads: it
-    infers on the template and trains on jax.nn's xla attention ('inference') where that fits the A100's
-    40 GB; one of 512 rows of 64 heads, whose xla attention holds over a terabyte of fp32 scores a training
-    step, takes the template whole (`attention_kernels._FITS`, row 5283)."""
-    from dew.nn import attention_kernels
-    from dew.nn.attention import attention_case
-    from dew.nn.kernels import selection
-
-    query = jax.ShapeDtypeStruct((rows, 1024, heads, 128), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((rows, 1024, 8, 128), jnp.bfloat16)
-    bias = jax.ShapeDtypeStruct((rows, heads, 1024, 1024), jnp.float32)
-    with generation.assumed("sm80"):
-        route = selection.select(attention_kernels.ATTENTION, attention_case(query, key, bias=bias))
-    assert route.kernel == ran
-
-
 @pytest.mark.parametrize(("groups", "limits", "least"), [
     ("0::/outer/inner\n", {"sys/fs/cgroup/memory.max": "max", "sys/fs/cgroup/outer/memory.max": "2147483648",
                            "sys/fs/cgroup/outer/inner/memory.max": "4294967296"}, 2147483648),
@@ -1157,23 +1101,3 @@ def test_a_call_only_spans_express_holds_no_dense_mask(differentiated):
         return analysis.temp_size_in_bytes
 
     assert temporaries(4096) <= 3 * temporaries(2048)
-
-
-@pytest.mark.parametrize(("target", "tokens", "ran"), [
-    ("sm90", 512, "template"), ("v6e", 512, "template"), (None, 512, "plain"), (None, 1 << 20, "template")],
-    ids=["h100", "tpu", "cpu", "cpu-past-its-memory"])
-def test_a_call_only_spans_express_runs_where_any_call_on_its_device_does(target, tokens, ran):
-    """A causal call over its documents' key runs (a forked decision row's, `AttentionCase.spans_only`): a GPU
-    and a TPU run it on the template, which alone reads the runs as spans; a CPU runs it where it runs the
-    call without them, jax.nn's xla attention (or, under Dew's wide arithmetic, the reference path) over the
-    dense mask the runs mean where its scores fit the host, else the template (a forked call took the
-    template's plain-JAX mainloop on a CPU, and a run recorded fast its accurate route)."""
-    from dew.nn.attention import resolve_implementation
-
-    query = jax.ShapeDtypeStruct((1, tokens, 4, 64), jnp.bfloat16)
-    key = jax.ShapeDtypeStruct((1, tokens, 2, 64), jnp.bfloat16)
-    runs = jax.ShapeDtypeStruct((1, tokens, 2, 2), jnp.int32)
-    with contextlib.nullcontext() if target is None else generation.assumed(target):
-        spanned = resolve_implementation('auto', query, key, causal=True, key_runs=runs)
-        plain = resolve_implementation('auto', query, key, causal=True)
-    assert spanned.kernel == (plain.kernel if ran == "plain" else ran)

@@ -74,7 +74,7 @@ WGMMA = mosaic_sm90.WGMMA.name
 INTERPRETED_ON = {"sm90": WGMMA, "sm80": "mma.sync"}
 """The GPUs an interpreted cell runs as (`_device`), each family's own walk: an H100's warpgroup MMA and an
 A100's mma.sync (Main 11-08: an interpreted check of one family alone left the A100's backward unchecked on
-a CPU). A cell of one family's mechanism names its GPU itself (`ONE_FAMILY`)."""
+a CPU). A cell of one family's mechanism names its GPU itself; the others run on each (`ON_EACH_FAMILY`)."""
 _INTERPRETED = contextvars.ContextVar("interpreted_on", default="sm90")
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
@@ -175,31 +175,10 @@ def _drawn(shape: tuple[int, int, int, int], dtype, width: int = 128, keys: int 
     return draw
 
 
-ONE_FAMILY = frozenset({
-    "test_a_tpu_cores_forward_is_on_par_interpreted", "test_a_tpu_cores_backward_is_on_par_interpreted",
-    "test_the_forward_on_three_consumers_holds_check_1_interpreted",
-    "test_the_forward_on_tcgen05s_chunks_holds_check_1_interpreted",
-    "test_the_training_forwards_rows_past_fp32s_largest_keep_their_mean_and_every_other_row_interpreted",
-    "test_a_backward_whose_dkv_launch_holds_more_keys_than_its_dq_launch_writes_every_key_interpreted",
-    "test_a_causal_backward_whose_consumers_stage_shared_logits_walks_each_query_tile_interpreted",
-    "test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted",
-    "test_every_tuning_variant_is_on_par_interpreted",
-    "test_an_fp32_forward_walks_its_operands_bf16_parts_interpreted",
-    "test_an_fp16_backward_in_one_launch_holds_check_1_interpreted",
-})
-"""The interpreted cells of one family's mechanism, each naming its GPU itself: a TPU core's, an H100's three
-consumers, a B200's tcgen05 chunks, an H100's pinned layouts (its keys-first dK/dV launch, its consumers'
-shared logits and keys), the tuning variants of the launches the cell's own target derives, and an fp32
-call's forward of bf16 parts, which an A100's pipeline loads in no pieces (row 4475), and an fp16
-backward's one launch, an H100's layouts'."""
-
-
-def pytest_generate_tests(metafunc):
-    """Each interpreted cell (a test named `*_interpreted`) once a GPU of `INTERPRETED_ON`, as its family's
-    own walk (`interpreted_on`), but a cell of one family's mechanism (`ONE_FAMILY`)."""
-    name = metafunc.function.__name__
-    if name.endswith("_interpreted") and name not in ONE_FAMILY:
-        metafunc.parametrize("interpreted_on", list(INTERPRETED_ON), indirect=True)
+ON_EACH_FAMILY = pytest.mark.parametrize("interpreted_on", list(INTERPRETED_ON), indirect=True)
+"""An interpreted cell run once a GPU of `INTERPRETED_ON`, as its family's own walk (`interpreted_on`); a cell
+of one family's mechanism (a TPU core's, an H100's three consumers or pinned layouts, a B200's tcgen05 chunks,
+an fp32 call's bf16 parts, which an A100's pipeline loads in no pieces, row 4475) names its GPU itself."""
 
 
 @pytest.fixture(autouse=True)
@@ -507,6 +486,7 @@ def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, sc
     return terms
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("form", ["default", "fused"])
 @pytest.mark.parametrize("call", CALLS)
@@ -582,6 +562,7 @@ def test_the_plain_jax_backward_takes_the_kept_outputs_residuals():
                     "plain-JAX backward from the kept output", seeds=SEEDS, terms=_gradient_terms(spans))
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("call", CALLS)
@@ -633,6 +614,7 @@ def test_a_tpu_cores_backward_is_on_par_interpreted(call):
                     target=generation.gpu_target("v5e"))
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("call", CALLS)
 def test_a_dropping_backward_is_on_par_over_every_call_interpreted(call):
@@ -641,6 +623,7 @@ def test_a_dropping_backward_is_on_par_over_every_call_interpreted(call):
     _check_backward(call, SHAPES["interpreted"], form="default", interpret=True, drop=True)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("call", CALLS)
 def test_the_fast_forward_is_on_par_interpreted(call):
@@ -653,6 +636,7 @@ def test_the_fast_forward_is_on_par_interpreted(call):
         _check_forward(call, jnp.float16, SHAPES["interpreted"], natural=False, interpret=True)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("call", CALLS)
@@ -672,6 +656,7 @@ def the_training_forward_is_on_par_on_an_h100(call):
                    training=template.Kept.SPLIT)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
 @pytest.mark.parametrize("call", CALLS)
@@ -681,6 +666,7 @@ def test_the_natural_forward_is_on_par_interpreted(call, dtype):
     _check_forward(call, dtype, SHAPES["interpreted"], natural=True, interpret=True)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("form", CASES)
 def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
@@ -688,6 +674,7 @@ def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
     _check_call_form(form, interpret=True)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
 def test_the_forward_is_on_par_at_head_widths_interpreted(width, value_width):
@@ -697,6 +684,7 @@ def test_the_forward_is_on_par_at_head_widths_interpreted(width, value_width):
                    value_width=value_width, tiles=_form_tiles())
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 def test_the_backward_at_a_width_of_256_is_on_par_under_bidirectional_blocks_interpreted():
     """The derived backward of heads 256 wide (dK's and dV's widths split among programs,
@@ -711,6 +699,7 @@ def test_the_backward_at_a_width_of_256_is_on_par_under_bidirectional_blocks_int
                     spans=spans)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
 def test_the_backward_is_on_par_at_head_widths_interpreted(width, value_width):
@@ -728,6 +717,7 @@ DROPPING_FORWARDS += [("causal", training, jnp.float16)
 whose dropped weights narrow as they are (`algebra.dropped_parts`), the walk bf16's otherwise."""
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize(("call", "training", "dtype"), DROPPING_FORWARDS,
                          ids=[f"{call}-{training.name}-{jnp.dtype(dtype).name}"
@@ -740,6 +730,7 @@ def test_the_forward_is_on_par_dropping_interpreted(call, training, dtype):
                    drop=True)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize(("form", "dtype"), [*((form, jnp.bfloat16) for form in (*HOOKED_FORMS, "fused")),
                                              ("derived", jnp.float16)],
@@ -752,6 +743,7 @@ def test_the_backward_is_on_par_dropping_interpreted(form, dtype):
     _check_backward("causal", SHAPES["interpreted"], form=form, interpret=True, drop=True, dtype=dtype)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize(("dtype", "natural"), HOOK_FORMS.values(), ids=HOOK_FORMS)
 @pytest.mark.parametrize("hooks", FORWARD_HOOKS)
@@ -796,6 +788,7 @@ def _keys_first_gradients(query, key, value, dout, spans, *, form: str, scale: f
     return tuple(np.asarray(grad, np.float64) for grad in grads), truth
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("form", HOOKED_FORMS)
 def test_the_keys_first_backward_keeps_the_logits_the_forward_keeps_finite_interpreted(form):
@@ -816,6 +809,7 @@ def test_the_keys_first_backward_keeps_the_logits_the_forward_keeps_finite_inter
         np.testing.assert_array_equal(mine, true)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("form", HOOKED_FORMS)
 def test_the_keys_first_backward_keeps_the_logits_of_keys_the_power_would_flush_interpreted(form):
@@ -843,6 +837,7 @@ def test_the_keys_first_backward_keeps_the_logits_of_keys_the_power_would_flush_
                     f"keys-first backward {form} over keys the power would flush", seeds=SEEDS)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("form", HOOKED_FORMS)
 def test_the_keys_first_backward_keeps_the_key_gradients_of_queries_the_power_would_flush_interpreted(form):
@@ -862,6 +857,7 @@ def test_the_keys_first_backward_keeps_the_key_gradients_of_queries_the_power_wo
         np.testing.assert_array_equal(mine, true)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize(("queries", "form"), PADDED_CALLS.values(), ids=PADDED_CALLS)
 def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
@@ -1209,6 +1205,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
     _check_backward("causal", shape, form=None, interpret=True, target=target)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("form", ["default", "accurate"])
 def test_the_backward_is_on_par_from_the_triton_mainloops_residuals_interpreted(form):
@@ -1246,6 +1243,7 @@ def test_a_hook_shaped_to_the_launchs_tile_is_taken():
                     seeds=SEEDS)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("case", CASES)
@@ -1254,6 +1252,7 @@ def test_the_backward_is_on_par_over_every_call_form_interpreted(case, form):
     _check_call_form(case, interpret=True, backward=True, form=form)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("form", ["forward", *BACKWARD_FORMS])
 @pytest.mark.parametrize("case", RUN_CASES)
@@ -1276,6 +1275,7 @@ def test_an_fp32_forward_walks_its_operands_bf16_parts_interpreted(call, score):
     _check_spans(f"{call} fp32 parts", spans, (1, 128, 2, 1), interpret=True, score=score, dtype=jnp.float32)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
 @pytest.mark.parametrize("call", CALLS)
@@ -1287,6 +1287,7 @@ def test_a_call_of_whole_key_tiles_reads_no_padding_interpreted(call, backward):
     _check_spans(f"{call} of whole key tiles", spans, (1, 128, 2, 1), interpret=True, backward=backward)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("call", CALLS)
@@ -1295,6 +1296,7 @@ def test_the_backward_is_on_par_interpreted(call, form):
     _check_backward(call, SHAPES["interpreted"], form=form, interpret=True, width=FORM_WIDTHS.get(form, 128))
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("accurate", [False, True], ids=["fast", "accurate"])
 @pytest.mark.parametrize("call", CALLS)
@@ -1306,6 +1308,7 @@ def test_an_fp16_backward_is_on_par_interpreted(call, accurate):
                     dtype=jnp.float16)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
     """A causal call of 64 queries over 256 keys, whose last key tiles no query sees: the fast form's
@@ -1465,6 +1468,7 @@ takes 128 draws at any head count, past the CPU suite's 240 s target interpreted
 heads: 270 to 650 s, row 1849); the CPU keeps every other hook, sinks and softcap among them."""
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("form", ["default", "accurate"])
 @pytest.mark.parametrize("hooks", [hooks for hooks in BACKWARD_HOOKS if hooks not in HOPPER_HOOK_SITES])
@@ -1475,6 +1479,7 @@ def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
     _check_hooked_backward(hooks, form=form, interpret=True)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("kept", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
 def test_a_folded_forward_whose_products_pass_fp32_below_zero_rewalks_natural_interpreted(kept):
@@ -1495,6 +1500,7 @@ def test_a_folded_forward_whose_products_pass_fp32_below_zero_rewalks_natural_in
     assert np.array_equal(np.asarray(out, np.float32), np.ones(shape, np.float32))
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
     """The forward's kernel is lowered once for every call of its static facts (`tuning.lowered_once`, row
@@ -1520,6 +1526,7 @@ def test_a_forward_kernel_built_for_its_facts_runs_each_calls_own_interpreted():
                         f"mosaic forward at scale {scale}", seeds=SEEDS)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 def test_a_forward_kernel_built_for_its_facts_holds_no_calls_arrays_interpreted():
     """The forward's kernel, lowered once for every call of its static facts (`tuning.lowered_once`, rows
@@ -1547,6 +1554,7 @@ def test_a_backward_256_wide_shares_its_keys_and_is_on_par_interpreted(call):
     _check_backward(call, SHAPES["interpreted"], form="fused-shared-keys", interpret=True, width=256)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("call", CALLS)
 def test_a_quantized_calls_weights_round_at_each_rows_maximum_interpreted(call):
@@ -1558,6 +1566,7 @@ def test_a_quantized_calls_weights_round_at_each_rows_maximum_interpreted(call):
                    value_width=64, training=template.Kept.SPLIT, rounds=attention_quantized.BOUND)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("sinks", [False, True], ids=["plain", "sinks"])
 @pytest.mark.parametrize("call", ["causal", "full"])
@@ -1571,6 +1580,7 @@ def test_a_training_forward_256_wide_past_the_folds_reach_is_on_par_interpreted(
                    value_width=256, training=template.Kept.SPLIT, query_scale=2.0 ** 16, sinks=sinks)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize(("hooks", "deterministic"), [("key-bias", False), ("tile-bias", False),
                                                       ("tile-bias", True)])
@@ -1583,6 +1593,7 @@ def test_a_parameter_every_row_shares_takes_each_rows_gradient_interpreted(hooks
     _check_hooked_backward(hooks, form="default", interpret=True, shared=True)
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize(("hooks", "form"), [("softcap", "fused"), ("softcap", "fused-shared-keys"),
                                              ("sinks", "fused")])
@@ -1596,6 +1607,7 @@ def test_a_hooked_backward_in_one_launch_holds_check_1_interpreted(hooks, form, 
     _check_hooked_backward(hooks, form=form, interpret=True, width=FORM_WIDTHS.get(form, 64))
 
 
+@ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("hooks", ["key-bias", "tile-bias"])
 def test_a_width_split_backward_writes_its_score_parameters_gradients_once_interpreted(hooks):
@@ -2068,3 +2080,25 @@ def _residuals(shape) -> tuple:
     stats = jnp.zeros((batch, heads, queries), jnp.float32)
     return (stats, stats, jnp.zeros((batch, heads, queries), jnp.int32),
             template.Split(jnp.zeros((batch, heads, queries, width), jnp.float32), stats, stats, stats))
+
+
+@INTERPRETS
+def test_an_unrounded_fused_backward_keeps_its_key_and_value_gradients_fp32_interpreted():
+    """The fast form's one launch of a bf16 causal call (`BackwardTiles.fused`) whose caller takes dK and dV
+    unrounded (`attention_mosaic.backward`'s `rounded` False: a sequence exchange's, summed across shards
+    and rounded once): its dK and dV are its fp32 sums, bits past bf16's among them, where the launch stored
+    them in bf16 when its block held the typed stage (`attention_mosaic_fused.stores_typed`) and the caller
+    took them rounded twice."""
+    shape = (2, 128, 4, 4)
+    spans = template.spans(shape[1], shape[1], shape[0], causal=True)
+    query, key, value, dout = _drawn(shape, jnp.bfloat16, 64)(0)
+    _, config = _backward_form("fused")
+    with _device(interpret=True):
+        residuals = attention_mosaic.forward(query, key, value, spans, None, residuals=template.Kept.SPLIT,
+                                             interpret=True)[1:]
+        with _pinned(backward=config):
+            grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
+                                              interpret=True, rounded=False)
+    for grad in (grads.key, grads.value):
+        assert grad.dtype == jnp.float32
+        assert np.any(np.asarray(grad) != np.asarray(grad.astype(jnp.bfloat16).astype(jnp.float32)))

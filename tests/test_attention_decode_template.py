@@ -597,3 +597,46 @@ def test_a_split_decode_step_resumed_past_fp32s_largest_in_raw_units_keeps_its_s
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "template decode split resumed past raw fp32",
                     seeds=SEEDS)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("held", ["dense", "sources", "paged"])
+@pytest.mark.parametrize("large", [False, True], ids=["ordinary", "near-bf16s-largest"])
+def test_a_decode_step_given_its_caches_value_bounds_walks_as_one_given_none_interpreted(held, large):
+    """A bf16 decode step over a cache that states each key's largest value magnitude (`attend`'s `bounds`,
+    head-major as a cache's scales: dense, a work list's rows by `sources`, a paged pool's by its table): its
+    output is bit for bit the step's given no bounds, which takes them from the values it reads and so
+    launches the same walk: the unscaled one on ordinary values, the scaled one on values near bf16's
+    largest."""
+    positions, heads, kv_heads = CALLS["one-query"]
+    spans = _spans(positions)
+    query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(0)
+    if large:
+        value = value.at[0, :8].set(jnp.finfo(jnp.bfloat16).max)
+    bound = jnp.moveaxis(jnp.max(jnp.abs(value.astype(jnp.float32)), axis=-1), 1, 2)  # [B, KV, K]
+    page = 4
+    table = jnp.asarray(np.random.default_rng(page).permutation(2 * KEYS // page).reshape(2, KEYS // page),
+                        jnp.int32)
+    order = jnp.argsort(table.reshape(-1))
+
+    def pooled(cache):
+        # [B, K, ...] as pools [KV, P, page, ...] holding each row's keys at the pages its table names.
+        pages = jnp.moveaxis(cache.reshape(2 * KEYS // page, page, *cache.shape[2:]), 2, 0)
+        return pages[:, order]
+
+    def attended(bounds):
+        with generation.assumed("sm90"):
+            if held == "paged":
+                pooled_bounds = None if bounds is None else pooled(jnp.moveaxis(bounds, 1, 2))
+                return attention_decode.attend(query, pooled(key), pooled(value), spans, interpret=True,
+                                               table=table, bounds=pooled_bounds)
+            if held == "sources":
+                # Batch row b reads cache row sources[b]: the cache holds the rows in the other order.
+                sources = jnp.asarray([1, 0], jnp.int32)
+                rows = jnp.argsort(sources)
+                held_bounds = None if bounds is None else bounds[rows]
+                return attention_decode.attend(query, key[rows], value[rows], spans, interpret=True,
+                                               sources=sources, bounds=held_bounds)
+            return attention_decode.attend(query, key, value, spans, interpret=True, bounds=bounds)
+
+    np.testing.assert_array_equal(np.asarray(jax.jit(attended)(bound)), np.asarray(jax.jit(attended)(None)))

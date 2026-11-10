@@ -29,6 +29,7 @@ from dew.nn.kernels.templates.attention_mosaic_dkv import _dkv_launch
 from dew.nn.kernels.templates.attention_mosaic_dq import _dq_launch
 from dew.nn.kernels.templates.attention_mosaic_fused import _fused_launch
 from dew.nn.kernels.templates.attention_mosaic_program import (
+    BackwardRegisters,
     BackwardTiles,
     _columns,
     _Program,
@@ -45,7 +46,8 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                      shift, others, own, others_total, forward_total, start, end, query_ids, key_ids,
                      score_params, *, score_mod, score_kinds, score_dtypes, scale: float, prescale: float,
                      spec: algebra.Forward, accurate: bool, tiles: BackwardTiles, family: mosaic.Family,
-                     interpret: bool, drop: Dropout | None = None):
+                     interpret: bool, drop: Dropout | None = None, rounded: bool = True,
+                     registered: BackwardRegisters | None = None):
     """`gradients`' launch on this mainloop: D from the forward's split sums, each query's anchor key as the
     first pass chose it. Two launches: the dQ program's sums, their finish (`gradient.dq_finish`) and the
     dK/dV program under its refined D, whose cotangents sum to 0 where the first pass's do not (a small weight
@@ -60,7 +62,9 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     rows, each query's anchor key, the dQ parameters' gradients (`DQ_GRADS`; a head's as per-query sums `[1,
     B, H, 1]`, which `gradients` sums over the batch), then dK, dV and the dK/dV parameters' (`DKV_GRADS`).
     The query arrives the call's own: its logits are those of the query taken by `prescale` (`by_power`) at
-    `scale`, the scale left (`gradients`), which `spec` takes."""
+    `scale`, the scale left (`gradients`), which `spec` takes; dK and dV leave fp32 where the caller takes
+    them unrounded (`rounded`, `MosaicBackward.rounded`). Each launch states its registers by `registered`
+    (`_Backward.registers`)."""
     spec = dataclasses.replace(spec, scale=scale, prescale=prescale)
     width, value_width = query.shape[-1], value.shape[-1]
     _, state_total = gradient.off_anchor_start(peak0, total0, maximum, value_width, shift)
@@ -88,7 +92,8 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     approx_math = not accurate and approximate(hooks, (tiles.block_q, tiles.block_k), value_width,
                                                differentiated=True)
     walk = _Backward(program, spec, accurate, tiles.consumers, interpret, tiles.fused, score_kinds,
-                     approx_math, score_places(hooks), drop is not None, hook_reduces(hooks))
+                     approx_math, score_places(hooks), drop is not None, hook_reduces(hooks), rounded,
+                     registered)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)
     spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k, readers=True)
     # The queries taken by the call's power: the logits' operand of the two launches (`_dkv_step`).
