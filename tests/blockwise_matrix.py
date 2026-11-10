@@ -71,9 +71,10 @@ def supported(case: dict[str, str]) -> bool:
 
 CASES = (
     ('sm90', '128', '1', 'float32'),
-    ('sm90', '128', '4', 'bfloat16'),
-    ('sm90', '1', '1', 'bfloat16'),
-    ('sm90', '1', '4', 'float32'),
+    ('sm90', '1', '4', 'bfloat16'),
+    ('sm90', '128', '1', 'bfloat16'),
+    ('sm90', '128', '4', 'float32'),
+    ('sm90', '1', '1', 'float32'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
 (`kernel_matrix.covering("blockwise_fp8")`'s pairs)."""
