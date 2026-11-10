@@ -413,6 +413,36 @@ def _launched(query, key, spans: tuple, scale: float, how: algebra.Recompute, bl
             block_map(KeySpans(start, end, query_ids, key_ids, key.shape[1]), block_q, block_k))
 
 
+def _query_tile(i, *, block_q: int, row, head, columns: jax.Array, k_tile: jax.Array, query: jax.Array,
+                dout: jax.Array, spans, score_mod, prescale: float, factor: float, statistics: tuple,
+                key_index: jax.Array, score_params: tuple = (), score_kinds: tuple = (), draw=None):
+    """Query tile `i`'s operands as a derived dK/dV walk reads them over its key tile (`columns`, `k_tile`) of
+    batch row `row` and head `head` (`attention_program.dkv_sums`, `fused_sums`): its rows, queries, output
+    cotangents and mask, its logits as the forward formed them under the score hook and its parameters
+    (`score_params` of `score_kinds`, each at the tile's rows and columns) and their slopes, the forward's
+    `statistics` at its rows (maxima, denominators, anchors' terms and D), its anchor test, and where `draw`
+    draws dropout its keep bits. The dK/dV launch's and the one launch's alike; they differ in how they
+    accumulate the tile."""
+    rows = i * block_q + jnp.arange(block_q)
+    q = jax.lax.dynamic_slice_in_dim(query[row, :, head], i * block_q, block_q)
+    do = jax.lax.dynamic_slice_in_dim(dout[row, :, head], i * block_q, block_q)
+    seen = _seen(spans, row, rows, columns)
+    params = tuple(_tile_param(param, kind, row, head, rows, columns)
+                   for param, kind in zip(score_params, score_kinds, strict=True))
+    logits, slopes = gradient.tile_logits(score_mod, interpreted_dot(by_power(q, prescale), k_tile.T), seen,
+                                          rows[:, None], columns[None, :], params, scale=factor, slopes=True)
+    peak, total, anchor, delta = statistics
+    tiles = {"logits": logits, "q": q, "dout": do, "peak": peak[row, head, rows],
+             "total": total[row, head, rows], "anchor": anchor[row, head, rows],
+             "delta": delta[row, head, rows], "seen": seen,
+             "at_anchor": columns[None, :] == key_index[row, head, rows][:, None]}
+    if slopes is not None:
+        tiles["slope"] = slopes[0]
+    if draw is not None:
+        tiles["keep"] = draw(rows[:, None], columns[None, :])
+    return tiles, slopes, seen
+
+
 def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans, score_params, *,
                 score_mod, score_kinds: tuple[Kind, ...], scale: float, prescale: float, grad_scale: float,
                 how: algebra.Recompute, block_q: int, block_k: int, accurate: bool, drop=None):
@@ -435,28 +465,11 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         k_tile = jax.lax.dynamic_slice_in_dim(key[row, :, kv_head], j * block_k, block_k)
         v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
 
-        def formed(i):
-            # A query tile's operands as the derived dK/dV walk reads them (`attention_program.dkv_sums`):
-            # its rows, queries, output cotangents, mask, logits as the forward formed them and their hook's
-            # slopes, and dropout multipliers.
-            rows = i * block_q + jnp.arange(block_q)
-            q = jax.lax.dynamic_slice_in_dim(query[row, :, head], i * block_q, block_q)
-            do = jax.lax.dynamic_slice_in_dim(dout[row, :, head], i * block_q, block_q)
-            seen = _seen(spans, row, rows, columns)
-            params = tuple(_tile_param(param, kind, row, head, rows, columns)
-                           for param, kind in zip(score_params, score_kinds, strict=True))
-            logits, slopes = gradient.tile_logits(score_mod, interpreted_dot(by_power(q, prescale), k_tile.T),
-                                                 seen, rows[:, None], columns[None, :], params, scale=factor,
-                                                 slopes=True)
-            tiles = {"logits": logits, "q": q, "dout": do, "peak": peak[row, head, rows],
-                     "total": total[row, head, rows], "anchor": anchor[row, head, rows],
-                     "delta": delta[row, head, rows], "seen": seen,
-                     "at_anchor": columns[None, :] == key_index[row, head, rows][:, None]}
-            if slopes is not None:
-                tiles["slope"] = slopes[0]
-            if draw is not None:
-                tiles["keep"] = draw(rows[:, None], columns[None, :])
-            return tiles, slopes, seen
+        formed = functools.partial(
+            _query_tile, block_q=block_q, row=row, head=head, columns=columns, k_tile=k_tile, query=query,
+            dout=dout, spans=spans, score_mod=score_mod, prescale=prescale, factor=factor,
+            statistics=(peak, total, anchor, delta), key_index=key_index, score_params=score_params,
+            score_kinds=score_kinds, draw=draw)
 
         def pulled(i, hooks, pieces):
             # Query tile `i`'s hook pieces (`gradient.pulled`): the tile parameters' gradients written at its
@@ -510,22 +523,10 @@ def _fused_launch(query, key, value, dout, peak, total, anchor, delta, key_index
             k_tile = jax.lax.dynamic_slice_in_dim(key[row, :, kv_head], j * block_k, block_k)
             v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
 
-            def formed(i):
-                # A query tile's operands as the derived walk reads them (`_dkv_launch`'s `formed`).
-                rows = i * block_q + jnp.arange(block_q)
-                q = jax.lax.dynamic_slice_in_dim(query[row, :, head], i * block_q, block_q)
-                do = jax.lax.dynamic_slice_in_dim(dout[row, :, head], i * block_q, block_q)
-                seen = _seen(spans, row, rows, columns)
-                logits, slopes = gradient.tile_logits(
-                    score_mod, interpreted_dot(by_power(q, prescale), k_tile.T), seen, rows[:, None],
-                    columns[None, :], (), scale=factor, slopes=True)
-                tiles = {"logits": logits, "q": q, "dout": do, "peak": peak[row, head, rows],
-                         "total": total[row, head, rows], "anchor": anchor[row, head, rows],
-                         "delta": delta[row, head, rows], "seen": seen,
-                         "at_anchor": columns[None, :] == key_index[row, head, rows][:, None]}
-                if slopes is not None:
-                    tiles["slope"] = slopes[0]
-                return tiles, slopes, seen
+            formed = functools.partial(
+                _query_tile, block_q=block_q, row=row, head=head, columns=columns, k_tile=k_tile, query=query,
+                dout=dout, spans=spans, score_mod=score_mod, prescale=prescale, factor=factor,
+                statistics=(peak, total, anchor, delta), key_index=key_index)
 
             def add_dq(i, dq, tile):
                 held = jax.lax.dynamic_slice_in_dim(dq, i * block_q, block_q)

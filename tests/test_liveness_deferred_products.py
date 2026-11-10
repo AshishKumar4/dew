@@ -268,7 +268,6 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward(launches)
     import jax
     import jax.numpy as jnp
     import test_attention_mosaic as attention
-    import test_attention_mosaic_compile as compiled
     from fla_gdn_support import KernelCase
 
     from dew.nn.kernels import generation
@@ -285,22 +284,17 @@ def test_the_pass_reads_no_more_than_ptxas_holds_an_attention_backward(launches)
                                           accurate=False)
         return grads.query, grads.key, grads.value
 
-    accurate = False
-    op, ba, _ = compiled._gated_backward("sm90", width, accurate, "none")
-    # The pinned config of the launches asked for.
+    # The pinned config of the launches asked for, each launch's model its own as it lowers.
     tiles, launch = BACKWARD_LAUNCHES[launches]
     config = attention_mosaic.BackwardTiles(64, 64, 2, **tiles)
     with generation.assumed("sm90"), attention._pinned(backward=config):
-        models = compiled._backward_models(op, ba, config)
         shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)
-
-        def case(models: dict):
-            return KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)), models)
+        case = KernelCase("backward", lambda: (backward, (query, key, key, query, shapes)))
 
         # The pass's count by launch (`lowered_models`) and each launch's least spill-free cap by ptxas
         # (`least`, `kernel_compile.register_need`).
         # Twice: a module compiled before in the process prints no PTX, its cap read from its first print.
-        records = [kernel_compile.compile_mosaic_kernels([case(models)], "sm90", least=least)[0]
+        records = [kernel_compile.compile_mosaic_kernels([case], "sm90", least=least)[0]
                    for least in (False, True)]
         record = records[-1]
     lowered = record.get("lowered_models", {})

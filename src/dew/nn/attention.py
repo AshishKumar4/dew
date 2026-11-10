@@ -22,6 +22,7 @@ import tokamax
 from flax.linen.dtypes import promote_dtype
 from jax.ad_checkpoint import checkpoint_name
 
+from dew._devices import deterministic_ops_requested
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
 
 from .attention_kernels import (
@@ -752,8 +753,25 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
         value = widen_value_heads(query, value)
 
     if implementation == 'cudnn':
-        out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
-                              key_value_seq_lengths)
+        def fused(query, key, value):
+            return cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
+                                   key_value_seq_lengths)
+
+        if deterministic_ops_requested():
+            # The decode selector takes cuDNN's forward under deterministic ops (`attention_kernels.DECODE`),
+            # whose backward crashes there (`CUDNN_SUPPORTS`): a differentiated call takes the reference
+            # path's derivative of the attention it computes, the decode kernel's own glue.
+            visible = combined_attention_mask(
+                query.shape[-3], key.shape[-3], causal, sliding_window,
+                mask if key_value_seq_lengths is None
+                else with_key_lengths(mask, key_value_seq_lengths, key.shape[-3]))
+
+            def referenced(query, key, value):
+                return reference_attention(query, key, value, mask=visible, bias=bias)
+
+            out = forward_differentiable(fused, referenced, query, key, value)
+        else:
+            out = fused(query, key, value)
     elif implementation == 'triton':
         out = triton_attention(query, key, value, causal)
     elif implementation == 'flash':

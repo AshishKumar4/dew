@@ -18,6 +18,7 @@ from dew.nn.kernels.templates import (
 from dew.nn.kernels.templates.attention import DQ_GRADS, Kind, by_power
 from dew.nn.kernels.templates.attention_backward_algebra import derived_cotangents
 from dew.nn.kernels.templates.attention_mosaic_program import (
+    BackwardRegisters,
     BackwardTiles,
     _param,
     _Program,
@@ -51,6 +52,20 @@ class _Backward:
     reduces: bool
     """Whether its score hook may reduce across warps (`hook_reduces`), its launches' warpgroups reserving
     their scratch (`reducing`)."""
+    rounded: bool = True
+    """Whether its caller takes dK and dV rounded to the operands' dtypes (`MosaicBackward.rounded`); where
+    not, the fused launch stores them fp32 (`attention_mosaic_fused.stores_typed`)."""
+    registered: BackwardRegisters | None = None
+    """The call's facts its launches' registers read (`BackwardRegisters`), none where None."""
+
+    def registers(self, *, dq: bool) -> int | None:
+        """A consumer's registers in its launch at its program's tiles, the dQ launch's (`dq`) or a dK/dV
+        one's, as its derivation counts them (`BackwardRegisters.at`), which the launch states with its
+        kernel (`Family.kernel`'s `registers`); None where it states none, or its family budgets none
+        (`Family.budgets_registers`)."""
+        if self.registered is None or not self.program.family.budgets_registers:
+            return None
+        return self.registered.at(self.program.tiles, dq=dq)
 
     def places_read(self, *, masked: bool | None = None) -> tuple[bool, bool]:
         """Whether a step surely reads its queries' places and its keys' (`algebra.places_read`), `masked` or
@@ -197,6 +212,31 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
                                walk.accurate)
     exponentials, weights, cotangents = forms.mapped(tiles)
     return exponentials, weights, cotangents, slopes, seen
+
+def _rescaled_parts(walk: _Backward, acc, shift, rhs, refs: tuple, staged: tuple = ()):
+    """An fp16 step's accumulator `acc` (dV's or dK's) taken to its walk's new scale (`shift`,
+    `algebra.scaled_by`, a power of two at most 1) before its operand's two fp16 parts' products over `rhs`
+    issue into it from their staged `refs`; `staged` the parts each staged into its ref just before its
+    product (the fused launch's order, `attention_mosaic_fused._sixteen_step`), none where they are staged
+    already (the cooperative launch's exchange, `attention_mosaic_coop._sixteen_step`)."""
+    family = walk.program.family
+    acc = family.rescaled_products(acc, lambda value: algebra.scaled_by(value, shift), (), rhs,
+                                   walk.interpret)
+    for index, ref in enumerate(refs):
+        if staged:
+            family.staged(staged[index], ref)
+        acc = family.products(acc, ref.transpose((1, 0)), rhs)
+    return acc
+
+
+def _parts_dq(walk: _Backward, refs: tuple, keys, shape: tuple[int, int], exponent) -> jax.Array:
+    """An fp16 step's dQ: its score cotangents' two staged fp16 parts (`refs`) times `keys`, summed and taken
+    back by their scale `exponent` (`algebra.running_restored`)."""
+    family = walk.program.family
+    low, high = refs
+    return algebra.running_restored(family.product(low, keys, shape) + family.product(high, keys, shape),
+                                    exponent)
+
 
 def _dq_added(walk: _Backward, dq_ref, out_smem, place: tuple, index, q_first, dq, columns=None) -> None:
     """A fused dK/dV consumer's tile `dq` added into dQ at its queries from `q_first` (`place` its row and

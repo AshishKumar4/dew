@@ -118,9 +118,9 @@ def test_the_attention_kernels_run_on_this_gpu(part):
                    stability.test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges,
                    family, name))
           for family, name in sorted(stability.GPU_ONLY["accurate"])),
-        *(Cell(f"the Pallas-Triton backward reads a guarded forward's rows whatever its pass: {family}",
+        *(Cell(f"the Pallas-Triton backward reads a scaled forward's rows whatever its pass: {family}",
                functools.partial(
-                   stability.test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_pass,
+                   stability.test_the_frozen_triton_backward_reads_a_scaled_forwards_rows_whatever_its_pass,
                    family))
           for family in sorted(stability.GPU_ONLY["frozen rows"])),
         *(Cell(f"decode is finite and as exact as the reference at fp32's edges: {family} {form}",
@@ -150,6 +150,8 @@ def test_the_attention_kernels_run_on_this_gpu(part):
           for name, softcap in (("plain", None), ("softcap", decode.SOFTCAP))),
         Cell("the decode kernel's attention differentiates as the folded attention",
              decode.attention_the_decode_kernel_takes_differentiates_as_the_folded_attention),
+        Cell("a decode call naming cuDNN differentiates under deterministic ops",
+             decode.a_decode_call_naming_cudnn_differentiates_under_deterministic_ops),
         *(Cell(f"a verify block of {drafts} through the route is on par",
                functools.partial(decode_template.a_verify_block_through_the_route_is_on_par, drafts))
           for drafts in (4, 8, 16)),

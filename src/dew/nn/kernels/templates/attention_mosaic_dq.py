@@ -234,6 +234,7 @@ def _dq_columns(query, key, value, dout, peak, prior, anchor, delta, key_index, 
         interpret=walk.interpret, approx_math=walk.approx_math,
         name=name,
         reducing_warpgroups=reducing(family, consumers, walk.reduces),
+        registers=walk.registers(dq=True),
         # The products this launch issues (`stated`): its `S` and `dP` recomputed, each part of its share of
         # dQ's (`part_count`) and, in the accurate form, of the keyed sums'; its share of dQ's product the
         # model's it owns (`modelled`).

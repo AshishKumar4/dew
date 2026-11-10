@@ -1334,11 +1334,20 @@ def may_scale(value: jax.Array, *, keys_axis: int, initial: jax.Array | None = N
     (`resumed`), so where the largest such sum of any key head is below `2^(HEADROOM - 1)` (a binade for the
     bound's own rounding) no row's is past `2^HEADROOM`, and the unscaled walk is the scaled one bit for bit:
     a call there launches its mainloop's unscaled kernels, one pass over its values before them."""
+    # Each key's largest. A call of no keys or rows reads no value: its bound is 0.
+    largest = jnp.max(jnp.abs(value.astype(jnp.float32)), axis=-1, initial=0)
+    return bounded_past(largest, keys_axis=keys_axis, initial=initial, amplified=amplified)
+
+
+def bounded_past(largest: jax.Array, *, keys_axis: int, initial: jax.Array | None = None,
+                 amplified: float = 1.0) -> jax.Array:
+    """`may_scale` of a call whose keys' largest value magnitudes `largest` (each key's over its columns,
+    its keys along `keys_axis`) are given: a cache's, which states each written key's as it writes it
+    (`attention_decode.attend`'s `bounds`), so a call over it reads no value to choose its kernel."""
     unit = np.float32(2.0 ** -BOUND_UNIT)
-    # Each key's largest at the bound's unit, summed over the keys: a key head's bound. A call of no keys or
-    # rows reads no value: its bound is 0.
-    largest = jnp.max(jnp.abs(value.astype(jnp.float32)) * unit, axis=-1, initial=0)
-    bound = jnp.max(jnp.sum(largest, axis=keys_axis), initial=0) * np.float32(amplified)
+    # Each key's largest at the bound's unit, summed over the keys: a key head's bound.
+    bound = jnp.max(jnp.sum(largest.astype(jnp.float32) * unit, axis=keys_axis), initial=0)
+    bound = bound * np.float32(amplified)
     if initial is not None:
         bound = bound + jnp.max(jnp.abs(initial.astype(jnp.float32)), initial=0) * unit
     return bound >= np.float32(2.0 ** (HEADROOM - 1 - BOUND_UNIT))
