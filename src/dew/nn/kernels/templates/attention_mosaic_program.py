@@ -1387,9 +1387,17 @@ def _mask_places(family: mosaic.Family, block_q: int, block_k: int) -> list:
     return [] if family.folds_indices(block_k) else [(block_q, block_k, jnp.int32)] * 3
 
 
+def _converted(block_k: int, *widths: int) -> list[list[tuple]]:
+    """A quantized call's phases converting a slot of codes beside its sums (`Family.converted`): its codes
+    read in the accumulator's layout, biased to int32 and taken to fp32, a tile of each live at once, the
+    keys' `[bk, D]` and then the values' `[bk, Dv]` (an A100's int8 decode at width 128, 64-key tiles:
+    priced 108 without them, ptxas held it at 160, FS undercount gate4)."""
+    return [[(block_k, width, jnp.int32), (block_k, width, jnp.float32)] for width in dict.fromkeys(widths)]
+
+
 def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool, *,
                        natural: bool = False, params: tuple = (), width: int | None = None,
-                       parts: int = 1, scaled: bool = False) -> int:
+                       parts: int = 1, scaled: bool = False, codes: bool = False) -> int:
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
@@ -1497,6 +1505,8 @@ def forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dty
                          lhs_swizzle=query_swizzle(family))
     carried = [(block_q, value_width, jnp.float32)]
     scored = resources.live_registers(family, carried, [logits, *hooked]) + vectors
+    if codes:
+        phases += _converted(block_k, value_width if width is None else width, value_width)
     # A training walk's per-query rows (`TRAINING_ROWS`), in the accumulator's row layout.
     rows = TRAINING_ROWS * family.row_registers(block_q, jnp.float32) if residuals else 0
     return max(resources.live_registers(family, carried, *phases, *products), scored) + rows + (
@@ -1536,7 +1546,8 @@ class ForwardRegisters:
     operands' dtype (an fp32 call's, whose launches walk its 16-bit `parts`), its query and value heads'
     widths, whether it keeps a training walk's split sums (`residuals`), whether its logits stay natural
     (`natural`, beside a config's own natural form), its score hook's parameters' kinds and kept dtypes,
-    and whether its walk scales in its kernel (`scaled`, `MosaicForward.scales_in_kernel`)."""
+    and whether its walk scales in its kernel (`scaled`, `MosaicForward.scales_in_kernel`) and converts its
+    keys' and values' quantized codes (`codes`, `attention_mosaic_forward._Codes`)."""
     dtype: Any
     width: int
     value_width: int
@@ -1545,6 +1556,7 @@ class ForwardRegisters:
     params: tuple
     parts: int
     scaled: bool
+    codes: bool = False
 
     def at(self, family: mosaic.Family, tiles: Tiles, *, peaks: bool = False,
            columns: int | None = None) -> int | None:
@@ -1559,7 +1571,7 @@ class ForwardRegisters:
         value_width = columns or tiles.columns or _width(self.value_width, family, self.dtype)
         return forward_registers(family, tiles, value_width, self.dtype, self.residuals,
                                  natural=tiles.natural_form or self.natural, params=self.params,
-                                 width=width, parts=self.parts, scaled=self.scaled)
+                                 width=width, parts=self.parts, scaled=self.scaled, codes=self.codes)
 
 
 DQ_ROWS = 7
