@@ -727,8 +727,9 @@ class _Writer:
         observed once, so a reader that never runs out sees it too."""
         with self.lock:
             completion = self.seal_future
-            # A completion a closing reader abandoned was cancelled, and counted (`abandoned`).
-            if completion is None or not completion.done() or completion.cancelled():
+            # A completion a closing reader abandoned ends `Abandoned`, and was counted (`abandoned`).
+            if (completion is None or not completion.done() or completion.cancelled()
+                    or isinstance(completion.exception(), Abandoned)):
                 return
             self.seal_future = None
         self._settled(completion.result)

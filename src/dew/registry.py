@@ -1329,7 +1329,7 @@ def dtype_name(value: DTypeLike | None) -> DtypeName | None:
         return None
     name = storage_name(value)
     if name is None:
-        raise ValueError(f"{value!r} is not a dtype a config can name")
+        raise Unrecordable(f"{value!r} is not a dtype a config can name")
     return name
 
 

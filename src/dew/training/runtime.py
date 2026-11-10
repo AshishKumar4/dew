@@ -352,6 +352,10 @@ class SignalWake:
         os.set_blocking(self._write, False)
         self._previous = signal.set_wakeup_fd(self._write, warn_on_full_buffer=False)
         self._waiting = False
+        # poll, which takes any descriptor, where select takes none past FD_SETSIZE and a run raises the
+        # descriptor limit far past it (`_raise_limits`).
+        self._poll = select.poll()
+        self._poll.register(self._read, select.POLLIN)
 
     def notify(self) -> None:
         """Wake the main thread's wait (`wait`), called holding the condition it waits on: a byte only while
@@ -368,7 +372,7 @@ class SignalWake:
             self._waiting = True
             condition.release()
             try:
-                select.select([self._read], [], [])
+                self._poll.poll()
                 self._drained()
             finally:
                 condition.acquire()

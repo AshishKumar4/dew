@@ -1652,14 +1652,56 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
         rows.close()
 
 
-def test_a_training_close_waits_out_its_uploads_and_a_store_gone_fails_them_without_a_segment():
-    """A training read closed early waits for each upload in flight to end, written or failed, and none
-    runs past its writer: a store that is gone fails its transfer by its transport's own timeout, the
-    close then ends, the upload counted abandoned, and no segment is published."""
+def test_a_training_close_waits_out_an_upload_in_flight_and_publishes_no_segment_or_seal():
+    """A training read closed while an upload is in flight waits for it to end, and what the upload would
+    have published after the close began, its segment and the fill's seal, is not: the shard it wrote
+    stays unreferenced, the fill counted abandoned, and the close raises nothing of its own."""
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    entered, closing = threading.Event(), threading.Event()
+    rows = None
+
+    class Slow(MemoryFileSystem):
+        """Memory objects behind a third-party conditional write whose shard upload ends only once the
+        reader's close has begun."""
+
+        protocol = "slow"
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(path.replace("slow://", "memory://", 1))
+
+        def put_conditional(self, path, payload, version):
+            if "/shards/" in path:
+                entered.set()
+                assert closing.wait(10)
+                while not rows.writer.closed:
+                    time.sleep(0.01)
+            if self.exists(path):
+                raise FileExistsError(path)
+            self.pipe_file(path, payload)
+            return hashlib.sha256(payload).hexdigest()
+
+    fsspec.register_implementation("slow", Slow, clobber=True)
+    root = f"cache-{uuid4().hex}"
+    rows = Cache(f"slow://{root}", shard_bytes=1, retry=0).mapped(
+        grain.MapDataset.source(Memory([{"id": 0}]).records("indexed")), _key())
+    assert rows[0] == {"id": 0}
+    assert entered.wait(5)
+    closing.set()
+    rows.close()
+    written = MemoryFileSystem().find(f"/{root}")
+    assert any("/shards/" in path for path in written)
+    assert not any("/segments/" in path for path in written), written
+    assert rows.metrics()["abandoned"] > 0
+
+
+def test_a_training_close_ends_when_its_store_is_gone():
+    """A store that is gone fails an upload in flight by its transport's own timeout, so a close that
+    waits out its uploads ends, the upload counted abandoned and nothing of the fill published."""
     from fsspec.implementations.memory import MemoryFileSystem
 
     entered = threading.Event()
-    stored = []
 
     class Gone(MemoryFileSystem):
         """Memory objects behind a third-party conditional write whose store is gone: its transfer
@@ -1673,19 +1715,17 @@ def test_a_training_close_waits_out_its_uploads_and_a_store_gone_fails_them_with
 
         def put_conditional(self, path, payload, version):
             entered.set()
-            time.sleep(0.5)
             raise TimeoutError("the transport's own timeout: no answer from the store")
 
     fsspec.register_implementation("gone", Gone, clobber=True)
-    source = Memory([{"id": 0}])
-    cache = Cache(f"gone://cache-{uuid4().hex}", shard_bytes=1, retry=0)
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key())
+    root = f"cache-{uuid4().hex}"
+    rows = Cache(f"gone://{root}", shard_bytes=1, retry=0).mapped(
+        grain.MapDataset.source(Memory([{"id": 0}]).records("indexed")), _key())
     assert rows[0] == {"id": 0}
     assert entered.wait(5)
     rows.close()
-    assert all(future.done() for future in rows.writer.futures)
     assert rows.metrics()["abandoned"] > 0
-    assert not any("/segments/" in path for path in stored)
+    assert not MemoryFileSystem().find(f"/{root}")
 
 
 @pytest.mark.network
