@@ -565,6 +565,25 @@ def dot_precisions(function, *arguments) -> list:
                 for equation in equations(graph, platform="cuda") if equation.primitive.name == "dot_general"]
 
 
+def logits_operands(function, *arguments, width: int) -> set:
+    """The dtypes every product `function` traces over `arguments` that contracts one axis `width` long (an
+    attention's logits over its head width) multiplies in, nested programs included, as the program states
+    them: the witness of a policy that widens the query and keys before their product (`wide_logits`), which
+    no output shows on a CPU, whose compiler may keep a bf16 result wider than bf16 (rows 5429 and 5439).
+    jax.nn's 16-bit logits are fp32 sums of 16-bit operands, which this tells apart. A float64 sum Dew's wide
+    CPU arithmetic takes (`dew.nn.precision.float64_sum`) multiplies float64."""
+    graph = jax.make_jaxpr(function)(*arguments)
+    found = set()
+    for equation in equations(graph):
+        if equation.primitive is not jax.lax.dot_general_p:
+            continue
+        # Its contracted axes' lengths, which its two operands share.
+        (contracted, _), _ = equation.params["dimension_numbers"]
+        if [equation.invars[0].aval.shape[axis] for axis in contracted] == [width]:
+            found.add(jnp.promote_types(*(variable.aval.dtype for variable in equation.invars)))
+    return found
+
+
 def assert_fp32_reduction_bound(dew, reference, magnitudes, terms: int) -> None:
     """Two fp32 reductions differ by at most 2 gamma_n sum(abs(products))
     (`dew._accuracy.reduction_bound`): `magnitudes` holds the elementwise sum of

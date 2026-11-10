@@ -43,6 +43,7 @@ from dew.nn.kernels.templates.attention import (
     Kind,
     Split,
     block_map,
+    blocked,
     by_power,
     gradients,
     interpreted_dot,
@@ -928,6 +929,11 @@ def _dq_staging(ba: tokamax.BoundArguments, config: BackwardTiles, target: gener
     elements = (staged.buffers(stages) * keys * (width + value_width) + rows * (width + value_width))
     if staged.fp32 or (not staged.warpgroup and rows < value_width):
         elements += rows * keys
+    if staged.fp32 and blocked(width) and blocked(keys):
+        # The key tile staged again for dQ's product, its blocks along the keys where the logits' product took
+        # them along the width (`kernel_dot`): Triton asked 8192 bytes more at 32 x 32, width 64, and 32768 at
+        # 64 x 64, width 128, on an A100, an H100 and a B200 (et-tsmem).
+        elements += keys * width
     fp16 = jnp.dtype(query.dtype) == jnp.dtype(jnp.float16)
     if fp16:
         elements += rows * keys

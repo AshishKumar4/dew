@@ -176,20 +176,23 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
     if kv_lengths is None and kv_pad:
         kv_lengths = jnp.full(key.shape[:1], kv_len, jnp.int32)
 
-    def local(query, key, value, bias=None, mask=None, key_value_seq_lengths=None):
-        # A window of (l, r) keeps the l keys before the query and the r after it
-        # on both the xla and the cudnn path, the sides `window_sides` counts.
-        return jax.nn.dot_product_attention(
-            query, key, value, bias=bias, mask=mask, is_causal=causal,
-            key_value_seq_lengths=key_value_seq_lengths,
-            local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
-            implementation='cudnn')
-
+    local = functools.partial(_jax_nn, causal=causal, sliding_window=sliding_window, implementation='cudnn')
     out = on_attention_shards(local, query, key, value,
                     bias=(None if bias is None else four_dimensional(bias), SCORES),
                     mask=(None if mask is None else four_dimensional(mask), SCORES),
                     key_value_seq_lengths=(kv_lengths, ("activation_batch",)))
     return out[:, :q_len] if q_pad else out
+
+
+def _jax_nn(query, key, value, bias=None, mask=None, key_value_seq_lengths=None, *, causal: bool,
+            sliding_window, implementation: Literal["xla", "cudnn"]):
+    """jax.nn's attention of the call on its `implementation`, 'xla' or 'cudnn': a window of (l, r) keeps
+    the l keys before the query and the r after it, the sides `window_sides` counts."""
+    return jax.nn.dot_product_attention(
+        query, key, value, bias=bias, mask=mask, is_causal=causal,
+        key_value_seq_lengths=key_value_seq_lengths,
+        local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
+        implementation=implementation)
 
 
 def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=None, segment_ids=None,
@@ -801,30 +804,39 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
                                        starts=(held.get("starts"), rows),
                                        sinks=(held.get("sinks"), ("activation_heads",)))
 
-        def folded(query, key, value, lengths, *given):
+        def decoded_reference(query, key, value, lengths, *given):
             held = dict(zip(rest, given, strict=True))
             visible = with_key_starts(with_key_lengths(None, lengths, key.shape[-3]), held.get("starts"),
                                       key.shape[-3])
-            if "sinks" not in held and softcap is None:
-                return folded_attention(query, key, value, visible)
-            # The folded form has neither; the reference path computes both over the same keys.
             return reference_attention(query, key, value, mask=visible, sinks=held.get("sinks"),
-                                       softcap=softcap)
+                                       softcap=softcap, scale_logits=True)
 
         # The kernel has no derivative, so both modes differentiate the attention it stands in for, the
-        # sinks among its operands, at the kernel's arithmetic: IEEE products for fp32 operands
-        # (`decode_attention`), its 16-bit products summed in fp32 otherwise.
+        # sinks among its operands, at the kernel's arithmetic (IEEE products for fp32 operands, 16-bit
+        # ones summed in fp32, logits fp32: `scale_logits`) on the reference path, not the folded form,
+        # whose products read the keys across heads: an H100's fp32 gradients through it held 1.82 to 2.08
+        # times the reference's error, through the reference path 1.00 (M-ET-62, row 5268).
         kernel_precision = "highest" if query.dtype == jnp.float32 else None
-        out = forward_differentiable(decoded, folded, query, key, value, key_value_seq_lengths,
+        out = forward_differentiable(decoded, decoded_reference, query, key, value, key_value_seq_lengths,
                                      *rest.values(), precision=kernel_precision)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
-        # kernel takes the call the two forms agree bitwise.
-        out = folded_attention(query, key, value, mask if key_value_seq_lengths is None
-                               else with_key_lengths(mask, key_value_seq_lengths, key.shape[-3]))
+        # kernel takes the call the two forms agree bitwise. Its derivative is the reference path's, as
+        # the decode kernel's is: the folded form's products read the keys across heads, and an H100's
+        # fp32 gradients through them held twice the reference's error (M-ET-62, row 5268).
+        visible = (mask if key_value_seq_lengths is None
+                   else with_key_lengths(mask, key_value_seq_lengths, key.shape[-3]))
+        held = () if visible is None else (visible,)
+
+        def folded(query, key, value, *visible):
+            return folded_attention(query, key, value, *visible)
+
+        def folded_reference(query, key, value, *visible):
+            return reference_attention(query, key, value, mask=visible[0] if visible else None,
+                                       scale_logits=True)
+
+        out = forward_differentiable(folded, folded_reference, query, key, value, *held)
     elif implementation == 'xla':
-        # A window of (l, r) keeps the l keys before the query and the r after
-        # it on both the xla and the cudnn path, the sides `window_sides` counts.
         # Its softmax takes the textbook derivative y (g - sum(y g)) (`jax.softmax_custom_jvp`, which jax
         # ships off), exactly zero for a query that reads one key, as torch's and the reference path's.
         # The default differentiates `exp(x - max) / sum`, whose g / e - g e / e^2 is zero only where that
@@ -832,11 +844,8 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
         # into one FMA, which leaves e at 1 +- a rounding of the logit, so a rounding's worth of query
         # and key gradient there. The values are the same bits either way.
         with jax.softmax_custom_jvp(new_val=True):
-            out = jax.nn.dot_product_attention(
-                query, key, value, bias=bias, mask=mask, is_causal=causal,
-                key_value_seq_lengths=key_value_seq_lengths,
-                local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
-                implementation='xla')
+            out = _jax_nn(query, key, value, bias, mask, key_value_seq_lengths, causal=causal,
+                          sliding_window=sliding_window, implementation='xla')
     elif implementation == 'template':
         out = template_attention(query, key, value, causal, sliding_window, sinks=sinks, softcap=softcap,
                                  segment_ids=segment_ids, lengths=key_value_seq_lengths,

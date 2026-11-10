@@ -16,12 +16,14 @@ import pytest
 from generation_support import COMPILES_ON_CPU, INTERPRETS
 from reference_error import assert_as_exact
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
     attention_decode,
+    attention_mosaic,
     bundles,
+    report,
 )
 
 KEYS = 256
@@ -640,3 +642,28 @@ def test_a_decode_step_given_its_caches_value_bounds_walks_as_one_given_none_int
             return attention_decode.attend(query, key, value, spans, interpret=True, bounds=bounds)
 
     np.testing.assert_array_equal(np.asarray(jax.jit(attended)(bound)), np.asarray(jax.jit(attended)(None)))
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
+def test_a_walk_its_compile_refused_plans_a_config_its_launch_pins(dtype):
+    """A decode step's walk whose launch a compile refused (its kernel spilled, `report.refuse_launch`) plans
+    that walk again at a config its own launch pins: each walk's plan is its launched op's (`WALKS`), so the
+    refusal of the scaled walk's launch steps it down, never pinning it to the config refused (row 5420)."""
+    query = jnp.zeros((8, 1, 16, 64), dtype)
+    key = value = jnp.zeros((8, KEYS, 8, 64), dtype)
+    spans = template.spans(1, KEYS, 8, lengths=jnp.full((8,), KEYS, jnp.int32))
+    with generation.assumed("sm90"):
+        work, rows, row_spans, whole = attention_decode.planned(query, key, value, spans, template.Hooks())
+        walk = "scaled" if "scaled" in work else "plain"
+        assert work[walk].slices == 1
+        op, args = attention_mosaic._forward_call(rows, key, value, row_spans, whole, scale=None,
+                                                  natural=False, masked=True, subtracted=True,
+                                                  **attention_decode.WALKS[walk]._asdict())
+        launch = op.bind(*args, residuals=template.Kept.NONE, interpret=False)
+        refused = op.completed(launch, work[walk].config)
+        with report.refusals():
+            report.refuse_launch(op, launch, refused, {"attention_forward"})
+            again = attention_decode.planned(query, key, value, spans, template.Hooks())[0][walk]
+            with tuning.pinned({attention_mosaic.MosaicForward: again.config}):
+                chosen = op._chosen(launch)
+    assert chosen != refused

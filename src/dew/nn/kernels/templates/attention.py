@@ -1072,14 +1072,45 @@ stability suite holds to check 1 at extreme inputs, where the default holds to f
 ruling, 2026-10-23). Every backward's default reads it."""
 
 
+FP32_BLOCK = 16
+"""The depth of the blocks a Triton kernel's fp32 product is summed in (`kernel_dot`): the least a dot
+takes."""
+
+
+def blocked(depth: int) -> bool:
+    """Whether a Triton kernel's fp32 product over `depth` sums in blocks (`kernel_dot`): two or more
+    `FP32_BLOCK`-deep blocks, a power of two of them, the parts Pallas's Triton lowering splits a value in."""
+    blocks = depth // FP32_BLOCK
+    return depth % FP32_BLOCK == 0 and blocks >= 2 and not blocks & (blocks - 1)
+
+
 def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
-    """`a @ b` accumulated in fp32 as a template's Triton kernels issue it: bf16's and fp16's own product,
-    IEEE fp32 for fp32 operands; interpreted, the template's CPU product (`interpreted_dot`)."""
+    """`a @ b` accumulated in fp32 as a template's Triton kernels issue it: bf16's and fp16's own product;
+    for fp32 operands IEEE fp32 products, a contraction of blocks (`blocked`) summed a block at a time, each
+    block's one chain, the blocks' sums added in order with each addition's rounding carried (`two_sum`) and
+    the carries added last, a non-finite sum's the plain one (`compensated_total`). One chain over the depth
+    held a GPU's fp32 decode step at 1.91 times the error of the reference path, whose one-query products
+    XLA reduces as a tree (its dot strength reduction), its blocks so 1.12; the template's fp32 gradients
+    1.56 to 1.69 times, so 0.83 to 0.92 (M-ET-75, rows 5414, 5404). Interpreted, the template's CPU
+    product (`interpreted_dot`)."""
     if interpret:
         return interpreted_dot(a, b)
     from jax.experimental.pallas import triton as plgpu
 
-    return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+    from dew.nn.precision import compensated_total, two_sum
+
+    def dot(a, b):
+        return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+
+    if a.dtype != jnp.float32 or b.dtype != jnp.float32 or not blocked(a.shape[-1]):
+        return dot(a, b)
+    blocks = a.shape[-1] // FP32_BLOCK
+    lefts, rights = jnp.split(a, blocks, axis=-1), jnp.split(b, blocks, axis=0)
+    total, carried = two_sum(dot(lefts[0], rights[0]), dot(lefts[1], rights[1]))
+    for left, right in zip(lefts[2:], rights[2:], strict=True):
+        total, dropped = two_sum(total, dot(left, right))
+        carried = carried + dropped
+    return compensated_total((total, carried), total)
 
 
 def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:

@@ -36,6 +36,7 @@ from dew.nn.kernels.templates import (
     attention_mosaic_program,
     attention_portable,
     attention_quantized,
+    attention_route,
     attention_triton,
     bundles,
     mosaic_sm90,
@@ -181,15 +182,29 @@ of one family's mechanism (a TPU core's, an H100's three consumers or pinned lay
 an fp32 call's bf16 parts, which an A100's pipeline loads in no pieces, row 4475) names its GPU itself."""
 
 
+def on_each_family_for(names: str | tuple[str, ...], values, ids=None) -> pytest.MarkDecorator:
+    """`ON_EACH_FAMILY` crossed with `values` of the parameters `names`, one of them `form`: the cells each
+    GPU's family takes, a backward form of an H100's layouts alone (`WGMMA_FORMS`) on its family alone."""
+    names = (names,) if isinstance(names, str) else tuple(names)
+    values = list(values)
+    if callable(ids):
+        labels = ["-".join(ids(each) for each in (value if len(names) > 1 else (value,))) for value in values]
+    else:
+        labels = [str(value) for value in values] if ids is None else list(ids)
+    at = names.index("form")
+    cells = [(generation_name, *(value if len(names) > 1 else (value,)), f"{generation_name}-{label}")
+             for generation_name in INTERPRETED_ON for value, label in zip(values, labels, strict=True)
+             if INTERPRETED_ON[generation_name] == WGMMA
+             or (value[at] if len(names) > 1 else value) not in WGMMA_FORMS]
+    return pytest.mark.parametrize(("interpreted_on", *names), [cell[:-1] for cell in cells],
+                                   ids=[cell[-1] for cell in cells], indirect=["interpreted_on"])
+
+
 @pytest.fixture(autouse=True)
 def interpreted_on(request):
     """The GPU this cell runs as interpreted (`_device`, `_form_tiles`, `_backward_form`): its parameter's,
-    an H100 where it has none; a backward form of an H100's layouts alone (`WGMMA_FORMS`) is no A100
-    cell."""
+    an H100 where it has none (`on_each_family_for` generates no cell of a form its family lacks)."""
     generation_name = getattr(request, "param", "sm90")
-    form = getattr(getattr(request.node, "callspec", None), "params", {}).get("form")
-    if INTERPRETED_ON[generation_name] != WGMMA and form in WGMMA_FORMS:
-        pytest.skip(f"{form} is an H100's layout's form alone")
     token = _INTERPRETED.set(generation_name)
     yield generation_name
     _INTERPRETED.reset(token)
@@ -264,20 +279,6 @@ def _dropping(shape) -> template.Hooks:
         jnp.arange(shape[2], dtype=jnp.int32), DROP_RATE))
 
 
-def _mosaic_backward_takes(spans: template.KeySpans, query, key, hooks: template.Hooks | None, *,
-                           accurate: bool) -> None:
-    """Skips the check where the Mosaic backward declines a call of `query`'s and `key`'s shapes and dtype
-    under `hooks` on the target in effect: a call it declines for its registers (`MosaicBackward.declined`'s
-    resources) is the route's next mainloop's, whose own suites check it; it declines no call it takes
-    otherwise."""
-    query, key = (jnp.zeros(array.shape, array.dtype) for array in (query, key))
-    reason = attention_mosaic.backward_declined(query, key, key, spans, hooks, query,
-                                                residuals=_residuals(query.shape), accurate=accurate)
-    assert reason is None or reason.code == "resources", reason
-    if reason is not None:
-        pytest.skip(f"the Mosaic backward declines it: {reason}")
-
-
 def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
                  form: str = "default", score: tuple = (), gate: bool = False, dtype=jnp.bfloat16,
                  natural: bool = False, seeds: int | None = None, width: int = 64,
@@ -305,10 +306,6 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
                               output.output_mod, output.output_params)
 
     accurate, config = _backward_form(form)
-    if backward:
-        query, key = (jax.ShapeDtypeStruct((rows, queries, count, width), dtype) for count in shape[2:])
-        with _device(interpret):
-            _mosaic_backward_takes(spans, query, key, hooked(*draw_hooks(0)), accurate=accurate)
 
     def ours(query, key, value, dout, params, initial):
         hooks = hooked(params, initial)
@@ -322,8 +319,10 @@ def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool
             # The backward from this mainloop's own training forward's residuals.
             residuals = attention_mosaic.forward(query, key, value, spans, hooks, natural=natural,
                                                  residuals=template.Kept.SPLIT, interpret=interpret)[1:]
-            grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
-                                              accurate=accurate, interpret=interpret)
+            # On the mainloop the route takes it to (`attention_route.backward`): this one's, else the
+            # Pallas-Triton one's where this one's registers hold no tile of it.
+            grads = attention_route.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                                             accurate=accurate, interpret=interpret)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def reference(query, key, value, dout, params, initial):
@@ -486,9 +485,8 @@ def _gradient_terms(spans: template.KeySpans, hooked: Callable | None = None, sc
     return terms
 
 
-@ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize("form", ["default", "fused"])
+@on_each_family_for("form", ["default", "fused"])
 @pytest.mark.parametrize("call", CALLS)
 def test_the_backward_from_the_kept_output_is_on_par_interpreted(call, form):
     """The backward from a training forward that keeps its output for D (`template.Kept.OUTPUT`: the inference
@@ -666,9 +664,8 @@ def test_the_natural_forward_is_on_par_interpreted(call, dtype):
     _check_forward(call, dtype, SHAPES["interpreted"], natural=True, interpret=True)
 
 
-@ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize("form", CASES)
+@on_each_family_for("form", CASES)
 def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
     """The forward over each of the template core's call forms under the interpreter."""
     _check_call_form(form, interpret=True)
@@ -730,11 +727,10 @@ def test_the_forward_is_on_par_dropping_interpreted(call, training, dtype):
                    drop=True)
 
 
-@ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize(("form", "dtype"), [*((form, jnp.bfloat16) for form in (*HOOKED_FORMS, "fused")),
-                                             ("derived", jnp.float16)],
-                         ids=lambda value: value if isinstance(value, str) else jnp.dtype(value).name)
+@on_each_family_for(("form", "dtype"),
+                    [*((form, jnp.bfloat16) for form in (*HOOKED_FORMS, "fused")), ("derived", jnp.float16)],
+                    ids=lambda value: value if isinstance(value, str) else jnp.dtype(value).name)
 def test_the_backward_is_on_par_dropping_interpreted(form, dtype):
     """The backward in each form under probability dropout over a causal call, the fast form's one launch
     too (each consumer's tile its own draw), its D the forward's dropped split sums' about the anchor's
@@ -788,9 +784,8 @@ def _keys_first_gradients(query, key, value, dout, spans, *, form: str, scale: f
     return tuple(np.asarray(grad, np.float64) for grad in grads), truth
 
 
-@ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize("form", HOOKED_FORMS)
+@on_each_family_for("form", HOOKED_FORMS)
 def test_the_keys_first_backward_keeps_the_logits_the_forward_keeps_finite_interpreted(form):
     """Queries of 2^120 over keys of 4, one of 8, 64 wide at the scale 1/8: the forward's logits, the
     queries taken by the scale's power before their products (`attention.prescale`), are 2^125 and 2^126,
@@ -809,9 +804,8 @@ def test_the_keys_first_backward_keeps_the_logits_the_forward_keeps_finite_inter
         np.testing.assert_array_equal(mine, true)
 
 
-@ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize("form", HOOKED_FORMS)
+@on_each_family_for("form", HOOKED_FORMS)
 def test_the_keys_first_backward_keeps_the_logits_of_keys_the_power_would_flush_interpreted(form):
     """Queries of 2^126 over keys of 2^-126 and 2^-125 in turn, 64 wide at the scale 2^-10: the forward's
     logits are 1/16 and 1/8, where keys taken by the scale's power would fall below bf16's least subnormal
@@ -837,9 +831,8 @@ def test_the_keys_first_backward_keeps_the_logits_of_keys_the_power_would_flush_
                     f"keys-first backward {form} over keys the power would flush", seeds=SEEDS)
 
 
-@ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize("form", HOOKED_FORMS)
+@on_each_family_for("form", HOOKED_FORMS)
 def test_the_keys_first_backward_keeps_the_key_gradients_of_queries_the_power_would_flush_interpreted(form):
     """A query of 2^-126 over two zero keys, 64 wide at the scale 2^-10, whose values' first entries are
     2^126 and -2^126 under a cotangent on that entry alone: each logit is 0, each score cotangent ±2^125
@@ -857,9 +850,8 @@ def test_the_keys_first_backward_keeps_the_key_gradients_of_queries_the_power_wo
         np.testing.assert_array_equal(mine, true)
 
 
-@ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize(("queries", "form"), PADDED_CALLS.values(), ids=PADDED_CALLS)
+@on_each_family_for(("queries", "form"), PADDED_CALLS.values(), ids=PADDED_CALLS)
 def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
     """A call of `queries` queries over as many keys, padded to whole programs, under a hook dividing by a
     query's parameter and adding a head's: the padding rows' parameter is 0, so the hook is 0/0 there, and a
@@ -881,14 +873,11 @@ def test_padding_rows_reach_no_hook_gradient_interpreted(queries, form):
 
     params = (jnp.ones((1, 1, queries), jnp.float32), jnp.zeros((1,), jnp.float32))
     hooks = hooked(*params)
-    with _device(interpret=True):
-        # Its hook divides by a query's parameter, a temperature (`_mosaic_backward_takes`).
-        _mosaic_backward_takes(spans, query, key, hooks, accurate=accurate)
     with _device(interpret=True), _pinned(backward=config):
         residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=template.Kept.SPLIT,
                                              interpret=True)[1:]
-        grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
-                                          accurate=accurate, interpret=True)
+        grads = attention_route.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                                         accurate=accurate, interpret=True)
     _, pull = jax.vjp(lambda q, k, v, t, b: template.reference(q, k, v, spans, hooked(t, b)), query, key,
                       value, *params)
     for found, expected in zip((grads.query, grads.key, grads.value, *grads.score_params), pull(dout),
@@ -1205,9 +1194,8 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
     _check_backward("causal", shape, form=None, interpret=True, target=target)
 
 
-@ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize("form", ["default", "accurate"])
+@on_each_family_for("form", ["default", "accurate"])
 def test_the_backward_is_on_par_from_the_triton_mainloops_residuals_interpreted(form):
     """The backward from the Triton mainloop's training forward's residuals, as the route feeds them on a GPU
     (`attention_route`), under the interpreter."""
@@ -1243,18 +1231,16 @@ def test_a_hook_shaped_to_the_launchs_tile_is_taken():
                     seeds=SEEDS)
 
 
-@ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize("form", BACKWARD_FORMS)
+@on_each_family_for("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("case", CASES)
 def test_the_backward_is_on_par_over_every_call_form_interpreted(case, form):
     """The backward in both forms over each of the template core's call forms under the interpreter."""
     _check_call_form(case, interpret=True, backward=True, form=form)
 
 
-@ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize("form", ["forward", *BACKWARD_FORMS])
+@on_each_family_for("form", ["forward", *BACKWARD_FORMS])
 @pytest.mark.parametrize("case", RUN_CASES)
 def test_a_call_over_runs_is_on_par_interpreted(case, form):
     """A decision row's runs (`test_attention_template.RUN_CASES`), several key intervals a query, under the
@@ -1287,9 +1273,8 @@ def test_a_call_of_whole_key_tiles_reads_no_padding_interpreted(call, backward):
     _check_spans(f"{call} of whole key tiles", spans, (1, 128, 2, 1), interpret=True, backward=backward)
 
 
-@ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize("form", BACKWARD_FORMS)
+@on_each_family_for("form", BACKWARD_FORMS)
 @pytest.mark.parametrize("call", CALLS)
 def test_the_backward_is_on_par_interpreted(call, form):
     """The backward in every form under the interpreter, each at its width (`FORM_WIDTHS`)."""
@@ -1468,9 +1453,8 @@ takes 128 draws at any head count, past the CPU suite's 240 s target interpreted
 heads: 270 to 650 s, row 1849); the CPU keeps every other hook, sinks and softcap among them."""
 
 
-@ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize("form", ["default", "accurate"])
+@on_each_family_for("form", ["default", "accurate"])
 @pytest.mark.parametrize("hooks", [hooks for hooks in BACKWARD_HOOKS if hooks not in HOPPER_HOOK_SITES])
 def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
     """The backward in both forms under each score hook over causal packed documents under a window, under
@@ -1593,10 +1577,9 @@ def test_a_parameter_every_row_shares_takes_each_rows_gradient_interpreted(hooks
     _check_hooked_backward(hooks, form="default", interpret=True, shared=True)
 
 
-@ON_EACH_FAMILY
 @INTERPRETS
-@pytest.mark.parametrize(("hooks", "form"), [("softcap", "fused"), ("softcap", "fused-shared-keys"),
-                                             ("sinks", "fused")])
+@on_each_family_for(("hooks", "form"),
+                    [("softcap", "fused"), ("softcap", "fused-shared-keys"), ("sinks", "fused")])
 def test_a_hooked_backward_in_one_launch_holds_check_1_interpreted(hooks, form, without_deterministic_ops):
     """The fast form's one launch queries first under a softcap, a score hook of no parameters, each
     consumer its own keys or its share of a shared key block (`attention_mosaic_coop`), its score
@@ -1777,13 +1760,10 @@ def test_the_backward_under_every_score_hook_lowers_for_an_h100(hooks, accurate)
         hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
                                                  for value, kind in zip(params, kinds, strict=True)),
                                 initial)
-        return attention_mosaic.backward(q, k, v, spans, hooked, dout, residuals=residuals, accurate=accurate)
+        return attention_route.backward(q, k, v, spans, hooked, dout, residuals=residuals, accurate=accurate)
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        hooked = template.Hooks(score_mod, tuple(template.Param(value, kind)
-                                                 for value, kind in zip(params, kinds, strict=True)), initial)
-        _mosaic_backward_takes(spans, q, kv, hooked, accurate=accurate)
         jax.jit(backward_of).trace(q, kv, kv, q, residuals, params, initial).lower(
             lowering_platforms=("cuda",))
 

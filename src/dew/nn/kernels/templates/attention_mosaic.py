@@ -694,7 +694,9 @@ class MosaicForward(_Mainloop[Tiles]):
         computed = query.dtype if scales is not None else value.dtype
         return ForwardRegisters(query.dtype, query.shape[-1], value.shape[-1], residuals is Kept.SPLIT,
                                 self._natural(query), params, self.parts,
-                                self._scales(table, sources, scales, computed), codes=scales is not None)
+                                self._scales(table, sources, scales, computed), codes=scales is not None,
+                                positions=math.ceil(query.shape[1] / self.per_span)
+                                if self.form == "spans" and self.per_span > 1 else 0, per_span=self.per_span)
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> Refusal | None:
@@ -819,9 +821,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
         spans = spans.per_query()
     op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural,
                              out_dtype=out_dtype, masked=masked, splits=splits, table=table, sources=sources,
-                             subtracted=subtracted, scales=scales)
-    if scaled or bounded:
-        op = dataclasses.replace(op, scaled=scaled, bounded=bounded)
+                             subtracted=subtracted, scales=scales, scaled=scaled, bounded=bounded)
     return op(*args, residuals=residuals, interpret=interpret)
 
 
@@ -858,10 +858,12 @@ def certified(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
                   scale: float | None, natural: bool, out_dtype=None, masked: bool = False,
                   splits: int = 1, table: jax.Array | None = None, sources: jax.Array | None = None,
-                  subtracted: bool = False,
-                  scales: tuple[jax.Array, jax.Array] | None = None) -> tuple[MosaicForward, tuple]:
+                  subtracted: bool = False, scales: tuple[jax.Array, jax.Array] | None = None,
+                  scaled: bool = False, bounded: bool = False) -> tuple[MosaicForward, tuple]:
     """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
-    (`refused`)."""
+    (`refused`): the op it launches, `scaled` or `bounded` as the call names (`MosaicForward.scaled`,
+    `MosaicForward.bounded`), so a plan of it derives that launch's config and reads that launch's
+    refusals (`attention_decode.plan`)."""
     hooks = Hooks() if hooks is None else hooks
     fp32 = all(jnp.dtype(x.dtype) == jnp.dtype(jnp.float32) for x in (query, key, value))
     parts = product.EXACT_PARTS if fp32 else 1
@@ -883,7 +885,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        scale=logit_scale(query.shape[3], scale), natural=natural,
                        out_dtype=None if out_dtype is None else jnp.dtype(out_dtype).name, masked=masked,
                        splits=splits, subtracted=subtracted, per_span=spans.per_span,
-                       parts=parts, rounds=hooks.rounds)
+                       parts=parts, rounds=hooks.rounds, scaled=scaled, bounded=bounded)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop,

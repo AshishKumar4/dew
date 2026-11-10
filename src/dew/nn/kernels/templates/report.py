@@ -36,8 +36,8 @@ from dew import communicators
 from dew.nn.kernels import generation
 
 if TYPE_CHECKING:
+    from dew.nn.kernels.lowered import KernelCall
     from dew.nn.kernels.templates.resources import RegisterModel
-
 
 SHARED_REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
 """XLA's refusal of a program one of whose Triton kernels asks more shared memory than a block holds,
@@ -510,10 +510,11 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     template only so). The last compile's own spills are recorded,
     neither refused nor stepped, so every process derives the program this compile keeps; a relowering whose
     derivations find no config left (`Exhausted`: a launch a call pins) keeps the program before it, its
-    misses recorded as not stepped. Refusals commit only as a replacement compiles, so a later process
-    derives the program kept here. A program loaded from the persistent compilation cache carries its
-    kernels' binaries as one compiled here does. A program whose block XLA refuses steps its asking Triton
-    launches down (`_unblocked`)."""
+    misses recorded as not stepped. Each relowering's refused launches compile alone until none spills
+    (`_stepped_alone`), the whole program once after them. Refusals commit only as a replacement compiles,
+    so a later process derives the program kept here. A program loaded from the persistent compilation
+    cache carries its kernels' binaries as one compiled here does. A program whose block XLA refuses steps
+    its asking Triton launches down (`_unblocked`)."""
     if first.error is not None:
         asked = shared_asked(first.error)
         if asked is None:
@@ -531,14 +532,15 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
             break
         try:
             with _proposing(refusals) as proposal:
-                replacement, spilling = _compiled_reported(relower(), options)
+                program, alone = _stepped_alone(relower, options, {identity for (identity, _), _ in refusals})
+                replacement, spilling = _compiled_reported(program, options)
         except Exhausted as failed:
             _log.warning("relowering after a spill found no config: %s; the program before it runs", failed)
             break
         _commit(proposal)
-        for refusal, kernel in refusals:
+        for refusal, kernel in [*refusals, *((refusal, report.kernel) for refusal, report, _ in alone)]:
             _record(refusal, None, frozenset({kernel}))
-        _recorded(found, stepped=True)
+        _recorded([*found, *alone], stepped=True)
         executable, found = replacement, _misses_of(spilling)
     # The kept program's own spills are misses alone: refused, they would have every process seeded with
     # them derive another program, not the one this compile keeps and runs.
@@ -548,45 +550,67 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
 
 TRITON_TARGET = "__gpu$xla.gpu.triton"
 """The custom call target of a Pallas-Triton kernel, whose backend config names it."""
+MOSAIC_CALL = MOSAIC_TARGET.decode()
+"""The custom call target of a Mosaic GPU kernel (`MOSAIC_TARGET`), as a lowered module names it."""
 
 
-def refused_alone(lowered: jax.stages.Lowered) -> dict[str, int]:
-    """The Pallas-Triton kernels of `lowered` XLA refuses for their shared memory each compiled alone, by
-    name, with the bytes each asked (`shared_asked`): each kernel's call cloned into a module of its own,
-    its operands the module's parameters and its results the module's, compiled by `lowered`'s own backend
-    for one of its devices (a compile-only device's too). A kernel alone that compiles, or that XLA refuses
-    for another reason, is none of them."""
+@dataclasses.dataclass(frozen=True)
+class Alone:
+    """A kernel call compiled in a module of its own (`compiled_alone`): the binaries its executable carries
+    (`binaries`' reading), or the error XLA raised of it."""
+    binaries: tuple["Binary", ...] = ()
+    error: Exception | None = None
+
+
+def compiled_alone(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
+                   wanted: Callable[["KernelCall"], bool]) -> dict[str, Alone] | None:
+    """Each Pallas-Triton and Mosaic GPU kernel call of `lowered` that `wanted` takes, compiled alone, by its
+    kernel's name: the call cloned into a module of its own, every attribute kept but the program's
+    shardings (its operands' aliasing and its side effects among them), its operands the module's parameters
+    and its results the module's, compiled by `lowered`'s own backend for one of its devices (a compile-only
+    device's too) under the program's own compile options (its lowering's and `options`), so its binary is
+    the one the program's compile makes: a kernel's code compiles apart from the program around it. None
+    where a wanted call reads its program's devices (a Mosaic call over collective metadata or replicas),
+    which no module of one device holds."""
     import jaxlib.xla_client as xla_client
     from jax._src import compiler
     from jax._src.interpreters import pxla
     from jax._src.lib.mlir.dialects import func
 
-    # The compile's own backend and devices: a jit's lowering holds them (`pxla.MeshComputation`); `Lowered`
-    # states neither.
+    from dew.nn.kernels.lowered import kernel_call
+
+    # The compile's own backend, devices and options: a jit's lowering holds them (`pxla.MeshComputation`);
+    # `Lowered` states none of them.
     lowering = lowered._lowering
     if not isinstance(lowering, pxla.MeshComputation) or lowering._device_list is None:
-        raise TypeError(f"kernels are refused alone from a jit's lowering over its devices, not "
+        raise TypeError(f"kernels are compiled alone from a jit's lowering over its devices, not "
                         f"{type(lowering).__name__}")
     backend, device = lowering.compile_args["backend"], next(iter(lowering._device_list))
+    overrides = dict(lowering._compiler_options_kvs + tuple((options or {}).items()))
     module = lowering.stablehlo()
-    calls = []
+    calls: dict[str, ir.Operation] = {}
 
     def walk(operation) -> None:
         for region in operation.regions:
             for block in region.blocks:
                 for inner in block.operations:
                     inner = inner.operation
-                    if (inner.name == "stablehlo.custom_call"
-                            and ir.StringAttr(inner.attributes["call_target_name"]).value == TRITON_TARGET):
-                        calls.append(inner)
+                    target = (ir.StringAttr(inner.attributes["call_target_name"]).value
+                              if inner.name == "stablehlo.custom_call" else None)
+                    if target in (TRITON_TARGET, MOSAIC_CALL):
+                        called = kernel_call(target, inner)
+                        if called is not None and wanted(called):
+                            calls.setdefault(launch_name(called.name, called.launch), inner)
                     walk(inner)
 
     walk(module.operation)
-    refused: dict[str, int] = {}
-    for call in calls:
-        name = ir.StringAttr(ir.DictAttr(call.attributes["mhlo.backend_config"])["name"]).value
-        if name in refused:
-            continue
+    for call in calls.values():
+        config = ir.DictAttr(call.attributes["mhlo.backend_config"])
+        if "xla_replica_ids" in config or ("uses_xla_collective_metadata" in config
+                                           and ir.BoolAttr(config["uses_xla_collective_metadata"]).value):
+            return None
+    compiled: dict[str, Alone] = {}
+    for name, call in calls.items():
         with module.context, ir.Location.unknown():
             alone = ir.Module.create()
             alone.operation.attributes["sym_name"] = ir.StringAttr.get("alone")
@@ -605,14 +629,59 @@ def refused_alone(lowered: jax.stages.Lowered) -> dict[str, int]:
                     for attribute in [name for name in held if name.startswith("sdy.")]:
                         del clone.attributes[attribute]
                     func.ReturnOp(clone.results)
-        options = compiler.get_compile_options(num_replicas=1, num_partitions=1, device_assignment=(device,),
-                                               backend=backend)
+        built = compiler.get_compile_options(num_replicas=1, num_partitions=1, device_assignment=(device,),
+                                             env_options_overrides=overrides, backend=backend)
         try:
-            compiler.backend_compile_and_load(backend, alone, xla_client.DeviceList((device,)), options, [])
+            executable = compiler.backend_compile_and_load(backend, alone, xla_client.DeviceList((device,)),
+                                                           built, [])
         except jax.errors.JaxRuntimeError as error:
-            if (bytes_asked := shared_asked(error)) is not None:
-                refused[name] = bytes_asked
-    return refused
+            compiled[name] = Alone(error=error)
+            continue
+        compiled[name] = Alone(tuple(_carried(executable.serialize())))
+    return compiled
+
+
+def refused_alone(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None
+                  ) -> dict[str, int]:
+    """The Pallas-Triton kernels of `lowered` XLA refuses for their shared memory each compiled alone
+    (`compiled_alone`), by name, with the bytes each asked (`shared_asked`). A kernel alone that compiles,
+    or that XLA refuses for another reason, is none of them; a Triton call reads no collective metadata, so
+    none is left to its program's compile (`compiled_alone`'s None)."""
+    alone = compiled_alone(lowered, options, lambda call: call.kind == "triton") or {}
+    return {name: asked for name, each in alone.items()
+            if each.error is not None and (asked := shared_asked(each.error)) is not None}
+
+
+def _stepped_alone(relower: Callable[[], jax.stages.Lowered], options: jax.stages.CompilerOptions | None,
+                   stepped: set[str]) -> tuple[jax.stages.Lowered, list]:
+    """The program `relower`ed past the refusals in scope (`_proposing`'s), the launches `stepped` names (by
+    identity) relowered again past each config whose kernel spills compiled alone (`compiled_alone`), until
+    none of them spills alone; and those misses, each now refused in the scope (`_misses_of`'s form). A
+    whole program's compile a step cost an sm100 step's step-down 18 s of its 30, eight of them spilling
+    recurrence launches (row 5359), where a kernel alone costs its own compile. A stepped launch whose call
+    cannot compile alone steps at the whole program's compile, as before; the whole compile after these is
+    the net (`settled`)."""
+    missed: list = []
+    while True:
+        program = relower()
+
+        def wanted(call) -> bool:
+            launch = traced(call.launch or kernel_of(call.name)[1] or "")
+            return launch is not None and launch.identity in stepped
+
+        alone = compiled_alone(program, options, wanted)
+        if alone is None or any(each.error is not None for each in alone.values()):
+            return program, missed
+        held = _registry().refused
+        found = [(refusal, report, launch)
+                 for refusal, report, launch in _misses_of([binary for each in alone.values()
+                                                            for binary in each.binaries if binary.frame])
+                 if refusal is not None and report.kernel not in held.get(refusal, frozenset())]
+        if not found:
+            return program, missed
+        for refusal, report, _ in found:
+            _record(refusal, None, frozenset({report.kernel}))
+        missed += found
 
 
 def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
@@ -629,7 +698,7 @@ def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions 
     from dew.nn.kernels.lowered import kernel_calls
 
     tried: dict[tuple[str, Hashable], tuple[str, Launch]] = {}
-    alone = refused_alone(lowered)
+    alone = refused_alone(lowered, options)
     # Every Triton kernel XLA compiles, a branch no run reaches too (a guarded forward's rewalk).
     for call in kernel_calls(lowered, unrun=True):
         kernel, digest = kernel_of(call.name)
@@ -727,25 +796,56 @@ def binaries(executable: jax.stages.Compiled, *, decoded: bool = False) -> list[
     removed it under them ('Directory not empty', row 2790), and the settings turn on every dump Mosaic has
     (row 2816). `decoded`, each binary's SASS findings too (`sass_findings`, the compile gate's), each
     cubin disassembled from a file of its own."""
+    runtime = executable.runtime_executable()
+    if runtime is None:
+        raise ValueError("a compiled program with no runtime executable carries no kernel binaries to read")
+    return _carried(runtime.serialize(), decoded)
+
+
+def _carried(serialized: bytes, decoded: bool = False) -> list[Binary]:
+    """`binaries`' reading of an executable as XLA serializes it (a program's, or a kernel's compiled alone,
+    `compiled_alone`)."""
+    found: list[Binary] = []
+    for name, proto in _thunk_protos(serialized):
+        found.extend(thunk_kernels(proto, decoded=decoded))
+        # XLA's own kernels (its fusions, its Triton GEMMs) carry their cubins too: a template launch's
+        # names its launch (`named`).
+        kernel = custom_kernel(proto) if LAUNCH_SUFFIX.search(name) else None
+        if kernel is not None:
+            elf, shared = kernel
+            found.append(dataclasses.replace(_binary(name, elf, decoded), shared=shared))
+    return found
+
+
+def launched_kernels(executable: jax.stages.Compiled) -> list[tuple[str, int]]:
+    """Every custom kernel `executable` launches, by the name its thunk gives it, with the shared bytes its
+    launch asks for (`custom_kernel`): a Pallas-Triton call's whatever its name (`binaries` keeps a
+    template launch's), and XLA's own custom kernels, read from its serialized form as `binaries`."""
+    runtime = executable.runtime_executable()
+    if runtime is None:
+        raise ValueError("a compiled program with no runtime executable launches no kernel to read")
+    return [(name, kernel[1]) for name, proto in _thunk_protos(runtime.serialize())
+            if (kernel := custom_kernel(proto)) is not None]
+
+
+def _thunk_protos(serialized: bytes) -> list[tuple[str, bytes]]:
+    """Each thunk an executable XLA serialized as `serialized` calls (its thunk sequence, read by thunky's
+    reader of the serialized form, which its public `jax_executable_to_mlir` reads from a
+    `jax.stages.Compiled`, where a kernel's compiled alone is a backend's `LoadedExecutable`), by its
+    kernel's name, with its serialized proto."""
     from jax._src.thunky import thunky
 
-    found: list[Binary] = []
+    found: list[tuple[str, bytes]] = []
+    thunky._check_thunky_available()
     context = thunky.make_ir_context()
     with context:
-        module = thunky.jax_executable_to_mlir(executable, context)
+        module = thunky._thunky.jax_executable_to_mlir(serialized, context)
 
         def visit(operation: ir.Operation) -> ir.WalkResult:
             if operation.name == "thunky.call_thunk_proto":
                 attributes = operation.attributes
-                proto = ir.StringAttr(attributes["thunk_proto"]).value_bytes
-                found.extend(thunk_kernels(proto, decoded=decoded))
-                name = ir.StringAttr(attributes["kernel_name"]).value
-                # XLA's own kernels (its fusions, its Triton GEMMs) carry their cubins too: a template
-                # launch's names its launch (`named`).
-                kernel = custom_kernel(proto) if LAUNCH_SUFFIX.search(name) else None
-                if kernel is not None:
-                    elf, shared = kernel
-                    found.append(dataclasses.replace(_binary(name, elf, decoded), shared=shared))
+                found.append((ir.StringAttr(attributes["kernel_name"]).value,
+                              ir.StringAttr(attributes["thunk_proto"]).value_bytes))
             return ir.WalkResult.ADVANCE
 
         module.operation.walk(visit)
