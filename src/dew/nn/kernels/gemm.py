@@ -40,7 +40,6 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
-from jax.extend import core as jax_core
 
 from dew import _cache
 from dew.algebra import bits
@@ -51,6 +50,7 @@ from dew.nn.kernels.templates.axes import GROUPS
 from dew.nn.kernels.templates.gemm import mosaic_gpu, rows_padded, scattered
 from dew.nn.kernels.templates.product import EXACT_PARTS, SCALE_DEPTH, declared, formed
 from dew.nn.precision import accumulated, at_least_fp32, projected, refuse_recipe
+from dew.nn.programs import read_by
 from dew.nn.sharding import explicit_spec, seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -1768,7 +1768,7 @@ def _reads_accumulators(epilogue, count: int, acc: jax.ShapeDtypeStruct, sides: 
     """Whether the epilogue's VJP reads any of its `count` accumulators: a bias's does not, a product with
     a side operand's does. Read from the VJP's own program, shapes alone."""
     closed, _ = _epilogue_vjp(epilogue, count, acc, sides)
-    return bool(set(closed.jaxpr.invars[:count]) & _needed(closed.jaxpr, closed.jaxpr.outvars))
+    return bool(set(closed.jaxpr.invars[:count]) & read_by(closed.jaxpr, closed.jaxpr.outvars))
 
 
 def _passes_cotangent(epilogue, count: int, at: int, acc: jax.ShapeDtypeStruct, sides: tuple, dtypes: tuple,
@@ -1798,15 +1798,6 @@ def _epilogue_vjp(epilogue, count: int, acc: jax.ShapeDtypeStruct, sides: tuple)
     outs = jax.eval_shape(tupled, *accs, *sides)
     closed = jax.make_jaxpr(pulled)(accs, sides, outs)
     return closed, list(closed.jaxpr.invars[count + len(sides):])
-
-
-def _needed(jaxpr, outvars) -> set:
-    """The variables of `jaxpr` that `outvars` depend on."""
-    needed = {var for var in outvars if isinstance(var, jax_core.Var)}
-    for equation in reversed(jaxpr.eqns):
-        if needed.intersection(equation.outvars):
-            needed.update(var for var in equation.invars if isinstance(var, jax_core.Var))
-    return needed
 
 
 def _as_tuple(outs) -> tuple:

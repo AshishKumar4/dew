@@ -515,7 +515,7 @@ def _prologue_axes(whole, arrays: list, shape: tuple) -> tuple | Refusal:
               for block, array in zip(specs, arrays, strict=True)]
     ids = (jnp.int32(0), jnp.int32(0))
     closed = jax.make_jaxpr(lambda ids, *blocks: tiled(ids, (), *blocks))(ids, *blocks)
-    if any(var in gemm._needed(closed.jaxpr, closed.jaxpr.outvars) for var in closed.jaxpr.invars[:2]):
+    if any(var in programs.read_by(closed.jaxpr, closed.jaxpr.outvars) for var in closed.jaxpr.invars[:2]):
         return Refusal('reads_position', "the producer reads its tile's position")
     return tuple(axes)
 
@@ -630,7 +630,7 @@ def _reads_position(tiled, value_specs, values, probe, dtype) -> bool:
     tile = jax.ShapeDtypeStruct(probe, dtype)
     closed = jax.make_jaxpr(lambda ids, tiles, tile: tiled(ids, (), tiles, tile))(
         (jnp.int32(0), jnp.int32(0)), tiles, tile)
-    needed = gemm._needed(closed.jaxpr, closed.jaxpr.outvars)
+    needed = programs.read_by(closed.jaxpr, closed.jaxpr.outvars)
     return any(var in needed for var in closed.jaxpr.invars[:2])
 
 
