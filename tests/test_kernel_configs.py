@@ -1233,34 +1233,58 @@ def test_a_gate_holding_its_models_fails_a_spill_free_disagreement_and_an_unmode
     def judged(most: int) -> list[str]:
         model = resources.RegisterModel(96, 255, 1, most, 8, 0, shared=1024, file=65536)
         record = {"name": "forward", "generation": "sm120", "limit": 101376, "tmem_limit": 0,
-                  "models": {}, "lowered_models": {"dew_gmm": model.record()}, "kernels": [kernel]}
+                  "models": {"dew_gmm": model.record()}, "kernels": [kernel]}
         assert not mosaic_failures([record])
         return model_failures([record])
 
     assert judged(most=2) == []
     assert judged(most=4)
     unmodelled = {"name": "forward", "generation": "sm90", "limit": 232448, "tmem_limit": 0, "models": {},
-                  "lowered": {"dew_gmm": ["launch"]}, "kernels": [kernel]}
-    mosaic_failures([unmodelled])
+                  "kernels": [kernel]}
     assert model_failures([unmodelled])
 
 
-def test_a_kernel_is_judged_by_the_model_its_launch_lowered_not_the_cases_declared_one():
-    """A kernel whose launch lowered its own register model (`lowered_models`: its plan's two programs)
-    is judged by that model, whose residency ptxas's need was searched at: the case's declared model for
-    its name (a family's four programs by registers alone) states no decision this launch made, so it
-    adds no disagreement (row 1971: 381 of the gate's 511 recorded misses were the declared model's
-    residency against the lowered launch's need)."""
+def test_an_undercounting_model_fails_the_gate_and_an_overcounting_one_does_not():
+    """The gate fails a model that admits more programs a multiprocessor than ptxas's caps hold
+    (`undercounts`: here four where the caps hold two, or a tile no cap holds spill-free), the launch then
+    spilling or planned past its residency; a model admitting fewer passes, its cost a smaller tile; a launch
+    no model states fails."""
+    from kernel_compile import undercounts
+
+    need = {"admitted": True, "programs": 2, "budget": 255, "refusal_holds": True, "refusal_programs": 2,
+            "caps": [{"cap": 255, "registers": 96, "spilled": 0, "compiled": True, "holds": True},
+                     {"cap": 64, "registers": 64, "spilled": 40, "compiled": True, "holds": False}]}
+    kernel = {"kernel": "dew_gmm", "launch": None, "unread": [], "shared": 1024, "tmem": 0, "registers": 96,
+              "spilled": 0, "need": need}
+
+    def failed(most: int, held: dict = need) -> list[str]:
+        model = resources.RegisterModel(96, 255, 1, most, 8, 0, shared=1024, file=65536)
+        return undercounts([{"name": "forward", "models": {"dew_gmm": model.record()},
+                             "kernels": [{**kernel, "need": held}]}])
+
+    assert failed(most=2) == [] and failed(most=1) == []
+    assert failed(most=4) and "ptxas holds 2" in failed(most=4)[0]
+    assert failed(most=2, held={**need, "admitted": False})
+    assert undercounts([{"name": "forward", "models": {}, "kernels": [kernel]}]) == [
+        "forward dew_gmm: a launch no register model states"]
+
+
+def test_a_kernel_is_judged_by_the_model_its_launch_stated_not_the_cases_declared_one():
+    """A kernel whose launch stated its own register model as it traced (`stated_models`: its plan's two
+    programs) is judged by that model, the decision its derivation made: the case's declared model for its
+    name (a family's four programs by registers alone) states no decision this launch made, so it adds no
+    disagreement (row 1971: 381 of the gate's 511 recorded misses were a declared model's residency against
+    the launch's need)."""
     from kernel_compile import _register_evidence
 
     declared = resources.RegisterModel(112, 255, 1, 4, 8, 0, shared=49232, file=65536)
-    lowered = resources.RegisterModel(112, 255, 1, 2, 8, 0, shared=49232, file=65536)
+    stated = resources.RegisterModel(112, 255, 1, 2, 8, 0, shared=49232, file=65536)
     need = {"admitted": True, "programs": 2, "budget": 255, "refusal_holds": True, "refusal_programs": 2,
             "caps": [{"cap": 255, "registers": 96, "spilled": 0, "compiled": True, "holds": True}]}
     kernel = {"kernel": "dew_tgmm", "launch": None, "unread": [], "shared": 49232, "tmem": 0,
               "registers": 96, "spilled": 0, "need": need}
     record = {"name": "kernel gradient", "generation": "sm120", "limit": 101376, "tmem_limit": 0,
-              "models": {"dew_tgmm": declared.record()}, "lowered_models": {"dew_tgmm": lowered.record()},
+              "models": {"dew_tgmm": declared.record()}, "stated_models": {"dew_tgmm": stated.record()},
               "kernels": [kernel]}
     rows = _register_evidence(record)
     assert rows and all(row["agrees"] for row in rows), rows
