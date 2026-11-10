@@ -1019,6 +1019,15 @@ def served_by(server):
     return server, tickets
 
 
+def shared_page(options: dict) -> int:
+    """The prompt tokens a repeated "1234567" reads from its first run's pages under `options`: one full
+    page of four where the server pages its cache in fours and shares prefixes, as a paged server does
+    unless told not to (`prefix_cache` None), its last token prefilled again; none in pages of 16, which
+    the prompt fills none of, or over a dense cache."""
+    layout = options.get("kv_cache")
+    return 4 if layout is not None and layout.page_size == 4 and options.get("prefix_cache", True) else 0
+
+
 @pytest.mark.parametrize("options", [
     {"kv_cache": KVCache(page_size=16, pages=12)},
     {"kv_cache": KVCache(page_size=16, pages=12), "chunk": 2},
@@ -1031,7 +1040,8 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     server reserves, a prompt prefilled two or three tokens a step
     attends to its earlier pieces through the page table (or its dense
     row), and a repeated prompt starts from the page its first run
-    published. None of it changes a greedy draw: every row is the lone task
+    published, as a paged server shares prefixes by default (`prefix_cache`
+    None). None of it changes a greedy draw: every row is the lone task
     call's. Each runs the mixed admitting step."""
     bound = task()
     alone = [bound(prompt, budget, key=index)
@@ -1040,8 +1050,7 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.mixed_refusal is None
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), lone)
-    # "1234567" keeps its last token to prefill: one full page of four is shared.
-    assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
+    assert server.prefix_hits == shared_page(options)
 
 
 def test_a_host_tier_reads_back_a_prefix_whose_upload_reclaims_the_last_device_pages():
@@ -1167,6 +1176,29 @@ def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alon
     assert tickets[4].admitted <= tickets[1].admitted
     for ticket, lone in zip(tickets, alone, strict=True):
         assert_same_generation(ticket.result(), lone)
+
+
+@pytest.mark.parametrize("kind", ["attention", "hybrid"])
+def test_a_finished_requests_history_is_read_by_a_prompt_that_continues_it(kind):
+    """A finished request names its history, its prompt and every draw its cache holds (all but its last,
+    which no step fed), so a later prompt that continues it, a conversation's next turn, declaring that
+    history its shared segment (`Server.__call__`'s `shared`), reads its pages, and over a hybrid stack
+    the recurrent state its rows were left in there, and prefills only what follows: its draws are the
+    lone task call's over the whole prompt, and the history's every token is read from the cache."""
+    model = (decoder() if kind == "attention" else hybrid_model(VOCAB)).clone(max_seq_len=128)
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    bound = TextGeneration(model, params, sampling=Sampling(temperature=0, eos_token_ids=EOS))
+    server = Server.from_task(bound, slots=2, capacity=64, kv_cache=KVCache(page_size=4, pages=40))
+    prompt = [1, 2, 3, 4, 5, 6, 7]
+    first = server([prompt], 9, key=0)[0].host()
+    count = int(first.lengths[0])
+    drawn = [int(token) for token in first.tokens[0, first.prompt_width:first.prompt_width + count]]
+    history = [*prompt, *drawn[:-1]]
+    continued = [*prompt, *drawn, 8, 9]
+    before = server.prefix_hits
+    second = server([continued], 6, key=1, shared=[len(history)])[0]
+    assert_same_generation(second, bound([continued], 6, key=1))
+    assert server.prefix_hits - before == len(history)
 
 
 @pytest.mark.parametrize("prefix_cache", [False, True], ids=["unshared", "prefix"])
@@ -1551,7 +1583,7 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
         server, tickets = served_alongside(placed, slots=8, admission=8, **options)
         assert_sharded(placed.variables["params"], server.mesh)
         assert server.groups == jax.device_count() // mesh.tensor
-        assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
+        assert server.prefix_hits == shared_page(options)
         if "kv_cache" in options:
             pool = next(leaf for leaf in jax.tree.leaves(server.cache) if leaf.ndim == 4)
             pages = pool.sharding.spec[1]
