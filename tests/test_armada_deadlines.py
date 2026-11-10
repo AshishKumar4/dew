@@ -86,15 +86,19 @@ def wheel(root: Path) -> Path:
 
 @pytest.mark.parametrize("launched", [False, True], ids=["pytest", "a release check's"])
 @pytest.mark.parametrize("stall", STALLS)
-def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, tmp_path, stall, launched):
+def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, tmp_path, monkeypatch, stall,
+                                                                           launched):
     """A task interrupted at its deadline reports its pytest's every thread as it stood then, its Python
     frames and the native ones under them, a stall before any test ran included, which pytest's own report
     of an interrupt cannot give (2026-11-03: a group stalled 28 minutes in a read with no deadline during
     collection, its row saying only that no tests ran): a thread stalled in the interpreter, or in native
     code holding the GIL or not (an XLA compile, a wait on a device, a collective), read from outside the
     process. A release check's pytest runs under `uv run`, which stands between the task and pytest: the
-    stacks are still pytest's own."""
+    stacks are still pytest's own. The row names the stall's whole record among its evidence in the task's
+    artifacts (`stalls.kept`), its stacks and the host's cgroup quota beside them (rows 5452, 5454)."""
     source, stalled = STALLS[stall]
+    artifacts = tmp_path / "artifacts"
+    monkeypatch.setenv("ARMADA_ARTIFACTS", str(artifacts))
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_stalls.py": f"{source}\n\ndef test_never():\n    pass\n"})
     ci.task("3.12", ["tests/test_stalls.py"], "", tmp_path / "rows.json", 10.0 if launched else 3.0,
@@ -103,6 +107,9 @@ def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, 
     assert interrupted["kind"] == "deadline"
     # py-spy's frame of the stalled function, by its file and line.
     assert f"{stalled} (test_stalls.py:" in interrupted["output"]
+    [kept] = interrupted["artifacts"]
+    record = artifacts / kept
+    assert f"{stalled} (test_stalls.py:" in record.read_text() and "cpu.max" in record.read_text()
 
 
 def test_a_task_within_its_deadline_writes_no_stacks(ci, tmp_path):
