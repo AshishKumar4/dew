@@ -85,9 +85,10 @@ DELTA_GATES_FASTER = ("e5198da4e: a gated delta net's b and a, 24,576 tokens, fo
 """The receipt behind the delta net's gates' joined cells."""
 
 JOINED_FASTER = {
-    (Choice.GATE_UP, 'sm80'): "dbf402f36: Qwen3.5-0.8B's packed step, 24,576 tokens, one 1024 -> 7168 GEMM for "
-                         "two 1024 -> 3584 ones, 0.36 ms a layer less on an A100 80GB (forward 1.67 -> 1.54, "
-                         "input gradient 1.55 -> 1.49, weight gradient 1.70 -> 1.51 ms); none on an H100",
+    (Choice.GATE_UP, 'sm80'): (
+        "dbf402f36: Qwen3.5-0.8B's packed step, 24,576 tokens, one 1024 -> 7168 GEMM for two 1024 -> 3584 "
+        "ones, 0.36 ms a layer less on an A100 80GB (forward 1.67 -> 1.54, input gradient 1.55 -> 1.49, "
+        "weight gradient 1.70 -> 1.51 ms); none on an H100"),
     (Choice.DELTA_GATES, 'sm80'): DELTA_GATES_FASTER,
     (Choice.DELTA_GATES, 'sm90'): DELTA_GATES_FASTER,
 }
