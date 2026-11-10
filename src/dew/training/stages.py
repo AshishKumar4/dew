@@ -747,10 +747,7 @@ class _Numbering:
 
         params = equation.params
         if jax_name(equation.primitive) == "scan":
-            counts = _scan_counts(equation)
-            if counts is None:
-                return None
-            consts, carries = counts
+            consts, carries = _scan_counts(equation)
             scanned = operands[consts + carries:]
             if params["length"] > UNROLLED or any(isinstance(value, tuple) for value in scanned):
                 return None
@@ -795,35 +792,12 @@ class _Numbering:
         return chosen
 
 
-def _scan_counts(equation) -> tuple[int, int] | None:
-    """A loop's (`scan`) count of constants and of carried values among its operands: as its parameters
-    state them where they do (`num_consts`, `num_carry`), else the one split its program's values allow,
-    each constant and carry its program's own, each scanned value and each stacked result its program's
-    a step, `length` steps of it; None where none or several do."""
-    params = equation.params
-    if "num_consts" in params:
-        return params["num_consts"], params["num_carry"]
-    body, length = params["jaxpr"].jaxpr, params["length"]
-    given, made = [var.aval for var in equation.invars], [var.aval for var in equation.outvars]
-    reads, writes = [var.aval for var in body.invars], [var.aval for var in body.outvars]
-
-    def alike(one, other) -> bool:
-        return tuple(one.shape) == tuple(other.shape) and one.dtype == other.dtype
-
-    def stepped(whole, step) -> bool:
-        return tuple(whole.shape) == (length, *step.shape) and whole.dtype == step.dtype
-
-    def fits(consts: int, carries: int) -> bool:
-        held = consts + carries
-        return (held <= len(given)
-                and all(map(alike, given[:held], reads[:held]))
-                and all(map(alike, writes[:carries], reads[consts:held]))
-                and all(map(stepped, given[held:], reads[held:]))
-                and all(map(stepped, made[carries:], writes[carries:])))
-
-    splits = [(consts, carries) for consts in range(len(given) + 1) for carries in range(len(made) + 1)
-              if fits(consts, carries)]
-    return splits[0] if len(splits) == 1 else None
+def _scan_counts(equation) -> tuple[int, int]:
+    """A loop's (`scan`) count of constants and of carried values among its operands, as JAX's own
+    declaration of its operands splits them (`ft_in`), which the footprint and the compiled program read
+    too."""
+    consts, carries, _ = equation.params["ft_in"].update(range(len(equation.invars))).unpack()
+    return len(consts), len(carries)
 
 
 UNROLLED = 256
