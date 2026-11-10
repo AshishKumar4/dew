@@ -109,8 +109,7 @@ def read_ledger(path: Path, space: Space) -> list[TrialFinished]:
     if ledger['space'] != _recorded(space):
         raise ValueError(f'{path} holds a sweep over {sorted(ledger["space"])}, not this space; '
                          f'a resumed sweep continues the space it started')
-    return [TrialFinished(int(row['index']), str(row['name']), dict(row['overrides']),
-                          float(row['value'])) for row in ledger['trials']]
+    return [TrialFinished.read(row) for row in ledger['trials']]
 
 
 def write_ledger(path: Path, space: Space, trials: Sequence[TrialFinished]) -> None:

@@ -20,7 +20,7 @@ from typing import Literal
 
 from dew import _checkout
 from dew._pool import PREEMPTED_EXIT
-from dew._records import JSON
+from dew._records import JSON, integer, record, text
 
 _log = logging.getLogger(__name__)
 
@@ -231,6 +231,15 @@ class TrialFinished:
     name: str
     overrides: Mapping[str, JSON]
     value: float
+
+    @classmethod
+    def read(cls, row: Mapping[str, object]) -> TrialFinished:
+        """The trial a ledger's row holds as `tracker_json` wrote it, each field read as it declares: its
+        score a number or a nonfinite one's spelling (`reported_number`)."""
+        readers = {int: integer, str: text, float: reported_number}
+        hints = typing.get_type_hints(cls)
+        return cls(**{field.name: readers.get(hints[field.name], record)(row[field.name], field.name)
+                      for field in dataclasses.fields(cls)})
 
 
 type Record = (RunRecord | FitStarted | StepCompiled | CheckpointRequested | ProfileTraced | FitEnded
