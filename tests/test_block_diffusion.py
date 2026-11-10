@@ -178,6 +178,24 @@ def test_diffusion_gemma_export_reads_only_the_requested_decoder_tensor(system):
     np.testing.assert_array_equal(result[name], original[name])
 
 
+def test_diffusion_gemma_writes_back_its_releases_generation_config_and_self_conditioning(system):
+    """The release's generation config reads into a process that writes back every field it stated, and its
+    self-conditioning tensors export under the names and with the values the release stores: one
+    declaration each, read and written (`GENERATION_CONFIG`, `SELF_CONDITIONING`)."""
+    model, variables, process, _, config = system
+    stated = json.loads((WORKFLOW / "generation_config.json").read_text())
+    written = adapter.generation_config_of(process, max_new_tokens=stated["max_new_tokens"],
+                                           pad_token_id=stated["pad_token_id"],
+                                           eos_token_ids=(stated["eos_token_id"],))
+    assert written == {name: stated[name] for name in written}
+    original = load_file(str(WORKFLOW / "model.safetensors"))
+    exported = adapter.export_weights(model, variables, config)
+    conditioning = {name for name in original if ".self_conditioning." in name}
+    assert conditioning == {name for name in exported if ".self_conditioning." in name}
+    for name in conditioning:
+        np.testing.assert_array_equal(exported[name], original[name], err_msg=name)
+
+
 def test_native_shared_model_forward_matches_reference(system):
     """Bare and self-conditioned canvas logits after drawn prompts of five
     tokens, held to transformers' own (`assert_canvas_logits`). Five prompt
