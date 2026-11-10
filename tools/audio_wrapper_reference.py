@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import transformers
 from audio_reference import audio_config, perturb, waveforms
+from hf_reference import GEMMA4_MM_TEXT
 from safetensors.torch import save_file
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import (
@@ -84,18 +85,8 @@ def gemma3n():
 
 
 def gemma4():
-    # The same dense decoder shape as tests/fixtures/hf/gemma4-tiny-mm.
-    text = Gemma4TextConfig(
-        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=3,
-        layer_types=["sliding_attention", "sliding_attention", "full_attention"],
-        num_attention_heads=4, num_key_value_heads=2, head_dim=8, hidden_activation="gelu_pytorch_tanh",
-        attention_k_eq_v=True, sliding_window=4, hidden_size_per_layer_input=0, num_kv_shared_layers=0,
-        per_layer_config={"2": {"head_dim": 16, "num_key_value_heads": 1}}, max_position_embeddings=64,
-        rms_norm_eps=1e-6, final_logit_softcapping=30.0, tie_word_embeddings=True, bos_token_id=2,
-        eos_token_id=1, pad_token_id=0, use_bidirectional_attention="vision", use_double_wide_mlp=False,
-        rope_parameters={"full_attention": {"rope_type": "proportional", "rope_theta": 1e6,
-                                            "partial_rotary_factor": 0.25},
-                         "sliding_attention": {"rope_type": "default", "rope_theta": 1e4}})
+    # The dense decoder of tests/fixtures/hf/gemma4-tiny-mm, as hf_reference declares it.
+    text = Gemma4TextConfig(**GEMMA4_MM_TEXT)
     vision = Gemma4VisionConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=2,
                                 num_attention_heads=4, num_key_value_heads=2, head_dim=8,
                                 pooling_kernel_size=2, patch_size=8, position_embedding_size=64,
