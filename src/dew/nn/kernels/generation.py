@@ -987,11 +987,13 @@ def gpu_facts(part: str | None = None) -> GpuFacts:
         bundles=tuple(bundle.name for bundle in bundles.layouts(target.generation, 'bfloat16')))
 
 
+@functools.lru_cache(maxsize=64)
 def _resolved(device, generation: str, real: bool) -> GpuTarget:
     """`device`'s target within `generation`: its kind picks the SKU's peaks within it, and where the table
     names no SKU of that kind of the generation, a `real` device keeps its own kind, so its peaks stay
     unknown, and another takes the generation's canonical device; a `real` one carries the facts it reports
-    (`runtime_facts`)."""
+    (`runtime_facts`). Resolved once a device and generation: a device's kind and facts are its own for the
+    process, and a trace asks for its target tens of thousands of times."""
     kind = device.device_kind
     target = gpu_target(kind)
     if target.generation != generation:
