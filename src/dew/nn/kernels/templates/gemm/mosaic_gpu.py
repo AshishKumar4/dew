@@ -2274,15 +2274,15 @@ def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int,
     k where the last wave's idling and the partials' passes cost least (below), each slice keeping at least
     the ring's stages and one more steps and its runs sharing the steps whole (`split_runs`, as `gmm`'s runs
     share them); it splits where the walk it saves outweighs its partials and their launch, and is one where
-    it does not, where the device states no rate, or where the call has no whole tile or no step. Key's
-    2560 x 1024 gradient over 24,576 rows on an H100 splits in three, 2 x 128 steps against 384. Its steps
-    priced at their MMA alone, a decode product's few tiles walked unsplit: an A100's 2048 x 2048 input
-    gradient at 1-32 rows ran 12 programs on 108 multiprocessors, 2.8-3.0x XLA's 128 (M-NS-12, row 483),
-    where its matrix's stream is the walk."""
+    it does not, where the device states no rate, or where the call has no whole tile (a contraction of no
+    steps holds no slice past the ring's, so it is one too). Key's 2560 x 1024 gradient over 24,576 rows on
+    an H100 splits in three, 2 x 128 steps against 384. Its steps priced at their MMA alone, a decode
+    product's few tiles walked unsplit: an A100's 2048 x 2048 input gradient at 1-32 rows ran 12 programs on
+    108 multiprocessors, 2.8-3.0x XLA's 128 (M-NS-12, row 483), where its matrix's stream is the walk."""
     wave = multiprocessors * tiles.programs
     output = groups * -(-depth // tiles.block_m) * (width // tiles.block_n)
     steps = -(-rows // max(groups, 1) // tiles.block_k)
-    if step_seconds is None or bandwidth is None or output == 0 or steps == 0:
+    if step_seconds is None or bandwidth is None or output == 0:
         return 1
     operand_bytes = rows * (depth * itemsizes[0] + width * itemsizes[1])
     held = groups * depth if partial_rows is None else partial_rows
