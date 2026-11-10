@@ -36,7 +36,15 @@ from dew.batch import POSITIONS_FIELD, VALIDITY_FIELD, Coordinates, Forks, coord
 from dew.data.text import HFTokenizer, Offsets, Tokenizer
 from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
-from dew.decision.renderer import Chunk, Point, Rendered, Unit, render as rendered_chunks
+from dew.decision.renderer import (
+    Chunk,
+    Point,
+    Rendered,
+    Unit,
+    render as rendered_chunks,
+    stream_point,
+    streamed_chunks,
+)
 from dew.nn.inputs import pad_token_rows
 
 if TYPE_CHECKING:
@@ -725,10 +733,14 @@ class QuestionLayout(Layout):
     siblings: bool = dataclasses.field(default=False, repr=False, metadata={_records.ADDED: True})
     """Whether a question of a row of several (`shared_state`) also reads the ones before it in its row,
     whole (`dew.decision.shared_state.fork_depth`); off, each reads the shared part and itself."""
+    streamed: bool = dataclasses.field(default=False, repr=False, metadata={"record": False})
+    """Whether its rows over one state stand in streams, as a data plan before 12 laid them, where they
+    now stand as documents continuing the shared part; the plan's version states which, no record of the
+    layout does (`dew.decision.shared_state`)."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if self.shared_state is not None or self.siblings:
+        if self.shared_state is not None or self.siblings or self.streamed:
             from dew.decision.shared_state import check_sharing
 
             check_sharing(self)
@@ -801,16 +813,21 @@ class QuestionLayout(Layout):
         return tuple(encoder.encode(text, add_special_tokens=False))
 
     def row_questions(self, questions: int) -> int:
-        """As many of them as one row asks over one state (`shares`, `shared_state`), else one."""
-        return min(questions, self.shared_state) if self.shares and self.shared_state is not None else 1
+        """As many of them as one row asks over one state (`shares`, `streamed`: `shared_state`), else
+        one."""
+        if self.shared_state is not None and (self.shares or self.streamed):
+            return min(questions, self.shared_state)
+        return 1
 
     @property
     def shares(self) -> bool:
-        """Whether a request's questions share one copy of its state in their rows (`shared_state`, stated
-        past one)."""
+        """Whether a request's questions share one copy of its state in their rows as documents
+        continuing it (`shared_state`, stated past one); rows in streams share it otherwise
+        (`streamed`)."""
         from dew.decision.shared_state import forkable
 
-        return self.shared_state is not None and self.shared_state > 1 and forkable(self)
+        return (self.shared_state is not None and self.shared_state > 1 and not self.streamed
+                and forkable(self))
 
     @property
     def spans_in_context(self) -> bool:
@@ -820,9 +837,11 @@ class QuestionLayout(Layout):
 
     @property
     def attention(self) -> "tuple[tuple[tuple[int, ...], ...], int] | None":
-        """Its rows' reads over their streams (`streamed_attention`)."""
-        return streamed_attention(self.reads, self.written)
+        """Its rows' reads over their streams (`streamed_attention`), or of rows in streams over one state
+        (`streamed`, `dew.decision.shared_state.stream_reads`)."""
+        from dew.decision.shared_state import stream_reads
 
+        return stream_reads(self) if self.streamed else streamed_attention(self.reads, self.written)
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None, media: Sequence[int] = (),
@@ -1771,28 +1790,6 @@ def fragment_count(segments: "Sequence[Segment | QuestionSegment]") -> int:
     named = ["row", *(name for name in (segment_stream(segment, segments) for segment in segments)
                       if name != "context"), "row"]
     return sum(1 for index, name in enumerate(named) if index == 0 or name != named[index - 1])
-
-
-def stream_point(chunks: "list[Chunk] | list[Chunk | State]", stream: str, current: str) -> str:
-    """Append to `chunks` the boundary where a row's stream turns to `stream` from `current`, a chunk of no
-    ids at which its text is encoded apart (`dew.decision.renderer.render`), and return the stream now
-    written; none where it stays."""
-    if stream not in (current, "context"):
-        chunks.append(Chunk(ids=(), points=((("stream", len(chunks), stream), 0),)))
-        return stream
-    return current
-
-
-def streamed_chunks(chunks: Sequence[Chunk], streams: Sequence[str]) -> list[Chunk]:
-    """`chunks`, each in its stream of `streams`, with the boundaries where the row turns to another
-    (`stream_point`), the row's own again after them."""
-    marked: list[Chunk] = []
-    current = "row"
-    for chunk, stream in zip(chunks, streams, strict=True):
-        current = stream_point(marked, stream, current)
-        marked.append(chunk)
-    stream_point(marked, "row", current)
-    return marked
 
 
 def token_streams(points: Mapping[Hashable, int], length: int,

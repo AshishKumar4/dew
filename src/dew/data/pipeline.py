@@ -915,11 +915,13 @@ def chains(pipeline: Pipeline) -> Iterator[Pipeline]:
 
 def with_children(pipeline: Pipeline, rewrite: Callable[[Pipeline], Pipeline]) -> Pipeline:
     """`pipeline` with each chain its mixture or phases read rewritten by `rewrite`; `pipeline` itself
-    where it reads a store."""
+    where it reads a store, or `rewrite` leaves every chain as it was."""
     source = pipeline.source
     if not isinstance(source, (Mixture, Phases)):
         return pipeline
     rewritten = tuple(rewrite(child) for child in source.pipelines)
+    if all(now is was for now, was in zip(rewritten, source.pipelines, strict=True)):
+        return pipeline
     return dataclasses.replace(pipeline, source=dataclasses.replace(source, pipelines=rewritten))
 
 
@@ -1393,6 +1395,43 @@ class Piped:
     input: Pipeline | None = None
 
 
+_EARLIER: dict[int, tuple[Callable[..., Dataset], list[tuple[int, tuple[tuple[str, JSON], ...]]]]] = {}
+"""The settings each function chains are piped through was read at by data plans before a version, where
+a call states none of them (`earlier`), by the function's `id`: a chain is piped through any callable, one
+that does not hash among them."""
+
+
+def earlier[Function: Callable[..., Dataset]](before: int, **settings: JSON
+                                              ) -> Callable[[Function], Function]:
+    """Declare, on a function chains are piped through (`Dataset.pipe`), that data plans before version
+    `before` read a call that states none of `settings` at these values: what the function did before it
+    took them, or before their default changed. A chain compiled under such a plan makes the call again
+    with them (`Pipeline.at`), so a run saved then reads on by the stages it saved, whether its chain
+    comes from its record or its script builds it again."""
+    def declared(function: Function) -> Function:
+        _EARLIER.setdefault(id(function), (function, []))[1].append((before, tuple(settings.items())))
+        return function
+
+    return declared
+
+
+def _called(entry: Piped) -> str:
+    """A `pipe` call's function, as a plan names what a stage runs (`StepIdentity`) and a refusal it."""
+    from dew.data.plan import StepIdentity
+
+    return StepIdentity.of(entry.function).name
+
+
+def _earlier_settings(entry: Piped, version: int) -> dict[str, JSON]:
+    """The settings data plan `version` read `entry`'s call at that the call states none of (`earlier`)."""
+    declared = _EARLIER.get(id(entry.function))
+    if declared is None or declared[0] is not entry.function:
+        return {}
+    stated = dict(entry.settings)
+    return {name: value for before, settings in declared[1] if version < before
+            for name, value in settings if name not in stated}
+
+
 @dataclasses.dataclass(frozen=True)
 class Pipeline(Dataset):
     """A dataset's store and the stages its verbs added; what every verb returns."""
@@ -1405,10 +1444,87 @@ class Pipeline(Dataset):
     _elastic: bool = False
     """Whether a training run reads it elastically (`Dataset.elastic`)."""
     piped: tuple[Piped, ...] = dataclasses.field(default=(), compare=False, repr=False)
-    """The calls of `pipe` that made its stages (`Piped`), outermost last; no plan reads them."""
+    """The calls of `pipe` that made its stages (`Piped`), outermost last. No plan's identity holds them;
+    a plan of an earlier version makes again the ones it read otherwise (`at`)."""
 
     def _then(self, *stages: Stage) -> Pipeline:
         return dataclasses.replace(self, stages=(*self.stages, *stages))
+
+    def at(self, version: int) -> Pipeline:
+        """The chain as data plan `version` read it, beside `ObjectiveData.at`: each call of `pipe` whose
+        function declares that plans before a version read a setting otherwise (`earlier`), and which
+        states none of it, made again with it in its place in the chain (`_remade`); a mix's or phases'
+        members each so. Itself where no plan before `version` read a call of it otherwise. A call that
+        made another store of a chain such a plan read otherwise is refused by name: the store it made
+        is of the chain as it stands.
+
+        Every compile reads its chains so first (`dew.data.compile.compile`). The chain it returns is for
+        a plan to read; the run's record writes the one it was given."""
+        return self._at(version, {})
+
+    def _at(self, version: int, read: dict[int, tuple[Pipeline, Pipeline]]) -> Pipeline:
+        """`at`, each chain of the traversal read once (`read`, by its identity, the chain held beside
+        what it reads as): a chain's calls keep the chains they made stores of, and those keep theirs, so
+        a walk that read each again where it met it would read a chain of thirty such calls two to the
+        thirtieth times."""
+        found = read.get(id(self))
+        if found is not None and found[0] is self:
+            return found[1]
+        chain = with_children(self, lambda member: member._at(version, read))
+        for entry in chain.piped:
+            if entry.input is not None and entry.input._at(version, read) is not entry.input:
+                raise ValueError(f"data plan {version} read the chain {_called(entry)} made a store of "
+                                 "otherwise than it stands; state its calls' settings as that plan read "
+                                 "them")
+        while (remade := next(((index, settings) for index, entry in enumerate(chain.piped)
+                               if (settings := _earlier_settings(entry, version))), None)) is not None:
+            chain = chain._remade(*remade, version)
+        read[id(self)] = (self, chain)
+        return chain
+
+    def _remade(self, index: int, read: Mapping[str, JSON], version: int) -> Pipeline:
+        """The chain with its `index`-th call of `pipe` made again with the settings `read`, as data plan
+        `version` read it: the call's stages replaced where they stand, its source, the stages before and
+        after and what later verbs set kept. The call is first made as it states itself, on the chain
+        before it, and must make the stages the chain holds, each the same stage
+        (`dew.data.analysis.same_stage`): a call that made another store of its input, or whose stages
+        were rewritten or would be made otherwise now, cannot be put back where it stood, and is refused
+        by name with the settings to state."""
+        from dew.data.analysis import same_stage
+
+        entry, stated = self.piped[index], dict(self.piped[index].settings)
+        refusal = (f"data plan {version} read {_called(entry)}'s call at {dict(read)}, and the call cannot "
+                   f"be made again where it stands in {self.name or 'the chain'}: state them in the call")
+        before = dataclasses.replace(self, stages=self.stages[:entry.start], piped=())
+
+        def extends(each: Dataset) -> TypeGuard[Pipeline]:
+            """Whether a call's result is the chain before it with stages after: no other store."""
+            return (isinstance(each, Pipeline) and each.source is self.source
+                    and len(each.stages) >= entry.start
+                    and all(now is was for now, was in zip(each.stages, before.stages, strict=False)))
+
+        as_stated, as_read = (before.pipe(entry.function, *entry.args, **settings)
+                              for settings in (stated, stated | read))
+        # What the call sets beside its stages (its mode, its loading) is the chain's as it stands, so a
+        # setting that changed any of it has no place to be put back in.
+        if entry.input is not None or not extends(as_stated) or not extends(as_read):
+            raise ValueError(refusal)
+        made, held = as_stated.stages[entry.start:], self.stages[entry.start:entry.end]
+        if len(made) != len(held) or not all(map(same_stage, made, held)) or dataclasses.replace(
+                as_stated, stages=(), piped=()) != dataclasses.replace(as_read, stages=(), piped=()):
+            raise ValueError(refusal)
+        stages = as_read.stages[entry.start:]
+        moved = len(stages) - (entry.end - entry.start)
+
+        def placed(other: Piped) -> Piped:
+            """A call that stood after the remade one, or around it, by its place in the new chain."""
+            after = other.start >= entry.end
+            return dataclasses.replace(other, start=other.start + moved * after, end=other.end + moved)
+
+        piped = (*(other for other in self.piped[:index] if other.end <= entry.start), *as_read.piped,
+                 *(placed(other) for other in self.piped[index + 1:]))
+        return dataclasses.replace(self, stages=(*self.stages[:entry.start], *stages,
+                                                 *self.stages[entry.end:]), piped=piped)
 
     def _chain(self) -> Pipeline:
         return self

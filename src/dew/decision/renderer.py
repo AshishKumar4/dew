@@ -121,3 +121,25 @@ def _whole(run: Sequence[Chunk], encoder: Encoder, offset: int, marks: dict[Hash
         points.update({key: offset + bisect.bisect_right(ends, at + point) for key, point in chunk.points})
         at += len(chunk.text)
     return ids
+
+
+def stream_point[Piece](chunks: list[Chunk | Piece], stream: str, current: str) -> str:
+    """Append to `chunks` the boundary where a row's stream turns to `stream` from `current`, a chunk of no
+    ids at which its text is encoded apart (`render`), and return the stream now written; none where it
+    stays. `chunks` may hold a layout's other pieces beside its chunks."""
+    if stream not in (current, "context"):
+        chunks.append(Chunk(ids=(), points=((("stream", len(chunks), stream), 0),)))
+        return stream
+    return current
+
+
+def streamed_chunks(chunks: Sequence[Chunk], streams: Sequence[str]) -> list[Chunk]:
+    """`chunks`, each in its stream of `streams`, with the boundaries where the row turns to another
+    (`stream_point`), the row's own again after them."""
+    marked: list[Chunk] = []
+    current = "row"
+    for chunk, stream in zip(chunks, streams, strict=True):
+        current = stream_point(marked, stream, current)
+        marked.append(chunk)
+    stream_point(marked, "row", current)
+    return marked

@@ -771,8 +771,11 @@ def compile(
     reads its order as it did (`dew.config.RunConfig.data_plan_version`), refused before anything is
     provisioned where this Dew reads by none of it (`dew.data.plan.read_by`)."""
     read_by(plan_version)
-    # The objective's data as the plan's version reads it (`ObjectiveData.at`).
+    # The objective's data and each chain's calls as the plan's version reads them (`ObjectiveData.at`,
+    # `Pipeline.at`).
     objective = None if objective is None else objective.at(plan_version)
+    train = train.at(plan_version)
+    validation = None if validation is None else validation.at(plan_version)
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _TRAINING_LOADING
@@ -1650,6 +1653,7 @@ def iterate(
     """A finite record pass through the same lowering, for publication and export, read by data plan
     `plan_version` (`compile`'s)."""
     read_by(plan_version)
+    pipeline = pipeline.at(plan_version)
     if any(
         isinstance(stage, (RandomMap, BatchStage, MapBatch, Workers, Repeat)) for stage in _steps(pipeline)
     ):
@@ -1814,6 +1818,14 @@ def fitted[Entry](
     (`Loader.pass_examples`), reads it bounded to that many passes, as
     `examples` bounds it (`Loader.epochs`), in the one compile (`_staged`)."""
     objective = objective.at(plan_version)
+    # Each chain's calls as the plan's version reads them, before anything is measured (`Pipeline.at`).
+    if isinstance(dataset, Dataset):
+        dataset = dataset._chain().at(plan_version)
+    if isinstance(validation, Dataset):
+        validation = validation._chain().at(plan_version)
+    elif validation is not None:
+        validation = {name: entry._chain().at(plan_version) if isinstance(entry, Dataset) else entry
+                      for name, entry in validation.items()}
     if not isinstance(dataset, (Dataset, Loader)):
         if examples is not None:
             raise ValueError("examples= counts a Dataset chain's source examples, and data handed as it "
@@ -1897,9 +1909,10 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
     refused. A pass reads every record: a batch it fills only in part keeps the records it holds,
     filled out with copies its `VALID_ROWS` marks, where a training read would drop them. `measured`
     is the chain as its run's widths measured it (`_held_measure`), which it reads as it stands."""
-    # The objective's data as the plan's version reads it, before it is measured (`ObjectiveData.at`).
+    # The objective's data and the chain's calls as the plan's version reads them, before it is measured
+    # (`ObjectiveData.at`, `Pipeline.at`).
     objective = None if objective is None else objective.at(plan_version)
-    chain = _held_batched(dataset._chain(), batch)
+    chain = _held_batched(dataset._chain().at(plan_version), batch)
     if measured is None:
         measured = _held_measure(chain, objective)
     elif not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in measured.branches[0].stages):
@@ -1964,6 +1977,7 @@ def validation(
     reads by data plan version `plan_version`, its run's (`compile`)."""
     read_by(plan_version)
     objective = None if objective is None else objective.at(plan_version)
+    pipeline = pipeline.at(plan_version)
     read = read or _preferred_read((pipeline,), provision=provision)
 
     # One pass reads every record, in the chain's own batches or `batch`'s (`_held_batched`).
@@ -2002,6 +2016,7 @@ def publish(
     from dew.data.packing import PackingPlan, plan_name
 
     read_by(plan_version)
+    pipeline = pipeline.at(plan_version)
     if not isinstance(cache, Cache):
         raise TypeError("publish needs a Cache destination")
     if isinstance(pipeline.source, (Mixture, Phases)):

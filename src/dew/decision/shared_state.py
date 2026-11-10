@@ -17,7 +17,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.decision.layout import AnswerCue, Encoded, Instructions, Layout, OptionLines, QuestionLayout, State
+from dew.batch import Forks
+from dew.decision.layout import (
+    HOWS,
+    AnswerCue,
+    Encoded,
+    Instructions,
+    Layout,
+    OptionLines,
+    QuestionLayout,
+    State,
+)
 from dew.nn.protocols import ForkedCalls
 
 if TYPE_CHECKING:
@@ -28,10 +38,12 @@ if TYPE_CHECKING:
 
 
 def check_sharing(layout: QuestionLayout) -> None:
-    """Refuse `layout`'s sharing where its rows cannot ask questions over one state: siblings with no
-    `shared_state`, a `shared_state` under one, or several questions a row it cannot lay (`forkable`)."""
+    """Refuse `layout`'s sharing where its rows cannot ask questions over one state: siblings or rows in
+    streams with no `shared_state`, a `shared_state` under one, or several questions a row it cannot lay
+    (`forkable`)."""
     if layout.shared_state is None:
-        raise ValueError("siblings are the questions a row over one state asks; give shared_state=")
+        raise ValueError("siblings, and rows in streams, are of the questions a row over one state asks; "
+                         "give shared_state=")
     if layout.shared_state < 1:
         raise ValueError(f"shared_state is at least 1, got {layout.shared_state}")
     if layout.shared_state > 1 and not forkable(layout):
@@ -44,26 +56,27 @@ def over_one_state(own: Sequence[Encoded], layout: QuestionLayout) -> list[Encod
     """Each question's `own` row, in order, in the first row over one shared part that takes it (`takes`)
     within `layout`'s `max_len` and `shared_state` questions, or a row of its own, where it shares
     (`QuestionLayout.shares`); with siblings, each question in a row continuing the one before it
-    (`merged`). `own` as it stands where it shares none."""
-    if not layout.shares or layout.shared_state is None:
+    (`merged`). Rows in streams (`QuestionLayout.streamed`) are merged so at any `shared_state`, one
+    question's too, as the plans that laid them did. `own` as it stands where it shares none."""
+    if layout.shared_state is None or not (layout.shares or layout.streamed):
         return list(own)
-    max_len, count, chained = layout.max_len, layout.shared_state, layout.siblings
+    max_len, count, streamed = layout.max_len, layout.shared_state, layout.streamed
     rows: list[list[Encoded]] = []
     for row in own:
-        taken = next((held for held in rows if takes(held, row, max_len, count)), None)
+        taken = next((held for held in rows if takes(held, row, max_len, count, empty=streamed)), None)
         if taken is None:
             rows.append([row])
         else:
             taken.append(row)
-    return [merged(held, chained=chained) for held in rows]
+    return [merged(held, chained=layout.siblings, streamed=streamed) for held in rows]
 
 
-def takes(held: Sequence[Encoded], row: Encoded, max_len: int, count: int) -> bool:
+def takes(held: Sequence[Encoded], row: Encoded, max_len: int, count: int, *, empty: bool = False) -> bool:
     """Whether the row of `held`'s questions takes `row`'s: both hold the whole state and write alike before
-    their questions, fewer than `count` asked, and room for its part within `max_len`."""
+    their questions, fewer than `count` asked, and room for its part within `max_len`. A row writing
+    nothing before its question shares nothing, unless `empty`, as rows in streams took it."""
     shared = held[0].questions[0].span[0]
-    if not shared:
-        # A row writing nothing before its question shares nothing.
+    if not shared and not empty:
         return False
     whole = all(each.state_kept == each.state_tokens for each in (held[0], row))
     alike = held[0].tokens[:shared] == row.tokens[:row.questions[0].span[0]]
@@ -71,13 +84,15 @@ def takes(held: Sequence[Encoded], row: Encoded, max_len: int, count: int) -> bo
             and shared + sum(len(each.tokens) - shared for each in (*held, row)) <= max_len)
 
 
-def merged(rows: Sequence[Encoded], *, chained: bool = False) -> Encoded:
+def merged(rows: Sequence[Encoded], *, chained: bool = False, streamed: bool = False) -> Encoded:
     """`rows`, each one question's own, as one row: their shared part once (document 1), then each one's own
     part (documents 2...), each token at its own row's position; its cuts its questions', its state's
     once. Each question's document continues the shared part, or where `chained` the question's before it
-    (`Encoded.forked_parents`), which it then reads whole (`QuestionLayout.siblings`)."""
+    (`Encoded.forked_parents`), which it then reads whole (`QuestionLayout.siblings`). Where `streamed`,
+    the shared part is the row's stream 0 and each question's own part a stream of its own
+    (`Encoded.streams`), which the layout's `attention` reads (`QuestionLayout.streamed`)."""
     shared = rows[0].questions[0].span[0]
-    if not shared:
+    if not shared and not streamed:
         # Nothing before the question to share (`takes`): the row alone, one document.
         [row] = rows
         alone = (0,) * len(row.tokens)
@@ -96,12 +111,17 @@ def merged(rows: Sequence[Encoded], *, chained: bool = False) -> Encoded:
         positions += range(shared, len(row.tokens))
         documents += [document] * (len(row.tokens) - shared)
     first = rows[0]
-    return Encoded(tuple(tokens), tuple(questions), tuple(positions), None, first.state_tokens,
-                   first.state_kept, instructions_cut=sum(row.instructions_cut for row in rows),
-                   options_cut=sum(row.options_cut for row in rows), state_cut=first.state_cut,
-                   state_characters_cut=first.state_characters_cut,
-                   options_alike=any(row.options_alike for row in rows), forked=tuple(documents),
-                   forked_parents=tuple(document - 1 for document in documents) if chained else None)
+    row = Encoded(tuple(tokens), tuple(questions), tuple(positions), None, first.state_tokens,
+                  first.state_kept, instructions_cut=sum(row.instructions_cut for row in rows),
+                  options_cut=sum(row.options_cut for row in rows), state_cut=first.state_cut,
+                  state_characters_cut=first.state_characters_cut,
+                  options_alike=any(row.options_alike for row in rows))
+    if streamed:
+        # A stream is its document's number less one: the shared part's 0.
+        return dataclasses.replace(row, streams=tuple(document - 1 for document in documents))
+    return dataclasses.replace(
+        row, forked=tuple(documents),
+        forked_parents=tuple(document - 1 for document in documents) if chained else None)
 
 
 def fork_depth(layout: Layout) -> int:
@@ -133,10 +153,45 @@ def collated_forks(rows: Sequence[Encoded], documents: np.ndarray, count: int
             chained)
 
 
+def asked_over(documents: jax.Array, parents: jax.Array, depth: int) -> jax.Array:
+    """How many questions' own rows hold each document of a window `[B, D]`, as float32: a question's own
+    row writes the shared part and its own part (with siblings, the questions' before it too), so a
+    question's document counts itself and every question continuing it, a shared part the questions
+    continuing it, and a document nothing continues, a row of one, once; 0 for a document the window
+    holds none of. `documents` `[B, L]` number each token's document from 1 (`DecisionInputs.documents`),
+    `parents` `[B, D]` the document each continues, 0 for a shared part, and `depth` bounds a chain of them
+    (`fork_depth`). What a term over a row's own tokens weighs a document's tokens by, so rows over one
+    state sum what each question's own row gives (`DecisionObjective.input_terms`)."""
+    numbers = jnp.arange(1, parents.shape[1] + 1, dtype=documents.dtype)
+    held = jnp.any(documents[:, :, None] == numbers, axis=1)
+    asks = held & (parents > 0)
+    # Each question's document counts for itself and once for each document of its chain
+    # (`Forks.ancestors`).
+    chains = jnp.where(asks[:, :, None], Forks(parents, depth=depth).ancestors(), 0)
+    over = jnp.sum(chains[:, :, :, None] == numbers, axis=(1, 2), dtype=jnp.float32)
+    return jnp.maximum(asks + over, held.astype(jnp.float32))
+
+
+def stream_reads(layout: QuestionLayout) -> tuple[tuple[tuple[int, ...], ...], int]:
+    """The reads of `layout`'s rows in streams over one state (`QuestionLayout.streamed`), as
+    `QuestionLayout.attention` gives a row's: stream 0, the shared part, reads itself causally; each
+    question's stream itself causally, the shared part whole and, with `siblings`, the questions' before
+    it whole; with the streams' count less one."""
+    count = layout.shared_state
+    assert count is not None, "rows in streams state their shared_state (`check_sharing`)"
+    questions = tuple((HOWS["causal"], HOWS["whole"],
+                       *(HOWS["whole"] if layout.siblings and other < own else 0
+                         for other in range(1, count + 1)))
+                      for own in range(1, count + 1))
+    return ((HOWS["causal"], *[0] * (count + 1)), *questions), count + 1
+
+
 def over_one_state_row(row: Encoded) -> bool:
     """Whether `row` asks several questions over one state (`merged`): each a document of its own
-    continuing the shared part, which a head reading across its row's questions would join."""
-    return row.forked is not None and len(row.questions) > 1
+    continuing the shared part, or a stream of its own at its own row's positions, which a head reading
+    across its row's questions would join."""
+    apart = row.forked is not None or (row.streams is not None and row.positions is not None)
+    return apart and len(row.questions) > 1
 
 
 def forkable(layout: QuestionLayout) -> bool:
