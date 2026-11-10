@@ -145,3 +145,35 @@ def test_a_changed_check_held_to_a_base_its_checkout_lacks_fails_and_one_gate_ru
     assert check(root, "--changed", "slop", BASE=base).returncode == 1
     assert check(root, "--changed", "ruff", BASE=base).returncode == 0
     assert check(root, "--changed", "slop", BASE="1" * 40).returncode == 2
+
+
+def test_a_changed_type_check_reads_the_heads_files_under_every_root_its_gate_reads(tmp_path):
+    """--changed runs the type gate's own command over the head's Python files under its inputs (src/dew
+    and src/_dew_torch, `pyright_inputs`), where the full run reads the inputs whole: a type error in a
+    changed src/dew file fails it, as the full run fails it (2026-11-10: the gate took its command's last
+    word for its only root, so a head whose every FitSearch(...) call was a type error read "pyright ok")."""
+    root = checkout(tmp_path)
+    # The type checker stood in for: it fails on a file given it holding a type error, listing what it read.
+    (root / "tools/typecheck.sh").write_text(
+        'for path in "$@"; do echo "$path" >> typecheck.log; '
+        '! grep -rq TYPE_ERROR "$path" 2>/dev/null || exit 1; done\n')
+    lines = (root / "tools/check_gates").read_text().splitlines()
+    command = next(line.split("\t")[1] for line in lines if line.split("\t")[0] == "pyright")
+    (root / "tools/check_gates").write_text("".join(
+        f"pyright\tsh tools/typecheck.sh {command.split()[-1]}\n" if line.split("\t")[0] == "pyright"
+        else f"{line}\n" for line in lines))
+    git(root, "commit", "-qam", "the type gate stood in for, its inputs as the real gate's")
+    (root / "src/dew/fit.py").write_text("search: int = 'TYPE_ERROR'\n")
+    (root / "src/_dew_torch/fit.py").write_text("search: int = 1\n")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "a head whose src/dew file is a type error")
+    assert check(root, "--changed", "pyright").returncode == 1
+    (root / "src/dew/fit.py").write_text("search: int = 1\n")
+    git(root, "commit", "-qam", "the type error fixed")
+    (root / "typecheck.log").unlink()
+    assert check(root, "--changed", "pyright").returncode == 0
+    # It read the head's files under both inputs, never an input whole in their place.
+    assert sorted((root / "typecheck.log").read_text().split()) == ["src/_dew_torch/fit.py", "src/dew/fit.py"]
+    (root / "typecheck.log").unlink()
+    assert check(root, "--gate", "pyright").returncode == 0
+    assert (root / "typecheck.log").read_text().split() == ["src/dew", "src/_dew_torch"]
