@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
 import jax
 from jax import lax, numpy as jnp
+from jax._src.lib.mlir.dialects import nvvm
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
@@ -1669,6 +1670,20 @@ class Transport[Allocated, Opened](abc.ABC):
         their shared tiles: a family that stores through registers has none."""
         del pending
 
+    def kept(self, parts, views, interpret: bool, *, smem) -> None:
+        """Each of `parts` written to its view of `views` in global memory for the program's own loads to read
+        back later (`tile_of`, a walk's table of memories): stored whole (`stored`, waited), its writes
+        visible to the warpgroup's loads past it (`visible`), its threads past them (`synced`); a thread
+        reads back what another wrote."""
+        self.stored(parts, views, smem=smem)
+        self.visible(interpret)
+        synced(interpret)
+
+    def visible(self, interpret: bool) -> None:
+        """The program's completed stores to global memory visible to its own loads: a family that stores
+        through its threads' writes needs nothing."""
+        del interpret
+
     def at_store(self, index: jax.Array) -> jax.Array:
         """A view's `index` (its first row) formed where a store reads it (`stored`): through an optimization
         barrier (`opaque`) on a GPU, whose copy is addressed by a 64-bit offset the compiler would otherwise
@@ -2137,6 +2152,12 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def store_wait(self, pending: int) -> None:
         plgpu.wait_smem_to_gmem(pending, wait_read_only=True)
+
+    def visible(self, interpret: bool) -> None:
+        # TMA wrote them in the async proxy; the threads' loads read in the generic one (PTX's proxy fence).
+        if interpret:
+            return
+        plgpu.inline_mgpu()(lambda ctx: nvvm.fence_proxy(nvvm.ProxyKind.async_global))()
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         if interpret:

@@ -502,19 +502,27 @@ class KeyKept(NamedTuple):
     through the pairs, summed."""
 
 
-def _first_decays(dg, run, dh0):
+def _first_decays(dg, run, dh0, taken=None):
     """`dg` `[R, HV * Dk]` with each sequence's first token's taken from the memory its decay scales, as
     fla_kda's port takes it (`fla_kda.first_decay_grad`): `<h0, dh0>` over the values for a sequence that
     takes its memory (begins its row), exactly zero for any other, which
     starts from no memory. Cumulated from its chunk's end, that token's gradient is every term of its chunk,
     which cancel to fp32's residue where the memory is zero: rows of float64 zero 1.5e-7 from it against fla's
-    3.3e-9 (row 5194, M-JS-26-a100)."""
+    3.3e-9 (row 5194, M-JS-26-a100). A forked call's documents each take theirs up at a chunk's first token
+    (`mainloop.Table.loads`): `<h, taken>` there, the memory the chunk entered and its gradient (`taken`,
+    the reverse walk's)."""
     call = run.call
     shared = jnp.sum(run.h0 * dh0, axis=-1).reshape(run.batch, -1)
     first, sizes, row, begins = (run.sequences[:, i] for i in range(4))
     value = jnp.where((begins == 1)[:, None], shared[row], 0.0)
     index = jnp.where(sizes > 0, first * call.chunk, call.rows)
-    return dg.at[index].set(value.astype(dg.dtype), mode="drop")
+    dg = dg.at[index].set(value.astype(dg.dtype), mode="drop")
+    if taken is None:
+        return dg
+    entered = jnp.sum(run.h * jnp.where((run.table.loads >= 0).repeat(call.heads * call.width)[:, None],
+                                        taken, 0.0), axis=-1).reshape(call.chunks, -1)
+    index = jnp.where(run.table.loads >= 0, jnp.arange(call.chunks) * call.chunk, call.rows)
+    return dg.at[index].set(entered.astype(dg.dtype), mode="drop")
 
 
 def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
@@ -525,7 +533,8 @@ def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
     (XLA's, `algebra.key_gated`'s), the memory's and WY part and the pairs' part, summed; the log decay's
     gradient each token's terms, the memory decay's on each chunk's last token (`_reverse`'s fourth),
     cumulated from the chunk's end (its prefix is the chunk's own), a key head's value heads' queries' and
-    keys' gradients summed. Returns them with each launch's outputs as stored (`KeyKept`)."""
+    keys' gradients summed. Returns them, and a forked call's gradient of the memory each chunk takes up
+    (`_reverse`'s table output, None for another), with each launch's outputs as stored (`KeyKept`)."""
     from dew.nn.kernels.templates.recurrence.mainloop_backward import _reverse
 
     call = run.call
@@ -535,8 +544,10 @@ def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
     query = jnp.repeat(query.reshape(rows, heads // group, width), group, axis=1).reshape(rows, heads * width)
     gated = held.split(algebra.key_gated(query, (run.hi, run.lo), run.scale))
     d_scores, local = _key_scores_back(run.scores, laid_do, run.corrected, run.taken, call)
-    dh, dv2, dh0, decayed = _reverse(gated, run.keys, run.w, laid_do, local, run.hi, run.lo, dht,
-                                     run.sequences, None, None, call, tiles, scale=run.scale, memory=run.h)
+    dh, dv2, dh0, decayed, *taken = _reverse(gated, run.keys, run.w, laid_do, local, run.hi, run.lo, dht,
+                                             run.sequences, None, None, call, tiles, scale=run.scale,
+                                             memory=run.h, table=run.table)
+    taken = taken[0] if taken else None
     dq_m, dk_m, dg_m, d_weights, dbeta_m = _key_memory_back(
         run.q, run.k, run.hi, run.lo, laid_do, run.corrected, dv2, run.h, dh, run.a, run.beta, run.taken,
         call, scale=run.scale)
@@ -552,7 +563,7 @@ def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
     last = tuple(x.reshape(call.chunks, call.chunk, heads * width)[:, -1] for x in (run.hi, run.lo))
     terms = terms.at[:, -1].add(decayed.sum(0).reshape(call.chunks, -1) * algebra.raised(*last))
     dg = jnp.flip(jnp.cumsum(jnp.flip(terms, 1), 1), 1).reshape(rows, heads * width)
-    dg = _first_decays(dg, run, dh0)
+    dg = _first_decays(dg, run, dh0, taken)
 
     def keyed(x):
         """A value head's gradient `[R, HV * Dk]` summed onto its key head's `[R, H * Dk]`."""
@@ -560,4 +571,4 @@ def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
 
     kept = KeyKept(run, d_scores, local, dh, dv2, dh0, decayed, dq_m, dk_m, dg_m, d_weights, dbeta_m, dv,
                    d_system, dbeta_v, dq_p, dk_p, dg_p, dbeta_p)
-    return (keyed(dq_m + dq_p), keyed(dk_m + dk_p), dv, dg, (dbeta_m + dbeta_v + dbeta_p).T, dh0), kept
+    return (keyed(dq_m + dq_p), keyed(dk_m + dk_p), dv, dg, (dbeta_m + dbeta_v + dbeta_p).T, dh0, taken), kept

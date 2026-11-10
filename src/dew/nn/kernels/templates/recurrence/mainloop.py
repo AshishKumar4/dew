@@ -1739,9 +1739,206 @@ def _weighted_values(v, a, beta, taken, call: Call):
                          landing={"values": held.landing(chunk, vb)})(v, a, beta, taken)
 
 
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class Table:
+    """A forked call's table as the walks take it (`chunk_forward.ForkedTable`, laid on
+    `chunked_launch.AlignedDocuments`): each row's given memories `given` `[rows * count * HV * Dk, Dv]` fp32,
+    laid as the memories are; the slot each chunk takes its memory up from, `loads` `[chunks]` (one-based,
+    zero a zero memory, -1 none: the chunk continues the one before), and the stored slot it leaves its
+    memory in, `stores` (zero none); each chunk's entry write `entries` `[chunks * HV * Dk, Dv]` fp32, zero
+    but where it takes a document up, where the call gives one; and a row's slots, `count` given and `held`
+    stored."""
+
+    given: jax.Array
+    loads: jax.Array
+    stores: jax.Array
+    entries: jax.Array | None
+    count: int = dataclasses.field(metadata={'static': True})
+    held: int = dataclasses.field(metadata={'static': True})
+
+    @property
+    def operands(self) -> tuple:
+        """What a walk's launch reads of it, in order (`Taking.of`, `Returning.of`)."""
+        return (self.given, self.loads, self.stores, *(() if self.entries is None else (self.entries,)))
+
+
+@dataclasses.dataclass(frozen=True)
+class Slots:
+    """A role's view of a table's memories (`Table`): a memory `[Dk, Dv]` of `base` (a chunk, or a row's slot)
+    the key slices `[block, bv]` of its head and the role's columns."""
+
+    call: Call
+    head: jax.Array
+    column: jax.Array
+    bv: int
+
+    def views(self, ref, base) -> list:
+        call = self.call
+        return [ref.at[pl.ds((base * call.heads + self.head) * call.width + i * call.block, call.block),
+                       pl.ds(self.column, self.bv)] for i in range(call.width // call.block)]
+
+    def read(self, ref, base) -> list:
+        """The memory at `base` of `ref`, in the walk's registers (`Family.tile_of`)."""
+        return [self.call.family.tile_of(view) for view in self.views(ref, base)]
+
+    def zeros(self) -> list:
+        return [self.call.family.zeros((self.call.block, self.bv))] * (self.call.width // self.call.block)
+
+
+@dataclasses.dataclass(frozen=True)
+class Taking:
+    """A forward walk's table for one role (`sequence_walk`'s `table`): before a chunk that takes a document
+    up (`Table.loads`), its memory the table's slot's, given or stored by an earlier document of the row, and
+    its entry write added; after a chunk that ends a storing document (`Table.stores`), its memory written to
+    the row's stored slot, which a later chunk of the same walk reads back (`Family.kept`)."""
+
+    slots: Slots
+    refs: tuple
+    stored: object
+    row: jax.Array
+    count: int
+    held: int
+    smem: object
+
+    @classmethod
+    def of(cls, table: Table, refs: Sequence, stored, slots: Slots, row, smem) -> "Taking":
+        """`table`'s walk from its refs as a launch reads them (`Table.operands`) and its stored slots'
+        output `stored`."""
+        given, loads, stores, *entries = refs
+        return cls(slots, (given, loads, stores, entries[0] if entries else None), stored, row, table.count,
+                   table.held, smem)
+
+    def opened(self) -> None:
+        """Nothing: a stored slot is written by a document before any later one reads it."""
+
+    def before(self, n, state):
+        given, loads, _, entries = self.refs
+        load = loads[n]
+
+        def taken():
+            def from_given():
+                return lax.cond(load > 0, lambda: self.slots.read(given, self.row * self.count + load - 1),
+                                self.slots.zeros)
+
+            def from_stored():
+                return self.slots.read(self.stored, self.row * self.held + load - self.count - 1)
+
+            memory = lax.cond(load > self.count, from_stored, from_given) if self.held else from_given()
+            if entries is not None:
+                written = self.slots.read(entries, n)
+                memory = [part + entry for part, entry in zip(memory, written, strict=True)]
+            return memory
+
+        return lax.cond(load >= 0, taken, lambda: list(state))
+
+    def after(self, n, state):
+        if not self.held:
+            return state
+        slot = self.refs[2][n]
+
+        @pl.when(slot > 0)
+        def _():
+            call = self.slots.call
+            call.family.kept(list(state), self.slots.views(self.stored, self.row * self.held + slot - 1),
+                             call.interpret, smem=self.smem)
+
+        return state
+
+
+@dataclasses.dataclass(frozen=True)
+class Returning:
+    """A reverse walk's table for one role (`sequence_walk`'s `table`), from a row's last chunk to its first:
+    before a chunk that ended a storing document (`Table.stores`), the gradient its stored slot gathered from
+    the documents that took it up added to the gradient the chunk leaves; after a chunk that takes a document
+    up (`Table.loads`), the gradient of the memory it entered written as its own (`taken`: the caller sums a
+    given slot's and forms the entry write's from it) and, for a stored slot, added into the slot's
+    (`returned`, read back by the walk, `Family.kept`), the walk before it carrying none."""
+
+    slots: Slots
+    loads: object
+    stores: object
+    taken: object
+    returned: object
+    row: jax.Array
+    count: int
+    held: int
+    chunks: int
+    smem: object
+
+    def opened(self) -> None:
+        """The row's stored slots' gradients zeroed for the walk's sums."""
+        call = self.slots.call
+        for slot in range(self.held):
+            call.family.kept(self.slots.zeros(), self.slots.views(self.returned, self.row * self.held + slot),
+                             call.interpret, smem=self.smem)
+
+    def before(self, f, grad):
+        if not self.held:
+            return grad
+        slot = self.stores[self.chunks - 1 - f]
+
+        def stored():
+            gathered = self.slots.read(self.returned, self.row * self.held + slot - 1)
+            return [part + more for part, more in zip(grad, gathered, strict=True)]
+
+        return lax.cond(slot > 0, stored, lambda: list(grad))
+
+    def after(self, f, grad):
+        n = self.chunks - 1 - f
+        load = self.loads[n]
+        call = self.slots.call
+
+        def taken():
+            call.family.stored(list(grad), self.slots.views(self.taken, n), smem=self.smem)
+            if self.held:
+                @pl.when(load > self.count)
+                def _():
+                    base = self.row * self.held + load - self.count - 1
+                    summed = [part + more for part, more in zip(grad, self.slots.read(self.returned, base),
+                                                                strict=True)]
+                    call.family.kept(summed, self.slots.views(self.returned, base), call.interpret,
+                                     smem=self.smem)
+            return self.slots.zeros()
+
+        return lax.cond(load >= 0, taken, lambda: list(grad))
+
+
+def table_returned(call: Call, table: Table, batch: int) -> tuple:
+    """A reverse walk's table outputs (`Returning`): the gradient of the memory each chunk takes up
+    `[chunks * HV * Dk, Dv]` fp32 (a chunk that takes nothing up written by none), and its stored slots'
+    gathered gradients where the table holds any, as `table_stored` lays them."""
+    return (jax.ShapeDtypeStruct((call.chunks * call.heads * call.width, call.value_width), jnp.float32),
+            *table_stored(call, table, batch))
+
+
+def table_stored(call: Call, table: Table | None, batch: int) -> tuple:
+    """A forward walk's stored slots' output where its `table` holds any (`Taking`): `held` memories a row,
+    fp32, as the memories are laid."""
+    if table is None or not table.held:
+        return ()
+    return (jax.ShapeDtypeStruct((batch * table.held * call.heads * call.width, call.value_width),
+                                 jnp.float32),)
+
+
+def table_held(held: Held, call: Call, table: Table | None, bv: int) -> Held:
+    """`held` (a walk's `Held`) with its table's phase where it walks a forked call's (`Taking`, `Returning`):
+    beside the memory carried, the memory it takes up and the entry write it adds, or the gradient a stored
+    slot gathered and its sum."""
+    if table is None:
+        return held
+    return dataclasses.replace(held, phases=(*held.phases, [f32(call.width, bv)] * 2))
+
+
+def table_landing(call: Call, keeps: bool, bv: int) -> dict:
+    """A walk's tile its table's memories land through (`Family.kept`), a key slice `[block, bv]` fp32, where
+    it `keeps` any (a forward's stored slots, a reverse walk's taken gradients)."""
+    return {"table": ((call.block, bv), jnp.float32)} if keeps else {}
+
+
 def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walked: tuple, step, start,
                   count, kept, written, out, bv: int, *, landing, prefetch: Callable | None = None,
-                  walkers: int = 1, producer: int | None = None) -> None:
+                  walkers: int = 1, producer: int | None = None, table: Callable | None = None) -> None:
     """A sequence's memory over `walkers` value blocks `bv` wide, one a consumer role beside one producer
     (`Tiles.walkers`): the memory each role takes, its columns of each key slice's tile `{name}{i}` of
     `memory` (`entering`, the opened streams and their views), zero where `kept` is 0; the role's
@@ -1753,7 +1950,9 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
     each step issues the next chunk's loads before its own work and takes the ones the step before issued
     (`step(role)(n, slots, state, accumulators, loaded)`), so their latency is the step's, not on its path.
     Its producer lowers to `producer`, the floor its launch plans with (`launch_kernel`'s; where None
-    `resources.producer_floor`)."""
+    `resources.producer_floor`). A forked call's walk takes a role's table (`table(role)`: `Taking`, or the
+    reverse walk's `Returning`): before each step its memory as the table gives it, after it as the table
+    keeps it, and at the walk's start the table opened where it opens."""
     family, slices = call.family, call.width // call.block
     (entered, entered_views), (chunks, views) = entering, walked
 
@@ -1762,7 +1961,16 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
         mosaic.per_role(wg, walkers, walk)
 
     def walk(role, wg):
-        walked_step = role_step = step(role)
+        role_step = step(role)
+        if table is not None:
+            tabled, stepped = table(role), role_step
+            tabled.opened()
+
+            def role_step(n, slots, state, accumulators, *loaded):
+                state, accumulators = stepped(n, slots, tabled.before(n, state), accumulators, *loaded)
+                return tabled.after(n, state), accumulators
+
+        walked_step = role_step
         if (fetch := prefetch) is not None:
             last = start + count - 1
 
@@ -1946,7 +2154,8 @@ def _states_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
 
 
 @lowered_once
-def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tiles):
+def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tiles,
+            table: Table | None = None):
     """`(h [chunks * HV * Dk, Dv], corrected [R, HV * Dv], final [B * HV * Dk, Dv])`: the memory each chunk
     enters and the corrected values as `call.held`, and each row's final memory, fp32, each sequence's chunks
     in order over a value block (`algebra.corrected`, `carried`). Under the delta rule `u` is the weighted
@@ -1958,9 +2167,13 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
     keys decayed so (`_weighted`'s third) and the memory's rows take their own decays. `sequences` `[N, 5]` is
     each sequence's first chunk, its chunks, its row and whether it begins and ends its row; `h0` `[B * HV *
     Dk, Dv]` fp32 each row's initial memory. A program walks `tiles.walkers` value blocks of its sequence and
-    head, one a consumer role, its keys and weighted keys streamed once for all of them."""
+    head, one a consumer role, its keys and weighted keys streamed once for all of them. A forked call's
+    `table` gives each chunk that takes a document up its memory and keeps each storing document's (`Taking`),
+    its stored slots an output no caller reads."""
     chunk = call.chunk
     width, value_width, bv, family = call.width, call.value_width, tiles.block_v, call.family
+    tabled = 0 if table is None else len(table.operands)
+    stores_table = table is not None and table.held > 0
     slices, walkers = width // call.block, tiles.walkers
     walked_width = bv * walkers
     held, memories = dataclasses.replace(call.held, rows=call.rows), call.memories
@@ -1978,8 +2191,10 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
     # at 40 or 48, jsf-states-held, jsf-pfloor-ab).
     producer = stated_producer(call, 48)
 
-    def program(at, k_ref, w_ref, u_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, h_ref,
-                *outputs, streams, staging, landing):
+    def program(at, k_ref, w_ref, u_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, *refs,
+                streams, staging, landing):
+        table_refs, (h_ref, *outputs) = refs[:tabled], refs[tabled:]
+        *outputs, stored_ref = outputs if stores_table else (*outputs, None)
         corrected_ref, final_ref = outputs if stores_corrected else (None, *outputs)
         j, s, h = at["blocks"], at["sequences"], at["heads"]
         first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
@@ -2042,24 +2257,33 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
                 gated, decay, held.dtype, issue, last=separate)
             return state, accumulators
 
+        def taking(role):
+            slots = Slots(call, h, walked + role * bv, bv)
+            return Taking.of(table, table_refs, stored_ref, slots, row, roled(role)[1].get("table"))
+
         sequence_walk(call, initial, "initial", (entering, initial_views), (chunks, views), step, first,
                       count, begins, ends,
                       lambda role, i: final_ref.at[pl.ds(memory(row, i), call.block),
                                                    pl.ds(walked + role * bv, bv)], bv,
                       prefetch=None if call.per_key else prefetch,
-                      landing=lambda role: roled(role)[1].get("final"), walkers=walkers, producer=producer)
+                      landing=lambda role: roled(role)[1].get("final"), walkers=walkers, producer=producer,
+                      table=None if table is None else taking)
 
     out_type, blocks, initials, staging, landing, after, work = _states_launch(
-        call, tiles, delta, keys, values, batch, sequences.shape[0], stores_corrected)
+        call, tiles, delta, keys, values, batch, sequences.shape[0], stores_corrected, table)
     launched = launch_kernel(program, call, out_type=out_type,
                              grid=(value_width // walked_width, sequences.shape[0], call.heads),
                              grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
                              live=lambda at, refs: refs[7][at["sequences"], 1] > 0, work=work,
-                             consumers=walkers, held=_states_held(call, values, keys, bv), staging=staging,
+                             consumers=walkers, staging=staging,
+                             held=table_held(_states_held(call, values, keys, bv), call, table, bv),
                              once=initials, landing=landing, after=after,
                              # Its last write's column sums an fp32 call's alone (`column_sums`).
                              reduces=held.parts > 1, producer=producer)(
-        k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken)
+        k, k if w is None else w, u, hi, lo, beta, h0, sequences, taken,
+        *(() if table is None else table.operands))
+    if stores_table:
+        launched = launched[:-1]
     if stores_corrected:
         return launched
     assert jnp.dtype(u.dtype) == held.dtype, "the values as given are held so (`Call.gated_keys`)"
@@ -2068,10 +2292,11 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tile
 
 
 def _states_launch(call: Call, tiles: Tiles, delta: bool, keys: Operand, values: Operand, batch: int,
-                   sequences: int, stores_corrected: bool) -> tuple:
-    """`_states`' outputs (the memories, the corrected values where it stores them, the final memories),
-    its streamed blocks and its initial memories' at `tiles`, its staging and landing tiles and what its
-    final memories' landing waits after (`final_memory_landing`), and its `Work` over `sequences`."""
+                   sequences: int, stores_corrected: bool, table: Table | None = None) -> tuple:
+    """`_states`' outputs (the memories, the corrected values where it stores them, the final memories, and
+    a forked call's stored slots where its `table` holds any), its streamed blocks and its initial memories'
+    at `tiles`, its staging and landing tiles (a stored slot's, `table_landing`) and what its final memories'
+    landing waits after (`final_memory_landing`), and its `Work` over `sequences`."""
     chunk = call.chunk
     width, value_width, walked_width = call.width, call.value_width, tiles.block_v * tiles.walkers
     bv = tiles.block_v
@@ -2079,7 +2304,8 @@ def _states_launch(call: Call, tiles: Tiles, delta: bool, keys: Operand, values:
                                                                             jnp.dtype(jnp.float32))
     out_type = (call.memories.shape(value_width),
                 *((held.shape(call.heads * value_width),) if stores_corrected else ()),
-                jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))
+                jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32),
+                *table_stored(call, table, batch))
     blocks = stream_blocks(**({"w": ((chunk, width), held)} if delta else {}), keys=((chunk, width), keys),
                            values=((chunk, walked_width), values))
     initials = stream_blocks(**{f"initial{i}": ((call.block, walked_width), initial)
@@ -2087,7 +2313,8 @@ def _states_launch(call: Call, tiles: Tiles, delta: bool, keys: Operand, values:
     staging = (_write_staging(call, bv), column_sums_scratch(call))
     final_landing, after = final_memory_landing(call, bv)
     landing = {**memory_landing(call, bv),
-               **({"corrected": held.landing(chunk, bv)} if stores_corrected else {}), **final_landing}
+               **({"corrected": held.landing(chunk, bv)} if stores_corrected else {}), **final_landing,
+               **table_landing(call, table is not None and table.held > 0, bv)}
     # A sequence's chunks, the mean over the laid sequences; two products a chunk.
     steps = call.chunks / sequences
     return (out_type, blocks, initials, staging, landing, after,
@@ -2126,7 +2353,7 @@ def _scan_held(call: Call, values: Operand, keys: Operand, bv: int) -> Held:
 
 @lowered_once
 def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Tiles, *, scale: float,
-          out_dtype, skip=None):
+          out_dtype, skip=None, table: Table | None = None):
     """`(o [R, HV * Dv], final [B * HV * Dk, Dv])` of a forward under a decay a head, one walk: `_states`'
     walk over each sequence's chunks in order, a value block a role, each chunk's output (`_output`'s: its
     own pairs' scores, `algebra.chunk_scores`, and `algebra.chunk_output` of the memory it enters and its
@@ -2140,7 +2367,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
     written nor read. `v` the values as given, the rest `_states`' operands and the queries `q`, `scale`
     and `out_dtype` `_output`'s, and a `skip` `[HV]` adds `D v`, from the values as given, where the write
     gate takes the keys' side (`Call.gated_keys`). A decay a key dimension's output takes the intra
-    launch's scores (`_output`'s `scores`): not this walk's."""
+    launch's scores (`_output`'s `scores`): not this walk's. A forked call's `table` is `_states`'."""
     chunk = call.chunk
     assert not call.per_key, "a decay a key dimension's scores are the intra launch's"
     assert skip is None or call.gated_keys, "a skip reads the values a call whose keys take the gate holds"
@@ -2153,10 +2380,13 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
     delta = a is not None
     assert delta == call.delta, "the delta rule's walk corrects its values from the chunks' inverses"
     values = keys = call.given
+    skipped, tabled = int(skip is not None), 0 if table is None else len(table.operands)
+    stores_table = table is not None and table.held > 0
 
     def program(at, q_ref, k_ref, a_ref, v_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, *refs,
                 streams, staging, landing):
-        *skip_ref, o_ref, final_ref = refs
+        skip_ref, table_refs, (o_ref, final_ref, *stored) = (
+            refs[:skipped], refs[skipped:skipped + tabled], refs[skipped + tabled:])
         j, s, h = at["blocks"], at["sequences"], at["heads"]
         first, count, row, begins, ends = (seq_ref[s, i] for i in range(5))
         roled = role_tiles(staging, landing, walkers)
@@ -2222,22 +2452,33 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
                                     held.dtype, issue, last=separate)
             return state, accumulators
 
+        def taking(role):
+            slots = Slots(call, h, walked + role * bv, bv)
+            return Taking.of(table, table_refs, stored[0] if stored else None, slots, row,
+                             roled(role)[1].get("table"))
+
         sequence_walk(call, initial, "initial", (entering, initial_views), (chunks, views), step, first,
                       count, begins, ends,
                       lambda role, i: final_ref.at[pl.ds(memory(row, i), call.block),
                                                    pl.ds(walked + role * bv, bv)], bv,
-                      prefetch=prefetch, landing=lambda role: roled(role)[1].get("final"), walkers=walkers)
+                      prefetch=prefetch, landing=lambda role: roled(role)[1].get("final"), walkers=walkers,
+                      table=None if table is None else taking)
 
     blocks, initials, staging, landing, after, work, out_type = _scan_launched(
         call, tiles, out_dtype, steps=call.chunks / sequences.shape[0], rows=batch * call.heads * width)
-    return launch_kernel(program, call, out_type=out_type,
-                         grid=(value_width // walked_width, sequences.shape[0], call.heads),
-                         grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
-                         live=lambda at, refs: refs[8][at["sequences"], 1] > 0, work=work, consumers=walkers,
-                         held=_scan_held(call, values, keys, bv), staging=staging, once=initials,
-                         landing=landing, after=after, reduces=held.parts > 1)(
+    landing |= table_landing(call, stores_table, bv)
+    out_type = (*out_type, *table_stored(call, table, batch))
+    launched = launch_kernel(program, call, out_type=out_type,
+                             grid=(value_width // walked_width, sequences.shape[0], call.heads),
+                             grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
+                             live=lambda at, refs: refs[8][at["sequences"], 1] > 0, work=work,
+                             consumers=walkers, staging=staging,
+                             held=table_held(_scan_held(call, values, keys, bv), call, table, bv),
+                             once=initials, landing=landing, after=after, reduces=held.parts > 1)(
         q, k, k if a is None else a, v, hi, lo, beta, h0, sequences, taken,
-        *(() if skip is None else (skip.astype(jnp.float32),)))
+        *(() if skip is None else (skip.astype(jnp.float32),)), *(() if table is None else table.operands))
+    # The output and final memories; a forked call's stored slots no caller reads.
+    return launched[:2]
 
 
 def _scan_corrected(call: Call, slots, tile, bv: int, state, prefix: tuple, betas, issue: Issuer):

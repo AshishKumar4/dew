@@ -366,7 +366,8 @@ def documents_draw(seed: int):
 def documents_on_the_kernel(x, b, c, a, given):
     """The kernel over a forked call, each document laid from a chunk's edge and taking its table slot's
     memory up there (`recurrence_chunk._ported_documents`): the output and the row's last memory."""
-    from dew.nn.kernels.recurrence_chunk import AlignedDocuments, Forked, _ported_documents
+    from dew.nn.kernels.chunked_launch import AlignedDocuments, Forked
+    from dew.nn.kernels.recurrence_chunk import _ported_documents
 
     loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
     forked = Forked(jnp.asarray(DOCUMENTS, jnp.int32), loads, stores, None, 2)

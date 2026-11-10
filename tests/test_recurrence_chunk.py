@@ -371,43 +371,35 @@ def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hoo
     assert_entering_on_par('xla', hooks)
 
 
-@pytest.mark.parametrize('kernel', ['fla', 'mosaic_gpu'])
-def test_a_kernel_taking_no_forked_call_refuses_one_named_or_handed_to_it(kernel):
+def test_fla_refuses_a_forked_call_named_or_handed_to_it():
     """fla's varlen port runs a call's documents as sequences of their own in parallel, so no forked call
-    (`Chunk.loads`), whose documents enter earlier documents' finals, is one it takes (inherently); the
-    template's walk keeps no table yet (ledger 5376). A forked call naming either (`generation.chosen`), and
-    its table of memories `[B, S', Hv, Dk, Dv]` handed to either's rule directly, are refused alike: the
-    selector's typed refusal, its reason and row, never a shape's error."""
+    (`Chunk.loads`), whose documents enter earlier documents' finals, is one it takes (inherently). A forked
+    call naming it (`generation.chosen`), and its table of memories `[B, S', Hv, Dk, Dv]` handed to its rule
+    directly, are refused alike: the selector's typed refusal, its reason and row, never a shape's error."""
     from dew.nn.kernels.selection import KernelRefused
 
-    refusal, rule = {'fla': (recurrence_chunk.PORT_FORKED, recurrence_chunk.fla_rule),
-                     'mosaic_gpu': (recurrence_chunk.TEMPLATE_FORKED, recurrence_chunk.template_rule)}[kernel]
     hooks = HOOKS[4]
     operands = entering_documents(entered_draw(hooks, 0)[0])
     with pytest.raises(KernelRefused) as named:
-        chunk_on(kernel, hooks, operands, chunk_size=CHUNK)
-    assert refusal in named.value.refusals
+        chunk_on('fla', hooks, operands, chunk_size=CHUNK)
+    assert recurrence_chunk.PORT_FORKED in named.value.refusals
     g = jnp.zeros(operands.value.shape[:3])
     with pytest.raises(KernelRefused) as handed:
-        rule(operands.query, operands.key, operands.value, g, g, operands.state)
-    assert handed.value.refusals == [refusal]
+        recurrence_chunk.fla_rule(operands.query, operands.key, operands.value, g, g, operands.state)
+    assert handed.value.refusals == [recurrence_chunk.PORT_FORKED]
 
 
-@pytest.mark.check1_shards(seeds=80, per_task=8)
-@pytest.mark.parametrize('hooks', [FORMED[4], FORMED[5]], ids=str)
-def test_the_ssd_ports_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
-    """The port of mamba_ssm's kernels over a forked call, each document laid from a chunk's edge and the
-    state passing taking up its table slot's memory there, keeping the finals its documents store
-    (`_ported_documents`): its output, the row's last memory and every operand's gradient, the given
-    memories' included, as the port's call over each document alone from its slot's memory in the row's
-    order, the recurrence a token at a time in float64 their truth (check 1). The port's own numbers
-    (mamba_ssm's) are tests/test_mamba_ssd.py's."""
+def assert_forked_as_each_alone(kernel: str, hooks, draw, site: str, seeds: int) -> None:
+    """A forked call on `kernel` (`entering_documents` of `draw`'s operands): its output, the row's last
+    memory and every operand's gradient, the given memories' included, as `kernel`'s call over each document
+    alone from its table slot's memory in the row's order (`document_by_document`), the recurrence a token
+    at a time in float64 their truth (check 1)."""
     def ours(operands):
-        out, final = chunk_on('pallas', hooks, entering_documents(operands), chunk_size=CHUNK)
+        out, final = chunk_on(kernel, hooks, entering_documents(operands), chunk_size=CHUNK)
         return out.astype(jnp.float32), final.astype(jnp.float32)
 
     def alone(hooks, piece):
-        return chunk_on('pallas', hooks, piece, chunk_size=CHUNK)
+        return chunk_on(kernel, hooks, piece, chunk_size=CHUNK)
 
     def theirs(operands):
         out, final = document_by_document(hooks, operands, alone)
@@ -423,10 +415,40 @@ def test_the_ssd_ports_documents_entering_memories_of_their_own_are_as_exact_as_
         with jax.enable_x64(new_val=True):
             return wide(jax.tree.map(widened, operands), jax.tree.map(widened, seeded))
 
-    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(theirs)),
-                    functools.partial(entered_draw, hooks),
-                    f'pallas {hooks} a forked call\'s documents, against each alone', seeds=80,
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(theirs)), draw, site, seeds=seeds,
                     truth_fn=truth)
+
+
+@pytest.mark.check1_shards(seeds=80, per_task=8)
+@pytest.mark.parametrize('hooks', [FORMED[4], FORMED[5]], ids=str)
+def test_the_ssd_ports_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
+    """The port of mamba_ssm's kernels over a forked call, each document laid from a chunk's edge and the
+    state passing taking up its table slot's memory there, keeping the finals its documents store
+    (`_ported_documents`), as the port's call over each document alone (`assert_forked_as_each_alone`). The
+    port's own numbers (mamba_ssm's) are tests/test_mamba_ssd.py's."""
+    assert_forked_as_each_alone('pallas', hooks, functools.partial(entered_draw, hooks),
+                                f'pallas {hooks} a forked call\'s documents, against each alone', seeds=80)
+
+
+def narrowed_draw(hooks, seed: int):
+    """`entered_draw`'s operands with their queries, keys, values and write gate in bf16, a 16-bit call as the
+    recurrence template's fast backward trains it (`mainloop_backward.fast_backward_form`)."""
+    operands, seeded = entered_draw(hooks, seed)
+    return dataclasses.replace(operands, **{name: getattr(operands, name).astype(jnp.bfloat16)
+                                            for name in ('query', 'key', 'value', 'beta')
+                                            if getattr(operands, name) is not None}), seeded
+
+
+@pytest.mark.check1_shards(seeds=40, per_task=4)
+@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[8], FORMED[4]], ids=str)
+def test_the_templates_forked_documents_are_as_exact_as_each_alone_interpreted(hooks):
+    """The recurrence template interpreted over a forked call in 16 bits, the gated delta rule, Kimi delta
+    attention and Mamba2's SSD: its walks take each document's memory up from the call's table and keep
+    the finals its documents store (`mainloop.Taking`, `mainloop.Returning`; ledger 5376), as its call over
+    each document alone (`assert_forked_as_each_alone`)."""
+    assert_forked_as_each_alone('mosaic_gpu', hooks, functools.partial(narrowed_draw, hooks),
+                                f'mosaic_gpu {hooks} a forked call\'s documents, against each alone',
+                                seeds=40)
 
 
 def edge_draw(hooks, seed: int):

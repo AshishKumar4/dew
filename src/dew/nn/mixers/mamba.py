@@ -44,7 +44,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
-from dew.nn.kernels import recurrence_algebra, recurrence_chunk
+from dew.nn.kernels import chunked_launch, recurrence_algebra, recurrence_chunk
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
@@ -59,7 +59,7 @@ not depend on it."""
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int = CHUNK_SIZE, *,
-                   forked: recurrence_chunk.Forked | None = None):
+                   forked: chunked_launch.Forked | None = None):
     """`mamba_selective_scan` (modeling_mamba.py:175-282) after the softplus.
 
     `x` and `dt` `[B, S, D]`, `A` `[D, N]`, `B` and `C` `[B, S, N]`, `D` `[D]`;
@@ -80,7 +80,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     # own slot.
     entered = None
     if forked is not None:
-        aligned = recurrence_chunk.AlignedDocuments.of(forked, length, chunk_size)
+        aligned = chunked_launch.AlignedDocuments.of(forked, length, chunk_size)
         entered = (aligned, x * D)
         x, dt, B, C = aligned.laid(x, dt, B, C)
         starts, length = None, aligned.length
