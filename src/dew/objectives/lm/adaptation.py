@@ -154,6 +154,17 @@ def _carried_start(level) -> Mapping:
     return jax.tree.map(jnp.zeros_like, level)
 
 
+def _carried_onto(start: Mapping, variables) -> Mapping:
+    """The level a run that carries its level starts an update from: the trained `start` plus what the run
+    carried (`CARRIED`), its displacement a constant of the step in the level's dtype, which every level
+    stepped in context reads (the continuum's and stacked blocks')."""
+    if CARRIED not in variables:
+        raise ValueError(f"a run that carries its level holds what it carried in `{CARRIED}`, and these "
+                         "variables hold none: a state built for this objective (`LMObjective.init`)")
+    return jax.tree.map(lambda leaf, held: leaf + jax.lax.stop_gradient(held).astype(leaf.dtype),
+                        start, variables[CARRIED])
+
+
 def _carried_update(carried, moved: Mapping) -> Mapping:
     """What a run carries after an update (`CARRIED`): `carried` plus the mean over its counted rows of
     how far their steps moved the level, `moved` the rows' summed moves (`moves`) and their count
@@ -683,13 +694,7 @@ def _start(model: nn.Module, variables, adaptation: ChunkAdaptation) -> Mapping:
     start = model.in_context_level(variables) if isinstance(model, SteppedInContext) else None
     if start is None:
         raise ValueError("the model has no continuum level to step in context")
-    if adaptation.carry != "run":
-        return start
-    if CARRIED not in variables:
-        raise ValueError(f"a run that carries its level holds what it carried in `{CARRIED}`, and these "
-                         "variables hold none: a state built for this objective (`LMObjective.init`)")
-    return jax.tree.map(lambda leaf, held: leaf + jax.lax.stop_gradient(held).astype(leaf.dtype),
-                        start, variables[CARRIED])
+    return _carried_onto(start, variables) if adaptation.carry == "run" else start
 
 
 def _moved(reached: Mapping, started: Mapping, weights: jax.Array) -> Mapping:

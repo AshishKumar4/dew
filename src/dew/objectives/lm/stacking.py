@@ -42,7 +42,7 @@ from dew.batch import BLOCKS_FIELD, COORDINATES_FIELD, TOKEN_LAYOUT_FIELDS, Coor
 from dew.nn.backbones.decoder_stack import StackView
 from dew.nn.continuum import feedforward_levels, with_feedforward_levels
 from dew.nn.protocols import SteppedFeedForward
-from dew.objectives.lm.adaptation import CARRIED, Adapted, ChunkAdaptation, _moved, _rows, _stepped_mask
+from dew.objectives.lm.adaptation import Adapted, ChunkAdaptation, _carried_onto, _moved, _rows, _stepped_mask
 
 
 def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.Array, weights: jax.Array,
@@ -69,11 +69,7 @@ def stacked_scores(model: nn.Module, variables, inputs: jax.Array, targets: jax.
     view = model.stored_view(variables)
     starts = feedforward_levels(view, variables, layers)
     if adaptation.carry == "run":
-        if CARRIED not in variables:
-            raise ValueError(f"a run that carries its levels holds what it carried in `{CARRIED}`, and these "
-                             "variables hold none: a state built for this objective (`LMObjective.init`)")
-        starts = jax.tree.map(lambda leaf, held: leaf + jax.lax.stop_gradient(held).astype(leaf.dtype),
-                              starts, variables[CARRIED])
+        starts = _carried_onto(starts, variables)
     names = tuple(starts)
     steps = {name: _stepped_mask(starts[name], adaptation) for name in names}
     rows, length = targets.shape
