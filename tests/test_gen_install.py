@@ -25,9 +25,10 @@ def scratch(root: Path) -> Path:
         shutil.copy(REPO / name, root / name)
     shutil.copytree(REPO / "src", root / "src", ignore=lambda _, names: [
         name for name in names if name.endswith(".py") and name not in ("_builds.py", "tpu_setup.py")])
-    # The generator and what it reads beside it, and the tested Pythons, which tools/armada/ci.py reads from
-    # pyproject.toml's classifiers.
-    for directory in ("site/scripts", "tools/armada"):
+    # The generator, and the tested Pythons, which tools/armada/ci.py reads from pyproject.toml's classifiers:
+    # the whole tools tree, as ci.py loads its siblings and theirs by path (digests.py loads
+    # tools/fetched_fixtures.py).
+    for directory in ("site/scripts", "tools"):
         shutil.copytree(REPO / directory, root / directory, ignore=shutil.ignore_patterns("__pycache__"))
     return root
 
