@@ -47,8 +47,20 @@ STAGES = ((64, 64), (128, 128), (256, 256, 256), (512, 512, 512), (512, 512, 512
 """VGG16's convolution widths, stage by stage; a 2x2 max pool opens every
 stage after the first."""
 
-TORCHVISION_LAYERS = (0, 2, 5, 7, 10, 12, 14, 17, 19, 21, 24, 26, 28)
-"""Where each convolution sits in torchvision's `vgg16().features`."""
+def _torchvision_layers() -> tuple[int, ...]:
+    """Where each convolution of `STAGES` sits in torchvision's `vgg16().features`, which lays each out as
+    a convolution and its ReLU and closes each stage with its 2x2 max pool."""
+    layers, index = [], 0
+    for widths in STAGES:
+        for _ in widths:
+            layers.append(index)
+            index += 2
+        index += 1
+    return tuple(layers)
+
+
+TORCHVISION_LAYERS = _torchvision_layers()
+"""Where each convolution sits in torchvision's `vgg16().features` (0, 2, 5, ..., 28)."""
 
 VGG16_WEIGHTS = ("timm/vgg16.tv_in1k", "model.safetensors", "b8d8aa2dd860af9233c8c67385a8097fd6c35d3f",
                  "57b026918159a6bf9faf8405c3a551903768e7138989d9c6224a14227203fad8")
