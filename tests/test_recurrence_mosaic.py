@@ -1333,11 +1333,12 @@ FORKED_GATE = [(target, name, training) for target in ('sm80', 'sm90', 'sm100') 
 a forked call on each family's bundle."""
 
 
-def forked_case(target: str, name: str, training: bool):
+def forked_case(target: str, name: str, training: bool) -> tuple:
     """`name`'s 16-bit call over a forked call's three documents a row, entering a table of a given memory
     and two stored slots (`chunked_launch.Forked`), the gated delta net's with an entry write, at the
     template's derived tiles on `target`, its forward or training pass as a gate case (`KernelCase`): its
-    operands laid from the chunks' edges and its table as the walks take it (`template.forked_laid`)."""
+    operands laid from the chunks' edges and its table as the walks take it (`template.forked_laid`). Returns
+    the case, the bound call and its tiles."""
     from fla_gdn_support import KernelCase
 
     facts = generation.gpu_target(target)
@@ -1378,7 +1379,7 @@ def forked_case(target: str, name: str, training: bool):
         return fn, (*laid, *tabled, *cotangents, *skip)
 
     label = f"{name} bfloat16 {'training' if training else 'forward'} forked {tiles}"
-    return KernelCase(label, call)
+    return KernelCase(label, call), bound, tiles
 
 
 @COMPILES_ON_CPU
@@ -1387,10 +1388,22 @@ def test_a_forked_calls_walks_keep_its_table_spilling_none(target, name, trainin
     """A forked call's launches (`forked_case`) compiled by Mosaic on this CPU for `target`: its walks taking
     each document's memory up from the call's table and keeping its stored finals (`mainloop.Taking`,
     `mainloop.Returning`; ledger 5376) lower, every kernel spilling none and every report read
-    (`kernel_compile.mosaic_failures`)."""
+    (`kernel_compile.mosaic_failures`), at the tiles a run settles on: a launch spilling at its derived tiles
+    refused and the call derived again, as a run's compile steps it down (`report.refuse_launch`,
+    `stepped_down`; such a spill the register model's miss, row 5357)."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
-    found = compile_mosaic_kernels([forked_case(target, name, training)], target)
+    facts, stepped = generation.gpu_target(target), set()
+    while True:
+        case, bound, tiles = forked_case(target, name, training)
+        found = compile_mosaic_kernels([case], target)
+        spilling = {kernel["kernel"] for record in found for kernel in record.get("kernels", ())
+                    if kernel.get("spilled")}
+        if not spilling or tiles in stepped:
+            break
+        stepped.add(tiles)
+        with generation.assumed(facts):
+            report.refuse_launch(template.MOSAIC, bound, tiles, spilling)
     assert mosaic_failures(found) == []
 
 
