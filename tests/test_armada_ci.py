@@ -1660,6 +1660,9 @@ def test_a_tool_that_comes_or_goes_runs_no_file_again_that_imported_none(tmp_pat
     # The harness as a checkout holds it, under the checkout's root, beside the project it reads.
     shutil.copytree(ROOT / "tools/armada", tmp_path / "tools/armada",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    # The tool digests reads a fetched fixture's pin's place from, beside tools/armada as in a checkout.
+    fetched = Path(load("digests", "tools/armada").fetched.__file__).relative_to(ROOT)
+    shutil.copy(ROOT / fetched, tmp_path / fetched)
     owner = load("child_groups", "tools/armada").SOURCE.relative_to(ROOT)
     (tmp_path / owner).parent.mkdir(parents=True)
     shutil.copy(ROOT / owner, tmp_path / owner)

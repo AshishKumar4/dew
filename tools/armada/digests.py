@@ -187,8 +187,8 @@ def contents(name: str) -> bytes:
             return b"missing"
         return code_of(path) if executed == followed.WHOLE else unit(path, executed)
     path = Path(name)
-    manifest = fetched.manifest(path)
-    if path.name and manifest.is_file():
+    manifest = fetched.manifest(path) if path.name else None
+    if manifest is not None and manifest.is_file():
         return bytes.fromhex(json.loads(manifest.read_text())["sha256"])
     if path.is_file():
         return hashlib.sha256(path.read_bytes()).digest()
