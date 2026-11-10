@@ -59,10 +59,11 @@ def anonymous(run: Path, name: str, places: dict[str, str]) -> bytes:
     return packed.getvalue()
 
 
-EVIDENCE = 2
+EVIDENCE = 3
 """The version of what a recorded generation's runs record they serialized (`evidence`), which its
 `source.json` states; a generation that states one holds every kind's. Version 2 records the dtypes
-one request of each task multiplies in by module path (`products`)."""
+one request of each task multiplies in by module path (`products`), in the suite's wide CPU arithmetic;
+version 3 records them in a user's process, which the runs themselves are the same in (row 5442)."""
 
 
 def evidence(run, state, directory: Path) -> dict:
@@ -83,7 +84,7 @@ def evidence(run, state, directory: Path) -> dict:
     plan = compiled["plan"] or {}
     tasked = objectives[run.objective.name].saved_task is not None
     return {"step": int(state.step), "compute": run.compute_dtype(),
-            "products": computed(directory)["products"] if tasked else None,
+            "products": computed(directory, wide=False)["products"] if tasked else None,
             "params": sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])}),
             "scale": None if state.scale is None else float(state.scale.scale),
             "finite_steps": None if state.scale is None else int(state.scale.fin_steps),

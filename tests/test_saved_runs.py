@@ -47,6 +47,12 @@ PRODUCTS = 2
 """The evidence version from which a generation records the dtypes one request of each run's task
 multiplies in, by module path (`saved_run_kinds.computed`); an earlier one's are not compared."""
 
+USERS_PRODUCTS = 3
+"""The evidence version from which a generation records its products in a user's process
+(`saved_runs_reference.EVIDENCE`); an earlier one recorded them in the suite's wide CPU arithmetic, and
+they are read again in it (`computed`'s `wide`): a product of float32 operands there multiplies in
+float64 (row 5442)."""
+
 
 def evidence(recorded: str, kind: str) -> dict | None:
     """What `kind`'s run the main `recorded` saved serialized (`saved_runs_reference.evidence`), beside
@@ -131,7 +137,7 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind)
         if declared and seen["version"] >= PRODUCTS:
             # The task loaded multiplies as the one the run saved did: one request's products, module by
             # module, in the dtypes they multiplied in then.
-            found = computed(run)
+            found = computed(run, wide=seen["version"] < USERS_PRODUCTS)
             assert found["products"] == unpacked(seen["products"], found["packs"])
     if declared:
         saved = SavedRun.pinned(str(run))
@@ -223,7 +229,7 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
         # The model the resumed fit trained computes as the saved one did: the task its new step saves.
         # Where its main recorded them: a run whose objective declared no task then recorded none.
         if task is not None and seen["version"] >= PRODUCTS and seen["products"] is not None:
-            found = computed(run, int(state.step))
+            found = computed(run, int(state.step), wide=seen["version"] < USERS_PRODUCTS)
             assert found["products"] == unpacked(seen["products"], found["packs"])
         # The step the resumed fit compiled, at the rung it was admitted at.
         compiled = [row["value"] for row in records[resumed:] if row["type"] == "StepCompiled"][-1]
@@ -413,15 +419,17 @@ def test_a_packed_projections_products_count_at_each_of_its_members():
     assert unpacked(moved, packs) != unpacked(now, packs)
 
 
-def test_a_called_product_is_read_at_the_scope_that_called_it(tmp_path):
+def test_a_called_product_is_read_at_the_scope_that_called_it(tmp_path, monkeypatch):
     """A product in a called program is read at the scope of the call that runs it, as XLA inlines it: a wide
-    sum's (`precision.accumulated` on a CPU, one private function traced once for its types, its own
-    location naming no scope) at its caller's, and one under a scope of the called program's own at that
-    (row 3193)."""
+    sum's (`precision.accumulated` on a CPU in the wide arithmetic the corpus's earlier generations recorded
+    in, one private function traced once for its types, its own location naming no scope) at its caller's,
+    and one under a scope of the called program's own at that (row 3193)."""
     import jax.numpy as jnp
     from saved_run_products import SCOPE, products
 
-    from dew.nn.precision import accumulated
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC, accumulated
+
+    monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
 
     @jax.jit
     def block(x, weight):
