@@ -266,7 +266,7 @@ class Tensor:
 
     def drain(self, turns) -> None:
         """The product warp's last turns' give-backs, which no later product waited for (`mosaic.drained`)."""
-        mosaic.drained(self.read_done, turns, self.shape.count)
+        mosaic.drained((self.read_done,), turns, self.shape.count)
 
 
 def column_span(tmem, first, count: int):
@@ -729,8 +729,7 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
             def load():
                 loads = functools.partial(mosaic.loads, rings)
                 loaded, _ = persistent.tiled(tiles, schedule, loads, axis=axis)
-                for ring in rings.values():
-                    ring.drain(loaded)
+                mosaic.drain(rings.values(), loaded)
 
             def issue_all():
                 _, computed = persistent.tiled(tiles, schedule, products, axis=axis, turns=windows)

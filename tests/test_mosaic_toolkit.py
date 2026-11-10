@@ -55,7 +55,7 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                         block = x_gmem.at[pl.ds((first + step) * BLOCK[0], BLOCK[0])]
                         ring.load(ring.turn(first + step), block)
 
-                ring.drain(jnp.int32(_first_step(TILES)))
+                mosaic.drain((ring,), jnp.int32(_first_step(TILES)))
 
             def consumer(wg):
                 @plgpu.nd_loop((TILES,), collective_axes="sm")
