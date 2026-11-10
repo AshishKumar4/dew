@@ -554,9 +554,10 @@ def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> l
 
 def decoded_expert_banks(variables: Variables) -> Variables:
     """`variables` with each packed expert bank (`expert_matrix`) decoded into `params` under its name,
-    `[experts, in, out]` float32, each value its code times its block's scale times its expert's, exactly
-    (`NvFp4.decoded` times its factor), and the bank gone from `QUANTIZATION`: the float tree an export or
-    a merge takes, as `decoded_frozen_fp8` decodes a frozen FP8 site."""
+    `[..., experts, in, out]` float32 (a scanned run's banks stacked on its layer axis before their
+    experts), each value its code times its block's scale times its expert's, exactly (`NvFp4.decoded`
+    times its factor), and the bank gone from `QUANTIZATION`: the float tree an export or a merge takes,
+    as `decoded_frozen_fp8` decodes a frozen FP8 site."""
     from dew.nn.kernels.gemm import NvFp4
 
     held = flatten_dict(dict(variables.get(QUANTIZATION, {})),
@@ -566,8 +567,8 @@ def decoded_expert_banks(variables: Variables) -> Variables:
         return variables
     # Multiplied on the host: an MXFP4 group under the 0x00 byte holds float32 subnormals, which XLA's CPU
     # arithmetic flushes to zero.
-    dense = {path: np.asarray(bank.decoded(), np.float32) * np.asarray(bank.factor, np.float32)[:, None, None]
-             for path, bank in banks.items()}
+    dense = {path: np.asarray(bank.decoded(), np.float32)
+             * np.asarray(bank.factor, np.float32)[..., None, None] for path, bank in banks.items()}
     rest = {path: leaf for path, leaf in held.items() if path not in banks}
     decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
     decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **dense})
