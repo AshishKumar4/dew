@@ -324,32 +324,57 @@ def native_release(source: str | Path) -> bool:
 def native_source[Loaded: Pretrained](kind: type[Loaded], source: str | Path, *, mesh: MeshSpec | Mesh | None,
                                       layout: Layout | None, dtype: DTypeLike | None,
                                       param_dtype: DTypeLike | Literal["auto"] | None, on_host: bool,
+                                      weights: bool, attention_impl: str, max_seq_len: int | None,
                                       building: Mapping[str, object]) -> Loaded:
     """The native release in `source` as the `kind` of source a run starts from: its run's step
-    (`dew.inference.models.ReleasedRun`) as its task's bundle (`ReleasedTask.source_of`; row 4776: such a
-    release's record states no dtypes a family's load reads, and a run started from it raised KeyError),
-    placed on `mesh` under `layout`, or on the host (`on_host`), every tree of it, computing in `dtype`
-    and stored in `param_dtype` ("auto": as the release stores it). A load option that builds a
-    family's model another way (`building`, set where neither None nor False, a 0 among them) is
-    refused, as the release builds the model its run recorded, and so is a bundle of another kind than
+    (`dew.inference.models.ReleasedRun`) as its task's bundle where its task declares one
+    (`ReleasedTask.source_of`, a decision task's), else as its model's (`Pretrained.from_saved`: any
+    token task's run, its model in its native layout where no family's writes it; row 4785), placed on
+    `mesh` under `layout`, or on the host (`on_host`), every tree of it, computing in `dtype` and stored in
+    `param_dtype` ("auto": as the release stores it), its weights read where `weights` asks (else their
+    shapes alone). The load's `attention_impl` (but "auto") and `max_seq_len` are the recorded model's own
+    fields, its attention implementation and the context it is reloaded at (`ModelConfig.with_declared`).
+    A load option
+    that builds a family's model another way (`building`, set where neither None nor False, a 0 among them)
+    is refused, as the release builds the model its run recorded, and so is a bundle of another kind than
     `kind`."""
+    from dataclasses import replace
+
     from dew.inference.models import ReleasedRun
+    from dew.inference.tasks import saved_model
+    from dew.interop.pretrained import Pretrained
     from dew.objectives.base import ReleasedTask
+    from dew.registry import ModelConfig, to_record
 
     built = [name for name, value in building.items() if value is not None and value is not False]
     if built:
         raise ValueError(f"{source} is a run's native release, which builds the model its run recorded; "
                          f"load it without {', '.join(built)}")
     run = ReleasedRun.of(str(source))
+    asked = (("attention_impl", attention_impl), ("max_seq_len", max_seq_len))
+    fields = {name: value for name, value in asked if value is not None and value != "auto"}
+    if fields:
+        # The recorded model with the load's own fields, which every builder of the run reads off its record.
+        model = saved_model(run.record, None)
+        for name, value in fields.items():
+            model = model.with_declared(name, value)
+        run = replace(run, record={**run.record, "model": to_record(model, ModelConfig)})
     task = run.objective.saved_task
-    if task is None or not issubclass(task, ReleasedTask):
-        raise ValueError(f"{source} is the native release of a {run.objective.__name__} run, which declares "
-                         "no task a run starts from")
-    bundle = task.source_of(run, mesh=mesh, layout=layout, dtype=dtype,
-                            param_dtype=None if param_dtype == "auto" else param_dtype)
+    placed = {"mesh": mesh, "layout": layout, "dtype": dtype,
+              "param_dtype": None if param_dtype == "auto" else param_dtype}
+    if task is not None and issubclass(task, ReleasedTask):
+        bundle = task.source_of(run, **placed)
+    elif "model" in run.record:
+        bundle = Pretrained.from_saved(run, **placed)
+    else:
+        raise ValueError(f"{source} is the native release of a {run.objective.__name__} run, which records "
+                         "no model of Dew's and declares no task a run starts from")
     if not isinstance(bundle, kind):
         raise TypeError(f"{source} is a {type(bundle).__name__} source, not a {kind.__name__}; load it with "
                         f"{type(bundle).__name__}.load or Pretrained.load")
+    if not weights:
+        return bundle.map_variables(lambda tree: jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), tree))
     return bundle.map_variables(jax.device_get) if on_host else bundle
 
 

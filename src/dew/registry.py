@@ -1334,33 +1334,38 @@ def storage_name(value: DTypeLike) -> DtypeName | None:
 
 
 def with_dtype(name: str, fields: Mapping[str, object], dtype: str | None) -> Mapping[str, object]:
-    """`fields`, the model `name` builds from, computing in `dtype`.
-
-    The dtype is written into the model's own `dtype` field, or, for a
-    composite that declares none (DiffusionGemma around its text decoder),
-    into each model part it holds that declares one, as a record or built.
-    A model with neither refuses a dtype. None leaves `fields` as they are."""
-    from flax import linen as nn
-
+    """`fields`, the model `name` builds from, computing in `dtype` (`with_declared`); None leaves `fields`
+    as they are."""
     if dtype is None:
         return fields
+    return with_declared(name, fields, "dtype", dtype, built=resolve_dtype(dtype))
+
+
+def with_declared(name: str, fields: Mapping[str, object], field: str, value: str | int, *,
+                  built: DTypeLike | None = None) -> Mapping[str, object]:
+    """`fields`, the model `name` builds from, with `value` in its field `field`: written into the model's
+    own `field`, and into each model part it holds that declares one, as a record or built (`built`, the
+    value a built part takes, `value` where None), so a composite that declares none (DiffusionGemma around
+    its text decoder) takes it in its parts. A model with neither refuses it."""
+    from flax import linen as nn
+
     member = models[name]
     assert isinstance(member, type)
-    parts: dict[str, object] = ({"dtype": dtype}
-                              if "dtype" in {field.name for field in dataclasses.fields(member)} else {})
-    for key, value in fields.items():
-        part = _part_type(member, key, configured(value))
-        if part is None or "dtype" not in {field.name for field in dataclasses.fields(part)}:
+    parts: dict[str, object] = ({field: value}
+                              if field in {declared.name for declared in dataclasses.fields(member)} else {})
+    for key, held in fields.items():
+        part = _part_type(member, key, configured(held))
+        if part is None or field not in {declared.name for declared in dataclasses.fields(part)}:
             continue
-        if isinstance(value, nn.Module):
-            parts[key] = value.clone(dtype=resolve_dtype(dtype))
-        elif isinstance(value, Mapping) and (named := class_record(value)) is not None:
-            parts[key] = {"class": named[0], "fields": {**named[1], "dtype": dtype}}
-        elif isinstance(value, Mapping):
-            parts[key] = {**value, "dtype": dtype}
+        if isinstance(held, nn.Module):
+            parts[key] = dataclasses.replace(held, **{field: value if built is None else built})
+        elif isinstance(held, Mapping) and (named := class_record(held)) is not None:
+            parts[key] = {"class": named[0], "fields": {**named[1], field: value}}
+        elif isinstance(held, Mapping):
+            parts[key] = {**held, field: value}
     if not parts:
-        raise ValueError(f"{member.__qualname__} declares no dtype field and holds no part that does, so "
-                         f"it cannot compute in {dtype}")
+        raise ValueError(f"{member.__qualname__} declares no {field} field and holds no part that does, so "
+                         f"it cannot take {field}={value!r}")
     return {**fields, **parts}
 
 
@@ -1693,6 +1698,10 @@ class ModelConfig(Registered):
     def with_dtype(self, dtype: str | None) -> Self:
         """This model computing in `dtype` (`with_dtype`); None keeps it."""
         return dataclasses.replace(self, fields=with_dtype(self.name, self.fields, dtype))
+
+    def with_declared(self, field: str, value: str | int) -> Self:
+        """This model with `value` in its field `field`, or its parts' (`with_declared`)."""
+        return dataclasses.replace(self, fields=with_declared(self.name, self.fields, field, value))
 
     def build(self, **derived: Configured):
         """Build the model from its fields and the ones the recipe `derived`."""
