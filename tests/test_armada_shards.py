@@ -198,6 +198,25 @@ def test_a_sites_map_tasks_its_measured_rate_puts_past_the_target_are_cut_finer_
         "test_site.draws-0-4", "test_site.draws-4-12", "test_site.draws-12-20"]
 
 
+def test_a_sites_map_tasks_are_cut_by_their_setup_and_draws_apart_never_task_seconds_over_units(ci, tmp_path):
+    """A map task pays its setup once (its environment, imports and compiles before its first draw) and each
+    draw after it, which armada's measures of a site's tasks of two sizes tell apart. A site whose setup
+    alone passes the target keeps its declared cut, a finer one paying the setup again for nothing, and an
+    unmeasured task weighs its setup and its draws (2026-11-09: a task of one draw and one of two both took
+    516 s, and task seconds over units, charging each draw the setup a task pays once, cut such sites a draw
+    a task)."""
+    site_checkout(tmp_path)
+
+    def task(span: tuple[int, int]) -> str:
+        return ci.site_task("3.12", "tests/test_site.py", "test_site", span)
+
+    # 480 s of setup and 5 s a draw: 500 s for 4 draws, 520 s for 8.
+    measured = {task((0, 4)): 500.0, task((4, 12)): 520.0}
+    assert [(entry["split"], entry["weight"]) for entry in ci.plan(256.0, {"rows": measured})
+            if entry["python"] == "3.12" and ".draws-" in entry["split"]] == [
+        ("test_site.draws-0-4", 500.0), ("test_site.draws-4-12", 520.0), ("test_site.draws-12-20", 520.0)]
+
+
 def test_a_site_whose_map_tasks_armada_has_no_measure_of_weighs_the_target_not_its_judges_record(
         ci, tmp_path):
     """A site the last run reused ran no map task, so armada keeps no measure of any (it keeps what a run
