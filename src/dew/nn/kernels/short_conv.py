@@ -26,7 +26,7 @@ import numpy as np
 from dew.nn.derivatives import KernelGlue, contracted
 
 from . import generation
-from .generation import INHERENT
+from .generation import INHERENT, Choice
 from .selection import Kernel, Op, Requirement
 
 WIDEST_TAPS = 8
@@ -80,7 +80,7 @@ def _fit(width: int, head: int | None) -> bool:
     return conv.fits(width, head)
 
 
-CONV: Op[ConvCase] = Op('short_conv', (Kernel('mosaic_gpu', SUPPORTS), Kernel('xla', (), generic=True)),
+CONV: Op[ConvCase] = Op(Choice.SHORT_CONV, (Kernel('mosaic_gpu', SUPPORTS), Kernel('xla', (), generic=True)),
                         lambda case: 'mosaic_gpu' if generation.backend() == 'gpu' else 'xla')
 """The conv selector: the template's kernels on a GPU where their requirements hold, else XLA's conv
 (`dew.nn.linear.xla_conv1d`)."""

@@ -2004,7 +2004,7 @@ class Apart:
 
 APART = Apart()
 
-GROUPED: selection.Op[GroupedCase] = selection.Op('grouped_matmul', (
+GROUPED: selection.Op[GroupedCase] = selection.Op(generation.Choice.GROUPED_MATMUL, (
     *(_launch_kernel(launch.name, *_NEEDS.get(launch.name, ())) for launch in _GMMS),
     selection.Kernel[GroupedCase](APART.name, (_Need('single', lambda case: case.paired,
                                                 "the call is one product", row=INHERENT),), generic=True),
