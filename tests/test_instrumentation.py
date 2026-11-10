@@ -237,7 +237,7 @@ def _flash_module(target, stated, *, length=64, heads=2, query_width=192, value_
     operands = ", ".join(f"%a{index}" for index in range(len(arrays) + len(offsets)))
     return f"""HloModule step
 
-ENTRY %main () -> f32[] {{
+ENTRY %main {{
 {parameters}
   %call = ({arrays[stated.query]}) custom-call({operands}), custom_call_target="{target}", \
 api_version=API_VERSION_TYPED_FFI
@@ -589,8 +589,16 @@ def test_a_collectives_bytes_are_as_xla_sizes_its_sub_byte_and_packed_results():
     byte where the layout packs them (`E(4)`), each rounded up to a whole byte."""
     from dew.telemetry.instrumentation import hlo_instructions
 
-    module = """ENTRY %main () -> (s4[3], u4[], s4[3]) {
-  %gathered = (s4[3]{0}, u4[]{}, s4[3]{0:E(4)}, bf16[2,3]{1,0}) all-gather-done(%started)
+    module = """HloModule gathered
+
+ENTRY %main {
+  %p = s4[3]{0} parameter(0)
+  %q = u4[] parameter(1)
+  %r = s4[3]{0:E(4)} parameter(2)
+  %s = bf16[1,3]{1,0} parameter(3)
+  %started = ((s4[3]{0}, u4[], s4[3]{0:E(4)}, bf16[1,3]{1,0}), (s4[3]{0}, u4[], s4[3]{0:E(4)}, \
+bf16[2,3]{1,0})) all-gather-start(%p, %q, %r, %s), dimensions={0}
+  ROOT %gathered = (s4[3]{0}, u4[], s4[3]{0:E(4)}, bf16[2,3]{1,0}) all-gather-done(%started)
 }"""
     assert hlo_instructions(module)["gathered"].buffers == (3, 1, 2, 12)
 
@@ -602,15 +610,27 @@ def test_a_collectives_device_groups_are_read_in_every_form_xla_prints():
     as any collective's."""
     from dew.telemetry.instrumentation import hlo_instructions
 
-    module = """ENTRY %main (p: f32[8]) -> f32[8] {
-  %listed = f32[8]{0} all-reduce(f32[8]{0} %p), replica_groups={{0,1},{4,5},{2,3},{6,7}}
-  %iota = f32[8]{0} all-reduce(f32[8]{0} %p), replica_groups=[4,2]<=[2,2,2]T(2,1,0)
-  %named = f32[8]{0} all-gather(f32[2]{0} %p), replica_groups=mesh['fsdp'=4,'sequence'=2] {'fsdp'}
-  %pairs = f32[8]{0} collective-permute(f32[8]{0} %p), source_target_pairs={{1,0},{3,2},{5,4},{7,6}}
-  %every = f32[8]{0} all-reduce(f32[8]{0} %p), replica_groups={}
-  %reduced = f32[8]{0} collective-reduce(f32[8]{0} %p), replica_groups={{0,1,2,3},{4,5,6,7}}
+    module = """HloModule groups
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+ENTRY %main {
+  %p = f32[8]{0} parameter(0)
+  %listed = f32[8]{0} all-reduce(%p), replica_groups={{0,1},{4,5},{2,3},{6,7}}, to_apply=%add
+  %iota = f32[8]{0} all-reduce(%p), replica_groups=[4,2]<=[2,2,2]T(2,1,0), to_apply=%add
+  %named = f32[32]{0} all-gather(%p), replica_groups=mesh['fsdp'=4,'sequence'=2] {'fsdp'}, dimensions={0}
+  %pairs = f32[8]{0} collective-permute(%p), source_target_pairs={{1,0},{3,2},{5,4},{7,6}}
+  %every = f32[8]{0} all-reduce(%p), replica_groups={}, to_apply=%add
+  ROOT %reduced = f32[8]{0} collective-reduce(%p), replica_groups={{0,1,2,3},{4,5,6,7}}, to_apply=%add
 }"""
-    assert {name: instruction.groups for name, instruction in hlo_instructions(module).items()} == {
+    from dew.telemetry.trace import collective
+
+    assert {name: instruction.groups for name, instruction in hlo_instructions(module).items()
+            if collective(instruction.op)} == {
         "listed": ((0, 1), (4, 5), (2, 3), (6, 7)),
         "iota": ((0, 4), (2, 6), (1, 5), (3, 7)),
         "named": ((0, 2, 4, 6), (1, 3, 5, 7)),

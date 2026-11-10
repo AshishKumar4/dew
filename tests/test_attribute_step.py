@@ -15,8 +15,18 @@ from tool_support import load
 
 attribute = load("attribute_step")
 
+ADD = """%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+"""
+"""A reduction's adder, which a module's every reduce calls: XLA's parser reads a module whole, each
+computation it calls defined."""
+
 MODULE = """HloModule jit_step
 
+""" + ADD + """
 %fused_multiply_transpose.8 (param_0: f32[8,16,3072], param_1: f32[8,16,48,64]) -> f32[8,16,3072] {
   %param_1 = f32[8,16,48,64]{3,2,1,0} parameter(1)
   %exp.178 = f32[8,16,48,64]{3,2,1,0} exponential(%param_1)
@@ -38,6 +48,17 @@ MODULE = """HloModule jit_step
 """
 ENTRY = [
     "  %p0 = bf16[8,3072,8,256]{3,2,1,0} parameter(0)",
+    "  %a = f32[8,16,3072]{2,1,0} parameter(1)",
+    "  %b = f32[8,16,48,64]{3,2,1,0} parameter(2)",
+    "  %c = f32[8,16,3072]{2,1,0} parameter(3)",
+    "  %input_concatenate_fusion.8 = bf16[8,3072,8,256]{3,2,1,0} parameter(4)",
+    "  %bitcast.13109.0 = bf16[8,16,2800,64]{3,2,1,0} parameter(5)",
+    "  %bitcast.13113.0 = bf16[8,16,2800,64]{3,2,1,0} parameter(6)",
+    "  %bitcast.478.0 = f32[6144,64,128]{2,1,0} parameter(7)",
+    "  %bitcast.remat.237 = bf16[1024,4096]{1,0} parameter(8)",
+    "  %bitcast.2097.0 = bf16[4096,3584]{1,0} parameter(9)",
+    "  %loop_convert_fusion.83 = bf16[8,3072,8,256]{3,2,1,0} fusion(%p0), kind=kLoop, "
+    "calls=%fused_convert.83",
     "  %ffi_call.114 = (bf16[8,3072,8,256]{3,2,1,0}, bf16[8,3072,8,256]{3,2,1,0}) custom-call("
     "%loop_convert_fusion.83, %input_concatenate_fusion.8), custom_call_target=\"dew_flash_mha_bwd\", "
     "api_version=API_VERSION_TYPED_FFI",
@@ -49,12 +70,10 @@ ENTRY = [
     "%bitcast.2097.0), custom_call_target=\"__cublas$lt$matmul\"",
     "  %input_multiply_transpose_fusion.8 = f32[8,16,3072]{2,1,0} fusion(%a, %b), kind=kInput, "
     "calls=%fused_multiply_transpose.8",
-    "  %loop_convert_fusion.83 = bf16[8,3072,8,256]{3,2,1,0} fusion(%p0), kind=kLoop, "
-    "calls=%fused_convert.83",
     "  %input_reduce_fusion.89 = f32[8,16]{1,0} fusion(%c), kind=kInput, calls=%fused_reduce.89",
     "  ROOT %copy.5 = bf16[8,3072,8,256]{2,3,1,0} copy(%p0)",
 ]
-MODULE += "ENTRY %main.1 (p0: bf16[8,3072,8,256]) -> bf16[8,3072,8,256] {\n" + "\n".join(ENTRY) + "\n}\n"
+MODULE += "ENTRY %main.1 {\n" + "\n".join(ENTRY) + "\n}\n"
 
 LAYER = ("jit(step)/transpose(jvp(MultimodalTransformer.hidden_states))/language_model.hidden_states/"
          "language_model.stack/layers_11/layers_11._forward/layers_11._mix/self_attn/")
@@ -104,6 +123,8 @@ TRACED = ('metadata={op_name="jit(step)/transpose(jvp(MultimodalTransformer.hidd
           'source_file="/root/dew/src/dew/nn/attention.py" source_line=292}')
 NAMELESS = "\n".join([
     "HloModule jit_step",
+    "",
+    *ADD.splitlines(),
     "",
     "%fused_norm.4 (param_0: f32[8,3072,1024]) -> (f32[8,3072], f32[8,3072,1024]) {",
     "  %param_0 = f32[8,3072,1024]{2,1,0} parameter(0)",

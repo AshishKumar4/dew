@@ -114,7 +114,9 @@ def test_a_compiled_programs_communicators_are_read_through_the_flop_counts_pars
     sequence step's two groupings are two), its all-to-alls' and ragged all-to-alls' groups, and its
     permutes' directed pairs on one clique of its devices, the module's positions read as the GPUs its
     device assignment names."""
-    program = ("HloModule step, entry_computation_layout={()->f32[8]}\n\nENTRY %main () -> f32[8] {\n"
+    program = ("HloModule step\n\n%add (lhs: f32[], rhs: f32[]) -> f32[] {\n  %lhs = f32[] parameter(0)\n"
+               "  %rhs = f32[] parameter(1)\n  ROOT %sum = f32[] add(%lhs, %rhs)\n}\n\n"
+               "ENTRY %main (x: f32[8]) -> f32[8] {\n"
                "  %x = f32[8] parameter(0)\n"
                "  %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n"
                "  %b = f32[8] all-reduce(f32[8] %x), replica_groups=[2,2]<=[4], to_apply=%add\n"
@@ -207,7 +209,9 @@ def test_a_programs_communicators_are_kept_under_the_digest_of_dews_code(tmp_pat
     for earlier in (kept / f"{b'step'.hex()}.json", kept / ("0" * 64) / f"{b'step'.hex()}.json"):
         earlier.parent.mkdir(parents=True, exist_ok=True)
         earlier.write_text(json.dumps(planted.to_json()))
-    program = ("HloModule step, entry_computation_layout={()->f32[8]}\n\nENTRY %main () -> f32[8] {\n"
+    program = ("HloModule step\n\n%add (lhs: f32[], rhs: f32[]) -> f32[] {\n  %lhs = f32[] parameter(0)\n"
+               "  %rhs = f32[] parameter(1)\n  ROOT %sum = f32[] add(%lhs, %rhs)\n}\n\n"
+               "ENTRY %main (x: f32[8]) -> f32[8] {\n"
                "  %x = f32[8] parameter(0)\n"
                "  ROOT %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n}\n")
     assert communicators.collectives_kept(b"step", (0, 1, 2, 3), lambda: program) == Collectives(
@@ -219,7 +223,9 @@ def test_a_programs_communicators_are_read_once_per_executable(tmp_path, monkeyp
     fingerprint as positions in its device assignment, so a warm start that loads it from the compilation
     cache reads no text, and the same executable over other GPUs maps them to those."""
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    program = ("HloModule step, entry_computation_layout={()->f32[8]}\n\nENTRY %main () -> f32[8] {\n"
+    program = ("HloModule step\n\n%add (lhs: f32[], rhs: f32[]) -> f32[] {\n  %lhs = f32[] parameter(0)\n"
+               "  %rhs = f32[] parameter(1)\n  ROOT %sum = f32[] add(%lhs, %rhs)\n}\n\n"
+               "ENTRY %main (x: f32[8]) -> f32[8] {\n"
                "  %x = f32[8] parameter(0)\n"
                "  ROOT %a = f32[8] all-gather(f32[8] %x), replica_groups={{0,1},{2,3}}, dimensions={0}\n}\n")
     read = []

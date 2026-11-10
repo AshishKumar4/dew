@@ -305,14 +305,14 @@ def assigned(devices: Iterable) -> tuple[int, ...]:
     return tuple(ordinal(device) for device in devices)
 
 
-def collectives_of(program: str, gpus: tuple[int, ...]) -> Collectives:
-    """The communicators a compiled program's text makes on `gpus` (its device assignment, `assigned`), read
-    by the parser the FLOP count reads (`hlo_instructions`) and its collective vocabulary
-    (`dew.telemetry.trace.collective`): each distinct group of its collectives and of its all-to-alls,
-    however XLA prints it, and its permutes' directed pairs on one clique of all its devices; a group whose
-    positions lie past the assignment is taken as every device, and a send or a receive of no pairs read
-    as connecting every pair. The communicators it read are kept under the digest of Dew's own code, so
-    a change to how it reads a program reads them again (`collectives_kept`)."""
+def collectives_of(program: str | jax.stages.Compiled, gpus: tuple[int, ...]) -> Collectives:
+    """The communicators a compiled program makes on `gpus` (its device assignment, `assigned`), read from
+    its module as the FLOP count reads it (`hlo_instructions`: the executable's own, or one's text) and its
+    collective vocabulary (`dew.telemetry.trace.collective`): each distinct group of its collectives and of
+    its all-to-alls, however XLA states it, and its permutes' directed pairs on one clique of all its
+    devices; a group whose positions lie past the assignment is taken as every device, and a send or a
+    receive of no pairs read as connecting every pair. The communicators it read are kept under the digest
+    of Dew's own code, so a change to how it reads a program reads them again (`collectives_kept`)."""
     groups: set[tuple[int, ...]] = set()
     exchanges: set[tuple[int, ...]] = set()
     pairs: set[tuple[int, int]] = set()
@@ -465,16 +465,17 @@ def held() -> Sizing | None:
     return _HELD
 
 
-def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...], text: Callable[[], str]) -> Collectives:
-    """The communicators an executable makes on `gpus` (`collectives_of`), read from its `text` once per
+def collectives_kept(fingerprint: bytes, gpus: tuple[int, ...],
+                     program: Callable[[], str | jax.stages.Compiled]) -> Collectives:
+    """The communicators an executable makes on `gpus` (`collectives_of`), read from its `program` once per
     executable and kept in Dew's cache under its `fingerprint` as positions in its device assignment, below
     the digest of Dew's own code (`dew._cache.package_digest`), so a warm start that loads it from the
-    compilation cache reads no text, and another Dew's are read again."""
+    compilation cache reads no module, and another Dew's are read again."""
     kept = Path(dew_cache_dir()) / "communicators" / "programs" / package_digest()
     path = kept / f"{fingerprint.hex()}.json"
     if path.exists():
         return Collectives.of(json.loads(path.read_text()), gpus)
-    positions = collectives_of(text(), tuple(range(len(gpus))))
+    positions = collectives_of(program(), tuple(range(len(gpus))))
     path.parent.mkdir(parents=True, exist_ok=True)
     write_atomically(path, json.dumps(positions.to_json()))
     return Collectives.of(positions.to_json(), gpus)
@@ -498,10 +499,10 @@ def admit(executable: jax.stages.Compiled, free: Callable[[int], int | None] = g
     gpus = assigned(devices)
     fingerprint = runtime.fingerprint
     if not isinstance(fingerprint, bytes):
-        made = collectives_of(executable.as_text() or "", gpus)
+        made = collectives_of(executable, gpus)
         loaded = None
     else:
-        made = collectives_kept(fingerprint, gpus, lambda: executable.as_text() or "")
+        made = collectives_kept(fingerprint, gpus, lambda: executable)
         memory = compiled_memory(executable)
         # A backend that states no memory analysis states no code of the program's either.
         loaded = None if memory is None else Loaded(fingerprint, gpus, memory.generated_code)
