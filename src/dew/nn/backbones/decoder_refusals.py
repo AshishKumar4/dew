@@ -24,9 +24,6 @@ def mixed_admission(decoder: CausalTransformer) -> str | None:
     if decoder.cross_attention is not None:
         return ("cross-attention reads each row's own context, which the mixed call's one row of "
                 "every slot's tokens does not seat")
-    if decoder.position_embedding == "learned":
-        return ("a learned position embedding's table is read in the decoder's own row layout, not the "
-                "mixed row's")
     if decoder.engram is not None:
         return ("an n-gram reads the tokens before each in its row, which the mixed call's row of every "
                 "slot's tokens holds apart")

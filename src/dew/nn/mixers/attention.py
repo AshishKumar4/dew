@@ -18,7 +18,7 @@ from flax import linen as nn
 from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
-from dew.batch import Coordinates, prefix_sum
+from dew.batch import Coordinates
 from dew.nn.attention import (
     AttentionImpl,
     attention_case,
@@ -63,6 +63,8 @@ from dew.nn.kv_cache import (
     KVStore,
     cached_validity,
     filled_slots,
+    mixed_counts,
+    mixed_positions,
     open_kv_cache,
     rotated,
 )
@@ -1491,14 +1493,7 @@ class CausalSelfAttention(nn.Module):
         refusal = mixed_attention_refusal(self.ctx, alibi=self.alibi)
         if refusal is not None:
             raise ValueError(f"a mixed serving step needs plain attention; {self.name}: {refusal}")
-        index = self.get_variable("cache", "cache_index")
-        rows, pieces = index.shape[0], admitted.slots.shape[0]
-        valid = jnp.asarray(valid, bool)[0]
-        prompt = valid[rows:].reshape(pieces, -1)
-        filled = admitted.cursors[:, None] + prefix_sum(prompt, dtype=jnp.int32) - 1
-        positions = jnp.concatenate([jnp.where(valid[:rows], index, -1),
-                                     jnp.where(prompt, filled, -1).reshape(-1)])
-        return positions[None]
+        return mixed_positions(self.get_variable("cache", "cache_index"), admitted, valid)
 
     def _mixed_attended(self, query, key, value, positions, metadata: AttentionMetadata):
         """A mixed call's attention: every valid token's keys and values go
@@ -1532,8 +1527,7 @@ class CausalSelfAttention(nn.Module):
                   if getattr(metadata, name) is not None}
         store.write_tokens(key[0], value[0], token_rows, positions, groups)
         prompt = positions[rows:].reshape(pieces, width)
-        index.value = (index.value + (positions[:rows] >= 0)).at[admitted.slots].set(
-            admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
+        index.value = mixed_counts(index.value, admitted, positions[None])
         # A cache keeping its keys rotated (an int8 one's) is read by queries in the same rotation.
         rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
         if rotation is not None:

@@ -1677,8 +1677,10 @@ class CausalTransformer(LinearProducts):
             tokens_at = coordinates_of(attention_metadata, *tokens.shape)
             valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
             # Every cached call counts its real tokens, those at given places too, so a later call
-            # without places continues after them.
-            counted = self.decode_cursor(valid) if decode else prefix_sum(valid, dtype=jnp.int32) - 1
+            # without places continues after them; a serving step's mixed call counts each row's own.
+            admitted = None if attention_metadata is None else attention_metadata.admitted
+            counted = (self.decode_cursor(valid, admitted) if decode
+                       else prefix_sum(valid, dtype=jnp.int32) - 1)
             places = counted if tokens_at.positions is None else tokens_at.positions
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
         if self.embedding_norm and self.embedding_norm_reads == 'inputs':
