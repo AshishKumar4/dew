@@ -240,17 +240,17 @@ def supported(case: dict[str, str]) -> bool:
 CASES = (
     ('sm90', 'mosaic', 'dense', 'n-major', 'plain', 'bfloat16'),
     ('sm90', 'triton', 'grouped', 'k-major', 'bias', 'float16'),
-    ('sm80', 'mosaic', 'grouped', 'n-major', 'paired', 'float16'),
-    ('v5e', 'mosaic', 'dense', 'k-major', 'row-scale', 'bfloat16'),
+    ('sm80', 'mosaic', 'grouped', 'n-major', 'row-scale', 'float16'),
+    ('v5e', 'mosaic', 'dense', 'k-major', 'paired', 'bfloat16'),
     ('sm80', 'triton', 'dense', 'n-major', 'bias', 'bfloat16'),
     ('sm90', 'cutlass', 'grouped', 'k-major', 'plain', 'bfloat16'),
     ('sm80', 'triton', 'dense', 'k-major', 'plain', 'float16'),
-    ('sm80', 'triton', 'grouped', 'n-major', 'row-scale', 'float16'),
-    ('v5e', 'mosaic', 'dense', 'n-major', 'paired', 'bfloat16'),
+    ('sm90', 'mosaic', 'grouped', 'n-major', 'paired', 'float16'),
+    ('v5e', 'mosaic', 'dense', 'n-major', 'row-scale', 'bfloat16'),
     ('v5e', 'mosaic', 'grouped', 'n-major', 'bias', 'bfloat16'),
-    ('sm90', 'mosaic', 'grouped', 'k-major', 'paired', 'bfloat16'),
-    ('sm90', 'mosaic', 'grouped', 'n-major', 'row-scale', 'bfloat16'),
+    ('sm90', 'mosaic', 'grouped', 'k-major', 'row-scale', 'bfloat16'),
     ('sm90', 'cutlass', 'grouped', 'n-major', 'plain', 'bfloat16'),
+    ('sm80', 'mosaic', 'grouped', 'n-major', 'paired', 'bfloat16'),
     ('v5e', 'mosaic', 'dense', 'n-major', 'plain', 'bfloat16'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves

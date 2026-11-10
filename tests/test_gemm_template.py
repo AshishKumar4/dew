@@ -500,13 +500,13 @@ def test_the_prologues_rounding_is_in_its_derivative():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(jax.jit(jax.grad(plain))(scale)))
 
 
-@pytest.mark.parametrize("generation_name", generations("sm90"))
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 @pytest.mark.parametrize("sizes", [[3], None], ids=["ragged", "dense"])
 def test_a_prologue_never_sees_the_depths_padding(generation_name, sizes):
     """A depth no tile divides is padded with zeros, which `reciprocal` turns to infinities: the template's
-    launch, named, ragged or dense, zeroes them again before the product (`mosaic_gpu.depth_masked`), so
-    every output is the sum of 17 ones (NaN where the launch padded the depth before its prologue,
-    ff76ff7f19f)."""
+    launch, named, ragged or dense, on mma.sync and wgmma, zeroes them again before the product
+    (`mosaic_gpu.depth_masked`), so every output is the sum of 17 ones (NaN where the launch padded the
+    depth before its prologue, ff76ff7f19f)."""
     x, w = jnp.ones((3, 17), jnp.bfloat16), jnp.ones((1, 17, 16), jnp.bfloat16)
     w = w if sizes else w[0]
     with (generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"),
@@ -2245,9 +2245,8 @@ def test_the_templates_paired_product_holds_check_1(generation_name, grouped):
     gradient (the rows', both matrices') through the paired product's own reverse mode on the routes the
     selector takes (its two accumulators recomputed, the input gradient's two products summed wide: the
     SwiGLU's fp32 cotangents multiply wide, which warpgroup MMA's 16-bit products do not take), each as
-    exact as the unfused program's from float64 truth. On mma.sync too the paired product is one launch,
-    its only hook the epilogue over its two accumulators (`grouped_matmul._pair_alone`, row 2100). The
-    gradients run eagerly, as the Mosaic interpreters' ordered callbacks need."""
+    exact as the unfused program's from float64 truth. On mma.sync too the paired product is one launch
+    (row 2100). The gradients run eagerly, as the Mosaic interpreters' ordered callbacks need."""
     rows, depth, width = 136, 128, 256
     sizes = jnp.asarray([70, 66], jnp.int32) if grouped else None
     groups = 2 if grouped else 1

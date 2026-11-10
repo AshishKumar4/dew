@@ -88,11 +88,11 @@ def test_an_integer_regions_product_is_xlas_own_dot_with_nothing_to_analyse():
 
 @INTERPRETS
 def test_a_regions_analysis_reports_what_fusing_it_would_raise():
-    """Where the call names a kernel that refuses the region (the template on mma.sync, whose model counts no
-    side operand, under `generation.chosen`), `fused_gemm.analysis` reports the refusal `fused` raises, so a
-    pass never takes a region whose fusion fails."""
+    """Where the call names a kernel that refuses the region (the template, which multiplies 16-bit operands
+    alone, named for fp32 ones under `generation.chosen`), `fused_gemm.analysis` reports the refusal `fused`
+    raises, so a pass never takes a region whose fusion fails."""
     sizes = jnp.asarray([100, 156], jnp.int32)
-    x, w = jnp.ones((256, 512), jnp.bfloat16), jnp.ones((2, 512, 256), jnp.bfloat16)
+    x, w = jnp.ones((256, 512), jnp.float32), jnp.ones((2, 512, 256), jnp.float32)
     bias = jnp.ones((256,), jnp.float32)
 
     def region(x, w, sizes, bias):
