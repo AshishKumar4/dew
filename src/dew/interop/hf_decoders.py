@@ -708,6 +708,25 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     return record
 
 
+def language_model_name(name: str) -> str | None:
+    """A wrapper checkpoint's language-model tensor `name` under its decoder's own (`wrapper_route`'s
+    language model): one leading `model.` off, the released nesting, then `language_model.` off, its
+    decoder's `model.` kept or restored (`model.language_model.` and `language_model.model.` both become
+    `model.`) and its head's and prediction layers' names as they are; the head at the wrapper's root as it
+    is. None for a tensor of none of them."""
+    bare = name.removeprefix("model.")
+    if bare.startswith("language_model."):
+        return _language_model_tail(bare)
+    return bare if bare == "lm_head.weight" else None
+
+
+def _language_model_tail(bare: str) -> str:
+    """A tensor under a wrapper's `language_model.` (`bare`, its leading `model.` off) under its decoder's
+    own name (`language_model_name`)."""
+    tail = bare.removeprefix("language_model.")
+    return tail if tail.startswith(("model.", "lm_head.weight", "mtp.")) else f"model.{tail}"
+
+
 def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     """Return the wrapper component a source tensor belongs to, and its name there.
 
@@ -743,10 +762,7 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     if bare.startswith(tuple(record.get("text_unprefixed", ()))):
         return "language_model", f"model.{bare}"
     if bare.startswith("language_model."):
-        tail = bare[len("language_model."):]
-        return "language_model", tail if tail.startswith(
-            ("model.", "lm_head.weight", "mtp.")
-        ) else f"model.{tail}"
+        return "language_model", _language_model_tail(bare)
     for prefix in (projector_prefix,) if isinstance(projector_prefix, str) else projector_prefix or ():
         if bare.startswith(prefix):
             return "projector", bare[len(prefix):]

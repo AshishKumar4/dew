@@ -890,13 +890,13 @@ def _bind_language_model[C: ConditionEncoder](
         lambda name: source[name.removeprefix("text_encoder/")])
 
 
-def _qwen_text_name(name: str) -> str:
-    """A Qwen3-VL checkpoint's language-model tensor under the Qwen3 decoder's own name, its head too."""
-    if name.startswith("model.language_model."):
-        return "model." + name.removeprefix("model.language_model.")
-    if name == "lm_head.weight":
-        return name
-    raise ValueError(f"unknown tensor name {name!r}")
+def _text_name(name: str) -> str:
+    """A multimodal text encoder's language-model tensor under its decoder's own name, its head too, as a
+    wrapper's language model names it (`hf_decoders.language_model_name`)."""
+    named = decoders.language_model_name(name)
+    if named is None:
+        raise ValueError(f"unknown tensor name {name!r}")
+    return named
 
 
 def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compute, *,
@@ -919,7 +919,7 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
         raise ValueError("Qwen-Image's Qwen3-VL encoder computes in a named dtype; pass dtype")
     decoder = from_record(CausalTransformer, {**record, "dtype": named, "attention_impl": attention_impl})
     encoder, layouts, retained = _bind_language_model(
-        directory, record, "qwen3", _qwen_text_name,
+        directory, record, "qwen3", _text_name,
         lambda bound: QwenImageConditioner(decoder, pinned.transformers(), bound, str(directory),
                                            tokens=tokens, param_dtype=param_dtype, tokenizer_files=pinned),
         vision=("model.visual.",), param_dtype=param_dtype, params=params, lazy=lazy, stored=stored)
@@ -941,21 +941,11 @@ root beside `language_model.model.`, or under `model.` beside
 def _hidden_states_name(multimodal: bool) -> Callable[[str], str]:
     """Name a hidden-states text encoder's tensor as its decoder's checkpoint
     does: a Qwen3's own names, or a Mistral-3's language model as the
-    Mistral decoder's. A Mistral-3 checkpoint names its language model
+    Mistral decoder's (`_text_name`). A Mistral-3 checkpoint names its language model
     `language_model.model.` and its head `language_model.lm_head` (transformers
     4.50 and 5 write these), or `model.language_model.` and `lm_head` (4.52 to
     4.57)."""
-
-    def name_of(name: str) -> str:
-        if not multimodal or name == "lm_head.weight":
-            return name
-        if name == "language_model.lm_head.weight":
-            return "lm_head.weight"
-        for prefix in ("model.language_model.", "language_model.model."):
-            if name.startswith(prefix):
-                return "model." + name.removeprefix(prefix)
-        raise ValueError(f"unknown tensor name {name!r}")
-    return name_of
+    return _text_name if multimodal else lambda name: name
 
 
 def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], compute, *,
