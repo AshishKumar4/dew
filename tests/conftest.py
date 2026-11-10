@@ -307,10 +307,11 @@ def released_past_budget():
 @pytest.fixture
 def without_deterministic_ops(monkeypatch):
     """The cuda lane runs the whole suite under --xla_gpu_deterministic_ops,
-    which Dew refuses cudnn attention under (openxla/xla#46500). XLA read the
+    under which Dew's fused kernels take their ordered schedules (a
+    FlashAttention backward's atomic sum is refused there). XLA read the
     variable at the compile above, so taking the flag back out of the
     environment leaves this executable's reductions as they are and lets a
-    test reach the cudnn path it is about."""
+    test run the default schedules a user's process runs."""
     flags = os.environ.get("XLA_FLAGS", "")
     monkeypatch.setenv("XLA_FLAGS", lane_environment.without_deterministic_ops(flags))
 

@@ -51,8 +51,8 @@ def test_two_gpus_run_their_collectives_and_shards(tmp_path_factory):
 
 
 def test_two_gpus_shard_cudnn_attention(tmp_path_factory, without_deterministic_ops):
-    """The two-GPU cuDNN cells, without XLA's deterministic ops, which Dew refuses cuDNN attention under
-    (`without_deterministic_ops`)."""
+    """The two-GPU cuDNN cells, without XLA's deterministic ops (`without_deterministic_ops`), as a user's
+    process runs them."""
     run_cells([
         *(Cell(f"cuDNN runs inside the {exchange} exchange: {'causal' if causal else 'full'}",
                on_two(functools.partial(sequence_parallel.cudnn_runs_inside_either_exchange, exchange, causal,

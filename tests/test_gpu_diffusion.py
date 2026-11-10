@@ -16,8 +16,8 @@ pytestmark = pytest.mark.gpu(reason="the models' fused attention kernels: flash 
 
 def test_the_image_models_run_their_gpu_kernels(without_deterministic_ops):
     """Every image and diffusion cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept
-    and all raised together; the cuDNN cell runs without XLA's deterministic ops, which Dew refuses
-    cuDNN attention under (`without_deterministic_ops`)."""
+    and all raised together, without XLA's deterministic ops (`without_deterministic_ops`): the fused
+    kernels' default schedules, as a user's process runs them."""
     run_cells([
         Cell("MeanFlow trains through a fused attention kernel",
              mean_flow.meanflow_trains_through_a_fused_attention_kernel),

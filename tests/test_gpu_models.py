@@ -36,8 +36,8 @@ pytestmark = pytest.mark.gpu(reason="each model's own GPU kernels: flash, cuDNN,
 
 def test_the_models_run_their_gpu_kernels(without_deterministic_ops):
     """Every model cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
-    together. The cuDNN cells run without XLA's deterministic ops, which Dew refuses cuDNN attention
-    under (`without_deterministic_ops`)."""
+    together, without XLA's deterministic ops (`without_deterministic_ops`): the fused kernels' default
+    schedules, as a user's process runs them."""
     run_cells([
         Cell("a bf16 decoder trains on a packed batch and serves its cache through the GPU's kernels",
              lambda: causal.a_bf16_decoder_trains_and_serves_through_its_gpu_kernels(

@@ -13,8 +13,8 @@ MESH_DEVICES = 8
 
 
 DETERMINISTIC_OPS = "--xla_gpu_deterministic_ops=true"
-"""Under it a process keeps no picks (`dew._cache.keeps_picks`) and XLA refuses cudnn attention
-(openxla/xla#46500)."""
+"""Under it a process keeps no picks (`dew._cache.keeps_picks`) and Dew's fused kernels take their ordered
+schedules (`dew._devices.deterministic_ops_requested`)."""
 
 REPEATABLE_GPU_FLAGS = (DETERMINISTIC_OPS, "--xla_gpu_autotune_level=0", "--xla_gpu_enable_triton_gemm=false")
 """The cuda lane's flags for steps repeatable across processes. Deterministic
