@@ -23,7 +23,7 @@ import dataclasses
 import functools
 import math
 import operator
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
 import jax
@@ -1296,11 +1296,13 @@ class Issuer[Accumulator](abc.ABC):
         where the issuer accumulates in registers or in a ref its walk reads out whole."""
         return columns
 
-    def chunks(self, accumulators: tuple) -> tuple:
+    def chunks(self, accumulators: tuple) -> Iterator[tuple[int, tuple]]:
         """A tile's accumulators (its walk's) as its consumer reads them out: `(first_column, values)` a
-        chunk of `chunk_columns` columns each, `values` each accumulator's: the accumulators themselves,
-        one chunk, where the walk returns their values."""
-        return ((0, accumulators),)
+        chunk of `chunk_columns` columns each, `values` each accumulator's, each chunk's load issued as it
+        is taken, after the consumer is done with the chunk before (the live set one chunk's, as the
+        register model counts it): the accumulators themselves, one chunk, where the walk returns their
+        values."""
+        yield 0, accumulators
 
     def started(self, shapes: tuple, initial: tuple | None = None) -> tuple[jax.Array, ...]:
         """Register accumulators of `shapes` as a walk starts: their `initial` values, zero where None."""

@@ -18,7 +18,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import jax
@@ -468,12 +468,15 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     def chunk_columns(self, columns: int) -> int:
         return min(columns, CHUNK_COLUMNS)
 
-    def chunks(self, accumulators: tuple) -> tuple:
-        # Each chunk's columns read from each accumulator's tensor memory (`read`).
+    def chunks(self, accumulators: tuple) -> Iterator[tuple[int, tuple]]:
+        # Each chunk's columns read from each accumulator's tensor memory (`read`) as its consumer asks for
+        # it, after the chunk before it is stored: read all at once, every load was in flight together and a
+        # thread held the tile's whole row, ptxas's least spill-free cap 144 at 128 columns and 208 at 192
+        # where a chunk's model holds 112 (the compile gate's caps scan, EM-least).
         width = accumulators[0].shape[1]
         columns = self.chunk_columns(width)
-        return tuple((first, tuple(self.read(acc, first=first, columns=columns) for acc in accumulators))
-                     for first in range(0, width, columns))
+        for first in range(0, width, columns):
+            yield first, tuple(self.read(acc, first=first, columns=columns) for acc in accumulators)
 
     def read(self, acc: Accumulator, *, first: int = 0, columns: int | None = None, pending: int = 0,
              layout=STORED) -> jax.Array:
