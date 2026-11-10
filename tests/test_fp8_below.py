@@ -26,19 +26,11 @@ def _codes(seed: int, dtype=jnp.float8_e4m3fn) -> tuple:
     return rows, matrix, jnp.asarray(rng.uniform(0.5, 2.0, size=WIDTH), jnp.float32)
 
 
-def _whole(seed: int) -> tuple:
-    """FP8 codes of whole numbers under power-of-two scales: a product fp32 sums exactly and bfloat16's
-    eight bits do not hold."""
+def _whole(seed: int, most: int = 15) -> tuple:
+    """FP8 codes of whole numbers up to `most` in size under power-of-two scales: a product fp32 sums
+    exactly, and bfloat16's eight bits do not hold at 15 and do at 1."""
     rng = np.random.default_rng(seed)
-    rows, matrix = (jnp.asarray(rng.integers(-15, 16, size=(count, DEPTH)), jnp.float8_e4m3fn)
-                    for count in (ROWS, WIDTH))
-    return rows, matrix, jnp.asarray(2.0 ** rng.integers(-1, 2, size=WIDTH), jnp.float32)
-
-
-def _unit(seed: int) -> tuple:
-    """FP8 codes of -1, 0 and 1 under power-of-two scales: a product bfloat16's eight bits hold too."""
-    rng = np.random.default_rng(seed)
-    rows, matrix = (jnp.asarray(rng.integers(-1, 2, size=(count, DEPTH)), jnp.float8_e4m3fn)
+    rows, matrix = (jnp.asarray(rng.integers(-most, most + 1, size=(count, DEPTH)), jnp.float8_e4m3fn)
                     for count in (ROWS, WIDTH))
     return rows, matrix, jnp.asarray(2.0 ** rng.integers(-1, 2, size=WIDTH), jnp.float32)
 
@@ -109,7 +101,7 @@ def test_a_named_arm_that_is_exact_leaves_nothing_to_be_below():
 def test_a_first_stage_of_exact_seeds_draws_the_second_before_it_is_the_verdict():
     """A site whose first seeds every arm holds exactly has nothing to be below yet, a finding as any other:
     the second stage is drawn, and a form below the named arm over its seeds holds."""
-    _judged(_dequantized, _narrow, lambda seed: _unit(seed) if seed < 8 else _codes(seed))
+    _judged(_dequantized, _narrow, lambda seed: _whole(seed, most=1) if seed < 8 else _codes(seed))
 
 
 def test_a_row_that_cancels_is_sized_by_its_terms():
