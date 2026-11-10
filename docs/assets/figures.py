@@ -1319,14 +1319,14 @@ def architecture_template_figure():
     """A kernel template's layers, and an attention forward call through them."""
     label = ("A template's layers, top deciding: choice derives one config from device facts; the mainloop "
              "orders the bundle's steps; the toolkit's Family is an issuer and a transport, its bundles "
-             "WGMMA, FED, Mma and MmaFed routed and TCGEN05 not; then structure, hooks and the algebra. An "
+             "WGMMA, FED, Mma, MmaFed, RINGS, PAIR and CHUNKS; then structure, hooks and the algebra. An "
              "attention forward call goes from attention_route through MosaicForward.derived, bundles.of, "
              "the launch and each consumer's walk.")
     parts = [
         ("choice: Template.derived", ["one config from device facts, or none"], "dew", (16, 34, 400, 62), 0),
         ("mainloop", ["the order of the bundle's steps"], "dew", (16, 104, 400, 62), 1),
         ("toolkit: Family = Issuer + Transport", ["products, waits, walks, rings, roles;",
-                                                  "WGMMA, FED, Mma, MmaFed; TCGEN05 unrouted"], "dew",
+                                                  "WGMMA, FED, Mma, MmaFed, RINGS, PAIR, CHUNKS"], "dew",
          (16, 174, 400, 81), 2),
         ("structure", ["block lists, groups, chunks, pages"], "plain", (16, 263, 400, 62), 3),
         ("hooks", ["score, mask and output callables"], "plain", (16, 333, 400, 62), 4),

@@ -40,8 +40,6 @@ TMEM = plgpu.Layout.TCGEN05_TMEM_NATIVE
 """A tile's register layout as tensor memory loads it natively (a thread a row)."""
 STORED = plgpu.Layout.TCGEN05
 """An accumulator's register layout for an epilogue, the one a swizzled shared-memory tile takes."""
-WARPGROUPS = 2
-"""A program's warpgroups: one reading role's and the issuing one (`ISSUING`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -86,72 +84,6 @@ PAIRED = Topology(2)
 PRODUCT_COLUMNS = 256
 """tcgen05's widest product, its columns (N): one CTA's, or a pair's, each CTA reading its half of them (PTX
 ISA, tcgen05.mma's shapes)."""
-
-
-@dataclasses.dataclass(frozen=True)
-class Tcgen05:
-    """The tcgen05 bundle's facts and pieces (the module's account)."""
-
-    name = "tcgen05"
-    rows = 128
-    """A product's rows on one CTA (tcgen05's M without a CTA pair)."""
-    consumers = 1
-    """The warpgroups reading accumulators: one."""
-    cluster = 1
-
-    @staticmethod
-    def registers() -> int:
-        """The registers a thread of a program holds: its warpgroups' entry share (setmaxnreg moves none
-        where the GPU's compile ignores it, `resources.RAISES_HONORED`)."""
-        return resources.entry_registers(WARPGROUPS)
-
-    @staticmethod
-    def columns(target: generation.GpuTarget) -> int:
-        """Tensor memory's columns a multiprocessor holds (PTX ISA, tcgen05.alloc: 512)."""
-        if target.tmem_columns is None:
-            raise ValueError(f"{target.generation} has no tensor memory")
-        return target.tmem_columns
-
-    @staticmethod
-    def kernel(entry: Callable, *, out_type, grid: tuple, grid_names: tuple, scratch: tuple,
-               interpret, name: str | None = None, topology: Topology = SINGLE,
-               warpgroups: int = WARPGROUPS) -> Callable:
-        """`entry` as a program of `warpgroups` warpgroups (axis 'wg', `WARPGROUPS` by default: a template
-        whose roles are more, `handoffs.Schedule`'s), its kernel named `name`, `grid` the clusters of
-        `topology`'s CTAs (one each without a pair)."""
-        return mosaic.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
-                             warpgroups=warpgroups, family=Tcgen05.name, scratch=scratch,
-                             interpret=interpret, name=name, cluster=topology.ctas)
-
-    @staticmethod
-    def product(acc, lhs, rhs, released, *, accumulate, topology: Topology = SINGLE) -> None:
-        """`acc` (`+`)= `lhs @ rhs`, issued by the product warp into tensor memory (onto `acc` where
-        `accumulate`), `released` (a stage's release barrier) arrived at once the product has read its
-        operands; over `topology`'s CTAs, the leader's product spanning both."""
-        plgpu.tcgen05_mma(acc, lhs, rhs, released, accumulate=accumulate, **topology.issued())
-
-    @staticmethod
-    def loaded() -> None:
-        """Every load of tensor memory this thread issued done (`Tcgen05Issuer.read`), before its columns are
-        reused or released."""
-        plgpu.wait_load_tmem()
-
-    @staticmethod
-    def relaid(value: jax.Array, smem, layout) -> jax.Array:
-        """`value` in `layout`, through the shared buffer `smem` (a row vector's tensor-memory layout to an
-        epilogue's, which no register relayout reaches)."""
-        smem[...] = value
-        return plgpu.load(smem, layout=layout)
-
-    @staticmethod
-    def zeros(shape: tuple[int, int]) -> jax.Array:
-        """An fp32 accumulator chunk of zeros in an epilogue's layout (`STORED`): an output a tile that
-        multiplies nothing stores."""
-        return plgpu.layout_cast(jnp.zeros(shape, jnp.float32), STORED)
-
-
-TCGEN05 = Tcgen05()
-"""The bundle, which the templates' Blackwell mainloops import (no route reaches them yet)."""
 
 
 def swizzled(dtype, contraction: int) -> tuple:
@@ -266,7 +198,9 @@ class Accumulators:
 
     def scratch(self, target: generation.GpuTarget) -> tuple:
         columns = (self.count + self.running) * self.columns
-        if columns > TCGEN05.columns(target):
+        if target.tmem_columns is None:
+            raise ValueError(f"{target.generation} has no tensor memory")
+        if columns > target.tmem_columns:
             raise ValueError(f"{self.count + self.running} accumulators of {self.columns} columns exceed "
                              "tensor memory")
         tmem = plgpu.TMEM((self.rows, columns), jnp.float32, collective=self.topology.paired)
@@ -551,13 +485,15 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
                 loop.then()
         return state[0], accumulators
 
-    def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True
+    def products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True, released=None
                  ) -> Accumulator:
-        # The left operand from shared memory, or from tensor memory (an `Accumulator` a role wrote,
-        # tcgen05's TS form: FlashAttention 4's P·V); the right from shared memory.
+        """`Issuer.products`: the left operand from shared memory, or from tensor memory (an `Accumulator` a
+        role wrote, tcgen05's TS form: FlashAttention 4's P·V), the right from shared memory, issued over its
+        `topology`'s CTAs; `released`, where given, a barrier the product arrives at once it has read its
+        operands (a stage's release, which a walk of its own gives back by it: attention's on Blackwell)."""
         left = _tensor_memory(lhs) if isinstance(lhs, Accumulator) else lhs
-        plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, accumulate=acc.accumulate if accumulate else False,
-                          **self.topology.issued())
+        plgpu.tcgen05_mma(_tensor_memory(acc), left, rhs, released,
+                          accumulate=acc.accumulate if accumulate else False, **self.topology.issued())
         return dataclasses.replace(acc, accumulate=True)
 
     def scaled_products(self, acc: Accumulator, lhs, rhs, scales: tuple) -> Accumulator:
