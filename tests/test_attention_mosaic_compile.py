@@ -61,6 +61,13 @@ BACKWARD_GATE += [(generation_name, width, accurate, hooks) for generation_name 
                   for hooks in BACKWARD_HOOKS if hooks != "none"]
 BACKWARD_GATE += [("sm90", 256, False, "softcap")]
 BACKWARD_GATE = [case for case in BACKWARD_GATE if _takes(case[0], case[2], case[3])]
+SPILLING = {("sm86", 64, False, "temperature"), ("sm89", 64, False, "temperature")}
+"""The gate's cases that spill, each an open row's: an sm86's and an sm89's dK/dV at width 64 under a
+temperature, 64 bytes, the operand pipeline's per-thread shared offsets formed at the launch's entry and
+held through its loop beside the statistics' reads (row 5483, the owner's exception). Each fails here until
+it compiles spill-free, and is deleted with the fix."""
+SPILLS = pytest.mark.xfail(strict=True, reason="row 5483: 64 bytes spilled")
+BACKWARD_GATE = [pytest.param(*case, marks=SPILLS) if case in SPILLING else case for case in BACKWARD_GATE]
 """The backward resource gate's cases, each a form its GPU's bundles take (`_takes`; a form of two
 launches refused by its typed fact where the bundle's dQ launch has no producer): each GPU whose family the
 backward runs on (`BACKWARD_GATED`), a causal
