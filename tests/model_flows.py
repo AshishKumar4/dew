@@ -324,6 +324,10 @@ def programs_of(flow: Flow) -> dict[str, tuple[Callable, list]]:
             for kind in ("train", "decode") for arm in ("dew", "reference")}
 
 
+class Unreached(AssertionError):
+    """A flow whose Dew arm did not take a route it is for (`held_routes`)."""
+
+
 def held_routes(flow: Flow, found: list) -> None:
     """Raise unless the flow's Dew arm took every route it is for (`Flow.native`): a kernel off the reference
     path, or the one it names, among the kernels its choice ran (a decode's prefill over its cache's keys
@@ -335,7 +339,7 @@ def held_routes(flow: Flow, found: list) -> None:
         kernels = taken.get(choice, set())
         held = kernels - generic_kernels()[choice] if kernel == NATIVE else kernels & {kernel}
         if not held:
-            raise AssertionError(f"{flow.name}: its {choice} took {sorted(kernels) or 'nothing'} on "
+            raise Unreached(f"{flow.name}: its {choice} took {sorted(kernels) or 'nothing'} on "
                                  f"{generation.device_generation()}, not {kernel}: the flow does not reach "
                                  "the route it is for")
 

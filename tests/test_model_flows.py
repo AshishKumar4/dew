@@ -48,7 +48,7 @@ def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monk
             model_flows.held_routes(flow, dew)
         else:
             # A GPU the flow does not run on takes the portable math on its routes, as `Flow.families` says.
-            with pytest.raises(AssertionError, match="does not reach the route it is for"):
+            with pytest.raises(model_flows.Unreached):
                 model_flows.held_routes(flow, dew)
         model_flows.held_reference(flow, reference)
 
