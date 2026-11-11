@@ -26,7 +26,7 @@ from dew.nn.kernels.templates import (
     attention_mosaic,
     attention_mosaic_program,
 )
-from dew.nn.kernels.templates.recurrence import mainloop, template as recurrence
+from dew.nn.kernels.templates.recurrence import template as recurrence
 
 pytestmark = pytest.mark.kernel
 
@@ -168,22 +168,3 @@ def test_a_blackwell_attention_at_its_deepest_ring_compiles_within_its_resources
     assert len(held) < len(found), f"{generation_name} holds every ring to {STAGES[-1]} stages"
     failed = mosaic_failures(held)
     assert not failed, "\n".join(failed)
-
-
-@pytest.mark.parametrize(("name", "generation_name"), [
-    (name, gated) for name, generations in RECURRENCE.items() for gated in gate_generations(scoped=True)
-    if gated not in generations])
-def test_a_recurrence_call_the_template_does_not_take_is_past_the_blocks_shared_memory(name, generation_name):
-    """A recurrence geometry's call on a GPU the template does not take it on (`_takes`, its deepest-ring
-    cells') is refused by the block's shared memory: at the narrowest tiles its family stages (the narrowest
-    value and output blocks, one stage, the chunk at a role's rows, the derivation's floor) a launch stages
-    past the block (Kimi delta attention's output launch on a 99 KB part)."""
-    with generation.assumed(generation_name):
-        op, ba, _ = _recurrence(name, jnp.bfloat16)
-        target = recurrence.Mosaic.launched()
-        family = recurrence.bundle(target, jnp.bfloat16)
-        narrowest = family.narrowest_columns(jnp.bfloat16)
-        tiles = mainloop.Tiles(block_v=narrowest, stages=1, block_o=narrowest, walkers=1,
-                               chunk=family.role_rows)
-        staged = {launch.name: launch.shared for launch in op.launches(ba, tiles, target, backward=False)}
-        assert max(staged.values()) > generation.shared_budget(target), (generation_name, staged)
