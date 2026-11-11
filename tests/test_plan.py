@@ -1266,6 +1266,9 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
     lowered = jax.jit(lambda: None).lower()
 
     class Program:
+        # The lowering Dew's compile point reads the target's devices from (`report.targeted`).
+        _lowering = lowered._lowering
+
         def compiler_ir(self, dialect):
             return lowered.compiler_ir(dialect)
 
