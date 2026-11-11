@@ -358,7 +358,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
             return target
         return dataclasses.replace(generation.interpreted_target(), multiprocessors=None)
 
-    def _launches(self, ba: tokamax.BoundArguments, config: mainloop.Tiles, target: generation.GpuTarget, *,
+    def launches(self, ba: tokamax.BoundArguments, config: mainloop.Tiles, target: generation.GpuTarget, *,
                   backward: bool) -> tuple[mainloop.Launch, ...]:
         """The launches the call `ba` runs at `config` by `target`'s bundle (`planned`);
         with `backward`, its fast backward's too where it takes it (a decay a head, 16-bit operands)."""
@@ -396,7 +396,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         target = self.launched()
         if bundle(target) is None:
             return None
-        return max(launch.registers for launch in self._launches(ba, config, target, backward=False))
+        return max(launch.registers for launch in self.launches(ba, config, target, backward=False))
 
     def register_budget(self, config: mainloop.Tiles) -> int:
         family = bundle(self.launched())
@@ -412,7 +412,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
             return super()._held(ba, config)
         return all(launch.resident > 0
                    and launch.registers <= (launch.family or family).registers(launch.consumers)
-                   for launch in self._launches(ba, config, target, backward=False))
+                   for launch in self.launches(ba, config, target, backward=False))
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mainloop.Tiles | None:
         """The call's tiles on `target`, from its shape and the device's and its bundle's facts
@@ -492,7 +492,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
             if not spilled:
                 return joined
             refused[True].add(trained.block_v)
-            forward = {launch.name for launch in self._launches(ba, joined, target, backward=False)}
+            forward = {launch.name for launch in self.launches(ba, joined, target, backward=False)}
             if alone is not None and any(kernel.startswith(name) for kernel in spilled for name in forward):
                 refused[False].add(alone.block_v)
 
@@ -610,8 +610,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def _backward_holds(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,
                         target: generation.GpuTarget) -> bool:
         """Whether the launches the call's fast backward runs, its own and the forward it takes, hold at
-        `tiles` (`holds`; a call taking none, `_launches`', holds its forward's)."""
-        both = self._launches(ba, tiles, target, backward=True)
+        `tiles` (`holds`; a call taking none, `launches`', holds its forward's)."""
+        both = self.launches(ba, tiles, target, backward=True)
         family = bundle(target, _dtype(ba))
         assert family is not None
         return holds(both, family, generation.shared_budget(target))
@@ -627,7 +627,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """The forward's walk over each sequence's chunks: a forward without a gradient's scan, forming the
         output in the walk (`mainloop._scan`), or where `training` the states launch of the forward its fast
         backward takes (`chunk_forward.kept_forward`), a call without one its scan."""
-        return next(launch for launch in self._launches(ba, tiles, target, backward=training)
+        return next(launch for launch in self.launches(ba, tiles, target, backward=training)
                     if launch.name.startswith(("recurrence_states", "recurrence_scan")))
 
     def _blocks(self, ba: tokamax.BoundArguments, family: mosaic.Family, *, training: bool = True
@@ -699,7 +699,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def staged_bytes(self, ba: tokamax.BoundArguments, config: mainloop.Tiles,
                      target: generation.GpuTarget) -> int:
         # The forward's launches: the fast backward's are held where its rule takes them.
-        return max(launch.shared for launch in self._launches(ba, config, target, backward=False))
+        return max(launch.shared for launch in self.launches(ba, config, target, backward=False))
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         """Whether the mainloop runs the call on `target`: 16-bit or fp32 operands, a decay a key dimension's

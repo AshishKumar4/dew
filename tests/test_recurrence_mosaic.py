@@ -964,7 +964,7 @@ def test_a_refusal_under_the_remat_rung_reaches_the_route():
                                      **options)
         assert report._identity(template.MOSAIC, bound) == identity
         while (tiles := template.MOSAIC.derived(bound, target)) is not None:
-            names = {launch.name for launch in template.MOSAIC._launches(bound, tiles, target, backward=True)}
+            names = {launch.name for launch in template.MOSAIC.launches(bound, tiles, target, backward=True)}
             report.refuse([(identity, tiles, names)])
         with pytest.raises(KernelRefused) as refused:
             named()
@@ -1137,7 +1137,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
             # The tile the derivation takes where every register held, refused for its registers alone.
             unheld = [] if held is None or held == derived else [(held, 'refused ')]
             if unheld and any(launch.shared > shared for launch in
-                              template.MOSAIC._launches(bound, held, facts, backward=training)):
+                              template.MOSAIC.launches(bound, held, facts, backward=training)):
                 unheld = []
             if derived is None and variant is not None:
                 return []
@@ -1161,7 +1161,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                 # do not hold (`template.backward_holds`); where only their registers refuse them,
                 # the gate compiles them, held to ptxas's need.
                 refused.append(f"{name} {jnp.dtype(dtype).name} fast backward{' packed' if packed else ''}")
-                launches = template.MOSAIC._launches(bound, derived, facts, backward=True)
+                launches = template.MOSAIC.launches(bound, derived, facts, backward=True)
                 if any(launch.shared > shared for launch in launches):
                     return []
                 return [case(name, dtype, args, starts, bound, derived, training=True, packed=packed,
@@ -1187,7 +1187,7 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
 
         label = (f"{name} {jnp.dtype(dtype).name} {'training' if training else 'forward'}"
                  f"{' packed' if packed else ''} {kind}{tiles}")
-        plans[label] = template.MOSAIC._launches(bound, tiles, facts, backward=training)
+        plans[label] = template.MOSAIC.launches(bound, tiles, facts, backward=training)
         if launched is not None:
             launched[label] = (bound, tiles)
         unwide = {key: value for key, value in _form(name, dtype).items() if key != 'wide'}
@@ -1375,7 +1375,7 @@ def test_a_packed_key_decay_training_call_checks_forward_and_recomputed_kernels(
     starts = jax.ShapeDtypeStruct((1, 256), jnp.bool_)
     bound = template.MOSAIC.bind(*args, starts, max_segments=8, bound=1.0, **_form(name, dtype))
     tiles = mainloop.Tiles(32, 3, 128, 2, chunk=64)
-    launches = template.MOSAIC._launches(bound, tiles, facts, backward=True)
+    launches = template.MOSAIC.launches(bound, tiles, facts, backward=True)
     models = _models(launches, family, facts)
     given = [*args, jax.ShapeDtypeStruct(args[2].shape, dtype),
              jax.ShapeDtypeStruct(args[5].shape, jnp.float32)]
