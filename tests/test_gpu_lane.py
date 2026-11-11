@@ -521,8 +521,8 @@ def test_a_tier_cut_groups_green_row_is_reused_while_its_cut_holds_the_same_test
         rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
         assert sorted(rows) == [f"3.12:{group}" for group in groups]
         assert all(row["exitCode"] == 0 for row in rows.values()), rows
-        return ({name: (tmp_path / f"ran-{name}").read_text() for name in names},
-                [{node.rpartition("::test_")[2] for node in rows[f"3.12:{group}"]["tests"]} for group in groups])
+        held = [{node.rpartition("::test_")[2] for node in rows[f"3.12:{group}"]["tests"]} for group in groups]
+        return {name: (tmp_path / f"ran-{name}").read_text() for name in names}, held
 
     assert lane(a=30.0, b=30.0, c=30.0, d=30.0) == (dict.fromkeys(names, "1"), [{"a", "b"}, {"c", "d"}])
     # The same cut again, and one of other seconds that gives each group the same tests: no test runs, and
