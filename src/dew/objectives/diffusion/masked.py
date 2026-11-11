@@ -149,7 +149,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         self.block = block
         self.samples = samples
         self.decode = decode
-        self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
+        self.inputs = InputSpec(sample=Field.indexing(TEXT_KEY, (seq_len,), model))
         self.ema = EMASpec.constant(ema_decay)
 
     @property

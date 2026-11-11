@@ -5,6 +5,8 @@ block [1, 3) run once in the first and twice in the second (`DecoderRunConfig.lo
 `phase_passes`)."""
 
 import csv
+import dataclasses
+import itertools
 from pathlib import Path
 
 import jax
@@ -86,6 +88,8 @@ def test_a_decision_run_whose_passes_grow_by_phase_is_its_phases_runs_and_resume
         run(tmp_path, (1, 2, 3), phased(tmp_path))
     data = phased(tmp_path)
     first, _ = trained(run(tmp_path, STEPS, data), tmp_path, "first", trainer={"steps": PHASE})
+    # The comparisons below hold on numbers: NaN equals NaN to them.
+    assert all(np.all(np.isfinite(leaf)) for leaf in parameters(first).values())
     alone, _ = trained(run(tmp_path, 1, asked(tickets(tmp_path, "first", "billing"))), tmp_path, "alone",
                        trainer={"steps": PHASE})
     assert parameters(first).keys() == parameters(alone).keys()
@@ -94,6 +98,7 @@ def test_a_decision_run_whose_passes_grow_by_phase_is_its_phases_runs_and_resume
     assert not np.any(theta(first)), "θ's gradient is zero while each step runs one pass"
 
     whole, _ = trained(run(tmp_path, STEPS, data), tmp_path, "whole", trainer={"steps": 4})
+    assert all(np.all(np.isfinite(leaf)) for leaf in parameters(whole).values())
     assert np.any(theta(whole)), "θ moves once a step runs two passes"
     trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 3, "checkpoint_every": 1})
     resumed, _ = trained(run(tmp_path, STEPS, data), tmp_path, "stopped",
@@ -104,3 +109,54 @@ def test_a_decision_run_whose_passes_grow_by_phase_is_its_phases_runs_and_resume
     loaded = Decide.from_run(str(tmp_path / "runs" / "stopped"))
     assert loaded.model.backbone.loop.steps == STEPS[-1]
 
+
+
+def test_each_phases_step_of_the_decision_run_is_a_fixed_count_runs_step_and_counts_its_flops(tmp_path):
+    """From the same state over the same batch, each phase's step of the phased decision run computes what
+    a run whose loop runs that phase's count computes: its loss and its stepped parameters the same bits (the
+    ask's invariant 1); and the FLOPs it counts are that run's, so its FLOP count follows the phase's count,
+    two passes counting more than one (invariant 5)."""
+    from dew.batch import PHASE as READ_IN
+    from dew.config import TrainerConfig
+    from dew.data.dataset import DataPartition
+    from dew.distributed.batches import split_fields
+    from dew.training import Layout, MeshSpec
+
+    settings = TrainerConfig(checkpoint_dir=str(tmp_path / "runs"), steps=4, log_every=1, eval_every=None,
+                             checkpoint_every=None, checkpoint_final=False, multi_host=False,
+                             mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=64))
+
+    def built(steps, data, name: str):
+        """The run's trainer and its training read, as `train` builds them."""
+        prepared = dataclasses.replace(run(tmp_path, steps, data), trainer=settings).prepare()
+        readied, loader, _, _, _ = prepared.run.readied(prepared.objective, prepared.dataset, None, (), name)
+        trainer = readied.built(prepared.objective, readied.trainer.mesh, None)
+        # Its optimizer built over the run's length, as `fit` builds it.
+        trainer.scheduled(settings.steps)
+        return trainer, loader
+
+    stepping, loader = built(STEPS, phased(tmp_path), "phased")
+    stream = loader.train(DataPartition())
+    try:
+        batches = {}
+        for batch in itertools.islice(stream, 4):
+            batches.setdefault(batch[READ_IN].index, batch)
+    finally:
+        stream.close()
+    assert sorted(batches) == [0, 1]
+    counted = []
+    for phase, passes in enumerate(STEPS):
+        # The count the step runs is its batch's phase's, read on the host; the step reads the rest.
+        assert stepping.phase_passes.at(batches[phase]) == passes
+        batch, _ = split_fields(batches[phase])
+        state, _, _ = stepping.place()
+        stepped, loss, *_ = stepping.compile(state, batch)(state, batch)
+        alone, _ = built(passes, asked(tickets(tmp_path, "first", "billing")), f"alone-{passes}")
+        start, _, _ = alone.place()
+        own, own_loss, *_ = alone.compile(start, batch)(start, batch)
+        assert np.isfinite(np.asarray(loss)) and np.array_equal(np.asarray(loss), np.asarray(own_loss)), phase
+        assert jax.tree.all(jax.tree.map(lambda a, b: bool(np.array_equal(a, b)),
+                                         jax.device_get(stepped.variables), jax.device_get(own.variables)))
+        assert stepping.step_flops == alone.step_flops is not None
+        counted.append(stepping.step_flops)
+    assert counted[0] != counted[1]

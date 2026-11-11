@@ -18,7 +18,7 @@ every diffusion loss, sample, artifact and image metric uses, and
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -53,11 +53,56 @@ class Field:
     key: str
     shape: tuple[int, ...]
     variable_axes: tuple[int, ...] = ()
+    rows: int | None = dataclasses.field(default=None, metadata={"record": False})
+    """The rows of the table the field's integers index, a token field's its model's embedding table
+    (`dew.nn.blocks.token_table`), read off the model where an objective declares the field: every value
+    in `[0, rows)` but the ids its model replaces before the table reads them (`replaced`), as `bounded`
+    holds it; None for a field that indexes nothing. Not recorded: the model a run rebuilds states it."""
+    replaced: frozenset[int] = dataclasses.field(default=frozenset(), metadata={"record": False})
+    """Ids the model replaces before its table reads them (a media placeholder), which hold no row."""
 
     def __post_init__(self):
         object.__setattr__(self, "shape", tuple(int(size) for size in self.shape))
+        object.__setattr__(self, "replaced", frozenset(int(token) for token in self.replaced))
         if any(axis < 0 or axis >= len(self.shape) for axis in self.variable_axes):
             raise ValueError("variable field axes must index its per-sample shape")
+
+    @classmethod
+    def indexing(cls, key: str, shape: tuple[int, ...], model: object, *,
+                 variable_axes: tuple[int, ...] = ()) -> Field:
+        """The field `key` of `shape` whose integers index `model`'s embedding table
+        (`dew.nn.blocks.token_table`): its rows and the ids it replaces, none where it states no table."""
+        from dew.nn.blocks import token_table
+
+        table = token_table(model)
+        rows, replaced = (None, frozenset()) if table is None else table
+        return cls(key, shape, variable_axes, rows=rows, replaced=replaced)
+
+    def bounded(self, value: object, spelling: Callable[[int], str] | None = None) -> None:
+        """Refuse `value`, this field's rows (a `ModelInputs`'s token rows), where it holds an id outside
+        `[0, rows)` not `replaced`: such an id reads no row of the table, whose gather fills it with NaN
+        (`jnp.take`'s out-of-bounds fill), a run's loss and a served token NaN with finite logits beside
+        it. Names the id, its token where `spelling` knows it, and the table's rows."""
+        if self.rows is None:
+            return
+        held = value.tokens if isinstance(value, ModelInputs) else value
+        if isinstance(held, jax.Array):
+            raise TypeError(f"field {self.key!r} is bounded on the host, before it is placed; a device "
+                            "array reaches it only by a caller's error, never read back for it")
+        ids = np.asarray(held)
+        if ids.size == 0 or ids.dtype.kind not in "iu":
+            return
+        low, high = int(ids.min()), int(ids.max())
+        if low >= 0 and high < self.rows:
+            return
+        outside = np.unique(ids[(ids < 0) | (ids >= self.rows)])
+        outside = outside[~np.isin(outside, list(self.replaced))] if self.replaced else outside
+        if outside.size == 0:
+            return
+        token = int(outside[0] if outside[0] < 0 else outside[-1])
+        named = "" if spelling is None or token < 0 else f" ({spelling(token)!r})"
+        raise ValueError(f"field {self.key!r} holds the id {token}{named}, outside the {self.rows} rows of "
+                         "the table it indexes: its tokens come from another vocabulary than the model's")
 
     @classmethod
     def of(cls, key: str, batch: Batch) -> Field:
@@ -187,6 +232,14 @@ class InputSpec:
                     f"objective.inputs field {declared.key!r} declares shape {declared.shape}, "
                     f"but the first training batch has shape {tuple(actual)}"
                 )
+
+    def bounded(self, batch: Batch, spelling: Callable[[int], str] | None = None) -> None:
+        """Refuse `batch`, a host batch, where a field this spec names holds an id outside the table it
+        indexes (`Field.bounded`): every training batch's, on the prefetch worker before it is placed,
+        and every validation batch's before it is placed; `check`, of shapes alone, reads a placed one."""
+        for declared in (self.sample, self.mask):
+            if declared is not None and declared.key in batch:
+                declared.bounded(batch[declared.key], spelling)
 
     @staticmethod
     def bound(record: Mapping[str, object], *, params: Mapping[str, Variables] | None = None) -> InputSpec:

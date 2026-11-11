@@ -1317,8 +1317,14 @@ def parameters(state) -> dict:
 
 
 def assert_same(left: dict, right: dict, why: str) -> None:
+    """`left` and `right` the same numbers, leaf by leaf, each finite first: NaN equals NaN to an array
+    comparison, so two runs trained to NaN would pass as one."""
     assert set(left) == set(right)
     for name in left:
+        for side in (left[name], right[name]):
+            values = np.asarray(side)
+            finite = values.dtype.kind not in "fc" or np.all(np.isfinite(values))
+            assert finite, f"{why}: {name} is not finite"
         np.testing.assert_array_equal(left[name], right[name], err_msg=f"{why}: {name}")
 
 
