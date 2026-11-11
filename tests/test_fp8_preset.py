@@ -13,7 +13,7 @@ from model_support import float64_twin
 from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound, widened, with_gradients
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import generation, low_rank, projections
 from dew.nn.precision import FP8, LowPrecision, Numerics, RecipeRefused, numerics_of
 
 VOCAB, WIDTH = 256, 128
@@ -81,14 +81,14 @@ def test_a_grouped_output_projection_takes_the_recipe_group_by_group():
     assert [route.kernel != "unquantized" for route in found if route.choice == "blockwise_fp8"] == [True]
     kernel = params["params"]["kernel"]
     # The recipe's operands, dequantized: E4M3 codes times power-of-two scales, whose products are exact.
-    block_codes, block_scales = gemm.blocks_quantized(kernel)
+    block_codes, block_scales = projections.blocks_quantized(kernel)
     matrices = np.asarray(block_codes, np.float64) * np.repeat(np.repeat(
         np.asarray(block_scales, np.float64), WIDTH, axis=1), WIDTH, axis=2)
     for group in range(x.shape[0]):
         rows = x[group].reshape(-1, WIDTH)
         with generation.run_precision(FP8), projection_role("mixer"):
-            alone = gemm.recipe_projection(rows, kernel[group], out_dtype=jnp.float32)
-        row_codes, row_scales = gemm.rows_quantized(rows)
+            alone = projections.recipe_projection(rows, kernel[group], out_dtype=jnp.float32)
+        row_codes, row_scales = projections.rows_quantized(rows)
         dequantized = np.asarray(row_codes, np.float64) * np.repeat(np.asarray(row_scales, np.float64), WIDTH,
                                                                     axis=-1)
         assert_fp32_reduction_bound(np.asarray(out[group]).reshape(-1, WIDTH), alone,
@@ -137,7 +137,7 @@ def test_a_projection_the_recipe_takes_under_a_product_wrapper_is_refused():
 
 
 def test_an_adapters_fused_product_refuses_a_projection_the_recipe_takes():
-    """An adapter's update fused into its projection's product (`gemm.low_rank`, LoRA's fused site under
+    """An adapter's update fused into its projection's product (`low_rank.low_rank`, LoRA's fused site under
     `generation.chosen(low_rank='fused')`, which returns before the layer's own product) on a projection
     the 'fp8' numerics take by role would train it unquantized, silently: refused, and a role the recipe
     keeps is not."""
@@ -147,9 +147,9 @@ def test_an_adapters_fused_product_refuses_a_projection_the_recipe_takes():
     kernel, a, b = jnp.ones((WIDTH, WIDTH)), jnp.ones((WIDTH, rank)), jnp.zeros((rank, WIDTH))
     with generation.run_precision(FP8):
         with projection_role("mlp"), pytest.raises(RecipeRefused):
-            gemm.low_rank(rows, kernel, a, b, 1.0, out_dtype=jnp.float32)
+            low_rank.low_rank(rows, kernel, a, b, 1.0, out_dtype=jnp.float32)
         with projection_role("router"):
-            gemm.low_rank(rows, kernel, a, b, 1.0, out_dtype=jnp.float32)
+            low_rank.low_rank(rows, kernel, a, b, 1.0, out_dtype=jnp.float32)
 
 
 def test_the_experts_kernel_gradient_keeps_the_master_dtype():
@@ -173,16 +173,16 @@ def test_the_experts_kernel_gradient_keeps_the_master_dtype():
 
 
 def emulated(dtype):
-    """`gemm.blockwise_fp8_projection` emulated in `dtype`: the recipe's quantizers
-    (`gemm.rows_quantized`, `gemm.blocks_quantized`), each group's product of the dequantized values in
-    `dtype` at its highest precision, and its gradients the recipe's (`blockwise_matrix.recipe_truth`'s),
-    each row's group read from `group_blocks` as the model's routing gives it: float64 the step's truth,
-    float32 the fake-quantized reference a recipe is measured against."""
+    """`projections.blockwise_fp8_projection` emulated in `dtype`: the recipe's quantizers
+    (`projections.rows_quantized`, `projections.blocks_quantized`), each group's product of the dequantized
+    values in `dtype` at its highest precision, and its gradients the recipe's
+    (`blockwise_matrix.recipe_truth`'s), each row's group read from `group_blocks` as the model's routing
+    gives it: float64 the step's truth, float32 the fake-quantized reference a recipe is measured against."""
     def dequantized(codes, scales):
         return codes.astype(dtype) * jnp.repeat(scales.astype(dtype), 128, axis=-1)
 
     def blocks(w):
-        codes, scales = gemm.blocks_quantized(w)
+        codes, scales = projections.blocks_quantized(w)
         return codes.astype(dtype) * jnp.repeat(jnp.repeat(scales.astype(dtype), 128, axis=1), 128, axis=2)
 
     def owned(group_blocks, rows):
@@ -197,7 +197,8 @@ def emulated(dtype):
 
     @jax.custom_vjp
     def run(x, w, group_blocks):
-        return grouped(dequantized(*gemm.rows_quantized(x)), blocks(w), owned(group_blocks, x.shape[0]))
+        return grouped(dequantized(*projections.rows_quantized(x)), blocks(w),
+                       owned(group_blocks, x.shape[0]))
 
     def forward(x, w, group_blocks):
         return run(x, w, group_blocks), (x, w, group_blocks)
@@ -205,9 +206,10 @@ def emulated(dtype):
     def backward(residuals, cotangent):
         x, w, group_blocks = residuals
         owners = owned(group_blocks, x.shape[0])
-        d_x = grouped(dequantized(*gemm.rows_quantized(cotangent)), jnp.swapaxes(blocks(w), 1, 2), owners)
-        rows_t = dequantized(*gemm.rows_quantized(x.T))
-        dy_t = dequantized(*gemm.rows_quantized(cotangent.T))
+        d_x = grouped(dequantized(*projections.rows_quantized(cotangent)), jnp.swapaxes(blocks(w), 1, 2),
+                      owners)
+        rows_t = dequantized(*projections.rows_quantized(x.T))
+        dy_t = dequantized(*projections.rows_quantized(cotangent.T))
         d_w = jnp.stack([jnp.matmul(rows_t * owners[g], dy_t.T, precision="highest")
                          for g in range(w.shape[0])])
         return d_x.astype(x.dtype), d_w.astype(w.dtype), None
@@ -222,9 +224,9 @@ def emulated(dtype):
 
 
 def laid_projection(dtype):
-    """`gemm.recipe_projection` of a projection's rows written apart in `dtype`: `run(rows, matrices, sizes)`,
-    each group's rows (`sizes` a group's, in order, any rows past their sum outside every group) laid in
-    whole 128-row blocks behind zero rows, a run of zero blocks after them, the recipe emulated over them
+    """`projections.recipe_projection` of a projection's rows written apart in `dtype`: `run(rows, matrices,
+    sizes)`, each group's rows (`sizes` a group's, in order, any rows past their sum outside every group) laid
+    in whole 128-row blocks behind zero rows, a run of zero blocks after them, the recipe emulated over them
     (`emulated`), and each row's output read back, a row outside every group's zero."""
     project = emulated(dtype)
 
@@ -247,9 +249,9 @@ def laid_projection(dtype):
 
 def test_a_recipe_projection_of_rows_an_explicit_axis_splits_is_each_devices_own():
     """Row 4854: under the 'fp8' numerics, a dense projection of rows an Explicit data axis splits over eight
-    devices (`gemm.recipe_projection`, through a layer's product too: `gemm.dot_general`'s
-    `_recipe_general`) runs each device's rows apart (`gemm._projected_apart`, `jax.shard_map`), each laid
-    in whole 128-row blocks of its own: its value and the rows' gradient bitwise each device's rows'
+    devices (`projections.recipe_projection`, through a layer's product too: `projections.dot_general`'s
+    `_recipe_general`) runs each device's rows apart (`projections._projected_apart`, `jax.shard_map`), each
+    laid in whole 128-row blocks of its own: its value and the rows' gradient bitwise each device's rows'
     projection alone, the matrix's gradient their gradients' sum. Integers, so every quantization and sum is
     exact whatever adds them."""
     from dew.distributed.placement import MeshSpec
@@ -263,8 +265,8 @@ def test_a_recipe_projection_of_rows_an_explicit_axis_splits_is_each_devices_own
 
     def pulled(rows, matrix, cotangent):
         with generation.run_precision(FP8), projection_role("mlp"):
-            value, pull = jax.vjp(lambda r, m: gemm.dot_general(jax.lax.dot_general)(r, m, numbers), rows,
-                                  matrix)
+            value, pull = jax.vjp(lambda r, m: projections.dot_general(jax.lax.dot_general)(r, m, numbers),
+                                  rows, matrix)
             return (value, *pull(cotangent))
 
     alone = [jax.jit(pulled)(rows[i:i + 1], matrix, cotangent[i:i + 1]) for i in range(8)]
@@ -281,11 +283,12 @@ def test_a_recipe_projection_of_rows_an_explicit_axis_splits_is_each_devices_own
 
 
 def test_a_recipes_experts_of_rows_an_explicit_axis_splits_are_each_devices_share_of_each_group():
-    """Row 4859: under the 'fp8' numerics, experts' projection (`gemm.recipe_projection` with group sizes
-    counting every device's rows: ragged, one empty, rows past them) of rows an Explicit data axis splits
-    over eight devices runs each device's rows with its own share of each group (`gemm._local_sizes`): its
-    value and the rows' gradient bitwise each device's rows projected alone with those counts, the matrices'
-    gradient their gradients' sum. Integers, every quantization and sum exact."""
+    """Row 4859: under the 'fp8' numerics, experts' projection (`projections.recipe_projection` with group
+    sizes counting every device's rows: ragged, one empty, rows past them) of rows an Explicit data axis
+    splits over eight devices runs each device's rows with its own share of each group
+    (`projections._local_sizes`): its value and the rows' gradient bitwise each device's rows projected alone
+    with those counts, the matrices' gradient their gradients' sum. Integers, every quantization and sum
+    exact."""
     from dew.distributed.placement import MeshSpec
     from dew.nn.precision import projection_role
 
@@ -297,8 +300,10 @@ def test_a_recipes_experts_of_rows_an_explicit_axis_splits_are_each_devices_shar
 
     def pulled(rows, matrices, cotangent, sizes):
         with generation.run_precision(FP8), projection_role("experts"):
-            value, pull = jax.vjp(lambda r, m: gemm.recipe_projection(r, m, sizes, out_dtype=jnp.float32),
-                                  rows, matrices)
+            def projected(r, m):
+                return projections.recipe_projection(r, m, sizes, out_dtype=jnp.float32)
+
+            value, pull = jax.vjp(projected, rows, matrices)
             return (value, *pull(cotangent))
 
     ends, starts = np.cumsum(sizes), np.cumsum(sizes) - sizes
@@ -321,8 +326,8 @@ def test_a_recipes_experts_of_rows_an_explicit_axis_splits_are_each_devices_shar
 
 @pytest.mark.parametrize("role", ["mlp", "experts"])
 def test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference(role):
-    """A projection the 'fp8' numerics take (`gemm.recipe_projection`, which a layer of the role hands its
-    rows): a dense one's, every row its one group's, and experts' of ragged groups, one empty, with rows
+    """A projection the 'fp8' numerics take (`projections.recipe_projection`, which a layer of the role hands
+    its rows): a dense one's, every row its one group's, and experts' of ragged groups, one empty, with rows
     past them; its output and both gradients on par with the recipe written apart in float32 over the same
     groups' whole 128-row blocks (`laid_projection`: the fake-quantized reference a recipe is measured
     against), from it in float64 (check 1)."""
@@ -341,7 +346,7 @@ def test_the_recipes_projection_is_on_par_with_its_fake_quantized_reference(role
     def projected(rows, matrix):
         with generation.run_precision(FP8), projection_role(role):
             sized = None if role == "mlp" else jnp.asarray(sizes, jnp.int32)
-            return gemm.recipe_projection(rows, matrix, sized, out_dtype=jnp.float32)
+            return projections.recipe_projection(rows, matrix, sized, out_dtype=jnp.float32)
 
     @as_given
     def truth(rows, matrix, cotangent):

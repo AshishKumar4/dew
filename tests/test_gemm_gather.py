@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact, equations
 
-from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels import formats, gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 SEEDS = 8
@@ -273,8 +273,8 @@ def test_a_blackwells_gathered_block_scaled_product_gathers_its_scales_by_its_ta
     scales by the same table, bitwise the product of the operand gathered first (codes and scales), its
     groups whole 128-row blocks, one empty."""
 
-    choice, form, product = {"mxfp8": ("mxfp8", gemm.MxFp8, gemm.mxfp8_product),
-                             "nvfp4": ("nvfp4_block", gemm.NvFp4Block, gemm.nvfp4_block_product)}[format_]
+    choice, form, product = {"mxfp8": ("mxfp8", formats.MxFp8, gemm.mxfp8_product),
+                             "nvfp4": ("nvfp4_block", formats.NvFp4Block, gemm.nvfp4_block_product)}[format_]
     rng = np.random.default_rng(17)
     tokens = form.quantized(jnp.asarray(rng.normal(size=(300, 256)), jnp.float32))
     matrices = form.quantized(jnp.asarray(rng.normal(size=(4, 128, 256)), jnp.float32))

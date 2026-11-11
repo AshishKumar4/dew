@@ -1378,7 +1378,7 @@ class MosaicGmm(_Mosaic):
 
 
 class _PackedMatrix(Protocol):
-    """A packed matrix's fields as the packed launch streams them (`gemm.NvFp4`'s)."""
+    """A packed matrix's fields as the packed launch streams them (`formats.NvFp4`'s)."""
 
     words: jax.Array
     scales: jax.Array
@@ -1387,8 +1387,8 @@ class _PackedMatrix(Protocol):
 @dataclasses.dataclass(frozen=True)
 class MosaicPackedGmm(MosaicGmm):
     """`MosaicGmm` of an NVFP4 matrix (`gemm.nvfp4_product`'s packed kernel, row 3621): bfloat16 rows times
-    its `kernel`, the bank as Dew stores it (`gemm.NvFp4`: its words and block scales, K-major, its shape and
-    dtype the bfloat16 matrix it decodes to, `[groups, depth, width]`), streamed as its words and block
+    its `kernel`, the bank as Dew stores it (`formats.NvFp4`: its words and block scales, K-major, its shape
+    and dtype the bfloat16 matrix it decodes to, `[groups, depth, width]`), streamed as its words and block
     scales and each stage decoded in place into the consumer's buffers (`mosaic_gpu.gmm`'s `scales`), so its
     tile takes `mosaic_gpu.NVFP4_STEP`-deep steps, whole 64-column tiles, the decode's shared memory and
     registers, and no cluster, split, swap or hook."""

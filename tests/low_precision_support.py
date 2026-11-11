@@ -7,17 +7,18 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn import fake_quant
-from dew.nn.kernels import gemm
+from dew.nn.kernels import formats
 
 
-def nvfp4(seed: int, depth: int, width: int, *, scale: float) -> tuple[gemm.NvFp4, np.ndarray]:
-    """An NVFP4 matrix (`gemm.NvFp4.of`) of random E2M1 codes (`fake_quant.E2M1`, each code's value) under
+def nvfp4(seed: int, depth: int, width: int, *, scale: float) -> tuple[formats.NvFp4, np.ndarray]:
+    """An NVFP4 matrix (`formats.NvFp4.of`) of random E2M1 codes (`fake_quant.E2M1`, each code's value) under
     power-of-two block scales from 2^-3 to 2^3 and the tensor's `scale`, and its values in float64, each
     exact: code times block scale times `scale`."""
     rng = np.random.default_rng(seed)
     magnitudes = fake_quant.E2M1[rng.integers(0, 16, size=(depth, width))].astype(np.float64)
     block = np.exp2(rng.integers(-3, 4, size=(depth // 16, width)))
-    matrix = gemm.NvFp4.of(jnp.asarray(magnitudes, jnp.float32), jnp.asarray(block, jnp.float8_e4m3fn), scale)
+    matrix = formats.NvFp4.of(jnp.asarray(magnitudes, jnp.float32), jnp.asarray(block, jnp.float8_e4m3fn),
+                              scale)
     return matrix, magnitudes * np.repeat(block, 16, axis=0) * scale
 
 

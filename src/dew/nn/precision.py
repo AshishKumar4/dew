@@ -618,14 +618,14 @@ def _ragged(product: Callable) -> bool:
 
 def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision,
                        preferred_element_type, group_sizes=None) -> jax.Array | None:
-    """A layer's projection (`product`, its own `jax.lax.dot_general`, as `gemm.dot_general` takes a layer's
-    product past the template) of float32 operands into float32, summed as a vectorized dot sums it where a
-    CPU runs it (`pairwise.pairwise_dot_general`, row 4863) and as `product` sums it on any other platform;
-    None where `product` is the CPU's sum already (Dew's wide test arithmetic, `_sums_in_float64`), a
-    quantized model's rule matching its module owns it (`products_quantized`; a module the rules leave alone
-    sums as the plain model's), its declared algorithm narrows the operands (`exact_products`: its own
-    product keeps the declaration), or its dtypes are others. Every float32 contraction `accumulated` sums
-    takes it too (`_paired`). With `group_sizes`, `product` is a ragged dot (`jax.lax.ragged_dot_general`, its
+    """A layer's projection (`product`, its own `jax.lax.dot_general`, as `projections.dot_general` takes a
+    layer's product past the template) of float32 operands into float32, summed as a vectorized dot sums it
+    where a CPU runs it (`pairwise.pairwise_dot_general`, row 4863) and as `product` sums it on any other
+    platform; None where `product` is the CPU's sum already (Dew's wide test arithmetic, `_sums_in_float64`),
+    a quantized model's rule matching its module owns it (`products_quantized`; a module the rules leave alone
+    sums as the plain model's), its declared algorithm narrows the operands (`exact_products`: its own product
+    keeps the declaration), or its dtypes are others. Every float32 contraction `accumulated` sums takes it
+    too (`_paired`). With `group_sizes`, `product` is a ragged dot (`jax.lax.ragged_dot_general`, its
     `dimension_numbers` the ragged ones) of a grouped GEMM's layout (`programs.ragged_layout`), summed so by
     `pairwise.pairwise_ragged_dot_general`; None for any other form."""
     from dew.nn import pairwise
@@ -660,10 +660,10 @@ def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision
 
 
 def projected(product: Callable) -> Callable:
-    """`product`, a layer's projection (a `jax.lax.dot_general`), summed on a CPU as `projection_product`
-    sums it where that takes it: whether or not the GEMM template's dispatch runs it (`gemm.dot_general`,
-    which a wrapper's scope skips: an adapter's, `dew.nn.dense.intercepted`), a layer's projection is
-    summed alike."""
+    """`product`, a layer's projection (a `jax.lax.dot_general`), summed on a CPU as `projection_product` sums
+    it where that takes it: whether or not the GEMM template's dispatch runs it (`projections.dot_general`,
+    which a wrapper's scope skips: an adapter's, `dew.nn.dense.intercepted`), a layer's projection is summed
+    alike."""
     def summed(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, **kwargs):
         if not kwargs and (projection := projection_product(
                 product, lhs, rhs, dimension_numbers, precision, preferred_element_type)) is not None:
@@ -970,7 +970,7 @@ or an embedding's, keeps the run's dtypes under every recipe."""
 LOW_PRECISION_RECIPES = ("blockwise_fp8",)
 """The low-precision recipes a run's projections train in: DeepSeek-V3's blockwise FP8, each product's
 operands E4M3 by 1 x 128 activation tiles and 128 x 128 weight blocks, power-of-two scales, fp32 sums, and
-its gradients FP8 products of requantized operands (`dew.nn.kernels.gemm.blockwise_fp8_projection`)."""
+its gradients FP8 products of requantized operands (`dew.nn.kernels.projections.blockwise_fp8_projection`)."""
 
 
 @dataclasses.dataclass(frozen=True)

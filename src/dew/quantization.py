@@ -86,7 +86,7 @@ if TYPE_CHECKING:
 
     from dew.batch import Variables
     from dew.diffusion.process import Conditioning
-    from dew.nn.kernels.gemm import NvFp4
+    from dew.nn.kernels.formats import NvFp4
 
 QuantizedDtype = Literal["int8", "fp8"]
 """The gemm dtypes a run trains with: int8 on any backend, fp8 where the
@@ -533,7 +533,7 @@ def decoded_frozen_fp8(variables: Variables) -> Variables:
 
 def expert_matrix(module: nn.Module, name: str, make: Callable[[], jax.Array]) -> jax.Array | NvFp4:
     """An expert bank's matrix `name` of `module` (`[experts, in, out]`): the packed bank its `QUANTIZATION`
-    collection holds under the name (`dew.nn.kernels.gemm.NvFp4`, a checkpoint's 4-bit experts served as
+    collection holds under the name (`dew.nn.kernels.formats.NvFp4`, a checkpoint's 4-bit experts served as
     their codes, row 4516), else its parameter, `make()`."""
     if module.has_variable(QUANTIZATION, name):
         return module.get_variable(QUANTIZATION, name)
@@ -544,7 +544,7 @@ def expert_leaf_axes(matrix: jax.Array | NvFp4, axes: Sequence[str | None]) -> l
     """The logical axes of each leaf of an expert bank's `matrix` (`expert_matrix`), its own `[experts, in,
     out]` being `axes`: one leaf, the matrix; a packed bank's three (`NvFp4`), its words and block scales
     `[experts, out, in / 8 or in / 16]` and its tensor scales `[experts]`, in its leaves' order."""
-    from dew.nn.kernels.gemm import NvFp4
+    from dew.nn.kernels.formats import NvFp4
 
     if not isinstance(matrix, NvFp4):
         return [tuple(axes)]
@@ -558,7 +558,7 @@ def decoded_expert_banks(variables: Variables) -> Variables:
     experts), each value its code times its block's scale times its expert's, exactly (`NvFp4.decoded`
     times its factor), and the bank gone from `QUANTIZATION`: the float tree an export or a merge takes,
     as `decoded_frozen_fp8` decodes a frozen FP8 site."""
-    from dew.nn.kernels.gemm import NvFp4
+    from dew.nn.kernels.formats import NvFp4
 
     held = flatten_dict(dict(variables.get(QUANTIZATION, {})),
                         is_leaf=lambda _, leaf: isinstance(leaf, NvFp4))
