@@ -868,8 +868,8 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
                                padded=spec.keys % tiles.block_k != 0)
     # The block's first query formed where the mask reads it (`first_at`): carried across the logits'
     # product, which waits on the step's register-A products to retire (`retires_register_products`), an
-    # H100's training forward at 128 x 64 on three consumers spilled its two query places, 16 bytes (row
-    # 5416's retirement; armada 20261111140541-04a31d5a).
+    # H100's training forward at 128 x 64 on three consumers spilled its two query places, 16 bytes, and
+    # its fp32 forward at width 64 8 (row 5416's retirement; armada 20261111140541-04a31d5a).
     if first_at is not None:
         first = first_at()
     coords = _coords(family, spans, row, first, k_first, shape, read=read,
@@ -1002,8 +1002,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
                        hooks=hooks, drawn=hooked.drop is not None, held=held, product=product,
                        interpret=interpret, codes=codes, training=training,
-                       first_at=(first_at if training and family.in_flight
-                                 and family.retires_register_products else None))
+                       first_at=(first_at if family.in_flight and family.retires_register_products
+                                 else None))
 
     # The values' tiles as the products read them: a quantized call's in the query's dtype (`_Codes`), an
     # fp32 call's its parts (`_Program.parted`).
