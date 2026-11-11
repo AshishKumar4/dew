@@ -123,19 +123,20 @@ class Exponents:
 
 
 def raised_exponent(exponents: Iv, lane: Lane) -> Iv:
-    """`exp2` of a base-2 exponent within `exponents` as `algebra.raised` forms it: its integer part's power
-    of two exact, its fraction's exp2 at the lane's reach (`exp2`, the fraction an fp32 under 2), each end at
-    its own floor (`exp2(x)` is monotone in `x`), zero where it may fall below fp32's normal range. Taken as
-    one fp32 operand of exp2, an exponent near -40 sat on a grid 2^-18 apart, past the fraction's own: legal
-    decays the algebra forms between its points lay outside (778 of 1024 at decays down to -3 a token, row
-    5412's witness)."""
+    """`exp2` of a base-2 exponent within `exponents` as `algebra.raised` forms it: its fraction's exp2 at the
+    lane's reach (`exp2`, the fraction an fp32 under 2) scaled by its integer part's power of two
+    (`attention_algebra.power2`), whose last product rounds once to nearest on fp32's grid, below its normal
+    range among its subnormals unless the lane flushes them (`fp32`); each end at its own floor (`exp2(x)` is
+    monotone in `x`). Taken as one fp32 operand of exp2, an exponent near -40 sat on a grid 2^-18 apart, past
+    the fraction's own: legal decays the algebra forms between its points lay outside (778 of 1024 at decays
+    down to -3 a token, row 5412's witness). Scaled exactly, a decay past -149 left its subnormal rounding
+    out: a query's memory gradient at a subnormal decay lay one subnormal step past it (M-MC-7)."""
     def scaled(at, side):
         whole = np.floor(at)
         fraction = exp2(Iv(at - whole, at - whole), lane)
         return np.ldexp(getattr(fraction, side), whole.astype(np.int32))
 
-    lo, hi = scaled(exponents.lo, "lo"), scaled(exponents.hi, "hi")
-    return Iv(np.where(lo < 2.0 ** FLOAT32.emin, 0.0, lo), hi)
+    return fp32(Iv(scaled(exponents.lo, "lo"), scaled(exponents.hi, "hi")), lane)
 
 
 def between(later, later_bound, earlier, earlier_bound, lane: Lane) -> Iv:
