@@ -256,7 +256,9 @@ def test_a_resumed_run_clamps_to_the_bounds_it_names_refused_bounds_its_state_la
     based = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(params)
              if labelled(groups(tmp_path, "bounded"), params)[
                  tuple(getattr(entry, "key", entry) for entry in path)] == "base"]
-    assert based and max(float(jnp.max(jnp.abs(leaf))) for leaf in based) <= 1e-3
+    # The interval as each leaf's dtype holds it (float32's 1e-3 a hair above Python's).
+    assert based and all(float(jnp.max(jnp.abs(leaf))) <= float(np.asarray(1e-3, leaf.dtype))
+                         for leaf in based)
     fenced = dataclasses.replace(FRESH, bounds=(-1.0, 1.0))
     with pytest.raises(ValueError, match="bounds added or dropped"):
         trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(fenced, tight))),
