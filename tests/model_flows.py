@@ -17,8 +17,8 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import pickle
 import subprocess
-import sys
 from collections.abc import Callable, Mapping
 from functools import cached_property
 from pathlib import Path
@@ -28,6 +28,7 @@ import jax
 import jax.numpy as jnp
 import kernel_matrix
 import numpy as np
+from gpu_flow import Cell, run_cells
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact, stored_truths
 
@@ -42,6 +43,9 @@ PREPARE = "DEW_TIER_PREPARE"
 
 TRUTHS = "DEW_TIER_TRUTHS"
 """The directory a part's prepare writes its flows' truths and programs to and its run reads them from."""
+
+PARAMS = "params.pickle"
+"""The file of a flow's store holding the parameters its prepare drew (`Flow.params`)."""
 
 TOPOLOGY = "DEW_NODE_TOPOLOGY"
 """The node's GPUs' serialized topology (dew-ops' session hands a prepare its node's): the GPU a flow's
@@ -141,8 +145,12 @@ class Flow:
 
     @cached_property
     def params(self):
-        """The flow's parameters, float32, drawn once on the host's CPU: a GPU's normal transform differs from
-        the CPU's in its last bits, so a draw on the GPU would be other parameters than its prepare's."""
+        """The flow's parameters, float32, drawn once on the host's CPU (a GPU's normal transform differs from
+        the CPU's in its last bits, so a draw on the GPU would be other parameters than its prepare's) where
+        the flow prepares, or where no tier's store holds them; a run reads its prepare's (`PARAMS`), and
+        initializes no model."""
+        if TRUTHS in os.environ and not preparing():
+            return pickle.loads((store_of(self) / PARAMS).read_bytes())
         with jax.default_device(jax.devices("cpu")[0]):
             tokens = jnp.zeros((self.rows, self.length), jnp.int32)
             return jax.device_get(self.model.init(jax.random.key(5461), tokens)["params"])
@@ -194,6 +202,11 @@ class Flow:
 NATIVE = "native"
 """A flow's route taken by any kernel off the reference path (`generic_kernels`)."""
 
+TEMPLATE = {"attention": NATIVE, "attention_mainloop": NATIVE}
+"""An attention flow's routes on the template: its attention off the reference path, and the template's
+passes on a GPU's own mainloop, not its plain-JAX one (`templates.attention_route.MAINLOOP`), which a
+template call would otherwise take unseen."""
+
 DENSE = {"hidden_size": 512, "num_attention_heads": 4, "num_key_value_heads": 4, "head_dim": 128,
          "intermediate_size": 1024, "num_hidden_layers": 2, "vocab_size": 512,
          "max_position_embeddings": 1024, "attention_bias": False}
@@ -241,18 +254,16 @@ LIGHTNING = {"hidden_size": 512, "num_hidden_layers": 2, "head_dim": 128, "num_a
 """MiniMax-Text-01's lightning attention, then its softmax layer, every token routed to both its experts."""
 
 FLOWS = (
-    Flow("dense bf16, the lane's", "llama-tiny", DENSE, "bfloat16", {"attention": NATIVE, "decode": NATIVE}),
-    Flow("dense bf16, a user's", "llama-tiny", DENSE, "bfloat16", {"attention": "flash", "decode": NATIVE},
-         lane=False),
+    Flow("dense bf16, the lane's", "llama-tiny", DENSE, "bfloat16", {**TEMPLATE, "decode": NATIVE}),
+    Flow("dense bf16, a user's", "llama-tiny", DENSE, "bfloat16",
+         {"attention": "flash", "attention_mainloop": NATIVE, "decode": NATIVE}, lane=False),
     Flow("dense fp32", "llama-tiny", DENSE, "float32", {}),
-    Flow("window and softcap, the lane's", "gemma2-tiny", GEMMA2, "bfloat16", {"attention": NATIVE}),
-    Flow("window and softcap, a user's", "gemma2-tiny", GEMMA2, "bfloat16", {"attention": NATIVE},
-         lane=False),
-    Flow("sinks, the lane's", "gpt-oss-tiny", GPT_OSS, "bfloat16", {"attention": NATIVE}),
-    Flow("sinks, a user's", "gpt-oss-tiny", GPT_OSS, "bfloat16", {"attention": NATIVE}, lane=False),
-    Flow("latent attention, the lane's", "deepseek-v2-tiny", MLA, "bfloat16", {"attention": NATIVE}),
-    Flow("latent attention, a user's", "deepseek-v2-tiny", MLA, "bfloat16", {"attention": NATIVE},
-         lane=False),
+    Flow("window and softcap, the lane's", "gemma2-tiny", GEMMA2, "bfloat16", TEMPLATE),
+    Flow("window and softcap, a user's", "gemma2-tiny", GEMMA2, "bfloat16", TEMPLATE, lane=False),
+    Flow("sinks, the lane's", "gpt-oss-tiny", GPT_OSS, "bfloat16", TEMPLATE),
+    Flow("sinks, a user's", "gpt-oss-tiny", GPT_OSS, "bfloat16", TEMPLATE, lane=False),
+    Flow("latent attention, the lane's", "deepseek-v2-tiny", MLA, "bfloat16", TEMPLATE),
+    Flow("latent attention, a user's", "deepseek-v2-tiny", MLA, "bfloat16", TEMPLATE, lane=False),
     Flow("delta attention (KDA)", "kimi-linear-tiny", KDA, "bfloat16", {"gated_delta_rule": NATIVE}),
     Flow("gated delta net and its short conv", "qwen3-next-tiny", GDN, "bfloat16",
          {"gated_delta_rule": NATIVE, "short_conv": NATIVE, "delta_decode": "step"}),
@@ -304,13 +315,17 @@ class WrongProcess(AssertionError):
 
 def held_process(flow: Flow) -> None:
     """Raise unless this process is of the flow's variant (row 5461): XLA parses its flags once a process and
-    JAX reads its precision as it starts, so a flow holds only where its process opened its backend under
-    the flow's flags, as XLA_FLAGS carried them while it was closed (`dew._devices.flags_set`), and multiplies
-    at the flow's precision (`Flow.precision`)."""
-    from dew._devices import flags_set
+    JAX reads its precision as it starts, so a flow holds only where its process's XLA runtime runs under the
+    flow's flags (`flow_flags`) and JAX multiplies at the flow's precision (`Flow.precision`). A prepare's
+    process, which Dew's import precedes jaxlib's (`PREPARED_APART`), shows its flags hold for every runtime
+    XLA loads (`dew._devices.flags_hold`); a run's, which tests/conftest.py configures before it imports JAX
+    and the tier starts in its variant's environment, that XLA_FLAGS carried them while its backend was
+    closed (`flags_set`), what a process that loaded jaxlib before Dew can show."""
+    from dew._devices import flags_hold, flags_set
 
     flags = flow_flags(flow)
-    if not flags_set(flags) or jax.config.jax_default_matmul_precision != flow.precision:
+    held = flags_hold(flags) if preparing() else flags_set(flags)
+    if not held or jax.config.jax_default_matmul_precision != flow.precision:
         raise WrongProcess(f"{flow.name}: its process opened its backend under XLA_FLAGS "
                            f"{os.environ.get('XLA_FLAGS', '')!r} at matmul precision "
                            f"{jax.config.jax_default_matmul_precision!r}, not {flags!r} at "
@@ -416,6 +431,7 @@ def prepare(flow: Flow) -> bool:
         return False
     directory = store_of(flow)
     directory.mkdir(parents=True, exist_ok=True)
+    (directory / PARAMS).write_bytes(pickle.dumps(flow.params))
     named = programs_of(flow)
     with generation.routes() as found:
         compile_programs({name: program for name, program in named.items() if name.endswith("dew")},
@@ -425,18 +441,37 @@ def prepare(flow: Flow) -> bool:
         compile_programs({name: program for name, program in named.items() if name.endswith("reference")},
                          target.generation, target.multiprocessors).save(directory / "reference.programs")
     held_reference(flow, found)
-    judge(flow, {})
+    for kind in KINDS:
+        judge(flow, {}, kind)
     return True
 
 
+PREPARED_APART = """import sys
+import dew  # before jaxlib loads, so XLA_FLAGS' flags are proven held (`dew._devices.flags_hold`)
+import model_flows
+model_flows.prepared_here(sys.argv[1])
+"""
+"""A flow's prepare process's program (`prepared_apart`)."""
+
+
 def prepared_apart(flow: Flow) -> dict | None:
-    """The flow's prepare (`prepare`) in a process of its own, started under its XLA flags (`flow_flags`) and
-    this process's arithmetic, its variant's (`users_process`): XLA parses its flags once a process, as it
-    starts, and the programs it compiles state them (`BuildTarget`). What it took where it prepared
-    (`measured`), None where the node's GPU does not run the flow."""
+    """The flow's prepare (`prepare`) in a process of its own (`PREPARED_APART`), started under its XLA
+    flags (`flow_flags`) and this process's arithmetic, its variant's (`users_process`): XLA parses its flags
+    once a process, as it starts, and the programs it compiles state them (`BuildTarget`). What it took where
+    it prepared (`measured`), None where the node's GPU does not run the flow."""
     from process_support import fresh
 
-    return fresh(Path(__file__), flow.name, flags=flow_flags(flow))
+    return fresh(PREPARED_APART, flow.name, flags=flow_flags(flow))
+
+
+def prepared_here(name: str) -> None:
+    """The flow `name` prepared in this process, what it took printed (`measured`), null where the node's GPU
+    does not run it: `PREPARED_APART`'s program."""
+    import time
+
+    began = time.perf_counter()
+    flow = flow_named(name)
+    print(json.dumps(measured(flow, began) if prepare(flow) else None))
 
 
 def loaded(flow: Flow) -> dict[str, Callable]:
@@ -451,20 +486,27 @@ def loaded(flow: Flow) -> dict[str, Callable]:
             for name, program in held.items()}
 
 
-def judge(flow: Flow, programs: Mapping[str, Callable]) -> None:
-    """Check 1 of the flow's training step and decode loop, each against its float64 truth from the tier's
-    store (prepared there where this process prepares, `programs` none)."""
+KINDS = ("train", "decode")
+"""A flow's programs: its training step's loss and gradients, and its decode loop's logits."""
+
+
+def judge(flow: Flow, programs: Mapping[str, Callable], kind: str) -> None:
+    """Check 1 of the flow's program `kind` (`KINDS`) against its float64 truth from the tier's store
+    (prepared there where this process prepares, `programs` none)."""
     truth_model = float64_twin(flow.model)
+    truth = flow.train(truth_model) if kind == "train" else flow.decode_truth(truth_model)
     with stored_truths(store_of(flow) / "truths", prepare=preparing(), stamp=stamp()):
-        for kind, truth in (("train", flow.train(truth_model)), ("decode", flow.decode_truth(truth_model))):
-            assert_as_exact(programs.get(f"{kind} dew"), programs.get(f"{kind} reference"), flow.draw,
-                            f"{flow.name}: {kind}", seeds=flow.seeds, truth_fn=truth)
+        assert_as_exact(programs.get(f"{kind} dew"), programs.get(f"{kind} reference"), flow.draw,
+                        f"{flow.name}: {kind}", seeds=flow.seeds, truth_fn=truth)
 
 
 def run(flow: Flow) -> int:
-    """The flow on this GPU from its prepared programs and truths: check 1 of each program; its device's
-    peak bytes after them, which the test reports."""
-    judge(flow, loaded(flow))
+    """The flow on this GPU from its prepared programs and truths: check 1 of each program, each a cell
+    (`gpu_flow.run_cells`, which reports the cells that ran); its device's peak bytes after them, which the
+    test reports."""
+    programs = loaded(flow)
+    run_cells([Cell(f"{flow.name}: {kind}", functools.partial(judge, flow, programs, kind))
+               for kind in KINDS])
     return int((jax.devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0))
 
 
@@ -477,11 +519,3 @@ def measured(flow: Flow, began: float) -> dict:
     written = sum(path.stat().st_size for path in store_of(flow).rglob("*") if path.is_file())
     return {"seconds": time.perf_counter() - began, "written_bytes": written,
             "peak_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024}
-
-
-if __name__ == "__main__":
-    import time
-
-    began = time.perf_counter()
-    flow = flow_named(sys.argv[1])
-    print(json.dumps(measured(flow, began) if prepare(flow) else None))

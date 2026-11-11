@@ -46,11 +46,24 @@ def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monk
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
     with generation.assumed(target), jax.default_matmul_precision(flow.precision):
-        dew = [route for kind in ("train", "decode") for route in _routes(programs[f"{kind} dew"])]
-        reference = [route for kind in ("train", "decode")
+        dew = [route for kind in model_flows.KINDS for route in _routes(programs[f"{kind} dew"])]
+        reference = [route for kind in model_flows.KINDS
                      for route in _routes(programs[f"{kind} reference"], reference=True)]
         model_flows.held_routes(flow, dew, target)
         model_flows.held_reference(flow, reference)
+
+
+def test_an_attention_flow_on_the_templates_plain_jax_mainloop_does_not_reach_its_route():
+    """An attention flow whose template call runs the plain-JAX mainloop (`generation.chosen`'s
+    `attention_mainloop='portable'`, as a GPU's mainloops declining it would) does not hold: its route is the
+    GPU's own mainloop (`model_flows.TEMPLATE`), not the template's outer call alone."""
+    flow = model_flows.flow_named("dense bf16, the lane's")
+    programs = model_flows.programs_of(flow)
+    with generation.assumed("sm90"), jax.default_matmul_precision(flow.precision):
+        with generation.chosen(attention_mainloop="portable"):
+            found = [route for kind in model_flows.KINDS for route in _routes(programs[f"{kind} dew"])]
+        with pytest.raises(model_flows.Unreached):
+            model_flows.held_routes(flow, found, "sm90")
 
 
 def test_the_reference_arm_runs_each_choices_generic_kernel_that_takes_every_call():
@@ -70,7 +83,8 @@ def test_a_flows_truth_computes_in_float64(name, tmp_path, monkeypatch):
     flow = model_flows.flow_named(name)
     monkeypatch.setenv(model_flows.TRUTHS, str(tmp_path))
     monkeypatch.setenv(model_flows.PREPARE, "1")
-    model_flows.judge(flow, {})
+    for kind in model_flows.KINDS:
+        model_flows.judge(flow, {}, kind)
     written = sorted((model_flows.store_of(flow) / "truths").iterdir())
     assert len(written) == 2
     assert all(len(list(site.glob("*.truth"))) == staged_units(flow.seeds) for site in written)

@@ -7,6 +7,8 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
   under every regime (test_recurrence_stability).
 - A Mamba layer under the template's selective scan, packed and from a held state, as exact as under the
   portable scan, on an H100 (test_selective_template).
+- A two-role walk's training on an H100, its two consumers a launch no flow's widths reach
+  (test_recurrence_mosaic_gradient).
 - Each recurrence layer trained on its port's kernels, natively (`PORT_KERNELS`): a gated delta net on the
   FLA GDN kernels and a Kimi delta attention layer on FLA KDA's chunk_kda, packed rows, forward and every
   gradient on par from float64 with the portable rule's; their training step the same bit for bit each
@@ -38,6 +40,8 @@ import numpy as np
 import pytest
 import test_fla_gdn as fla_gdn
 import test_mamba_ssd as mamba_ssd
+import test_recurrence_mosaic as forward
+import test_recurrence_mosaic_gradient as gradient
 import test_recurrence_stability as stability
 import test_recurrence_template_stability as template_stability
 import test_selective_template as selective_template
@@ -249,6 +253,15 @@ def port_training_cells() -> list[Cell]:
     ]
 
 
+def walk_cells() -> list[Cell]:
+    """A two-role walk's training on an H100 (`Tiles.walkers`): its two consumers' synchronization and stores,
+    which the derivation gives a call whose walks fill more than a wave, a launch no flow's widths reach."""
+    walk = gradient.test_a_walk_of_two_roles_is_as_exact_as_its_reference
+    return [Cell(f"a walk of two roles is as exact as its reference: {name}",
+                 functools.partial(walk, *values), "sm90")
+            for name, values in forward.native(gradient.WALK_GRID, gradient.INTERPRETED_WALKS)]
+
+
 def decode_cells() -> list[Cell]:
     """The decode launches as a server runs them."""
     return [
@@ -262,7 +275,7 @@ def decode_cells() -> list[Cell]:
     ]
 
 
-FAMILIES = {"template stability": template_stability_cells,
+FAMILIES = {"two-role walk": walk_cells, "template stability": template_stability_cells,
             "portable and SSD port": portable_and_ssd_port_cells, "selective scan": selective_cells,
             "port training and decode": lambda: [*port_training_cells(), *decode_cells()]}
 """The recurrence cells by family, each family a test of its own: the planner times and packs each, and one

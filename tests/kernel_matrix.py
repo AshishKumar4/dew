@@ -251,7 +251,7 @@ NATIVE: dict[str, tuple[str, ...]] = {
     "blockwise_fp8": ("generation", "out_dtype"),
     "mxfp8": ("generation", "format", "out_dtype"),
     "recurrence": ("generation", "form", "kernel", "dtype"),
-    "short_conv": ("generation", "dtype"),
+    "short_conv": ("generation", "model", "dtype", "documents"),
     "selective_scan": ("generation", "case"),
     "delta_decode": ("generation", "layer", "kernel", "state"),
     "norm_swiglu": ("generation", "op", "form", "dtype"),
@@ -263,7 +263,8 @@ wgmma the backward's shared-keys launch at 256, on sm100 the forward's value-col
 precision it computes in, whose summation order on the GPU is its own (rows 3522, 5268, 5404 and 5414: fp32
 cells red on a GPU alone, green interpreted). Every other axis is a shape or a hook, whose pairs the CPU's
 interpreted cells cover, and the compile gate. The selective scan's recorded cases are each a numerics regime
-of its own."""
+of its own, and the short conv's shapes each a GPU's memory of its own: a 9B conv's packed fp32 rows ran out
+of an H100's memory where the CPU interprets them (the GPU tier at 475913063)."""
 
 
 def native_cells(family: str) -> list:

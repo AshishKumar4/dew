@@ -167,15 +167,6 @@ def cells_of(check, generation: str | None = None, **fixtures) -> list[Cell]:
     return cells
 
 
-def cells_where(check, kept: Callable[..., bool], generation: str | None = None, **fixtures) -> list[Cell]:
-    """`cells_of(check, generation, **fixtures)`'s cells whose parameter set `kept(**arguments)` keeps: a
-    flow's covering set of a property's grid on a GPU (row 5461), the rest of the grid the CPU's, interpreted
-    and through the compile gate."""
-    sets = [arguments for _, arguments, _ in _parameter_grid(check)]
-    return [cell for cell, arguments in zip(cells_of(check, generation, **fixtures), sets, strict=True)
-            if kept(**arguments)]
-
-
 def _parameter_grid(check) -> Iterable[tuple[str, dict, list]]:
     """Each parameter set of `check`'s own `pytest.mark.parametrize` marks (their product, as pytest
     collects them): its label, its arguments by name, and its marks, `check`'s own with the set's."""
