@@ -5,6 +5,7 @@ computes (`lane`, measured on it), and a primitive without a contract refused.""
 import itertools
 
 import certified as ct
+import interval_certificates as ic
 import jax
 import jax.numpy as jnp
 import ml_dtypes
@@ -700,6 +701,32 @@ def test_a_tf32_operand_rounds_to_nearest_a_tie_away_from_zero():
                         for side in (0, 1))
     read = nc.tf32_operand(np.float32(values))
     assert np.array_equal(read, expected) and np.array_equal(np.signbit(read), np.signbit(expected))
+
+
+def test_an_operand_read_as_tf32_is_enclosed_under_either_tie_and_truncation():
+    """An fp32 value a tensor core reads as TF32 from its register, no conversion stated
+    (`interval_certificates.operand`'s 'read', warpgroup MMA's): its enclosure's ends lie on TF32's grid,
+    within one TF32 step outside the value's, and hold the value rounded to nearest with a tie to even, with
+    a tie away from zero, and truncated, at fp32 values across the range, both signs, ties, subnormals and
+    the largest. TF32 is no array's format, and the enclosure once stepped through a NumPy dtype it lacks
+    (KeyError 'tfloat32' on an H100)."""
+    rng = np.random.default_rng(2084)
+    drawn = np.float32(rng.standard_normal(4096) * 2.0 ** rng.integers(-140, 127, 4096)).astype(np.float64)
+    edges = np.asarray([0.0, 1 + 2.0 ** -11, 1 + 3 * 2.0 ** -11, 2 - 2.0 ** -11, 2.0 ** -137, 2.0 ** -126,
+                        2.0 ** 128 - 2.0 ** 117, 2.0 ** 128 - 2.0 ** 104])
+    values = np.concatenate([drawn, edges, -edges])
+    lane = ic.Lane(reach=1, flushes=False, block=0, wide=True, tf32="read")
+    read = ic.operand(ic.point(values), lane)
+    for end in read:
+        on_grid = np.isinf(end) | (oc.truncated(end, oc.TFLOAT32) == end)
+        assert on_grid.all()
+    for rounding in (oc.nearest, oc.rounded_away, oc.truncated):
+        as_read = rounding(values, oc.TFLOAT32)
+        finite = np.isfinite(as_read)
+        assert np.all((read.lo <= as_read) | ~finite) and np.all((as_read <= read.hi) | ~finite)
+    step = oc.above(np.nextafter(np.abs(values), np.inf), oc.TFLOAT32) - oc.below(np.abs(values), oc.TFLOAT32)
+    assert np.all(read.lo <= values) and np.all(values <= read.hi)
+    assert np.all((read.hi - read.lo <= step) | np.isinf(read.hi) | np.isinf(read.lo))
 
 
 def test_a_native_dot_holds_tf32_products_and_refuses_bf16_ones_tf32_ones_for_bf16_and_a_truncation():
