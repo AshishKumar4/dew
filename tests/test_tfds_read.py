@@ -101,8 +101,7 @@ def test_streamed_tfds_pins_one_fingerprint_for_all_virtual_shards(tmp_path, mon
         assert int(decode_image(source.records("indexed")[0]["image"])[0, 0, 0]) == 10
     finally:
         reader.close()
-    assert opened["dataset_info.json"] == 2
-    assert opened["features.json"] == opened["label.labels.txt"] == 1
+    assert opened["dataset_info.json"] == opened["features.json"] == opened["label.labels.txt"] == 1
     assert opened["dew_images-train.array_record-00000-of-00001"] == 1
     assert opened["dew_images-test.array_record-00000-of-00001"] == 1
     assert source.fingerprint()["files"] == selected("all").fingerprint()["files"]
