@@ -92,6 +92,14 @@ class Flow:
     length: int = 256
     prefill: int = 248
     seeds: int = 8
+    families: tuple[str, ...] | None = None
+    """The instruction families (`generation.family`) of the GPUs where the routes the flow is for take a
+    native kernel; None, every GPU's. Elsewhere they run the portable math, and the flow, which covers nothing
+    of that GPU's own there, runs not at all (`runs_on`)."""
+
+    def runs_on(self, target: str) -> bool:
+        """Whether the GPU generation `target` runs the routes the flow is for natively (`families`)."""
+        return self.families is None or generation.family(target) in self.families
 
     @cached_property
     def config(self) -> dict:
@@ -183,9 +191,10 @@ GPT_OSS = {**DENSE, "sliding_window": 64, "num_local_experts": 2, "num_experts_p
 """GPT-OSS's sinks and alternating window at `DENSE`'s widths, every token routed to both its experts: no
 routing decision two arms could take apart."""
 
-MLA = {**DENSE, "kv_lora_rank": 128, "qk_nope_head_dim": 64, "qk_rope_head_dim": 64, "qk_head_dim": 128,
-       "v_head_dim": 64, "first_k_dense_replace": 2}
-"""DeepSeek-V2's latent attention, its value heads narrower than its query heads, every layer's MLP dense."""
+MLA = {**DENSE, "head_dim": 64, "kv_lora_rank": 128, "qk_nope_head_dim": 64, "qk_rope_head_dim": 64,
+       "qk_head_dim": 128, "v_head_dim": 64, "first_k_dense_replace": 2}
+"""DeepSeek-V2's latent attention, its value heads narrower than its query heads, every layer's MLP dense (its
+`head_dim` the rope slice's, as DeepSeek points it)."""
 
 KDA = {"hidden_size": 512, "num_hidden_layers": 2, "head_dim": 128, "num_attention_heads": 4,
        "num_key_value_heads": 4, "intermediate_size": 1024, "vocab_size": 512, "first_k_dense_replace": 2,
@@ -234,13 +243,15 @@ FLOWS = (
     Flow("state-space duality (SSD), bf16", "mamba2-tiny", SSD, "bfloat16", {"ssd": NATIVE}),
     Flow("state-space duality (SSD), fp32", "mamba2-tiny", SSD, "float32", {"ssd": NATIVE}),
     Flow("selective scan", "mamba-tiny", SELECTIVE, "bfloat16", {"selective_scan": NATIVE}),
-    Flow("lightning attention", "minimax-tiny", LIGHTNING, "bfloat16", {"gated_delta_rule": NATIVE}),
+    Flow("lightning attention", "minimax-tiny", LIGHTNING, "bfloat16", {"gated_delta_rule": NATIVE},
+         families=("wgmma",)),
 )
 """Every model flow, by the route it is for (docs/design/testing.md: a kernel's native run is a flow's
 cell): each family that takes a distinct default route on a GPU, its bf16 attention flows twice, under the
 lane's deterministic ops (the template) and as a user's process runs it (FlashAttention, which refuses
 them), the dense fp32 flow on XLA's declared fp32 route, and the SSD port in fp32 too (its products' own
-precision, row 5461's proof)."""
+precision, row 5461's proof). Lightning attention's decay without the delta rule takes the recurrence template
+on a Hopper GPU alone: fla's port hands it to the portable math (`recurrence_chunk.PORT_SUPPORTS`)."""
 
 
 def flow_named(name: str) -> Flow:
@@ -337,14 +348,17 @@ def held_reference(flow: Flow, found: list) -> None:
         raise AssertionError(f"{flow.name}: its reference arm ran {native}, not its reference path")
 
 
-def prepare(flow: Flow) -> None:
+def prepare(flow: Flow) -> bool:
     """The flow's prepare: its programs compiled for the node's GPU into its store, Dew's arm's routes held
-    to the ones it is for, the reference arm's to its reference path; then every draw's truth (`judge`)."""
+    to the ones it is for, the reference arm's to its reference path; then every draw's truth (`judge`).
+    Whether it prepared: none where the node's GPU does not run the flow (`Flow.runs_on`)."""
     from dew.training.ahead import compile_programs
 
+    target = _target()
+    if not flow.runs_on(target.generation):
+        return False
     directory = store_of(flow)
     directory.mkdir(parents=True, exist_ok=True)
-    target = _target()
     named = programs_of(flow)
     with generation.routes() as found:
         compile_programs({name: program for name, program in named.items() if name.endswith("dew")},
@@ -355,15 +369,16 @@ def prepare(flow: Flow) -> None:
                          target.generation, target.multiprocessors).save(directory / "reference.programs")
     held_reference(flow, found)
     judge(flow, {})
+    return True
 
 
-def prepared_apart(flow: Flow) -> None:
+def prepared_apart(flow: Flow) -> bool:
     """The flow's prepare (`prepare`) in a process of its own, started under its XLA flags (`flow_flags`):
     XLA parses them once a process, as it starts, and the programs it compiles state them (`BuildTarget`), a
-    lane's flow's deterministic ops among them, which a user's flow sets false."""
+    lane's flow's deterministic ops among them, which a user's flow sets false. Whether it prepared."""
     from process_support import fresh
 
-    fresh(Path(__file__), flow.name, flags=flow_flags(flow))
+    return fresh(Path(__file__), flow.name, flags=flow_flags(flow))
 
 
 def loaded(flow: Flow) -> dict[str, Callable]:
@@ -396,5 +411,4 @@ def run(flow: Flow) -> int:
 
 
 if __name__ == "__main__":
-    prepare(flow_named(sys.argv[1]))
-    print(json.dumps(None))
+    print(json.dumps(prepare(flow_named(sys.argv[1]))))

@@ -10,6 +10,8 @@ flow whose prepare did not write them is red, naming what is missing."""
 import model_flows
 import pytest
 
+from dew.nn.kernels import generation
+
 pytestmark = [pytest.mark.gpu(reason="each family's own GPU kernels, from programs compiled for this GPU"),
               pytest.mark.prepares]
 
@@ -20,8 +22,11 @@ def test_a_model_trains_and_decodes_on_its_gpu_routes(name, monkeypatch, record_
     peak bytes reported (`peak_bytes`)."""
     flow = model_flows.flow_named(name)
     if model_flows.preparing():
-        model_flows.prepared_apart(flow)
+        if not model_flows.prepared_apart(flow):
+            pytest.skip(f"{flow.name}: the node's GPU runs its routes on the portable math (`Flow.families`)")
         return
+    if not flow.runs_on(generation.device_generation()):
+        pytest.skip(f"{flow.name}: this GPU runs its routes on the portable math (`Flow.families`)")
     # Its programs, compiled ahead, compile nothing here: the flags a load holds them to (`BuildTarget.held`).
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     record_property("peak_bytes", model_flows.run(flow))

@@ -68,8 +68,10 @@ import contextvars
 import dataclasses
 import functools
 import hashlib
+import json
 import os
 import pickle
+import shutil
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
@@ -677,42 +679,61 @@ class MissingTruth(AssertionError):
 
 @dataclasses.dataclass(frozen=True)
 class TruthStore:
-    """Prepared float64 truths (`stored_truths`): each check-1 site's under `directory`, one file a site
-    by its label's digest, holding the truth and its terms of every draw its two stages may take, keyed by
-    the digest of the draw's widened inputs, and the `stamp` it was prepared under (the commit), which a
-    run reads against its own."""
+    """Prepared float64 truths (`stored_truths`): each check-1 site's under `directory`, a directory a site
+    by its label's digest, holding a file a draw its two stages may take, its truth and terms, named by the
+    digest of the draw's widened inputs, and the site's own record (`SITE`): its label, whether it is sized
+    by terms, and the `stamp` it was prepared under (the commit and JAX), which a run reads against its own.
+    A draw is written as it is computed, so a site's prepare holds one draw's truth at a time; its record is
+    written last, so a prepare cut short leaves none a run reads."""
 
     directory: Path
     prepare: bool
     stamp: str
 
-    def path(self, label: str) -> Path:
-        return self.directory / f"{hashlib.sha256(label.encode()).hexdigest()[:32]}.truths"
+    SITE = "site.json"
 
-    def write(self, label: str, terms: bool, held: dict) -> None:
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self.path(label).write_bytes(pickle.dumps({"stamp": self.stamp, "label": label, "terms": terms,
-                                                   "truths": held}))
+    def path(self, label: str) -> Path:
+        return self.directory / hashlib.sha256(label.encode()).hexdigest()[:32]
+
+    @staticmethod
+    def drawn(site: Path, inputs) -> Path:
+        """The file of the draw `inputs` (its widened inputs, `_inputs_digest`) in the site's directory."""
+        return site / f"{int(_inputs_digest(inputs)):016x}.truth"
+
+    def begun(self, label: str) -> Path:
+        """The site's directory, emptied of an earlier prepare's draws."""
+        site = self.path(label)
+        if site.exists():
+            shutil.rmtree(site)
+        site.mkdir(parents=True)
+        return site
+
+    def finished(self, label: str, terms: bool) -> None:
+        (self.path(label) / self.SITE).write_text(json.dumps({"stamp": self.stamp, "label": label,
+                                                              "terms": terms}))
 
     def site(self, label: str) -> tuple[Callable, Callable | bool]:
         """The site's truth and its terms as the gate takes them (`assert_as_exact`'s `truth_fn`, run as
         given, and `terms`): each the prepared value of the draw's widened inputs; refused, as a red
         (`MissingTruth`), where the site has none prepared for this stamp or for a draw it takes."""
-        path = self.path(label)
-        if not path.is_file():
+        site = self.path(label)
+        if not (site / self.SITE).is_file():
             raise MissingTruth(f"{label}: no truth prepared under {self.directory} (the tier's prepare did "
                                f"not reach this site)")
-        stored = pickle.loads(path.read_bytes())
+        stored = json.loads((site / self.SITE).read_text())
         if stored["stamp"] != self.stamp:
             raise MissingTruth(f"{label}: its truths were prepared at {stored['stamp']}, not this run's "
                                f"{self.stamp}")
-        held = stored["truths"]
+
+        @functools.lru_cache(maxsize=1)
+        def read(path: Path):
+            return pickle.loads(path.read_bytes())
 
         def prepared(inputs, part: int):
-            found = held.get(_inputs_digest(inputs))
-            if found is None:
+            path = self.drawn(site, inputs)
+            if not path.is_file():
                 raise MissingTruth(f"{label}: no truth prepared for these inputs (its prepare drew others)")
-            return found[part]
+            return read(path)[part]
 
         truth = as_given(lambda *inputs: prepared(inputs, 0))
         return truth, (as_given(lambda *inputs: prepared(inputs, 1)) if stored["terms"] else False)
@@ -759,15 +780,15 @@ def _prepare_site(store: TruthStore, dew_fn, reference_fn, draw, label: str, *, 
     truth_program = _truth_program(truth_fn if truth_fn is not None else reference_fn)
     terms_fn = _site_terms(terms_fn, terms, draw, truth_fn if truth_fn is not None else reference_fn,
                            truth_program)
-    held = {}
+    site = store.begun(label)
     for seed in range(staged_units(seeds)):
         inputs = draw(seed)
         truth, found = _truth_and_terms(truth_program, terms_fn, inputs)
         if not seed:
             _of_float64(label, truth_program, inputs, truth)
         with jax.enable_x64(new_val=True):
-            held[_inputs_digest(widened(inputs))] = jax.device_get((truth, found))
-    store.write(label, terms_fn is not None, held)
+            store.drawn(site, widened(inputs)).write_bytes(pickle.dumps(jax.device_get((truth, found))))
+    store.finished(label, terms_fn is not None)
 
 
 class NarrowTruth(TypeError):

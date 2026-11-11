@@ -4,6 +4,8 @@ its reference arm the reference path alone, and its truth computes in float64; a
 truths (`reference_error.stored_truths`) judge as the truths a site computes itself, a missing or stale
 one refused."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import model_flows
@@ -12,6 +14,7 @@ import pytest
 from reference_error import MissingTruth, assert_as_exact, stored_truths
 
 from dew.nn.kernels import generation
+from dew.parity_stages import staged_units
 
 
 def _routes(program, *, reference: bool = False) -> list:
@@ -32,8 +35,8 @@ def _routes(program, *, reference: bool = False) -> list:
 def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monkeypatch):
     """The flow's training step and decode loop traced as `target`'s GPU chooses (`generation.assumed`) and
     held as its prepare holds them: every route the flow is for taken off the reference path or by the
-    kernel it names (`model_flows.held_routes`), its reference arm on the reference path alone
-    (`model_flows.held_reference`)."""
+    kernel it names (`model_flows.held_routes`), but by the portable math on a GPU it does not run on
+    (`Flow.families`); its reference arm on the reference path alone (`model_flows.held_reference`)."""
     flow = model_flows.flow_named(name)
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
@@ -41,7 +44,12 @@ def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monk
         dew = [route for kind in ("train", "decode") for route in _routes(programs[f"{kind} dew"])]
         reference = [route for kind in ("train", "decode")
                      for route in _routes(programs[f"{kind} reference"], reference=True)]
-        model_flows.held_routes(flow, dew)
+        if flow.runs_on(target):
+            model_flows.held_routes(flow, dew)
+        else:
+            # A GPU the flow does not run on takes the portable math on its routes, as `Flow.families` says.
+            with pytest.raises(AssertionError, match="does not reach the route it is for"):
+                model_flows.held_routes(flow, dew)
         model_flows.held_reference(flow, reference)
 
 
@@ -59,12 +67,14 @@ def test_the_reference_arm_runs_each_choices_generic_kernel_that_takes_every_cal
 def test_a_flows_truth_computes_in_float64(name, tmp_path, monkeypatch):
     """The flow's truths prepared on a CPU as its node prepares them, its first draw's of each program held to
     float64 (check 1's `_of_float64`), every draw its two stages may take written to the store."""
-    flow = model_flows.flow_named(name)
+    # One declared seed: the rule holds a truth's first draw, each further one the same program's.
+    flow = dataclasses.replace(model_flows.flow_named(name), seeds=1)
     monkeypatch.setenv(model_flows.TRUTHS, str(tmp_path))
     monkeypatch.setenv(model_flows.PREPARE, "1")
     model_flows.judge(flow, {})
     written = sorted((model_flows.store_of(flow) / "truths").iterdir())
     assert len(written) == 2
+    assert all(len(list(site.glob("*.truth"))) == staged_units(flow.seeds) for site in written)
 
 
 def _site(salt: int = 5461):
