@@ -26,6 +26,7 @@ from jax.extend.core import primitives
 from dew._devices import xla_flag
 from dew.algebra.terms import parameter_key, parameters_key
 from dew.nn.programs import (
+    NATIVE_KERNELS,
     bodies,
     branches,
     called,
@@ -60,7 +61,7 @@ def bitcast(equation: jcore.JaxprEqn) -> bool:
     return False
 
 UNEVALUATED = (primitives.pure_callback_p, primitives.io_callback_p, primitives.debug_callback_p,
-               primitives.ffi_call_p, pallas_call_p, jax.lax.axis_index_p)
+               primitives.ffi_call_p, *NATIVE_KERNELS, jax.lax.axis_index_p)
 """Primitives XLA's evaluator computes no offset through: those JAX lowers to a custom call, and the
 device's index, a partition or replica id (`GetLeafDependencies`, dynamic_slice_analysis.cc)."""
 

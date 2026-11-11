@@ -453,12 +453,10 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
     default and highest matmul precision (row 2113's gate, in the kernel gate's evidence shape,
     `compile_evidence`). The need is the program's as XLA lays it out on a roomy GPU, and the
     derivation's, read off that compile, admits it at 1.6 times and refuses it at 0.6. A gate decoder's
-    peak is the program's own (`Footprint.exact`), an expert decoder's at JAX's default precision too: its
-    ragged products run on CUDA as Pallas grouped kernels, custom calls that hold their outputs alone
-    (`dew.nn.programs.opaque`). At highest precision they are XLA's ragged products, the GEMM template's
-    portable route (`grouped_matmul.xla_ragged_dot`), which XLA lays out as its target, dtype and flags
-    choose: that peak alone is a bound from below, never above the compile's need, which never refuses a
-    step the compile fits and may admit one it refuses, a miss its compile corrects. On a GPU stating 1.6
+    peak is the program's own (`Footprint.exact`), an expert decoder's at both precisions too: its ragged
+    products run on CUDA as the grouped selector's native kernels (`grouped_matmul.GROUPED`: Triton's at
+    JAX's default precision, Mosaic GPU's at highest), custom calls that hold their outputs alone
+    (`dew.nn.programs.opaque`). On a GPU stating 1.6
     times the compile is the roomy one, whose need it holds, XLA's rematerialization changing nothing in a
     module already within its limit (`RematerializeComputation`,
     xla/hlo/transforms/simplifiers/hlo_rematerialization.cc), so its fit is read off that compile, at 0.6
@@ -467,9 +465,7 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
 
     (roomy,) = gated(layers, generation, remat, 1 << 34, tmp_path / "roomy", precision)
     need, derived = (1 << 34) - roomy["headroom"], (1 << 34) - roomy["derived_headroom"]
-    exact = roomy["derived"]["peak_exact"]
-    assert exact == (layers != "moe" or precision != "highest"), roomy["derived"]
-    assert exact or derived <= need, (derived, need)
+    assert roomy["derived"]["peak_exact"], roomy["derived"]
     for margin, admits in ((1.6, True), (0.6, False)):
         budget = int(need * margin)
         evidence = Evidence(
@@ -478,4 +474,4 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
             Prediction({"peak": roomy["derived"]["peak"]}, derived, budget, derived <= budget, "bytes"),
             Measurement({"temp": roomy["temp"]}, need <= budget, "xla", jax.__version__))
         assert evidence.compiled.admits == admits, evidence.describe()
-        assert evidence.agrees or (not exact and derived <= budget), evidence.describe()
+        assert evidence.agrees, evidence.describe()
