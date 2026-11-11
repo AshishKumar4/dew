@@ -302,6 +302,9 @@ class TFDS(Dataset):
             "split": self.split,
             "shard_rows": self.shard_rows,
             **({} if mounted else {"directory": self.path if self.remote else directory}),
+            # dataset_info.json is hashed among the definitions too; this second hash stays, since dropping
+            # it changes every TFDS fingerprint, and goes with the next fingerprint change made for a reason
+            # of its own (P3 row, continuation-5 #8).
             "metadata_sha256": hashlib.sha256(metadata).hexdigest(),
             "definitions": definitions,
             "files": files,
