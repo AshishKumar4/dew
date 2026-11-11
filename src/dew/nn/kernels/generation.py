@@ -31,6 +31,27 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
+TRACED_FACTS: dict[str, Callable[[], object]] = {}
+"""Each fact of this process or its host that a trace reads and neither its call's arguments, JAX's trace
+context, the installed code nor Dew's environment variables hold, by where its reader is defined
+(`traced_fact`): what a program kept for another process is held to beside them
+(`dew.training.identity.facts`). The attached devices' own facts, their generation and multiprocessors
+(`device_target`), are no entry here: a kept program's target holds them
+(`dew.training.ahead.BuildTarget`). Nor are the kernel picks stored beside the compilation cache: a
+launch reads them within `dew.nn.kernels.tuning.reading` alone, and a call inside that block has no
+identity (`dew.training.identity`)."""
+
+
+def traced_fact[Reader: Callable[[], object]](reader: Reader) -> Reader:
+    """Declare `reader`, which takes no argument, as a fact a trace reads of the process or its host (the
+    memory a device holds, a wheel's presence), where it is defined: a program compiled under one answer
+    is another under the next (a route taken, a kernel refused), so a process handed programs another
+    kept is refused where any answer differs (`TRACED_FACTS`). A reader of such a fact left undeclared
+    lets a kept program run where this process would have traced another."""
+    TRACED_FACTS[f"{reader.__module__}.{reader.__qualname__}"] = reader
+    return reader
+
+
 @dataclasses.dataclass(frozen=True)
 class Assumption:
     """The device `assumed` stands in for the default device's: its generation, its facts (`target`)
@@ -1383,6 +1404,7 @@ def placed_platform() -> str:
     return 'gpu' if platform in ('cuda', 'rocm') else platform
 
 
+@traced_fact
 def gpu_placed() -> bool:
     """Whether a call runs on this process's own GPU: what a CUDA library call needs, which its trace
     asks the installed plugin about and its lowering the devices, where `backend()` also takes an
@@ -1392,6 +1414,7 @@ def gpu_placed() -> bool:
     return assumption() is None and jax.default_backend() == 'gpu' and placed_platform() == 'gpu'
 
 
+@traced_fact
 def host_memory_share() -> int:
     """A CPU device's share of the memory this process can hold, in bytes: the least of its host's physical
     memory, its control groups' limits (`cgroup_memory_limits`: a container's, a service's) and its address
@@ -1436,6 +1459,7 @@ def cgroup_memory_limits(root: str = "/") -> list[int]:
     return limits
 
 
+@traced_fact
 def device_memory() -> int | None:
     """The bytes one device a call is chosen for holds: the least allocator limit of the devices this
     process places it on (`placed_devices`; `Device.memory_stats`' `bytes_limit`, what an allocation fails

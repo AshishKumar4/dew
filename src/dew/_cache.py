@@ -5,13 +5,15 @@ interop, config and inference modules take their cache paths without
 importing the FLOP accounting.
 """
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
 import importlib.metadata
 import os
 import sys
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import jax
@@ -138,6 +140,11 @@ def beside_compilation_cache(variable: str, name: str) -> Path | None:
     return None if not cache else Path(cache) / name
 
 
+_UNCACHED = threading.RLock()
+"""Held while the process's cache is set up again (`enable_compilation_cache`) or turned off for a while
+(`uncached`), so neither restores a setting the other made; one thread may do both, nested."""
+
+
 def enable_compilation_cache(path: str):
     """Persist compiled executables so restarts skip XLA compilation, and the
     GPU autotuner's picks beside them.
@@ -174,14 +181,15 @@ def enable_compilation_cache(path: str):
     from jax.experimental.compilation_cache import compilation_cache
 
     os.makedirs(path, exist_ok=True)
-    moved = jax.config.jax_compilation_cache_dir not in (None, path)
-    jax.config.update('jax_compilation_cache_dir', path)
-    if moved:
-        # JAX settles its cache at the process's first compile and keeps it; `reset_cache` forgets
-        # it, so the next compile settles it again, under the directory named first, so no compile
-        # between the two settles it on the old one; a compile on another thread already settling
-        # it is waited for, under JAX's own initialization lock (Dew's JAX build, row 2836).
-        compilation_cache.reset_cache()
+    with _UNCACHED:
+        moved = jax.config.jax_compilation_cache_dir not in (None, path)
+        jax.config.update('jax_compilation_cache_dir', path)
+        if moved:
+            # JAX settles its cache at the process's first compile and keeps it; `reset_cache` forgets
+            # it, so the next compile settles it again, under the directory named first, so no compile
+            # between the two settles it on the old one; a compile on another thread already settling
+            # it is waited for, under JAX's own initialization lock (Dew's JAX build, row 2836).
+            compilation_cache.reset_cache()
     # The autotuner's picks follow the policy above, through XLA_FLAGS; JAX's own placement of them
     # in the cache directory would name one directory for every jaxlib and write picks from a
     # process this policy keeps to reading (`jax._src.compiler.get_compile_options`).
@@ -209,6 +217,36 @@ def enable_compilation_cache(path: str):
         os.environ['XLA_FLAGS'] = f"{flags} --xla_gpu_per_fusion_autotune_cache_dir={picks}".strip()
 
 
+UNCACHED = ("jax_enable_compilation_cache",)
+"""The settings of JAX's that `uncached` turns off for its block: whether a compile reads and writes the
+persistent cache, which no program reads, so a program's identity states none of them
+(`dew.training.identity.settings`)."""
+
+
+@contextlib.contextmanager
+def uncached() -> Iterator[None]:
+    """Compile with JAX's persistent cache neither read nor written, for programs kept to be handed to a
+    later process (`dew.training.ahead.keeping`): an executable XLA loaded from that cache serializes
+    without its kernels (on a CPU it then loads and fails at its first call), so each kept one is
+    compiled anew. A compile ahead for a compile-only client uses the cache as any compile does.
+
+    JAX settles whether a process uses its cache at its first compile and keeps that; its
+    `reset_cache` forgets it, so the compiles inside settle it again with the cache turned off, and
+    the next one after with the setting as it was. Compiles on other threads meanwhile go without the
+    cache, and calls on two threads take turns, so neither restores the setting the other made."""
+    from jax.experimental.compilation_cache import compilation_cache
+
+    with _UNCACHED:
+        enabled = jax.config.jax_enable_compilation_cache
+        jax.config.update('jax_enable_compilation_cache', val=False)
+        compilation_cache.reset_cache()
+        try:
+            yield
+        finally:
+            jax.config.update('jax_enable_compilation_cache', val=enabled)
+            compilation_cache.reset_cache()
+
+
 def plugin_builds() -> str:
     """The build of each CUDA PJRT plugin installed, in order of the builds' names (an order any other reader
     of the installed wheels can take): `-<build>-<version>` each. The GPU compile, XLA's, Triton's and Mosaic
@@ -216,6 +254,39 @@ def plugin_builds() -> str:
     (row 3560)."""
     return "".join(f"-{build}-{importlib.metadata.version(f'jax-{build}-pjrt')}"
                    for build in sorted(cuda_builds()))
+
+
+def cuda_libraries() -> tuple[tuple[str, int | None], ...]:
+    """The versions of cuBLAS and cuDNN this process's CUDA plugin loads, as JAX's plugin reads them for its
+    own check (`jax._src.lib.cuda_versions`), at the precision NVIDIA promises compatibility at and JAX
+    checks them at: the major and minor version, a patch ignored. They are the libraries whose state a GPU
+    compile writes into its executable for a loader to read again: the GEMM algorithms XLA's autotuner picked
+    for that cuBLAS, the cuDNN graphs it serialized. A library the plugin cannot load is None: a compile here
+    writes none of its state. Empty where no CUDA plugin is installed."""
+    from jax._src.lib import cuda_versions
+
+    if cuda_versions is None:
+        return ()
+
+    def loaded(read: Callable[[], int]) -> int | None:
+        # JAX's own reader raises where the library does not load, as JAX's plugin check takes it
+        # (jax_plugins/cuda: `_version_check`).
+        try:
+            return read() // 100
+        except RuntimeError:
+            return None
+
+    return (("cublas", loaded(cuda_versions.cublas_get_version)),
+            ("cudnn", loaded(cuda_versions.cudnn_get_version)))
+
+
+def topology_digest(serialized: bytes) -> str:
+    """The digest of a GPU topology as its client serializes it
+    (`jax.experimental.topologies.get_attached_topology("cuda").serialize()`): a host's GPUs, its SKU's
+    memory, clocks and multiprocessors, which XLA's compile and its persistent cache key read. A process
+    reading its attached GPUs and a host's prepare reading the file its node wrote (`host_gpus`) digest the
+    same bytes."""
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def autotune_dir(path: str) -> str:
@@ -274,6 +345,12 @@ KERNEL_ROUTES = jax.make_user_context(())
 """The collections each open `dew.nn.kernels.generation.routes` block records its dispatches' routes
 into: JAX keys its trace caches on their identities, as on `KERNEL_SEEN`'s, so a trace cached before
 traces, and reports its routes, again."""
+
+RECORDING = (KERNEL_SEEN, KERNEL_ROUTES)
+"""The contexts a trace records into (`KERNEL_SEEN`, `KERNEL_ROUTES`): JAX keys its trace caches on their
+values' identities so a cached trace records again, and the program is the same under any of them, so a
+program's identity states none (`dew.training.ahead.call_identity`), as the persistent cache's key reads
+none."""
 
 KERNEL_PINS = jax.make_user_context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this

@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from test_optim import assert_updates_as
+from test_optim import assert_updates_as, in_forms
 
 from dew.nn.cross_attention import CrossAttention, crossing
 from dew.optim import FRESH_LEARNING_RATE, Exponential, Linear, OptimConfig, ParamGroup, param_labels
@@ -55,6 +55,31 @@ def test_a_loaded_parameter_steps_as_ungrouped_and_a_fresh_one_at_its_groups_rat
                             (("layers_0", "dense", "bias"), alone(RATE, 0.0)),
                             (("layers_1", "cross_attention", "q", "kernel"), alone(RATE * MULTIPLIER, 0.1))):
         assert_updates_as(solver, reference, params, [path], f"{optimizer} at {'/'.join(path)}")
+
+
+def test_under_muon_a_fresh_groups_rate_reaches_its_vector_and_its_matrix():
+    """Under the Muon hybrid a fresh group is the whole hybrid at the group's rate: a parameter a loaded
+    module gains, a per-channel vector (a looped model's `loop_theta`), takes AdamW's update and a fresh
+    module's matrix Muon's, each at the fresh rate, and a loaded vector and matrix theirs at the run's,
+    each on par with Optax's own optimizer stepping it alone at that rate (check 1; a run retrofitting
+    such a vector at zero trains it at many times its base's rate, which no test held under Muon)."""
+    params = {"layers_0": {"dense": {"kernel": jnp.zeros((6, 4)), "bias": jnp.zeros((4,))},
+                           "loop_theta": jnp.zeros((4,))},
+              "layers_1": {"cross_attention": {"q": {"kernel": jnp.zeros((4, 4))}}}}
+    grouped = OptimConfig(optimizer="muon", learning_rate=RATE, param_groups=(FRESH, BASE)).with_fresh(
+        ("layers_1/cross_attention",), ("layers_0/loop_theta",))
+    # Traced under the accurate forms, whose float32 Newton-Schulz is the one held to Optax's Muon.
+    solver = in_forms(grouped.build(4), "accurate")
+
+    def vector(rate: float) -> optax.GradientTransformation:
+        return optax.adamw(rate, nesterov=True, weight_decay=0.0)
+
+    for path, reference in ((("layers_0", "dense", "kernel"), optax.contrib.muon(RATE)),
+                            (("layers_0", "dense", "bias"), vector(RATE)),
+                            (("layers_0", "loop_theta"), vector(RATE * MULTIPLIER)),
+                            (("layers_1", "cross_attention", "q", "kernel"),
+                             optax.contrib.muon(RATE * MULTIPLIER))):
+        assert_updates_as(solver, reference, params, [path], f"muon at {'/'.join(path)}")
 
 
 @pytest.mark.parametrize(("schedule", "peak", "fresh"), [

@@ -304,10 +304,13 @@ def refuse_launch(op, arguments: tokamax.BoundArguments, config: Hashable, kerne
     _record((_identity(op, arguments), config), None, frozenset(kernels))
 
 
+@generation.traced_fact
 def refused_launches() -> tuple[tuple[str, Hashable, frozenset[str]], ...]:
     """Every (launch identity, config, spilled kernel names) refused in this context (a `refusals` scope's or
     the process's), ordered. A validated plan can hand them to another process explicitly (`refuse` within
-    `refusals`); a shared compilation cache alone must not transfer them between programs."""
+    `refusals`); a shared compilation cache alone must not transfer them between programs. A trace after a
+    refusal derives the next config, so a program kept after one is another than a process without it
+    traces (`traced_fact`)."""
     with _GUARD:
         return tuple(sorted(((identity, config, kernels)
                              for (identity, config), kernels in _registry().refused.items()), key=repr))

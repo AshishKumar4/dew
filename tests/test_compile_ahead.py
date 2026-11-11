@@ -14,12 +14,15 @@ import json
 import logging
 import os
 import shutil
+import subprocess
+import sys
 
 import lane_environment
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import process_support
 import pytest
 from lane_environment import without_flags
 from jax.extend import custom_call_targets, xla
@@ -86,6 +89,176 @@ def test_a_program_compiled_ahead_runs_in_place_of_compiling():
     with taking({program_digest(lowered): loaded}), Compiles(None) as compiles:
         owned_program(lambda values: values * 3, out_shardings=placed)(values)
     assert [program.kind for program in compiles.programs].count("compiled") == 1
+
+
+KEPT_MODULE = '''
+import dataclasses
+import os
+
+import jax.numpy as jnp
+
+from dew.nn.kernels.generation import traced_fact
+
+OFFSET = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class Scale:
+    by: int
+
+
+def scaled(scale, values):
+    return jnp.tanh(values) * scale.by
+
+
+def shifted(values):
+    return values + OFFSET
+
+
+def chosen(flag, values):
+    return values + (1 if flag is None else 2)
+
+
+def _by(values):
+    return values * OFFSET
+
+
+def helped(values):
+    return _by(values)
+
+
+def nested(values):
+    return (lambda held: held - OFFSET)(values)
+
+
+@dataclasses.dataclass(frozen=True)
+class Factor:
+    factor = 1
+
+    def __call__(self, values):
+        return values * self.factor
+
+
+def applied(factor, values):
+    return factor(values)
+
+
+@traced_fact
+def kept_fact():
+    return os.environ.get("KEPT_FACT")
+'''
+"""The module the kept programs' functions and their static argument's class are defined in
+(tests/kept_programs_worker.py), which each test writes beside its file: a user's own, outside any installed
+distribution, with a setting its code changes at run time (`OFFSET`) and a fact of the process it declares
+its traces read (`kept_fact`)."""
+
+
+def kept_worker(directory, mode: str, scale: int = 2, offset: int = 1,
+                environment=None) -> subprocess.CompletedProcess:
+    """tests/kept_programs_worker.py in a fresh process: `mode` over the programs file in `directory` at
+    `scale` and `offset`, `kept_module` read from `directory`, with `environment`'s variables beside this
+    process's."""
+    path = os.pathsep.join((str(directory), str(process_support.REPO_ROOT / "src"),
+                            str(process_support.REPO_ROOT / "tests")))
+    return subprocess.run(
+        [sys.executable, str(process_support.REPO_ROOT / "tests" / "kept_programs_worker.py"), mode,
+         str(directory / "programs.dew-aot"), str(scale), str(offset)],
+        env={**os.environ, "PYTHONPATH": path, **(environment or {})}, capture_output=True, text=True,
+        cwd=process_support.REPO_ROOT)
+
+
+def kept_answer(run: subprocess.CompletedProcess) -> dict:
+    assert run.returncode == 0, run.stderr[-3000:]
+    return json.loads(run.stdout.splitlines()[-1])
+
+
+def kept_in(directory, scale: int = 2, offset: int = 1) -> dict:
+    """What a fresh process keeping its programs in `directory` at `scale` and `offset` answers and keeps."""
+    directory.mkdir(exist_ok=True)
+    (directory / "kept_module.py").write_text(KEPT_MODULE)
+    return kept_answer(kept_worker(directory, "keep", scale, offset))
+
+
+def test_a_program_one_process_kept_runs_in_another_that_traces_nothing(tmp_path):
+    """A process keeps the executable of each program it compiles at Dew's compile point
+    (`dew.training.ahead.keeping`) and saves them; a later process of the same target, code and settings,
+    handed the file (`dew.training.ahead.kept`), answers every call exactly as the first did and needs no
+    trace and no compile of any of them. Each program is kept for its own call alone: a static argument
+    that is None and one that is an empty tuple, and two functions written on one line that differ in a
+    constant, each answer as their own. A call that differs in what its trace reads is another call,
+    which the handed process compiles and answers as a process compiling it does: at another static
+    argument, and at another value of a global its function names, a function of the user's it calls
+    names or code nested in it names, or of a class attribute a static argument's `__call__` reads, each
+    of which its module's code changed at run time. With `verify` each handed call also lowers its
+    own program and finds the kept one's. A CPU's file states its host's processor; a function that
+    reads an array outside its arguments, and a
+    call made inside one of Dew's own contexts, have no identity a file can state and are named as not
+    kept (row 5265: a warm scoring server paid its programs' traces)."""
+    saved = kept_in(tmp_path / "kept")
+    assert saved["refused"] == ["__main__.<lambda> (0)", "kept_module.scaled (1)"], saved["reasons"]
+    assert saved["kept"] == 9
+    assert (saved["cpu"] is not None) == (jax.default_backend() == "cpu")
+    answers = saved["answers"]
+    assert answers["none"] != answers["empty"] and answers["one"] != answers["two"]
+    assert kept_answer(kept_worker(tmp_path / "kept", "take")) == {"answers": answers, "needed": []}
+    assert kept_answer(kept_worker(tmp_path / "kept", "verify"))["answers"] == answers
+    other = kept_answer(kept_worker(tmp_path / "kept", "take", scale=3, offset=4))
+    assert other["needed"] == ["applied", "helped", "nested", "scaled", "shifted"]
+    compiled = kept_in(tmp_path / "other", scale=3, offset=4)["answers"]
+    assert other["answers"] == compiled
+    differing = {name for name in answers if answers[name] != compiled[name]}
+    assert differing == {"applied", "helped", "nested", "scaled", "shifted"}
+
+
+@pytest.mark.parametrize(("changed", "process", "target"), [
+    ("source", ["source kept_module"], []), ("environment", ["environment DEW_KEPT_PROGRAMS_TEST"], []),
+    ("fact", ["fact kept_module.kept_fact"], []), ("setting", ["setting jax_default_prng_impl"], []),
+    ("flags", [], ["flags"]), ("target", [], ["host"])])
+def test_programs_kept_under_other_code_settings_or_target_are_refused_by_name(tmp_path, changed, process,
+                                                                                target):
+    """A file of kept programs is refused before any call where the process handed it is not the one that
+    kept it, and its records name what differs (`Process.differences`, `BuildTarget.differences`): a
+    module's source edited since (the functions' own, a user's module no installed distribution
+    versions), an environment variable of Dew's, a fact of the process its code declares its traces read
+    (`traced_fact`), a setting of JAX's that a trace reads and JAX's own trace context does not hold (the
+    default PRNG implementation), an XLA flag that decides what a program computes (deterministic ops,
+    which Dew's kernels' routes read), or a target that is not this host's. A kept executable is run for
+    nothing but the call, code and settings it was compiled from."""
+    from dew.training.ahead import AheadPrograms
+
+    kept_in(tmp_path)
+    flags = f"{os.environ.get('XLA_FLAGS', '')} --xla_gpu_deterministic_ops=true".strip()
+    environment = {"environment": {"DEW_KEPT_PROGRAMS_TEST": "1"}, "fact": {"KEPT_FACT": "another"},
+                   "setting": {"JAX_DEFAULT_PRNG_IMPL": "rbg"}, "flags": {"XLA_FLAGS": flags}}.get(changed)
+    if changed == "source":
+        (tmp_path / "kept_module.py").write_text(KEPT_MODULE.replace("jnp.tanh(values)", "jnp.sin(values)"))
+    elif changed == "target":
+        path = tmp_path / "programs.dew-aot"
+        programs = AheadPrograms.load(path)
+        dataclasses.replace(programs, target=dataclasses.replace(programs.target, host="another")).save(path)
+    assert kept_worker(tmp_path, "take", environment=environment).returncode != 0
+    assert kept_answer(kept_worker(tmp_path, "differences", environment=environment)) == {
+        "process": process, "target": target}
+
+
+def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):
+    """`kept(path, verify=True)` lowers each handed call's own program and holds it to the kept one's
+    digest: a file whose program for a call is another program (here its recorded digest changed) is
+    refused at that call (`NotTheKeptProgram`), where the same file handed without verifying runs. And a
+    file of programs compiled ahead by name, none kept by its call, is refused as it is handed."""
+    from dew.training.ahead import AheadProgram, AheadPrograms, kept
+
+    answers = kept_in(tmp_path)["answers"]
+    path = tmp_path / "programs.dew-aot"
+    programs = AheadPrograms.load(path)
+    other = {digest: dataclasses.replace(each, program=AheadProgram("0" * 64, each.program.executable))
+             for digest, each in programs.kept.items()}
+    dataclasses.replace(programs, kept=other).save(path)
+    assert kept_answer(kept_worker(tmp_path, "take")) == {"answers": answers, "needed": []}
+    assert kept_answer(kept_worker(tmp_path, "verify")) == {"refused": "NotTheKeptProgram"}
+    AheadPrograms(programs.target, {}).save(path)
+    with pytest.raises(ValueError), kept(path):
+        pass
 
 
 def test_a_program_called_over_shapes_while_collecting_compiles_there_and_runs_where_handed():
@@ -962,6 +1135,25 @@ def test_a_build_holds_a_call_to_the_memory_it_states_else_to_its_least_part_and
     assert not build.differences(dataclasses.replace(build, memory=None))
 
 
+def test_a_build_binds_its_loader_to_its_plugin_and_linked_libraries_and_not_to_its_topology():
+    """Programs compiled ahead carry the CUDA plugin that compiled them and the cuBLAS and cuDNN they loaded
+    (a cuDNN graph is serialized at compile), so a process of another plugin build, or of another version
+    of a library the compile loaded, is refused them, naming which; a library the compile could not load
+    wrote none of its state and binds no loader. The topology they were compiled over names the compile
+    alone: a host's own GPUs run what a generation's canonical ones built."""
+    from dew.training.ahead import BuildTarget
+
+    build = BuildTarget("sm90", 132, 1, "0", "0", (), "x86_64", plugin="-cuda12-0.12.0.1.post73",
+                        libraries=(("cublas", 1209), ("cudnn", 927)), topology=None)
+    plugin = dataclasses.replace(build, plugin="-cuda13-0.12.0.1.post73")
+    cudnn = dataclasses.replace(build, libraries=(("cublas", 1209), ("cudnn", 928)))
+    assert [line.split()[0] for line in build.differences(plugin)] == ["plugin"]
+    assert [line.split()[:2] for line in build.differences(cudnn)] == [["libraries", "cudnn"]]
+    unloaded = dataclasses.replace(build, libraries=(("cublas", 1209), ("cudnn", None)))
+    assert not unloaded.differences(cudnn)
+    assert not build.differences(dataclasses.replace(build, topology="0" * 64))
+
+
 def test_a_configured_run_compiling_ahead_with_its_frontier_records_it_in_the_saved_plan(tmp_path):
     """`--trainer.compile-ahead.frontier` (`RunConfig.cli`) asks the step compiled ahead for its frontier,
     which its saved plan records (rows 3108, 3147): on GPUs of 0.0007 GiB, where the plan needs two
@@ -1420,7 +1612,10 @@ def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_
     with pytest.raises(ValueError):
         loaded.loaded()
     here = BuildTarget.of(jax.devices()[:1])
-    assert [line.split()[0] for line in built.target.differences(here)] == ["generation", "multiprocessors"]
+    # This host's CPU is another generation, of no multiprocessors, a processor a GPU's target has none
+    # of (`BuildTarget.cpu`), and no CUDA plugin, which compiled the GPU's build (`BuildTarget.plugin`).
+    assert [line.split()[0] for line in built.target.differences(here)] == ["generation", "multiprocessors",
+                                                                             "cpu", "plugin"]
     # A kind of the generation with its multiprocessors is its target, whatever its memory or its name: the
     # build's target is sm90's facts, 132 multiprocessors.
     assert (built.target.generation, built.target.multiprocessors) == ("sm90", 132)
