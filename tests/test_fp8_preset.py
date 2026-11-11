@@ -447,11 +447,13 @@ def test_a_training_step_in_the_fp8_preset_is_on_par_with_a_fake_quantized_model
                                                                                                    cotangent)
         return run
 
+    # Compiled whole as the arms are, once for every draw.
+    wide = jax.jit(arm(float64_twin(model), plain, fake_quantized(jnp.float64)))
+
     @as_given
     def truth(params, tokens, cotangent):
         with jax.enable_x64(new_val=True):
-            return arm(float64_twin(model), plain, fake_quantized(jnp.float64))(
-                widened(params), tokens, cotangent.astype(jnp.float64))
+            return wide(widened(params), tokens, cotangent.astype(jnp.float64))
 
     assert_as_exact(jax.jit(arm(model, FP8)), jax.jit(arm(model, plain, fake_quantized(jnp.float32))), draw,
                     "fp8 preset step", seeds=SEEDS, truth_fn=truth)
