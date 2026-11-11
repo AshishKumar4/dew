@@ -20,7 +20,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -34,6 +34,9 @@ from dew.nn.precision import at_least_fp32, divided
 from dew.nn.text_checkpoints import DEFAULT_MODEL
 from dew.registry import DtypeName
 
+if TYPE_CHECKING:
+    from flax import linen as nn
+
 
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
     """Convert pixels in [0, 255] to [-1, 1].
@@ -44,6 +47,18 @@ def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
     pixels = jnp.asarray(pixels)
     # IEEE division: XLA takes a division by a constant as a product with its rounded reciprocal.
     return divided(pixels.astype(at_least_fp32(pixels.dtype)) - 127.5, 127.5)
+
+
+class OutsideTable(ValueError):
+    """A token id outside the embedding table it indexes (`Field.bounded`, `Field.admits`), which reads no row
+    of it: `holder`, what holds the id, the `token`, the table's `rows`, and the token's spelling where a
+    processor knows it."""
+
+    def __init__(self, holder: str, token: int, rows: int, spelled: str | None = None):
+        self.holder, self.token, self.rows = holder, token, rows
+        named = "" if spelled is None else f" ({spelled!r})"
+        super().__init__(f"{holder} holds the id {token}{named}, outside the {rows} rows of the table it "
+                         "indexes: its tokens come from another vocabulary than the model's")
 
 
 @dataclass(frozen=True)
@@ -68,7 +83,7 @@ class Field:
             raise ValueError("variable field axes must index its per-sample shape")
 
     @classmethod
-    def indexing(cls, key: str, shape: tuple[int, ...], model: object, *,
+    def indexing(cls, key: str, shape: tuple[int, ...], model: nn.Module, *,
                  variable_axes: tuple[int, ...] = ()) -> Field:
         """The field `key` of `shape` whose integers index `model`'s embedding table
         (`dew.nn.blocks.token_table`): its rows and the ids it replaces, none where it states no table."""
@@ -100,9 +115,13 @@ class Field:
         if outside.size == 0:
             return
         token = int(outside[0] if outside[0] < 0 else outside[-1])
-        named = "" if spelling is None or token < 0 else f" ({spelling(token)!r})"
-        raise ValueError(f"field {self.key!r} holds the id {token}{named}, outside the {self.rows} rows of "
-                         "the table it indexes: its tokens come from another vocabulary than the model's")
+        raise OutsideTable(f"field {self.key!r}", token, self.rows,
+                           None if spelling is None or token < 0 else spelling(token))
+
+    def admits(self, token: int) -> bool:
+        """Whether `token` reads a row of the table this field indexes, or is an id its model replaces
+        before the table reads it; any id where the field indexes no table."""
+        return self.rows is None or 0 <= token < self.rows or token in self.replaced
 
     @classmethod
     def of(cls, key: str, batch: Batch) -> Field:

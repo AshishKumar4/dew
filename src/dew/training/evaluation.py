@@ -707,9 +707,7 @@ def _bounded(objective: Objective[Loss, Effects], batch: Batch | None) -> None:
     """Refuse a validation batch, on the host before it is placed, where its token ids fall outside its
     model's table (`InputSpec.bounded`), as each training batch is."""
     if batch is not None and objective.inputs is not None:
-        tokenizer = getattr(objective, "tokenizer", None)
-        spelling = None if tokenizer is None else (lambda token: tokenizer.decode([token]))
-        objective.inputs.bounded(batch, spelling)
+        objective.inputs.bounded(batch)
 
 
 def _admitted(objective: Objective[Loss, Effects], batch: Batch, seen: set) -> None:

@@ -46,26 +46,30 @@ def _table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
     return rows_taken(table, ids).astype(dtype)
 
 
-def token_table(model: object) -> tuple[int, frozenset[int]] | None:
+def token_table(model: nn.Module) -> tuple[int, frozenset[int]] | None:
     """The embedding table a model reads its tokens through, which a token field indexes
     (`dew.inputs.spec.Field.indexing`): the rows its declared vocabulary
     (`dew.nn.protocols.Bounded`) builds, found on the model, the backbone a head reads
     (`dew.nn.wrapping.HeadedModel`) or the decoder a wrapper holds (`DecoderWrapper.wraps`), and the
     placeholder ids a multimodal model replaces before its table reads them (`image_token_id`,
     `extra_placeholder_ids`), which hold no row of their own; None for a model of no stated vocabulary."""
+    from dew.nn.multimodal import MultimodalTransformer
     from dew.nn.protocols import Bounded
+    from dew.nn.wrapping import DecoderWrapper, HeadedModel
 
     replaced: set[int] = set()
-    seen: set[int] = set()
-    while model is not None and id(model) not in seen:
-        seen.add(id(model))
-        replaced |= {token for token in (getattr(model, "image_token_id", None),
-                                         *getattr(model, "extra_placeholder_ids", ())) if token is not None}
+    while True:
+        if isinstance(model, MultimodalTransformer):
+            replaced |= {*model.extra_placeholder_ids,
+                         *(() if model.image_token_id is None else (model.image_token_id,))}
         if isinstance(model, Bounded) and isinstance(model.vocab_size, int):
             return model.vocab_size, frozenset(replaced)
-        wraps = getattr(model, "wraps", None)
-        model = getattr(model, wraps, None) if isinstance(wraps, str) else getattr(model, "backbone", None)
-    return None
+        if isinstance(model, DecoderWrapper):
+            model = getattr(model, model.wraps)
+        elif isinstance(model, HeadedModel):
+            model = model.backbone
+        else:
+            return None
 
 
 def table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:

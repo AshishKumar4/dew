@@ -15,7 +15,10 @@ from dew.data import Memory
 from dew.data.pipeline import Pipeline
 from dew.data.text import HFTokenizer
 from dew.decision import DecisionObjective
+from dew.diffusion.discrete import MDLM
 from dew.inference.tasks import RunProcessor, TextGeneration
+from dew.inputs import OutsideTable
+from dew.objectives.diffusion import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Trainer
@@ -27,9 +30,14 @@ ROWS = 200
 SEQ_LEN = 16
 
 
-def short():
+def short(**fields):
     return models.build("causal_transformer", vocab_size=ROWS, emb_features=32, num_layers=1, num_heads=2,
-                        mlp_features=64, max_seq_len=64)
+                        mlp_features=64, max_seq_len=64, **fields)
+
+
+def outside(raised: pytest.ExceptionInfo[OutsideTable]) -> tuple[int, int]:
+    """The id a refusal names and the rows of the table it names."""
+    return raised.value.token, raised.value.rows
 
 
 def token_rows(*past: int):
@@ -46,8 +54,9 @@ def test_an_lm_run_whose_rows_hold_an_id_outside_its_models_table_is_refused_at_
     below zero), is refused at the batch that holds it, naming the id and the table's rows; the batch
     before it trains."""
     trainer = Trainer(LMObjective(short(), seq_len=SEQ_LEN), optax.sgd(0.1), key=jax.random.key(0))
-    with pytest.raises(ValueError, match=rf"holds the id {past}, outside the {ROWS} rows"):
+    with pytest.raises(OutsideTable) as raised:
         trainer.fit(token_rows(past), steps=2)
+    assert outside(raised) == (past, ROWS)
     finite = trainer.fit(token_rows(ROWS - 1), steps=2)
     assert int(finite.step) == 2
 
@@ -62,8 +71,9 @@ def test_an_lm_runs_validation_split_holding_an_id_outside_its_models_table_is_r
         return Pipeline(Memory([{"text": row} for row in rows])).batch(8)
 
     trainer = Trainer(LMObjective(short(), seq_len=SEQ_LEN), optax.sgd(0.1), key=jax.random.key(0))
-    with pytest.raises(ValueError, match=rf"holds the id {ROWS + 3}, outside the {ROWS} rows"):
+    with pytest.raises(OutsideTable) as raised:
         trainer.fit(token_rows(ROWS - 1), steps=2, validation=split(ROWS + 3), eval_every=1)
+    assert outside(raised) == (ROWS + 3, ROWS)
     scored = trainer.fit(token_rows(ROWS - 1), steps=2, validation=split(), eval_every=1)
     assert int(scored.step) == 2
 
@@ -73,12 +83,15 @@ def test_a_decision_run_whose_rows_place_a_token_outside_its_backbones_table_is_
     token its backbone's table has no row for, naming the token."""
     from dew.decision import decisions
 
-    objective = DecisionObjective(short(), tokenizer=HFTokenizer(str(FIXTURE), local_files_only=True))
+    tokenizer = HFTokenizer(str(FIXTURE), local_files_only=True)
+    objective = DecisionObjective(short(), tokenizer=tokenizer)
     rows = Pipeline(Memory([{"text": "token7 token250", "label": label} for label in ("a", "b")] * 8))
     data = rows.pipe(decisions, question="label", options=("a", "b")).repeat().batch(8)
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0))
-    with pytest.raises(ValueError, match=rf"\(.token250.\), outside the {ROWS} rows"):
+    with pytest.raises(OutsideTable) as raised:
         trainer.fit(data, steps=1)
+    [token] = tokenizer.encode("token250", add_special_tokens=False)
+    assert outside(raised) == (token, ROWS)
 
 
 def test_a_request_holding_an_id_outside_its_models_table_is_refused_by_a_task_and_a_server():
@@ -92,8 +105,20 @@ def test_a_request_holding_an_id_outside_its_models_table_is_refused_by_a_task_a
     variables = model.init(jax.random.key(0), np.zeros((1, 4), np.int32))
     task = TextGeneration(model, variables, RunProcessor(HFTokenizer(str(FIXTURE), local_files_only=True)))
     task([[4, 5, 6]], 2, key=0)
-    with pytest.raises(ValueError, match=rf"holds the id 250\b.*outside the {ROWS} rows"):
+    with pytest.raises(OutsideTable) as raised:
         task([[4, 5, 250]], 2, key=0)
+    assert outside(raised) == (250, ROWS)
     server = Server.from_task(task, slots=1, capacity=32)
-    with pytest.raises(ValueError, match=rf"holds the id 250 \('token250'\), outside the {ROWS} rows"):
+    with pytest.raises(OutsideTable) as raised:
         server.submit([4, 5, 250], max_new_tokens=2, key=0)
+    assert outside(raised) == (250, ROWS)
+
+
+def test_a_masked_run_whose_mask_id_is_outside_its_models_table_is_refused_as_its_objective_is_made():
+    """A masked diffusion objective places its mask id inside the compiled step, where no host check of a
+    batch sees it, so an objective whose mask id its model's table holds no row for is refused as it is
+    made, naming the id; one masking to the table's last row is made."""
+    with pytest.raises(OutsideTable) as raised:
+        MaskedDiffusionObjective(short(causal=False), MDLM(mask_id=ROWS)(), SEQ_LEN)
+    assert outside(raised) == (ROWS, ROWS)
+    MaskedDiffusionObjective(short(causal=False), MDLM(mask_id=ROWS - 1)(), SEQ_LEN)
