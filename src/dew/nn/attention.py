@@ -815,15 +815,16 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
         # sinks among its operands, at the kernel's arithmetic (IEEE products for fp32 operands, 16-bit
         # ones summed in fp32, logits fp32: `scale_logits`) on the reference path, not the folded form,
         # whose products read the keys across heads: an H100's fp32 gradients through it held 1.82 to 2.08
-        # times the reference's error, through the reference path 1.00 (M-ET-62, row 5268).
+        # times the reference's error, through the reference path 1.00 (M-ET-62, row 5268); a differentiated
+        # call's output the reference's too, one forward (`primal_alone`; the kernel's a second, rCM's).
         kernel_precision = "highest" if query.dtype == jnp.float32 else None
         out = forward_differentiable(decoded, decoded_reference, query, key, value, key_value_seq_lengths,
-                                     *rest.values(), precision=kernel_precision)
+                                     *rest.values(), precision=kernel_precision, primal_alone=True)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
         # kernel takes the call the two forms agree bitwise. Its derivative is the reference path's, as
         # the decode kernel's is: the folded form's products read the keys across heads, and an H100's
-        # fp32 gradients through them held twice the reference's error (M-ET-62, row 5268).
+        # fp32 gradients through them held twice the reference's error (M-ET-62, row 5268), one forward.
         visible = (mask if key_value_seq_lengths is None
                    else with_key_lengths(mask, key_value_seq_lengths, key.shape[-3]))
         held = () if visible is None else (visible,)
@@ -835,7 +836,7 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
             return reference_attention(query, key, value, mask=visible[0] if visible else None,
                                        scale_logits=True)
 
-        out = forward_differentiable(folded, folded_reference, query, key, value, *held)
+        out = forward_differentiable(folded, folded_reference, query, key, value, *held, primal_alone=True)
     elif implementation == 'xla':
         # Its softmax takes the textbook derivative y (g - sum(y g)) (`jax.softmax_custom_jvp`, which jax
         # ships off), exactly zero for a query that reads one key, as torch's and the reference path's.
