@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 import zipfile
@@ -1618,6 +1619,34 @@ def test_a_watched_directory_lost_mid_run_keeps_no_row(ci, tmp_path, monkeypatch
                                        "    Path('tests/fixtures/scratch').mkdir()\n"})
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     assert [run(), run()] == [1, 2]
+
+
+def test_a_checkouts_stamps_read_through_directories_another_process_makes_and_removes(ci, tmp_path):
+    """A task's stamps of its checkout (`watched.stamps`, what it wrote) read while other processes of the
+    task make and remove directories in it, as a GPU lane's pytest processes do with their records' children
+    beside one another: a directory gone between its listing and its reading is none of the checkout, never
+    the task's crash (2026-11-11: test_gpu_lane's 4 processes, FileNotFoundError on a sibling's
+    `verdict.json.2.lifetime.log.children`)."""
+    for index in range(20):
+        (tmp_path / f"held-{index}").mkdir()
+        (tmp_path / f"held-{index}" / "file").write_text("")
+    churned = tmp_path / "churned"
+    stopped = threading.Event()
+
+    def churn() -> None:
+        while not stopped.is_set():
+            (churned / "inner").mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(churned, ignore_errors=True)
+
+    churner = threading.Thread(target=churn)
+    churner.start()
+    try:
+        # A walk reads a removed directory about once in four with the churner beside it (11-11, 18k walks).
+        read = [ci.watched.stamps(str(tmp_path), ()) for _ in range(400)]
+    finally:
+        stopped.set()
+        churner.join()
+    assert all(f"held-{index}/file" in stamped for stamped in read for index in range(20))
 
 
 def test_a_pool_change_reruns_no_file_and_the_environments_variables_every_file(
