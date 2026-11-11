@@ -1762,7 +1762,7 @@ class LMObjective(TokenScorer):
             term = weighed(self._weights_over(self.model), passes[0])
             units = shares(term, weights)
             prediction = Ratio(self.row_mean(term, batch, weights=weights).total, mass)
-        elif passes is not None:
+        elif passes is not None and self.exit_entropy is not None:
             # Ouro's exit objective in the cross entropy's place, over the same counted targets.
             pass_losses, gates, _ = passes
             term, expected, entropy = exit_objective(pass_losses, gates, self.exit_entropy, width)
