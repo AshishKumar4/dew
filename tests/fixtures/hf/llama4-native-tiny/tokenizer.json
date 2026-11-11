@@ -866,42 +866,6 @@
       "rstrip": false,
       "normalized": false,
       "special": true
-    },
-    {
-      "id": 96,
-      "content": "<mask>",
-      "single_word": false,
-      "lstrip": false,
-      "rstrip": false,
-      "normalized": false,
-      "special": true
-    },
-    {
-      "id": 97,
-      "content": "<start_of_image>",
-      "single_word": false,
-      "lstrip": false,
-      "rstrip": false,
-      "normalized": false,
-      "special": true
-    },
-    {
-      "id": 98,
-      "content": "<end_of_image>",
-      "single_word": false,
-      "lstrip": false,
-      "rstrip": false,
-      "normalized": false,
-      "special": true
-    },
-    {
-      "id": 99,
-      "content": "<image_soft_token>",
-      "single_word": false,
-      "lstrip": false,
-      "rstrip": false,
-      "normalized": false,
-      "special": true
     }
   ],
   "normalizer": null,
