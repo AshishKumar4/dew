@@ -19,7 +19,9 @@ the commit that wrote them. A later main reads each back as a user's process wou
 
 Run it on CPU from a clean checkout of the main it records, then commit the files (and `upload` a pinned
 one): the corpus only grows, one directory per recorded main, so a later main is read against every
-earlier one.
+earlier one. A run is never recorded again: where the repo later changes an input a generation's runs read
+(a fixture's tokenizer), that generation keeps the input as its runs read it beside them (`inputs/`, at its
+path in the checkout), which tests/test_saved_runs.py reads them over (`checkout_of`).
 """
 
 import argparse
