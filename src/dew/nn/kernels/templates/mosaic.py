@@ -1507,13 +1507,14 @@ class Transport[Allocated, Opened](abc.ABC):
         where the family streams from a role of its own, lowered to `producer` registers a thread
         (setmaxnreg's least where None: a launch states more where its producer's issue loop holds more)."""
 
-    def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None):
+    def scheduled(self, consumers: int, consumer, producer, *, floor: int | None = None,
+                  exclusive: bool = False):
         """The family's roles run (`roles`, its producer lowered to `floor`): `consumer(index)` on its compute
-        roles and `producer()` on its producer's where it has one; the consumers' value where they are its
-        every warpgroup."""
+        roles and `producer()` on its producer's where it has one, each a branch of one switch where
+        `exclusive` (`handoffs.Schedule.run`); the consumers' value where they are its every warpgroup."""
         schedule = self.roles(consumers, floor)
         bodies = {"consumer": consumer, "producer": producer}
-        return schedule.run(**{role.name: bodies[role.name] for role in schedule.roles})
+        return schedule.run(exclusive=exclusive, **{role.name: bodies[role.name] for role in schedule.roles})
 
     def lifetimes(self, streams: Allocated, steps: int | None = None) -> tuple[tuple, tuple]:
         """A program's `streams` (`streams`') by lifetime (`resources.Scope`): those the program holds whole,

@@ -1085,11 +1085,20 @@ class _Program[T: (Tiles, BackwardTiles)]:
         """This program's query tile of the grid's `count`: a causal call's longest first (its last query
         tiles see the most keys), so the grid's tail holds its shortest programs, as FlashAttention-3's
         scheduler orders them; a full call's in order. Its grid coordinate read where it is used where
-        `fresh` (`Family.program_index`)."""
+        `fresh` (`Family.program_index`). A grid of one tile reads none: read afresh, a decode step's split
+        coordinate was divided into its one tile's address on an A100 and its offsets spilled 32 bytes, a
+        coordinate read as it is folded (row 5466). A causal call's reversal of a power of two tiles is the
+        index's complement (`count - 1 - index`, the same tile), which ptxas forms again where it is used:
+        subtracted, a B200's forward at width 256 held it and spilled 8 bytes, complemented none (row
+        5466)."""
+        if count == 1:
+            return jnp.int32(0)
         index = self.family.program_index("q_tiles", fresh=fresh)
         if self.splits > 1:
             index = lax.div(index, self.splits)
-        return count - 1 - index if self.causal else index
+        if not self.causal:
+            return index
+        return index ^ (count - 1) if count & (count - 1) == 0 else count - 1 - index
 
     def __post_init__(self):
         if not whole_tiles(self.family, self.tiles):

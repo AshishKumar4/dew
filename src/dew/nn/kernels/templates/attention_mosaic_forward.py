@@ -1639,11 +1639,11 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
             *_, views, _, own = placed()
             family.stream(streams, views, *own)
 
-        # A family that keeps its products' accumulators in the program's scratch, a role's own share
-        # (`Issuer.product_scratch`: tcgen05's chunks'), takes each consumer built at its static role.
+        # tcgen05's product scratch a role's own share (`Issuer.product_scratch`): each consumer built at its
+        # static role. Each role forms what it reads (`_placed`), one switch's branch (`exclusive`).
         family.scheduled(consumers, (functools.partial(mosaic.per_role, roles=consumers,
                                                        run=lambda role, index: consumer(index))
-                                     if scopes_products(family) else consumer), producer)
+                                     if scopes_products(family) else consumer), producer, exclusive=True)
 
     products = forward_products(tiles, value_width, query.dtype, peaks=peaks, parts=parts)
     entry = functools.partial(_entry, program, layout, body, (scoped, rings, after, products),
