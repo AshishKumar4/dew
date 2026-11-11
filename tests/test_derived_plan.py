@@ -324,6 +324,31 @@ def test_a_split_the_derivation_refuses_is_still_asked_at_its_half_rung():
     assert str(asked.value) != base
 
 
+def test_a_run_that_states_its_split_and_remat_derives_nothing_and_compiles_once(monkeypatch, tmp_path):
+    """A run that states its split and its remat leaves the derivation nothing to choose: no footprint is
+    derived, before the search or for its compile, and the one compile decides (row 5479: a 4B decoder's
+    derivation held its first step 47 minutes at a split and remat the run had stated). Its record says so
+    ("stated"), and a run that leaves either to the plan derives as it did."""
+    from dew.training import _candidates
+
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    free(monkeypatch, LIMIT)
+    derived = []
+    real = _candidates.candidate_footprint
+    # Where a candidate step's footprint is derived (`_candidates._candidate`).
+    monkeypatch.setattr(_candidates, "candidate_footprint",
+                        lambda *args, **kwargs: derived.append(1) or real(*args, **kwargs))
+    stated = deep(REMAT_POLICIES["full"], split=1)
+    with Compiles("step") as compiles:
+        compiled(stated)
+    assert compiles.count == 1 and not derived
+    assert [entry["label"] for entry in stated.plan["derived"]] == ["stated"]
+    assert stated.plan["probes"][0]["derived_headroom"] is None and stated.plan["probes"][0]["fits"]
+    for left in (deep(REMAT_POLICIES["full"], split=None), deep(None, split=1)):
+        compiled(left)
+        assert derived and "stated" not in [entry["label"] for entry in left.plan["derived"]]
+
+
 def test_a_run_that_sets_its_remat_derives_its_own_rung_alone_and_compiles_there_once(monkeypatch, tmp_path):
     """A run that sets its remat compiles at it alone (row 2111), once, its split derived there; no rung
     below its own is traced for it, which cost a run every lighter rung's trace before its first step to
@@ -331,7 +356,7 @@ def test_a_run_that_sets_its_remat_derives_its_own_rung_alone_and_compiles_there
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
     free(monkeypatch, LIMIT)
     for remat in ("full", "save_qkv_proj"):
-        trainer = deep(REMAT_POLICIES[remat])
+        trainer = deep(REMAT_POLICIES[remat], split=None)
         with Compiles("step") as compiles:
             compiled(trainer)
         assert compiles.count == 1 and trainer.plan["remat"] == remat
@@ -349,7 +374,7 @@ def test_a_run_over_two_devices_that_sets_its_remat_derives_its_share_and_compil
     free(monkeypatch, LIMIT)
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=8, num_heads=2, mlp_features=64,
                               max_seq_len=256, remat=REMAT_POLICIES["full"])
-    trainer = Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0), split=1,
+    trainer = Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=2).build(jax.devices()[:2]))
     with Compiles("step") as compiles:
         compiled(trainer)
@@ -368,7 +393,7 @@ def test_a_run_over_a_tensor_axis_whose_footprint_the_derivation_cannot_judge_co
     free(monkeypatch, LIMIT)
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=8, num_heads=2, mlp_features=64,
                               max_seq_len=256, remat=REMAT_POLICIES["full"])
-    trainer = Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0), split=1,
+    trainer = Trainer(LMObjective(model, seq_len=256), optax.sgd(1e-2), key=jax.random.key(0),
                       mesh=MeshSpec(tensor=2).build(jax.devices()[:2]))
     with Compiles("step") as compiles:
         compiled(trainer)
@@ -387,14 +412,15 @@ def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monke
     each warning marked with the probe it names (`MODEL_MISS`), read whatever its wording (A40)."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
     free(monkeypatch, LIMIT)
-    sizing = deep(REMAT_POLICIES["full"])
+    # The split left to the plan, so the derivation judges what it compiles.
+    sizing = deep(REMAT_POLICIES["full"], split=None)
     compiled(sizing)
     (measured,) = sizing.plan["probes"]
     derived, compiled_need = LIMIT - measured["derived_headroom"], LIMIT - measured["headroom"]
     assert derived != compiled_need
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "between"))
     free(monkeypatch, (derived + compiled_need) // 2)
-    trainer = deep(REMAT_POLICIES["full"])
+    trainer = deep(REMAT_POLICIES["full"], split=None)
     refused: PlanRefused | None = None
     with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
         try:
