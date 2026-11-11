@@ -8,13 +8,15 @@ variables that wandb and the tokenizers read. So the library does it in
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import resource
+import select
 import signal
 import threading
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -49,12 +51,16 @@ if TYPE_CHECKING:
 
 EXECUTION_TIMEOUT = "30m"
 """How long one device execution of a process pool may run before XLA ends
-its process.
+its process: the stated bound on a rank that stalls alive.
 
 A rank that stalls without failing, blocked on a read or on a compile that
 waits for peers, leaves the other ranks inside a collective or a
-communicator's setup. No GPU backend times that out and no process reports it,
-so the pool would hang for ever with every process alive. XLA's execution
+communicator's setup. The coordination service knows a process that died (its
+heartbeats, `end_pool_on_failure`), not one that is alive and stalled, whose
+agent heartbeats on; no GPU backend times that out and no process reports it,
+so the pool would hang for ever with every process alive. Each source of such
+a stall failing on its own is the cause's fix (row 5402); a data read's
+already does (`dew.data.storage.IDLE_SECONDS`). XLA's execution
 watchdog ends a process whose execution runs past this, and `dew launch`,
 srun or the scheduler then stops the rest. An execution is a whole step or
 sampling loop, which can run for minutes, so the bound is generous;
@@ -324,6 +330,97 @@ class PreemptionNotice:
             return False
         self._asked += 1
         return multihost_utils.reached_preemption_sync_point(self._asked)
+
+
+class SignalWake:
+    """The main thread's waits on another thread, woken by a signal as by that thread's notice: CPython's
+    own mechanism (`signal.set_wakeup_fd`), installed by `fit` from the main thread for its life
+    (`installed`).
+
+    CPython runs a signal's Python handler only on the main thread, between bytecodes, and a signal that
+    trips as that thread enters a native lock wait leaves the wait blocked, the handler pending: a Ctrl-C
+    during a source's restore, which the prefetch worker holds until fit unwinds and asks it to stop,
+    never reached fit (rows 5215, 5229; 6 of 200 and 9 of 200 runs before, none after). Here the main
+    thread waits in one `select` on a pipe that the C-level handler writes each signal's number to and
+    the waited-on thread writes a zero to (`notify`), so a signal however it lands ends the wait and its
+    handler runs. A wakeup fd already set, an asyncio loop's, gets every signal's byte as before, each
+    forwarded to it as the pipe is read and when the wake is closed (`close`), which puts that fd back."""
+
+    def __init__(self):
+        self._read, self._write = os.pipe()
+        os.set_blocking(self._read, False)
+        os.set_blocking(self._write, False)
+        self._previous = signal.set_wakeup_fd(self._write, warn_on_full_buffer=False)
+        self._waiting = False
+        # poll, which takes any descriptor, where select takes none past FD_SETSIZE and a run raises the
+        # descriptor limit far past it (`_raise_limits`).
+        self._poll = select.poll()
+        self._poll.register(self._read, select.POLLIN)
+
+    def notify(self) -> None:
+        """Wake the main thread's wait (`wait`), called holding the condition it waits on: a byte only while
+        it waits, so notices never fill the pipe a signal's byte needs room in. A full pipe already holds a
+        byte that wakes it."""
+        if self._waiting:
+            with contextlib.suppress(BlockingIOError):
+                os.write(self._write, b"\0")
+
+    def wait(self, condition: threading.Condition, ready: Callable[[], object]) -> None:
+        """Wait, holding `condition`, until `ready()` holds, woken by a notice (`notify`) or a signal, whose
+        handler then runs here and may raise."""
+        while not ready():
+            self._waiting = True
+            condition.release()
+            try:
+                self._poll.poll()
+                self._drained()
+            finally:
+                condition.acquire()
+                self._waiting = False
+
+    def _drained(self) -> None:
+        """Empty the pipe, each signal's byte forwarded to the wakeup fd set before this one, as CPython's
+        own handler writes it: a byte a full fd cannot take is dropped, as CPython drops it."""
+        while True:
+            try:
+                read = os.read(self._read, 512)
+            except BlockingIOError:
+                return
+            signals = read.replace(b"\0", b"")
+            if signals and self._previous != -1:
+                with contextlib.suppress(BlockingIOError):
+                    os.write(self._previous, signals)
+
+    def close(self) -> None:
+        """Put back the wakeup fd this one replaced, the signals it holds forwarded to it."""
+        signal.set_wakeup_fd(self._previous)
+        self._drained()
+        os.close(self._read)
+        os.close(self._write)
+
+
+_WAKES: list[SignalWake] = []
+
+
+@contextlib.contextmanager
+def signal_wake() -> Iterator[None]:
+    """A `SignalWake` for the main thread's waits while the block runs (`installed`), closed on every exit;
+    on another thread, which no signal's handler runs on, none, and the waits there wait as they do."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    wake = SignalWake()
+    _WAKES.append(wake)
+    try:
+        yield
+    finally:
+        _WAKES.remove(wake)
+        wake.close()
+
+
+def installed() -> SignalWake | None:
+    """The innermost `signal_wake` installed, None where none is."""
+    return _WAKES[-1] if _WAKES else None
 
 
 def run_timestamp() -> str:

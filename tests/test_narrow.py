@@ -497,6 +497,7 @@ def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped(monkeypatch):
     assert not plan["narrow"] and state.compute is None
 
 
+@pytest.mark.check1_shards(seeds=8, per_task=2)
 def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads(monkeypatch):
     """Each shape a run meets plans its copies itself (`_at_base_rung`): where a longer batch fits only
     without them and a shorter one with them, the steps take turns, each reading the state as its own plan

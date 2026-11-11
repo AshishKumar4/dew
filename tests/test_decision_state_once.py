@@ -20,10 +20,10 @@ from dew.batch import unboxed
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Example
 from dew.decision.head import JointSchemaHead, LabelReadout
+from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import (
     HOWS,
     AnswerCue,
-    DecisionInputs,
     Instructions,
     OptionLines,
     QuestionLayout,

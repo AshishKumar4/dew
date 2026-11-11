@@ -11,6 +11,8 @@ import socket
 import subprocess
 import sys
 import threading
+import time
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
@@ -36,15 +38,17 @@ def keeping_picks() -> str:
 
 
 def fresh(script: str | Path, *arguments: str, cache_dir=None, flags: str | None = None,
-          source: Path = REPO_ROOT / "src", cwd: Path | None = None, platforms: str | None = None):
+          source: Path = REPO_ROOT / "src", cwd: Path | None = None, platforms: str | None = None,
+          variables: Mapping[str, str] | None = None):
     """`script`'s last printed JSON, run by a fresh interpreter on the package at `source` (this
     checkout's) and these tests: its text, or the file at its path, in `cwd` where given, compiling into
-    `cache_dir` under XLA `flags` where given, else into this process's cache under its flags, and seeing
-    the platforms `platforms` names where given (`JAX_PLATFORMS`), else this process's."""
+    `cache_dir` under XLA `flags` where given, else into this process's cache under its flags, seeing
+    the platforms `platforms` names where given (`JAX_PLATFORMS`), else this process's, and the
+    environment `variables` set over this process's."""
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join((str(source), str(REPO_ROOT / "tests"))),
                    **({} if cache_dir is None else {"JAX_COMPILATION_CACHE_DIR": str(cache_dir)}),
                    **({} if flags is None else {"XLA_FLAGS": flags}),
-                   **({} if platforms is None else {"JAX_PLATFORMS": platforms})}
+                   **({} if platforms is None else {"JAX_PLATFORMS": platforms}), **(variables or {})}
     command = [str(script)] if isinstance(script, Path) else ["-c", script]
     run = subprocess.run([sys.executable, *command, *arguments], env=environment, check=False,
                          capture_output=True, text=True, cwd=cwd)
@@ -120,11 +124,82 @@ def worker_env(devices: int) -> dict[str, str]:
             "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}"}
 
 
-def owned(command: Sequence[str], environment: Mapping[str, str]) -> subprocess.Popen[str]:
-    """`command` from the checkout under `environment`, its output piped, as a group its owner holds
-    (tools/armada/child_groups.py's `start`): its lifeline kills it as its owner dies, however it dies."""
-    return groups.start(command, cwd=REPO_ROOT, env=dict(environment), stdout=subprocess.PIPE,
-                        stderr=subprocess.STDOUT, text=True)
+class Drained:
+    """An owned process's merged output (`owned`), read by a thread of its own as it is written and kept,
+    each line passed to `sink` too where one is given: no process's pipe fills while its owner waits on
+    another, as an owner reading one rank to its end before the next would leave a rank that writes past
+    a pipe's 64 KiB blocked mid-write, and its peers waiting on it for ever (row 5434: a rank's 142 KB of
+    XLA warnings, its peer in a collective it never reached)."""
+
+    def __init__(self, process: subprocess.Popen[str], sink: Callable[[str], None] | None = None):
+        self.lines: list[str] = []
+        self.closed = False
+        """Whether its output has closed: every process holding it has ended."""
+        # Its command alone, for a timeout's error: the map that holds it is weakly keyed by the process.
+        self._command = process.args
+        self._written = threading.Condition()
+        self._reader = threading.Thread(target=self._read, args=(process, sink), daemon=True)
+        self._reader.start()
+
+    def _read(self, process: subprocess.Popen[str], sink: Callable[[str], None] | None) -> None:
+        try:
+            for line in process.stdout or ():
+                with self._written:
+                    self.lines.append(line)
+                    self._written.notify_all()
+                if sink is not None:
+                    sink(line)
+        finally:
+            with self._written:
+                self.closed = True
+                self._written.notify_all()
+
+    def line(self, index: int, timeout: float) -> str:
+        """The `index`th line it writes, once written; a TimeoutError where none is within `timeout`, an
+        EOFError where its output closes first."""
+        with self._written:
+            if not self._written.wait_for(lambda: len(self.lines) > index or self.closed, timeout):
+                raise TimeoutError(f"no line {index} within {timeout:.0f} s")
+            if len(self.lines) <= index:
+                raise EOFError(f"the process ended after {len(self.lines)} lines")
+            return self.lines[index]
+
+    def text(self, timeout: float | None = None) -> str:
+        """Everything it wrote, once its output has closed (every process holding it ended, a descendant
+        that kept it included); `subprocess.TimeoutExpired` where it is still open after `timeout`, as
+        `Popen.communicate` raises it."""
+        with self._written:
+            if not self._written.wait_for(lambda: self.closed, timeout):
+                raise subprocess.TimeoutExpired(self._command, timeout or 0.0, "".join(self.lines))
+            return "".join(self.lines)
+
+
+_DRAINED: "weakref.WeakKeyDictionary[subprocess.Popen[str], Drained]" = weakref.WeakKeyDictionary()
+
+
+def owned(command: Sequence[str], environment: Mapping[str, str],
+          sink: Callable[[str], None] | None = None) -> subprocess.Popen[str]:
+    """`command` from the checkout under `environment`, its merged output read as it comes (`drained`), as a
+    group its owner holds (tools/armada/child_groups.py's `start`): its lifeline kills it as its owner dies,
+    however it dies."""
+    process = groups.start(command, cwd=REPO_ROOT, env=dict(environment), stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True)
+    _DRAINED[process] = Drained(process, sink)
+    return process
+
+
+def drained(process: subprocess.Popen[str]) -> Drained:
+    """The output an owned process writes (`owned`), as it is read."""
+    return _DRAINED[process]
+
+
+def output(process: subprocess.Popen[str], timeout: float | None = None) -> str:
+    """An owned process's whole output once it exits and its output closes, as `Popen.communicate` reads
+    it; `subprocess.TimeoutExpired` where either runs past `timeout`."""
+    started = time.monotonic()
+    process.wait(timeout)
+    left = None if timeout is None else max(0.0, timeout - (time.monotonic() - started))
+    return drained(process).text(left)
 
 
 class Relayed(NamedTuple):
@@ -146,28 +221,18 @@ def relayed(command: Sequence[str], environment: Mapping[str, str], *, timeout: 
     gang's deadline kill it (row 4686: trains 670 and 671's lost gangs logged nothing of their children). One
     that runs past `timeout` is aborted for its faulthandler stacks, which pass through too, its group ended,
     and the test failed with its output's tail."""
-    process = owned(command, environment)
-    kept: list[str] = []
-
-    def relay() -> None:
-        for line in process.stdout or ():
-            sink(line)
-            kept.append(line)
-
-    reader = threading.Thread(target=relay, daemon=True)
-    reader.start()
+    process = owned(command, environment, sink)
     try:
-        process.wait(timeout)
+        written = output(process, timeout)
     except subprocess.TimeoutExpired:
         with contextlib.suppress(ProcessLookupError):
             os.kill(process.pid, signal.SIGABRT)
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(60)
         terminate(process)
-        reader.join(60)
-        pytest.fail(f"{' '.join(command)} did not end within {timeout:.0f} s\n{''.join(kept)[-12000:]}")
-    reader.join(60)
-    return Relayed(process.returncode, "".join(kept))
+        tail = drained(process).text()[-12000:]
+        pytest.fail(f"{' '.join(command)} did not end within {timeout:.0f} s\n{tail}")
+    return Relayed(process.returncode, written)
 
 
 def start_process(command: Sequence[str], devices: int, *,
@@ -218,14 +283,13 @@ class ProcessGroup:
             print(worker_outputs(self.running))
         else:
             for process in self.running:
-                process.communicate(timeout=60)
+                output(process, 60)
 
 
 def worker_outputs(pool: Sequence[subprocess.Popen[str]]) -> str:
     outputs = []
     for index, process in enumerate(pool):
-        output = process.communicate(timeout=60)[0]
-        outputs.append(f"--- process {index}, exit {process.returncode}\n{output}")
+        outputs.append(f"--- process {index}, exit {process.returncode}\n{output(process, 60)}")
     return "\n".join(outputs)
 
 
@@ -247,7 +311,7 @@ def stuck(pool: Sequence[subprocess.Popen[str]], what: str) -> str:
 def report_of(process: subprocess.Popen[str], out: Path, timeout: float = 600,
               pool: Sequence[subprocess.Popen[str]] | None = None) -> dict:
     try:
-        log = process.communicate(timeout=timeout)[0]
+        log = output(process, timeout)
     except subprocess.TimeoutExpired:
         pytest.fail(stuck([process] if pool is None else pool,
                           f"let {out.name} finish within {timeout}s"))

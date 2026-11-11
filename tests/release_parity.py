@@ -4,8 +4,10 @@ one harness lays out through Dew's public loader and judges by check 1 (`assert_
 
 A recording's site holds, stacked on its seeds, the rows the engine laid (`tokens` `[R, L]`, `lengths` `[R]`,
 `options` `[R, Q, O]` or `[R, O]` the real options, `spans` their spans, `blocks` where its rows are read in
-blocks) and its answers (`scores`, each real option's logit; a `probe` beside them, the gradients of their
-probed sum the engine took, `gradient.hidden` and `gradient.<name>` of the head's parameters). A release is
+blocks, and where its requests show pictures, `images` `[R, P, H, W, 3]` and how many of them each request
+carries, `image_counts` `[R]`) and its answers (`scores`, each real option's logit; a `probe` beside them,
+the gradients of their probed sum the engine took, `gradient.hidden` and `gradient.<name>` of the head's
+parameters). A release is
 declared by its directory, its requests, the site, and the names its engine gives the head's parameters.
 """
 
@@ -22,6 +24,7 @@ import numpy as np
 from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 
 from dew.batch import part
+from dew.nn.inputs import ModelInputs
 
 
 @dataclass(frozen=True)
@@ -48,9 +51,13 @@ class ReleaseParity:
 
 def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
     """Load `parity`'s release through Dew's public loader (`Pretrained.load`, `Decide.of`), lay each
-    seed's requests out, assert the rows the engine laid exactly (tokens, option spans, blocks), and judge
-    its scores and the gradients the recording holds by check 1."""
+    seed's requests out, a request's recorded pictures before its state by the release's own processor,
+    assert the rows the engine laid exactly (tokens, option spans, blocks), and judge its scores and the
+    gradients the recording holds by check 1."""
+    from PIL import Image
+
     from dew.decision import Decide, DecisionInputs, Question
+    from dew.decision.images import Images
     from dew.interop import Pretrained
 
     # A release of an engine outside Dew states no task of Dew's: its bundle's (`Decide.of`).
@@ -61,8 +68,19 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
     requests = json.loads(parity.requests.read_text())
 
     @jax.jit
-    def scored(inputs):
-        return task.model.logits(task.variables, inputs)
+    def scored(inputs, media=None):
+        return task.model.logits(task.variables, inputs, media=media)
+
+    def batched(rows, shown, tokens, mask) -> ModelInputs:
+        # The backbone's inputs for a seed's rows of pictures as its engine batched them: its padded
+        # tokens, each row's per-token fields over its row and 0 past it, and the pixel fields joined in
+        # the processor's batch order.
+        assert task.processor is not None, "a release whose engine read pictures loads with its processor"
+        aligned = {name: np.concatenate([
+            np.pad(images.spread(row)[name], ((0, 0), (0, tokens.shape[1] - len(row.tokens))))
+            for row, images in zip(rows, shown, strict=True)]) for name in shown[0].aligned}
+        fields = {name: np.concatenate([images.fields[name] for images in shown]) for name in shown[0].fields}
+        return task.processor.from_hf({"input_ids": tokens, "attention_mask": mask, **aligned, **fields})
 
     @jax.jit
     def head_alone(inputs, states):
@@ -95,10 +113,16 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
         # A recording of one question a row states it `[R, O]`; every question its own `[R, Q, O]`.
         options = held["options"] if held["options"].ndim == 3 else held["options"][:, None]
         spans = held["spans"] if held["spans"].ndim == 4 else held["spans"][:, None]
-        rows = []
-        for request in requests[int(index)]:
+        rows, shown = [], []
+        for at, request in enumerate(requests[int(index)]):
             questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
-            rows.extend(task.layout.rows(task.tokenizer, task.specials, request["state"], questions))
+            if "images" in held:
+                assert task.processor is not None
+                pictures = held["images"][at, :held["image_counts"][at]]
+                shown.append(Images.of(task.processor, [Image.fromarray(picture) for picture in pictures],
+                                       task.processor.image_text()))
+            rows.extend(task.layout.rows(task.tokenizer, task.specials, request["state"], questions,
+                                         media=shown[-1].tokens if shown else ()))
         laid = DecisionInputs.collate(rows, task.specials.pad, questions=options.shape[1],
                                       options=options.shape[2])
         mask = np.arange(held["tokens"].shape[1])[None] < held["lengths"][:, None]
@@ -123,6 +147,8 @@ def assert_answers_as_its_engine(parity: ReleaseParity, scratch: Path) -> None:
             probe = np.zeros(options.shape, np.float32)
             probe[options] = held["probe"]
             result = forward(inputs, jnp.asarray(probe))
+        elif shown:
+            result = {"scores": scored(inputs, batched(rows, shown, held["tokens"], mask))}
         else:
             result = {"scores": scored(inputs)}
         scores = np.asarray(result["scores"])

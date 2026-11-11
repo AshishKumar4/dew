@@ -216,6 +216,57 @@ def test_an_immutable_put_reads_again_only_an_upload_that_reads_back_otherwise()
     assert (calls["writes"], calls["reads"]) == (1, 0)
 
 
+def test_an_immutable_put_to_a_store_that_reads_its_writes_back_at_once_refuses_other_bytes_at_once():
+    """A store that states a write is read back at once (`READ_AFTER_WRITE`: this process's memory here, S3
+    and GCS as their makers state it) holds what it took: an object it reads back otherwise was written
+    otherwise, refused on its first read whatever the retries."""
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    reads = []
+
+    class Garbling(MemoryFileSystem):
+        protocol = ("garbling", "memory")
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(path.replace("garbling://", "memory://", 1))
+
+        def cat_file(self, path, *args, **kwargs):
+            reads.append(path)
+            return super().cat_file(path, *args, **kwargs)[::-1]
+
+    fsspec.register_implementation("garbling", Garbling, clobber=True)
+    with pytest.raises(OSError, match="did not verify"):
+        Store(f"garbling://storage-{uuid4().hex}/value").put_immutable(b"payload", retries=5)
+    assert len(reads) == 1
+
+
+def test_a_gcs_read_whose_store_goes_silent_fails_rather_than_waiting(monkeypatch):
+    """A GCS store that takes a connection and never answers fails the transfer once it has been idle
+    `IDLE_SECONDS`, as an S3 transfer does by botocore's own bound, where gcsfs bounds none: a close that
+    waits out its transfers (`dew.data.cache`) ends when its store is gone."""
+    import socket
+
+    import aiohttp
+
+    from dew.data import storage
+
+    monkeypatch.setattr(storage, "IDLE_SECONDS", 1)
+    silent = socket.socket()
+    silent.bind(("127.0.0.1", 0))
+    silent.listen()
+    taken = []
+    threading.Thread(target=lambda: taken.append(silent.accept()), daemon=True).start()
+    store = Store(f"gs://silent-{uuid4().hex}/object",
+                  {"endpoint_url": f"http://127.0.0.1:{silent.getsockname()[1]}", "token": "anon"})
+    try:
+        with pytest.raises((OSError, TimeoutError, aiohttp.ClientError)):
+            store.read()
+        assert taken
+    finally:
+        silent.close()
+
+
 def test_two_finalizers_publish_only_one_snapshot(store):
     start = threading.Barrier(2)
 
@@ -618,9 +669,10 @@ class _Observed:
         self.directory = str(directory)
 
     def __call__(self, row):
-        from dew.data.storage import mirror_metrics
+        from dew.data.storage import Mirrored
 
-        Path(self.directory, f"{os.getpid()}.json").write_text(json.dumps(mirror_metrics()))
+        # A loading worker is a process of its own: its mirrors' counters since it began are its reads'.
+        Path(self.directory, f"{os.getpid()}.json").write_text(json.dumps(Mirrored().metrics()))
         return row
 
 
@@ -669,9 +721,10 @@ def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers
     from dew.data import Loading
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
-    from dew.data.storage import mirror_metrics
+    from dew.data.storage import Mirrored
 
     (tmp_path / "observed").mkdir()
+    since = Mirrored.now()
     chain = _mirrored_store(tmp_path).repeat(1).batch(1)
     loader = compile(chain.elastic() if elastic else chain, read=read, steps=10**9,
                      loading=Loading(workers=workers, max_workers=2, threads=1, read_buffer=1,
@@ -685,8 +738,59 @@ def test_a_runs_mirror_metrics_count_its_loading_workers_reads(tmp_path, workers
     workers_did = _workers_counters(tmp_path / "observed")
     in_workers = not (workers == "auto" and read == "streamed" and not elastic)
     assert (workers_did["data/mirror/misses"] > 0) == in_workers
-    own = mirror_metrics()
-    assert {name: statistics[name] for name in COUNTED} == {name: own[name] + workers_did[name]
+    own = since.metrics()
+    assert {name: statistics[name] for name in COUNTED} == {name: own.get(name, 0.0) + workers_did[name]
+                                                            for name in COUNTED}
+
+
+def test_a_run_counts_its_own_mirror_reads_never_an_earlier_readers_of_its_process(tmp_path):
+    """A run whose reads go through no mirror logs no mirror counters, though a reader before it in its
+    process read through one (rows 5220, 5221: such a run logged that reader's hits and misses as its
+    own)."""
+    from dew.data import Loading, Memory
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+
+    earlier = Store(f"dewcache::memory://earlier-{uuid4().hex}/object",
+                    {"dewcache": {"cache_storage": str(tmp_path / "earlier"), "max_bytes": 1024}})
+    earlier.put_if_absent(b"read before the run")
+    assert earlier.read() == b"read before the run"
+    loader = compile(Memory([{"id": index} for index in range(8)]).batch(2), loading=Loading(workers=0))
+    reader = loader.train(DataPartition())
+    try:
+        assert len(list(reader)) == 4
+        statistics = dict(loader.statistics())
+    finally:
+        reader.close()
+    assert not any(name.startswith("data/mirror/") for name in statistics)
+
+
+def test_a_memory_read_counts_the_mirror_reads_its_compile_made(tmp_path):
+    """A memory read downloads its corpus through the mirror as its compile measures and holds it, before
+    any reader is built: its run counts those reads, its own, and nothing an earlier reader of its process
+    read (rows 5220, 5258)."""
+    from dew.data import Loading
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.data.storage import Mirrored
+
+    (tmp_path / "observed").mkdir()
+    earlier = Store(f"dewcache::memory://earlier-{uuid4().hex}/object",
+                    {"dewcache": {"cache_storage": str(tmp_path / "earlier"), "max_bytes": 1024}})
+    earlier.put_if_absent(b"read before the run")
+    assert earlier.read() == b"read before the run"
+    since = Mirrored.now()
+    loader = compile(_mirrored_store(tmp_path).repeat(1).batch(1), read="memory",
+                     loading=Loading(workers=0, cache=False))
+    compiled = since.metrics()
+    reader = loader.train(DataPartition())
+    try:
+        assert len(list(reader)) == 40
+        statistics = dict(loader.statistics())
+    finally:
+        reader.close()
+    assert compiled["data/mirror/misses"] > 0
+    assert {name: statistics[name] for name in COUNTED} == {name: since.metrics().get(name, 0.0)
                                                             for name in COUNTED}
 
 
@@ -696,7 +800,7 @@ def test_a_reader_restored_mid_read_counts_its_own_workers_mirror_reads_alone(tm
     from dew.data import Loading
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
-    from dew.data.storage import mirror_metrics
+    from dew.data.storage import Mirrored
 
     (tmp_path / "observed").mkdir()
     chain = _mirrored_store(tmp_path).repeat(1).batch(1)
@@ -713,6 +817,7 @@ def test_a_reader_restored_mid_read_counts_its_own_workers_mirror_reads_alone(tm
         first.close()
     for path in (tmp_path / "observed").glob("*.json"):
         path.unlink()
+    since = Mirrored.now()
     loader = compile(chain, read="streamed", loading=loading, resume="non-exact")
     reader = loader.train(DataPartition())
     try:
@@ -721,6 +826,6 @@ def test_a_reader_restored_mid_read_counts_its_own_workers_mirror_reads_alone(tm
         statistics = dict(loader.statistics())
     finally:
         reader.close()
-    own, workers_did = mirror_metrics(), _workers_counters(tmp_path / "observed")
-    assert {name: statistics[name] for name in COUNTED} == {name: own[name] + workers_did[name]
+    own, workers_did = since.metrics(), _workers_counters(tmp_path / "observed")
+    assert {name: statistics[name] for name in COUNTED} == {name: own.get(name, 0.0) + workers_did[name]
                                                             for name in COUNTED}

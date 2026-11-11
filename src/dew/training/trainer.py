@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import itertools
 import logging
 import os
 import sys
@@ -21,7 +22,7 @@ import time
 import types
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from itertools import accumulate, pairwise
-from typing import TYPE_CHECKING, Generic, Protocol
+from typing import TYPE_CHECKING, Generic, Protocol, Unpack
 
 import jax
 import jax.numpy as jnp
@@ -66,7 +67,7 @@ from dew.inputs import Field, InputSpec
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels.generation import gpu_target
-from dew.nn.kernels.options import owned_program
+from dew.nn.kernels.options import owned_program, shapes_of
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import Link, Schedule, boxed, measured_links, pipeline_microbatches
 from dew.objectives.base import (
@@ -80,6 +81,7 @@ from dew.objectives.base import (
     taken_record,
 )
 from dew.optim import STACKED_OPTIMIZERS, declaring, held_rates, scaled_rates, settable_rates, with_rates
+from dew.registry import Unrecordable
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
@@ -88,6 +90,7 @@ from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitSt
 from dew.training._candidates import Stepping, candidate_for, lowered_for, prepared_for
 from dew.training._fit import (
     Emptied,
+    FitArguments,
     FitPlan,
     FitRun,
     HandedSplits,
@@ -114,7 +117,7 @@ from dew.training._fit import (
 )
 from dew.training._lowering import Lowered, routed
 from dew.training.budget import Pause, Plateau
-from dew.training.cadence import Cadence, Counted
+from dew.training.cadence import Counted
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -132,7 +135,16 @@ from dew.training.distributed import (
     step_reads,
     traced_start,
 )
-from dew.training.evaluation import COOLDOWN, EvalSuite, Evaluation, Split, Summary, admit_split, episodic
+from dew.training.evaluation import (
+    COOLDOWN,
+    EvalSuite,
+    Evaluation,
+    Split,
+    Summary,
+    admit_split,
+    episodic,
+    warmed_ahead,
+)
 from dew.training.footprint import Footprint, traced_loss
 from dew.training.inspection import Inspection
 from dew.training.interval import Interval, Reading, Taken, TokenClock, copied, logged_scalars
@@ -173,7 +185,7 @@ from dew.training.planning import (
 from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, reported_window, waited_export
 from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
-from dew.training.runtime import Preempted, PreemptionNotice, ready_process
+from dew.training.runtime import Preempted, PreemptionNotice, ready_process, signal_wake
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
 from dew.training.staging import fetched
@@ -746,14 +758,15 @@ class Trainer(Generic[Loss, Effects]):
     def _artifact(self) -> JSON:
         """The objective's inference record, which a checkpoint carries for
         loaders. Training and resuming never read it, so a model or component
-        no record can describe still checkpoints: the record says why, a
-        loader raises that, and the first checkpoint warns it, as it does a
-        model defined where no import path reaches it (`__main__`, a function)."""
+        no record can describe (`dew.registry.Unrecordable`: one defined where no import path reaches it,
+        `__main__` or a function, or holding what no record carries) still checkpoints: the record says
+        why, a loader raises that, and the first checkpoint warns it. Any other error is the record's own
+        bug, and raises."""
         artifact: JSON
         reason = None
         try:
             artifact = self.objective.inference_record()
-        except (KeyError, TypeError, ValueError) as error:
+        except Unrecordable as error:
             reason = f"{type(self.objective).__name__}: {error}"
             artifact = {'unrecorded': reason}
         if reason is not None and reason != self._unrecorded:
@@ -1142,8 +1155,8 @@ class Trainer(Generic[Loss, Effects]):
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
 
-        def lower(split: int, narrow: bool, footprint: Footprint | None = None, derived: bool = True,
-                  lowering=True) -> Candidate:
+        def lower(split: int, narrow: bool, footprint: Footprint | None = None, *, derived: bool = True,
+                  lowering: bool = True) -> Candidate:
             rung = {**self._rung(), 'narrow': narrow, 'split': split}
             return candidate_for(self._stepping(), state, batch, schedule, placement, replicated, split,
                                  narrow, recorded_launches(recorded, rung), lowering=lowering,
@@ -1241,27 +1254,9 @@ class Trainer(Generic[Loss, Effects]):
         self,
         dataset: Dataset | Loader | Handed,
         *,
-        steps: int | None = None,
-        epochs: int | None = None,
-        tokens: int | None = None,
-        examples: int | None = None,
-        log_every: int | str | Counted = 100,
-        eval_every: int | str | Counted | None = None,
-        checkpoint_every: int | str | Counted | datetime.timedelta | None = None,
-        checkpoint_final: bool = True,
-        metrics: Sequence[Metric] = (),
-        preview: bool = False,
-        scored_to: str | os.PathLike[str] | None = None,
-        best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None = None,
-        stop: Plateau | Pause | None = None,
-        validation: HandedSplits | None = None,
-        summaries: Sequence[Summary] = (),
-        restore_best: bool = False,
         state: TrainState | None = None,
-        observe: Observe | None = None,
-        device_prefetch: int = PREFETCH_DEPTH,
         resume: Resume = "auto",
-        cooldowns: Cooldowns | None = None,
+        **asked: Unpack[FitArguments],
     ) -> TrainState:
         """Train until the step or real-token cap is reached, resuming the latest checkpoint as `resume` says;
         return the state as the run holds it, which over a pipeline's stages its model reads off the mesh
@@ -1312,60 +1307,79 @@ class Trainer(Generic[Loss, Effects]):
         (`dew.training.runtime.ready_process`), as `prepare_process` readies it: a program that never called
         that gets Dew's log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
-        self._startup = Startup()
-        loader, held, tokens, steps, examples = run_data(
-            self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
-            examples=examples, accumulation=self.accumulation, startup=self._startup)
-        self.reading(loader, device_prefetch, examples=examples, steps=steps)
-        self.scheduled(None if steps is None else steps // self.accumulation)
-        plan = self._plan(loader, held, dataset, steps=steps, tokens=tokens,
-                          written=(log_every, eval_every, checkpoint_every),
-                          checkpoint_final=checkpoint_final, metrics=metrics, preview=preview,
-                          scored_to=scored_to, best=best, stop=stop, summaries=summaries,
-                          restore_best=restore_best, observe=observe, cooldowns=cooldowns)
-        run = FitRun(time.perf_counter())
-        # A display of this fit's own: one before it may have run other steps.
-        self._display = TrainingDisplay()
-        profile, checkpoints, profiler = self.profile, self.checkpoints, owned_capture(self.profile)
-        # One boundary lookup at setup: the prefetch worker and the step scopes share whichever profiler
-        # owns the capture.
-        tracer = profiler if profiler is not None else telemetry_profile.active_profile()
-        try:
-            # A run handed a step compiled ahead runs every program compiled with it as compiled (`_taking`).
-            with self._taking():
-                trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state,
-                                              resume)
-            # The state a checkpoint would hold: the step rebuilds its narrow copies.
-            trained = dataclasses.replace(trained, compute=None)
-            # Whether this fit trained or found the run complete, inside the lifecycle, so a selection
-            # that fails is the run's outcome.
-            if restore_best and run.preempted is None:
-                trained = self._best_model(trained, run)
-        finally:
-            primary = sys.exception()
-            error = self._closed(run, primary, profiler)
-            if primary is None and error is not None:
-                raise error
+        # The main thread's waits on the data's workers take a signal however it lands (`signal_wake`),
+        # from the plan's first read of the data on.
+        with signal_wake():
+            plan = self._fit_plan(dataset, **asked)
+            run = FitRun(time.perf_counter())
+            # A display of this fit's own: one before it may have run other steps.
+            self._display = TrainingDisplay()
+            profile, checkpoints, profiler = self.profile, self.checkpoints, owned_capture(self.profile)
+            # One boundary lookup at setup: the prefetch worker and the step scopes share whichever profiler
+            # owns the capture.
+            tracer = profiler if profiler is not None else telemetry_profile.active_profile()
+            try:
+                # A run handed a step compiled ahead runs every program compiled with it as compiled
+                # (`_taking`).
+                with self._taking():
+                    trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state,
+                                                  resume)
+                # The state a checkpoint would hold: the step rebuilds its narrow copies.
+                trained = dataclasses.replace(trained, compute=None)
+                # Whether this fit trained or found the run complete, inside the lifecycle, so a selection
+                # that fails is the run's outcome.
+                if plan.restore_best and run.preempted is None:
+                    trained = self._best_model(trained, run)
+            finally:
+                primary = sys.exception()
+                error = self._closed(run, primary, profiler)
+                if primary is None and error is not None:
+                    raise error
         if run.preempted is not None:
             raise Preempted(run.preempted)
         # One stage's scan holds its runs stacked for its step alone: the state a run returns holds them on
         # their stored layers, as every reader by layer name reads them, at no device's cost but the copy.
         return trained if self._staging.stages > 1 else self.stored(trained)
 
-    def _plan(self, loader: Loader, held: Mapping[str, Split | EvalSuite] | None,
-              dataset: Dataset | Loader | Handed, *, steps: int | None, tokens: int | None,
-              written: tuple[Cadence | str, Cadence | str, Cadence | str | datetime.timedelta],
-              checkpoint_final: bool, metrics: Sequence[Metric], preview: bool,
-              scored_to: str | os.PathLike[str] | None,
-              best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None,
-              stop: Plateau | Pause | None, summaries: Sequence[Summary], restore_best: bool,
-              observe: Observe | None, cooldowns: Cooldowns | None) -> FitPlan:
-        """What `fit` was asked for over its compiled data: its cadences resolved against the run's
-        length (`FitPlan.cadences`), its scores declared, its best and stop policies, and its refusals
-        made before anything is placed (`_preflight`)."""
+    def _fit_plan(
+        self,
+        dataset: Dataset | Loader | Handed,
+        *,
+        steps: int | None = None,
+        epochs: int | None = None,
+        tokens: int | None = None,
+        examples: int | None = None,
+        log_every: int | str | Counted = 100,
+        eval_every: int | str | Counted | None = None,
+        checkpoint_every: int | str | Counted | datetime.timedelta | None = None,
+        checkpoint_final: bool = True,
+        metrics: Sequence[Metric] = (),
+        preview: bool = False,
+        scored_to: str | os.PathLike[str] | None = None,
+        best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None = None,
+        stop: Plateau | Pause | None = None,
+        validation: HandedSplits | None = None,
+        summaries: Sequence[Summary] = (),
+        restore_best: bool = False,
+        observe: Observe | None = None,
+        device_prefetch: int = PREFETCH_DEPTH,
+        cooldowns: Cooldowns | None = None,
+    ) -> FitPlan:
+        """What `fit` over these arguments (`FitArguments`) runs, before it places anything: its data compiled
+        and read (`run_data`, `reading`), its optimizer built for its updates (`scheduled`), and its
+        cadences, scores and policies (`FitPlan`). Its defaults are `fit`'s, stated here alone, which a run
+        compiled ahead plans its evaluations by too (`dew.training.ahead.fit_plan`)."""
+        self._startup = Startup()
+        loader, held, tokens, steps, examples = run_data(
+            self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
+            examples=examples, accumulation=self.accumulation, startup=self._startup)
+        self.reading(loader, device_prefetch, examples=examples, steps=steps)
+        self.scheduled(None if steps is None else steps // self.accumulation)
+        # Its cadences resolved against the run's length, its scores declared, its best and stop policies,
+        # and its refusals made before anything is placed (`_preflight`).
         logged, evaluated, saved, local, suites = FitPlan.cadences(
-            loader, held, metrics, steps, tokens, self.accumulation, written, self.checkpoints,
-            self._examples)
+            loader, held, metrics, steps, tokens, self.accumulation,
+            (log_every, eval_every, checkpoint_every), self.checkpoints, self._examples)
         declared = declarations(suites, metrics, summaries, loss=self.objective.defines_validation_loss)
         selection, plateau, pause = fit_policies(self.objective, best, stop, declared, saved, steps=steps,
                                                  tokens=tokens, accumulation=self.accumulation,
@@ -1378,7 +1392,8 @@ class Trainer(Generic[Loss, Effects]):
             checkpoint_every=saved, checkpoint_final=checkpoint_final, local_every=local,
             metrics=metrics, preview=preview and self.tracker is not None, best=selection, stop=plateau,
             suites=suites, pause=pause, scored_to=None if scored_to is None else os.fspath(scored_to),
-            held_best=restore_best and self.checkpoints is None, observe=observe, summaries=tuple(summaries),
+            held_best=restore_best and self.checkpoints is None, restore_best=restore_best, observe=observe,
+            summaries=tuple(summaries),
             declared=declared, branches=() if cooldowns is None else cooldowns.branches(
                 steps, tokens, self.accumulation, self._examples),
         )
@@ -2039,8 +2054,7 @@ class Trainer(Generic[Loss, Effects]):
         # already: only the others are scored now, joined to the scores that step reported.
         joined = run.evaluation if run.evaluation is not None and run.evaluation.step == current else None
         scored = run.scored if joined is not None else frozenset()
-        if ((plan.validation or plan.eval_every or plan.best or plan.stop or plan.held_best)
-                and run.preempted is None and run.paused is None):
+        if plan.evaluates and run.preempted is None and run.paused is None:
             missing = [name for name in plan.suites if name not in scored]
             if not plan.suites or missing:
                 run.evaluation = self._evaluation(plan, state, shardings, run.training, missing,
@@ -2087,6 +2101,49 @@ class Trainer(Generic[Loss, Effects]):
             for split, suite in plan.suites.items():
                 admit_split(self.objective, suite.data, self.device_mesh, split)
 
+    def _warmed_ahead(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState]) -> None:
+        """The programs `_warm_evaluations` compiles, called over `state`, the run's first state as shapes
+        placed by `shardings`, where a run compiled ahead collects them (`dew.training.ahead.started`):
+        each suite's warming pass (`dew.training.evaluation.warmed_ahead`) where it evaluates midway, and
+        its evaluations' own where those score otherwise (writing what it scores, `scored_to`), the event
+        alone where no suite is scored, over the weights, averaged weights and key `_evaluate` reads
+        (`_fetched`), under the rules it scores under (`_scoring`): a run that evaluates at its end alone
+        runs those as well."""
+        if not plan.evaluates:
+            return
+        # A warming pass writes nothing; an evaluation writes what it scores where the run says where.
+        kinds = {*((False,) if plan.evaluates_midway else ()), plan.scored_to is not None}
+        averaged = with_ema(state.variables, self._fetched(state, shardings).ema)
+        # The step the objective's schedules read, of the dtype `_schedule_step` reads it in.
+        counters = {name: np.ones(getattr(state, name).shape, getattr(state, name).dtype)
+                    for name in ("microstep", "window_size")}
+        schedule = shapes_of(jax.ShapeDtypeStruct((), self._schedule_step(dataclasses.replace(state,
+                                                                                            **counters)).dtype))
+        scored = self._scored(plan) or [(None, None, False)]
+        with self._scoring(self.device_mesh):
+            for (_, suite, loss), kept in itertools.product(scored, sorted(kinds)):
+                warmed_ahead(self.objective, state.variables, None if suite is None else suite.data,
+                             self.device_mesh, key=state.key, schedule=schedule, averaged=averaged,
+                             metrics=() if suite is None else suite.metrics, loss=loss, kept=kept)
+
+    def _scored(self, plan: FitPlan, names: Sequence[str] | None = None) -> list[tuple[str, EvalSuite, bool]]:
+        """The suites in `names`, every suite when None, each by its split and whether an evaluation scores
+        its loss: wherever the objective defines one, and where the loss ranks the run's checkpoints or
+        the state it holds, which preflight checks it can, unless a metric of the suite is the loss."""
+        ranks = (self.checkpoints is not None or plan.held_best) and not plan.best
+        return [(split, suite, (ranks or self.objective.defines_validation_loss)
+                 and not any(metric.name == 'loss' for metric in suite.metrics))
+                for split, suite in ((split, plan.suites[split])
+                                     for split in (plan.suites if names is None else names))]
+
+    @contextlib.contextmanager
+    def _scoring(self, mesh: Mesh) -> Iterator[None]:
+        """The rules an evaluation on `mesh` traces its programs under: the microbatch count, the layout's
+        rules and the mesh's links (`_evaluate`, `_warmed_ahead`)."""
+        with (pipeline_microbatches(self.microbatches),
+              nn.logical_axis_rules(self.layout.axis_rules), measured_links(self._links(mesh))):
+            yield
+
     def _consumed(self, *intervals: Interval) -> int | None:
         """The examples a run on the examples clock had consumed, as its host counted them over `intervals`
         (`Interval.consumed`: the run's, and a cooldown branch's beyond it), the count its log records;
@@ -2105,18 +2162,12 @@ class Trainer(Generic[Loss, Effects]):
         reports nothing (`_warm_evaluations`)."""
         ranks = self.checkpoints is not None or plan.best or plan.stop or plan.held_best
         reports = training if ranks and not warm else None
-        chosen = list(plan.suites if names is None else names)
+        chosen = self._scored(plan, names)
         if not chosen:
             return self._evaluate(state, shardings, None, (), plan.preview, split="val", training=reports,
                                   warm=warm, examples=examples, cooled=cooled)
         evaluations = []
-        for split in chosen:
-            suite = plan.suites[split]
-            # The loss is recorded wherever the objective defines one, and is scored where it ranks
-            # the run's checkpoints or the state it holds, which preflight checks it can.
-            ranks = (self.checkpoints is not None or plan.held_best) and not plan.best
-            loss = ((ranks or self.objective.defines_validation_loss)
-                    and not any(metric.name == 'loss' for metric in suite.metrics))
+        for split, suite, loss in chosen:
             evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
                                               loss=loss, split=split, training=reports, warm=warm,
                                               scored_to=plan.scored_to, examples=examples, cooled=cooled))
@@ -2408,8 +2459,7 @@ class Trainer(Generic[Loss, Effects]):
         # The rules and the microbatch count; `Evaluation.run` scores under the mesh itself, and
         # previews decode outside it. The objective's schedules read steps, as training does
         # (`Transaction`): a window of window_size microbatches is `accumulation` steps.
-        with (pipeline_microbatches(self.microbatches),
-              nn.logical_axis_rules(self.layout.axis_rules), measured_links(self._links(mesh))):
+        with self._scoring(mesh):
             evaluation = Evaluation.run(
                 self.objective, params, reader, metrics=metrics, key=key,
                 step=state.step, schedule_step=self._schedule_step(state),

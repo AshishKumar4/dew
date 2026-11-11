@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Annotated, ClassVar, TypedDict
+from typing import TYPE_CHECKING, Annotated, TypedDict
 
 import jax
 import numpy as np
@@ -136,7 +136,6 @@ class TeacherArguments(TypedDict, total=False):
 class DiffusionRunConfig(RunConfig):
     """A diffusion run's configuration: the shared run fields plus the diffusion objective's own settings."""
 
-    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {**RunConfig._FLAG_SELECTED, "rollout": "rollout"}
 
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))

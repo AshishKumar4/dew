@@ -182,8 +182,6 @@ class EnvRunConfig(RunConfig):
     updates from there at its own pace. The run has no epochs, so its
     trainer validates and checkpoints at the cadences it names, none by default, and at its end."""
 
-    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {**RunConfig._FLAG_SELECTED, "env": "env",
-                                                   "teacher": "teacher"}
     RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "env", "episodes", "rollout")
     BUILT: ClassVar[tuple[str, ...]] = (*RunConfig.BUILT, "teacher.step")
 

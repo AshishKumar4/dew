@@ -482,7 +482,7 @@ shell.run_cell({cell!r}).raise_error()
     assert json.loads(lines[-1].removeprefix("ran ")) == [[8, 8, 8, 8, 8], 20, True, [True, True, True]]
     assert [line for line in lines if line.startswith("Live run:")] == [
         "Live run: batch 64 -> 8, so it fits a shared 4-vCPU host."] * 6 + [
-        "Live run: steps 1000 -> 20, log_every 100 -> 5, so it finishes in about two minutes."]
+        "Live run: steps 1000 -> 20, log_every (its default) -> 5, so it finishes in about two minutes."]
 
 
 def test_a_session_idle_past_its_allowance_ends_and_says_so(bridge, monkeypatch):

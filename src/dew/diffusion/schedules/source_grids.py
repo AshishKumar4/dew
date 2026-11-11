@@ -94,10 +94,12 @@ def _interpolate(x, xp, fp):
     jnp.interp finds it by bisection, a loop of log2(len(xp)) steps. Inside
     `sample`'s scan with one row, XLA rewrites the table reads into dynamic
     slices whose offsets come out of that loop, and XLA:GPU's
-    DynamicSliceAnnotator (jax 0.11.1) evaluates each offset without running
-    the loop, then fails the whole compile on the unknown value instead of
-    skipping the slice (openxla/xla#49299). A grid holds a few dozen points,
-    so comparing against all of them costs nothing and leaves no loop.
+    DynamicSliceAnnotator evaluates each offset without running the loop,
+    then fails the whole compile on the unknown value instead of skipping the
+    slice (openxla/xla#49299, open as of 2026-11-10, so in the XLA jaxlib
+    0.12.0.1 builds). A grid holds a few dozen points, the size JAX's own
+    `compare_all` search is for, so comparing against all of them costs
+    nothing and leaves no loop.
     """
     x = jnp.asarray(x, jnp.float32)
     i = jnp.clip(jnp.searchsorted(xp, x, side="right", method="compare_all"), 1, len(xp) - 1)

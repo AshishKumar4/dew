@@ -564,6 +564,23 @@ def siblings(frontier: Frontier, program: jcore.Jaxpr) -> tuple[dict[int, int], 
             if not frontier.fusing(equation)}
     position = {out: index for index, equation in enumerate(program.eqns) for out in equation.outvars}
 
+    # Each value's storage and element count are read once: a program's products pair their operands by
+    # the thousand (a hybrid MoE step asked 1.2 million pairs, each walking its two values' storage anew:
+    # 2.5 million walks, 552 s of a 633 s derivation, row 5360).
+    stored: dict[jcore.Var, frozenset[jcore.Var]] = {}
+    counted: dict[jcore.Var, int] = {}
+
+    def roots(value) -> frozenset[jcore.Var]:
+        """The storage `value` reads (`Frontier.roots`)."""
+        if value not in stored:
+            stored[value] = frozenset(frontier.roots([value]))
+        return stored[value]
+
+    def elements(value) -> int:
+        if value not in counted:
+            counted[value] = math.prod(dimensions(value))
+        return counted[value]
+
     def computed_from(value, other) -> bool:
         """Whether `value` is computed from `other` through any equation."""
         seen, pending = set(), [value]
@@ -579,21 +596,21 @@ def siblings(frontier: Frontier, program: jcore.Jaxpr) -> tuple[dict[int, int], 
 
     def ready(*values) -> int:
         """The index past which every value the storage `values` read is made."""
-        return max((position.get(root, -1) for value in values for root in frontier.roots([value])),
-                   default=-1)
+        return max((position.get(root, -1) for value in values for root in roots(value)), default=-1)
 
     def sibling(left, right) -> bool:
-        common = frontier.roots([left]) & frontier.roots([right])
-        return (math.prod(dimensions(left)) == math.prod(dimensions(right))
-                and any(math.prod(dimensions(stored)) > 1 for stored in common)
+        return (elements(left) == elements(right)
+                and any(elements(held) > 1 for held in roots(left) & roots(right))
                 and not computed_from(left, right) and not computed_from(right, left))
 
     beside: dict[int, set] = {}
     first: dict = {}
     for later, values in made.items():
         for earlier, others in made.items():
+            if earlier >= later:
+                continue
             for other, value in itertools.product(others - values, values):
-                if earlier >= later or not sibling(value, other):
+                if not sibling(value, other):
                     continue
                 if ready(value, other) < earlier:
                     # Made before the earlier product, beside its operand, and held to its own reader.

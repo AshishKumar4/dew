@@ -21,7 +21,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -602,6 +602,15 @@ def spill_record(miss: report.Miss) -> dict[str, JSON]:
             "frame": miss.frame, "shared": miss.shared, "stepped": miss.stepped}
 
 
+class Lower(Protocol):
+    """A search's step at a split and whether it keeps its narrow copies, at the objective's rung
+    (`FitSearch.lower`): lowered with the `footprint` its derivation traced of it, or one derived for it
+    where it is handed none and `derived`; or, not `lowering`, traced alone for its derived footprint."""
+
+    def __call__(self, split: int, narrow: bool, footprint: Footprint | None = None, *, derived: bool = True,
+                 lowering: bool = True) -> Candidate: ...
+
+
 @dataclasses.dataclass
 class FitSearch[LossT, EffectsT]:
     """A step's search over the fit ladder (`planned`): the first of the run's split candidates (`splits`)
@@ -624,7 +633,7 @@ class FitSearch[LossT, EffectsT]:
     that keeps its residuals in pinned host memory ('minimal_offloaded') keeps as many on the device as
     'full' does (`tests/test_remat_rungs.py`' `_saved`: a decoder's 107,720 bytes both, 'save_dot_except_mlp'
     132,296), so it fits nowhere 'full' does not, and a run takes it by its own remat."""
-    lower: Callable[[int, bool, Footprint | None, bool], Candidate]
+    lower: Lower
     options: Callable[[Candidate], jax.stages.CompilerOptions | None]
     objective: Objective[LossT, EffectsT]
     mesh: Mesh
@@ -700,8 +709,10 @@ class FitSearch[LossT, EffectsT]:
         first rung the one the derivation picks (`derived_start`). Once admission succeeds, no optional
         alternate policy is compiled."""
         # A rung fits where its most microbatches do; the derivation then finds its split there, which
-        # alone is compiled where it is right (`derived_split`).
-        self.derived_start(candidates[-1])
+        # alone is compiled where it is right (`derived_split`). A step that fits at its fewest fits at
+        # every split, at the rung it stands on: one derivation says so, and no rung is walked.
+        if not self.fits_at_fewest(candidates, first):
+            self.derived_start(candidates[-1])
         first = self.derived_split(candidates, first)
         seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
         split = planned(candidates, first, self.fits, self.climb, self.likely,
@@ -756,6 +767,22 @@ class FitSearch[LossT, EffectsT]:
         modules, tile, fused = configuration
         self.objective.substitute(list(modules))
         self.objective.restore_head(tile, fused=fused)
+
+    def fits_at_fewest(self, candidates: Sequence[int], first: int) -> bool:
+        """Whether the derivation judges the step to fit at the fewest of `candidates`, at the rung the
+        objective stands on, read before any rung is walked: that rung is then the least-recompute one,
+        and the fewest is the split the search compiles first (`derived_split`), on one derivation where
+        the walk and the halving read two (a step that fit at once traced its footprint at four
+        microbatches and at one, 34 s each, row 5361). It is the plan the walk at the most microbatches
+        and the halving reach where memory falls with the split (`planned`); where it grows with it (a
+        state that replays its microbatches), theirs climbs a rung the fewest never needed, and this one
+        stands. False where the search reads no derivation first (`derived_start`,
+        `derived_split`), judges none, or the fewest does not fit: the walk and the halving then read what
+        they did, the halving from this judgment where the walk ends on this rung."""
+        if self.derive is None or self.resumed is not None or first != 0 or not self.judging():
+            return False
+        headroom = self.judged(candidates[0], self.narrow)
+        return headroom is not None and headroom >= 0
 
     def derived_start(self, split: int) -> None:
         """Move the objective to the least-recompute rung whose derived footprint at `split`, the run's
@@ -830,13 +857,23 @@ class FitSearch[LossT, EffectsT]:
         footprint the derivation traced of it where it read it (`footprints`); one the step compiled ahead
         serves (`ahead`) derives none, its compile having judged the derivation where it was compiled."""
         return self.lower(split, self.narrow, self.footprints.get(self.candidate_key(split, self.narrow)),
-                          self.ahead is None)
+                          derived=self.ahead is None)
 
     def relowering(self, split: int) -> Candidate:
-        """The step at `split` lowered afresh past a kernel that spilled (`Relowered`), its footprint traced
-        again: the kernel's next config can change the buffers the derivation traced at its first (a
-        Triton attention backward's partial gradients, a block of queries each)."""
-        return self.lower(split, self.narrow, None, self.ahead is None)
+        """The step at `split` lowered afresh past a kernel that spilled (`Relowered`), with no footprint:
+        a compile lowers its step once for each config it refuses on its way, and judges none of them but
+        the one it keeps, whose footprint is derived then (`footprinted`)."""
+        return self.lower(split, self.narrow, derived=False)
+
+    def footprinted(self, split: int, candidate: Candidate) -> Candidate:
+        """`candidate`, the step at `split` a compile kept after lowering it afresh past kernels that
+        spilled, with its derived footprint, traced once at the configs its launches settled on (`lower`,
+        not lowering): a kernel's next config can change the buffers the derivation traced at its first (a
+        Triton attention backward's partial gradients, a block of queries each), so the footprint the
+        search held is not this step's. Derived at each relowering, a hybrid's step that stepped down
+        twelve times traced twelve footprints, 11 s each, to judge one (row 5361)."""
+        traced = self.lower(split, self.narrow, lowering=False)
+        return dataclasses.replace(candidate, footprint=traced.footprint)
 
     def candidate_key(self, split: int, narrow: bool) -> tuple[str, int]:
         """The step at `split` and `narrow` at the objective's rung, as the derivation's judgments keep it."""
@@ -861,6 +898,10 @@ class FitSearch[LossT, EffectsT]:
                 _log.warning("the run sets remat %s, and its devices state no memory to judge its footprint "
                              "against (a CPU, or a compile-only GPU given no capacity), so the derivation "
                              "picks no plan and the compiles decide it", self.remat_rung())
+            return first
+        # The fewest, where the search judged it at this rung (`fits_at_fewest`), is read as it was.
+        fewest = self.judged_at.get(self.candidate_key(candidates[0], self.narrow), -1)
+        if fewest is not None and fewest >= 0:
             return first
         headroom = self.judged(candidates[-1], self.narrow)
         if headroom is None or headroom < 0:
@@ -900,14 +941,14 @@ class FitSearch[LossT, EffectsT]:
             return under
         return under * temporaries // missed
 
-    def learned(self, foreseen: int | None, measured: int | None, *, fit: bool, split: int,
+    def learned(self, foreseen: int | None, measured: int | None, *, fit: bool,
                 temporaries: int | None) -> None:
-        """What a compile at the objective's remat at `split` teaches the derivation's next judgments there:
+        """What a compile at the objective's remat teaches the derivation's next judgments there:
         the headroom it `measured` short of the one `foreseen` corrects them (`under`), in proportion to the
-        derived `temporaries` it was short of (`missed_at`), and a compile that fit where the derivation, so
-        corrected, judged it short rules its refusals out (`overstated`)."""
+        derived `temporaries` it was short of (`missed_at`), and a compile that fit where the derivation
+        judged it short rules its refusals out (`overstated`)."""
         rung = self.remat_rung()
-        if foreseen is not None and fit and foreseen - self.shortfall(split) < 0:
+        if foreseen is not None and fit and foreseen < 0:
             self.overstated.add(rung)
         if foreseen is not None and measured is not None and foreseen - measured > self.under.get(rung, 0):
             self.under[rung] = foreseen - measured
@@ -917,15 +958,18 @@ class FitSearch[LossT, EffectsT]:
                 self.missed_at.pop(rung, None)
 
     def refused(self, split: int) -> bool:
-        """Whether the derivation judges the step at `split` short past a miss, corrected by what a compile
-        at the rung needed beyond it (`under`), which the halving below a split that fits does not compile
-        (`planned`): no split it cannot judge, and none at a remat where a compile it judged short fit
-        (`overstated`: a tiny model's derived peak, its fixed buffers, over-states the step many times)."""
+        """Whether the derivation judges the step at `split` short by its own footprint, which the halving
+        below a split that fits does not compile (`planned`): no split it cannot judge, and none at a remat
+        where a compile it judged short fit (`overstated`: a tiny model's derived peak, its fixed buffers,
+        over-states the step many times). What a compile at another split missed past the derivation
+        (`shortfall`) orders the compiles (`likely`) and rules none out: scaled from one split to another
+        it states no bound on this one's need (row 5427: a correction from two microbatches judged four
+        short by 658,639 bytes, and they fit to the byte, so the search took eight)."""
         rung = self.remat_rung()
         if rung in self.overstated:
             return False
         derived = self.judgment(split)
-        return derived is not None and derived - self.shortfall(split) < 0
+        return derived is not None and derived < 0
 
     def judging(self) -> bool:
         """Whether every process's devices judge a derived footprint (`memory.judged`) at the search's
@@ -1001,8 +1045,10 @@ class FitSearch[LossT, EffectsT]:
                                              first=firsts[0])
             candidate = relowered.candidate(candidate)
             if relowered.last is not None:
-                # A spill's refusal changes the configs every derivation traced: each is traced again.
+                # A spill's refusal changes the configs every derivation traced: each is traced again, the
+                # kept step's here.
                 self.footprints.clear()
+                candidate = self.footprinted(split, candidate)
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
         self.sampled = None
         if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
@@ -1019,7 +1065,7 @@ class FitSearch[LossT, EffectsT]:
 
             def resampled() -> jax.stages.Lowered:
                 """The sampled step lowered afresh, its launches derived past a spilled one's config."""
-                again = self.lowering(split).sampled
+                again = self.relowering(split).sampled
                 assert again is not None
                 lowered.append(again())
                 return lowered[-1]
@@ -1034,7 +1080,7 @@ class FitSearch[LossT, EffectsT]:
         foreseen = pooled_headroom(None if candidate.footprint is None else derived_headroom(
             candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen)
-        self.learned(foreseen, pooled_headroom(headroom), fit=fit, split=split,
+        self.learned(foreseen, pooled_headroom(headroom), fit=fit,
                      temporaries=None if candidate.footprint is None else candidate.footprint.temporaries)
         if foreseen is not None and (foreseen >= 0) != fit:
             # A derived peak bounded from below (`Footprint.exact`) admits provisionally: its miss names

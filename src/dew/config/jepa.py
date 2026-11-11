@@ -18,14 +18,11 @@ from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig
 from dew.config.media import media_field
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
+from dew.nn.dit import FROM_ENCODER
 from dew.nn.protocols import ReadsClips
 from dew.objectives.jepa.masking import MultiBlockMask
 from dew.optim import OptimConfig
 from dew.registry import JsonDict, ModelConfig
-
-SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ratio",
-                     "ssm_state_dim", "dropout_rate", "precision")
-"""What the predictor takes from the encoder unless `predictor` overrides it."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,10 +72,11 @@ class JepaRunConfig(RunConfig):
         grid = (sample.shape[-3] // encoder.patch_size, sample.shape[-2] // encoder.patch_size)
         # The encoder's settings as it was built, read off the built module: its class's defaults and what
         # the run derived for it (its compute dtype from the run's numerics), which no record of its
-        # arguments states. The predictor takes the shared ones unless `predictor` sets them, and always
-        # computes as the encoder does, its dtype and attention kernel.
-        shared = {key: getattr(encoder, key) for key in SHARED_MODEL_KEYS
-                  if hasattr(encoder, key) and key not in self.predictor}
+        # arguments states. The predictor takes the options its encoder's class marks as its
+        # (`FROM_ENCODER`) unless `predictor` sets them, and always computes as the encoder does, its dtype
+        # and attention kernel.
+        shared = {option.name: getattr(encoder, option.name) for option in dataclasses.fields(encoder)
+                  if option.metadata.get(FROM_ENCODER) and option.name not in self.predictor}
         predictor = ModelConfig("jepa_predictor", {
             **self.predictor, "grid": grid, "factorized": video, "scan_order": encoder.scan_order}).build(
                 **shared, dtype=encoder.dtype, attention_impl=encoder.attention_impl)

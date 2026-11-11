@@ -344,6 +344,9 @@ class Profiler:
         self._reports = reports
         self._capture: Path | None = None
         self._converter: _Converter | None = None
+        self._session: jax.profiler.ProfileSession | None = None
+        """The trace this profiler started, JAX's own session, which it stops: never a trace another owner
+        started in its process (`jax.profiler.stop_trace` stops whichever is running, row 3455)."""
         self._metadata: dict[str, JSON] = {}
         self._temporary = directory is None
         self._phase: Literal["starting", "running", "stopping"] | None = None
@@ -383,7 +386,7 @@ class Profiler:
                 raise RuntimeError("A Dew profile is already running in this process")
             _active = self
             self._phase = "starting"
-        owned_start = False
+        session: jax.profiler.ProfileSession | None = None
         try:
             converter = require_profile_support() if self._reports else None
             backend = jax.default_backend()
@@ -412,16 +415,16 @@ class Profiler:
                 "XLA_FLAGS": os.environ.get("XLA_FLAGS"),
                 "view_command": "xprof --logdir=" + shlex.quote(str(capture)),
             }
-            jax.profiler.start_trace(capture, profiler_options=options)
-            owned_start = True
+            session = jax.profiler.start_trace(capture, profiler_options=options)
             with _lifecycle:
                 self._capture, self._converter, self._metadata = capture, converter, metadata
+                self._session = session
                 self._phase = "running"
         except BaseException as primary:
             try:
-                if owned_start:
+                if session is not None:
                     try:
-                        jax.profiler.stop_trace()
+                        session.stop()
                     except BaseException as cleanup:
                         primary.add_note(f"Owned profile start cleanup failed: {cleanup}")
             finally:
@@ -430,6 +433,7 @@ class Profiler:
                     self._phase = None
                     self._capture = None
                     self._converter = None
+                    self._session = None
                     self._metadata = {}
             raise
         return self
@@ -450,13 +454,15 @@ class Profiler:
                 raise RuntimeError("This profiler does not own a running capture")
             self._phase = "stopping"
             capture, converter, metadata = self._capture, self._converter, self._metadata
+            session = self._session
+        assert session is not None
         try:
             try:
                 _drain()
             except BaseException as error:
                 failures.append(error)
             try:
-                jax.profiler.stop_trace()
+                session.stop()
             except BaseException as error:
                 failures.append(error)
         finally:
@@ -465,6 +471,7 @@ class Profiler:
                 self._phase = None
                 self._capture = None
                 self._converter = None
+                self._session = None
                 self._metadata = {}
         assert capture is not None
         self._captures.append(capture)

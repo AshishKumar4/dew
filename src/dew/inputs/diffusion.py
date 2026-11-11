@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.artifacts import pixel_levels
 from dew.batch import Variables, coordinates
 from dew.inputs.condition import ConditionEncoder
 from dew.nn.blocks import torch_nearest_resize
@@ -23,7 +24,7 @@ from dew.nn.inputs import DenoisingCondition
 from dew.nn.precision import accumulated
 from dew.nn.protocols import LayerStates
 from dew.nn.safety import CLIPSafetyHead
-from dew.nn.sharding import abstract, drawn_axes
+from dew.nn.sharding import abstract
 from dew.nn.text_encoders import CLIPTextTransformer, CLIPTowerOutput, T5EncoderTransformer
 from dew.registry import dtype_name
 
@@ -175,18 +176,6 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         if self.t5 is not None:
             towers[self.t5.name] = abstract(self.t5.tower.init, key, ids)["params"]
         return towers
-
-    def parameter_axes(self) -> dict[tuple[str, ...], tuple[str | None, ...]]:
-        """Each CLIP tower's draw under its name's `text_model`, and the T5 segment's under its own name,
-        over a row of token ids (`ConditionEncoder.parameter_axes`)."""
-        ids = jnp.zeros((1, 2), jnp.int32)
-        table: dict[tuple[str, ...], tuple[str | None, ...]] = {
-            (name, "text_model", *path[1:]): axes for name, tower in zip(self.names, self.towers, strict=True)
-            for path, axes in drawn_axes(tower.init, ids).items()}
-        if self.t5 is not None:
-            drawn = drawn_axes(self.t5.tower.init, ids)
-            table.update({(self.t5.name, *path[1:]): axes for path, axes in drawn.items()})
-        return table
 
     def dependencies(self) -> Mapping[str, object]:
         """The encoder's fields and the hashes of the tokenizer files it reads, so an exact resume
@@ -433,10 +422,6 @@ class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
     `dependencies` records."""
     keyword: ClassVar[str] = "conditioning"
     assets: ClassVar[str] = "tokenizer"
-
-    def parameter_axes(self) -> dict[tuple[str, ...], tuple[str | None, ...]]:
-        """The language tower's draw over a row of token ids (`ConditionEncoder.parameter_axes`)."""
-        return drawn_axes(self.tower.init, jnp.zeros((1, 2), jnp.int32))
 
     def drawn(self) -> Mapping:
         """The language tower drawn over a row of token ids, its variables under `text_encoder`, as
@@ -731,6 +716,14 @@ class CLIPImageTransform:
 
     @classmethod
     def from_config(cls, config):
+        """The transform a `preprocessor_config.json` states, each field it leaves out the PIL processor's
+        default: OpenAI's mean and std as transformers states them (`transformers.utils.constants`, a
+        package the pipeline's tokenizers already load); a 224 shortest edge and center crop, bicubic
+        resampling (3) and a 1/255 rescale as `CLIPImageProcessorPil` declares them (transformers 5.17,
+        models/clip/image_processing_pil_clip.py and `BaseImageProcessor.rescale_factor`), whose module
+        this path does not import (it would load transformers' image processing for four constants)."""
+        from transformers.utils.constants import OPENAI_CLIP_MEAN, OPENAI_CLIP_STD
+
         if config.get("resample", 3) != 3:
             raise ValueError("Only bicubic CLIP preprocessing is implemented")
         size = config.get("size", {"shortest_edge": 224})
@@ -741,9 +734,9 @@ class CLIPImageTransform:
         return cls(
             size,
             crop,
-            tuple(config.get("image_mean", (0.48145466, 0.4578275, 0.40821073))),
-            tuple(config.get("image_std", (0.26862954, 0.26130258, 0.27577711))),
-            config.get("rescale_factor", 1 / 255) if config.get("do_rescale", True) else 1.0,
+            tuple(config.get("image_mean", OPENAI_CLIP_MEAN)),
+            tuple(config.get("image_std", OPENAI_CLIP_STD)),
+            config.get("rescale_factor", cls.rescale) if config.get("do_rescale", True) else 1.0,
             config.get("do_resize", True),
             config.get("do_center_crop", True),
             config.get("do_normalize", True),
@@ -800,7 +793,8 @@ class ImageSafety:
     transform: CLIPImageTransform
 
     def __call__(self, variables, images):
-        pixels = jnp.clip(jnp.round((images + 1) * 127.5), 0, 255)
+        # The levels its preprocessing reads, as every decoded image is converted (`pixel_levels`).
+        pixels = pixel_levels(images, jnp)
         flagged = self.model.apply({"params": variables["encoders"]["safety"]}, self.transform(pixels))
         assert isinstance(flagged, jax.Array)
         return jnp.where(flagged[:, None, None, None], -jnp.ones_like(images), images)

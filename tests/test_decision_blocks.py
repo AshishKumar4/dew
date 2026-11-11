@@ -20,7 +20,8 @@ from dew.data.dataset import DataPartition
 from dew.data.text import HFTokenizer
 from dew.decision import Choice, DecisionObjective, MarkerLayout, StateFirstLayout
 from dew.decision.head import DecisionHead
-from dew.decision.layout import DecisionInputs, Instructions, Labels, State, Text
+from dew.decision.inputs import DecisionInputs
+from dew.decision.layout import Instructions, Labels, State, Text
 from dew.decision.model import DecisionModel
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import AttentionMixer

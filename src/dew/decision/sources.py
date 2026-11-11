@@ -24,6 +24,7 @@ from dew.interop.pretrained import Pretrained
 from dew.interop.releases import ReleasePlan, writable
 from dew.lora import FACTORS
 from dew.nn.attention import AttentionImpl
+from dew.nn.cross_attention import ContextEncoder
 from dew.nn.sharding import drawn_axes
 from dew.registry import dtype_name, from_record, import_path
 
@@ -88,6 +89,10 @@ class PretrainedDecision(Pretrained):
     assumed: frozenset[str] = frozenset()
     """The question budgets its layout holds that its release states none of, Laya's own
     (`LAYA_BUDGETS`), as a run reports where each came from."""
+    context_encoder: ContextEncoder = "table"
+    """How its model encodes a row's context for its cross-attention (`DecisionModel.context_encoder`):
+    a run's task's own, which a run started from the bundle trains on as it was trained (row 4797); a
+    release, whose backbone reads no context, the token table's."""
 
     def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
         return dataclasses.replace(self, variables=transform(self.variables),
@@ -147,7 +152,8 @@ class PretrainedDecision(Pretrained):
         held = {**{field.name: getattr(decoder, field.name) for field in dataclasses.fields(Pretrained)},
                 "numerics": task.precision}
         return cls(**held, head=head, head_variables=thaw(part(task.variables, "head")), layout=task.layout,
-                   specials=task.specials, calibration=task.calibration, decision_tokenizer=task.tokenizer)
+                   specials=task.specials, calibration=task.calibration, decision_tokenizer=task.tokenizer,
+                   context_encoder=task.model.context_encoder)
 
     @classmethod
     def from_components(cls, backbone: Pretrained, head: Head, head_variables: Variables,

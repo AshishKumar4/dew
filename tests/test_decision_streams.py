@@ -21,9 +21,9 @@ from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example, JointLayout, Schema, State, Text, decisions
 from dew.decision.config import DecisionRunConfig
 from dew.decision.head import JointSchemaHead, LabelReadout
+from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import (
     AnswerCue,
-    DecisionInputs,
     Instructions,
     Layout,
     OptionLines,

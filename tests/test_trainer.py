@@ -263,6 +263,35 @@ def test_a_checkpoint_that_counted_every_steps_tokens_is_refused_by_name(tmp_pat
             make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), log_every=1, **length)
 
 
+def test_a_run_no_record_describes_checkpoints_its_reason_and_a_records_own_error_raises(tmp_path):
+    """An objective no record can describe, defined where no import path reaches it, still trains and
+    checkpoints, and a loader of its run says why it rebuilds no model (`dew.registry.Unrecordable`); an
+    error of the record's own making is the run's, and the fit raises it."""
+    from dew.inference.tasks import TextGeneration, TextSettings
+    from dew.sampling.text import Sampling
+
+    class Unnamed(Regression):
+        saved_task = TextGeneration
+        settings = TextSettings
+
+        def task_settings(self):
+            return TextSettings(seq_len=8, max_new_tokens=3, sampling=Sampling(), tokenizer=None,
+                                processor=None)
+
+    trainer = make_trainer(tmp_path, objective=Unnamed())
+    trainer.fit(dataset(), steps=1)
+    trainer.checkpoints.wait()
+    with pytest.raises(ValueError, match="no import path a record can name"):
+        TextGeneration.from_run(trainer.checkpoints.directory)
+
+    class Broken(Regression):
+        def inference_record(self):
+            raise KeyError("the record's own bug")
+
+    with pytest.raises(KeyError, match="the record's own bug"):
+        make_trainer(tmp_path / "broken", objective=Broken()).fit(dataset(), steps=1)
+
+
 def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
     make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), steps=2, tokens=30)
     trainer = make_trainer(tmp_path, objective=TokenRegression())

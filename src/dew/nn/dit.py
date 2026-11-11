@@ -9,6 +9,7 @@ inside the block (attention or S5 SSM) and in how the blocks are arranged
 sandwich; the model files arrange blocks.
 """
 
+import dataclasses
 import inspect
 import math
 from collections.abc import Sequence
@@ -475,11 +476,16 @@ class _ConditioningOptions(TypedDict, total=False):
     time_scale: float
 
 
+FROM_ENCODER = "from_encoder"
+"""The metadata key of an option a JEPA predictor takes from its encoder unless its run sets the option
+(`dew.config.jepa`): marked where the option is declared, on the encoder's class or a base it shares."""
+
+
 class _TransformerOptions(nn.Module, kw_only=True):
     """Shared controls stay keyword-only so token stacks can require their widths."""
-    mlp_ratio: int = 4
+    mlp_ratio: int = dataclasses.field(default=4, metadata={FROM_ENCODER: True})
     dtype: Dtype | None = None
-    precision: PrecisionLike = None
+    precision: PrecisionLike = dataclasses.field(default=None, metadata={FROM_ENCODER: True})
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-5
     attention_impl: AttentionImpl = 'auto'
@@ -512,7 +518,7 @@ class _TransformerOptions(nn.Module, kw_only=True):
 
 
 class _AttentionStackOptions(_TransformerOptions, kw_only=True):
-    dropout_rate: float = 0.0
+    dropout_rate: float = dataclasses.field(default=0.0, metadata={FROM_ENCODER: True})
     qk_norm: bool = False
 
     def _block_options(self) -> _AttentionBlockOptions:
@@ -538,8 +544,8 @@ class _TokenStackOptions(_AttentionBlockOptions):
 
 class _JepaStackOptions(_AttentionStackOptions, kw_only=True):
     num_heads: int
-    ssm_attention_ratio: str = 'all-attn'
-    ssm_state_dim: int = 64
+    ssm_attention_ratio: str = dataclasses.field(default='all-attn', metadata={FROM_ENCODER: True})
+    ssm_state_dim: int = dataclasses.field(default=64, metadata={FROM_ENCODER: True})
     bidirectional_ssm: bool = True
 
     def _stack_options(self) -> _TokenStackOptions:

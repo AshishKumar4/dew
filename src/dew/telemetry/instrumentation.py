@@ -13,15 +13,17 @@ matmul (docs/research/benchmark-parity.md:5-9,93-102).
 """
 
 import functools
+import importlib
+import importlib.util
 import json
 import math
 import re
 import sys
 import threading
 import weakref
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import NamedTuple
+from typing import NamedTuple, Protocol
 
 import jax
 import numpy as np
@@ -57,121 +59,253 @@ def compilation_cache_counts() -> dict[str, float]:
         return {f'train/{event.rsplit("/", 1)[-1]}': float(count)
                 for event, count in _cache_counts.items()}
 
-# One instruction: `%name = shape op(operands), attributes`, with ROOT optional.
-# The shape is non-greedy so it stops at the operand list, which leaves a tuple
-# result whole; the first shape inside it is the value, the rest is workspace.
-# An HLO module's text as a compiled executable prints it (`%` before each name, a computation's
-# signature in its header) or as a lowered one does (`Lowered.as_text(dialect='hlo')`: neither).
-_INSTRUCTION = re.compile(
-    r'^\s*(?:ROOT\s+)?%?(?P<name>[\w.\-]+)\s+=\s+(?P<shape>.*?)\s'
-    r'(?P<op>[a-z][a-z0-9\-]*)\((?P<rest>.*)$')
-_COMPUTATION = re.compile(r'^\s*(?:ENTRY\s+)?%?(?P<name>[\w.\-]+)\s*(?:\(.*\)\s*->.*)?\{\s*$')
-_DIMS = re.compile(r'[a-z][\w]*\[([\d,]*)\]')
-_TRIP_COUNT = re.compile(r'"known_trip_count":\s*\{\s*"n":\s*"(\d+)"')
-_INTEGER = re.compile(r'(-?\d+)\)')
-_ELEMENT = re.compile(r'\s*([a-z]\w*)\[')
-_INTEGER_TYPE = re.compile(r'([su])(8|16|32|64)$')
-_INDEX = re.compile(r', index=(\d+)')
-_NAME = re.compile(r'%?([\w.\-]+)')
-_CALLS = re.compile(r'(?:calls|to_apply|select|scatter|condition|body)=%?([\w.\-]+)')
-_BRANCHES = re.compile(r'branch_computations=\{([^}]*)\}')
-_TARGET = re.compile(r'custom_call_target="([^"]+)"')
-_TRACED = re.compile(r'op_name="([^"]*)"(?:[^}]*?source_file="([^"]*)"\s+source_line=(\d+))?')
-_CONTRACTING = re.compile(r'lhs_contracting_dims=\{([\d,]*)\}')
-_GEMM_CONTRACTING = re.compile(r'"lhs_contracting_dimensions":\s*\[([^\]]*)\]')
-_WINDOW = re.compile(r'window=\{([^}]*)\}')
-_LABELS = re.compile(r'dim_labels=(\S+?)(?:[,\s]|$)')
-_GROUPS = re.compile(r'feature_group_count=(\d+)')
 # A multiply-add is two FLOPs.
 _MAC = 2
-_ARRAY = re.compile(r'([a-z][a-z0-9]*)\[([\d,]*)\](\{[^}]*\})?')
-_PACKED = re.compile(r'E\((\d+)\)')
+_INTEGER_TYPE = re.compile(r'([su])(8|16|32|64)$')
+"""An integer element type's sign and width, as HLO names its types (`s32`, `u8`)."""
 _BITS = re.compile(r'(\d+)')
-_GROUPED = re.compile(r"(?:replica_groups|source_target_pairs)=(\{\}|\{\{[\d,{}]*\}\}|\[[\d,]+\]<=\[[\d,]+\]"
-                      r"(?:T\([\d,]+\))?|mesh\[[^\]]*\]\s*\{[^}]*\})")
-_NUMBERS = re.compile(r'\d+')
-_SIZED = re.compile(r"'([^']+)'=(\d+)")
-_QUOTED = re.compile(r"'([^']+)'")
+
+# The one instruction a row of XProf's hlo_stats displays (`hlo_op_expression`, cut short): XProf's display of
+# it, no module, so read for its opcode and custom-call target alone (`reported_instruction`).
+_REPORTED = re.compile(r'^\s*(?:ROOT\s+)?%?[\w.\-]+\s+=\s+.*?\s(?P<op>[a-z][a-z0-9\-]*)\(')
+_REPORTED_TARGET = re.compile(r'custom_call_target="([^"]+)"')
 
 
-def _groups(attributes: str) -> tuple[tuple[int, ...], ...]:
-    """A collective's device groups, each the positions in the module's device assignment that
-    take part together, from the forms XLA prints them in: its `replica_groups` listed, as an
-    iota (`[4,2]<=[2,4]T(1,0)`, the positions laid out, transposed and cut into rows) or over a
-    mesh's named axes (`mesh['fsdp'=4,'sequence'=2] {'fsdp'}`), or a collective-permute's
-    `source_target_pairs`, a pair a group. Empty where every device takes part together (`{}`)."""
-    found = _GROUPED.search(attributes)
-    if found is None:
-        return ()
-    text = found.group(1)
-    if text.startswith('mesh'):
-        axes, within = text.split(']', 1)
-        sized = [(name, int(size)) for name, size in _SIZED.findall(axes)]
-        taking = set(_QUOTED.findall(within))
-        moved = [index for index, (name, _) in enumerate(sized) if name in taking]
-        kept = [index for index in range(len(sized)) if index not in moved]
-        sizes = [size for _, size in sized]
-        positions = np.arange(math.prod(sizes)).reshape(sizes).transpose(kept + moved)
-        return tuple(map(tuple, positions.reshape(-1, math.prod(sizes[index] for index in moved)).tolist()))
-    if text.startswith('['):
-        shape, source = text.split('<=')
-        laid, _, order = source.partition('T')
-        sizes = [int(size) for size in _NUMBERS.findall(laid)]
-        positions = np.arange(math.prod(sizes)).reshape(sizes)
-        if order:
-            positions = positions.transpose([int(axis) for axis in _NUMBERS.findall(order)])
-        return tuple(map(tuple, positions.reshape([int(size) for size in _NUMBERS.findall(shape)]).tolist()))
-    return tuple(tuple(int(position) for position in _NUMBERS.findall(group))
-                 for group in re.findall(r'\{([\d,]*)\}', text[1:-1]))
+def _element(shape) -> str:
+    """An array shape's element type as HLO names it (`f32`, `bf16`, `pred`), read off XLA's schema's
+    own enum (`xla.PrimitiveType`); empty for a tuple's."""
+    if shape.tuple_shapes:
+        return ''
+    return shape.DESCRIPTOR.fields_by_name['element_type'].enum_type.values_by_number[
+        shape.element_type].name.lower()
 
 
-def _buffers(shape: str) -> tuple[int, ...]:
-    """The bytes of each array an instruction's result holds, a tuple's every
-    element, as XLA sizes it (`ShapeUtil::ByteSizeOfElements`): its layout's
-    element size where it packs one (`E(4)`), else its type's width rounded up
-    to whole bytes (`pred` and `s4` one byte each), by its elements, rounded up."""
-    found = []
-    for element, dims, layout in _ARRAY.findall(shape):
-        packed = _PACKED.search(layout)
-        width = 1 if element == 'pred' else int(next(iter(_BITS.findall(element)), 0))
-        bits = int(packed.group(1)) if packed else -(-width // 8) * 8
-        found.append(-(-bits * math.prod(int(d) for d in dims.split(',') if d) // 8))
-    return tuple(found)
+def _arrays(shape) -> tuple[tuple[str, tuple[int, ...], int], ...]:
+    """Each array a result holds, a tuple's every element in order: its element type (`_element`), its
+    dimensions and its bytes as XLA sizes them (`ShapeUtil::ByteSizeOfElements`): its layout's element
+    size where it packs one, else its type's width rounded up to whole bytes (`pred` and `s4` one byte
+    each), by its elements, rounded up."""
+    if shape.tuple_shapes:
+        return tuple(array for element in shape.tuple_shapes for array in _arrays(element))
+    element, dims = _element(shape), tuple(shape.dimensions)
+    width = 1 if element == 'pred' else int(next(iter(_BITS.findall(element)), 0))
+    bits = shape.layout.element_size_in_bits or -(-width // 8) * 8
+    return ((element, dims, -(-bits * math.prod(dims) // 8)),)
 
 
-_CUSTOM_CALLS = (
-    ("gemm", re.compile(r'^__cublas')),
-    ("convolution", re.compile(r'^__cudnn\$conv')),
-    ("attention", re.compile(r'^__cudnn\$fmha|^dew_flash3?_mha')),
-    ("grouped_gemm", re.compile(r'^dew_cutlass_grouped_gemm')),
-    ("triton", re.compile(r'^__gpu\$xla\.gpu\.triton$')),
-    ("mosaic_gpu", re.compile(r'^mosaic_gpu(_v\d+)?$')),
-    ("mosaic_tpu", re.compile(r'^tpu_custom_call$')),
-    ("no_matmul", re.compile(r'^(Sharding|SPMD(FullToShard|ShardToFull)Shape|annotate_device_placement'
-                             r'|MoveTo(Device|Host)|xla\.sdy\.|GetRngSeed|cu_threefry2x32|TopK|__cub\$'
-                             r'|xla_(ffi_)?python_)')),
-)
+def _groups(proto) -> tuple[tuple[int, ...], ...]:
+    """A collective's device groups, each the positions in the module's device assignment that take part
+    together, as XLA's schema states them: listed (`collective_device_list`, or the older
+    `replica_groups`), as an iota (`iota_collective_device_list`: the positions laid out, transposed and
+    cut into groups), over a mesh's named axes (`mesh_axes_replica_group_list`), or a
+    collective-permute's `source_target_pairs`, a pair a group. Empty where every device takes part
+    together."""
+    if proto.source_target_pairs:
+        return tuple((pair.source, pair.target) for pair in proto.source_target_pairs)
+    form = proto.WhichOneof('replica_group_list')
+    if form == 'iota_collective_device_list':
+        iota = proto.iota_collective_device_list
+        count = iota.num_replica_groups * iota.num_devices_per_group
+        positions = np.arange(count).reshape(list(iota.iota_reshape_dims) or [count])
+        if iota.iota_transpose_perm:
+            positions = positions.transpose(list(iota.iota_transpose_perm))
+        return tuple(map(tuple, positions.reshape(iota.num_replica_groups,
+                                                  iota.num_devices_per_group).tolist()))
+    if form == 'mesh_axes_replica_group_list':
+        return _mesh_groups(proto.mesh_axes_replica_group_list)
+    listed = (proto.collective_device_list.replica_groups if form == 'collective_device_list'
+              else proto.replica_groups)
+    return tuple(tuple(group.replica_ids) for group in listed)
+
+
+def _mesh_groups(groups) -> tuple[tuple[int, ...], ...]:
+    """The device groups of a collective over a mesh's axes (`xla.MeshAxesReplicaGroupListProto`): the
+    mesh's positions (its device ids, its iota or its order), each axis cut where a sub-axis it takes
+    part over splits it (a sub-axis `(m)k` of an axis of size `n` the middle of its factors `m`, `k`,
+    `n/(mk)`), and the positions that differ over the axes it takes part over alone grouped together."""
+    mesh = groups.mesh
+    sizes = [axis.size for axis in mesh.axes]
+    count = math.prod(sizes)
+    if mesh.device_ids:
+        positions = np.asarray(mesh.device_ids)
+    elif mesh.HasField('iota_transform'):
+        transform = mesh.iota_transform
+        positions = np.arange(count).reshape(list(transform.reshape_dims))
+        positions = positions.transpose(list(transform.transpose_perm)).ravel()
+    else:
+        positions = np.arange(count)
+    factors: list[int] = []
+    taken: list[bool] = []
+    for index, size in enumerate(sizes):
+        refs = [ref for ref in groups.axes if ref.mesh_axis_index == index]
+        cuts = sorted((ref.sub_axis_info.pre_size, ref.sub_axis_info.size) for ref in refs
+                      if ref.HasField('sub_axis_info'))
+        if not cuts:
+            factors.append(size)
+            taken.append(bool(refs))
+            continue
+        reached = 1
+        for before, cut in cuts:
+            if before > reached:
+                factors.append(before // reached)
+                taken.append(False)
+            factors.append(cut)
+            taken.append(True)
+            reached = before * cut
+        if size > reached:
+            factors.append(size // reached)
+            taken.append(False)
+    moved = [index for index, take in enumerate(taken) if take]
+    kept = [index for index, take in enumerate(taken) if not take]
+    laid = positions.reshape(factors).transpose(kept + moved)
+    return tuple(map(tuple, laid.reshape(-1, math.prod(factors[index] for index in moved)).tolist()))
+
+
+class Attention(Protocol):
+    """What a fused attention's call states of its operands, as a FlashAttention wheel's targets state it
+    (`dew_flash_attn.TARGETS`): where its query sits among them (a backward's first is the output's
+    gradient), whether it runs the backward, and whether its sequences lie between cumulative offsets
+    given at run time (`packed`), whose pairs no shape states."""
+
+    @property
+    def query(self) -> int: ...
+
+    @property
+    def backward(self) -> bool: ...
+
+    @property
+    def packed(self) -> bool: ...
+
+
+@dataclass(frozen=True)
+class _Fused:
+    """cuDNN's fused attention, as XLA calls it: its query, key and value first, batched `[B, S, H, D]`."""
+
+    backward: bool
+    query: int = 0
+    packed: bool = False
+
+
+@dataclass(frozen=True)
+class _Call:
+    """What one custom-call target computes (`custom_call_kind`), with the facts its reader needs: a fused
+    attention's operands, a cuDNN convolution's direction (`forward`, `input`, `filter`: which gradient,
+    if any, it computes)."""
+
+    kind: str
+    attention: Attention | None = None
+    direction: str = "forward"
+
+
+_XLA_CALLS: dict[str, _Call] = {
+    **{target: _Call("gemm") for target in (
+        "__cublas$gemm", "__cublas$lt$matmul", "__cublas$lt$matmul$f8", "__cublas$lt$matmul$mx")},
+    **{target: _Call("convolution", direction=direction) for target, direction in (
+        ("__cudnn$convForward", "forward"), ("__cudnn$convBiasActivationForward", "forward"),
+        ("__cudnn$convForwardGraph", "forward"), ("__cudnn$convBackwardInput", "input"),
+        ("__cudnn$convBackwardFilter", "filter"))},
+    **{target: _Call("attention", _Fused(backward)) for target, backward in (
+        ("__cudnn$fmhaSoftmax", False), ("__cudnn$fmhaSoftmaxF8", False),
+        ("__cudnn$fmhaSoftmaxDropout", False),
+        ("__cudnn$fmhaScaleBiasSoftmax", False), ("__cudnn$fmhaScaleBiasSoftmaxDropout", False),
+        ("__cudnn$fmhaSoftmaxBackward", True), ("__cudnn$fmhaSoftmaxBackwardF8", True),
+        ("__cudnn$fmhaSoftmaxDropoutBackward", True), ("__cudnn$fmhaScaleBiasSoftmaxBackward", True),
+        ("__cudnn$fmhaScaleBiasSoftmaxDropoutBackward", True))},
+    **{target: _Call("no_matmul") for target in (
+        "__cudnn$norm", "__cudnn$convReorderFilter", "__cudnn$convReorderFilterAndBias",
+        "xla.gpu.ext.cub_sort_unassigned_scratch_size", "xla.gpu.ext.cub_sort_pairs",
+        "xla.gpu.ext.cub_sort_keys", "xla.gpu.ext.cub_scan_unassigned_scratch_size", "xla.gpu.ext.cub_scan",
+        "Sharding", "SPMDFullToShardShape", "SPMDShardToFullShape", "annotate_device_placement",
+        "MoveToHost", "MoveToDevice", "PinToDevice", "TopK",
+        "xla.sdy.FuncResultSharding", "xla.sdy.ShardingGroup", "xla.sdy.PropagationBarrier",
+        "xla.sdy.GlobalToLocalShape", "xla.sdy.LocalToGlobalShape")},
+}
+"""The custom-call targets XLA states, each by what it computes. XLA names them in C++ alone, so they are
+read from its source at d867969800d4 (the revision jaxlib 0.12.0.1 builds): xla/service/gpu/cublas_cudnn.h's
+cuBLAS, cuDNN and CUB targets, xla/service/memory_annotations.h's placements,
+xla/service/spmd/shardy/constants.h's sharding marks and Shardy's round trip, xla/service/topk_rewriter.cc's
+"TopK". JAX's own targets JAX states (`jax.extend.custom_call_targets`), which `_calls` reads. A target
+this table and its owners' (`_calls`) do not hold, a cuBLAS triangular solve or grouped matmul and cuDNN's
+block-scaled dot among them, is one nothing here sizes. A fused attention's backward reads its query first;
+an F8 attention's form is its own target."""
+
+
+@functools.cache
+def _calls() -> dict[str, _Call]:
+    """Every custom-call target this count knows, by what it computes: XLA's (`_XLA_CALLS`), JAX's as
+    JAX states them (`jax.extend.custom_call_targets`: its Pallas kernels', its random bits', its
+    callbacks' and `lax.empty`'s) and those of Dew's kernel wheels where installed, each stating its own
+    (`dew_cutlass.TARGETS`, `dew_flash_attn.TARGETS`); a wheel this process lacks states none, and its
+    calls go unsized."""
+    from jax.extend import custom_call_targets as jax_targets
+
+    calls = {**_XLA_CALLS, jax_targets.TRITON: _Call("triton"), jax_targets.MOSAIC_GPU: _Call("mosaic_gpu"),
+             jax_targets.TPU_CUSTOM_CALL: _Call("mosaic_tpu"),
+             **{target: _Call("no_matmul") for target in (
+                 jax_targets.ALLOCATE_BUFFER, *jax_targets.THREEFRY2X32.values(),
+                 *jax_targets.PYTHON_CALLBACK.values(), *jax_targets.BUFFER_CALLBACK.values())}}
+    if importlib.util.find_spec("dew_cutlass") is not None:
+        cutlass = importlib.import_module("dew_cutlass")
+        calls.update({target: _Call("grouped_gemm") for target in cutlass.TARGETS})
+    if importlib.util.find_spec("dew_flash_attn") is not None:
+        targets: Mapping[str, Attention] = importlib.import_module("dew_flash_attn").TARGETS
+        calls.update({target: _Call("packed_attention" if stated.packed else "attention", stated)
+                      for target, stated in targets.items()})
+    return calls
+
 
 PALLAS = ("triton", "mosaic_gpu", "mosaic_tpu")
 """The kinds of custom call a Pallas kernel lowers to, whose work is the cost the kernel states."""
 
 _STATED = re.compile(r'cost_estimate_json\s*=\s*"((?:[^"\\]|\\.)*)"')
-"""A Mosaic GPU kernel's own cost as its call states it (`cost_estimate_json`), its quotes and other
-bytes escaped as an MLIR string prints them (`\\22`)."""
+"""A Mosaic GPU kernel's own cost as its call's backend config states it (`cost_estimate_json`), its quotes
+and other bytes escaped as an MLIR string writes them (`\\22`)."""
 
 _STATED_TPU = re.compile(r'cost_estimate\\?"\s*:\s*\{[^}]*?\bflops\\?"\s*:\s*(\d+)')
 """A Mosaic TPU kernel's own FLOPs as its call's JSON config states them (`cost_estimate`)."""
 
 
 @dataclass(frozen=True)
+class _Convolution:
+    """A convolution's dimension numbers and window as XLA's schema states them, an HLO convolution's and a
+    cuDNN convolution call's alike: where its input's and its output's features lie, its window's size and
+    its input (base) dilation along each spatial axis, and its feature groups."""
+
+    input_features: int
+    output_features: int
+    window: tuple[int, ...]
+    dilation: tuple[int, ...]
+    groups: int
+
+
+@dataclass(frozen=True)
 class _Instruction:
-    """The parts of one HLO instruction the FLOP count reads."""
+    """The parts of one HLO instruction the counts read, as XLA's schema states them
+    (`jax.extend.xla.Instruction`)."""
 
     op: str
     dims: tuple[int, ...]
+    """Its result's dimensions: a tuple's first array's."""
     operands: tuple[str, ...]
-    attributes: str
-    """Its attributes after the operands, its `metadata={...}` taken out."""
+    called: tuple[str, ...] = ()
+    """The computations it calls, in XLA's order: a while loop's body then its condition, a fusion's body,
+    a conditional's branches."""
+    target: str = ''
+    """A custom call's target, empty for any other op."""
+    config: str = ''
+    """Its backend config as it is stored: a library call's JSON, a while loop's trip count, a kernel's
+    stated cost and attributes."""
+    frontend: Mapping[str, str] = field(default_factory=dict)
+    """Its frontend attributes (`MODEL_FLOPS`)."""
+    contracting: tuple[int, ...] = ()
+    """A dot's left operand's contracting dimensions."""
+    convolution: _Convolution | None = None
+    direction: str = ''
+    """A compare's direction (`LT`)."""
+    tuple_index: int = 0
+    """The element a get-tuple-element reads."""
+    parameter: int = 0
+    """A parameter's number."""
     recomputed: bool = False
     """Whether it recomputes the forward: JAX's remat names its recomputation
     `rematted_computation`, and XLA's own rematerialization clones an
@@ -180,7 +314,7 @@ class _Instruction:
     """Its metadata's `op_name source_file:line`, interned: a module repeats
     each a great many times."""
     buffers: tuple[int, ...] = ()
-    """A collective's or a custom call's result, each array's bytes (`_buffers`); empty for any other op."""
+    """A collective's or a custom call's result, each array's bytes (`_arrays`); empty for any other op."""
     shapes: tuple[tuple[int, ...], ...] = ()
     """A collective's or a custom call's result, each array's dimensions, as `buffers` sizes them; empty
     for any other op."""
@@ -204,174 +338,129 @@ class _Computation:
     constants: dict[str, int] = field(default_factory=dict)
 
 
-def _dims(text: str) -> tuple[int, ...]:
-    """Dimensions of the first shape in `text`, which for a tuple is its head."""
-    match = _DIMS.search(text)
-    if match is None:
-        return ()
-    body = match.group(1).strip()
-    return tuple(int(d) for d in body.split(',')) if body else ()
+def _module(source: str | Iterable[str] | jax.stages.Compiled):
+    """The HLO module `source` holds: a compiled executable's optimized one (its first, as JAX's own
+    `Compiled.as_text` prints it), or one written as text (an XLA dump, whole or as its lines; a module a
+    test writes), read by XLA's own parser (`jax.extend.xla.module_from_text`). None for an executable
+    that holds no module."""
+    from jax.extend import xla
+
+    if isinstance(source, jax.stages.Compiled):
+        executable = source.runtime_executable()
+        modules = [] if executable is None else executable.hlo_modules()
+        return modules[0] if modules else None
+    return xla.module_from_text(source if isinstance(source, str) else '\n'.join(source))
 
 
-def _without_metadata(attributes: str) -> tuple[str, str]:
-    """`attributes` with its `metadata={...}` taken out, and that metadata."""
-    start = attributes.find('metadata={')
-    if start < 0:
-        return attributes, ''
-    quoted, end = False, len(attributes)
-    for index in range(start + len('metadata={'), len(attributes)):
-        character = attributes[index]
-        if character == '"' and attributes[index - 1] != '\\':
-            quoted = not quoted
-        elif character == '}' and not quoted:
-            end = index + 1
-            break
-    return attributes[:start] + attributes[end:], attributes[start:end]
+def _integer(literal, element: str) -> int | None:
+    """The integer a scalar constant of `element` type holds (`xla.LiteralProto`), None for any other."""
+    kind = _INTEGER_TYPE.match(element)
+    if kind is None:
+        return None
+    sign, bits = kind.groups()
+    values = getattr(literal, f'{sign}{bits}s')
+    if isinstance(values, bytes):
+        values = np.frombuffer(values, f"<{'i' if sign == 's' else 'u'}{int(bits) // 8}").tolist()
+    return int(values[0]) if len(values) == 1 else None
 
 
-def _split_operands(rest: str) -> tuple[tuple[str, ...], str]:
-    """The operand names of an instruction, and the attribute text after them."""
-    depth, end = 1, len(rest)
-    for index, character in enumerate(rest):
-        depth += (character == '(') - (character == ')')
-        if depth == 0:
-            end = index
-            break
-    named = rest[:end]
-    operands = (tuple(match.group(1) for match in re.finditer(r'%([\w.\-]+)', named)) if '%' in named
-                else tuple(re.findall(r'([\w.\-]+)\s*(?:,|$)', named)))
-    return operands, rest[end + 1:]
+def _read(source: str | Iterable[str] | jax.stages.Compiled) -> tuple[dict[str, _Computation], str | None]:
+    """The module's computations, and the name of its entry computation (`_module`), each instruction
+    read through XLA's own schema (`jax.extend.xla.instructions`), keeping the facts the counts read: of
+    its metadata, which is most of a module, only its traced name. No computations for an executable that
+    holds no module."""
+    from jax.extend import xla
 
-
-def _joined(lines: Iterable[str]) -> Iterator[str]:
-    """`lines` with each instruction's continuation lines joined onto it: a backend config whose JSON holds
-    newlines (a Mosaic TPU call's cost estimate) leaves the instruction's braces open across lines, until
-    they close or the next instruction or computation starts."""
-    pending = None
-    for line in lines:
-        if pending is not None and not (_INSTRUCTION.match(line) or _COMPUTATION.match(line)):
-            pending += line.strip()
-            if pending.count('{') <= pending.count('}'):
-                yield pending
-                pending = None
-            continue
-        if pending is not None:
-            yield pending
-            pending = None
-        if line.count('{') > line.count('}') and _INSTRUCTION.match(line):
-            pending = line
-            continue
-        yield line
-    if pending is not None:
-        yield pending
-
-
-def _parse(text: str | Iterable[str]) -> tuple[dict[str, _Computation], str | None]:
-    """The module's computations, and the name of its entry computation, from
-    its text or its lines one at a time (a dump file read as it streams): a
-    module's metadata is most of its text, and only its traced names are kept."""
+    module = _module(source)
     computations: dict[str, _Computation] = {}
-    entry, current = None, None
-    for line in _joined(text.splitlines() if isinstance(text, str) else text):
-        stripped = line.strip()
-        header = _COMPUTATION.match(line)
-        if header and ' = ' not in stripped:
-            current = header.group('name')
-            computations[current] = _Computation()
-            if stripped.startswith('ENTRY'):
-                entry = current
-            continue
-        if stripped == '}':
-            current = None
-            continue
-        match = _INSTRUCTION.match(line)
-        if match is None or current is None:
-            continue
-        name = match.group('name')
-        operands, attributes = _split_operands(match.group('rest'))
-        dims = _dims(match.group('shape'))
-        computation = computations[current]
-        computation.shapes[name] = dims
-        element = _ELEMENT.match(match.group('shape'))
-        computation.elements[name] = element.group(1) if element else ''
-        recomputed = '.remat' in name or '.remat' in current or 'rematted_computation' in attributes
-        attributes, metadata = _without_metadata(attributes)
-        traced = tuple(sys.intern(f"{op_name} {file}:{line}".strip() if file else op_name)
-                       for op_name, file, line in _TRACED.findall(metadata) if op_name)
-        moved = collective(match.group('op'))
-        sized = moved or match.group('op') == 'custom-call'
-        arrays = _ARRAY.findall(match.group('shape')) if sized else []
-        computation.instructions[name] = _Instruction(
-            match.group('op'), dims, operands, attributes, recomputed, traced,
-            _buffers(match.group('shape')) if sized else (),
-            tuple(tuple(int(d) for d in each.split(',') if d) for _, each, _ in arrays),
-            _groups(attributes) if moved else (), tuple(element for element, _, _ in arrays))
-        if stripped.startswith('ROOT'):
-            computation.root = name
-        literal = _INTEGER.match(match.group('rest'))
-        integer = _INTEGER_TYPE.match(computation.elements[name])
-        if match.group('op') == 'constant' and not dims and literal and integer:
-            computation.constants[name] = int(literal.group(1))
+    entry = None
+    if module is None:
+        return computations, entry
+    for read in xla.instructions(module):
+        proto = read.proto
+        computation = computations.setdefault(read.computation, _Computation())
+        if read.entry:
+            entry = read.computation
+        arrays = _arrays(proto.shape)
+        dims = arrays[0][1] if arrays else ()
+        element = _element(proto.shape)
+        computation.shapes[read.name] = dims
+        computation.elements[read.name] = element
+        metadata = proto.metadata
+        traced = ((sys.intern(f"{metadata.op_name} {metadata.source_file}:{metadata.source_line}"
+                              if metadata.source_file else metadata.op_name),) if metadata.op_name else ())
+        moved = collective(read.opcode)
+        sized = moved or read.opcode == 'custom-call'
+        convolution = None
+        if proto.HasField('convolution_dimension_numbers'):
+            numbers = proto.convolution_dimension_numbers
+            dimensions = proto.window.dimensions
+            convolution = _Convolution(numbers.input_feature_dimension, numbers.output_feature_dimension,
+                                       tuple(each.size for each in dimensions),
+                                       tuple(each.base_dilation or 1 for each in dimensions),
+                                       proto.feature_group_count or 1)
+        computation.instructions[read.name] = _Instruction(
+            read.opcode, dims, read.operands, read.called, read.custom_call_target or '',
+            proto.backend_config.decode('latin-1'), dict(proto.frontend_attributes.map),
+            tuple(proto.dot_dimension_numbers.lhs_contracting_dimensions), convolution,
+            proto.comparison_direction, proto.tuple_index, proto.parameter_number,
+            ('.remat' in read.name or '.remat' in read.computation
+             or 'rematted_computation' in metadata.op_name), traced,
+            tuple(size for _, _, size in arrays) if sized else (),
+            tuple(each for _, each, _ in arrays) if sized else (),
+            _groups(proto) if moved else (), tuple(each for each, _, _ in arrays) if sized else ())
+        if read.root:
+            computation.root = read.name
+        if read.opcode == 'constant' and not dims:
+            value = _integer(proto.literal, element)
+            if value is not None:
+                computation.constants[read.name] = value
     return computations, entry
 
 
-def _window(attributes: str) -> dict[str, list[int]]:
-    """A convolution's window: its size and its dilations, per spatial axis."""
-    window = {'size': [1], 'lhs_dilate': [1]}
-    match = _WINDOW.search(attributes)
-    if match is None:
-        return window
-    for key in window:
-        found = re.search(key + r'=([0-9x]+)', match.group(1))
-        if found:
-            window[key] = [int(extent) for extent in found.group(1).split('x')]
-    return window
-
-
 def _dot_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]],
-               contracting: tuple[int, ...]) -> float:
-    """Every output element costs one multiply-add per contracted element."""
+               contracting: tuple[int, ...]) -> float | None:
+    """Every output element costs one multiply-add per contracted element; None where the module states
+    no shape for its first operand."""
     lhs = shapes.get(instruction.operands[0]) if instruction.operands else None
     if lhs is None:
-        return 0.0
+        return None
     contracted = math.prod(lhs[axis] for axis in contracting if axis < len(lhs))
     return _MAC * math.prod(instruction.dims) * contracted
 
 
 def _convolution_flops(instruction: _Instruction,
-                       shapes: dict[str, tuple[int, ...]]) -> float:
-    """Output elements times the kernel window times the input features.
+                       shapes: dict[str, tuple[int, ...]]) -> float | None:
+    """Output elements times the kernel window times the input features; None where the module states
+    no shape for its input.
 
     Dividing by the input dilation counts a strided convolution's gradient at
     the multiply-adds its forward pass costs: the dilated positions are zeros,
     and no kernel multiplies them.
     """
     lhs = shapes.get(instruction.operands[0]) if instruction.operands else None
-    labels = _LABELS.search(instruction.attributes)
-    if lhs is None or labels is None:
-        return 0.0
-    features = lhs[labels.group(1).split('_')[0].index('f')]
-    window = _window(instruction.attributes)
-    groups = _GROUPS.search(instruction.attributes)
-    macs = (math.prod(instruction.dims) * math.prod(window['size']) * features
-            / (int(groups.group(1)) if groups else 1)
-            / math.prod(window['lhs_dilate']))
+    convolution = instruction.convolution
+    if lhs is None or convolution is None:
+        return None
+    macs = (math.prod(instruction.dims) * math.prod(convolution.window) * lhs[convolution.input_features]
+            / convolution.groups / math.prod(convolution.dilation))
     return _MAC * macs
 
 
-def _grouped_gemm_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]]) -> float:
+def _grouped_gemm_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]]) -> float | None:
     """A CUTLASS grouped GEMM's call (`dew_cutlass_grouped_gemm`, and `_k`'s weight gradient): each row of
     its first operand, the tokens, multiplies its features into the result's last axis once, whichever
-    group holds it."""
+    group holds it; None where the module states no shape for the tokens."""
     tokens = shapes.get(instruction.operands[0]) if instruction.operands else None
-    return 0.0 if tokens is None else _MAC * math.prod(tokens) * instruction.dims[-1]
+    return None if tokens is None else _MAC * math.prod(tokens) * instruction.dims[-1]
 
 
-def _cudnn_convolution_flops(target: str, instruction: _Instruction,
-                             shapes: dict[str, tuple[int, ...]]) -> float:
-    """A cuDNN convolution call, at the multiply-adds of its forward shape.
+def _cudnn_convolution_flops(direction: str, instruction: _Instruction,
+                             shapes: dict[str, tuple[int, ...]]) -> float | None:
+    """A cuDNN convolution call computing `direction` (`_Call.direction`), at the multiply-adds of its
+    forward shape; None where the module states no shape for an operand it reads.
 
-    XLA keeps the forward convolution's window and dim_labels on all three
+    XLA keeps the forward convolution's window and dimension numbers on all three
     kinds, so each reduces to the same product `B Ho Wo O Kh Kw I / groups`
     read off whichever operand holds each factor: the forward call takes the
     input and the filter, the input-gradient call the output gradient and the
@@ -379,28 +468,18 @@ def _cudnn_convolution_flops(target: str, instruction: _Instruction,
     """
     lhs = shapes.get(instruction.operands[0]) if instruction.operands else None
     rhs = shapes.get(instruction.operands[1]) if len(instruction.operands) > 1 else None
-    labels = _LABELS.search(instruction.attributes)
-    if lhs is None or rhs is None or labels is None:
-        return 0.0
-    lhs_labels, output_labels = labels.group(1).split('_')[0], labels.group(1).split('->')[1]
-    kernel = math.prod(_window(instruction.attributes)['size'])
-    groups = _GROUPS.search(instruction.attributes)
+    convolution = instruction.convolution
+    if lhs is None or rhs is None or convolution is None:
+        return None
+    kernel = math.prod(convolution.window)
     dims = instruction.dims
-    if 'BackwardInput' in target:
-        macs = math.prod(lhs) * kernel * dims[lhs_labels.index('f')]
-    elif 'BackwardFilter' in target:
-        outputs = rhs[output_labels.index('f')]
-        macs = math.prod(dims) * math.prod(rhs) / outputs
+    if direction == 'input':
+        macs = math.prod(lhs) * kernel * dims[convolution.input_features]
+    elif direction == 'filter':
+        macs = math.prod(dims) * math.prod(rhs) / rhs[convolution.output_features]
     else:
-        macs = math.prod(dims) * kernel * lhs[lhs_labels.index('f')]
-    return _MAC * macs / (int(groups.group(1)) if groups else 1)
-
-
-_FLASH = {'dew_flash_mha_fwd': (0, False), 'dew_flash_mha_bwd': (1, True),
-          'dew_flash3_mha_fwd': (0, False), 'dew_flash3_mha_bwd': (1, True)}
-"""FlashAttention-2's and FlashAttention-3's calls (dew_flash_attn): where
-the query sits among each one's operands (the backward's first is the
-output's gradient), and whether it is the backward."""
+        macs = math.prod(dims) * kernel * lhs[convolution.input_features]
+    return _MAC * macs / convolution.groups
 
 
 _CAUSAL = re.compile(r'is_causal = true|"mask_type":"(?:PADDING_)?CAUSAL"')
@@ -408,7 +487,7 @@ _SIDES = re.compile(r'window_size_(left|right) = (-?\d+)')
 _SLIDING = re.compile(r'"sliding_window_length":(\d+)')
 
 
-def _reached(queries: int, keys: int, attributes: str) -> int:
+def _reached(queries: int, keys: int, config: str) -> int:
     """How many (query, key) pairs a fused attention computes: each query row
     reaches the keys its call's mask leaves it, under a causal mask the keys up
     to its own position (aligned to the last key, as FlashAttention aligns
@@ -416,10 +495,11 @@ def _reached(queries: int, keys: int, attributes: str) -> int:
     and right of it. dew_flash_attn states `is_causal` and
     `window_size_left`/`_right` (-1 unbounded); cuDNN its `mask_type` and a
     `sliding_window_length` of the window's left side and the query's own
-    key (0 none)."""
-    causal = bool(_CAUSAL.search(attributes))
-    sides = {side: int(size) for side, size in _SIDES.findall(attributes)}
-    sliding = _SLIDING.search(attributes)
+    key (0 none). Each states its mask in its call's backend config (`config`), cuDNN's as JSON and the
+    FFI call's as its attributes' MLIR dictionary, which no schema of XLA's decodes."""
+    causal = bool(_CAUSAL.search(config))
+    sides = {side: int(size) for side, size in _SIDES.findall(config)}
+    sliding = _SLIDING.search(config)
     left = sides.get('left', int(sliding.group(1)) - 1 if sliding and int(sliding.group(1)) else -1)
     right = 0 if causal else sides.get('right', -1)
     diagonal = np.arange(queries) + (keys - queries)
@@ -428,11 +508,12 @@ def _reached(queries: int, keys: int, attributes: str) -> int:
     return int(np.clip(high - low + 1, 0, None).sum())
 
 
-def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]], *,
-                           query: int, backward: bool) -> tuple[float, float]:
-    """A fused-attention call (cuDNN's or dew_flash_attn's), from the query,
-    key and value it is given, the operands at `query` and the two after it,
-    and the pairs of them its mask computes (`_reached`).
+def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]],
+                           attention: Attention) -> tuple[float, float] | None:
+    """A fused-attention call (cuDNN's or dew_flash_attn's) as its target states its operands
+    (`Attention`), from the query, key and value it is given, the operands at its `query` and the two
+    after it, and the pairs of them its mask computes (`_reached`); None where they are not batched
+    `[batch, sequence, heads, width]` arrays the module states.
 
     The kernel keeps the scores off memory, so nothing in the module states
     its arithmetic; the operands do. They are `[batch, sequence, heads, width]`
@@ -450,29 +531,31 @@ def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[in
     it kept off memory, one `Q K^T` more at the query's width, the hardware's
     alone.
     """
+    query = attention.query
     if len(instruction.operands) < query + 3:
-        return 0.0, 0.0
+        return None
     queries, key, value = (shapes.get(instruction.operands[query + offset]) for offset in range(3))
-    if any(operand is None or len(operand) != 4 for operand in (queries, key, value)):
-        return 0.0, 0.0
-    assert queries is not None and key is not None and value is not None
+    if queries is None or key is None or value is None:
+        return None
+    if any(len(each) != 4 for each in (queries, key, value)):
+        return None
     batch, length, heads, width = queries
-    pairs = _MAC * batch * heads * _reached(length, key[1], instruction.attributes)
-    model = (2 if backward else 1) * pairs * (width + value[3])
-    return model, model + (pairs * width if backward else 0.0)
+    pairs = _MAC * batch * heads * _reached(length, key[1], instruction.config)
+    model = (2 if attention.backward else 1) * pairs * (width + value[3])
+    return model, model + (pairs * width if attention.backward else 0.0)
 
 
 def custom_call_kind(target: str) -> str | None:
-    """What a custom call computes, by its target: cuBLAS's GEMMs ('gemm'),
-    cuDNN's convolutions ('convolution'), the fused attentions of cuDNN and
-    dew_flash_attn ('attention'), dew_cutlass's grouped GEMMs ('grouped_gemm'),
-    the kernels Pallas lowers to (`PALLAS`), and
-    the calls that run no matmul (sharding and placement marks, host copies and
-    callbacks, random bits, sorts and top-k: 'no_matmul'); None for any other,
-    whose work nothing here sizes (`sizes`). The FLOP count, the kernel report
-    (`dew.training._lowering`) and tools/attribute_step.py read custom calls
-    through this one table."""
-    return next((kind for kind, pattern in _CUSTOM_CALLS if pattern.search(target)), None)
+    """What a custom call computes, by its target (`_calls`, each name read from the owner that states
+    it): cuBLAS's GEMMs ('gemm'), cuDNN's convolutions ('convolution'), the fused attentions of cuDNN and
+    dew_flash_attn ('attention', and 'packed_attention' for a call over sequences between offsets given
+    at run time, whose work no shape states), dew_cutlass's grouped GEMMs ('grouped_gemm'), the kernels
+    Pallas lowers to (`PALLAS`), and the calls that run no matmul (sharding and placement marks, host
+    copies and callbacks, random bits, sorts, scans and top-k: 'no_matmul'); None for any other, whose
+    work nothing here sizes (`sizes`). The FLOP count, the kernel report (`dew.training._lowering`) and
+    tools/attribute_step.py read custom calls through this one table."""
+    call = _calls().get(target)
+    return None if call is None else call.kind
 
 
 @dataclass(frozen=True)
@@ -495,9 +578,10 @@ class HloInstruction:
     """The traced names of the parameters it reads, through bitcasts, copies
     and tuple elements: a jitted step's own are its arguments' paths, such
     as `current.opt_state[0].mu['head']`."""
-    flops: float
+    flops: float | None
     """The matmul and convolution work of one call, a fusion's included, as
-    the step's count (`hlo_flops`) counts it."""
+    the step's count (`hlo_flops`) counts it; None where any of it is unsized
+    (`StepFlops.unsized`)."""
     runs: float
     """Its calls per call of the module, as `hlo_flops` weighs them: a loop
     body's trip count, every branch of a conditional once."""
@@ -518,22 +602,37 @@ class HloInstruction:
     dimensions: a cuBLAS call's `s8` workspace beside its product."""
 
 
-def reported_instruction(expression: str) -> HloInstruction | None:
-    """The one instruction `expression` writes, as a row of XProf's hlo_stats holds it
-    (`hlo_op_expression`, cut short), read as a module of it alone; None where it writes none."""
-    return next(iter(hlo_instructions(f"ENTRY %row () -> () {{\n  {expression}\n}}").values()), None)
+class Reported(NamedTuple):
+    """What a row of XProf's hlo_stats displays of its instruction (`reported_instruction`)."""
+
+    op: str
+    target: str
+    """A custom call's target, empty for any other op."""
 
 
-def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
-    """Every instruction of the module in `text` (`compiled.as_text()`, or an XLA
-    dump's after-optimizations HLO, whole or as its lines) by name, read by the
-    parser the FLOP count reads (`hlo_flops`). Each computation's body is
-    gathered once, so the fusions that call one share its sets."""
-    computations, entry = _parse(text)
+def reported_instruction(expression: str) -> Reported | None:
+    """The opcode and custom-call target of the one instruction `expression` displays, as a row of XProf's
+    hlo_stats holds it (`hlo_op_expression`, cut short): XProf's display, no module XLA's parser reads, for
+    a row whose module was not given (`hlo_instructions` reads one that was); None where it displays
+    none."""
+    found = _REPORTED.match(expression)
+    if found is None:
+        return None
+    target = _REPORTED_TARGET.search(expression) if found.group('op') == 'custom-call' else None
+    return Reported(found.group('op'), target.group(1) if target else '')
+
+
+def hlo_instructions(source: str | Iterable[str] | jax.stages.Compiled) -> dict[str, HloInstruction]:
+    """Every instruction of the module `source` holds (`_module`: a compiled executable's, or an XLA dump's
+    after-optimizations HLO, whole or as its lines) by name, read as the FLOP count reads it
+    (`hlo_flops`). Each computation's body is gathered once, so the fusions that call one share its
+    sets."""
+    computations, entry = _read(source)
     weights = {} if entry is None else _weights(computations, entry)
-    bodies: dict[str, tuple[frozenset[str], frozenset[str], float]] = {}
+    bodies: dict[str, tuple[frozenset[str], frozenset[str], float | None]] = {}
 
-    def fused(name: str, seen: frozenset[str] = frozenset()) -> tuple[frozenset[str], frozenset[str], float]:
+    def fused(name: str,
+              seen: frozenset[str] = frozenset()) -> tuple[frozenset[str], frozenset[str], float | None]:
         if name in bodies:
             return bodies[name]
         computation = computations.get(name)
@@ -541,14 +640,14 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             return frozenset(), frozenset(), 0.0
         ops = {instruction.op for instruction in computation.instructions.values()}
         names = {each for instruction in computation.instructions.values() for each in instruction.traced}
-        flops = sum(_instruction_flops(instruction, computation.shapes)[1]
-                    for instruction in computation.instructions.values())
+        flops = _summed(_hardware(_instruction_flops(instruction, computation.shapes))
+                        for instruction in computation.instructions.values())
         for instruction in computation.instructions.values():
-            for called in _CALLS.findall(instruction.attributes):
+            for called in instruction.called:
                 inner_ops, inner_names, inner_flops = fused(called, seen | {name})
                 ops |= inner_ops
                 names |= inner_names
-                flops += inner_flops
+                flops = _summed((flops, inner_flops))
         bodies[name] = frozenset(ops), frozenset(names), flops
         return bodies[name]
 
@@ -565,15 +664,14 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
     found = {}
     for called_as, computation in computations.items():
         for name, instruction in computation.instructions.items():
-            target = _TARGET.search(instruction.attributes)
-            calls = _CALLS.findall(instruction.attributes) if instruction.op == 'fusion' else []
+            calls = instruction.called if instruction.op == 'fusion' else ()
             called = [fused(each) for each in calls]
             ops = called[0][0] if len(called) == 1 else frozenset().union(*(each for each, _, _ in called))
             names = frozenset(instruction.traced).union(*(each for _, each, _ in called))
             reads = frozenset().union(*(parameters(computation, each) for each in instruction.operands))
-            flops = (_instruction_flops(instruction, computation.shapes)[1]
-                     + sum(each for _, _, each in called))
-            found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
+            flops = _summed([_hardware(_instruction_flops(instruction, computation.shapes)),
+                             *(each for _, _, each in called)])
+            found[name] = HloInstruction(instruction.op, instruction.target,
                                          tuple(instruction.operands), ops, instruction.recomputed, names,
                                          reads, flops, weights.get(called_as, 0.0), instruction.buffers,
                                          instruction.shapes, instruction.groups, computation.elements[name],
@@ -582,9 +680,24 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
     return found
 
 
-def _instruction_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]]) -> tuple[float, float]:
+def _hardware(flops: tuple[float, float] | None) -> float | None:
+    """The hardware's share of an instruction's work (`_instruction_flops`), None where it is unsized."""
+    return None if flops is None else flops[1]
+
+
+def _summed(parts: Iterable[float | None]) -> float | None:
+    """The sum of `parts`, None where any is: work one part leaves unsized leaves the whole unsized."""
+    parts = list(parts)
+    return None if any(part is None for part in parts) else sum(part for part in parts if part is not None)
+
+
+def _instruction_flops(instruction: _Instruction,
+                       shapes: dict[str, tuple[int, ...]]) -> tuple[float, float] | None:
     """The multiply-add work of one instruction, the model's and the hardware's (a kernel's recomputed
-    products the hardware's alone), and zero for anything else.
+    products the hardware's alone), zero for anything that runs no matmul, and None for one whose work the
+    count cannot size (`sizes`): a custom call nothing here knows (`custom_call_kind`), a Pallas kernel that
+    states no cost, an attention over sequences its shapes do not state, or a matmul whose operands the
+    module states no shape for. Missing work stays missing, never counted as zero.
 
     Only the matmuls and convolutions count. Everything the compiler leaves
     elementwise (the optimizer, the EMA, normalization, the softmax, the loss
@@ -592,63 +705,65 @@ def _instruction_flops(instruction: _Instruction, shapes: dict[str, tuple[int, .
     about, which is the convention this repo's benchmarks state
     (docs/research/benchmark-parity.md:44-48).
     """
-    target = target_of(instruction)
-    if custom_call_kind(target) == 'attention':
-        query, backward = _FLASH.get(target, (0, target.endswith('Backward')))
-        return _fused_attention_flops(instruction, shapes, query=query, backward=backward)
-    if custom_call_kind(target) in PALLAS:
+    if instruction.op != 'custom-call':
+        flops = _matmul_flops(instruction, shapes)
+        return None if flops is None else (flops, flops)
+    call = _calls().get(instruction.target)
+    if call is None:
+        return None
+    if call.kind in PALLAS:
         # A Pallas kernel's work is the hardware's it states, the model's share where it declares one
-        # (`MODEL_FLOPS`); `_unsized` counts a kernel that states none.
-        hardware = _stated_flops(instruction.attributes) or 0.0
-        declared = _MODEL_FLOPS.search(instruction.attributes)
-        return (hardware if declared is None else float(declared.group(1))), hardware
-    flops = _matmul_flops(instruction, shapes)
-    return flops, flops
-
-
-def target_of(instruction: _Instruction) -> str:
-    """A custom call's target, empty for any other instruction."""
-    target = _TARGET.search(instruction.attributes) if instruction.op == 'custom-call' else None
-    return target.group(1) if target else ''
+        # (`MODEL_FLOPS`).
+        hardware = _stated_flops(instruction.config)
+        if hardware is None:
+            return None
+        declared = instruction.frontend.get(MODEL_FLOPS)
+        return (hardware if declared is None else float(declared)), hardware
+    if call.kind == 'no_matmul':
+        return 0.0, 0.0
+    if call.kind == 'attention' and call.attention is not None:
+        return _fused_attention_flops(instruction, shapes, call.attention)
+    flops = _library_flops(call, instruction, shapes)
+    return None if flops is None else (flops, flops)
 
 
 MODEL_FLOPS = "dew_model_flops"
 """The frontend attribute a kernel's launch declares the model's share of the work it states by (`declared`):
 the rest its own recomputation (attention's scores, `attention_mosaic_program.stated`)."""
 
-_MODEL_FLOPS = re.compile(MODEL_FLOPS + r'="(\d+)"')
-
-
-def _matmul_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]]) -> float:
-    """A matmul's or a convolution's multiply-add work, a GEMM library call's among them; zero for any other
-    instruction."""
+def _matmul_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]]) -> float | None:
+    """A `dot`'s or a `convolution`'s multiply-add work, None where the module states too little to size
+    it; zero for any other instruction but a custom call (`_instruction_flops`)."""
     if instruction.op == 'dot':
-        contracting = _CONTRACTING.search(instruction.attributes)
-        axes = () if contracting is None else tuple(
-            int(axis) for axis in contracting.group(1).split(',') if axis)
-        return _dot_flops(instruction, shapes, axes)
+        return _dot_flops(instruction, shapes, instruction.contracting)
     if instruction.op == 'convolution':
         return _convolution_flops(instruction, shapes)
-    target = target_of(instruction)
-    kind = custom_call_kind(target)
-    if kind == 'gemm':
-        contracting = _GEMM_CONTRACTING.search(instruction.attributes)
-        axes = () if contracting is None else tuple(
-            int(axis.strip(' "')) for axis in contracting.group(1).split(',')
-            if axis.strip(' "'))
-        return _dot_flops(instruction, shapes, axes)
-    if kind == 'convolution':
-        return _cudnn_convolution_flops(target, instruction, shapes)
-    if kind == 'grouped_gemm':
-        return _grouped_gemm_flops(instruction, shapes)
     return 0.0
 
 
-def _stated_flops(attributes: str) -> float | None:
-    """The FLOPs a Pallas kernel's call states (`_STATED`, `_STATED_TPU`), None where it states none."""
-    if found := _STATED_TPU.search(attributes):
+def _library_flops(call: _Call, instruction: _Instruction,
+                   shapes: dict[str, tuple[int, ...]]) -> float | None:
+    """A GEMM library call's multiply-add work, a cuBLAS GEMM's, a cuDNN convolution's or a grouped GEMM's;
+    None for any other call, and where the module states too little to size it."""
+    if call.kind == 'gemm':
+        # cuBLAS's call states its dot's dimension numbers in its JSON config (`xla.gpu.GemmBackendConfig`).
+        numbers = json.loads(instruction.config or '{}').get('gemm_backend_config', {}).get(
+            'dot_dimension_numbers', {})
+        return _dot_flops(instruction, shapes,
+                          tuple(int(axis) for axis in numbers.get('lhs_contracting_dimensions', ())))
+    if call.kind == 'convolution':
+        return _cudnn_convolution_flops(call.direction, instruction, shapes)
+    if call.kind == 'grouped_gemm':
+        return _grouped_gemm_flops(instruction, shapes)
+    return None
+
+
+def _stated_flops(config: str) -> float | None:
+    """The FLOPs a Pallas kernel's call states in its backend config (`_STATED`, `_STATED_TPU`), None where
+    it states none."""
+    if found := _STATED_TPU.search(config):
         return float(found.group(1))
-    found = _STATED.search(attributes)
+    found = _STATED.search(config)
     if found is None:
         return None
     text = re.sub(r'\\([0-9A-Fa-f]{2})', lambda escaped: chr(int(escaped.group(1), 16)), found.group(1))
@@ -658,8 +773,9 @@ def _stated_flops(attributes: str) -> float | None:
 
 def sizes(kind: str | None, stated: float | None) -> bool:
     """Whether the FLOP count sizes the work of a custom call of `kind` (`custom_call_kind`) whose kernel
-    states `stated` FLOPs: a library's GEMM, convolution or attention by its shapes, a Pallas kernel by
-    the cost it states, a call that runs no matmul as none; never a call nothing here knows."""
+    states `stated` FLOPs: a library's GEMM, convolution or batched attention by its shapes, a Pallas
+    kernel by the cost it states, a call that runs no matmul as none; never a packed attention, whose
+    sequences its shapes do not state, nor a call nothing here knows."""
     return (kind in ("gemm", "convolution", "attention", "grouped_gemm", "no_matmul")
             or (kind in PALLAS and stated is not None))
 
@@ -674,16 +790,11 @@ def _call_counts(instruction: _Instruction, caller: _Computation,
     becomes infinite, and the caller then reports no count. A conditional
     runs one of its branches, so counting every branch bounds it.
     """
-    counts = dict.fromkeys(_CALLS.findall(instruction.attributes), 1.0)
-    branches = _BRANCHES.search(instruction.attributes)
-    if branches is not None:
-        counts.update(dict.fromkeys(_NAME.findall(branches.group(1)), 1.0))
+    counts = dict.fromkeys(instruction.called, 1.0)
     if instruction.op == 'while':
-        body = _called(instruction, 'body')
-        trip = _TRIP_COUNT.search(instruction.attributes)
-        if body:
-            counts[body] = (float(trip.group(1)) if trip
-                            else _counted_trips(instruction, caller, computations))
+        trip = json.loads(instruction.config or '{}').get('known_trip_count', {}).get('n')
+        counts[_body(instruction)] = (float(trip) if trip is not None
+                                      else _counted_trips(instruction, caller, computations))
     return counts
 
 
@@ -699,8 +810,8 @@ def _counted_trips(loop: _Instruction, caller: _Computation,
     executable wraps them in (`_term`). Infinite for any other loop, and for
     one whose last step overflows the counter's type, since a wrapped counter
     need never reach the bound."""
-    condition = computations.get(_called(loop, 'condition'))
-    body = computations.get(_called(loop, 'body'))
+    condition = computations.get(loop.called[1])
+    body = computations.get(_body(loop))
     if condition is None or body is None or not loop.operands:
         return math.inf
     root = _term(condition, condition.root, computations)
@@ -713,8 +824,7 @@ def _compared_trips(loop: _Instruction, caller: _Computation, body: _Computation
                     computations: dict[str, _Computation]) -> float:
     """`_counted_trips` of `loop` by `compare` (a `_term`), its condition's counted bound, or infinite
     where it is none."""
-    if (compare is None or compare[0] != 'compare' or 'direction=LT' not in compare[1]
-            or len(compare[2]) != 2):
+    if compare is None or compare[0] != 'compare' or compare[1] != 'LT' or len(compare[2]) != 2:
         return math.inf
     counter, bound = compare[2]
     if counter is None or counter[0] != 'element' or bound is None or bound[0] != 'constant':
@@ -732,16 +842,15 @@ def _term(computation: _Computation, name: str | None, computations: dict[str, _
     """The expression that makes `name` in `computation`, through copies and through a fusion of
     elementwise ops over its operands (an executable's loop condition and counter step): `('element',
     index, type)` for an element of the computation's tuple parameter, `('constant', value)` for an
-    integer constant, `(op, attributes, operands)` for any other instruction, its operands each such a
-    term; a fused computation's parameters bound to its fusion's operands (`bound`). None where it is
-    none of these."""
+    integer constant, `(op, direction, operands)` for any other instruction (a compare's direction), its
+    operands each such a term; a fused computation's parameters bound to its fusion's operands (`bound`).
+    None where it is none of these."""
     made = _source(computation, name)
     if made is None:
         return None
     if made.op == 'parameter' and bound:
-        # A fused computation's parameter, its number its one operand (`parameter(1)`).
-        number = int(made.operands[0]) if made.operands and made.operands[0].isdigit() else len(bound)
-        return bound[number] if number < len(bound) else None
+        # A fused computation's parameter, bound to its fusion's operand of its number.
+        return bound[made.parameter] if made.parameter < len(bound) else None
     value = _constant(computation, made_name := _origin(computation, name))
     if value is not None:
         return ('constant', value)
@@ -750,9 +859,9 @@ def _term(computation: _Computation, name: str | None, computations: dict[str, _
         return ('element', index, computation.elements.get(made_name, ''))
     operands = tuple(_term(computation, operand, computations, bound) for operand in made.operands)
     if made.op == 'fusion':
-        fused = computations.get(_called(made, 'calls'))
+        fused = computations.get(made.called[0])
         return None if fused is None else _term(fused, fused.root, computations, operands)
-    return (made.op, made.attributes, operands)
+    return (made.op, made.direction, operands)
 
 
 def _step(stepped: tuple | None, index: int) -> int | None:
@@ -780,10 +889,10 @@ def counted_trips(start: int, bound: int, step: int, bits: int, *, signed: bool)
     return float(trips)
 
 
-def _called(instruction: _Instruction, key: str) -> str:
-    """The computation an instruction names under `key`, or ''."""
-    match = re.search(key + r'=%?([\w.\-]+)', instruction.attributes)
-    return match.group(1) if match else ''
+def _body(loop: _Instruction) -> str:
+    """A while loop's body, the first computation it calls (XLA's `kBodyComputationIndex`; its condition
+    the second, `kConditionComputationIndex`, xla/hlo/ir/hlo_instruction.h)."""
+    return loop.called[0]
 
 
 def _origin(computation: _Computation, name: str | None) -> str:
@@ -810,8 +919,7 @@ def _element_index(computation: _Computation, name: str | None) -> int | None:
     if read is None or read.op != 'get-tuple-element' or not read.operands:
         return None
     tuple_ = computation.instructions.get(read.operands[0])
-    index = _INDEX.search(read.attributes)
-    return int(index.group(1)) if tuple_ is not None and tuple_.op == 'parameter' and index else None
+    return read.tuple_index if tuple_ is not None and tuple_.op == 'parameter' else None
 
 
 def _tuple_element(computation: _Computation, name: str | None, index: int) -> str | None:
@@ -860,8 +968,7 @@ def call_weights(calls: Mapping[str, Mapping[str, float]], entry: str) -> dict[s
 def _branches(instruction: _Instruction) -> list[str]:
     """The computations a conditional `instruction` runs one of, its branches; none for another
     instruction."""
-    branches = _BRANCHES.search(instruction.attributes)
-    return [] if branches is None else _NAME.findall(branches.group(1))
+    return list(instruction.called) if instruction.op == 'conditional' else []
 
 
 def _merged_call_counts(computation: _Computation,
@@ -879,10 +986,11 @@ class StepFlops:
     """One step's FLOPs: the `model`'s, the forward a remat recomputes counted
     once, and the `hardware`'s, every matmul the device runs. MFU is read off
     the first and HFU off the second (PaLM's distinction). `unsized` counts
-    the custom calls the step runs whose work neither holds (`sizes`): a
-    Pallas kernel that states no cost (JAX's Triton lowering drops the
-    kernel's `CostEstimate`; Mosaic's keep theirs) or a call nothing here
-    knows, so where any runs both are lower bounds."""
+    the instructions the step runs whose work neither holds (`_instruction_flops`):
+    a Pallas kernel that states no cost (JAX's Triton lowering drops the
+    kernel's `CostEstimate`; Mosaic's keep theirs), an attention over
+    sequences its shapes do not state (`packed_attention`), or a call nothing
+    here knows, so where any runs both are lower bounds."""
 
     model: float
     hardware: float
@@ -955,8 +1063,7 @@ def step_flops(compiled: jax.stages.Compiled) -> StepFlops | None:
     module contains a loop whose length neither XLA states nor its counter
     gives, since the count would then be the body's, not the run's.
     """
-    text = compiled.as_text()
-    return None if text is None else hlo_flops(text)
+    return hlo_flops(compiled)
 
 
 def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
@@ -965,14 +1072,14 @@ def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
     return None if flops is None else flops.hardware
 
 
-def hlo_flops(text: str) -> StepFlops | None:
-    """Matmul and convolution FLOPs of one call of an optimized HLO module,
-    parsed and weighted once: the forward a remat recomputes counted once in
-    `model` and each time it runs in `hardware`, each Pallas kernel at the cost
+def hlo_flops(source: str | jax.stages.Compiled) -> StepFlops | None:
+    """Matmul and convolution FLOPs of one call of an optimized HLO module (`_module`: a compiled
+    executable's, or one written as text), read and weighted once: the forward a remat recomputes counted
+    once in `model` and each time it runs in `hardware`, each Pallas kernel at the cost
     it states, the model's share of it where it declares one (`MODEL_FLOPS`),
     beside the custom calls it runs whose work neither counts
     (`StepFlops.unsized`, `sizes`)."""
-    computations, entry = _parse(text)
+    computations, entry = _read(source)
     if entry is None:
         return None
     found = _inclusive(entry, computations, {})
@@ -989,11 +1096,11 @@ def _inclusive(name: str, computations: dict[str, _Computation], memo: dict[str,
     if name in memo:
         return memo[name]
     computation = computations[name]
-    counted = [(*_instruction_flops(instruction, computation.shapes), instruction.recomputed)
+    counted = [(_instruction_flops(instruction, computation.shapes), instruction.recomputed)
                for instruction in computation.instructions.values()]
-    launches = sum(_unsized(instruction) for instruction in computation.instructions.values())
-    total = StepFlops(sum(flops for flops, _, recomputed in counted if not recomputed),
-                      sum(flops for _, flops, _ in counted), float(launches))
+    sized = [(*flops, recomputed) for flops, recomputed in counted if flops is not None]
+    total = StepFlops(sum(flops for flops, _, recomputed in sized if not recomputed),
+                      sum(flops for _, flops, _ in sized), float(len(counted) - len(sized)))
     for instruction in computation.instructions.values():
         branches = _branches(instruction)
         for callee, times in _call_counts(instruction, computation, computations).items():
@@ -1007,14 +1114,6 @@ def _inclusive(name: str, computations: dict[str, _Computation], memo: dict[str,
             total = total + max(ran, key=lambda flops: (flops.hardware, flops.model, flops.unsized))
     memo[name] = total
     return total
-
-
-def _unsized(instruction: _Instruction) -> bool:
-    """Whether `instruction` is a custom call whose work the count cannot size (`sizes`): a Pallas
-    kernel's that states no cost of its own (`_stated_flops`), or one nothing here knows."""
-    target = _TARGET.search(instruction.attributes) if instruction.op == 'custom-call' else None
-    return target is not None and not sizes(custom_call_kind(target.group(1)),
-                                            _stated_flops(instruction.attributes))
 
 
 def model_flops_utilization(

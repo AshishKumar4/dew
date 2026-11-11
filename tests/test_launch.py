@@ -7,19 +7,17 @@ code, the output, and which processes are left alive.
 
 import errno
 import os
-import queue
 import signal
 import socket
 import subprocess
 import sys
-import threading
 import time
 from collections.abc import Sequence
 from pathlib import Path
 
 import pytest
 from lane_environment import outside_any_cluster
-from process_support import owned, running
+from process_support import drained, output, owned, running
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 # The launches below stand in for Slurm, Open MPI or a plain host with
@@ -102,15 +100,13 @@ def test_a_ranks_lines_reach_the_launch_while_the_rank_runs():
     program = "import time\nprint('ready')\ntime.sleep(600)\n"
     shell = {name: value for name, value in ENV.items() if name != "PYTHONUNBUFFERED"}
     launch = launcher("--port", "1", "--", sys.executable, "-c", program, env=shell)
-    lines: queue.Queue[str] = queue.Queue()
-    threading.Thread(target=lambda: [lines.put(line) for line in launch.stdout or ()],
-                     daemon=True).start()
     seen = []
     deadline = time.monotonic() + 30
     try:
         while "[0] ready" not in seen:
-            seen.append(lines.get(timeout=max(0.0, deadline - time.monotonic())).rstrip())
-    except queue.Empty:
+            left = max(0.0, deadline - time.monotonic())
+            seen.append(drained(launch).line(len(seen), timeout=left).rstrip())
+    except TimeoutError:
         pytest.fail(f"the rank's line had not arrived after 30 s; the launch printed {seen}")
     finally:
         launch.send_signal(signal.SIGTERM)
@@ -122,7 +118,7 @@ def test_a_rank_killed_by_a_signal_exits_the_launch_128_plus_it():
     wrappers test for; Python's -9 would reach the shell as 247."""
     program = "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n"
     launch = launcher("--port", "1", "--", sys.executable, "-c", program)
-    launch.communicate(timeout=60)
+    output(launch, 60)
     assert launch.returncode == 137
 
 
@@ -141,7 +137,7 @@ def test_a_failing_rank_stops_the_pool_and_is_named_with_its_last_lines(tmp_path
     launch = launcher("--processes-per-host", "2", "--port", "1", "--",
                       sys.executable, "-c", program, str(tmp_path))
     try:
-        launch.communicate(timeout=60)
+        output(launch, 60)
     finally:
         launch.kill()
     ranks = [int(path.read_text()) for path in tmp_path.glob("rank*")]
@@ -165,7 +161,7 @@ def test_a_failing_rank_leaves_none_of_its_own_processes_running(tmp_path):
     launch = launcher("--processes-per-host", "2", "--port", "1", "--",
                       sys.executable, "-c", program, str(tmp_path))
     try:
-        launch.communicate(timeout=60)
+        output(launch, 60)
     finally:
         launch.kill()
     assert launch.returncode == 3
@@ -187,7 +183,7 @@ def test_a_pool_that_exits_zero_leaves_none_of_its_ranks_processes_running(tmp_p
     launch = launcher("--processes-per-host", "2", "--port", "1", "--",
                       sys.executable, "-c", program, str(tmp_path))
     try:
-        launch.communicate(timeout=60)
+        output(launch, 60)
     finally:
         launch.kill()
     assert launch.returncode == 0
@@ -293,7 +289,7 @@ def test_a_failing_rank_over_ssh_leaves_none_of_its_processes_on_its_host(tmp_pa
                       sys.executable, "-c", program, str(tmp_path),
                       env={**ENV, "PATH": f"{binaries}:{ENV['PATH']}"})
     try:
-        launch.communicate(timeout=60)
+        output(launch, 60)
     finally:
         launch.kill()
     assert launch.returncode == 3

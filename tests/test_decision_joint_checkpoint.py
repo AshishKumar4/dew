@@ -563,12 +563,10 @@ def test_two_joint_release_runs_average_into_a_task_that_reloads(joint_runs):
                 np.testing.assert_equal(dataclasses.asdict(found[name]), dataclasses.asdict(answers[name]))
 
 
-def test_a_joint_release_reads_images_as_its_own_model_does(tmp_path):
-    """A request's images, laid out before the state by the backbone's own
-    processor as the release's `systemone` lays them out: the same token ids,
-    and logits held to twice the release's fp32 model's distance from its
-    float64 run,
-    the vision tower included. `systemone` reads them as data URLs."""
+def test_a_joint_release_serves_a_requests_images_as_urls_or_pictures_alike(tmp_path):
+    """`systemone` reads a request's images as data URLs or as pictures, answers the two alike and as a
+    call with them does, counts their tokens in its usage, and answers otherwise than without them. Its
+    parity with the release's own model over pictures is the harness's (tests/test_release_parity.py)."""
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
     decide = Decide.from_pretrained(tmp_path, attention_impl="xla")
@@ -579,16 +577,6 @@ def test_a_joint_release_reads_images_as_its_own_model_does(tmp_path):
     media = Images.of(decide.processor, pictures, decide.processor.image_text())
     [row] = decide.layout.rows(decide.tokenizer, decide.specials, request["state"], questions,
                                media=media.tokens)
-    assert list(row.tokens) == json.loads((TINY / "images.json").read_text())["ids"]
-    scores = np.asarray(decide.model.logits(decide.variables, DecisionInputs.collate([row], 0),
-                                            media=media.inputs(decide.processor, row)))
-    with np.load(TINY / "images.npz") as logits:
-        names = [laid.name for laid in row.questions]
-        found = [scores[0, slot, :len(laid.options)] for slot, laid in enumerate(row.questions)]
-        reference = [logits[name] for name in names]
-        truth = [logits[f"{name}/f64"] for name in names]
-        assert_as_exact_as_the_reference(np.concatenate(found), np.concatenate(reference),
-                                         np.concatenate(truth), "joint head over Dew's Qwen 3.5, with images")
 
     def url(picture: Image.Image) -> str:
         encoded = io.BytesIO()

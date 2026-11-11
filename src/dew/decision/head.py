@@ -24,7 +24,8 @@ from flax.typing import Dtype, PrecisionLike
 from dew import _records
 from dew._records import JSON
 from dew.data.text import Tokenizer
-from dew.decision.layout import DecisionInputs, Encoded, Labels
+from dew.decision.inputs import DecisionInputs
+from dew.decision.layout import Encoded, Labels
 from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.decision.shared_state import over_one_state_row
 from dew.nn.activations import gelu_exact_torch

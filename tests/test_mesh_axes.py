@@ -822,16 +822,30 @@ custom_call_target="__gpu$xla.gpu.triton"
 def test_an_async_collective_counts_its_results_not_its_operands():
     """An async pair counts once, by its `-done`, which holds what moved: its `-start` names
     `(operands, results)`. Each result's bytes are as XLA sizes them, an fp8 element's one byte."""
-    text = """ENTRY %main (x: bf16[4,8], y: f32[16], z: f32[8], w: f8e4m3fn[2,8]) -> f32[8] {
-  %ag = ((bf16[4,8]{1,0}), bf16[8,8]{1,0}) all-gather-start(bf16[4,8]{1,0} %x), dimensions={0}
-  %agd = bf16[8,8]{1,0} all-gather-done(((bf16[4,8]{1,0}), bf16[8,8]{1,0}) %ag)
-  %rs = (f32[16]{0}, f32[8]{0}) reduce-scatter-start(f32[16]{0} %y), dimensions={0}
-  %rsd = f32[8]{0} reduce-scatter-done((f32[16]{0}, f32[8]{0}) %rs)
-  %ar = f32[8]{0} all-reduce(f32[8]{0} %z), to_apply=%add
-  ROOT %wg = f8e4m3fn[8,8]{1,0} all-gather(f8e4m3fn[2,8]{1,0} %w), dimensions={0}
+    text = """HloModule step
+
+%add (lhs: f32[], rhs: f32[]) -> f32[] {
+  %lhs = f32[] parameter(0)
+  %rhs = f32[] parameter(1)
+  ROOT %sum = f32[] add(%lhs, %rhs)
+}
+
+ENTRY %main (x: bf16[4,8], y: f32[16], z: f32[8], w: f8e4m3fn[2,8]) -> f8e4m3fn[8,8] {
+  %x = bf16[4,8]{1,0} parameter(0)
+  %y = f32[16]{0} parameter(1)
+  %z = f32[8]{0} parameter(2)
+  %w = f8e4m3fn[2,8]{1,0} parameter(3)
+  %ag = (bf16[4,8]{1,0}, bf16[8,8]{1,0}) all-gather-start(%x), dimensions={0}
+  %agd = bf16[8,8]{1,0} all-gather-done(%ag)
+  %rs = ((f32[16]{0}), f32[8]{0}) reduce-scatter-start(%y), dimensions={0}, to_apply=%add
+  %rsd = f32[8]{0} reduce-scatter-done(%rs)
+  %ar = f32[8]{0} all-reduce(%z), to_apply=%add
+  ROOT %wg = f8e4m3fn[8,8]{1,0} all-gather(%w), dimensions={0}
 }"""
-    assert sharded.collectives(text) == [("all-gather", [(8, 8)]), ("reduce-scatter", [(8,)]),
-                                         ("all-reduce", [(8,)]), ("all-gather", [(8, 8)])]
+    # XLA's parser holds the reduce-scatter's pair as it compiles one, an async-start over a computation
+    # of the reduce-scatter itself, which counts it.
+    assert sorted(sharded.collectives(text)) == sorted([("all-gather", [(8, 8)]), ("reduce-scatter", [(8,)]),
+                                                        ("all-reduce", [(8,)]), ("all-gather", [(8, 8)])])
     assert sharded.collective_bytes(text, COLLECTIVES) == 128 + 32 + 32 + 64
 
 

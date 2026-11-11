@@ -8,10 +8,12 @@ a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 
 import contextlib
 import dataclasses
+import functools
 import itertools
 import json
 import logging
 import os
+import shutil
 
 import lane_environment
 import jax
@@ -103,6 +105,67 @@ def test_a_program_called_over_shapes_while_collecting_compiles_there_and_runs_w
         answered = owned_program(lambda values: values * 2 + 1)(values)
     assert [program.kind for program in compiles.programs].count("compiled") == 0
     np.testing.assert_array_equal(np.asarray(answered), np.arange(4) * 2 + 1)
+
+
+@pytest.mark.parametrize("asked", ["midway", "at its end", "scored to"])
+def test_a_runs_evaluations_called_over_its_first_states_shapes_are_the_programs_its_fit_runs(
+        asked, tmp_path):
+    """A run's evaluations' programs, called over its first state's shapes where a run compiled ahead
+    collects them (`Trainer._warmed_ahead`, `dew.training.evaluation.warmed_ahead`), are the ones its fit
+    compiles: a fit evaluating midway, at its end alone, or writing what it scores (`scored_to`, which
+    reports its artifacts beside its loss) compiles each (its event's and scoring's keys, its loss or
+    report, the loss's sum and reduction), and a fit handed the collection (`taking`) takes every program
+    in it and compiles none of them, each fit in a process whose programs hold no executable before
+    it (`release`). Which executables it ran is counted where they are handed, as XLA's persistent cache
+    would hand the second fit what the first compiled, which compiles nothing either (row 4752)."""
+    from dew.data import Memory
+    from dew.distributed.placement import placed_shapes
+    from dew.nn.kernels.options import collecting, release, taking
+    from dew.training.ahead import fit_plan
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+
+    # A split of two batches, whose loss's statistics the pass sums.
+    validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
+    fit = {"steps": 4, "log_every": 2, "validation": validation,
+           **{"midway": {"eval_every": 2}, "at its end": {},
+              "scored to": {"eval_every": 2, "scored_to": str(tmp_path / "scores")}}[asked]}
+    # The run warms each split midway (its loss alone), and its evaluations score the loss with what they
+    # write (`_validation_scores`).
+    scored = {"validated_loss", *(("_validation_scores",) if asked == "scored to" else ())}
+    functions = {"_fold", *scored, "_summed", "reduce_loss"}
+    evaluations = {f"jit({function})" for function in functions}
+
+    def compiled(handed) -> set[str]:
+        release()
+        jax.clear_caches()
+        written = tmp_path / "scores"
+        if written.exists():
+            shutil.rmtree(written)
+        run = fine_tune(MeshSpec().build(jax.devices()[:1]), xla=True)
+        with taking(handed), Compiles(None) as compiles:
+            run.fit(batch, **fit)
+        # A fit asked to write what it scores writes it, handed its programs or not.
+        assert (asked == "scored to") == any(written.rglob("*"))
+        return {program.name for program in compiles.programs if program.kind == "compiled"}
+
+    assert evaluations <= compiled({})
+    ahead = fine_tune(MeshSpec().build(jax.devices()[:1]), xla=True)
+    plan = fit_plan(ahead, batch, fit)
+    start = ahead._started()
+    with collecting() as collected:
+        ahead._warmed_ahead(plan, placed_shapes(start.abstract, start.shardings), start.shardings)
+    served: set[str] = set()
+
+    def serving(digest, executable):
+        served.add(digest)
+        return executable
+
+    handed = {digest: functools.partial(serving, digest, executable)
+              for digest, executable in collected.items()}
+    assert not evaluations & compiled(handed)
+    # Every program the run collected ahead is one its fit took, and it compiled as many as the fit runs.
+    assert served == set(collected) and len(collected) >= len(evaluations)
 
 
 def test_two_calls_whose_texts_agree_as_jax_prunes_an_unread_argument_each_take_their_own_executable():
@@ -791,6 +854,30 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     assert not runs.exists()
 
 
+def test_a_configured_fresh_run_that_pauses_compiles_ahead_planned_as_it_trains_and_makes_no_directory(
+        tmp_path):
+    """A configured run that pauses (`Pause`, which its checkpoints resume) and keeps a local tier compiles
+    its step ahead in a directory that holds nothing yet, planned with the checkpointer the run trains
+    with, and creates neither its directory nor its local tier's: the compile ahead's trainer held no
+    checkpointer where no directory was, so its plan refused the pause its run takes (review of row 4752),
+    and asking a local tier for its step opened it (`Checkpoints.latest`)."""
+    from run_kinds import lm
+
+    from dew.training.ahead import AheadOfTime, AheadTarget, CompiledAhead
+    from dew.training.budget import Pause
+
+    runs, local, path = tmp_path / "runs", tmp_path / "local", tmp_path / "step.dew-aot"
+    default = lm(tmp_path, drawn=False)
+    target = AheadTarget(generation="sm80", devices=1, path=str(path), capacity_gib=1)
+    run = dataclasses.replace(default, trainer=dataclasses.replace(
+        default.trainer, name="ahead", checkpoint_dir=str(runs), local_directory=str(local), local_every=2,
+        steps=4, stop=Pause(0.5), compile_ahead=target))
+    with pytest.raises(CompiledAhead) as ended:
+        run.run()
+    assert ended.value.code == 0 and AheadOfTime.load(path).plan is not None
+    assert not runs.exists() and not local.exists()
+
+
 def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_loads_only_there(
         tmp_path, monkeypatch):
     """`--trainer.compile-ahead.multiprocessors` states the GPU a step is compiled ahead for within its
@@ -798,7 +885,8 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     step and its sampled step over compile-only GPUs of 114 (as they state), and the saved build target and
     the facts its launches derived for are that GPU's, so a GPU of 114 runs it and the canonical one is
     refused; the rung its plan recorded is that GPU's, which a second build for it reuses, apart from the
-    canonical build's beside it in one record directory."""
+    canonical build's beside it in one record directory. Its runs score no split midway, whose programs a
+    build compiles too (row 4752), so its three builds are their steps' alone (row 3981)."""
     import dataclasses
 
     from run_kinds import lm
@@ -821,7 +909,8 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
                                "--trainer.compile-ahead.devices", "1",
                                "--trainer.compile-ahead.path", str(path),
                                "--trainer.compile-ahead.capacity-gib", "0.0007",
-                               "--trainer.inspection.every", "1", *stated],
+                               "--trainer.inspection.every", "1", "--trainer.eval-every", "None",
+                               "--trainer.checkpoint-every", "None", *stated],
                               default=lm(root, drawn=False))
         with pytest.raises(CompiledAhead):
             run.run()
@@ -916,7 +1005,9 @@ def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progres
     """A decision run bounded in examples, which its objective expands after its bound so no pass counts
     its steps, keeps its progress on the examples clock: compiled ahead for a GPU it lacks, its step reads
     that progress as fit's does (`Trainer.reading`), under a schedule over the run (`Linear`), and the run
-    ends with the step saved, where it was compiled over no clock and refused the schedule (row 2434)."""
+    ends with the step saved, where it was compiled over no clock and refused the schedule (row 2434). Its
+    tickets stream, of no record count, so its evaluations and checkpoints are counted in steps, as its run
+    reads them (`CLOCKED`), which its compile reads too to compile its evaluations (row 4752)."""
     from run_kinds import decision
 
     from dew.decision.config import DecisionRunConfig
@@ -926,7 +1017,8 @@ def test_a_run_on_the_examples_clock_compiles_its_step_ahead_reading_its_progres
     default = decision(tmp_path, drawn=False)
     assert isinstance(default, DecisionRunConfig)
     run = DecisionRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(runs),
-                                 "--trainer.examples", "16", "--optim.learning-rate",
+                                 "--trainer.examples", "16", "--trainer.eval-every", "3",
+                                 "--trainer.checkpoint-every", "3", "--optim.learning-rate",
                                  '{"class": "linear", "fields": {"peak_value": 0.001}}',
                                  "--trainer.compile-ahead.generation", "sm80",
                                  "--trainer.compile-ahead.devices", "1",

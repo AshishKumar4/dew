@@ -23,6 +23,7 @@ of warmup, equal peak memory; Colab job dew-gpu-c20-gelu-a100-job-1).
 
 # tests/test_jepa_source.py checks these modules against V-JEPA's own code.
 
+import dataclasses
 from typing import ClassVar
 
 import jax
@@ -36,6 +37,7 @@ from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.scatter import gather_positions
 
 from ..dit import (
+    FROM_ENCODER,
     ModulatedBlock,
     _JepaStackOptions,
     build_block_pattern,
@@ -211,9 +213,9 @@ class FactorizedTokenStack(_JepaStackOptions):
 class JepaEncoder(_JepaStackOptions):
     """ViT over an image, optionally restricted to a subset of its patches."""
     patch_size: int = 16
-    emb_features: int = 384
+    emb_features: int = dataclasses.field(default=384, metadata={FROM_ENCODER: True})
     num_layers: int = 12
-    num_heads: int = 6
+    num_heads: int = dataclasses.field(default=6, metadata={FROM_ENCODER: True})
     scan_order: ScanOrder = "raster"
 
     stack_type: ClassVar[type[TokenStack | FactorizedTokenStack]] = TokenStack

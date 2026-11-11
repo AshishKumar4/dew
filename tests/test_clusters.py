@@ -3,11 +3,11 @@ one a process runs under, and a pool joined through a scheduler of the user's ow
 
 import os
 import socket
-import subprocess
 import sys
 from pathlib import Path
 
 from lane_environment import outside_any_cluster
+from process_support import output, owned
 
 from dew.clusters import CloudTPU, Joining, Kubernetes, Launched, OpenMPI, Slurm, detected_environment
 
@@ -116,10 +116,10 @@ def test_a_pool_joins_through_a_scheduler_of_the_users_own():
                "print('pool', jax.process_count(), jax.process_index())\n")
     env = {**outside_any_cluster(os.environ), "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu",
            "MY_COORDINATOR": f"127.0.0.1:{port}"}
-    ranks = [subprocess.Popen([sys.executable, "-c", program], cwd=REPO_ROOT, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True, env={**env, "MY_RANK": str(rank)})
-             for rank in range(2)]
-    outputs = [rank.communicate(timeout=300) for rank in ranks]
+    # Each rank's output read as it comes (`owned`), as one read to its end before the other's would leave
+    # the other blocked on a full pipe beside a peer waiting on it (row 5434).
+    ranks = [owned([sys.executable, "-c", program], {**env, "MY_RANK": str(rank)}) for rank in range(2)]
+    outputs = [output(rank, 300) for rank in ranks]
     assert [rank.returncode for rank in ranks] == [0, 0], outputs
-    pools = sorted(line for stdout, _ in outputs for line in stdout.splitlines() if line.startswith("pool"))
+    pools = sorted(line for written in outputs for line in written.splitlines() if line.startswith("pool"))
     assert pools == ["pool 2 0", "pool 2 1"], outputs
