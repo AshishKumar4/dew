@@ -383,6 +383,7 @@ def test_packed_pairs_train_as_each_pair_a_row(kind, share):
     scored from its own predecessors, a half's first token from the shared prompt's last, each pair's sums
     reduced by its number across the batch (`pair_numbers`)."""
     from model_support import TINY_DECODER, float64_twin
+    from optim_support import in_float64
 
     from dew.batch import coordinates
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -454,8 +455,9 @@ def test_packed_pairs_train_as_each_pair_a_row(kind, share):
             return {"loss": value, "chosen": chosen, "grads": grads}
         return jax.jit(run)
 
-    # A user's module states no dtype of its own: the gate's float64 run of the reference arm is its truth.
-    truth_fn = None if segments == 1 else each_row(float64_twin(model))
+    # A user's module states no dtype of its own: its truth is the reference arm over the float64 draws,
+    # its scores and rewards in a float64 run's output dtype (`in_float64`) where the run's are float32.
+    truth_fn = in_float64(each_row(model)) if segments == 1 else each_row(float64_twin(model))
 
     initialized = jax.jit(objective.init)
 

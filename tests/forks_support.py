@@ -7,7 +7,8 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import assert_as_exact
+from model_support import float64_twin
+from reference_error import assert_as_exact, widened
 
 from dew.batch import Forks, coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -80,13 +81,13 @@ def assert_forks_as_own_rows(module, variables, width: int, layout: str, label: 
     own_rows = MixerCall(AttentionMetadata(coordinates=coordinates(
         valid=jnp.asarray(owned), segments=jnp.asarray(owned.astype(np.int32)))))
 
-    def apart(params, hidden):
+    def apart(params, hidden, *, model=module, collections=variables):
         rows = []
         for number, length in placed:
             pieces = [hidden[:, begins[above]:begins[above] + lengths[above]] for above in chain(number)]
             row = jnp.concatenate([*pieces, hidden[:, begins[number]:begins[number] + length]], axis=1)
             rows.append(jnp.pad(row, ((0, 0), (0, longest - row.shape[1]), (0, 0))))
-        found = module.apply({**variables, "params": params}, jnp.concatenate(rows, axis=0), own_rows)
+        found = model.apply({**collections, "params": params}, jnp.concatenate(rows, axis=0), own_rows)
         out = jnp.zeros_like(hidden)
         for index, (number, length) in enumerate(placed):
             row = found[index * FORKED_ROWS:(index + 1) * FORKED_ROWS]
@@ -94,17 +95,25 @@ def assert_forks_as_own_rows(module, variables, width: int, layout: str, label: 
                 row[:, shared_of[number]:shared_of[number] + length])
         return out
 
-    def outputs(run):
-        return jax.jit(lambda hidden, _: run(variables["params"], hidden))
+    def outputs(run, parameters=variables["params"]):
+        return jax.jit(lambda hidden, _: run(parameters, hidden))
 
-    def gradients(run):
+    def gradients(run, parameters=variables["params"]):
         def grads(hidden, cotangent):
             params, rows = jax.grad(lambda params, rows: jnp.sum(run(params, rows) * cotangent),
-                                    argnums=(0, 1))(variables["params"], hidden)
+                                    argnums=(0, 1))(parameters, hidden)
             return {"params": params, "hidden": rows}
         return jax.jit(grads)
 
-    assert_as_exact(outputs(forked), outputs(apart), draw, f"{label}, {layout}", seeds=FORKED_SEEDS)
+    # The module's explicit dtype and closed-over parameters otherwise stay fp32 when the gate widens
+    # only the drawn hidden states; parameter gradients also keep their parameters' dtype.
+    wide, wide_variables = float64_twin(module), widened(variables)
+
+    def truth(params, hidden):
+        return apart(params, hidden, model=wide, collections=wide_variables)
+
+    assert_as_exact(outputs(forked), outputs(apart), draw, f"{label}, {layout}", seeds=FORKED_SEEDS,
+                    truth_fn=outputs(truth, wide_variables["params"]))
     assert_as_exact(gradients(forked), gradients(apart), draw, f"{label}'s gradients, {layout}",
-                    seeds=FORKED_SEEDS)
+                    seeds=FORKED_SEEDS, truth_fn=gradients(truth, wide_variables["params"]))
     assert not np.any(np.asarray(outputs(forked)(*draw(0)))[:, ~valid])

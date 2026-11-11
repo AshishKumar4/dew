@@ -254,12 +254,12 @@ def halves_case(kind):
 
 def test_a_meanflow_update_read_as_halves_is_on_par_with_its_whole_batch():
     """The halves' summed losses, each example at its own draws and role, are on par with the whole
-    batch's over drawn weights (check 1), the float64 twin's the truth: the outcome the recorded draws
+    batch's over drawn weights (check 1), its float64 replay the truth: the outcome the recorded draws
     and roles above feed."""
-
+    from float64_replay import float64_replay
     from reference_error import assert_as_exact
 
-    objective, twin, batch, draw = halves_case("meanflow")
+    objective, _, batch, draw = halves_case("meanflow")
     rows = HALVES_ROWS
 
     def summed(objective, part: slice):
@@ -274,8 +274,10 @@ def test_a_meanflow_update_read_as_halves_is_on_par_with_its_whole_batch():
     def halves(variables):
         return np.asarray(first(variables)) + np.asarray(second(variables))
 
+    # The truth is the whole batch's update replayed in float64 (`float64_replay`): its noise and times the
+    # same draws' bits, each computed from them in float64, which a float64 twin would draw otherwise.
     assert_as_exact(halves, summed(objective, slice(0, rows)), draw, "meanflow halves", seeds=HALVES_SEEDS,
-                    truth_fn=summed(twin, slice(0, rows)))
+                    truth_fn=float64_replay(summed(objective, slice(0, rows))))
 
 
 def test_a_shortcut_update_read_as_halves_targets_each_example_as_its_whole_batch_does():

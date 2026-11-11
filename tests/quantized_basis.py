@@ -37,12 +37,15 @@ def dequantized_in_own_basis(values, quantized: str, *, keys: bool):
     rotate = keys and quantized == "int8"
     basis = hadamard_basis(values.shape[-1]) if rotate else None
     stored = rotated(values, basis) if rotate else values
-    wide = stored.astype(jnp.float32)
+    # At the values' width, fp32 at least (a float64 truth's float64); the scale is the float32 a cache
+    # stores (its quotient rounded once to fp32, as fp32's division rounds it), each code its rounding.
+    width = jnp.promote_types(values.dtype, jnp.float32)
+    wide = stored.astype(width)
     limit = 127.0 if quantized == "int8" else float(jnp.finfo(jnp.float8_e4m3fn).max)
-    scaled_amax = jnp.max(jnp.abs(wide), axis=-1) / limit
+    scaled_amax = (jnp.max(jnp.abs(wide), axis=-1) / limit).astype(jnp.float32).astype(width)
     scale = jnp.where(scaled_amax >= jnp.finfo(jnp.float32).tiny, scaled_amax, 1.0)
     scaled = wide / scale[..., None]
     codes = (jnp.clip(jnp.rint(scaled), -127, 127).astype(jnp.int8) if quantized == "int8"
              else scaled.astype(jnp.float8_e4m3fn))
-    back = (codes.astype(jnp.float32) * scale[..., None]).astype(values.dtype)
+    back = (codes.astype(width) * scale[..., None]).astype(values.dtype)
     return rotated(back, basis.T) if rotate else back

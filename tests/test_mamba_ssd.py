@@ -230,8 +230,15 @@ def test_a_packed_calls_skip_gradient_on_the_template_is_as_exact_as_on_mamba_ss
     def draw(seed):
         return (mamba_ssd_draw(seed, SKIPPED, jnp.bfloat16, documents=True),)
 
+    def truth(arrays):
+        # The portable math over the draw's own operands, uncast: float64 in the truth, where it sums the
+        # skip's gradient exactly.
+        with generation.chosen(ssd="xla"):
+            return mamba_ssd_xla(arrays, 16)["D"]
+
     assert_as_exact(jax.jit(skip_gradient("mosaic_gpu")), jax.jit(skip_gradient("pallas")), draw,
-                    "the packed skip's gradient on the template", seeds=SKIPPED_SEEDS)
+                    "the packed skip's gradient on the template", seeds=SKIPPED_SEEDS,
+                    truth_fn=jax.jit(truth))
 
 
 def test_the_port_takes_widths_padded_to_powers_of_two():

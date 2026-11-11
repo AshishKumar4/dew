@@ -14,7 +14,7 @@ import ml_dtypes
 import numpy as np
 from flax import linen as nn
 
-from dew.nn.precision import correctly_rounded_divide
+from dew.nn.precision import at_least_fp32, correctly_rounded_divide
 
 E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
 """Each E2M1 code's value in code order (ml_dtypes' float4_e2m1fn): 0 to 6
@@ -102,7 +102,7 @@ def straight_through(x, rounded):
 def fp8_scaled_blocks(x, block: int):
     """`x` in fp32 blocks of `block` channels and each block's power-of-two scale (act_quant with scale_fmt
     ue8m0, kernel.py:40-124): amax floored at 1e-4, the scale the ceiling power of two of amax / 448."""
-    blocks = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, block)
+    blocks = x.astype(at_least_fp32(x.dtype)).reshape(*x.shape[:-1], -1, block)
     amax = jnp.maximum(jnp.max(jnp.abs(blocks), -1, keepdims=True), 1e-4)
     return blocks, _power_of_two_ceil(amax * jnp.float32(1 / _E4M3_MAX))
 
@@ -133,17 +133,23 @@ def fake_quant_fp8(x, block: int):
 
 
 def fp4_scaled_blocks(x, block: int, e4m3_scale: bool):
-    """`x` in fp32 blocks of `block` channels and each block's scale (fp4_act_quant, kernel.py:127-204):
-    with `e4m3_scale` the E4M3 of amax / 6 with amax floored at 6 * 2**-9 (the compressed KV), else the
-    ceiling power of two of amax / 6 with amax floored at 6 * 2**-126 (the indexer)."""
-    blocks = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, block)
+    """`x` in blocks of `block` channels at its width, fp32 at least (a float64 truth's float64), and each
+    block's scale (fp4_act_quant, kernel.py:127-204): with `e4m3_scale` the E4M3 of amax / 6 with amax
+    floored at 6 * 2**-9 (the compressed KV), else the ceiling power of two of amax / 6 with amax floored
+    at 6 * 2**-126 (the indexer)."""
+    wide = at_least_fp32(x.dtype)
+    blocks = x.astype(wide).reshape(*x.shape[:-1], -1, block)
     amax = jnp.max(jnp.abs(blocks), -1, keepdims=True)
     if e4m3_scale:
         # the kernel's cast saturates at E4M3's 448 (cvt.rn.satfinite)
         floored = jnp.maximum(amax, _E2M1_MAX * 2 ** -9)
-        # amax / 6 correctly rounded, as the kernel's division is: a plain `/` by the constant compiles on
-        # the CPU to a multiply by RN(1/6), off by an ulp in a quarter of blocks (ledger 1402).
-        return blocks, _round_e4m3fn(jnp.minimum(correctly_rounded_divide(floored, _E2M1_MAX), _E4M3_MAX))
+        # amax / 6 as fp32's correctly rounded quotient, as the kernel's division is: a plain `/` by the
+        # constant compiles on the CPU to a multiply by RN(1/6), off by an ulp in a quarter of blocks
+        # (ledger 1402). At a float64 truth's width, the float64 quotient rounded once to fp32, IEEE's
+        # (53 >= 2 x 24 + 2), then rounded to E4M3 at that width, exactly.
+        quotient = (correctly_rounded_divide(floored, _E2M1_MAX) if wide == jnp.float32
+                    else (floored / _E2M1_MAX).astype(jnp.float32).astype(wide))
+        return blocks, _round_e4m3fn(jnp.minimum(quotient, _E4M3_MAX))
     return blocks, _power_of_two_ceil(jnp.maximum(amax, _E2M1_MAX * 2 ** -126) * jnp.float32(1 / _E2M1_MAX))
 
 

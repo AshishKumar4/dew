@@ -1,5 +1,6 @@
 """What the optimizer tests share: the learning rate they build at, the small decoder whose parameter
-tree they step, the axes its modules draw it in, and its tree drawn afresh for a seed."""
+tree they step, the axes its modules draw it in, its tree drawn afresh for a seed, and a float64 truth's
+numerics (`in_float64`)."""
 
 import jax
 import jax.numpy as jnp
@@ -7,9 +8,29 @@ import numpy as np
 
 from dew.batch import unboxed
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.kernels.generation import run_precision
+from dew.nn.precision import Dtypes, Numerics
 from dew.nn.sharding import boxed, boxed_axes
 
 LR = 1e-3
+
+FLOAT64 = Numerics(dtypes=Dtypes(params="float64", compute="float64", output="float64"))
+"""A float64 run's numerics, under which an optimizer's matrix iteration multiplies in float64
+(`dew.nn.precision.iteration_dtype`)."""
+
+WIDE_MOMENTS = {"mu_dtype": None, "nu_dtype": None}
+"""An optimizer's `optimizer_opts` keeping its moments in its parameters' dtype, a float64 truth's, where
+`OptimConfig.state_dtype`'s float32 holds them in float32 whatever the parameters'."""
+
+
+def in_float64(fn):
+    """`fn` run under a float64 run's numerics (`FLOAT64`): a float64 truth, an optimizer's Newton-Schulz
+    iterating in its parameters' float64 and an objective's scores in a float64 output dtype, where the
+    run's default numerics take float32 for both."""
+    def wide(*args):
+        with run_precision(FLOAT64):
+            return fn(*args)
+    return wide
 
 
 def decoder_draw():

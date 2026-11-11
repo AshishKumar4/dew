@@ -206,7 +206,9 @@ def test_a_model_that_would_read_forks_otherwise_lays_its_rows_whole():
 
 def test_a_mask_beside_forks_narrows_what_they_read():
     """A call's pairwise mask beside its forks reads a key where both let it (`call_visibility`): the same
-    as the call whose mask is already the forks' visibility narrowed by it, over drawn weights (check 1)."""
+    as the call whose mask is already the forks' visibility narrowed by it, over drawn weights (check 1),
+    each held to the float64 twin's narrowed call: a model of a stated `dtype` computes in it whatever its
+    inputs, so the reference widened would be the reference again, its rounding no truth's."""
     from dew.nn.attention_masks import visibility_mask
 
     model = attention_model(attention_impl="xla")
@@ -229,13 +231,15 @@ def test_a_mask_beside_forks_narrows_what_they_read():
         return jnp.where(real, model.apply(variables, forks.tokens, coordinates=laid,
                                            attention_pairwise_mask=mask), 0)
 
-    def narrowed(variables):
-        return jnp.where(real, model.apply(variables, forks.tokens, coordinates=plain,
-                                           attention_pairwise_mask=mask & seen), 0)
+    def narrowed(model):
+        def run(variables):
+            return jnp.where(real, model.apply(variables, forks.tokens, coordinates=plain,
+                                               attention_pairwise_mask=mask & seen), 0)
+        return run
 
-    assert_as_exact(jax.jit(beside), jax.jit(narrowed),
+    assert_as_exact(jax.jit(beside), jax.jit(narrowed(model)),
                     lambda seed: (initialized(jax.random.key(seed), jnp.ones((1, WIDTH), jnp.int32)),),
-                    "a mask beside forks", seeds=FORK_SEEDS)
+                    "a mask beside forks", seeds=FORK_SEEDS, truth_fn=narrowed(float64_twin(model)))
 
 
 # ---------------------------------------------------------------- a cached call over a tree of candidates
@@ -317,7 +321,8 @@ def test_a_tree_after_a_packed_prompt_reads_its_last_document_alone():
     document and its own ancestors alone (`fork_anchor`: the cache's run from that document's first slot):
     each token's logits are on par with the tree after the last document prefilled alone (check 1), so the
     earlier document never leaks into the verify, as a packed prompt's continuation reads its last document
-    alone."""
+    alone; each held to the float64 twin's tree after the document alone, as a model of a stated `dtype`
+    computes in it whatever its inputs."""
     model = attention_model(max_seq_len=16)
     rows = 2
     initialized = jax.jit(model.init)
@@ -328,7 +333,7 @@ def test_a_tree_after_a_packed_prompt_reads_its_last_document_alone():
         ids = jax.random.randint(key, (rows, 6 + len(TREE)), 0, VOCAB)
         return nn.unbox(initialized(jax.random.fold_in(key, 1), ids)), ids[:, :6], ids[:, 6:]
 
-    def after(*, packed: bool):
+    def after(model, *, packed: bool):
         @jax.jit
         def run(params, prompt, block):
             cache = (cached(model, params, prompt, segments) if packed
@@ -340,8 +345,9 @@ def test_a_tree_after_a_packed_prompt_reads_its_last_document_alone():
             return logits
         return run
 
-    assert_as_exact(after(packed=True), after(packed=False), draw, "a tree after a packed prompt",
-                    seeds=FORK_SEEDS)
+    assert_as_exact(after(model, packed=True), after(model, packed=False), draw,
+                    "a tree after a packed prompt", seeds=FORK_SEEDS,
+                    truth_fn=after(float64_twin(model), packed=False))
 
 
 def assert_reads_paths(model: CausalTransformer, tree: tuple[int, ...], label: str, *,

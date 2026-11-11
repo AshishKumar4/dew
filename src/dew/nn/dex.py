@@ -155,8 +155,10 @@ def annealed(updates: jax.Array | None, layer: LayerDex, start: jax.Array, learn
     `lambda_init` `start`; `learned` past the anneal, and outside training (`updates` None)."""
     if updates is None:
         return learned
-    fraction = jnp.minimum(jnp.asarray(updates, jnp.float32) / layer.anneal_steps, 1.0)
-    began = fraction * jnp.asarray(start, jnp.float32)
+    # In float32 at least, the lambda's own width where wider (a float64 truth's).
+    wide = jnp.promote_types(learned.dtype, jnp.float32)
+    fraction = jnp.minimum(jnp.asarray(updates, wide) / layer.anneal_steps, 1.0)
+    began = fraction * jnp.asarray(start, wide)
     return (1 - fraction) * began.astype(learned.dtype) + fraction.astype(learned.dtype) * learned
 
 
