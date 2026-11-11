@@ -79,8 +79,9 @@ class Flow:
     """One model family's flow: the released config of `fixture` with `widths` set (its text config's for a
     wrapper), computing in `dtype`; `native` each choice its training step or decode runs on a GPU and the
     kernel it must take there (a name, or `NATIVE`: any kernel off the reference path); under the lane's
-    deterministic ops where `lane`, as a user's process runs without them otherwise; `rows` sequences of
-    `length` tokens, decoded from `prefill` of them a token a step."""
+    deterministic ops and matmul precision where `lane`, as a user's process runs otherwise, without them
+    and at the default precision (`precision`); `rows` sequences of `length` tokens, decoded from `prefill`
+    of them a token a step."""
 
     name: str
     fixture: str
@@ -96,6 +97,13 @@ class Flow:
     """The instruction families (`generation.family`) of the GPUs where the routes the flow is for take a
     native kernel; None, every GPU's. Elsewhere they run the portable math, and the flow, which covers nothing
     of that GPU's own there, runs not at all (`runs_on`)."""
+
+    @property
+    def precision(self) -> str:
+        """The default matmul precision its programs trace at (`jax_default_matmul_precision`): the lane's,
+        whose fp32 products are whole (tests/lane_environment.py), or a user's default, under which a port
+        takes an fp32 call's products in TF32 (`recurrence_chunk._port_precision`)."""
+        return "highest" if self.lane else "default"
 
     def runs_on(self, target: str) -> bool:
         """Whether the GPU generation `target` runs the routes the flow is for natively (`families`)."""
@@ -241,7 +249,8 @@ FLOWS = (
     Flow("gated delta net and its short conv", "qwen3-next-tiny", GDN, "bfloat16",
          {"gated_delta_rule": NATIVE}),
     Flow("state-space duality (SSD), bf16", "mamba2-tiny", SSD, "bfloat16", {"ssd": NATIVE}),
-    Flow("state-space duality (SSD), fp32", "mamba2-tiny", SSD, "float32", {"ssd": NATIVE}),
+    Flow("state-space duality (SSD), fp32, a user's", "mamba2-tiny", SSD, "float32", {"ssd": NATIVE},
+         lane=False),
     Flow("selective scan", "mamba-tiny", SELECTIVE, "bfloat16", {"selective_scan": NATIVE}),
     Flow("lightning attention", "minimax-tiny", LIGHTNING, "bfloat16", {"gated_delta_rule": NATIVE},
          families=("wgmma",)),
@@ -249,9 +258,10 @@ FLOWS = (
 """Every model flow, by the route it is for (docs/design/testing.md: a kernel's native run is a flow's
 cell): each family that takes a distinct default route on a GPU, its bf16 attention flows twice, under the
 lane's deterministic ops (the template) and as a user's process runs it (FlashAttention, which refuses
-them), the dense fp32 flow on XLA's declared fp32 route, and the SSD port in fp32 too (its products' own
-precision, row 5461's proof). Lightning attention's decay without the delta rule takes the recurrence template
-on a Hopper GPU alone: fla's port hands it to the portable math (`recurrence_chunk.PORT_SUPPORTS`)."""
+them), the dense fp32 flow on XLA's declared fp32 route, and the SSD port in fp32 too, as a user's process
+runs it (its products in TF32 at the default precision, which the lane's whole fp32 products refuse).
+Lightning attention's decay without the delta rule takes the recurrence template on a Hopper GPU alone: fla's
+port hands it to the portable math (`recurrence_chunk.PORT_SUPPORTS`)."""
 
 
 def flow_named(name: str) -> Flow:
@@ -377,12 +387,14 @@ def prepare(flow: Flow) -> bool:
 
 
 def prepared_apart(flow: Flow) -> bool:
-    """The flow's prepare (`prepare`) in a process of its own, started under its XLA flags (`flow_flags`):
-    XLA parses them once a process, as it starts, and the programs it compiles state them (`BuildTarget`), a
-    lane's flow's deterministic ops among them, which a user's flow sets false. Whether it prepared."""
+    """The flow's prepare (`prepare`) in a process of its own, started under its XLA flags (`flow_flags`) and
+    its matmul precision (`Flow.precision`): XLA parses its flags once a process, as it starts, and the
+    programs it compiles state them (`BuildTarget`), a lane's flow's deterministic ops among them, which a
+    user's flow sets false. Whether it prepared."""
     from process_support import fresh
 
-    return fresh(Path(__file__), flow.name, flags=flow_flags(flow))
+    return fresh(Path(__file__), flow.name, flags=flow_flags(flow),
+                 variables={"JAX_DEFAULT_MATMUL_PRECISION": flow.precision})
 
 
 def loaded(flow: Flow) -> dict[str, Callable]:

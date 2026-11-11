@@ -4,8 +4,6 @@ its reference arm the reference path alone, and its truth computes in float64; a
 truths (`reference_error.stored_truths`) judge as the truths a site computes itself, a missing or stale
 one refused."""
 
-import dataclasses
-
 import jax
 import jax.numpy as jnp
 import model_flows
@@ -40,7 +38,7 @@ def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monk
     flow = model_flows.flow_named(name)
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
-    with generation.assumed(target):
+    with generation.assumed(target), jax.default_matmul_precision(flow.precision):
         dew = [route for kind in ("train", "decode") for route in _routes(programs[f"{kind} dew"])]
         reference = [route for kind in ("train", "decode")
                      for route in _routes(programs[f"{kind} reference"], reference=True)]
@@ -67,8 +65,7 @@ def test_the_reference_arm_runs_each_choices_generic_kernel_that_takes_every_cal
 def test_a_flows_truth_computes_in_float64(name, tmp_path, monkeypatch):
     """The flow's truths prepared on a CPU as its node prepares them, its first draw's of each program held to
     float64 (check 1's `_of_float64`), every draw its two stages may take written to the store."""
-    # One declared seed: the rule holds a truth's first draw, each further one the same program's.
-    flow = dataclasses.replace(model_flows.flow_named(name), seeds=1)
+    flow = model_flows.flow_named(name)
     monkeypatch.setenv(model_flows.TRUTHS, str(tmp_path))
     monkeypatch.setenv(model_flows.PREPARE, "1")
     model_flows.judge(flow, {})
