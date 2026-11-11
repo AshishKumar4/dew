@@ -46,7 +46,6 @@ from dew.nn.kernels.templates import (
     product,
     report,
     resources,
-    shifted_rows,
     swizzling,
 )
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Ring, Turn, drain, loads, opaque, passed, streamed
@@ -731,9 +730,10 @@ class Issuer[Accumulator](abc.ABC):
         """`tile` (a register tile in the accumulator's layout, `tile_of`'s) with each row `i` holding row
         `i - shift`'s values within its `period`-row group, any value where that row leaves the group (a
         caller's mask), `shift` traced: read at a row offset in registers, by the layout's own lane
-        permutation (`shifted_rows.row_shifted`, a warp's shuffles), not through shared memory, whose shifted
-        plain reads conflict on every bank (row 5305); interpreted, the tile's own rows gathered. A layout
-        whose warps hold no whole groups of `period` rows takes none (`shifted_rows.lanes`)."""
+        permutation (Mosaic GPU's `FragmentedArray.row_shifted`, a warp's shuffles, the fork's from
+        0.12.0.1.post79), not through shared memory, whose shifted plain reads conflict on every bank (row
+        5305); interpreted, the tile's own rows gathered. A layout whose warps hold no whole groups of
+        `period` rows takes none (the fork refuses it)."""
         if interpret:
             rows = lax.broadcasted_iota(jnp.int32, tile.shape, 0)
             group = rows - rows % period
@@ -743,7 +743,7 @@ class Issuer[Accumulator](abc.ABC):
         def shifted(ctx, array, by):
             del ctx
             [value] = by.registers.flat
-            return shifted_rows.row_shifted(array, value, period)
+            return array.row_shifted(value, period)
 
         returned = plgpu.ShapeDtypeStruct(tile.shape, tile.dtype, layout=self.layout)
         return plgpu.inline_mgpu(arg_types=(self.layout, plgpu.Layout.WG_SPLAT(())), return_type=returned)(

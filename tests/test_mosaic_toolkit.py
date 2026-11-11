@@ -1493,35 +1493,6 @@ def test_a_programs_settled_arguments_are_read_as_such_and_never_donated():
     np.testing.assert_array_equal(np.asarray(served(doubled, x)), np.asarray(x * 2.0))
 
 
-@pytest.mark.parametrize("shape", [(64, 32), (128, 16)])
-def test_a_row_shift_reads_each_element_from_the_lane_holding_its_source_row(shape):
-    """The register row shift's lowering on an m16 fragment's layout (an H100's warpgroup MMA accumulator,
-    an A100's mma.sync one at four warps): at every shift within a 16-row group, each element's source lane
-    and register (`shifted_rows.source`, the lowering's own arithmetic on integers) hold, by the layout's own
-    index map (`shifted_rows.elements`), the element `shift` rows up in its column."""
-    from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments
-
-    from dew.nn.kernels.templates import shifted_rows
-
-    layout = mgpu_fragments.WGMMA_LAYOUT
-    form = shifted_rows.lanes(layout, shape)
-    placed = shifted_rows.elements(layout, shape)
-    rows, columns = placed[..., 0], placed[..., 1]
-    wrong = []
-    for shift in range(-15, 16):
-        for warp, lane, *at in np.ndindex(rows.shape[:-1]):
-            row = rows[(warp, lane, *at, 0)]
-            if not 0 <= row % 16 - shift < 16:
-                continue
-            lane_from, offset = shifted_rows.source(form.offsets[tuple(at)] + lane // form.columns, shift,
-                                                    lane, form, shifted_rows.Integers)
-            source = (warp, lane_from, *form.peers[tuple(at)][offset])
-            here = columns[(warp, lane, *at)]
-            if not (np.all(rows[source] == row - shift) and np.all(columns[source] == here)):
-                wrong.append((shift, warp, lane, *at))
-    assert wrong == []
-
-
 @pytest.mark.parametrize("shift", [0, 5, -7])
 def test_a_row_shift_takes_each_row_from_its_groups_row_shift_up(shift):
     """A tile's rows shifted within groups of 16 (`Issuer.row_shifted`, interpreted at an H100's facts):
