@@ -23,8 +23,11 @@ from fsspec.implementations.http import HTTPFileSystem
 _log = logging.getLogger(__name__)
 
 _HEADERS = {"User-Agent": "dew-data/1", "Accept-Encoding": "identity"}
-# As urllib's redirect handler: a redirect's status and the hops followed before giving up.
-_REDIRECTS, _HOPS = (301, 302, 303, 307, 308), 10
+_REDIRECTS = frozenset(int(name.removeprefix("http_error_"))
+                       for name in dir(urllib.request.HTTPRedirectHandler) if name.startswith("http_error_3"))
+"""The statuses urllib's redirect handler follows, read off the handlers it declares (`http_error_30x`)."""
+_HOPS = urllib.request.HTTPRedirectHandler.max_redirections
+"""The redirects urllib follows before it gives up."""
 
 _FILESYSTEMS: dict[tuple[int, int], tuple[asyncio.AbstractEventLoop, HTTPFileSystem]] = {}
 """Each process's HTTP filesystem for each of fsspec's IO loops it fetches on, by the process and the loop,
