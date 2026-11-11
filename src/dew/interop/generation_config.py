@@ -131,7 +131,9 @@ _CONTROLS = {
     "bad_words_ids": _Control("transform"),
     "begin_suppress_tokens": _Control("transform"),
     "bos_token_id": _Control("inapplicable"),
-    "cache_config": _Control("unsupported", refusal="quantized and offloaded caches are not implemented"),
+    # transformers reads a cache_config only for its quantized cache (`_prepare_cache_for_generation`), which
+    # cache_implementation refuses; beside any other cache it configures nothing.
+    "cache_config": _Control("inapplicable"),
     "cache_implementation": _Control(
         "unsupported",
         neutral=("static", "offloaded", "offloaded_static"),
