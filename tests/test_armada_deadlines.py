@@ -4,6 +4,7 @@ it holds red, and says where every thread of its pytest stood."""
 import base64
 import hashlib
 import json
+import re
 import subprocess
 import sys
 import time
@@ -96,7 +97,8 @@ def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, 
     code holding the GIL or not (an XLA compile, a wait on a device, a collective), read from outside the
     process. A release check's pytest runs under `uv run`, which stands between the task and pytest: the
     stacks are still pytest's own. The row names the stall's whole record among its evidence in the task's
-    artifacts (`stalls.kept`), its stacks and the host's cgroup quota beside them (rows 5452, 5454)."""
+    artifacts (`stalls.kept`), its stacks and the host's cgroup quota beside them, the host read while the
+    stalled pytest still ran (rows 5452, 5454)."""
     source, stalled = STALLS[stall]
     artifacts = tmp_path / "artifacts"
     interpreter(tmp_path, "3.12")
@@ -108,8 +110,11 @@ def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, 
     # py-spy's frame of the stalled function, by its file and line.
     assert f"{stalled} (test_stalls.py:" in interrupted["output"]
     [kept] = interrupted["artifacts"]
-    record = artifacts / kept
-    assert f"{stalled} (test_stalls.py:" in record.read_text() and "cpu.max" in record.read_text()
+    record = (artifacts / kept).read_text()
+    assert f"{stalled} (test_stalls.py:" in record and "cpu.max" in record
+    # The host read before the interrupt: the stalled pytest (py-spy's dumped process) among its processes.
+    [stalled_pid] = re.findall(r"^Process (\d+):", record, re.M)
+    assert any(line.split()[:1] == [stalled_pid] for line in record.split("--- ps")[1].splitlines())
 
 
 def test_each_stall_of_a_tasks_runs_of_the_same_rows_keeps_its_own_record(ci, tmp_path):
@@ -126,26 +131,25 @@ def test_a_stalled_pytests_threads_say_which_still_compute(ci, tmp_path):
     """A stalled pytest's record tells a process still computing from a stalled one (`stalls.activity`): its
     main thread waiting on another's result, as pytest waits on an XLA computation's buffer, uses no CPU over
     the watch, the thread computing it does (rows 5452, 5454: a dump of Python threads alone showed the
-    wait, never whether XLA's threads computed)."""
-    # The computing thread named by prctl's PR_SET_NAME (15), as the kernel names it.
+    wait, never whether XLA's threads computed). The computing thread is named past the kernel's 15 bytes
+    (prctl's PR_SET_NAME, 15), its name cut mid-character, as a thread's may be."""
     source = ("import ctypes, sys, threading\n\n\ndef spin(started):\n"
-              "    ctypes.CDLL(None).prctl(15, b'computing')\n    started.set()\n"
+              "    ctypes.CDLL(None).prctl(15, ('\\u00e9' * 9).encode())\n    started.set()\n"
               "    while True:\n        pass\n\n\n"
               "started = threading.Event()\n"
-              "threading.Thread(target=spin, args=(started,), daemon=True).start()\n"
-              "started.wait()\nprint('ready', flush=True)\nsys.stdin.read()\n")
+              "spinning = threading.Thread(target=spin, args=(started,), daemon=True)\n"
+              "spinning.start()\nstarted.wait()\nprint(spinning.native_id, flush=True)\nsys.stdin.read()\n")
     process = subprocess.Popen([sys.executable, "-c", source], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                text=True)
     try:
-        assert process.stdout.readline() == "ready\n"
+        computing = int(process.stdout.readline())
         pid = tmp_path / "pid"
         pid.write_text(str(process.pid))
         threads = {thread.tid: thread for thread in ci.stalls.activity(pid)}
     finally:
         process.kill()
         process.wait()
-    [computing] = [thread for thread in threads.values() if thread.name == "computing"]
-    assert computing.cpu > 0 and threads[process.pid].cpu == 0
+    assert threads[computing].cpu > 0 and threads[process.pid].cpu == 0
 
 
 def test_a_task_within_its_deadline_writes_no_stacks(ci, tmp_path):
