@@ -30,8 +30,8 @@ def staged(family: mosaic.Family, value: jax.Array, buffers, *,
            before: Callable[[Any], None] | None = None) -> "Parts":
     """`value` staged once in shared memory as the parts its products take, one a buffer of `buffers`: its
     16-bit parts where they are more than one (`product.formed`), itself in one (`Family.staged`), each
-    after `before(buffer)` (an issuer's wait for the products in flight that may read it). The one staging
-    of a register tile for products: the issuer's operands' and the recurrence's staged tiles'."""
+    after `before(buffer)` (an issuer's wait for the products in flight that may read it): an issuer's
+    operands' staging (`Issuer._operand`)."""
     values = product.formed(value, len(buffers)) if len(buffers) > 1 else (value,)
     refs = []
     for part, buffer in zip(values, buffers, strict=True):

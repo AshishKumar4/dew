@@ -199,11 +199,16 @@ class Unlowerable(RuntimeError):
     """A kernel the target runs that this host cannot lower for it (`Op.unlowered`: a step traced for an
     assumed GPU on a host without the kernel's library): no kernel lowers in its place, as the program would
     not be the GPU's (row 4616), so a compile ahead refuses the program, naming it. The op's `choice`, the
-    `kernel` and `why`."""
+    `kernel`, `why`, and the `program` a compile ahead refuses for it (`refusing`)."""
 
-    def __init__(self, choice: str, kernel: str, why: str) -> None:
-        super().__init__(f"{choice} kernel {kernel!r} does not lower on this host: {why}")
-        self.choice, self.kernel, self.why = choice, kernel, why
+    def __init__(self, choice: str, kernel: str, why: str, program: str | None = None) -> None:
+        super().__init__(f"{choice} kernel {kernel!r} does not lower on this host: {why}"
+                         + ("" if program is None else f" (program {program!r} not compiled ahead)"))
+        self.choice, self.kernel, self.why, self.program = choice, kernel, why, program
+
+    def refusing(self, program: str) -> Unlowerable:
+        """This refusal as a compile ahead states it: `program`, the program it refuses."""
+        return Unlowerable(self.choice, self.kernel, self.why, program)
 
 
 class KernelRefused(ValueError):

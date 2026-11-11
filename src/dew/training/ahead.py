@@ -99,12 +99,13 @@ def target_config(target: GpuTarget, capacity: int | None = None) -> str:
     if version is None or shared is None or multiprocessors is None or clock is None or bandwidth is None:
         raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
     major, minor = version
+    multiprocessor = target.multiprocessor
     return f"""gpu_device_info {{
-  threads_per_block_limit: 1024
-  threads_per_warp: 32
-  shared_memory_per_block: 49152
-  shared_memory_per_core: {shared + 1024}
-  threads_per_core_limit: {target.multiprocessor.resident_threads}
+  threads_per_block_limit: {multiprocessor.block_threads}
+  threads_per_warp: {multiprocessor.warp_threads}
+  shared_memory_per_block: {multiprocessor.block_shared}
+  shared_memory_per_core: {shared + multiprocessor.reserved_shared}
+  threads_per_core_limit: {multiprocessor.resident_threads}
   core_count: {multiprocessors}
   fpus_per_core: {64 if (major, minor) == (8, 0) else 128}
   block_dim_limit_x: 2147483647
@@ -119,8 +120,8 @@ def target_config(target: GpuTarget, capacity: int | None = None) -> str:
     minor: {minor}
     feature_extension: {"ACCELERATED_FEATURES" if major >= 9 else "NONE"}
   }}
-  registers_per_core_limit: 65536
-  registers_per_block_limit: 65536
+  registers_per_core_limit: {multiprocessor.registers}
+  registers_per_block_limit: {multiprocessor.block_registers}
 }}
 platform_name: "CUDA"
 device_description_str: "{target.device_kind}"
@@ -550,8 +551,7 @@ def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDt
                 with assumed(target, portable=True), jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
                     return owned_program(function, out_shardings=placed).lower(*shapes)
             except Unlowerable as refused:
-                refused.add_note(f"program {name!r} cannot be compiled ahead for {generation} on this host")
-                raise
+                raise refused.refusing(name) from refused
         lowerings.append((lowered(), None, lowered))
     # Through Dew's compile point, as a run compiles them, at once (`report.compiled_at_once`): a launch
     # whose kernel spills there is derived again at its next config.
@@ -815,8 +815,7 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
                                              frontier)
             starts = started(trainer, start, planned)
     except Unlowerable as refused:
-        refused.add_note(f"the step cannot be compiled ahead for {generation} on this host")
-        raise
+        raise refused.refusing("step") from refused
     # The sampled step as the search compiled it, its program what it lowered then.
     sampled = None if planned.sampled is None else AheadProgram.of(*planned.sampled)
     seconds = time.perf_counter() - began
