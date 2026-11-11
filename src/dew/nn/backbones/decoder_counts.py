@@ -61,8 +61,8 @@ def _root_flops(decoder: CausalTransformer, lengths, depth_counter) -> float:
 
 def final_norm_runs(decoder: CausalTransformer) -> int:
     """How many times a call runs the decoder's final norm (`norm`): after its last layer where it ends in
-    one, and in a loop (`dew.nn.backbones.looping`) before each later pass where its exit gate reads the
-    output through it (`normed_output`) or its step reads the normed state, and, under `reinject`, on
+    one, and in a loop (`dew.nn.backbones.looping`) before each later pass where every pass exits through
+    it (`Loop.exiting`, `normed_output`) or its step reads the normed state, and, under `reinject`, on
     each pass's input and after the passes. Under nGPT none, its norm being the unit sphere's, which
     learns nothing."""
     if decoder.ngpt is not None:
@@ -72,9 +72,9 @@ def final_norm_runs(decoder: CausalTransformer) -> int:
     if loop is not None:
         later = loop.steps - 1
         coda = loop.layers is not None and loop.layers[1] < decoder.num_layers
-        # The gate's norm of a pass's output serves its step norm too, where no coda runs between them.
-        gated = loop.exit_gate and decoder.normed_output
-        runs += later * (int(gated) + int(loop.step_norm and (coda or not gated)))
+        # The exit's norm of a pass's output serves its step norm too, where no coda runs between them.
+        exited = loop.exiting and decoder.normed_output
+        runs += later * (int(exited) + int(loop.step_norm and (coda or not exited)))
         if loop.reinject:
             runs += 1 + later + 1
     return runs
@@ -105,11 +105,11 @@ def _layer_flops(decoder: CausalTransformer, lengths, counter: Counter) -> float
 
 def layer_passes(decoder: CausalTransformer, index: int) -> int:
     """How many times a call runs layer `index`: a loop's steps for a layer it repeats, and for one after
-    its block where an exit gate weighs every pass (`Loop.exit_gate`), else once."""
+    its block where every pass exits (`Loop.exiting`), else once."""
     if decoder.loop is None:
         return 1
     start, end = (0, decoder.num_layers) if decoder.loop.layers is None else decoder.loop.layers
-    return decoder.loop.steps if start <= index < end or (decoder.loop.exit_gate and index >= end) else 1
+    return decoder.loop.steps if start <= index < end or (decoder.loop.exiting and index >= end) else 1
 
 
 def logits_flops(decoder: CausalTransformer, lengths) -> float:

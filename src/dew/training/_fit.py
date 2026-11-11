@@ -13,7 +13,7 @@ import math
 import os
 import time
 import types
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from typing import TypedDict
 
 import grain.python as pygrain
@@ -389,9 +389,10 @@ class FitRun:
     reads: dict[Signature, tuple[bool, ...]] = dataclasses.field(default_factory=dict)
     """Which leaves of a batch of each signature its compiled step reads
     (`step_reads`), which the prefetcher alone places."""
-    compiled: dict[Signature, tuple] = dataclasses.field(default_factory=dict)
-    """The step compiled for each batch signature the run met, with its measured FLOPs
-    (`Trainer._compiled_for`), which its cooldown branches step too."""
+    compiled: dict[Hashable, tuple] = dataclasses.field(default_factory=dict)
+    """The step compiled for each batch signature the run met, at each pass count its phases run
+    (`Trainer._compile_key`), with its measured FLOPs (`Trainer._compiled_for`), which its cooldown branches
+    step too."""
     cooling: Mapping[str, object] | None = None
     """The cooldown branch the run is to run at its current step before it reads on, resolved
     (`dew.training.cooldown.Pending`): one its checkpoints kept unfinished, as the pool agreed it, or

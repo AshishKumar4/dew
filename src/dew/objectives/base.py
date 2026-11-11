@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import copy
 import enum
 import functools
 import math
@@ -1030,6 +1031,17 @@ class Objective(ABC, Generic[Loss, Effects]):
                              f"and {len(modules)} were given")
         if modules:
             (self.model,) = modules
+
+    def substituted(self, modules: Sequence[nn.Module]) -> Self:
+        """A copy of this objective running `modules` (`substitute`), this one as it was: every objective
+        it holds (a distillation's student and teacher, an actor) copied too, so the copy's substitution
+        reaches none of this one's."""
+        clone = copy.copy(self)
+        for name, held in vars(self).items():
+            if isinstance(held, Objective):
+                setattr(clone, name, held.substituted([entry.module for entry in held.program_key()]))
+        clone.substitute(modules)
+        return clone
 
     def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
         """The scanned layer stacks this objective runs, which a host layout streams as banks, as they

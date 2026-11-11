@@ -97,6 +97,7 @@ from ..precision import (
 )
 from ..progress import Progress
 from ..protocols import (
+    EXITS,
     BoundedNorm,
     ExitPasses,
     OutputTable,
@@ -1707,7 +1708,7 @@ class CausalTransformer(LinearProducts):
             # nothing unless a caller opens the collection.
             self.sow(_FINAL, 'states', residual, reduce_fn=lambda _, value: value, init_fn=lambda: None)
         streams, x = self._collapse(residual)
-        hidden = constrain(self.output_states(x), RESIDUAL)
+        hidden = self.exit_states(x)
         self._gate_exit(hidden)
         hidden = self.head_states(hidden)
         # V4's depth input: inference/model.py MTPBlock.forward at b5968e9.
@@ -1729,11 +1730,13 @@ class CausalTransformer(LinearProducts):
             return
         logit = self.early_exit_gate(normed)
         if not self.is_initializing():
-            self.sow('exits', 'logits', logit)
+            self.sow(EXITS, 'logits', logit)
 
-    def output_states(self, x):
-        """The stack's output `x` as the head and the exit gate read it (`normed_output`)."""
-        return residual_normed(self.norm, x) if self.normed_output else x
+    def exit_states(self, x):
+        """The stack's one residual `x` as it leaves for the head and the exit gate: through the final norm
+        (`normed_output`), placed as the stream is. A loop's every exit leaves so (`looping.run_loop`), its
+        residual one under a loop (`_collapse`), the last pass's through `_exited`."""
+        return constrain(residual_normed(self.norm, x) if self.normed_output else x, RESIDUAL)
 
     @property
     def normed_output(self) -> bool:
@@ -1743,8 +1746,8 @@ class CausalTransformer(LinearProducts):
     @nn.nowrap
     def exit_passes(self, collections: Mapping[str, Mapping]) -> ExitPasses:
         """What a forward with `exits` open gathered (`Looped`): a loop of one pass has no earlier pass."""
-        exits = collections['exits']
-        return tuple(exits.get('states', ())), tuple(exits['logits'])
+        exits = collections[EXITS]
+        return tuple(exits.get('states', ())), tuple(exits.get('logits', ()))
 
     def head_states(self, normed):
         """The states the head reads from the final norm's `normed`: divided by `logits_scaling`, in at
@@ -2232,18 +2235,18 @@ class CausalTransformer(LinearProducts):
     def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
                     backprop_steps: int | None = None, remat: bool | None = None,
                     implicit: bool | None = None, exit_gate: bool | None = None,
-                    exit_threshold: float | None = None) -> Self | None:
+                    exit_threshold: float | None = None, exits: bool | None = None) -> Self | None:
         """This model with its loop run `steps` times (None keeps its count), over the block `layers`
         where given (None keeps its block). `backprop_steps` sets how many final passes train through,
-        `remat` checkpoints each pass, `implicit` takes each later pass by the θ-method, and `exit_gate`
-        and `exit_threshold` weigh and take each pass's exit (`Loop`); None keeps the loop's own value.
+        `remat` checkpoints each pass, `implicit` takes each later pass by the θ-method, and `exit_gate`,
+        `exit_threshold` and `exits` weigh, take and give each pass's exit (`Loop`); None keeps its own.
 
         A model with no loop gains one over `layers`, with no norm between its
         passes, so one pass computes the model as it was, and every count does
         where it is implicit; None when it has no loop and the two do not both
         say what to add."""
         stated = {'backprop_steps': backprop_steps, 'remat': remat, 'implicit': implicit,
-                  'exit_gate': exit_gate, 'exit_threshold': exit_threshold}
+                  'exit_gate': exit_gate, 'exit_threshold': exit_threshold, 'exits': exits}
         options = {name: value for name, value in stated.items() if value is not None}
         if self.loop is None:
             if steps is None or layers is None:

@@ -2278,9 +2278,11 @@ class DecoderRunConfig(RunConfig):
     block, the passes trained through and their recomputation (`CausalTransformer.with_passes`), each
     the run's choice over the checkpoint's own. The language-model and the decision runs take it."""
 
-    loop_steps: int | None = None
+    loop_steps: int | tuple[int, ...] | None = None
     """The passes a looped checkpoint runs its block (`CausalTransformer.loop`), such
-    as Ouro's at 1, 2 or 4; None keeps the checkpoint's own."""
+    as Ouro's at 1, 2 or 4; or one count a phase of the run's data (`dew.data.phases`,
+    `Trainer`'s `phase_passes`), a pass count that grows over the run, each phase's step
+    compiled with its own and the run handing on the last; None keeps the checkpoint's own."""
     loop_layers: tuple[int, int] | None = None
     """The block of layers [first, end) that `loop_steps` repeats: a pretrained
     decoder with no loop gains one over its own layers, as Qwen 3.5's middle block
@@ -2303,6 +2305,28 @@ class DecoderRunConfig(RunConfig):
     """Exit each token at the first pass whose cumulative exit probability reaches this
     (`Loop.exit_threshold`); None keeps a checkpoint's own choice."""
 
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if isinstance(self.loop_steps, tuple) and self.data is not None:
+            # Refused before anything loads: a count a phase the data reads in.
+            phases = self.data.phase_count
+            if len(self.loop_steps) != phases:
+                raise ValueError(f"loop_steps names {len(self.loop_steps)} pass counts, one a phase, and the "
+                                 f"run's data reads {phases} phase(s)")
+
+    @property
+    def handed_passes(self) -> int | None:
+        """The pass count the run's model holds and hands on: the last phase's, where the run names one a
+        phase (`loop_steps`), else `loop_steps`."""
+        return self.loop_steps[-1] if isinstance(self.loop_steps, tuple) else self.loop_steps
+
+    def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
+                               mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
+                               **resources) -> "Trainer[LossT, EffectsT]":
+        """`RunConfig.built`, its steps run each phase's pass count where the run names one a phase."""
+        phased = {"phase_passes": self.loop_steps} if isinstance(self.loop_steps, tuple) else {}
+        return super().built(objective, mesh, rollout, **phased, **resources)
+
     @property
     def loops(self) -> bool:
         """Whether the run asks anything of a loop (`looped`)."""
@@ -2314,7 +2338,7 @@ class DecoderRunConfig(RunConfig):
         """`start` with its block run as the run asks (`looping`), as loaded where it asks nothing."""
         if not self.loops:
             return start
-        return looping(start, self.loop_steps, self.loop_layers, backprop_steps=self.loop_backprop_steps,
+        return looping(start, self.handed_passes, self.loop_layers, backprop_steps=self.loop_backprop_steps,
                        remat=self.loop_remat or None, implicit=self.loop_implicit or None,
                        exit_gate=self.loop_exit_gate or None, exit_threshold=self.loop_exit_threshold,
                        key=self.trainer.key)

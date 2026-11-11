@@ -636,10 +636,10 @@ class MultimodalTransformer(DecoderWrapper):
     def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
                     backprop_steps: int | None = None, remat: bool | None = None,
                     implicit: bool | None = None, exit_gate: bool | None = None,
-                    exit_threshold: float | None = None) -> Self | None:
+                    exit_threshold: float | None = None, exits: bool | None = None) -> Self | None:
         language_model = self.language_model.with_passes(steps, layers, backprop_steps=backprop_steps,
                                                          remat=remat, implicit=implicit, exit_gate=exit_gate,
-                                                         exit_threshold=exit_threshold)
+                                                         exit_threshold=exit_threshold, exits=exits)
         return None if language_model is None else self._over(language_model)
 
     @nn.nowrap

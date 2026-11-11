@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import itertools
+import json
 import os
 import threading
 import typing
@@ -74,6 +75,7 @@ from dew.data.dataset import (
     PhasedStream,
     Reader,
     Records,
+    StepPhases,
     phase_stages,
     rows_of,
     take_batch,
@@ -1309,23 +1311,24 @@ def _compile_phases(
             _delivered(phase.train, end - start, consumed)
         return consumed
 
-    def ordered(index: int, phase: _Staged) -> _Staged:
-        """Phase `index`, refused where it reads in no global order: a phase after it continues each corpus
-        past the records it read by its order's shares (`consumed_by`), which a read streamed, rejecting
-        or packed online has none of."""
-        if not phase.build.global_order:
-            raise ValueError(f"phase {index} needs a global order; "
-                             "streamed, rejecting and online-packed phases are refused")
-        return phase
-
     tokens = source.clock == "tokens"
+    first = staged_at(0, {})
+    # Phases on the step clock whose first reads per share (its order cut where each share reads it: a
+    # stream batched by its tokens after steps that drop rows) read each its own stream (`StepPhases`).
+    per_share = not tokens and not first.build.global_order
+    if per_share:
+        _apart(source)
     staged: list[tuple[_Staged, int | None]] = []
     for index, until in enumerate(source.ends):
+        if per_share:
+            # Its end is its step's, the steps its own stream reads.
+            staged.append((first if not index else staged_at(index, {}), until))
+            continue
         # A phase on the token clock ends where the run reaches it, so it is staged as it reads first,
         # and again with the ends of the phases before it once the run reaches them (`opened`).
         ends = [end for _, end in staged if end is not None]
-        phase = ordered(index, staged_at(index, {} if tokens
-                                         else consumed_by([phase for phase, _ in staged], ends)))
+        phase = _ordered(index, first if not index else staged_at(
+            index, {} if tokens else consumed_by([phase for phase, _ in staged], ends)))
         # A phase on the step clock ends at its step's record: the records of the phases before it, and its
         # own steps in its own rows (row 4812).
         before, started = (ends[-1] if ends else 0), (source.ends[index - 1] or 0) if index else 0
@@ -1369,11 +1372,17 @@ def _compile_phases(
         return counted(loader)
 
     batches = tuple(phase.build.batch for phase, _ in staged)
-    stages = () if tokens else phase_stages(batches, (0, *(end for _, end in staged[:-1] if end is not None)))
+    stages = () if tokens or per_share else phase_stages(
+        batches, (0, *(end for _, end in staged[:-1] if end is not None)))
+    # A read of phases each on its own stream states its own (`StepPhases.stages`).
 
     def training(partition: DataPartition) -> Iterator[Batch]:
         if not tokens:
             _updates_aligned(source.ends, batches, partition.window)
+        if per_share:
+            readers = [functools.partial(loaded.train, partition) for loaded, _ in built]
+            return StepPhases(readers, source.ends, batches=batches,
+                              opened=lambda index: counted(built[index][0]) and None)
 
         def global_reader(index: int, ends: tuple[int, ...]) -> GlobalReader:
             opened_reader = opened(index, ends).train(partition)
@@ -1396,6 +1405,35 @@ def _compile_phases(
                                token_ends=source.ends if tokens else None, batches=batches, stages=stages,
                                token_batches=tuple(loaded.batch_tokens for loaded, _ in built),
                                widths=merge_facts(loaded.widths for loaded, _ in built))
+
+
+def _ordered(index: int, phase: _Staged) -> _Staged:
+    """Phase `index` of phases read in one global order, refused where it reads in none: a phase after it
+    continues each corpus past the records it read by its order's shares (`consumed_by`), which a read
+    streamed, rejecting or packed online has none of; on the step clock, a run whose first phase reads per
+    share reads each phase on its own stream (`StepPhases`), its phases' too."""
+    if not phase.build.global_order:
+        raise ValueError(f"phase {index} needs a global order, as the phases before it read in one; "
+                         "streamed, rejecting and online-packed phases are read each on its own stream on "
+                         "the step clock where the first phase is one too, and refused on the token clock")
+    return phase
+
+
+def _apart(phases: Phases) -> None:
+    """Refuse phases read each on its own stream (`StepPhases`) where two read one corpus: the later
+    opens it at its first record, where phases in one global order continue it from where the one before
+    left it, so it would read the records the earlier phase read again."""
+    seen: dict[str, tuple[int, str]] = {}
+    for index, pipeline in enumerate(phases.pipelines):
+        for chain, corpus in _leaves(pipeline):
+            # A corpus is its store's content (`Source.fingerprint`), whatever a chain names it.
+            key = json.dumps(corpus.fingerprint(), sort_keys=True, default=str)
+            earlier, named = seen.setdefault(key, (index, _name(chain)))
+            if earlier != index:
+                raise ValueError(f"phases {earlier} and {index} both read one corpus ({named}, "
+                                 f"{_name(chain)}), each phase on its own stream as a read per share is, "
+                                 "which opens the corpus at its first record again; read each corpus in one "
+                                 "phase, or make the phases one global order")
 
 
 def _updates_aligned(ends: Sequence[int | None], batches: Sequence[int], window: int = 1) -> None:
