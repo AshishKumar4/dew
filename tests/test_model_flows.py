@@ -53,13 +53,14 @@ def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monk
         model_flows.held_reference(flow, reference)
 
 
-def test_a_training_step_on_the_templates_plain_jax_mainloop_does_not_reach_its_route():
+def test_a_training_step_on_the_templates_plain_jax_mainloop_does_not_reach_its_route(monkeypatch):
     """An attention flow whose training step runs the template on the plain-JAX mainloop
     (`generation.chosen`'s `attention_mainloop='portable'`, as a GPU's mainloops declining it would), its
     decode loop on the GPU's own, does not hold: each program is held to its own routes, and the template's
     every pass to a GPU's mainloop (`model_flows.EVERY`), so a training step whose one pass, its backward,
     took the plain-JAX one beside a native forward does not hold either."""
     flow = model_flows.flow_named("dense bf16, the lane's")
+    monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
     with generation.assumed("sm90"), jax.default_matmul_precision(flow.precision):
         native = {kind: _routes(programs[f"{kind} dew"]) for kind in model_flows.KINDS}
