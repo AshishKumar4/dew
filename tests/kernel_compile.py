@@ -689,7 +689,10 @@ def _assembled(ptx: str, generation: str, cap: int, *, honored: bool) -> tuple[i
     """`_ptxas` at `cap`: a raise's where the kernel `ptx` raises its consumers' registers and the compile
     takes it (`honored`), its entry's in a relocatable compile otherwise."""
     if honored and RAISE.search(ptx):
-        return _ptxas(ptx, generation, cap=255, raised=cap, relocatable=False)
+        # The raise at `cap` under the entry's own constraint, as the launch states it: an entry raised to 255
+        # besides allocates apart, an H100's training forward held at a raise of 160 under its own entry and
+        # spilled 60 bytes at 255's (armada 20261111140619-add46709).
+        return _ptxas(ptx, generation, cap=None, raised=cap, relocatable=False)
     return _ptxas(ptx, generation, cap=cap, relocatable=not honored)
 
 

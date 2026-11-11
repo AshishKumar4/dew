@@ -828,17 +828,19 @@ class _Codes(NamedTuple):
 def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, spans: _Spans | None,
             hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks, drawn: bool,
             held: tuple | None = None, product: Callable[[], jax.Array] | None = None,
-            interpret: bool = False, codes: _Codes | None = None, training: bool = False) -> tuple:
+            interpret: bool = False, codes: _Codes | None = None, training: bool = False,
+            first_at: Callable | None = None) -> tuple:
     """A key tile's first key, coordinates and logits under the score hook (batch row and head `place`, its
-    queries from `first`), and their products where the logits are a factor of them (`algebra.logits_of`),
-    every walk's (`_consumer`'s, `_peak_consumer`'s), so a peak walk's logits are the training walk's to the
-    bit; its places read by the walk's dropout where it draws it (`drawn`). A tile every query sees whole
-    takes no mask: one walk, the choice a tile's (a walk of each, these rings' waits and arrivals in two
-    loops, faulted on an H100 under jax 0.11.2's lowering). The tile's `Q Kᵀ` its own fresh product, or
-    `product()`'s where the walk issues it. A training forward's walks' query places (`training`: its peak
-    walk's and its anchored one's), where its hook reads them, are in the accumulator's layout
-    (`Family.as_tile`): a hook's term of a slice of them (a row-indexed one's `q_pos[:, :1]`) found no
-    layout on mma.sync, whose reductions' inference offers no accumulator layout (row 5279)."""
+    queries from `first`, or from `first_at()` formed at its mask), and their products where the logits are a
+    factor of them (`algebra.logits_of`), every walk's (`_consumer`'s, `_peak_consumer`'s), so a peak walk's
+    logits are the training walk's to the bit; its places read by the walk's dropout where it draws it
+    (`drawn`). A tile every query sees whole takes no mask: one walk, the choice a tile's (a walk of each,
+    these rings' waits and arrivals in two loops, faulted on an H100 under jax 0.11.2's lowering). The
+    tile's `Q Kᵀ` its own fresh product, or `product()`'s where the walk issues it. A training forward's
+    walks' query places (`training`: its peak walk's and its anchored one's), where its hook reads them, are
+    in the accumulator's layout (`Family.as_tile`): a hook's term of a slice of them (a row-indexed one's
+    `q_pos[:, :1]`) found no layout on mma.sync, whose reductions' inference offers no accumulator layout (row
+    5279)."""
     row, head = place
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
@@ -864,6 +866,12 @@ def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, sp
     # Its mask chosen at run time (`whole`): the masked tile's reads.
     read = algebra.places_read(spec, masked=True, hooked=score_places(hooks), dropped=drawn,
                                padded=spec.keys % tiles.block_k != 0)
+    # The block's first query formed where the mask reads it (`first_at`): carried across the logits'
+    # product, which waits on the step's register-A products to retire (`retires_register_products`), an
+    # H100's training forward at 128 x 64 on three consumers spilled its two query places, 16 bytes (row
+    # 5416's retirement; armada 20261111140541-04a31d5a).
+    if first_at is not None:
+        first = first_at()
     coords = _coords(family, spans, row, first, k_first, shape, read=read,
                      draw=None if hooked.drop is None else hooked.drop.draw(row, head), held=held)
     if training and score_places(hooks)[0]:
@@ -952,7 +960,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
               q_smem, q_loaded, out_stage: Callable, row_smem, streams, views: dict, turn, streamed: tuple,
               first, spans: _Spans | None, hooked: _Hooked, place: tuple, *, hooks: Hooks, training: bool,
               anchors: tuple | None = None, interpret: bool, certified: tuple | None = None, kept=None,
-              relay=None, codes: _Codes | None = None, value_width: int):
+              relay=None, codes: _Codes | None = None, value_width: int,
+              first_at: Callable | None = None):
     """A consumer's query block (batch row, head and key head `place`): its walk of the key tiles it reads
     through the family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook
     on each tile, passing those of the program's `streamed` range its partner alone reads; then its output
@@ -992,7 +1001,9 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     def scored(index, slots, product=None):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
                        hooks=hooks, drawn=hooked.drop is not None, held=held, product=product,
-                       interpret=interpret, codes=codes, training=training)
+                       interpret=interpret, codes=codes, training=training,
+                       first_at=(first_at if training and family.in_flight
+                                 and family.retires_register_products else None))
 
     # The values' tiles as the products read them: a quantized call's in the query's dtype (`_Codes`), an
     # fp32 call's its parts (`_Program.parted`).
@@ -1628,7 +1639,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                       turn, streamed, block.first, read.spans, read.hooked,
                       (row, head, lax.div(head, group)), hooks=hooks, training=training,
                       anchors=read.anchors, interpret=interpret, certified=ahead.certify,
-                      kept=read.kept,
+                      kept=read.kept, first_at=lambda: afresh().first,
                       relay=None if refs.relay is None else refs.relay.at[index],
                       codes=None if refs.converted is None or read.hooked.scales is None else _Codes.of(
                           family, tuple(tile.at[index] for tile in refs.converted), read.hooked.scales,
