@@ -111,10 +111,11 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     )
 
 
-MEANFLOW_SEEDS = {"triton": 128, "cudnn": 8}
-"""Check 1's declared seeds for a MeanFlow step through each fused attention kernel, sized paired on the
-GPUs the site runs on (`seeds_for` with the fused step as `dew_fn`, its confirming block; `meanflow_case`),
-the largest of an A100's and a GH200's."""
+MEANFLOW_SEEDS = 8
+"""Check 1's declared seeds for a MeanFlow step through a fused attention kernel, sized paired on the GPUs
+the site runs on (`seeds_for` with the fused step as `dew_fn`, its confirming block; `meanflow_case`): 8 for
+Triton's kernel and for cuDNN's on an A100 and a GH200 alike (node receipts UB-MEANFLOW-SEEDS-a100 and
+-gh200, 11-11), where every weight drawn at a flat 0.3 had sized 128."""
 
 
 def meanflow_case(kernel: str):
@@ -171,7 +172,7 @@ def agrees_with_xla(kernel: str) -> None:
     """A MeanFlow step through the fused attention `kernel` runs, and its loss and every parameter's
     gradient are on par with the xla kernel's (check 1) from the float64 truth (`meanflow_case`)."""
     dew, reference, truth, draw = meanflow_case(kernel)
-    assert_as_exact(dew, reference, draw, f"MeanFlow step on {kernel}", seeds=MEANFLOW_SEEDS[kernel],
+    assert_as_exact(dew, reference, draw, f"MeanFlow step on {kernel}", seeds=MEANFLOW_SEEDS,
                     truth_fn=truth)
 
 
