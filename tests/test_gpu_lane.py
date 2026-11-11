@@ -165,6 +165,35 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
     assert stored, "its run's rows are recorded as any lane's"
 
 
+def test_a_file_that_does_not_collect_is_its_own_red_row_and_the_lanes_other_files_run(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A lane reads which of its files hold tests for another process by collecting them: a file that does
+    not import is red in its own row, as every lane's is, and the lane's other files run and are reported
+    (review: the lane's reading of its files raised on the first that did not collect, and no file ran, no
+    row written). A lane given no file collects nothing, where pytest with no path collects the checkout."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    (tmp_path / "tests/test_broken.py").write_text("import a_module_no_environment_holds\n")
+    (tmp_path / "tests/test_whole.py").write_text(LANE_TEST)
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_lane("3.12", ["tests/test_broken.py", "tests/test_whole.py"], out, cache="on", processes=2,
+                       deadline=600.0) == 0
+    rows = {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]}
+    assert rows == {"3.12:tests/test_broken.py": 1, "3.12:tests/test_whole.py": 0}
+    assert ci.collected("3.12", "users_process", []) == {}
+    # A reading that was interrupted is no reading: the lane stops, where one that went on would run its files
+    # with no second process and leave green rows of tests that ran nowhere (review).
+    (tmp_path / "tests/conftest.py").write_text(
+        "import pytest\n"
+        "def pytest_collection_modifyitems(config, items):\n"
+        "    if config.option.markexpr == 'users_process':\n"
+        "        pytest.exit('interrupted', returncode=2)\n")
+    with pytest.raises(SystemExit):
+        ci.gpu_lane("3.12", ["tests/test_whole.py"], out, cache="on", processes=1, deadline=600.0)
+
+
 def test_a_lanes_prepare_ends_within_its_one_deadline_however_many_files_it_holds(
         ci, tmp_path, monkeypatch, cache_worker):
     """A lane's prepare is given one deadline for all of it: each file's process has what is left of it as
@@ -179,17 +208,21 @@ def test_a_lanes_prepare_ends_within_its_one_deadline_however_many_files_it_hold
     (tmp_path / "tests/conftest.py").write_text(
         "def pytest_configure(config):\n"
         "    config.addinivalue_line('markers', 'prepares: prepared on the CPU before its GPU run')\n")
-    names = [f"tests/test_slow_{index}.py" for index in range(3)]
-    for name, seconds in zip(names, (2, 2, 25), strict=True):
-        (tmp_path / name).write_text("import pytest, time\n@pytest.mark.prepares\n"
-                                     f"def test_prepares():\n    time.sleep({seconds})\n")
-    # One process at a time, and twenty seconds for all three beside the allowance a process keeps back for
-    # its own end: the first two prepare, and the third, which needs more than is left, is cut at what is
-    # left, where a deadline of its own would have let it end.
+    names = [f"tests/test_slow_{index}.py" for index in range(4)]
+    for name, seconds in zip(names, (2, 2, 25, 0), strict=True):
+        (tmp_path / name).write_text(
+            "import pytest, time\nfrom pathlib import Path\n@pytest.mark.prepares\n"
+            f"def test_prepares():\n    Path('started-{Path(name).stem}').write_text('')\n"
+            f"    time.sleep({seconds})\n")
+    # One process at a time, and twenty seconds for all four beside the allowance a process keeps back for
+    # its own end: the first two prepare; the third, which needs more than is left, is cut at what is left,
+    # where a deadline of its own would have let it end; and the fourth, with none left, is never started.
     out = tmp_path / "verdict.json"
-    assert ci.gpu_prepared("3.12", names, out, processes=1, deadline=ci.session.GRACE + ci.SETTLE + 20.0) == 0
+    assert ci.gpu_prepared("3.12", names, out, processes=1, deadline=ci.session.GRACE + ci.SETTLE + 30.0) == 0
     rows = {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]}
-    assert rows == {f"3.12:{names[0]}": 0, f"3.12:{names[1]}": 0, f"3.12:{names[2]}": 1}
+    assert rows == {f"3.12:{name}": code for name, code in zip(names, (0, 0, 1, 1), strict=True)}
+    assert sorted(path.name for path in tmp_path.glob("started-*")) == [
+        "started-test_slow_0", "started-test_slow_1", "started-test_slow_2"]
 
 
 def test_a_file_with_tests_for_a_users_process_runs_them_in_a_process_of_their_own(
@@ -523,6 +556,15 @@ def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measur
     monkeypatch.setattr(sys, "argv", ["gpu_holds.py", "--tests=tests/test_wide.py#2/3 tests/test_new.py"])
     assert holds.main() == 0
     assert json.loads(capsys.readouterr().out) == {"tests/test_wide.py": 2 * (4 * gib * 1.25 + gib)}
+    # A file's process under a user's flags is a run of the file too: where it held more than the lane's own,
+    # the file's part is admitted for it (its record was no "whole" record's, and the part was sized without
+    # it).
+    users = "/" + ci.record_key("3.12", ci.row("3.12", "tests/test_wide.py", ci.varied("", "users")),
+                                "NVIDIA-H100-80GB-HBM3-x86")
+    stored[users] = json.dumps({"key": None, "depends": ["tests/test_wide.py"], "row": {}, "reads": [],
+                                "peak": 6 * gib, "shares": 1, "pools": 0}).encode()
+    assert holds.main() == 0
+    assert json.loads(capsys.readouterr().out) == {"tests/test_wide.py": 2 * (6 * gib * 1.25 + gib)}
     # The cache not answering (here, refusing the token) fails the tool, which sizes a job by what it says:
     # read as files no class measured, a part took the default (2026-11-11: a file measured at 5.9 GiB ran
     # out of the 4 GiB lane of a part composed while a read of its record did not come back). A lane on its

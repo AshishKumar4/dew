@@ -173,7 +173,9 @@ costs = _loaded(HERE / "costs.py")
 command_line = _loaded(HERE / "arguments.py")
 rows = _loaded(HERE / "rows.py")
 row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
-VARIED, varied, cut_of = rows.VARIED, rows.varied, rows.cut_of
+VARIED, varied, cut_of, whole_place = rows.VARIED, rows.varied, rows.cut_of, rows.whole_place
+shares = _loaded(HERE / "shares.py")
+apportioned, deadline_shares = shares.apportioned, shares.deadline_shares
 # The names the land queue's tools read from this module at every commit they run (land.sh's `ci.STALE`,
 # run_tests.py's `node_of`), older commits' and newer alike.
 STALE, node_of = grading.STALE, grading.node_of
@@ -1373,28 +1375,6 @@ def ynn_switched(cases) -> list[dict]:
             for site in json.loads(item.get("value") or "[]")]
 
 
-def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dict[str, float]:
-    """Each file's share of a task's `wall` time, in proportion to its tests' own times (`task`), or an
-    even split over the task's `rows` (a file named twice is two) where no test recorded a time."""
-    total = sum(own_seconds.values())
-    pace = wall / total if total > 0 else 0.0
-    return {name: own * pace if pace else wall / rows for name, own in own_seconds.items()}
-
-
-def deadline_shares(own_seconds: Mapping[str, float], reported: Container[str], wall: float,
-                    running: str | None) -> dict[str, float]:
-    """The seconds of the rows of a task that ran out of time, of the files that have any, by file: one that
-    `reported` tests, its tests' own seconds, and the file `running` at the deadline, the one whose test
-    started last (`followed.visited`), its own and all of the task's `wall` time no file's tests account for
-    (its imports and its collection, and the test the interrupt stopped, which pytest's report gives no
-    time), so its row holds at least what the file needs. A file that reported none and was not running never
-    started, and has none: absent. `apportioned` split the wall time, the interrupted test's included, over
-    the files that finished, in proportion to their tests' times, or evenly where none finished."""
-    unaccounted = max(wall - sum(own_seconds.values()), 0.0)
-    return {name: own + (unaccounted if name == running else 0.0) for name, own in own_seconds.items()
-            if name == running or name in reported}
-
-
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
          grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False,
          release: str = "", census: bool = False) -> int:
@@ -1952,15 +1932,23 @@ def network_files(python: str) -> dict[str, int]:
     return collected(python, "network")
 
 
-def collected(python: str, marks: str, files: list[str] | None = None) -> dict[str, int]:
+def collected(python: str, marks: str, files: list[str] | None = None,
+              within: float | None = None) -> dict[str, int]:
     """Each test file of this checkout (of `files`, where given) with tests pytest's `-m marks` selects, and
-    how many, as pytest collects it on the CPU."""
+    how many, as pytest collects it on the CPU. Of `files`, one that does not collect has none and stops no
+    other's reading (its own run says its error, as every lane's does; a lane that died of one file's import
+    ran none of its files), within `within` seconds where a lane has a deadline."""
+    if files is not None and not files:
+        return {}
     every = sorted(str(path) for path in Path("tests").glob("test_*.py")
                    if str(path) not in SKIPPED) if files is None else files
     done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-m", marks,
-                           *every], capture_output=True, text=True,
+                           *([] if files is None else ["--continue-on-collection-errors"]), *every],
+                          capture_output=True, text=True, timeout=within,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
-    if done.returncode not in (0, 5):
+    # Given files and told to go on past one that does not collect, pytest exits 1 for those; 2 is a
+    # collection interrupted, no reading at all.
+    if done.returncode not in ((0, 5) if files is None else (0, 1, 5)):
         raise SystemExit(f"collecting the tests marked {marks} exited {done.returncode}\n"
                          f"{done.stdout[-4000:]}{done.stderr[-2000:]}")
     counts: dict[str, int] = {}
@@ -1992,7 +1980,8 @@ def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
 def borrowed_records(names: list[str], python: str, held: str, token: str,
                      strict: bool = False) -> dict[str, dict]:
     """For each of `names`, test files no run on class `held` measured, the last record of the whole
-    file on another class whose run measured its GPU peak, the one that holds the most
+    file on another class whose run measured its GPU peak, any of its processes' (`varied`: a file's
+    process under a user's flags may hold more than the lane's own), the one that holds the most
     (`gpu_needs`): what a file has taken on a GPU, which a first lane on a class takes as its share.
     One no class measured is absent, as every one is where the Worker does not list its records. Its run on
     `held` records its own, which every later lane reads. With `strict`, a read the Worker does not answer is
@@ -2014,7 +2003,7 @@ def borrowed_records(names: list[str], python: str, held: str, token: str,
               file=sys.stderr)
         return {}
     keys = [key for key in every
-            if (parts := key_parts(key))[0] != held and parts[2] == "whole" and parts[1] in wanted]
+            if (parts := key_parts(key))[0] != held and whole_place(parts[2]) and parts[1] in wanted]
 
     def read(key: str) -> tuple[str, dict | None]:
         if strict:
@@ -2041,13 +2030,13 @@ environment it runs under. XLA reads a process's flags once, so tests that must 
 (no deterministic ops, JAX's own matmul precision) are a process of their own: under its word the suite's
 conftest runs the marked GPU tests and skips the others, as without it it skips the marked ones, so both
 processes select and cut a file alike and each test runs in one."""
-def lane_units(python: str, tests: list[str]) -> dict[str, tuple[str, str, str]]:
+def lane_units(python: str, tests: list[str], within: float | None = None) -> dict[str, tuple[str, str, str]]:
     """Each process a GPU lane runs for `tests`, by its name, as its file, its group and its variant: each
     test's own, and after it one for each of `VARIANTS` whose marked tests its file holds, as pytest collects
     the lane's files on the CPU, once a mark. A file with none of a variant's tests starts no process for it;
     one that holds some never goes without it (a variant no lane ran is tests that ran nowhere, silently)."""
     files = sorted({name.partition("#")[0] for name in tests})
-    holding = {variant: collected(python, mark, files) for variant, (mark, _) in VARIANTS.items()}
+    holding = {variant: collected(python, mark, files, within) for variant, (mark, _) in VARIANTS.items()}
     units = {}
     for name in tests:
         file, _, group = name.partition("#")
@@ -2079,28 +2068,40 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
     (tools/fetched_fixtures.py), so the run finds each whole and waits on no download with the GPU held.
     `deadline` is the whole prepare's: each process is given what is left of it as its turn comes, its own
     end's allowance kept back, so the prepare ends within it however many files and waves it holds, and a
-    file it leaves no time is a red row of its own (review: a deadline a process let five files outlast the
-    job's own prepare bound, whose session then ended the job and every file's prepare with it)."""
+    file it leaves no time is a red row of its own, never started (review: a deadline a process let five
+    files outlast the job's own prepare bound, whose session then ended the job and every file's prepare
+    with it); its fetch and its collections are within it too."""
     began = time.monotonic()
-    subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch"], check=True)
-    units = lane_units(python, tests)
-    holding = collected(python, PREPARES, sorted({file for file, _, _ in units.values()}))
+
+    def left() -> float:
+        return deadline - (time.monotonic() - began)
+
+    subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch"], check=True,
+                   timeout=max(1.0, left()))
+    units = lane_units(python, tests, max(1.0, left()))
+    holding = collected(python, PREPARES, sorted({file for file, _, _ in units.values()}), max(1.0, left()))
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(units)
                 if units[name][0] in holding}
     threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
 
     def prepared(name: str, verdict: Path) -> int:
-        left = max(1.0, deadline - (time.monotonic() - began) - session.GRACE - SETTLE)
-        return tested(python, [units[name][0]], units[name][1], verdict, left, "off", session.GRACE, "",
-                      {**PREPARING, "OMP_NUM_THREADS": threads,
-                       **(VARIANTS[units[name][2]][1] if units[name][2] else {})},
-                      recorded=False, variant=units[name][2])
+        file, group, variant = units[name]
+        # What a process's own end may take past its deadline is kept back (its grace, its group's settling,
+        # its reader's last ten seconds); with none left, it is not started.
+        if (mine := left() - session.GRACE - SETTLE - 10.0) <= 0:
+            verdict.write_text(json.dumps({"rows": [{
+                "name": row(python, file, varied(group, variant)), "exitCode": 1, "seconds": 0.0, "tests": {},
+                "output": "not prepared: its lane's prepare had no time left for it"}]}))
+            return 0
+        return tested(python, [file], group, verdict, mine, "off", session.GRACE, "",
+                      {**PREPARING, "OMP_NUM_THREADS": threads, **(VARIANTS[variant][1] if variant else {})},
+                      recorded=False, variant=variant)
 
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
         for done in [pool.submit(prepared, name, verdict) for name, verdict in verdicts.items()]:
             done.result()
-    out.write_text(json.dumps({"rows": [row for verdict in verdicts.values()
-                                        for row in json.loads(verdict.read_text())["rows"]]}))
+    out.write_text(json.dumps({"rows": [row_ for verdict in verdicts.values()
+                                        for row_ in json.loads(verdict.read_text())["rows"]]}))
     return 0
 
 
