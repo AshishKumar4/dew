@@ -232,9 +232,12 @@ query heads, so its decode folds onto the decode kernel (`attention_kernels.deco
 GEMMA2 = {**DENSE, "query_pre_attn_scalar": 128, "sliding_window": 64}
 """Gemma 2's alternating window of 64 keys and its softcaps, at `DENSE`'s widths."""
 
-GPT_OSS = {**DENSE, "sliding_window": 64, "num_local_experts": 2, "num_experts_per_tok": 2}
-"""GPT-OSS's sinks and alternating window at `DENSE`'s widths, every token routed to both its experts: no
-routing decision two arms could take apart."""
+GPT_OSS = {**DENSE, "sliding_window": 64, "num_local_experts": 16, "num_experts_per_tok": 16,
+           "intermediate_size": 128}
+"""GPT-OSS's sinks and alternating window at `DENSE`'s widths, every token routed to every one of its experts:
+no routing decision two arms could take apart. Sixteen experts 128 wide hold the parameters two 1024 wide
+would, and give the router's bias sixteen values a draw where two left check 1 Inconclusive on it at 40 draws
+on an A100 (pooled ratio 1.25 in [0.74, 2.01])."""
 
 MLA = {**DENSE, "head_dim": 64, "kv_lora_rank": 128, "qk_nope_head_dim": 64, "qk_rope_head_dim": 64,
        "qk_head_dim": 128, "v_head_dim": 64, "first_k_dense_replace": 2}
