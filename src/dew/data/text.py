@@ -441,9 +441,15 @@ class Tokenize(grain.MapTransform):
         """Token ids of each document's length under "text", by `tokenizer`, `vocab_size` of them."""
         from dew.data.facts import unshaped
 
-        ended = self.eos if self.eos is not None else self.vocabulary.eos_id is not None
         return {**unshaped(facts, self.field, "text"), "tokenizer": self.tokenizer,
-                "vocab_size": self.vocabulary.vocab_size, "eos_id": self.vocabulary.eos_id if ended else None}
+                "vocab_size": self.vocabulary.vocab_size,
+                "eos_id": self.vocabulary.eos_id if self.ends else None}
+
+    @functools.cached_property
+    def ends(self) -> bool:
+        """Whether each document is closed by the vocabulary's EOS: as `eos` states, or where it states
+        nothing, whenever the vocabulary has one."""
+        return bool(self.eos) if self.eos is not None else self.vocabulary.eos_id is not None
 
     @functools.cached_property
     def vocabulary(self) -> ByteTokenizer | HFTokenizer:
@@ -466,9 +472,7 @@ class Tokenize(grain.MapTransform):
         value = element[self.field]
         if not isinstance(value, str):
             raise ValueError(f"Tokenize field {self.field!r} must contain text")
-        tokenizer = self.vocabulary
-        ended = bool(self.eos) or (self.eos is None and tokenizer.eos_id is not None)
-        ids = tokenizer.document(value, eos=ended)
+        ids = self.vocabulary.document(value, eos=self.ends)
         kept = {key: value for key, value in element.items() if key != self.field}
         return {**kept, "text": np.asarray(ids, np.int32), "_dew_length": len(ids)}
 
