@@ -537,6 +537,13 @@ def test_a_tier_cut_groups_green_row_is_reused_while_its_cut_holds_the_same_test
     assert lane(a=300.0, b=30.0, c=30.0, d=30.0) == (dict.fromkeys(names, "11"), [{"a"}, {"b", "c", "d"}])
     # The first cut again: its rows, kept under their own keys, are found, and no test runs.
     assert lane(a=30.0, b=30.0, c=30.0, d=30.0) == (dict.fromkeys(names, "11"), [{"a", "b"}, {"c", "d"}])
+    # Seconds that name fewer of the file's tests leave the first group its own two, and the test they lack
+    # to whichever group the collection gives it: no group's row stands, and every test runs, the one the
+    # seconds lack among them (review: the first group's row was reused, and that test ran in no group).
+    weights.write_text(json.dumps({f"tests/test_long.py::test_{name}": seconds
+                                   for name, seconds in (("a", 30.0), ("b", 30.0), ("c", 60.0))}))
+    assert ci.gpu_lane("3.12", groups, out, cache="on", processes=2, deadline=600.0) == 0
+    assert {name: len(list(tmp_path.glob(f"ran-{name}-*"))) for name in names} == dict.fromkeys(names, 3)
 
 
 def test_a_tiers_files_are_named_with_the_generations_their_tests_are_pinned_to(ci, tmp_path, monkeypatch):
