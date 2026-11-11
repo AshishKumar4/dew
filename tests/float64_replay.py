@@ -47,7 +47,8 @@ def float64_replay(fn, *, compiled: bool = False):
     Returns a function of `fn`'s arguments whose float results are float64, for check 1's
     `truth_fn` where a float64 run of `fn` would be another program (a float64 draw reads 64-bit
     random bits). It traces `fn` as the float32 program, x64 off, whatever the caller's mode and
-    however widened its arguments arrive (check 1 hands a truth widened inputs under x64), and
+    however widened its arguments arrive (check 1 hands a truth widened inputs under x64, host arrays
+    or, where a GPU holds the draw, float64 JAX arrays: `_without_x64`), and
     rounds each argument to its traced dtype before widening it, as the program would read it. It runs
     eagerly, each operation its own float64 dispatch, so its bits are each operation's own, and the
     gate runs it as given. `fn` is traced once a signature of its arguments (their tree, shapes and
@@ -65,7 +66,7 @@ def float64_replay(fn, *, compiled: bool = False):
                                                          else np.result_type(value))) for value in leaves))
         if signature not in traced:
             with jax.enable_x64(new_val=False):
-                closed, made = jax.make_jaxpr(fn, return_shape=True)(*arguments)
+                closed, made = jax.make_jaxpr(fn, return_shape=True)(*jax.tree.map(_without_x64, arguments))
                 traced[signature] = (lowered(closed), made)
         graph, shapes, *program = traced[signature]
         native = [value if jax.dtypes.issubdtype(aval.dtype, jax.dtypes.extended)
@@ -78,6 +79,17 @@ def float64_replay(fn, *, compiled: bool = False):
             outputs = program[0](*native) if compiled else _walked(graph, native)
             return jax.tree.unflatten(jax.tree.structure(shapes), [_widened(value) for value in outputs])
     return as_given(run)
+
+
+def _without_x64(value):
+    """`value` as a process without x64 holds it, for the program's trace: a 64-bit array at JAX's own
+    narrowing of its dtype (`jax.dtypes.canonicalize_dtype`, read with x64 off: float64's float32). JAX
+    narrows a host array so itself as it traces one, but keeps a JAX array's 64 bits whatever the mode, and
+    a draw's leaves a GPU holds arrive as those (`arm_arithmetic.widened`). A key array, and a value of no
+    dtype, as they are."""
+    if not hasattr(value, "dtype") or jax.dtypes.issubdtype(value.dtype, jax.dtypes.extended):
+        return value
+    return value.astype(jax.dtypes.canonicalize_dtype(value.dtype))
 
 
 def _walked(graph, native) -> list:

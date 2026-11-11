@@ -64,19 +64,23 @@ TRAIN_REFUSED = """
 import sys
 
 import jax
-from test_compile_ahead import fine_tune
+from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune
+from token_support import token_rows
 
 from dew.training import Inspection, MeshSpec
 from dew.training.ahead import AheadOfTime
 
+run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(sys.argv[1]), xla=True, split=2,
+                inspection=Inspection(every=2))
 try:
-    fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(sys.argv[1]), xla=True, split=2,
-              inspection=Inspection(every=2))
+    run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=1, log_every=1)
 except ValueError:
     sys.exit(0)
 sys.exit("the step loaded in a process whose XLA computes otherwise")
 """
-"""A fresh process whose trainer loads the step at argv[1] (`QUIET_BUILD`'s), which its loader must refuse."""
+"""A fresh process whose trainer trains a step from the step at argv[1] (`QUIET_BUILD`'s), which its loader
+must refuse as it loads it: a trainer handed a step loads it at its first step's compile, not as it is
+made."""
 QUIET_BUILD = """
 import sys
 
