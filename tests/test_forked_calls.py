@@ -678,6 +678,27 @@ def test_the_per_layer_embedding_reads_each_documents_chain_over_forks(layout):
     assert_forks_as_own_rows(module, variables, 16, layout, "the per-layer embedding")
 
 
+def test_a_block_over_runs_reads_no_key_past_the_calls_lengths():
+    """A causal call over key runs with block groups and key lengths (`spans`) reads a query's block whole
+    within its run and never a key past its row's length or before its start: the dense rule's
+    `(causal or block) and run and starts <= key < length`, query by query (the block's widening took the
+    run's end past the length, 9d3e1d9a1)."""
+    from dew.nn.attention_masks import visibility_mask
+
+    keys = 4
+    runs = jnp.broadcast_to(jnp.asarray([0, keys], jnp.int32), (2, keys, 1, 2))
+    blocks = jnp.zeros((2, keys), jnp.int32)
+    lengths, starts = jnp.asarray([2, 4], jnp.int32), jnp.asarray([0, 1], jnp.int32)
+    found = np.asarray(visibility_mask(keys, keys, causal=True, sliding_window=None,
+                                       key_value_seq_lengths=lengths, key_value_seq_starts=starts,
+                                       key_runs=runs, block_groups=blocks))[:, 0]
+    for row in range(2):
+        for query in range(keys):
+            for key in range(keys):
+                bounded = int(starts[row]) <= key < int(lengths[row])
+                assert found[row, query, key] == bounded, (row, query, key)
+
+
 def test_a_windowed_block_over_forks_reads_its_block_whole_and_its_window_else():
     """A windowed layer reading a prompt's block over forks (`fork_runs` with the block groups it reads, the
     spans' `_whole_blocks`) sees what the dense rule gives within each token's chain: a key of its own
