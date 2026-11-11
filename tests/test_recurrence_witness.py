@@ -17,14 +17,14 @@ TARGETS = ("sm80", "sm90")
 
 def test_a_decay_encloses_every_fraction_the_algebra_raises():
     """A chunk's decays as `algebra.raised` forms them, an integer power of two times the exp2 of an fp32
-    fraction correctly rounded, lie inside the witness's enclosure (`rw.raised_exponent`) at prefixes down
-    to -192: taken as one fp32 operand of exp2, the exponent's grid there excluded 778 of the 1024 legal
-    decays."""
+    fraction correctly rounded, rounded to fp32 as the scaling's last product rounds it (subnormals kept,
+    `power2`), lie inside the witness's enclosure (`rw.raised_exponent`) at prefixes down to -192: taken as
+    one fp32 operand of exp2, the exponent's grid there excluded 778 of the 1024 legal decays."""
     decays = -np.random.default_rng(2084).uniform(0, 3, (64, 16)).astype(np.float32)
     exponents = rw.Exponents.of(decays)
     whole = np.floor(exponents.exact)
     fraction = (exponents.exact - whole).astype(np.float32)
-    legal = np.ldexp(exp2_rounded(fraction, FLOAT32), whole.astype(np.int32))
+    legal = np.ldexp(exp2_rounded(fraction, FLOAT32), whole.astype(np.int32)).astype(np.float32)
     enclosed = exponents.raised(rw.interpreted_lane())
     assert np.all(within(legal, enclosed)), int(np.sum(~within(legal, enclosed)))
 

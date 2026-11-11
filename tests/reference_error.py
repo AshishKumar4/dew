@@ -1438,10 +1438,13 @@ def _fp8_codes(operand) -> bool:
 
 def assert_fp8_below(dew_fn, named_fn, draw, label: str, *, seeds: int, named: str, codes, reference_fn,
                      truth_fn) -> None:
-    """The contract of an FP8 form where no FP8 kernel reaches check 1's parity (docs/design/testing.md,
-    "FP8 products": a tensor core's running sum within a step is narrower than fp32, and the dequantized
-    reference's fp32 sums of FP8 products are exact): `dew_fn`'s error from the float64 truth is below
-    `named_fn`'s, the arm the spec names (`named`, cuBLASLt's FP8 GEMM), on the same draws.
+    """The contract of an FP8 form whose scales are a whole operand's, where no FP8 kernel reaches check
+    1's parity (docs/design/testing.md, "FP8 products": a tensor core's running sum within a step is
+    narrower than fp32, and the dequantized reference's fp32 sums of FP8 products are exact): `dew_fn`'s
+    error from the float64 truth is below `named_fn`'s, the arm the spec names (`named`, cuBLASLt's FP8
+    GEMM, which sums the whole depth narrow), on the same draws. A block-scaled form sums a block as
+    cuBLASLt's GEMM of that block does and is held to parity with it, check 1's own (`assert_as_exact`
+    with that arm as its reference), not this.
 
     It is check 1 against the named arm (`_staged`: its draws, its two pre-declared stages, its rows and
     values) with one rule changed, the pooled ratio's: a leaf holds where its ratio's interval lies wholly

@@ -404,8 +404,8 @@ Each source control has one rule for its consumer, neutral value, mode and refus
 | `renormalize_logits` | `Renormalize` | |
 | `epsilon_cutoff`, `eta_cutoff`, `top_h` | `EpsilonCutoff`, `EtaCutoff`, `TopH` | |
 | `use_cache` | native decoding always runs through its own cache | `use_cache=False` |
-| `cache_implementation` | the fixed-capacity static cache | any other implementation |
-| `cache_config` | | quantized and offloaded caches are not implemented |
+| `cache_implementation` | the fixed-capacity static cache, in device memory or, offloaded, in host memory (`KVCache.offloaded`) | any other implementation |
+| `cache_config` | inapplicable: transformers reads it for its quantized cache alone, which `cache_implementation` refuses | |
 | `prefill_chunk_size` | | the native prefill evaluates a prompt in one call |
 | `continuous_batching_config` | | continuous batching is not implemented in the task's `generate` path; `dew.inference.Server` batches continuously as a separate object |
 | `compile_config`, `disable_compile` | | the native decoder owns its compilation and always runs compiled |
