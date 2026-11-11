@@ -10,6 +10,7 @@ import dataclasses
 import functools
 import hashlib
 import importlib.metadata
+import logging
 import os
 import sys
 import threading
@@ -20,6 +21,8 @@ import jax
 
 from dew._builds import dew_cache_dir
 from dew._devices import cuda_builds, deterministic_ops_requested, xla_flag
+
+_log = logging.getLogger(__name__)
 
 VERSION_FILE = "_version.py"
 """The release's version (`dew._version`), which no code of Dew's computes from: no part of its
@@ -273,7 +276,8 @@ def cuda_libraries() -> tuple[tuple[str, int | None], ...]:
         # (jax_plugins/cuda: `_version_check`).
         try:
             return read() // 100
-        except RuntimeError:
+        except RuntimeError as refused:
+            _log.debug("a CUDA library does not load, so a compile writes none of its state: %s", refused)
             return None
 
     return (("cublas", loaded(cuda_versions.cublas_get_version)),

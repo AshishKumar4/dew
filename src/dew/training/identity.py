@@ -59,7 +59,7 @@ from pathlib import Path
 import jax
 import numpy as np
 from jax._src import config as jax_config
-from jax.experimental.layout import Format
+from jax.experimental.layout import Format, Layout
 
 from dew import _cache
 from dew._records import JSON
@@ -239,13 +239,17 @@ def _parts(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     """One of JAX's values that a call's key holds and the algebra's key does not state, by its parts
     (each through `again`, `stated` as its caller walks): an abstract value, a tree's structure, a format,
     one device's sharding, a device, and any other of JAX's by its attributes where it holds them plainly
-    (an axis environment's sizes and names). None for a value that is none of them."""
+    (an axis environment's sizes and names), the layout XLA chooses (`Layout.AUTO`). None for a value that
+    is none of them."""
     if isinstance(value, jax.core.ShapedArray):
         return ["abstract", list(value.shape), str(value.dtype), bool(value.weak_type)]
     if isinstance(value, type(jax.tree.structure(()))):
         return _tree(value, at, again)
     if isinstance(value, Format):
         return ["format", again(value.layout, at=f"{at}.layout"), again(value.sharding, at=f"{at}.sharding")]
+    if value is Layout.AUTO:
+        # The layout XLA chooses, one singleton: what a format asks of the compile, not a layout it holds.
+        return ["layout", "auto"]
     if isinstance(value, jax.sharding.SingleDeviceSharding):
         [device] = value.device_set
         return ["device sharding", again(device, at=at), value.memory_kind]

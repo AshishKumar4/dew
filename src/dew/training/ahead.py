@@ -41,6 +41,7 @@ import functools
 import hashlib
 import importlib.metadata
 import importlib.util
+import io
 import json
 import logging
 import os
@@ -56,6 +57,7 @@ import jax
 import jax.experimental.topologies as topologies
 import numpy as np
 from jax.experimental import serialize_executable
+from jaxlib import xla_client
 
 from dew import communicators
 from dew._cache import cuda_libraries, plugin_builds, topology_digest, uncached
@@ -195,6 +197,35 @@ def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
 
 
 @dataclasses.dataclass(frozen=True)
+class HeldTraceback:
+    """A traceback a program's trees hold, as its file holds it: its frames as text. A checkified program's
+    error tree holds each check's (`jax.experimental.checkify`'s `FailedCheckError.traceback_info`), which
+    no pickle holds as JAX holds it; its check's message is its own, so a loaded program's failed check
+    says what the kept one's would."""
+
+    frames: tuple[str, ...]
+
+    def __str__(self) -> str:
+        return "\n".join(self.frames)
+
+
+class _FilePickler(pickle.Pickler):
+    """A program file's pickler: a traceback of JAX's as its frames (`HeldTraceback`)."""
+
+    def reducer_override(self, obj):
+        if isinstance(obj, xla_client.Traceback):
+            return HeldTraceback, (tuple(str(frame) for frame in obj.frames),)
+        return NotImplemented
+
+
+def filed(value: object) -> bytes:
+    """`value` as a program file holds it (`_FilePickler`)."""
+    held = io.BytesIO()
+    _FilePickler(held, protocol=pickle.HIGHEST_PROTOCOL).dump(value)
+    return held.getvalue()
+
+
+@dataclasses.dataclass(frozen=True)
 class Executable:
     """A program compiled ahead, serialized, and the trees of its inputs and outputs, as
     `serialize_executable.serialize` gives them."""
@@ -204,7 +235,13 @@ class Executable:
 
     @staticmethod
     def of(compiled: jax.stages.Compiled) -> Executable:
+        """`compiled` serialized with its trees, as a file holds them (`filed`); refused (ValueError) where a
+        tree holds what no file holds, so a file that would hold it is never written short."""
         executable, in_tree, out_tree = serialize_executable.serialize(compiled)
+        try:
+            filed((in_tree, out_tree))
+        except (TypeError, pickle.PicklingError) as refusal:
+            raise ValueError(f"its trees hold what no file holds: {refusal}") from refusal
         return Executable(executable, (in_tree, out_tree))
 
     def loaded(self, devices: Sequence) -> jax.stages.Compiled:
@@ -355,7 +392,7 @@ class AheadOfTime:
 
     def save(self, path: str | Path) -> None:
         """Write the step to `path`, for `load` on a host of its topology."""
-        Path(path).write_bytes(pickle.dumps(self))
+        Path(path).write_bytes(filed(self))
 
     @staticmethod
     def load(path: str | Path) -> AheadOfTime:
@@ -561,7 +598,7 @@ class AheadPrograms:
 
     def save(self, path: str | Path) -> None:
         """Write the programs to `path`, for `load` in a process of their target."""
-        Path(path).write_bytes(pickle.dumps(self))
+        Path(path).write_bytes(filed(self))
 
     @staticmethod
     def load(path: str | Path) -> AheadPrograms:

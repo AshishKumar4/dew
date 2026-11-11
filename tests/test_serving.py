@@ -2237,26 +2237,46 @@ import numpy as np
 from dew.inference.serving import Server
 from dew.inference.tasks import TextGeneration
 from dew.registry import models
-from dew.training.ahead import keeping
+from dew.telemetry.compiles import Compiles
+from dew.training.ahead import keeping, kept
 
+mode, path = sys.argv[1], sys.argv[2]
 model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
                      mlp_features=64, max_seq_len=64)
 variables = model.init(jax.random.key(0), np.zeros((1, 4), np.int32))
-with keeping() as programs:
+
+
+def served():
     server = Server.from_task(TextGeneration(model, variables, None), slots=1, capacity=32)
-    server([[4, 5, 6]], 2, key=0)
-saved = programs.save(sys.argv[1])
-print(json.dumps({"kept": len(saved.kept), "refused": sorted(programs.refused.values())}))
+    return [np.asarray(row.host().tokens).tolist() for row in server([[4, 5, 6]], 2, key=0)]
+
+
+if mode == "keep":
+    with keeping() as programs:
+        tokens = served()
+    saved = programs.save(path)
+    # Each kept program by the name its compile reports (`jit(<function>)`).
+    found = {"kept": sorted({f"jit({program.call['function'][2]})" for program in saved.kept.values()}),
+             "refused": sorted(programs.refused.values())}
+else:
+    with kept(path), Compiles(None) as compiles:
+        tokens = served()
+    found = {"compiled": sorted(program.name for program in compiles.programs)}
+print(json.dumps({"tokens": tokens, **found}))
 """
-"""A process that serves one request from a text server under `keeping`, printing what it kept and
-refused."""
+"""A process that serves one request from a text server, keeping its programs (`keep`) or handed them
+(`take`), printing its tokens with what it kept and refused or what it compiled."""
 
 
 def test_a_text_server_serving_under_keeping_keeps_every_program_it_compiles(tmp_path):
     """A text server built and serving within `keeping` keeps each program it compiles and refuses none: the
     server's own context, its stack and sequences whole (`dew.nn.sharding.whole`), is part of what each
-    call's identity states."""
+    call's identity states, its formats' chosen layouts too, and its checks' tracebacks are held as their
+    frames (`HeldTraceback`). A fresh process handed them serves the same tokens compiling none of them."""
     import process_support
 
-    found = process_support.fresh(KEPT_TEXT, str(tmp_path / "text.dew-aot"))
-    assert found["refused"] == [] and found["kept"] > 0
+    path = str(tmp_path / "text.dew-aot")
+    keep = process_support.fresh(KEPT_TEXT, "keep", path)
+    assert keep["refused"] == [] and keep["kept"]
+    take = process_support.fresh(KEPT_TEXT, "take", path)
+    assert not set(take["compiled"]) & set(keep["kept"]) and take["tokens"] == keep["tokens"]

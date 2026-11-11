@@ -296,6 +296,14 @@ def test_a_phases_objective_is_its_own_whatever_objectives_it_holds():
     assert phases.objective_for(1) is first
 
 
+def corpus(tag: int):
+    """Thirty-two rows of 17 tokens, read on in batches of eight, each `tag`'s own."""
+    from dew.data import Memory
+
+    rows = [{"text": (np.arange(17, dtype=np.int32) * (tag + 3) + index) % 256} for index in range(32)]
+    return Memory(rows).repeat().batch(8)
+
+
 def remade(state, batch, key):
     """A rollout that makes its batch afresh of the rows it reads, as a sampler's does: none of the read's
     own fields (its phase among them) on what it makes."""
@@ -311,13 +319,9 @@ def test_a_phased_fit_steps_each_phase_as_a_run_of_its_own_pass_count_does(tmp_p
     import optax
     from test_data_mixtures import READ, assert_same, parameters
 
-    from dew.data import Memory, phases
+    from dew.data import phases
     from dew.data.compile import compile
     from dew.training import Checkpoints, Layout, Trainer
-
-    def corpus(tag: int):
-        rows = [{"text": (np.arange(17, dtype=np.int32) * (tag + 3) + index) % 256} for index in range(32)]
-        return Memory(rows).repeat().batch(8)
 
     data = compile(phases((corpus(1), 2), (corpus(2), None)), read="indexed", loading=READ)
     model = looped()
@@ -359,13 +363,9 @@ def test_a_phased_runs_work_counts_each_step_at_its_phases_pass_count():
     import optax
     from test_data_mixtures import READ
 
-    from dew.data import Memory, phases
+    from dew.data import phases
     from dew.data.compile import compile
     from dew.training import Layout, Trainer
-
-    def corpus(tag: int):
-        rows = [{"text": (np.arange(17, dtype=np.int32) * (tag + 3) + index) % 256} for index in range(32)]
-        return Memory(rows).repeat().batch(8)
 
     def counted(model, data, steps, **phased):
         flops = Flops()
