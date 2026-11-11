@@ -137,7 +137,8 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         return lines
 
     out, marked = tmp_path / "verdict.json", {"test_1", "test_3", "test_5"}
-    # A recalled attempt's progress, naming a test it passed: a prepare sets nothing aside by it, and keeps none.
+    # A recalled attempt's progress, naming a test it passed: a prepare sets nothing aside by it, and keeps
+    # none.
     resume = tmp_path / "resume"
     resume.mkdir()
     (resume / "progress.jsonl").write_text(
