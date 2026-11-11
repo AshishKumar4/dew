@@ -1946,7 +1946,9 @@ def collected(python: str, marks: str, files: list[str] | None = None,
                            *([] if files is None else ["--continue-on-collection-errors"]), *every],
                           capture_output=True, text=True, timeout=within,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
-    if done.returncode not in ((0, 5) if files is None else (0, 1, 2, 5)):
+    # Given files and told to go on past one that does not collect, pytest exits 1 for those; 2 is a collection
+    # interrupted, no reading at all.
+    if done.returncode not in ((0, 5) if files is None else (0, 1, 5)):
         raise SystemExit(f"collecting the tests marked {marks} exited {done.returncode}\n"
                          f"{done.stdout[-4000:]}{done.stderr[-2000:]}")
     counts: dict[str, int] = {}
