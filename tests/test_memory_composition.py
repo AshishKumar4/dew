@@ -671,7 +671,9 @@ def test_a_served_memorys_prefix_is_its_rounding_streams_alone(network, weight_o
 
         task = task.quantized(Quantization(patterns=(INNER,), weight_only=weight_only, bwd_qtype="int8",
                                            bwd_stochastic_rounding="uniform"))
-    server = Server.from_task(task, slots=2, capacity=64, kv_cache=KVCache(page_size=16), prefix_cache=True)
+    # A slot, and the prefix state it keeps, a continuation of each of two keys: both keys' states held.
+    server = Server.from_task(task, slots=2 * continuations, capacity=64, kv_cache=KVCache(page_size=16),
+                              prefix_cache=True)
     prompt = "1" * 33
 
     def reused(key: int) -> int:
