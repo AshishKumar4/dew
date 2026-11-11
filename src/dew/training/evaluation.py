@@ -1102,7 +1102,7 @@ def schedule_step(state: TrainState, accumulation: int) -> np.ndarray:
 
 
 @dataclass(frozen=True)
-class Evaluator:
+class Evaluator[L, E]:
     """A run's evaluations of its suites (`FitPlan.suites`) between its steps and at its end: what each
     scores, the rules it traces under, and the reports it writes. It holds what a run states once: its
     objective, its layout and meshes (`mesh` the devices', `state_mesh` where a CPU-owned run keeps its
@@ -1110,7 +1110,7 @@ class Evaluator:
     reports (`display`, `tracker`), and whether the run ranks its checkpoints (`ranks`); a state, its
     placement and the links its step traced with (`Link`) are each call's."""
 
-    objective: Objective[Loss, Effects]
+    objective: Objective[L, E]
     layout: Layout
     mesh: Mesh
     state_mesh: Mesh

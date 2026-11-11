@@ -90,15 +90,15 @@ class Compiled:
     step: CompiledStep | None = None
 
 
-class StepCompiler:
+class StepCompiler[L, E]:
     """Where a run's fit ladder stands and the links its traces read, and the compile of its step
     (`compile`): its objective's rung as the first compile found it and as each shape compiled at it, the
     rungs a resumed checkpoint recorded, whether the step keeps XLA's default options and its narrow
     copies, each mesh axis's measured bandwidth, the links a run states (`links`) and a step compiled ahead
     (`ahead`), until a compile takes it. Everything else a compile reads is its call's."""
 
-    def __init__(self, objective: Objective, links: Mapping[str, Link] | None, ahead: AheadOfTime | None,
-                 phase_passes: PhasePasses):
+    def __init__(self, objective: Objective[L, E], links: Mapping[str, Link] | None,
+                 ahead: AheadOfTime | None, phase_passes: PhasePasses[L, E]):
         self.objective = objective
         self.phase_passes = phase_passes
         self.ahead = ahead
