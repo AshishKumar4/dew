@@ -2245,11 +2245,14 @@ def test_an_unseeded_mix_reads_its_members_in_the_order_it_declares_them(read):
 
 
 def test_a_phased_runs_statistics_count_each_phase_it_reached():
-    """A run's statistics count every phase it has read: a later phase's corpus appears once the run
+    """A run's statistics count every phase it has read: a corpus a later phase adds appears once the run
     reaches it, beside the first phase's, and not before."""
-    # Corpora that count their targets (`CountTargets`), which a run's statistics log by corpus.
-    chain = phases((_token_rows("first", 1, 4).repeat(), 3), (_token_rows("second", 2, 4).repeat(), None))
-    data = compile(chain.batch(8), read="indexed", loading=READ)
+    from dew.data.pipeline import Phases
+
+    first = mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat()], by="tokens")
+    second = mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat(),
+                  _token_rows("added", 3, 4).repeat()], by="tokens")
+    data = compile(Pipeline(Phases((first, second), (10, None))).batch(1), read="memory", loading=READ)
     stream = data.train(DataPartition())
 
     def labels() -> set[str]:
@@ -2257,9 +2260,9 @@ def test_a_phased_runs_statistics_count_each_phase_it_reached():
                 if name.startswith("data/weighed_tokens/")}
 
     try:
-        list(itertools.islice(stream, 2))
-        assert labels() == {"first"}
-        list(itertools.islice(stream, 3))
-        assert labels() == {"first", "second"}
+        list(itertools.islice(stream, 5))
+        assert labels() == {"short", "long"}
+        list(itertools.islice(stream, 15))
+        assert labels() == {"short", "long", "added"}
     finally:
         stream.close()
