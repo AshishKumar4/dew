@@ -549,7 +549,7 @@ class Generation:
             encoded = _checked(Store(self.url, self.storage_options), plan["pages"][page])
             loaded = np.load(io.BytesIO(encoded), allow_pickle=False)
             stated = np.dtype(plan["dtype"])
-            if stated.kind == "V" and stated.fields is None:
+            if stated.kind == "V" and stated.fields is None and plan["dtype"] == stated.str:
                 # A plan written before its dtype was named exactly (`dtype_name`): an ML dtype's pages
                 # stated as a void of its width, which names no number to read them as.
                 raise ValueError(f"packing plan {name!r} states its dtype as {plan['dtype']}, which names "

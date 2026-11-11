@@ -2245,16 +2245,21 @@ def test_an_unseeded_mix_reads_its_members_in_the_order_it_declares_them(read):
 
 
 def test_a_phased_runs_statistics_count_each_phase_it_reached():
-    """A run's statistics count every phase it read, a later phase's corpus among them: its rows
-    once the run reached it, beside the first phase's."""
+    """A run's statistics count every phase it has read: a later phase's corpus appears once the run
+    reaches it, beside the first phase's, and not before."""
     chain = phases((_named("first", 1).repeat(), 3), (_named("second", 2).repeat(), None)).batch(8)
     data = compile(chain, read="indexed", loading=READ)
     stream = data.train(DataPartition())
+
+    def labels() -> set[str]:
+        # Each corpus counted logs its share of rows cut short, under its label.
+        return {name.removeprefix("data/truncated/") for name in data.statistics()
+                if name.startswith("data/truncated/")}
+
     try:
-        list(itertools.islice(stream, 5))
-        statistics = data.statistics()
+        list(itertools.islice(stream, 2))
+        assert labels() == {"first"}
+        list(itertools.islice(stream, 3))
+        assert labels() == {"first", "second"}
     finally:
         stream.close()
-    rows = {name.removeprefix("data/rows/"): count for name, count in statistics.items()
-            if name.startswith("data/rows/")}
-    assert sorted(rows.values()) == [16, 24], rows
