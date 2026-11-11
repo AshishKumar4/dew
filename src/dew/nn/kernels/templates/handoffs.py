@@ -116,15 +116,19 @@ class Schedule:
         return tuple(shape.opened(*(ref if isinstance(ref, tuple) else (ref,)))
                      for shape, ref in zip(self.stated(), refs, strict=True))
 
-    def run[R](self, **bodies: Callable[..., R]) -> R | None:
+    def run[R](self, *, exclusive: bool = False, **bodies: Callable[..., R]) -> R | None:
         """Each role's body by its name: on a schedule of one role, `body(index)` on every warpgroup, its
         index along `axis` (the value it returns, a program's whose consumers keep theirs); otherwise each
         raised role's `body(index)` on its warpgroups, its index among them, their registers raised to its
         share at the launch's residency (`registers`, `bodies.RESIDENT`), and the last warpgroup's, lowered
-        to the least, its role's `body()` or each warp role's on its warp: each role a branch of one switch
-        on the warpgroup, its register instruction first. Two conditionals, one a role, are two regions the
-        compiler allocates apart around the producer's register drop: a B200's forward at width 256 held
-        the consumers' values across it and spilled 172 bytes, 112 in one switch (row 5466)."""
+        to the least, its role's `body()` or each warp role's on its warp, each body its register
+        instruction first. Each role is a conditional of its own, or, `exclusive`, a branch of one switch
+        on the warpgroup, for bodies that form every value they read within themselves (an attention
+        forward's `_placed`): conditionals apart are regions the compiler allocates apart around the
+        producer's register drop, where a B200's forward at width 256 held the consumers' values across it
+        and spilled 172 bytes, 112 under one switch and none with its values formed in each role (row
+        5466); a switch commons a value both bodies read above their register instructions, where a
+        recurrence's persistent tile index and its count spilled 52 bytes, conditionals apart none."""
         if set(bodies) != {role.name for role in self.roles}:
             raise ValueError(f"a schedule of {[role.name for role in self.roles]} given bodies for "
                              f"{sorted(bodies)}")
@@ -137,30 +141,37 @@ class Schedule:
         for role in self.raised:
             def raised(role=role, first=first):
                 plgpu.set_max_registers(budgets[role.name], action="increase")
-                # The first role's warpgroups are those below its count, each its own index: no shift is
-                # traced for it (an attention forward's spill-free registers on an H100 turn on it,
+                # The first role's warpgroups are those below its count, each its own index: no bound and no
+                # shift is traced for it (an attention forward's spill-free registers on an H100 turn on it,
                 # test_attention_mosaic's compile gate).
                 bodies[role.name](wg if first == 0 else wg - first)
 
             branches.append(raised)
             first += role.count
             bounds.append(first)
-        index = sum((wg >= bound).astype(jnp.int32) for bound in bounds[:-1])
         lowered = [role for role in self.roles if not role.weight]
+
+        def lower():
+            plgpu.set_max_registers(budgets[lowered[0].name], action="decrease")
+            if not lowered[0].warp:
+                bodies[lowered[0].name]()
+                return
+
+            @plgpu.warp_map
+            def _(warp):
+                for place, role in enumerate(lowered):
+                    @pl.when(warp == place)
+                    def _(body=bodies[role.name]):
+                        body()
+
+        if not exclusive:
+            for start, bound, branch in zip((0, *bounds[:-1]), bounds, branches, strict=True):
+                pl.when(wg < bound if start == 0 else (wg >= start) & (wg < bound))(branch)
+            if lowered:
+                pl.when(wg == first)(lower)
+            return None
+        index = sum((wg >= bound).astype(jnp.int32) for bound in bounds[:-1])
         if lowered:
-            def lower():
-                plgpu.set_max_registers(budgets[lowered[0].name], action="decrease")
-                if not lowered[0].warp:
-                    bodies[lowered[0].name]()
-                    return
-
-                @plgpu.warp_map
-                def _(warp):
-                    for place, role in enumerate(lowered):
-                        @pl.when(warp == place)
-                        def _(body=bodies[role.name]):
-                            body()
-
             # The lowered role's branch first: Mosaic lowers a switch's first branch twice (once for its
             # results' types), the producer's the cheaper.
             branches.insert(0, lower)
