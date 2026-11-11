@@ -1068,8 +1068,6 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
     if start.resume is not None and trainer.checkpoints is not None:
         # A resumed run's step compiles at the rung its checkpoint records, as its resume would.
         trainer._compiler.resume_rung(trainer.checkpoints.rung(start.resume))
-    # A TPU topology's executable loads onto no client here: the persistent cache neither reads an entry
-    # for it nor writes one (`dew._cache.uncached`).
     on = generation if stated is None else stated
     # A canonical target's devices stand for any GPU of the generation; a host's own topology's, for its own.
     portable = not on_tpus and not set(trainer.device_mesh.devices.flat) <= _HOSTS_GPUS
