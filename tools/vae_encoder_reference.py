@@ -24,7 +24,6 @@ import ml_dtypes
 import numpy as np
 import torch
 from diffusers import AutoencoderKL
-from diffusers_reference_helpers import on_bfloat16_grid, perturb
 
 CONFIG = {"in_channels": 3, "out_channels": 3, "latent_channels": 4,
           "down_block_types": ["DownEncoderBlock2D"] * 2, "up_block_types": ["UpDecoderBlock2D"] * 2,
@@ -48,6 +47,8 @@ def walk(encoder, image, probe, dtype):
 
 
 def main():
+    # The generator's siblings, beside it where it runs (tests/test_models.py imports `walk` alone).
+    from diffusers_reference_helpers import on_bfloat16_grid, perturb
     from reference_source import saved_fixture
 
     if len(sys.argv) != 2:
