@@ -222,6 +222,25 @@ def test_a_sites_map_tasks_are_cut_by_their_setup_and_draws_apart_never_task_sec
         ("test_site.draws-0-4", 720.0), ("test_site.draws-4-12", 960.0), ("test_site.draws-12-20", 960.0)]
 
 
+def test_a_sites_map_tasks_are_cut_by_what_their_records_say_they_paid_whatever_their_sizes(ci, tmp_path):
+    """Each map task records the seconds before its first draw and its draws' (map_judge's
+    `record_units`), and its judge times the site's (`site_costs`), which the next plan cuts it by
+    (`rate`): tasks of one size, whose seconds alone cannot tell a setup from its draws, are cut by them,
+    never by task seconds over units, which charged each draw the setup, cut a site finer, and measured it
+    at one size again, run after run (2026-11-11: test_recurrence_mosaic's sites from 4-16 seeds a task to
+    1-2, 565 tasks to 1,344)."""
+    site_checkout(tmp_path)
+    task = ci.site_task("3.12", "tests/test_site.py", "test_site")
+    first = ci.site_task("3.12", "tests/test_site.py", "test_site", (0, 4))
+    # Each task of 4 seeds took 300 s, 280 s of it before its first draw and 5 s a draw: its setup alone
+    # passes the target, so the declared cut stands, its tasks weighed at their setup and draws.
+    recorded = {"rows": {first: 300.0},
+                "files": {ci.costed(task, "setup"): 280.0, ci.costed(task, "unit"): 5.0}}
+    assert [(entry["split"], entry["weight"]) for entry in ci.plan(256.0, recorded)
+            if entry["python"] == "3.12" and ".draws-" in entry["split"]] == [
+        ("test_site.draws-0-4", 300.0), ("test_site.draws-4-12", 320.0), ("test_site.draws-12-20", 320.0)]
+
+
 def test_a_site_whose_map_tasks_armada_has_no_measure_of_weighs_the_target_not_its_judges_record(
         ci, tmp_path):
     """A site the last run reused ran no map task, so armada keeps no measure of any (it keeps what a run
@@ -404,9 +423,11 @@ def test_a_judge_judges_its_map_tasks_pooled_draws_from_its_inputs_and_refuses_a
         ci, tmp_path, monkeypatch):
     """Check 1 itself (tests/reference_error.py), as a task runs it: a product on par, marked to draw its 80
     seeds 40 a map task, plans two map tasks, each drawing its seeds into its artifacts and judging nothing,
-    and a judge that pools whatever its inputs hold (ARMADA_INPUTS) and passes, the site's row green; the
-    file's own row runs the rest of the file alone. A judge whose inputs miss a map task's seeds is refused
-    (the gate's PoolRefused), never judged."""
+    and a judge that pools whatever its inputs hold (ARMADA_INPUTS) and passes, the site's row green and
+    timing, beside its pooling, what its map tasks' records say they paid before their first draw and each
+    unit they drew (`site_costs`), which the next plan cuts the site by (`rate`); the file's own row runs the
+    rest of the file alone. A judge whose inputs miss a map task's seeds is refused (the gate's
+    PoolRefused), never judged."""
     out = site_checkout(tmp_path, f"""import sys
 from pathlib import Path
 
@@ -444,6 +465,10 @@ def test_site():
     assert [(found["name"], found["exitCode"], sorted(found["tests"])) for found in (own, row)] == [
         ("3.12:tests/test_site.py", 0, ["tests/test_site.py::test_light"]),
         ("3.12:tests/test_site.py#test_site", 0, ["tests/test_site.py::test_site"])]
+    task = ci.site_task("3.12", "tests/test_site.py", "test_site")
+    costs = {key: seconds for key, seconds in row["timings"].items() if key != row["name"]}
+    assert sorted(costs) == [ci.costed(task, "setup"), ci.costed(task, "unit")]
+    assert all(seconds > 0 for seconds in costs.values()), costs
     shutil.rmtree(inputs / "job/0")
     assert entry_task(ci, monkeypatch, judge, out, inputs=inputs) == 0
     [row] = json.loads(out.read_text())["rows"]
