@@ -247,7 +247,7 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
 
 PACKED_CONFIG = {**fixture_config("gpt-oss-tiny"), "hidden_size": 256, "intermediate_size": 256,
                  "num_attention_heads": 4, "head_dim": 64, "quantization_config": {"quant_method": "mxfp4"}}
-"""A GPT-OSS whose experts are whole NVFP4 stages deep (256, `gemm.NVFP4_STAGE`): the tiny fixture's 32
+"""A GPT-OSS whose experts are whole NVFP4 stages deep (256, `formats.NVFP4_STAGE`): the tiny fixture's 32
 wide is not, so its banks would stay dense."""
 
 
@@ -292,7 +292,7 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
     exactly the values the dequantizing load decodes; its logits on par with that load's, both bf16 with
     the stored weights' own dtype (check 1, truth the decoded load in float64); and its export the source's
     MXFP4 values."""
-    from dew.nn.kernels.gemm import NvFp4
+    from dew.nn.kernels.formats import NvFp4
     from dew.quantization import QUANTIZATION
 
     source = _mxfp4_gpt_oss(tmp_path)
@@ -338,7 +338,7 @@ def test_an_mxfp4_bank_under_the_zero_byte_loads_packed_as_it_loads_dense(tmp_pa
     bit, signed zeros included, and exports the values its dense load exports."""
     from safetensors.numpy import load_file, save_file
 
-    from dew.nn.kernels.gemm import NvFp4
+    from dew.nn.kernels.formats import NvFp4
     from dew.quantization import QUANTIZATION
 
     source = _mxfp4_gpt_oss(tmp_path)
@@ -377,7 +377,7 @@ def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(
     axis as the dense matrix's experts are, and its logits on par with the unplaced packed load's
     (check 1)."""
     from dew.distributed.placement import Layout, MeshSpec
-    from dew.nn.kernels.gemm import NvFp4
+    from dew.nn.kernels.formats import NvFp4
     from dew.quantization import QUANTIZATION
 
     source = _mxfp4_gpt_oss(tmp_path)

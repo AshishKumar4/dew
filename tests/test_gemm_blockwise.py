@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact, with_gradients
 
-from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels import gemm, generation, grouped_matmul, projections, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
@@ -147,15 +147,15 @@ def a_blockwise_kernel_gradients_portable_arm_sums_exactly():
 
 def test_a_blockwise_fp8_projections_training_step_is_on_par():
     """On an H100, interpreted, one training step through the blockwise FP8 recipe
-    (`gemm.blockwise_fp8_projection`: its output and both gradients), the template named, on par with the
-    recipe through XLA's arms (check 1), from the recipe in float64 (tests/blockwise_matrix.py's
+    (`projections.blockwise_fp8_projection`: its output and both gradients), the template named, on par with
+    the recipe through XLA's arms (check 1), from the recipe in float64 (tests/blockwise_matrix.py's
     `recipe_truth`): the step-level parity a preset's projections hold (row 2513)."""
     group_blocks = jnp.asarray([1, 0, 2], jnp.int32)
 
     def step(kernel):
         def projection(x, w):
             with generation.chosen(blockwise_fp8=kernel):
-                return gemm.blockwise_fp8_projection(x, w, group_blocks, out_dtype=jnp.float32,
+                return projections.blockwise_fp8_projection(x, w, group_blocks, out_dtype=jnp.float32,
                                                      interpret_on_cpu=True)
         return with_gradients(projection)
 
@@ -167,10 +167,10 @@ def test_a_blockwise_fp8_projections_training_step_is_on_par():
 
 
 def test_a_biased_recipe_projection_rounds_once_after_its_bias():
-    """A biased projection the 'fp8' recipe takes (`gemm.recipe_projection`'s `bias`, audit A1) adds each
-    group's bias to its rows' fp32 sums and rounds the whole once: bitwise its unbiased fp32 product plus the
-    bias, rounded to bfloat16, where a bias cancelling all but 2^-10 of each sum leaves that remainder, which
-    rounding the product to bfloat16 first lost."""
+    """A biased projection the 'fp8' recipe takes (`projections.recipe_projection`'s `bias`, audit A1) adds
+    each group's bias to its rows' fp32 sums and rounds the whole once: bitwise its unbiased fp32 product plus
+    the bias, rounded to bfloat16, where a bias cancelling all but 2^-10 of each sum leaves that remainder,
+    which rounding the product to bfloat16 first lost."""
     from dew.nn.precision import FP8, projection_role
 
     rng = np.random.default_rng(9)
@@ -180,7 +180,7 @@ def test_a_biased_recipe_projection_rounds_once_after_its_bias():
 
     def projected(bias, out_dtype):
         with generation.run_precision(FP8), projection_role("experts"):
-            return gemm.recipe_projection(rows, matrices, sizes, out_dtype=out_dtype, bias=bias)
+            return projections.recipe_projection(rows, matrices, sizes, out_dtype=out_dtype, bias=bias)
 
     summed = projected(None, jnp.float32)
     group = np.repeat([0, 1], [120, 80])

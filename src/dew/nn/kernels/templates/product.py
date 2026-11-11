@@ -54,7 +54,7 @@ class Product:
 class BlockFormat(NamedTuple):
     """A block-scaled product's operand format (row 4519): its scales' dtype and the depths one scale
     covers, which its operands' quantization, their values and the native products' scale streams all read
-    (`gemm.MxFp8`, `gemm.NvFp4Block`, `gemm.mosaic_gpu.gmm`'s `mx_scales`)."""
+    (`formats.MxFp8`, `formats.NvFp4Block`, `gemm.mosaic_gpu.gmm`'s `mx_scales`)."""
 
     scale: np.dtype
     depth: int

@@ -13,7 +13,7 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew.nn import pairwise, precision
-from dew.nn.kernels import gemm
+from dew.nn.kernels import gemm, projections
 
 
 def test_a_contractions_block_keeps_its_rounding_path_within_a_vectorized_dots():
@@ -84,7 +84,7 @@ def test_a_rows_product_alone_is_on_par_with_its_product_among_others():
 
 
 def test_a_layers_projection_and_every_accumulated_contraction_sum_as_a_vectorized_dot():
-    """A layer's projection (`gemm.dot_general`, a Dense's product past the template) and every float32
+    """A layer's projection (`projections.dot_general`, a Dense's product past the template) and every float32
     contraction `accumulated` sums (`float32_dot_general`, a product the algebra derives, a mixer's
     `float32_einsum`) take the CPU's vectorized-dot sum: one order for sums that cancel each other."""
     numbers = (((1,), (0,)), ((), ()))
@@ -103,7 +103,7 @@ def test_a_layers_projection_and_every_accumulated_contraction_sum_as_a_vectoriz
         return "platform_index" in set(walked(traced.jaxpr))
 
     with jax.default_matmul_precision(precision.FP32_SUMS):
-        assert chooses(lambda a, b: gemm.dot_general(precision.float32_dot_general)(a, b, numbers))
+        assert chooses(lambda a, b: projections.dot_general(precision.float32_dot_general)(a, b, numbers))
         assert chooses(lambda a, b: precision.float32_dot_general(a, b, numbers))
         assert chooses(lambda a, b: precision.float32_einsum("rd,dc->rc", a, b))
 
@@ -135,16 +135,17 @@ def test_a_mixers_einsum_on_a_cpu_is_the_pairwise_product():
 
 @pytest.mark.parametrize("depth", [64, 128, 1024])
 def test_a_dense_layers_float32_product_on_a_cpu_is_as_exact_as_a_vectorized_dot(depth):
-    """A dense layer's product in fixed float32 sums on a CPU (`gemm.dot_general` of `float32_dot_general`
-    under `FP32_SUMS`, as row 4735's llama.cpp comparison runs Dew): bitwise `pairwise_dot_general`'s, and
-    its value, its rows' gradient and its matrix's each on par (check 1) with a vectorized dot's
-    accumulation on this CPU (`vectorized`: libggml's and a BLAS kernel's partial sums, a lane of each FMA
-    in flight, summed as a tree), where XLA's one-chain dot was 2.0 to 6.1 times its error."""
+    """A dense layer's product in fixed float32 sums on a CPU (`projections.dot_general` of
+    `float32_dot_general` under `FP32_SUMS`, as row 4735's llama.cpp comparison runs Dew): bitwise
+    `pairwise_dot_general`'s, and its value, its rows' gradient and its matrix's each on par (check 1) with a
+    vectorized dot's accumulation on this CPU (`vectorized`: libggml's and a BLAS kernel's partial sums, a
+    lane of each FMA in flight, summed as a tree), where XLA's one-chain dot was 2.0 to 6.1 times its error.
+    """
     numbers = (((1,), (0,)), ((), ()))
 
     def dense(rows, matrix):
-        # A Dense layer's product past the template (`gemm.dot_general`).
-        return gemm.dot_general(precision.float32_dot_general)(rows, matrix, numbers)
+        # A Dense layer's product past the template (`projections.dot_general`).
+        return projections.dot_general(precision.float32_dot_general)(rows, matrix, numbers)
 
     def draw(seed):
         rng = np.random.default_rng((depth, seed))

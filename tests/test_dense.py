@@ -17,7 +17,7 @@ from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral, _accumulated_dot_general
-from dew.nn.kernels import gemm
+from dew.nn.kernels import projections
 from dew.nn.precision import FP32_SUMS, fp32_result_dot_general
 from dew.quantization import Quantization, quantize_for_serving
 
@@ -80,7 +80,7 @@ def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dt
     x = jnp.asarray(np.random.default_rng(0).standard_normal(shape), dtype)
     mine, theirs = build(ours), build(flaxs)
     if isinstance(theirs, nn.Dense | nn.DenseGeneral) and theirs.dot_general is None:
-        theirs = theirs.clone(dot_general=gemm.dot_general(_accumulated_dot_general))
+        theirs = theirs.clone(dot_general=projections.dot_general(_accumulated_dot_general))
     variables, drawn = jax.jit(lambda key: [layer.init(key, x) for layer in (theirs, mine)])(
         jax.random.key(0))
     if getattr(theirs, "batch_dims", ()):

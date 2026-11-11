@@ -78,8 +78,10 @@ recomputes each of its files' keys from the record made on its own class
 (`device_class`: float32 results differ by CPU microarchitecture, and by GPU)
 and reports the recorded green row
 instead of running a file whose key matches, which ran green on exactly these
-inputs there. A file that started another Python process is never reused, since
-no event saw that process's code. The records live in the dew-xla-cache Worker
+inputs there. A row keeps no key, and is never reused, where its run was red,
+where its task's watch of the files it opened was blind, where it read a file
+its own processes wrote, or where it is a group of a file the record its groups
+are cut by does not wholly name (`record`). The records live in the dew-xla-cache Worker
 under `CACHE_PREFIX`. With DEW_TEST_CACHE=off where the plan runs, which its
 entries carry to their tasks (`--cache`), or without the Worker's URL and
 token, a task runs every file.
@@ -87,7 +89,9 @@ token, a task runs every file.
 A row's record also says where its tests read the backend and which are
 marked to run on a GPU (`gpu-tier --evidence` reports it); `gpu-tier` names the
 files marked to run on a GPU, a day's and a batch's alike: the behavioural flows
-(tests/test_gpu_*.py; no unit test runs on a GPU, ledger 2452). A GPU
+(tests/test_gpu_*.py; no unit test runs on a GPU, ledger 2452), and after them,
+on a line of JSON, the GPU generations each file's tests are pinned to (the
+mark `generations`; none, a file every generation runs). A GPU
 node runs them with `gpu-lane`, each as a task of a CUDA lane, whose rows are
 recorded and reused on the GPU's class as a CPU task's are on the CPU's. With `--prepare`, a lane's files
 run first on the node's CPU, no GPU drawn, for what their GPU run reads and must not compute while it holds
@@ -175,6 +179,7 @@ rows = _loaded(HERE / "rows.py")
 row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
 VARIED, varied, cut_of, whole_place = rows.VARIED, rows.varied, rows.cut_of, rows.whole_place
 shares = _loaded(HERE / "shares.py")
+collection = _loaded(HERE / "collection.py")
 apportioned, deadline_shares = shares.apportioned, shares.deadline_shares
 # The names the land queue's tools read from this module at every commit they run (land.sh's `ci.STALE`,
 # run_tests.py's `node_of`), older commits' and newer alike.
@@ -364,11 +369,15 @@ class Reading:
         # Under the lock: the plan's threads share a reading (train 679: a half-parted record cut empty).
         with self.lock:
             if self.durations is None:
-                self.durations = parted_record()
+                self.durations = parted_record(session.cut_record())
             if (name, count) not in self.cuts:
                 own = own_tests(name, self.durations.get(name, {}))
                 self.cuts[(name, count)] = session.cut(list(own), list(own.values()), count)
             return self.cuts[(name, count)]
+
+    def named(self, name: str) -> list[str]:
+        """Every test of file `name` the cut's record names (`cut`), whatever group holds it."""
+        return [node for group in self.cut(name, 1) for node in group]
 
     def part(self, path: str) -> bytes:
         """Input `path`'s part of a key: a unit's digest (`unit`), or its contents' (`digests.contents`)."""
@@ -394,9 +403,10 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
               reading: Reading | None = None) -> str:
     """The key of test file `name`'s row in `split`'s group whose run executed or read `depends`
     (executed.py): its `inputs`' contents, its directories' entries, `common`, and for a group of a split
-    file, the group and the tests split.py cuts into it from the durations record (`members`), the record's
-    only part a run's outcome depends on: not their seconds, which each train's fold of main's durations
-    moves (the maintainer, 2026-10-28: every train re-keyed its split files and reran them cold, row 2000).
+    file, the group, the tests split.py cuts into it from the durations record (`members`) and the names of
+    all it holds for the file (`Reading.named`), the record's only part a run's outcome depends on: not
+    their seconds, which each train's fold of main's durations moves (the maintainer, 2026-10-28: every
+    train re-keyed its split files and reran them cold, row 2000).
     A check-1 site's judge is keyed by its test, its inputs its map tasks' with its own (`site_inputs`): the
     site's key; a map task's, by its seeds besides (`sites`). The inputs as `reading` finds them: the keys of
     one reading read each input once, however many rows name it."""
@@ -408,8 +418,11 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
         digest.update(split.encode())
     elif split and split != COLLECT:
         # A process variant's (`varied`) by its name beside its cut's tests; a whole file's variant, its name.
+        # And every test its record names for the file: one it drops joins a group by the collection alone
+        # (`session.kept`), a group whose own tests, and key, stood (review: its row reused, the test unrun).
         cut = cut_of(split)
-        digest.update(split.encode() + (json.dumps(members(name, cut, reading)).encode() if cut else b""))
+        held = [members(name, cut, reading), reading.named(name)] if cut else []
+        digest.update(split.encode() + (json.dumps(held).encode() if cut else b""))
     return digest.hexdigest()
 
 
@@ -676,8 +689,7 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
 
 def fresh(recorded: dict, name: str, common: str, reading: Reading | None = None) -> bool:
     """Whether test file `name`'s record was made by a green run on exactly these inputs, as `reading` finds
-    them (`cache_key`). A red run, or one of a file that started another Python process, whose code no event
-    saw, leaves no key."""
+    them (`cache_key`). A run that keeps no key (`record`: a red one among them) is fresh on none."""
     return recorded["key"] is not None and recorded["key"] == cache_key(
         common, name, parsed_row(recorded["row"]["name"])[2], recorded["depends"], reading)
 
@@ -692,10 +704,11 @@ def recorded_tests() -> dict[str, list[float]]:
     return {name: session.unit_seconds(list(own), list(own.values())) for name, own in found.items() if own}
 
 
-def parted_record() -> dict[str, dict[str, float]]:
-    """The durations record by test file, each file's tests in node-id order."""
+def parted_record(path: Path = session.DURATIONS) -> dict[str, dict[str, float]]:
+    """The durations record by test file, each file's tests in node-id order; `path`, the record a task's
+    groups are cut by where it is another's (`session.cut_record`: a GPU tier's own seconds)."""
     parted: dict[str, dict[str, float]] = {}
-    record = durations_record()
+    record = durations_record(path)
     for node in sorted(record):
         parted.setdefault(node.split("::")[0], {})[node] = record[node]
     return parted
@@ -706,14 +719,16 @@ def own_tests(name: str, tests: dict[str, float]) -> dict[str, float]:
     return session.own(tests, sites(name))
 
 
-def durations_record() -> dict[str, float]:
-    """The durations record (`session.DURATIONS`): each test's node id and its seconds."""
-    return json.loads(session.DURATIONS.read_text()) if session.DURATIONS.is_file() else {}
+def durations_record(path: Path = session.DURATIONS) -> dict[str, float]:
+    """The durations record (`session.DURATIONS`, or the one at `path`): each test's node id and seconds."""
+    return json.loads(path.read_text()) if path.is_file() else {}
 
 
 def members(name: str, split: str, reading: Reading | None = None) -> list[str]:
     """The node ids split.py cuts into group `split` ("G/N") of test file `name`'s recorded tests but its
-    sites' (`own_tests`), by their seconds, a shared setup's together, once a reading (`Reading.cut`)."""
+    sites' (`own_tests`), by their seconds, a shared setup's together, once a reading (`Reading.cut`): by the
+    record the task's groups are cut by (`session.cut_record`), so a GPU tier's group, cut by its GPUs' own
+    seconds, is keyed by the tests that cut gives it, and its row stands for no other cut's group."""
     index, count = (int(part) for part in split.split("/"))
     return (Reading() if reading is None else reading).cut(name, count)[index - 1]
 
@@ -1141,7 +1156,7 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
     # What every entry carries to its task (.armada.json's command): the cache's policy, the whole suite's
     # cells and the census.
     stamped = {"cache": cache, "whole": cells, "census": "1" if census else "0"}
-    every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
+    every = test_files()
     # Every file's check-1 sites its marks shard, refused where one site's map tasks outnumber what its
     # judges' job takes (`refused_sites`).
     shards = {name: held for name in every if (held := sites(name))}
@@ -1915,15 +1930,22 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         for name, found in pool.map(evidence_of, keys):
             evidence.setdefault(name, set()).update(found)
-    every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
+    every = test_files()
     unrecorded = {name: ["unrecorded"] for name in every if name not in evidence}
     return {name: sorted(evidence[name]) for name in every if evidence.get(name)} | unrecorded
 
 
-def marked(python: str) -> dict[str, int]:
+def marked(python: str) -> tuple[dict[str, int], dict[str, list[str]]]:
     """Each test file of this checkout with tests marked one of `session.MARKS`, and how many, as pytest
-    collects it on the CPU: what a batch's GPU run holds, whatever the records say."""
-    return collected(python, " or ".join(session.MARKS))
+    collects it on the CPU: what a batch's GPU run holds, whatever the records say; and each such file's
+    GPU generations, those its marked tests are pinned to (the mark `generations`, pins.py), none where a
+    test of it runs on every one."""
+    return collection.collected(python, " or ".join(session.MARKS), test_files(), pinned=True)
+
+
+def test_files() -> list[str]:
+    """The checkout's test files CI's tasks run (`SKIPPED` run apart)."""
+    return sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
 
 
 def network_files(python: str) -> dict[str, int]:
@@ -1935,27 +1957,10 @@ def network_files(python: str) -> dict[str, int]:
 def collected(python: str, marks: str, files: list[str] | None = None,
               within: float | None = None) -> dict[str, int]:
     """Each test file of this checkout (of `files`, where given) with tests pytest's `-m marks` selects, and
-    how many, as pytest collects it on the CPU. Of `files`, one that does not collect has none and stops no
-    other's reading (its own run says its error, as every lane's does; a lane that died of one file's import
-    ran none of its files), within `within` seconds where a lane has a deadline."""
-    if files is not None and not files:
-        return {}
-    every = sorted(str(path) for path in Path("tests").glob("test_*.py")
-                   if str(path) not in SKIPPED) if files is None else files
-    done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-m", marks,
-                           *([] if files is None else ["--continue-on-collection-errors"]), *every],
-                          capture_output=True, text=True, timeout=within,
-                          env={**os.environ, "JAX_PLATFORMS": "cpu"})
-    # Given files and told to go on past one that does not collect, pytest exits 1 for those; 2 is a
-    # collection interrupted, no reading at all.
-    if done.returncode not in ((0, 5) if files is None else (0, 1, 5)):
-        raise SystemExit(f"collecting the tests marked {marks} exited {done.returncode}\n"
-                         f"{done.stdout[-4000:]}{done.stderr[-2000:]}")
-    counts: dict[str, int] = {}
-    for node in done.stdout.splitlines():
-        if "::" in node:
-            counts[node.split("::")[0]] = counts.get(node.split("::")[0], 0) + 1
-    return counts
+    how many, as pytest collects it on the CPU (collection.py): of `files`, one that does not collect has
+    none and stops no other's reading, within `within` seconds where a lane has a deadline."""
+    return collection.collected(python, marks, test_files() if files is None else files, within,
+                                tolerant=files is not None)[0]
 
 
 GPU_HEADROOM = (1.25, 2 ** 30)
@@ -2204,11 +2209,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                            "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
                            "OMP_NUM_THREADS": threads}
                 file, group, variant = units[fits]
-                # A group cut by the tier's own GPU seconds (DEW_SPLIT_DURATIONS, split.py) is no group
-                # any record's key holds: it reads no cached row, as it writes none, so no earlier cut's row
-                # stands for it beside groups cut afresh (review of b3bcbe0fe).
-                policy = "off" if group and os.environ.get("DEW_SPLIT_DURATIONS") else cache
-                running[pool.submit(tested, python, [file], group, verdicts[fits], deadline, policy,
+                running[pool.submit(tested, python, [file], group, verdicts[fits], deadline, cache,
                                     session.GRACE, common,
                                     {**environ, **(VARIANTS[variant][1] if variant else {})}, None, network,
                                     variant=variant)] = fits
@@ -2443,7 +2444,7 @@ def main() -> int:
     if args.operation == "gpu-tier":
         # A GPU runs its marked files alone, a batch's and a day's alike (ledger 2452); --evidence prints that
         # tier, each file with its records' backend reads beside its marked tests.
-        tier = marked(PYTHONS[0])
+        tier, pinned = marked(PYTHONS[0])
         if args.evidence:
             reads = gpu_tier(PYTHONS[0])
             for name, count in tier.items():
@@ -2454,6 +2455,8 @@ def main() -> int:
         recorded = recorded_tests()
         for _, names in packed({name: sum(recorded.get(name, [1.0])) for name in tier}, args.shards):
             print(*names)
+        # And each file's pinned generations, one line of JSON: what a tier's composer cuts each kind's by.
+        print(json.dumps(pinned))
         return 0
     if args.operation == "pytest":
         # argparse keeps the `--` that sets pytest's arguments apart from these.

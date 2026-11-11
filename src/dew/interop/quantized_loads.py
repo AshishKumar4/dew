@@ -15,7 +15,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from dew.interop import unread
 from dew.interop.codecs import source_quantization
 from dew.interop.streaming import WeightLayout
-from dew.nn.kernels.gemm import NvFp4
+from dew.nn.kernels.formats import NvFp4
 from dew.objectives.base import Variables
 
 _log = logging.getLogger(__name__)
@@ -107,15 +107,15 @@ def bank_axes(table: Mapping[tuple[str, ...], tuple[str | None, ...]], variables
 def packed_banks(tensors: Mapping[str, unread.Stored], config: Mapping[str, object]
                   ) -> tuple[dict[str, unread.Stored], dict[str, NvFp4]]:
     """`tensors` with each MXFP4 expert bank a load serves packed (`Pretrained.load`'s `packed_experts`)
-    taken out of the source's decoding, and those banks by their source names (`dew.nn.kernels.gemm.NvFp4`,
+    taken out of the source's decoding, and those banks by their source names (`dew.nn.kernels.formats.NvFp4`,
     built on the host, exactly the MXFP4 values: `codecs.mxfp4_as_nvfp4`). In each one's place an unread
     leaf of its decoded shape and dtype, which the decoder's translation binds as it binds a load without
     weights (`unread.Unread`), and `with_banks` replaces. A bank whose depth is no whole NVFP4 stages
-    (`gemm.NVFP4_STAGE`), whose experts' group powers span past one tensor scale's reach
+    (`formats.NVFP4_STAGE`), whose experts' group powers span past one tensor scale's reach
     (`mxfp4_tensor_powers` None), or that holds no experts (a 2-D weight's blocks), is decoded as the source
     states it, and named in the load's log, once a load; another source format is refused."""
     from dew.interop import codecs
-    from dew.nn.kernels.gemm import NVFP4_STAGE
+    from dew.nn.kernels.formats import NVFP4_STAGE
 
     quantization = source_quantization(config)
     if quantization is None or quantization is not codecs.MXFP4:

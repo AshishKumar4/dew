@@ -2183,6 +2183,35 @@ def test_a_cache_config_beside_an_offloaded_cache_configures_nothing():
             source_decoding({}, controls, model, 1, None)
 
 
+@pytest.mark.parametrize("kv_cache", [KVCache(page_size=16), KVCache()], ids=["paged", "dense"])
+def test_an_offloaded_caches_scanned_decode_compiles_for_a_gpu(kv_cache):
+    """An offloaded cache's decode step over scanned layers whose banks lie in host memory (`scan_layers`,
+    read a layer at a time) compiles for an A100 (`compile_programs`): its first and last layers read and
+    write their keys, values and weights at a constant index of a host bank, which XLA:GPU takes where each
+    copy keeps the bank's axis in host memory and reshapes in device memory (`dew.nn.host_memory`), the one
+    owner of that movement for the stack and the cache alike."""
+    from dew.nn.kv_cache import offloaded
+    from dew.training.ahead import compile_programs
+
+    model = decoder().clone(num_layers=2, max_seq_len=64, scan_layers=True,
+                            kv_cache=dataclasses.replace(kv_cache, offloaded=True))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))["params"]
+    leaves, tree = jax.tree.flatten(params)
+
+    def decoded(*arguments):
+        params = jax.tree.unflatten(tree, arguments[:-1])
+        # Its layers' banks in host memory, as a held-banks server keeps them, read a layer at a time.
+        variables = {"params": {name: jax.device_put(held, jax.memory.Space.Host)
+                                if name.startswith("layers_") else held for name, held in params.items()}}
+        _, made = model.apply(variables, 2, method=CausalTransformer.init_cache, mutable=["cache"])
+        cache = offloaded(made["cache"], model.kv_cache)
+        logits, _ = model.apply({**variables, "cache": cache}, arguments[-1], decode=True, mutable=["cache"])
+        return logits
+
+    shapes = [jax.ShapeDtypeStruct(leaf.shape, leaf.dtype) for leaf in leaves]
+    compile_programs({"decode": (decoded, [*shapes, jax.ShapeDtypeStruct((2, 4), jnp.int32)])}, "sm80")
+
+
 def test_a_sources_offloaded_cache_generates_what_a_resident_one_does():
     """A source whose generation config names Hugging Face's offloaded cache (`cache_implementation`
     "offloaded") generates over a cache whose keys and values live in host memory

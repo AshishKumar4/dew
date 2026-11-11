@@ -4,7 +4,7 @@
 shapes, initializers, promotion and product hooks alike, so checkpoints,
 LoRA and Qwix see the layers they did, but for a batched `DenseGeneral`'s
 kernel, which draws each batch member alone (`_members`). Their call is their own: the same
-product (the GEMM template's dense product where a launch takes it, `gemm.dot_general`, XLA's program
+product (the GEMM template's dense product where a launch takes it, `projections.dot_general`, XLA's program
 otherwise), rounded to its dtype as flax's is, then the bias added by `biased`,
 which adds it in the dtype flax's addition gives them and broadcasts it at
 fp32, so its gradient sums at fp32 as torch's addmm sums it, and in float64 on a CPU under
@@ -34,7 +34,7 @@ from flax.typing import Array
 from dew._cache import INTERCEPTED
 
 from .derivatives import KernelGlue, contracted, declared_tangent
-from .kernels import gemm
+from .kernels import projections
 from .precision import accumulated, biased, float32_dot_general, projected, refuse_recipe
 from .sharding import declared
 
@@ -61,7 +61,7 @@ def _product(layer: nn.Dense | nn.DenseGeneral):
     it, else its `dot_general`, or lax's at its stated precision (`accumulated`: the plain product, its fp32
     sum taken in float64 on a CPU under Dew's tests). A plain product (lax's or `float32_dot_general`: its
     operands' dtype out, at the layer's precision) goes through the GEMM template's dense product where a
-    launch takes it (`gemm.dot_general`; XLA's program wherever the template declares XLA faster), but
+    launch takes it (`projections.dot_general`; XLA's program wherever the template declares XLA faster), but
     where a wrapper owns the products (`intercepted`: Qwix quantizes them as it intercepts `dot_general`). A
     product with a policy of its own (a head's fp32 result: `fp32_result_dot_general`, `head_dot_general`)
     is the layer's own: the template reads no policy from a callable."""
@@ -71,7 +71,7 @@ def _product(layer: nn.Dense | nn.DenseGeneral):
     product = layer.dot_general if layer.dot_general is not None else _accumulated_dot_general
     plain = layer.dot_general in (None, float32_dot_general)
     if not intercepted():
-        return gemm.dot_general(product) if plain else product
+        return projections.dot_general(product) if plain else product
     refuse_recipe("a wrapper's product (an adapter's, a quantizer's)")
     # A wrapper's scope skips the template, not the projection's CPU sum, which a quantizer's rule
     # matching the layer owns (`precision.projected`).
@@ -85,7 +85,7 @@ def plain_product():
     wrapper's scope takes the products past the template (`intercepted`). A product read
     apart from its layer, as a vocabulary head's table reads `project_out` (`Projection`), takes it."""
     plain = _accumulated_dot_general
-    return projected(plain) if intercepted() else gemm.dot_general(plain)
+    return projected(plain) if intercepted() else projections.dot_general(plain)
 
 
 def _accumulated_dot_general(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None,

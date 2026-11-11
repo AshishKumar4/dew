@@ -1,4 +1,4 @@
-"""Packed NVFP4 expert banks (`dew.nn.kernels.gemm.NvFp4`) and their exact values, for the expert layers'
+"""Packed NVFP4 expert banks (`dew.nn.kernels.formats.NvFp4`) and their exact values, for the expert layers'
 served-checkpoint tests (row 4516)."""
 
 import jax.numpy as jnp
@@ -9,7 +9,7 @@ def packed_banks(experts: int, depth: int, width: int, seed: int):
     """Packed NVFP4 expert banks of random codes and block scales, each expert's tensor scale a power of two
     (an MXFP4 checkpoint's, `codecs.mxfp4_as_nvfp4`), and their values `[experts, depth, width]` float32,
     exactly."""
-    from dew.nn.kernels.gemm import NvFp4
+    from dew.nn.kernels.formats import NvFp4
 
     rng = np.random.default_rng(seed)
     codes = rng.integers(0, 16, (experts, depth, width), dtype=np.uint8)

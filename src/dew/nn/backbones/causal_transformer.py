@@ -76,6 +76,7 @@ from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer, PLELayer
 from ..flops import counted_flops, parameter_flops
 from ..gemma3n import AltUp, clamped_predictions, rescale_to
+from ..host_memory import on_host
 from ..hyper_connections import Carried, HyperConnections, enter_streams, leave_streams, stream_head
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of
 from ..kv_cache import DecodeCursor, KVCache
@@ -136,7 +137,6 @@ from .decoder_stack import (
     banked_collections,
     microbatch_count,
     off_stages,
-    on_host,
     run_pipeline,
     run_stack,
     split_stages,
