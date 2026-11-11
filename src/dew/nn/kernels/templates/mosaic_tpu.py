@@ -280,8 +280,10 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
         return launched
 
-    def program_index(self, name: str) -> jax.Array:
-        # Pallas TPU numbers a grid's axes: `name`'s place among the launch's (`kernel`'s `grid_names`).
+    def program_index(self, name: str, *, fresh: bool = False) -> jax.Array:
+        # Pallas TPU numbers a grid's axes: `name`'s place among the launch's (`kernel`'s `grid_names`), a
+        # scalar its copies read where they are issued, fresh or not.
+        del fresh
         return pl.program_id(_GRID_NAMES.get().index(name))
 
     def program_scoped(self, body, *allocations, streams):
@@ -453,10 +455,6 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
         for part, view in zip(parts, views, strict=True):
             smem[...] = part.astype(smem.dtype)
             pltpu.sync_copy(smem, view)
-
-    def at_store(self, index: jax.Array) -> jax.Array:
-        # Mosaic TPU lowers no optimization barrier; its copies read their views' indices as scalars.
-        return index
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         # No atomic into HBM: the view read into VMEM, added to and written back, the launch's programs in

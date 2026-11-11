@@ -130,6 +130,9 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
                 acc = acc + jnp.dot(part, rhs[...], preferred_element_type=jnp.float32)
             else:
                 plgpu.wgmma(acc, part, rhs)
+                # Register A remains live until its group completes. The next part or loop iteration
+                # may reuse these registers even when the shared-memory rings retain the older slot.
+                plgpu.wgmma_wait(0)
         return acc
 
     def summed(self, shape: tuple[int, int], issue) -> jax.Array:

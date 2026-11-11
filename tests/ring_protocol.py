@@ -94,7 +94,8 @@ class _Interpreter:
 
     def equation(self, equation, values) -> list:
         name, params = equation.primitive.name, equation.params
-        if name == "axis_index":
+        if name in ("axis_index", "fresh_axis_index"):
+            # A grid or thread axis's index, read once or afresh where it is used (`plgpu.fresh_axis_index`).
             return [np.int32(self.thread if params["axis_name"] == THREAD_AXIS else 0)]
         if name == "layout_cast":
             # A register layout's statement (`plgpu.layout_cast`), its value its operand's.

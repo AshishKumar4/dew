@@ -97,26 +97,34 @@ def _blocked(lhs_t, rhs_t, row_scales, column_scales, wide, precision=None):
     owners = np.repeat(np.arange(len(GRADIENT_BLOCKS)), np.asarray(GRADIENT_BLOCKS))
     for block, owner in enumerate(owners):
         rows = slice(128 * block, 128 * (block + 1))
-        partial = jnp.dot(lhs_t[:, rows].astype(wide), rhs_t[:, rows].astype(wide).T, precision=precision,
-                          preferred_element_type=wide)
+        partial = jnp.dot(lhs_t[:, rows], rhs_t[:, rows].T, precision=precision, preferred_element_type=wide)
         out = out.at[owner].add(partial * row_scales[block, :, None].astype(wide)
                                 * column_scales[block, None, :].astype(wide))
     return out
 
 
-def _gradient_truth(*operands):
-    return _blocked(*operands, jnp.float64)
+def _gradient_truth(lhs_t, rhs_t, *scales):
+    wide = jnp.float64
+    return _blocked(lhs_t.astype(wide), rhs_t.astype(wide), *scales, wide)
+
+
+def _gradient_cublaslt(*operands):
+    """cuBLASLt's FP8 GEMM on the kernel gradient's codes a block at a time (`blockwise_matrix.cublaslt_arm`:
+    its blocks' dots of the FP8 codes into fp32), each partial scaled and added in order."""
+    return _blocked(*operands, jnp.float32)
 
 
 def a_blockwise_kernel_gradient_is_on_par(interpret: bool = False):
     """Each group's rows of FP8 operands (rows contiguous) contracted over its whole 128-row blocks, each
     block's partial times its depth rows' and its columns' scales before it is added to its group's sum,
-    through the template named (`mosaic_gpu.tgmm`'s `k_major` and `step_scales`), on par with XLA's (check 1),
-    from float64; an empty group's gradient is zero. On this GPU, or `interpret`ed (test_gpu_gemm's cell)."""
+    through the template named (`mosaic_gpu.tgmm`'s `k_major` and `step_scales`), on par with cuBLASLt's FP8
+    GEMM on the same codes a block at a time (check 1, `_gradient_cublaslt`: block-scaled FP8 on Hopper is
+    held at parity with cuBLASLt), from float64; an empty group's gradient is zero. On this GPU, or
+    `interpret`ed (test_gpu_gemm's cell)."""
+    reference = blockwise_matrix.cublaslt_arm(_gradient_cublaslt, _gradient_operands(0))
     with generation.routes() as routes:
-        assert_as_exact(jax.jit(_gradient("mosaic", interpret)), jax.jit(_gradient("xla", interpret)),
-                        _gradient_operands, "blockwise kernel gradient", seeds=blockwise_matrix.SEEDS,
-                        truth_fn=_gradient_truth)
+        assert_as_exact(jax.jit(_gradient("mosaic", interpret)), reference, _gradient_operands,
+                        "blockwise kernel gradient", seeds=blockwise_matrix.SEEDS, truth_fn=_gradient_truth)
     assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
 
 

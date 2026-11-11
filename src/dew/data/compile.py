@@ -1309,13 +1309,23 @@ def _compile_phases(
             _delivered(phase.train, end - start, consumed)
         return consumed
 
+    def ordered(index: int, phase: _Staged) -> _Staged:
+        """Phase `index`, refused where it reads in no global order: a phase after it continues each corpus
+        past the records it read by its order's shares (`consumed_by`), which a read streamed, rejecting
+        or packed online has none of."""
+        if not phase.build.global_order:
+            raise ValueError(f"phase {index} needs a global order; "
+                             "streamed, rejecting and online-packed phases are refused")
+        return phase
+
     tokens = source.clock == "tokens"
     staged: list[tuple[_Staged, int | None]] = []
     for index, until in enumerate(source.ends):
         # A phase on the token clock ends where the run reaches it, so it is staged as it reads first,
         # and again with the ends of the phases before it once the run reaches them (`opened`).
         ends = [end for _, end in staged if end is not None]
-        phase = staged_at(index, {} if tokens else consumed_by([phase for phase, _ in staged], ends))
+        phase = ordered(index, staged_at(index, {} if tokens
+                                         else consumed_by([phase for phase, _ in staged], ends)))
         # A phase on the step clock ends at its step's record: the records of the phases before it, and its
         # own steps in its own rows (row 4812).
         before, started = (ends[-1] if ends else 0), (source.ends[index - 1] or 0) if index else 0
@@ -1326,11 +1336,6 @@ def _compile_phases(
     built: list[tuple[Loader, int | None]] = []
     for index, (phase, end) in enumerate(staged):
         loaded = _compiled(phase, packed, host=host, resume=resume, batches=planned(index))
-        if loaded.plan is None or loaded.plan.lowering != "global":
-            raise ValueError(
-                f"phase {index} needs a global order; "
-                "streamed, rejecting and online-packed phases are refused"
-            )
         if built and loaded.device != built[0][0].device:
             # The run applies one set of device steps to every batch (`Loader.device`), so a phase
             # whose own differ would run the first phase's.

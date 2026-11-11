@@ -1098,11 +1098,18 @@ def numerics_of(given: Numerics | str) -> Numerics:
 
 def exact_float32(precision: jax.lax.PrecisionLike) -> jax.lax.PrecisionLike:
     """The precision a float32 product whose rounding decides what follows takes, a numerically critical
-    one, a vocabulary head's (the loss's logits), a router's or a recurrence's state's, each stating its
-    reason where it calls this: the one the call states, else IEEE float32 (`Precision.HIGHEST`), stated
-    over JAX's configured precision, whose default runs TF32 on a GPU and one bf16 pass on a TPU, where
-    the references multiply IEEE float32 (torch's float32 matmul). Every other product follows JAX's
-    configured precision and the run's numerics (`dew.nn.kernels.generation.run_precision`)."""
+    one, a vocabulary head's (the loss's logits), a router's or the state's of Dew's own recurrence math
+    (`recurrence_algebra`'s products, the TPU scan's, `ssd`), each stating its reason where it calls this:
+    the one the call states, else IEEE float32 (`Precision.HIGHEST`), stated over JAX's configured
+    precision, whose default runs TF32 on a GPU and one bf16 pass on a TPU, where the references multiply
+    IEEE float32 (torch's float32 matmul). Every other product follows JAX's configured precision and the
+    run's numerics (`dew.nn.kernels.generation.run_precision`), a port of an upstream's kernels among them
+    and not this rule's: the gated delta rule's and Kimi delta attention's of fla's and the SSD's of
+    mamba_ssm's (`fla_gdn._dot`) multiply an fp32 product as their upstream's Triton dots do at their own
+    default, one TF32, under a run's numerics at the default precision (`Numerics()`), and decline a run
+    whose configured precision is above the default (`ACCURATE`'s 'highest', `recurrence_chunk.
+    _port_precision`), whose call takes the portable math at that precision (the owner, 2026-11-11: "tf32
+    default, fp32 if accurate")."""
     return jax.lax.Precision.HIGHEST if precision is None else precision
 
 

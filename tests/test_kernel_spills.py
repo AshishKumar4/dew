@@ -754,7 +754,24 @@ DEAD_MMA_LISTING = """
 dropped for one writing no register, the stored tile a constant."""
 
 
+REGISTER_A_LISTING = """
+.text.dew_gmm_mosaic_gpu_kernel:
+.L_x_9:
+        /*1c20*/                   LEA R131, R20, UR16, 0x2 ;
+        /*1c40*/                   LDSM.16.M88.4 R124, [R131] ;
+        /*2600*/                   WARPGROUP.ARRIVE ;
+        /*2630*/                   HGMMA.64x192x16.F32.BF16 R24, R124, gdesc[UR24].tnspB, R24, gsb0 ;
+        /*26a0*/                   WARPGROUP.DEPBAR.LE gsb0, 0x1 ;
+        /*27e0*/               @P1 BRA `(.L_x_9) ;
+        /*2810*/                   WARPGROUP.DEPBAR.LE gsb0, 0x0 ;
+"""
+"""Row 5416's prologued forward at 2497d1526ec (dew_gmm__lc7f44bb880, its loop cut to one product): a
+register-A warpgroup MMA's group kept pending (`DEPBAR.LE gsb0, 0x1`) across the loop's back edge, where
+the next trip's load writes its operand A (R124)."""
+
+
 DEAD = "warpgroup MMA writing no register"
+REUSED = "register operand A before its group retired"
 
 
 @pytest.mark.parametrize(("listing", "found"), [
@@ -762,16 +779,20 @@ DEAD = "warpgroup MMA writing no register"
     (DEAD_MMA_LISTING, DEAD),
     (DEAD_MMA_LISTING.replace("HGMMA.64x8x16.F16", "QGMMA.64x8x32.F32.E4M3.E4M3"), DEAD),
     (DEAD_MMA_LISTING.replace("HGMMA.64x8x16.F16", "@P0 IGMMA.64x8x32.S32.S8.S8"), DEAD),
+    (REGISTER_A_LISTING, REUSED),
 ])
 def test_the_sass_rules_find_what_ptxas_left_of_a_kernel(listing, found):
     """The compile gate's SASS rules read nvdisasm's listing of a kernel (row 4071, the kernel challenge's
     harness/ptxas checks): an elect waterfall (a backward BRA.U.ANY) holding an R2UR serializes a copy whose
     operand ptxas could not prove uniform, and a warpgroup MMA writing no register (an HGMMA, an fp8 QGMMA or
     an integer IGMMA whose destination is RZ) is what ptxas leaves of products it found never read (row 4346);
-    each is one finding the gate fails, and a loop's conversion with neither is none."""
+    a loop writing a register-A MMA's operand while its group is pending is undefined behaviour (row 5416);
+    each is one finding the gate fails, and a loop's conversion with none is none, as is the register-A loop
+    that retires its group before the back edge."""
     (finding,) = report.sass_findings_of(listing)
     assert found in finding
     assert report.sass_findings_of(CONVERTING_LISTING) == ()
+    assert report.sass_findings_of(REGISTER_A_LISTING.replace("gsb0, 0x1", "gsb0, 0x0")) == ()
 
 
 def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read():

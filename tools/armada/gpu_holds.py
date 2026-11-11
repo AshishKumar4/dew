@@ -25,8 +25,10 @@ def holds(tests: list[str]) -> dict[str, float]:
     spec.loader.exec_module(ci)
     files = sorted({name.partition("#")[0] for name in tests})
     token = os.environ.get("DEW_XLA_CACHE_TOKEN", "")
+    # Read whole or not at all (`strict`): a read the Worker does not answer fails this tool, whose caller
+    # sizes a job by it, and never reads as a file no class measured.
     return {name: ci.gpu_needs(found, math.inf)[1]
-            for name, found in ci.borrowed_records(files, ci.PYTHONS[0], "", token).items()}
+            for name, found in ci.borrowed_records(files, ci.PYTHONS[0], "", token, strict=True).items()}
 
 
 def main() -> int:

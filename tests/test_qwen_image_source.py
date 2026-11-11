@@ -159,8 +159,9 @@ def test_a_padded_row_is_its_own_prompt_alone(source, record):
                prediction(qwen_walk(source, record, "padded", wide=True)), leaves=["output"])
 
 
-CUDNN_SEEDS = None
-"""Check 1's declared seeds for the cuDNN cell, sized paired by `seeds_for` on a GPU (`cudnn_case`)."""
+CUDNN_SEEDS = 16
+"""Check 1's declared seeds for the cuDNN cell, sized paired by `seeds_for` on a GPU (`cudnn_case`): 16 on
+an A100 and on a GH200 (M-ET-80c)."""
 
 
 def cudnn_case():

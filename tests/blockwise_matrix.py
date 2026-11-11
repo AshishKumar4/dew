@@ -14,6 +14,7 @@ What the route serves is read from the product's own selector: the product trace
 case's generation with the template named, the route its choice reports the template.
 """
 
+import functools
 import itertools
 
 import jax
@@ -23,7 +24,7 @@ import pytest
 from gpu_flow import cell
 from jax.sharding import Mesh
 from kernel_matrix import AXES
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, without_ynn
 
 from dew.nn.kernels import gemm, generation
 
@@ -89,6 +90,45 @@ def _product(groups: int, out_dtype: str, kernel: str):
     return product
 
 
+CUBLASLT = {"xla_gpu_enable_triton_gemm": False}
+"""XLA's options that make an FP8 dot cuBLASLt's FP8 GEMM at any lane flag: its Triton GEMMs off."""
+
+
+def cublaslt_arm(fn, inputs):
+    """`fn`, a program whose dots multiply FP8 codes into fp32, compiled as cuBLASLt's FP8 GEMM runs each
+    (`CUBLASLT`), the reference arm of a block-scaled FP8 form on Hopper (docs/design/testing.md, "FP8
+    products": held at parity with cuBLASLt, the owner's ruling of 2026-11-11). On a GPU its compiled program
+    on `inputs` is checked to hold the FP8 cuBLASLt call, so no lane flag or fusion choice gives it another
+    GEMM; on a CPU its dots are XLA's own, exact."""
+    compiled = without_ynn(fn, compiler_options=CUBLASLT)
+    if jax.default_backend() == "gpu":
+        program = compiled.lower(*inputs).compile().as_text()
+        assert "__cublas$lt$matmul$f8" in program, "the reference arm holds no cuBLASLt FP8 GEMM"
+    return compiled
+
+
+def cublaslt(sizes, out_dtype: str) -> callable:
+    """cuBLASLt's FP8 GEMM on a product's codes a 128-deep block at a time (XLA's dot of two FP8 operands
+    into fp32, `cublaslt_arm`), every row by each group's matrix and a group's rows kept, each block's
+    partial scaled by its rows' and columns' scales and the blocks added in fp32, as the product's
+    definition (`truth`) orders them: `run(rows, matrices, row_scales, column_scales)`."""
+    owners = np.repeat(np.arange(len(sizes)), np.asarray(sizes))
+
+    def run(rows, matrices, row_scales, column_scales):
+        per = matrices.shape[1] // column_scales.shape[-1]
+        out = jnp.zeros((rows.shape[0], matrices.shape[1]), jnp.float32)
+        for group in range(matrices.shape[0]):
+            mine = jnp.asarray(np.pad(owners == group, (0, rows.shape[0] - owners.size)))[:, None]
+            for block in range(row_scales.shape[0]):
+                depth = slice(128 * block, 128 * (block + 1))
+                partial = jnp.dot(rows[:, depth], matrices[group, :, depth].T,
+                                  preferred_element_type=jnp.float32)
+                columns = jnp.repeat(column_scales[group, block], per)
+                out = out + jnp.where(mine, partial * row_scales[block, :, None] * columns[None, :], 0)
+        return out.astype(out_dtype)
+    return run
+
+
 def truth(sizes) -> callable:
     """The dequantized blocks' scaled sum in float64, each group's rows and each 128-deep block apart (the
     product's definition, written out): `run(rows, matrices, row_scales, column_scales)`."""
@@ -115,16 +155,17 @@ def truth(sizes) -> callable:
     generation.device_generation() != case[0], reason=f"an {case[0]} cell runs on its own GPU alone"))
     for case in CASES], ids="-".join)
 def a_blockwise_fp8_product_is_on_par(case: tuple[str, ...]) -> None:
-    """The blockwise-scaled FP8 product of `case` on its GPU through the template on par with the scaled
-    blocks summed in XLA (check 1), from the float64 sum of the dequantized blocks. The routes it records run
+    """The blockwise-scaled FP8 product of `case` on its GPU through the template on par with cuBLASLt's FP8
+    GEMM on the same codes a block at a time (check 1, `cublaslt`: block-scaled FP8 on Hopper is held at
+    parity with cuBLASLt), from the float64 sum of the dequantized blocks. The routes it records run
     `blockwise_fp8` `mosaic_gpu` and every other choice at XLA."""
     combination = dict(zip(AXES["blockwise_fp8"], case, strict=True))
     groups, out_dtype = int(combination["groups"]), combination["out_dtype"]
+    draw = functools.partial(_operands, combination)
+    reference = cublaslt_arm(cublaslt(_sizes(groups), out_dtype), draw(0))
     with generation.routes() as routes:
-        assert_as_exact(jax.jit(_product(groups, out_dtype, "mosaic")),
-                        jax.jit(_product(groups, out_dtype, "xla")),
-                        lambda seed: _operands(combination, seed), "-".join(case), seeds=SEEDS,
-                        truth_fn=truth(_sizes(groups)))
+        assert_as_exact(jax.jit(_product(groups, out_dtype, "mosaic")), reference, draw, "-".join(case),
+                        seeds=SEEDS, truth_fn=truth(_sizes(groups)))
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
     assert ("blockwise_fp8", "mosaic") in recorded and not unnamed, (sorted(recorded), unnamed)

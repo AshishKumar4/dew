@@ -96,6 +96,169 @@ def test_a_gpu_lane_given_the_whole_gpu_hands_its_files_jaxs_default_share(ci, t
     assert float(share) == float(ci.WHOLE_GPU)
 
 
+def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_nothing(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A lane's prepare (`gpu-lane --prepare`) runs each of its files that holds a test marked `prepares`, on
+    the CPU under the prepare's word (DEW_TIER_PREPARE, which the suite's conftest reads to skip every other
+    test), with the store its environment names: a cut file's group prepares exactly the tests its run then
+    holds, as both select and cut the file alike (a prepare that selected the marked tests alone would cut
+    them into other groups, and a run would find a test its part never prepared); a file with nothing to
+    prepare starts no process; and a prepare records no row, so no lane or task reuses it as a test's run.
+    The fixtures are fetched first, as a run's are."""
+    url, stored, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    interpreter(tmp_path, "3.12")
+    fetched = fetcher(tmp_path)
+    monkeypatch.setenv("DEW_TIER_TRUTHS", str(tmp_path / "truths"))
+    # The harness's side, as the suite's own conftest has it: a prepare skips every test but those it
+    # prepares.
+    (tmp_path / "tests/conftest.py").write_text(
+        "import os, pytest\n"
+        "def pytest_configure(config):\n"
+        "    config.addinivalue_line('markers', 'prepares: prepared on the CPU before its GPU run')\n"
+        "def pytest_runtest_setup(item):\n"
+        "    if os.environ.get('DEW_TIER_PREPARE') == '1' and item.get_closest_marker('prepares') is None:\n"
+        "        pytest.skip('nothing to prepare')\n")
+    (tmp_path / "tests/test_flows.py").write_text(
+        "import os, pytest\n"
+        "def said(name):\n"
+        "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
+        "    with open(f'{kind}.log', 'a') as log:\n"
+        "        log.write(' '.join([name, os.environ.get('JAX_PLATFORMS', '-'),\n"
+        "                            os.environ.get('DEW_TIER_TRUTHS', '-')]) + chr(10))\n"
+        + "".join(f"{'@pytest.mark.prepares' + chr(10) if index % 2 else ''}"
+                  f"def test_{index}():\n    said('test_{index}')\n" for index in range(6)))
+    (tmp_path / "tests/test_plain.py").write_text(LANE_TEST)
+
+    def said(kind: str) -> list[list[str]]:
+        log = tmp_path / f"{kind}.log"
+        lines = [line.split() for line in log.read_text().splitlines()] if log.is_file() else []
+        log.unlink(missing_ok=True)
+        return lines
+
+    out, marked = tmp_path / "verdict.json", {"test_1", "test_3", "test_5"}
+    # A recalled attempt's progress, naming a test it passed: a prepare sets nothing aside by it, and keeps
+    # none.
+    resume = tmp_path / "resume"
+    resume.mkdir()
+    (resume / "progress.jsonl").write_text(
+        json.dumps({"node": "tests/test_flows.py::test_1", "seconds": 1.0}) + "\n")
+    monkeypatch.setenv("ARMADA_RESUME", str(resume))
+    prepared = {}
+    for group in ("1/2", "2/2"):
+        name = f"tests/test_flows.py#{group}"
+        assert ci.gpu_prepared("3.12", [name, "tests/test_plain.py"], out, processes=2, deadline=600.0) == 0
+        assert [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]] == [
+            (f"3.12:{name}", 0)]
+        lines = said("prepared")
+        assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"))}
+        prepared[group] = {line[0] for line in lines}
+    assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "nothing to prepare starts no process"
+    assert not stored, "a prepare records no row"
+    assert not (tmp_path / "artifacts" / "progress.jsonl").exists(), "nor any test as passed (review)"
+    monkeypatch.delenv("ARMADA_RESUME")
+    assert prepared["1/2"] | prepared["2/2"] == marked and not prepared["1/2"] & prepared["2/2"]
+    for group in ("1/2", "2/2"):
+        assert ci.gpu_lane("3.12", [f"tests/test_flows.py#{group}"], out, cache="on", processes=1,
+                           deadline=600.0) == 0
+        assert {line[0] for line in said("ran")} & marked == prepared[group], group
+    assert stored, "its run's rows are recorded as any lane's"
+
+
+def test_a_lanes_prepare_ends_within_its_one_deadline_however_many_files_it_holds(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A lane's prepare is given one deadline for all of it: each file's process has what is left of it as
+    its turn comes (its own end's allowance kept back), so more files than processes cannot outlast it, and
+    a file it leaves too little is a red row of its own, the files before it prepared (a deadline a process
+    let a part's files run in waves past its job's prepare bound, and the node's session ended the job
+    whole)."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    (tmp_path / "tests/conftest.py").write_text(
+        "def pytest_configure(config):\n"
+        "    config.addinivalue_line('markers', 'prepares: prepared on the CPU before its GPU run')\n")
+    names = [f"tests/test_slow_{index}.py" for index in range(3)]
+    for name, seconds in zip(names, (2, 2, 25), strict=True):
+        (tmp_path / name).write_text("import pytest, time\n@pytest.mark.prepares\n"
+                                     f"def test_prepares():\n    time.sleep({seconds})\n")
+    # One process at a time, and twenty seconds for all three beside the allowance a process keeps back for
+    # its own end: the first two prepare, and the third, which needs more than is left, is cut at what is
+    # left, where a deadline of its own would have let it end.
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_prepared("3.12", names, out, processes=1, deadline=ci.session.GRACE + ci.SETTLE + 20.0) == 0
+    rows = {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]}
+    assert rows == {f"3.12:{names[0]}": 0, f"3.12:{names[1]}": 0, f"3.12:{names[2]}": 1}
+
+
+def test_a_file_with_tests_for_a_users_process_runs_them_in_a_process_of_their_own(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """XLA reads a process's flags once, so a file's tests that must open under a user's flags (the mark
+    `users_process`) run in a second process of the lane, under its word, which the suite's conftest reads
+    to run those tests and skip the file's others, as without it it skips them: every GPU test of the file
+    runs in exactly one process, a cut file's group as the lane's own process cuts it, and the second
+    process's rows and records are its own (`<file>#G/N@users`), so neither stands for the other. A file
+    with no such test starts no second process; one that holds some never runs without it, in its prepare
+    as in its run."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    # The harness's side, as the suite's own conftest has it.
+    (tmp_path / "tests/conftest.py").write_text(
+        "import os, pytest\n"
+        "def pytest_configure(config):\n"
+        "    for mark in ('users_process', 'prepares'):\n"
+        "        config.addinivalue_line('markers', mark + ': a lane mark')\n"
+        "def pytest_runtest_setup(item):\n"
+        "    users = os.environ.get('DEW_TEST_USERS_ARITHMETIC') == '1'\n"
+        "    if users != (item.get_closest_marker('users_process') is not None):\n"
+        "        pytest.skip('another process of the lane runs it')\n"
+        "    if os.environ.get('DEW_TIER_PREPARE') == '1' and item.get_closest_marker('prepares') is None:\n"
+        "        pytest.skip('nothing to prepare')\n")
+    (tmp_path / "tests/test_flows.py").write_text(
+        "import os, pytest\n"
+        "from pathlib import Path\n"
+        "def said(name):\n"
+        "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
+        # A file a run of its own, written whole: nothing a later run reads, so no record's input.
+        "    users = os.environ.get('DEW_TEST_USERS_ARITHMETIC', '0')\n"
+        "    Path(f'flow-{kind}-{name}-{os.getpid()}').write_text(users)\n"
+        + "".join(f"@pytest.mark.prepares\n{'@pytest.mark.users_process' + chr(10) if index % 3 == 0 else ''}"
+                  f"def test_{index}():\n    said('test_{index}')\n" for index in range(6)))
+    (tmp_path / "tests/test_plain.py").write_text(LANE_TEST)
+
+    def said(kind: str) -> list[tuple[str, str]]:
+        """Each test a `kind` of process ran since the last look, and the word it ran under."""
+        found = []
+        for path in sorted(tmp_path.glob(f"flow-{kind}-*")):
+            found.append((path.name.split("-")[2], path.read_text()))
+            path.unlink()
+        return sorted(found)
+
+    every = sorted((f"test_{index}", "1" if index % 3 == 0 else "0") for index in range(6))
+    out, groups = tmp_path / "verdict.json", ["tests/test_flows.py#1/2", "tests/test_flows.py#2/2"]
+    assert ci.gpu_prepared("3.12", [*groups, "tests/test_plain.py"], out, processes=2, deadline=600.0) == 0
+    assert said("prepared") == every, "each test prepared once, under the flags its process runs it under"
+    assert ci.gpu_lane("3.12", [*groups, "tests/test_plain.py"], out, cache="on", processes=2,
+                       deadline=600.0) == 0
+    assert said("ran") == every, "each test run once, the marked ones in the users' process"
+    rows = {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]}
+    assert rows == {"3.12:tests/test_flows.py#1/2": 0, "3.12:tests/test_flows.py#1/2@users": 0,
+                    "3.12:tests/test_flows.py#2/2": 0, "3.12:tests/test_flows.py#2/2@users": 0,
+                    "3.12:tests/test_plain.py": 0}
+    # Its records are its own: the file whole (a group of a file no durations record names keeps no key), a
+    # later lane reuses each process's row apart and runs none again.
+    whole = ["tests/test_flows.py"]
+    assert ci.gpu_lane("3.12", whole, out, cache="on", processes=2, deadline=600.0) == 0
+    assert said("ran") == every
+    assert ci.gpu_lane("3.12", whole, out, cache="on", processes=2, deadline=600.0) == 0
+    reused = {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]}
+    assert said("ran") == []
+    assert reused == {"3.12:tests/test_flows.py": 0, "3.12:tests/test_flows.py#@users": 0}
+
+
 def test_a_gpu_lane_names_its_files_but_with_network(ci, monkeypatch):
     """`gpu-lane` without --tests is the network lane's alone, which runs every file holding a network-marked
     test: a CUDA lane names its files, and one that names none is refused, not run over the network files'
@@ -360,3 +523,13 @@ def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measur
     monkeypatch.setattr(sys, "argv", ["gpu_holds.py", "--tests=tests/test_wide.py#2/3 tests/test_new.py"])
     assert holds.main() == 0
     assert json.loads(capsys.readouterr().out) == {"tests/test_wide.py": 2 * (4 * gib * 1.25 + gib)}
+    # The cache not answering (here, refusing the token) fails the tool, which sizes a job by what it says:
+    # read as files no class measured, a part took the default (2026-11-11: a file measured at 5.9 GiB ran
+    # out of the 4 GiB lane of a part composed while a read of its record did not come back). A lane on its
+    # node, which only packs by it, still runs: each file alone, with the whole share.
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "another")
+    with pytest.raises(Exception) as unanswered:
+        holds.main()
+    assert "R2Error" in {base.__name__ for base in type(unanswered.value).__mro__}
+    assert capsys.readouterr().out == ""
+    assert ci.borrowed_records(["tests/test_wide.py"], "3.12", "", "another") == {}

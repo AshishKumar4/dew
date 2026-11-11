@@ -1067,9 +1067,12 @@ class _Program[T: (Tiles, BackwardTiles)]:
         return operands.Parts(tuple(tile.at[pl.ds(part * rows, rows)] for part in range(self.parts)),
                               jnp.float32)
 
-    def split(self):
-        """This program's slice of its query tile's keys (`splits`), 0 of one."""
-        return lax.rem(self.family.program_index("q_tiles"), self.splits) if self.splits > 1 else jnp.int32(0)
+    def split(self, *, fresh: bool = False):
+        """This program's slice of its query tile's keys (`splits`), 0 of one; its grid coordinate read where
+        it is used where `fresh` (`Family.program_index`)."""
+        if self.splits == 1:
+            return jnp.int32(0)
+        return lax.rem(self.family.program_index("q_tiles", fresh=fresh), self.splits)
 
     def padded(self, first) -> jax.Array | bool:
         """Whether the query tile from `first` holds padding rows past the call's queries, some or all of
@@ -1078,11 +1081,12 @@ class _Program[T: (Tiles, BackwardTiles)]:
             return False
         return first + self.tiles.block_q > self.queries
 
-    def query_tile(self, count: int):
+    def query_tile(self, count: int, *, fresh: bool = False):
         """This program's query tile of the grid's `count`: a causal call's longest first (its last query
         tiles see the most keys), so the grid's tail holds its shortest programs, as FlashAttention-3's
-        scheduler orders them; a full call's in order."""
-        index = self.family.program_index("q_tiles")
+        scheduler orders them; a full call's in order. Its grid coordinate read where it is used where
+        `fresh` (`Family.program_index`)."""
+        index = self.family.program_index("q_tiles", fresh=fresh)
         if self.splits > 1:
             index = lax.div(index, self.splits)
         return count - 1 - index if self.causal else index
@@ -1362,6 +1366,20 @@ def _views_of(refs: dict, row, head) -> dict:
     """The streams' views by name (`Family.opened`, `Family.stream`, `rings.viewed`): each `[B, S, H, D]`
     operand's `[S, D]` at batch row `row` and head `head`, step `j` its `j`-th block of rows."""
     return {name: (ref.at[row, :, head], lambda j: (j, 0)) for name, ref in refs.items()}
+
+
+def _fused_held(logits: tuple, dtype, *, dropped: bool) -> list:
+    """The tiles a fused backward launch holds beside both products and its pullback (`backward_registers`):
+    a dropping call's multipliers (`algebra.drawn`); fp16's parts formed at the running scale beside the tile
+    and its scaled copy, the other left operand fp32 still live (`algebra.running_parts`: a 128-wide fused
+    launch 281 registers live at its peak, the scale's exp2, and 2240 bytes spilled where one tile priced it
+    at 246, et-c7512). A score hook's output and slopes are its pullback's, held once: a bf16 step on mma.sync
+    issues its later products in loops of their own (`Issuer.looped_products`), so none holds another's
+    fragments, an overlap a second count of the slopes had covered (row 5477); an fp16 step's parts are priced
+    here, and a family reading its operands from shared memory holds its narrowed weights beside the pullback
+    (`backward_registers`)."""
+    return (([logits] if dropped else [])
+            + ([logits] * 3 if jnp.dtype(dtype) == jnp.dtype(jnp.float16) else []))
 
 
 def _hook_live(family: mosaic.Family, block_q: int, block_k: int, params: tuple, *, grads: str | None = None,
@@ -1779,15 +1797,12 @@ def backward_registers(family: mosaic.Family, config: BackwardTiles, width: int,
             resources.Product(block_k, block_q, value_width, beside=[logits]),
             resources.Product(block_k, block_q, width, beside=[logits]),
             resources.Product(block_q, block_k, width, beside=dq_tile))
-        # A score hook's slopes (`gradient.tile_logits`) formed with the logits and held to its pullback
-        # (`gradient.pulled`) beside both products, and a dropping call's multipliers (`algebra.drawn`): the
-        # fused launch at 64 x 64 and width 128 under a softcap spilled 104 bytes where its slopes priced a
-        # phase of their own, 246 registers (softcap2).
-        # fp16's parts formed at the running scale beside the tile and its scaled copy, the other left
-        # operand fp32 still live (`algebra.running_parts`: a 128-wide fused launch 281 registers live at its
-        # peak, the scale's exp2, and 2240 bytes spilled where one tile priced it at 246, et-c7512).
-        held = ([logits] * slopes + ([logits] if dropped else [])
-                + ([logits] * 3 if jnp.dtype(dtype) == jnp.dtype(jnp.float16) else []))
+        if not family.operands_in_registers:
+            # A family reading its operands from shared memory holds the weights narrowed for dV's product
+            # beside the pullback until they are staged: wgmma's at 64 x 64, width 128, under a softcap held
+            # six packed words of them at its peak, where it spilled 104 bytes (softcap2, row 5477).
+            fragments.append([*pullback, (block_q, block_k, dtype)])
+        held = _fused_held(logits, dtype, dropped=dropped)
         return resources.live_registers(family, carried, products + held, pullback + held, dq_tile,
                                         *fragments) + statistics
     queries = block_q // config.consumers if split else block_q

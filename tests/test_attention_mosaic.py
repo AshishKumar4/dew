@@ -1020,17 +1020,20 @@ def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, resi
         assert op.registers(ba, derived) <= op.register_budget(derived)
 
 
-@pytest.mark.parametrize(("target", "width", "hooks"), [
-    ("sm90", 64, ("softcap",)), ("sm90", 128, ("softcap",)), ("sm90", 128, ("alibi",)), ("sm100", 128, ()),
-    ("sm100", 64, ("softcap",)), ("sm80", 128, ("softcap",)), ("sm120", 128, ())])
+@pytest.mark.parametrize(("target", "width", "hooks", "queries"), [
+    ("sm90", 64, ("softcap",), 512), ("sm90", 128, ("softcap",), 512), ("sm90", 128, ("alibi",), 512),
+    ("sm100", 128, (), 512), ("sm100", 64, ("softcap",), 512), ("sm80", 128, ("softcap",), 512),
+    ("sm120", 128, (), 512), ("sm80", 32, (), 48), ("sm86", 64, (), 33), ("sm90", 64, ("softcap",), 48),
+    ("sm120", 128, (), 48)])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
-def test_a_scaled_forward_derives_wherever_its_common_one_does(target, width, hooks, dtype):
-    """A rare call's scaled op (`MosaicForward.scaled`) derives its own config, legal on the target, for
-    every call whose common op derives one: its small weights' parts and their products priced in its
-    register model (an H100's fp32 call under a softcap and a B200's fp32 call at width 128 derived none,
-    their scaled walk's terms priced beside tiles they are not live with) and narrower blocks of its value
-    columns where a family stages them swizzled (`_column_blocks_of`), so no call leaves the mainloop."""
-    queries = 512
+def test_a_scaled_forward_derives_wherever_its_common_one_does(target, width, hooks, queries, dtype):
+    """A rare call's scaled op (`MosaicForward.scaled`) derives its own config, legal on the target with
+    its natural rewalk where it folds (`MosaicForward.legal`), for every call whose common op derives one:
+    its small weights' parts and their products priced in its register model (an H100's fp32 call under a
+    softcap and a B200's fp32 call at width 128 derived none, their scaled walk's terms priced beside tiles
+    they are not live with), narrower blocks of its value columns where a family stages them swizzled
+    (`_column_blocks_of`), and a call of fewer queries than a role's at fewer of them a tile (a 48-query
+    training walk's on mma.sync held no tile of 48, and its trace failed), so no call leaves the mainloop."""
     spans = template.spans(queries, queries, 1, causal=True)
     score_mod, kinds, draw = score_hooks(hooks, queries, queries, width, rows=1, heads=4)
     params, initial = draw(0)

@@ -716,16 +716,19 @@ def natural_exp(x: jax.Array, scale: float = 1.0, offset: jax.Array | None = Non
     # Bit splitting avoids overflowing Dekker's splitter where raw logits are large and scale is small.
     hi, error = two_product(x, high, bit_split=True)
     lo = error + x * low
+    # Outside these bounds every fp32 exponential is zero or infinite; infinities have no residual. A raise's
+    # `offset` (`Forward.raised`) joins the exponent before its bounds, so a weight past them (a key no row
+    # sees, -inf) stays 0: exact, a small weight's exponent at most -62 and its offset a whole number at most
+    # 63, so the sum is nearer zero on the same ulp's grid. It joins past the clip, never the product: a GPU's
+    # compile contracts a product's add into one fused multiply-add, whose sum holds the product's rounding,
+    # which the residual `error` then counts again (the recurrence's prefix scan, M-MC-8/9).
+    shift = 0.0 if offset is None else offset
+    bounded = jnp.clip(hi, -150.0 - shift, 128.0 - shift)
     if offset is not None:
-        # A raise's `offset` (`Forward.raised`) taken into the exponent before its bounds, so a weight past
-        # them (a key no row sees, -inf) stays 0: exact, a small weight's exponent at most -62 and its
-        # offset a whole number at most 63, so the sum is nearer zero on the same ulp's grid.
-        hi = hi + offset
-    # Outside these bounds every fp32 exponential is zero or infinite; infinities have no residual.
-    bounded = jnp.clip(hi, -150.0, 128.0)
+        bounded = bounded + shift
     exponent = jnp.floor(bounded)
     exponent += (bounded - exponent >= 0.5).astype(x.dtype)
-    live = (jnp.abs(x) < jnp.inf) & (hi >= -150.0) & (hi <= 128.0)
+    live = (jnp.abs(x) < jnp.inf) & (hi >= -150.0 - shift) & (hi <= 128.0 - shift)
     lo = jnp.where(live, lo, 0.0)
     # The exponent within [-150, 129]: two factors take it (`power2`'s `reach`).
     return power2(jnp.exp2((bounded - exponent) + lo), exponent, reach=NATURAL_EXPONENT_REACH)

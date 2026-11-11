@@ -1023,7 +1023,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
             raise ValueError(f"{self.name} has no {width}-column accumulator in its program's product "
                              f"scratch (`product_scratch`'s widths)")
         role = mosaic.ROLE.get()
-        return found["tmem"][width][role], found["done"].at[role]
+        return _addressed_here(found["tmem"][width][role], axis=1), found["done"].at[role]
 
     def summed(self, shape: tuple[int, int], issue) -> jax.Array:
         tmem, done = self._scratch(shape[1])
@@ -1086,7 +1086,7 @@ class Tcgen05ChunksIssuer(mosaic_sm90.WgmmaLayout, mosaic.Issuer[Accumulator | j
         if tiles is None or rows != self.rows:
             raise ValueError(f"{self.name} stages a {self.rows}-row register left operand of its program's "
                              f"product scratch (`product_scratch`'s lefts), not {part.shape} {part.dtype}")
-        return tiles[mosaic.ROLE.get()]
+        return _addressed_here(tiles[mosaic.ROLE.get()], axis=0)
 
     def registers_product(self, lhs: jax.Array, rhs) -> jax.Array:
         return self.summed((lhs.shape[0], rhs.shape[1]), lambda acc: self.register_products(
@@ -1173,6 +1173,18 @@ PADDED = 32
 def _left_key(depth: int, dtype) -> str:
     """A staged left operand's tile's name in a program's product scratch (`product_scratch`'s lefts)."""
     return f"{depth}:{jnp.dtype(dtype).name}"
+
+
+def _addressed_here(ref, *, axis: int):
+    """`ref` whole, as a view at an offset the compiler cannot see through (`rings.opaque`), so its address
+    (a tensor-memory column's, a shared tile's descriptor) is formed where each use reads it, not once when
+    the role opens its scratch and held to its last product: a B200's forward at width 256 held its
+    accumulators' and staged left tiles' addresses across its producer's register drop and spilled them
+    (row 5466: 40 of its 52 bytes, the query index its rows are stored at the rest)."""
+    size = ref.shape[axis]
+    at = [slice(None)] * len(ref.shape)
+    at[axis] = pl.ds(rings.opaque(0) * size, size)
+    return ref.at[tuple(at)]
 
 CHUNKS = Tcgen05Chunks()
 """tcgen05's bundle for the recurrence's 64-row chunks."""

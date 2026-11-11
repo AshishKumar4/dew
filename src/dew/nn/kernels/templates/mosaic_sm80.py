@@ -417,6 +417,32 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
             fragments = ahead
         return self._mma(acc, *fragments)
 
+    def looped_products(self, acc, lhs, rhs, *, accumulate: bool = True):
+        """`products`, its instruction slices issued in a loop of their own, each slice's operands loaded from
+        shared memory within it: unrolled, ptxas interleaved a fused backward step's three later products
+        (dV, dK, dQ, independent of each other) and held 170 words of their fragments at once, an A100's step
+        at 64 x 64, width 64, under a softcap spilling 96 bytes; looped, 20 (one slice's), none spilled, the
+        same 320 mma.sync instructions issued (row 5477). Interpreted, `products`."""
+        if bodies.interpreting():
+            return self.products(acc, lhs, rhs, accumulate=accumulate)
+        if jnp.dtype(lhs.dtype) != self.dtype:
+            return self.for_dtype(lhs.dtype).looped_products(acc, lhs, rhs, accumulate=accumulate)
+        if not accumulate:
+            acc = self.zeros(acc.shape)
+        step = self.fragment_depth(int(rhs.shape[0]))
+
+        def issue(index, acc):
+            start = index * step
+            left = self._left(lhs.at[:, pl.ds(start, step)])
+            right = plgpu.load(rhs.at[pl.ds(start, step)], layout=self.rhs,
+                               optimized=self._matrix_loads)
+            return self._mma(acc, left, right)
+
+        return lax.fori_loop(0, int(rhs.shape[0]) // step, issue, acc, unroll=False)
+
+    def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
+        return self.looped_products(self.zeros(shape), lhs, rhs)
+
     def _mma(self, acc, left, right):
         """`acc + left @ right` by one mma.sync product of its operands' fragments: fp32's as TF32 through
         Mosaic GPU's lane-level `mma` (`inline_mgpu`; the fork's TF32 from 0.12.0.1.post42), the dialect's op
