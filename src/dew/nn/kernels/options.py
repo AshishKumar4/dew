@@ -195,7 +195,16 @@ def taking(programs: Taken) -> Iterator[None]:
         _TAKEN.reset(token)
 
 
-_COLLECTED: contextvars.ContextVar[dict[str, jax.stages.Compiled] | None] = contextvars.ContextVar(
+@dataclasses.dataclass(frozen=True)
+class _Collecting:
+    """What `collecting` holds: the executables compiled by digest, and the compiler options they compile
+    under."""
+
+    programs: dict[str, jax.stages.Compiled]
+    options: jax.stages.CompilerOptions | None
+
+
+_COLLECTED: contextvars.ContextVar[_Collecting | None] = contextvars.ContextVar(
     "dew_collected_programs", default=None)
 
 
@@ -207,16 +216,17 @@ def shapes_of(tree):
 
 
 @contextlib.contextmanager
-def collecting() -> Iterator[dict[str, jax.stages.Compiled]]:
+def collecting(options: jax.stages.CompilerOptions | None = None) -> Iterator[dict[str, jax.stages.Compiled]]:
     """Within the block, a call of a program through Dew's compile point (`OuterProgram`) compiles it over
-    its arguments, shapes where a caller hands shapes (`jax.ShapeDtypeStruct`), and answers with its
-    results' shapes (`shapes_of`), running nothing: the mapping it yields holds each executable by its
-    program's digest (`program_digest`). A run compiled ahead compiles so the programs it runs on its
-    step's results, the code that runs them called as the run calls it (`dew.training.ahead.started`)."""
-    collected: dict[str, jax.stages.Compiled] = {}
+    its arguments, shapes where a caller hands shapes (`jax.ShapeDtypeStruct`), under `options` beside its
+    own (a compile-only target's, `dew.training.memory.deviceless_options`), and answers with its results'
+    shapes (`shapes_of`), running nothing: the mapping it yields holds each executable by its program's
+    digest (`program_digest`). A run compiled ahead compiles so the programs it runs on its step's results,
+    the code that runs them called as the run calls it (`dew.training.ahead.started`)."""
+    collected = _Collecting({}, options)
     token = _COLLECTED.set(collected)
     try:
-        yield collected
+        yield collected.programs
     finally:
         _COLLECTED.reset(token)
 
@@ -583,13 +593,14 @@ class OuterProgram:
         # A program compiled ahead for this target runs as it was compiled (`taking`).
         if (taken := _TAKEN.get()) and (ahead := taken.get(program_digest(lowered))) is not None:
             return ahead()
-        executable = report.compiled(lowered,
+        collected = _COLLECTED.get()
+        executable = report.compiled(lowered, None if collected is None else collected.options,
                                      relower=functools.partial(self._relowered, args, kwargs, relowered))
         # Later calls trace as the relowering did, past the trace its refused config is in.
         if relowered:
             self.jitted, lowered = relowered[-1]
-        if (collected := _COLLECTED.get()) is not None:
-            collected[program_digest(lowered)] = executable
+        if collected is not None:
+            collected.programs[program_digest(lowered)] = executable
         return executable
 
     def lower(self, *args, **kwargs) -> jax.stages.Lowered:
