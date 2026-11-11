@@ -75,8 +75,8 @@ def lanes(layout, shape: tuple[int, int]) -> Lanes | None:
         return None
     placed = elements(layout, shape)
     rows_of, columns_of = placed[..., 0], placed[..., 1]
-    columns = next((n for n in (1, 2, 4, 8, 16, 32) if n == WARP or np.any(rows_of[:, n] != rows_of[:, 0])),
-                   None)
+    # A row's lanes: the fewest lanes apart whose rows differ, or a whole warp's.
+    columns = next(n for n in (1, 2, 4, 8, 16, WARP) if n == WARP or np.any(rows_of[:, n] != rows_of[:, 0]))
     lane = np.arange(WARP).reshape(1, WARP, *(1,) * (rows_of.ndim - 2))
     registers = tuple(np.ndindex(rows_of.shape[2:-1]))
     # The largest group a warp holds whole (an m16 fragment's 16 rows, its two halves registers apart).

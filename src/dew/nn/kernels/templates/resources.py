@@ -114,8 +114,11 @@ class Stored(Protocol):
     """A launch's operand as it holds it (a recurrence `mainloop.Operand`'s): the dtype it stores and the
     16-bit parts an fp32 value takes."""
 
-    stored: jnp.dtype
-    parts: int
+    @property
+    def stored(self) -> jnp.dtype: ...
+
+    @property
+    def parts(self) -> int: ...
 
 
 class OperandRead(NamedTuple):

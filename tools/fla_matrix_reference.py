@@ -19,6 +19,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
+from typing import Any
 
 
 def serve(source: str) -> None:
@@ -28,7 +29,7 @@ def serve(source: str) -> None:
     import reference_worker
     import torch
 
-    namespace = {"__name__": "fla_layer"}
+    namespace: dict[str, Any] = {"__name__": "fla_layer"}
     exec(Path(source).read_text(), namespace)
 
     def answer(request):

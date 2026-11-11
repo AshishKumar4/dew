@@ -101,7 +101,7 @@ reference against itself reads four times its count, from offsets past it)."""
 
 
 
-def _op(hooks) -> str:
+def _op(hooks) -> generation.Choice:
     """The choice a form's call takes its kernel from: the rated scan's (`recurrence_chunk.SCAN`) or the
     delta rule's (`GATED_DELTA`)."""
     op = recurrence_chunk.SCAN if hooks.rated and not hooks.delta else recurrence_chunk.GATED_DELTA
@@ -296,7 +296,7 @@ def _deficit(named: dict[str, str], seeds: int, truth) -> str:
     """The cell's kernel's distance from float64 against Dew's own chunk math's (the portable math's), each
     leaf's pooled RMS ratio over the first `seeds` draws: reported beside the verdict, never judged."""
     port, portable = (jax.jit(_step(named, kernel)) for kernel in (named["kernel"], "xla"))
-    errors: dict[str, list] = {}
+    errors: dict[str, dict[str, list[float]]] = {}
     for seed in range(seeds):
         drawn = _drawn(named, seed)
         with jax.enable_x64(new_val=True):

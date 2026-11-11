@@ -1433,17 +1433,18 @@ def product_results(call: Call) -> str:
     return "tensor" if call.family.tensor_columns(call.chunk, 1) else "registers"
 
 
-class Walked(NamedTuple):
+class Walked[C: tables.Column](NamedTuple):
     """A sequence's row of the template's walks' table `[N, 5]` (`chunk_forward._layout`), its one
     declaration: its first chunk and its chunks, the row whose memory it enters and leaves, and whether it
     takes that memory and gives it back (1 or 0; `chunked_launch.Span`'s `takes` and `gives`, its row's
-    where it begins and ends its row)."""
+    where it begins and ends its row). `C` is its columns' arrays: the host's table, or a kernel's scalar
+    loads of its row (`tables.unpacked`)."""
 
-    first: tables.Column
-    chunks: tables.Column
-    row: tables.Column
-    takes: tables.Column
-    gives: tables.Column
+    first: C
+    chunks: C
+    row: C
+    takes: C
+    gives: C
 
 
 def sequence_live(table: int) -> Callable:
@@ -1797,7 +1798,7 @@ def table_held(held: Held, call: Call, table: Table | None, bv: int) -> Held:
 
 
 def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walked: tuple, step,
-                  sequence: Walked, out, bv: int, *, landing, prefetch: Callable | None = None,
+                  sequence: Walked[jax.Array], out, bv: int, *, landing, prefetch: Callable | None = None,
                   walkers: int = 1, producer: int | None = None, table: Callable | None = None) -> None:
     """A sequence's memory over `walkers` value blocks `bv` wide, one a consumer role beside one producer
     (`Tiles.walkers`): the memory each role takes, its columns of each key slice's tile `{name}{i}` of
@@ -1833,8 +1834,8 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
             state, accumulators = stepped(n, slots, state, accumulators, *loaded)
             return (state if tabled is None else tabled.after(n, state)), accumulators
 
-        def walked_step(n, slots, state, accumulators):
-            return role_step(n, slots, taken_up(n, state), accumulators)
+        def walked_step(n, slots, carry, accumulators):
+            return role_step(n, slots, taken_up(n, carry), accumulators)
 
         if (fetch := prefetch) is not None:
             last = start + count - 1
