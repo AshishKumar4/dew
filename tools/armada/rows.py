@@ -46,3 +46,9 @@ def key_parts(key: str) -> tuple[str, str, str]:
     held, rest = key.split("/", 1)
     name, group = rest.rsplit("/", 1)
     return held, name, group
+
+
+def whole_place(group: str) -> bool:
+    """Whether a record's group (`key_parts`) is a whole file's run, the lane's own process's or a variant's
+    (`row_place`: `whole`, `whole-as-<variant>`)."""
+    return group.partition("-as-")[0] == "whole"
