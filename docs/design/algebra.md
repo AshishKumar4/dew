@@ -754,7 +754,7 @@ class Rewrite:                        # one region's
   Every layer of a stack and every compile of one step (the planner's candidates, a resumed run's
   relowering) take the first derivation, spliced into each program apart.
 - `passes` is the seam's switch. `ALGEBRA` lives in JAX's trace context, so every jit and every executable map
-  that keys on `trace_context` (jit's own, `OuterProgram._keyed`) retraces when it changes: a program already held
+  that keys on `trace_context` (jit's own, `OuterProgram.key_of`) retraces when it changes: a program already held
   never runs a form traced under another switch or priced for another target. The gate opens it per arm: off for
   the reference and the float64 truth, on for the candidate, priced at a named target (§3). Outside any `passes`,
   the pass is on and prices for the process's own GPU. Tests hold a retained step to a new executable when the

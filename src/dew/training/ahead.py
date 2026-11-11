@@ -38,6 +38,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import importlib.metadata
 import importlib.util
 import json
@@ -47,7 +48,7 @@ import pickle
 import platform
 import tempfile
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -57,8 +58,10 @@ import numpy as np
 from jax.experimental import serialize_executable
 
 from dew import communicators
+from dew._cache import cuda_libraries, plugin_builds, topology_digest, uncached
 from dew._records import JSON, record
 from dew.batch import Batch
+from dew.nn.kernels import options
 from dew.nn.kernels.generation import (
     GpuTarget,
     assumed,
@@ -68,11 +71,12 @@ from dew.nn.kernels.generation import (
     gpu_target,
     tpu,
 )
-from dew.nn.kernels.options import collecting, owned_program, program_digest, shapes_of, taking
+from dew.nn.kernels.options import OuterProgram, collecting, owned_program, program_digest, shapes_of, taking
 from dew.nn.kernels.selection import Unlowerable
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, compiled_memory, step_flops
+from dew.training import identity
 from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
@@ -440,9 +444,15 @@ class BuildTarget:
     multiprocessors times its programs (tail.py:62-66, gemm/mosaic_gpu.py:597), and the program starting a
     tile waits on later programs' partials (mosaic.py:1875-1888), so a grid past the GPU's residency can
     wait on a program that never starts. A GPU whose multiprocessors are shared (MPS limits, MIG) holds
-    fewer than it states, and runs none of them. The CUDA plugin is not part of it: an H100 ran sm90
-    programs a CUDA 12 plugin built, unchanged, under the CUDA 13 plugin of a node's own environment, bit
-    for bit as the jitted programs (2026-11-02, GS-compileahead-pilot-h100)."""
+    fewer than it states, and runs none of them. For a CUDA GPU, the plugin that compiled them and the cuBLAS
+    and cuDNN the compile loaded are part of it (`plugin`, `libraries`): JAX's own persistent-cache key
+    holds the plugin's build, and a compile writes its GEMM algorithms for that cuBLAS and serializes its
+    cuDNN graphs, so a program carries both. One run of sm90
+    programs a CUDA 12 plugin built, under a CUDA 13 plugin, matched the jitted programs bit for bit
+    (2026-11-02, GS-compileahead-pilot-h100), which one program's run does not extend to every graph a
+    library serializes. The topology a compile was placed on (`topology`) names the compile, and the
+    persistent cache and a shared bundle key by it, but no loader holds it: a program compiled over a
+    generation's canonical GPUs runs on a host's own of that generation and multiprocessors."""
 
     generation: str
     multiprocessors: int | None
@@ -455,35 +465,70 @@ class BuildTarget:
     """The bytes a device holds that the build's plan held each call to, where the build stated them (its
     capacity: `built_target`'s `memory`): a device holding fewer (its allocator's limit) runs past what the
     plan kept and is refused; a build stating none planned for the least of its target's parts."""
+    cpu: str | None = None
+    """A CPU target's own processor (`host_cpu`): XLA compiles a CPU's program to the instruction sets of
+    the host that compiles it, so its executable runs on a host of the same ones. None for a GPU's or a
+    TPU's, whose program is its devices' (a TPU's target is its kind's generation and its devices), and for
+    a CPU host that states no processor, which programs kept by their calls refuse (`cpu_stated`)."""
+    plugin: str = ""
+    """The build of each CUDA PJRT plugin installed where they were compiled (`dew._cache.plugin_builds`),
+    empty for a target of no CUDA GPU, a CPU's or a TPU's, whose programs no CUDA plugin compiles."""
+    libraries: tuple[tuple[str, int | None], ...] = ()
+    """The cuBLAS and cuDNN versions the compile loaded (`dew._cache.cuda_libraries`), None for one it
+    could not load, which then wrote none of its state; empty for a target of no CUDA GPU."""
+    topology: str | None = None
+    """The digest of the GPU topology the programs were compiled over (`dew._cache.topology_digest`): a
+    host's own GPUs, serialized (`host_gpus`, or the GPUs attached), None for a generation's canonical
+    ones (`compile_only_gpus`) and for any other platform's. It names the compile, which no loader holds
+    (`differences`)."""
 
     @staticmethod
-    def built(target: GpuTarget, devices: int, memory: int | None = None) -> BuildTarget:
+    def built(target: GpuTarget, devices: int, memory: int | None = None, *,
+              topology: bytes | None = None) -> BuildTarget:
         """The build for `devices` devices of the GPU `target` (its generation and multiprocessors), each
-        holding the `memory` its plan states, under this process's JAX, jaxlib, computing XLA flags and host:
-        the one place a build's environment is read."""
+        holding the `memory` its plan states, over the serialized `topology` of a host's own GPUs where it
+        was given one, under this process's JAX, jaxlib, computing XLA flags and host, and for a CUDA GPU
+        (one of a compute capability) its CUDA plugin and libraries: the one place a build's environment is
+        read."""
+        cuda = capability(target.generation) is not None
         return BuildTarget(target.generation, target.multiprocessors, devices,
                            importlib.metadata.version("jax"), importlib.metadata.version("jaxlib"),
-                           computation_flags(), platform.machine(), memory)
+                           computation_flags(), platform.machine(), memory,
+                           plugin=plugin_builds() if cuda else "", libraries=cuda_libraries() if cuda else (),
+                           topology=None if topology is None else topology_digest(topology))
 
     @staticmethod
     def of(devices: Sequence) -> BuildTarget:
         """The target `devices` are, each by its own facts whatever `assumed` says (`device_target`), the
-        least allocator limit among them its memory where they state one, under this process's JAX, XLA
-        flags and host; refused where they are not all of one generation and multiprocessors."""
+        least allocator limit among them its memory where they state one, a CPU's with its host's
+        processor (`host_cpu`), under this process's JAX, XLA flags and host; refused where they are not
+        all of one generation and multiprocessors."""
         found = {(target.generation, target.multiprocessors) for target in map(device_target, devices)}
         if len(found) != 1:
             raise ValueError(f"these devices are of several targets, {sorted(found, key=str)}: programs "
                              "compiled ahead load onto devices of one")
         limits = [stats["bytes_limit"] for device in devices
                   if "bytes_limit" in (stats := device.memory_stats() or {})]
-        return BuildTarget.built(device_target(devices[0]), len(devices), min(limits, default=None))
+        own = device_target(devices[0])
+        # Attached CUDA GPUs are their client's topology, as a host serializes it for a prepare (`host_gpus`).
+        attached = (topologies.get_attached_topology("cuda").serialize()
+                    if devices[0].platform == "gpu" and capability(own.generation) is not None else None)
+        built = BuildTarget.built(own, len(devices), min(limits, default=None), topology=attached)
+        # A CPU's program is its host's code (`cpu`).
+        return dataclasses.replace(built, cpu=host_cpu()) if devices[0].platform == "cpu" else built
 
     def differences(self, other: BuildTarget) -> list[str]:
         """Each field `other` holds otherwise, said as this one's and other's: memory where other's is
-        known and below this one's (a device holding more than a build planned for runs it)."""
-        named = [field.name for field in dataclasses.fields(self) if field.name != "memory"]
+        known and below this one's (a device holding more than a build planned for runs it), a library
+        where this build loaded it and other's version is another (a build that loaded none wrote none of
+        its state), and never the topology, which names the compile and binds no loader."""
+        named = [field.name for field in dataclasses.fields(self)
+                 if field.name not in ("memory", "topology", "libraries")]
         found = [f"{name} {getattr(self, name)!r}, not {getattr(other, name)!r}" for name in named
                  if getattr(self, name) != getattr(other, name)]
+        theirs = dict(other.libraries)
+        found += [f"libraries {name} {version}, not {theirs.get(name)}" for name, version in self.libraries
+                  if version is not None and theirs.get(name) != version]
         if self.memory is not None and other.memory is not None and other.memory < self.memory:
             found.append(f"memory {self.memory} bytes, not {other.memory}")
         return found
@@ -506,6 +551,13 @@ class AheadPrograms:
 
     target: BuildTarget
     programs: dict[str, Executable]
+    process: identity.Process | None = None
+    """The process that traced `kept` (`dew.training.identity.Process`), None for a file of named
+    programs alone."""
+    kept: dict[str, KeptProgram] = dataclasses.field(default_factory=dict)
+    """The programs a process compiled at Dew's compile point, each by the digest of its call's identity
+    (`KeptProgram`, `keeping`): a process that is their target and their `process` runs each for the same
+    call, tracing nothing (`kept`)."""
 
     def save(self, path: str | Path) -> None:
         """Write the programs to `path`, for `load` in a process of their target."""
@@ -513,10 +565,13 @@ class AheadPrograms:
 
     @staticmethod
     def load(path: str | Path) -> AheadPrograms:
-        """The programs `save` wrote to `path`."""
+        """The programs `save` wrote to `path`: one saved before a file held programs by their calls
+        (`kept`) holds its named programs alone."""
         programs = _saved(path, AheadPrograms, "programs")
-        _current(path, "programs", list(programs.programs.values()))
-        return programs
+        kept = vars(programs).get("kept", {})
+        _current(path, "programs", [*programs.programs.values(),
+                                    *(each.program.executable for each in kept.values())])
+        return programs if "kept" in vars(programs) else AheadPrograms(programs.target, programs.programs)
 
     def loaded(self) -> dict[str, jax.stages.Compiled]:
         """Each program, by its name, loaded onto this process's first `BuildTarget.devices` devices, the ones
@@ -542,6 +597,172 @@ def _current(path: str | Path, what: str, held: Sequence[object]) -> None:
     if not all(isinstance(executable, Executable) for executable in held):
         raise ValueError(f"{path} holds {what} saved by an earlier Dew, whose executables this one does not "
                          "load: compile them ahead again")
+
+
+def host_cpu() -> str | None:
+    """This host's processor as a CPU target states it (`BuildTarget.cpu`): its model and the instruction
+    sets it reports (Linux's `/proc/cpuinfo`), which XLA's CPU compile reads to choose a program's code.
+    None on a system that states them nowhere Python reads: no CPU program is kept for such a host or
+    handed on one (`cpu_stated`)."""
+    cpuinfo = Path("/proc/cpuinfo")
+    if not cpuinfo.exists():
+        return None
+    first = cpuinfo.read_text().split("\n\n", 1)[0]
+    named = sorted(line for line in first.splitlines()
+                   if line.split(":", 1)[0].strip() in ("model name", "flags", "Features", "CPU part"))
+    return hashlib.sha256("\n".join(named).encode()).hexdigest()[:16]
+
+
+def cpu_stated(target: BuildTarget, devices: Sequence) -> None:
+    """Refuse programs kept by their calls for a CPU whose host states no processor (`host_cpu`): two
+    such hosts of other instruction sets would read as one target."""
+    if devices[0].platform == "cpu" and target.cpu is None:
+        raise ValueError("this host states no processor features (no /proc/cpuinfo), so a CPU program "
+                         "cannot be kept for it or handed on it")
+
+
+@dataclasses.dataclass(frozen=True)
+class KeptProgram:
+    """A program a process compiled at Dew's compile point, kept for a later process (`keeping`): the
+    identity of the call it compiled for (`dew.training.identity.call_identity`), which a call is handed
+    it by, its executable with its lowering's digest (`AheadProgram`), which `kept`'s `verify` proves it
+    by, and the ids of the devices it runs on, as its executable states them."""
+
+    call: JSON
+    program: AheadProgram
+    devices: tuple[int, ...]
+    """The ids of the devices it runs on, among the devices of its file's target (`jax.devices()`)."""
+
+    def loaded(self) -> jax.stages.Compiled:
+        """The executable, loaded onto this process's devices of the ids it was compiled for; refused,
+        naming them, where the process holds none of an id."""
+        held = {device.id: device for device in jax.devices()}
+        if missing := [number for number in self.devices if number not in held]:
+            raise ValueError(f"a kept program runs on devices {list(self.devices)}, and this process holds "
+                             f"none of {missing}")
+        return self.program.executable.loaded([held[number] for number in self.devices])
+
+
+class Keeping:
+    """The programs Dew's compile point compiles while `keeping` is open, each kept by its call's identity,
+    for `save`. `refused` names each it could not keep and why (a call with no stated identity, an
+    executable XLA does not serialize): those compile again where the file is handed."""
+
+    def __init__(self) -> None:
+        self.kept: dict[str, KeptProgram] = {}
+        self.refused: dict[str, str] = {}
+
+    def heard(self, program: OuterProgram, key: Hashable, args: tuple, kwargs: dict,
+              lowered: jax.stages.Lowered, executable: jax.stages.Compiled) -> None:
+        """Keep `executable`, which `program`'s call under `key` compiled from `lowered`
+        (`dew.nn.kernels.options.keeping`)."""
+        del args, kwargs
+        named = f"{identity.called(program)} ({len(self.refused)})"
+        try:
+            call = identity.call_identity(program, key)
+            serialized = Executable.of(executable)
+        except identity.Unestablished as refusal:
+            self.refused[named] = str(refusal)
+            return
+        except (NotImplementedError, ValueError) as refusal:
+            # As `compile_programs` reads it: an array a program closed over is a constant of its
+            # program, which no executable serializes.
+            self.refused[named] = f"its executable does not serialize: {refusal}"
+            return
+        runtime = executable.runtime_executable()
+        assert runtime is not None, "a program compiled on this process's devices is loaded"
+        ran = runtime.local_devices()
+        if not set(ran) <= set(jax.devices()):
+            # The file's target is the process's default backend's (`save`), which this program is none of.
+            self.refused[named] = f"it runs on {sorted({device.platform for device in ran})} devices, " \
+                                  "outside the process's default backend"
+            return
+        devices = tuple(device.id for device in ran)
+        program_kept = AheadProgram(program_digest(lowered), serialized)
+        self.kept[identity.digest(call)] = KeptProgram(call, program_kept, devices)
+
+    def save(self, path: str | Path) -> AheadPrograms:
+        """Write the programs kept so far to `path` with this process's target and record, for `kept` in
+        a process of both; returns what it wrote. Each program it could not keep is logged with its
+        reason (`refused`)."""
+        for named, reason in self.refused.items():
+            _log.warning("the program %s is not kept, and compiles where the file is handed: %s", named,
+                         reason)
+        target = BuildTarget.of(jax.devices())
+        cpu_stated(target, jax.devices())
+        programs = AheadPrograms(target, {}, identity.Process.here(), dict(self.kept))
+        programs.save(path)
+        return programs
+
+
+@contextlib.contextmanager
+def keeping() -> Iterator[Keeping]:
+    """Within the block, every program this thread compiles at Dew's compile point
+    (`dew.nn.kernels.options.OuterProgram`: a scoring task's passes, a server's steps, an evaluation's
+    programs) is kept by the identity of the call it compiled for, and the `Keeping` it yields saves them:
+
+        with keeping() as programs:
+            server = ScoringServer.from_task(task, variables)
+        programs.save("scoring.dew-aot")
+
+    A later process of the same target, code and settings hands them back (`kept`) and traces none of
+    them. A program compiled before the block, or handed or taken within it, is not among them. The
+    block compiles with JAX's persistent cache off (`dew._cache.uncached`): an executable XLA loaded
+    from that cache serializes without its kernels (on a CPU it then loads and fails at its first call,
+    "Function ... not found"; plain JAX, 2026-11-09), so each kept one is compiled here."""
+    kept = Keeping()
+    with uncached(), options.keeping(kept.heard):
+        yield kept
+
+
+@contextlib.contextmanager
+def kept(path: str | Path, *, verify: bool = False) -> Iterator[AheadPrograms]:
+    """Within the block, a call at Dew's compile point whose identity
+    (`dew.training.identity.call_identity`) one of the programs kept at `path` was compiled for
+    (`keeping`) runs that executable, loaded onto the devices it was compiled for, and traces, lowers and
+    compiles nothing; a call the file holds no program for compiles as without it.
+
+    Refused before any call, naming what differs, where this process is not the one the file was kept in:
+    its devices, JAX, jaxlib, XLA flags and host (`BuildTarget.held`), or its Python, Dew's source, a
+    distribution's version, another module's source, a setting of JAX's, an environment variable of Dew's
+    or a fact its traces read (`dew.training.identity.Process.held`). A stale executable is a wrong
+    result with nothing to show it, so what an identity cannot state is not kept (`Keeping.refused`); what
+    it covers is `dew.training.identity`'s to say. Code that changes what a trace computes by assigning
+    module state at run time is outside the identity, as it is outside `jax.jit`'s cache.
+
+    With `verify`, each call handed a program also lowers its own and holds the two to one digest
+    (`program_digest`), at the cost of the trace the file saves: the proof, for this file and this
+    process, that the identity covered what the trace read (`NotTheKeptProgram` where it did not)."""
+    programs = AheadPrograms.load(path)
+    if programs.process is None:
+        raise ValueError(f"{path} holds programs compiled ahead by name, none kept by its call (`keeping`)")
+    cpu_stated(programs.target, jax.devices())
+    programs.target.held(jax.devices())
+    programs.process.held()
+
+    def give(program: OuterProgram, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled | None:
+        try:
+            found = programs.kept.get(identity.digest(identity.call_identity(program, key)))
+        except identity.Unestablished as refusal:
+            _log.info("a call with no stated identity is handed no kept program, and compiles: %s", refusal)
+            return None
+        if found is None:
+            return None
+        if verify and program_digest(program.lower(*args, **kwargs)) != found.program.program:
+            raise NotTheKeptProgram(
+                f"{identity.called(program)} lowers here to another program than the one kept at "
+                f"{path} for the same identity: something its trace reads is outside the identity "
+                "(`dew.training.identity`); declare what it reads (`traced_fact`) and keep the programs "
+                "again")
+        return found.loaded()
+
+    with options.handing(give):
+        yield programs
+
+
+class NotTheKeptProgram(ValueError):
+    """A call whose identity a kept program was compiled for lowers to another program (`kept`'s
+    `verify`): its trace read something its identity does not state."""
 
 
 def compile_programs(programs: Mapping[str, tuple[Callable, Sequence[jax.ShapeDtypeStruct]]],
@@ -704,7 +925,8 @@ class AheadTarget:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
         ahead = _compiled_ahead(trainer, first_step_batch(trainer, loader, steps, examples, resume),
-                                self.capacity, frontier=self.frontier, plan=plan)
+                                self.capacity, frontier=self.frontier, plan=plan,
+                                topology=None if self.topology is None else Path(self.topology).read_bytes())
         ahead.save(self.path)
         return CompiledAhead(self.path, ahead)
 
@@ -777,7 +999,8 @@ def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
 
 def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
                                    capacity: int | None = None, *, frontier: bool = False,
-                                   fit: FitArguments | None = None) -> AheadOfTime:
+                                   fit: FitArguments | None = None, topology: bytes | None = None
+                                   ) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only devices its
     mesh is built over, GPUs of one CUDA generation (`compile_only_gpus`) or a TPU topology's
     (`compile_only_tpus`), and never run. The planner `Trainer.compile` uses
@@ -791,9 +1014,11 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     absent it, memory fit is unknown rather than measured. The GPU it compiles for is the one the mesh's
     compile-only GPUs state, as XLA compiles over them: their generation and multiprocessors
     (`compile_only_gpus`' `multiprocessors`, `built_target`), which the step's launches derive for and it
-    records. Profiling, tuning and rollout require execution and are refused."""
+    records. `topology` is the serialized topology of a host's own GPUs the mesh's devices were read from
+    (`host_gpus`), which the saved build names (`BuildTarget.topology`); None for a generation's canonical
+    GPUs. Profiling, tuning and rollout require execution and are refused."""
     return _compiled_ahead(trainer, batch, capacity, frontier=frontier,
-                           plan=None if fit is None else fit_plan(trainer, batch, fit))
+                           plan=None if fit is None else fit_plan(trainer, batch, fit), topology=topology)
 
 
 def fit_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], dataset: Dataset | Loader | Handed,
@@ -803,7 +1028,8 @@ def fit_plan[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], dataset: Datase
 
 
 def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, capacity: int | None,
-                                     *, frontier: bool, plan: FitPlan | None) -> AheadOfTime:
+                                     *, frontier: bool, plan: FitPlan | None, topology: bytes | None = None
+                                     ) -> AheadOfTime:
     """`compile_ahead`'s step and programs, the evaluations' with `plan`, what the run's `fit` is asked for
     (`Trainer._fit_plan`), over its own data or a configured run's loader (`AheadTarget.compiled`)."""
     if capacity is not None and capacity <= 0:
@@ -869,7 +1095,7 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
         argument_bytes=memory.argument, output_bytes=memory.output, alias_bytes=memory.alias,
         temp_bytes=memory.temp, code_bytes=memory.generated_code, plan=trainer.plan, planned_seconds=seconds,
         capacity=capacity, links=dict(trainer.links), target=target,
-        built=BuildTarget.built(target, len(devices), capacity),
+        built=BuildTarget.built(target, len(devices), capacity, topology=topology),
         refusals=report.refused_launches(), sampled=sampled, starts=starts)
 
 

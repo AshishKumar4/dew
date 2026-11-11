@@ -20,14 +20,19 @@ import jax.numpy as jnp
 from dew._cache import unintercepted
 from dew.nn.derivatives import KernelGlue, contracted, declared_derivative
 from dew.nn.kernels import tuning
+from dew.nn.kernels.generation import traced_fact
 from dew.nn.kernels.templates import attention_route
 from dew.nn.kernels.templates.attention import Hooks, KeySpans, Kind, Param, dense, score_modded
 from dew.nn.precision import float32_einsum, products_quantized
 
 
+@traced_fact
 def owner():
     """The Qwix rule that owns this call's products, a quantized model's matching `dot_general` at the
-    calling module (`precision.products_quantized`, `qwix.pallas.get_current_rule`), or None."""
+    calling module (`precision.products_quantized`, `qwix.pallas.get_current_rule`), or None. A model's
+    interception installs its rule inside the trace, where a call's function states it; a rule that
+    encloses a whole call (a program called within Qwix's interception) is this process's, which a kept
+    program is held to (`traced_fact`)."""
     if not products_quantized():
         return None
     from qwix import pallas as qwix_pallas

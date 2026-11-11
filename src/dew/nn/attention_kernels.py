@@ -56,6 +56,7 @@ def flash_architectures() -> tuple[str, ...] | None:
     return importlib.import_module('dew_flash_attn').ARCHITECTURES
 
 
+@generation.traced_fact
 def flash_lowered() -> bool:
     """Whether FlashAttention's call lowers here for the call's target: the installed wheel holds code for
     it, on this process's own GPU (`gpu_placed`) or, within `assumed`, for the assumed GPU's compile-only

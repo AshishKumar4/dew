@@ -31,7 +31,7 @@ from jax.sharding import Sharding
 
 from dew import algebra
 from dew._devices import xla_flag
-from dew.nn.kernels.generation import backend, gpu_target
+from dew.nn.kernels.generation import backend, gpu_target, traced_fact
 from dew.nn.nested import staged
 
 if TYPE_CHECKING:
@@ -195,6 +195,49 @@ def taking(programs: Taken) -> Iterator[None]:
         _TAKEN.reset(token)
 
 
+type Handed = Callable[["OuterProgram", Hashable, tuple, dict], jax.stages.Compiled | None]
+"""What hands a call its executable before it traces (`handing`): given the program, the call's key
+(`OuterProgram.key_of`) and its arguments, the executable to keep under that key, or None for one it holds
+none of."""
+
+_HANDED: contextvars.ContextVar[Handed | None] = contextvars.ContextVar("dew_handed_programs", default=None)
+
+
+@contextlib.contextmanager
+def handing(handed: Handed) -> Iterator[None]:
+    """Within the block, the first call of a key through Dew's compile point (`OuterProgram`) asks `handed`
+    for its executable before it traces: one given is kept under the key as a compiled one is, so the call
+    and every later one of that key runs it, tracing, lowering and compiling nothing; None compiles as
+    without the block. `taking` hands an executable to a program already lowered, by its lowering's
+    digest; this one to a call not yet traced, by what its giver can state of it without a trace
+    (`dew.training.ahead.handed`)."""
+    token = _HANDED.set(handed)
+    try:
+        yield
+    finally:
+        _HANDED.reset(token)
+
+
+type Kept = Callable[["OuterProgram", Hashable, tuple, dict, jax.stages.Lowered, jax.stages.Compiled], None]
+"""What hears each program the compile point compiles (`keeping`): the program, the call's key and
+arguments, the lowering it compiled (its last relowering's, past a spill) and its executable."""
+
+_KEEPING: contextvars.ContextVar[Kept | None] = contextvars.ContextVar("dew_keeping_programs", default=None)
+
+
+@contextlib.contextmanager
+def keeping(kept: Kept) -> Iterator[None]:
+    """Within the block, `kept` hears each executable Dew's compile point compiles (`OuterProgram.compiled`,
+    `compiled_together`), with the call it compiled for and its lowering, on the thread that keeps it: what
+    a save of a process's programs reads (`dew.training.ahead.keeping`). One handed or taken, compiled
+    elsewhere, is not heard."""
+    token = _KEEPING.set(kept)
+    try:
+        yield
+    finally:
+        _KEEPING.reset(token)
+
+
 _COLLECTED: contextvars.ContextVar[dict[str, jax.stages.Compiled] | None] = contextvars.ContextVar(
     "dew_collected_programs", default=None)
 
@@ -227,7 +270,7 @@ type Relowered = list[tuple[jax.stages.Wrapped, jax.stages.Lowered]]
 @dataclasses.dataclass
 class _Lowering:
     """A call lowered within `compiled_together`: its program, the key its executable is kept by
-    (`OuterProgram._keyed`) and the compile it owns there (`OuterProgram._kept`'s future), its lowering,
+    (`OuterProgram.key_of`) and the compile it owns there (`OuterProgram._kept`'s future), its lowering,
     its arguments, and the relowerings a spill made of it."""
 
     program: OuterProgram
@@ -241,6 +284,24 @@ class _Lowering:
 
 _TOGETHER: contextvars.ContextVar[dict[tuple[int, Hashable], _Lowering] | None] = contextvars.ContextVar(
     "dew_programs_compiled_together", default=None)
+
+
+@traced_fact
+def rule_sets() -> dict[str, tuple]:
+    """The algebra's registered rule sets, each by what it states plainly: its rounding class, the
+    measurement it ships with, whether it is a dev-time set or an aid, and its rewrites' names. They are
+    the sets the pass a program's trace runs chooses among (`dew.algebra.rules.admitted`), which a module
+    registers as it is imported, so two processes that imported other modules hold other sets; a set's
+    rules are the code that registered it, which the process's record states."""
+    return {name: (rules.rounding, rules.receipt, rules.dev, rules.aid,
+                   tuple(family.name for family in rules.families))
+            for name, rules in algebra.rules.RULES.items()}
+
+
+COMPILE_POINT = frozenset({_TAKEN, _HANDED, _KEEPING, _COLLECTED, _TOGETHER})
+"""The compile point's own blocks (`taking`, `handing`, `keeping`, `collecting`, `compiled_together`): each
+decides how a call's program is compiled and kept, none what it computes, so a call's identity holds none
+of them (`dew.training.ahead.call_identity`)."""
 
 
 @contextlib.contextmanager
@@ -279,6 +340,11 @@ def compiled_together() -> Iterator[None]:
         raise
     for call, executable in zip(held, executables, strict=True):
         call.program._keep(call.key, call.pending, executable, call.relowered)
+    # Heard once every compile is settled, so a listener that raises leaves no call waiting.
+    if (kept := _KEEPING.get()) is not None:
+        for call, executable in zip(held, executables, strict=True):
+            kept(call.program, call.key, call.args, call.kwargs,
+                 call.relowered[-1][1] if call.relowered else call.lowered, executable)
 """Every program alive (`OuterProgram`), whose executables `release` drops."""
 
 _PASSING: contextvars.ContextVar[bool] = contextvars.ContextVar("outer_program_passing", default=False)
@@ -330,7 +396,7 @@ class OuterProgram:
     templates' reports (`dew.nn.kernels.templates.report.compiled`): where a launch's kernel spills, its
     config is refused and the function traced afresh, by a new jit of a new callable past JAX's trace
     cache, and compiled once more, the launch's derivation taking the next config. Called as its jit
-    is, it runs the executable that what jit keys its own on chooses (`_keyed`): the static arguments,
+    is, it runs the executable that what jit keys its own on chooses (`key_of`): the static arguments,
     the others' structure, shapes, dtypes and placements, and the trace context, the `CACHED` latest compiled;
     `lower` and `trace` are its jit's. Called within another trace (a `jax.grad`, a `jax.vmap`, an
     enclosing jit), it is its jit, which the enclosing program compiles as its own. Its `settled` arguments
@@ -448,7 +514,7 @@ class OuterProgram:
         if _COLLECTED.get() is not None:
             return shapes_of(self.compiled(*args, **kwargs).out_info)
         self.held(args, kwargs)
-        key, dynamic, named = self._keyed(args, kwargs)
+        key, dynamic, named = self.key_of(args, kwargs)
         if (together := _TOGETHER.get()) is not None:
             return self._together(together, key, args, kwargs)
         ready = self._ready.get(key)
@@ -494,7 +560,7 @@ class OuterProgram:
         arguments held to the settled ones' contract (`held`); a caller running the executable again holds
         each call's (`Fetched`)."""
         self.held(args, kwargs)
-        key, _, _ = self._keyed(args, kwargs)
+        key, _, _ = self.key_of(args, kwargs)
         ready = self._ready.get(key)
         return self._kept(key, args, kwargs) if ready is None else ready
 
@@ -518,10 +584,17 @@ class OuterProgram:
         pending, owner = self._reserved(key)
         if owner:
             try:
-                self._keep(key, pending, self.compiled(*args, **kwargs), [])
+                handed = self._handed(key, args, kwargs)
+                self._keep(key, pending, handed if handed is not None else self.compiled(*args, **kwargs), [])
             except BaseException as error:
                 self._released(key, pending, error)
         return pending.result()
+
+    def _handed(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled | None:
+        """The executable a block hands this call before it traces (`handing`), None outside one or
+        where it holds none of the call."""
+        handed = _HANDED.get()
+        return None if handed is None else handed(self, key, args, kwargs)
 
     def _relowered(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
         """A call's program traced afresh past a spill's refused config (`report.compiled`'s `relower`), on
@@ -544,6 +617,10 @@ class OuterProgram:
             return shapes_of(pending.result().out_info if pending.done() and pending.exception() is None
                              else self.trace(*args, **kwargs).out_info)
         try:
+            # A call handed its executable keeps it, tracing nothing (`handing`).
+            if (handed := self._handed(key, args, kwargs)) is not None:
+                self._keep(key, pending, handed, [])
+                return shapes_of(handed.out_info)
             lowered = self.lower(*args, **kwargs)
         except BaseException as failure:
             self._released(key, pending, failure)
@@ -590,6 +667,8 @@ class OuterProgram:
             self.jitted, lowered = relowered[-1]
         if (collected := _COLLECTED.get()) is not None:
             collected[program_digest(lowered)] = executable
+        if (kept := _KEEPING.get()) is not None:
+            kept(self, self.key_of(args, kwargs)[0], args, kwargs, lowered, executable)
         return executable
 
     def lower(self, *args, **kwargs) -> jax.stages.Lowered:
@@ -598,7 +677,7 @@ class OuterProgram:
     def trace(self, *args, **kwargs) -> jax.stages.Traced:
         return self._traced(self.jitted, args, kwargs)
 
-    def _keyed(self, args: tuple, kwargs: dict) -> tuple[Hashable, tuple, dict]:
+    def key_of(self, args: tuple, kwargs: dict) -> tuple[Hashable, tuple, dict]:
         """The key of the executable a call runs, and the arguments the executable takes, the static
         ones dropped. It holds what jit keys on: the trace context, with its abstract mesh, and the
         concrete mesh in place (`jax.sharding.get_mesh`), so a mesh of the same shape over other devices
@@ -627,7 +706,7 @@ def _given_tuple(given) -> tuple:
 def trace_context() -> Hashable:
     """What JAX keys a trace on beside its arguments (its configuration's traced states, Dew's own run
     precision among them, and the abstract mesh), and the concrete mesh in place: what a call's executable
-    is kept under beside its arguments (`OuterProgram._keyed`), for a cache of traces kept outside the
+    is kept under beside its arguments (`OuterProgram.key_of`), for a cache of traces kept outside the
     compile point (`dew.training._candidates`)."""
     return jax_config.trace_context(), jax.sharding.get_mesh()
 
@@ -693,7 +772,7 @@ class Fetched:
     """`program`, of no static argument, as a host loop that calls it every step runs it: the executable of
     its first call in each trace context it is called in (`OuterProgram.executable`; a reference arm's run
     with the algebra pass off is another context), which each call after it in that context runs, so none
-    builds the dispatch key a call reads from every argument (`OuterProgram._keyed`, which jit read in C++).
+    builds the dispatch key a call reads from every argument (`OuterProgram.key_of`, which jit read in C++).
     A step of the loop keeps the first's shapes, dtypes and placements: its executable refuses other
     arguments, where the program would compile for them. A server's step, one executable for each size of its
     admission, runs as this does (`dew.inference.serving_kernel.dispatched`)."""
