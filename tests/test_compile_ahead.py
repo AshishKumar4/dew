@@ -1611,10 +1611,10 @@ def test_programs_compiled_ahead_save_and_load_whole_and_load_only_on_their_own_
     with pytest.raises(ValueError):
         loaded.loaded()
     here = BuildTarget.of(jax.devices()[:1])
-    # This host's CPU is another generation, of no multiprocessors, and a processor a GPU's target has none
-    # of (`BuildTarget.cpu`).
+    # This host's CPU is another generation, of no multiprocessors, a processor a GPU's target has none
+    # of (`BuildTarget.cpu`), and no CUDA plugin, which compiled the GPU's build (`BuildTarget.plugin`).
     assert [line.split()[0] for line in built.target.differences(here)] == ["generation", "multiprocessors",
-                                                                             "cpu"]
+                                                                             "cpu", "plugin"]
     # A kind of the generation with its multiprocessors is its target, whatever its memory or its name: the
     # build's target is sm90's facts, 132 multiprocessors.
     assert (built.target.generation, built.target.multiprocessors) == ("sm90", 132)
