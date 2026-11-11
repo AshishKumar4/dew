@@ -157,13 +157,14 @@ def _fused_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, wh
     narrowed, part = _tile_scores(walk, (q_slot, do_slot), resident, rows_of(slots, q_first), coords,
                                   whole(index), shape, masked=masked)
     family.staged(narrowed, staged.at[0])
-    dv_acc = family.products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
+    dv_acc = family.looped_products(dv_acc, staged.at[0].transpose((1, 0)), do_slot)
     cotangents_staged = staged.at[1]
     family.staged(part, cotangents_staged)
-    dk_acc = family.products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
+    dk_acc = family.looped_products(dk_acc, cotangents_staged.transpose((1, 0)), q_slot)
     # The tile's dQ, its staged cotangents times the resident keys (`algebra.cotangent_product`'s `a @ b`),
     # added into dQ: the query tile's other key blocks add theirs.
-    add_dq(q_first, family.product(cotangents_staged, k_smem, (tiles.block_q, k_smem.shape[-1])))
+    add_dq(q_first, family.looped_product(cotangents_staged, k_smem,
+                                         (tiles.block_q, k_smem.shape[-1])))
     return carry, (dk_acc, dv_acc)
 
 def _sixteen_step(walk: _Backward, k_smem, staged, add_dq, slots, carry, accumulators, q_first,

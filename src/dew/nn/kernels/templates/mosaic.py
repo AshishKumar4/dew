@@ -1134,6 +1134,16 @@ class Issuer[Accumulator](abc.ABC):
         unless `accumulate`, the accumulator started from zero (a walk's own fresh product, `read` once
         done)."""
 
+    def looped_products(self, acc: Accumulator, lhs, rhs, *, accumulate: bool = True) -> Accumulator:
+        """`products`, its instruction steps issued in a loop of their own where the issuer reads its
+        operands' fragments in registers, each step's loaded within it, so a product beside others holds no
+        fragment of theirs (`MmaIssuer.looped_products`); a shared-memory issuer's `products`."""
+        return self.products(acc, lhs, rhs, accumulate=accumulate)
+
+    def looped_product(self, lhs, rhs, shape: tuple[int, int]) -> jax.Array:
+        """`looped_products` into a fresh accumulator, returned as a value (`product`'s)."""
+        return self.product(lhs, rhs, shape)
+
     def read(self, acc: Accumulator, *, first: int = 0, columns: int | None = None, pending: int = 0
              ) -> jax.Array:
         """The accumulator's columns `first` to `first + columns` (all of them where None), once at most

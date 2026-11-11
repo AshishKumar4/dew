@@ -1368,21 +1368,15 @@ def _views_of(refs: dict, row, head) -> dict:
     return {name: (ref.at[row, :, head], lambda j: (j, 0)) for name, ref in refs.items()}
 
 
-def _fused_held(family: mosaic.Family, logits: tuple, dtype, *, slopes: int, dropped: bool) -> list:
+def _fused_held(logits: tuple, dtype, *, dropped: bool) -> list:
     """The tiles a fused backward launch holds beside both products and its pullback (`backward_registers`):
-    a score hook's `slopes` (`gradient.tile_logits`) formed with the logits and held to its pullback
-    (`gradient.pulled`), the fused launch at 64 x 64 and width 128 under a softcap spilling 104 bytes where
-    its slopes priced a phase of their own, 246 registers (softcap2, wgmma); a dropping call's multipliers
-    (`algebra.drawn`); fp16's parts formed at the running scale beside the tile and its scaled copy, the other
-    left operand fp32 still live (`algebra.running_parts`: a 128-wide fused launch 281 registers live at its
-    peak, the scale's exp2, and 2240 bytes spilled where one tile priced it at 246, et-c7512). A walk whose
-    consumers feed their own rings and whose products end in their step (`feeds_itself`, not `in_flight`)
-    spends its logits as the hook forms its output and slopes, which its pullback holds already: a B200's fed
-    one launch at 64 x 64, width 64, under a softcap held 230 registers at its peak, no logits word beside the
-    slopes, where the slopes held again priced 307 (fused4). An A100's priced so holds its operand fragments
-    across its later products, which `_products` counts short (row 5477)."""
-    overlap = 0 if family.feeds_itself and not family.in_flight else slopes
-    return ([logits] * overlap + ([logits] if dropped else [])
+    a dropping call's multipliers (`algebra.drawn`); fp16's parts formed at the running scale beside the tile
+    and its scaled copy, the other left operand fp32 still live (`algebra.running_parts`: a 128-wide fused
+    launch 281 registers live at its peak, the scale's exp2, and 2240 bytes spilled where one tile priced it
+    at 246, et-c7512). A score hook's output and slopes are its pullback's, held once: its later products
+    load their operands within their own loops (`Issuer.looped_products`), so none holds another's fragments,
+    which a second count of the slopes had covered (row 5477)."""
+    return (([logits] if dropped else [])
             + ([logits] * 3 if jnp.dtype(dtype) == jnp.dtype(jnp.float16) else []))
 
 
@@ -1801,7 +1795,12 @@ def backward_registers(family: mosaic.Family, config: BackwardTiles, width: int,
             resources.Product(block_k, block_q, value_width, beside=[logits]),
             resources.Product(block_k, block_q, width, beside=[logits]),
             resources.Product(block_q, block_k, width, beside=dq_tile))
-        held = _fused_held(family, logits, dtype, slopes=slopes, dropped=dropped)
+        if not family.operands_in_registers:
+            # A family reading its operands from shared memory holds the weights narrowed for dV's product
+            # beside the pullback until they are staged: wgmma's at 64 x 64, width 128, under a softcap held
+            # six packed words of them at its peak, where it spilled 104 bytes (softcap2, row 5477).
+            fragments.append([*pullback, (block_q, block_k, dtype)])
+        held = _fused_held(logits, dtype, dropped=dropped)
         return resources.live_registers(family, carried, products + held, pullback + held, dq_tile,
                                         *fragments) + statistics
     queries = block_q // config.consumers if split else block_q
