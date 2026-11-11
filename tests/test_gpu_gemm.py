@@ -25,16 +25,23 @@ one process (`gpu_flow`), each cell its own file's property:
   512, its sums the tensor cores' own at the default precision (test_grouped_gemm; M-EM-3).
 - The toolkit's warpgroup scan walks a linear recurrence forward and reversed, each position's state or
   the one before it, as float64 does (test_warpgroup_scan).
-
-GEMM's check-1 matrices swept on the GPU are gone (row 5461's covering set): a product's layouts, hooks and
-dtypes are the CPU's, interpreted and through the compile gate, and a model flow's projections on its GPU
-are the model flows' (tests/test_gpu_flows.py).
+- GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the reference
+  path's, dense and grouped, each matrix layout, hook and dtype its served pairs name (gemm_matrix).
+- The fused GEMM's check-1 matrix (tests/kernel_matrix.py): a region's training step through the fuser's
+  prologue and epilogue on par with the same region's stages in XLA (fused_gemm_matrix).
+- The joined projections' check-1 matrix (tests/kernel_matrix.py): a gated MLP's gate and up projections, or a
+  gated delta net's b and a, run as one GEMM, the layer's training step on par with the projections apart
+  (join_matrix).
+- The NVFP4, MX, blockwise FP8 and adapted products' check-1 matrices (tests/kernel_matrix.py). Each matrix
+  runs here over the combinations of the axes a GPU runs natively, its kernel or form and precision, and the
+  cases a red found on a GPU (`kernel_matrix.native_cells`); its other pairs are the CPU's.
 """
 
 import functools
 
 import jax
 import jax.numpy as jnp
+import kernel_matrix
 import numpy as np
 import pytest
 import test_contracts_gemm as contracts_gemm
@@ -181,3 +188,53 @@ def test_the_gemm_kernels_run_on_this_gpu():
           for positions in warpgroup_scan.POSITIONS for reverse in (False, True)
           for exclusive in (False, True)),
     ])
+
+
+def test_the_gemm_matrix_holds_on_this_gpu():
+    """GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the
+    reference path's (XLA's ragged dot), at each combination of the axes a GPU runs natively
+    (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    run_cells(kernel_matrix.native_cells("gemm"))
+
+
+def test_the_fused_gemm_matrix_holds_on_this_gpu():
+    """The fused GEMM's check-1 matrix (tests/kernel_matrix.py): a region's training step with its producer
+    and consumers fused into the template's stages on par with the same region's stages and product in XLA, at
+    each combination of the axes a GPU runs natively (`kernel_matrix.native_cells`), each cell on its own
+    GPU."""
+    run_cells(kernel_matrix.native_cells("fused_gemm"))
+
+
+def test_the_nvfp4_matrix_holds_on_this_gpu():
+    """The NVFP4 product's check-1 matrix (tests/kernel_matrix.py): its training step with the matrix decoded
+    in the mainloop on par with it decoded once a call, at each combination of the axes a GPU runs natively
+    (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    run_cells(kernel_matrix.native_cells("nvfp4"))
+
+
+def test_the_mx_matrix_holds_on_this_gpu():
+    """The MX product's check-1 matrix (tests/kernel_matrix.py): its forward through the template's block-
+    scaled products on par with the decoded operands' product in XLA, at each combination of the axes a GPU
+    runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    run_cells(kernel_matrix.native_cells("mxfp8"))
+
+
+def test_the_blockwise_matrix_holds_on_this_gpu():
+    """The blockwise-scaled FP8 product's check-1 matrix (tests/kernel_matrix.py): its forward through the
+    template's step-scaled walk on par with the scaled blocks summed in XLA, at each combination of the axes a
+    GPU runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    run_cells(kernel_matrix.native_cells("blockwise_fp8"))
+
+
+def test_the_low_rank_matrix_holds_on_this_gpu():
+    """The adapted product's check-1 matrix (tests/kernel_matrix.py): a LoRA-adapted projection's training
+    step with its base product and update fused on par with them apart, at each combination of the axes a GPU
+    runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    run_cells(kernel_matrix.native_cells("low_rank"))
+
+
+def test_the_join_matrix_holds_on_this_gpu():
+    """The joined projections' check-1 matrix (tests/kernel_matrix.py): a layer's training step with two of
+    its projections run as one GEMM on par with the projections apart, at each combination of the axes a GPU
+    runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    run_cells(kernel_matrix.native_cells("join"))

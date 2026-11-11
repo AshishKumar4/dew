@@ -33,8 +33,8 @@ def _routes(program, *, reference: bool = False) -> list:
 def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monkeypatch):
     """The flow's training step and decode loop traced as `target`'s GPU chooses (`generation.assumed`) and
     held as its prepare holds them: every route the flow is for taken off the reference path or by the
-    kernel it names (`model_flows.held_routes`), but by the portable math on a GPU it does not run on
-    (`Flow.families`); its reference arm on the reference path alone (`model_flows.held_reference`)."""
+    kernel it names (`model_flows.held_routes`), but by the portable math where it is native on other GPUs
+    alone (`Flow.families`); its reference arm on the reference path alone (`model_flows.held_reference`)."""
     flow = model_flows.flow_named(name)
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
@@ -42,12 +42,7 @@ def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monk
         dew = [route for kind in ("train", "decode") for route in _routes(programs[f"{kind} dew"])]
         reference = [route for kind in ("train", "decode")
                      for route in _routes(programs[f"{kind} reference"], reference=True)]
-        if flow.runs_on(target):
-            model_flows.held_routes(flow, dew)
-        else:
-            # A GPU the flow does not run on takes the portable math on its routes, as `Flow.families` says.
-            with pytest.raises(model_flows.Unreached):
-                model_flows.held_routes(flow, dew)
+        model_flows.held_routes(flow, dew, target)
         model_flows.held_reference(flow, reference)
 
 

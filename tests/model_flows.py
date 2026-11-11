@@ -93,10 +93,10 @@ class Flow:
     length: int = 256
     prefill: int = 248
     seeds: int = 8
-    families: tuple[str, ...] | None = None
-    """The instruction families (`generation.family`) of the GPUs where the routes the flow is for take a
-    native kernel; None, every GPU's. Elsewhere they run the portable math, and the flow, which covers nothing
-    of that GPU's own there, runs not at all (`runs_on`)."""
+    families: Mapping[str, tuple[str, ...]] = dataclasses.field(default_factory=dict)
+    """Each choice the flow is for that takes a native kernel on some GPUs alone: the instruction families
+    (`generation.family`) of those GPUs, elsewhere the portable math; a choice it names none for takes one on
+    every GPU."""
 
     @property
     def precision(self) -> str:
@@ -105,9 +105,17 @@ class Flow:
         takes an fp32 call's products in TF32 (`recurrence_chunk._port_precision`)."""
         return "highest" if self.lane else "default"
 
+    def native_on(self, target: str) -> dict[str, str]:
+        """The choices the flow is for that take a native kernel on the GPU generation `target` (`families`),
+        each with the kernel it must take there."""
+        family = generation.family(target)
+        return {choice: kernel for choice, kernel in self.native.items()
+                if family in self.families.get(choice, (family,))}
+
     def runs_on(self, target: str) -> bool:
-        """Whether the GPU generation `target` runs the routes the flow is for natively (`families`)."""
-        return self.families is None or generation.family(target) in self.families
+        """Whether the flow runs on the GPU generation `target`: where a choice it is for is native there, or
+        where it is for none (a precision's flow on its declared routes)."""
+        return not self.native or bool(self.native_on(target))
 
     @cached_property
     def config(self) -> dict:
@@ -247,13 +255,13 @@ FLOWS = (
          lane=False),
     Flow("delta attention (KDA)", "kimi-linear-tiny", KDA, "bfloat16", {"gated_delta_rule": NATIVE}),
     Flow("gated delta net and its short conv", "qwen3-next-tiny", GDN, "bfloat16",
-         {"gated_delta_rule": NATIVE}),
+         {"gated_delta_rule": NATIVE, "short_conv": NATIVE, "delta_decode": "step"}),
     Flow("state-space duality (SSD), bf16", "mamba2-tiny", SSD, "bfloat16", {"ssd": NATIVE}),
     Flow("state-space duality (SSD), fp32, a user's", "mamba2-tiny", SSD, "float32", {"ssd": NATIVE},
          lane=False),
     Flow("selective scan", "mamba-tiny", SELECTIVE, "bfloat16", {"selective_scan": NATIVE}),
     Flow("lightning attention", "minimax-tiny", LIGHTNING, "bfloat16", {"gated_delta_rule": NATIVE},
-         families=("wgmma",)),
+         families={"gated_delta_rule": ("wgmma",)}),
 )
 """Every model flow, by the route it is for (docs/design/testing.md: a kernel's native run is a flow's
 cell): each family that takes a distinct default route on a GPU, its bf16 attention flows twice, under the
@@ -335,23 +343,32 @@ def programs_of(flow: Flow) -> dict[str, tuple[Callable, list]]:
 
 
 class Unreached(AssertionError):
-    """A flow whose Dew arm did not take a route it is for (`held_routes`)."""
+    """A flow whose Dew arm did not take a route it is for, or took a native kernel where it holds the route
+    portable (`held_routes`)."""
 
 
-def held_routes(flow: Flow, found: list) -> None:
-    """Raise unless the flow's Dew arm took every route it is for (`Flow.native`): a kernel off the reference
-    path, or the one it names, among the kernels its choice ran (a decode's prefill over its cache's keys
-    may run another)."""
+def held_routes(flow: Flow, found: list, target: str) -> None:
+    """Raise unless the flow's Dew arm, traced for the GPU generation `target`, took every route it is for
+    there (`Flow.native_on`): a kernel off the reference path, or the one it names, among the kernels its
+    choice ran (a decode's prefill over its cache's keys may run another); and the portable math alone on a
+    choice native on other GPUs only (`Flow.families`), so a kernel that comes to take it is a flow's to
+    cover."""
     taken = {}
     for route in found:
         taken.setdefault(str(route.choice), set()).add(route.kernel)
+    native = flow.native_on(target)
     for choice, kernel in flow.native.items():
         kernels = taken.get(choice, set())
+        if choice not in native:
+            if kernels - generic_kernels()[choice]:
+                raise Unreached(f"{flow.name}: its {choice} took {sorted(kernels)} on {target}, where the "
+                                "flow holds it portable (`Flow.families`): name "
+                                f"{generation.family(target)} there")
+            continue
         held = kernels - generic_kernels()[choice] if kernel == NATIVE else kernels & {kernel}
         if not held:
-            raise Unreached(f"{flow.name}: its {choice} took {sorted(kernels) or 'nothing'} on "
-                                 f"{generation.device_generation()}, not {kernel}: the flow does not reach "
-                                 "the route it is for")
+            raise Unreached(f"{flow.name}: its {choice} took {sorted(kernels) or 'nothing'} on {target}, not "
+                            f"{kernel}: the flow does not reach the route it is for")
 
 
 def held_reference(flow: Flow, found: list) -> None:
@@ -377,7 +394,7 @@ def prepare(flow: Flow) -> bool:
     with generation.routes() as found:
         compile_programs({name: program for name, program in named.items() if name.endswith("dew")},
                          target.generation, target.multiprocessors).save(directory / "dew.programs")
-    held_routes(flow, found)
+    held_routes(flow, found, target.generation)
     with generation.routes() as found, generation.chosen(**reference_kernels()):
         compile_programs({name: program for name, program in named.items() if name.endswith("reference")},
                          target.generation, target.multiprocessors).save(directory / "reference.programs")

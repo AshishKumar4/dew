@@ -19,11 +19,15 @@ interpreted and through the compile gate:
   and each kernel's requirements are what it takes on this GPU (test_kernels); a row that sees no key
   reads nothing on the fused kernels (test_attention_masked_rows). Flash's plain training step is the
   dense flow's, a user's.
-- The Mosaic template on an H100: its backward over the call forms and score hooks no flow trains
-  (`UNREACHED_FORMS`, `UNREACHED_HOOKS`), its natural form, a call over runs, its one launch backward and a
-  span call's (test_attention_mosaic, attention_inplace_operands); an fp16 call through the route
-  (test_attention_route); the fast form's default route not on par with IEEE fp32, the accurate form's
-  control (test_attention_accurate_form).
+- The Mosaic template on an H100, each test its own cells: its forward and backward over every call form,
+  head width and hook it declares, its natural forward, a call over runs, a chunked prefill's backward, its
+  one launch backward and a span call's (test_attention_mosaic, attention_inplace_operands); an fp16 call
+  through the route, and a long sequence on par with the reference path (test_attention_route); the fast
+  form's default route not on par with IEEE fp32, the accurate form's control
+  (test_attention_accurate_form). Its causal forward and backward at a flow's widths are the flows'.
+- The check-1 matrices of attention, its kernels and decode (tests/kernel_matrix.py), each over the
+  combinations of the axes a GPU runs natively, its GPU, kernel or launch and precision
+  (`kernel_matrix.native_cells`), and the cases a red found on a GPU (`kernel_matrix.SEEDED`).
 """
 
 import dataclasses
@@ -33,6 +37,7 @@ import attention_inplace_operands as inplace
 import attention_triton_stages as triton_stages
 import jax
 import jax.numpy as jnp
+import kernel_matrix
 import numpy as np
 import pytest
 import test_attention_accurate_form as accurate_form
@@ -46,17 +51,7 @@ import test_contracts_attention as contracts
 import test_decode_attention as decode
 import test_kernels as kernels
 import test_local_attention as local
-from gpu_flow import (
-    BF16_PRODUCTS,
-    Cell,
-    cells_of,
-    cells_where,
-    in_parts,
-    parted,
-    repeats_bit_for_bit,
-    run_cells,
-    when,
-)
+from gpu_flow import BF16_PRODUCTS, Cell, cells_of, in_parts, parted, repeats_bit_for_bit, run_cells, when
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.generation import bf16_dot_runs
@@ -170,19 +165,19 @@ def test_the_fused_attention_routes_run_on_this_gpu(without_deterministic_ops):
     ])
 
 
-UNREACHED_FORMS = frozenset({"full", "two-sided-window", "causal-chunk", "documents",
-                             "causal-documents-window", "cross-causal", "cross-causal-lengths-starts",
-                             "lengths-starts"})
-"""The template's call forms no model flow's training step reaches (tests/model_flows.py: the dense, windowed,
-sink and latent flows reach causal, causal window and softcap, causal sinks and causal of unequal value
-widths): an encoder's full call, a two-sided window, Llama 4's chunked local, a packed step's documents with
-and without a causal window, a cross attention's, and a serving prefill's over ragged cache rows; each one
-backward on an H100 (row 5461's covering set)."""
+MOSAIC_CELLS = (mosaic.the_natural_forward_is_on_par_on_an_h100,
+                mosaic.the_forward_is_on_par_over_every_call_form_on_an_h100,
+                mosaic.the_forward_is_on_par_at_head_widths_on_an_h100,
+                mosaic.the_forward_is_on_par_under_every_hook_on_an_h100,
+                mosaic.the_backward_is_on_par_at_head_widths_on_an_h100,
+                mosaic.the_backward_is_on_par_over_every_call_form_on_an_h100,
+                mosaic.the_backward_is_on_par_under_every_score_hook_on_an_h100,
+                mosaic.a_call_over_runs_is_on_par_on_an_h100,
+                mosaic.a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100)
+"""The Mosaic template's H100 checks, each test its own cells, so a red names its form: every call form and
+hook its forward and backward declare, its head widths, a call over runs and a chunked prefill's backward. Its
+causal forward, training forward and backward at a flow's widths are the model flows' (row 5461)."""
 
-UNREACHED_HOOKS = frozenset({"alibi", "temperature", "key-bias", "tile-bias", "resumed", "custom-vjp",
-                             "row-indexed", "softcap-sinks-alibi"})
-"""The score hooks no model flow's training step reaches (`test_attention_triton.SCORE_HOOKS`): each one
-backward on an H100."""
 KERNEL_CELLS = (kernels.flash_through_dews_attention_refuses_rows_it_would_misread,
                 kernels.a_fused_kernel_takes_forward_mode_through_the_reference,
                 kernels.cudnn_trains_odd_lengths_and_agrees_with_xla,
@@ -223,32 +218,48 @@ def test_the_fused_kernels_hold_on_this_gpu(without_deterministic_ops, part):
     ], part, FUSED_PARTS))
 
 
-MOSAIC_PARTS = 2
-"""The Mosaic flow's parts (`in_parts`)."""
+@pytest.mark.usefixtures("without_deterministic_ops")
+def test_the_attention_matrix_holds_on_this_gpu():
+    """Attention's check-1 matrix (tests/kernel_matrix.py): the route's training step on par with the
+    reference path at each combination of the axes a GPU runs natively (`kernel_matrix.native_cells`), each
+    cell on its own GPU, without XLA's deterministic ops (a deterministic run never derives the one launch its
+    cells pin)."""
+    run_cells(kernel_matrix.native_cells("attention"))
+
+
+@pytest.mark.usefixtures("without_deterministic_ops")
+def test_the_attention_kernels_matrix_holds_on_this_gpu():
+    """The attention op's kernels' check-1 matrix (tests/kernel_matrix.py): each GPU kernel's training step
+    through the public call on par with the reference path at each combination of the axes a GPU runs
+    natively, each cell on its own GPU, without XLA's deterministic ops (FlashAttention's and cuDNN's refuse
+    a deterministic call)."""
+    run_cells(kernel_matrix.native_cells("attention_kernels"))
+
+
+def test_the_decode_matrix_holds_on_this_gpu():
+    """Decode's check-1 matrix (tests/kernel_matrix.py): a serving step's decode, dense and paged, on par with
+    the reference path at each combination of the axes a GPU runs natively, each cell on its own GPU, under
+    the lane's deterministic ops."""
+    run_cells(kernel_matrix.native_cells("decode"))
+
+
+MOSAIC_PARTS = 8
+"""The Mosaic flow's parts (`in_parts`): past the 3600 s deadline whole on a GH200 (MAINGPU-df3e6ac66), its
+cells' kernels' compiles most of it."""
 
 
 @pytest.mark.usefixtures("without_deterministic_ops")
 @in_parts(MOSAIC_PARTS)
 def test_the_mosaic_template_holds_on_an_h100(part):
-    """The Mosaic template's cells no model flow reaches on an H100 (row 5461): its backward over each call
-    form and under each score hook no flow takes (`UNREACHED_FORMS`, `UNREACHED_HOOKS`), its fast form;
-    its natural form; a call over a decision row's runs and a span call's one launch, which no flow forks;
-    its one launch backward each way on wgmma; an fp16 call through the route; and the fast form's default
-    route not on par with IEEE fp32, the accurate form's control. Each one's failure kept and all raised
-    together, a part's share of them, without XLA's deterministic ops: the fused backward forms its cells pin
-    add dQ atomically, which a deterministic run never derives (`MosaicBackward.derived`), so held to a
-    bitwise repeat there (check 1's `_repeat_promised`) they failed as unpaired draws (row 3171). Their
-    head widths, other forms and hooks' forwards are the CPU's, interpreted and through the compile gate."""
+    """Every Mosaic template cell above on an H100 (`gpu_flow.cells_of`), and the route's fp16 call and
+    long sequence, each one's failure kept and all raised together, a part's share of them, without XLA's
+    deterministic ops: the fused backward forms its cells pin add dQ atomically, which a deterministic run
+    never derives (`MosaicBackward.derived`), so held to a bitwise repeat there (check 1's
+    `_repeat_promised`) they failed as unpaired draws (row 3171)."""
     run_cells(parted([
-        *cells_where(mosaic.the_backward_is_on_par_over_every_call_form_on_an_h100,
-                     lambda case, form: case in UNREACHED_FORMS and form == "default", "sm90"),
-        *cells_where(mosaic.the_backward_is_on_par_under_every_score_hook_on_an_h100,
-                     lambda hooks, form: hooks in UNREACHED_HOOKS and form == "default", "sm90"),
-        *cells_where(mosaic.the_natural_forward_is_on_par_on_an_h100,
-                     lambda call, dtype: call == "causal" and dtype == jnp.bfloat16, "sm90"),
-        *cells_where(mosaic.a_call_over_runs_is_on_par_on_an_h100,
-                     lambda case, form: form in ("forward", "default"), "sm90"),
+        *(cell for check in MOSAIC_CELLS for cell in cells_of(check, "sm90")),
         *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90"),
+        *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path),
         *cells_of(accurate_form.the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32, "sm90"),
         *cells_of(inplace.a_routes_one_launch_backward_is_on_par_on_an_h100, "sm90"),
         *cells_of(inplace.a_span_calls_one_launch_is_on_par_on_an_h100, "sm90"),

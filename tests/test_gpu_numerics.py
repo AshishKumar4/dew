@@ -15,15 +15,15 @@
   the seeds it needs (test_chunked_cross_entropy).
 - A Dense layer's float64 terms on a GPU host are its inputs' placement's own, CPU or GPU, in either order
   (test_float64_terms).
-
-The fused norms', SiLU products' and narrow copies' check-1 matrices swept on the GPU are gone (row 5461's
-covering set): their axes are the CPU's, and a model flow's norms and products on its GPU the model flows'
-(tests/test_gpu_flows.py).
+- The fused norms' and SiLU products' check-1 matrix (tests/kernel_matrix.py): a training step through each
+  entry on par with its XLA arithmetic, at each combination of the axes a GPU runs natively
+  (norm_swiglu_matrix, `kernel_matrix.native_cells`).
 """
 
 import functools
 
 import jax.numpy as jnp
+import kernel_matrix
 import pytest
 import test_audio as audio
 import test_chunked_cross_entropy as chunked_cross_entropy
@@ -128,3 +128,18 @@ def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_determinis
              functools.partial(norm_swiglu_tests.a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses,
                                without_deterministic_ops, implementation))
         for implementation in ("auto", "pallas")])
+
+
+def test_the_norm_swiglu_matrix_holds_on_this_gpu():
+    """The fused norms' and SiLU products' check-1 matrix (tests/kernel_matrix.py): a training step through
+    the RMS norm's plain, stream and gated entries and the SwiGLU product's apart and packed ones, the Pallas
+    kernel on par with XLA's arithmetic at each combination of the axes a GPU runs natively
+    (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    run_cells(kernel_matrix.native_cells("norm_swiglu"))
+
+
+def test_the_narrow_copies_matrix_holds_on_this_gpu():
+    """The narrow copies' check-1 matrix (tests/kernel_matrix.py): a decoder's training run through the copies
+    of its weights the update writes on par with the forward's own casts at each combination of the axes a
+    GPU runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    run_cells(kernel_matrix.native_cells("narrow_copies"))

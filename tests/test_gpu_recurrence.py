@@ -17,9 +17,15 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
   state and output alone, bit for bit; the fused step's bits the same however its launches are timed; and
   a layer choosing the fused step decoding over two GPUs, its rows or its heads split, as on one device.
 
+- The check-1 matrices of the recurrence's choices (tests/kernel_matrix.py): the chunked op on each kernel
+  against its form's port (recurrence_matrix), the short conv against XLA's (short_conv_matrix), the
+  selective scan against recorded mamba_ssm (selective_matrix), and the decode tokens on each decode kernel
+  against the portable step (delta_decode_matrix), each over the combinations of the axes a GPU runs
+  natively, its form, kernel and precision, and the cases a red found on a GPU (`kernel_matrix.native_cells`).
+
 The Mosaic mainloop's forward and gradient, and each recurrence's chunked op, short conv and decode on its
-default kernels, are the model flows' (tests/test_gpu_flows.py, row 5461's covering set); their shapes and
-hooks past these are the CPU's, interpreted and through the compile gate.
+default kernels at a model's widths, are the model flows' (tests/test_gpu_flows.py, row 5461's covering
+set); their shapes and hooks past these are the CPU's, interpreted and through the compile gate.
 """
 
 import functools
@@ -27,6 +33,7 @@ import functools
 import gpu_flow
 import jax
 import jax.numpy as jnp
+import kernel_matrix
 import numpy as np
 import pytest
 import test_fla_gdn as fla_gdn
@@ -270,3 +277,29 @@ def test_the_recurrences_run_on_this_gpu(family):
     """A family's recurrence cells on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
     together."""
     run_cells(FAMILIES[family]())
+
+
+def test_the_recurrence_matrix_holds_on_this_gpu():
+    """The recurrence's check-1 matrix (tests/kernel_matrix.py): the chunked op's training step, its kernel
+    named, on par with its form's port's, or the portable math's where no port takes it, at each combination
+    of the axes a GPU runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    run_cells(kernel_matrix.native_cells("recurrence"))
+
+
+def test_the_short_conv_matrix_holds_on_this_gpu():
+    """The short conv's check-1 matrix: a delta net's conv at its training shapes on the kernels, on par with
+    XLA's conv, in each precision on each GPU (`kernel_matrix.native_cells`)."""
+    run_cells(kernel_matrix.native_cells("short_conv"))
+
+
+def test_the_selective_scan_matrix_holds_on_this_gpu():
+    """The selective scan's check-1 matrix: each recorded case on the template, on par with recorded
+    mamba_ssm, each cell on its own GPU."""
+    run_cells(kernel_matrix.native_cells("selective_scan"))
+
+
+def test_the_recurrent_decode_matrix_holds_on_this_gpu():
+    """The recurrent decode's check-1 matrix: each layer's decode tokens on each decode kernel, its state in
+    each precision, on par with the portable step's, each cell on its own GPU
+    (`kernel_matrix.native_cells`)."""
+    run_cells(kernel_matrix.native_cells("delta_decode"))

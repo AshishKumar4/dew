@@ -4,10 +4,10 @@ Each family declares its axes (`AXES`) and one matrix cell function (`CELLS`): a
 the forward and its backward in one program as a user calls them, held to check 1 with the float64 terms,
 its launch form pinned. Its cells cover every pair of axis values the family's route serves
 (docs/design/testing.md's covering scenarios): what it serves is read from the route's own analyses
-(`supported`, the cell module's), never a second list. A TPU tier runs `TPU_FLOWS`; the GPU tier runs no
-matrix since the owner's ruling of 2026-11-11 (row 5461): a GPU's native routes are its model flows' and its
-bare cells' (tests/test_gpu_flows.py), a family's pairs the CPU's. tests/test_kernel_matrix.py holds each
-family's cells to its supported pairs (`covered`). Nothing here needs a GPU.
+(`supported`, the cell module's), never a second list. The CPU runs every cell, interpreted. Main's GPU
+tier runs `FLOWS` on an H100 and an A100, each over the cells a GPU runs natively (`native_cells`: the
+owner's ruling of 2026-11-11, row 5461's covering set), and tests/test_kernel_matrix.py holds each family's
+cells to its supported pairs (`covered`). A TPU tier runs `TPU_FLOWS`. Nothing here needs a GPU.
 """
 
 import functools
@@ -238,6 +238,68 @@ CELLS: dict[str, tuple[str, str]] = {
     "narrow_copies": ("narrow_copies_matrix", "a_narrow_copy_training_run_is_on_par"),
 }
 """Each family's matrix cell function, by its module and name (`gpu_flow.cell`)."""
+
+NATIVE: dict[str, tuple[str, ...]] = {
+    "attention": ("generation", "width", "launch", "dtype", "form"),
+    "attention_kernels": ("generation", "kernel", "dtype"),
+    "decode": ("generation", "layout", "kernel", "dtype"),
+    "gemm": ("generation", "kernel", "form", "dtype"),
+    "fused_gemm": ("generation", "stage", "dtype"),
+    "join": ("generation", "join", "dtype"),
+    "low_rank": ("generation", "dtype"),
+    "nvfp4": ("generation", "out_dtype"),
+    "blockwise_fp8": ("generation", "out_dtype"),
+    "mxfp8": ("generation", "format", "out_dtype"),
+    "recurrence": ("generation", "form", "kernel", "dtype"),
+    "short_conv": ("generation", "dtype"),
+    "selective_scan": ("generation", "case"),
+    "delta_decode": ("generation", "layer", "kernel", "state"),
+    "norm_swiglu": ("generation", "op", "form", "dtype"),
+    "narrow_copies": ("generation", "dtype", "form", "window"),
+}
+"""Each GPU family's axes that name what a GPU runs natively (row 5461's covering set): its GPU; the kernel,
+launch, layout or form its route takes, each a program of its own (attention's heads 256 wide among them: on
+wgmma the backward's shared-keys launch at 256, on sm100 the forward's value-column blocks); and the
+precision it computes in, whose summation order on the GPU is its own (rows 3522, 5268, 5404 and 5414: fp32
+cells red on a GPU alone, green interpreted). Every other axis is a shape or a hook, whose pairs the CPU's
+interpreted cells cover, and the compile gate. The selective scan's recorded cases are each a numerics regime
+of its own."""
+
+
+def native_cells(family: str) -> list:
+    """The cells of `family`'s matrix a GPU runs (`FLOWS`): the first in its order to cover each combination
+    of its native axes' values (`NATIVE`), and each case a ledger row names (`SEEDED`), which proves the row
+    closed where it was found."""
+    seeded = {case for _, case in SEEDED.get(family, ())}
+    seen: set[tuple[str, ...]] = set()
+    kept = []
+    for cell, (_, combination) in zip(gpu_flow.cells_of(check(family)), covered(family), strict=True):
+        native = tuple(combination[axis] for axis in NATIVE[family])
+        if native not in seen or tuple(combination.values()) in seeded:
+            seen.add(native)
+            kept.append(cell)
+    return kept
+
+
+FLOWS: tuple[str, ...] = (
+    "tests/test_gpu_attention.py::test_the_attention_matrix_holds_on_this_gpu",
+    "tests/test_gpu_attention.py::test_the_attention_kernels_matrix_holds_on_this_gpu",
+    "tests/test_gpu_attention.py::test_the_decode_matrix_holds_on_this_gpu",
+    "tests/test_gpu_gemm.py::test_the_gemm_matrix_holds_on_this_gpu",
+    "tests/test_gpu_gemm.py::test_the_fused_gemm_matrix_holds_on_this_gpu",
+    "tests/test_gpu_gemm.py::test_the_join_matrix_holds_on_this_gpu",
+    "tests/test_gpu_gemm.py::test_the_low_rank_matrix_holds_on_this_gpu",
+    "tests/test_gpu_gemm.py::test_the_nvfp4_matrix_holds_on_this_gpu",
+    "tests/test_gpu_gemm.py::test_the_blockwise_matrix_holds_on_this_gpu",
+    "tests/test_gpu_gemm.py::test_the_mx_matrix_holds_on_this_gpu",
+    "tests/test_gpu_recurrence.py::test_the_recurrence_matrix_holds_on_this_gpu",
+    "tests/test_gpu_recurrence.py::test_the_short_conv_matrix_holds_on_this_gpu",
+    "tests/test_gpu_recurrence.py::test_the_selective_scan_matrix_holds_on_this_gpu",
+    "tests/test_gpu_recurrence.py::test_the_recurrent_decode_matrix_holds_on_this_gpu",
+    "tests/test_gpu_numerics.py::test_the_norm_swiglu_matrix_holds_on_this_gpu",
+    "tests/test_gpu_numerics.py::test_the_narrow_copies_matrix_holds_on_this_gpu",
+)
+"""The flows that run the matrices' native cells on the GPU tier (`native_cells`), by pytest node id."""
 
 TPU_FLOWS: tuple[str, ...] = (
     "tests/test_attention_splash.py::test_the_attention_kernels_matrix_holds_on_this_tpu",
