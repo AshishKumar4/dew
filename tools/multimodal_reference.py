@@ -549,8 +549,12 @@ def write_processors() -> None:
     gemma4_unified_processor().save_pretrained(ROOT / "gemma4-unified-native-tiny")
     llama4 = json.loads((ROOT / "llama4-native-tiny" / "config.json").read_text())
     llama4_processor(ROOT / "llama4-native-tiny", llama4["text_config"]["vocab_size"])
-    for name in ("qwen35-native-tiny", "qwen35-moe-native-tiny", "qwen4-exp-native-tiny"):
+    for name in ("qwen35-native-tiny", "qwen35-moe-native-tiny"):
         qwen3_vl_processor(ROOT / name)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from qwen4_exp_reference import native_processor
+
+    native_processor(ROOT / "qwen4-exp-native-tiny")
 
 
 if __name__ == "__main__":
