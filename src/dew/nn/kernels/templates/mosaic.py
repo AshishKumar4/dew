@@ -796,7 +796,15 @@ class Issuer[Accumulator](abc.ABC):
     in_flight: int = 0
     """The steps whose products a walk keeps running past their step (`walk`'s `in_flight`), each holding
     its stage: none where products are synchronous; one where they run asynchronously, CUTLASS's sm90
-    mainloops' `K_PIPE_MMAS`, so a step's issue overlaps the previous step's products."""
+    mainloops' `K_PIPE_MMAS`, so a step's issue overlaps the previous step's products. Products whose left
+    operand is in registers keep none where the family retires them (`retires_register_products`)."""
+
+    retires_register_products: bool = False
+    """Whether `register_products` retires each part's product as it issues it, so no register-A product
+    runs past its issue: where products run asynchronously and read operand A from registers until their
+    group retires (warpgroup MMA's, PTX ISA "wgmma.mma_async"), whose registers the walk's next step then
+    writes (row 5416). A register model prices its register-A products one at a time, none overlapping
+    what the walk forms after them (a forward's next logits beside its weights)."""
 
     products_overlap: bool
     """Whether a warpgroup's products run asynchronously, an issued product's accumulator held while the

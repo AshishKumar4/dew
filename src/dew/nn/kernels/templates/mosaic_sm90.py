@@ -71,6 +71,7 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
     operands_in_registers = False
     products_overlap = True
     in_flight = 1
+    retires_register_products = True
 
     assembled = 26
     """The registers past an MMA's fp32 accumulator a thread's register target holds at least, whatever its
@@ -130,8 +131,9 @@ class WgmmaIssuer(WgmmaLayout, mosaic.Issuer):
                 acc = acc + jnp.dot(part, rhs[...], preferred_element_type=jnp.float32)
             else:
                 plgpu.wgmma(acc, part, rhs)
-                # Register A remains live until its group completes. The next part or loop iteration
-                # may reuse these registers even when the shared-memory rings retain the older slot.
+                # Operand A is read from its registers until its group retires, and the next part or the
+                # walk's next step writes them (`retires_register_products`): retired now, the groups
+                # before it with it, as they retire in order.
                 plgpu.wgmma_wait(0)
         return acc
 
