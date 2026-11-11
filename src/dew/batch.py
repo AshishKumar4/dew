@@ -12,6 +12,7 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
+from types import MappingProxyType
 from typing import Any, ClassVar, Literal
 
 import jax
@@ -117,6 +118,10 @@ def padded_rows(rows: int, count: int) -> tuple[np.ndarray, np.ndarray]:
     places = np.arange(count)
     return places % rows, places >= rows
 
+
+FLAT = "flat"
+"""The metadata key of a `Coordinates` field a call's flat layout gives (`LAID_FIELDS`): the flat field's
+name."""
 
 VALIDITY_FIELD = "attention_mask"
 """The token field that marks real slots. Absent means every slot is real."""
@@ -381,9 +386,9 @@ class Coordinates:
     each a document's final id, which no input reads (`predecessors`).
     """
 
-    positions: jax.Array | None = None
-    segments: jax.Array | None = None
-    valid: jax.Array | None = None
+    positions: jax.Array | None = struct.field(default=None, metadata={FLAT: POSITIONS_FIELD})
+    segments: jax.Array | None = struct.field(default=None, metadata={FLAT: SEGMENTS_FIELD})
+    valid: jax.Array | None = struct.field(default=None, metadata={FLAT: VALIDITY_FIELD})
     starts: jax.Array | None = None
     firsts: jax.Array | None = None
     forks: Forks | None = None
@@ -575,9 +580,13 @@ def coordinates(shape: tuple[int, ...] | None = None, *, segments=None, valid=No
                        right_padded=right_padded)
 
 
-TOKEN_LAYOUT_FIELDS = (SEGMENTS_FIELD, VALIDITY_FIELD, POSITIONS_FIELD)
+LAID_FIELDS: Mapping[str, str] = MappingProxyType(
+    {field.name: field.metadata[FLAT] for field in dataclasses.fields(Coordinates) if FLAT in field.metadata})
+"""Each `Coordinates` field a call's flat layout gives, by the flat field that gives it (`FLAT`)."""
+
+TOKEN_LAYOUT_FIELDS = tuple(LAID_FIELDS.values())
 """The flat token fields a call's layout is given in where it gives no `Coordinates`
-(`token_coordinates`): its documents, its validity and its places."""
+(`token_coordinates`): its places, its documents and its validity."""
 
 
 def token_coordinates(shape: tuple[int, ...], given: Coordinates | None = None, *, segments=None,
@@ -586,8 +595,9 @@ def token_coordinates(shape: tuple[int, ...], given: Coordinates | None = None, 
     else built (`coordinates`) from the flat fields `segment_ids` (`segments`), `attention_mask`
     (`valid`) and `positions`, None where the call gives none. A call giving both is refused: its
     `Coordinates` would silently drop its flat fields (ledger 1122)."""
-    fields = zip(TOKEN_LAYOUT_FIELDS, (segments, valid, positions), strict=True)
-    flat = [name for name, value in fields if value is not None] + (["right_padded"] if right_padded else [])
+    given_fields = {SEGMENTS_FIELD: segments, VALIDITY_FIELD: valid, POSITIONS_FIELD: positions}
+    flat = ([name for name in TOKEN_LAYOUT_FIELDS if given_fields[name] is not None]
+            + (["right_padded"] if right_padded else []))
     if given is not None:
         if flat:
             raise ValueError(f"a call's tokens are laid out by their coordinates or by their fields, not "

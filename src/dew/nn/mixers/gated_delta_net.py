@@ -5,7 +5,8 @@ from __future__ import annotations
 import dataclasses
 import functools
 
-from dew.nn.mixer_base import DELTA_RULE_RESIDUALS, MixerBase, MixerContext
+from dew.nn.mixer_base import MixerBase, MixerContext
+from dew.nn.residuals import DELTA_RULE_RESIDUALS
 
 
 @dataclasses.dataclass(frozen=True)

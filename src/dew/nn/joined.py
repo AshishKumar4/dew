@@ -99,9 +99,9 @@ them, which each join's selector reads and thresh's declared-set seam registers 
 def _join(choice: Choice) -> Op[JoinCase]:
     """The join's selector for `choice` (`CHOICES`): the projections apart, but joined where
     the join measured faster (`JOINED_FASTER`) and its requirements hold."""
-    return Op(choice, (Kernel('joined', JOIN_SUPPORTS), Kernel('apart', (), generic=True)),
-              lambda case: 'apart',
-              declared={(device, 'join'): ('joined', receipt)
+    joined = Kernel[JoinCase]('joined', JOIN_SUPPORTS)
+    return Op(choice, (joined, Kernel('apart', (), generic=True)), lambda case: 'apart',
+              declared={(device, 'join'): (joined, receipt)
                         for (join, device), receipt in JOINED_FASTER.items() if join == choice})
 
 

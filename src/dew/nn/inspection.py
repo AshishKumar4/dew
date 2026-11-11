@@ -13,7 +13,6 @@ import contextlib
 import contextvars
 import dataclasses
 import fnmatch
-import re
 from collections.abc import Iterator, Mapping
 
 import flax.linen as nn
@@ -23,6 +22,7 @@ import numpy as np
 from jax.custom_derivatives import zero_from_primal
 
 from dew.batch import PROBES
+from dew.nn.backbones.layer_names import any_layer
 from dew.nn.derivatives import Surrogate, contracted, declared_derivative
 from dew.nn.sharding import in_pipeline_stage
 
@@ -108,11 +108,6 @@ BY_PATH = "__by_path__"
 """The mark a stacked run's module sows where a glob takes it for one of its layers alone: the log keeps
 the entries of the layers the glob names (`kept`)."""
 
-_STACKED = re.compile(r"(?:^|(?<=/))(?:stages/)?layers_\d+(?:_\d+)?(?=/|$)")
-"""A traced path's stacked layer component: a scanned run (`layers_3_7`) or a pipeline stage's layer
-(`stages/layers_1`), whose module runs layers the log names apart."""
-
-_LAYER = re.compile(r"(?:^|(?<=/))layers_[^/]*(?=/|$)")
 _LIVE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("live_rows", default=None)
 _SCALE: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("loss_scale", default=None)
 
@@ -262,9 +257,9 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False,
         # A stacked run of layers (`layers_3_7`, a pipeline stage's `stages/layers_j`) is any of the layers
         # the log names its entries by: a glob over one of them takes the run, and the log keeps that layer's
         # entries alone (`flattened`).
-        widened = _STACKED.sub("layers_*", path)
+        widened = any_layer(path)
         candidate = widened != path and any(
-            fnmatch.fnmatchcase(widened, _LAYER.sub("layers_*", glob)) for glob in modules)
+            fnmatch.fnmatchcase(widened, any_layer(glob, pattern=True)) for glob in modules)
         if context.method_name != "__call__" or not (named or candidate):
             return output
         if not module.is_mutable_collection(INSPECTED):

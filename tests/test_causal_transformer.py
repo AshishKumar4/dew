@@ -90,8 +90,8 @@ def tokens(rng, batch=2, length=SEQ):
 SEEDS = {'decode': 16, 'kernels': 16, 'window kernels': 8, 'softcap': 32, 'routed softcap': 64,
          'grouped': 32, 'sliding decode': 16, 'hybrid decode': 512, 'sandwich': 8, 'packed alone': 16,
          'metadata': 128, 'packed kernels': 16, 'bf16 head': 8, 'strict head': 8, 'norm gradient': 8,
-         'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'packed cudnn': 8,
-         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 512,
+         'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'gpu kernels': 16,
+         'right padded': 16, 'rotary': 8, 'old record': 512,
          'learned hybrid decode': 8, 'layouts': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, and the GPU
 sites on an A100): the most any of a site's cases took."""
@@ -389,17 +389,6 @@ def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
     params = nn.unbox(model.init(rng, ids))
     assert decode_logits(model, params, ids[:, :4], ids[:, 4:]).shape == (ids.shape[0], SEQ - 3, VOCAB)
     decoded_against_full(model, 4, f"{attention_impl} decode", SEEDS['decode'])
-
-
-def a_cached_prompt_reads_its_cache_as_the_uncached_forward(without_deterministic_ops):
-    """A bf16 prompt prefilled into the cache under 'auto' reads it as the documents its tokens end, no
-    mask, whatever kernel the GPU takes: its logits are on par with the xla kernel's uncached forward from
-    the float64 forward over drawn weights and prompts (check 1)."""
-    model = tiny(dtype=jnp.bfloat16)
-    made, step = decode_steps(model)
-    assert_as_exact(lambda params, prompt: step(params, made(params, prompt.shape[0]), prompt)[0],
-                    applied(model.clone(attention_impl='xla')), drawn(model, length=6), "cached prefill",
-                    seeds=SEEDS['cached prefill'], truth_fn=applied(float64(model)))
 
 
 @pytest.mark.parametrize("scanned", [False, True], ids=["loop", "scan"])
@@ -1001,21 +990,7 @@ def test_padding_in_a_packed_row_reaches_no_query(rng):
     assert jnp.all(jnp.isfinite(changed))
 
 
-def a_layer_naming_cudnn_takes_a_packed_batch_as_its_document_mask(rng, without_deterministic_ops):
-    """A bf16 model whose layers name cudnn (`attention_impl`) runs a packed batch on cuDNN, its
-    documents reaching the kernel as their mask, an additive bias (`_attention_kernel`): the logits are
-    on par with the xla kernel's from the float64 model over drawn weights and tokens (check 1)."""
-    _, segment_ids, positions = packed_pair(rng)
-    named = tiny(attention_impl='cudnn', dtype=jnp.bfloat16)
-    packed = {"positions": positions, "segment_ids": segment_ids}
-    plain = tiny(attention_impl='xla', dtype=jnp.bfloat16)
-    assert_as_exact(applied(named, **packed), applied(plain, **packed), drawn(tiny()), "packed cudnn logits",
-                    seeds=SEEDS['packed cudnn'],
-                    truth_fn=applied(float64(tiny()), **packed))
-
-
-def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what_it_fails(
-        rng, without_deterministic_ops):
+def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what_it_fails(rng):
     """A model whose layers name cudnn (`attention_impl`) forces it, so a call cudnn does not take
     raises, naming the kernel (`dew.nn.kernels.selection.select`), as torch's `sdpa_kernel` does,
     rather than running another kernel: here an fp32 model, packed or not. 'auto' runs both."""
@@ -1031,8 +1006,7 @@ def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what
     tiny().apply(params, ids, positions=positions, segment_ids=segment_ids)
 
 
-def test_metadata_that_restricts_no_visibility_keeps_the_fused_kernel(
-        rng, without_deterministic_ops):
+def test_metadata_that_restricts_no_visibility_keeps_the_fused_kernel(rng):
     """Rotary positions rotate q and k and narrow nobody's view, so a batch
     that carries them keeps causality as a kernel flag. Pinning cudnn is what
     proves the routing, as in the packed case above: cudnn refuses the fp32
@@ -1545,45 +1519,6 @@ def test_a_decode_step_reads_each_key_head_once_for_its_group(rng):
     decoded_against_full(model, 4, "grouped decode", SEEDS['grouped decode'])
 
 
-def a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
-    """A decode step's keys are the cache's filled slots, a count per row, so
-    they reach cuDNN as its padding lengths rather than as a materialized mask:
-    that mask sent Qwen3-0.6B's decode to xla's two dense dots over the whole
-    cache on an RTX 4080 (1.00 against cuDNN's 0.30 ms a layer at 128 rows),
-    and a small model to cuDNN's bias variant, which reads it per head. The
-    steps decode on par with the full pass, both from the model in float64
-    (check 1)."""
-    model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
-    decoded_against_full(model, 4, "cudnn decode", SEEDS['cudnn decode'])
-
-
-
-def a_padded_prefill_is_on_par_with_the_full_pass(rng, without_deterministic_ops):
-    """A cache prefill of left-padded prompts on a GPU's kernels, its rows'
-    padding the selector's key validity (docs/performance.md, the prefill's
-    attention), scores on par with the full pass, both from the model in
-    float64 (check 1)."""
-    model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
-    valid = jnp.ones((2, SEQ), bool).at[0, :3].set(False)
-    made, _ = decode_steps(model)
-    prefill = jax.jit(lambda params, cache, ids: model.apply(
-        {**params, 'cache': cache}, ids, attention_mask=valid, decode=True, mutable=['cache'])[0])
-
-    def held(logits):
-        # A padded slot's logits are no contract: the real tokens' are held.
-        return jnp.where(valid[..., None], logits, 0)
-
-    def full(model):
-        return jax.jit(lambda params, ids: held(model.apply(params, ids, attention_mask=valid)))
-
-    def prefilled(params, ids):
-        return held(prefill(params, made(params, ids.shape[0]), ids))
-
-    assert_as_exact(prefilled, full(model), drawn(model), "padded prefill", seeds=SEEDS['padded prefill'],
-                    truth_fn=full(float64(model)))
-
-
-
 @pytest.mark.parametrize("causal", [True, False])
 def test_right_padded_rows_attend_causally_with_no_mask(rng, causal):
     """Rows declared right-padded reach the attention kernel as an unpadded
@@ -1718,3 +1653,75 @@ def test_a_parallel_layer_reads_its_branches_initializers_and_indexers():
     indexed = tiny(num_layers=1, mixer=ParallelMixer(branches=(
         ParallelBranch("mamba", mamba, 1.0, 1.0), ParallelBranch("latent", latent, 1.0, 1.0))))
     assert indexed.indexed_mixers == (latent,)
+
+
+def a_bf16_decoder_trains_and_serves_through_its_gpu_kernels():
+    """One bf16 decoder through the GPU's own attention kernels in one process, every property judged
+    together by check 1 from the model in float64 over drawn weights and tokens (the GPU's ones beside the
+    xla kernel's):
+
+    - a packed batch on a layer naming cuDNN (`attention_impl`), its documents the kernel's mask (an
+      additive bias, `_attention_kernel`), its logits and every parameter's gradient on par with the xla
+      kernel's: a packed training step's forward and backward;
+    - a prompt prefilled into the cache under 'auto' reads it as the documents its tokens end, no mask,
+      whatever kernel the GPU takes, on par with the uncached forward;
+    - its decode steps, whose keys are the cache's filled slots, a count per row, reach cuDNN as its
+      padding lengths rather than as a materialized mask (that mask sent Qwen3-0.6B's decode to xla's
+      two dense dots over the whole cache on an RTX 4080, 1.00 against cuDNN's 0.30 ms a layer at 128
+      rows), on par with the full pass at the widths each reads;
+    - a prefill of left-padded prompts, its rows' padding the selector's key validity
+      (docs/performance.md, the prefill's attention), on par with the full pass over the real tokens."""
+    model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
+    named, plain = model.clone(attention_impl='cudnn'), model.clone(attention_impl='xla')
+    wide = float64(model)
+    _, segment_ids, positions = packed_pair(jax.random.key(0))
+    packed = {"positions": positions, "segment_ids": segment_ids}
+    cotangent = jax.random.normal(jax.random.key(1), (2, SEQ, VOCAB), jnp.float32)
+    valid = jnp.ones((2, SEQ), bool).at[0, :3].set(False)
+    prompt = 4
+    made, step = decode_steps(model)
+    prefill = jax.jit(lambda params, cache, ids: model.apply(
+        {**params, 'cache': cache}, ids, attention_mask=valid, decode=True, mutable=['cache'])[0])
+
+    def trained(model):
+        def loss(params, variables, ids):
+            logits = model.apply({**variables, 'params': params}, ids, **packed)
+            return jnp.sum(logits.astype(jnp.float32) * cotangent.astype(logits.dtype)), logits
+        gradient = jax.grad(loss, has_aux=True)
+        return jax.jit(lambda variables, ids: gradient(variables['params'], variables, ids))
+
+    def held(logits):
+        # A padded slot's logits are no contract: the real tokens' are held.
+        return jnp.where(valid[..., None], logits, 0)
+
+    def full(model):
+        forward = jax.jit(model.apply)
+        padded = jax.jit(lambda params, ids: held(model.apply(params, ids, attention_mask=valid)))
+        training = trained(model)
+
+        def run(params, ids):
+            gradients, logits = training(params, ids)
+            return {"packed logits": logits, "packed gradients": gradients,
+                    "cached prefill": forward(params, ids),
+                    "decode steps": forward(params, ids)[:, prompt - 1:],
+                    "padded prefill": padded(params, ids)}
+        return run
+
+    def stepped_reference(params, ids):
+        reference = full(plain)(params, ids)
+        # The widths a cached decode computes, from its last prompt position on.
+        stepped = as_stepped(lambda tokens: plain.apply(params, tokens), ids, prompt)
+        reference["decode steps"] = stepped[:, prompt - 1:]
+        return reference
+
+    training = trained(named)
+
+    def ours(params, ids):
+        gradients, logits = training(params, ids)
+        return {"packed logits": logits, "packed gradients": gradients,
+                "cached prefill": step(params, made(params, ids.shape[0]), ids)[0],
+                "decode steps": decode_logits(model, params, ids[:, :prompt], ids[:, prompt:], (made, step)),
+                "padded prefill": held(prefill(params, made(params, ids.shape[0]), ids))}
+
+    assert_as_exact(ours, stepped_reference, drawn(model), "a bf16 decoder on its GPU kernels",
+                    seeds=SEEDS['gpu kernels'], truth_fn=full(wide))

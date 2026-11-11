@@ -54,8 +54,9 @@ from .linear import (
     over_sequence,
     split_delta_rule,
 )
-from .mixer_base import DELTA_RULE_RESIDUALS, MixerBase, MixerContext
+from .mixer_base import MixerBase, MixerContext
 from .precision import at_least_fp32, float32_dot_general
+from .residuals import DELTA_RULE_RESIDUALS
 from .sharding import LogicalAxes, sequence_shards
 
 KDA_AXES: dict[str, LogicalAxes] = {

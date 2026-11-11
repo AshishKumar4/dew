@@ -174,7 +174,7 @@ _ROUTES = Table(
 
 
 # A model whose norms group their statistics; the 0.9B's single group exports as Llama, whose norm
-# orders its cast and weight otherwise, the same product in fp32 (`hf_decoders._RUNTIME_FIELDS`),
+# orders its cast and weight otherwise, the same product in fp32 (`dew._records.RUNS`),
 # and whose rotary builds its YaRN.
 K2_HORIZON = DecoderFamily(
     ('k2_horizon',), K2_HORIZON_CONFIG,

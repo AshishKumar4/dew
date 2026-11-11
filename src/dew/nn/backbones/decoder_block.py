@@ -52,13 +52,13 @@ from ..inputs import (
     routing_blocks,
 )
 from ..kernels.recurrence_chunk import recomputing
-from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..mlp import GatedMLP
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, WEIGHT_SUM_EPSILON, SparseMLP, resolved_dispatch
 from ..ngpt import NGPT, stepped
-from ..norms import GatedRMSNorm, LayerNorm, OffsetLayerNorm, RMSNorm
+from ..norms import GatedRMSNorm, LayerNorm, NormSite, OffsetLayerNorm, RMSNorm
 from ..precision import float32_dot_general, projection_role, scaled
 from ..protocols import ProjectionGroup, ReadsTrain, declared_groups, partitioned_routes, routed_children
+from ..residuals import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS, Residual
 from ..sharding import RESIDUAL, constrain, declared
 
 if TYPE_CHECKING:
@@ -85,11 +85,6 @@ class NormSpec:
     'routed' ones alone (A.X-K2 gates its feed-forward's norm where it routes), a layer's norm's choice;
     a norm outside the layers (the final one's, the embedding's, the head's) gates wherever it runs."""
     gated_layers: Literal['every', 'routed'] = 'every'
-
-
-NORM_SITES = ('input_layernorm', 'post_attention_layernorm', 'attention_output_norm', 'mlp_output_norm',
-              'post_per_layer_input_norm', 'embedding_layernorm', 'norm', 'head_norm')
-"""The decoder's norms a `NormSpec` may change, by the module name each is built under."""
 
 
 def norm_gated(spec: NormSpec, name: str, routed: bool | None) -> bool:
@@ -129,6 +124,8 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float 
     norm's input dtype's (`RMSNorm.epsilon`); a layer norm states its own."""
 
     def build(*, name: str) -> nn.Module:
+        # A site's own name, a plain string (`NormSite`'s value): the module's path holds no enum.
+        name = str(name)
         spec = (specs or {}).get(name, NormSpec())
         eps = epsilon if spec.eps is None else spec.eps
         gated = norm_gated(spec, name, routed)
@@ -535,16 +532,17 @@ class RematPolicy:
 
 REMAT_POLICIES: Mapping[str, RematPolicy] = {
     'full': RematPolicy(),
-    'all_but_delta_memory': RematPolicy(recompute=('delta_memory',)),
-    'minimal_with_scan_and_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, 'scan', 'conv', *MLP_RESIDUALS)),
-    'minimal_with_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, 'conv', *MLP_RESIDUALS)),
+    'all_but_delta_memory': RematPolicy(recompute=(Residual.DELTA_MEMORY,)),
+    'minimal_with_scan_and_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, Residual.SCAN, Residual.CONV,
+                                                     *MLP_RESIDUALS)),
+    'minimal_with_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, Residual.CONV, *MLP_RESIDUALS)),
     'minimal': RematPolicy(save=ATTENTION_RESIDUALS + MLP_RESIDUALS),
-    'minimal_with_context': RematPolicy(save=(*ATTENTION_RESIDUALS, 'context', *MLP_RESIDUALS)),
+    'minimal_with_context': RematPolicy(save=(*ATTENTION_RESIDUALS, Residual.CONTEXT, *MLP_RESIDUALS)),
     'save_dot_except_mlp': RematPolicy(save=ATTENTION_RESIDUALS),
-    'save_dot_with_context_except_mlp': RematPolicy(save=(*ATTENTION_RESIDUALS, 'context')),
-    'save_dot_except_mlpwi': RematPolicy(save=(*ATTENTION_RESIDUALS, 'down_proj')),
+    'save_dot_with_context_except_mlp': RematPolicy(save=(*ATTENTION_RESIDUALS, Residual.CONTEXT)),
+    'save_dot_except_mlpwi': RematPolicy(save=(*ATTENTION_RESIDUALS, Residual.DOWN_PROJ)),
     'save_qkv_proj': RematPolicy(save=QKV_RESIDUALS),
-    'save_out_proj': RematPolicy(save=('o_proj',)),
+    'save_out_proj': RematPolicy(save=(Residual.O_PROJ,)),
     'minimal_offloaded': RematPolicy(offload=ATTENTION_RESIDUALS + MLP_RESIDUALS),
     'qkv_proj_offloaded': RematPolicy(offload=QKV_RESIDUALS),
 }
@@ -778,12 +776,12 @@ class DecoderBlock(nn.Module):
         wiring norms them, and the per-layer input's where it reads one."""
         normed = self.wiring.pre_norms or self.wiring.residual_norms
         return tuple(site for site, built in (
-            ('input_layernorm', normed and self.attention_norm),
-            ('post_attention_layernorm', normed and self.feedforward is not None
+            (NormSite.INPUT, normed and self.attention_norm),
+            (NormSite.POST_ATTENTION, normed and self.feedforward is not None
              and not self.wiring.shared_parallel_norm),
-            ('attention_output_norm', self.wiring.output_norms),
-            ('mlp_output_norm', self.wiring.output_norms and self.feedforward is not None),
-            ('post_per_layer_input_norm', bool(self.per_layer_input_dim))) if built)
+            (NormSite.ATTENTION_OUTPUT, self.wiring.output_norms),
+            (NormSite.MLP_OUTPUT, self.wiring.output_norms and self.feedforward is not None),
+            (NormSite.PER_LAYER_INPUT, bool(self.per_layer_input_dim))) if built)
 
     @nn.nowrap
     def _submodule_flops(self, lengths, counter) -> float:
@@ -865,11 +863,11 @@ class DecoderBlock(nn.Module):
                 or self.laurel_rank is not None or self.parallel is not None):
             raise ValueError('parallel_residual requires a plain pre-norm attention and feed-forward block')
         built = self._built_norms()
-        if 'input_layernorm' in built:
-            self.input_layernorm = norm(name='input_layernorm')
+        if NormSite.INPUT in built:
+            self.input_layernorm = norm(name=NormSite.INPUT)
         self.self_attn = self.mixer(name='self_attn')
-        if 'post_attention_layernorm' in built:
-            self.post_attention_layernorm = norm(name='post_attention_layernorm')
+        if NormSite.POST_ATTENTION in built:
+            self.post_attention_layernorm = norm(name=NormSite.POST_ATTENTION)
         if self.wiring.residual_norms and (self.hyper_connections is not None or self.altup is not None
                                            or self.residual_site is not None or self.laurel_rank is not None
                                            or self.parallel is not None or not self.attention_norm):
@@ -882,10 +880,10 @@ class DecoderBlock(nn.Module):
             raise ValueError("normed_residual and stream_multiplier join the plain stream: they take no "
                              "hyper-connections, AltUp, depth residuals, LAuReL, parallel experts, "
                              "cross-attention or an unnormed attention")
-        if 'attention_output_norm' in built:
-            self.attention_output_norm = norm(name='attention_output_norm')
-        if 'mlp_output_norm' in built:
-            self.mlp_output_norm = norm(name='mlp_output_norm')
+        if NormSite.ATTENTION_OUTPUT in built:
+            self.attention_output_norm = norm(name=NormSite.ATTENTION_OUTPUT)
+        if NormSite.MLP_OUTPUT in built:
+            self.mlp_output_norm = norm(name=NormSite.MLP_OUTPUT)
         if self.feedforward is not None:
             self.mlp = self.feedforward(name='mlp')
         elif self.parallel is not None or self.laurel_rank is not None:
@@ -905,7 +903,7 @@ class DecoderBlock(nn.Module):
                                               name='per_layer_input_gate', kernel_axes=('embed', 'mlp'))
             self.per_layer_projection = dense(projections['per_layer_projection'][1],
                                               name='per_layer_projection', kernel_axes=('mlp', 'embed'))
-            self.post_per_layer_input_norm = norm(name='post_per_layer_input_norm')  # in `_built_norms`
+            self.post_per_layer_input_norm = norm(name=NormSite.PER_LAYER_INPUT)  # in `_built_norms`
         if self.altup is not None:
             if not self.wiring.pre_norms or self.parallel is not None or self.wiring.layer_scalar:
                 raise ValueError(

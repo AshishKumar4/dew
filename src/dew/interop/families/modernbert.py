@@ -35,7 +35,6 @@ from dew.interop.decoder_parts import (
     ungated_mlp,
 )
 from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Spelled, Table, constant, unread
-from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import Configured
 
@@ -200,16 +199,6 @@ _HEAD: Leaves = {
     'head.norm.bias': ('head_norm', 'bias'), 'lm_head.bias': ('head_bias',)}
 
 
-def _nested(name: str) -> str:
-    """A bare `ModernBertModel` checkpoint's name as the masked LM nests it."""
-    return 'model.' + name if name.startswith(('embeddings.', 'layers.', 'final_norm.')) else name
-
-
-def _modernbert_prepare(tensors: Mapping[str, Stored],
-                        _config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
-    return {_nested(name): tensor for name, tensor in tensors.items()}
-
-
 _MASKED_LM_ROUTES = spelled(_MODERNBERT_NAMES, leaves=_HEAD)
 
 _MODERNBERT_ROUTES = Table(
@@ -226,7 +215,7 @@ MODERNBERT = DecoderFamily(
     lambda fields: not fields.causal and fields.embedding_norm and not fields.first_attention_norm,
     'modernbert', 'ModernBertForMaskedLM',
     routes=_MODERNBERT_ROUTES,
-    prepare=_modernbert_prepare, spelling=_nested, packed=_MODERNBERT_PACKED, preserve_source_layout=False,
+    packed=_MODERNBERT_PACKED, preserve_source_layout=False,
     tied_head_names=('decoder.weight', 'model.embeddings.tok_embeddings.weight'),
     defaults={'pad_token_id': 50283},
     padding_idx=True,

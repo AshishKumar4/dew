@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, traverse_util
-from model_support import stepped_outputs
+from model_support import decode_through, stepped_outputs
 
 from dew.batch import coordinates
 from dew.nn.inputs import PLAIN_CALL, AttentionMetadata, MixerCall
@@ -247,18 +247,10 @@ def packed(segments: np.ndarray, positions: np.ndarray | None = None) -> MixerCa
 
 
 def decoded(module: nn.Module):
-    """`module` over a draw's stream through its decode cache: a first call allocating it, a prefill of
-    six tokens, then one token a call."""
-    decode = MixerCall(decode=True)
-
+    """`module` over a draw's stream through its decode cache (`decode_through`): a first call allocating
+    it, a prefill of six tokens, then one token a call."""
     @jax.jit
     def run(x, params):
-        _, cache = module.apply(params, x[:, :1], decode, mutable=["cache"])
-        prefill, cache = module.apply({**params, **cache}, x[:, :6], decode, mutable=["cache"])
-        reads = [prefill]
-        for t in range(6, LENGTH):
-            token, cache = module.apply({**params, **cache}, x[:, t:t + 1], decode, mutable=["cache"])
-            reads.append(token)
-        return jnp.concatenate(reads, axis=1)
+        return decode_through(module, params, x, 6)[0]
 
     return run

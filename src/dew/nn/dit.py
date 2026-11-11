@@ -25,6 +25,7 @@ from dew._records import JSON
 from dew.nn.attention import AttentionImpl
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
+from dew.nn.residuals import Residual
 
 from .activations import gelu_exact_torch, gelu_tanh
 from .attention_blocks import NormalAttention, QKNorm
@@ -362,13 +363,13 @@ FUSED_ATTENTION_FORWARD = frozenset(
 
 _DOTS_AND_ATTENTION_OUTPUT = jax.checkpoint_policies.save_from_both_policies(
     jax.checkpoint_policies.dots_with_no_batch_dims_saveable,
-    jax.checkpoint_policies.save_only_these_names('attention_output'))
+    jax.checkpoint_policies.save_only_these_names(Residual.ATTENTION_OUTPUT))
 
 
 def saved_through_remat(prim, *args, **params) -> bool:
     """The values a rematerialized block keeps instead of recomputing:
     unbatched matmul outputs (leaving the reference path's [B, H, Q, K] scores
-    out), the 'attention_output' `scaled_dot_product_attention` labels, and the
+    out), the `Residual.ATTENTION_OUTPUT` `scaled_dot_product_attention` labels, and the
     fused attention primitive itself, whose backward also needs the softmax
     statistics, so saving it takes a step from two fused forward calls per layer
     to one.

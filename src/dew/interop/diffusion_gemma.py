@@ -29,6 +29,7 @@ from dew.interop.hf_decoders import (
     translate_config,
     translate_denoiser_weights,
 )
+from dew.interop.layouts import ConfigField, ConfigLayout, ConfigPart, Route, Table
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
 from dew.interop.towers import tower_layout, tower_variables as vision_variables
@@ -49,6 +50,9 @@ from dew.nn.vision.gemma4 import Gemma4Projector, Gemma4Vision
 from dew.registry import from_record, projectors, towers
 
 if TYPE_CHECKING:
+    from flax import linen as nn
+
+    from dew.interop.layouts import SourceLayout, Unwritable
     from dew.nn.attention import AttentionImpl
 
 VISION_PREFIX = "model.encoder.vision_tower."
@@ -106,33 +110,46 @@ def build(config: Mapping[str, object], *, dtype: str | None = "bfloat16",
                           conditioner=conditioner)
 
 
+SELF_CONDITIONING = Table(Route("pre_norm.weight", "params/pre_norm/scale"),
+                          *(Route(f"{projection}.weight", f"params/{projection}/kernel")
+                            for projection in ("gate_proj", "up_proj", "down_proj")))
+"""The self-conditioning block's tensors below its `self_conditioning.` (a release's
+`model.decoder.self_conditioning.`) and their leaves below the model's `self_conditioning`, both ways: the
+norm's gain its scale, each projection's weight its kernel."""
+
+
 def translate_self_conditioning(
     hf_tensors: Mapping[str, Stored], *, param_dtype: str = "float32"
 ) -> Tree[Stored]:
-    """Self-conditioning parameters, cast per weight before the layout copy."""
-    paths = {
-        "pre_norm.weight": ("pre_norm", "scale"),
-        "gate_proj.weight": ("gate_proj", "kernel"),
-        "up_proj.weight": ("up_proj", "kernel"),
-        "down_proj.weight": ("down_proj", "kernel"),
-    }
+    """Self-conditioning parameters (`SELF_CONDITIONING`), cast per weight before the layout copy."""
+    modules = {route.leaf.split("/")[1] for route in SELF_CONDITIONING.entries
+               if isinstance(route, Route) and route.leaf is not None}
     seen = set()
 
     def path_of(name: str) -> tuple[str, ...]:
-        bare = name.removeprefix("self_conditioning.")
-        if bare not in paths:
+        found = SELF_CONDITIONING.read(name.removeprefix("self_conditioning."), {})
+        if found is None or found.path is None:
             raise ValueError(f"unknown tensor name {name!r}")
-        path = paths[bare]
+        path = found.path[1:]
         if path[0] in seen:
             raise ValueError(f"duplicate self-conditioning tensor {name!r}")
         seen.add(path[0])
         return path
 
     params = translate_parameters(hf_tensors, path_of, param_dtype)
-    missing = {path[0] for path in paths.values()} - seen
+    missing = modules - seen
     if missing:
         raise ValueError(f"missing self-conditioning tensors for {sorted(missing)}")
     return params
+
+
+def _self_conditioning_name(path: tuple[str, ...]) -> str:
+    """The release's name of the self-conditioning leaf at `path` (`SELF_CONDITIONING`), its collection
+    first and the block's own `self_conditioning` after it."""
+    written = SELF_CONDITIONING.write((path[0], *path[2:]), {})
+    if written is None:
+        raise ValueError(f"{'/'.join(path)} is no self-conditioning tensor")
+    return f"model.decoder.self_conditioning.{written}"
 
 
 def translate_weights(
@@ -190,49 +207,64 @@ def _named(prefix: str, layouts: tuple[WeightLayout, ...]) -> tuple[WeightLayout
     return tuple(dataclasses.replace(layout, name=prefix + layout.name) for layout in layouts)
 
 
-def generation_process(config: Mapping[str, object], generation: Mapping[str, object]) -> BlockProcess:
-    """Build the block-diffusion process the published generation config describes.
+_SAMPLER = "EntropyBoundSamplerConfig"
+"""The one sampler a DiffusionGemma generation config names, entropy-bounded sampling."""
 
-    Each field falls back to the reference's own default when
-    `generation_config.json` omits it.
-    """
-    sampler = generation.get("sampler_config")
-    if sampler is None:
-        budget = 0.1
-    else:
-        sampler_fields = _section(generation, "sampler_config")
-        kind = sampler_fields.get("_cls_name", "EntropyBoundSamplerConfig")
-        if kind != "EntropyBoundSamplerConfig":
-            raise ValueError(f"DiffusionGemma sampler {kind!r} is not entropy-bounded sampling")
-        budget = _number(sampler_fields, "entropy_bound", 0.1)
-    return BlockProcess(
-        canvas_length=_integer(config, "canvas_length", 256),
-        vocab_size=_integer(text_config(config), "vocab_size"),
-        max_steps=_integer(generation, "max_denoising_steps", 48),
-        t_min=_number(generation, "t_min", 0.4),
-        t_max=_number(generation, "t_max", 0.8),
-        entropy_bound=budget,
-        stability_threshold=_integer(generation, "stability_threshold", 1),
-        confidence_threshold=_number(generation, "confidence_threshold", 0.005))
+
+def _sampler() -> ConfigPart[BlockProcess]:
+    """`sampler_config`'s entropy bound, both ways: an entropy-bounded sampler's, at 0.1 where the config
+    states none (DiffusionGemmaGenerationConfig's), any other sampler refused."""
+    def read(generation: Mapping[str, object], used: set[str],
+             record: NativeFields[BlockProcess]) -> NativeFields[BlockProcess]:
+        used.add("sampler_config")
+        bound: object = 0.1
+        if generation.get("sampler_config") is not None:
+            sampler = _section(generation, "sampler_config")
+            kind = sampler.get("_cls_name", _SAMPLER)
+            if kind != _SAMPLER:
+                raise ValueError(f"DiffusionGemma sampler {kind!r} is not entropy-bounded sampling")
+            bound = sampler.get("entropy_bound", bound)
+        record["entropy_bound"] = _records.number(bound, "entropy_bound")
+        return record
+
+    def write(process: BlockProcess) -> Mapping[str, object]:
+        return {"sampler_config": {"_cls_name": _SAMPLER, "entropy_bound": float(process.entropy_bound)}}
+    return ConfigPart(read, write, keys=("sampler_config",))
+
+
+GENERATION_CONFIG: ConfigLayout[BlockProcess] = ConfigLayout(
+    ConfigField("max_denoising_steps", "max_steps", 48, _records.integer),
+    ConfigField("t_min", "t_min", 0.4, _records.number, spell=lambda value: _records.number(value, "t_min")),
+    ConfigField("t_max", "t_max", 0.8, _records.number, spell=lambda value: _records.number(value, "t_max")),
+    ConfigField("stability_threshold", "stability_threshold", 1, _records.integer),
+    ConfigField("confidence_threshold", "confidence_threshold", 0.005, _records.number,
+                spell=lambda value: _records.number(value, "confidence_threshold")),
+    _sampler())
+"""The `BlockProcess` fields a DiffusionGemma generation_config.json states, both ways, each at
+DiffusionGemmaGenerationConfig's default where the file omits it, a real written as a float where the
+process also takes an int, as transformers' reader requires (generation_diffusion_gemma.py:181-183, 333).
+The canvas and vocabulary are the model's (`generation_process`)."""
+
+
+def generation_process(config: Mapping[str, object], generation: Mapping[str, object]) -> BlockProcess:
+    """Build the block-diffusion process the published generation config describes
+    (`GENERATION_CONFIG`), over the model's canvas and vocabulary."""
+    model = NativeFields(BlockProcess, {"canvas_length": _integer(config, "canvas_length", 256),
+                                        "vocab_size": _integer(text_config(config), "vocab_size")})
+    return GENERATION_CONFIG.read(generation, set(), model).value
 
 
 def generation_config_of(process: BlockProcess, *, max_new_tokens: int | None = None,
                          pad_token_id: int | None = None, eos_token_ids: Sequence[int] = ()
                          ) -> dict[str, _records.JSON]:
     """The generation_config.json transformers' DiffusionGemmaGenerationConfig
-    reads, and `generation_process` reads back as `process`: its inverse. The
-    canvas and vocabulary are the model's in both, as a block run's process
-    takes them from its model (`BlockDiffusionObjective`)."""
-    # Floats where BlockProcess also takes an int, as transformers' reader
-    # requires (generation_diffusion_gemma.py:181-183, 333).
-    sampler: dict[str, _records.JSON] = {"_cls_name": "EntropyBoundSamplerConfig",
-                                        "entropy_bound": float(process.entropy_bound)}
+    reads, and `generation_process` reads back as `process`: its inverse
+    (`GENERATION_CONFIG`). The canvas and vocabulary are the model's in both,
+    as a block run's process takes them from its model
+    (`BlockDiffusionObjective`)."""
     values: dict[str, _records.JSON] = {
-        "max_denoising_steps": process.max_steps, "t_min": float(process.t_min),
-        "t_max": float(process.t_max), "stability_threshold": process.stability_threshold,
-        "confidence_threshold": float(process.confidence_threshold), "sampler_config": sampler,
-        **eos_field(eos_token_ids),
-    }
+        name: _records.json_value(value, name) for name, value in GENERATION_CONFIG.write(process).items()}
+    values.update(eos_field(eos_token_ids))
     if max_new_tokens:
         values["max_new_tokens"] = max_new_tokens
     if pad_token_id is not None:
@@ -302,11 +334,35 @@ def published_config(model: DiffusionGemma) -> Mapping[str, object]:
     return config
 
 
-def publishable(model: DiffusionGemma) -> bool:
-    """Whether transformers' DiffusionGemmaForBlockDiffusion can build the config `model` publishes
-    (`_unbuildable`): a block decoder with none of what it requires exports as its run's native release
+def release_layout(block: DiffusionGemma, model: nn.Module,
+                   config: Mapping[str, object] | None = None) -> SourceLayout | Unwritable:
+    """The layout a DiffusionGemma `block` (`model` itself, or the adapter over it whose factors its export
+    merges) is written in (`dew.interop.layouts.source_layout`): transformers'
+    DiffusionGemmaForBlockDiffusion's, its config the one `published_config` writes (or `config`, a loaded
+    source's own) and its tensors the bundle's own export (`export_weights`), where that class builds what
+    the model publishes; else what it cannot hold: a field it would rebuild otherwise, or a part it builds
+    that the model has none of (`_unbuildable`), which exports as the run's native release
     (`dew.interop.releases.native_plan`)."""
-    return not _unbuildable(published_config(model))
+    from dew.interop.layouts import SourceLayout, Unwritable
+
+    try:
+        published = published_config(block)
+    except ValueError as error:
+        return Unwritable(f"transformers' DiffusionGemmaForBlockDiffusion does not hold this DiffusionGemma: "
+                          f"{error}")
+    missing = _unbuildable(published)
+    if missing:
+        return Unwritable(_unreadable(missing))
+
+    def tensors(variables: Mapping[str, object]) -> Mapping[str, np.ndarray]:
+        # The bundle's own export: its storage read as layers, the factors merged, the published writer.
+        from dew.interop.pretrained import PretrainedBlockDecoder
+
+        bundle = PretrainedBlockDecoder(block, variables, None, published, None, {},
+                                        export_adapter=export_weights)
+        return bundle.bound(model, variables).export()
+
+    return SourceLayout(published if config is None else config, {}, tensors)
 
 
 def _unbuildable(config: Mapping[str, object]) -> list[str]:
@@ -320,15 +376,19 @@ def _unbuildable(config: Mapping[str, object]) -> list[str]:
         ("vision_config", config.get("vision_config"))) if not present]
 
 
+def _unreadable(missing: Sequence[str]) -> str:
+    """Why transformers' class cannot read an export of a DiffusionGemma that has none of `missing`."""
+    return (f"this DiffusionGemma has no {' or '.join(missing)}, and transformers' "
+            "DiffusionGemmaForBlockDiffusion, the implementation its checkpoint layout is for, builds "
+            "both, so it cannot read an export of it; keep training it from the run's checkpoint "
+            "(dew.checkpoints) rather than a published directory")
+
+
 def _refuse_unreadable(config: Mapping[str, object]) -> None:
     """Refuse a config transformers' class cannot build (`_unbuildable`)."""
     missing = _unbuildable(config)
     if missing:
-        raise ValueError(
-            f"this DiffusionGemma has no {' or '.join(missing)}, and transformers' "
-            "DiffusionGemmaForBlockDiffusion, the implementation its checkpoint layout is for, builds "
-            "both, so it cannot read an export of it; keep training it from the run's checkpoint "
-            "(dew.checkpoints) rather than a published directory")
+        raise ValueError(_unreadable(missing))
 
 
 def export_weights(
@@ -365,7 +425,7 @@ def export_weights(
     leaves: dict[tuple[str, ...], object] = {}
     for path, leaf in flatten_dict(dict(params["self_conditioning"])).items():
         leaves[("params", "self_conditioning", *(str(part) for part in path))] = leaf
-    layouts = leaf_layouts(leaves, lambda path: f"model.decoder.self_conditioning.{path[-2]}.weight")
+    layouts = leaf_layouts(leaves, _self_conditioning_name)
     if "conditioner" in params:
         if vision is None:
             tower = {collection: tree["conditioner"]["tower"] for collection, tree in variables.items()

@@ -159,8 +159,7 @@ def a_fused_kernel_takes_forward_mode_through_the_reference(implementation, with
     (333, 333, True, 64),    # the concatenated text-plus-image sequence, causal
     (3072, 3072, True, 256),  # Qwen3.5's 256-wide heads, which cudnn takes from Hopper on
 ])
-def cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal, head_dim,
-                                                      without_deterministic_ops):
+def cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal, head_dim):
     """cudnn's kernel has no backward pass for an odd length; the padded call
     trains, and what it computes for the real rows is what the xla kernel
     computes: within two bf16 ulps of the output scale, forward and backward,
@@ -795,8 +794,7 @@ def test_key_lengths_attend_as_the_mask_they_mean(implementation, causal):
     (77, 77, True),            # its text queries, causal over the text alone
     (78, 78, True),            # an even length, which the kernel takes unpadded
 ])
-def cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal, as_mask,
-                                                     without_deterministic_ops):
+def cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal, as_mask):
     """cuDNN reads the lengths as its padding mask, odd lengths included:
     within two bf16 ulps of the output scale of the xla kernel, forward and
     backward, as `test_cudnn_trains_odd_lengths_and_agrees_with_xla` bounds
@@ -813,7 +811,7 @@ def cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal, as_mask,
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
-def single_query_cudnn_decode_matches_float64_attention_and_gradients(without_deterministic_ops):
+def single_query_cudnn_decode_matches_float64_attention_and_gradients():
     """One query, GQA and distinct key counts against the highest-precision path.
 
     The single query is padded for the cuDNN backward even though the

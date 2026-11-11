@@ -126,7 +126,7 @@ PROGRAMS = {
     "jit": jax.jit(_arithmetic),
     "custom_vjp": _custom,
     "scan": lambda x: jax.lax.scan(lambda carry, row: (carry + _arithmetic(row), carry * row), x[0], x)[1],
-    # A remat's call, which the replay opens as the gate does (`dew.nn.programs.CALLS`).
+    # A remat's call, which the replay opens as the gate does (`dew.nn.programs.called`).
     "remat": jax.checkpoint(_arithmetic),
     # A marked span's call (`dew.nn.derivatives.marked`: an error-free transform's), opened so too.
     "marked": marked(Protected(), _arithmetic),
@@ -177,12 +177,17 @@ def test_what_a_programs_results_do_not_read_is_not_replayed():
     np.testing.assert_array_equal(rows.view(np.uint64), summed.view(np.uint64))
 
 
+def decomposed(x):
+    """A decomposition's first row: no operation whose arithmetic JAX states entry by entry."""
+    return jnp.linalg.cholesky(jnp.diag(x))[0]
+
+
 REFUSED = {
-    "float": lambda x: jnp.tan(x),
+    "float": decomposed,
     "complex": lambda x: jnp.cos(x.astype(jnp.complex64)).real,
     # A call whose integer boundary hides float arithmetic inside.
     "hidden": lambda x: jax.lax.while_loop(lambda carry: carry[0] < 2, lambda carry: (
-        carry[0] + 1, carry[1] + jnp.tan(x).astype(jnp.int32)), (0, x.astype(jnp.int32)))[1],
+        carry[0] + 1, carry[1] + decomposed(x).astype(jnp.int32)), (0, x.astype(jnp.int32)))[1],
 }
 
 
@@ -193,6 +198,20 @@ def test_a_float_operation_without_a_float64_rule_refuses(name):
     with pytest.raises(NotImplementedError):
         float64_replay(REFUSED[name])(np.ones(3, np.float32))
 
+
+
+def test_a_padded_product_replays_in_float64():
+    """A program that pads a float before it multiplies and sums, as Dew's blocked CPU product pads a depth
+    to whole blocks in a library process's arithmetic, replays in float64: what the program computes on
+    float64 inputs. The replay named the operations it knew and `pad` was not among them, so a model's
+    initial parameters could not be replayed in a user's arithmetic (tests/test_parallelism_matrix.py)."""
+    def padded(x):
+        return jnp.sum(jnp.pad(x, (0, 5)).reshape(2, -1) ** 2, axis=0)
+
+    x = np.random.default_rng(0).normal(size=11).astype(np.float32)
+    with jax.enable_x64(new_val=True):
+        wide = padded(jnp.asarray(x, jnp.float64))
+    np.testing.assert_array_equal(np.asarray(float64_replay(padded)(x)), np.asarray(wide))
 
 
 @pytest.mark.parametrize("name", sorted(DRAWS))

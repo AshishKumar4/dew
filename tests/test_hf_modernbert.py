@@ -82,7 +82,7 @@ BF16_SEEDS = 8
 """The bf16 states' declared draws of ids on a GPU's kernels (check 1), sized by `seeds_for` paired there."""
 
 
-def modernbert_states_in_bf16_on_the_gpu_kernels(without_deterministic_ops):
+def modernbert_states_in_bf16_on_the_gpu_kernels():
     """'auto' runs the global layers on cuDNN and keeps the local layers'
     two-sided window off it, which cuDNN refuses; the bf16 states are on par
     with ModernBertModel's own bf16 run over drawn ids (check 1), from the

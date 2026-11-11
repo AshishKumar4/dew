@@ -18,6 +18,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
+import itertools
 import json
 import math
 import shutil
@@ -1121,7 +1122,6 @@ def slot_request(seed):
                                                    "criteria": dict.fromkeys(options)}}}
 
 
-@pytest.mark.whole_suite
 def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers_states(tmp_path):
     """A slot release whose backbone no registered family computes loads it as tier 3 and decides
     over it: each option's score is the release's law (`SlotReadout`: `<slot_i, h> + <q h, k m_i> /
@@ -1224,9 +1224,10 @@ def test_a_tier_3_source_generates_through_the_pipeline_loader_as_its_bundle_doe
 @pytest.mark.parametrize("family", sorted(PACKED_MODELS))
 def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_prefix(family, stated, tmp_path):
     """A tier-3 model on Dew's attention decodes through Dew's cache: a padded prompt fills its row's
-    slots and each next token one more, and every decoded step's logits hold check 1 against
-    transformers' full forward of that row's prefix, each step's its own at the width it reads (ledger
-    1543; its float64 twin's one forward the truth), Cohere 2's window
+    slots and each next token one more, the prompt prefilled whole or in two pieces, each piece written
+    after the last's at its places in the whole prompt, and every decoded step's logits hold check 1
+    against transformers' full forward of that row's prefix, each step's its own at the width it reads
+    (ledger 1543; its float64 twin's one forward the truth), Cohere 2's window
     included, the padding stated by a validity mask or as the document 0 of the row's segments; its
     greedy generation's tokens are the full forward's argmax at each step."""
     from dew.inference import TextGeneration
@@ -1247,14 +1248,21 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
     reference.set_attn_implementation("eager")
     steps = 4
 
-    @jax.jit
-    def decoded(variables, prompt, valid, continued):
-        cache = loaded.model.apply(variables, prompt.shape[0], method="init_cache", mutable=["cache"])[1]
-        # One document a row, its padding the document 0 of the row's segments where so stated.
-        padding = ({"attention_mask": valid} if stated == "mask" else {"coordinates": coordinates(
-            prompt.shape, segments=valid.astype(jnp.int32), max_segments=1)})
-        logits, state = loaded.model.apply({**variables, **cache}, prompt, decode=True, mutable=["cache"],
-                                           **padding)
+    @functools.partial(jax.jit, static_argnums=4)
+    def decoded(variables, prompt, valid, continued, pieces):
+        state = loaded.model.apply(variables, prompt.shape[0], method="init_cache", mutable=["cache"])[1]
+        # The prompt in `pieces` calls, each writing its tokens after the last's.
+        cuts = np.linspace(0, prompt.shape[1], pieces + 1).astype(int)
+        # One document a row, its padding the document 0 of the row's segments where so stated, each
+        # piece's places its tokens' in the whole prompt (a piece's segments alone would count from 0).
+        whole = coordinates(prompt.shape, segments=valid.astype(jnp.int32), max_segments=1)
+        for start, end in itertools.pairwise(cuts):
+            part, held = prompt[:, start:end], valid[:, start:end]
+            padding = ({"attention_mask": held} if stated == "mask" else {"coordinates": coordinates(
+                part.shape, segments=held.astype(jnp.int32), positions=whole.positions[:, start:end],
+                max_segments=1)})
+            logits, state = loaded.model.apply({**variables, **state}, part, decode=True, mutable=["cache"],
+                                               **padding)
         stepped = [logits[:, -1]]
         for step in range(steps):
             logits, state = loaded.model.apply({**variables, **state}, continued[:, step:step + 1],
@@ -1272,7 +1280,8 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
 
     @as_given
     def ours(prompt, valid, continued):
-        return np.asarray(decoded(loaded.variables, prompt, valid, continued), np.float64)
+        return {f"{pieces} pieces": np.asarray(decoded(loaded.variables, prompt, valid, continued, pieces),
+                                               np.float64) for pieces in (1, 2)}
 
     def theirs(source, precision=contextlib.nullcontext, *, stepped: bool = True):
         def forward(ids):
@@ -1288,7 +1297,8 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
                     rows.append(np.stack([forward(ids[:real + step])[-1] for step in range(steps + 1)]))
                 else:
                     rows.append(forward(ids)[real - 1:real + steps])
-            return np.stack(rows)
+            # The same prefixes whichever way the prompt was prefilled.
+            return dict.fromkeys(("1 pieces", "2 pieces"), np.stack(rows))
         return as_given(run)
 
     assert_as_exact(ours, theirs(reference), draw, f"{family} cached logits ({stated})",

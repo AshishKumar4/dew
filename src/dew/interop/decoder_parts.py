@@ -15,7 +15,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict
+from typing import TYPE_CHECKING, NamedTuple, NoReturn, NotRequired, Protocol, TypedDict, get_type_hints
 
 import jax
 import jax.numpy as jnp
@@ -25,7 +25,8 @@ from flax.traverse_util import flatten_dict
 from dew import _records
 from dew._model_types import SANDWICH_NORMS
 from dew.batch import unboxed
-from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.codecs import CODEC_FIELDS
+from dew.interop.config_records import NativeFields, hf_metadata, native_fields
 from dew.interop.layouts import (
     Condition,
     Config,
@@ -52,6 +53,7 @@ from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
+from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.rope import RopeScaling, YarnScaling
 from dew.nn.sharding import drawn_axes
 from dew.registry import from_record, to_record
@@ -132,25 +134,20 @@ def hf_ungated(mlp: GatedActivation | None, family: str, tanh: str = 'gelu_new')
 GEMMA3_MODEL_TYPE = 'gemma3_text'
 QWEN35 = 'qwen3_5_text'
 
-# The gated delta net's own geometry, the config's names and the mixer kind's.
-LINEAR_FIELDS = ('linear_num_key_heads', 'linear_num_value_heads',
-                  'linear_key_head_dim', 'linear_value_head_dim',
-                  'linear_conv_kernel_dim')
+LINEAR_FIELDS = tuple(field.name for field in dataclasses.fields(GatedDeltaNetMixer)
+                      if get_type_hints(GatedDeltaNetMixer)[field.name] is int)
+"""The gated delta net's own geometry, the config's names and the mixer kind's: the mixer's integer
+fields, in its order."""
 
 # These fields have no effect on an eval-time forward pass: metadata, token
 # ids, or runtime knobs of the reference implementation (Gemma 3 ships
 # cache_implementation 'hybrid', which describes transformers' KV cache).
-IGNORED_FIELDS = set(_records.HF_METADATA) | {
+IGNORED_FIELDS = frozenset({
     'attention_dropout', 'attn_implementation', 'auto_map', 'bos_token_id', 'cache_implementation',
     'eos_token_id', 'initializer_range', 'max_window_layers', 'pad_token_id', 'pretraining_tp',
     'use_cache', 'use_sliding_window', 'unk_token_id',
-}
+})
 
-# Read by the codec rather than by any family: `codecs.source_quantization`
-# decodes the weights these name and refuses a format it cannot, before a
-# family translator sees the config. DeepSeek-V4 names its routed experts'
-# storage as `expert_dtype` beside its quantization_config.
-CODEC_FIELDS = frozenset({'quantization_config', 'expert_dtype'})
 
 # A wrapper's text_config serialized by transformers 4.56.2 carries every
 # PreTrainedConfig attribute (moonshotai/Kimi-K2.5 and moonshotai/Kimi-K3).
@@ -226,7 +223,7 @@ def _unread(hf_config: Mapping[str, object], used: set[str]) -> set[str]:
     model_type = hf_config.get('model_type')
     inert = _INERT_FIELDS[None] | _INERT_FIELDS.get(model_type if isinstance(model_type, str) else None,
                                                     frozenset())
-    return (set(hf_config) - used - IGNORED_FIELDS - CODEC_FIELDS - inert
+    return (set(hf_config) - used - hf_metadata() - IGNORED_FIELDS - CODEC_FIELDS - inert
             - {key for key in hf_config if str(key).startswith('_')})
 
 
@@ -551,6 +548,12 @@ class Ropes:
     full_only: bool = False
 
 
+ROPE_SPELLINGS = frozenset({'rope_theta', 'rope_parameters', 'rope_scaling'})
+"""The config fields a rotary record is read from (`rope_records`): transformers' `rope_parameters` and the
+legacy `rope_theta` and `rope_scaling` its configs still convert (`convert_rope_params_to_dict`,
+modeling_rope_utils.py:742-760)."""
+
+
 def rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
                   ) -> tuple[tuple[str, dict], tuple[str, dict] | None]:
     """The full layers' and the sliding layers' effective rope records, each
@@ -609,7 +612,7 @@ def read_rope(hf_config: Mapping[str, object], used: set, spelling: RopeSpelling
     family's `defaults`, as `_rope_entry` describes. `ramps` names the
     scaling types the family computes; `per_kind=False` refuses nested records.
     """
-    used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
+    used.update(ROPE_SPELLINGS)
     stated = hf_config.get('max_position_embeddings')
     yarn_max_pos = None if stated is None else _records.integer(stated, 'max_position_embeddings')
     if spelling.local_field is not None:
@@ -657,7 +660,7 @@ def read_partial_rope(hf_config: Mapping[str, object], used: set, spelling: Rope
     Qwen3_5TextRotaryEmbedding do: the record as the class resolves it (`rope_records`, a legacy
     rope_scaling replacing rope_parameters whole), its fraction else the config's flat one else
     `default_factor` (`convert_rope_params_to_dict`, modeling_rope_utils.py:742-760)."""
-    used.update(('rope_theta', 'rope_parameters', 'rope_scaling', 'partial_rotary_factor'))
+    used.update((*ROPE_SPELLINGS, 'partial_rotary_factor'))
     (field, record), sliding = rope_records(hf_config, spelling)
     if sliding is not None:
         refuse(sliding[0], 'this family reads one rotary record for every layer')
@@ -957,12 +960,6 @@ def record_float(record: Mapping[str, object], field: str, default: float | None
     return _recorded(record, field, default, used, _records.number)
 
 
-def record_bool(record: Mapping[str, object], field: str, default: bool | None = None, *,
-                used: set[str] | None = None) -> bool:
-    """Read a boolean field out of a record by name (`_recorded`)."""
-    return _recorded(record, field, default, used, _records.boolean)
-
-
 # Where a layer's norms sit in the two trees: without the sandwich the names
 # are the same, and with it they move (`SANDWICH_NORMS`).
 _PRE_NORMS = {
@@ -1062,10 +1059,6 @@ _V4_HEAD = ('hc_fn', 'hc_base', 'hc_scale')
 # the frozen table a hash router selects by; none is a parameter, so each
 # lands where `Router` keeps it (modeling_deepseek_v4.py:1033, :1062).
 _MOE_STATE = ('e_score_correction_bias', 'media_bias', 'tid2eid')
-
-
-def _norm_names(sandwich: bool) -> dict[str, str]:
-    return SANDWICH_NORMS if sandwich else _PRE_NORMS
 
 
 # The decoder's tensors outside its layers, read one way on load and the
@@ -1973,10 +1966,10 @@ class DecoderFamily:
     before this, by `Pretrained.load`, which records what it undid for the
     export."""
     spelling: Callable[[str], str] = field(default=lambda name: name)
-    """The name the family reads a stored tensor under and its encoder writes it
-    under, where a checkpoint may store it as another: a bare GPT2Model leaves
-    out GPT-2's `transformer.`. `prepare` renames by it, and a quantized source
-    is written back under its own names (`Pretrained.export`)."""
+    """The name the family's encoder writes a stored tensor under, where a checkpoint may store it as
+    another its `routes` read too: a bare GPT2Model leaves out GPT-2's `transformer.` (`Spelled.leading`
+    of the routes' own respelling). A quantized source whose `prepare` rewrites its tensors, so binds
+    none, is written back under its own names by it (`Pretrained.export`)."""
     packed: tuple[Packed, ...] = ()
     """Source tensors that hold several the path map reads, split on load and
     packed again on export: fused experts and GPT-2's Conv1D projections."""

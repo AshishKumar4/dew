@@ -348,8 +348,8 @@ def test_every_pallas_kernel_a_measured_cell_runs_has_a_lowering_probe():
     GPU session's compile."""
     from dew.nn.kernels import grouped_matmul, norm_swiglu
 
-    named = {(op.choice, kernel) for op in (norm_swiglu.NORM, norm_swiglu.SWIGLU, grouped_matmul.GROUPED)
-             for kernel, _ in op.declared.values() if kernel in PALLAS_CHOICES}
+    named = {(op.choice, kernel.name) for op in (norm_swiglu.NORM, norm_swiglu.SWIGLU, grouped_matmul.GROUPED)
+             for kernel, _ in op.declared.values() if kernel.name in PALLAS_CHOICES}
     assert named <= set(FAMILIES), sorted(named - set(FAMILIES))
 
 
@@ -982,7 +982,7 @@ def test_a_remat_rung_keeping_the_delta_rules_residuals_runs_the_templates_forwa
     forward launches once, as the layer without remat does, where the rung that saves nothing ('full')
     replays them in the backward: a Qwen3.5-4B training step at 4x6,144 tokens a device under 'full' ran
     each GDN layer's forward twice, 63.6 ms of its 1.6 s on an H100 (row 2023)."""
-    from dew.nn.mixer_base import DELTA_RULE_RESIDUALS
+    from dew.nn.residuals import DELTA_RULE_RESIDUALS
 
     unrematted, saved, full = (_template_launches(policy) for policy in (None, DELTA_RULE_RESIDUALS, ()))
     assert unrematted == saved < full, (unrematted, saved, full)

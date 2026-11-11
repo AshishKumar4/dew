@@ -11,7 +11,6 @@ that write every tensor back, so `Pretrained.save` restores what it read.
 from __future__ import annotations
 
 import copy
-import dataclasses
 import functools
 import json
 import os
@@ -37,16 +36,7 @@ from dew.inference.images import TextToImage
 from dew.inference.loading import place
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import InputSpec
-from dew.interop import (
-    decoder_parts,
-    gguf,
-    hf_decoders as decoders,
-    mamba2,
-    quantized_loads,
-    sources,
-    unread,
-    verify,
-)
+from dew.interop import decoder_parts, gguf, hf_decoders as decoders, mamba2, quantized_loads, sources, unread
 from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.composite import CompositeSource, NativeComponent
 from dew.interop.config_records import NativeFields
@@ -64,7 +54,7 @@ from dew.interop.generation_config import (
     source_cache,
     source_decoding,
 )
-from dew.interop.layouts import CROSSING_UNWRITTEN, Unwritable
+from dew.interop.layouts import CROSSING_UNWRITTEN, SourceLayout, Unwritable
 from dew.interop.pipeline_assembly import (
     SourceTask,
     assemble_pipeline,
@@ -75,6 +65,17 @@ from dew.interop.pipeline_assembly import (
 )
 from dew.interop.processors import Processor, hosts
 from dew.interop.release import load_settings, with_rounding
+from dew.interop.routes import (
+    DecoderRoute,
+    DiffusionGemmaRoute,
+    SourceRoute,
+    TorchRoute,
+    VerifiedRoute,
+    WrapperRoute,
+    lazy_route,
+    media_wrapper,
+    source_route,
+)
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
 from dew.interop.saved_sources import (
     RunPipeline,
@@ -114,7 +115,6 @@ if TYPE_CHECKING:
 
     from dew.inference.tasks import SavedRun, TaskSettings
     from dew.interop.releases import ReleasePlan
-    from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
     from dew.nn.attention import AttentionImpl
     from dew.nn.cross_attention import CrossBlocks
@@ -372,9 +372,13 @@ class Pretrained:
 
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
-                   layout: Layout | None = None) -> Self:
+                   layout: Layout | None = None, dtype: DTypeLike | None = None,
+                   param_dtype: DTypeLike | None = None) -> Self:
         """Return the pinned checkpoint `run` (`SavedRun.pinned`), rebuilt from the run's own inference
-        record, in the layout of the architecture the record names."""
+        record, in the layout of the architecture the record names, computing in `dtype` and stored in
+        `param_dtype` where given. A decoder no family's layout writes (`dew.interop.layouts.source_layout`)
+        is held in its native layout: the bundle a run starts from, whose `export` refuses with the
+        layout's reason (row 4785)."""
         from dew.inference.tasks import (
             BlockSettings,
             MaskedSettings,
@@ -385,10 +389,10 @@ class Pretrained:
         )
         from dew.registry import models
 
-        model_config = saved_model(run.record, None)
+        model_config = saved_model(run.record, dtype)
         model = model_config.build()
         # Restored where `mesh` and `layout` place them, sharded as a run's own load is.
-        variables = run.variables(ema=ema, mesh=mesh, layout=layout)
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         # The run's task as its loader reads it (`saved_settings`): its policy, budget, pad and
         # end-of-sequence ids and process, which the export writes in the format its readers read.
         held = None if run.objective.settings is None else saved_settings(run.record, run.objective.settings)
@@ -407,14 +411,27 @@ class Pretrained:
                           if isinstance(held, MaskedSettings) else
                           generation_config_of(held.sampling, budget) if isinstance(held, TextSettings)
                           else None)
+            from dew.interop.layouts import source_layout
+
             if isinstance(model, MediaWrapper):
                 bundle = PretrainedDecoder.from_model(model, variables, tokenizer=tokenizer,
                                                       generation_config=generation)
             else:
                 decoder = from_record(CausalTransformer, model)
-                source = PretrainedDecoder.from_model(decoder.with_cross_attention(None), variables,
-                                                      tokenizer=tokenizer, generation_config=generation)
-                bundle = replace(source, model=decoder)
+                stated = source_layout(decoder.with_cross_attention(None))
+                if isinstance(stated, Unwritable):
+                    # No family's layout writes it: the run's own model, in Dew's layout, which a run
+                    # starts from and whose export states the layout's reason.
+                    bundle = PretrainedDecoder(decoder, variables, None, {}, None, model_config.fields,
+                                               dict(decoders.GENERATION_DEFAULTS) if generation is None
+                                               else generation,
+                                               export_adapter=_unwritten(stated), tokenizer=tokenizer)
+                else:
+                    # Resolved once: the bundle is written in the layout just found.
+                    source = PretrainedDecoder.from_model(decoder.with_cross_attention(None), variables,
+                                                          tokenizer=tokenizer, generation_config=generation,
+                                                          layout=stated)
+                    bundle = replace(source, model=decoder)
             bundle = replace(bundle, processor=processor)
             if isinstance(held, MaskedSettings):
                 # A masked run's model is a decoder: no wrapper denoises.
@@ -563,13 +580,13 @@ class Pretrained:
         if native_release(name_or_dir):
             # A run's native release builds the model its run recorded (`saved_sources.native_source`).
             return native_source(cls, name_or_dir, mesh=mesh, layout=layout, dtype=dtype,
-                                 param_dtype=param_dtype, on_host=on_host, building={
-                "attention_impl": attention_impl != "auto", "max_seq_len": max_seq_len, "revision": revision,
-                "subfolder": subfolder, "gguf_file": gguf_file, "single_file": single_file,
-                "dduf_file": dduf_file, "fallback": fallback, "text_only": text_only,
-                "modeling_overrides": modeling_overrides or None, "prediction_depths": prediction_depths,
-                "dex": dex, "precision": precision, "scan_layers": scan_layers,
-                "packed_experts": packed_experts})
+                                 param_dtype=param_dtype, on_host=on_host, weights=weights,
+                                 attention_impl=attention_impl, max_seq_len=max_seq_len, building={
+                "revision": revision, "subfolder": subfolder, "gguf_file": gguf_file,
+                "single_file": single_file, "dduf_file": dduf_file, "fallback": fallback,
+                "text_only": text_only, "modeling_overrides": modeling_overrides or None,
+                "prediction_depths": prediction_depths, "dex": dex, "precision": precision,
+                "scan_layers": scan_layers, "packed_experts": packed_experts})
         return cls._from_family(
             name_or_dir, trust_remote_code, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len, revision=revision, subfolder=subfolder,
@@ -879,7 +896,8 @@ class PretrainedDecoder(Pretrained):
     @classmethod
     def from_model(cls, model: nn.Module, variables: Variables, *,
                    tokenizer: str | decoders.ExportTokenizer | None = None,
-                   generation_config: Mapping[str, object] | None = None) -> PretrainedDecoder:
+                   generation_config: Mapping[str, object] | None = None,
+                   layout: SourceLayout | None = None) -> PretrainedDecoder:
         """Wrap a model trained in Dew as a bundle that `save` writes in its family's Hugging Face layout.
 
         The layout is the one every writer asks (`layouts.source_layout`): a wrapper's family's release
@@ -894,14 +912,22 @@ class PretrainedDecoder(Pretrained):
         by name. `save` writes its files next to the weights, so the directory that
         `Pretrained.load` reads back includes its processor. `generation_config` is
         what generation_config.json records; None uses the native defaults with
-        the exported model's cache mode.
+        the exported model's cache mode. `layout` is the model's layout where the caller has resolved it
+        already (`Pretrained.from_saved`), so it is resolved once.
         """
         from dew.interop.layouts import source_layout
 
-        layout = source_layout(model)
-        if isinstance(layout, Unwritable):
+        resolved = source_layout(model) if layout is None else layout
+        if isinstance(resolved, Unwritable):
             raise decoder_parts.ExportRefused(
-                f"{type(model).__name__} has no Hugging Face layout Dew writes: {layout.reason}")
+                f"{type(model).__name__} has no Hugging Face layout Dew writes: {resolved.reason}")
+        return cls._of_layout(model, variables, resolved, tokenizer, generation_config)
+
+    @classmethod
+    def _of_layout(cls, model: nn.Module, variables: Variables, layout: SourceLayout,
+                   tokenizer: str | decoders.ExportTokenizer | None,
+                   generation_config: Mapping[str, object] | None) -> PretrainedDecoder:
+        """`from_model`'s bundle of `model` written in `layout`, its writable layout."""
         if isinstance(model, MediaWrapper):
             wrapper = from_record(MultimodalTransformer, model)
             return cls(wrapper, variables, None, layout.config, None,
@@ -1370,7 +1396,7 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     """Build the host preprocessing a source ships, or None where it ships none.
 
     Only a media source, a wrapper whose config names towers beside its
-    decoder (`_media_wrapper`), reads images or audio, and only through the
+    decoder (`media_wrapper`), reads images or audio, and only through the
     processor its repo ships; a text decoder takes its tokenizer whatever
     processor files sit beside it (DiffusionGemma publishes a Gemma 4
     processor config beside a text-only model), and a tiny multimodal
@@ -1388,7 +1414,7 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     processor_files = config.get("processor_config") is not None or any(
         (directory / name).exists() for name in ("processor_config.json", "preprocessor_config.json"))
     # A bundle's language model alone (`text_only`) translates to a decoder's record, which reads no media.
-    media = _media_wrapper(config) and processor_files and "tower" in record
+    media = media_wrapper(config) and processor_files and "tower" in record
     if media or (directory / "tokenizer_config.json").exists() or gguf_path is not None:
         from dew.data.text import load_tokenizer
         # A GGUF repo ships none; the file carries its tokenizer.
@@ -1431,7 +1457,7 @@ def load_processor(source: sources.SourceReference, model: nn.Module) -> Process
     else:
         config = component.config
         directory = directory / component.config_folder
-    record = decoders.translate_wrapper_config(config) if _media_wrapper(config) else {}
+    record = decoders.translate_wrapper_config(config) if media_wrapper(config) else {}
     return source_processor(directory, config, record, model, source=source)
 
 
@@ -1651,7 +1677,7 @@ def _decoded(tensors: Mapping[str, unread.Stored], config: Mapping[str, object],
     cast, which the readers then take as equal (`decoders.Checked`); and the
     stored tensors of each quantized weight as their headers state them, which
     an export writes it back as (`SourceQuantization.requantize`). `media`
-    is whether the loader reads the source as a media wrapper (`_media_wrapper`)."""
+    is whether the loader reads the source as a media wrapper (`media_wrapper`)."""
     quantization = source_quantization(config)
     if quantization is None:
         return tensors, (), None, {}, decoders.NOTHING_CHECKED, {}
@@ -1769,139 +1795,6 @@ def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperF
     return _Built(model, variables, record, wrapper, layouts, retained)
 
 
-@dataclasses.dataclass(frozen=True)
-class DecoderRoute:
-    """A registered decoder family's source, `record` its translated config."""
-
-    record: decoder_parts.DecoderFields
-
-
-@dataclasses.dataclass(frozen=True)
-class WrapperRoute:
-    """A media wrapper's source, `wrapper` its translated config."""
-
-    wrapper: decoder_parts.WrapperFields
-
-
-@dataclasses.dataclass(frozen=True)
-class DiffusionGemmaRoute:
-    """DiffusionGemma's source, read by `dew.interop.diffusion_gemma`."""
-
-
-@dataclasses.dataclass(frozen=True)
-class VerifiedRoute:
-    """An unregistered decoder read through a registered family's convention, `verified` the mapping
-    transformers' class checked (tier 2, `dew.interop.verify`)."""
-
-    verified: verify.VerifiedMapping
-
-
-@dataclasses.dataclass(frozen=True)
-class TorchRoute:
-    """An unregistered causal LM no registered convention computes, run as transformers' own forward
-    by torchax (tier 3, `dew.interop.torchax_fallback`), `admitted` the decision that it runs."""
-
-    admitted: TorchAdmission
-
-
-type SourceRoute = DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedRoute | TorchRoute
-"""How `Pretrained.load` reads a source, decided on its config alone before any weight downloads
-(`source_route`): each case carries what its reader reads."""
-
-
-def source_route(config: Mapping[str, object], *,
-                 verified: Callable[..., verify.VerifiedMapping | verify.Unmapped] = verify.verify_mapping,
-                 admitted: Callable[[verify.Unmapped], TorchAdmission] | None = None,
-                 qualified: Callable[[Mapping[str, object], verify.ProbeUnavailable], TorchAdmission]
-                 | None = None,
-                 remote: Path | None = None, pinned: sources.SourceReference | None = None) -> SourceRoute:
-    """The route `Pretrained.load` reads `config`'s source by, or the refusal it raises for it, on the
-    config alone: a storage format the codecs cannot decode, a registered family's or wrapper's own
-    refusal of the config, a speculative drafter of any model_type (`decoder_parts.DrafterRefused`),
-    or an unregistered model_type no registered family's convention computes and tier 3 does not run
-    (`torchax_fallback.admitted`; tier 3 reads float weights only), or whose shrunken probe cannot run
-    and tier 3 does not qualify on its full config (`torchax_fallback.qualified`).
-    `verified` checks an unregistered decoder against transformers (`verify.verify_mapping`), and
-    `admitted` decides whether tier 3 runs one it leaves unmapped (`torchax_fallback.admitted` when
-    None), and `qualified` whether it runs one whose probe cannot run (`torchax_fallback.qualified` when
-    None); a census over many configs passes a memo of each. `remote` is the repository whose own
-    modeling code the load opted into running (`trust_remote_code`), and `pinned` the repository, Hub
-    commit and folder it was fetched at, which a verification of that code is recorded under."""
-    source_quantization(config)
-    decoder_parts.refuse_drafter(config)
-    if (route := _native_route(config)) is not None:
-        return route
-    try:
-        verdict = verified(config) if remote is None else verified(config, remote=remote, pinned=pinned)
-    except verify.ProbeUnavailable as unavailable:
-        # No shrunken model runs: tier 3 qualifies the source on its full config, no weights read.
-        from dew.interop import torchax_fallback
-
-        torchax_fallback.refuse_quantized(config)
-        qualify = torchax_fallback.qualified if qualified is None else qualified
-        return TorchRoute(qualify(config, unavailable))
-    match verdict:
-        case verify.VerifiedMapping() as mapping:
-            return VerifiedRoute(mapping)
-        case verify.Unmapped() as unmapped:
-            from dew.interop import torchax_fallback
-
-            torchax_fallback.refuse_quantized(config)
-            return TorchRoute((admitted or torchax_fallback.admitted)(unmapped))
-
-
-def _native_route(config: Mapping[str, object]) -> DecoderRoute | WrapperRoute | DiffusionGemmaRoute | None:
-    """The route of a source Dew translates itself, on its config alone: DiffusionGemma, a media wrapper
-    or a registered decoder family; None for an unregistered model_type (tiers 2 and 3)."""
-    family = config.get("model_type")
-    if family == "diffusion_gemma":
-        return DiffusionGemmaRoute()
-    if _media_wrapper(config):
-        return WrapperRoute(decoders.translate_wrapper_config(config))
-    if isinstance(family, str) and family not in decoders.families():
-        return None
-    return DecoderRoute(decoders.translate_config(config))
-
-
-def _lazy_route(config: Mapping[str, object]) -> DecoderRoute | WrapperRoute:
-    """The route of a source read one tensor at a time (`native_backbone`): an unquantized registered
-    decoder or its media wrapper, of a family whose preparation leaves its tensors as they are stored, or
-    splits a packed one into views of it (`Packed.viewed`).
-    Any other source is refused on its config, before any weight is read or any verification runs."""
-    if source_quantization(config) is not None:
-        raise ValueError("a lazy read takes unquantized safetensors; a whole-model codec is not bounded")
-    decoder_parts.refuse_drafter(config)
-    match _native_route(config):
-        case DecoderRoute() | WrapperRoute() as route:
-            text = _records.text(route.wrapper["text_model_type"] if isinstance(route, WrapperRoute)
-                                 else config["model_type"], "model_type")
-            entry = decoders.family_entry(text)
-            # A packed tensor split into views of itself stays unread until a row is placed; a preparation,
-            # or parts interleaved in runs, copies it at translation.
-            if (entry.prepare is not decoder_parts.DecoderFamily.prepare
-                    or not all(packing.viewed for packing in entry.packed)):
-                raise ValueError(f"a lazy read takes a family whose tensors translate as they are stored or "
-                                 f"split into views of themselves; {text}'s preparation or interleaved "
-                                 f"packing copies checkpoint weights")
-            return route
-        case _:
-            raise ValueError(f"a lazy read takes a registered native decoder or its media wrapper, not "
-                             f"{config.get('model_type')!r}")
-
-
-def _media_wrapper(config: Mapping[str, object]) -> bool:
-    """Whether a source is a media wrapper: its decoder under text_config, or a bundle its decoder
-    family reads whole (`DecoderFamily.wrapper`, `decoders.bundles`), its decoder at its root or nested.
-
-    Where its model_type is a registered decoder family, the text half is
-    the model unless the family reads its media bundle whole. DiffusionGemma
-    nests its text config too.
-    """
-    family = config.get("model_type")
-    return family != "diffusion_gemma" and (decoders.bundles(config) if family in decoders.families()
-                                            else decoders.carries_text(config))
-
-
 def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransformer,
                             variables: Mapping[str, object], config: Mapping[str, object]
                             ) -> Mapping[str, np.ndarray]:
@@ -1966,9 +1859,10 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
         # The family's own encoder, the inverse `PretrainedDecoder.from_model` writes
         # through too. A quantized source keeps its packed format by going back
         # over its source names (`weight_layouts`) where it binds them; a family
-        # whose `prepare` rewrites its tensors first (GPT-2, GPT-J, GPT-NeoX,
-        # ModernBERT) binds none, and its encoder undoes that rewrite, under the
-        # source's own names, before the format encodes the weights again (`export`).
+        # whose `prepare` rewrites its tensors first (GPT-2, GPT-J, GPT-NeoX)
+        # binds none, and its encoder undoes that rewrite, under the source's own
+        # names (`DecoderFamily.spelling`), before the format encodes the weights
+        # again (`export`).
         if not quantized:
             export_adapter = decoders.export_decoder_weights
         elif not layouts:
@@ -1992,6 +1886,16 @@ def _extended[Loaded: Pretrained](loaded: Loaded, dex: DifferentialExtension | N
     if not isinstance(extended.model, Scanning):
         raise TypeError(f"scan_layers scans a decoder's layers; a {type(extended.model).__name__} has none")
     return replace(extended, model=extended.model.with_scanned_layers())
+
+
+def _unwritten(layout: Unwritable) -> Callable[..., Mapping[str, np.ndarray]]:
+    """The export of a source held in Dew's own layout because no family's writes it (`layout`): refused,
+    stating why, as a bundle of it is refused at once where one is built to be written
+    (`PretrainedDecoder.from_model`)."""
+    def refused(*_) -> Mapping[str, np.ndarray]:
+        raise decoder_parts.ExportRefused(
+            f"no Hugging Face layout Dew writes holds this model: {layout.reason}")
+    return refused
 
 
 def _within(name: str, layers: frozenset[int]) -> bool:
@@ -2309,7 +2213,7 @@ def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping
     that reads its tensor from the read-only memory-mapped safetensors only when it is read: a decoder,
     a media wrapper around one, or the backbone a release with a separately stored readout describes,
     translated and checked as `Pretrained.load` translates it, with no processor, generation config or
-    bundle. Its route is a lazy one (`_lazy_route`); a source without safetensors weights is refused
+    bundle. Its route is a lazy one (`lazy_route`); a source without safetensors weights is refused
     before any translation. `param_dtype` is a dtype name or 'auto'."""
     from dew.interop.safetensors_io import read_weights
 
@@ -2319,7 +2223,7 @@ def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping
                  else description.backbone)
     if component is None:
         raise ValueError(f"{folder} holds a standalone readout and no native backbone")
-    translated = _translated(component.config, _lazy_route(component.config),
+    translated = _translated(component.config, lazy_route(component.config),
                              component.own_tensors(read_weights(folder / component.weights_folder)), folder,
                              dtype="float32", param_dtype=param_dtype, attention_impl="reference",
                              max_seq_len=None, streaming=True)

@@ -14,6 +14,8 @@ import ml_dtypes
 import numpy as np
 from flax import linen as nn
 
+from dew.nn.precision import correctly_rounded_divide
+
 E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
 """Each E2M1 code's value in code order (ml_dtypes' float4_e2m1fn): 0 to 6
 by codes 0-7, then their negatives with the sign in bit 3, -0 included. The
@@ -139,7 +141,9 @@ def fp4_scaled_blocks(x, block: int, e4m3_scale: bool):
     if e4m3_scale:
         # the kernel's cast saturates at E4M3's 448 (cvt.rn.satfinite)
         floored = jnp.maximum(amax, _E2M1_MAX * 2 ** -9)
-        return blocks, _round_e4m3fn(jnp.minimum(floored / _E2M1_MAX, _E4M3_MAX))
+        # amax / 6 correctly rounded, as the kernel's division is: a plain `/` by the constant compiles on
+        # the CPU to a multiply by RN(1/6), off by an ulp in a quarter of blocks (ledger 1402).
+        return blocks, _round_e4m3fn(jnp.minimum(correctly_rounded_divide(floored, _E2M1_MAX), _E4M3_MAX))
     return blocks, _power_of_two_ceil(jnp.maximum(amax, _E2M1_MAX * 2 ** -126) * jnp.float32(1 / _E2M1_MAX))
 
 

@@ -36,11 +36,13 @@ from truth_sketch import truth_sketch
 
 from dew.parity import (
     MOST_SEEDS,
+    RECORDED_KINDS,
     SIZING_FROM,
     Inconclusive,
     example_mse,
     example_worst,
     leaf_summaries,
+    recorded_kinds,
     rows_summary,
     seeds_resolving,
 )
@@ -504,26 +506,26 @@ def _finished(label: str, evidence: Mapping[str, np.ndarray], confirmed: int) ->
 
 
 def _kept(label: str, evidence: Mapping[str, np.ndarray], kept: int) -> dict[str, np.ndarray]:
-    """`evidence`'s (`_evidence`) first `kept` seeds, each leaf's rows of float64 zero by their span a seed
-    (`zero_offsets`)."""
+    """`evidence`'s (`_evidence`) first `kept` seeds, each of a leaf's entries cut as the recording's layout
+    holds its kind (`dew.parity.RECORDED_KINDS`): a row a seed, its rows of float64 zero by their span a seed
+    with the spans' offsets, or whole."""
     result = {f"{label}.input_digest": evidence[f"{label}.input_digest"][:kept]}
     names = [key.removeprefix(f"{label}.mse.") for key in evidence if key.startswith(f"{label}.mse.")]
+    (offsets_kind,) = recorded_kinds("offsets")
     for name in names:
         offsets = np.cumsum([0, *evidence[f"{label}.zero_counts.{name}"][:kept]])
-        result.update({f"{label}.{field}.{name}": evidence[f"{label}.{field}.{name}"][:kept]
-                       for field in ("mse", "worst", "finite", "sketch", "example_mse", "example_worst")
-                       if f"{label}.{field}.{name}" in evidence})
-        result.update({f"{label}.zero_rows.{name}": evidence[f"{label}.zero_rows.{name}"][:offsets[-1]],
-                       f"{label}.zero_errors.{name}": evidence[f"{label}.zero_errors.{name}"][:offsets[-1]],
-                       f"{label}.zero_offsets.{name}": offsets,
-                       f"{label}.shape.{name}": evidence[f"{label}.shape.{name}"],
-                       f"{label}.dtype.{name}": evidence[f"{label}.dtype.{name}"]})
+        cuts = {"seed": slice(kept), "span": slice(offsets[-1]), "whole": ...}
+        result.update({f"{label}.{kind}.{name}": evidence[f"{label}.{kind}.{name}"][cuts[held]]
+                       for kind, held in RECORDED_KINDS.items()
+                       if held in cuts and f"{label}.{kind}.{name}" in evidence})
+        result[f"{label}.{offsets_kind}.{name}"] = offsets
     return result
 
 
 def _whole(label: str, key: str) -> bool:
-    """Whether `key` holds one value for the whole recording (a leaf's shape and dtype), not one a seed."""
-    return key.startswith((f"{label}.shape.", f"{label}.dtype."))
+    """Whether `key` holds one value for the whole recording (a leaf's shape and dtype), not one a seed
+    (`dew.parity.RECORDED_KINDS`' whole kinds)."""
+    return key.startswith(tuple(f"{label}.{kind}." for kind in recorded_kinds("whole")))
 
 
 def _runs(seeds: np.ndarray) -> str:

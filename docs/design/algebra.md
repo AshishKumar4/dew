@@ -421,6 +421,15 @@ class Term(Expr):
   constructor. An `iota`, a prefix sum (`cumsum`, `cummax`) and every other primitive outside the language are
   leaves; a recurrence's prefix is the scan derivation's (`linear_scan`, §6.9), which reads the token update,
   not a prefix term.
+- The language's operations are declared, one declaration an operation, on JAX's primitive objects
+  (`terms.OPERATIONS`, an `Operation` each): its symbol in the language (the primitive's own name), the term
+  it is written as, what its value proves of its operand's magnitude and sign (§6.3) and whether the
+  special-function units evaluate it (§6.5). An equation is of the language by its primitive's object, never
+  its name: another library's or a user's primitive under one of these names is a leaf, as is the sum JAX's
+  derivatives accumulate cotangents and tangents with (`add_any`), which no rule reads (row 5346: reading it
+  as `add` reaches a backward's own sums, and takes the gate's step programs and the pass's seconds measured
+  with it first). What JAX itself states of a primitive (a call's program, an entrywise operation, a
+  reduction) every reader takes from `dew.nn.programs`.
 - `terms.region(closed) -> Region` converts a window's equations (`program._windows`):
   - every equation outside the language becomes a `leaf` for each of its outputs;
   - a `Protected` span (§6.10) is one marked call, a `leaf` for each of its outputs, its equations kept as
@@ -507,11 +516,11 @@ Notes on the table:
 - The inputs' facts come from the traced avals, their shardings, and a declaration's roles (§6.9).
 
 A reduction names its monoid in the language (`Term.reduce`'s name), from the closed set the language holds
-(`terms.REDUCTIONS`: `sum`, `max`, `min`). There is no open registry: the derivation reads each monoid's
+(the reductions' declarations, `terms.OPERATIONS`: `sum`, `max`, `min`). There is no open registry: the derivation reads each monoid's
 algebra in its own rules (`derive.py`'s `summed` and `peaked` facts, the walked merge's `max` and `add`, the
 softmax's rescaling by `exp(k_carried - k_new)`) and its identity in `derive._identity` (a sum's zero, a
-maximum's least value), so a new reduction is a new name in `terms.REDUCTIONS` with the rules and the identity
-that read it, each held by the laws (`tests/test_algebra_laws.py`). An open `Monoid` registry, whose
+maximum's least value), so a new reduction is a new declaration with the rules and the identity that read
+it, each held by the laws (`tests/test_algebra_laws.py`). An open `Monoid` registry, whose
 combine and identity were jaxprs a rule could read, was the earlier draft: no reduction the templates take
 needs one, and a monoid's rules cannot be written from its combine alone (the softmax's rescaling is a rule
 about `exp`, not about the monoid).

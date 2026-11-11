@@ -89,7 +89,7 @@ from dew.nn.dense import Dense
 from dew.nn.documents import within_documents
 from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.kv_cache import ROUNDING_KEYS
-from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
+from dew.nn.residuals import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.quantization import (
@@ -107,7 +107,7 @@ from .precision import at_least_fp32, l2norm
 
 CARRY = MEMORY_RESIDUALS[0]
 """The name of the state a chunk hands the next (`checkpoint_name`), for a remat policy to save
-(`dew.nn.mixer_base.RESIDUALS`)."""
+(`dew.nn.residuals.RESIDUALS`)."""
 
 STATE, MOMENTUM, START, COUNT = "memory_state", "memory_momentum", "memory_start", "memory_count"
 """The decode cache's variables: the network's fast parameters now, the momentum, the parameters at the
@@ -454,7 +454,7 @@ class InContextMemory(LinearProducts):
 
     @property
     def residuals(self) -> tuple[str, ...]:
-        """The residuals this layer may mark for a remat policy (`dew.nn.mixer_base.RESIDUALS`): those of
+        """The residuals this layer may mark for a remat policy (`dew.nn.residuals.RESIDUALS`): those of
         every path its configuration can take, as the call's wrappers decide between them and the
         configuration does not see the wrappers (`_route`). A linear memory on the shared recurrence
         marks its rule's (the delta rule's port saves its decay, inverse and memory; the dot rule's

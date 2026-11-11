@@ -159,43 +159,51 @@ def test_a_padded_row_is_its_own_prompt_alone(source, record):
                prediction(qwen_walk(source, record, "padded", wide=True)), leaves=["output"])
 
 
-def cudnn_attends_a_padded_batch_as_xla_does(without_deterministic_ops):
-    """The fused kernel runs both of the block's attention calls over a
-    padded prompt, forward and backward, and computes what xla computes.
+CUDNN_SEEDS = None
+"""Check 1's declared seeds for the cuDNN cell, sized paired by `seeds_for` on a GPU (`cudnn_case`)."""
 
-    bf16 and a head width of 64 are what cuDNN takes; the fixture cases'
-    width of 12 sends 'auto' to xla. The text is odd-length, so both calls
-    also take the kernel's own odd-length padding. cuDNN once refused the
-    key-padding mask this model passed (a [B, 1, 1, K] bool), which only a
-    run through the kernel shows. The bound is two bf16 ulps (2**-7 each)
-    of each array's scale: the two kernels round the same products in a
-    different order, and the block carries that into the output and the
-    gradients. One block, because the cuda lane's deterministic ops crash
-    an executable holding two identical cuDNN backward calls
-    (openxla/xla#46500); two blocks outside that lane: 1.1 ulps on an
-    RTX 4080."""
-    model = QwenImageTransformer(in_channels=4, out_channels=4, num_layers=1, heads=2, head_dim=64,
+
+def cudnn_case():
+    """The cuDNN cell's site: two blocks of QwenImageTransformer in bf16 with a head width of 64, which
+    cuDNN takes, its pullback over a padded prompt `(dew, reference, truth, draw)`: cuDNN's, xla's, and
+    the float64 twin's on xla, over latents, contexts and probes drawn by seed."""
+    model = QwenImageTransformer(in_channels=4, out_channels=4, num_layers=2, heads=2, head_dim=64,
                                  context_in_dim=16, axes_dims_rope=(16, 24, 24), dtype=jnp.bfloat16,
                                  attention_impl="cudnn")
-    keys = jax.random.split(jax.random.PRNGKey(0), 4)
-    latent = jax.random.normal(keys[0], (2, 4, 6, 4))
-    context = jax.random.normal(keys[1], (2, 25, 16))
-    condition = DenoisingCondition(context, mask=jnp.arange(25)[None] < jnp.asarray([[25], [13]]))
+    mask = jnp.arange(25)[None] < jnp.asarray([[25], [13]])
     times = jnp.asarray([731.0, 42.0])
-    params = model.init(keys[2], latent, times, condition)["params"]
-    probe = jax.random.normal(keys[3], (2, 4, 6, 4))
+    params = model.init(jax.random.PRNGKey(0), jnp.zeros((2, 4, 6, 4)), times,
+                        DenoisingCondition(jnp.zeros((2, 25, 16)), mask=mask))["params"]
 
-    def pullback(implementation):
-        def forward(params, latent, context):
-            return model.clone(attention_impl=implementation).apply(
-                {"params": params}, latent, times, DenoisingCondition(context, mask=condition.mask))
-        output, vjp = jax.vjp(forward, params, latent, context)
-        return [output, *jax.tree.leaves(vjp(probe.astype(output.dtype)))]
+    def draw(seed: int):
+        keys = jax.random.split(jax.random.PRNGKey(seed), 3)
+        return (jax.random.normal(keys[0], (2, 4, 6, 4)), jax.random.normal(keys[1], (2, 25, 16)),
+                jax.random.normal(keys[2], (2, 4, 6, 4)))
 
-    fused, reference = jax.jit(lambda: pullback("cudnn"))(), jax.jit(lambda: pullback("xla"))()
-    for got, want in zip(fused, reference, strict=True):
-        got, want = np.asarray(got, np.float32), np.asarray(want, np.float32)
-        assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+    def pullback(net, held, dtype):
+        def run(latent, context, probe):
+            def forward(params, latent, context):
+                return net.apply({"params": params}, latent, times, DenoisingCondition(context, mask=mask))
+            output, vjp = jax.vjp(forward, held, latent.astype(dtype), context.astype(dtype))
+            return [output, *jax.tree.leaves(vjp(probe.astype(output.dtype)))]
+        return run
+
+    twin = model.clone(attention_impl="xla", dtype=jnp.float64)
+    return (pullback(model, params, jnp.float32),
+            pullback(model.clone(attention_impl="xla"), params, jnp.float32),
+            pullback(twin, widened(params), jnp.float64), draw)
+
+
+def cudnn_attends_a_padded_batch_as_xla_does():
+    """The fused kernel runs both attention calls of each of two blocks over a padded prompt, forward and
+    backward, and computes what xla computes: check 1 from the float64 twin, over drawn latents, contexts
+    and probes (`cudnn_case`). bf16 and a head width of 64 are what cuDNN takes; the fixture cases' width
+    of 12 sends 'auto' to xla. The text is odd-length, so both calls also take the kernel's own odd-length
+    padding. cuDNN once refused the key-padding mask this model passed (a [B, 1, 1, K] bool), which only a
+    run through the kernel shows. Two blocks, two identical cuDNN backward calls in one executable, which
+    XLA's deterministic ops once crashed (openxla/xla#46500, fixed in Dew's JAX build post74)."""
+    dew, reference, truth, draw = cudnn_case()
+    assert_as_exact(dew, reference, draw, "cuDNN padded batch", seeds=CUDNN_SEEDS, truth_fn=truth)
 
 
 def test_every_declared_qwen_image_tensor_is_mapped(source):

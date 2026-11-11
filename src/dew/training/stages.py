@@ -58,9 +58,10 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from dew.algebra.terms import parameter_key, parameters_key
 from dew.batch import unboxed
 from dew.mesh import STAGE_AXIS, LayoutRefused
+from dew.nn import programs
 from dew.nn.kernels.options import owned_program, program
 from dew.nn.kernels.templates.layout import entrywise
-from dew.nn.programs import ENTRYWISE, jax_name
+from dew.nn.programs import branches, cumulative, reduction, scan_body
 from dew.nn.sharding import abstract, held_by_stage
 
 if TYPE_CHECKING:
@@ -640,16 +641,17 @@ class _Numbering:
         scalar's broadcast is the scalar, whatever shape it fills; an entrywise result's entry is its
         operands' entries'; any other's reads its operands' shapes too. A scalar's sum of scalars is one
         sum of their terms (`summed`)."""
-        name = jax_name(equation.primitive)
-        spread = name == "broadcast_in_dim" and tuple(shapes[0]) == ()
-        if name == "add" and all(tuple(shape) == () for shape in shapes) and all(
+        primitive = equation.primitive
+        spread = primitive is jax.lax.broadcast_in_dim_p and tuple(shapes[0]) == ()
+        if primitive is jax.lax.add_p and all(tuple(shape) == () for shape in shapes) and all(
                 operand in self.nonnegative for operand in operands):
             return [self.summed(operands)]
         held = {key: setting for key, setting in params.items() if not (spread and key in _SHAPED)}
         _, keyed = parameters_key(equation.primitive, held)
         # An entrywise result over operands of one shape, or scalars, reads no shape; one that broadcasts
         # an operand's axes of one entry reads which.
-        free = spread or (name in ENTRYWISE and len({tuple(shape) for shape in shapes} - {()}) <= 1)
+        mapped = programs.entrywise(primitive)
+        free = spread or (mapped and len({tuple(shape) for shape in shapes} - {()}) <= 1)
         read = () if free else tuple(map(tuple, shapes))
         made = [self.number((equation.primitive, keyed, tuple(operands), read, index))
                 for index in range(len(equation.outvars))]
@@ -657,9 +659,9 @@ class _Numbering:
         # entry.
         uniform = all(operand in self.uniform or tuple(shape) == ()
                       for operand, shape in zip(operands, shapes, strict=True))
-        if spread or (free and name in ENTRYWISE and uniform):
+        if spread or (free and mapped and uniform):
             self.uniform.update(made)
-        if _keeps_sign(equation, name, params, operands, self.nonnegative):
+        if _keeps_sign(equation, params, operands, self.nonnegative):
             self.nonnegative.update(made)
         return made
 
@@ -689,8 +691,7 @@ class _Numbering:
         (`inlined`); a stack's rows moved whole (`_moved`); an equation of no stack as it is; and one over
         a stack row by row (`_row_form`), or a sum over every axis of one (`_full_sum`). None where a row
         reads another."""
-        name = jax_name(equation.primitive)
-        if name in ("scan", "cond"):
+        if equation.primitive in (jax.lax.scan_p, jax.lax.cond_p):
             return self.inlined(equation, operands, leads)
         moved = _moved(equation, operands, leads)
         if moved is not None:
@@ -746,7 +747,7 @@ class _Numbering:
                     for number, value in zip(out, returned, strict=True)]
 
         params = equation.params
-        if jax_name(equation.primitive) == "scan":
+        if equation.primitive is jax.lax.scan_p:
             counts = _scan_counts(equation)
             if counts is None:
                 return None
@@ -761,7 +762,7 @@ class _Numbering:
                 sliced = [self.number(("scanned", value, step)) for value in scanned]
                 values = [*operands[:consts], *(number for number, _ in carry), *sliced]
                 held = [*leads[:consts], *(lead for _, lead in carry), *([None] * len(sliced))]
-                out = run(params["jaxpr"], values, held)
+                out = run(scan_body(equation), values, held)
                 if out is None or any(isinstance(number, tuple) for number, _ in out[carries:]):
                     return None
                 carry, steps[step] = out[:carries], [number for number, _ in out[carries:]]
@@ -773,11 +774,11 @@ class _Numbering:
         index, *given = operands
         if isinstance(index, tuple):
             return None
-        branches = [run(branch, given, leads[1:]) for branch in params["branches"]]
-        if any(branch is None for branch in branches):
+        ran = [run(branch, given, leads[1:]) for branch in branches(equation)]
+        if any(branch is None for branch in ran):
             return None
         chosen = []
-        for outs in zip(*branches, strict=True):
+        for outs in zip(*ran, strict=True):
             if len(set(outs)) == 1:
                 chosen.append(outs[0])
             elif all(not isinstance(number, tuple) for number, _ in outs):
@@ -803,7 +804,7 @@ def _scan_counts(equation) -> tuple[int, int] | None:
     params = equation.params
     if "num_consts" in params:
         return params["num_consts"], params["num_carry"]
-    body, length = params["jaxpr"].jaxpr, params["length"]
+    body, length = scan_body(equation).jaxpr, params["length"]
     given, made = [var.aval for var in equation.invars], [var.aval for var in equation.outvars]
     reads, writes = [var.aval for var in body.invars], [var.aval for var in body.outvars]
 
@@ -831,9 +832,9 @@ UNROLLED = 256
 numbered once a step; a longer one keeps every layer whole."""
 
 
-def _keeps_sign(equation, name: str | None, params: Mapping, operands: Sequence,
+def _keeps_sign(equation, params: Mapping, operands: Sequence,
                 nonnegative: set[int]) -> bool:
-    """Whether an equation `name` under `params` over `operands` makes no negative entry, its operands and
+    """Whether `equation` under `params` over `operands` makes no negative entry, its operands and
     results all real floating point (an integer's magnitude or square can overflow negative, a
     complex square is no ordering at all): a square (`x * x`, `square`, an even integer power), a
     magnitude, an exponential, or a sum, product, maximum, quotient, root or floating conversion of
@@ -841,14 +842,16 @@ def _keeps_sign(equation, name: str | None, params: Mapping, operands: Sequence,
     values = [*equation.invars, *equation.outvars]
     if not all(jnp.issubdtype(value.aval.dtype, jnp.floating) for value in values):
         return False
-    if name in ("abs", "exp", "square") or (name == "mul" and len(operands) == 2
-                                             and operands[0] == operands[1]):
+    primitive = equation.primitive
+    if primitive in (jax.lax.abs_p, jax.lax.exp_p, jax.lax.square_p) or (
+            primitive is jax.lax.mul_p and len(operands) == 2 and operands[0] == operands[1]):
         return True
-    if name == "integer_pow" and params.get("y", 1) % 2 == 0:
+    if primitive is jax.lax.integer_pow_p and params.get("y", 1) % 2 == 0:
         return True
-    return name in ("add", "mul", "div", "max", "sqrt", "rsqrt", "reduce_sum", "reduce_max",
-                    "convert_element_type", "broadcast_in_dim", "reshape", "squeeze", "expand_dims") and all(
-        operand in nonnegative for operand in operands)
+    kept = (jax.lax.add_p, jax.lax.mul_p, jax.lax.div_p, jax.lax.max_p, jax.lax.sqrt_p, jax.lax.rsqrt_p,
+            jax.lax.reduce_sum_p, jax.lax.reduce_max_p, jax.lax.convert_element_type_p,
+            jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.squeeze_p)
+    return primitive in kept and all(operand in nonnegative for operand in operands)
 
 
 def _moved(equation, operands: list, leads: list) -> tuple | None:
@@ -856,14 +859,14 @@ def _moved(equation, operands: list, leads: list) -> tuple | None:
     its rows' axes (merging, splitting or adding them, a value of no stack becoming a stack of one row,
     one row its value again), a squeeze of its rows' axes of one row, a slice of rows along its one axis
     of them, or a concatenation of stacks along it. None for any other equation."""
-    name, params = jax_name(equation.primitive), equation.params
-    if name not in ("reshape", "squeeze", "slice", "concatenate"):
+    primitive, params = equation.primitive, equation.params
+    if primitive not in (jax.lax.reshape_p, jax.lax.squeeze_p, jax.lax.slice_p, jax.lax.concatenate_p):
         return None
     shape = tuple(equation.invars[0].aval.shape)
     number, lead = operands[0], leads[0]
     out = tuple(equation.outvars[0].aval.shape)
-    if name in ("reshape", "squeeze"):
-        if name == "reshape" and params.get("dimensions") is not None:
+    if primitive in (jax.lax.reshape_p, jax.lax.squeeze_p):
+        if primitive is jax.lax.reshape_p and params.get("dimensions") is not None:
             return None
         held = 0 if lead is None else lead
         row = shape[held:]
@@ -871,7 +874,7 @@ def _moved(equation, operands: list, leads: list) -> tuple | None:
             return None
         rows = out[:len(out) - len(row)]
         count = 1 if lead is None else len(number)
-        if math.prod(rows) != count or (name == "squeeze" and rows):
+        if math.prod(rows) != count or (primitive is jax.lax.squeeze_p and rows):
             return None
         if not rows:
             # One row, its value again.
@@ -879,14 +882,14 @@ def _moved(equation, operands: list, leads: list) -> tuple | None:
         return ((number,) if lead is None else number), len(rows)
     if lead != 1:
         return None
-    if name == "slice":
+    if primitive is jax.lax.slice_p:
         strides = params["strides"]
         start, limit = tuple(params["start_indices"]), tuple(params["limit_indices"])
         whole = start[1:] == (0,) * (len(shape) - 1) and limit[1:] == shape[1:]
         if (strides is not None and any(stride != 1 for stride in strides)) or not whole:
             return None
         return number[start[0]:limit[0]], 1
-    if name == "concatenate" and params["dimension"] == 0 and all(
+    if primitive is jax.lax.concatenate_p and params["dimension"] == 0 and all(
             isinstance(operand, tuple) for operand in operands) and all(held == 1 for held in leads):
         return tuple(row for operand in operands for row in operand), 1
     return None
@@ -906,7 +909,7 @@ def _shifted(axes, held: int) -> tuple[int, ...] | None:
 def _full_sum(equation, held: int) -> Mapping | None:
     """A sum of a stack over every axis (`reduce_sum`), as each row's sum over its own axes's parameters;
     None for any other equation."""
-    if jax_name(equation.primitive) != "reduce_sum":
+    if equation.primitive is not jax.lax.reduce_sum_p:
         return None
     rank = len(equation.invars[0].aval.shape)
     if tuple(sorted(equation.params["axes"])) != tuple(range(rank)):
@@ -921,47 +924,47 @@ def _row_form(equation, held: int, stacked: set[int], shapes: Sequence) -> Mappi
     a cumulative one, a squeeze, an expansion or a concatenation along a row's own axes; a product of rows
     batched on their leading axes, or of a stack's rows and one operand of no stack. None where a row
     reads another, or the rows leave their leading axes."""
-    name, params = jax_name(equation.primitive), dict(equation.params)
+    primitive, params = equation.primitive, dict(equation.params)
     out = equation.outvars[0].aval.shape
     rows = shapes[next(iter(stacked))][:held]
     if tuple(out[:held]) != tuple(rows):
         return None
-    if entrywise(equation) and name != "broadcast_in_dim":
+    if entrywise(equation) and primitive is not jax.lax.broadcast_in_dim_p:
         # Each operand of its result's shape, a scalar, or of one entry along an axis it broadcasts.
         fits = all(tuple(shape) == () or (len(shape) == len(out) and all(
             size in (whole, 1) for size, whole in zip(shape, out, strict=True))) for shape in shapes)
         return params if fits else None
-    if name == "broadcast_in_dim":
+    if primitive is jax.lax.broadcast_in_dim_p:
         dims = tuple(params["broadcast_dimensions"])
         if dims[:held] != tuple(range(held)):
             return None
         return {**params, "shape": tuple(params["shape"])[held:],
                 "broadcast_dimensions": _shifted(dims[held:], held)}
-    if name == "reshape":
+    if primitive is jax.lax.reshape_p:
         if params.get("dimensions") is not None:
             return None
         return {**params, "new_sizes": tuple(params["new_sizes"])[held:]}
-    if name == "transpose":
+    if primitive is jax.lax.transpose_p:
         order = tuple(params["permutation"])
         if order[:held] != tuple(range(held)):
             return None
         return {**params, "permutation": _shifted(order[held:], held)}
     for key in ("axes", "dimensions"):
-        if key in params and name in _ALONG:
+        if key in params and _along(primitive):
             moved = _shifted(tuple(params[key]), held)
             return None if moved is None else {**params, key: moved}
-    if name == "concatenate" and stacked != set(range(len(shapes))):
+    if primitive is jax.lax.concatenate_p and stacked != set(range(len(shapes))):
         return None
     for key in ("axis", "dimension"):
-        if key in params and name in _ALONG:
+        if key in params and _along(primitive):
             moved = _shifted((params[key],), held)
             return None if moved is None else {**params, key: moved[0]}
-    if name == "pad":
+    if primitive is jax.lax.pad_p:
         config = tuple(params["padding_config"])
         if stacked != {0} or any(tuple(int(edge) for edge in axis) != (0, 0, 0) for axis in config[:held]):
             return None
         return {**params, "padding_config": config[held:]}
-    if name == "dot_general":
+    if primitive is jax.lax.dot_general_p:
         (lhs_c, rhs_c), (lhs_b, rhs_b) = params["dimension_numbers"]
         if stacked == {0, 1}:
             if tuple(lhs_b[:held]) != tuple(range(held)) or tuple(rhs_b[:held]) != tuple(range(held)):
@@ -976,7 +979,8 @@ def _row_form(equation, held: int, stacked: set[int], shapes: Sequence) -> Mappi
     return None
 
 
-_ALONG = frozenset({"reduce_sum", "reduce_max", "reduce_min", "reduce_prod", "reduce_and", "reduce_or",
-                    "argmax", "argmin", "squeeze", "expand_dims", "cumsum", "cumprod", "cummax", "cummin",
-                    "cumlogsumexp", "concatenate"})
-"""The equations along axes their parameters name, which a row reads where none is a row's own."""
+def _along(primitive) -> bool:
+    """Whether `primitive` runs along axes its parameters name, which a row reads where none is a row's own:
+    a reduction, a cumulative one, a squeeze or a concatenation."""
+    return reduction(primitive) or cumulative(primitive) or primitive in (jax.lax.squeeze_p,
+                                                                          jax.lax.concatenate_p)

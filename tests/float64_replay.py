@@ -7,21 +7,25 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 import numpy as np
+from arm_arithmetic import FORMATTED
 from float64_terms import evaluated_on, walked
+from jax.extend.core import primitives
 from reference_error import _floating, as_given, equations
 
-REPLAYED = frozenset({
-    "add", "sub", "mul", "div", "neg", "max", "min", "sqrt", "square", "exp", "expm1", "log", "erf",
-    "erf_inv", "sin", "cos", "rsqrt", "integer_pow", "logistic", "ne", "is_finite", "reduce_sum",
-    "reduce_max", "dot_general", "conv_general_dilated", "broadcast_in_dim", "dynamic_slice", "split",
-    "concatenate", "convert_element_type", "gather", "iota", "reshape", "select_n", "slice", "squeeze",
-    "stack", "stop_gradient", "transpose",
-})
-"""The float operations `float64_replay` evaluates in float64: those an initializer's parameters
-depend on (the parallelism matrix's models', surveyed). Any other operation on a float refuses."""
-FORMATTED = frozenset({"bitcast_convert_type", "nextafter", "reduce_precision"})
-"""Operations whose meaning is a float format's: `float64_replay` runs them at the traced dtypes
-and widens a float they return."""
+from dew.nn import programs
+
+
+def _replayed(primitive) -> bool:
+    """Whether `float64_replay` evaluates `primitive` on floats in float64, bound on its operands widened:
+    an operation whose arithmetic is its dtype's at any width, as JAX states where it defines each
+    (`dew.nn.programs`): one that computes each entry from its operands' entries, only moves entries (a
+    padding among them, which Dew's blocked CPU product puts in a library process's every contraction),
+    reduces or scans an axis, or scatters; and the contractions and `iota`, which state no such fact and are
+    their dtype's too. Any other operation on a float refuses: a decomposition, another library's
+    primitive."""
+    return (programs.entrywise(primitive) or programs.rearranges(primitive) or programs.reduction(primitive)
+            or programs.cumulative(primitive) or programs.scatter(primitive)
+            or primitive in (primitives.dot_general_p, primitives.conv_general_dilated_p, primitives.iota_p))
 
 
 def float64_replay(fn, *, compiled: bool = False):
@@ -32,10 +36,10 @@ def float64_replay(fn, *, compiled: bool = False):
     is the program's value widened. The program is walked as the gate walks every program
     (`float64_terms.walked`, by `Replay`): its calls (`jit`), custom derivatives' calls, scans,
     rematerialized calls (a remat module's init), the branch a conditional takes and a reduction's
-    combining body inside, each equation under the context it was traced in; a float operation outside
-    `REPLAYED`, a complex one, and any other call of a program refuse by name. Only what the results
-    read is replayed: an initializer's forward pass, which a module's init traces and whose outputs it
-    drops, never runs.
+    combining body inside, each equation under the context it was traced in; a float operation the replay
+    does not evaluate (`_replayed`), a complex one, and any other call of a program refuse by name. Only
+    what the results read is replayed: an initializer's forward pass, which a module's init traces and
+    whose outputs it drops, never runs.
     Returns a function of `fn`'s arguments whose float results are float64, for check 1's
     `truth_fn` where a float64 run of `fn` would be another program (a float64 draw reads 64-bit
     random bits). It traces `fn` as the float32 program, x64 off, whatever the caller's mode and
@@ -126,14 +130,14 @@ class Replay:
         if next(equations(params), None) is not None:
             # A call the walk does not open may hold float arithmetic its integer boundary hides.
             raise NotImplementedError(f"float64_replay does not replay inside {name}")
-        if name in FORMATTED or not any(_floating(dtype) for dtype in dtypes):
+        if equation.primitive in FORMATTED or not any(_floating(dtype) for dtype in dtypes):
             traced = [jnp.asarray(value).astype(variable.aval.dtype) if hasattr(variable.aval, "dtype")
                       and _floating(variable.aval.dtype) else value
                       for value, variable in zip(values, equation.invars, strict=True)]
             outputs = equation.primitive.bind(*traced, **equation.primitive.get_bind_params(params))
             outputs = outputs if equation.primitive.multiple_results else [outputs]
             return [_widened(output) if _floating(output.dtype) else output for output in outputs]
-        if name not in REPLAYED:
+        if not _replayed(equation.primitive):
             raise NotImplementedError(f"float64_replay has no float64 rule for {name}")
         widened = {key: jnp.float64 if key in ("dtype", "new_dtype", "preferred_element_type")
                    and value is not None and _floating(value) else value for key, value in params.items()}

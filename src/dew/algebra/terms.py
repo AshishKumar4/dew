@@ -42,18 +42,88 @@ from jax._src.literals import TypedNdArray
 from jax.core import ShapedArray
 from jax.extend import core as jcore
 
-BINARY = frozenset({"add", "sub", "mul", "div", "max", "min", "pow", "atan2", "rem", "nextafter", "and",
-                    "or", "xor"})
-UNARY = frozenset({"neg", "exp", "exp2", "log", "log2", "log1p", "expm1", "sqrt", "rsqrt", "abs", "sign",
-                   "tanh", "logistic", "integer_pow", "square", "sin", "cos", "erf", "erf_inv", "floor",
-                   "ceil", "round", "is_finite", "not", "optimization_barrier"})
-COMPARISONS = frozenset({"lt", "le", "eq", "ne", "ge", "gt"})
-REDUCTIONS = {"reduce_sum": "sum", "reduce_max": "max", "reduce_min": "min"}
-SHAPES = frozenset({"broadcast_in_dim", "reshape", "transpose", "squeeze", "expand_dims"})
-"""The primitives of the language (§1): elementwise arithmetic and comparisons, casts, the layout changes, the
-reductions a rule reads, and products (`dot_general`); an optimization barrier among the unaries, whose value
-is its operand's, which no rule rewrites through (a value rounded once before its readers, as a declaration's
-dropped products are). Every other equation is a leaf of the region."""
+
+@dataclasses.dataclass(frozen=True)
+class Operation:
+    """One of JAX's operations as the term language speaks it (§1), declared on its primitive object
+    (`OPERATIONS`): its `symbol` in the language (the primitive's own name), the term it is written as
+    (`kind`: a binary or unary function, a comparison, a layout change, a reduction over its `monoid`, a cast,
+    a selection, a product), and what its value proves of its operand's (`_real_bound`, `_bounded`): a
+    magnitude at most 1 over a real operand of any magnitude (`bounded`; over a complex one, `sin(pi/2 +
+    89j)` is 2.2e38), one no larger than its operand's (`keeps_magnitude`), an integer it rounds to, no
+    larger than its operand's or 1 (`integral`: `ceil(2**-126)` is 1), a bitwise result, a boolean's at most
+    1 and an integer's any value of its dtype (`bitwise`: int32's `not(-2**31)` is `2**31 - 1`), a value at
+    most 0 where its operand is (`keeps_sign`; a conversion where it keeps the sign, `_keeps_sign`); and
+    whether its work is the special-function units' (`exponential`, `cost.work`)."""
+
+    symbol: str
+    kind: str
+    monoid: str | None = None
+    bounded: bool = False
+    keeps_magnitude: bool = False
+    integral: bool = False
+    bitwise: bool = False
+    keeps_sign: bool = False
+    exponential: bool = False
+
+
+OPERATIONS: dict[jcore.Primitive, Operation] = {}
+"""The language's operations, each by its JAX primitive object: elementwise arithmetic and comparisons, casts,
+the layout changes, the reductions a rule reads, and products (`dot_general`); an optimization barrier among
+the unaries, whose value is its operand's, which no rule rewrites through (a value rounded once before its
+readers, as a declaration's dropped products are). Every other equation is a leaf of the region, another
+library's primitive of one of these names among them, and the sum JAX's derivatives accumulate with
+(`add_any`), which no rule reads."""
+
+
+def _speaks(kind: str, *primitives: jcore.Primitive, **facts) -> None:
+    """Declares `primitives` operations of the language of `kind`, each under its own name."""
+    for primitive in primitives:
+        OPERATIONS[primitive] = Operation(primitive.name, kind, **facts)
+
+
+_speaks("binary", jax.lax.add_p, jax.lax.sub_p, jax.lax.mul_p, jax.lax.div_p, jax.lax.max_p, jax.lax.min_p,
+        jax.lax.atan2_p, jax.lax.rem_p, jax.lax.nextafter_p)
+_speaks("binary", jax.lax.pow_p, exponential=True)
+_speaks("binary", jax.lax.and_p, jax.lax.or_p, jax.lax.xor_p, bitwise=True)
+_speaks("unary", jax.lax.sign_p, jax.lax.integer_pow_p, jax.lax.square_p, jax.lax.erf_inv_p,
+        jax.lax.is_finite_p, jax.lax.optimization_barrier_p)
+_speaks("unary", jax.lax.neg_p, jax.lax.abs_p, keeps_magnitude=True)
+_speaks("unary", jax.lax.exp_p, jax.lax.exp2_p, jax.lax.log_p, jax.lax.log2_p, jax.lax.log1p_p,
+        jax.lax.expm1_p, jax.lax.sqrt_p, jax.lax.rsqrt_p, exponential=True)
+_speaks("unary", jax.lax.tanh_p, jax.lax.logistic_p, jax.lax.sin_p, jax.lax.cos_p, jax.lax.erf_p,
+        bounded=True, exponential=True)
+_speaks("unary", jax.lax.floor_p, jax.lax.ceil_p, jax.lax.round_p, integral=True)
+_speaks("unary", jax.lax.not_p, bitwise=True)
+_speaks("comparison", jax.lax.lt_p, jax.lax.le_p, jax.lax.eq_p, jax.lax.ne_p, jax.lax.ge_p, jax.lax.gt_p)
+_speaks("shape", jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.transpose_p, jax.lax.squeeze_p,
+        keeps_magnitude=True, keeps_sign=True)
+_speaks("reduction", jax.lax.reduce_sum_p, monoid="sum")
+_speaks("reduction", jax.lax.reduce_max_p, monoid="max", keeps_magnitude=True, keeps_sign=True)
+_speaks("reduction", jax.lax.reduce_min_p, monoid="min", keeps_magnitude=True, keeps_sign=True)
+_speaks("cast", jax.lax.convert_element_type_p, keeps_magnitude=True, keeps_sign=True)
+_speaks("select", jax.lax.select_n_p)
+_speaks("product", jax.lax.dot_general_p)
+
+
+def symbol(primitive: jcore.Primitive) -> str | None:
+    """`primitive`'s symbol in the language (`OPERATIONS`), None for one it does not speak."""
+    spoken_as = OPERATIONS.get(primitive)
+    return None if spoken_as is None else spoken_as.symbol
+
+
+def _symbols(chosen: Callable[[Operation], bool]) -> frozenset[str]:
+    """The symbols of the language's operations `chosen` holds of."""
+    return frozenset(operation.symbol for operation in OPERATIONS.values() if chosen(operation))
+
+
+BINARY = _symbols(lambda operation: operation.kind == "binary")
+UNARY = _symbols(lambda operation: operation.kind == "unary")
+COMPARISONS = _symbols(lambda operation: operation.kind == "comparison")
+SHAPES = _symbols(lambda operation: operation.kind == "shape")
+REDUCTIONS = {operation.symbol: operation.monoid for operation in OPERATIONS.values()
+              if operation.kind == "reduction"}
+"""The language's symbols by the term each is written as, read from the declarations (`OPERATIONS`)."""
 RESCALE = "rescale"
 """A binary no program holds: a derived walk's rescale of a carried state from its first operand's anchor to
 its second's where the declaration states its own (`derive.Reduction.rescale`), evaluated by that function
@@ -221,12 +291,20 @@ class Region[Node: (Term, Skeleton)]:
     """Each product's parameters' index (`Term.dot`'s), its operands' dtypes (a rule's product its own's)."""
     literal_keys: frozenset[Hashable] = frozenset()
     """Each literal's term's key (`literals`' terms)."""
+    indexed: dict[Hashable, int] = dataclasses.field(default_factory=dict)
+    """Each interned entry of `params` by what makes two entries one (`interned`)."""
     extents: dict[Hashable, tuple[int, ...]] = dataclasses.field(init=False)
 
     def __post_init__(self):
         self.extents = {}
         for term, extent in self.shapes:
             self.extents.setdefault(key(term), extent)
+
+    def interned(self, primitive: jcore.Primitive, values: Mapping, operands: tuple | None = None) -> int:
+        """The index of `primitive` at `values` in the region's table (`params`), added where it holds none
+        (`_interned`): a rule set's own parameters (a transposed product's plain one) by the rule the
+        region's equations were interned by."""
+        return _interned(self.params, self.products, self.indexed, primitive, values, operands)
 
     def shape(self, term: Node) -> tuple[int, ...]:
         """`term`'s shape as its equation states it, a term of the region's: the one lookup of the shapes its
@@ -257,6 +335,21 @@ def key(term: BaseExpr | Skeleton) -> Hashable:
     if not isinstance(term, RuntimeExpr):
         raise TypeError(f"{term!r} is no egglog term")
     return term.__egg_typed_expr__
+
+
+def _interned(params: list, products: dict, indexed: dict, primitive: jcore.Primitive, values: Mapping,
+              operands: tuple | None = None) -> int:
+    """The index of `primitive` at `values` in a region's table `params`, added where it holds none: two
+    entries are one where their primitive and parameters are (`parameters_key`) and, of a product, its
+    `operands`' dtypes too, which key its mode (`cost.work`) and are kept in `products`. The one interning
+    of a region's parameters, while it is built (`_region`) and after (`Region.interned`)."""
+    entry = (*parameters_key(primitive, values), operands)
+    if entry not in indexed:
+        indexed[entry] = len(params)
+        params.append((primitive, dict(values)))
+        if operands is not None:
+            products[indexed[entry]] = operands
+    return indexed[entry]
 
 
 def parameters_key(primitive: jcore.Primitive, values: Mapping) -> tuple[jcore.Primitive, Hashable]:
@@ -430,15 +523,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
 
     products: dict[int, tuple[np.dtype | None, ...]] = {}
 
-    def param(primitive: jcore.Primitive, values: Mapping, operands: tuple | None = None) -> int:
-        # A product's operands' dtypes key its parameters too, its mode's (`cost.work`).
-        key = (*parameters_key(primitive, values), operands)
-        if key not in indexed:
-            indexed[key] = len(params)
-            params.append((primitive, dict(values)))
-            if operands is not None:
-                products[indexed[key]] = operands
-        return indexed[key]
+    param = functools.partial(_interned, params, products, indexed)
 
     env: dict[jcore.Var, Node] = {}
     dtypes: dict[Hashable, np.dtype] = {}
@@ -493,7 +578,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
             env[out] = term
             shapes.append((term, _shape(out)))
             operands = [magnitude_of(atom) for atom in equation.invars]
-            name = equation.primitive.name
+            name = symbol(equation.primitive)
             source = equation.invars[0]
             held = isinstance(source, jcore.Var) and source in nonpositive
             if name in KEEPING_SIGN and held and (name != "convert_element_type" or _keeps_sign(source, out)):
@@ -523,24 +608,18 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     stock = {name: param(primitive, values) for name, (primitive, values) in stocked().items()}
     return Region(leaves, opaque, outputs, literal_outputs, params, literals, shapes,
                   max(depths.values(), default=0), len(jaxpr.eqns), stock, dtypes, magnitudes, products,
-                  frozenset(key(forms.literal(index)) for index in range(len(literals))))
+                  frozenset(key(forms.literal(index)) for index in range(len(literals))), indexed)
 
 
-BOUNDED = frozenset({"tanh", "logistic", "sin", "cos", "erf"})
-"""The language's functions whose magnitude is at most 1 over a real operand of any magnitude (over a complex
-one, `sin(pi/2 + 89j)` is 2.2e38: unbounded)."""
-KEEPING_MAGNITUDE = frozenset({"neg", "abs", "convert_element_type", "reduce_max", "reduce_min"}) | SHAPES
-"""The language's equations whose output is no larger in magnitude than their operand's."""
-INTEGRAL = frozenset({"floor", "ceil", "round"})
-"""The language's equations rounding to an integer: no larger in magnitude than their operand's or 1, an
-integer bounding any value it bounds (`ceil(2**-126)` is 1)."""
-BITWISE = frozenset({"and", "or", "xor", "not"})
-"""The language's bitwise equations: a boolean's at most 1, an integer's any value of its dtype (int32's
-`not(-2**31)` is `2**31 - 1`)."""
+BOUNDED = _symbols(lambda operation: operation.bounded)
+KEEPING_MAGNITUDE = _symbols(lambda operation: operation.keeps_magnitude)
+INTEGRAL = _symbols(lambda operation: operation.integral)
+BITWISE = _symbols(lambda operation: operation.bitwise)
+KEEPING_SIGN = _symbols(lambda operation: operation.keeps_sign)
+EXPONENTIALS = _symbols(lambda operation: operation.exponential)
+"""The symbols whose operations' values prove each fact of their operand's, and those the special-function
+units evaluate (`Operation`)."""
 UNIT = 0
-KEEPING_SIGN = frozenset({"convert_element_type", "reduce_max", "reduce_min"}) | SHAPES
-"""The language's equations whose output is at most 0 where their operand is, a conversion where it keeps
-the sign (`_keeps_sign`)."""
 
 
 def _keeps_sign(source, out) -> bool:
@@ -583,7 +662,7 @@ def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> Magn
     if not jnp.issubdtype(dtype, jnp.integer):
         return real
     full = _integer_range(dtype)
-    name = equation.primitive.name
+    name = symbol(equation.primitive)
     source = equation.invars[0].aval
     from_unsigned = isinstance(source, ShapedArray) and jnp.issubdtype(source.dtype, jnp.unsignedinteger)
     wraps = jnp.issubdtype(dtype, jnp.unsignedinteger) and (
@@ -621,7 +700,7 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> M
       TPU) sums their products' rounding too, given one power; a mode whose rounding no source states (FP8
       fast accumulation) proves none (`_contraction_slack`).
     Any other equation proves none (a quotient, a logarithm, a power of a float exponent)."""
-    name = equation.primitive.name
+    name = symbol(equation.primitive)
     real = not any(isinstance(atom.aval, ShapedArray) and jnp.issubdtype(atom.aval.dtype, jnp.complexfloating)
                    for atom in equation.invars)
     if name in BITWISE:
@@ -734,14 +813,14 @@ def stocked() -> Mapping[str, tuple[jcore.Primitive, Mapping]]:
     scalar = jax.ShapeDtypeStruct((), jnp.float32)
     traced = jax.make_jaxpr(lambda a: (a / a, a - a, a + a, a * a, jnp.maximum(a, a), jnp.exp(a),
                                        jnp.log1p(a), jnp.expm1(a)))(scalar)
-    return {equation.primitive.name: (equation.primitive, dict(equation.params))
+    return {symbol(equation.primitive): (equation.primitive, dict(equation.params))
             for equation in traced.jaxpr.eqns}
 
 
 def spoken(equation: jcore.JaxprEqn) -> bool:
     """Whether `equation` is of the language (`_term` makes a term of it): a protected span is one marked
     call (`dew.nn.derivatives.Protected`), no equation of it."""
-    name, arity = equation.primitive.name, len(equation.invars)
+    name, arity = symbol(equation.primitive), len(equation.invars)
     if len(equation.outvars) != 1:
         return False
     binary = name in BINARY or name in COMPARISONS or name == "dot_general"
@@ -807,7 +886,7 @@ def _shape(atom) -> tuple[int, ...]:
 def _term[Node: (Term, Skeleton)](equation: jcore.JaxprEqn, read: Callable[..., Node],
                                    param: Callable) -> Node | None:
     """`equation` as a term over its inputs' (`read`), or None where it is outside the language."""
-    name, primitive = equation.primitive.name, equation.primitive
+    name, primitive = symbol(equation.primitive), equation.primitive
     if len(equation.outvars) != 1:
         return None
     if name in BINARY and len(equation.invars) == 2:

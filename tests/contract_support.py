@@ -10,28 +10,33 @@ second forward derivative, the last two again under a rematerialized call (`jax.
 normal draw and at draws at float32's exponent edges. Each order runs (a custom derivative's tangent tree
 and dtypes as JAX requires: rows 1861 and 1862, a boolean residual's tangent and a cotangent tree of the
 wrong length), and each of its leaves is finite wherever the same order's float64 run is a normal float32
-(row 1768, a contraction that overflowed before its division). Behaviour alone: no route, structure or bits
-are read, and each seam is its public call."""
+(row 1768, a contraction that overflowed before its division) and no order of its sums can overflow (row
+5426, `assert_contract`). Behaviour alone: no route, structure or bits are read, and each seam is its
+public call."""
 
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from float64_terms import float64_magnitudes
 from reference_error import widened
 
-TINY, LARGEST = float(np.finfo(np.float32).tiny), float(np.finfo(np.float32).max)
+LEAST = float(np.finfo(np.float32).tiny) * (1 + 2.0**-16)
+"""Just above float32's least normal value."""
+MOST = float(np.finfo(np.float32).max) * (1 - 2.0**-16)
+"""Just below float32's largest value."""
 
 
 class LessFinite(AssertionError):
-    """A seam's order not finite where its float64 run is a normal float32 (and the plain formula's is
-    finite): what the contract refuses, apart from an order that does not run."""
+    """A seam's order not finite where the contract holds it (`assert_contract`): what the contract refuses,
+    apart from an order that does not run."""
 
 
 def normal_float32(values) -> np.ndarray:
     """Whether each float64 value is a float32 a few roundings inside its normal range: from just above
     the least normal to just below the largest, or zero."""
     size = np.abs(np.asarray(values, np.float64))
-    return (size == 0) | ((size >= TINY * (1 + 2.0**-16)) & (size <= LARGEST * (1 - 2.0**-16)))
+    return (size == 0) | ((size >= LEAST) & (size <= MOST))
 
 
 def pulled(fn, primals, cotangent):
@@ -112,16 +117,18 @@ def ran(order, label: str, name: str):
 
 
 def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=None, plain_fn=None,
-                    held: tuple[str, ...] | None = None, without: tuple[str, ...] = ()) -> None:
-    """Every order of `fn` runs at the draw, and each leaf is finite wherever the same order of its float64
-    run is a normal float32 and, given `plain_fn` (the plain float32 formula, JAX's own derivatives of it),
-    the plain formula's is finite: no less finite than the plain arithmetic (row 1768, a contraction Dew
-    overflowed where the plain formula did not), where float32 itself overflows a partial sum the float64
-    run cancels. The float64 run is `fn`'s own, or `truth_fn`'s, the plain float64 formula, where `fn`
-    computes in a fixed precision whatever its inputs' (a declared dot algorithm). `held`, where given, names
-    the orders a decision its caller cites holds the call to: each order it drops must break, so the
-    exemption ends when the call holds it. `without` names orders the contract does not take yet, each
-    joining with its row's fix (a row's head brings its own test)."""
+                    without: tuple[str, ...] = ()) -> None:
+    """Every order of `fn` runs at the draw, and each leaf is finite at every position the contract holds:
+    where the same order of its float64 run is a normal float32; where, given `plain_fn` (the plain float32
+    formula, JAX's own derivatives of it), the plain formula's is finite; and where no order of summation
+    can overflow, the magnitudes of the terms the float64 run's sums add (`float64_magnitudes`, a sum behind
+    a sum at its own) summing inside float32's range. So a form that overflows where the plain formula's
+    own operations stay in range fails (row 1768, a contraction Dew summed before the division that brought
+    it back), and a sum whose terms float32 can overflow in one order and not another is held to neither
+    order (row 5426: Dew's blocked sum and XLA's chain each overflow partials the other does not). The
+    float64 run is `fn`'s own, or `truth_fn`'s, the plain float64 formula, where `fn` computes in a fixed
+    precision whatever its inputs' (a declared dot algorithm). `without` names orders the contract does not
+    take yet, each joining with its row's fix (a row's head brings its own test)."""
 
     def orders_of(f, *drawn):
         return {name: order for name, order in orders(f, *drawn).items() if name not in without}
@@ -136,7 +143,7 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     for name, order in narrow.items():
         values = jax.tree.leaves(ran(order, label, name))
         plains = jax.tree.leaves(plain[name]) if plain else [None] * len(values)
-        broken = []
+        lost = {}
         for index, (value, truth, plainly) in enumerate(zip(values, jax.tree.leaves(truths[name]), plains,
                                                             strict=True)):
             # JAX's dtype lattice, which holds bfloat16 (ml_dtypes' is no NumPy inexact type).
@@ -145,14 +152,17 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
             kept = normal_float32(truth) & np.isfinite(truth)
             if plainly is not None:
                 kept &= np.isfinite(plainly)
-            lost = kept & ~np.isfinite(value)
-            if lost.any():
-                broken.append(f"{label}, {name}, leaf {index}: {int(lost.sum())} values not finite where "
-                              f"float64's are normal float32s, e.g. {value[lost][:3]}")
-        if held is not None and name not in held:
-            if not broken:
-                raise AssertionError(f"{label}, {name}: holds, so the exemption that drops it is over")
-        elif broken:
+            if (kept & ~np.isfinite(value)).any():
+                lost[index] = kept & ~np.isfinite(value)
+        if lost:
+            # The float64 run's terms, read only for an order with a value to lose: its program walked once.
+            with jax.enable_x64(new_val=True):
+                reach = jax.tree.leaves(float64_magnitudes(wide[name])[1])
+            lost = {index: where & (np.asarray(reach[index]) <= MOST) for index, where in lost.items()}
+        broken = [f"{label}, {name}, leaf {index}: {int(where.sum())} values not finite where float64's are "
+                  f"normal float32s and no order of their sums overflows, e.g. {values[index][where][:3]}"
+                  for index, where in lost.items() if where.any()]
+        if broken:
             raise LessFinite(broken[0])
 
 

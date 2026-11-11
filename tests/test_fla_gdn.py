@@ -738,7 +738,7 @@ three."""
 @pytest.mark.parametrize("policy", [None, {"recompute": ("delta_memory",)},
                                     {"save": ("context", "delta_decay", "delta_inverse")}])
 def test_a_remat_policy_changes_no_gradient(policy):
-    """A block's remat policy over the port's named residuals (`mixer_base.RESIDUALS`): none,
+    """A block's remat policy over the port's named residuals (`residuals.RESIDUALS`): none,
     'all_but_delta_memory', which the block applies by tracing its layers recomputing that name
     (`recurrence_chunk.recomputing`) rather than by a checkpoint policy, and a policy saving the output,
     decay and inverse. Each computes the gradients the layer computes without remat, on

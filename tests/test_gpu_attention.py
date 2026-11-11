@@ -59,11 +59,10 @@ CASES = ("causal-documents-window", *triton.IRREGULAR)
 """The Triton sweeps' calls (`triton.every_config_on_a_gpu`)."""
 
 
-def sweep(check, space) -> list[Cell]:
-    """`check` at every config of `space` over every call of CASES, each config's call its own cell."""
+def sweep(check) -> list[Cell]:
+    """`check` over every call of CASES, each call's every config in one cell (one check of them all)."""
     name = check.__name__.replace('_', ' ')
-    return [Cell(f"{name}: {case} {config}", functools.partial(check, config, case))
-            for case in CASES for config in space]
+    return [Cell(f"{name}: {case}", functools.partial(check, case)) for case in CASES]
 
 
 def a_shared_bias_step_repeats_bit_for_bit(bias_shape: tuple, kv_heads: int = 8) -> None:
@@ -104,8 +103,8 @@ def test_the_attention_kernels_run_on_this_gpu(part):
     """Every kernel cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
     together, a part's share of them (`in_parts`); the Mosaic cells on an H100 alone."""
     run_cells(parted([
-        *sweep(triton.every_config_on_a_gpu, triton.FORWARD_TILES),
-        *sweep(triton.every_backward_config_on_a_gpu, triton.BACKWARD_TILES),
+        *sweep(triton.every_config_on_a_gpu),
+        *sweep(triton.every_backward_config_on_a_gpu),
         # The Pallas-Triton dK/dV launch's prescaled query on an H100: right and repeating (the pipeliner's
         # race, attention_triton_stages).
         *cells_of(triton_stages.a_prescaled_tritons_backward_is_on_par_and_repeats_on_an_h100, "sm90"),
@@ -251,11 +250,10 @@ def test_the_attention_kernels_matrix_holds_on_this_gpu():
     run_cells(cells_of(kernels_matrix.a_kernels_training_step_is_on_par))
 
 
-@pytest.mark.usefixtures("without_deterministic_ops")
 def test_the_decode_matrix_holds_on_this_gpu():
     """Decode's check-1 matrix (tests/kernel_matrix.py): a serving step's decode, dense and paged, on par with
-    the reference path at every pair of axis values its selectors serve, each cell on its own GPU, without
-    XLA's deterministic ops (cuDNN's decode refuses a deterministic call)."""
+    the reference path at every pair of axis values its selectors serve, each cell on its own GPU, under the
+    lane's deterministic ops."""
     run_cells(cells_of(decode_matrix.a_decode_step_is_on_par))
 
 

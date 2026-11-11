@@ -52,11 +52,13 @@ Scope is per rule, because the rules are not all about the same thing:
   construction, which keeps what its constructor computed in float32; its
   twin is built inside src/_dew_torch/precision.py's `float64`
   (`lint_promotions`).
-- SLOP024 is about `src/<package>`: a JAX array is never divided by a literal
-  that is no power of two, which XLA computes as a product with the literal's
-  rounded reciprocal, not correctly rounded (rows 1402, 1403); `precision.
-  divided` divides as IEEE does. It reports only an operand it proves is an
-  array (`_array`), so a Python number or a name it cannot prove passes.
+- SLOP024 is about `src/<package>`: a JAX array is never divided by a
+  compile-time constant no power of two divides exactly by (a literal, a named
+  constant, a module's attribute, a function of constants), which XLA computes
+  as a product with the constant's rounded reciprocal, not correctly rounded
+  (rows 1402, 1403); `precision.divided` divides as IEEE does. It reports only
+  an operand it proves is an array (`_array`, or a name assigned one), so a
+  Python number or a name it cannot prove passes.
 - SLOP025 is about `src/<package>`: no program compiles by a bare `jax.jit` or
   `jax.pmap`, by any name it is imported as, but the compile point's own
   (`OuterProgram`) and the nested program's (`dew.nn.nested.nested`), which
@@ -130,7 +132,6 @@ import functools
 import hashlib
 import io
 import json
-import math
 import re
 import subprocess
 import sys
@@ -142,6 +143,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lint_assertions as assertion_rules
 import lint_derivatives as derivative_rules
+import lint_divisors as divisor_rules
 import lint_promotions as promotion_rules
 import lint_scopes as scopes
 import lint_tolerances as tolerance_rules
@@ -648,71 +650,10 @@ def jax_private(module: Module) -> Iterator[Finding]:
                           f"reads JAX's private {node.attr}; {JAX_PRIVATE[node.attr]}")
 
 
-ARRAY_MODULES = ("jax.numpy", "jax.lax", "jax.nn", "jax.random", "jax.scipy")
-"""The modules whose functions return JAX arrays (but `ARRAY_FACTS`), which SLOP024 proves an operand by."""
-ARRAY_FACTS = {"dtype", "finfo", "iinfo", "issubdtype", "result_type", "promote_types", "can_cast", "shape",
-               "ndim", "size", "isdtype"}
-"""The functions of `ARRAY_MODULES` that return no array: a dtype, its facts, a shape or a count."""
-ARRAY_TYPES = {"jax.Array", "jax.numpy.ndarray"}
-"""The annotations that make a parameter an array."""
-
-
-def _array(node: ast.expr, table: Mapping[str, str], arrays: set[str]) -> bool:
-    """Whether SLOP024 proves `node` a JAX array, its names read as the imports `table` gives them
-    (`lint_scopes.scoped`): a call of a function of `ARRAY_MODULES` but its facts, a method or subscript of an
-    array, arithmetic with one, or a name in `arrays` (a parameter annotated as one)."""
-    if isinstance(node, ast.Call):
-        called = scopes.resolved(node.func, table)
-        module, _, function = called.rpartition(".")
-        if module in ARRAY_MODULES or any(module.startswith(f"{each}.") for each in ARRAY_MODULES):
-            return function not in ARRAY_FACTS
-        return (isinstance(node.func, ast.Attribute) and node.func.attr not in ("item", "tolist")
-                and _array(node.func.value, table, arrays))
-    if isinstance(node, ast.Subscript):
-        return _array(node.value, table, arrays)
-    if isinstance(node, ast.BinOp):
-        return _array(node.left, table, arrays) or _array(node.right, table, arrays)
-    if isinstance(node, ast.UnaryOp):
-        return _array(node.operand, table, arrays)
-    return isinstance(node, ast.Name) and node.id in arrays
-
-
-def _rounded_divisor(node: ast.expr) -> float | None:
-    """The literal `node` is, where it is a number no power of two divides exactly by (its reciprocal is
-    no float), else None."""
-    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub):
-        value = _rounded_divisor(node.operand)
-        return None if value is None else -value
-    if (isinstance(node, ast.Constant) and isinstance(node.value, (int, float))
-            and not isinstance(node.value, bool) and node.value and math.frexp(node.value)[0] != 0.5):
-        return node.value
-    return None
-
-
 def divisions(module: Module) -> Iterator[Finding]:
-    """SLOP024: a JAX array (`_array`) divided by a literal no power of two (`_rounded_divisor`), each name
-    read in its own scope (`lint_scopes.scoped`), a parameter annotated as an array read as one within its
-    function."""
-    scoped = list(scopes.scoped(module.tree.body, {}, _parent(module)))
-    tables = {id(node): table for node, table in scoped}
-    arrays: dict[int, set[str]] = {}
-    for function in ast.walk(module.tree):
-        if isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            annotated = {name for name, annotation in scopes.annotations(function)
-                         if scopes.resolved(annotation, tables.get(id(function), {})) in ARRAY_TYPES}
-            arrays.update({id(node): annotated for node in scopes.own(function)})
-    for node, table in scoped:
-        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
-            numerator, divisor = node.left, node.right
-        elif isinstance(node, ast.AugAssign) and isinstance(node.op, ast.Div):
-            numerator, divisor = node.target, node.value
-        else:
-            continue
-        value = _rounded_divisor(divisor)
-        if value is not None and _array(numerator, table, arrays.get(id(node), set())):
-            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP024",
-                          f"divides a JAX array by {value!r}, which XLA computes as a product with its "
-                          "rounded reciprocal, not correctly rounded; divide with precision.divided")
+    """SLOP024: a JAX array divided by a constant whose reciprocal rounds (tools/lint_divisors.py)."""
+    for line, col, message in divisor_rules.divisions(module.path, module.tree, _parent(module)):
+        yield Finding(module.relative, line, col, "SLOP024", message)
 
 
 def size(module: Module) -> Iterator[Finding]:
@@ -1001,20 +942,35 @@ def imports(module: Module) -> Iterator[Finding]:
 
 
 def _mixing(module: Module) -> frozenset[str]:
-    """The `MIXING` names the package's `nn/inputs.py` assigns, or none where it has none."""
+    """The `MIXING` names the package's `nn/inputs.py` marks, or none where it has none."""
     root = module.path.parents[len(Path(module.relative).parents) - 1]
     return _assigned_mixing(root / "src" / module.package / "nn" / "inputs.py")
 
 
 @functools.cache
 def _assigned_mixing(inputs: Path) -> frozenset[str]:
+    """The `AttentionMetadata` fields `inputs` marks as mixing tokens, where each is declared: a field whose
+    metadata holds `MIXES`, and a `mixing_property` (`dew.nn.inputs.MIXING`)."""
     if not inputs.is_file():
         return frozenset()
     for node in ast.parse(inputs.read_text()).body:
-        if (isinstance(node, ast.Assign) and any(scopes.dotted(target) == "MIXING" for target in node.targets)
-                and isinstance(node.value, ast.Tuple)):
-            return frozenset(item.value for item in node.value.elts if isinstance(item, ast.Constant))
+        if isinstance(node, ast.ClassDef) and node.name == "AttentionMetadata":
+            return frozenset(_marked_mixing(node))
     return frozenset()
+
+
+def _marked_mixing(metadata: ast.ClassDef) -> Iterator[str]:
+    for item in metadata.body:
+        if (isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name)
+                and isinstance(item.value, ast.Call)):
+            marked = (keyword.value for keyword in item.value.keywords
+                      if keyword.arg == "metadata" and isinstance(keyword.value, ast.Dict))
+            if any(isinstance(key, ast.Name) and key.id == "MIXES" for value in marked for key in value.keys):
+                yield item.target.id
+        elif isinstance(item, ast.FunctionDef) and any(
+                isinstance(decorator, ast.Name) and decorator.id == "mixing_property"
+                for decorator in item.decorator_list):
+            yield item.name
 
 
 def _declared_reads(value: ast.expr | None) -> frozenset[str] | str | None:
@@ -1033,18 +989,45 @@ def _declared_reads(value: ast.expr | None) -> frozenset[str] | str | None:
     return None
 
 
-def _handed(module: Module, function: ast.FunctionDef, tables: Mapping[int, Mapping[str, str]]) -> set[str]:
+def _handed(module: Module, function: ast.FunctionDef, tables: Mapping[int, Mapping[str, str]],
+            methods: Mapping[str, ast.FunctionDef], roots: frozenset[str] = frozenset({"call"}),
+            seen: frozenset[str] = frozenset()) -> set[str]:
     """The attributes the package's functions load that a mixer's call (`function`) hands what it was
-    called with: a call made in it with an argument read from `call`, or from a name its body binds from
-    one (`tokens = coordinates_of(call.metadata, ...)`), to a top-level function of a module of the package
-    it imports (`held_scan(..., coordinates=tokens)`), whose body's attribute loads are what it reads. The
-    call's own scope alone (`scopes.nodes_of`): a name a nested scope binds is that scope's, and a name
+    called with: a call made in it with an argument read from `call` (`roots`), or from a name its body
+    binds from one (`tokens = coordinates_of(call.metadata, ...)`), to a top-level function of a module of
+    the package it imports (`held_scan(..., coordinates=tokens)`), whose body's attribute loads are what it
+    reads; or to a method of its own class (`self.<name>(...)`, one of `methods`), which reads what it
+    hands on in turn from the parameters it was handed them as, each method once along a chain (`seen`).
+    The call's own scope alone (`scopes.nodes_of`): a name a nested scope binds is that scope's, and a name
     counts as bound only where it is stored (a tuple's names), not an attribute's receiver or a subscript's
     container."""
     nodes = scopes.nodes_of(function.body)
+    derived = _derived(nodes, roots)
+    handed: set[str] = set()
+    for node in nodes:
+        handed_on = (*node.args, *(keyword.value for keyword in node.keywords)) if isinstance(
+            node, ast.Call) else ()
+        if not any(_reads_names(argument, derived) for argument in handed_on):
+            continue
+        assert isinstance(node, ast.Call)
+        method = _own_method(node.func, methods)
+        if method is not None:
+            if method.name not in seen:
+                handed |= _handed(module, method, tables, methods,
+                                  _handed_parameters(node, method, derived), seen | {method.name})
+            continue
+        path = scopes.resolved(node.func, tables.get(id(node.func), {}))
+        if path.split(".")[0] == module.package:
+            handed |= _package_loads(module.path.parents[len(Path(module.relative).parents) - 1], path)
+    return handed
+
+
+def _derived(nodes: Sequence[ast.AST], roots: Iterable[str]) -> set[str]:
+    """`roots` and every name a scope's `nodes` bind from one of them, as far as it grows: what a call
+    handed on reads of what its scope was handed."""
     assignments = [node for node in nodes if isinstance(node, ast.Assign | ast.AnnAssign)
                    and node.value is not None]
-    derived = {"call"}
+    derived = set(roots)
     grown = True
     while grown:
         grown = False
@@ -1056,17 +1039,25 @@ def _handed(module: Module, function: ast.FunctionDef, tables: Mapping[int, Mapp
             bound = {name.id for target in targets for name in _stored(target)}
             grown |= not bound <= derived
             derived |= bound
-    handed: set[str] = set()
-    for node in nodes:
-        handed_on = (*node.args, *(keyword.value for keyword in node.keywords)) if isinstance(
-            node, ast.Call) else ()
-        if not any(_reads_names(argument, derived) for argument in handed_on):
-            continue
-        assert isinstance(node, ast.Call)
-        path = scopes.resolved(node.func, tables.get(id(node.func), {}))
-        if path.split(".")[0] == module.package:
-            handed |= _package_loads(module.path.parents[len(Path(module.relative).parents) - 1], path)
-    return handed
+    return derived
+
+
+def _own_method(called: ast.expr, methods: Mapping[str, ast.FunctionDef]) -> ast.FunctionDef | None:
+    """The method of the class `self.<name>` names, of its `methods`; None for any other callee."""
+    if isinstance(called, ast.Attribute) and isinstance(called.value, ast.Name) and called.value.id == "self":
+        return methods.get(called.attr)
+    return None
+
+
+def _handed_parameters(node: ast.Call, method: ast.FunctionDef, derived: set[str]) -> frozenset[str]:
+    """The parameters of `method` (`self` its first) that the call `node` hands an argument read from
+    `derived`: by position, then by keyword."""
+    positional = [argument.arg for argument in (*method.args.posonlyargs, *method.args.args)][1:]
+    by_position = {parameter for parameter, argument in zip(positional, node.args, strict=False)
+                   if not isinstance(argument, ast.Starred) and _reads_names(argument, derived)}
+    by_keyword = {keyword.arg for keyword in node.keywords
+                  if keyword.arg is not None and _reads_names(keyword.value, derived)}
+    return frozenset(by_position | by_keyword)
 
 
 def _stored(target: ast.expr) -> Iterator[ast.Name]:
@@ -1087,17 +1078,41 @@ def _reads_names(node: ast.AST, names: set[str]) -> bool:
 
 
 @functools.cache
-def _package_loads(root: Path, path: str) -> frozenset[str]:
+def _package_loads(root: Path, path: str, seen: frozenset[str] = frozenset()) -> frozenset[str]:
     """The attributes the top-level function `path` (`dew.nn.linear.held_scan`) loads in its body, read
-    from its module's source under `root`'s `src`; none where `path` names no such function."""
+    from its module's source under `root`'s `src`, and those the package's functions it hands what it was
+    handed load in turn (`dew.nn.mixers.attention.call_visibility` handing its metadata to
+    `dew.nn.inputs.fork_runs`), each once along a chain (`seen`); none where `path` names no such
+    function."""
     module, _, name = path.rpartition(".")
     source = root / "src" / Path(*module.split("."))
     for candidate in (source.with_suffix(".py"), source / "__init__.py"):
-        if candidate.is_file():
-            for node in ast.parse(candidate.read_text()).body:
-                if isinstance(node, ast.FunctionDef) and node.name == name:
-                    return frozenset(inner.attr for inner in ast.walk(node)
-                                     if isinstance(inner, ast.Attribute) and isinstance(inner.ctx, ast.Load))
+        if not candidate.is_file():
+            continue
+        tree = ast.parse(candidate.read_text())
+        functions = {node.name: node for node in tree.body if isinstance(node, ast.FunctionDef)}
+        if name not in functions:
+            return frozenset()
+        function = functions[name]
+        loads = {inner.attr for inner in ast.walk(function)
+                 if isinstance(inner, ast.Attribute) and isinstance(inner.ctx, ast.Load)}
+        tables = {id(node): table for node, table in scopes.scoped(
+            tree.body, {}, scopes.package_of(module, candidate.name == "__init__.py"))}
+        arguments = function.args
+        nodes = scopes.nodes_of(function.body)
+        derived = _derived(nodes, (argument.arg for argument in (
+            *arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs)))
+        for node in nodes:
+            if not isinstance(node, ast.Call) or not any(
+                    _reads_names(argument, derived)
+                    for argument in (*node.args, *(keyword.value for keyword in node.keywords))):
+                continue
+            local = isinstance(node.func, ast.Name) and node.func.id in functions
+            called = (f"{module}.{node.func.id}" if local and isinstance(node.func, ast.Name)
+                      else scopes.resolved(node.func, tables.get(id(node.func), {})))
+            if called.split(".")[0] == path.split(".")[0] and called != path and called not in seen:
+                loads |= _package_loads(root, called, seen | {path})
+        return frozenset(loads)
     return frozenset()
 
 
@@ -1107,6 +1122,11 @@ def calls(module: Module) -> Iterator[Finding]:
     the module loads, or a package function its call hands its call's fields to
     (`_handed`)."""
     mixing = _mixing(module)
+    if Path(module.relative).parts[-2:] == ("nn", "inputs.py") and not mixing:
+        # The marks every other module's check reads: none read, and SLOP014 would check no mixer.
+        yield Finding(module.relative, 1, 1, "SLOP014",
+                      "reads no mixing fields of AttentionMetadata (`MIXES`, `mixing_property`), so no "
+                      "mixer's reads are checked")
     loaded = {node.attr for node in ast.walk(module.tree)
               if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)}
     tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, _parent(module))}
@@ -1144,7 +1164,8 @@ def calls(module: Module) -> Iterator[Finding]:
         else:
             unread = (declared & mixing) - loaded
             if unread:
-                unread -= _handed(module, function, tables)
+                unread -= _handed(module, function, tables, {
+                    method.name: method for method in cls.body if isinstance(method, ast.FunctionDef)})
             extra, unknown = read - declared, declared - mixing
         line, col = where.lineno, where.col_offset + 1
         for name in sorted(extra):

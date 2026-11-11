@@ -63,6 +63,7 @@ from dew.nn.mixers.mamba2 import Mamba2, recurrent_ssd
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.moe import SparseMLP
+from dew.nn.norms import NormSite
 from dew.nn.protocols import Counted, CountedDecisions, CountedLogits, CountedTraining
 from dew.nn.ssm import BidirectionalS5Layer, S5Layer, _scanned_directions
 from dew.objectives.diffusion import DiffusionObjective
@@ -157,6 +158,38 @@ def test_a_traced_program_counts_its_products_convolutions_scans_and_branches():
 
     with pytest.raises(MissingFlopsCount):
         traced_flops(solved, shaped(2))
+
+
+def test_a_traced_program_counts_a_grouped_product_and_refuses_work_it_does_not_count():
+    """A grouped product (`ragged_dot_general`, a mixture's experts on a CPU) counts each row against its own
+    group's matrix, `2 x rows x depth x width` whatever the groups, and its gradient's two grouped products
+    (the inputs' and, its groups partitioning the depth, the matrices') each as much again; a factorization
+    and a kernel launch, which no traced count states, are refused by name, never counted as nothing (row
+    5372)."""
+    from jax.experimental import pallas as pl
+
+    def shaped(*shape, dtype=jnp.float32):
+        return jax.ShapeDtypeStruct(shape, dtype)
+
+    def grouped(x, w, sizes):
+        return jax.lax.ragged_dot(x, w, sizes)
+
+    rows, depth, width, groups = 12, 5, 7, 3
+    arguments = (shaped(rows, depth), shaped(groups, depth, width), shaped(groups, dtype=jnp.int32))
+    assert traced_flops(grouped, *arguments) == 2 * rows * depth * width
+    gradient = jax.grad(lambda x, w, sizes: jnp.sum(grouped(x, w, sizes)), argnums=(0, 1))
+    assert traced_flops(gradient, *arguments) == 3 * (2 * rows * depth * width)
+    with pytest.raises(MissingFlopsCount):
+        traced_flops(lambda a: jnp.linalg.cholesky(a @ a.T), shaped(4, 4))
+
+    def launched(x):
+        def kernel(x_ref, out_ref):
+            out_ref[...] = x_ref[...] @ x_ref[...]
+
+        return pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype), interpret=True)(x)
+
+    with pytest.raises(MissingFlopsCount):
+        traced_flops(launched, shaped(8, 8))
 
 
 def test_a_world_model_run_reports_its_updates_gradient_programs_work():
@@ -728,7 +761,7 @@ def convolution_tap(equation, producers):
     return tapped and shifted
 
 
-GATED_NORM_SITES = ("embedding_layernorm", "norm", "input_layernorm", "post_attention_layernorm")
+GATED_NORM_SITES = (NormSite.EMBEDDING, NormSite.FINAL, NormSite.INPUT, NormSite.POST_ATTENTION)
 
 
 @pytest.mark.parametrize("fields", [

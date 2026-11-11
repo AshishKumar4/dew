@@ -122,7 +122,7 @@ def legal(family: mosaic.Family, architecture: generation.Architecture) -> bool:
     copies = {mosaic.RingFamily: True, mosaic_sm80.CpAsync: False}
     by_tma = next((tma for loader, tma in copies.items() if isinstance(family, loader)), architecture.tma)
     return (by_tma == architecture.tma and family.cluster <= architecture.cluster
-            and (architecture.block_scales or not family.takes_block_scales))
+            and (architecture.block_scales or not family.block_formats))
 
 
 def of(generation_name: str, dtype, *, stated: bool = False, scoped: bool = False, tpu: bool = False

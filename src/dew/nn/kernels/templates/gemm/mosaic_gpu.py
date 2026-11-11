@@ -1106,7 +1106,7 @@ def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs
     caller's)."""
     if mx_scales is None:
         return
-    if not (family.takes_block_scales and transpose_rhs and plain and tiles.splits == 1
+    if not (family.block_formats and transpose_rhs and plain and tiles.splits == 1
             and tiles.block_m % 128 == 0 and tiles.block_n % 128 == 0 and tiles.block_k % 128 == 0):
         raise ValueError(f"a block-scaled product runs on a family whose products take block scales "
                          f"({family.name}'s do not, or its call or {tiles} is not one it takes)")

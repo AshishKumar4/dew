@@ -101,6 +101,53 @@ def test_a_decision_run_starts_from_a_saved_run_whose_export_is_its_native_relea
     assert answer.probabilities.shape == (3,) and np.all(answer.probabilities > 0)
 
 
+@pytest.mark.mesh(devices=8)
+def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(tmp_path, monkeypatch):
+    """A language model run whose decoder no family's layout holds (GPT-J's parallel layout under a gated
+    MLP, its positions a learned table) exports as its native release, and loads (`Pretrained.load(run)`,
+    at the attention a run asks and twice the context, its learned table keeping its rows, as every
+    task resizes a cache) as its model in Dew's own layout, its parameters the run's final ones, whose own
+    export refuses, stating why; asked no weights, it reads their shapes and dtypes alone; a second run
+    naming it (`--pretrained <run>`) starts from it and trains its step (row 4785: a token run's native
+    release declared no task a run starts from)."""
+    from flax import linen as nn
+
+    from dew.config.lm import LMRunConfig
+    from dew.inference.tasks import saved_model
+    from dew.interop import Pretrained
+    from dew.interop.decoder_parts import ExportRefused
+    from dew.interop.layouts import source_layout
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    gated = ModelConfig("causal_transformer", {
+        "emb_features": 16, "num_layers": 1, "num_heads": 2, "dtype": "float32", "parallel_residual": True,
+        "shared_parallel_norm": True, "head_bias": True, "attention_bias": False, "mlp": "swiglu",
+        "position_embedding": "learned"})
+    first = dataclasses.replace(lm(tmp_path, drawn=False), model=gated)
+    state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
+    source = tmp_path / "runs" / "first"
+    assert not source_layout(saved_model(SavedRun.pinned(str(source)).record, None).build())
+    loaded = Pretrained.load(str(source), max_seq_len=2 * SEQ, attention_impl="xla")
+    assert (loaded.model.max_seq_len, loaded.model.attention_impl) == (2 * SEQ, "xla")
+    leaves_alike(loaded.variables["params"], state.variables["params"])
+    # The model built at the larger context holds the parameters the run trained, its table's rows kept.
+    ids = jax.ShapeDtypeStruct((1, 2), "int32")
+    built = nn.unbox(jax.eval_shape(loaded.model.init, jax.random.key(0), ids))
+    assert jax.tree.map(lambda leaf: leaf.shape, built["params"]) == jax.tree.map(
+        lambda leaf: leaf.shape, loaded.variables["params"])
+    with pytest.raises(ExportRefused):
+        loaded.export()
+    shapes = Pretrained.load(str(source), weights=False)
+    assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(shapes.variables))
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables["params"]) == jax.tree.map(
+        lambda leaf: (leaf.shape, leaf.dtype), state.variables["params"])
+    run = dataclasses.replace(first, pretrained=str(source), source=SourceOptions(step="latest"),
+                              model=ModelConfig("causal_transformer", {"dtype": "float32"}))
+    second, _ = trained(run, tmp_path, "second", trainer={"checkpoint_final": True})
+    assert int(second.step) == 1
+    assert LMRunConfig.load(str(tmp_path / "runs" / "second")).pretrained == str(source)
+
+
 def test_a_decision_run_starts_from_a_saved_chat_format_decision_run(tmp_path, monkeypatch):
     """A chat-format decision run, a joint head over Qwen 3.5's chat backbone, its rows framed as a
     conversation by the backbone's chat template, saved, is a source a second decision run names

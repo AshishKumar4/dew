@@ -681,8 +681,9 @@ class FitSearch[LossT, EffectsT]:
     there rule no compile out (`refused`)."""
     kernels: dict[str, JSON] = dataclasses.field(default_factory=dict)
     """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
-    found spilling (`report.misses`, `spill_record`) and each launch config they refused
-    (`report.refused_launches`), none the registry held before it searched."""
+    found spilling (`report.misses`, `spill_record`), each launch config they refused
+    (`report.refused_launches`), each region the algebra pass read (`report.rewrites`) and each traced
+    program's whole pass in seconds (`report.passes`), none the registry held before it searched."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh, self.capacity)
@@ -704,13 +705,17 @@ class FitSearch[LossT, EffectsT]:
         self.derived_start(candidates[-1])
         first = self.derived_split(candidates, first)
         seen, held, traced = len(report.misses()), set(report.refused_launches()), len(report.rewrites())
+        passed = len(report.passes())
         split = planned(candidates, first, self.fits, self.climb, self.likely,
                         functools.partial(self.fits, pruned=True))
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
         refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()
                                if refusal not in held]
         rewrites: list[JSON] = [rewrite_record(made) for made in report.rewrites()[traced:]]
-        self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites}
+        # Each program the search traced, its whole algebra pass in seconds (`report.passes`), beside the
+        # regions' own: what the pass cost this plan's compiles.
+        passes: list[JSON] = list(report.passes()[passed:])
+        self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites, "passes": passes}
         if split is None or self.fitted is None:
             raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)

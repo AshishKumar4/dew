@@ -40,8 +40,9 @@ def test_only_a_weight_read_once_through_its_cast_is_copied():
 
 def test_a_users_primitive_named_as_a_cast_is_read_as_its_own():
     """A primitive of a user's that takes the name of JAX's cast (`convert_element_type`) and none of its
-    parameters is read as its own, not the cast its name spells (`dew.nn.programs.named`): a weight it
-    reads is not copied narrower, where reading its parameters as a cast's raised KeyError (row 4094)."""
+    parameters is read as its own, not the cast its name spells (an operation is known by its object): a
+    weight it reads is not copied narrower, where reading its parameters as a cast's raised KeyError (row
+    4094)."""
     from jax.extend import core as jcore
     from jax.interpreters import mlir
 

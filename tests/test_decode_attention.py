@@ -273,11 +273,10 @@ CUDNN_DECODE_SEEDS = 8
 
 
 def a_decode_call_naming_cudnn_differentiates_under_deterministic_ops():
-    """A bf16 call of one query over its keys' lengths naming cuDNN, which the decode selector admits under
-    --xla_gpu_deterministic_ops (`attention_kernels.DECODE`: a decode step takes no gradient), differentiated
-    on this GPU under the lane's deterministic ops: its gradients on par (check 1) with the reference path's,
-    its derivative the reference path's (`forward_differentiable`), where XLA's cuDNN attention backward
-    crashed under those ops (`CUDNN_SUPPORTS`)."""
+    """A bf16 call of one query over its keys' lengths naming cuDNN, differentiated on this GPU under the
+    lane's deterministic ops: its gradients, cuDNN's own backward's, are on par (check 1) with the reference
+    path's. XLA's cuDNN attention backward failed under those ops before Dew's JAX build 0.12.0.1.post74 (a
+    cached compile lost its deterministic configuration, openxla/xla#46500)."""
     lengths = jnp.asarray([512, 300], jnp.int32)
 
     def gradients(implementation):

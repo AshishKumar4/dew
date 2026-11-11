@@ -22,7 +22,7 @@ from types import MappingProxyType
 import numpy as np
 
 from dew import _records
-from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.config_records import NativeFields
 from dew.interop.decoder_config import DecoderSpelling, integer, kind_mixer
 from dew.interop.decoder_parts import (
     DELTA_NET_ROUTES,
@@ -77,38 +77,56 @@ _HEAD = {**{f'model.hyper_connection_mixer.{name}.weight': ('hc_head', name, 'ke
 _BUFFERS = ('layer_multipliers', 'ngram_heads_vocab_sizes', 'ngram_heads_offsets')
 
 
+def _head_width() -> ConfigPart[Engram]:
+    """`ple_embed_dim`, the lookups' width (the model's where it states none), both ways: each of the
+    `(ngram_size - 1) * heads_per_ngram` n-gram heads takes an equal part, its `head_dim`."""
+    def read(hf_config: Mapping[str, object], used: set[str],
+             record: NativeFields[Engram]) -> NativeFields[Engram]:
+        used.add('ple_embed_dim')
+        heads = (_records.integer(record['max_ngram_size'], 'ngram_size') - 1) * _records.integer(
+            record['n_heads'], 'heads_per_ngram')
+        width = _records.integer(hf_config.get('ple_embed_dim') or hf_config['hidden_size'], 'ple_embed_dim')
+        if width % heads:
+            refuse(f'ple_embed_dim {width}', f'each of the {heads} n-gram heads takes an equal part')
+        record['head_dim'] = width // heads
+        return record
+
+    def write(engram: Engram) -> Mapping[str, object]:
+        return {'ple_embed_dim': engram.head_dim * engram.n_heads * (engram.max_ngram_size - 1)}
+    return ConfigPart(read, write, keys=('ple_embed_dim',))
+
+
+ENGRAM_CONFIG: ConfigLayout[Engram] = ConfigLayout(
+    integer('ngram_size', 'max_ngram_size', 3), integer('heads_per_ngram', 'n_heads', 8), _head_width(),
+    integer('ple_conv_kernel_size', 'ple_conv_kernel_size', 4),
+    integer('ngram_vocab_size_base', 'vocab_size', 20000000),
+    integer('make_ngram_vocab_size_divisible_by', 'row_multiple', 128),
+    integer('seed', 'multiplier_seed', 1234), integer('split_ngram_parts', 'table_parts', 1))
+"""The n-gram lookups' own config keys and the `Engram` fields they state, both ways, each at
+Qwen4ExpTextConfig's default where the config states none. The layers they sit at, the model's vocabulary
+and its end of sequence are the model's (`_engram`)."""
+
+
 def _engram(hf_config: Mapping[str, object], used: set[str], record: DecoderFields) -> DecoderFields:
-    """The n-gram lookups `ple_layer_ids` names, as `Engram` fields; none where it names none."""
-    used.update(('ple_layer_ids', 'ple_embed_dim', 'ple_conv_kernel_size', 'ngram_size', 'heads_per_ngram',
-                 'ngram_vocab_size_base', 'make_ngram_vocab_size_divisible_by', 'seed', 'split_ngram_parts'))
+    """The n-gram lookups `ple_layer_ids` names, as `Engram` fields (`ENGRAM_CONFIG`); none where it names
+    none."""
+    used.add('ple_layer_ids')
     named = _records.integers(hf_config.get('ple_layer_ids') or [], 'ple_layer_ids')
     if not named:
+        used.update(ENGRAM_CONFIG.names())
         return record
     layers = _records.integer(record['num_layers'], 'num_layers')
     if min(named) < 1 or max(named) > layers:
         refuse(f'ple_layer_ids {list(named)}', f'they name layers one-indexed, 1 to {layers}')
-    size = _records.integer(hf_config.get('ngram_size', 3), 'ngram_size')
-    heads = _records.integer(hf_config.get('heads_per_ngram', 8), 'heads_per_ngram')
-    width = _records.integer(hf_config.get('ple_embed_dim') or hf_config['hidden_size'], 'ple_embed_dim')
-    if width % ((size - 1) * heads):
-        refuse(f'ple_embed_dim {width}', f'each of the {(size - 1) * heads} n-gram heads takes an equal part')
+    engram = ENGRAM_CONFIG.read(hf_config, used, NativeFields(Engram, {}))
     eos = hf_config.get('eos_token_id')
     if eos is None:
         refuse('eos_token_id', 'the n-gram lookups stop at the end of a sequence and fill with its id')
     eos = _records.integer(eos[0] if isinstance(eos, list) else eos, 'eos_token_id')
-    record['engram'] = native_fields(Engram)(
-        layer_ids=tuple(layer - 1 for layer in named), num_embeddings=(), max_ngram_size=size,
-        vocab_size=_records.integer(hf_config.get('ngram_vocab_size_base', 20000000),
-                                    'ngram_vocab_size_base'),
-        n_heads=heads, head_dim=width // ((size - 1) * heads),
-        compressed_vocab_size=_records.integer(hf_config['vocab_size'], 'vocab_size'), pad_token_id=eos,
-        multiplier_seed=_records.integer(hf_config.get('seed', 1234), 'seed'), stop_token_id=eos,
-        row_multiple=_records.integer(hf_config.get('make_ngram_vocab_size_divisible_by', 128),
-                                      'make_ngram_vocab_size_divisible_by'),
-        ple_conv_kernel_size=_records.integer(hf_config.get('ple_conv_kernel_size', 4),
-                                              'ple_conv_kernel_size'),
-        table_parts=_records.integer(hf_config.get('split_ngram_parts', 1), 'split_ngram_parts'),
-        media_stops=False)
+    engram.update(layer_ids=tuple(layer - 1 for layer in named), num_embeddings=(),
+                  compressed_vocab_size=_records.integer(hf_config['vocab_size'], 'vocab_size'),
+                  pad_token_id=eos, stop_token_id=eos, media_stops=False)
+    record['engram'] = engram
     return record
 
 
@@ -116,12 +134,8 @@ def _engram_written(model: CausalTransformer) -> Mapping[str, object]:
     engram = model.engram
     if engram is None:
         return {'ple_layer_ids': []}
-    return {'ple_layer_ids': [layer + 1 for layer in engram.layer_ids], 'ngram_size': engram.max_ngram_size,
-            'heads_per_ngram': engram.n_heads,
-            'ple_embed_dim': engram.head_dim * engram.n_heads * (engram.max_ngram_size - 1),
-            'ple_conv_kernel_size': engram.ple_conv_kernel_size, 'ngram_vocab_size_base': engram.vocab_size,
-            'make_ngram_vocab_size_divisible_by': engram.row_multiple, 'seed': engram.multiplier_seed,
-            'split_ngram_parts': engram.table_parts, 'eos_token_id': engram.stop_token_id}
+    return {'ple_layer_ids': [layer + 1 for layer in engram.layer_ids], **ENGRAM_CONFIG.write(engram),
+            'eos_token_id': engram.stop_token_id}
 
 
 def _output_gate(hf_config: Mapping[str, object], used: set[str],

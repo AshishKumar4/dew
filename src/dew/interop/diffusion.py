@@ -8,13 +8,14 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import jax
 import numpy as np
 from jax.typing import DTypeLike
 
 from dew import _records
+from dew._records import JSON
 from dew.interop import weights
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import read_weights
@@ -887,15 +888,54 @@ def flax_component_parameters(component: str, tensors: Mapping[str, np.ndarray])
     return parameters
 
 
-def write_flax_component(directory: Path, component: str, tensors: Mapping[str, np.ndarray]) -> None:
-    """Write `tensors` as the msgpack file a Flax component of `component` ships.
+class Declared(NamedTuple):
+    """A pipeline component as its `model_index.json` entry declares it: `[library, class]`."""
+
+    library: str
+    name: str
+
+    @classmethod
+    def of(cls, entry: JSON, component: str) -> Declared:
+        """`component`'s entry read: a pair of names, which a pipeline's index states for each component."""
+        library, name = _records.strings(entry, f"model_index {component}")
+        return cls(library, name)
+
+    @classmethod
+    def read(cls, index: Mapping[str, JSON], component: str, config: Mapping[str, JSON]) -> Declared:
+        """`component` as the pipeline's `index` declares it, or, where the index omits it (Dew reads a
+        pipeline's denoiser, autoencoder and text encoders by their files, `pipeline_assembly`), as its own
+        `config` was written: transformers' configs always state their type (`model_type`, which
+        `PretrainedConfig.to_dict` writes), Diffusers' none (an older AutoencoderKL's or UNet's not even its
+        class); its class is then none the index names, so no Flax one."""
+        entry = index.get(component)
+        if entry is not None:
+            return cls.of(entry, component)
+        return cls("transformers" if "model_type" in config else "diffusers", "")
+
+    @property
+    def stem(self) -> str:
+        """The stem its weight files are named by, as its library writes them: Diffusers'
+        `diffusion_pytorch_model` and `diffusion_flax_model`, transformers' (a text encoder, a safety
+        checker) `model` and `flax_model`."""
+        return "diffusion_pytorch_model" if self.library == "diffusers" else "model"
+
+    @property
+    def flax_file(self) -> str:
+        """The msgpack a Flax component of its library ships (`stem`)."""
+        return "diffusion_flax_model.msgpack" if self.library == "diffusers" else "flax_model.msgpack"
+
+
+def write_flax_component(directory: Path, component: str, declared: Declared,
+                         tensors: Mapping[str, np.ndarray]) -> None:
+    """Write `tensors` as the msgpack file a Flax component of `component`, declared so, ships
+    (`Declared.flax_file`).
 
     A source that declares a Flax class keeps that format beside the
     safetensors, so a reader of either one finds what it expects.
     """
     from flax.serialization import to_bytes
-    filename = "diffusion_flax_model.msgpack" if component in ("unet", "vae") else "flax_model.msgpack"
-    (directory / component / filename).write_bytes(to_bytes(flax_component_parameters(component, tensors)))
+    (directory / component / declared.flax_file).write_bytes(
+        to_bytes(flax_component_parameters(component, tensors)))
 
 
 def save_source(source, values, destination: Path, max_shard_size: int | str) -> None:
@@ -954,15 +994,9 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
         carried = LazyTensors({name: specifications[original] for name, original in names.items()},
                               lambda name, names=names: source.retained_tensors[names[name]])
         tensors = layout_tensors(layouts.get(component, {}), values, retained=carried)
-        weights = "diffusion_pytorch_model" if component in ("unet", "vae", "transformer") else "model"
-        save_sharded(tensors, destination / component, max_shard_size, stem=weights)
-        declared = index.get(component)
-        if (
-            isinstance(declared, (list, tuple))
-            and len(declared) == 2
-            and isinstance(declared[1], str)
-            and declared[1].startswith("Flax")
-        ):
+        declared = Declared.read(index, component, component_configs.get(component, {}))
+        save_sharded(tensors, destination / component, max_shard_size, stem=declared.stem)
+        if declared.name.startswith("Flax"):
             # Diffusers' Flax classes read one whole msgpack, so it is built whole.
-            write_flax_component(destination, component, dict(tensors))
+            write_flax_component(destination, component, declared, dict(tensors))
     source.inputs.conditions["conditioning"].encoder.save_assets(destination)

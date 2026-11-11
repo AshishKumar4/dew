@@ -762,6 +762,40 @@ def test_field_only_linear_subclasses_train_their_adapter():
         assert np.any(np.asarray(gradient["proj"]["lora_B"]))
 
 
+@pytest.mark.parametrize("field, value", [("use_qalora", True), ("alora_invocation_tokens", [5, 6]),
+                                          ("layer_replication", [[0, 1]]), ("use_dora", True)])
+def test_an_adapter_config_setting_a_field_the_loader_does_not_carry_is_refused(decoder, tmp_path, field,
+                                                                                 value):
+    """An adapter config that sets a PEFT field changing what the adapter computes, which this loader does not
+    carry (QA-LoRA's pooled inputs, an activated LoRA's invocation tokens, a layer replication, DoRA), is
+    refused by name, rather than loaded as the plain LoRA it is not."""
+    import json
+    import shutil
+
+    adapter = tmp_path / "adapter"
+    shutil.copytree(ADAPTER, adapter)
+    config = json.loads((adapter / "adapter_config.json").read_text())
+    (adapter / "adapter_config.json").write_text(json.dumps({**config, field: value}))
+    with pytest.raises(ValueError):
+        LoRA.load(decoder.model, decoder.variables, adapter, layouts=decoder.layouts)
+
+
+def test_an_adapter_config_recording_its_initialization_loads(decoder, loaded, tmp_path):
+    """An adapter whose config records how PEFT initialized it (EVA's, its ranks and scales in the patterns
+    the loader reads) loads as its saved factors compute, the same adapter as without the record."""
+    import json
+    import shutil
+
+    adapter = tmp_path / "adapter"
+    shutil.copytree(ADAPTER, adapter)
+    config = json.loads((adapter / "adapter_config.json").read_text())
+    recorded = {**config, "init_lora_weights": "eva", "eva_config": {"rho": 2.0, "tau": 0.99}}
+    (adapter / "adapter_config.json").write_text(json.dumps(recorded))
+    again = LoRA.load(decoder.model, decoder.variables, adapter, layouts=decoder.layouts)
+    assert jax.tree.all(jax.tree.map(lambda one, other: bool((one == other).all()), again.variables,
+                                     loaded.variables))
+
+
 @pytest.mark.parametrize("arithmetic", [False, True])
 def test_an_opaque_linear_override_is_refused_instead_of_training_unused_factors(arithmetic):
     from dew.nn.dense import Dense

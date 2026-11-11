@@ -43,7 +43,7 @@ print(json.dumps({**compilation_cache_counts(), "partitioner": partitioner,
 """
 
 
-def a_sharded_cudnn_attention_compiles_once_across_processes(tmp_path, without_deterministic_ops):
+def a_sharded_cudnn_attention_compiles_once_across_processes(tmp_path):
     """Two fresh processes train one causal cuDNN attention with its rows over two GPUs against one
     persistent cache: the program holds no partitioner, the second process compiles nothing, both
     take the same gradients, and those match the attention run whole, bit for bit, since every row

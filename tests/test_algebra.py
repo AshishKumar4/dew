@@ -414,7 +414,7 @@ def test_one_input_rewrites_to_one_program_in_any_process():
 
 @pytest.mark.parametrize("call", ["jit", "checkpoint", "custom_jvp", "custom_vjp", "custom_vmap"])
 def test_recognition_reads_a_program_inside_any_call_as_the_program(call):
-    """A program run inside a call (`dew.nn.programs.CALLS`: a jit, a checkpoint, a custom derivative's
+    """A program run inside a call (`dew.nn.programs.called`: a jit, a checkpoint, a custom derivative's
     primal, a custom batching rule's program), closed over a value the enclosing trace holds (a custom
     rule's leading constant), is read by recognition's normal form (`canonical`) as the program itself:
     canonicalized beside it, its result is the program's own value."""

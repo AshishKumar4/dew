@@ -40,6 +40,7 @@ from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted
 from dew.nn.inputs import cu_seqlens
 from dew.nn.precision import asks_default_precision, at_least_fp32, exact_products, l2norm, rounds_products
+from dew.nn.residuals import Residual
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
@@ -322,7 +323,7 @@ itself; and keys wider than the port takes in their dtype. Packed documents take
 stores the memories by where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
 (`chunked_launch.Sequences`)."""
 
-PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {}
+PORT_CELLS: dict[tuple[str | None, str], tuple[Kernel[PortCase], str]] = {}
 """The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows Dew's port
 of fla's kernels (`fla_rule`; "the port" below) faster than the recurrence template, each its old route's
 kernel and that receipt; every time below sets the template against that port, not against upstream fla's
@@ -824,7 +825,7 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
     forward and its own pullback in reverse mode, and the portable tangent, in the kernels' dtypes, in
     forward mode however a jit, a scan or a remat staged the call, where a kernel's custom VJP gives none
     (row 2395). The training kernel's forward runs as it is (not `nested`), so the residuals its port names
-    (`dew.nn.mixer_base.DELTA_RESIDUALS`) are a remat policy's to keep. The cells' products differ
+    (`dew.nn.residuals.DELTA_RESIDUALS`) are a remat policy's to keep. The cells' products differ
     (`PORT_CELLS`, `SCAN_CELLS`, or a template that trains no such call), and a trace cannot tell them apart
     before its gradient is asked. A training kernel that refused the call refuses where a gradient is
     traced, not a forward alone. Where both products are the portable math's (a CPU's, or a device no
@@ -1013,7 +1014,7 @@ def recomputed_memory() -> bool:
     template's call takes it as an argument (`template.mosaic_rule`'s `recomputed`), so the selectors' binds
     (`port_kernel`, `scan_kernel`) and the run's (`template_rule`) read it alike, and a launch a compile
     refused under the rung is the one the route judges (row 4133)."""
-    return "delta_memory" in RECOMPUTED.get()
+    return Residual.DELTA_MEMORY in RECOMPUTED.get()
 
 
 @contextlib.contextmanager
@@ -1374,13 +1375,16 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
     return select(SCAN, case).kernel
 
 
-SCAN_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
+SSD_PORT = Kernel[ScanCase]('pallas', SSD_SUPPORTS)
+"""Dew's port of mamba_ssm's SSD kernels (`mamba_ssd.ssd_scan`)."""
+
+SCAN_CELLS: dict[tuple[str | None, str], tuple[Kernel[ScanCase], str]] = {
     ('wgmma', 'training'): (
-        'pallas', "on an H100 80GB HBM3, the port's forward and gradient 1.592 ms against the template's "
+        SSD_PORT, "on an H100 80GB HBM3, the port's forward and gradient 1.592 ms against the template's "
                   "1.877 on Nemotron-H 4B's SSD and 0.660 against 0.820 on 30B's, its query/key launch "
                   "0.385 and 0.160 of them (window-h100-c70aaa8-b8109ee)"),
     ('mma.sync', 'training'): (
-        'pallas', "on an A100 SXM4 40GB, the port's forward and gradient 3.954 ms against the template's "
+        SSD_PORT, "on an A100 SXM4 40GB, the port's forward and gradient 3.954 ms against the template's "
                   "4.217 on Nemotron-H 4B's SSD and 1.584 against 2.200 on 30B's (ssd-train-a100-fdab2424c)"),
 }
 """The cells, each an instruction family and a product (`ScanCase.cell`), where a receipt timing the same
@@ -1398,7 +1402,7 @@ the fast forms (`mainloop_backward.fast_backward_form`); under the accurate ones
 the template's refusal, not a cell."""
 
 SCAN: Op[ScanCase] = Op(Choice.SSD, (Kernel('mosaic_gpu', (*SSD_SUPPORTS[:3], *TEMPLATE_SUPPORTS)),
-                               Kernel('pallas', SSD_SUPPORTS), Kernel('tpu', TPU_SCAN_SUPPORTS),
+                               SSD_PORT, Kernel('tpu', TPU_SCAN_SUPPORTS),
                                Kernel('xla', (), generic=True)), declared=SCAN_CELLS)
 """The rated scan's selector: on a declared port cell (`SCAN_CELLS`) the port where it takes the call;
 otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the

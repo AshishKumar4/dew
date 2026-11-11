@@ -25,6 +25,7 @@ from .attention_parallel import query_split, split_with_queries, tensor_shards
 from .documents import with_documents
 from .inputs import sequence_blocks
 from .kernels.templates import attention as template
+from .residuals import Residual
 from .sharding import HEADS, KV_HEADS, explicit_spec, manual_map, rows_like, rows_spec, sequence_shards
 from .visibility import same_chunk, visible
 
@@ -187,7 +188,7 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
                             window=window, chunk=chunk, places=places,
                             segment_ids=segment_ids, valid=keys,
                             implementation=implementation, masked=masked)
-    return checkpoint_name(out, 'attention_output')
+    return checkpoint_name(out, Residual.ATTENTION_OUTPUT)
 
 
 def chunk_runs(places, segment_ids, valid, rows: int, length: int, chunk: int) -> jax.Array:

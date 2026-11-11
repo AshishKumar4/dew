@@ -102,6 +102,12 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
              "distribution": ("transformers", "5.16.1"),
              "weighed": f"{family}/text" in importlib.import_module("multimodal_families").WEIGHED}
             for family in importlib.import_module("multimodal_families").TEXT_DRAWN},
+         **{f"codec-modelopt-{name}": {"test": "test_codec_checkpoints", "arms": f"modelopt/{name}",
+                                     "worker": "modelopt_worker.py",
+                                     "reference": "NVIDIA/TensorRT-Model-Optimizer 0.47.0 with "
+                                                  "huggingface/transformers 5.16.1",
+                                     "license": "Apache-2.0", "distribution": ("nvidia-modelopt", "0.47.0"),
+                                     "outputs": True} for name in ("tiny", "mixed")},
          **{f"codec-{family}-{kind}": {"test": "test_codec_checkpoints", "arms": f"{family}/{kind}",
                                        "worker": "codec_worker.py",
                                        "reference": "neuralmagic/compressed-tensors 0.17.1 with "

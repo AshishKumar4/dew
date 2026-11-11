@@ -36,7 +36,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
@@ -53,6 +53,9 @@ from dew.nn.kernels.selection import Kernel, Op, Requirement, select, selected
 from dew.nn.precision import float32_einsum
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import manual_map, sequence_shards
+
+if TYPE_CHECKING:
+    from dew.nn.inputs import Admitted
 
 KVDtype = Literal["int8", "float8_e4m3fn"]
 """The storage formats a quantized cache takes."""
@@ -1240,9 +1243,8 @@ def template_quantized(query, key, value, table, lengths, key_scale, value_scale
 
 def _rows_ordered(scale: jax.Array, table: jax.Array) -> jax.Array:
     """A paged pool's scales `[KV, P, page]` at each row's pages of `table` `[rows, pages a row]`, in the
-    row's key order: `[rows, KV, keys]`."""
-    (rows, pages), (kv_heads, _, page) = table.shape, scale.shape
-    return jnp.moveaxis(scale[:, table], 1, 0).reshape(rows, kv_heads, pages * page)
+    row's key order, heads first: `[rows, KV, keys]`, the paged read's (`_gather_pages`) heads moved."""
+    return jnp.swapaxes(_gather_pages(scale, table, 1), 1, 2)
 
 
 @functools.cache
@@ -1363,6 +1365,29 @@ def cache_positions(module: nn.Module, batch: int, length: int, valid):
     return positions, allocated
 
 
+def mixed_positions(index: jax.Array, admitted: Admitted, valid) -> jax.Array:
+    """Each token's slot in its row in a serving step's mixed call (`dew.nn.inputs.Admitted`), `[1,
+    tokens]`, -1 for padding: a decoding row's token at its row's count `index` `[rows]`, an admitted
+    prompt's after its row's start (`Admitted.cursors`)."""
+    rows, pieces = index.shape[0], admitted.slots.shape[0]
+    valid = jnp.asarray(valid, bool)[0]
+    prompt = valid[rows:].reshape(pieces, -1)
+    filled = admitted.cursors[:, None] + prefix_sum(prompt, dtype=jnp.int32) - 1
+    positions = jnp.concatenate([jnp.where(valid[:rows], index, -1),
+                                 jnp.where(prompt, filled, -1).reshape(-1)])
+    return positions[None]
+
+
+def mixed_counts(index: jax.Array, admitted: Admitted, positions: jax.Array) -> jax.Array:
+    """Each row's count of real tokens `[rows]` after a mixed call whose tokens sit at `positions` `[1,
+    tokens]` (`mixed_positions`): a decoding row's one more where its token is real, an admitted row's its
+    start and its prompt's real tokens, a padding piece's (its slot past the rows) dropped."""
+    rows, pieces = index.shape[0], admitted.slots.shape[0]
+    prompt = positions[0, rows:].reshape(pieces, -1)
+    return (index + (positions[0, :rows] >= 0)).at[admitted.slots].set(
+        admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
+
+
 class DecodeCursor(nn.Module):
     """A decoder's own count of each row's real tokens, the logical cursor a model-level reader
     takes a cached call's places from (`cache_positions`): allocation-aware, so the call that
@@ -1370,11 +1395,18 @@ class DecodeCursor(nn.Module):
     keeps no cursor of its own included."""
 
     @nn.compact
-    def __call__(self, valid) -> jax.Array:
+    def __call__(self, valid, admitted: Admitted | None = None) -> jax.Array:
         """Each token's place `[B, S]` continuing its row's count, a padding slot -1; the count
-        advances by the call's real tokens (`valid`)."""
-        batch, length = valid.shape
-        return cache_positions(self, batch, length, valid)[0]
+        advances by the call's real tokens (`valid`). A serving step's mixed call (`admitted`) places its
+        one row's tokens in their own rows and counts each row's as attention counts them
+        (`mixed_positions`, `mixed_counts`)."""
+        if admitted is None:
+            batch, length = valid.shape
+            return cache_positions(self, batch, length, valid)[0]
+        index = self.variable("cache", "cache_index", jnp.zeros, (0,), jnp.int32)
+        positions = mixed_positions(index.value, admitted, valid)
+        index.value = mixed_counts(index.value, admitted, positions)
+        return positions
 
 
 def cached_validity(module: nn.Module, length: int) -> jax.Array:

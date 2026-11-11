@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable, Mapping
 
 from dew.registry import Configured, configured, from_record
@@ -43,3 +44,15 @@ def native_fields[**Fields, Value](constructor: Callable[Fields, Value]
         return NativeFields(constructor, {name: configured(value) for name, value in kwargs.items()})
 
     return recorded
+
+
+@functools.cache
+def hf_metadata() -> frozenset[str]:
+    """The fields every Hugging Face config serializes that describe no computation: what transformers' base
+    config writes (`PretrainedConfig().to_dict()`: its classes and release, its output and return flags,
+    its label maps and task), and `torch_dtype`, the name transformers 4 wrote `dtype` under, which its
+    configs still read. A translator that refuses fields it does not read leaves these out, beside its
+    own."""
+    from transformers import PretrainedConfig
+
+    return frozenset(PretrainedConfig().to_dict()) | {"torch_dtype"}

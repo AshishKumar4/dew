@@ -45,7 +45,7 @@ import sys
 import types
 import typing
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator, Mapping, MutableMapping, MutableSequence, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, MutableMapping, MutableSequence, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import (
@@ -533,9 +533,12 @@ def to_record(value, annotation) -> JSON:
             with recording() as written:
                 written.taken.add(number)
         return mapping
+    if isinstance(value, Enum):
+        # A member is recorded as its value, which `from_record` reads back as the member (`_rebuilt`).
+        return to_record(value.value, None)
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
-    if not isinstance(value, (type, Enum)) and _owned(type(value), called=False):
+    if not isinstance(value, type) and _owned(type(value), called=False):
         # A plain class of Dew's or a trusted package's, rebuilt from its
         # constructor's parameters as `_built` builds one; it declares no
         # fields, so its record always names it.
@@ -653,12 +656,18 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     """
     if dtypes and name == "dtype":
         return resolve_dtype(value)
+    if annotation is JSON:
+        # Data a record holds as written, whatever it spells (a chat message's `{"function": ...}`).
+        return configured(value)
     annotation = resolve_alias(annotation)
+    if isinstance(annotation, type) and issubclass(annotation, Enum):
+        # An enum's member is recorded as its value, an IntEnum's its int (`to_record`).
+        return annotation(value)
     if (isinstance(value, Mapping) and set(value) == {"function"} and isinstance(value["function"], str)
             and _admits_function(annotation)):
         return imported(value["function"])
     if (isinstance(value, Mapping) and annotation not in (None, object)
-            and typing.get_origin(annotation) not in _MAPPINGS and _sharing(value) is not None):
+            and typing.get_origin(_unwrapped(annotation)) not in _MAPPINGS and _sharing(value) is not None):
         return _shared(annotation, value, dtypes=dtypes)
     if typing.get_origin(annotation) in (Union, types.UnionType):
         if value is None:
@@ -1180,9 +1189,10 @@ def _derives(member: type, base: type) -> bool:
     return _owned(member, called=False) if is_protocol(base) else issubclass(member, base)
 
 
-def record_fields(value: DataclassInstance, owner: type) -> dict[str, JSON]:
+def record_fields(value: DataclassInstance, owner: type, *, without: Collection[str] = ()) -> dict[str, JSON]:
     """The record of a dataclass value's constructor fields, each as `owner`
-    declares it, at every level of a nested value alike.
+    declares it, at every level of a nested value alike; the fields named
+    `without` left out, where another record carries them.
 
     A field still holding its declared callable default, such as a Flax
     layer's initializer closure, is left out: no record can name a closure,
@@ -1198,7 +1208,8 @@ def record_fields(value: DataclassInstance, owner: type) -> dict[str, JSON]:
             held = getattr(value, field.name)
             binding = isinstance(value, nn.Module) and (field.name == 'parent' or (field.name == 'name'
                                                                                     and held is None))
-            if _recorded(field) and not binding and not (callable(held) and held is field.default):
+            if (_recorded(field) and not binding and field.name not in without
+                    and not (callable(held) and held is field.default)):
                 fields[field.name] = to_record(held, declared_type(owner, field.name))
     return fields
 
@@ -1261,6 +1272,12 @@ def wrapper_layers(model_type: type) -> tuple[type, tuple[WrapperClass, ...]]:
         layers.append(model_type)
         model_type = model_type._dew_wrapped
     return model_type, tuple(layers)
+
+
+def recorded_names(owner: type) -> tuple[str, ...]:
+    """The fields a record of the dataclass `owner` holds (`record_fields` writes them, `from_record`
+    reads them): its constructor's, none marked unrecorded (`_recorded`)."""
+    return tuple(field.name for field in dataclasses.fields(owner) if _recorded(field))
 
 
 def _recorded(field: dataclasses.Field) -> bool:
@@ -1334,33 +1351,38 @@ def storage_name(value: DTypeLike) -> DtypeName | None:
 
 
 def with_dtype(name: str, fields: Mapping[str, object], dtype: str | None) -> Mapping[str, object]:
-    """`fields`, the model `name` builds from, computing in `dtype`.
-
-    The dtype is written into the model's own `dtype` field, or, for a
-    composite that declares none (DiffusionGemma around its text decoder),
-    into each model part it holds that declares one, as a record or built.
-    A model with neither refuses a dtype. None leaves `fields` as they are."""
-    from flax import linen as nn
-
+    """`fields`, the model `name` builds from, computing in `dtype` (`with_declared`); None leaves `fields`
+    as they are."""
     if dtype is None:
         return fields
+    return with_declared(name, fields, "dtype", dtype, built=resolve_dtype(dtype))
+
+
+def with_declared(name: str, fields: Mapping[str, object], field: str, value: str | int, *,
+                  built: DTypeLike | None = None) -> Mapping[str, object]:
+    """`fields`, the model `name` builds from, with `value` in its field `field`: written into the model's
+    own `field`, and into each model part it holds that declares one, as a record or built (`built`, the
+    value a built part takes, `value` where None), so a composite that declares none (DiffusionGemma around
+    its text decoder) takes it in its parts. A model with neither refuses it."""
+    from flax import linen as nn
+
     member = models[name]
     assert isinstance(member, type)
-    parts: dict[str, object] = ({"dtype": dtype}
-                              if "dtype" in {field.name for field in dataclasses.fields(member)} else {})
-    for key, value in fields.items():
-        part = _part_type(member, key, configured(value))
-        if part is None or "dtype" not in {field.name for field in dataclasses.fields(part)}:
+    parts: dict[str, object] = ({field: value}
+                              if field in {declared.name for declared in dataclasses.fields(member)} else {})
+    for key, held in fields.items():
+        part = _part_type(member, key, configured(held))
+        if part is None or field not in {declared.name for declared in dataclasses.fields(part)}:
             continue
-        if isinstance(value, nn.Module):
-            parts[key] = value.clone(dtype=resolve_dtype(dtype))
-        elif isinstance(value, Mapping) and (named := class_record(value)) is not None:
-            parts[key] = {"class": named[0], "fields": {**named[1], "dtype": dtype}}
-        elif isinstance(value, Mapping):
-            parts[key] = {**value, "dtype": dtype}
+        if isinstance(held, nn.Module):
+            parts[key] = dataclasses.replace(held, **{field: value if built is None else built})
+        elif isinstance(held, Mapping) and (named := class_record(held)) is not None:
+            parts[key] = {"class": named[0], "fields": {**named[1], field: value}}
+        elif isinstance(held, Mapping):
+            parts[key] = {**held, field: value}
     if not parts:
-        raise ValueError(f"{member.__qualname__} declares no dtype field and holds no part that does, so "
-                         f"it cannot compute in {dtype}")
+        raise ValueError(f"{member.__qualname__} declares no {field} field and holds no part that does, so "
+                         f"it cannot take {field}={value!r}")
     return {**fields, **parts}
 
 
@@ -1693,6 +1715,10 @@ class ModelConfig(Registered):
     def with_dtype(self, dtype: str | None) -> Self:
         """This model computing in `dtype` (`with_dtype`); None keeps it."""
         return dataclasses.replace(self, fields=with_dtype(self.name, self.fields, dtype))
+
+    def with_declared(self, field: str, value: str | int) -> Self:
+        """This model with `value` in its field `field`, or its parts' (`with_declared`)."""
+        return dataclasses.replace(self, fields=with_declared(self.name, self.fields, field, value))
 
     def build(self, **derived: Configured):
         """Build the model from its fields and the ones the recipe `derived`."""

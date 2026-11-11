@@ -17,8 +17,9 @@ from ..activations import Situ
 from ..dex import HeadOutputs
 from ..mixers import AttentionMixer, MixerBase
 from ..mixers.mlp import MLPMixer
+from ..norms import NormSite
 from ..rope import rope_scaling_from_record
-from .decoder_block import NORM_SITES, remat_policy
+from .decoder_block import remat_policy
 
 if TYPE_CHECKING:
     from .causal_transformer import CausalTransformer
@@ -399,10 +400,10 @@ def settle_fields(model: CausalTransformer) -> None:
         # A config states SiTU's betas as a record in the activation's place.
         object.__setattr__(model, "mlp", from_record(Situ, model.mlp))
     if model.norms is not None:
-        unknown = sorted(set(model.norms) - set(NORM_SITES))
+        unknown = sorted(set(model.norms) - set(NormSite))
         if unknown:
             raise ValueError(f"norms names {unknown}, which are no norms the decoder builds; "
-                             f"it builds {list(NORM_SITES)}")
+                             f"it builds {[site.value for site in NormSite]}")
         # Frozen, because a module's fields are static to jit and a plain
         # dict cannot be hashed.
         object.__setattr__(model, "norms", flax.core.freeze(dict(model.norms)))

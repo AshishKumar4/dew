@@ -92,6 +92,7 @@ from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, re
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
 
 from dew._accuracy import distance, reduction_bound, within
+from dew.nn import programs
 from dew.parity import (
     CONFIDENCE,
     FACTOR,
@@ -100,6 +101,7 @@ from dew.parity import (
     MOST_SEEDS,
     NARROW_FACTORS,
     PARITY,
+    RECORDED_KINDS,
     ROW_FACTOR,
     SIZING_FROM,
     UPPER_TAIL,
@@ -108,6 +110,7 @@ from dew.parity import (
     GateFailure,
     Inconclusive,
     RecordedLeaf,
+    _below_one,
     _drawn_from,
     _Draws,
     _enough_seeds,
@@ -115,6 +118,7 @@ from dew.parity import (
     _example_ratios,
     _example_worst_rows,
     _interval,
+    _judged,
     _judged_leaves,
     _LaidTruths,
     _leaf_paths,
@@ -125,6 +129,7 @@ from dew.parity import (
     _term_leaves,
     _verdict,
     heavy_masks,
+    recorded_kinds,
 )
 from dew.parity_stages import REDRAW, staged_units
 
@@ -303,6 +308,7 @@ class _Paired:
 
     def __call__(self, *inputs, **options):
         return (self.plain if self.pairing.with_ynn else self.without)(*inputs, **options)
+
 
 
 def _paired_arms(arms) -> list[_Paired]:
@@ -536,9 +542,8 @@ def equations(graph, *, platform: str | None = None):
             if chosen is None:
                 yield from equations(equation.params, platform=platform)
                 continue
-            taken = next(index for index, platforms in enumerate(chosen)
-                         if platforms is None or platform in platforms)
-            yield from equations(equation.params["branches"][taken], platform=platform)
+            taken = programs.platform_branch(chosen, platform)
+            yield from equations(programs.branches(equation)[taken], platform=platform)
     elif hasattr(graph, "jaxpr"):
         yield from equations(graph.jaxpr, platform=platform)
     elif isinstance(graph, dict):
@@ -562,7 +567,8 @@ def dot_precisions(function, *arguments) -> list:
         return [(equation.params["precision"],
                  jnp.result_type(*(variable.aval.dtype for variable in equation.invars)),
                  tuple(variable.aval.shape for variable in equation.invars))
-                for equation in equations(graph, platform="cuda") if equation.primitive.name == "dot_general"]
+                for equation in equations(graph, platform="cuda")
+                if equation.primitive is jax.lax.dot_general_p]
 
 
 def logits_operands(function, *arguments, width: int) -> set:
@@ -1237,6 +1243,75 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
                else AssertionError(found))
 
 
+BELOW: list[dict] = []
+"""What each FP8 site this test judged measured (`assert_fp8_below`), the JUnit property `fp8_below`
+(tests/conftest.py) of a test that passes as of one that fails: a leaf, the arm it is held below, Dew's
+pooled ratio to that arm and its interval, Dew's ratio to the dequantized reference (the measured miss of
+check 1's parity, which goes to the owner) and the seeds they were measured over."""
+
+
+def _fp8_codes(operand) -> bool:
+    """Whether `operand` holds an FP8 format's codes: floats of eight bits with a significand (E4M3, E5M2
+    and their kin), which a block scale's E8M0 has none of, as JAX's dtypes read them."""
+    dtype = jnp.result_type(operand)
+    return jnp.issubdtype(dtype, jnp.floating) and jnp.finfo(dtype).bits == 8 and jnp.finfo(dtype).nmant > 0
+
+
+def assert_fp8_below(dew_fn, named_fn, draw, label: str, *, seeds: int, named: str, codes, reference_fn,
+                     truth_fn) -> None:
+    """The contract of an FP8 form where no FP8 kernel reaches check 1's parity (docs/design/testing.md,
+    "FP8 products": a tensor core's running sum within a step is narrower than fp32, and the dequantized
+    reference's fp32 sums of FP8 products are exact): `dew_fn`'s error from the float64 truth is below
+    `named_fn`'s, the arm the spec names (`named`, cuBLASLt's FP8 GEMM), on the same draws.
+
+    It is check 1 against the named arm (`_staged`: its draws, its two pre-declared stages, its rows and
+    values) with one rule changed, the pooled ratio's: a leaf holds where its ratio's interval lies wholly
+    under one (`dew.parity._below_one`), where check 1 allows PARITY. A leaf the named arm holds exactly
+    has nothing to be below: Dew off float64 there fails as under check 1, and Dew exact there fails too,
+    as a form at parity holds check 1 itself. `truth_fn` is the float64 product of the operands as
+    quantized, a row that cancels sized by its terms as check 1 sizes it (`_site_terms`), and
+    `reference_fn` the dequantized product with fp32 sums, check 1's reference for an FP8 product: it runs
+    beside the two on the same draws and Dew's ratio to it is recorded with the verdict's (`BELOW`), never
+    judged.
+
+    Only an FP8 product's site takes this contract: `codes(*inputs)` gives the product's multiplicands of a
+    draw's inputs, and each must hold an FP8 format's codes (`_fp8_codes`: not a narrower format's, nor an
+    FP8 scale beside them), else the site is refused and holds check 1."""
+    _enough_seeds(seeds, label)
+    multiplied = tuple(codes(*draw(0)))
+    if not multiplied or not all(_fp8_codes(operand) for operand in multiplied):
+        raise TypeError(f"{label}: the product's multiplicands are "
+                        f"{[str(jnp.result_type(operand)) for operand in multiplied]}, not FP8 codes; an "
+                        f"error below a named arm's is the FP8 products' contract alone "
+                        f"(docs/design/testing.md), and this site holds check 1 (`assert_as_exact`)")
+    _refuse_numpy_arms(draw, dew_fn, named_fn, reference_fn)
+    dew_fn, named_fn, (reference_fn,) = _arms_with(dew_fn, named_fn, [reference_fn], label)
+    truth_program = _truth_program(truth_fn)
+    terms_fn = _site_terms(None, None, draw, truth_fn, truth_program)
+    arms = [dew_fn, named_fn, reference_fn]
+    # Each range's draws against the named arm and against the reference, Dew and the truth run once.
+    ranges: dict[tuple[int, int], list[_Draws]] = {}
+
+    def drawn(start, stop):
+        ranges[start, stop] = _drawn(dew_fn, named_fn, draw, range(start, stop), truth_program,
+                                     also=[reference_fn], terms_fn=terms_fn, label=label)
+        return ranges[start, stop][0]
+
+    held = f"{label}, against {named}"
+    over, unresolved, stage = _staged(drawn, seeds, held, ratio_rule=_below_one)
+    against, parity = (functools.reduce(_Draws.joined, each) for each in zip(*ranges.values(), strict=True))
+    for index, name in enumerate(against.names):
+        ratio, low, high = _judged(against, index)
+        BELOW.append({"leaf": held + name, "named": named, "seeds": len(against.mine), "ratio": ratio,
+                      "interval": [low, high],
+                      "reference_ratio": _pooled(parity.mine[:, index], parity.theirs[:, index])})
+    _logged(held, stage, _verdict(over, unresolved), _narrow(against), _mode_of(arms))
+    if over:
+        raise GateFailure(_with_mode(over + unresolved, arms))
+    if unresolved:
+        raise Inconclusive(_with_mode(unresolved, arms))
+
+
 def recorded_pilots(reference_fn, draw, count: int):
     """A view of `reference_fn`, a recorded reference (one `.recorded`), that holds `count` pilot draws
     from SIZING_FROM on, disjoint from every verdict's seeds, the reference and its truth recorded on the
@@ -1421,20 +1496,14 @@ def input_digest(inputs) -> np.uint64:
     return np.frombuffer(digest.digest()[:8], np.uint64)[0]
 
 
-LEAF_ENTRIES = ("reference", "truth", "mse", "worst", "finite", "sketch", "zero_rows", "zero_errors",
-                "zero_offsets", "shape", "dtype")
-"""The kinds of a recording's entries kept one a leaf, `<site>.<kind>.<leaf>` (a pilot's
-`<site>.pilot.<kind>.<leaf>`): a full recording's outputs and truths, a summarized one's evidence and
-sketches. Every other entry (inputs, digests, counts, provenance) is the whole recording's."""
-
-
 def _of_leaves(stored, site: str, leaves) -> dict:
-    """`stored` with the entries of `leaves` alone of those kept one a leaf (LEAF_ENTRIES), verdict and
-    pilot alike, and every entry the whole recording shares; a leaf the recording lacks is refused."""
+    """`stored` with the entries of `leaves` alone of those kept one a leaf (`dew.parity.RECORDED_KINDS`),
+    verdict and pilot alike, and every entry the whole recording shares; a leaf the recording lacks is
+    refused."""
     wanted, found, kept = set(leaves), set(), {}
     for key, value in stored.items():
         kind, _, name = key.removeprefix(f"{site}.").removeprefix("pilot.").partition(".")
-        if key.startswith(f"{site}.") and kind in LEAF_ENTRIES and name:
+        if key.startswith(f"{site}.") and kind in RECORDED_KINDS and name:
             if name not in wanted:
                 continue
             found.add(name)
@@ -1564,8 +1633,8 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         return {name.removeprefix(prefix): np.asarray(value) for name, value in stored.items()
                 if name.startswith(prefix)}
 
-    kinds = ("mse", "worst", "finite", "sketch", "zero_rows", "zero_errors", "zero_offsets", "example_mse",
-             "example_worst")
+    # A summary's evidence, each kind as the recording's layout holds it (`dew.parity.RECORDED_KINDS`).
+    kinds = recorded_kinds("seed", "span", "offsets")
     verdict, pilot = ({kind: tree(prefix + kind) for kind in kinds} for prefix in ("", "pilot."))
     mse, worst, finite, sketch, zero_offsets = (verdict[kind] for kind in
                                                 ("mse", "worst", "finite", "sketch", "zero_offsets"))
@@ -1773,16 +1842,16 @@ def chain_roundings(closed_jaxpr) -> int:
     visits each operation at most once, so no chain makes more."""
 
     def length(equation) -> int:
-        name, params = equation.primitive.name, equation.params
+        primitive, params = equation.primitive, equation.params
         shape = equation.invars[0].aval.shape if equation.invars else ()
-        if name == "dot_general":
+        if primitive is jax.lax.dot_general_p:
             (contracting, _), _ = params["dimension_numbers"]
             return int(np.prod([shape[axis] for axis in contracting], dtype=np.int64))
-        if name == "conv_general_dilated":
+        if primitive is jax.lax.conv_general_dilated_p:
             kernel = equation.invars[1].aval.shape
             spec = params["dimension_numbers"].rhs_spec
             return int(np.prod([kernel[axis] for axis in spec[1:]], dtype=np.int64))
-        if name.startswith(("reduce_", "argmax", "argmin", "cum")) and "axes" in params:
+        if programs.reduction(primitive):
             return int(np.prod([shape[axis] for axis in params["axes"]], dtype=np.int64))
         return 1
 
@@ -1790,12 +1859,8 @@ def chain_roundings(closed_jaxpr) -> int:
         total = 0
         for equation in jaxpr.eqns:
             total += times * length(equation)
-            steps = equation.params.get("length", 1) if equation.primitive.name == "scan" else 1
-            for value in equation.params.values():
-                for inner in value if isinstance(value, (tuple, list)) else (value,):
-                    body = getattr(inner, "jaxpr", inner)
-                    if hasattr(body, "eqns"):
-                        total += walk(body, times * steps)
+            steps = equation.params["length"] if equation.primitive is jax.lax.scan_p else 1
+            total += sum(walk(body, times * steps) for body in programs.bodies(equation))
         return total
 
     return walk(closed_jaxpr.jaxpr, 1)

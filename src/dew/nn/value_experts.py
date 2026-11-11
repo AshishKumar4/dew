@@ -21,6 +21,8 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.nn.residuals import Residual
+
 from .moe import ExpertLinear, Layered, Router, expert_compute_dtype, expert_dispatch, expert_projection
 from .precision import at_least_fp32, float32_einsum
 
@@ -79,7 +81,7 @@ class RoutedValues(nn.Module):
     def _project(self, tokens, sizes, _expert_ids, kernels, *, dtype):
         projected = expert_projection(tokens, kernels[0], sizes, dtype, self.mixture.implementation,
                                       self.precision)
-        return jax.nn.silu(checkpoint_name(jnp.asarray(projected), 'v_proj'))
+        return jax.nn.silu(checkpoint_name(jnp.asarray(projected), Residual.V_PROJ))
 
     def __call__(self, x: jax.Array) -> jax.Array:
         weights, indices = self.router(x)

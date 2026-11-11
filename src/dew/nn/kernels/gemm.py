@@ -31,6 +31,7 @@ accumulator only where the epilogue's VJP reads it.
 """
 
 import dataclasses
+import enum
 import functools
 import math
 
@@ -39,7 +40,6 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
-from jax.extend import core as jax_core
 
 from dew import _cache
 from dew.algebra import bits
@@ -57,6 +57,7 @@ from dew.nn.precision import (
     projected,
     refuse_recipe,
 )
+from dew.nn.programs import read_by
 from dew.nn.sharding import explicit_spec, seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -488,6 +489,14 @@ NVFP4_ROW = 'ledger 3621'
 """The NVFP4 product's in-stage decode (K51)."""
 
 
+class PackedRows(enum.Enum):
+    """An NVFP4 call's size as its receipts measure it (`PackedCase.cell`): decode-sized (at most
+    `NVFP4_DECODE_ROWS` rows, the packed matrix's bytes its time) or a prefill."""
+
+    DECODE = 'decode'
+    PREFILL = 'prefill'
+
+
 @dataclasses.dataclass(frozen=True)
 class PackedCase:
     """An NVFP4 product as its selector reads it (`NVFP4`): the tile the template's packed launch plans for
@@ -497,11 +506,11 @@ class PackedCase:
     rows: int
 
     @property
-    def cell(self) -> tuple[str, str]:
-        """The cell a receipt measures (`selection.Celled`): the device's generation and whether the call is
-        decode-sized (at most `NVFP4_DECODE_ROWS` rows, the packed matrix's bytes its time) or a prefill."""
+    def cell(self) -> tuple[str, PackedRows]:
+        """The cell a receipt measures (`selection.Celled`): the device's generation and the call's size
+        (`PackedRows`)."""
         return (generation.device_generation(),
-                'decode' if self.rows <= NVFP4_DECODE_ROWS else 'prefill')
+                PackedRows.DECODE if self.rows <= NVFP4_DECODE_ROWS else PackedRows.PREFILL)
 
 
 NVFP4_DECODE_ROWS = 64
@@ -520,9 +529,17 @@ PACKED_FASTER_SM90 = (
     "against 71-250 MB; at 4096 rows 5.2-5.3x slower, its stage decode unhidden under the products")
 """The receipt behind the packed NVFP4 kernel's declared H100 cell (`NVFP4_CELLS`)."""
 
-NVFP4_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('sm80', 'decode'): ('packed', PACKED_FASTER),
-    ('sm90', 'decode'): ('packed', PACKED_FASTER_SM90),
+PACKED = selection.Kernel[PackedCase]('packed', (
+    selection.Requirement(
+        'planned', lambda case: case.tile is not None, "the template plans no tile of the packed "
+        "product here: a Mosaic GPU family's, its depth whole 256s and its width whole 64-column tiles",
+        NVFP4_ROW),
+))
+"""The packed kernel: the template's mainloop decoding each stage of the packed matrix in place."""
+
+NVFP4_CELLS: dict[tuple[str | None, PackedRows], tuple[selection.Kernel[PackedCase], str]] = {
+    ('sm80', PackedRows.DECODE): (PACKED, PACKED_FASTER),
+    ('sm90', PackedRows.DECODE): (PACKED, PACKED_FASTER_SM90),
 }
 """The NVFP4 product's declared cells (`selection.Op.declared`), (device generation, call size) to the
 packed kernel and its receipt: a literal of them, which the selector reads and thresh's declared-set seam
@@ -530,13 +547,7 @@ registers (.thresh/thresh.cue)."""
 
 
 NVFP4: selection.Op[PackedCase] = selection.Op(generation.Choice.NVFP4, (
-    selection.Kernel('packed', (
-        selection.Requirement(
-            'planned', lambda case: case.tile is not None, "the template plans no tile of the packed "
-            "product here: a Mosaic GPU family's, its depth whole 256s and its width whole 64-column tiles",
-            NVFP4_ROW),
-        )),
-    selection.Kernel('xla', (), generic=True)), lambda case: 'xla', declared=NVFP4_CELLS)
+    PACKED, selection.Kernel('xla', (), generic=True)), lambda case: 'xla', declared=NVFP4_CELLS)
 """An NVFP4 product's selector (`nvfp4_product`): the matrix decoded once a call and its product (`gemm`),
 but the template's mainloop decoding each stage of the packed matrix in place (`mosaic_gpu.gmm`'s `scales`)
 where a receipt measured it faster (a decode-sized call on an A100 or an H100: `NVFP4_CELLS`) or it is
@@ -1881,7 +1892,7 @@ def _reads_accumulators(epilogue, count: int, acc: jax.ShapeDtypeStruct, sides: 
     """Whether the epilogue's VJP reads any of its `count` accumulators: a bias's does not, a product with
     a side operand's does. Read from the VJP's own program, shapes alone."""
     closed, _ = _epilogue_vjp(epilogue, count, acc, sides)
-    return bool(set(closed.jaxpr.invars[:count]) & _needed(closed.jaxpr, closed.jaxpr.outvars))
+    return bool(set(closed.jaxpr.invars[:count]) & read_by(closed.jaxpr, closed.jaxpr.outvars))
 
 
 def _passes_cotangent(epilogue, count: int, at: int, acc: jax.ShapeDtypeStruct, sides: tuple, dtypes: tuple,
@@ -1892,7 +1903,7 @@ def _passes_cotangent(epilogue, count: int, at: int, acc: jax.ShapeDtypeStruct, 
     closed, cotangents = _epilogue_vjp(epilogue, count, acc, sides)
     var = closed.jaxpr.outvars[at]
     producers = {out: equation for equation in closed.jaxpr.eqns for out in equation.outvars}
-    while var in producers and producers[var].primitive.name == 'convert_element_type':
+    while var in producers and producers[var].primitive is jax.lax.convert_element_type_p:
         var = producers[var].invars[0]
     if var not in cotangents:
         return False
@@ -1911,15 +1922,6 @@ def _epilogue_vjp(epilogue, count: int, acc: jax.ShapeDtypeStruct, sides: tuple)
     outs = jax.eval_shape(tupled, *accs, *sides)
     closed = jax.make_jaxpr(pulled)(accs, sides, outs)
     return closed, list(closed.jaxpr.invars[count + len(sides):])
-
-
-def _needed(jaxpr, outvars) -> set:
-    """The variables of `jaxpr` that `outvars` depend on."""
-    needed = {var for var in outvars if isinstance(var, jax_core.Var)}
-    for equation in reversed(jaxpr.eqns):
-        if needed.intersection(equation.outvars):
-            needed.update(var for var in equation.invars if isinstance(var, jax_core.Var))
-    return needed
 
 
 def _as_tuple(outs) -> tuple:

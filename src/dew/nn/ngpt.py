@@ -19,7 +19,7 @@ from jax.typing import DTypeLike
 
 from dew.nn.derivatives import Algebra, contracted
 from dew.nn.kernels.generation import linear_tangent, unbroadcast
-from dew.nn.precision import L2NORM_EPS, at_least_fp32
+from dew.nn.precision import L2NORM_EPS, at_least_fp32, l2_squares, l2_unit
 
 __all__ = ["NGPT"]
 
@@ -91,18 +91,6 @@ def stepped(residual: jax.Array, branch: jax.Array, alpha: jax.Array, scale: flo
                        functools.partial(_stepped, scale), kind=Algebra()))(residual, branch, alpha)
 
 
-def _squares(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`x` in at least fp32 and its rows' sums of squares, a unit norm's reduction
-    (`dew.nn.precision.l2norm`)."""
-    wide = x.astype(at_least_fp32(x.dtype))
-    return wide, jnp.sum(jnp.square(wide), axis=-1, keepdims=True)
-
-
-def _unit(wide: jax.Array, squares: jax.Array, dtype) -> jax.Array:
-    """`l2norm` of the rows `wide` from their sums of squares, rounded to `dtype`."""
-    return (wide * jax.lax.rsqrt(squares + L2NORM_EPS)).astype(dtype)
-
-
 def _stepped(scale: float, residual, branch, alpha) -> jax.Array:
     return _stepped_forward(scale, residual, branch, alpha)[0]
 
@@ -110,13 +98,13 @@ def _stepped(scale: float, residual, branch, alpha) -> jax.Array:
 def _stepped_forward(scale: float, residual, branch, alpha):
     """The joined rows, and the sums of squares of the residual's, the branch's and the step's rows."""
     wide = at_least_fp32(jnp.result_type(residual, branch, alpha))
-    residual_wide, residual_squares = _squares(residual)
-    branch_wide, branch_squares = _squares(branch)
-    start = _unit(residual_wide, residual_squares, residual.dtype).astype(wide)
-    end = _unit(branch_wide, branch_squares, branch.dtype).astype(wide)
+    residual_wide, residual_squares = l2_squares(residual)
+    branch_wide, branch_squares = l2_squares(branch)
+    start = l2_unit(residual_wide, residual_squares, residual.dtype).astype(wide)
+    end = l2_unit(branch_wide, branch_squares, branch.dtype).astype(wide)
     rate = jnp.abs(alpha.astype(wide) * scale)
-    joined, joined_squares = _squares(start + rate * (end - start))
-    return _unit(joined, joined_squares, residual.dtype), (residual_squares, branch_squares, joined_squares)
+    joined, joined_squares = l2_squares(start + rate * (end - start))
+    return l2_unit(joined, joined_squares, residual.dtype), (residual_squares, branch_squares, joined_squares)
 
 
 def _stepped_backward(scale: float, saved, operands, cotangent) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -185,8 +173,8 @@ def _hidden(factor: float, product, gate, up, gate_gain, up_gain) -> jax.Array:
 def _hidden_forward(factor: float, product, gate, up, gate_gain, up_gain):
     """The normed hidden rows and their sums of squares."""
     gated, upped, _ = _gated(factor, gate, up, gate_gain, up_gain)
-    hidden, squares = _squares(product(gated, upped).astype(gate.dtype))
-    return _unit(hidden, squares, gate.dtype), (squares,)
+    hidden, squares = l2_squares(product(gated, upped).astype(gate.dtype))
+    return l2_unit(hidden, squares, gate.dtype), (squares,)
 
 
 def _hidden_backward(factor: float, product, saved, operands, cotangent):

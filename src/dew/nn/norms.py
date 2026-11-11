@@ -5,6 +5,7 @@
 input's.
 """
 
+import enum
 import functools
 import math
 from collections.abc import Callable
@@ -21,6 +22,22 @@ from .precision import at_least_fp32, float32_dot_general, rms_statistics, rms_w
 from .sharding import LogicalAxes, declared
 
 
+class NormSite(enum.StrEnum):
+    """The decoder's norms, each by the module name it is built under
+    (`dew.nn.backbones.decoder_block.decoder_norm`), the one place each is named: a block's
+    (`DecoderBlock._built_norms`), a cross-attention block's, and the model's own. A `NormSpec` may change
+    any of them (`CausalTransformer.norms`)."""
+
+    INPUT = 'input_layernorm'
+    POST_ATTENTION = 'post_attention_layernorm'
+    ATTENTION_OUTPUT = 'attention_output_norm'
+    MLP_OUTPUT = 'mlp_output_norm'
+    PER_LAYER_INPUT = 'post_per_layer_input_norm'
+    EMBEDDING = 'embedding_layernorm'
+    FINAL = 'norm'
+    HEAD = 'head_norm'
+
+
 def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
     """Wrap a norm body in `jax.checkpoint` so nothing fp32 is retained.
 
@@ -28,7 +45,7 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
     the backward pass would keep two fp32 copies of the activations per norm
     (2.35 GiB on one SimpleDiT step). Saving nothing keeps the arguments (the
     bf16 input, the weight and the bias) and leaves the residuals to the policy
-    that recomputes the block (`mixer_base.RESIDUALS`). The wrapped function
+    that recomputes the block (`residuals.RESIDUALS`). The wrapped function
     takes arrays first and static arguments last, so no flax lifting sits
     between the checkpoint and the module; forward values are unchanged.
     """

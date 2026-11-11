@@ -23,8 +23,8 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Callable, Iterator, Mapping
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from collections.abc import Callable, Hashable, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from .generation import Choice, Route
@@ -140,11 +140,11 @@ class Kernel[C]:
 class Celled(Protocol):
     """A case an op with declared cells reads (`Op.declared`): its `cell`, the scope a receipt measures
     (a template's instruction family, `generation.family`, None outside every family; a standalone
-    kernel's device generation, `generation.device_generation`) and the kind of call it is (a GEMM's
-    'grouped forward', a recurrence's product, a norm's 'bfloat16')."""
+    kernel's device generation, `generation.device_generation`) and the kind of call it is, the object
+    its op states it by (a GEMM's `grouped_matmul.Kind`, a norm's rows' dtype, a recurrence's product)."""
 
     @property
-    def cell(self) -> tuple[str | None, str]: ...
+    def cell(self) -> tuple[str | None, Hashable]: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -157,14 +157,16 @@ class Op[C]:
     a measurement found another kernel faster than the op's preference (a template's old route, owner,
     bible da64ae5; a standalone kernel against XLA's program), each cell (`Celled.cell`: the scope the
     receipt measured, a template's instruction family or a device's generation, and the kind of call) to
-    that kernel and the receipt. A declared cell runs its kernel where it takes the call; any other call,
-    and a declared one its kernel cannot run, the op's order."""
+    that kernel (one of `kernels`, the object itself) and the receipt. A declared cell runs its kernel where
+    it takes the call; any other call, and a declared one its kernel cannot run, the op's order."""
 
     choice: Choice
     kernels: tuple[Kernel[C], ...]
     preferred: Callable[[C], str] | None = None
     unlowered: Callable[[str], str | None] = lambda kernel: None
-    declared: Mapping[tuple[str | None, str], tuple[str, str]] = dataclasses.field(
+    # A cell's kind is its op's own object (`Celled.cell`); a mapping's keys are invariant, so each op's
+    # table states its own kind and the field takes any.
+    declared: Mapping[tuple[str | None, Any], tuple[Kernel[C], str]] = dataclasses.field(
         default_factory=dict, compare=False, hash=False)
     named_from: Mapping[tuple[Choice, str], str] = dataclasses.field(
         default_factory=dict, compare=False, hash=False)
@@ -331,8 +333,8 @@ def _old_route[C](op: Op[C], case: C, *, reported: bool = True
     cell = case.cell
     if cell not in op.declared:
         return None
-    name, receipt = op.declared[cell]
-    kernel = op.kernel(name)
+    kernel, receipt = op.declared[cell]
+    name = kernel.name
     if kernel.refused(case) is not None:
         return None
     preferred = _preferred(op, case) if reported else name
@@ -340,7 +342,7 @@ def _old_route[C](op: Op[C], case: C, *, reported: bool = True
         return kernel, name, None
     return kernel, preferred, Refusal(
         'measured', f"{name} measured faster than {preferred} on this cell "
-                    f"({', '.join(part for part in cell if part)}): {receipt}",
+                    f"({', '.join(str(part) for part in cell if part)}): {receipt}",
         'bible da64ae5', kind='measured')
 
 

@@ -103,10 +103,12 @@ def xla_attention(query, key, value):
 
 
 def written_attention(query, key, value):
-    """The same attention written out: grouped heads, fp32 logits, a softmax in fp32 rounded to bf16."""
+    """The same attention written out: grouped heads, logits in at least fp32, a softmax there rounded to the
+    operands' dtype."""
     group = query.shape[2] // key.shape[2]
     keys, values = jnp.repeat(key, group, axis=2), jnp.repeat(value, group, axis=2)
-    logits = jnp.einsum("btnh,bsnh->bnts", query, keys, preferred_element_type=jnp.float32)
+    wide = jnp.promote_types(query.dtype, jnp.float32)
+    logits = jnp.einsum("btnh,bsnh->bnts", query, keys, preferred_element_type=wide)
     weights = jax.nn.softmax(logits / np.sqrt(query.shape[-1]), axis=-1).astype(query.dtype)
     return jnp.einsum("bnts,bsnh->btnh", weights, values)
 
@@ -2021,10 +2023,10 @@ def test_a_change_moves_the_result_only_past_rounding():
         assert_moves(_product, _reordered, _draw, "reordered", seeds=8)
 
     def zero(x, w):
-        return {"y": jnp.zeros(3, jnp.float32)}
+        return {"y": jnp.zeros(3, x.dtype)}
 
     def off_zero(x, w):
-        return {"y": jnp.full(3, 1e-30, jnp.float32)}
+        return {"y": jnp.full(3, 1e-30, x.dtype)}
 
     assert_moves(jax.jit(zero), jax.jit(off_zero), _draw, "off zero", seeds=8)
 

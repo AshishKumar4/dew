@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import itertools
 import math
@@ -18,6 +19,7 @@ from jax.core import Tracer
 from dew._coordination import agreed
 from dew.batch import (
     COORDINATES_FIELD,
+    LAID_FIELDS,
     POSITIONS_FIELD,
     SEGMENTS_FIELD,
     TOKEN_LAYOUT_FIELDS,
@@ -83,6 +85,22 @@ def sequence_blocks(x: jax.Array, block: int, blocks: int | None = None, *,
                 constant_values=fill)
     x = x.reshape(x.shape[0], blocks, block, *x.shape[2:])
     return jnp.moveaxis(x, 1, 0) if leading else x
+
+
+MEDIA_INDEX_FIELDS = ("image_indices", "audio_indices")
+"""The token fields naming the media feature each token reads, -1 for none: the placeholders media fill."""
+
+
+def media_slots(fields: Mapping[str, object], shape: tuple[int, ...], *, xp=jnp):
+    """Which of a request's `shape` `[B, S]` slots media fill: those any media index field it holds
+    (`MEDIA_INDEX_FIELDS`) points at a feature from (>= 0); none where it holds none. A filled slot reads
+    no embedding row of its id. `xp` is the array module."""
+    filled = xp.zeros(shape, bool)
+    for name in MEDIA_INDEX_FIELDS:
+        indices = fields.get(name)
+        if indices is not None:
+            filled = filled | (xp.asarray(indices) >= 0)
+    return filled
 
 
 def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 0,
@@ -574,6 +592,16 @@ class CrossContext:
         return embeddings, lengths, segments
 
 
+MIXES = "mixes"
+"""The metadata key of an `AttentionMetadata` field that says which tokens a mixer lets each token read, or
+how much (`MIXING`)."""
+
+
+class mixing_property(property):
+    """An `AttentionMetadata` property that says which tokens a mixer lets each token read, as a field marked
+    `MIXES` does (`MIXING`)."""
+
+
 @struct.dataclass
 class AttentionMetadata:
     """Per-token data the layers read alongside their inputs, independent of physical cache-slot addresses.
@@ -625,15 +653,15 @@ class AttentionMetadata:
     image_groups: jax.Array | None = None
     block_groups: jax.Array | None = None
     rotary_positions: jax.Array | None = None
-    pairwise_mask: jax.Array | None = None
-    key_positions: jax.Array | None = None
-    key_runs: jax.Array | None = None
-    key_valid: jax.Array | None = None
+    pairwise_mask: jax.Array | None = struct.field(default=None, metadata={MIXES: True})
+    key_positions: jax.Array | None = struct.field(default=None, metadata={MIXES: True})
+    key_runs: jax.Array | None = struct.field(default=None, metadata={MIXES: True})
+    key_valid: jax.Array | None = struct.field(default=None, metadata={MIXES: True})
     token_ids: jax.Array | None = None
     engram_ids: jax.Array | None = None
     media: jax.Array | None = None
-    admitted: Admitted | None = None
-    position_bias: jax.Array | None = None
+    admitted: Admitted | None = struct.field(default=None, metadata={MIXES: True})
+    position_bias: jax.Array | None = struct.field(default=None, metadata={MIXES: True})
     blocks: jax.Array | None = None
     context: CrossContext | None = None
     progress: jax.Array | None = None
@@ -653,7 +681,7 @@ class AttentionMetadata:
     def right_padded(self) -> bool:
         return self.coordinates is not None and self.coordinates.right_padded
 
-    @property
+    @mixing_property
     def forks(self) -> Forks | None:
         """The documents that continue another (`Coordinates.forks`), None where none does."""
         return None if self.coordinates is None else self.coordinates.forks
@@ -702,22 +730,6 @@ def intersected_runs(first, second):
     return runs.reshape(*runs.shape[:2], -1, 2)
 
 
-MIXING = ("pairwise_mask", "key_positions", "key_runs", "key_valid", "position_bias", "admitted", "forks")
-"""The `AttentionMetadata` fields that say which tokens a mixer lets each token
-read, or how much: a call's own mask, or its keys' runs, and the key positions
-it is read by, an additive bias, a server's mixed layout, the documents that
-continue another (`Forks`). A
-mixer runs a call that sets one only where it reads it (`MixerCall`). The rest
-describe the tokens themselves, which a mixer reads as far as its form uses
-them: their coordinates, rotary positions, and image and block groups, which
-only attention that sees an image or a block whole reads, and the ids the block
-reads for its feed-forward and n-gram lookup."""
-
-TOKENWISE = frozenset(MIXING)
-"""The `MIXING` fields a mixer that reads no other token holds to: every one,
-by construction, since none changes what a token alone computes."""
-
-
 @dataclass(frozen=True)
 class MixerCall:
     """Everything a token mixer is called with beside its input: the stack's
@@ -738,10 +750,17 @@ class MixerCall:
 
     def unread(self, reads: frozenset[str]) -> tuple[str, ...]:
         """The `MIXING` fields this call sets that a mixer reading `reads` does not read."""
+        return tuple(name for name in self._set() if name not in reads)
+
+    def given(self, reads: frozenset[str]) -> tuple[str, ...]:
+        """The `MIXING` fields this call sets that a mixer reading `reads` reads (`unread`'s others)."""
+        return tuple(name for name in self._set() if name in reads)
+
+    def _set(self) -> tuple[str, ...]:
+        """The `MIXING` fields this call's metadata sets, in `MIXING`'s order."""
         if self.metadata is None:
             return ()
-        return tuple(name for name in MIXING
-                     if name not in reads and getattr(self.metadata, name) is not None)
+        return tuple(name for name in MIXING if getattr(self.metadata, name) is not None)
 
 
 PLAIN_CALL = MixerCall()
@@ -768,6 +787,23 @@ class Admitted:
     cursors: jax.Array
     tables: jax.Array | None = None
     continuing: bool = struct.field(pytree_node=False, default=True)
+
+
+MIXING = (*(field.name for field in dataclasses.fields(AttentionMetadata) if field.metadata.get(MIXES)),
+          *(name for name, value in vars(AttentionMetadata).items() if isinstance(value, mixing_property)))
+"""The `AttentionMetadata` fields that say which tokens a mixer lets each token
+read, or how much, each marked where it is declared (`MIXES`, `mixing_property`):
+a call's own mask, or its keys' runs, and the key positions it is read by, a
+server's mixed layout, an additive bias, the documents that continue another
+(`Forks`). A mixer runs a call that sets one only where it reads it
+(`MixerCall`). The rest describe the tokens themselves, which a mixer reads as
+far as its form uses them: their coordinates, rotary positions, and image and
+block groups, which only attention that sees an image or a block whole reads,
+and the ids the block reads for its feed-forward and n-gram lookup."""
+
+TOKENWISE = frozenset(MIXING)
+"""The `MIXING` fields a mixer that reads no other token holds to: every one,
+by construction, since none changes what a token alone computes."""
 
 
 FEEDFORWARD_ROUTES = 'feedforward'
@@ -861,10 +897,6 @@ def _response_document(value: jax.Array, valid: jax.Array, width: int) -> jax.Ar
 def _response_text(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
     """Text: no media feature, no image or block group (-1)."""
     return jnp.full((value.shape[0], width, *value.shape[2:]), -1, value.dtype)
-
-
-LAID_FIELDS = {"valid": VALIDITY_FIELD, "positions": POSITIONS_FIELD, "segments": SEGMENTS_FIELD}
-"""Each `Coordinates` field a request's flat layout gives, by the flat field that gives it."""
 
 
 def _continued_layout(value: Coordinates, valid: jax.Array, width: int,

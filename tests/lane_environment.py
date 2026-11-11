@@ -11,28 +11,28 @@ from collections.abc import Mapping, MutableMapping
 # as one GPU, reports it as skipped with both counts.
 MESH_DEVICES = 8
 
+USERS_ARITHMETIC = "DEW_TEST_USERS_ARITHMETIC"
+"""The environment variable that, set to 1, has a lane configure its devices and threads and none of its
+arithmetic (`configure_lane`): no matmul precision of the suite's and no wide CPU arithmetic, so a test
+process computes as a library process does (`users_process`)."""
+
 
 DETERMINISTIC_OPS = "--xla_gpu_deterministic_ops=true"
-"""Under it a process keeps no picks (`dew._cache.keeps_picks`) and XLA refuses cudnn attention
-(openxla/xla#46500)."""
+"""Under it a process keeps no picks (`dew._cache.keeps_picks`) and Dew's fused kernels take their ordered
+schedules (`dew._devices.deterministic_ops_requested`)."""
 
-REPEATABLE_GPU_FLAGS = (DETERMINISTIC_OPS, "--xla_gpu_autotune_level=0", "--xla_gpu_enable_triton_gemm=false")
+REPEATABLE_GPU_FLAGS = (DETERMINISTIC_OPS, "--xla_gpu_autotune_level=0")
 """The cuda lane's flags for steps repeatable across processes. Deterministic
 ops order the reductions; autotuning off leaves every cuBLAS and cuDNN call
 the configuration it was emitted with, so no process chooses one; and such
 a run keeps no stored picks (`dew._cache.keeps_picks`), which XLA and Dew's
-kernels would take instead. Deterministic ops take Triton out of the GEMM
-configurations (`GetEnabledBackends` in
-xla/service/gpu/autotuning/config_assigner_pass.cc) while XLA still fuses
-dots for Triton, and the mean-flow hybrid DiT's jvp dot over a
-concatenation then had no configuration ("No supported config found");
-with Triton GEMMs off every dot is a cuBLAS call from the start. With
-Triton GEMMs off and autotuning on, eight processes sharing the H100 failed
-five tests that pass alone (a cuDNN engine index refused, a reload's logits
-not bitwise), which reads as configurations chosen under contention; it was
-not proven. Autotuning off leaves an fp8 convolution's emitted
-configuration, which cuDNN refuses on an H100, so that test compiles in its
-own process without it (tests/test_quantization.py)."""
+kernels would take instead. The lane states nothing of XLA's Triton GEMM
+fusions: which backend runs a dot is XLA's choice under these flags, and
+Dew's own options for those fusions (`dew.nn.kernels.options`) apply as in
+a user's process, which a flag of the lane's would override. Autotuning off
+leaves an fp8 convolution's emitted configuration,
+which cuDNN refuses on an H100, so that test compiles in its own process
+without it (tests/test_quantization.py)."""
 
 
 def without_flags(flags: str, *names: str) -> str:
@@ -73,14 +73,18 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     accelerator = next((name for name in platforms if name in local), None)
     if accelerator is None:
         cpu_devices = MESH_DEVICES
-        # Under XLA:CPU's default schedule a launch of the simulated devices can reach its collectives
-        # on different device groups in different orders, which then wait on each other for good: a
-        # pipeline of two stages over two tensor shards (tests/test_run_option_matrix.py's staged lm
-        # run) aborted in about one run in ten, its devices split between the stage permute and the
-        # tensor and data all-gathers. Under its memory-optimized schedule it held 0 of 60 runs, the
-        # default 3 of 30 in the same batch, no slower (armada jobs 20261103013431-f98757ad and
-        # 20261103014328-bb1be83e). The cause inside XLA:CPU is open; Dew's products are unchanged, the
-        # setting the CPU lane's alone.
+        # XLA:CPU orders the thunks that hold a collective by when each starts, not when it ends
+        # (`Resource::kCollectiveCommunicator`, a scheduling edge), and a while loop's thunk returns
+        # pending before its inner collective has started: under the default schedule the next loops'
+        # collectives then start, their rendezvous block every worker of the pool, and the device the
+        # first one waits for never runs (row 5397: a plain JAX program of three such loops on a 2x2 mesh
+        # hangs 11 of 12 processes, none with the communicator made a completion dependency; armada job
+        # 20261110120401-1a75cf8e; the program is dew-ops upstream/xla_cpu_collective_order_repro.py).
+        # The memory-optimized schedule reuses buffers between the loops, whose dependencies keep them
+        # apart: tests/test_run_option_matrix.py's staged lm run aborted 3 of 30 runs under the default
+        # schedule and 0 of 60 under this one. XLA's CPU backend ships in jaxlib, which Dew takes as
+        # released, so the setting is a boundary of that dependency (CONTRIBUTING.md) until a jaxlib
+        # release orders CPU collectives by completion.
         flags.append("--xla_cpu_scheduler_type=CPU_SCHEDULER_TYPE_MEMORY_OPTIMIZED")
     else:
         if accelerator == "cuda":
@@ -106,15 +110,16 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     # past 1,500 s beside four busy loops, and 80 s beside them on one thread (ledger 3829). A count a
     # process is given (the GPU lane's share of a node's CPUs, tools/armada/ci.py) stands.
     environ.setdefault("OMP_NUM_THREADS", "1")
-    # Parity tests assert fp32 against references computed in fp32. Ampere and
-    # later GPUs default fp32 matmuls to TF32, a 10-bit mantissa, which puts
-    # 1e-2 between two correct implementations.
-    environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "highest")
-    # The arithmetic the suite holds a CPU to (`dew.nn.precision.WIDE_CPU_ARITHMETIC`): float32
-    # products summed in float64, a loop's running sum of them compensated, and a row's reductions in
-    # float64 (`widened_reduction`).
-    # Dew's test setting, never the library's default.
-    environ.setdefault("DEW_WIDE_CPU_ARITHMETIC", "1")
+    if environ.get(USERS_ARITHMETIC) != "1":
+        # Parity tests assert fp32 against references computed in fp32. Ampere and
+        # later GPUs default fp32 matmuls to TF32, a 10-bit mantissa, which puts
+        # 1e-2 between two correct implementations.
+        environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "highest")
+        # The arithmetic the suite holds a CPU to (`dew.nn.precision.WIDE_CPU_ARITHMETIC`): float32
+        # products summed in float64, a loop's running sum of them compensated, and a row's reductions in
+        # float64 (`widened_reduction`).
+        # Dew's test setting, never the library's default.
+        environ.setdefault("DEW_WIDE_CPU_ARITHMETIC", "1")
 
 
 def configured(environ: Mapping[str, str]) -> dict[str, str]:
@@ -124,6 +129,15 @@ def configured(environ: Mapping[str, str]) -> dict[str, str]:
     lane = dict(environ)
     configure_lane(lane)
     return lane
+
+
+def users_process(environ: Mapping[str, str]) -> dict[str, str]:
+    """`environ` for a test process that computes on a CPU as a user's does: outside the suite
+    (`outside_suite`), then configured by its own conftest with the suite's simulated devices, which a test
+    of a mesh needs, and a user's arithmetic (`USERS_ARITHMETIC`). What the suite's own processes cannot
+    show: every program a library process builds outside check 1's arms, its shapes, placements, routes
+    and footprints (tests/test_users_process.py)."""
+    return {**outside_suite(environ), USERS_ARITHMETIC: "1"}
 
 
 def outside_suite(environ: Mapping[str, str]) -> dict[str, str]:

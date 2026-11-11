@@ -44,6 +44,7 @@ from dew.batch import Coordinates, Forks, document_ranks, prefix_sum, valid_orde
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
+from dew.nn.residuals import Residual
 
 from .attention_masks import repeat_kv_heads
 from .blocks import normal_kernel
@@ -153,8 +154,8 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
         else:
             out = xla_conv1d(x, kernel, activation, bias, valid=valid, segments=segments, parts=parts,
                              dtype=dtype)
-    # The conv's output, which a remat policy may keep (`dew.nn.mixer_base.RESIDUALS`).
-    return jax.tree.map(lambda piece: checkpoint_name(piece, 'conv'), out)
+    # The conv's output, which a remat policy may keep (`dew.nn.residuals.RESIDUALS`).
+    return jax.tree.map(lambda piece: checkpoint_name(piece, Residual.CONV), out)
 
 
 def _row_split(x) -> MeshAxes | None:
@@ -434,7 +435,7 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
             out, history, final = token(mixed, conv_state.value, held.value)
             conv_state.value = history.astype(conv_state.value.dtype)
             held.value = final.astype(held.value.dtype)
-            return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
+            return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
     valid = coordinates.valid
     mixed, history = held_conv1d(mixed, taps, valid,
                                  None if conv_state is None else conv_state.value.astype(mixed.dtype),
@@ -448,7 +449,7 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
         held.value = final.astype(held.value.dtype)
     # The scan's output under both names a remat policy reads it by (`RESIDUALS`): a mixer's
     # 'context', as MaxText's recipes keep it, and the 'scan' only a recurrence marks.
-    return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
+    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
 
 
 def fork_histories(x, documents, real, forks: Forks, width: int, history=None):
@@ -583,7 +584,7 @@ def forked_scan(convolved, rule, coordinates: Coordinates, start):
         states = jax.tree.map(settled, states, finals)
         out = found if out is None else jnp.where(valid.reshape(*valid.shape, *(1,) * (found.ndim - 2)),
                                                   found, out)
-    return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
+    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
 
 
 def _forked(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
@@ -725,7 +726,7 @@ def split_delta_rule(mixed, g, beta, segments, starts, valid, taps, *, widths, p
                              widths, strict=True))
     state = entering_memory(rule, query, key, value, g, beta, starts, axis=SEQUENCE_AXIS)
     out, _ = rule(query, key, value, g, beta, state, starts=starts)
-    return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
+    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
 
 
 def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts=None, dtype=None,

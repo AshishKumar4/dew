@@ -41,11 +41,7 @@ from dew.nn.inputs import (
     document_reach,
 )
 from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
-
-# dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
-# contracts from base avoids importing the kind hub back during this module's
-# initialization, so either kind can be the first imported.
-from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
+from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.attention import call_visibility, dense_visibility, group_fields
 from dew.nn.norms import LayerNorm, RMSNorm
 from dew.nn.precision import (
@@ -55,6 +51,11 @@ from dew.nn.precision import (
     float32_dot_general,
     float32_einsum,
 )
+
+# dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
+# contracts from base avoids importing the kind hub back during this module's
+# initialization, so either kind can be the first imported.
+from dew.nn.residuals import ATTENTION_CONTEXT_RESIDUALS, Residual
 from dew.nn.rope import (
     LongRopeScaling,
     Scaling,
@@ -543,7 +544,7 @@ class MultiHeadLatentAttention(LinearProducts):
         batch, length, _ = x.shape
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # The projections carry the names a remat policy saves or offloads
-        # (mixer_base.RESIDUALS); kv_b_proj is the fused K/V one.
+        # (residuals.RESIDUALS); kv_b_proj is the fused K/V one.
         gate = None
         if self.q_lora_rank is None:
             q_resid = None
@@ -558,7 +559,7 @@ class MultiHeadLatentAttention(LinearProducts):
         else:
             q_resid = constrain(self.q_a_layernorm(self.q_a_proj(constrain(x, place))), place)
             queries = self.q_b_proj(constrain(q_resid, RESIDUAL))
-        queries = checkpoint_name(queries, 'q_proj')
+        queries = checkpoint_name(queries, Residual.Q_PROJ)
         return queries.reshape(batch, length, self.num_heads, qk_head_dim), q_resid, gate
 
     def _latents(self, x, place: LogicalAxes):
@@ -595,7 +596,7 @@ class MultiHeadLatentAttention(LinearProducts):
         """Latent and rope head into per-head keys and values."""
         batch, length = latent.shape[0], latent.shape[1]
         width = self.qk_nope_head_dim + self.v_head_dim
-        kv = checkpoint_name(self.kv_b_proj(latent), 'kv_proj').reshape(
+        kv = checkpoint_name(self.kv_b_proj(latent), Residual.KV_PROJ).reshape(
             batch, length, self.num_heads, width)
         nope, values = jnp.split(kv, [self.qk_nope_head_dim], axis=-1)
         rot = jnp.broadcast_to(
@@ -641,7 +642,7 @@ class MultiHeadLatentAttention(LinearProducts):
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax, implementation=self.attention_impl,
             key_value_seq_lengths=jnp.maximum(lengths, 1), segment_ids=queries, key_segment_ids=segments,
-            max_segments=max_segments), 'context')
+            max_segments=max_segments), Residual.CONTEXT)
         return self._output(attention, gate)
 
     @nn.nowrap
@@ -824,18 +825,12 @@ class MultiHeadLatentAttention(LinearProducts):
         if selecting and (self.sliding_window is not None or self.attention_chunk is not None):
             raise ValueError("an indexed mla layer selects its candidates among every key before it; "
                              "a window or chunk narrows a dense layer's keys")
-        own = None if metadata is None else [
-            name for name, given in (("pairwise_mask", metadata.pairwise_mask),
-                                     ("key_runs", metadata.key_runs),
-                                     ("forks", metadata.forks),
-                                     ("key_valid", metadata.key_valid),
-                                     ("key_positions", metadata.key_positions),
-                                     ("position_bias", metadata.position_bias)) if given is not None]
+        own = call.given(self.reads)
         if own and selecting:
             raise ValueError(f"an indexed mla layer selects among every key before each query, and reads "
                              f"none of {', '.join(own)}")
         # A cached call's keys are its cache's, whose validity it holds (`cached_validity`).
-        uncached = [name for name in own or () if name in ("position_bias", "key_valid")]
+        uncached = [name for name in own if name in ("position_bias", "key_valid")]
         if uncached and call.decode:
             raise ValueError(f"an mla layer reads {', '.join(uncached)} on a dense layer's uncached call, "
                              "its keys the call's own")
@@ -1050,7 +1045,7 @@ class MultiHeadLatentAttention(LinearProducts):
         layer's input's, under `output_gate`; by `gating`'s own sigmoid, the gate's logits, under
         `query_gate`, in at least float32 and rounded once (modeling_axk2.py:670)."""
         batch, length = attention.shape[:2]
-        context = checkpoint_name(attention, "context").reshape(
+        context = checkpoint_name(attention, Residual.CONTEXT).reshape(
             batch, length, self.num_heads * self.v_head_dim
         )
         if self.query_gate:
@@ -1058,7 +1053,7 @@ class MultiHeadLatentAttention(LinearProducts):
             context = (context.astype(wide) * nn.sigmoid(gating.astype(wide))).astype(context.dtype)
         elif self.output_gate:
             context = context * nn.sigmoid(self.g_proj(gating))
-        return checkpoint_name(self.o_proj(context), 'o_proj')
+        return checkpoint_name(self.o_proj(context), Residual.O_PROJ)
 
 
 def latent_refusals(ctx: MixerContext) -> Mapping[str, object]:

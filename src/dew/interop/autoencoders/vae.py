@@ -9,6 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
+from dew.interop.layouts import Renames, renamed
 from dew.interop.weights import ParamTree, indexed_path, stored_shape, translate_parameters
 
 from .common import check_class
@@ -16,10 +17,9 @@ from .common import check_class
 _log = logging.getLogger(__name__)
 
 
-_VAE_ATTENTION = {"to_q": "query", "to_k": "key", "to_v": "value"}
-
-
-_FLAX_ATTENTION = {flax: torch for torch, flax in _VAE_ATTENTION.items()}
+_VAE_ATTENTION: Renames = (("to_q", "query"), ("to_k", "key"), ("to_v", "value"), ("to_out.0", "proj_attn"))
+"""The mid-block attention's projections as diffusers names them onto `FlaxAttentionBlock`'s, both ways
+(`renamed`): `to_out.0` is the output projection, the module's last; there is no second entry."""
 
 
 def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
@@ -32,13 +32,9 @@ def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
     stores every gain as `weight`, where linen has a norm's `scale` and a
     convolution's or a dense's `kernel`, which `rank` tells apart.
     """
-    parts = torch_name.split(".")
-    leaf = "bias" if parts[-1] == "bias" else ("scale" if rank == 1 else "kernel")
-    names = parts[:-1]
-    # to_out.0 is the projection, the module's last; there is no second entry.
-    if names[-2:] == ["to_out", "0"]:
-        names[-2:] = ["proj_attn"]
-    return (*indexed_path(_VAE_ATTENTION.get(name, name) for name in names), leaf)
+    module, _, stored = torch_name.rpartition(".")
+    leaf = "bias" if stored == "bias" else ("scale" if rank == 1 else "kernel")
+    return (*indexed_path(renamed(module, _VAE_ATTENTION).split(".")), leaf)
 
 
 def translate_vae_weights(torch_tensors: ParamTree) -> ParamTree:
@@ -239,11 +235,8 @@ def _torch_name(path: tuple[str, ...]) -> str:
     *names, leaf = path
     tokens: list[str] = []
     for name in names:
-        if name == "proj_attn":
-            tokens += ["to_out", "0"]
-            continue
-        name = _FLAX_ATTENTION.get(name, name)
         head, _, index = name.rpartition("_")
         tokens += [head, index] if head and index.isdigit() else [name]
-    return ".".join([*tokens, "bias" if leaf == "bias" else "weight"])
+    module = renamed(".".join(tokens), _VAE_ATTENTION, export=True)
+    return f"{module}.{'bias' if leaf == 'bias' else 'weight'}"
 

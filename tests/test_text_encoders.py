@@ -561,16 +561,30 @@ def test_public_text_encoder_storage_is_separate_from_compute(kind, tmp_path):
 
 def test_a_tower_layer_asking_wide_logits_attends_with_them():
     """`clip_layer`'s `wide_logits` reaches its attention (`MixerContext.wide_logits`): from the same
-    weights and bf16 inputs, a layer asking them answers otherwise than the layer that does not, which is
-    CLIP's own (row 4149's review, train 608: the world model's blocks build on `clip_layer`, attending
-    so)."""
+    weights and bf16 inputs, the program of a layer asking them multiplies every product over the head
+    width (its attention logits) from operands of at least 32 bits, and the layer that does not, which is
+    CLIP's own, from its 16-bit ones (row 4149's review, train 608: the world model's blocks build on
+    `clip_layer`, attending so). Read from the program's operands, as no output shows it on a CPU, and a
+    16-bit attention's logits are float32 there too (rows 5429, 5439)."""
     import jax.numpy as jnp
 
+    from dew.nn.programs import equations
     from dew.nn.text_encoders import clip_layer
 
     x = jnp.asarray(np.random.default_rng(23).normal(scale=4.0, size=(2, 8, 32)), jnp.bfloat16)
     wide, narrow = (clip_layer(32, 2, 64, 8, norm_type="rms", qk_norm=True, wide_logits=flag,
                                dtype=jnp.bfloat16) for flag in (True, False))
     variables = narrow.init(jax.random.key(24), x)
-    assert not np.array_equal(np.asarray(wide.apply(variables, x), np.float32),
-                              np.asarray(narrow.apply(variables, x), np.float32))
+
+    def operands(layer) -> set[np.dtype]:
+        # The promoted operand dtype of every product contracting one axis the head width (16) long.
+        program = jax.make_jaxpr(layer.apply)(variables, x)
+        return {np.dtype(jnp.promote_types(equation.invars[0].aval.dtype, equation.invars[1].aval.dtype))
+                for equation in equations(program.jaxpr) if equation.primitive is jax.lax.dot_general_p
+                and [equation.invars[0].aval.shape[axis]
+                     for axis in equation.params["dimension_numbers"][0][0]] == [16]}
+
+    # At least 32 bits where asked (float64 under Dew's wide CPU test arithmetic), 16 where not.
+    asked, own = operands(wide), operands(narrow)
+    assert asked and all(dtype.itemsize >= 4 for dtype in asked)
+    assert own and all(dtype.itemsize == 2 for dtype in own)

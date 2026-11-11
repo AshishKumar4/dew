@@ -298,12 +298,14 @@ def decode_cells() -> list[Cell]:
     ]
 
 
-FAMILIES = {"mainloop forward": mainloop_forward_cells, "mainloop gradient": mainloop_gradient_cells,
+FAMILIES = {"mainloop": lambda: [*mainloop_forward_cells(), *mainloop_gradient_cells()],
             "template stability": template_stability_cells,
             "portable and SSD port": portable_and_ssd_port_cells, "selective scan": selective_cells,
-            "port training": port_training_cells, "decode": decode_cells}
+            "port training and decode": lambda: [*port_training_cells(), *decode_cells()]}
 """The recurrence cells by family, each family a test of its own: the planner times and packs each, and one
-family's failure hides no other's (a single flow of every family ran past a GPU job's 50 minutes)."""
+family's failure hides no other's (a single flow of every family ran past a GPU job's 50 minutes). The
+mainloop's forward and gradient run as one flow over the same launches (selected by `-k mainloop`), and a
+layer's port training and its decode as another."""
 
 
 @pytest.mark.parametrize("family", list(FAMILIES))

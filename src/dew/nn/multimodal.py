@@ -12,7 +12,7 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
-from dew._model_types import GEMMA4_TYPES
+from dew._model_types import wrapper
 from dew.batch import (
     POSITIONS_FIELD,
     Coordinates,
@@ -367,7 +367,7 @@ class MultimodalTransformer(DecoderWrapper):
         ranges, so it runs this path with no payloads too; any other call
         without payloads leaves the decoder its own lookup.
         """
-        if self.family in GEMMA4_TYPES:
+        if wrapper(self.family).gemma4:
             placeholder = tokens == self.image_token_id
             for token_id in self.extra_placeholder_ids:
                 placeholder = placeholder | (tokens == token_id)

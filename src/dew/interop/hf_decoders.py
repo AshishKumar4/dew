@@ -39,12 +39,13 @@ import numpy as np
 
 from dew import _records
 from dew._files import write_atomically
-from dew._model_types import QWEN35_TEXT_TYPES, QWEN35_TYPES
+from dew._model_types import WRAPPERS, config_wrapper, wrapper
 from dew.batch import Variables
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.decoder_parts import (
     NO_AUDIO,
+    ROPE_SPELLINGS,
     SLICED,
     AudioFields,
     DecoderFamily,
@@ -94,7 +95,7 @@ from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.gemma3n import AltUp
-from dew.registry import from_record, towers
+from dew.registry import constructor_fields, from_record, towers
 
 if TYPE_CHECKING:
     from dew.nn.multimodal import MultimodalTransformer
@@ -165,21 +166,25 @@ def typed_part(hf_config: Mapping[str, object], nested: Mapping[str, object],
     return {"model_type": default, **nested}
 
 
-_QWEN_VL_TEXT_FIELDS = frozenset({
-    "vocab_size", "hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
-    "num_key_value_heads", "hidden_act", "max_position_embeddings", "initializer_range", "rms_norm_eps",
-    "use_cache", "use_sliding_window", "sliding_window", "max_window_layers", "layer_types",
-    "attention_dropout", "rope_parameters", "rope_scaling", "rope_theta", "bos_token_id", "eos_token_id",
-    "pad_token_id"})
-"""The decoder fields Qwen2-VL's and Qwen2.5-VL's configs read off the wrapper's root, as the Hub's flat
-configs state them (`Qwen2_5_VLConfig.__post_init__`, transformers 5.17: its text config's fields and
-the rope's spellings): the text_config where none is nested, else ignored beside the nested one."""
+@functools.cache
+def _flat_text_fields(model_type: str) -> frozenset[str]:
+    """The decoder fields a Qwen2-VL's or Qwen2.5-VL's config reads off the wrapper's root, as the Hub's flat
+    configs state them, as its class reads them (`Qwen2_5_VLConfig.__post_init__`): each field its text
+    config's class declares that its own does not, and the rotary record's spellings (`ROPE_SPELLINGS`);
+    the text_config where none is nested, else ignored beside the nested one."""
+    from transformers import CONFIG_MAPPING
+
+    wrapper = CONFIG_MAPPING[model_type]
+    own = {field.name for field in dataclasses.fields(wrapper)}
+    text = {field.name for field in dataclasses.fields(wrapper.sub_configs["text_config"])}
+    return frozenset(text - own) | ROPE_SPELLINGS
+
 
 _FLAT_TEXT_TYPES = ("qwen2_vl", "qwen2_5_vl")
 _TEXT_VLMS = (*_FLAT_TEXT_TYPES, "qwen3_vl", "qwen3_vl_moe")
 """The VLMs whose text decoder a registered family computes and whose vision tower Dew has no port of
 (`TEXT_FAMILIES`, `_text_vlm_wrapper`)."""
-"""The VLM wrappers whose config reads a flat root as its text config (`_QWEN_VL_TEXT_FIELDS`)."""
+"""The VLM wrappers whose config reads a flat root as its text config (`_flat_text_fields`)."""
 
 
 def text_scope(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -201,11 +206,11 @@ def vlm_text(hf_config: Mapping[str, object], used: set[str]) -> Mapping[str, ob
     class decides (`vlm_tied`)."""
     model_type = _records.text(hf_config["model_type"], "model_type")
     flat = model_type in _FLAT_TEXT_TYPES
-    if flat:
-        used.update(field for field in _QWEN_VL_TEXT_FIELDS if field in hf_config)
+    fields = _flat_text_fields(model_type) if flat else frozenset()
+    used.update(field for field in fields if field in hf_config)
     nested = hf_config.get("text_config")
     if flat and nested is None:
-        text = {field: hf_config[field] for field in _QWEN_VL_TEXT_FIELDS if field in hf_config}
+        text = {field: hf_config[field] for field in fields if field in hf_config}
         dtype = hf_config.get("torch_dtype", hf_config.get("dtype"))
         nested = {**text, **({} if dtype is None else {"torch_dtype": dtype})}
     return {**dict(typed_part(hf_config, _records.record(nested, "text_config"), "text")),
@@ -281,7 +286,7 @@ def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
         # Transformers ties by the wrapper config's own field (modeling_utils' tie_weights reads
         # `getattr(config, "tie_word_embeddings", False)`), which Qwen 3.5's and Muse Glimmer's
         # configs leave unset.
-        default_tied = hf_config.get("model_type") not in (*QWEN35_TYPES, "muse_glimmer")
+        default_tied = config_wrapper(hf_config).head_tied_by_default
         tied = hf_config.get("tie_word_embeddings", default_tied)
         if tied is not None and not isinstance(tied, bool):
             refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
@@ -668,7 +673,7 @@ whose release is its own code; and an audio tower."""
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
     "gemma4_unified": _gemma4_unified_wrapper,
-    **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper,
+    **{name: _qwen35_wrapper for name, kind in WRAPPERS.items() if kind.qwen35}, "gemma3n": _gemma3n_wrapper,
     "sensenova_loop": _sensenova_loop_wrapper,
     "muse_glimmer": _muse_glimmer_wrapper, "lfm3_vl": _lfm3_vl_wrapper,
     **dict.fromkeys(_TEXT_VLMS, _text_vlm_wrapper)}
@@ -701,6 +706,25 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
                 "the wrapper has no counterpart, so translating them would "
                 "silently change the model")
     return record
+
+
+def language_model_name(name: str) -> str | None:
+    """A wrapper checkpoint's language-model tensor `name` under its decoder's own (`wrapper_route`'s
+    language model): one leading `model.` off, the released nesting, then `language_model.` off, its
+    decoder's `model.` kept or restored (`model.language_model.` and `language_model.model.` both become
+    `model.`) and its head's and prediction layers' names as they are; the head at the wrapper's root as it
+    is. None for a tensor of none of them."""
+    bare = name.removeprefix("model.")
+    if bare.startswith("language_model."):
+        return _language_model_tail(bare)
+    return bare if bare == "lm_head.weight" else None
+
+
+def _language_model_tail(bare: str) -> str:
+    """A tensor under a wrapper's `language_model.` (`bare`, its leading `model.` off) under its decoder's
+    own name (`language_model_name`)."""
+    tail = bare.removeprefix("language_model.")
+    return tail if tail.startswith(("model.", "lm_head.weight", "mtp.")) else f"model.{tail}"
 
 
 def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
@@ -738,10 +762,7 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     if bare.startswith(tuple(record.get("text_unprefixed", ()))):
         return "language_model", f"model.{bare}"
     if bare.startswith("language_model."):
-        tail = bare[len("language_model."):]
-        return "language_model", tail if tail.startswith(
-            ("model.", "lm_head.weight", "mtp.")
-        ) else f"model.{tail}"
+        return "language_model", _language_model_tail(bare)
     for prefix in (projector_prefix,) if isinstance(projector_prefix, str) else projector_prefix or ():
         if bare.startswith(prefix):
             return "projector", bare[len(prefix):]
@@ -753,7 +774,7 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
         return "audio_projector", bare[len("embed_audio."):]
     if record.get("audio") is not None and bare.startswith("audio_tower."):
         return "audio_tower", bare[len("audio_tower."):]
-    if ((bare.startswith("mtp.") and record["text_model_type"] in QWEN35_TEXT_TYPES)
+    if ((bare.startswith("mtp.") and wrapper(record["model_type"]).qwen35)
             or bare == "lm_head.weight"):
         return "language_model", bare
     if bundled is not None:
@@ -906,12 +927,13 @@ def language_model_quantization(hf_config: Mapping[str, object], record: Wrapper
         layers = {str(module): entry for module, entry in
                   _records.record(quantization["quantized_layers"], "quantized_layers").items()}
 
-        # Each of the wrapper's weights takes the longest key naming its module or a container of it, as
-        # the codec reads the table (`_modelopt_algo`), keyed by its text name.
+        # Each of the wrapper's weights takes the key the codec reads it by (`codecs.governing_layer`),
+        # keyed by its text name.
+        from dew.interop.codecs import governing_layer
+
         table: dict[str, object] = {}
         for module in wrapper_weights():
-            key = max((key for key in layers if module == key or module.startswith(key + ".")), key=len,
-                      default=None)
+            key = governing_layer(module, layers)
             if key is not None and (name := renamed(module)) is not None:
                 table[name] = layers[key]
         if not table:
@@ -1493,21 +1515,11 @@ def export_config(model) -> Mapping[str, object]:
     return written
 
 
-NUMERICS_FIELDS = frozenset({'dtype', 'precision'})
-"""A module's fields that say in what numbers it computes, not what: a decoder's, and every part of a
-wrapper's (its towers, projections), which no export's config reads back as fields."""
-
-_RUNTIME_FIELDS = NUMERICS_FIELDS | frozenset({
-    'parent', 'name', 'force_fp32_for_softmax', 'attention_impl', 'kv_cache', 'remat',
-    'scan_layers', 'bank_layers', 'dropout_rate', 'embedding_dropout_rate', 'attention_dropout_rate',
-    'initializer_range', 'depth_scaled_init', 'max_seq_len', 'mask_token_id', 'layer_scalar',
-    'scale_after_cast'})
-"""CausalTransformer fields that say how a model runs or trains, not what it
-computes: precision and kernels, dropout, and the initialization a loaded
-model's weights replace. `layer_scalar` is whether Gemma 4's scalars train;
-either way the forward multiplies by them. `scale_after_cast` orders a
-norm's scale and its cast to the compute dtype, which are the same product
-in fp32."""
+NUMERICS_FIELDS = frozenset(field.name for field in dataclasses.fields(CausalTransformer)
+                            if field.metadata.get(_records.NUMBERS))
+"""A module's fields that say in what numbers it computes, not what (`dew._records.NUMBERS`): a
+decoder's, and every part of a wrapper's (its towers, projections), which no export's config reads back
+as fields."""
 
 _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
     "num_kv_heads": lambda model: model.kv_heads,
@@ -1554,8 +1566,10 @@ def refuse_rebuilt(model: CausalTransformer, rebuilt: CausalTransformer, model_t
     """Refuse a decoder whose written config reads back as `rebuilt`, another computation than `model`,
     naming the fields that differ."""
     lost: dict[str, tuple[str, str]] = {}
-    for declared in dataclasses.fields(model):
-        if declared.name in _RUNTIME_FIELDS:
+    # A Flax module's place in its tree aside (`constructor_fields`), and every field that says how the model
+    # runs, not what it computes (`dew._records.RUNS`).
+    for declared in constructor_fields(type(model)):
+        if declared.metadata.get(_records.RUNS):
             continue
         resolve = _RESOLVED.get(declared.name, operator.attrgetter(declared.name))
         ours, theirs = resolve(model), resolve(rebuilt)

@@ -40,7 +40,7 @@ from dew.algebra import SATURATION, derive, forms, fusion, normal_form, program,
 from dew.algebra.forms import aval
 from dew.nn.kernels import generation
 from dew.nn.kernels.generation import Choice
-from dew.nn.programs import bodies, jax_name, named
+from dew.nn.programs import bodies
 from dew.nn.sharding import sequence_shards
 
 REACH = 8
@@ -69,7 +69,7 @@ class Family(NamedTuple):
     """A kind of call (`ATTENTION`, `NORMS`): its anchor primitive and its candidates around an equation of
     it."""
 
-    anchor: str
+    anchor: jcore.Primitive
     candidates: Callable[[fusion.Index, int], Iterator[Candidate]]
 
 
@@ -215,18 +215,17 @@ def _chosen(index: fusion.Index, places: tuple[int, ...], members: Sequence[Cand
     return next((number for number, same in zip(taken, equal, strict=True) if same), None)
 
 
-def _holds(equation: jcore.JaxprEqn, name: str) -> bool:
-    """Whether `equation` binds the primitive `name`, or a nested program whose body does (`bodies`), as a
-    jit `jax.nn.silu` traces holds its sigmoid: the region around it reads the call whole, and its equality
-    its body inlined (`normal_form.canonical`)."""
-    return _binds(equation, frozenset({name}))
+def _holds(equation: jcore.JaxprEqn, primitive: jcore.Primitive) -> bool:
+    """Whether `equation` binds `primitive`, or a nested program whose body does (`bodies`), as a jit
+    `jax.nn.silu` traces holds its sigmoid: the region around it reads the call whole, and its equality its
+    body inlined (`normal_form.canonical`)."""
+    return _binds(equation, (primitive,))
 
 
-def _binds(equation: jcore.JaxprEqn, names: frozenset[str]) -> bool:
-    """Whether `equation` binds one of the primitives `names` (JAX's operations and the program holders,
-    `dew.nn.programs.named`), at any depth of the programs it nests."""
-    return named(equation.primitive) in names or any(
-        _binds(nested, names) for body in bodies(equation) for nested in body.eqns)
+def _binds(equation: jcore.JaxprEqn, primitives: Sequence[jcore.Primitive]) -> bool:
+    """Whether `equation` binds one of `primitives`, at any depth of the programs it nests."""
+    return equation.primitive in primitives or any(
+        _binds(nested, primitives) for body in bodies(equation) for nested in body.eqns)
 
 
 def _between(index: fusion.Index, operands: Sequence[jcore.Var],
@@ -269,7 +268,8 @@ def _between(index: fusion.Index, operands: Sequence[jcore.Var],
     return tuple(sorted(places))
 
 
-BARRIERS = frozenset({"custom_jvp_call", "custom_vjp_call", "custom_vmap_call"})
+BARRIERS = (jcore.primitives.custom_jvp_call_p, jcore.primitives.custom_vjp_call_p,
+            jcore.primitives.custom_vmap_p)
 """The equations a region the compile point writes never holds: a program's own derivative or batching rule,
 which the call written in its place would not keep. A gradient's stop is no barrier but no identity either
 (`VALUE_IDENTITIES`): it stays its own equation, so a region matches a declaration only where the declaration
@@ -490,13 +490,14 @@ def _constants(index: fusion.Index) -> frozenset[jcore.Var]:
     return _HELD_CONSTANTS[index]
 
 
-def _scalars(index: fusion.Index, places: Sequence[int], primitives: frozenset[str]) -> list[float]:
+def _scalars(index: fusion.Index, places: Sequence[int],
+             primitives: Sequence[jcore.Primitive]) -> list[float]:
     """The scalar floating constants the equations at `places` binding one of `primitives` read, each once:
     the static arguments a family's call may take (an epsilon a sum adds). A traced one (a value an enclosing
     trace closes over) holds no number until it runs, so no call takes it as its own (`_digest`)."""
     found: dict[float, None] = {}
     for place in places:
-        if jax_name(index.jaxpr.eqns[place].primitive) not in primitives:
+        if index.jaxpr.eqns[place].primitive not in primitives:
             continue
         for atom in index.jaxpr.eqns[place].invars:
             value = atom.val if isinstance(atom, jcore.Literal) else index.consts.get(atom)
@@ -540,7 +541,7 @@ def _norms(index: fusion.Index, place: int) -> Iterator[Candidate]:
             gates = [var for var in extras if aval(var).shape == aval(row).shape]
             if len(weights) > 1 or len(gates) > 1 or len(weights) + len(gates) != len(extras):
                 continue
-            epsilons = _scalars(index, _between(index, (row, *extras), (output,)) or (), frozenset({"add"}))
+            epsilons = _scalars(index, _between(index, (row, *extras), (output,)) or (), (jax.lax.add_p,))
             yield from _norm_candidates(index, row, output, weights[0] if weights else None,
                                         gates[0] if gates else None, epsilons)
 
@@ -566,7 +567,7 @@ def _norm_candidates(index: fusion.Index, row: jcore.Var, output: jcore.Var, wei
         return
     added = index.producer.get(row)
     streams: list[tuple[jcore.Var, ...] | None] = [None]
-    if added is not None and jax_name(index.jaxpr.eqns[added].primitive) == "add":
+    if added is not None and index.jaxpr.eqns[added].primitive is jax.lax.add_p:
         summands = tuple(atom for atom in index.jaxpr.eqns[added].invars if isinstance(atom, jcore.Var))
         if len(summands) == 2 and all(aval(atom).shape == aval(row).shape for atom in summands):
             streams.insert(0, summands)
@@ -661,7 +662,7 @@ def _summed_rows(index: fusion.Index, anchor: jcore.Var) -> list[jcore.Var]:
     rows: dict[jcore.Var, None] = {}
     for var in _backward(index, anchor):
         made = index.producer.get(var)
-        if made is None or jax_name(index.jaxpr.eqns[made].primitive) != "reduce_sum":
+        if made is None or index.jaxpr.eqns[made].primitive is not jax.lax.reduce_sum_p:
             continue
         summed = index.jaxpr.eqns[made].invars[0]
         if isinstance(summed, jcore.Var):
@@ -734,18 +735,23 @@ def _attentions(index: fusion.Index, place: int) -> Iterator[Candidate]:
                 fills, windows = _selections(index, (q, k, v, *given), region, output)
                 # Under a sequence axis the call takes no fill: its exchanges weigh a masked key nothing.
                 fills = fills if sequence_shards() == 1 else []
-                yield from _attention_candidates(q, k, v, output, extra,
-                                                 [None, *_scalars(index, region, frozenset({"div", "mul"}))],
-                                                 [None, *fills], [None, *windows])
+                scales = _scalars(index, region, (jax.lax.div_p, jax.lax.mul_p))
+                yield from _attention_candidates(q, k, v, output, extra, [None, *scales], [None, *fills],
+                                                 [None, *windows])
 
 
 def _attended(q: jcore.Var, k: jcore.Var, v: jcore.Var) -> bool:
     """Whether Dew's attention takes `q`, `k` and `v` as its query `[B, S, H, D]`, keys `[B, T, K, D]` and
-    values `[B, T, K, E]`: one batch, keys and values of one length and head count, which divides the
-    queries' heads, and queries and keys of one width. A region over another layout (a model's `[B, H, S,
-    D]`) is no call of it: read so, a cross-attention's two query tokens over 127 keys were two heads over
-    127 (`dew.nn.attention_masks.repeat_kv_heads`' refusal)."""
+    values `[B, T, K, E]`: of one dtype, one batch, keys and values of one length and head count, which
+    divides the queries' heads, and queries and keys of one width. A region over another layout (a model's
+    `[B, H, S, D]`) is no call of it: read so, a cross-attention's two query tokens over 127 keys were two
+    heads over 127 (`dew.nn.attention_masks.repeat_kv_heads`' refusal). Nor is one read with an operand its
+    program cast for the logits beside one it did not (float32 queries over half-precision values): the
+    call's float32 softmax is its own option over operands of one dtype (`_attention_candidates`' `wide`),
+    which the operands before their casts are tried under."""
     if aval(q).ndim != 4 or aval(k).ndim != 4 or aval(v).ndim != 4:
+        return False
+    if not aval(q).dtype == aval(k).dtype == aval(v).dtype:
         return False
     (batch, _, heads, width), (_, length, shared, keyed), (_, valued, held, _) = (
         aval(q).shape, aval(k).shape, aval(v).shape)
@@ -770,7 +776,7 @@ def _addends(index: fusion.Index, logits: int, anchor: jcore.Var) -> list[jcore.
     found: dict[jcore.Var, None] = {}
     for var in upstream:
         place = index.producer.get(var)
-        if var not in downstream or place is None or jax_name(index.jaxpr.eqns[place].primitive) != "add":
+        if var not in downstream or place is None or index.jaxpr.eqns[place].primitive is not jax.lax.add_p:
             continue
         for atom in index.jaxpr.eqns[place].invars:
             if isinstance(atom, jcore.Var) and atom not in downstream:
@@ -789,7 +795,7 @@ def _nearest_product(index: fusion.Index, reached: dict[jcore.Var, int], *, upst
         made = index.producer.get(var)
         near = ([made] if made is not None else []) if upstream else index.readers[var]
         places += [(distance, place) for place in near
-                   if jax_name(index.jaxpr.eqns[place].primitive) == "dot_general"]
+                   if index.jaxpr.eqns[place].primitive is jax.lax.dot_general_p]
     return min(places)[1] if places else None
 
 
@@ -837,7 +843,7 @@ def _selections(index: fusion.Index, operands: Sequence[jcore.Var], places: Sequ
     fills: dict[float, None] = {}
     windows: dict[int, None] = {}
     for equation in closed.jaxpr.eqns:
-        if jax_name(equation.primitive) != "select_n":
+        if equation.primitive is not jax.lax.select_n_p:
             continue
         for atom in equation.invars:
             if not isinstance(atom, jcore.Literal):
@@ -883,9 +889,9 @@ def _attention_taken(attend: Callable, operands: Sequence[jcore.Var]) -> bool:
     return any(route.choice == Choice.ATTENTION and route.kernel not in KEPT for route in found)
 
 
-ATTENTION = (Family("exp", _attentions),)
+ATTENTION = (Family(jax.lax.exp_p, _attentions),)
 """Attention, recognized before the products, so a product inside it is none of theirs."""
 
-NORMS = (Family("rsqrt", _norms), Family("logistic", _swiglus))
+NORMS = (Family(jax.lax.rsqrt_p, _norms), Family(jax.lax.logistic_p, _swiglus))
 """The norms, after the products, so an epilogue's norm is the product's; a gated norm before a SwiGLU, so its
 activation is the norm's."""

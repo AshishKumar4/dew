@@ -230,18 +230,10 @@ _GPTJ_ROUTES = Table(_buffers('attn.bias', 'attn.masked_bias'), spelled(_GPTJ_NA
 
 def _gpt2_prepare(tensors: Mapping[str, Stored],
                    _config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
-    """Check and drop the fixed attention buffers, and nest the bare model's names."""
-    prepared = {}
-    for name, tensor in tensors.items():
-        # The original gpt2 safetensors stores the bare GPT2Model and its
-        # old persistent causal buffers.
-        if not fixed_attention_buffer(name, tensor, 'attn', (-1e4,)):
-            prepared[_nested(name)] = tensor
-    return prepared
-
-
-def _nested(name: str) -> str:
-    return 'transformer.' + name if name.startswith(('h.', 'wte.', 'wpe.', 'ln_f.')) else name
+    """Check and drop the fixed attention buffers, which the original gpt2 safetensors stores beside the
+    bare GPT2Model (`_GPT2_BARE`)."""
+    return {name: tensor for name, tensor in tensors.items()
+            if not fixed_attention_buffer(name, tensor, 'attn', (-1e4,))}
 
 
 GPT2_NAMES: Renames = (('attn.c_proj', 'self_attn.o_proj'), *GPT_TRUNK, *GPT_MLP)
@@ -256,11 +248,11 @@ _GPT2_PACKED = (
       for conv in ('attn.c_proj', 'mlp.c_fc', 'mlp.c_proj')))
 
 
-_GPT2_ROUTES = Table(
-    _buffers('attn.bias', 'attn.masked_bias'), spelled(GPT2_NAMES),
-    # The bare GPT2Model's names, which a load nests under the causal LM's `transformer.`.
-    Spelled((('h', 'transformer.h'), ('wte', 'transformer.wte'), ('wpe', 'transformer.wpe'),
-             ('ln_f', 'transformer.ln_f')), spelled(GPT2_NAMES)))
+_GPT2_BARE = Spelled((('h', 'transformer.h'), ('wte', 'transformer.wte'), ('wpe', 'transformer.wpe'),
+                      ('ln_f', 'transformer.ln_f')), spelled(GPT2_NAMES))
+"""The bare GPT2Model's names, which a load nests under the causal LM's `transformer.`."""
+
+_GPT2_ROUTES = Table(_buffers('attn.bias', 'attn.masked_bias'), spelled(GPT2_NAMES), _GPT2_BARE)
 """GPT-2's names: the causal LM's, which an export writes, and the bare model's, which a load reads too;
 the old persistent causal buffers fill no leaf."""
 
@@ -300,16 +292,10 @@ norming its stream after each sublayer joins it (`n = ln_1(x + a)`, `h = ln_2(n 
 in no norm. Its `afn` 'gelu' is OpenAI's tanh GELU (`ACT_FNS`, gelu_new)."""
 
 
-def _openai_nested(name: str) -> str:
-    """A bare OpenAIGPTModel's names nested under the causal LM's `transformer`, as the original release
-    stores them."""
-    return 'transformer.' + name if name.startswith(('h.', 'tokens_embed.', 'positions_embed.')) else name
-
-
 def _openai_gpt_prepare(tensors: Mapping[str, Stored],
                         _config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
-    """Check and drop the fixed causal masks, and nest the bare model's names."""
-    return {_openai_nested(name): tensor for name, tensor in tensors.items()
+    """Check and drop the fixed causal masks."""
+    return {name: tensor for name, tensor in tensors.items()
             if not fixed_attention_buffer(name, tensor, 'attn', ())}
 
 
@@ -322,11 +308,12 @@ OPENAI_GPT_NAMES: Renames = (
 attention joins it and `ln_2` after the MLP (`post_residual_norms`), as OPT-350m's norms do."""
 
 
-_OPENAI_GPT_ROUTES = Table(
-    _buffers('attn.bias'), spelled(OPENAI_GPT_NAMES),
-    # The bare OpenAIGPTModel's names, which the original release stores.
-    Spelled((('h', 'transformer.h'), ('tokens_embed', 'transformer.tokens_embed'),
-             ('positions_embed', 'transformer.positions_embed')), spelled(OPENAI_GPT_NAMES)))
+_OPENAI_GPT_BARE = Spelled((('h', 'transformer.h'), ('tokens_embed', 'transformer.tokens_embed'),
+                            ('positions_embed', 'transformer.positions_embed')), spelled(OPENAI_GPT_NAMES))
+"""The bare OpenAIGPTModel's names, which the original release stores, nested under the causal LM's
+`transformer.`."""
+
+_OPENAI_GPT_ROUTES = Table(_buffers('attn.bias'), spelled(OPENAI_GPT_NAMES), _OPENAI_GPT_BARE)
 """GPT-1's names: the causal LM's, which an export writes, and the bare model's, which a load reads too;
 the fixed causal masks fill no leaf."""
 
@@ -340,7 +327,7 @@ OPENAI_GPT = DecoderFamily(
     'OpenAIGPTLMHeadModel',
     routes=_OPENAI_GPT_ROUTES,
     prepare=_openai_gpt_prepare,
-    spelling=_openai_nested,
+    spelling=_OPENAI_GPT_BARE.leading,
     packed=_GPT2_PACKED,
     preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.tokens_embed.weight'),
@@ -354,7 +341,7 @@ GPT2 = DecoderFamily(
     'GPT2LMHeadModel',
     routes=_GPT2_ROUTES,
     prepare=_gpt2_prepare,
-    spelling=_nested,
+    spelling=_GPT2_BARE.leading,
     packed=_GPT2_PACKED,
     preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.wte.weight'),

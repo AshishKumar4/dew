@@ -238,6 +238,29 @@ def test_each_call_lists_the_messages_the_observations_before_it_carried():
     assert episode_from_record(json.loads(json.dumps(asdict(episode)))) == episode
 
 
+def test_an_episode_record_reads_its_messages_as_the_data_they_are():
+    """A journaled episode reads back through its declaration (`registry.from_record`): its statuses as
+    members, and its chat messages and requests as the JSON they hold, whatever it spells: a tool call's
+    `{"function": ...}`, a class record's or a shared module's shape is data, not a record to build."""
+    from dew.objectives.rl.episodes import Episode, EpisodeId, Transition
+    from dew.objectives.rl.records import record_json
+
+    said = ({"role": "tool", "content": "done"}, {"function": "os.getcwd"},
+            {"class": "dew.lora.LoRA", "share": 2}, {"shared": 2})
+    request = {"shared": 1}
+    ended = Observation((), EpisodeStatus.COMPLETED, "verified", 1.0, said, request=request)
+    episode = Episode(EpisodeId(3, 0, 1, (7, 8), "cooldown"), 4, Sampling(temperature=0.7, eos_token_ids=EOS),
+                      Observation((1, 2), messages=said, request={"function": "os.getcwd"}),
+                      (Transition(Draw((1, 2), (3, EOS), (-.5, -.5), "stop", 4), ended),),
+                      EpisodeStatus.COMPLETED, "verified", 1.0, _binding_id="cohort")
+    read = episode_from_record(json.loads(record_json(episode)))
+    assert read == episode and read._binding_id == "cohort"
+    (turn,) = read.transitions
+    assert read.status is EpisodeStatus.COMPLETED and turn.observation.status is EpisodeStatus.COMPLETED
+    assert turn.observation.messages == said and turn.observation.request == request
+    assert read.initial is not None and read.initial.request == {"function": "os.getcwd"}
+
+
 def test_every_call_of_a_multi_turn_session_carries_its_draws_engine_records():
     """Routing and the sampling support come from each draw, not the episode,
     so a multi-turn session replays what the engine routed and kept."""
@@ -592,7 +615,7 @@ def test_a_prompt_sessions_source_is_its_data_source_and_the_metrics_report_each
     assert [trajectory.session for trajectory in from_verl(exported)] == sessions
     # The source is a session's, which every export names.
     del exported[0]["extra_fields"]["dew"]["session"]["source"]
-    with pytest.raises(KeyError):
+    with pytest.raises(ValueError):
         from_verl(exported)
 
 

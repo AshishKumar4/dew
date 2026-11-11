@@ -40,6 +40,55 @@ def test_collected_episodes_survive_verl_rows_and_context_compaction():
         np.testing.assert_array_equal(before[key], after[key], err_msg=key)
 
 
+def test_dews_record_of_a_verl_row_is_its_sessions_and_its_calls_own():
+    """A row's `extra_fields.dew` holds its session's record and each call's, as their dataclasses declare
+    them (`verl.DewRow`), in the bytes the hand-written record had, and reads back to the session."""
+    from dew.objectives.rl.sessions import chains
+
+    trainer, collector = build()
+    session = rollouts_of(collect(collector, trainer.initial_state()))[0]
+    built = chains(session, 0, 1 << 62)
+    rows = json.loads(json.dumps(to_verl([session])))
+    identity = {"task": session.task, "group": session.group, "sample": session.sample,
+                "attempt": session.attempt, "status": session.status.value,
+                "components": dict(session.components), "detail": session.detail, "source": session.source}
+
+    def written(call, first, count):
+        transcript = None if call.transcript is None else {
+            "messages": [dict(message) for message in call.transcript.messages],
+            "response": None if call.transcript.response is None else dict(call.transcript.response)}
+        return {"start": first, "count": count, "finish_reason": call.finish_reason, "version": call.version,
+                "raw_log_probs": None if call.raw_log_probs is None else list(call.raw_log_probs),
+                "support": None if call.support is None else [list(kept) for kept in call.support],
+                "reward": call.reward, "transcript": transcript}
+
+    for number, (row, chain) in enumerate(zip(rows, built, strict=True)):
+        assert json.dumps(row["extra_fields"]["dew"]) == json.dumps({
+            "session": identity, "chain": number, "chains": len(built),
+            "calls": [written(session.calls[index], first, count) for index, first, count in chain.members],
+            "stamped": True})
+    assert [trajectory.session for trajectory in from_verl(rows)] == [session]
+
+
+def test_a_dew_row_writes_scores_as_they_are_and_reads_calls_that_leave_their_nullable_fields_out():
+    """A session's integer component score is written as the integer it is, and a Dew row whose calls
+    leave out their nullable metadata (raw likelihoods, support, reward, transcript), as an earlier Dew wrote
+    them, reads back with each of those None, as the hand reader read it."""
+    trainer, collector = build()
+    session = replace(rollouts_of(collect(collector, trainer.initial_state()))[0], components={"score": 1})
+    rows = json.loads(json.dumps(to_verl([session])))
+    assert rows[0]["extra_fields"]["dew"]["session"]["components"] == {"score": 1}
+    assert type(rows[0]["extra_fields"]["dew"]["session"]["components"]["score"]) is int
+    nullable = ("raw_log_probs", "support", "reward", "transcript")
+    for row in rows:
+        for call in row["extra_fields"]["dew"]["calls"]:
+            for name in nullable:
+                del call[name]
+    (restored,) = [trajectory.session for trajectory in from_verl(rows)]
+    assert restored == replace(session, calls=tuple(
+        replace(call, **dict.fromkeys(nullable)) for call in session.calls))
+
+
 def test_an_episode_record_reads_back_every_sampling_control():
     """A recorded episode's sampling policy comes back whole, its penalties and stop strings
     included, and an unset pad id stays the task's to fill."""

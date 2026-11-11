@@ -19,11 +19,12 @@ import jax.numpy as jnp
 import numpy as np
 from jax._src import core as jax_core
 from jax.extend import core as jcore
+from jax.extend.core import primitives
 
 from dew.algebra import terms
 from dew.algebra.forms import aval
 from dew.nn.derivatives import marked_call_p
-from dew.nn.programs import called, host_evaluated, jax_name, on_host
+from dew.nn.programs import called, entrywise, host_evaluated, live, on_host
 
 
 def canonical(closed: jcore.Jaxpr) -> jcore.Jaxpr:
@@ -56,19 +57,9 @@ def canonical(closed: jcore.Jaxpr) -> jcore.Jaxpr:
             seen[named] = list(equation.outvars)
         equations.append(equation)
     outvars = [read(atom) for atom in jaxpr.outvars]
-    return jcore.Jaxpr(jaxpr.replace(constvars=[], eqns=_live(equations, outvars), outvars=outvars), [])
-
-
-def _live(equations: list[jcore.JaxprEqn], outvars: list) -> list[jcore.JaxprEqn]:
-    """The equations an output reads, in order: a layout the normal form left unread (a value's form before
-    its unit axes were erased) is no part of what the program computes. An effect is read by definition."""
-    wanted = {atom for atom in outvars if isinstance(atom, jcore.Var)}
-    kept = []
-    for equation in reversed(equations):
-        if equation.effects or wanted & set(equation.outvars):
-            kept.append(equation)
-            wanted.update(atom for atom in equation.invars if isinstance(atom, jcore.Var))
-    return kept[::-1]
+    # A layout the normal form left unread (a value's form before its unit axes were erased) is no part of
+    # what the program computes.
+    return jcore.Jaxpr(jaxpr.replace(constvars=[], eqns=live(equations, outvars), outvars=outvars), [])
 
 
 class _Made:
@@ -133,7 +124,7 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | No
             # mesh, which binds as traced. An equation over a traced value stays traced; the constants its
             # normal form builds beside it (a broadcast divisor) are computed.
             traced = any(isinstance(value, jax_core.Tracer) for value in operands)
-            folded = None if traced or jax_name(equation.primitive) not in FOLDED else host_evaluated(
+            folded = None if traced or equation.primitive not in FOLDED else host_evaluated(
                 equation.primitive, operands, equation.params)
             if folded is not None:
                 outputs = folded
@@ -147,16 +138,18 @@ def _evaluated(jaxpr: jcore.Jaxpr, consts: Sequence, *values, forms: _Forms | No
     return [read(atom) for atom in jaxpr.outvars]
 
 
-FOLDED = frozenset({"iota", "broadcast_in_dim", "reshape", "transpose", "squeeze", "expand_dims",
-                    "concatenate", "slice", "convert_element_type", "select_n", "eq", "ne", "lt", "le", "gt",
-                    "ge", "and", "or", "not", "add", "sub", "mul", "div", "max", "min", "neg", "abs",
-                    "reduce_sum", "reduce_max", "reduce_min", "integer_pow", "square", "sqrt", "rsqrt"})
+FOLDED = frozenset({jax.lax.iota_p, jax.lax.broadcast_in_dim_p, jax.lax.reshape_p, jax.lax.transpose_p,
+    jax.lax.squeeze_p, jax.lax.concatenate_p, jax.lax.slice_p, jax.lax.convert_element_type_p,
+    jax.lax.select_n_p, jax.lax.eq_p, jax.lax.ne_p, jax.lax.lt_p, jax.lax.le_p, jax.lax.gt_p, jax.lax.ge_p,
+    jax.lax.and_p, jax.lax.or_p, jax.lax.not_p, jax.lax.add_p, jax.lax.sub_p, jax.lax.mul_p, jax.lax.div_p,
+    jax.lax.max_p, jax.lax.min_p, jax.lax.neg_p, jax.lax.abs_p, jax.lax.reduce_sum_p, jax.lax.reduce_max_p,
+    jax.lax.reduce_min_p, jax.lax.integer_pow_p, jax.lax.square_p, jax.lax.sqrt_p, jax.lax.rsqrt_p})
 """The equations `_evaluated` computes where their operands are constants: those a mask, a divisor or a table
 is built from. Any other binds as traced, a collective or a program placed on a mesh among them, whose
 eager run needs devices a trace has not."""
 
 
-VALUE_IDENTITIES = frozenset({"name"})
+VALUE_IDENTITIES = (primitives.name_p,)
 """The equations whose value is their operand's (a checkpoint's name), which `_normal` reads through: what
 they change is a schedule, never the value compared. A gradient's stop is no identity (`BARRIERS`)."""
 
@@ -170,7 +163,8 @@ FULL_RANGE = frozenset({jnp.dtype(jnp.bfloat16)})
 a float16's underflows to zero where the cast keeps a subnormal (StableHLO's reduce_precision)."""
 
 
-ROUNDED_ONCE = frozenset({"add", "sub", "mul", "div", "max", "min", "neg", "abs", "sqrt"})
+ROUNDED_ONCE = frozenset({jax.lax.add_p, jax.lax.sub_p, jax.lax.mul_p, jax.lax.div_p, jax.lax.max_p,
+    jax.lax.min_p, jax.lax.neg_p, jax.lax.abs_p, jax.lax.sqrt_p})
 """The elementwise primitives whose narrow-float equation is its float32 one rounded once (`_normal`): IEEE's
 correctly rounded arithmetic, which float32 holds at least twice a bfloat16's or float16's digits and two
 more for, so a float32 result rounded again rounds as the narrow operation does. No transcendental: a
@@ -188,32 +182,34 @@ def _normal(equation: jcore.JaxprEqn, operands: list, widened: _Made,
     constant zero that value; a reshape that only adds unit axes the broadcast it is; and an elementwise
     equation over values one layout made from equal shapes, beside scalars, that equation before the
     layout (`laid`, each laid value by its source and layout). Every other equation as it is."""
-    name = jax_name(equation.primitive)
-    if name in VALUE_IDENTITIES:
+    primitive = equation.primitive
+    if primitive in VALUE_IDENTITIES:
         return list(operands)
-    if name == "sub" and _zero(operands[1]) and jnp.shape(operands[0]) == aval(equation.outvars[0]).shape:
-        return [operands[0]]
-    if (name in ("div", "mul") and _one(operands[1])
+    if (primitive is jax.lax.sub_p and _zero(operands[1])
             and jnp.shape(operands[0]) == aval(equation.outvars[0]).shape):
         return [operands[0]]
-    if name in ("broadcast_in_dim", "reshape"):
+    if (primitive in (jax.lax.div_p, jax.lax.mul_p) and _one(operands[1])
+            and jnp.shape(operands[0]) == aval(equation.outvars[0]).shape):
+        return [operands[0]]
+    if primitive in (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p):
         return [_laid(equation, operands[0], laid)]
-    if name in ELEMENTWISE and len(equation.outvars) == 1:
+    if entrywise(primitive) and len(equation.outvars) == 1:
         lifted = _lifted(equation, operands, widened, laid)
         if lifted is not None:
             return [lifted]
-    if name == "convert_element_type":
+    if primitive is jax.lax.convert_element_type_p:
         return [_converted(operands[0], equation.params["new_dtype"], widened)]
-    if name == "square" or (name == "integer_pow" and equation.params.get("y") == 2):
+    if primitive is jax.lax.square_p or (
+            primitive is jax.lax.integer_pow_p and equation.params.get("y") == 2):
         return [jax.lax.mul(operands[0], operands[0])]
-    if name == "reduce_precision":
+    if primitive is jax.lax.reduce_precision_p:
         bits = (equation.params["exponent_bits"], equation.params["mantissa_bits"])
         narrow = next((dtype for dtype, held in NARROW.items() if held == bits and dtype in FULL_RANGE), None)
         # A round trip through the narrow float from float32 alone, whose exponent range it holds: a wider
         # float's reduce_precision flushes what the narrow float keeps as a subnormal.
         if narrow is not None and jnp.result_type(operands[0]) == jnp.float32:
             return [_converted(_converted(operands[0], narrow, widened), operands[0].dtype, widened)]
-    if name in ROUNDED_ONCE and len(equation.outvars) == 1 and any(map(_uniform, operands)):
+    if primitive in ROUNDED_ONCE and len(equation.outvars) == 1 and any(map(_uniform, operands)):
         shape = aval(equation.outvars[0]).shape
         if all(_uniform(value) or jnp.shape(value) == shape for value in operands):
             # A constant of one value throughout reads, element by element, as that value: the equation over
@@ -221,10 +217,11 @@ def _normal(equation: jcore.JaxprEqn, operands: list, widened: _Made,
             scalars = [_scalar(value) if _uniform(value) else value for value in operands]
             if any(jnp.shape(value) == shape for value in scalars):
                 return _normal(equation, scalars, widened, laid)
-    if name == "dot_general":
+    if primitive is jax.lax.dot_general_p:
         return [equation.primitive.bind(*operands, **_stated(equation.params, operands))]
     out = aval(equation.outvars[0]).dtype if len(equation.outvars) == 1 else None
-    if name in ROUNDED_ONCE and out in NARROW and all(jnp.result_type(value) == out for value in operands):
+    if (primitive in ROUNDED_ONCE and out in NARROW
+            and all(jnp.result_type(value) == out for value in operands)):
         wide = [_converted(value, jnp.float32, widened) for value in operands]
         return [_converted(equation.primitive.bind(*wide, **equation.params), out, widened)]
     bound = equation.primitive.bind(*operands, **equation.params)
@@ -254,8 +251,8 @@ def _stated(params: dict, operands: Sequence) -> dict:
     return params
 
 
-UNIT_ERASED = frozenset({"dot_general", "transpose", "reduce_sum", "reduce_max", "reduce_min", "reshape",
-                         "broadcast_in_dim"})
+UNIT_ERASED = frozenset({jax.lax.dot_general_p, jax.lax.transpose_p, jax.lax.reduce_sum_p,
+    jax.lax.reduce_max_p, jax.lax.reduce_min_p, jax.lax.reshape_p, jax.lax.broadcast_in_dim_p})
 """The layout-reading equations `_erased` computes over their operands' axes of more than one element."""
 
 
@@ -266,9 +263,9 @@ def _erased(equation: jcore.JaxprEqn, operands: list, widened: _Made, laid: _Mad
     a layout puts it, so a statistic kept `[N, 1]` and one held `[N]` are one computation. The equation's
     axes are renumbered over the erased ones: a product's batch and contracting pairs of one element and a
     reduction over one dropped, a transpose's order kept among the rest. None for an equation that reads
-    no layout (`UNIT_ERASED`, `ELEMENTWISE`) or holds no such axis, which `_normal` computes as it is."""
-    name = jax_name(equation.primitive)
-    if len(equation.outvars) != 1 or not (name in UNIT_ERASED or name in ELEMENTWISE):
+    no layout (`UNIT_ERASED`, an entrywise one) or holds no such axis, which `_normal` computes as it is."""
+    primitive = equation.primitive
+    if len(equation.outvars) != 1 or not (primitive in UNIT_ERASED or entrywise(primitive)):
         return None
     out = aval(equation.outvars[0])
     shapes = [jnp.shape(value) for value in operands]
@@ -278,7 +275,7 @@ def _erased(equation: jcore.JaxprEqn, operands: list, widened: _Made, laid: _Mad
     renumbered = [{axis: place for place, axis in enumerate(axes)} for axes in kept]
     inner = [_squeeze(value, squeezed) for value in operands]
     params = dict(equation.params)
-    if name == "dot_general":
+    if primitive is jax.lax.dot_general_p:
         params = _stated(params, operands)
         (lc, rc), (lb, rb) = params["dimension_numbers"]
         left, right = renumbered
@@ -287,21 +284,21 @@ def _erased(equation: jcore.JaxprEqn, operands: list, widened: _Made, laid: _Mad
         params["dimension_numbers"] = ((tuple(left[a] for a, _ in contracting),
                                         tuple(right[b] for _, b in contracting)),
                                        (tuple(left[a] for a, _ in batch), tuple(right[b] for _, b in batch)))
-    elif name == "transpose":
+    elif primitive is jax.lax.transpose_p:
         order = [axis for axis in params["permutation"] if axis in renumbered[0]]
         params["permutation"] = tuple(renumbered[0][axis] for axis in order)
         if params["permutation"] == tuple(range(len(order))):
             # A transpose moving only axes of one element keeps every element where it was.
             return [_unsqueezed(inner[0], out.shape, squeezed)]
-    elif name.startswith("reduce_"):
+    elif primitive in (jax.lax.reduce_sum_p, jax.lax.reduce_max_p, jax.lax.reduce_min_p):
         params["axes"] = tuple(renumbered[0][axis] for axis in params["axes"] if axis in renumbered[0])
         if not params["axes"]:
-            if name != "reduce_sum":
+            if primitive is not jax.lax.reduce_sum_p:
                 return [_unsqueezed(inner[0], out.shape, squeezed)]
             # A sum of one element is its value plus the sum's zero, which makes a negative zero positive:
             # no identity, computed as written.
             return None
-    elif name == "broadcast_in_dim":
+    elif primitive is jax.lax.broadcast_in_dim_p:
         target = [size for size in out.shape if size != 1]
         at = {axis: place for place, axis in enumerate(a for a, size in enumerate(out.shape) if size != 1)}
         params["shape"] = tuple(target)
@@ -310,7 +307,7 @@ def _erased(equation: jcore.JaxprEqn, operands: list, widened: _Made, laid: _Mad
             # A broadcast that also reorders its operand's axes is another layout: computed as it is.
             return None
         params["broadcast_dimensions"] = dimensions
-    elif name == "reshape":
+    elif primitive is jax.lax.reshape_p:
         if params.get("dimensions") is not None:
             return None
         target = tuple(size for size in out.shape if size != 1)
@@ -367,7 +364,7 @@ def _unit_round_trip(equation: jcore.JaxprEqn, operands: list, squeezed: _Made) 
     """A reshape back to the shape of the erased value its operand was laid out from by axes of one element
     (`_unsqueezed`), that value: the axes added and taken away move no element; None for any other
     equation."""
-    if jax_name(equation.primitive) != "reshape" or equation.params.get("dimensions") is not None:
+    if equation.primitive is not jax.lax.reshape_p or equation.params.get("dimensions") is not None:
         return None
     core = squeezed.get(operands[0])
     return [core] if core is not None and jnp.shape(core) == aval(equation.outvars[0]).shape else None
@@ -380,15 +377,6 @@ def _unsqueezed(core, shape: tuple[int, ...], squeezed: _Made):
     made = jax.lax.reshape(core, tuple(shape))
     squeezed[made] = core
     return made
-
-
-ELEMENTWISE = ROUNDED_ONCE | {"convert_element_type", "select_n", "integer_pow", "square", "sign", "floor",
-                              "ceil", "round", "pow", "atan2", "rem", "exp", "exp2", "log", "log1p", "expm1",
-                              "logistic", "tanh", "erf", "sin", "cos", "rsqrt", "is_finite", "eq", "ne", "lt",
-                              "le", "gt", "ge", "and", "or", "not", "stop_gradient"}
-"""The equations computed element by element, which a layout of their operands commutes with exactly,
-whatever each element's arithmetic (a transcendental's included: the same inputs give the same outputs
-wherever a layout puts them)."""
 
 
 def _uniform(value) -> bool:
@@ -427,7 +415,7 @@ def _laid(equation: jcore.JaxprEqn, value, laid: _Made):
     """A broadcast's or a reshape's result, a reshape that only adds unit axes written as the broadcast it
     is, recorded in `laid` by its source and layout (`_lifted`)."""
     shape = aval(equation.outvars[0]).shape
-    if jax_name(equation.primitive) == "reshape":
+    if equation.primitive is jax.lax.reshape_p:
         ordered = equation.params.get("dimensions") is None
         dimensions = _unit_axes(jnp.shape(value), shape) if ordered else None
         if dimensions is None:
