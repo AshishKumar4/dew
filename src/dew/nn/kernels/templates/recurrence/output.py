@@ -103,7 +103,15 @@ def _output_held(call: Call, bv: int, swizzle: int | None = None) -> Held:
                   *held_tile(held, chunk, chunk),
                   *products]
         return Held(phases=(values, [f32(chunk, call.block)] * 4))
-    values = [f32(chunk, bv)] * (2 if family.products_overlap else 1) + held_tile(held, chunk, bv)
+    # Accurate three-part products each take a fresh accumulator (`Issuer.apart`), the memory's output
+    # beside the local product's sums: two stated, an unrounded fp32 write gate's output was admitted where
+    # ptxas serialized its warpgroup MMAs (C7512, sm90; armada output-values-fresh-sums). Two parts issue
+    # into one accumulator (`Issuer.__call__`).
+    fresh = (max(len(product.terms(given.parts, memories.parts)),
+                 len(product.terms(held.parts, held.parts)))
+             if family.products_overlap and max(given.parts, memories.parts, held.parts) > 2 else 1)
+    values = ([f32(chunk, bv)] * (1 + fresh if family.products_overlap else 1)
+              + held_tile(held, chunk, bv))
     # An fp32 call's prologue's high and low prefixes, a row's and a column's, held across the first step's
     # envelope where products overlap: unstated, Qwen3.5's fp32 forward claimed 2 programs an H100 at 204
     # registers, whose cap spilled 16 bytes (jsf-owncap).
