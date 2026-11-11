@@ -32,7 +32,17 @@ from dew.data.dataset import (
 )
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
-from dew.data.plan import COUNTERS, FILE_SHARDS, IN_ORDER, Plan, earlier_position, read_otherwise_at_11
+from dew.data.plan import (
+    COUNTERS,
+    DECLARED_MIX,
+    FILE_SHARDS,
+    IN_ORDER,
+    SHARED_STATE,
+    Plan,
+    earlier_position,
+    read_otherwise_at_11,
+    read_otherwise_at_13,
+)
 from dew.data.shared import SharedMapping
 from dew.data.storage import MIRRORED, Mirrored, PositionText, carried_mirrors
 
@@ -319,19 +329,25 @@ class _PerShare(Forwarding):
         self._statistics.publish(None)
 
     def resumed_at(self, decoded: Mapping[str, object]) -> None:
-        """Read on as the saved position `decoded` was read where it is one a Dew of version `FILE_SHARDS`
-        reads (`earlier_position`) and `IN_ORDER` reads otherwise (`read_otherwise_at_11`): its share in the
-        workers it names, its order as 10 reads it, which this Dew reads by. A run saved under 10 resumes as
-        10 read it, and goes on under 10; any other position is translated and checked as it was."""
-        if self._saved_as is None or self._plan.version < IN_ORDER:
+        """Read on as the saved position `decoded` was read where a later Dew reads it otherwise: one a Dew
+        of version `FILE_SHARDS` saved that `IN_ORDER` reads otherwise (`read_otherwise_at_11`), its share
+        in the workers it names; and one of `SHARED_STATE` that `DECLARED_MIX` reads otherwise
+        (`read_otherwise_at_13`), its mixes in their keys' order. A run so saved resumes as its version
+        read it, and goes on under it; any other position is translated and checked as it was."""
+        if self._saved_as is None:
             return
-        written, _ = earlier_position(decoded, dataclasses.replace(self._plan, version=FILE_SHARDS))
-        if written.get("version") != FILE_SHARDS or read_otherwise_at_11(written) is None:
+        for saved, later, otherwise in ((FILE_SHARDS, IN_ORDER, read_otherwise_at_11),
+                                        (SHARED_STATE, DECLARED_MIX, read_otherwise_at_13)):
+            if self._plan.version < later:
+                continue
+            written, _ = earlier_position(decoded, dataclasses.replace(self._plan, version=saved))
+            if written.get("version") != saved or otherwise(written) is None:
+                continue
+            topology = record(written.get("topology", {}), "saved data plan topology")
+            workers = integer(topology.get("workers", 0), "saved per-share workers")
+            self._open, self._plan = self._saved_as(saved, workers)
+            self._plan_record = SharedMapping.of(self._plan.record())
             return
-        topology = record(written.get("topology", {}), "saved data plan topology")
-        workers = integer(topology.get("workers", 0), "saved per-share workers")
-        self._open, self._plan = self._saved_as(FILE_SHARDS, workers)
-        self._plan_record = SharedMapping.of(self._plan.record())
 
     def identity(self) -> str:
         """What every share of the pool reads, which the pool agrees before it
