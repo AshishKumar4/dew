@@ -309,6 +309,32 @@ def test_a_remote_generation_of_more_shards_than_its_mirror_holds_reads_every_re
         generation.close()
 
 
+def test_a_cache_writer_rereads_more_uploaded_shards_than_its_mirror_holds(tmp_path):
+    """A fill reads again records it already uploaded, from more shards than Dew's mirror holds at once:
+    each shard read closes another's reader, so its room in the mirror is free before the next is
+    admitted, and every record reads back as written, past what a mirror of two shards holds. One upload
+    worker that blocks when its spool is full has uploaded every shard before the one it is writing, so
+    the records read again are the uploaded ones."""
+    blob = 1 << 16
+    count = 12
+    with moto_bucket("cache") as (bucket, options):
+        mirror = {"dewcache": {"cache_storage": str(tmp_path / "mirror")}}
+        cache = Cache(f"s3://{bucket}/cache", storage_options={**options, **mirror}, shard_bytes=1,
+                      upload_workers=1, on_full="block", spool_bytes=3 * (blob + 4096),
+                      mirror_bytes=2 * (blob + 4096) + blob // 2)
+        source = Memory([{"id": index, "blob": np.full(blob, index % 251, np.uint8)}
+                         for index in range(count)])
+        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key())
+        try:
+            for index in range(count - 2):
+                rows[index]
+            for index in (0, 1, 2, 3, 6, 7):
+                again = rows[index]
+                assert again["id"] == index and (np.asarray(again["blob"]) == index % 251).all()
+        finally:
+            rows.close()
+
+
 def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
     import fsspec
 

@@ -752,11 +752,13 @@ def read_otherwise_at_13(saved: Mapping[str, object]) -> str | None:
     holds a mixture of no seed whose members' keys (`dew.data.analysis._member_keys`) are not in their sorted
     order, which 12's iterator mixes read them in and 13's in the order the mixture declares them
     (`DECLARED_MIX`). Any read's, nested ones too: a streamed read mixes by iterator, and so does an indexed
-    per-share read of members that reject rows (`Accepted`); an indexed global read's mix kept its declared
-    order at 12, so it reads alike either way and goes on as 12 read it."""
+    per-share read of members that reject rows (`Accepted`); a global read by index mixes its members by
+    Grain's selection over their records in their declared order at both, so it reads alike."""
     from dew.data.analysis import _member_keys
 
     order = record(saved.get("order", {}), "saved order")
+    if saved.get("lowering") == "global" and order.get("read") in ("indexed", "memory"):
+        return None
 
     def mixes(node: object) -> Iterator[Mapping[str, object]]:
         if isinstance(node, Mapping):

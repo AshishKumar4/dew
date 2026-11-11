@@ -2260,3 +2260,34 @@ def test_a_phased_runs_statistics_count_each_phase_it_reached(tmp_path):
     alone = phased_packed((first, None))
     (counted,) = [count for name, count in alone.statistics().items() if name.startswith("data/rows/")]
     assert len(rows) == 2 and counted in rows.values() and all(count > 0 for count in rows.values()), rows
+
+
+@pytest.mark.parametrize(("read", "version"), [("indexed", 13), ("streamed", 12)])
+def test_a_mix_saved_under_plan_version_12_resumes_as_12_read_it(read, version):
+    """A mix of no seed whose members are named out of their sorted order, saved under plan version 12,
+    resumes under this Dew's on the batches 12's read goes on to: read by index, its order the same at
+    both, its position goes on as 13's; streamed, which 12 mixed in its keys' sorted order, as 12's."""
+    chain = mix([_named("z", 1).repeat(), _named("a", 2).repeat()]).batch(4)
+    earlier = compile(chain, read=read, loading=READ, plan_version=12)
+    now = compile(chain, read=read, loading=READ)
+
+    def listed(stream, count):
+        return ids(itertools.islice(stream, count))
+
+    reader = earlier.train(DataPartition())
+    try:
+        whole = listed(reader, 6)
+    finally:
+        reader.close()
+    reader = earlier.train(DataPartition())
+    try:
+        head, saved = listed(reader, 3), reader.get_state()
+    finally:
+        reader.close()
+    resumed = now.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert head + listed(resumed, 3) == whole
+        assert json.loads(resumed.get_state())["dew_data_plan"]["version"] == version
+    finally:
+        resumed.close()

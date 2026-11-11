@@ -390,16 +390,25 @@ class _Statistics:
 
 def statistics_of(sources: Sequence[_Statistics]) -> Mapping[str, float]:
     """The metrics of a run read by the loaders `sources` count, in the order it read them (a phased run's
-    phases): each corpus's counts of the prefix a memory read ran, the first loader's that holds it (every
-    loader of a corpus measures the same prefix, from its start), followed by what each loader's readers
-    read past it, summed over the loaders (a later phase reads on from where the one before it stopped,
-    `CorpusCounts.followed`, `CorpusCounts.add`); and what this process's mirrors did since the first
-    began (`Mirrored`, row 4299), once, beside every loading worker's."""
+    phases): each corpus's counts of the prefix a memory read ran, a measurement two loaders made alike
+    counted once (a corpus a later phase reads as the first prepares it, from its start) and one a later
+    loader made otherwise (its phase's own steps over the corpus) counted beside it, followed by what
+    each loader's readers read past it, summed over the loaders (a later phase reads on from where the
+    one before it stopped, `CorpusCounts.followed`, `CorpusCounts.add`); and what this process's mirrors
+    did since the first began (`Mirrored`, row 4299), once, beside every loading worker's."""
     prefix: dict[str, CorpusCounts] = {}
     read: dict[str, CorpusCounts] = {}
+    measured: dict[str, list[CorpusCounts]] = {}
     for source in sources:
         for name, counts in source.prefix().items():
-            prefix.setdefault(name, counts)
+            if counts in measured.setdefault(name, []):
+                continue
+            measured[name].append(counts)
+            if name in prefix:
+                combined = copy.deepcopy(prefix[name])
+                combined.add(counts)
+                counts = combined
+            prefix[name] = counts
         for name, counts in source.read().items():
             if name in read:
                 summed = copy.deepcopy(read[name])
