@@ -79,19 +79,27 @@ def test_an_lm_runs_validation_split_holding_an_id_outside_its_models_table_is_r
 
 
 def test_a_decision_run_whose_rows_place_a_token_outside_its_backbones_table_is_refused_naming_it(tmp_path):
-    """A decision run, whose rows its layout makes with its own tokenizer, is refused at the batch holding a
-    token its backbone's table has no row for, naming the token."""
+    """A decision run, whose rows its layout makes with its own tokenizer (its text and its specials), is
+    refused at the batch holding a token its backbone's table has no row for, naming the id and the table's
+    rows; the same rows over a backbone whose table holds the tokenizer's every id train."""
     from dew.decision import decisions
 
     tokenizer = HFTokenizer(str(FIXTURE), local_files_only=True)
-    objective = DecisionObjective(short(), tokenizer=tokenizer)
     rows = Pipeline(Memory([{"text": "token7 token250", "label": label} for label in ("a", "b")] * 8))
     data = rows.pipe(decisions, question="label", options=("a", "b")).repeat().batch(8)
-    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0))
+
+    def fitted(backbone):
+        objective = DecisionObjective(backbone, tokenizer=tokenizer)
+        return Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(data, steps=1)
+
     with pytest.raises(OutsideTable) as raised:
-        trainer.fit(data, steps=1)
-    # The row's own token past the table, whichever id its tokenizer gives it.
-    assert outside(raised) == (max(tokenizer.encode("token7 token250", add_special_tokens=False)), ROWS)
+        fitted(short())
+    token, rows_held = outside(raised)
+    assert rows_held == ROWS <= token
+    # Twice the fixture's ids, its added specials among them.
+    wide = models.build("causal_transformer", vocab_size=512, emb_features=32, num_layers=1, num_heads=2,
+                        mlp_features=64, max_seq_len=64)
+    assert int(fitted(wide).step) == 1
 
 
 def test_a_request_holding_an_id_outside_its_models_table_is_refused_by_a_task_and_a_server():
