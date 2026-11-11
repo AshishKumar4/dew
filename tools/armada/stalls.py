@@ -63,13 +63,15 @@ def activity(pid: Path, seconds: float = ACTIVITY_SECONDS) -> tuple[Thread, ...]
         found = {}
         for path in tasks.glob("*/stat"):
             try:
-                stat = path.read_text()
+                stat = path.read_bytes()
             except OSError:
                 continue
-            name, _, rest = stat[stat.index("(") + 1:].rpartition(")")
+            # The name as the kernel keeps it, 15 bytes at most, a multibyte name cut mid-character.
+            name, _, rest = stat[stat.index(b"(") + 1:].rpartition(b")")
             fields = rest.split()
             # After the name: the state, then the user and system ticks at the stat's 14th and 15th fields.
-            found[int(path.parent.name)] = (name, fields[0], int(fields[11]) + int(fields[12]))
+            found[int(path.parent.name)] = (name.decode(errors="replace"), fields[0].decode(),
+                                            int(fields[11]) + int(fields[12]))
         return found
 
     first = sampled()

@@ -1565,17 +1565,20 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
 
     reader = threading.Thread(target=read, daemon=True)
     reader.start()
-    expired, dump = False, ""
+    expired, dump, spent = False, "", 0.0
     try:
         done.wait(deadline)
     except subprocess.TimeoutExpired:
         # pytest as it stands at its deadline, before the interrupt below: its threads' activity, every
-        # thread's stack and the host it stood on (`stalls.stood`).
+        # thread's stack and the host it stood on (`stalls.stood`), read within its grace, so a stalled
+        # task's whole stop stays inside armada's own timeout (`SETTLE`'s sum).
+        reading = time.monotonic()
         expired, dump = True, stalls.stood(pid, spy, host.state)
+        spent = time.monotonic() - reading
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
-    if left := child_groups.stop(done, grace=grace if expired else 0.0, interrupt=signal.SIGINT,
-                                 settle=SETTLE):
+    if left := child_groups.stop(done, grace=max(grace - spent, 0.0) if expired else 0.0,
+                                 interrupt=signal.SIGINT, settle=SETTLE):
         print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
     # A process of the group still running may yet open a file: no record of this task keeps a key.
     closed = opens.closed()
