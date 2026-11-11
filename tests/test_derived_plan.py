@@ -456,7 +456,9 @@ def gated(layers: str, generation: str, remat: str, capacity: int, records, prec
     model = models.build("causal_transformer", vocab_size=128, emb_features=64, num_layers=2, num_heads=4,
                          num_kv_heads=2, mlp_features=128, max_seq_len=128,
                          remat=None if remat == "none" else REMAT_POLICIES[remat], **GATE_LAYERS[layers])
-    trainer = Trainer(LMObjective(model, seq_len=128), optax.adamw(1e-3), key=jax.random.key(0), split=1,
+    # The split left to the plan, so the derivation judges the step it compiles (a run that states its
+    # split and remat derives nothing, `FitSearch.stated`).
+    trainer = Trainer(LMObjective(model, seq_len=128), optax.adamw(1e-3), key=jax.random.key(0),
                       mesh=MeshSpec().build(compile_only_gpus(generation, 1)))
     tokens = ((np.arange(4 * 129).reshape(4, 129) * 7) % 128).astype(np.int32)
     with pytest.MonkeyPatch.context() as patch, jax.default_matmul_precision(precision):

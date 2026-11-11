@@ -1178,7 +1178,8 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, candidate.micro, candidate.prepared.variables, mesh),
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self._ahead, capacity=capacity,
-            derive=None if recorded is not None else functools.partial(lower, lowering=False))
+            derive=None if recorded is not None else functools.partial(lower, lowering=False),
+            split_stated=self._split is not None)
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)
         above = search.above(candidates, planned.split) if frontier else None

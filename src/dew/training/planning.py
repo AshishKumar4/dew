@@ -665,9 +665,11 @@ class FitSearch[LossT, EffectsT]:
     footprint (`dew.training.footprint`), which picks the search's first rung (`derived_start`); None
     for a run that starts from a plan, recorded, compiled ahead or resumed, which the search tries first."""
     derived: list[dict[str, JSON]] = dataclasses.field(default_factory=list)
+    split_stated: bool = False
+    """Whether the run states its split (`Trainer(split=...)`), which the search then reads alone."""
     stated: bool = False
-    """Whether the run states its split and its remat (`admitted`): nothing is left for the derivation to
-    choose, so it derives no footprint and the compile decides."""
+    """Whether the run states its split (`split_stated`) and its remat (`remat_set`): nothing is left for
+    the derivation to choose, so it derives no footprint and the compile decides (`admitted`)."""
     """Each rung the derivation read before the first compile: its rung, terms, headroom and label."""
     judged_at: dict[tuple[str, int], int | None] = dataclasses.field(default_factory=dict)
     """The derived headroom of each candidate the derivation read, by its rung (`rung`) and split: what
@@ -715,7 +717,7 @@ class FitSearch[LossT, EffectsT]:
         # A run that states its split (one candidate) and its remat leaves the derivation nothing to
         # choose: it reads no footprint, and the compile at that plan decides (a 4B decoder's derivation
         # held its first step for 47 minutes at a split and remat the run had stated, row 5479).
-        self.stated = len(candidates) == 1 and self.remat_set
+        self.stated = self.split_stated and self.remat_set
         if self.stated and self.derive is not None:
             self.derived.append({**self.current(), "narrow": self.narrow, "split": candidates[0],
                                  "headroom": None, "label": "stated", "terms": None})
