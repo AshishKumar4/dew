@@ -54,6 +54,7 @@ from dew.nn.inputs import (
     fork_runs,
     intersected_runs,
 )
+from dew.nn.inspection import QK
 from dew.nn.kernels.selection import select, selected
 from dew.nn.kernels.templates import attention as template
 from dew.nn.kv_cache import (
@@ -899,7 +900,7 @@ class CausalSelfAttention(nn.Module):
         # QK-Clip's logit maxima are taken under the mask (`_attended`), so a
         # layer that sows them keeps it.
         implied = (metadata is not None and metadata.right_padded and causal
-                   and not (not self.is_initializing() and self.is_mutable_collection("qk")))
+                   and not (not self.is_initializing() and self.is_mutable_collection(QK)))
         return metadata is not None and metadata.valid is not None and not implied
 
     @nn.compact
@@ -1454,16 +1455,16 @@ class CausalSelfAttention(nn.Module):
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
         # leaves bitwise identical.
-        sowing = not self.is_initializing() and self.is_mutable_collection("qk")
+        sowing = not self.is_initializing() and self.is_mutable_collection(QK)
         if sowing:
             # Over the keys the call sees, as its spans say them (`visibility_mask`).
             seen = visibility_mask(S, key.shape[-3], causal, window, mask, documents, block_groups=blocks,
                                    image_groups=images, key_valid=valid, key_runs=runs, places=held)
             # Beside a context this call read through the same projections first (`attend_context`).
             found = with_context_logits(self, max_attention_logits(query, key, mask=seen, bias=bias))
-            self.sow("qk", "max_logits", found)
-            self.sow("qk", "kv_heads", jnp.asarray(key.shape[-2]))
-            self.sow("qk", "head_dim", jnp.asarray(query.shape[-1]))
+            self.sow(QK, "max_logits", found)
+            self.sow(QK, "kv_heads", jnp.asarray(key.shape[-2]))
+            self.sow(QK, "head_dim", jnp.asarray(query.shape[-1]))
         if self.ctx.attention_dropout_rate and train:
             return checkpoint_name(scaled_dot_product_attention(
                 query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
@@ -1766,7 +1767,7 @@ class CausalSelfAttention(nn.Module):
         """
         if (self.ctx.sliding_window is None and self.ctx.attention_chunk is None) or not self.ctx.causal:
             return False
-        if self.alibi or decode or (not self.is_initializing() and self.is_mutable_collection("qk")):
+        if self.alibi or decode or (not self.is_initializing() and self.is_mutable_collection(QK)):
             return False
         return metadata is None or (not self._unhonoured(metadata, "local") and all(
             getattr(metadata, name) is None for name in self._group_fields()))

@@ -30,6 +30,7 @@ from dew.batch import (
     Variables,
     leaves_by_path,
     merge,
+    shifted_span,
     sown_nodes,
     token_layout,
 )
@@ -300,16 +301,11 @@ def apply_routed(balance: ExpertBalance | None, variables: Variables, effects: V
 
 def _router_queries(shape: tuple[int, ...], queries: jax.Array | None,
                     documents: jax.Array | None) -> jax.Array:
-    """The real queries of a router, including a prediction depth's shifted inputs."""
+    """The real queries of a router, a prediction depth's shifted inputs among them: each query whose span
+    to the input its depth shifts it to holds real inputs of one document (`shifted_span`)."""
     if queries is None:
         return jnp.ones(shape, bool)
-    width = shape[1]
-    valid = queries[:, :width].astype(bool)
-    for offset in range(1, queries.shape[1] - width + 1):
-        valid = valid & queries[:, offset:offset + width].astype(bool)
-        if documents is not None:
-            valid = valid & (documents[:, :width] == documents[:, offset:offset + width])
-    return valid
+    return shifted_span(queries.shape, queries.shape[1] - shape[1], valid=queries, segments=documents)
 
 
 def _selected_counts(indices: jax.Array, valid: jax.Array, experts: int) -> jax.Array:

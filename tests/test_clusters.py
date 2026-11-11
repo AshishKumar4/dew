@@ -123,3 +123,4 @@ def test_a_pool_joins_through_a_scheduler_of_the_users_own():
     assert [rank.returncode for rank in ranks] == [0, 0], outputs
     pools = sorted(line for written in outputs for line in written.splitlines() if line.startswith("pool"))
     assert pools == ["pool 2 0", "pool 2 1"], outputs
+

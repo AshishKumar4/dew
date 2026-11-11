@@ -287,8 +287,7 @@ class SourceLimitedPrediction(PredictionTransform):
         limited = self._limit(x_0)
         if not self.recompute_epsilon:
             return limited, epsilon
-        signal_rate, noise_rate = rates
-        return limited, divided(x_t - signal_rate * limited, noise_rate)
+        return from_clean(x_t, limited, rates)
 
     def get_target(self, x_0, epsilon, rates):
         return self.inner.get_target(x_0, epsilon, rates)

@@ -61,7 +61,7 @@ from dew.batch import (
 )
 from dew.distributed.placement import Layout, RefinesLayout
 from dew.nn.derivatives import contracted, surrogate
-from dew.nn.inspection import INSPECTED, Watched, watching
+from dew.nn.inspection import INSPECTED, QK, Watched, watching
 from dew.nn.kernels.options import Held, Option, compiler_options, owned_program
 from dew.nn.precision import (
     ROUNDING_STREAM,
@@ -223,10 +223,16 @@ class Recorded(TypedDict):
     evaluated: jax.Array
 
 
+_RECORDED_VALUES = f"{RECORD}values/"
+"""Where a step's record keeps its named values among its metrics; each other field of `Recorded` sits
+under `RECORD` by its own name."""
+
+
 def recorded_metrics(record: Recorded) -> dict[str, jax.Array]:
-    """`record` as a step's metrics, one array each under `RECORD`, as a compiled step returns them."""
-    fields = {f"{RECORD}{name}": record[name] for name in ("example_index", "column_ok", "evaluated")}
-    return {**fields, **{f"{RECORD}values/{name}": value for name, value in record["values"].items()}}
+    """`record` as a step's metrics, one array each under `RECORD`, as a compiled step returns them: each
+    field `Recorded` declares by its name, its values under `_RECORDED_VALUES`."""
+    fields = {f"{RECORD}{name}": record[name] for name in Recorded.__annotations__ if name != "values"}
+    return {**fields, **{f"{_RECORDED_VALUES}{name}": value for name, value in record["values"].items()}}
 
 
 def taken_record(metrics: Mapping[str, jax.Array]) -> tuple[Recorded | None, dict[str, jax.Array]]:
@@ -235,10 +241,10 @@ def taken_record(metrics: Mapping[str, jax.Array]) -> tuple[Recorded | None, dic
     rest = {name: value for name, value in metrics.items() if not name.startswith(RECORD)}
     if f"{RECORD}evaluated" not in metrics:
         return None, rest
-    values = {name.removeprefix(f"{RECORD}values/"): value for name, value in metrics.items()
-              if name.startswith(f"{RECORD}values/")}
-    return Recorded(values=values, example_index=metrics[f"{RECORD}example_index"],
-                    column_ok=metrics[f"{RECORD}column_ok"], evaluated=metrics[f"{RECORD}evaluated"]), rest
+    values = {name.removeprefix(_RECORDED_VALUES): value for name, value in metrics.items()
+              if name.startswith(_RECORDED_VALUES)}
+    fields = {name: metrics[f"{RECORD}{name}"] for name in Recorded.__annotations__ if name != "values"}
+    return Recorded(values=values, **fields), rest
 
 
 @dataclass(eq=False)
@@ -280,9 +286,6 @@ def stream(name: str) -> int:
         raise ValueError(f"the draws {name!r} and {_STREAMS[fold]!r} fold alike; rename one")
     return fold
 
-
-QK = "qk"
-"""The collection a model's attention sows its logit maxima in, where a step opens it (`Step.qk_stats`)."""
 
 OBSERVED = (QK, INSPECTED)
 """The collections a model call sows what a step observes in (`Step.observed`): its attention logit maxima
@@ -427,9 +430,15 @@ class Step:
         if self.tape is not None and name in self.tape:
             like = jax.eval_shape(drawn, jax.random.key(0))
             return self._taped(self.tape[name], name, examples, like.shape).astype(like.dtype)
-        key = jax.random.fold_in(counter_key(self.key if self.example_key is None else self.example_key),
-                                 stream(name))
+        key = self.update_key(name)
         return jax.vmap(lambda example: drawn(jax.random.fold_in(key, example)))(examples)
+
+    def update_key(self, name: str) -> jax.Array:
+        """The key of the update's draws `name` names, the same for every microbatch the update pools: the
+        examples' key where the step carries one (`example_key`), else the step's, through its counter and
+        folded with the name's stream. Each example's draw folds its place into it (`sample`)."""
+        return jax.random.fold_in(counter_key(self.key if self.example_key is None else self.example_key),
+                                  stream(name))
 
     def boundary(self, name: str, value: jax.Array) -> jax.Array:
         """`value`, one row an example, where the model's computation starts from it (a noised input,
@@ -906,9 +915,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         commits. By default every real input, each row's `real_lengths` summed; an objective that
         scores fewer, a language model its shifted targets, counts those. The FLOP count reads the
         inputs (`real_lengths`)."""
-        from dew.data.dataset import rows_of, take_row_fields
+        from dew.data.dataset import rows_of, take_batch
 
-        return np.asarray([np.sum(self.real_lengths(take_row_fields(batch, np.array([index]))))
+        return np.asarray([np.sum(self.real_lengths(take_batch(batch, np.array([index]))))
                            for index in range(rows_of(batch))], np.int64)
 
     def scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, jax.Array] | None:

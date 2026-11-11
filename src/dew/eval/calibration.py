@@ -24,9 +24,9 @@ import numpy as np
 def softmax(logits: np.ndarray, temperature: float = 1.0) -> np.ndarray:
     """The options' probabilities of `logits` at `temperature`, over the last axis, in float64; an option
     of logit -inf takes no mass."""
-    scaled = np.asarray(logits, np.float64) / temperature
-    shifted = np.exp(scaled - np.max(scaled, axis=-1, keepdims=True))
-    return shifted / np.sum(shifted, axis=-1, keepdims=True)
+    from scipy import special
+
+    return special.softmax(np.asarray(logits, np.float64) / temperature, axis=-1)
 
 
 def fit_temperature(logits: np.ndarray, targets: np.ndarray, real: np.ndarray) -> float:

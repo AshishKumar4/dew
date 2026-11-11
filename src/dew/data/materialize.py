@@ -24,10 +24,11 @@ from typing import ClassVar
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import JSON, integer, json_value, record
+from dew._records import record
 from dew.batch import Batch
 from dew.data.analysis import _analyzed, _identity, _label, _name, written
 from dew.data.dataset import Ranges, Records
+from dew.data.facts import largest_bounds
 from dew.data.handoff import _threads
 from dew.data.lowering import (
     _cache_inputs,
@@ -538,19 +539,5 @@ def _memory_order(
 
 
 def _measured_bounds(rows: Sequence[Batch]) -> Mapping[str, object]:
-    bounds: dict[str, JSON] = {}
-
-    def merge(target: dict[str, JSON], given: Mapping[str, object]) -> None:
-        for key, value in given.items():
-            if isinstance(value, Mapping):
-                previous = {
-                    name: json_value(datum, name) for name, datum in record(target.get(key, {}), key).items()
-                }
-                merge(previous, value)
-                target[key] = previous
-            else:
-                target[key] = max(integer(value, key), integer(target.get(key, 0), key))
-
-    for row in rows:
-        merge(bounds, record(row.get("_dew_bounds", {}), "record bounds"))
-    return bounds
+    """The bounds the rows state, each the largest of theirs (`largest_bounds`)."""
+    return largest_bounds(record(row.get("_dew_bounds", {}), "record bounds") for row in rows)

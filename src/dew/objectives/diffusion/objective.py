@@ -872,9 +872,9 @@ class DiffusionObjective(Objective[Ratio]):
         assert self.end_to_end is not None and self.autoencoder is not None
         weights = params["params"][AUTOENCODER]
         moments = self.autoencoder.moments(weights, images)
-        mean_shape = (*moments.shape[1:-1], moments.shape[-1] // 2)
-        raw = posterior_latent(moments, key, step.sample("posterior", jax.random.normal, mean_shape,
-                                                         dtype=jnp.float32, rows=moments.shape[0]))
+        # Its posterior's draw as every encode of the run draws it (`_posterior_noise`); end-to-end tuning
+        # trains a KL autoencoder alone (`_check_end_to_end`), whose posterior is stochastic.
+        raw = posterior_latent(moments, key, self._posterior_noise(step, "posterior", images))
         reconstruction = self.autoencoder.decode_raw(weights, raw)
         discriminator = params["params"].get(DISCRIMINATOR)
         regularizer, hinge, terms = self.end_to_end.regularizer(

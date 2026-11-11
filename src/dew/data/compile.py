@@ -1459,9 +1459,6 @@ def _training_reader(
             published=statistics.mirrored(),
         )
     else:
-        if build.elastic:
-            _refuse_inelastic(pipeline)
-
         def per_share(chosen: _Build) -> tuple[Opener, Plan]:
             """The reader `chosen` opens over this share and the plan its positions name."""
             return functools.partial(chosen.batches, pipeline, partition), dataclasses.replace(
@@ -1502,15 +1499,6 @@ def _training_reader(
     return _Host(opened, host) if host else opened
 
 
-def _refuse_inelastic(pipeline: Pipeline) -> None:
-    """Refuse an elastic read (`Pipeline.elastic`) whose batch is a token budget's, which takes no fixed
-    share of rows. Its loading workers read its inputs in their order, by index or as a stream
-    (`dew.data.elastic_order._InputOrder`, `_StreamOrder`)."""
-    if any(isinstance(stage, TokenBudget) for stage in pipeline.stages):
-        raise ValueError("an elastic read keeps a share of each batch's rows, and a token budget's batch "
-                         "holds no fixed count of them; batch it by rows")
-
-
 def _validation_reader(
     partition: DataPartition, *, pipeline: Pipeline, build: _Build, host: tuple[HostStep, ...]
 ) -> Iterator[Batch]:
@@ -1518,9 +1506,8 @@ def _validation_reader(
     opened: Iterator[Batch]
     if not build.global_order:
         build = dataclasses.replace(build, loading=dataclasses.replace(build.loading, workers=0))
-    # A token budget has no fixed row shape; its lowering enforces one share.
-    budgeted = any(isinstance(stage, TokenBudget) for stage in pipeline.stages)
-    if build.read == "streamed" and not budgeted:
+    # A token budget is fixed-length rows by now (`_budgeted`).
+    if build.read == "streamed":
         opened = _CanonicalPass(
             functools.partial(build.batches, pipeline, fill=False), partition, build.batch
         )

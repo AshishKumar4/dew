@@ -61,9 +61,10 @@ def corpus(cache: Path) -> Path:
 
     from dew.data import ByteTokenizer
     from dew.data.sinks import export
+    from dew.data.storage import EXPORT_MANIFEST
 
     tokens = cache / "tokens"
-    if (tokens / "_dew_manifest.json").is_file():
+    if (tokens / EXPORT_MANIFEST).is_file():
         return tokens
     cache.mkdir(parents=True, exist_ok=True)
     text = cache / "TinyStories-valid.txt"

@@ -74,7 +74,7 @@ from dew.nn.continuum import feedforward_levels
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows, rotate_rows
-from dew.nn.inspection import INSPECTED, current_positions, watched_positions
+from dew.nn.inspection import INSPECTED, QK, current_positions, watched_positions
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
@@ -368,15 +368,23 @@ def _unpadded(values: jax.Array, padding: jax.Array) -> tuple[jax.Array, jax.Arr
     return restored, valid
 
 
-def batch_text(batch) -> ModelInputs:
-    """The batch's `text` rows as `_prepared` gives them, a packed batch's `text_coordinates` folded in,
-    and its `text_block_groups` beside them."""
+def text_columns(batch) -> dict[str, object]:
+    """The packing columns a batch carries beside its `text` rows, by the token field each is: its
+    `text_coordinates` and `text_block_groups`, a column the batch leaves out or holds as None absent. The
+    one reading of them, which the loss (`batch_text`) and the host's counts (`_token_geometry`) convert
+    each its own way; a batch laid out in the flat fields of old is refused."""
     stale = sorted({"text_segment_ids", "text_positions"} & set(batch))
     if stale:
         raise ValueError(f"a packed batch lays its documents out in text_coordinates "
                          f"(dew.batch.coordinates), not {', '.join(stale)}")
-    laid = batch.get("text_coordinates")
-    blocks = batch.get(BLOCKS_KEY)
+    named = ((COORDINATES_FIELD, "text_coordinates"), (BLOCKS_FIELD, BLOCKS_KEY))
+    return {name: batch[key] for name, key in named if batch.get(key) is not None}
+
+
+def batch_text(batch) -> ModelInputs:
+    """The batch's `text` rows as `_prepared` gives them, its packing columns (`text_columns`) folded in."""
+    columns = text_columns(batch)
+    laid, blocks = columns.get(COORDINATES_FIELD), columns.get(BLOCKS_FIELD)
     return _prepared(batch[TEXT_KEY], coordinates=None if laid is None else jax.tree.map(jnp.asarray, laid),
                      block_groups=None if blocks is None else jnp.asarray(blocks, jnp.int32))
 
@@ -650,9 +658,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         loss reads."""
         raw = batch[TEXT_KEY]
         prepared = raw if isinstance(raw, ModelInputs) else ModelInputs(raw)
-        extra = {name: batch[key] for name, key in ((COORDINATES_FIELD, "text_coordinates"),
-                                                    (BLOCKS_FIELD, BLOCKS_KEY)) if key in batch}
-        return np.asarray(prepared.tokens), _with_columns(prepared, extra)
+        return np.asarray(prepared.tokens), _with_columns(prepared, text_columns(batch))
 
     def _counted_tokens(self, batch: Batch):
         """Host input geometry: each real token, and the documents."""
@@ -945,7 +951,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             replay["routed_experts"] = jax.tree.map(lambda record: jnp.asarray(record)[:, :-finals], routed)
             if covered is not None:
                 replay["routed"] = jnp.asarray(covered, bool)[:, :-finals]
-        collections = (([ROUTER_COLLECTION] if routing else []) + (["qk"] if qk_stats else [])
+        collections = (([ROUTER_COLLECTION] if routing else []) + ([QK] if qk_stats else [])
                        + ([INDEXER_COLLECTION] if indexer else []) + ([INSPECTED] if watched else []))
         stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, 'prediction_inputs'] if stream_depth else collections
@@ -965,7 +971,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             # Each target's state its predecessor's, a document's first token's its parent's last.
             hidden = _predicted(hidden, before)
         sown = gathered.get(ROUTER_COLLECTION, {}) if routing else None
-        qk = gathered.get("qk", {}) if qk_stats else None
+        qk = gathered.get(QK, {}) if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         inspected = gathered.get(INSPECTED, {}) if watched else None
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
@@ -996,7 +1002,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                                   mutable=collections or False, **packing)
         if collections:
             states, depth_sown = states
-            names = (ROUTER_COLLECTION, "qk", INDEXER_COLLECTION)
+            names = (ROUTER_COLLECTION, QK, INDEXER_COLLECTION)
             records = tuple({**(held or {}), **depth_sown.get(name, {})} if wanted else held
                             for held, name, wanted in zip(records, names, asked, strict=True))
         return self._depth_scores(params, states, targets, prepared, roles, dtype, table, rows), records

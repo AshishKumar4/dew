@@ -98,7 +98,7 @@ from dew.data.mixing import (
     rewound,
     token_weights,
 )
-from dew.data.packing import FirstFitPacked, _Concatenated, _OverlappedCuts
+from dew.data.packing import FirstFitPacked, _Concatenated, _OverlappedCuts, window_fields
 from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
@@ -935,7 +935,7 @@ def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
     (`FirstFitPacked`), the rest by Grain's own packers."""
     if stage.policy == "first-fit":
         return FirstFitPacked(documents, stage)
-    sizes = dict.fromkeys(stage.fields, stage.seq_len) | dict(stage.along)
+    sizes, _ = window_fields(stage)
     if stage.policy == "concat":
         cut = _OverlappedCuts(documents, stage) if stage.overlap else documents
         return _Concatenated(gx.ConcatThenSplitIterDataset(cut, length_struct=sizes))

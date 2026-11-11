@@ -114,6 +114,11 @@ def matching(found: ObjectInfo, expected: Mapping[str, object], url: str) -> Non
                       f"sha256={expected['sha256']}")
 
 
+EXPORT_MANIFEST = "_dew_manifest.json"
+"""The file an export's manifest is committed in at its root (`commit_export`), which every reader of an
+export opens (`dew.data.sources.files`, `dew.data.sinks`)."""
+
+
 def commit_export(
     root: Store, *, format: str, codec: int | None, rows: int, files: list[Mapping[str, object]],
     metadata: Mapping[str, object] | None = None, certified: Mapping[str, JSON] | None = None,
@@ -126,7 +131,7 @@ def commit_export(
     manifest = {"schema": 1, "format": format, "codec": codec, "rows": rows, **(certified or {}),
                 "files": files, "metadata": dict(metadata or {})}
     encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-    root.child("_dew_manifest.json").put_if_absent(encoded)
+    root.child(EXPORT_MANIFEST).put_if_absent(encoded)
     root.child("_SUCCESS").put_if_absent(hashlib.sha256(encoded).hexdigest().encode())
     return manifest
 

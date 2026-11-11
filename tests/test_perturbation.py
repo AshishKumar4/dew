@@ -92,7 +92,7 @@ class General(nn.Module):
     """Two DenseGeneral layers: the first contracts the input axes `axis` names, which need be neither
     trailing nor in order, the second the rest, and a scale no layer holds."""
 
-    axis: tuple[int, ...]
+    axis: tuple[int, ...] | range
 
     @nn.compact
     def __call__(self, x):
@@ -107,6 +107,8 @@ SITES = {
     "trailing-general": (lambda: General(axis=(-2, -1)), (3, 5), ("DenseGeneral_0", "DenseGeneral_1")),
     "inner-axis-general": (lambda: General(axis=(1,)), (3, 5, 2), ("DenseGeneral_0", "DenseGeneral_1")),
     "reordered-general": (lambda: General(axis=(3, 1)), (3, 5, 2), ("DenseGeneral_0", "DenseGeneral_1")),
+    # An axis Flax takes as any sequence of ints (`_canonicalize_tuple`), a range among them.
+    "range-general": (lambda: General(axis=range(1, 3)), (3, 5, 2), ("DenseGeneral_0", "DenseGeneral_1")),
 }
 """Each model the expectation test estimates, its per-example input shape and its dense layers."""
 

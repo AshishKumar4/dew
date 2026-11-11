@@ -1552,3 +1552,35 @@ def _captions_again(captions):
     """The words a batch's captions hold, handed back as `keep_captions` hands them: another reader
     of the same output."""
     return {"caption": np.asarray(captions)}
+
+
+def stepwide(rows):
+    """A user's batch function: the rows' ids stacked, and a field that holds one value for the whole
+    step (`dew.data.dataset.row_field`)."""
+    return {"index": np.asarray([row["index"] for row in rows]), "scale": 1.0}
+
+
+def test_a_short_last_batch_fills_its_rows_and_keeps_a_step_wide_field():
+    """A held split's short last batch is filled out with repeats of its rows (`FilledBatch`) in the fields
+    that hold one value a row; a field a batch function gives the whole step stays as it is."""
+    chain = Pipeline(Memory(_Indexed(6))).batch(4, drop_remainder=False, batch_fn=stepwide)
+    passes = validation(chain, batch=4, loading=Loading(workers=0))
+
+    batches, ended = _bounded(passes(DataPartition()), 4)
+
+    assert [batch["index"].tolist() for batch in batches] == [[0, 1, 2, 3], [4, 5, 4, 5]]
+    assert [batch["scale"] for batch in batches] == [1.0, 1.0]
+    assert ended
+
+
+def test_a_ramps_smaller_first_step_keeps_a_step_wide_field():
+    """A ramp cuts its first steps smaller than the batches it reads (`RampedStream`): each step's rows are
+    the stream's next, and a field the batch function gives the whole step stays as it is."""
+    from dew.data.dataset import Ramp, ramped
+
+    chain = Pipeline(Memory(_Indexed(16))).batch(8, batch_fn=stepwide)
+    steps = list(itertools.islice(ramped(compile(chain, loading=Loading(workers=0)),
+                                         Ramp(start=4, increment=4, samples=8)).train(DataPartition()), 3))
+
+    assert [batch["index"].tolist() for batch in steps] == [[0, 1, 2, 3], [4, 5, 6, 7], list(range(8, 16))]
+    assert [batch["scale"] for batch in steps] == [1.0, 1.0, 1.0]

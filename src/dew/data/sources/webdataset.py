@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tarfile
 from collections.abc import Mapping
 from contextlib import ExitStack
@@ -11,6 +12,10 @@ import grain.python as grain
 from dew.data.declared import Declared
 from dew.data.storage import Store
 
+_BASE_PLUS_EXT = re.compile(r"^((?:.*/|)[^.]+)[.]([^/]*)$")
+"""WebDataset's member-name grammar: a sample's key the name up to its basename's first dot, its field
+every extension after it (`a.image.jpg` the field `image.jpg` of `a`), as the format's own reader splits
+it (webdataset `tariterators.base_plus_ext`, at e0953f9bba17), not a dependency of Dew's."""
 
 class TarRows(grain.IterDataset):
     def __init__(self, url: str, storage_options: Mapping[str, object] | None = None,
@@ -45,9 +50,10 @@ class _TarIterator(grain.DatasetIterator):
         for member in self.members:
             if not member.isfile():
                 continue
-            key, dot, extension = member.name.rpartition(".")
-            if not dot:
+            named = _BASE_PLUS_EXT.match(member.name)
+            if named is None:
                 raise ValueError(f"WebDataset member {member.name!r} has no extension")
+            key, extension = named.groups()
             file = self.archive.extractfile(member)
             if file is None:
                 raise OSError(f"WebDataset member {member.name!r} is unreadable")

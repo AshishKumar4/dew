@@ -490,7 +490,7 @@ class JointSchemaHead(Head):
         return _laid_back(scores.astype(at_least_fp32(scores.dtype)), inputs)
 
 
-def _answers(states: jax.Array, inputs: DecisionInputs) -> jax.Array:
+def answer_states(states: jax.Array, inputs: DecisionInputs) -> jax.Array:
     """Each question's answer state `[B, Q, D]`, at its row's answer cue (`DecisionInputs.readout`)."""
     if inputs.readout is None:
         raise ValueError("a readout of labels reads rows whose options stand under labels (Labels)")
@@ -572,7 +572,7 @@ class LabelReadout(Head):
         bias = self.param("bias", lambda key: (
             jnp.zeros(ids.shape, _wide(table.matrix.dtype, self.dtype)) if table.bias is None
             else drawn(jnp.take(table.bias, ids.reshape(-1)).reshape(ids.shape))))
-        answers = table.states(_answers(states, inputs))
+        answers = table.states(answer_states(states, inputs))
         answers = answers.astype(_wide(jnp.result_type(answers, rows), self.dtype))
         logits = jnp.einsum("bqd,kvd->bqkv", answers, rows[:width], precision=jax.lax.Precision.HIGHEST)
         capped = capped_logits(scaled_logits(logits, None, bias[:width]), table.softcap)
@@ -652,7 +652,7 @@ class SlotReadout(Head):
                        drawn_dtype)
         k = self.param("k", nn.initializers.zeros, (self.head_dim, self.features), drawn_dtype)
         states = states.astype(_wide(jnp.result_type(states, slots), self.dtype))
-        answers = _answers(states, inputs)
+        answers = answer_states(states, inputs)
         lines = states if spanned is None else spanned.astype(states.dtype)
         pooled = span_means(lines, inputs.option_spans[:, :, :real])
         highest = jax.lax.Precision.HIGHEST

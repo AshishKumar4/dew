@@ -16,6 +16,7 @@ import numpy as np
 from dew.batch import Batch
 from dew.data.facts import shaped, unshaped
 from dew.data.pipeline import Rejected
+from dew.data.sources.av_utils import sample_count
 from dew.data.video import local_file, window
 
 
@@ -47,7 +48,7 @@ class DecodeAudio(grain.MapTransform):
         if not isinstance(seconds, (int, float)):
             return unshaped(facts, self.to, f"{self.to}_valid")
         heard = seconds + 2 * self.context
-        samples = round(heard * self.sample_rate)
+        samples = sample_count(heard, self.sample_rate)
         return {**shaped(shaped(facts, self.to, [samples]), f"{self.to}_valid", [samples]),
                 "sample_rate": self.sample_rate, "audio_seconds": heard}
 
@@ -59,7 +60,7 @@ class DecodeAudio(grain.MapTransform):
         from dew.data.sources.av_utils import audio_window, media_info
 
         start, stop = window(element, self.clip)
-        samples = round((stop - start + 2 * self.context) * self.sample_rate)
+        samples = sample_count(stop - start + 2 * self.context, self.sample_rate)
         try:
             with local_file(element[self.field]) as path:
                 _, _, sound = media_info(path)
