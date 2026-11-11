@@ -472,9 +472,12 @@ def record_key(python: str, row_name: str, held: str, inputs: str | None = None)
 
 def row_place(row_name: str, held: str) -> str:
     """Row `row_name`'s place on class `held` under a record prefix: `<class>/<test file>/<group>`, a group
-    `whole` or a split's `<index>-of-<count>` (`key_parts`)."""
+    `whole` or a split's `<index>-of-<count>` (`key_parts`), a process variant's (`varied`) with
+    `-as-<variant>` after it, in the Worker's key alphabet."""
     _, name, split = parsed_row(row_name)
-    return f"{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
+    group, _, variant = split.partition(VARIED)
+    return (f"{held}/{name}/" + ("-of-".join(group.split("/")) if group else "whole")
+            + (f"-as-{variant}" if variant else ""))
 
 
 def green_key(python: str, row_name: str, held: str, key: str) -> str:
@@ -755,6 +758,16 @@ def parsed_row(row_name: str) -> tuple[str, str, str]:
     python, rest = row_name.split(":", 1)
     name, _, split = rest.partition("#")
     return python, name, split
+
+
+VARIED = "@"
+"""What sets a process variant's name apart in a GPU lane's test name and in its rows' group (`varied`,
+`lane_units`): `<file>#G/N@users`, a whole file's `<file>#@users`."""
+
+
+def varied(group: str, variant: str) -> str:
+    """A row's group (`row`) for the process `variant` of it: the group's own, the lane's process."""
+    return f"{group}{VARIED}{variant}" if variant else group
 
 
 def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> list[float]:
@@ -1604,14 +1617,17 @@ def stall_evidence(python: str, tests: list[str], group: str, dump: str, began: 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
-           kept: Mapping[str, tuple[str, str]] | None = None, recorded: bool = True) -> int:
+           kept: Mapping[str, tuple[str, str]] | None = None, recorded: bool = True,
+           variant: str = "") -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's. A check-1
     site's map task (`session.SITE`) is never reused: its draws, among its artifacts, are what its judge
-    reads. A run that is no test of its files (a GPU lane's prepare, `recorded` false) records no row."""
+    reads. A run that is no test of its files (a GPU lane's prepare, `recorded` false) records no row. A
+    process of the files under other flags than the lane's (`variant`, a GPU lane's `VARIANTS`) runs the
+    same cut of them, its rows and their records named apart (`varied`)."""
     began = time.monotonic()
-    group = split or (f"{RELEASE}{release}" if release else "")
+    group = varied(split or (f"{RELEASE}{release}" if release else ""), variant)
     site = session.SITE.fullmatch(group)
     rows = ([] if cache == "off" or release or (site is not None and site["start"] is not None)
             else reused_rows(python, tests, group, common, network, kept))
@@ -2034,6 +2050,28 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
     return borrowed
 
 
+VARIANTS = {"users": ("users_process", {"DEW_TEST_USERS_ARITHMETIC": "1"})}
+"""A GPU lane's processes of a file beside its own, by name: the mark of the tests one runs and the
+environment it runs under. XLA reads a process's flags once, so tests that must open under a user's flags
+(no deterministic ops, JAX's own matmul precision) are a process of their own: under its word the suite's
+conftest runs the marked GPU tests and skips the others, as without it it skips the marked ones, so both
+processes select and cut a file alike and each test runs in one."""
+def lane_units(python: str, tests: list[str]) -> dict[str, tuple[str, str, str]]:
+    """Each process a GPU lane runs for `tests`, by its name, as its file, its group and its variant: each
+    test's own, and after it one for each of `VARIANTS` whose marked tests its file holds, as pytest collects
+    the lane's files on the CPU, once a mark. A file with none of a variant's tests starts no process for it;
+    one that holds some never goes without it (a variant no lane ran is tests that ran nowhere, silently)."""
+    files = sorted({name.partition("#")[0] for name in tests})
+    holding = {variant: collected(python, mark, files) for variant, (mark, _) in VARIANTS.items()}
+    units = {}
+    for name in tests:
+        file, _, group = name.partition("#")
+        units[name] = (file, group, "")
+        units |= {f"{file}#{varied(group, variant)}": (file, group, variant)
+                  for variant, files_ in holding.items() if file in files_}
+    return units
+
+
 PREPARES = "prepares"
 """The mark of a GPU test whose part's prepare runs it first, on the node's CPU (`gpu_prepared`)."""
 PREPARING = {"DEW_TIER_PREPARE": "1", "JAX_PLATFORMS": "cpu"}
@@ -2051,17 +2089,21 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
     environment names (DEW_TIER_TRUTHS), which the run is given too. Their rows are written to `out` and
     nothing is recorded, no test having run to its end: a prepare that fails is said in its row, and its run
     is red for what it lacks, never computing it on the GPU. A file with nothing to prepare starts no
-    process. First the pinned fixtures the tests read offline are fetched, as the run fetches them
+    process; a file's process under other flags (`lane_units`) prepares apart, under them, as it runs. First
+    the pinned fixtures the tests read offline are fetched, as the run fetches them
     (tools/fetched_fixtures.py), so the run finds each whole and waits on no download with the GPU held."""
     subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch"], check=True)
-    parts = {name: name.partition("#")[::2] for name in tests}
-    holding = collected(python, PREPARES, sorted({file for file, _ in parts.values()}))
-    verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)
-                if parts[name][0] in holding}
-    environ = {**PREPARING, "OMP_NUM_THREADS": str(max(1, len(os.sched_getaffinity(0)) // processes))}
+    units = lane_units(python, tests)
+    holding = collected(python, PREPARES, sorted({file for file, _, _ in units.values()}))
+    verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(units)
+                if units[name][0] in holding}
+    threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
-        for prepared in [pool.submit(tested, python, [parts[name][0]], parts[name][1], verdict, deadline,
-                                     "off", session.GRACE, "", environ, recorded=False)
+        for prepared in [pool.submit(tested, python, [units[name][0]], units[name][1], verdict, deadline,
+                                     "off", session.GRACE, "",
+                                     {**PREPARING, "OMP_NUM_THREADS": threads,
+                                      **(VARIANTS[units[name][2]][1] if units[name][2] else {})},
+                                     recorded=False, variant=units[name][2])
                          for name, verdict in verdicts.items()]:
             prepared.result()
     out.write_text(json.dumps({"rows": [row for verdict in verdicts.values()
@@ -2117,8 +2159,10 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     held = device_class(network)
     threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
 
-    # Each test's file and group (`<file>#G/N`; none, a whole file).
-    parts = {name: name.partition("#")[::2] for name in tests}
+    # Each process the lane runs (`lane_units`): a test's file and group (`<file>#G/N`; none, a whole
+    # file), and its file's process under other flags, where it holds tests for one.
+    units = lane_units(python, tests)
+    tests = list(units)
 
     # A group the tier cut by its own seconds holds tests another cut's group of its name did not: its
     # file's whole measured run, which holds any group of it, is its measure (2026-11-10: a group measured
@@ -2126,15 +2170,18 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     cut = bool(os.environ.get("DEW_SPLIT_DURATIONS"))
 
     def needs(name: str) -> dict | None:
-        file, group = parts[name]
-        return recorded(record_key(python, row(python, file, "" if cut else group), held), token)
+        file, group, variant = units[name]
+        return recorded(record_key(python, row(python, file, varied("" if cut else group, variant)), held),
+                        token)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         records = dict(zip(tests, pool.map(needs, tests), strict=True))
-    # A group no run on this class measured borrows its whole file's measure, which holds at least its own.
-    borrowed = borrowed_records(sorted({parts[name][0] for name, found in records.items() if found is None}),
+    # A group no run on this class measured borrows its whole file's measure, which holds at least its own;
+    # a file's process under other flags, its tests a part of the file's, the measure of the lane's own first.
+    borrowed = borrowed_records(sorted({units[name][0] for name, found in records.items() if found is None}),
                                 python, held, token)
-    measures = {name: records[name] or borrowed.get(parts[name][0]) for name in tests}
+    measures = {name: records[name] or records.get(f"{file}#{group}" if group else file)
+                or borrowed.get(file) for name, (file, group, _) in units.items()}
     needed = {name: gpu_needs(measures[name], budget) for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
@@ -2162,13 +2209,15 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
                 environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
                            "XLA_PYTHON_CLIENT_PREALLOCATE": "false" if shares[fits] >= budget else "true",
                            "OMP_NUM_THREADS": threads}
-                file, group = parts[fits]
+                file, group, variant = units[fits]
                 # A group cut by the tier's own GPU seconds (DEW_SPLIT_DURATIONS, split.py) is no group
                 # any record's key holds: it reads no cached row, as it writes none, so no earlier cut's row
                 # stands for it beside groups cut afresh (review of b3bcbe0fe).
                 policy = "off" if group and os.environ.get("DEW_SPLIT_DURATIONS") else cache
                 running[pool.submit(tested, python, [file], group, verdicts[fits], deadline, policy,
-                                    session.GRACE, common, environ, None, network)] = fits
+                                    session.GRACE, common,
+                                    {**environ, **(VARIANTS[variant][1] if variant else {})}, None, network,
+                                    variant=variant)] = fits
                 continue
             done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
             for future in done:
