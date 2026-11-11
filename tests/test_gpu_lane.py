@@ -165,6 +165,63 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
     assert stored, "its run's rows are recorded as any lane's"
 
 
+def test_a_file_with_tests_for_a_users_process_runs_them_in_a_process_of_their_own(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """XLA reads a process's flags once, so a file's tests that must open under a user's flags (the mark
+    `users_process`) run in a second process of the lane, under its word, which the suite's conftest reads
+    to run those tests and skip the file's others, as without it it skips them: every GPU test of the file
+    runs in exactly one process, a cut file's group as the lane's own process cuts it, and the second
+    process's rows and records are its own (`<file>#G/N@users`), so neither stands for the other. A file
+    with no such test starts no second process; one that holds some never runs without it, in its prepare
+    as in its run."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    # The harness's side, as the suite's own conftest has it.
+    (tmp_path / "tests/conftest.py").write_text(
+        "import os, pytest\n"
+        "def pytest_configure(config):\n"
+        "    for mark in ('users_process', 'prepares'):\n"
+        "        config.addinivalue_line('markers', mark + ': a lane mark')\n"
+        "def pytest_runtest_setup(item):\n"
+        "    users = os.environ.get('DEW_TEST_USERS_ARITHMETIC') == '1'\n"
+        "    if users != (item.get_closest_marker('users_process') is not None):\n"
+        "        pytest.skip('another process of the lane runs it')\n"
+        "    if os.environ.get('DEW_TIER_PREPARE') == '1' and item.get_closest_marker('prepares') is None:\n"
+        "        pytest.skip('nothing to prepare')\n")
+    (tmp_path / "tests/test_flows.py").write_text(
+        "import os, pytest\n"
+        "def said(name):\n"
+        "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
+        "    with open(f'{kind}.log', 'a') as log:\n"
+        "        log.write(name + ' ' + os.environ.get('DEW_TEST_USERS_ARITHMETIC', '0') + chr(10))\n"
+        + "".join(f"@pytest.mark.prepares\n{'@pytest.mark.users_process' + chr(10) if index % 3 == 0 else ''}"
+                  f"def test_{index}():\n    said('test_{index}')\n" for index in range(6)))
+    (tmp_path / "tests/test_plain.py").write_text(LANE_TEST)
+
+    def said(kind: str) -> list[tuple[str, str]]:
+        log = tmp_path / f"{kind}.log"
+        lines = [tuple(line.split()) for line in log.read_text().splitlines()] if log.is_file() else []
+        log.unlink(missing_ok=True)
+        return sorted(lines)
+
+    every = sorted((f"test_{index}", "1" if index % 3 == 0 else "0") for index in range(6))
+    out, groups = tmp_path / "verdict.json", ["tests/test_flows.py#1/2", "tests/test_flows.py#2/2"]
+    assert ci.gpu_prepared("3.12", [*groups, "tests/test_plain.py"], out, processes=2, deadline=600.0) == 0
+    assert said("prepared") == every, "each test prepared once, under the flags its process runs it under"
+    assert ci.gpu_lane("3.12", [*groups, "tests/test_plain.py"], out, cache="on", processes=2,
+                       deadline=600.0) == 0
+    assert said("ran") == every, "each test run once, the marked ones in the users' process"
+    rows = {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]}
+    assert rows == {"3.12:tests/test_flows.py#1/2": 0, "3.12:tests/test_flows.py#1/2@users": 0,
+                    "3.12:tests/test_flows.py#2/2": 0, "3.12:tests/test_flows.py#2/2@users": 0,
+                    "3.12:tests/test_plain.py": 0}
+    # Its records are its own: a later lane reuses each process's row apart, and runs none again.
+    assert ci.gpu_lane("3.12", groups, out, cache="on", processes=2, deadline=600.0) == 0
+    assert said("ran") == [] and len(json.loads(out.read_text())["rows"]) == 4
+
+
 def test_a_gpu_lane_names_its_files_but_with_network(ci, monkeypatch):
     """`gpu-lane` without --tests is the network lane's alone, which runs every file holding a network-marked
     test: a CUDA lane names its files, and one that names none is refused, not run over the network files'
