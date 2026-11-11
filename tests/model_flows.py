@@ -323,12 +323,16 @@ program and part a prepare's CPU process from its run's GPU one."""
 
 def flow_flags(flow: Flow) -> str:
     """The XLA flags a flow compiles its programs under in its prepare and loads them under in its run, the
-    same in both (`BuildTarget.held` reads them, in their order): the process's, but the host backend's own
-    (`HOST_FLAGS`), then its variant's on a cuda lane, the lane's repeatable flags where `lane`, else a
-    user's (`lane_environment.REPEATABLE_GPU_FLAGS`, `USERS_GPU_FLAGS`)."""
+    same in both (`BuildTarget.held` reads them, in their order): the process's that decide what a program
+    computes (`dew.training.ahead.computation_flags`: no phase's own, as a cache directory a process sets
+    after its backend opened), but the host backend's own (`HOST_FLAGS`), then its variant's on a cuda lane,
+    the lane's repeatable flags where `lane`, else a user's (`lane_environment.REPEATABLE_GPU_FLAGS`,
+    `USERS_GPU_FLAGS`)."""
+    from dew.training.ahead import computation_flags
+
     variant = lane_environment.REPEATABLE_GPU_FLAGS if flow.lane else lane_environment.USERS_GPU_FLAGS
     named = (*HOST_FLAGS, *(flag.split("=")[0] for flag in variant))
-    flags = lane_environment.without_flags(os.environ.get("XLA_FLAGS", ""), *named)
+    flags = lane_environment.without_flags(" ".join(computation_flags()), *named)
     return " ".join([flags, *variant]).strip()
 
 
