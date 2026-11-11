@@ -270,7 +270,6 @@ class TFDS(Dataset):
         from dew.data.storage import Store, content_version, local
 
         directory = str(self.builder.data_path)
-        metadata = Store(directory.rstrip("/") + "/dataset_info.json").read()
         fs, prefix = Store(directory).resolve()
         # A local copy is named by its content, so hosts that mounted it at different paths agree.
         mounted = local(fs)
@@ -302,10 +301,9 @@ class TFDS(Dataset):
             "split": self.split,
             "shard_rows": self.shard_rows,
             **({} if mounted else {"directory": self.path if self.remote else directory}),
-            # dataset_info.json is hashed among the definitions too; this second hash stays, since dropping
-            # it changes every TFDS fingerprint, and goes with the next fingerprint change made for a reason
-            # of its own (P3 row, continuation-5 #8).
-            "metadata_sha256": hashlib.sha256(metadata).hexdigest(),
+            # dataset_info.json's digest among the definitions, kept under its own key too, as every saved
+            # TFDS fingerprint holds it.
+            "metadata_sha256": definitions["dataset_info.json"],
             "definitions": definitions,
             "files": files,
             "decoders": _decoder_record(self.decoders),

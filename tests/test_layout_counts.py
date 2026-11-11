@@ -236,20 +236,14 @@ class Delivered:
         return {"text": row["text"], **Scored(1)(row)}
 
 
-@pytest.mark.parametrize("read", ["indexed", "streamed"])
-@pytest.mark.parametrize(("layout", "workers"), [("windows", 0), ("first-fit", 2), ("concat", 2)])
-def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupted_read(
-        read, layout, workers):
-    """A read of windows counted by their documents' rule saves the rule with its position, so a
-    resume whose next windows come from documents already read counts them by it too: windows
-    cut from a carried document, and a first-fit pack's open bins or a concatenating pack's
-    remainder held in loading workers."""
+def counted_read(read, layout, workers):
+    """A mixture's read of two corpora's windows counted by their documents' rule (role 1), laid out by
+    `layout` and loaded by `workers`: documents longer than a window, of lengths a window doesn't divide,
+    leave windows and partial bins held when the read stops, so a resume reads next from documents read
+    before; each of its own tokens, so a lost, repeated or replayed row shows."""
     from dew.data.steps.text import CountTargets
 
     def corpus(source, scored):
-        # Documents longer than a window, of lengths a window doesn't divide, leave windows and
-        # partial bins held when the read stops, so a resume reads next from documents read before;
-        # each of its own tokens, so a lost, repeated or replayed row shows.
         length = 40 if layout == "windows" else 11
         documents = Memory([{"text": np.arange(length, dtype=np.int32) + 1000 * index + 100_000 * source,
                              # The first `scored` targets in role 1, as `roled` scores them: a
@@ -263,26 +257,38 @@ def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupte
                     else counted.pack(16, fields=ROLED, policy=layout))
         return laid_out.map(Sourced(source)).repeat()
 
+    mixed = mix([corpus(0, 1), corpus(1, 5)], by="tokens")
     loading = dataclasses.replace(READ, workers=workers)
+    return compile(mixed.map(Delivered()).batch(2), read=read, loading=loading).train(DataPartition())
 
-    def stream():
-        mixed = mix([corpus(0, 1), corpus(1, 5)], by="tokens")
-        return compile(mixed.map(Delivered()).batch(2), read=read, loading=loading).train(DataPartition())
 
-    uninterrupted = stream()
+def state_after(read, layout, workers, steps):
+    """The saved state of `counted_read` after `steps` batches."""
+    stopped = counted_read(read, layout, workers)
+    try:
+        for _ in range(steps):
+            next(stopped)
+        return stopped.get_state()
+    finally:
+        stopped.close()
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+@pytest.mark.parametrize(("layout", "workers"), [("windows", 0), ("first-fit", 2), ("concat", 2)])
+def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupted_read(
+        read, layout, workers):
+    """A read of windows counted by their documents' rule saves the rule with its position, so a
+    resume whose next windows come from documents already read counts them by it too: windows
+    cut from a carried document, and a first-fit pack's open bins or a concatenating pack's
+    remainder held in loading workers."""
+    uninterrupted = counted_read(read, layout, workers)
     try:
         expected = [{name: np.asarray(value).tolist() for name, value in next(uninterrupted).items()}
                     for _ in range(6)]
     finally:
         uninterrupted.close()
-    stopped = stream()
-    try:
-        for _ in range(3):
-            next(stopped)
-        saved = stopped.get_state()
-    finally:
-        stopped.close()
-    resumed = stream()
+    saved = state_after(read, layout, workers, 3)
+    resumed = counted_read(read, layout, workers)
     try:
         resumed.set_state(saved)
         rest = [{name: np.asarray(value).tolist() for name, value in next(resumed).items()}
@@ -290,3 +296,38 @@ def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupte
     finally:
         resumed.close()
     assert rest == expected[3:]
+
+
+def saved_rules(state):
+    """Each count rule a saved read's state holds (`LayoutRule.state`'s `rule`), as the mapping to edit."""
+    if isinstance(state, dict):
+        if set(state) == {"seen", "rule"}:
+            return [state["rule"]] if isinstance(state["rule"], dict) else []
+        return [rule for value in state.values() for rule in saved_rules(value)]
+    if isinstance(state, list | tuple):
+        return [rule for value in state for rule in saved_rules(value)]
+    return []
+
+
+@pytest.mark.parametrize(("field", "value"), [("pad_id", 0.5), ("pad_id", True), ("role", "1"), ("roles", 3)])
+def test_a_resume_from_a_saved_count_rule_of_the_wrong_kind_is_refused(field, value):
+    """A saved read whose count rule holds a field of the wrong kind, a fractional or boolean padding id, a
+    role given as text or roles not named, is refused where it is resumed, never counting a resumed
+    window's padding as targets; the state as saved resumes."""
+    saved = state_after("indexed", "windows", 0, 3)
+    rules = saved_rules(saved)
+    assert rules, "the saved read holds its documents' count rule"
+    resumed = counted_read("indexed", "windows", 0)
+    try:
+        resumed.set_state(saved)
+        next(resumed)
+    finally:
+        resumed.close()
+    for rule in rules:
+        rule[field] = value
+    damaged = counted_read("indexed", "windows", 0)
+    try:
+        with pytest.raises(ValueError, match=field):
+            damaged.set_state(saved)
+    finally:
+        damaged.close()

@@ -9,7 +9,7 @@ from typing import Literal
 import grain.python as grain
 import numpy as np
 
-from dew._records import boolean, json_value
+from dew._records import boolean, integer, json_value, text
 from dew.batch import Batch
 from dew.data.pipeline import Rejected, cut
 
@@ -164,6 +164,14 @@ class CountRule:
     role: int | None
     pad_id: int | None
     roles: str
+
+    def __post_init__(self) -> None:
+        # A rule restored from a saved read's state counts a resumed read's windows: one of the wrong kind
+        # is refused there, not read as padding or a role.
+        for name in ("role", "pad_id"):
+            if (value := getattr(self, name)) is not None:
+                integer(value, name)
+        text(self.roles, "roles")
 
     @classmethod
     def of(cls, element: Batch) -> CountRule | None:
