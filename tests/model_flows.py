@@ -345,8 +345,9 @@ def _flat(flow: Flow, program: Callable):
 
 
 def _target():
-    """The node's GPU (`TOPOLOGY`): its generation and multiprocessors, as its serialized topology names
-    them."""
+    """The node's GPU (`TOPOLOGY`): its generation and multiprocessors, its kind's as the targets' table
+    states them (`generation.gpu_target`), read with no GPU visible, as a prepare runs; its run's load holds
+    them to the GPU's own (`BuildTarget.held`)."""
     from jax.experimental import topologies
 
     from dew.training.ahead import compile_only_gpus
@@ -355,7 +356,7 @@ def _target():
     # client (`dew.training.ahead.host_gpus`).
     compile_only_gpus("sm80", 1)
     device = topologies.TopologyDescription.deserialize(Path(os.environ[TOPOLOGY]).read_bytes()).devices[0]
-    return generation.device_target(device)
+    return generation.gpu_target(device.device_kind)
 
 
 def programs_of(flow: Flow) -> dict[str, tuple[Callable, list]]:
