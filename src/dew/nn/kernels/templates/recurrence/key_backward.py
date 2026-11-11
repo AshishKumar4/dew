@@ -16,9 +16,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra, tables
-from dew.nn.kernels.templates import mosaic, product, resources, swizzling
+from dew.nn.kernels.templates import mosaic, operands, resources, swizzling
 from dew.nn.kernels.templates.cost import Work
-from dew.nn.kernels.templates.operands import Issuer, Parts
+from dew.nn.kernels.templates.operands import Issuer
 from dew.nn.kernels.templates.recurrence import own_pairs
 from dew.nn.kernels.templates.recurrence.mainloop import (
     FAST_PARTS,
@@ -39,7 +39,6 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     masks,
     product_fragments,
     product_results,
-    staged_parts,
     staging_tiles,
     stream_blocks,
     stream_tile,
@@ -374,7 +373,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
     once a step in `_parted`'s form. The queries' and keys' each value head's, which `gradients` sums."""
     chunk = call.chunk
     width, family = call.width, call.family
-    given, gates, square, parted = call.given, call.gates, fp32_operand(call), _parted(call)
+    given, gates, square = call.given, call.gates, fp32_operand(call)
     keys = key_block(call, functools.partial(_key_pairs_held, call),
                      functools.partial(_key_pairs_staged, call))
     steps = width // keys
@@ -406,9 +405,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
             d_pairs = []
             for (name, scaled), buffers in zip((("scores", scale), ("system", 1.0)), squares, strict=True):
                 value = stream_tile(slots, name, square).value() * scaled
-                d_pairs.append(Parts([family.staged(part, buffer)
-                                      for part, buffer in zip(product.formed(value, parted.parts), buffers,
-                                                              strict=True)], jnp.float32))
+                d_pairs.append(operands.staged(family, value.astype(jnp.float32), buffers))
             query = stream_tile(slots, "queries", given).value().astype(jnp.float32)
             key = stream_tile(slots, "keys", given).value().astype(jnp.float32)
 
@@ -419,7 +416,7 @@ def _key_pairs_back(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *
 
             def staged(value):
                 """A pairs' rows gated down staged once a key block in `_parted`'s form, its own set."""
-                return staged_parts(family, value, next(staged_rows))
+                return operands.staged(family, value.astype(jnp.float32), next(staged_rows))
 
             found = {}
             algebra.key_decayed_pairs_back(
