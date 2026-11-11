@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from make_tiny_tokenizer import qwen_byte_tokenizer
-from qwen_mtp_reference import QwenMTP, published_mtp_logits
+from qwen_mtp_reference import QwenMTP, published_mtp_logits, published_mtp_loss
 from safetensors.torch import save_file
 from transformers import (
     AutoModelForCausalLM,
@@ -93,14 +93,7 @@ def write_video_reference(model, processor, destination: Path) -> None:
         generated = model.generate(**encoded, max_new_tokens=3, do_sample=False,
                                    eos_token_id=None, pad_token_id=processor.tokenizer.pad_token_id)
     logits, mtp_logits, admitted, _ = published_mtp_logits(model, encoded)
-    valid = encoded["attention_mask"].bool()
-    main_ce = torch.nn.functional.cross_entropy(logits[:, :-1].reshape(-1, logits.shape[-1]),
-                                                encoded["input_ids"][:, 1:].reshape(-1), reduction="none")
-    depth_ce = torch.nn.functional.cross_entropy(mtp_logits[:, :-1].reshape(-1, logits.shape[-1]),
-                                                 encoded["input_ids"][:, 2:].reshape(-1), reduction="none")
-    depth_valid = valid[:, :-2] & valid[:, 1:-1] & valid[:, 2:]
-    loss = ((main_ce.reshape(admitted.shape) * admitted).sum()
-            + .2 * (depth_ce.reshape(depth_valid.shape) * depth_valid).sum()) / admitted.sum()
+    loss = published_mtp_loss(encoded, logits, mtp_logits, admitted)
     loss.backward()
     with torch.no_grad():
         for parameter in model.parameters():
@@ -183,14 +176,8 @@ def write_reference(kind: str) -> None:
     model.zero_grad(set_to_none=True)
     main, mtp_logits, admitted, (hidden, embeddings, positions) = published_mtp_logits(model, encoded)
     mtp_expected = mtp_logits.detach().numpy()
-    main_ce = torch.nn.functional.cross_entropy(main[:, :-1].reshape(-1, main.shape[-1]),
-                                                encoded["input_ids"][:, 1:].reshape(-1), reduction="none")
-    depth_ce = torch.nn.functional.cross_entropy(mtp_logits[:, :-1].reshape(-1, main.shape[-1]),
-                                                 encoded["input_ids"][:, 2:].reshape(-1), reduction="none")
-    depth_valid = valid[:, :-2] & valid[:, 1:-1] & valid[:, 2:]
-    denominator = target_valid.sum()
-    total = ((main_ce.reshape(target_valid.shape) * target_valid).sum()
-             + 0.2 * (depth_ce.reshape(depth_valid.shape) * depth_valid).sum()) / denominator
+    # The admitted pairs are the targets the main loss reads (`target_valid`).
+    total = published_mtp_loss(encoded, main, mtp_logits, admitted)
     total.backward()
     with torch.no_grad():
         for parameter in model.parameters():

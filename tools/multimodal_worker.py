@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from multimodal_reference import _encode, numerics
-from reference_worker import serve
+from reference_worker import draws, paired, serve
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 
@@ -45,30 +45,32 @@ def run(family: str, text: bool, cases: dict[str, np.ndarray]) -> dict[str, np.n
     processor = AutoProcessor.from_pretrained(source, local_files_only=True)
     prompts = json.loads((ROOT / references / "prompts.json").read_text())
     out = {}
-    for name in sorted({key.split(".", 1)[0] for key in cases}):
-        clips = sorted(key for key in cases if key.startswith(f"{name}.audio_"))
-        encoded = ({key: torch.from_numpy(value) for key, value in text_rows(cases[f"{name}.ids"]).items()}
-                   if text else _encode(processor, cases[f"{name}.images"], prompts,
-                                        [cases[key] for key in clips] if clips else None))
+    for name, inputs in draws(cases).items():
+        clips = sorted(key for key in inputs if key.startswith("audio_"))
+        encoded = ({key: torch.from_numpy(value) for key, value in text_rows(inputs["ids"]).items()}
+                   if text else _encode(processor, inputs["images"], prompts,
+                                        [inputs[key] for key in clips] if clips else None))
         model = AutoModelForImageTextToText.from_pretrained(source, dtype=torch.float32,
                                                             attn_implementation="eager").eval()
         twin = float64_twin(model)
         with float64():
             widened = {key: value.double() if value.is_floating_point() else value
                        for key, value in encoded.items()}
-            if f"{name}.scale_seed" in cases:
+            if "scale_seed" in inputs:
                 # Each tapped run steps its own copy: `numerics` trains the model it is given in place.
                 def stepped(twin=twin, widened=widened):
                     return numerics(copy.deepcopy(twin), widened)
 
-                unit, seed = float(np.finfo(np.float32).eps) / 2, int(cases[f"{name}.scale_seed"])
+                unit, seed = float(np.finfo(np.float32).eps) / 2, int(inputs["scale_seed"])
                 _, scales = rounding_scale(stepped, unit, seed)
                 out.update({f"{name}.scale.{leaf}": value for leaf, value in scales.items()})
                 continue
-            for leaf, value in numerics(twin, widened).items():
-                out[f"{name}.truth.{leaf}"] = value
-        for leaf, value in numerics(model, encoded).items():
-            out[f"{name}.reference.{leaf}"] = value
+            truth = numerics(twin, widened)
+        # The float32 run after its truth, as each trains its own model in place; the answer's arrays in that
+        # order, the truth's first.
+        answer = paired(numerics(model, encoded), truth)
+        ordered = sorted(answer, key=lambda key: key.startswith("reference."))
+        out.update({f"{name}.{key}": answer[key] for key in ordered})
     return out
 
 

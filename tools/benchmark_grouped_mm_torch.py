@@ -14,6 +14,7 @@ import time
 
 import numpy as np
 import torch
+from benchmark_cases import grouped_operands
 
 
 def timed(fn, repeats):
@@ -41,13 +42,8 @@ def main():
     args = parser.parse_args()
     rows, experts = args.rows, args.experts
     width, features = (args.width, args.features) if args.shape == "up" else (args.features, args.width)
-    rng = np.random.default_rng(0)
-    sizes = np.floor(rng.dirichlet(np.ones(experts)) * rows).astype(np.int32)
-    sizes[-1] += rows - sizes.sum()
-    x = torch.tensor(rng.normal(size=(rows, width)), dtype=torch.bfloat16, device="cuda")
-    kernel = torch.tensor(rng.normal(size=(experts, width, features)) / np.sqrt(width), dtype=torch.bfloat16,
-                          device="cuda")
-    cotangent = torch.tensor(rng.normal(size=(rows, features)), dtype=torch.bfloat16, device="cuda")
+    sizes, *drawn = grouped_operands(rows, experts, width, features)
+    x, kernel, cotangent = (torch.tensor(value, dtype=torch.bfloat16, device="cuda") for value in drawn)
     offsets = torch.tensor(np.cumsum(sizes), dtype=torch.int32, device="cuda")
 
     def forward():

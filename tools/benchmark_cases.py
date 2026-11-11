@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+import numpy as np
+
 if TYPE_CHECKING:
     from flax import linen as nn
 
@@ -19,6 +21,33 @@ if TYPE_CHECKING:
 # the step cost depends only on the context's shape.
 TEXT_TOKENS = 77
 TEXT_FEATURES = 768
+
+
+def routed(rng: np.random.Generator, rows: int, experts: int) -> np.ndarray:
+    """A Dirichlet routing of `rows` rows over `experts` experts, its group sizes summing to `rows`."""
+    sizes = np.floor(rng.dirichlet(np.ones(experts)) * rows).astype(np.int32)
+    sizes[-1] += rows - sizes.sum()
+    return sizes
+
+
+def token_rows(rng: np.random.Generator, vocab: object, batch: int, width: int,
+               lowest: int = 0) -> np.ndarray:
+    """A language model benchmark's token rows `[batch, width]` int32 drawn uniformly from `lowest` to the
+    vocabulary's size from `rng`, the same bytes in every framework's run of the case."""
+    if not isinstance(vocab, int):
+        raise ValueError("the decoder preset needs an integer vocabulary size")
+    return rng.integers(lowest, vocab, size=(batch, width)).astype(np.int32)
+
+
+def grouped_operands(rows: int, experts: int, width: int, features: int):
+    """A grouped projection's operands in float64, one draw every framework's benchmark casts from:
+    seed 0's routing (`routed`), then the input `[rows, width]`, the experts' fan-in-scaled weights
+    `[experts, width, features]` and the cotangent `[rows, features]`, in that order."""
+    rng = np.random.default_rng(0)
+    sizes = routed(rng, rows, experts)
+    x = rng.normal(size=(rows, width))
+    kernel = rng.normal(size=(experts, width, features)) / np.sqrt(width)
+    return sizes, x, kernel, rng.normal(size=(rows, features))
 
 # The two decoders the performance gate and the kernel benchmarks step: a
 # dense one 24 layers deep and 1024 wide, and a 12-layer, 768-wide one whose

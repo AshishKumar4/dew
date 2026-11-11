@@ -480,7 +480,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
     from arm_arithmetic import unrewritten
     from reference_error import _drawn
 
-    from dew.parity import NO_ZERO_ROWS, _Draws, _staged
+    from dew.parity import NO_ZERO_ROWS, _Draws, _staged, _verdict
     from dew.parity_stages import staged_units
 
     # The same draws under either procedure, so their verdicts compare run by run.
@@ -508,7 +508,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
                           [[NO_ZERO_ROWS] * leaves] * count, np.ones((count, leaves), bool), (0,) * leaves)
 
         over, unresolved, stage = _staged(drawn, seeds, law, two_stage=two_stage)
-        verdicts.append(("over" if over else "inconclusive" if unresolved else "pass", stage))
+        verdicts.append((_verdict(over, unresolved), stage))
     return verdicts
 
 

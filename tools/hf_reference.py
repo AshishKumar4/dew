@@ -1256,25 +1256,23 @@ def write_diffusion_sc_tiny() -> None:
     from transformers.models.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaTextConfig
     from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaSelfConditioning
 
-    config = DiffusionGemmaTextConfig(
-        hidden_size=32, intermediate_size=64, hidden_activation="gelu_pytorch_tanh",
-        rms_norm_eps=1e-6)
+    # The narrow config the fixture records and the module is built from, one declaration.
+    fields = {"hidden_size": 32, "intermediate_size": 64, "hidden_activation": "gelu_pytorch_tanh",
+              "rms_norm_eps": 1e-6}
+    config = DiffusionGemmaTextConfig(**fields)
     module = DiffusionGemmaSelfConditioning(config)
     scatter_weights(module, seed=4321)
     module = module.float().eval()
     rng = np.random.RandomState(11)
-    embeds = rng.rand(BATCH, 4, 32).astype(np.float32)
-    signal = rng.rand(BATCH, 4, 32).astype(np.float32)
+    embeds = rng.rand(BATCH, 4, config.hidden_size).astype(np.float32)
+    signal = rng.rand(BATCH, 4, config.hidden_size).astype(np.float32)
     with torch.no_grad():
         ref = module(torch.from_numpy(embeds),
                      torch.from_numpy(signal)).to(torch.float32).numpy()
     directory = FIXTURES / "diffusion-gemma-sc-tiny"
     directory.mkdir(parents=True, exist_ok=True)
     save_file(module.state_dict(), directory / "model.safetensors")
-    (directory / "config.json").write_text(json.dumps(
-        {"hidden_size": 32, "intermediate_size": 64,
-         "hidden_activation": "gelu_pytorch_tanh", "rms_norm_eps": 1e-6},
-        indent=1) + "\n")
+    (directory / "config.json").write_text(json.dumps(fields, indent=1) + "\n")
     np.save(directory / "inputs.npy", embeds)
     np.save(directory / "signal.npy", signal)
     np.save(directory / "ref.npy", ref)
@@ -1479,9 +1477,10 @@ def write_released_config(name: str, repo: str, revision: str | None = None,
     """The real config.json of a released checkpoint, and the repo it came
     from in source.json. Only the config is downloaded, never the weights.
 
-    Google's Gemma repos answer 401 without an accepted licence, so those
-    come from unsloth's mirrors, which carry the identical config plus
-    marker keys of their own (unsloth_fixed, unsloth_version); the markers
+    Gated releases (Google's Gemma repos answer 401 without an accepted
+    licence, Meta's Llama 4) come from unsloth's mirrors, which carry the
+    identical config plus marker keys of their own (unsloth_fixed,
+    unsloth_version, and the text config's for_llm_compressor); the markers
     are dropped so the fixture is the released config alone.
     """
     directory = FIXTURES / name
@@ -1489,6 +1488,7 @@ def write_released_config(name: str, repo: str, revision: str | None = None,
     config = json.loads(Path(hf_hub_download(repo, filename, revision=revision)).read_text())
     for key in [key for key in config if key.startswith("unsloth")]:
         del config[key]
+    config.get("text_config", config).pop("for_llm_compressor", None)
     (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
     source = {"repo": repo, **({"revision": revision} if revision is not None else {}),
               **({"filename": filename} if filename != "config.json" else {})}

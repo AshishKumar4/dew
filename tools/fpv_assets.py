@@ -274,12 +274,10 @@ def glb(path: Path, parts: list[Part]) -> None:
 
 def gate(opening: float, frame: float, depth: float, image: Image.Image) -> list[Part]:
     """A square gate facing along x about its centre: four bars `frame` wide and `depth` deep about an opening
-    `opening` wide (the race's `bars`, ungrown)."""
-    half, edge, deep = opening / 2, opening / 2 + frame, depth / 2
-    return [box((-deep, -edge, half), (deep, edge, edge), image),
-            box((-deep, -edge, -edge), (deep, edge, -half), image),
-            box((-deep, half, -half), (deep, edge, half), image),
-            box((-deep, -edge, -half), (deep, -half, half), image)]
+    `opening` wide (the race's own, `dew.rl.flight.gate_boxes`)."""
+    from dew.rl.flight import gate_boxes
+
+    return [box(extent[:, 0], extent[:, 1], image) for extent in gate_boxes(opening, frame, depth)]
 
 
 def turned(part: Part, angle: float, offset=(0.0, 0.0, 0.0)) -> Part:

@@ -42,20 +42,7 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import numpy as np
 import torch
-from diffusers.schedulers import (
-    scheduling_deis_multistep,
-    scheduling_dpmsolver_multistep,
-    scheduling_dpmsolver_singlestep,
-    scheduling_edm_dpmsolver_multistep,
-    scheduling_k_dpm_2_ancestral_discrete,
-    scheduling_k_dpm_2_discrete,
-    scheduling_lcm,
-    scheduling_lms_discrete,
-    scheduling_pndm,
-    scheduling_tcd,
-    scheduling_unipc_multistep,
-)
-from diffusers_reference_helpers import fed_noise as fed_noise, step_noise as step_noise
+from diffusers_reference_helpers import fed_noise as fed_noise, scheduler_module, step_noise as step_noise
 
 from dew.diffusion import EpsilonPredictionTransform, LinearNoiseScheduler, Process
 
@@ -81,11 +68,12 @@ def dew_grid(steps: int) -> np.ndarray:
     return np.clip(times.astype(np.int32), 0, TRAIN_STEPS - 1)
 
 
-def trailing_grid(steps: int) -> np.ndarray:
-    """Diffusers' `timestep_spacing="trailing"` for `steps - 1` scheduler
-    steps, then the table's index 0 where its sigma_min terminal lands."""
-    timesteps = np.arange(TRAIN_STEPS, 0, -TRAIN_STEPS / (steps - 1)).round().astype(np.int64) - 1
-    return np.concatenate([timesteps, [0]])
+def published_grid(scheduler: str, config: dict, steps: int) -> np.ndarray:
+    """The timesteps `scheduler` under `config` sets for `steps - 1` steps (its own `set_timesteps`, a
+    `timestep_spacing` its config names), then the table's index 0 where its sigma_min terminal lands."""
+    published = getattr(scheduler_module(scheduler), scheduler)(trained_betas=BETAS, **config)
+    published.set_timesteps(steps - 1)
+    return np.concatenate([published.timesteps.numpy(), [0]])
 
 
 def vp_epsilon(x: torch.Tensor, index: int) -> torch.Tensor:
@@ -135,8 +123,8 @@ def lambda_walk(module: ModuleType, case: Case, x: torch.Tensor,
     scheduler = getattr(module, case.scheduler)(trained_betas=BETAS, **case.config)
     timesteps = case.grid[:-1].tolist()
     if "timestep_spacing" in case.config:
+        # The grid is the scheduler's own (`published_grid`).
         scheduler.set_timesteps(len(timesteps))
-        assert scheduler.timesteps.tolist() == timesteps, (scheduler.timesteps, timesteps)
     else:
         scheduler.set_timesteps(timesteps=timesteps)
     latents = []
@@ -240,36 +228,43 @@ def edm_walk(module: ModuleType, case: Case, x: torch.Tensor,
     return latents
 
 
-WALKS: dict[str, tuple[ModuleType, Callable[..., list[torch.Tensor]]]] = {
-    "DPMSolverMultistepScheduler": (scheduling_dpmsolver_multistep, lambda_walk),
-    "DPMSolverSinglestepScheduler": (scheduling_dpmsolver_singlestep, lambda_walk),
-    "DEISMultistepScheduler": (scheduling_deis_multistep, lambda_walk),
-    "UniPCMultistepScheduler": (scheduling_unipc_multistep, lambda_walk),
-    "LCMScheduler": (scheduling_lcm, lambda_walk),
-    "TCDScheduler": (scheduling_tcd, lambda_walk),
-    "PNDMScheduler": (scheduling_pndm, pndm_walk),
-    "KDPM2DiscreteScheduler": (scheduling_k_dpm_2_discrete, kdpm2_walk),
-    "KDPM2AncestralDiscreteScheduler": (scheduling_k_dpm_2_ancestral_discrete, kdpm2_walk),
-    "LMSDiscreteScheduler": (scheduling_lms_discrete, lms_walk),
-    "EDMDPMSolverMultistepScheduler": (scheduling_edm_dpmsolver_multistep, edm_walk),
+WALKS: dict[str, Callable[..., list[torch.Tensor]]] = {
+    "DPMSolverMultistepScheduler": lambda_walk,
+    "DPMSolverSinglestepScheduler": lambda_walk,
+    "DEISMultistepScheduler": lambda_walk,
+    "UniPCMultistepScheduler": lambda_walk,
+    "LCMScheduler": lambda_walk,
+    "TCDScheduler": lambda_walk,
+    "PNDMScheduler": pndm_walk,
+    "KDPM2DiscreteScheduler": kdpm2_walk,
+    "KDPM2AncestralDiscreteScheduler": kdpm2_walk,
+    "LMSDiscreteScheduler": lms_walk,
+    "EDMDPMSolverMultistepScheduler": edm_walk,
 }
+"""Each scheduler's walk, the tool's own; its module is the one that defines it (`scheduler_module`)."""
 
 
 def solver(scheduler: str, grid, **defaults):
     """A factory of `scheduler`'s cases, each an epsilon prediction with `defaults` beside the
-    case's own config, on `grid` of its `steps` (STEPS unless it names them)."""
+    case's own config, on `grid(scheduler, config, steps)` of its `steps` (STEPS unless it names them)."""
     def case(**config) -> Case:
         steps = config.pop("steps", STEPS)
-        return Case(scheduler, dict(prediction_type="epsilon", **defaults, **config), grid(steps))
+        config = dict(prediction_type="epsilon", **defaults, **config)
+        return Case(scheduler, config, grid(scheduler, config, steps))
 
     return case
 
 
-multistep = solver("DPMSolverMultistepScheduler", dew_grid, final_sigmas_type="sigma_min",
+def dew_steps(scheduler: str, config: dict, steps: int) -> np.ndarray:
+    """Dew's own grid of `steps` (`dew_grid`), whatever the scheduler."""
+    return dew_grid(steps)
+
+
+multistep = solver("DPMSolverMultistepScheduler", dew_steps, final_sigmas_type="sigma_min",
                    thresholding=False)
-singlestep = solver("DPMSolverSinglestepScheduler", dew_grid, final_sigmas_type="sigma_min")
-deis = solver("DEISMultistepScheduler", trailing_grid, timestep_spacing="trailing")
-unipc = solver("UniPCMultistepScheduler", trailing_grid, timestep_spacing="trailing",
+singlestep = solver("DPMSolverSinglestepScheduler", dew_steps, final_sigmas_type="sigma_min")
+deis = solver("DEISMultistepScheduler", published_grid, timestep_spacing="trailing")
+unipc = solver("UniPCMultistepScheduler", published_grid, timestep_spacing="trailing",
                final_sigmas_type="sigma_min")
 
 
@@ -278,7 +273,7 @@ def distilled(scheduler: str, **step_kwargs) -> Case:
     distillation grid, then the table's index 0 where the last step lands
     when the scheduler runs out of timesteps."""
     config = dict(prediction_type="epsilon", original_inference_steps=50, timestep_spacing="leading")
-    probe = getattr(scheduling_lcm if scheduler == "LCMScheduler" else scheduling_tcd, scheduler)(
+    probe = getattr(scheduler_module(scheduler), scheduler)(
         trained_betas=BETAS, **config)
     probe.set_timesteps(4)
     grid = np.concatenate([probe.timesteps.numpy(), [0]])
@@ -378,7 +373,7 @@ def run(name: str, case: Case) -> dict[str, np.ndarray]:
     x_T = torch.randn(SHAPE, generator=generator, dtype=torch.float64) * initial_scale(case)
     cotangent = torch.randn(SHAPE, generator=generator, dtype=torch.float64)
     x_T.requires_grad_(True)
-    module, walk = WALKS[case.scheduler]
+    module, walk = scheduler_module(case.scheduler), WALKS[case.scheduler]
     latents = walk(module, case, x_T, step_noise(SHAPE, len(case.grid) - 1, np.float32))
     assert len(latents) == len(case.grid) - 1, (name, len(latents), len(case.grid))
     (grad,) = torch.autograd.grad((latents[-1] * cotangent).sum(), x_T)

@@ -76,7 +76,7 @@ from dew.optim import (
     with_rates,
 )
 from dew.training import MeshSpec
-from tools.muonclip_reference import clip_mla_reference, clip_qk_kernel, clip_scale
+from tools.muonclip_reference import clip_qk_kernel, clip_scale
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -1029,10 +1029,10 @@ def test_the_latent_branches_match_maxtext():
     """The MLA branches against MaxText 0.2.4's own outputs, committed as
     tests/fixtures/muonclip/maxtext_mla.json: `q_proj` stands in for `wq_b`
     and `kv_b_proj` for `wkv_b`, the same per-head tensors under Dew's
-    names. Each case's clip is MaxText's: run in float64, its kernel is the
-    fixture's transcription of MaxText (`clip_mla_reference`, recorded bit
-    for bit equal to it) in float64 within the float64 rounding of Dew's own
-    chain of operations (the oracle rule)."""
+    names. Each case's clip is MaxText's: run in float64, its kernel is
+    MaxText's own kernel rule run in float64 (the fixture's `truth`) within
+    the float64 rounding of Dew's own chain of operations (the oracle
+    rule)."""
     fixture = json.loads(QK_FIXTURE.read_text())
     assert fixture['maxtext'] == '0.2.4'
     tx = scale_by_qk_clip(100.0)
@@ -1052,8 +1052,7 @@ def test_the_latent_branches_match_maxtext():
             wide = jnp.asarray(max_logits, jnp.float64)
             applied = np.asarray(clipped(flat, wide)).reshape(param.shape)
             roundings = chain_roundings(jax.make_jaxpr(clipped)(flat, wide))
-            scale = np.asarray(clip_scale(np.max(max_logits.astype(np.float64), axis=0), case['tau']))
-        truth = clip_mla_reference(param.astype(np.float64), scale, case['qk_nope'], case['layer'])
+        truth = np.asarray(case['truth'], np.float64)
         assert_computes_the_oracle(applied, truth, f"MaxText's {case['layer']}, case {index}",
                                    roundings=roundings)
 

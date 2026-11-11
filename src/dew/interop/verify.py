@@ -63,6 +63,7 @@ from dew.interop import (
 )
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.isolated import Isolated
+from dew.interop.probe import BATCH, LENGTH, probe_ids
 from dew.nn.blocks import padded_row
 from dew.nn.kernels.options import owned_program
 from dew.nn.sharding import abstract
@@ -95,8 +96,6 @@ PARTS = 'parts'
 """The candidate assembled from the registered families' parts (`dew.interop.parts`), tried first: each of
 its parts is read from the source's own modeling code."""
 
-BATCH, LENGTH = 2, 12
-"""The probe's token grid, which the committed fixtures share."""
 _DRAWN = (8, 16)
 """Each draw's token grid of tier 2's verdict (`_mapped`), its logits' and its gradients': past LENGTH, so a
 window, a chunk and a ramp's context the probe shrinks below it (`shrink`) act on every draw, forward and
@@ -244,11 +243,6 @@ def scatter_weights(model: torch.nn.Module, seed: int = 1234) -> None:
             if name.endswith(("e_score_correction_bias", "expert_bias")):
                 tensor.copy_(torch.linspace(-0.4, 0.4, tensor.shape[0]))
 
-
-def probe_ids(vocab_size: int, seed: int = 0, shape: tuple[int, int] = (BATCH, LENGTH)) -> np.ndarray:
-    """Return the probe's token ids of draw `seed`, `shape` (BATCH x LENGTH, the fixed ones a reference
-    is run on, at seed 0)."""
-    return np.random.RandomState(7 + seed).randint(0, vocab_size, shape).astype(np.int32)
 
 
 def twin_logits(twin: PreTrainedModel, ids: np.ndarray) -> np.ndarray:

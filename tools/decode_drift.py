@@ -109,17 +109,15 @@ def prefilled(model, variables, prompt: np.ndarray, forced: np.ndarray) -> np.nd
 
 def truth(model_dir: str):
     """A function scoring a prompt's `forced` tokens by the model in float64: its float32 load, every
-    module and weight widened (as tests/reference_error.py's float64_forward widens one), and the log
-    partition in float64."""
+    module widened (`model_support.float64_twin`) and every weight on the host (`arm_arithmetic.widened`),
+    and the log partition in float64."""
+    from arm_arithmetic import widened
+    from model_support import float64_twin
+
     loaded = Pretrained.load(model_dir, dtype=jnp.float32, param_dtype=jnp.float32,
                              attention_impl="reference")
-    model = loaded.model
-    with jax.enable_x64(new_val=True):
-        inner = {"language_model": model.language_model.clone(dtype=jnp.float64)} \
-            if hasattr(model, "language_model") else {}
-        wide = model.clone(dtype=jnp.float64, **inner)
-        variables = jax.tree.map(lambda leaf: np.asarray(
-            leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), loaded.variables)
+    wide = float64_twin(loaded.model)
+    variables = widened(jax.device_get(loaded.variables))
 
     def scored(prompt: np.ndarray, forced: np.ndarray) -> np.ndarray:
         with jax.enable_x64(new_val=True):

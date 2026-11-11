@@ -181,10 +181,18 @@ def numerics(model, encoded: dict) -> dict[str, np.ndarray]:
     return found
 
 
+NUMERICS = ("logits", "pixel_gradient", "updated_logits")
+"""The leaves of `numerics` a source draw's files hold beside its encoding (`_write_numerics`)."""
+BESIDE_ENCODING = ("raw_images", "continuation")
+"""The arrays `_write_encoding` writes beside the encoding's: the raw images and the reference's
+continuation. Every other array the draw's files hold is an encoding key, as `write_float64_truths`
+reads them."""
+
+
 def _write_numerics(found: dict[str, np.ndarray], destination: Path, suffix: str = "") -> None:
-    """`numerics` in the source draw's files: each leaf's `<leaf><suffix>.npy` and the loss in
+    """`numerics` in the source draw's files: each leaf's `<leaf><suffix>.npy` (`NUMERICS`) and the loss in
     training<suffix>.json."""
-    for leaf in ("logits", "pixel_gradient", "updated_logits"):
+    for leaf in NUMERICS:
         np.save(destination / f"{leaf}{suffix}.npy", found[leaf])
     (destination / f"training{suffix}.json").write_text(json.dumps({"loss": float(found["loss"])}) + "\n")
 
@@ -200,8 +208,8 @@ def _write_encoding(model, processor, destination: Path, images: np.ndarray, pro
             generated = model.generate(**single, max_new_tokens=3, do_sample=False,
                                        eos_token_id=None, use_cache=True, return_dict_in_generate=False)
             continuation.append(generated[0, single["input_ids"].shape[1]:])
-    np.save(destination / "raw_images.npy", images)
-    np.save(destination / "continuation.npy", torch.stack(continuation).numpy())
+    for name, value in zip(BESIDE_ENCODING, (images, torch.stack(continuation).numpy()), strict=True):
+        np.save(destination / f"{name}.npy", value)
     (destination / "prompts.json").write_text(json.dumps(prompts) + "\n")
     for key, value in encoded.items():
         np.save(destination / f"{key}.npy", value.numpy())
@@ -447,9 +455,8 @@ def write_float64_truths(references: str, checkpoint: str) -> None:
     destination, source = ROOT / references, ROOT / checkpoint
     model = AutoModelForImageTextToText.from_pretrained(source, dtype=torch.float32,
                                                         attn_implementation="eager").eval()
-    recorded = ("logits", "updated_logits", "pixel_gradient", "continuation", "raw_images")
     encoded = {path.stem: torch.from_numpy(np.load(path)) for path in destination.glob("*.npy")
-               if path.stem not in recorded and not path.stem.endswith("_f64")}
+               if path.stem not in (*NUMERICS, *BESIDE_ENCODING) and not path.stem.endswith("_f64")}
     twin = float64_twin(model)
     with float64():
         found = numerics(twin, {name: value.double() if value.is_floating_point() else value

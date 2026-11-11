@@ -41,15 +41,16 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from arm_arithmetic import float64_held
 from flax import linen as nn
 from flax.core import freeze
 from jax.experimental import io_callback
+from model_support import float64_twin
 from reference_error import distance
 
 from dew.interop import Pretrained
 from dew.nn.fake_quant import FakeQuantizing, fake_quant_fp4, fake_quant_fp8, straight_through
 from dew.nn.inputs import ModelInputs
-from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 
@@ -147,23 +148,11 @@ class Captured:
     picks: list[np.ndarray] = dataclasses.field(default_factory=list)
 
 
-def widened(model, variables):
-    """The model and its variables in float64, including a media model's
-    language model. Dew's precision policy preserves that dtype throughout;
-    its attention dispatch chooses a float64 implementation. x64 must be on.
-    """
-    wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
-                        if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, variables)
-    if isinstance(model, MultimodalTransformer):
-        return model.clone(dtype=jnp.float64,
-                           language_model=model.language_model.clone(dtype=jnp.float64)), wide
-    return model.clone(dtype=jnp.float64), wide
-
-
 def decided(run, model, variables):
     """`run(model, variables)` with every rounding and top-k pick taken from
-    its float64 twin: the same run with x64 on, the model and its variables
-    widened (`widened`). Each quantizer rounds its input's float32, which
+    its float64 twin: the same run with x64 on, the model and every module it
+    holds widened (`model_support.float64_twin`) and its variables float64
+    arrays on the host (`arm_arithmetic.float64_held`). Each quantizer rounds its input's float32, which
     rounds as the float64 value does except at a tie.
 
     A value within fp32 noise of where its rounding or pick changes then goes
@@ -245,7 +234,7 @@ def decided(run, model, variables):
     try:
         jax.lax.top_k = picked
         with nn.intercept_methods(exact), jax.enable_x64(new_val=True), jax.default_device(host):
-            wide = run(*widened(model, jax.device_put(variables, host)))
+            wide = run(float64_twin(model), float64_held(jax.device_put(variables, host)))
             jax.effects_barrier()
         pending = iter(made)
         jax.lax.top_k = ranked

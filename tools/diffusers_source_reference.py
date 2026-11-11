@@ -55,28 +55,10 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import numpy as np
 import torch
-from diffusers.schedulers import (
-    scheduling_ddim,
-    scheduling_ddpm,
-    scheduling_deis_multistep,
-    scheduling_dpmsolver_multistep,
-    scheduling_dpmsolver_sde,
-    scheduling_dpmsolver_singlestep,
-    scheduling_edm_dpmsolver_multistep,
-    scheduling_euler_ancestral_discrete,
-    scheduling_euler_discrete,
-    scheduling_heun_discrete,
-    scheduling_k_dpm_2_ancestral_discrete,
-    scheduling_k_dpm_2_discrete,
-    scheduling_lcm,
-    scheduling_lms_discrete,
-    scheduling_pndm,
-    scheduling_tcd,
-    scheduling_unipc_multistep,
-)
 from diffusers_reference_helpers import (
     fed_noise as fed_noise,
     restore_transformers_names,
+    scheduler_module,
     step_noise as step_noise,
 )
 from diffusers_wan_reference import float64_scheduler
@@ -93,25 +75,6 @@ SEED = 11
 GUIDANCE_SCALE = 3.0
 LABEL = 0.7
 
-MODULES: Mapping[str, ModuleType] = {
-    "DDIMScheduler": scheduling_ddim,
-    "PNDMScheduler": scheduling_pndm,
-    "DDPMScheduler": scheduling_ddpm,
-    "LMSDiscreteScheduler": scheduling_lms_discrete,
-    "EulerDiscreteScheduler": scheduling_euler_discrete,
-    "EulerAncestralDiscreteScheduler": scheduling_euler_ancestral_discrete,
-    "HeunDiscreteScheduler": scheduling_heun_discrete,
-    "KDPM2DiscreteScheduler": scheduling_k_dpm_2_discrete,
-    "KDPM2AncestralDiscreteScheduler": scheduling_k_dpm_2_ancestral_discrete,
-    "DPMSolverSDEScheduler": scheduling_dpmsolver_sde,
-    "DPMSolverMultistepScheduler": scheduling_dpmsolver_multistep,
-    "DPMSolverSinglestepScheduler": scheduling_dpmsolver_singlestep,
-    "DEISMultistepScheduler": scheduling_deis_multistep,
-    "UniPCMultistepScheduler": scheduling_unipc_multistep,
-    "EDMDPMSolverMultistepScheduler": scheduling_edm_dpmsolver_multistep,
-    "LCMScheduler": scheduling_lcm,
-    "TCDScheduler": scheduling_tcd,
-}
 TWO_STAGE = ("HeunDiscreteScheduler", "KDPM2DiscreteScheduler",
              "KDPM2AncestralDiscreteScheduler", "DPMSolverSDEScheduler")
 
@@ -485,7 +448,7 @@ def seeds(destination: Path) -> None:
     noises = step_noise(SEEDED_SHAPE, STEPS, np.float64)
     arrays: dict[str, np.ndarray] = {}
     for name in SEEDED_CASES:
-        case, module = CASES[name], MODULES[CASES[name].scheduler]
+        case, module = CASES[name], scheduler_module(CASES[name].scheduler)
         case = replace(case, steps=SEEDED_STEPS.get(name, case.steps))
         scheduler = getattr(module, case.scheduler)(**case.config)
         with tempfile.TemporaryDirectory(prefix="dew-source-scheduler-") as saved:
@@ -545,7 +508,7 @@ def rounding(destination: Path) -> None:
     torch.set_num_threads(2)
     arrays: dict[str, np.ndarray] = {}
     name = "cfg.epsilon"
-    case, module = CASES[name], MODULES[CASES[name].scheduler]
+    case, module = CASES[name], scheduler_module(CASES[name].scheduler)
     drawn = orders(int(np.prod(SHAPE[1:])), ORDERS, SEED)
     distances = []
     with np.load(FIXTURES / "source_schedulers.npz") as stored:
@@ -571,7 +534,7 @@ def rounding(destination: Path) -> None:
 
 
 def run(name: str, case: Case) -> dict[str, np.ndarray]:
-    module = MODULES[case.scheduler]
+    module = scheduler_module(case.scheduler)
     scheduler = getattr(module, case.scheduler)(**case.config)
     with tempfile.TemporaryDirectory(prefix="dew-source-scheduler-") as saved:
         scheduler.save_pretrained(saved)
@@ -639,14 +602,15 @@ def brownian_record() -> dict[str, np.ndarray]:
     built on are checked against a real one rather than assumed.
     """
     case = CASES["dpm_sde.default"]
-    scheduler = scheduling_dpmsolver_sde.DPMSolverSDEScheduler(**case.config)
+    module = scheduler_module(case.scheduler)
+    scheduler = module.DPMSolverSDEScheduler(**case.config)
     with tempfile.TemporaryDirectory(prefix="dew-source-brownian-") as saved:
         scheduler.save_pretrained(saved)
         config = json.loads((Path(saved) / "scheduler_config.json").read_text())
     scheduler.set_timesteps(case.steps)
     levels = np.asarray(scheduler.sigmas, np.float64)
     low, high = float(levels[levels > 0].min()), float(levels.max())
-    sampler = scheduling_dpmsolver_sde.BrownianTreeNoiseSampler
+    sampler = module.BrownianTreeNoiseSampler
     # Interior points: a query that starts exactly on the tree's own end warns
     # about its float boundary and says nothing extra about the identities.
     points = np.linspace(low, high, 7)[1:-1]
@@ -694,7 +658,7 @@ def refused_record() -> dict[str, np.ndarray]:
     """
     arrays: dict[str, np.ndarray] = {}
     for name, case in REFUSED.items():
-        module = MODULES[case.scheduler]
+        module = scheduler_module(case.scheduler)
         scheduler = getattr(module, case.scheduler)(**case.config)
         with tempfile.TemporaryDirectory(prefix="dew-source-refused-") as saved:
             scheduler.save_pretrained(saved)

@@ -12,15 +12,14 @@ per-head parameters.
 MaxText implements exactly this for MLA in `maxtext/utils/qk_clip_utils.py`
 (`_scale_from_max_logits`, `_clip_mla_weight`), refused for any other
 attention type, and applies it post-step in the training loop
-(`trainers/pre_train/train.py:704`). `clip_mla_reference` below transcribes
-that file's two functions; `write_maxtext_fixture` runs the real ones from
-a pip-installable maxtext checkout against fixed-seed inputs and stores the
-outputs under `tests/fixtures/muonclip/`. Dew's port is tested against that
-fixture, not against a live maxtext install.
-Regenerate with a maxtext checkout on the path:
+(`trainers/pre_train/train.py:704`). `write_maxtext_fixture` runs its
+kernel rule as published at the 0.2.4 release (`QK_CLIP`) in float64 on
+fixed-seed inputs and Dew's float64 per-head scale, and stores that truth
+under `tests/fixtures/muonclip/`. Dew's port is tested against that
+fixture, not against a live maxtext install. Regenerate with:
 
 ```
-PYTHONPATH=/path/to/maxtext-parent python tools/muonclip_reference.py
+python tools/muonclip_reference.py
 ```
 
 For grouped-query and multi-head attention, which MaxText refuses, the
@@ -40,7 +39,6 @@ python tools/muonclip_reference.py megatron
 
 from __future__ import annotations
 
-import importlib
 import json
 import sys
 import types
@@ -52,6 +50,9 @@ import numpy as np
 
 FIXTURE = (Path(__file__).resolve().parent.parent / "tests" / "fixtures"
            / "muonclip" / "maxtext_mla.json")
+QK_CLIP = ("https://raw.githubusercontent.com/AI-Hypercomputer/maxtext/"
+           "538fe7a3f3376d94cf3f04e77741aa6d7e8efa45/src/maxtext/utils/qk_clip_utils.py")
+"""MaxText's QK-Clip at its 0.2.4 release (tag maxtext-v0.2.4)."""
 MEGATRON = ("https://raw.githubusercontent.com/NVIDIA/Megatron-LM/"
             "4b4acac9a1d28ea6829c8d4f566d75698a21249d/megatron/core/transformer/attention.py")
 MEGATRON_CASES = {"gqa": (8, 2, [250.0, 10.0, 40.0, 120.0, 10.0, -5.0, 30.0, 99.0]),
@@ -87,27 +88,14 @@ def clip_qk_kernel(kernel: jax.Array, scale: jax.Array, heads: int) -> jax.Array
     return scaled.reshape(kernel.shape)
 
 
-def clip_mla_reference(param: np.ndarray, scale: np.ndarray, qk_nope: int,
-                       layer: str) -> np.ndarray:
-    """MaxText's `_clip_mla_weight` (`maxtext/utils/qk_clip_utils.py:91`),
-    transcribed: the head slice of a `wq_b`/`wkv_b` kernel by `sqrt(scale)`,
-    the tail of `wq_b` (rotary queries) by `scale`, the tail of `wkv_b`
-    (values) left alone."""
-    scale = np.asarray(scale)
-    # At least float32, as MaxText computes it; a float64 truth's scale stays float64.
-    scale_b = np.expand_dims(scale.astype(np.result_type(scale.dtype, np.float32)), -1)
-    head, tail = param[..., :qk_nope], param[..., qk_nope:]
-    head_new = head * np.sqrt(scale_b).astype(param.dtype)
-    if layer == "wq_b":
-        tail_new = tail * scale_b.astype(param.dtype)
-    else:
-        tail_new = tail
-    return np.concatenate([head_new, tail_new], axis=-1)
+def maxtext_clip_mla_weight():
+    """MaxText 0.2.4's `_clip_mla_weight`, as published (`QK_CLIP`)."""
+    from reference_source import definitions
+
+    return definitions(QK_CLIP, ("_clip_mla_weight",), {"jax": jax, "jnp": jnp})["_clip_mla_weight"]
 
 
 def write_maxtext_fixture() -> None:
-    sys.path.insert(0, "/tmp/mt")
-    qk_clip_utils = importlib.import_module("maxtext.utils.qk_clip_utils")
     cases = []
     for seed_case, (batches, heads, nope) in enumerate([(4, 3, 16), (2, 8, 32)]):
         case_rng = np.random.default_rng(100 + seed_case)
@@ -116,24 +104,25 @@ def write_maxtext_fixture() -> None:
         for layer, width in (("wq_b", nope + 8), ("wkv_b", nope + 16)):
             param = (case_rng.normal(0, 0.02, (5, heads, width))
                      .astype(np.float32))
-            scale = np.asarray(qk_clip_utils._scale_from_max_logits(
-                jnp.asarray(max_logits), 100.0))
-            expected = np.asarray(qk_clip_utils._clip_mla_weight(
-                layer, jnp.asarray(param), jnp.asarray(scale), nope))
-            check = clip_mla_reference(param, scale, nope, layer)
-            assert np.max(np.abs(check - expected)) == 0.0
+            # The float64 truth: MaxText's kernel rule run in float64 on the float64 per-head scale Dew's clip
+            # takes (`clip_scale`, which clips nothing for a head whose logits are all non-positive, where
+            # MaxText's scale goes negative).
+            clip = maxtext_clip_mla_weight()
+            with jax.enable_x64(new_val=True):
+                wide = clip_scale(np.max(max_logits.astype(np.float64), axis=0), 100.0)
+                truth = np.asarray(clip(
+                    layer, jnp.asarray(param, jnp.float64), jnp.asarray(wide, jnp.float64), nope))
             cases.append({
                 "layer": layer, "tau": 100.0, "qk_nope": nope,
                 "max_logits": max_logits.tolist(),
                 "param": param.tolist(),
-                "expected": np.asarray(expected).tolist(),
+                "truth": truth.tolist(),
             })
     FIXTURE.parent.mkdir(parents=True, exist_ok=True)
     FIXTURE.write_text(json.dumps(
         {"maxtext": "0.2.4", "source": "maxtext/utils/qk_clip_utils.py:85-101",
-         "note": "fixed-seed outputs of _scale_from_max_logits and "
-                 "_clip_mla_weight; the generator asserts the transcription "
-                 "in this file reproduces them bitwise",
+         "note": "fixed-seed inputs and _clip_mla_weight's output, as published "
+                 "at maxtext-v0.2.4, in float64 on Dew's float64 per-head scale",
          "cases": cases}, indent=2) + "\n")
     print(f"wrote {FIXTURE} with {len(cases)} cases")
 

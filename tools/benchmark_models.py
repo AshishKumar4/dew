@@ -19,6 +19,7 @@ from benchmark_cases import (
     canvas_split,
     images_per_row,
     media_pixels,
+    token_rows,
 )
 from jax.sharding import Mesh
 
@@ -382,7 +383,7 @@ def global_batch(case: Case, seed: int = 0) -> Batch:
         # would move the objective's own target support with the seed. Every
         # other row takes it as an ordinary token.
         lowest = 1 if case.canvas is not None else 0
-        tokens = rng.integers(lowest, vocab, size=(case.batch_size, width)).astype(np.int32)
+        tokens = token_rows(rng, vocab, case.batch_size, width, lowest)
         batch["text"] = tokens if case.media is None else media_row(case, tokens, rng)
         if case.decoder_objective == "sft":
             # A user's turn, then the assistant's, which alone the loss counts.

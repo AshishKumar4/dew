@@ -36,7 +36,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from benchmark_cases import LM_DENSE, LM_MOE, Case
+from benchmark_cases import LM_DENSE, LM_MOE, Case, grouped_operands, routed
 from benchmark_models import build_trainer, compiled_step, timed_steps
 
 from dew.nn.kernels import generation, grouped_matmul
@@ -62,13 +62,6 @@ def peak_bytes() -> int | None:
 ROUTINGS = 16
 """The routings a paired comparison's calls take in turn, one a call: a grouped product's time moved several
 percent from one routing seed to another (row 3616), so each arm meets the same ones in the same order."""
-
-
-def routed(rng: np.random.Generator, rows: int, experts: int) -> np.ndarray:
-    """A Dirichlet routing of `rows` rows over `experts` experts, its group sizes summing to `rows`."""
-    sizes = np.floor(rng.dirichlet(np.ones(experts)) * rows).astype(np.int32)
-    sizes[-1] += rows - sizes.sum()
-    return sizes
 
 
 KERNELS = tuple(kernel.name for kernel in grouped_matmul.GROUPED.kernels)
@@ -136,11 +129,10 @@ def paired(args: argparse.Namespace, x, kernel, cotangent) -> dict[str, object]:
 def projection(args: argparse.Namespace) -> dict[str, object]:
     rows, experts = args.rows, args.experts
     width, features = (args.width, args.features) if args.shape == "up" else (args.features, args.width)
-    rng = np.random.default_rng(0)
-    sizes = routed(rng, rows, experts)
-    x = jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16)
-    kernel = jnp.asarray(rng.normal(size=(experts, width, features)) / np.sqrt(width), jnp.float32)
-    cotangent = jnp.asarray(rng.normal(size=(rows, features)), jnp.bfloat16)
+    sizes, x, kernel, cotangent = grouped_operands(rows, experts, width, features)
+    # bf16 activations over float32 master weights, as a model's projection holds them.
+    x, kernel, cotangent = (jnp.asarray(x, jnp.bfloat16), jnp.asarray(kernel, jnp.float32),
+                            jnp.asarray(cotangent, jnp.bfloat16))
     group_sizes = jnp.asarray(sizes)
     forward, both = projections(args.kernel)
     output = np.asarray(forward(x, kernel, group_sizes), np.float64)

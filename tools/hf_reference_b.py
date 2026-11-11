@@ -186,7 +186,7 @@ from moe_reference import expert_tensors
 from qwen_mtp_reference import QwenMTP
 
 from dew.interop.safetensors_io import write_file
-from dew.interop.verify import BATCH, LENGTH, reference_logits, scatter_weights
+from dew.interop.verify import probe_ids, reference_logits, scatter_weights
 
 
 def tiny_deepseek_v2() -> DeepseekV2ForCausalLM:
@@ -438,7 +438,7 @@ def write_kimi_k25(name: str, repo: str, model: Kimi_K25ForConditionalGeneration
 
     saved = json.loads((directory / "config.json").read_text())
     vocab = int(saved["text_config"]["vocab_size"])
-    ids = np.random.RandomState(7).randint(0, vocab, (BATCH, LENGTH)).astype(np.int32)
+    ids = probe_ids(vocab)
     marks = {model.config.image_token_id, model.config.video_token_id}
     if marks & set(ids.reshape(-1).tolist()):
         raise SystemExit(f"{directory}: the ids carry a media mark of {sorted(marks)}, "
@@ -1145,23 +1145,6 @@ def add_layer_scalars(name: str) -> None:
     write_file(tensors, directory / "model.safetensors", {"format": "pt"})
 
 
-def write_mirrored_config(name: str, repo: str) -> None:
-    """A gated release's config from a mirror that carries it identically
-    plus its own marker keys, which are dropped: meta-llama/Llama-4-Scout,
-    google/gemma-4-26B-A4B and google/gemma-3n-E2B."""
-    import json
-
-    from huggingface_hub import hf_hub_download
-
-    directory = FIXTURES / name
-    directory.mkdir(parents=True, exist_ok=True)
-    config = json.loads(Path(hf_hub_download(repo, "config.json")).read_text())
-    config.pop("unsloth_fixed", None)
-    config.get("text_config", config).pop("for_llm_compressor", None)
-    (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
-    (directory / "source.json").write_text(json.dumps({"repo": repo}) + "\n")
-
-
 def write_glm4_moe() -> None:
     glm = tiny_glm4_moe()
     write_tiny("glm4-moe-tiny", glm)
@@ -1200,8 +1183,8 @@ def write_deepseek_v4() -> None:
 def write_llama4() -> None:
     write_tiny("llama4-tiny", tiny_llama4())
     write_llama4_blocks(FIXTURES.parent / "llama4")
-    write_mirrored_config("llama-4-scout", "unsloth/Llama-4-Scout-17B-16E")
-    write_mirrored_config("gemma4-26b-a4b", "unsloth/gemma-4-26B-A4B-it")
+    write_released_config("llama-4-scout", "unsloth/Llama-4-Scout-17B-16E")
+    write_released_config("gemma4-26b-a4b", "unsloth/gemma-4-26B-A4B-it")
 
 
 def write_gemma4_moe() -> None:
@@ -1233,7 +1216,7 @@ def write_released_configs() -> None:
     write_released_config("glm-5", "zai-org/GLM-5")
     write_released_config("glm-5.3", "zai-org/GLM-5.3")
     write_released_config("deepseek-v4-flash", "deepseek-ai/DeepSeek-V4-Flash")
-    write_mirrored_config("gemma-3n-e2b", "unsloth/gemma-3n-E2B")
+    write_released_config("gemma-3n-e2b", "unsloth/gemma-3n-E2B")
 
 
 WRITERS = {

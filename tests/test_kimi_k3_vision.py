@@ -16,12 +16,10 @@ from reference_runs import assert_as_exact_as_recorded
 
 from dew.interop import Pretrained
 from dew.nn.multimodal import MultimodalTransformer
+from tools.kimi_k3_vision_cases import GRIDS
 
 TINY = Path(__file__).parent / "fixtures" / "hf" / "kimi-k3-tiny"
 FIXTURE = TINY / "vision_recording.npz"
-GRIDS = {"image": (1, 4, 6), "video": (2, 4, 4)}
-"""Each drawn item's `(t, h, w)` grid in 14-pixel patches: an image of six merge blocks, its table resampled
-from the fixture's 4x4, and a two-frame video, its frames pooled into four (`sd2_tpool`)."""
 OUTPUTS = tuple(GRIDS)
 """Each item's projected merge blocks, the site's recorded leaves."""
 SEEDS = 8

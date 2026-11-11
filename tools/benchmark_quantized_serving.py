@@ -138,20 +138,17 @@ def sample(pipe: TextToImage, key: int | jax.Array) -> tuple[np.ndarray, dict[st
 
 
 def quality(pipe: TextToImage) -> dict:
-    from dew.data.text import load_tokenizer
-    from dew.eval.images import clip_image_text_cosine
+    from dew.eval.images import clip_image_text_cosine, clip_tokens
     from dew.nn.text_checkpoints import DEFAULT_MODEL
 
-    tokenizer = load_tokenizer(DEFAULT_MODEL)
-    tokens = tokenizer(list(PROMPTS), padding="max_length", max_length=tokenizer.model_max_length,
-                       truncation=True, return_tensors="np")
+    ids, mask = clip_tokens(PROMPTS, modelname=DEFAULT_MODEL)
     scores, seconds, counts = [], [], {"latents": 0, "pixels": 0}
     for seed in SEEDS:
         started = time.perf_counter()
         pixels, found = sample(pipe, seed)
         seconds.append(time.perf_counter() - started)
         counts = {stage: counts[stage] + found[stage] for stage in counts}
-        scores += list(np.asarray(clip_image_text_cosine(pixels, tokens["input_ids"], tokens["attention_mask"])))
+        scores += list(np.asarray(clip_image_text_cosine(pixels, ids, mask)))
     # The first seed compiles the sampler; the second is the warm time.
     row = {"sample_s": round(seconds[-1], 2), "clip": round(float(np.mean(scores)), 4)}
     return row | ({"nonfinite": counts} if any(counts.values()) else {})

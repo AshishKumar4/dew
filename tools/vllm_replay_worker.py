@@ -36,6 +36,7 @@ def scorers():
 def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """Every draw's completions, the leaves Dew replays, and transformers' scores of them."""
     import torch
+    from reference_worker import draws, paired
     from vllm_replay_reference import generated, scored
 
     from _dew_torch.precision import float64
@@ -44,13 +45,14 @@ def run(cases: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     torch.set_num_threads(1)
     narrow, twin = scorers()
     out = {}
-    for name in sorted({key.split(".", 1)[0] for key in cases}):
-        prompts = np.asarray(cases[f"{name}.prompt_ids"])
-        replay = generated(prompts, int(cases[f"{name}.seed"]))
+    for name, inputs in draws(cases).items():
+        prompts = np.asarray(inputs["prompt_ids"])
+        replay = generated(prompts, int(inputs["seed"]))
         out.update({f"{name}.replayed.{leaf}": value for leaf, value in replay.items()})
-        out[f"{name}.reference.log_probs"] = scored(narrow, prompts, replay)
+        reference = {"log_probs": scored(narrow, prompts, replay)}
         with float64():
-            out[f"{name}.truth.log_probs"] = scored(twin, prompts, replay)
+            truth = {"log_probs": scored(twin, prompts, replay)}
+        out.update({f"{name}.{key}": value for key, value in paired(reference, truth).items()})
     return out
 
 

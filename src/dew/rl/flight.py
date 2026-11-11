@@ -545,16 +545,23 @@ def delayed(pending: jax.Array, delay: jax.Array, command: jax.Array) -> tuple[j
     return pending, pending[delay]
 
 
+def gate_boxes(opening: float, frame: float, depth: float) -> np.ndarray:
+    """A gate's four frame bars `[4, 3, 2]` as built: each a box's extent along the gate's normal, its left
+    and up from its centre, about an opening `opening` wide, `frame` wide and `depth` deep (the race's
+    `bars` before the drone's radius, a renderer's meshes)."""
+    half, deep = opening / 2, depth / 2
+    edge = half + frame
+    return np.asarray([[(-deep, deep), (-edge, edge), (half, edge)],
+                       [(-deep, deep), (-edge, edge), (-edge, -half)],
+                       [(-deep, deep), (half, edge), (-half, half)],
+                       [(-deep, deep), (-edge, -half), (-half, half)]])
+
+
 def bars(racing: Racing) -> np.ndarray:
-    """A gate's four frame bars `[4, 3, 2]`, each a box's extent along the gate's normal, its left and up from
-    its centre, grown by the drone's `radius` on every side: where the drone's centre meets the frame."""
-    half, deep = racing.opening / 2, racing.depth / 2
-    edge = half + racing.frame
-    boxes = np.asarray([[(-deep, deep), (-edge, edge), (half, edge)],
-                        [(-deep, deep), (-edge, edge), (-edge, -half)],
-                        [(-deep, deep), (half, edge), (-half, half)],
-                        [(-deep, deep), (-edge, -half), (-half, half)]])
-    return boxes + np.asarray([-racing.radius, racing.radius])
+    """A gate's four frame bars (`gate_boxes`) grown by the drone's `radius` on every side: where the drone's
+    centre meets the frame."""
+    built = gate_boxes(racing.opening, racing.frame, racing.depth)
+    return built + np.asarray([-racing.radius, racing.radius])
 
 
 def _pillar_struck(racing: Racing, begin: jax.Array, end: jax.Array, obstacles: jax.Array) -> jax.Array:

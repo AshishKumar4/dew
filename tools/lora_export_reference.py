@@ -208,17 +208,19 @@ def _prediction(family: str, model, arrays: Mapping[str, np.ndarray], wide: bool
         output = model(hidden_states=tensor("latent").permute(0, 3, 1, 2), encoder_hidden_states=context,
                        pooled_projections=tensor("pooled"), timestep=times, return_dict=False)[0]
         return output.permute(0, 2, 3, 1).numpy()
-    channels = latent.shape[-1]
-    rows, columns = latent.shape[1] // 2, latent.shape[2] // 2
-    packed = tensor("latent").reshape(1, rows, 2, columns, 2, channels).permute(0, 1, 3, 5, 2, 4)
-    ids = torch.zeros(rows, columns, 3, dtype=times.dtype)
-    ids[..., 1] += torch.arange(rows)[:, None]
-    ids[..., 2] += torch.arange(columns)[None, :]
-    output = model(hidden_states=packed.reshape(1, rows * columns, -1), encoder_hidden_states=context,
+    from diffusers import FluxPipeline
+
+    # FLUX's own 2x2 latent packing, its inverse and its patches' ids, over Dew's channels-last latent.
+    _, height, width, channels = latent.shape
+    channels_first = tensor("latent").permute(0, 3, 1, 2).contiguous()
+    packed = FluxPipeline._pack_latents(channels_first, 1, channels, height, width)
+    output = model(hidden_states=packed, encoder_hidden_states=context,
                    pooled_projections=tensor("pooled"), timestep=times / 1000, guidance=tensor("guidance"),
                    txt_ids=torch.zeros(context.shape[1], 3, dtype=times.dtype),
-                   img_ids=ids.reshape(rows * columns, 3), return_dict=False)[0].numpy()
-    return output.reshape(1, rows, columns, channels, 2, 2).transpose(0, 1, 4, 2, 5, 3).reshape(latent.shape)
+                   img_ids=FluxPipeline._prepare_latent_image_ids(1, height // 2, width // 2, "cpu",
+                                                                   times.dtype),
+                   return_dict=False)[0]
+    return FluxPipeline._unpack_latents(output, height, width, 1).permute(0, 2, 3, 1).numpy()
 
 
 def _pipeline(family: str, source: Path, dtype):

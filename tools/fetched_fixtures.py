@@ -38,6 +38,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from typing import NotRequired, TypedDict
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 IN_GIT = 1 << 20
@@ -48,7 +49,25 @@ FIXTURES = "tests/fixtures"
 LOCAL = "tests/fixtures/fetched"
 PINNED = ".fetched.json"
 CATALOG = "catalog.json"
-FIELDS = ("repo", "revision", "path", "sha256", "bytes", "reference", "license")
+
+
+class Pin(TypedDict):
+    """A pinned file's record (`PINNED`): the repo and revision it is fetched from and its path there,
+    its sha256 and size, the reference it records or is (its repo, commit and file) and that reference's
+    license; a release's own file's `kind` (`RELEASE`), and where it is kept at its release (`origin`)."""
+    repo: str
+    revision: str | None
+    path: str
+    sha256: str
+    bytes: int
+    reference: str
+    license: str
+    kind: NotRequired[str]
+    origin: NotRequired[str]
+
+
+FIELDS = tuple(field for field in Pin.__annotations__ if field in Pin.__required_keys__)
+"""The fields every pin holds (`check`), in `Pin`'s order."""
 RELEASE = "release"
 """The `kind` of a pin that holds a release's own file (`pin_release`); a pin without one is a
 recording's."""
@@ -113,6 +132,18 @@ def _file_name(path: str) -> str:
     return name
 
 
+def _pin(data: bytes, name: str, *, reference: str, license: str, kind: str | None = None) -> Pin:
+    """The pin of `data` kept in the store for the fixture `name`, before its upload gives a revision: its
+    sha256 and size, `reference` and `license`, and a release file's `kind`, stored where `_store_path`
+    puts it."""
+    sha = digest(data)
+    pin: Pin = {"repo": STORE, "revision": None, "sha256": sha, "bytes": len(data), "reference": reference,
+                "license": license, "path": _store_path({"sha256": sha, "kind": kind}, name)}
+    if kind is not None:
+        pin["kind"] = kind
+    return pin
+
+
 def _store_path(pin: dict, name: str) -> str:
     """Where the store keeps the file pinned at the fixture `name`: a recording's under its sha256, a
     release file's under its sha256 and the fixture's own name (`pin_release`)."""
@@ -132,10 +163,7 @@ def pin_release(path, data: bytes, *, reference: str, license: str, origin: bool
     # Written where it resolves to: a symlink at the place, or above it, may not carry a write out.
     if name is None or not (root / name).resolve().is_relative_to((root / FIXTURES).resolve()):
         raise ValueError(f"{path}: a release file is pinned under {FIXTURES}/, and resolves there")
-    sha = digest(data)
-    pin = {"repo": STORE, "revision": None, "sha256": sha, "bytes": len(data), "reference": reference,
-           "license": license, "kind": RELEASE}
-    pin["path"] = _store_path(pin, name)
+    pin = _pin(data, name, reference=reference, license=license, kind=RELEASE)
     if origin:
         repo, revision, file = _released(reference)
         pin.update(repo=repo, revision=revision, path=file, origin="release")
@@ -197,10 +225,7 @@ def save(path, arrays: dict, *, reference: str, license: str, root: Path = REPO_
         target.write_bytes(data)
         manifest(root / name).unlink(missing_ok=True)
         return target
-    sha = digest(data)
-    pin = {"repo": STORE, "revision": None, "sha256": sha, "bytes": len(data), "reference": reference,
-           "license": license}
-    pin["path"] = _store_path(pin, name)
+    pin = _pin(data, name, reference=reference, license=license)
     stored = _stored(pin, root)
     stored.parent.mkdir(parents=True, exist_ok=True)
     stored.write_bytes(data)

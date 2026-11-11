@@ -24,6 +24,7 @@ import ml_dtypes
 import numpy as np
 import torch
 from diffusers import AutoencoderKL
+from diffusers_reference_helpers import on_bfloat16_grid, perturb
 
 CONFIG = {"in_channels": 3, "out_channels": 3, "latent_channels": 4,
           "down_block_types": ["DownEncoderBlock2D"] * 2, "up_block_types": ["UpDecoderBlock2D"] * 2,
@@ -54,11 +55,8 @@ def main():
     torch.set_num_threads(1)
     torch.manual_seed(SEED)
     encoder = AutoencoderKL.from_config(CONFIG).encoder.eval()
-    generator = torch.Generator().manual_seed(SEED + 1)
-    with torch.no_grad():
-        for parameter in encoder.parameters():
-            parameter.add_(0.1 * torch.randn(parameter.shape, generator=generator))
-            parameter.copy_(parameter.to(torch.bfloat16).float())
+    perturb(torch.Generator().manual_seed(SEED + 1), 0.1, encoder)
+    on_bfloat16_grid(encoder)
     arrays = {f"param.{name}": value.detach().numpy().astype(ml_dtypes.bfloat16).view(np.uint16)
               for name, value in encoder.named_parameters()}
     meta = {"diffusers": __import__("diffusers").__version__, "torch": torch.__version__, "config": CONFIG,

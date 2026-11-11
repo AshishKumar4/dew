@@ -145,10 +145,7 @@ def build(name: str, case: Case, root: Path):
     model = QwenImage21Transformer2DModel(**config).eval()
     # Every published tensor away from its initializer, the zero-centred
     # norms included, so no wiring hides behind an identity.
-    generator = torch.Generator().manual_seed(SEED + 2)
-    with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
+    perturb(torch.Generator().manual_seed(SEED + 2), 0.05, model)
     model.save_pretrained(root / name / "transformer", safe_serialization=True)
     return model
 
@@ -198,10 +195,7 @@ def text_encoder(tok):
         config[key] = tok.convert_tokens_to_ids(symbol)
     torch.manual_seed(SEED + 5)
     model = Qwen3VLForConditionalGeneration(Qwen3VLConfig(**config)).eval()
-    generator = torch.Generator().manual_seed(SEED + 6)
-    with torch.no_grad():
-        for parameter in model.parameters():
-            parameter.add_(torch.randn(parameter.shape, generator=generator) * 0.05)
+    perturb(torch.Generator().manual_seed(SEED + 6), 0.05, model)
     return model
 
 

@@ -89,19 +89,19 @@ def evaluated(arrays: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], dic
 
 
 def proxy(arrays):
-    """The same composition in JAX, which plans the seeds the recorder confirms on verl."""
+    """The same composition in JAX from Dew's own terms (`clipped_surrogate_terms`, its dual clip at verl's
+    3, and `sampled_kl`), which plans the seeds the recorder confirms on verl."""
     import jax
     import jax.numpy as jnp
+
+    from dew.rl.surrogate import clipped_surrogate_terms, sampled_kl
 
     mask = arrays["response_mask"]
 
     def loss(current):
-        ratio = jnp.exp(current - arrays["old_log_probs"])
-        advantages = arrays["advantages"]
-        clipped = jnp.maximum(-advantages * ratio, -advantages * jnp.clip(ratio, 0.8, 1.2))
-        policy = jnp.where(advantages < 0, jnp.minimum(clipped, -advantages * 3.0), clipped)
-        delta = arrays["ref_log_probs"] - current
-        kl = jnp.exp(delta) - delta - 1
+        policy, _ = clipped_surrogate_terms(current - arrays["old_log_probs"], arrays["advantages"], mask,
+                                            epsilon_low=0.2, epsilon_high=0.2, dual_clip=3.0)
+        kl = sampled_kl(arrays["ref_log_probs"] - current)
         return (jnp.sum(policy * mask) + BETA * jnp.sum(kl * mask)) / jnp.sum(mask)
 
     value, gradient = jax.value_and_grad(loss)(arrays["current_log_probs"])

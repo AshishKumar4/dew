@@ -42,6 +42,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import torch
+from recorded_draws import Tape, TorchDraws
 from reference_source import definitions, fetched
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
@@ -144,12 +145,6 @@ class Network(torch.nn.Module):
         return output, [self.projector(block)]
 
 
-def replayed(times: torch.Tensor, noise: torch.Tensor) -> types.SimpleNamespace:
-    """torch whose `rand` is `times` and `randn_like` `noise`, SILoss's two draws."""
-    return types.SimpleNamespace(**{**vars(torch), "rand": lambda *_, **__: times,
-                                    "randn_like": lambda like: noise})
-
-
 def composed() -> None:
     settings = COMPOSED
     b, side, patch, width = settings["batch"], settings["side"], settings["patch"], settings["width"]
@@ -200,10 +195,13 @@ def composed() -> None:
         raw = torch.as_tensor(pixels, dtype=dtype).permute(0, 3, 1, 2)
         prepared = preprocess["preprocess_raw_image"](raw, "dinov1").permute(0, 2, 3, 1)
         zs = [patches(prepared, patch) @ torch.as_tensor(encoder, dtype=dtype)]
-        loss_scope["torch"] = replayed(torch.as_tensor(times, dtype=dtype).reshape(-1, 1, 1, 1),
-                                       torch.as_tensor(noise, dtype=dtype).permute(0, 3, 1, 2))
+        # SILoss's two draws, its times then its noise (`recorded_draws`).
+        tape = Tape([torch.as_tensor(times, dtype=dtype).reshape(-1, 1, 1, 1),
+                     torch.as_tensor(noise, dtype=dtype).permute(0, 3, 1, 2)])
+        loss_scope["torch"] = TorchDraws(tape, dtype)
         images = raw / 127.5 - 1
         denoising, projection = loss_scope["SILoss"]()(network, images, zs=zs)
+        tape.spent()
         scope = {"loss": denoising, "proj_loss": projection, "args": types.SimpleNamespace(**settings)}
         exec(f"loss_mean = loss.mean()\nproj_loss_mean = proj_loss.mean()\n{composition}", scope)
         total = scope["loss"]

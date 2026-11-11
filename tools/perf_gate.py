@@ -65,10 +65,6 @@ LEVEL = 0.95
 """The level each row is judged at."""
 ALONE = "~aa"
 """The A/A arm's suffix: the base measured again, in processes and a compile cache of its own."""
-PASSING = ("level", "faster", "different, below floor")
-"""The states that pass a row and move a runner's baseline on: no change past its floor, judged."""
-FAILING = ("regressed", "broken")
-"""The states that fail a head: a change past its floor for the worse, or a row the head cannot run."""
 UNQUALIFIED = ("incomplete", "partial", "unjudged")
 """The states that judge nothing and fail the gate: the gate's own (Platform's), never a head's."""
 

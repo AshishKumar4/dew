@@ -54,6 +54,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import serialization, traverse_util
 
+from dew._files import write_atomically
 from dew.checkpoints import Checkpoints, Keep
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.env import EnvConfig, EnvRunConfig, RolloutConfig, TeacherConfig
@@ -162,11 +163,10 @@ def _latest(directory: Path) -> int:
         return checkpoints.latest or 0
 
 
-def _written(path: Path, text: str) -> None:
-    """`text` at `path`, written whole beside it before it replaces what was there, so a run stopped at any
-    point leaves either file whole."""
-    path.with_name(path.name + ".part").write_text(text)
-    path.with_name(path.name + ".part").replace(path)
+def advanced(level: float, crashed: float) -> float:
+    """The curriculum's next level from a score's crash rate: a tenth harder, to 1 at most, where fewer than
+    a third of the episodes crashed; the teacher and the world phase advance alike."""
+    return round(min(1.0, level + 0.1), 1) if crashed < 1 / 3 and level < 1.0 else level
 
 
 def scored(simulator, policy, params, memory, key: jax.Array, steps: int, *,
@@ -318,10 +318,9 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
         best = report["best"]
         if best is None or (level, point["return"]) > (best["level"], best["return"]):
             report["best"] = {"level": level, "return": point["return"], "step": updates}
-        if point["crashed"] < 1 / 3 and level < 1.0:
-            level = round(min(1.0, level + 0.1), 1)
+        level = advanced(level, point["crashed"])
         report["level"] = level
-        _written(path, json.dumps(report, indent=1))
+        write_atomically(path, json.dumps(report, indent=1))
     best = report["best"]
     saved = EnvRunConfig.load(str(out / TEACHER_RUN))
     with Checkpoints(str(out / TEACHER_RUN)) as checkpoints:
@@ -331,7 +330,7 @@ def teacher(out: Path, *, seconds: float = 6600.0, drones: int = 4096, hz: float
     names = ("trained", "held_out")
     report["final"] = {name: flown(judged, objective, variables, jax.random.key(2), racing_at(hz).max_steps,
                                    penalty) for name, judged in zip(names, final, strict=True)}
-    _written(path, json.dumps(report, indent=1))
+    write_atomically(path, json.dumps(report, indent=1))
     return report
 
 
@@ -348,7 +347,7 @@ def wrap(out: Path, *, weights: Path, hz: float = 60.0, level: float = 1.0, dron
     # The teacher phase's own report, unscored, so the phase goes on from the wrapped run.
     report = {"drones": drones, "hz": hz, "warm": str(weights), "curve": [], "best": None, "level": level,
               "wrapped": {"run": str(out / TEACHER_RUN), "step": int(state.step)}}
-    _written(out / "teacher.json", json.dumps(report, indent=1))
+    write_atomically(out / "teacher.json", json.dumps(report, indent=1))
     return report
 
 
@@ -459,13 +458,13 @@ def _staged(world: World, stage: str, updates: int, every: int | None, report: d
         points.append(point)
         report[stage] = points
         print(json.dumps(point), flush=True)
-        if point["crashed"] < 1 / 3 and level < 1.0:
-            level = round(min(1.0, level + 0.1), 1)
+        if (moved := advanced(level, point["crashed"])) != level:
+            level = moved
             for raced in (rollout.env, *races):
                 raced.difficulty = raced.ramp = level
         # The level the next chunk trains at, beside the score that earned it: a resumed stage goes on there.
         report["level"] = level
-        _written(world.out / "world.json", json.dumps(report, indent=1))
+        write_atomically(world.out / "world.json", json.dumps(report, indent=1))
     return state, agent, level
 
 
@@ -506,7 +505,7 @@ def world(world: World, *, pretrain_updates: int = 50_000, dagger_updates: int =
             variables = checkpoints.variables(step=world.teacher_step, ema=False)
         report["teacher"] = judge(teacher_policy(saved.agent(judged, variables)), variables, None,
                                   jax.random.key(4))
-        _written(path, json.dumps(report, indent=1))
+        write_atomically(path, json.dumps(report, indent=1))
     collecting = world.run("online", level).rollout.arguments
     online = int(round(environment_seconds * world.hz) * collecting["train_ratio"]
                  / (collecting["batch"] * collecting["length"]))
@@ -520,7 +519,7 @@ def world(world: World, *, pretrain_updates: int = 50_000, dagger_updates: int =
                                          film=world.out / filmed[stage])
         print(json.dumps({key: value for key, value in report.items() if not isinstance(value, list)}),
               flush=True)
-        _written(path, json.dumps(report, indent=1))
+        write_atomically(path, json.dumps(report, indent=1))
     return report
 
 

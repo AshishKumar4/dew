@@ -71,6 +71,15 @@ def float_as(dtype) -> tuple[object, str, object]:
     return torch.Tensor, "float", lambda tensor, *args, **kwargs: tensor.to(dtype)
 
 
+def float_scoped(function: Callable, dtype) -> Callable:
+    """`function` whose own `.float()` casts to `dtype` (`float_as`) for its call alone: a published
+    helper that pins float32 run at the run's precision without widening its caller's."""
+    def scoped(*args, **kwargs):
+        with replaced(float_as(dtype)):
+            return function(*args, **kwargs)
+    return scoped
+
+
 def dtype_widened(function: Callable) -> Callable:
     """`function` with its `dtype` keyword widened (`wide`): a constructor, `zeros_like`, `new_zeros`
     or `softmax` that pins float32 makes float64 instead."""
