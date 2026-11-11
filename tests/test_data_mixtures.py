@@ -2288,6 +2288,8 @@ def test_a_mix_saved_under_plan_version_12_resumes_as_12_read_it(read, version):
     try:
         resumed.set_state(saved)
         assert head + listed(resumed, 3) == whole
-        assert json.loads(resumed.get_state())["dew_data_plan"]["version"] == version
+        state = resumed.get_state()
+        plan = _position.read(state).plan if read == "indexed" else json.loads(state)["dew_data_plan"]
+        assert plan["version"] == version
     finally:
         resumed.close()

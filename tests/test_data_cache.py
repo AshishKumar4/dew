@@ -317,13 +317,21 @@ def test_a_cache_writer_rereads_more_uploaded_shards_than_its_mirror_holds(tmp_p
     the records read again are the uploaded ones."""
     blob = 1 << 16
     count = 12
+    source = Memory([{"id": index, "blob": np.full(blob, index % 251, np.uint8)} for index in range(count)])
     with moto_bucket("cache") as (bucket, options):
+        # The shards' size, read off a generation of the same records published first.
+        measured = Cache(f"s3://{bucket}/measured", storage_options=options, shard_bytes=1)
+        filled = measured.mapped(grain.MapDataset.source(source.records("indexed")), _key())
+        for index in range(count):
+            filled[index]
+        filled.finish()
+        filled.close()
+        measured.publish(_key(), source)
+        shard = max(entry["bytes"] for entry in measured.generation(_key()).manifest["shards"].values())
         mirror = {"dewcache": {"cache_storage": str(tmp_path / "mirror")}}
         cache = Cache(f"s3://{bucket}/cache", storage_options={**options, **mirror}, shard_bytes=1,
-                      upload_workers=1, on_full="block", spool_bytes=3 * (blob + 4096),
-                      mirror_bytes=2 * (blob + 4096) + blob // 2)
-        source = Memory([{"id": index, "blob": np.full(blob, index % 251, np.uint8)}
-                         for index in range(count)])
+                      upload_workers=1, on_full="block", spool_bytes=3 * shard,
+                      mirror_bytes=2 * shard + shard // 2)
         rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key())
         try:
             for index in range(count - 2):
