@@ -111,22 +111,26 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     )
 
 
-MEANFLOW_SEEDS = 128
-"""Check 1's declared seeds for a MeanFlow step through a fused attention kernel: the most paired sizing
-(`seeds_for` with the fused step as `dew_fn`, its confirming block) gave on the GPUs the site runs on, 128
-for Triton's kernel on an A100 and an H100 and 8 for cuDNN's (node receipts TL-a100-sizing-1851-679,
-TL-h100-sizing-1851-679), the largest declared as docs/design/testing.md's check 1 rules (6eafb57ba)."""
+MEANFLOW_SEEDS = {"triton": 128, "cudnn": 8}
+"""Check 1's declared seeds for a MeanFlow step through each fused attention kernel, sized paired on the
+GPUs the site runs on (`seeds_for` with the fused step as `dew_fn`, its confirming block; `meanflow_case`),
+the largest of an A100's and a GH200's."""
 
 
-def agrees_with_xla(kernel: str) -> None:
-    """A MeanFlow step through the fused attention `kernel` runs, and its loss and every parameter's
-    gradient are on par with the xla kernel's (check 1), both in bf16, the truth the xla step's program
-    replayed in float64 (`float64_replay`): the same draws of the step's times and noise, every operation
-    of the step in float64, its times' arithmetic in the target's derivative among them, which a float64
-    clone of the model would leave in the draws' float32. Each draw holds its own weights, images and the
-    step's key, which draws the step's times and noise: adaLN-Zero's gates and output start at zero, where
-    attention reaches neither the output nor any gradient (ledger 789), and drawn weights let every
-    parameter take part."""
+def meanflow_case(kernel: str):
+    """The site of a MeanFlow step through the fused attention `kernel`: `(dew, reference, truth, draw)`,
+    the step through `kernel` and through xla, both in bf16, and the xla step's program replayed in float64
+    (`float64_replay`), each the step's loss and every parameter's gradient as a function of a draw's
+    weights, images and the step's raw key, which draws the step's times and noise.
+
+    A draw's weights are the model's own initializers' at the draw's key, each matrix that initializes to
+    zero drawn as a lecun-normal matrix of its shape: adaLN-Zero's modulation and output start at zero,
+    where attention reaches neither the output nor any gradient (ledger 789). Every leaf drawn at a flat
+    0.3 instead made the output's derivative in time 2e7 to 1.3e8 (its Fourier time features, 2 pi 16 a
+    unit time, through gains a trained or initialized model has not), where one float32 rounding of the
+    time moves the output by the gradient's own size: float32 determined no digit of the gradients, and
+    check 1 judged no kernel (row 5469). At its initializers' scale the derivative is 1.3e5 to 2e5, a
+    float32 step 0.4 to 0.8% from the truth in its worst leaf and a bf16 step 1.2 to 1.9%."""
     def over(implementation: str, dtype: str) -> MeanFlowObjective:
         model = SimpleDiT(patch_size=2, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=1,
                           interval=True, attention_impl=implementation, dtype=dtype)
@@ -139,28 +143,36 @@ def agrees_with_xla(kernel: str) -> None:
     tokens = xla.inputs.tokenize(["a", "b", "c", "d"] * 4)
 
     def draw(seed):
-        leaves, tree = jax.tree.flatten(template["params"])
-        keys = jax.random.split(jax.random.PRNGKey(seed), len(leaves) + 2)
-        params = jax.tree.unflatten(tree, [0.3 * jax.random.normal(key, leaf.shape, leaf.dtype)
-                                           for key, leaf in zip(keys[2:], leaves, strict=True)])
+        keys = jax.random.split(jax.random.PRNGKey(seed), 4)
+        leaves, tree = jax.tree.flatten(xla.init(keys[2])["params"])
+        zeroed = jax.random.split(keys[3], len(leaves))
+        params = jax.tree.unflatten(tree, [
+            jax.random.normal(key, leaf.shape, leaf.dtype) / np.sqrt(np.prod(leaf.shape[:-1]))
+            if leaf.ndim >= 2 and not np.any(np.asarray(leaf)) else leaf
+            for key, leaf in zip(zeroed, leaves, strict=True)])
         pixels = np.asarray(jax.random.randint(keys[0], (16, 16, 16, 3), 0, 256), np.uint8)
         return params, pixels, np.asarray(keys[1])
 
-    def stepped(task, rest):
-        """The step's loss and the gradient of every parameter, a function of the parameters, the
-        images and the step's raw key."""
+    def stepped(task):
         def run(params, pixels, key):
             batch = {"image": pixels, **tokens}
             step = Step(step=jnp.asarray(0), key=jnp.asarray(key), ema=None)
 
             def loss_of(tree):
-                return task.scalar_loss({**rest, "params": tree}, batch, step)[0]
+                return task.scalar_loss({**template, "params": tree}, batch, step)[0]
 
             return jax.value_and_grad(loss_of)(params)
         return run
 
-    assert_as_exact(stepped(fused, template), stepped(xla, template), draw, f"MeanFlow step on {kernel}",
-                    seeds=MEANFLOW_SEEDS, truth_fn=float64_replay(stepped(xla, template), compiled=True))
+    return stepped(fused), stepped(xla), float64_replay(stepped(xla), compiled=True), draw
+
+
+def agrees_with_xla(kernel: str) -> None:
+    """A MeanFlow step through the fused attention `kernel` runs, and its loss and every parameter's
+    gradient are on par with the xla kernel's (check 1) from the float64 truth (`meanflow_case`)."""
+    dew, reference, truth, draw = meanflow_case(kernel)
+    assert_as_exact(dew, reference, draw, f"MeanFlow step on {kernel}", seeds=MEANFLOW_SEEDS[kernel],
+                    truth_fn=truth)
 
 
 def meanflow_trains_through_a_fused_attention_kernel():
