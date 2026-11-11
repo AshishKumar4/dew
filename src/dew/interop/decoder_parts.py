@@ -102,6 +102,16 @@ def ungated_mlp(activation: str, accepted: Collection[str], field: str, family: 
     return UNGATED_ACTIVATIONS[activation]
 
 
+def without_fixed_buffers(attention: str, sentinels: Collection[float]) -> "WeightPreparer":
+    """A classic family's `prepare`: a source's tensors with its fixed attention buffers under its `attention`
+    modules checked and dropped (`fixed_attention_buffer`, `sentinels` its releases' mask sentinels)."""
+    def prepare(tensors: Mapping[str, Stored],
+                _config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
+        return {name: tensor for name, tensor in tensors.items()
+                if not fixed_attention_buffer(name, tensor, attention, sentinels)}
+    return prepare
+
+
 def fixed_attention_buffer(name: str, tensor: Stored, attention: str,
                            sentinels: Collection[float]) -> bool:
     """Whether `name` is one of a classic family's fixed attention buffers,
