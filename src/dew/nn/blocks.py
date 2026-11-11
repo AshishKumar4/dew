@@ -3,7 +3,7 @@
 import functools
 from collections.abc import Callable
 from functools import partial
-from typing import overload
+from typing import TYPE_CHECKING, overload
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +24,9 @@ from .norms import GroupNorm, RMSNorm
 from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .rope import sinusoid_frequencies, sinusoids
 from .sharding import LogicalAxes, constrain, explicit_spec, rows_taken, whole_spec
+
+if TYPE_CHECKING:
+    from dew.nn.wrapping import HeadedModel
 
 
 def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
@@ -46,7 +49,7 @@ def _table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
     return rows_taken(table, ids).astype(dtype)
 
 
-def token_table(model: nn.Module) -> tuple[int, frozenset[int]] | None:
+def token_table(model: "nn.Module | HeadedModel") -> tuple[int, frozenset[int]] | None:
     """The embedding table a model reads its tokens through, which a token field indexes
     (`dew.inputs.spec.Field.indexing`): the rows its declared vocabulary
     (`dew.nn.protocols.Bounded`) builds, found on the model, the backbone a head reads

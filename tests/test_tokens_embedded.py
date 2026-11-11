@@ -130,3 +130,18 @@ def test_a_masked_run_whose_mask_id_is_outside_its_models_table_is_refused_as_it
         MaskedDiffusionObjective(short(causal=False), MDLM(mask_id=ROWS)(), SEQ_LEN)
     assert outside(raised) == (ROWS, ROWS)
     MaskedDiffusionObjective(short(causal=False), MDLM(mask_id=ROWS - 1)(), SEQ_LEN)
+
+
+def test_rows_given_already_placed_are_bounded_where_they_lie():
+    """A batch a caller places itself (device arrays, an in-memory run's) is bounded as a host batch is
+    (`Field.bounded`): an id outside the table refused, naming it, every id within it passing, and an id
+    the model replaces before its table reads it passing too."""
+    import jax.numpy as jnp
+
+    from dew.inputs import Field
+
+    field = Field("tokens", (4,), rows=ROWS, replaced=frozenset({ROWS + 7}))
+    field.bounded(jnp.asarray([[1, 2, ROWS - 1, ROWS + 7]], jnp.int32))
+    with pytest.raises(OutsideTable) as refused:
+        field.bounded(jnp.asarray([[1, ROWS + 3, 2, 3]], jnp.int32))
+    assert (refused.value.token, refused.value.rows) == (ROWS + 3, ROWS)

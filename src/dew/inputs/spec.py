@@ -37,6 +37,8 @@ from dew.registry import DtypeName
 if TYPE_CHECKING:
     from flax import linen as nn
 
+    from dew.nn.wrapping import HeadedModel
+
 
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
     """Convert pixels in [0, 255] to [-1, 1].
@@ -83,7 +85,7 @@ class Field:
             raise ValueError("variable field axes must index its per-sample shape")
 
     @classmethod
-    def indexing(cls, key: str, shape: tuple[int, ...], model: nn.Module, *,
+    def indexing(cls, key: str, shape: tuple[int, ...], model: nn.Module | HeadedModel, *,
                  variable_axes: tuple[int, ...] = ()) -> Field:
         """The field `key` of `shape` whose integers index `model`'s embedding table
         (`dew.nn.blocks.token_table`): its rows and the ids it replaces, none where it states no table."""
@@ -97,13 +99,18 @@ class Field:
         """Refuse `value`, this field's rows (a `ModelInputs`'s token rows), where it holds an id outside
         `[0, rows)` not `replaced`: such an id reads no row of the table, whose gather fills it with NaN
         (`jnp.take`'s out-of-bounds fill), a run's loss and a served token NaN with finite logits beside
-        it. Names the id, its token where `spelling` knows it, and the table's rows."""
+        it. Names the id, its token where `spelling` knows it, and the table's rows. Rows a caller gave
+        already placed (a batch of device arrays) are bounded where they lie, their least and greatest id
+        read back alone (two scalars, outside any step), and read back whole only to name a refused id."""
         if self.rows is None:
             return
         held = value.tokens if isinstance(value, ModelInputs) else value
         if isinstance(held, jax.Array):
-            raise TypeError(f"field {self.key!r} is bounded on the host, before it is placed; a device "
-                            "array reaches it only by a caller's error, never read back for it")
+            if held.size == 0 or not jnp.issubdtype(held.dtype, jnp.integer):
+                return
+            low, high = (int(bound) for bound in jax.device_get((jnp.min(held), jnp.max(held))))
+            if low >= 0 and high < self.rows:
+                return
         ids = np.asarray(held)
         if ids.size == 0 or ids.dtype.kind not in "iu":
             return
