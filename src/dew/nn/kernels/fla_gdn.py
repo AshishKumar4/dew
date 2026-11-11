@@ -311,7 +311,7 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, gl_ref, h_ref, corre
     the memory's rows by `exp2(g_last)` and not the values, whose keys carry their own decay. A row's
     first sequence starts from its initial memory and its last stores the final one."""
     span = _span(span_ref, length, chunk, aligned)
-    start, count, base, entered = span.first, span.count, span.base, span.entered
+    start, count, base, entered = span.first, span.tokens, span.base, span.entered
     memory, takes, gives = span.memory, span.takes, span.gives
     slices = k_ref.shape[-1] // 64
 
@@ -438,7 +438,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, g
     stays in q's dtype. A row's last sequence starts from the final
     memory's gradient and its first stores the initial memory's."""
     span = _span(span_ref, length, chunk, aligned)
-    start, count, base, left = span.first, span.count, span.base, span.left
+    start, count, base, left = span.first, span.tokens, span.base, span.left
     memory, takes, gives = span.memory, span.takes, span.gives
     slices = k_ref.shape[-1] // 64
     chunks = -(-count // chunk)

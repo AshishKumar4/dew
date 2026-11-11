@@ -545,7 +545,7 @@ def _first_decays(dg, run, dh0, taken=None):
     call = run.call
     walked = tables.unpacked(Walked, lambda i: run.sequences[:, i])
     dg = algebra.first_decays(dg, run.h0, dh0, walked.first * call.chunk, walked.row, walked.takes == 1,
-                              walked.count > 0)
+                              walked.chunks > 0)
     if taken is None:
         return dg
     chunks = jnp.arange(call.chunks)

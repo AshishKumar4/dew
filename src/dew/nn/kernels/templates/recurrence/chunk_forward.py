@@ -62,8 +62,8 @@ def _layout(batch: int, length: int, starts, max_segments: int | None, firsts=No
     table = tables.unpacked(chunked_launch.ChunkSpan, lambda i: jnp.asarray(spans.chunks)[:, i])
     span = tables.unpacked(chunked_launch.Span, lambda i: jnp.asarray(spans.spans)[:, i])
     chunks, taken = table.taken.shape[0], table.taken
-    sizes = -(-span.count // chunk)
-    live = span.count > 0
+    sizes = -(-span.tokens // chunk)
+    live = span.tokens > 0
     sequences = tables.packed(Walked(jnp.cumsum(sizes) - sizes, sizes, span.memory,
                                              live & (span.takes == 1), live & (span.gives == 1)))
     place = jnp.arange(chunk)

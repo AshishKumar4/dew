@@ -1440,7 +1440,7 @@ class Walked(NamedTuple):
     where it begins and ends its row)."""
 
     first: tables.Column
-    count: tables.Column
+    chunks: tables.Column
     row: tables.Column
     takes: tables.Column
     gives: tables.Column
@@ -1448,8 +1448,8 @@ class Walked(NamedTuple):
 
 def sequence_live(table: int) -> Callable:
     """A walk's program's liveness (`launch_kernel`'s `live`): its sequence's chunks past zero
-    (`Walked.count`), its walks' table its launch's `table`-th operand."""
-    count = tables.column(Walked, "count")
+    (`Walked.chunks`), its walks' table its launch's `table`-th operand."""
+    count = tables.column(Walked, "chunks")
     return lambda at, refs: refs[table][at["sequences"], count] > 0
 
 
@@ -1815,7 +1815,7 @@ def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walke
     keeps it, and at the walk's start the table opened where it opens."""
     family, slices = call.family, call.width // call.block
     (entered, entered_views), (chunks, views) = entering, walked
-    start, count, kept, written = sequence.first, sequence.count, sequence.takes, sequence.gives
+    start, count, kept, written = sequence.first, sequence.chunks, sequence.takes, sequence.gives
 
     def consumer(wg):
         # Each role's columns and tiles at static offsets (`mosaic.per_role`).

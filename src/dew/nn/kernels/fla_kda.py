@@ -953,7 +953,7 @@ def first_decay_grad(dg, h0, dh0, spans: Sequences):
     span = tables.unpacked(Span, lambda i: spans.spans[:, i])
     flat = dg.reshape(batch * length, *dg.shape[2:])
     return algebra.first_decays(flat, h0, dh0, span.first, span.memory, span.takes == 1,
-                                span.count > 0).reshape(dg.shape)
+                                span.tokens > 0).reshape(dg.shape)
 
 
 def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool, residual, cotangent):

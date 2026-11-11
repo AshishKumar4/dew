@@ -626,7 +626,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, v, beta, call: Call, ti
 
         # The sequence walked from its last chunk: its gradient the final's where it gives one, the initial
         # memory's where it takes one.
-        backward = sequence._replace(first=chunks - sequence.first - sequence.count, takes=sequence.gives,
+        backward = sequence._replace(first=chunks - sequence.first - sequence.chunks, takes=sequence.gives,
                                      gives=sequence.takes)
         sequence_walk(call, final, "final", (leaving, final_views), (walked_streams, views), step, backward,
                       lambda role, i: dh0_ref.at[pl.ds(memory(row, i), call.block),

@@ -125,13 +125,13 @@ def zero_padded(x, axis: int, size: int):
 
 
 class Span(NamedTuple):
-    """A sequence's row of `Sequences.spans`, its one declaration: its first token and count, the slot its
-    second chunk enters less one (`base`), the slots its first chunk enters and its last leaves, the call's
-    memory it takes and gives back (`h0`'s and the final's index), and whether it takes it and gives it
-    back (1 or 0)."""
+    """A sequence's row of `Sequences.spans`, its one declaration: its first token and its tokens, the slot
+    its second chunk enters less one (`base`), the slots its first chunk enters and its last leaves, the
+    call's memory it takes and gives back (`h0`'s and the final's index), and whether it takes it and gives
+    it back (1 or 0)."""
 
     first: Column
-    count: Column
+    tokens: Column
     base: Column
     entered: Column
     left: Column
@@ -338,7 +338,7 @@ def _span(span_ref, length: int, chunk: int, aligned: bool) -> Span:
     span = unpacked(Span, span_ref.__getitem__)
     if aligned:
         # The rows' own spans: each `length` long, whole chunks from a multiple of `chunk`.
-        span = span._replace(first=pl.multiple_of(span.first, chunk), count=length)
+        span = span._replace(first=pl.multiple_of(span.first, chunk), tokens=length)
     return span._replace(takes=span.takes == 1, gives=span.gives == 1)
 
 

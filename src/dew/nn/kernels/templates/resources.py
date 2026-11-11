@@ -11,8 +11,8 @@ import contextvars
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Hashable, Iterator
-from typing import TYPE_CHECKING, NamedTuple
+from collections.abc import Callable, Hashable, Iterator, Sequence
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -23,7 +23,6 @@ from dew.nn.kernels import generation
 if TYPE_CHECKING:
     from dew.nn.kernels.generation import GpuTarget
     from dew.nn.kernels.templates.mosaic import Family
-    from dew.nn.kernels.templates.operands import Operand
 
 
 CONTROL_REGISTERS = 16
@@ -111,6 +110,14 @@ def live_registers(family: "Family", carried, *phases, addressed=()) -> int:
             + int(-(-(_register_words(carried) + phase) // THREADS)))
 
 
+class Stored(Protocol):
+    """A launch's operand as it holds it (a recurrence `mainloop.Operand`'s): the dtype it stores and the
+    16-bit parts an fp32 value takes."""
+
+    stored: jnp.dtype
+    parts: int
+
+
 class OperandRead(NamedTuple):
     """How a product reads one operand: its `dtype` (its issuer's, `Family.for_dtype`), the 16-bit `parts`
     an fp32 value is split into (none where it is already held), its stage's `swizzle` (bytes; the
@@ -126,9 +133,8 @@ class OperandRead(NamedTuple):
     transposed: bool = False
 
     @classmethod
-    def of(cls, operand: "Operand", **read) -> "OperandRead":
-        """A launch's operand (`operands.Operand`) read so: its stored dtype and its parts, and `read`'s
-        facts."""
+    def of(cls, operand: Stored, **read) -> "OperandRead":
+        """A launch's operand (`Stored`) read so: its stored dtype and its parts, and `read`'s facts."""
         return cls(operand.stored, operand.parts, **read)
 
 
@@ -165,7 +171,7 @@ class Product(NamedTuple):
     rows: int
     depth: int
     columns: int
-    beside: tuple = ()
+    beside: Sequence[tuple] = ()
     held: bool = False
     transposed: bool = False
     source: Hashable | None = None
