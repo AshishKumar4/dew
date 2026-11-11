@@ -83,6 +83,8 @@ from dew.training import identity
 from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
+    from jaxlib._jax import Traceback
+
     from dew.checkpoints import Resume
     from dew.data.compile import Handed
     from dew.data.dataset import DataPartition, Dataset, Loader
@@ -210,7 +212,7 @@ class HeldTraceback:
         return "\n".join(self.frames)
 
 
-def _held_traceback(traceback: xla_client.Traceback) -> tuple[type[HeldTraceback], tuple[tuple[str, ...]]]:
+def _held_traceback(traceback: Traceback) -> tuple[type[HeldTraceback], tuple[tuple[str, ...]]]:
     """A traceback of JAX's reduced to its frames (`HeldTraceback`), as a program file holds it."""
     return HeldTraceback, (tuple(str(frame) for frame in traceback.frames),)
 
