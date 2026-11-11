@@ -36,6 +36,7 @@ and `LMObjective.head_tile`. No run times plans itself.
 from __future__ import annotations
 
 import contextlib
+import copyreg
 import dataclasses
 import functools
 import hashlib
@@ -209,19 +210,17 @@ class HeldTraceback:
         return "\n".join(self.frames)
 
 
-class _FilePickler(pickle.Pickler):
-    """A program file's pickler: a traceback of JAX's as its frames (`HeldTraceback`)."""
-
-    def reducer_override(self, obj):
-        if isinstance(obj, xla_client.Traceback):
-            return HeldTraceback, (tuple(str(frame) for frame in obj.frames),)
-        return NotImplemented
+def _held_traceback(traceback: xla_client.Traceback) -> tuple[type[HeldTraceback], tuple[tuple[str, ...]]]:
+    """A traceback of JAX's reduced to its frames (`HeldTraceback`), as a program file holds it."""
+    return HeldTraceback, (tuple(str(frame) for frame in traceback.frames),)
 
 
-def filed(value: object) -> bytes:
-    """`value` as a program file holds it (`_FilePickler`)."""
+def filed(value: Executable | AheadPrograms | AheadOfTime) -> bytes:
+    """`value` as a program file holds it: pickled, a traceback of JAX's as its frames (`HeldTraceback`)."""
     held = io.BytesIO()
-    _FilePickler(held, protocol=pickle.HIGHEST_PROTOCOL).dump(value)
+    pickler = pickle.Pickler(held, protocol=pickle.HIGHEST_PROTOCOL)
+    pickler.dispatch_table = {**copyreg.dispatch_table, xla_client.Traceback: _held_traceback}
+    pickler.dump(value)
     return held.getvalue()
 
 
@@ -238,11 +237,12 @@ class Executable:
         """`compiled` serialized with its trees, as a file holds them (`filed`); refused (ValueError) where a
         tree holds what no file holds, so a file that would hold it is never written short."""
         executable, in_tree, out_tree = serialize_executable.serialize(compiled)
+        held = Executable(executable, (in_tree, out_tree))
         try:
-            filed((in_tree, out_tree))
+            filed(held)
         except (TypeError, pickle.PicklingError) as refusal:
             raise ValueError(f"its trees hold what no file holds: {refusal}") from refusal
-        return Executable(executable, (in_tree, out_tree))
+        return held
 
     def loaded(self, devices: Sequence) -> jax.stages.Compiled:
         """The executable, loaded onto `devices` (the ones it was compiled for, which its loader checks:

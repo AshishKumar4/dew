@@ -653,7 +653,10 @@ class OuterProgram:
 
     def handed(self, *args, **kwargs) -> jax.stages.Compiled | None:
         """The executable a block hands a call over these arguments (`handing`), None outside one or where
-        it holds none of the call."""
+        it holds none of the call; outside one the call's key is never read (an abstract argument's
+        compile ahead has none)."""
+        if _HANDED.get() is None:
+            return None
         return self._handed(self.key_of(args, kwargs)[0], args, kwargs)
 
     def compiled(self, *args, **kwargs) -> jax.stages.Compiled:
