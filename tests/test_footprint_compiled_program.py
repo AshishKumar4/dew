@@ -10,8 +10,9 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from dew._devices import deviceless
 from dew.nn.programs import called
-from dew.training.compiled_program import compiled, deviceless, lowering_platform
+from dew.training.compiled_program import compiled, lowering_platform
 from dew.training.footprint import Workspace, gemm_workspace, gradient_peak, peak_bytes
 
 CALL_TOKENS, CALL_VOCAB, CALL_WIDTH = 256, 4096, 64

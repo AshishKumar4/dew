@@ -768,21 +768,25 @@ def regression_steps(x, *, pgle: bool):
     return {"loss": jnp.stack(losses), "params": state.variables["params"]}
 
 
-def regression_truth(x):
-    """`regression_steps`' run in float64: from the weights its trainer draws, each step's affine map,
-    squared error and SGD step at 0.1 over its eight rows computed in float64 (check 1's truth)."""
+def regression_truth() -> Callable:
+    """`regression_steps`' run in float64, a function of its rows: from the weights its trainer draws, held
+    in float64 here, each step's affine map, squared error and SGD step at 0.1 over its eight rows computed
+    in float64 (check 1's truth, which the gate traces and compiles)."""
     trainer = one_device(Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0)))
     state, _, _ = trainer.place()
-    params, losses = float64_held(state.variables["params"]), []
+    start = float64_held(state.variables["params"])
 
     def loss(params, rows):
         return jnp.mean((Affine().apply({"params": params}, rows) - 2 * rows[:, :2]) ** 2)
-    with jax.enable_x64(new_val=True):
-        for start in range(0, len(x), 8):
-            value, gradient = jax.value_and_grad(loss)(params, jnp.asarray(x[start:start + 8], jnp.float64))
+
+    def truth(x):
+        params, losses = start, []
+        for begin in range(0, x.shape[0], 8):
+            value, gradient = jax.value_and_grad(loss)(params, x[begin:begin + 8])
             params = jax.tree.map(lambda param, step: param - 0.1 * step, params, gradient)
             losses.append(value)
         return {"loss": jnp.stack(losses), "params": params}
+    return truth
 
 
 def test_a_compiled_steps_memory_is_xlas_analysis_whoever_reads_it():
@@ -821,10 +825,9 @@ def a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly
     assert trials.unguided is not None and trials.unguided() is None and live_executables() == trials.live
     guided = as_given(functools.partial(regression_steps, pgle=True))
     unguided = as_given(functools.partial(regression_steps, pgle=False))
-    label = "a step guided by its profile"
-    assert_as_exact(guided, unguided, regression_rows, label, truth_fn=regression_truth,
-                    seeds=seeds_for(unguided, regression_rows, label, dew_fn=guided,
-                                    truth_fn=regression_truth))
+    label, truth = "a step guided by its profile", regression_truth()
+    assert_as_exact(guided, unguided, regression_rows, label, truth_fn=truth,
+                    seeds=seeds_for(unguided, regression_rows, label, dew_fn=guided, truth_fn=truth))
 
 
 def test_a_pinned_split_is_read_as_given_and_its_state_holds_it():

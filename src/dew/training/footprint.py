@@ -30,6 +30,7 @@ from jax.core import ShapedArray
 from jax.extend.core import primitives
 
 from dew import algebra
+from dew._devices import deviceless
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
@@ -43,7 +44,6 @@ from dew.training.compiled_program import (
     Slicing,
     bitcast,
     cublas_product,
-    deviceless,
     dimensions,
     lowering_platform,
     simplified,

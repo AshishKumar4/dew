@@ -103,6 +103,12 @@ def _carries(loaded: str, flags: str) -> bool:
     return all(_flag(loaded, name) == value for name, value in asked.items())
 
 
+def deviceless(device) -> bool:
+    """Whether `device` is a compile-only target, no device of a running backend: one of a topology JAX
+    compiles for without a device (`compile_only_runtime`, `jax.experimental.topologies`)."""
+    return device.client.runtime_type == "compile_only_runtime"
+
+
 def xla_flag(name: str) -> str | None:
     """The value `--<name>` carries in XLA_FLAGS, or None when it is absent.
 

@@ -50,7 +50,6 @@ from dew.training.memory import (
     climbed,
     compiled_if_it_fits,
     derived_headroom,
-    deviceless_options,
     head_fused_of,
     head_tile_of,
     judged,
@@ -702,8 +701,9 @@ class FitSearch[LossT, EffectsT]:
         self.remat_set = any(entry is not None for entry in (record if isinstance(record, list)
                                                              else [record]))
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right, as the
-        # target compiles them (`deviceless_options`), as the step's own (`options`) are made.
-        self.required = deviceless_options(self.mesh, compiler_options(*self.objective.towers()) or None)
+        # step's own (`options`) are made; the target's own policy is the compile point's
+        # (`report.targeted`).
+        self.required = compiler_options(*self.objective.towers()) or None
 
     def admitted(self, candidates: Sequence[int], first: int) -> tuple[Planned, tuple[Probe, ...]]:
         """The first fitting plan found by the split-and-rung search, and every compile it made, its
@@ -1017,10 +1017,9 @@ class FitSearch[LossT, EffectsT]:
 
     def compiled_options(self, candidate: Candidate) -> jax.stages.CompilerOptions | None:
         """The options the search compiles `candidate` under: `required` on the half rung of XLA's defaults,
-        else the step's own (`options`), each under the compile-only policy (`deviceless_options`), which
-        the search alone applies, so a step whose options are its towers' own is that rung's program
-        (`climb`)."""
-        return self.required if self.xla_defaults else deviceless_options(self.mesh, self.options(candidate))
+        else the step's own (`options`), so a step whose options are its towers' own is that rung's program
+        (`climb`); the compile point adds the target's own (`report.targeted`)."""
+        return self.required if self.xla_defaults else self.options(candidate)
 
     def measured(self, split: int, candidate: Candidate) -> tuple[
             jax.stages.CompilerOptions | None, Candidate, jax.stages.Compiled | None, Probe]:

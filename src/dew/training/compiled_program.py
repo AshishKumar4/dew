@@ -80,12 +80,6 @@ def lowering_platform(device) -> str:
     return "rocm" if "rocm" in str(device.client.platform_version).lower() else "cuda"
 
 
-def deviceless(device) -> bool:
-    """Whether `device` is a compile-only target, no device of a running backend: one of a topology JAX
-    compiles for without a device (`compile_only_runtime`, `jax.experimental.topologies`)."""
-    return device.client.runtime_type == "compile_only_runtime"
-
-
 def compiled(program: jcore.Jaxpr, lowering: str,
              made: dict[int, tuple[jcore.Jaxpr, jcore.Jaxpr]] | None = None) -> jcore.Jaxpr:
     """`program` as JAX lowers it for the platform `lowering` (`lowering_platform`) and XLA compiles it:

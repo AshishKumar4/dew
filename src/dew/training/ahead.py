@@ -72,7 +72,6 @@ from dew.nn.kernels.selection import Unlowerable
 from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link
 from dew.telemetry.instrumentation import StepFlops, compiled_memory, step_flops
-from dew.training.memory import deviceless_options
 from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
@@ -886,9 +885,6 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
                                                *trainer.objective.towers(),
                                                out_shardings=candidate.shardings.compute).lower(variables))
 
-    # Each compiled as the step is for its compile-only GPUs, which hold no device to autotune a product on.
-    options = deviceless_options(trainer.device_mesh, None)
-
     def kept(lower: Callable[[], jax.stages.Lowered]) -> tuple[str, Executable]:
         # A program a refused launch's config relowers is keyed by the program it compiled, as the run's
         # compile point lowers it past the refusals the step carries (`OuterProgram.compiled`).
@@ -897,19 +893,18 @@ def started[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, pl
         def relower() -> jax.stages.Lowered:
             lowered.append(lower())
             return lowered[-1]
-        executable = report.compiled(lowered[0], options, relower=relower)
+        executable = report.compiled(lowered[0], relower=relower)
         return program_digest(lowered[-1]), Executable.of(executable)
-    collected = _results_programs(trainer, start, planned, plan, options)
+    collected = _results_programs(trainer, start, planned, plan)
     return {**dict(map(kept, lowerings)), **{digest: Executable.of(executable)
                                              for digest, executable in collected.items()}}
 
 
 def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start: Start, planned: Planned,
-                                       plan: FitPlan | None, options: jax.stages.CompilerOptions | None
-                                       ) -> dict[str, jax.stages.Compiled]:
+                                       plan: FitPlan | None) -> dict[str, jax.stages.Compiled]:
     """The programs a run's steps run on their results and its state, and with its `fit`'s `plan` its
-    evaluations' warming pass over its first state, compiled under `options` where the run's own code calls
-    them over shapes (`collecting`), by digest: `started`'s last part."""
+    evaluations' warming pass over its first state, compiled where the run's own code calls them over
+    shapes (`collecting`), by digest: `started`'s last part."""
     from dew.distributed.placement import placed_shapes
     from dew.state import apart, together
     from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest
@@ -921,7 +916,7 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     frozen = apart(placed)[1]
     # A sampled step's results hold its summaries (`Committed.inspected`), which its programs read too.
     steps = [planned.executable] + ([] if planned.sampled is None else [planned.sampled.executable])
-    with collecting(options) as collected:
+    with collecting() as collected:
         if trainer._builds_window(placed, candidate, window):
             trainer._window_of(dataclasses.replace(placed, compute=None), candidate, window)
         for step in steps:

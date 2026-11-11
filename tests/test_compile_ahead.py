@@ -420,36 +420,44 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
                                                                              plan["head_fused"])
 
 
-def test_a_step_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can_time(monkeypatch):
-    """A step compiled for compile-only GPUs takes autotuning off (`deviceless_options`), its programs' bytes
+def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_can_time(monkeypatch):
+    """Every program compiled for compile-only GPUs takes autotuning off at Dew's compile point
+    (`report.targeted`), a step and the programs a run compiles ahead beside it alike, its programs' bytes
     the same: XLA's config assigner gives each matmul its default config where no device is attached, while
-    its autotuner would still compile every candidate it cannot time. A run's own XLA_FLAGS setting, and a
-    mesh of devices that run, keep the options as given."""
+    its autotuner would still compile every candidate it cannot time, and fails a GEMM fusion whose
+    candidates are cuBLASLt's on a GPU host. A run's own XLA_FLAGS setting, and devices that run, keep the
+    options as given; the fit search compiles each rung under the step's own options, the target's left to
+    the compile point."""
     from dew.nn.kernels.options import compiler_options
+    from dew.nn.kernels.templates.report import targeted
     from dew.training.ahead import compile_only_gpus
-    from dew.training.memory import deviceless_options
     from dew.training.planning import FitSearch
 
     monkeypatch.setenv("XLA_FLAGS", without_flags(os.environ.get("XLA_FLAGS", ""),
                                                   "--xla_gpu_autotune_level"))
     deviceless = MeshSpec().build(compile_only_gpus("sm90", 1))
-    assert deviceless_options(deviceless, None) == {"xla_gpu_autotune_level": 0}
-    assert deviceless_options(deviceless, {"xla_gpu_enable_triton_gemm": False}) == {
-        "xla_gpu_enable_triton_gemm": False, "xla_gpu_autotune_level": 0}
     running = MeshSpec().build(jax.devices()[:1])
-    assert deviceless_options(running, {"xla_gpu_enable_triton_gemm": False}) == {
+
+    def lowered(mesh):
+        placed = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        shape = jax.ShapeDtypeStruct((64, 64), jnp.float32, sharding=placed)
+        return jax.jit(lambda x: x @ x).lower(shape)
+
+    assert targeted(lowered(deviceless), None) == {"xla_gpu_autotune_level": 0}
+    assert targeted(lowered(deviceless), {"xla_gpu_enable_triton_gemm": False}) == {
+        "xla_gpu_enable_triton_gemm": False, "xla_gpu_autotune_level": 0}
+    assert targeted(lowered(running), {"xla_gpu_enable_triton_gemm": False}) == {
         "xla_gpu_enable_triton_gemm": False}
-    # The fit search alone applies the policy, to the step's options and its towers' alike (row 3506): a
-    # step whose options are its towers' own compiles as the half rung of XLA's defaults does, one program.
+    # A step whose options are its towers' own compiles as the half rung of XLA's defaults does, one
+    # program (row 3506).
     objective = fine_tune(deviceless, split=None).objective
     search = FitSearch(lower=None, options=lambda candidate: compiler_options(*objective.towers()) or None,
                        objective=objective, mesh=deviceless, xla_defaults=False, narrow=False, base=None,
                        resumed=None, capacity=2**30)
-    assert search.compiled_options(None) == search.required == deviceless_options(
-        deviceless, compiler_options(*objective.towers()) or None)
+    assert search.compiled_options(None) == search.required == (compiler_options(*objective.towers()) or None)
     assert dataclasses.replace(search, xla_defaults=True).compiled_options(None) == search.required
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ['XLA_FLAGS']} --xla_gpu_autotune_level=2")
-    assert deviceless_options(deviceless, None) is None
+    assert targeted(lowered(deviceless), None) is None
 
 
 def test_compiling_ahead_with_its_frontier_on_gpus_of_no_stated_memory_is_refused(tmp_path, monkeypatch):
