@@ -2307,3 +2307,51 @@ def test_a_phase_on_the_step_clock_of_a_mix_weighed_by_tokens_streamed_is_refuse
     chain = phases((members(), 3), (members(), None)).batch(1)
     with pytest.raises(ValueError, match="phase 0 needs a global order"):
         compile(chain, read=read, loading=READ)
+
+
+def _endless_ids(chain, count: int, plan_version: int | None = None) -> list[list[int]]:
+    """The ids of the first `count` batches a run reads of `chain`, read on past its end (`fitted`)."""
+    from dew.data.compile import fitted
+    from dew.data.pipeline import ObjectiveData
+
+    versions = {} if plan_version is None else {"plan_version": plan_version}
+    loader, _ = fitted(chain, None, objective=ObjectiveData(), **versions)
+    stream = loader.train(DataPartition())
+    try:
+        return ids(itertools.islice(stream, count))
+    finally:
+        stream.close()
+
+
+def test_a_phase_batched_inside_itself_reads_on_as_a_single_stream_does():
+    """A phase that batches its own records, read on past its end by a run, reads as the same chain read
+    alone does, its repeat before its batch: a pass that holds a batch and a half continues its last into
+    the next pass, where a repeat after the batch dropped it and read the pass again from its start."""
+    first, second = Memory(Indexed(1, 12)), Memory(Indexed(2, 12))
+    phased = phases((Pipeline(first).batch(8), 2), (Pipeline(second).batch(8), None))
+    expected = (_endless_ids(Pipeline(first).batch(8), 2) + _endless_ids(Pipeline(second).batch(8), 2))
+    assert _endless_ids(phased, 4) == expected
+    assert expected[1] == [1008, 1009, 1010, 1011, 1000, 1001, 1002, 1003]
+
+
+def test_a_phase_whose_pass_holds_less_than_a_batch_yields_batches():
+    """A phase that batches its own records, each pass fewer than a batch, yields its batches, its repeat
+    before its batch, where a repeat after it read every pass to no batch and never yielded one."""
+    import threading
+
+    phased = phases((Pipeline(Memory(Indexed(1, 6))).batch(8), 1),
+                    (Pipeline(Memory(Indexed(2, 6))).batch(8), None))
+    read: list = []
+    reader = threading.Thread(target=lambda: read.extend(_endless_ids(phased, 2)), daemon=True)
+    reader.start()
+    reader.join(timeout=120)
+    assert read == [[1000, 1001, 1002, 1003, 1004, 1005, 1000, 1001],
+                    [2000, 2001, 2002, 2003, 2004, 2005, 2000, 2001]]
+
+
+def test_a_phase_batched_inside_itself_saved_under_plan_12_reads_as_12_did():
+    """A run whose data plan is version 12, as a run saved under it resumes, reads a phase batched inside
+    itself with its repeat after its batch, as 12 did."""
+    first, second = Memory(Indexed(1, 12)), Memory(Indexed(2, 12))
+    phased = phases((Pipeline(first).batch(8), 2), (Pipeline(second).batch(8), None))
+    assert _endless_ids(phased, 2, plan_version=12)[1] == list(range(1000, 1008))

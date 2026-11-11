@@ -1011,7 +1011,10 @@ members in the order the mixture declares them, the order its every prefix is co
 them in their keys' sorted order, as Grain's mix of a mapping does, so where the two orders differ
 (members named out of sorted order, or more than ten unnamed) a later phase read on past records the
 mix had not given and gave again ones it had. A position 12 saved goes on under 13 where its mixes'
-orders are one (`read_otherwise_at_13`)."""
+orders are one (`read_otherwise_at_13`). From 13 too, a chain of phases each batched inside itself and read
+endlessly repeats each phase before its own batch, as a single stream's repeat is
+(`dew.data.compile._endless`), where 12 repeated it after the batch: a pass holding less than a batch
+never yielded one."""
 
 PLAN_VERSIONS = (8, 9, FILE_SHARDS, IN_ORDER, SHARED_STATE, DECLARED_MIX)
 """The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a corpus's key, its name

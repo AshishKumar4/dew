@@ -137,7 +137,7 @@ from dew.data.pipeline import (
     with_children,
     with_stores,
 )
-from dew.data.plan import PLAN_VERSIONS, Plan, StepIdentity, fingerprint, read_by, unplaced
+from dew.data.plan import DECLARED_MIX, PLAN_VERSIONS, Plan, StepIdentity, fingerprint, read_by, unplaced
 from dew.data.readers import Opener, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
     Read,
@@ -946,7 +946,7 @@ def _staged(
         # Epochs of a read with a record count count it, read endlessly; of one with none, the source
         # examples a pass holds, its prepared rows as held, bounded to that many passes (`_bounded`).
         passes = None if _epoch_records(train, build) is not None else _pass_examples(train, read, build)
-        original, train = ((_endless(original), _endless(train)) if passes is None else
+        original, train = ((_endless(original, version), _endless(train, version)) if passes is None else
                            (_bounded(original, epochs * passes), _bounded(train, epochs * passes)))
         build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed,
                    version=version)
@@ -1879,7 +1879,7 @@ def fitted[Entry](
         chain = dataset._chain()
         # A run of epochs reads its chain as written, which staging reads endlessly or bounds to its
         # epochs' passes over its examples (`_staged`).
-        trained = chain if examples is not None or epochs is not None else _endless(chain)
+        trained = chain if examples is not None or epochs is not None else _endless(chain, plan_version)
         read = trained.mode or _preferred_read((trained,), provision=True)
         # A run of phases compiles each phase on its own (`_compile_phases`), so its measure is its own.
         measured = (None if not scored or (isinstance(trained.source, Phases) and examples is None) else
@@ -1905,12 +1905,15 @@ def fitted[Entry](
                     for name, entry in named.items()}
 
 
-def _endless(chain: Pipeline) -> Pipeline:
+def _endless(chain: Pipeline, version: int = PLAN_VERSIONS[-1]) -> Pipeline:
     """`chain` read endlessly: a repeat before its batch where it has none and its read can end. A
-    chain of phases reads each phase through the chain's own stages, and where one of them already
-    reads on (`_reads_on`), as Grain refuses to repeat an order without end, each other phase repeats
-    at the place the chain's own repeat takes, its share of the chain's stages before the batch moved
-    into it; a mixture whose members all read on is read as it is."""
+    chain of phases reads each phase through the chain's own stages before its batch, and each phase that
+    does not read on already (`_reads_on`, as Grain refuses to repeat an order without end) is read
+    endlessly itself, its repeat before its own batch as a single stream's is, the chain's batch after
+    the phases; a mixture whose members all read on is read as it is. A plan of a version before
+    `DECLARED_MIX` read a phase that batches inside itself with the repeat after its batch, so a pass
+    holding less than a batch never yielded one and each pass dropped what was left of its last; such a
+    plan reads so still, as a run saved under it read."""
     if any(isinstance(stage, Repeat) for stage in chain.stages) or _reads_on(chain):
         return chain
     batching = [index for index, stage in enumerate(chain.stages)
@@ -1919,8 +1922,10 @@ def _endless(chain: Pipeline) -> Pipeline:
     source = chain.source
     if isinstance(source, Phases):
         read = [child._then(*chain.stages[:at]) for child in source.pipelines]
-        if any(map(_reads_on, read)):
-            each = tuple(phase if _reads_on(phase) else phase.repeat() for phase in read)
+        if version >= DECLARED_MIX or any(map(_reads_on, read)):
+            each = tuple(phase if _reads_on(phase) else
+                         _endless(phase, version) if version >= DECLARED_MIX else phase.repeat()
+                         for phase in read)
             return dataclasses.replace(chain, source=dataclasses.replace(source, pipelines=each),
                                        stages=chain.stages[at:])
     return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
