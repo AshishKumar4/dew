@@ -39,6 +39,7 @@ import contextlib
 import dataclasses
 import functools
 import importlib.metadata
+import importlib.util
 import json
 import logging
 import os
@@ -204,12 +205,27 @@ class Executable:
 
     def loaded(self, devices: Sequence) -> jax.stages.Compiled:
         """The executable, loaded onto `devices` (the ones it was compiled for, which its loader checks:
-        `BuildTarget.held`) and admitted as a compiled one is (`dew.communicators.admit`)."""
+        `BuildTarget.held`) and admitted as a compiled one is (`dew.communicators.admit`), the installed
+        Dew kernel wheels' FFI targets registered first (`_wheel_targets_registered`)."""
+        _wheel_targets_registered()
         in_tree, out_tree = self.trees
         loaded = serialize_executable.deserialize_and_load(
             self.executable, in_tree, out_tree, backend=devices[0].client, execution_devices=devices)
         communicators.admit(loaded)
         return loaded
+
+
+def _wheel_targets_registered() -> None:
+    """Each installed Dew kernel wheel's FFI targets registered with jax: a wheel registers its own at the
+    first call that traces one, and a process that only loads a program compiled ahead traces none, so its
+    first run of a call to one found no handler (dew-cutlass's grouped GEMM, dew-flash's attention)."""
+    if importlib.util.find_spec("dew_cutlass") is not None:
+        from dew.nn.kernels import grouped_matmul
+
+        grouped_matmul.cutlass_registered()
+    if importlib.util.find_spec("dew_flash_attn") is not None:
+        # The wheel's own registration of its targets (`dew_flash_attn.TARGETS`), which its calls run.
+        importlib.import_module("dew_flash_attn")._registered()
 
 
 @dataclasses.dataclass(frozen=True)
