@@ -2100,10 +2100,10 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     cache reruns only those whose inputs changed (the maintainer, 2026-10-25: no CI run reached the published
     checkpoints' parity tests).
 
-    A file's process is given the share its last run on this GPU's class measured, green or red,
-    and files start heaviest first while what they hold with their children (`gpu_needs`) fits
-    the share this process was given (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at
-    most `processes` at once. A file that runs out of a measured share is red: it took more than
+    A file's process is given the share its last run on this GPU's class measured, green or red (a group
+    the tier cut, the most any run of its file on the class did), and files start heaviest first while what
+    they hold with their children (`gpu_needs`) fits the share this process was given
+    (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file that runs out of a measured share is red: it took more than
     its last run, whose peak its next run is given. A file no run on this class measured borrows its
     share from the largest any other GPU class's last run measured (`borrowed`), so a first lane on
     a class packs its files as a measured one does; one red under it is red, run once, as every red is
@@ -2157,8 +2157,8 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     else:
         with concurrent.futures.ThreadPoolExecutor(32) as pool:
             records = dict(zip(tests, pool.map(needs, tests), strict=True))
-    # A group no run on this class measured borrows its whole file's measure, which holds at least its own;
-    # a file's process under other flags, its tests a part of the file's, the measure of the lane's own first.
+    # A group no run on this class measured borrows the most its file held on another, which holds at least
+    # its own; a file's process under other flags, its tests a part of the file's, the lane's own's first.
     borrowed = borrowed_records(sorted({units[name][0] for name, found in records.items() if found is None}),
                                 python, held, token)
     measures = {name: records[name] or records.get(f"{file}#{group}" if group else file)
