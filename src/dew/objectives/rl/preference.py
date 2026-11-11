@@ -182,7 +182,8 @@ class DPOObjective(TokenScorer):
         """Read its batches as data plan `version` lays them out: a plan from before preference pairs packed
         into windows (`dew.data.plan.PAIR_WINDOWS`) lays a pair a row where the run states no `segments`,
         so the objective reads a pair a row (`segments=1`, which `traced` reads), as the run it resumes
-        did; a later plan, as stated."""
+        did; a later plan, as stated (and its prefix sharing, `TokenScorer.bind_plan`)."""
+        super().bind_plan(version)
         self._lay(1 if version < PAIR_WINDOWS and self._stated is None else self._stated)
 
     @property

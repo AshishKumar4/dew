@@ -523,12 +523,13 @@ def test_the_gpu_tier_is_every_file_whose_tests_read_the_backend_or_are_marked_f
 
 
 def named_tier(ci, monkeypatch, capsys, *flags: str, lines: bool = False) -> list:
-    """What `ci.py gpu-tier` with `flags` prints: its files, or its lines where `lines`."""
+    """What `ci.py gpu-tier` with `flags` prints: its files (each shard's line; the line of JSON after them,
+    each file's pinned generations, is test_gpu_lane.py's), or its lines where `lines`."""
     monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-tier", *flags])
     capsys.readouterr()
     assert ci.main() == 0
-    out = capsys.readouterr().out
-    return out.splitlines() if lines else out.split()
+    out = capsys.readouterr().out.splitlines()
+    return out if lines else [name for line in out if not line.startswith("{") for name in line.split()]
 
 
 def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(ci, tmp_path):

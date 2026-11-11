@@ -1047,6 +1047,15 @@ def served_by(server):
     return server, tickets
 
 
+def shared_page(options: dict) -> int:
+    """The prompt tokens a repeated "1234567" reads from its first run's pages under `options`: one full
+    page of four where the server pages its cache in fours and shares prefixes, as a paged server does
+    unless told not to (`prefix_cache` None), its last token prefilled again; none in pages of 16, which
+    the prompt fills none of, or over a dense cache."""
+    layout = options.get("kv_cache")
+    return 4 if layout is not None and layout.page_size == 4 and options.get("prefix_cache", True) else 0
+
+
 @pytest.mark.parametrize("options", [
     {"kv_cache": KVCache(page_size=16, pages=12)},
     {"kv_cache": KVCache(page_size=16, pages=12), "chunk": 2},
@@ -1059,7 +1068,8 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     server reserves, a prompt prefilled two or three tokens a step
     attends to its earlier pieces through the page table (or its dense
     row), and a repeated prompt starts from the page its first run
-    published. None of it changes a greedy draw: every row is the lone task
+    published, as a paged server shares prefixes by default (`prefix_cache`
+    None). None of it changes a greedy draw: every row is the lone task
     call's. Each runs the mixed admitting step."""
     bound = task()
     alone = [bound(prompt, budget, key=index)
@@ -1068,8 +1078,7 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.mixed_refusal is None
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), lone)
-    # "1234567" keeps its last token to prefill: one full page of four is shared.
-    assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
+    assert server.prefix_hits == shared_page(options)
 
 
 @pytest.mark.parametrize("fields", [{"position_embedding": "learned"},
@@ -1238,6 +1247,32 @@ def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alon
     assert tickets[0].admitted == tickets[1].admitted == tickets[3].admitted < tickets[4].admitted
     for ticket, lone in zip(tickets, alone, strict=True):
         assert_same_generation(ticket.result(), lone)
+
+
+@pytest.mark.parametrize(("kind", "budget"), [("attention", 9), ("hybrid", 9), ("attention", 7)],
+                         ids=["attention", "hybrid", "attention, a history inside a page"])
+def test_a_finished_requests_history_is_read_by_a_prompt_that_continues_it(kind, budget):
+    """A finished request names its history, its prompt and every draw its cache holds (all but its last,
+    which no step fed), so a later prompt that continues it, a conversation's next turn, reads its full
+    pages by their prefix hashes, and over a hybrid stack the recurrent state its rows were left in at its
+    end where that is a page's end (`PagedRows.finished`), and prefills only what follows: its draws are the
+    lone task call's over the whole prompt, and the history's every full page is read from the cache (all of
+    it, 16 tokens, at a budget of 9; its first 12 of 14 at a budget of 7)."""
+    model = (decoder() if kind == "attention" else hybrid_model(VOCAB)).clone(max_seq_len=128)
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    bound = TextGeneration(model, params, sampling=Sampling(temperature=0))
+    server = Server.from_task(bound, slots=2, capacity=64, kv_cache=KVCache(page_size=4, pages=40))
+    prompt = [1, 2, 3, 4, 5, 6, 7, 3]
+    first = server([prompt], budget, key=0)[0].host()
+    count = int(first.lengths[0])
+    assert count == budget
+    drawn = [int(token) for token in first.tokens[0, first.prompt_width:first.prompt_width + count]]
+    history = [*prompt, *drawn[:-1]]
+    continued = [*prompt, *drawn, 8, 9]
+    before = server.prefix_hits
+    second = server([continued], 6, key=1)[0]
+    assert_same_generation(second, bound([continued], 6, key=1))
+    assert server.prefix_hits - before == len(history) // 4 * 4
 
 
 @pytest.mark.parametrize("prefix_cache", [False, True], ids=["unshared", "prefix"])
@@ -1622,7 +1657,7 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
         server, tickets = served_alongside(placed, slots=8, admission=8, **options)
         assert_sharded(placed.variables["params"], server.mesh)
         assert server.groups == jax.device_count() // mesh.tensor
-        assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
+        assert server.prefix_hits == shared_page(options)
         if "kv_cache" in options:
             pool = next(leaf for leaf in jax.tree.leaves(server.cache) if leaf.ndim == 4)
             pages = pool.sharding.spec[1]
@@ -2146,6 +2181,35 @@ def test_a_cache_config_beside_an_offloaded_cache_configures_nothing():
                      {"cache_implementation": "quantized", "cache_config": settings}):
         with pytest.raises(ValueError):
             source_decoding({}, controls, model, 1, None)
+
+
+@pytest.mark.parametrize("kv_cache", [KVCache(page_size=16), KVCache()], ids=["paged", "dense"])
+def test_an_offloaded_caches_scanned_decode_compiles_for_a_gpu(kv_cache):
+    """An offloaded cache's decode step over scanned layers whose banks lie in host memory (`scan_layers`,
+    read a layer at a time) compiles for an A100 (`compile_programs`): its first and last layers read and
+    write their keys, values and weights at a constant index of a host bank, which XLA:GPU takes where each
+    copy keeps the bank's axis in host memory and reshapes in device memory (`dew.nn.host_memory`), the one
+    owner of that movement for the stack and the cache alike."""
+    from dew.nn.kv_cache import offloaded
+    from dew.training.ahead import compile_programs
+
+    model = decoder().clone(num_layers=2, max_seq_len=64, scan_layers=True,
+                            kv_cache=dataclasses.replace(kv_cache, offloaded=True))
+    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))["params"]
+    leaves, tree = jax.tree.flatten(params)
+
+    def decoded(*arguments):
+        params = jax.tree.unflatten(tree, arguments[:-1])
+        # Its layers' banks in host memory, as a held-banks server keeps them, read a layer at a time.
+        variables = {"params": {name: jax.device_put(held, jax.memory.Space.Host)
+                                if name.startswith("layers_") else held for name, held in params.items()}}
+        _, made = model.apply(variables, 2, method=CausalTransformer.init_cache, mutable=["cache"])
+        cache = offloaded(made["cache"], model.kv_cache)
+        logits, _ = model.apply({**variables, "cache": cache}, arguments[-1], decode=True, mutable=["cache"])
+        return logits
+
+    shapes = [jax.ShapeDtypeStruct(leaf.shape, leaf.dtype) for leaf in leaves]
+    compile_programs({"decode": (decoded, [*shapes, jax.ShapeDtypeStruct((2, 4), jnp.int32)])}, "sm80")
 
 
 def test_a_sources_offloaded_cache_generates_what_a_resident_one_does():

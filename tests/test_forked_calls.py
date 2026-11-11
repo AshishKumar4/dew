@@ -733,3 +733,49 @@ def test_a_windowed_block_over_forks_reads_its_block_whole_and_its_window_else()
                 windowed = before and 0 <= places[row, query] - places[row, key] < window
                 blocked = mine and blocks[row, query] >= 0 and blocks[row, key] == blocks[row, query]
                 assert found[row, query, key] == (windowed or blocked), (row, query, key)
+
+
+def test_rollouts_share_their_prompts_where_their_scorer_does_from_its_runs_plan():
+    """A rollout scheduler built before its run binds its plan packs a task's samples over one copy of
+    their prompt where the objective that trains on them shares, read at each call (`RolloutScheduler.
+    scorer`, its `shares_prefixes(train=True)`): a GRPO policy over a forked decoder, and a PPO objective
+    whose critic reads forks too; after a plan from before `SHARED_STATE` binds (`TokenScorer.bind_plan`,
+    a run saved before forks resuming) the same call packs every sample whole, as it does where the critic's
+    backbone reads no forks or no scorer is named."""
+    import optax
+    from model_support import TINY_DECODER
+    from test_rl_methods import Scripted, session
+
+    from dew.data.plan import PLAN_VERSIONS, SHARED_STATE
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.rl.grpo import GRPOObjective
+    from dew.objectives.rl.ppo import PPOObjective, ValueHead
+    from dew.objectives.rl.scheduler import RolloutScheduler, Synchronous
+    from dew.objectives.rl.sessions import FORK_PARENTS_KEY
+    from dew.training import Trainer
+
+    model = CausalTransformer(vocab_size=VOCAB, **TINY_DECODER)
+    sessions = {"0": [session(0, sample, float(sample), (2,)) for sample in range(2)]}
+    batch = {"task_id": np.asarray([0], np.int32)}
+
+    def packed(scorer, objective):
+        state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3)).initial_state()
+        scheduler = RolloutScheduler(Synchronous(Scripted(sessions)), groups=2, scorer=scorer)
+        return lambda: FORK_PARENTS_KEY in scheduler(state, batch, jax.random.key(0))
+
+    class Plain(nn.Module):
+        """A backbone that states no reading of a call over forks."""
+
+        def hidden_states(self, tokens, **_):
+            return jnp.zeros((*tokens.shape, 4))
+
+    policy = GRPOObjective(model, Scripted.width - 1)
+    critic = PPOObjective(model, Scripted.width - 1, critic=ValueHead(model))
+    for objective in (policy, critic):
+        shares = packed(objective, policy)
+        assert shares()
+        objective.bind_plan(SHARED_STATE - 1)
+        assert not shares()
+        objective.bind_plan(PLAN_VERSIONS[-1])
+    assert not packed(PPOObjective(model, Scripted.width - 1, critic=ValueHead(Plain())), policy)()
+    assert not packed(None, policy)()

@@ -16,17 +16,17 @@ from low_precision_support import nvfp4
 
 from dew.algebra import bits
 from dew.nn import fake_quant
-from dew.nn.kernels import gemm, generation, grouped_matmul
+from dew.nn.kernels import formats, gemm, generation, grouped_matmul
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
 def test_an_nvfp4_matrix_holds_its_codes_and_the_staged_order_reads_back():
-    """A matrix quantized from fp32 (`gemm.NvFp4.quantized`) holds `bits.nvfp4_quantized`'s codes and scales:
-    its codes read back in the depths' own order (`NvFp4.codes`) are the quantizer's natural words' codes,
-    its scales the quantizer's; and its words are K-major, in the staged order (`gemm.staged_rows`, within
-    each 128 depths word w holding depths w + 16j), not the natural one's."""
+    """A matrix quantized from fp32 (`formats.NvFp4.quantized`) holds `bits.nvfp4_quantized`'s codes and
+    scales: its codes read back in the depths' own order (`NvFp4.codes`) are the quantizer's natural words'
+    codes, its scales the quantizer's; and its words are K-major, in the staged order (`formats.staged_rows`,
+    within each 128 depths word w holding depths w + 16j), not the natural one's."""
     x = jnp.asarray(np.random.default_rng(5).standard_normal((256, 64)), jnp.float32)
-    matrix = gemm.NvFp4.quantized(x)
+    matrix = formats.NvFp4.quantized(x)
     words, scales, scale = bits.nvfp4_quantized(x)
     natural = bits.nvfp4_decoded(words, jnp.full(scales.shape, bits.NVFP4_OWED, jnp.float8_e4m3fn))
     np.testing.assert_array_equal(np.asarray(matrix.codes()), np.asarray(natural, np.float32))
@@ -34,7 +34,7 @@ def test_an_nvfp4_matrix_holds_its_codes_and_the_staged_order_reads_back():
     assert float(matrix.scale) == float(scale)
     assert matrix.words.shape == (64, 256 // 8)
     assert not np.array_equal(np.asarray(matrix.words.T), np.asarray(words))
-    order = gemm.staged_rows(256)
+    order = formats.staged_rows(256)
     assert sorted(order) == list(range(256)) and order[8 * 3 + 5] == 16 * 5 + 3 and order[128] == 128
 
 
@@ -143,13 +143,14 @@ def test_an_nvfp4_products_packed_kernel_is_its_decoded_product(generation_name)
     np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
 
 
-def nvfp4_bank(seed: int, groups: int, depth: int, width: int) -> tuple[gemm.NvFp4, np.ndarray]:
+def nvfp4_bank(seed: int, groups: int, depth: int, width: int) -> tuple[formats.NvFp4, np.ndarray]:
     """A bank of `groups` NVFP4 matrices (`nvfp4`'s each, its own tensor scale, row 4516) as one
-    `gemm.NvFp4` (`[groups, depth, width]`), and its values."""
+    `formats.NvFp4` (`[groups, depth, width]`), and its values."""
     matrices = [nvfp4(seed + group, depth, width, scale=2.0 ** -group) for group in range(groups)]
     codes = jnp.stack([matrix.codes() for matrix, _ in matrices])
     scales = jnp.stack([matrix.scales.T for matrix, _ in matrices])
-    bank = gemm.NvFp4.of(codes, scales, jnp.asarray([2.0 ** -group for group in range(groups)], jnp.float32))
+    bank = formats.NvFp4.of(codes, scales,
+                            jnp.asarray([2.0 ** -group for group in range(groups)], jnp.float32))
     return bank, np.stack([values for _, values in matrices])
 
 
@@ -206,16 +207,16 @@ def test_a_stack_of_nvfp4_banks_is_read_at_its_layer_as_that_layers_bank(kernel)
 
 def test_an_nvfp4_bank_packs_its_nibbles_on_the_host_as_its_values():
     """A bank's codes given as uint8 nibbles in NumPy (row 4516: a checkpoint's E2M1 codes, never floats)
-    pack on the host, `gemm.NvFp4.of` returning NumPy words, scales and scale, bitwise the words of the
+    pack on the host, `formats.NvFp4.of` returning NumPy words, scales and scale, bitwise the words of the
     same codes given as their E2M1 values on the device."""
     rng = np.random.default_rng(13)
     nibbles = rng.integers(0, 16, size=(2, 256, 64)).astype(np.uint8)
     scales = np.exp2(rng.integers(-3, 4, size=(2, 16, 64))).astype(jnp.float8_e4m3fn)
     scale = np.asarray([0.5, 0.25], np.float32)
-    host = gemm.NvFp4.of(nibbles, scales, scale)
+    host = formats.NvFp4.of(nibbles, scales, scale)
     assert all(isinstance(field, np.ndarray) for field in (host.words, host.scales, host.scale))
     values = fake_quant.E2M1[nibbles]
-    device = gemm.NvFp4.of(jnp.asarray(values, jnp.float32), jnp.asarray(scales), jnp.asarray(scale))
+    device = formats.NvFp4.of(jnp.asarray(values, jnp.float32), jnp.asarray(scales), jnp.asarray(scale))
     np.testing.assert_array_equal(host.words, np.asarray(device.words))
 
 
@@ -261,7 +262,7 @@ def test_an_nvfp4_products_input_gradient_keeps_its_cotangents_precision():
     """The packed NVFP4 product's input gradient (audit A2) multiplies the cotangent at its own precision:
     a cotangent row of 1 and -511/512 against a matrix of equal values sums to the 1/512 their difference
     is, where the cotangent narrowed to bfloat16 first (-511/512 rounding to -1) summed to 0."""
-    matrix = gemm.NvFp4.quantized(jnp.ones((512, 128), jnp.float32))
+    matrix = formats.NvFp4.quantized(jnp.ones((512, 128), jnp.float32))
     rows = jnp.zeros((8, 512), jnp.float32)
     cotangent = jnp.zeros((8, 128), jnp.float32).at[:, 0].set(1.0).at[:, 1].set(-511 / 512)
     with generation.assumed("sm90"), generation.chosen(nvfp4="packed"), generation.routes() as routes:

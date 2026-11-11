@@ -150,6 +150,52 @@ def test_the_quantizers_round_fp32_input_as_the_stand_ins(source):
                                       reference[f"qat_{site}_out"].view(np.uint32), err_msg=site)
 
 
+QAT_SEEDS = 2
+"""The quantization-aware step's draws of ids that check 2 certifies, each certified whole: its every
+primitive, executed alone, is within its own operation's contract, so a draw's every element holds."""
+
+
+def test_a_quantization_aware_step_is_never_wrong(source, monkeypatch):
+    """The tiny's quantization-aware training step, its activations rounding through the release's
+    quantizers with the straight-through estimator (`fake_quant.straight_through`, docs/design/training.md
+    Quantization-aware training): its loss, its gradient in every parameter and its parameters after one
+    SGD step, over drawn ids, each primitive within its own operation's contract (check 2,
+    `certified.assert_certified`), traced as its users run it, without the suite's wide CPU arithmetic. No
+    reference trains the release, which is inference code: the step is held to its own contract, element by
+    element."""
+    import optax
+    from certified import assert_certified
+
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC
+    from dew.objectives.base import Step
+    from dew.objectives.lm import LMObjective
+
+    loaded, _, reference = source
+    shape = reference["input_ids"].shape
+    objective = LMObjective(loaded.model, shape[1] - 1, ema_decay=None, pad_id=2)
+    optimizer = optax.sgd(2.0 ** -4)
+
+    def step(params, ids):
+        def loss(params):
+            statistics, _ = objective.loss({**loaded.variables, "params": params}, {"text": ids},
+                                           Step(step=jnp.int32(0), key=jax.random.key(0), ema=None))
+            return objective.reduce_loss(statistics)[0]
+
+        value, gradient = jax.value_and_grad(loss)(params)
+        updates, _ = optimizer.update(gradient, optimizer.init(params), params)
+        return value, gradient, optax.apply_updates(params, updates)
+
+    def draw(seed):
+        vocabulary = json.loads((TINY / "config.json").read_text())["text_config"]["vocab_size"]
+        ids = np.random.default_rng([4796, seed]).integers(3, vocabulary - 1, shape)
+        return loaded.variables["params"], jnp.asarray(ids, jnp.int32)
+
+    # The program its users run: the suite's wide CPU arithmetic (float64 sums and reductions) is the
+    # suite's alone, and check 2 holds float formats of the lane's own.
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    assert_certified(step, draw, "a quantization-aware step", seeds=QAT_SEEDS)
+
+
 def test_the_engram_hash_is_the_releases_int64_arithmetic():
     """At the release's sizes (a compressed vocabulary of 99092, buckets
     above 16M, 8 heads over 2- to 4-grams) the limb arithmetic equals

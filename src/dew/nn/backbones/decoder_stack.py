@@ -35,6 +35,7 @@ from dew.nn.inspection import QK
 from dew.nn.protocols import StagedStacks
 
 from .. import in_backward
+from ..host_memory import fetched, fetched_at, on_host
 from ..hyper_connections import Carried
 from ..inspection import counted, current_positions, watched_positions
 from ..kv_cache import cache_at_layer, cache_from_layer
@@ -64,41 +65,6 @@ StageRun = Callable[[list, jax.Array, jax.Array | None], jax.Array]
 """How a stack of blocks runs a stage's layers over a microbatch, with its rows
 of the inputs held by row, None where it holds none (`BlockStage`)."""
 
-def _fetched(tree):
-    """`tree` in device memory, the copy issued and not waited for.
-
-    `jax.device_put` to a memory space alone keeps each leaf's sharding and
-    dtype, so a fetched shard is the shard the layout placed on the host and
-    the collectives its layer issues are the ones a resident run issues. A
-    leaf already in device memory is not moved, so a bank the layout left
-    resident reads the same way and gives the same values.
-    """
-    return jax.tree.map(lambda leaf: jax.device_put(leaf, jax.memory.Space.Device), tree)
-
-
-def _fetched_layer(tree, index):
-    """Copy the layer with its bank axis intact; squeeze only in device memory.
-
-    TPU host tiles cannot in general be bitcast to the lower-rank shape.
-    The bank's layer-major physical layout also keeps the copied tile valid.
-    The index reaches the slice through an optimization barrier, so the
-    slice stays the dynamic one a scanned layer takes: at a constant index
-    (a run's first layer) over host rows a call stacks itself, XLA:GPU
-    folds the slice to the row and the squeeze into the host parameter's
-    own bitcast, which its layout assignment refuses ("Bitcast cannot have
-    different memory spaces").
-    """
-    index = jax.lax.optimization_barrier(jnp.asarray(index, jnp.int32))
-    return jax.tree.map(
-        lambda leaf: jax.lax.squeeze(jax.device_put(jax.lax.dynamic_index_in_dim(leaf, index, 0),
-                                                    jax.memory.Space.Device), (0,)), tree)
-
-
-def on_host(tree) -> bool:
-    """Whether any leaf of `tree` sits in host memory."""
-    return any(jax.typeof(leaf).memory_space is jax.memory.Space.Host
-               for leaf in jax.tree.leaves(tree))
-
 
 def _apart(held: dict) -> tuple[dict, dict]:
     """A run's read-only variables as its layers read them from their banks: those in host memory, which
@@ -109,12 +75,12 @@ def _apart(held: dict) -> tuple[dict, dict]:
     Qwen3-30B-A3B's experts, half a decode step on an H100, and 0.29 ms a step of its attention's
     projections, norms and router over 8 layers (OM-1342-cache-experts-2f9c0a176)."""
     flat = flatten_dict(held)
-    fetched = unflatten_dict({path: leaf for path, leaf in flat.items() if on_host(leaf)})
+    hosted = unflatten_dict({path: leaf for path, leaf in flat.items() if on_host(leaf)})
     in_place = unflatten_dict({path: leaf for path, leaf in flat.items() if not on_host(leaf)})
     params = in_place.get('params')
     if params is not None and holds_experts(params):
         in_place = {**in_place, **experts_apart({'params': params})}
-    return fetched, in_place
+    return hosted, in_place
 
 
 def _with(read, in_place: dict, index):
@@ -456,7 +422,7 @@ def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[Layer
             # host operand and refetches only this layer in backward
             # (MaxText layers/decoders.py:544-565).
             step = nn.remat(nn.map_variables(
-                step, mapped_collections=True, trans_in_fn=_fetched, init=False, mutable=True))
+                step, mapped_collections=True, trans_in_fn=fetched, init=False, mutable=True))
         if count == 1:
             x, written = step(run, x, None if inputs is None else inputs.layer(0), store)
             if store is not None:
@@ -635,7 +601,7 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
         if reader is not None:
             return reader.fetch(0, dependency)
         held = {name: runs[index].variables[name] for name in read_only(runs[index])}
-        return _fetched(held) if groups[index][1] == 1 else _fetched_layer(_apart(held)[0], 0)
+        return fetched(held) if groups[index][1] == 1 else fetched_at(_apart(held)[0], 0)
 
     probed: list[tuple[LayerSpec, list[str]]] = []
     staged = first_of(0, x)
@@ -738,7 +704,7 @@ def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *
     in_place = in_place or {}
     def body(carry, index):
         hidden, current, held = carry
-        staged = _fetched_layer(banks, index + 1) if reader is None else reader.fetch(index + 1, hidden)
+        staged = fetched_at(banks, index + 1) if reader is None else reader.fetch(index + 1, hidden)
         per_layer_slice = None if inputs is None else inputs.layer(index)
         hidden, changed = layer(_with(current, in_place, index), _layer_slice(state, index),
                                 None if held is None else cache_at_layer(held, index),

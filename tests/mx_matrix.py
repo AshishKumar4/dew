@@ -28,7 +28,7 @@ from kernel_matrix import AXES
 from low_precision_support import spread
 from reference_error import assert_as_exact
 
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import formats, gemm, generation
 from dew.nn.kernels.templates import product
 from dew.nn.precision import at_least_fp32
 
@@ -40,8 +40,8 @@ CHOICES = frozenset({"mxfp8", "nvfp4_block"})
 format's choice `mosaic_gpu` and every choice outside `CHOICES` at XLA."""
 KERNELS = {"mxfp8": frozenset({"mosaic"}), "nvfp4_block": frozenset({"mosaic"})}
 """The kernels under test of each choice the cells run: the template's block-scaled products."""
-FORMATS = {"mxfp8": ("mxfp8", gemm.MxFp8, gemm.mxfp8_product, product.MXFP8.depth),
-           "nvfp4": ("nvfp4_block", gemm.NvFp4Block, gemm.nvfp4_block_product, product.NVFP4.depth)}
+FORMATS = {"mxfp8": ("mxfp8", formats.MxFp8, gemm.mxfp8_product, product.MXFP8.depth),
+           "nvfp4": ("nvfp4_block", formats.NvFp4Block, gemm.nvfp4_block_product, product.NVFP4.depth)}
 """Each format's choice, operand form, product and the depths a scale covers."""
 
 
@@ -134,24 +134,24 @@ def an_mxfp8_product_is_on_par(case: tuple[str, ...]) -> None:
 
 
 def mx_values(x: jax.Array) -> jax.Array:
-    """`x` quantized to MXFP8 along its last axis (`gemm.MxFp8`), its values at `x`'s width (a float64
+    """`x` quantized to MXFP8 along its last axis (`formats.MxFp8`), its values at `x`'s width (a float64
     truth's, or float32)."""
-    return gemm.MxFp8.quantized(x).decoded(at_least_fp32(x.dtype))
+    return formats.MxFp8.quantized(x).decoded(at_least_fp32(x.dtype))
 
 
 def nvfp4_values(x: jax.Array) -> jax.Array:
-    """`x` quantized to NVFP4 along its last axis (`gemm.NvFp4Block`), its values, the tensor scale too, at
+    """`x` quantized to NVFP4 along its last axis (`formats.NvFp4Block`), its values, the tensor scale too, at
     `x`'s width: a float64 truth's exact, float32's rounded once."""
-    operand, wide = gemm.NvFp4Block.quantized(x), at_least_fp32(x.dtype)
+    operand, wide = formats.NvFp4Block.quantized(x), at_least_fp32(x.dtype)
     return operand.decoded(wide) * operand.scale.astype(wide)
 
 
 def recipe_truth(group_blocks, wide=jnp.float64, quantized=mx_values) -> callable:
-    """A block-scaled recipe's training step summed in `wide` (float64: `gemm.mxfp8_projection`'s truth, or
-    `gemm.nvfp4_projection`'s with `quantized` `nvfp4_values`): `run(x, w)` quantizing as the recipe does
-    (`quantized` along each product's contraction), each group's product of the values, its gradients the
-    recipe's: the cotangent and the matrices quantized along the width for the input's, the rows and the
-    cotangent along the tokens for the matrices'."""
+    """A block-scaled recipe's training step summed in `wide` (float64: `projections.mxfp8_projection`'s
+    truth, or `projections.nvfp4_projection`'s with `quantized` `nvfp4_values`): `run(x, w)` quantizing as the
+    recipe does (`quantized` along each product's contraction), each group's product of the values, its
+    gradients the recipe's: the cotangent and the matrices quantized along the width for the input's, the rows
+    and the cotangent along the tokens for the matrices'."""
     starts = np.cumsum([0, *(128 * np.asarray(group_blocks))])
 
     def decoded(values):

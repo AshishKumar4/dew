@@ -35,7 +35,7 @@ from dew.nn.residuals import Residual
 from dew.nn.sharding import declared
 
 if TYPE_CHECKING:
-    from dew.nn.kernels.gemm import NvFp4
+    from dew.nn.kernels.formats import NvFp4
 
 FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
     "gate_up_proj": ("exp", "embed", "mlp"),

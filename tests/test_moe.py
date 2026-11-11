@@ -416,7 +416,7 @@ def test_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
 
     from dew.quantization import QUANTIZATION
 
-    # An NVFP4 matrix's depth is whole stages (`gemm.NVFP4_STAGE`, 256).
+    # An NVFP4 matrix's depth is whole stages (`formats.NVFP4_STAGE`, 256).
     experts, width, hidden, tokens, top_k = 4, 256, 256, 24, 2
     shapes = (("gate_proj", (width, hidden)), ("up_proj", (width, hidden)), ("down_proj", (hidden, width)))
     banks = {name: packed_banks(experts, *shape, seed) for seed, (name, shape) in enumerate(shapes)}
@@ -444,7 +444,7 @@ def test_a_scanned_runs_stacked_packed_banks_are_read_at_its_layer_as_that_layer
     that layer's bank alone, its gathered rows read gathered and the output scattered to its slots alike."""
     from packed_experts import packed_banks
 
-    from dew.nn.kernels import gemm
+    from dew.nn.kernels import formats
     from dew.nn.moe import Gathered, Layered, expert_projection
 
     banks = [packed_banks(4, 256, 128, seed)[0] for seed in range(3)]
@@ -460,7 +460,7 @@ def test_a_scanned_runs_stacked_packed_banks_are_read_at_its_layer_as_that_layer
         return expert_projection(inputs, kernel, sizes, jnp.bfloat16, "auto", None, scatter=slots)
 
     for layer, bank in enumerate(banks):
-        assert isinstance(bank, gemm.NvFp4)
+        assert isinstance(bank, formats.NvFp4)
         got = jax.jit(project)(Layered(stack, jnp.asarray(layer)))
         want = jax.jit(project)(jax.tree.map(jnp.asarray, bank))
         assert np.asarray(got).tobytes() == np.asarray(want).tobytes(), layer

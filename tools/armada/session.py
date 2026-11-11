@@ -312,6 +312,15 @@ def own(recorded: Mapping[str, float], sites: Container[str]) -> dict[str, float
     return {node: seconds for node, seconds in recorded.items() if site_name(node, sites) not in sites}
 
 
+def cut_record() -> Path:
+    """The record a task's groups are cut by (split.py) and keyed by (ci.py's `members`): the durations record
+    (`DURATIONS`), or where the task is a GPU tier's, the seconds its GPUs took (DEW_SPLIT_DURATIONS, a record
+    of the same shape dew-ops' maintier writes: the CPU suite skips a file's GPU tests, so its record times
+    none of them)."""
+    weights = os.environ.get("DEW_SPLIT_DURATIONS")
+    return Path(weights) if weights else DURATIONS
+
+
 def kept(nodes: list[str], planned: list[list[str]], mean: float) -> list[list[str]]:
     """`nodes`, a task's collected tests of one split file in node-id order, as the plan's groups
     `planned` (the file's recorded tests cut, `cut`): each test the record names in its planned group, so no

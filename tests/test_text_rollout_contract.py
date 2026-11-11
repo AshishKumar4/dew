@@ -728,7 +728,7 @@ def test_a_rollout_draws_the_same_rows_from_a_legacy_key_as_from_its_typed_one()
     episodes = RolloutScheduler.episodes(
         TextGeneration(model, params), answered,
         lambda episode: float(sum(sum(turn.action.tokens) for turn in episode.transitions) % 5),
-        max_prompt_tokens=4, max_new_tokens=4, max_turns=1, groups=2, sampling=sampling)
+        objective=objective, max_prompt_tokens=4, max_new_tokens=4, max_turns=1, groups=2, sampling=sampling)
     for rollout, batch in ((sampled, prompts()), (episodes, {"task_id": np.array([31], np.int32)})):
         typed = rollout(state, batch, jax.random.key(3))
         legacy = rollout(state, batch, jax.random.PRNGKey(3))

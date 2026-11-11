@@ -164,7 +164,7 @@ Prompt = str | Sequence[int] | ArrayLike | ModelInputs
 """One request: text for the processor, one row of token ids, or one prepared row."""
 
 
-def _row_groups(mesh: Mesh | None) -> int:
+def row_groups(mesh: Mesh | None) -> int:
     """How many groups of rows a server over `mesh` keeps, one per share of the slots."""
     return 1 if mesh is None else math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
 
@@ -383,6 +383,11 @@ class DenseRows:
     def prefilled(self, row: _Row) -> None:
         """Nothing outlives a dense row's prompt."""
 
+    def finished(self, row: _Row, history: np.ndarray) -> int | None:
+        """Nothing outlives a dense row's draw: its slot is its storage."""
+        del row, history
+        return None
+
     def release(self, row: _Row) -> None:
         """A dense row's slot is its storage; freeing the slot frees it."""
 
@@ -516,6 +521,25 @@ class PagedRows:
         self.pages[row.group].written(row.writing)
         row.writing = ()
 
+    def finished(self, row: _Row, history: np.ndarray) -> int | None:
+        """A finished row's `history` (its prompt and every draw its cache holds) named for a later prompt
+        that continues it, as a prompt's own prefix is (`prefilled`): its full pages by their prefix hashes
+        (`Pages.publish`), where its keys came from the weights served now; and the `States` entry, global
+        over the groups, that keeps its state at that end where rows hold state beside pages and the history
+        ends at a page's end (`kept`'s), a page's prefix hash naming it; None where none does. A history
+        gives way to every prompt's prefix (`Pages.publish`'s and `States.take`'s `transient`): it takes room
+        no prefix holds, so a pool that serves no conversation keeps the prefixes it kept."""
+        if row.weights != self.weights:
+            return None
+        part = self.pages[row.group]
+        # Named to give way first: a history keeps no page or state any prompt's prefix would.
+        part.publish(history, row.pages, row.salt, transient=True)
+        if part.states is None or not len(history) or len(history) % part.size:
+            return None
+        entry = part.states.take(prefix_hashes(history, part.size, len(history) // part.size, row.salt)[-1],
+                                 transient=True)
+        return None if entry is None else row.group * self.states + entry
+
     def release(self, row: _Row) -> None:
         part = self.pages[row.group]
         part.written(row.writing)
@@ -533,6 +557,16 @@ class PagedRows:
         entry = part.states.take(digest)
         return None if entry is None else row.group * self.states + entry
 
+    def withdrawn(self) -> set[int]:
+        """The `States` entries, global over the groups, whose finished row's owed capture a prompt's state
+        took before it ran (`States.withdrawn`), each told once."""
+        held = set()
+        for group, part in enumerate(self.pages):
+            if part.states is not None:
+                held.update(group * self.states + entry for entry in part.states.withdrawn)
+                part.states.withdrawn.clear()
+        return held
+
     def reloaded(self) -> None:
         self.weights += 1
         for part in self.pages:
@@ -544,19 +578,29 @@ Rows = DenseRows | PagedRows
 
 def _refuse_unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bool = False,
                            prefix: bool = False) -> None:
-    """Refuse the serving modes that would change what `model` computes: a prompt prefilled in
-    pieces or after a reused prefix where the model takes each prompt whole
+    """Refuse the serving modes that would change what `model` computes (`_unserved_modes`)."""
+    reason = _unserved_modes(model, paged=paged, chunked=chunked, prefix=prefix)
+    if reason is not None:
+        raise ValueError(reason)
+
+
+def _unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bool = False,
+                    prefix: bool = False) -> str | None:
+    """Why the serving modes asked would change what `model` computes, None where none would: a prompt
+    prefilled in pieces or after a reused prefix where the model takes each prompt whole
     (`Serving.split_prefill_refusal`), and a paged cache where LongRoPE rebuilds a crossing request's
-    (`rebuild_position`). A mixed admitting step it takes only where the model's own mixed refusal
-    says none (`mixed_refusal`, LongRoPE's among them)."""
+    (`rebuild_position`). A mixed admitting step it takes only where the model's own mixed refusal says
+    none (`mixed_refusal`, LongRoPE's among them). The one owner of that policy, which a refusal and a
+    default read."""
     whole = model.split_prefill_refusal() if isinstance(model, Serving) else None
     split = [name for name, active in (('chunked prefill', chunked), ('prefix reuse', prefix)) if active]
     if whole is not None and split:
-        raise ValueError(f'{" and ".join(split)} would change what this model computes: {whole}')
+        return f'{" and ".join(split)} would change what this model computes: {whole}'
     position = rebuild_position(model)
     if position is not None and paged:
-        raise ValueError(f'LongRoPE crossing position {position} cannot rebuild paged serving; use '
-                         'whole-prompt dense admission')
+        return (f'LongRoPE crossing position {position} cannot rebuild paged serving; use whole-prompt '
+                'dense admission')
+    return None
 
 
 def _served_mesh(task: TextGeneration) -> Mesh | None:
@@ -604,7 +648,7 @@ class Server:
             raise ValueError("decode_steps must be a positive number of iterations per device call")
         variables = resident(model, variables)
         self.mesh = mesh_of(variables)
-        self.groups = _row_groups(self.mesh)
+        self.groups = row_groups(self.mesh)
         if slots % self.groups or admission % self.groups:
             raise ValueError(f"slots ({slots}) and admission ({admission}) must divide by the "
                              f"{self.groups} groups the mesh splits rows into")
@@ -744,6 +788,12 @@ class Server:
         """Each request drawing several continuations whose rows are not all finished: their generations
         by continuation (`_finish`)."""
         """The (slot, entry) pairs whose state the last call left at a kept boundary."""
+        self._finished: list[tuple[int, int]] = []
+        """The (slot, entry) pairs keeping a finished row's state at its history's end (`PagedRows.finished`),
+        which the next step keeps before anything reads or moves an entry: a continuation it seats restores
+        that entry, so the capture comes first."""
+        self._holding: set[int] = set()
+        """The slots of finished rows whose state `_finished` keeps, seated again once it has."""
         rows = self.rows
         if isinstance(rows, PagedRows) and rows.stateful:
             entries = rows.states * self.groups
@@ -789,8 +839,8 @@ class Server:
 
     @classmethod
     def from_task(cls, task: TextGeneration, *, slots: int, capacity: int,
-                  admission: int | None = None, kv_cache: KVCache | None = None,
-                  chunk: int | None = None, prefix_cache: bool = False, prefix_states: int | None = None,
+                  admission: int | None = None, kv_cache: KVCache | None = None, chunk: int | None = None,
+                  prefix_cache: bool | None = None, prefix_states: int | None = None,
                   prefix_state_every: int | None = None, host_pages: int = 0,
                   decode_steps: int = 1, prefill_mesh: Mesh | None = None) -> Server:
         """Build a server over the task's model, weights, processor and policy.
@@ -808,8 +858,13 @@ class Server:
         pieces of at most that many tokens, one piece a step, so a long prompt
         does not stall the rows beside it. It also works over a dense cache
         where the admitting step is mixed. `prefix_cache` lets a request reuse
-        the pages of a prompt prefix an earlier request computed, and needs a
-        paged cache. Where the model keeps a row's own state beside its pages
+        the pages of a prompt prefix an earlier request computed, its prompt's
+        or the whole history a finished one drew (`PagedRows.finished`), and
+        needs a paged cache; None, the default, keeps it wherever the layout
+        pages and the server can reuse a prefix (the rows sample a token a
+        step, prefill on the server's own mesh, and the model computes a prompt
+        split as it computes it whole, `Serving.split_prefill_refusal`), a
+        request drawing what it draws without it. Where the model keeps a row's own state beside its pages
         (a recurrent mixer's memory, latent attention's index keys), a reused
         prefix is read with the state its prompt left at its end: each group
         keeps `prefix_states` of them (one a slot by default), taken at a
@@ -860,6 +915,8 @@ class Server:
         mesh = _served_mesh(task)
         policy, chain, criteria = task._controls(None, None, None)
         transforms, stopping, strategy = resolve(policy, chain, criteria, task.strategy)
+        if prefix_cache is None:
+            prefix_cache = _reuses_prefixes(task.model, kv_cache, strategy, prefill_mesh)
         plan = _served_plan(strategy, mesh, chunk, prefix_cache)
         if chunk is not None and (type(chunk) is not int or chunk < 1):
             raise ValueError("chunk must be a positive number of prompt tokens per piece")
@@ -867,7 +924,7 @@ class Server:
             if value is not None and (type(value) is not int or value < 1):
                 raise ValueError(f"{name} must be a positive integer")
         model, layout, rounded = _served_layout(task.model, kv_cache, capacity)
-        groups = _row_groups(mesh)
+        groups = row_groups(mesh)
         model, rows = _cache_rows(cache_sized(model, rounded), layout, slots, rounded, groups, chunk,
                                   prefix_cache, prefix_states, prefix_state_every, host_pages)
         if plan is not None:
@@ -903,6 +960,12 @@ class Server:
     def cache(self) -> Variables:
         """The resident cache, updated in place by every step."""
         return joined(self._resident, self._carried).decoder.cache
+
+    @property
+    def reuses_prefixes(self) -> bool:
+        """Whether a request may read an earlier one's prefix pages (`from_task`'s `prefix_cache`): an
+        earlier prompt's, or the history a finished one drew (`PagedRows.finished`)."""
+        return isinstance(self.rows, PagedRows) and any(part.prefix_cache for part in self.rows.pages)
 
     @property
     def occupancy(self) -> int:
@@ -988,7 +1051,7 @@ class Server:
         first = self._prepared(prompt, max_new_tokens, seed, fold, adapter)
         ticket = self._queued(first)
         for continuation in range(1, self.n):
-            row = self._prepared(prompt, max_new_tokens, seed, fold, adapter)
+            row = self._prepared(prompt, max_new_tokens, seed, fold, adapter, continuation)
             self._queued(dataclasses.replace(row, ticket=ticket, continuation=continuation))
         return ticket
 
@@ -1003,7 +1066,7 @@ class Server:
         return row.ticket
 
     def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int,
-                  adapter: str | None = None) -> _Row:
+                  adapter: str | None = None, continuation: int = 0) -> _Row:
         names = adapter_names(self.model)
         if adapter is not None and adapter not in names:
             raise ValueError(f"this server's model holds no adapter named {adapter!r}"
@@ -1062,9 +1125,12 @@ class Server:
                 hasher.update(b"adapter" + np.int32(chosen).tobytes())
             if self.keyed:
                 # A cached memory rounds by the request's own key (`dew.nn.kv_cache.ROUNDING_KEYS`), so the
-                # state after a prefix is that key's: the prefix is shared only under one key.
+                # state after a prefix is that key's: the prefix is shared only under one key, a
+                # continuation's past its first folded again (`_row_keys`).
                 hasher.update(b"seed" if isinstance(seed, int) else b"key")
                 hasher.update(np.asarray(seed).tobytes() + np.int64(fold).tobytes())
+                if continuation:
+                    hasher.update(b"continuation" + np.int64(continuation).tobytes())
             if context is not None:
                 # The context's dtype too, so equal bytes of another dtype salt apart.
                 array_fingerprint(hasher, np.asarray(context))
@@ -1088,10 +1154,13 @@ class Server:
         booking's state, as `States` names it."""
         if row.prefilled not in row.snapshots or not isinstance(self.rows, PagedRows):
             return
-        entry = self.rows.kept(row)
+        self._booked(slot, self.rows.kept(row))
+
+    def _booked(self, slot: int, entry: int | None) -> None:
+        """Book the next call to keep the state `slot` holds in `States` entry `entry` (none where None), a
+        later booking of one entry replacing an earlier."""
         if entry is not None:
-            others = [(held, kept) for held, kept in self._captures if kept != entry]
-            self._captures = [*others, (slot, entry)]
+            self._captures = [*_without(self._captures, entry), (slot, entry)]
 
     def _piece_end(self, row: _Row) -> int:
         """Where the row's next prefill piece ends: the prompt's end, or `chunk` tokens on when the rows
@@ -1151,16 +1220,30 @@ class Server:
             admission = self._admit(pending, max(held["waiting"] for held in said),
                                     max(held["widest"] for held in said),
                                     sorted({name for held in said for name in held["fields"]}))
-            return admission, {"captures": [list(pair) for pair in self._captures], **self._owed()}
+            if isinstance(self.rows, PagedRows):
+                # A history whose entry a prompt's state took this seating keeps nothing (`States.withdrawn`).
+                withdrawn = self.rows.withdrawn()
+                self._finished = [(slot, entry) for slot, entry in self._finished if entry not in withdrawn]
+            return admission, {"captures": [list(pair) for pair in self._captures],
+                               "finished": [list(pair) for pair in self._finished], **self._owed()}
 
         # The admission is built on every process, and a failure building it stops every one, as the
         # seating's does; each process's captures and page copies come back with it.
         (admission, _), booked = self._agreed("serving admission", admitted, lambda held: held[1])
         captures = [tuple(pair) for held in booked for pair in held["captures"]]
+        finished = [tuple(pair) for held in booked for pair in held["finished"]]
         spills, uploads, state_spills, state_uploads = (
             [tuple(pair) for held in booked for pair in held[name]]
             for name in ("spills", "uploads", "state_spills", "state_uploads"))
         with self._context():
+            # A finished row's state first, before a spill reads its entry or a restore seats it: an
+            # admission's width of them a call, the capture's one program.
+            for start in range(0, len(finished), self.admission):
+                self._states = self._captured(self._states, self._resident, self._carried,
+                                              *_padded(finished[start:start + self.admission],
+                                                       self.admission, 1))
+            self._finished = []
+            self._holding.clear()
             # Spills read reclaimed pages before anything writes them.
             self._transferred(spills, uploads)
             # A state giving way goes to the host, and one a seated row reads comes back, before restores.
@@ -1190,7 +1273,7 @@ class Server:
         assert isinstance(self.rows.placement, Dense) and self.prefill_mesh is not None
         mesh = self.prefill_mesh
         # The rows split over the prefill mesh's row groups where they divide, else each device prefills all.
-        split = admission.slots.shape[0] % _row_groups(mesh) == 0
+        split = admission.slots.shape[0] % row_groups(mesh) == 0
         rows = _moved(admission, NamedSharding(mesh, P(batch_axes(mesh) or None) if split else P()),
                       phase="an admission to the prefill mesh")
         with jax.set_mesh(mesh), whole():
@@ -1331,16 +1414,23 @@ class Server:
         max_new_tokens: int | None = None,
         *,
         key: int | jax.Array,
+        first: int = 0,
     ) -> list[Generation]:
         """Submit a batch, run it through, and return its generations in order.
 
-        Row `i` draws with the request key folded by `i`, as the same batch
-        through `TextGeneration` would. Each row is validated as `submit`
-        validates one.
+        Row `i` draws with the request key folded by `first + i`, as the same
+        batch through `TextGeneration` would where it is a pool's rows from
+        global row `first` on. Each row is validated as `submit` validates
+        one. A prompt that continues an earlier request's whole history reads
+        the full pages that request named of it (`PagedRows.finished`), and
+        its state at the history's end where rows hold state and the history
+        ends at a page's end, so a turn of a conversation prefills what
+        follows its last full page.
         """
         base = _seed(key, self.prng)
         inputs = prepared_inputs(self.processor, prompts, images=None)
-        tickets = [self._enqueued(inputs.take_rows(jnp.arange(index, index + 1)), max_new_tokens, base, index)
+        tickets = [self._enqueued(inputs.take_rows(jnp.arange(index, index + 1)), max_new_tokens, base,
+                                  first + index)
                    for index in range(inputs.tokens.shape[0])]
         self.run()
         return [ticket.result() for ticket in tickets]
@@ -1367,7 +1457,8 @@ class Server:
         busy = self._busy()
         size, share = self.slots // self.groups, self.admission // self.groups
         # Another process's groups hold no slot this one seats.
-        free = [[slot for slot in range(group * size, (group + 1) * size) if slot not in self._rows]
+        free = [[slot for slot in range(group * size, (group + 1) * size)
+                 if slot not in self._rows and slot not in self._holding]
                 if group in self._local else [] for group in range(self.groups)]
         seated = self.rows.seat(self._waiting.queue, free, share, self._claimed)
         # After seating: a request another thread submitted while the queue
@@ -1524,12 +1615,26 @@ class Server:
                 drew[slot] = row
                 if draws.stopped[step, slot] or len(row.tokens) >= row.budget:
                     del self._rows[slot]
+                    self._kept_history(slot, row)
                     self.rows.release(row)
                     del drew[slot]
                     _streamed(row)
                     self._finish(row, terminated=bool(draws.ended[step, slot]))
         for row in drew.values():
             _streamed(row)
+
+    def _kept_history(self, slot: int, row: _Row) -> None:
+        """A finished row's history named for a later prompt that continues it (`PagedRows.finished`): its
+        prompt and every draw its cache holds, every one but its last, which no step fed (a stopped row
+        feeds nothing more, `Slots`); and its state there booked for the next call to keep, its slot held
+        until then."""
+        history = np.concatenate([row.prompt, np.asarray(row.tokens[:-1], row.prompt.dtype)])
+        entry = self.rows.finished(row, history)
+        if entry is not None:
+            # The stopped slot is fed nothing more; seated again once the next step has kept its state.
+            self._captures = _without(self._captures, entry)
+            self._finished = [*_without(self._finished, entry), (slot, entry)]
+            self._holding.add(slot)
 
     def fail(self, failure: BaseException) -> None:
         """Stop after `failure`: every waiting and running request settles with it, and a later
@@ -1615,6 +1720,16 @@ def _held_here(leaf: jax.Array) -> np.ndarray:
     for shard in leaf.addressable_shards:
         held[shard.index] = np.asarray(shard.data)
     return held
+
+
+def _reuses_prefixes(model: nn.Module, kv_cache: KVCache | None, strategy: Strategy,
+                     prefill_mesh: Mesh | None) -> bool:
+    """Whether a server keeps a prefix cache it was not told to keep or not (`from_task`'s `prefix_cache`):
+    where its layout pages (the model's own, or `kv_cache`), its rows sample a token a step on its own mesh,
+    and serving it paged with a reused prefix computes what the model computes (`_unserved_modes`)."""
+    layout = kv_cache if kv_cache is not None else model.kv_cache if isinstance(model, Layered) else None
+    return (layout is not None and layout.page_size is not None and isinstance(strategy, Sample)
+            and prefill_mesh is None and _unserved_modes(model, paged=True, prefix=True) is None)
 
 
 def _served_plan(strategy: Strategy, mesh: Mesh | None, chunk: int | None,
@@ -1719,6 +1834,11 @@ def _cache_rows(model: nn.Module, layout: KVCache, slots: int, capacity: int, gr
 def _offloaded(model: nn.Module) -> bool:
     """Whether the served model keeps its paged pool in host memory (`KVCache.offloaded`)."""
     return isinstance(model, Layered) and model.kv_cache.offloaded
+
+
+def _without(pairs: list[tuple[int, int]], entry: int) -> list[tuple[int, int]]:
+    """`pairs` (slot, entry) but any keeping `entry`, which a later booking keeps instead."""
+    return [(slot, kept) for slot, kept in pairs if kept != entry]
 
 
 def _padded(pairs: Sequence[tuple[int, int]], count: int, dropped: int) -> tuple[np.ndarray, np.ndarray]:

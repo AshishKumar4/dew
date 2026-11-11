@@ -14,6 +14,18 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   upstream's is. A run whose configured precision is above the default (`dew.nn.precision.ACCURATE`'s
   'highest') is declined by the ports and trains on the portable math in IEEE float32, as before.
 
+- A paged `Server` keeps a prefix cache by default (`prefix_cache=None` derives it on wherever the layout pages,
+  the rows sample a token a step on the server's own mesh and the model computes a split prompt as a whole
+  one); a request draws what it draws without it. Pass `prefix_cache=False` to keep pages private. A
+  finished request names its whole history's full pages, so a later prompt that continues it prefills what
+  follows the last of them, a hybrid reading the state its rows were left in where the history ends at a
+  page's end. `EpisodeCollector(kv_cache=KVCache(page_size=...))` runs a cohort's turns through the server
+  in process, each turn reading its row's history from the cache.
+- A DiffusionGemma run exports in transformers' DiffusionGemmaForBlockDiffusion layout where that class
+  builds the model, and its native release, stating why, where it cannot. A native release, any token
+  task's, is the source a run starts from (`--pretrained <run>`, `Pretrained.load(run)`), its model in Dew's
+  own layout, whose export refuses with the layout's reason.
+
 - A shared prefix is computed once in the backbone call (`dew.batch.Forks`): a row's documents may continue
   another, each reading its chain of ancestors as its own beginning, attention their keys and every recurrent
   mixer (gated delta net, Kimi delta attention, Mamba, Mamba-2, the short conv) the state and conv history
@@ -36,6 +48,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   teacher crossed to the device every step. Its checkpoints store the teacher banked (`layers_0_2`): a
   host-layout distillation saved before this keeps its teacher per layer (`layers_0` to `layers_2`) and
   does not restore into it; start such a run afresh from its teacher.
+- Dew requires its JAX build 0.12.0.1.post81, its CUDA and PJRT plugins post81's on every machine: under
+  deterministic ops XLA makes its GEMM fusions and keeps Triton's GEMMs, whatever the client states of
+  `--xla_gpu_experimental_deterministic_ops_triton` (post80's default never reached the compiler), and the
+  fork's audit fixes: staged custom-JVP outputs refused as shared through call and control-flow batching,
+  the functional GPU interpreter's TMA windows before their buffers, while conditions and predicated
+  copies, scaled-MMA race checks, TMEM load register limits and deviceless capture operands.
 - Dew requires its JAX build 0.12.0.1.post80, its CUDA and PJRT plugins post80's on every machine: under
   deterministic ops XLA keeps Triton's GEMM fusions by default, whose sums are ordered and repeat, where
   post79 routed every fused dot to cuBLASLt, whose chain of small batched products did not repeat its bits

@@ -37,7 +37,8 @@ def test_the_lane_flushes_operands_and_results_alike_however_it_compiles(dtype, 
 @pytest.mark.parametrize("name, fn, operands", [
     ("add", jnp.add, 2), ("add_any", jnp.add, 2), ("sub", jnp.subtract, 2), ("mul", jnp.multiply, 2),
     ("div", jnp.divide, 2), ("sqrt", jnp.sqrt, 1), ("rsqrt", jax.lax.rsqrt, 1), ("log", jnp.log, 1),
-    ("exp", jnp.exp, 1), ("logistic", jax.lax.logistic, 1), ("log1p", jnp.log1p, 1), ("expm1", jnp.expm1, 1)])
+    ("exp", jnp.exp, 1), ("logistic", jax.lax.logistic, 1), ("log1p", jnp.log1p, 1), ("expm1", jnp.expm1, 1),
+    ("sin", jnp.sin, 1), ("cos", jnp.cos, 1)])
 def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(name, fn, operands):
     """The lane's own result of each operation on random float32 operands, subnormal products and
     quotients included, holds its contract at the lane's measured reach; the same result moved past
@@ -169,6 +170,89 @@ def test_a_dot_holds_its_bound_and_an_element_twice_past_it_breaks_it():
     assert not held[1, 2] and held.sum() == held.size - 1
 
 
+def test_a_scatter_add_holds_its_bound_and_a_lost_update_breaks_it():
+    """A scatter-add of float32 updates, several landing on one element and one dropped out of range: the
+    lane's own result holds each element's sum in any order, and an element missing its largest update
+    breaks there alone; an integer scatter-add wraps, and one off breaks."""
+    rng = np.random.default_rng(7)
+    operand = np.float32(rng.standard_normal((6, 3)))
+    indices = np.int32([[1], [4], [1], [1], [9]])
+    updates = np.float32(rng.standard_normal((5, 3)) * 2.0 ** rng.integers(-6, 6, (5, 3)))
+
+    def added(operand, indices, updates):
+        return operand.at[indices[:, 0]].add(updates, mode="drop")
+
+    params, given, (native,) = _first_equation(added, [operand, indices, updates], "scatter-add")
+    native = np.asarray(native)
+    contract = ct.CONTRACTS["scatter-add"]
+    assert np.all(contract(params, given, native, oc.FLOAT32))
+    lost = native.copy()
+    lost[1, 0] -= updates[[0, 2, 3], 0][np.argmax(np.abs(updates[[0, 2, 3], 0]))]
+    held = contract(params, given, lost, oc.FLOAT32)
+    assert not held[1, 0] and held.sum() == held.size - 1
+    ints = [np.int32([[2 ** 31 - 1], [0]]), np.int32([[0], [0]]), np.int32([[1], [5]])]
+    params, given, (native,) = _first_equation(lambda o, i, u: o.at[i[:, 0]].add(u), ints, "scatter-add")
+    assert np.all(contract(params, given, np.asarray(native), None))
+    assert not np.all(contract(params, given, np.asarray(native) + np.int32(1), None))
+
+
+@pytest.mark.parametrize("ragged", ["rows", "contracting"])
+def test_a_ragged_dot_holds_each_groups_bound_and_an_element_twice_past_it_breaks_it(ragged):
+    """A ragged dot in each form a mixture of experts takes: each row times its group's weights (its
+    forward, its input's gradient) and each group's rows alone summed (its weights' gradient), with rows
+    past every group. The lane's own result holds every element's sum in any order, and one element moved
+    twice its bound breaks there alone."""
+    rng = np.random.default_rng(8)
+    sizes = np.int32([3, 0, 4])
+    lhs = np.float32(rng.standard_normal((9, 5)))
+    if ragged == "rows":
+        rhs = np.float32(rng.standard_normal((3, 5, 4)))
+
+        def product(lhs, rhs, sizes):
+            return jax.lax.ragged_dot(lhs, rhs, sizes, precision="highest")
+    else:
+        rhs = np.float32(rng.standard_normal((9, 4)))
+        numbers = jax.lax.RaggedDotDimensionNumbers(dot_dimension_numbers=(((0,), (0,)), ((), ())),
+                                                     lhs_ragged_dimensions=(0,), rhs_group_dimensions=())
+
+        def product(lhs, rhs, sizes):
+            return jax.lax.ragged_dot_general(lhs, rhs, sizes, numbers, precision="highest")
+
+    params, given, (native,) = _first_equation(product, [lhs, rhs, sizes], "ragged_dot_general")
+    native = np.asarray(native)
+    contract = ct.CONTRACTS["ragged_dot_general"]
+    assert np.all(contract(params, given, native, oc.FLOAT32))
+    off = native.copy()
+    at = (1, 2) if ragged == "rows" else (2, 1, 2)
+    off[at] += 2 * oc.gamma(9, oc.FLOAT32) * float(np.abs(lhs).sum() * np.abs(rhs).max())
+    held = contract(params, given, off, oc.FLOAT32)
+    assert not held[at] and held.sum() == held.size - 1
+
+
+@pytest.mark.parametrize("power", [-2, 3])
+def test_an_integer_power_holds_its_chain_of_roundings_and_a_value_twice_past_it_breaks_it(power):
+    """x to an integer power, by squarings and multiplies and a reciprocal where the power is negative: the
+    lane's own result holds within its roundings' bound of the exact power, a zero's pole and an infinity's
+    power named exactly; a value twice the bound off, or a negative zero's power of the other sign, breaks
+    there alone."""
+    rng = np.random.default_rng(9)
+    x = np.float32(rng.uniform(0.25, 4, 64) * rng.choice([-1, 1], 64))
+    x[:3] = np.float32([0.0, np.inf, -0.0])
+    native = np.asarray(jax.lax.integer_pow(x, power))
+    contract = ct.CONTRACTS["integer_pow"]
+    params = {"y": power}
+    assert np.all(contract(params, [x], native, oc.FLOAT32))
+    off = native.copy()
+    off[5] = np.float32(float(off[5]) * (1 + 2 * oc.gamma(4, oc.FLOAT32)))
+    held = contract(params, [x], off, oc.FLOAT32)
+    assert not held[5] and held.sum() == held.size - 1
+    # A negative zero's power, of its sign or a pole of it, with its sign flipped.
+    off = native.copy()
+    off[2] = -off[2]
+    held = contract(params, [x], off, oc.FLOAT32)
+    assert not held[2] and held.sum() == held.size - 1
+
+
 def test_a_computation_is_certified_through_its_calls_and_a_primitive_without_a_contract_refused():
     """`certified` runs a jitted call's and a cond's bodies one primitive at a time, and finds the
     primitive no contract covers, by its path."""
@@ -182,20 +266,20 @@ def test_a_computation_is_certified_through_its_calls_and_a_primitive_without_a_
     # The op-by-op run's outputs are the operations' own: x·x, + 1, log, · 2, each the lane's.
     stepped = np.asarray(jnp.multiply(jnp.log(jnp.add(jnp.multiply(x, x), np.float32(1))), np.float32(2)))
     np.testing.assert_array_equal(outputs, stepped)
-    _, findings = ct.certified(lambda x: jnp.sin(x), x)
-    assert len(findings) == 1 and "no contract for sin" in findings[0]
+    _, findings = ct.certified(lambda x: jnp.tan(x), x)
+    assert len(findings) == 1 and "no contract for tan" in findings[0]
     with pytest.raises(AssertionError):
-        ct.assert_certified(lambda x: jnp.sin(x), lambda seed: (x,), "sine", seeds=1)
+        ct.assert_certified(lambda x: jnp.tan(x), lambda seed: (x,), "tangent", seeds=1)
 
 
 def test_an_equation_whose_result_nothing_reads_is_held_too():
     """Check 2 holds every equation the program executes: a primitive without a contract whose result the
-    output never reads (a sine dropped before the return, inside a call too) is still a finding."""
+    output never reads (a tangent dropped before the return, inside a call too) is still a finding."""
     x = np.float32(np.linspace(0.1, 3, 32))
-    for discarded in (lambda x: (jnp.sin(x), x + 1)[1],
-                      lambda x: jax.jit(lambda x: (jnp.sin(x), x * 2))(x)[1]):
+    for discarded in (lambda x: (jnp.tan(x), x + 1)[1],
+                      lambda x: jax.jit(lambda x: (jnp.tan(x), x * 2))(x)[1]):
         _, findings = ct.certified(discarded, x)
-        assert len(findings) == 1 and "no contract for sin" in findings[0], findings
+        assert len(findings) == 1 and "no contract for tan" in findings[0], findings
 
 
 def test_an_equation_past_the_lanes_reach_is_a_finding_by_its_path():
@@ -395,12 +479,51 @@ def _off_by_one_element(result):
     ("rev", lambda a: jax.lax.rev(a, (0, 1)), [np.float32(np.arange(12).reshape(3, 4))]),
     ("split", lambda a: jax.lax.split(a, (1, 3), axis=1), [np.float32(np.arange(12).reshape(3, 4))]),
     ("name", lambda a: checkpoint_name(a, "held"), [np.float32([1, 2, 3])]),
+    ("dynamic_slice", lambda a, i: jax.lax.dynamic_slice(a, (i, 1), (2, 2)),
+     [np.float32(np.arange(12).reshape(4, 3)), np.int32(3)]),
+    ("sort", jax.lax.sort, [np.float32([2, -0.0, 0.0, np.nan, -np.inf, 1, 1, -1])]),
+    ("sort", lambda k, v: jax.lax.sort((k, v), num_keys=1, is_stable=True),
+     [np.int32([3, 1, 3, 0, 1]), np.int32([0, 1, 2, 3, 4])]),
+    ("sort", lambda k, v: jax.lax.sort((k, v), num_keys=1, is_stable=True),
+     [np.float32([0.0, -np.nan, -0.0, 1, np.nan]), np.int32([0, 1, 2, 3, 4])]),
+    ("top_k", lambda a: jax.lax.top_k(a, 3), [np.float32([[1, np.nan, -0.0, 0.0, 2], [1, 1, 1, -1, 0]])]),
+    ("unstack", lambda a: jnp.unstack(a, axis=1), [np.float32(np.arange(12).reshape(3, 4))]),
+    ("tile", lambda a: jnp.tile(a, 3), [np.int32([1, 2])]),
+    ("stop_gradient", jax.lax.stop_gradient, [np.float32([1, -0.0, 3])]),
+    ("xor", jnp.bitwise_xor, [np.uint32([1, 5, 2 ** 31]), np.uint32([3, 3, 1])]),
+    ("shift_right_arithmetic", jax.lax.shift_right_arithmetic,
+     [np.int32([-8, 8, -1, 5]), np.int32([1, 2, 40, -1])]),
+    ("rem", jax.lax.rem, [np.int32([-7, 7, -7, 9]), np.int32([3, -3, -3, 4])]),
+    ("rem", jax.lax.rem, [np.float32([-7.5, 7.25, 1e10, -0.0]), np.float32([2, -3, 3, 5])]),
+    ("sign", jax.lax.sign, [np.float32([-0.0, 0.0, -2.5, np.nan, np.inf])]),
+    ("sign", jax.lax.sign, [np.int32([-5, 0, 7])]),
+    ("round", lambda a: jax.lax.round(a, jax.lax.RoundingMethod.TO_NEAREST_EVEN),
+     [np.float32([0.5, 1.5, 2.5, -0.5, -2.5, 0.49999997, 1e10])]),
+    ("round", lambda a: jax.lax.round(a, jax.lax.RoundingMethod.AWAY_FROM_ZERO),
+     [np.float32([0.5, 1.5, 2.5, -0.5, -2.5, 0.49999997, 1e10])]),
+    ("reduce_precision", lambda a: jax.lax.reduce_precision(a, exponent_bits=8, mantissa_bits=7),
+     [np.float32([2.0 ** -130, 2.0 ** -140, 1 + 2.0 ** -8, 1 + 3 * 2.0 ** -8, 3.4e38, np.nan])]),
+    ("reduce_precision", lambda a: jax.lax.reduce_precision(a, exponent_bits=4, mantissa_bits=3),
+     [np.float32([2.0 ** -9, 2.0 ** -12, 1 + 2.0 ** -4, 1 + 3 * 2.0 ** -4, 250.0, -248.0])]),
+    ("scatter", lambda a, i, u: a.at[i[:, 0]].set(u, mode="drop"),
+     [np.float32(np.arange(12).reshape(4, 3)), np.int32([[2], [0], [7]]),
+      np.float32(-np.arange(9).reshape(3, 3))]),
+    ("scatter", lambda a, i, u: a.at[i[:, 0]].set(u),
+     [np.zeros((4, 2), bool), np.int32([[3], [1]]), np.ones((2, 2), bool)]),
 ], ids=["pad", "iota", "gather", "gather clipped", "gather filled", "gather batched", "gather clipped bf16",
-        "gather bf16", "stack", "barrier", "rev", "split", "name"])
+        "gather bf16", "stack", "barrier", "rev", "split", "name", "dynamic slice clamped", "sort",
+        "sort keyed", "sort keyed zeros and nans", "top_k", "unstack",
+        "tile", "stop_gradient", "xor", "shift", "rem", "rem float", "sign", "sign int", "round even",
+        "round away", "reduce to bf16", "reduce to e4m3", "scatter", "scatter bool"])
 def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(name, fn, operands):
     """Every move check 2 certifies by a numpy oracle of XLA's semantics (`CONTRACTS`), padding with
     interior and negative edges, an iota, a gather in each mode and batched, a stack, an optimization
-    barrier of two operands, a reversal, a split in two and a checkpoint name: the program certifies,
+    barrier of two operands, a reversal, a split in two, a checkpoint name, a dynamic slice clamped to fit,
+    a sort in the total order (its zeros and NaNs placed) and keyed (its zeros tied and its NaNs, either
+    sign, last), a top_k, an unstack, a tile, a
+    stop_gradient, the integer bit operations, a remainder, a sign, a rounding to an integral value either
+    way, a reduction of precision to bfloat16 and to E4M3 (subnormals, ties and overflow among them) and a
+    scatter: the program certifies,
     its contract holding the lane's own result at every element, and the contract refuses that result
     with one element a step off."""
     assert ct.certified(fn, *operands)[1] == []
@@ -412,6 +535,147 @@ def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(name, fn,
         operands = ct.RESULT_OPERANDS[name](params, given, index) if name in ct.RESULT_OPERANDS else given
         assert np.all(contract(params, operands, native, None)), name
         assert not np.all(contract(params, operands, _off_by_one_element(native), None)), name
+
+
+def test_a_move_of_keys_holds_their_data_and_a_word_off_breaks_it():
+    """A broadcast of PRNG keys, as a step's key reaches every row of a draw, moves each key's data whole:
+    the lane's own result holds, and one word of one key's data off breaks it there alone."""
+    keys = jax.random.split(jax.random.key(3), 2)
+
+    def broadcast(keys):
+        return jax.random.key_data(jax.lax.broadcast_in_dim(keys, (3, 2), (1,)))
+
+    assert ct.certified(broadcast, keys)[1] == []
+    params, given, (result,) = _first_equation(lambda keys: jax.lax.broadcast_in_dim(keys, (3, 2), (1,)),
+                                               [keys], "broadcast_in_dim")
+    contract = ct.CONTRACTS["broadcast_in_dim"]
+    assert np.all(contract(params, given, result, None))
+    words = np.array(jax.random.key_data(result))
+    words[1, 0, 0] ^= 1
+    held = contract(params, given, jax.random.wrap_key_data(words), None)
+    assert not held[1, 0] and held.sum() == held.size - 1
+
+
+def test_a_compensated_sum_holds_its_pairs_and_a_pair_a_step_off_breaks():
+    """A compensated sum's reduction (`dew.nn.precision.compensated_sum`'s, its combine
+    `compensated_add`) certifies: its `(hi, lo)` pairs hold the exact sum to fp32's precision squared, and a
+    pair whose `hi` is a step off, an error a plain sum's rounding could make, breaks there alone, as a
+    non-finite `hi` of a sum near the range's top that cannot overflow does."""
+    from dew.nn.precision import compensated_sum
+
+    rng = np.random.default_rng(10)
+    values = np.float32(rng.standard_normal((3, 64)) * 2.0 ** rng.integers(-8, 8, (3, 64)))
+    assert ct.certified(lambda x: compensated_sum(x, (1,)), values)[1] == []
+    params, given, results = _first_equation(lambda x: compensated_sum(x, (1,)), [values], "reduce")
+    held = ct._pair_held(params, given, [np.asarray(result) for result in results], oc.FLOAT32)
+    assert all(np.all(ok) for ok in held)
+    high = _off_by_one_element(np.asarray(results[0]))
+    held = ct._pair_held(params, given, [high, np.asarray(results[1])], oc.FLOAT32)
+    assert not held[0][0] and held[0].sum() == held[0].size - 1
+    # Sums near the range's top that no order overflows, the largest value alone and as two halves among
+    # them: a non-finite `hi` breaks each.
+    largest = np.finfo(np.float32).max
+    top = np.float32([[2.0 ** 127, 0], [largest, 0], [largest / 2, largest / 2]])
+    params, given, results = _first_equation(lambda x: compensated_sum(x, (1,)), [top], "reduce")
+    native = [np.asarray(result) for result in results]
+    assert all(np.all(ok) for ok in ct._pair_held(params, given, native, oc.FLOAT32))
+    for wrong in (np.nan, np.inf, -np.inf):
+        high = np.full(3, wrong, np.float32)
+        held = ct._pair_held(params, given, [high, np.asarray(results[1])], oc.FLOAT32)
+        assert not held[0].any(), wrong
+    # Two largest values overflow in every order, a TwoSum of an infinite sum making both halves NaN: the
+    # lane's NaN pair holds, an infinity of either sign breaks it.
+    twice = np.float32([[largest, largest]])
+    params, given, results = _first_equation(lambda x: compensated_sum(x, (1,)), [twice], "reduce")
+    native = [np.asarray(result) for result in results]
+    assert np.isnan(native[0]).all()
+    assert all(np.all(ok) for ok in ct._pair_held(params, given, native, oc.FLOAT32))
+    for wrong in (np.inf, -np.inf):
+        held = ct._pair_held(params, given, [np.float32([wrong]), native[1]], oc.FLOAT32)
+        assert not held[0].any(), wrong
+
+
+@pytest.mark.parametrize("predict", [False, True])
+def test_a_rows_online_softmax_holds_its_terms_and_a_sum_or_column_off_breaks(predict, monkeypatch):
+    """A row's online softmax (`dew.objectives.lm.chunked._row_terms`' reduction), as its users run it,
+    without the suite's float64 CPU reductions: its maximum exact, its sums of exponentials within their
+    bound and, where it predicts, the maximum's first column; a sum a thousandth off, or a column one off,
+    breaks that row alone."""
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC
+    from dew.objectives.lm.chunked import _row_terms
+
+    monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+
+    rng = np.random.default_rng(11)
+    logits = np.float32(rng.standard_normal((4, 48)) * 4)
+    logits[1, 7] = logits[1, 30] = logits[1].max() + 1
+    labels = np.int32([3, 0, 47, 12])
+
+    def terms(logits, labels):
+        return _row_terms(logits, predict, labels)
+
+    assert ct.certified(terms, logits, labels)[1] == []
+    params, given, results = _first_equation(terms, [logits, labels], "reduce")
+    native = [np.asarray(result) for result in results]
+    assert all(np.all(ok) for ok in ct._softmax_held(params, given, native, oc.FLOAT32))
+    wrong = [value.copy() for value in native]
+    wrong[1][2] *= np.float32(1.001)
+    held = ct._softmax_held(params, given, wrong, oc.FLOAT32)
+    assert not held[1][2] and held[1].sum() == held[1].size - 1
+    if predict:
+        wrong = [value.copy() for value in native]
+        wrong[3][1] += 1
+        held = ct._softmax_held(params, given, wrong, oc.FLOAT32)
+        assert not held[3][1] and held[3].sum() == held[3].size - 1
+
+
+def test_a_rows_online_softmax_keeps_the_least_column_of_a_tie_and_reads_its_initial_values():
+    """The online softmax's contract over operands in any order: of two equal maxima its column is the
+    lesser (the combine's tie rule), not the first in the row; an initial value past every logit is the
+    maximum and its column."""
+    params = {"dimensions": (1,)}
+    ones = np.float32([[1, 1]])
+    logits, columns, tail = np.float32([[0, 0]]), np.int32([[7, 3]]), 1 + 2 * np.exp(-5)
+    for initial, found, wrong in (((-np.inf, 0, 0, 2 ** 31 - 1), (0, 2, 2, 3), 7),
+                                  ((5, 1, 1, 9), (5, tail, tail, 9), 3)):
+        given = [logits, ones, ones, columns, *np.float32(initial[:3]), np.int32(initial[3])]
+        results = [*np.float32([[value] for value in found[:3]]), np.int32([found[3]])]
+        assert all(np.all(ok) for ok in ct._softmax_held(params, given, results, oc.FLOAT32))
+        assert not ct._softmax_held(params, given, [*results[:3], np.int32([wrong])], oc.FLOAT32)[3][0]
+
+
+def test_a_key_made_and_folded_holds_its_bits_and_one_off_breaks():
+    """A key made from a seed and folded with data, inside a program, holds the bits a separate key of the
+    same seed and data has; one bit off breaks it."""
+    seed, data = np.uint32(7), np.uint32(42)
+
+    def keyed(seed, data):
+        return jax.random.key_data(jax.random.fold_in(jax.random.key(seed), data))
+
+    assert ct.certified(keyed, seed, data)[1] == []
+    for name in ("random_seed", "random_fold_in"):
+        params, given, (result,) = _first_equation(keyed, [seed, data], name)
+        contract = ct.CONTRACTS[name]
+        assert np.all(contract(params, given, result, None)), name
+        data_of = np.array(jax.random.key_data(result))
+        data_of.reshape(-1)[0] ^= 1
+        assert not np.all(contract(params, given, jax.random.wrap_key_data(data_of), None)), name
+
+
+def test_an_integer_division_truncates_wraps_and_refuses_one_off():
+    """An integer division truncates toward zero, its most negative value over -1 wrapping to itself, at
+    every width: the lane's own result holds, and one off breaks."""
+    a = np.int32([-7, 7, -7, 9, -(2 ** 31)])
+    b = np.int32([2, -2, -2, 4, -1])
+    native = np.asarray(jax.lax.div(a, b))
+    contract = ct.CONTRACTS["div"]
+    assert np.all(contract({}, [a, b], native, None))
+    assert not np.all(contract({}, [a, b], native + np.int32(1), None))
+    # At a width past int64's magnitudes: the most negative int64 halved, an unsigned value past int64.
+    for a, b, quotient in ((np.int64([-(2 ** 63)]), np.int64([2]), np.int64([-(2 ** 62)])),
+                           (np.uint64([2 ** 64 - 2]), np.uint64([2]), np.uint64([2 ** 63 - 1]))):
+        assert contract({}, [a, b], quotient, None).all()
+        assert not contract({}, [a, b], quotient + quotient.dtype.type(1), None).any()
 
 
 def test_a_split_holds_each_piece_to_its_own_run():
@@ -496,9 +760,9 @@ def test_a_scan_is_certified_a_step_at_a_time_and_a_steps_finding_named_by_it():
     counted, findings = ct.certified(lambda c: jax.lax.scan(lambda c, _: (c * np.float32(2), c), c, None,
                                                             length=3), x[0])
     assert findings == [] and np.asarray(counted[1]).shape == (3, 3)
-    _, findings = ct.certified(lambda x: jax.lax.scan(lambda c, row: (c + jnp.sin(row), None),
+    _, findings = ct.certified(lambda x: jax.lax.scan(lambda c, row: (c + jnp.tan(row), None),
                                                       np.float32(np.zeros(3)), x), x)
-    assert len(findings) == 4 and all("scan#" in finding and f"/{step}/sin" in finding
+    assert len(findings) == 4 and all("scan#" in finding and f"/{step}/tan" in finding
                                       for step, finding in enumerate(findings)), findings
 
 
@@ -508,8 +772,8 @@ def test_calls_are_certified_inside_and_unsupported_types_refused():
     x = np.float32(np.linspace(1, 2, 8))
     _, findings = ct.certified(jax.checkpoint(lambda x: jnp.log(x) * x), x)
     assert findings == []
-    _, findings = ct.certified(jax.checkpoint(lambda x: jnp.sin(x)), x)
-    assert findings and "remat" in findings[0] and "sin" in findings[0]
+    _, findings = ct.certified(jax.checkpoint(lambda x: jnp.tan(x)), x)
+    assert findings and "remat" in findings[0] and "tan" in findings[0]
     for dtype in (jnp.float16, jnp.complex64, jnp.float8_e4m3fn):
         _, findings = ct.certified(lambda x, dtype=dtype: x.astype(dtype).reshape(2, 4), x)
         assert findings and "no format" in findings[0], dtype

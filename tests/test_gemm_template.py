@@ -18,7 +18,7 @@ from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import as_given, assert_as_exact, with_gradients
 from tuned import each_config
 
-from dew.nn.kernels import fused_gemm, gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels import fused_gemm, gemm, generation, grouped_matmul, low_rank, projections, tuning
 from dew.nn.kernels.templates import mosaic_sm90, product, resources, tail
 from dew.nn.kernels.templates.gemm import mosaic_gpu, triton_dense
 
@@ -560,7 +560,7 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 @pytest.mark.parametrize("frozen", [True, False])
 def test_an_adapted_products_fused_form_holds_check_1(generation_name, frozen):
-    """LoRA's adapted product as one template product over the depth its rank extends (`gemm.low_rank`,
+    """LoRA's adapted product as one template product over the depth its rank extends (`low_rank.low_rank`,
     row 1304), interpreted on each family, holds check 1 against the adapter's own program (`lora`'s
     branch: its factors at the layer's dtype, the low-rank products summed in fp32, the base product
     beside them), value and gradients; the kernel frozen (closed over, no gradient taken) or trained."""
@@ -579,7 +579,7 @@ def test_an_adapted_products_fused_form_holds_check_1(generation_name, frozen):
         return (jnp.dot(x, w, preferred_element_type=wide) + update).astype(out)
 
     def fused(x, w, a, b):
-        return gemm.low_rank(x, w, a, b, scale, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+        return low_rank.low_rank(x, w, a, b, scale, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
     def differentiated(f):
         def value_and_gradients(x, w, a, b, ct):
@@ -601,14 +601,14 @@ def test_an_adapted_products_fused_form_holds_check_1(generation_name, frozen):
 
 @INTERPRETS
 def test_an_adapted_products_fp32_cotangent_reaches_its_wide_gradients_unrounded():
-    """An adapted product into fp32 (`gemm.low_rank`) of bf16 rows, an fp32 master kernel and fp32 factors:
-    both operands' depths extended alike (at the rows' step, where the matrix's own fp32 step left them
-    unequal and no product took them), and its fp32 cotangent, 1 + 2^-12 everywhere (no bf16 holds it),
+    """An adapted product into fp32 (`low_rank.low_rank`) of bf16 rows, an fp32 master kernel and fp32
+    factors: both operands' depths extended alike (at the rows' step, where the matrix's own fp32 step left
+    them unequal and no product took them), and its fp32 cotangent, 1 + 2^-12 everywhere (no bf16 holds it),
     reaching the kernel's and the factors' gradients at its own precision, as the plain product's kernel
     gradient takes it (`_kernel_gradient`): over ones, every sum exact, the rows' gradient zero (the kernel
-    and the first factor zero), the kernel's 128 (1 + 2^-12) and the first factor's 256 (1 + 2^-12), where
-    the cotangent narrowed to the rows' bf16 gave 128 and 256; the first factor's through the second factor
-    as the forward multiplied it, rounded to bf16."""
+    and the first factor zero), the kernel's 128 (1 + 2^-12) and the first factor's 256 (1 + 2^-12), where the
+    cotangent narrowed to the rows' bf16 gave 128 and 256; the first factor's through the second factor as the
+    forward multiplied it, rounded to bf16."""
     rows, depth, width, rank, scale = 128, 128, 256, 16, 2.0
     x = jnp.ones((rows, depth), jnp.bfloat16)
     w, a = jnp.zeros((depth, width), jnp.float32), jnp.zeros((depth, rank), jnp.float32)
@@ -618,7 +618,7 @@ def test_an_adapted_products_fp32_cotangent_reaches_its_wide_gradients_unrounded
     cotangent = jnp.full((rows, width), 1 + 2.0 ** -12, jnp.float32)
 
     def fused(x, w, a, b):
-        return gemm.low_rank(x, w, a, b, scale, out_dtype=jnp.float32, interpret_on_cpu=True)
+        return low_rank.low_rank(x, w, a, b, scale, out_dtype=jnp.float32, interpret_on_cpu=True)
 
     with generation.assumed("sm90"):
         _, pull = jax.vjp(fused, x, w, a, b)
@@ -746,7 +746,7 @@ def test_a_named_kernels_derivative_pulled_after_its_block_holds_check_1():
 def test_a_dense_layers_product_through_the_template_holds_check_1(generation_name):
     """A model's projection, `dew.nn.dense.Dense` over `[batch, sequence, width]` rows with its product as
     GatedMLP and GatedDeltaNet form it (`float32_dot_general`), through the GEMM template's dense product
-    (`gemm.dot_general`; its launches named, as a dense cell declares XLA's dot faster): the output and
+    (`projections.dot_general`; its launches named, as a dense cell declares XLA's dot faster): the output and
     the gradients of the rows, the kernel and the bias hold check 1 from float64 against the same layer
     run on XLA's dot."""
     from dew.nn.dense import Dense
@@ -809,20 +809,20 @@ def test_each_dense_launch_lowers_once_however_many_layers_call_it():
 
 
 def test_a_dense_projections_launch_is_decided_once_and_reported_at_every_call():
-    """`gemm.dot_general`'s question, whether a launch takes a dense projection's products (`gemm._launched`),
-    is answered alike at every trace (row 3213 decides it once a key): two traces of one projection report
-    the same routes and the same answer, and a block naming a kernel is its own key, its answer the named
-    kernel's."""
+    """`projections.dot_general`'s question, whether a launch takes a dense projection's products
+    (`projections._launched`), is answered alike at every trace (row 3213 decides it once a key): two traces
+    of one projection report the same routes and the same answer, and a block naming a kernel is its own key,
+    its answer the named kernel's."""
     rows, matrix = jnp.zeros((640, 384), jnp.bfloat16), jnp.zeros((384, 640), jnp.bfloat16)
     with generation.assumed("sm90"):
         reported, answers = [], []
         for _ in range(2):
             with generation.routes() as found:
-                answers.append(gemm._launched(rows, matrix, jnp.bfloat16, None))
+                answers.append(projections._launched(rows, matrix, jnp.bfloat16, None))
             reported.append([(route.choice, route.kernel, route.refusal) for route in found])
         assert reported[0] == reported[1] and reported[0] and answers[0] == answers[1], reported
         with generation.chosen(grouped_matmul="mosaic"):
-            assert gemm._launched(rows, matrix, jnp.bfloat16, None)
+            assert projections._launched(rows, matrix, jnp.bfloat16, None)
 def test_two_launches_whose_padded_shapes_meet_name_their_own_kernels():
     """A GEMM at 4089 rows and one at 4096, which its Mosaic mainloop pads alike, lowered for an H100 in one
     program: each launch's kernel carries its own launch's digest (`report.named`), as a spill refuses the

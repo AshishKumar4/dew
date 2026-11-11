@@ -90,12 +90,13 @@ def continual_run[Task](tasks: Sequence[Task], fit: Callable[[int, Task], None],
 
 
 def label_scores(token_scores: Callable[[jax.Array, Coordinates], jax.Array],
-                 prompts: Sequence[Sequence[int]], labels: Sequence[Sequence[int]], *, share: bool = True
+                 prompts: Sequence[Sequence[int]], labels: Sequence[Sequence[int]], *, share: bool
                  ) -> jax.Array:
     """The log-likelihood a language model gives each label after each prompt, `[prompts, labels]`: each
     pair one row, the prompt then the label, summed over the label's tokens' log-likelihoods. The rows are
-    packed into windows (`ForkedRows`), with `share` (an objective's `shares_prefixes()`) over the prefixes
-    they share, so a prompt is computed once for all its labels, without it each row a window of its own;
+    packed into windows (`ForkedRows`), with `share` (the scoring objective's `shares_prefixes()`, which
+    its caller states, as no default knows the model) over the prefixes they share, so a prompt is computed
+    once for all its labels, without it each row a window of its own;
     `token_scores(tokens, coordinates)` gives the windows' next-token losses
     (`LMObjective.token_scores(variables, tokens, coordinates=coordinates).losses`, the target at `t + 1`'s
     at `t`), read back for each row (`ForkedRows.targets`). The windows are laid out on the host, so the

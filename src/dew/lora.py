@@ -82,7 +82,7 @@ from dew.nn.flops import (
     parameter_flops,
     projection_flops,
 )
-from dew.nn.kernels import gemm, selection
+from dew.nn.kernels import low_rank, selection
 from dew.nn.precision import accumulated, at_least_fp32, biased, float32_dot_general
 from dew.nn.protocols import (
     Counted,
@@ -937,11 +937,12 @@ class _Branch:
 
 
     def _fused(self, module: nn.Module, x: jax.Array, target: Target) -> jax.Array | None:
-        """The site's adapted output as one template product (`gemm.low_rank`, row 1304) where its selector
-        names it (`gemm.LOW_RANK`: by name until a receipt qualifies it) and the site is a plain dense layer
-        it takes: initialized, its kernel a matrix, a product of its own (no quantizing product class), no
-        adapter set's rows, no dropout drawn on the branch; its operands promoted as the layer promotes them,
-        its bias added after. None everywhere else, where the base product and the update run apart."""
+        """The site's adapted output as one template product (`low_rank.low_rank`, row 1304) where its
+        selector names it (`low_rank.LOW_RANK`: by name until a receipt qualifies it) and the site is a plain
+        dense layer it takes: initialized, its kernel a matrix, a product of its own (no quantizing product
+        class), no adapter set's rows, no dropout drawn on the branch; its operands promoted as the layer
+        promotes them, its bias added after. None everywhere else, where the base product and the update run
+        apart."""
         if (self.bound.names or not _plain_dense(module) or module.is_initializing()
                 or not module.has_variable("params", "kernel")):
             return None
@@ -954,14 +955,14 @@ class _Branch:
                 or module.dot_general_cls is not None
                 or module.dot_general not in (None, float32_dot_general)):
             return None
-        if selection.select(gemm.LOW_RANK, None).kernel != "fused":
+        if selection.select(low_rank.LOW_RANK, None).kernel != "fused":
             return None
         a, b = (meta.unbox(module.get_variable("params", factor)) for factor in LOW_RANK_FACTORS)
         bias = meta.unbox(module.get_variable("params", "bias")) if module.use_bias else None
         # Promoted as the layer promotes its operands and bias, and the adapter its factors (`_low_rank`).
         x, kernel, a, b, bias = promote_dtype(x, kernel, a, b, bias, dtype=module.dtype)
         rows = x.reshape(-1, x.shape[-1])
-        out = gemm.low_rank(rows, kernel, a, b, _scale(target, self.rslora), out_dtype=x.dtype,
+        out = low_rank.low_rank(rows, kernel, a, b, _scale(target, self.rslora), out_dtype=x.dtype,
                             precision=module.precision)
         out = out.reshape(*x.shape[:-1], kernel.shape[1])
         # The bias added as the layer adds it (`dense._biased`).

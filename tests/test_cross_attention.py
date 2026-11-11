@@ -537,7 +537,9 @@ def test_a_served_request_reads_its_own_context(options):
     for ticket, lone in zip([*tickets, again, elsewhere], [*alone, alone[2], other], strict=True):
         assert_same_generation(ticket.result(), lone)
     # "1234567" keeps its last token to prefill: one full page of four is shared, under its context alone.
-    assert (hits, server.prefix_hits) == ((4, 4) if options.get("prefix_cache") else (0, 0))
+    # A paged server shares prefixes unless told not to (`prefix_cache` None).
+    shares = "kv_cache" in options and options.get("prefix_cache", True)
+    assert (hits, server.prefix_hits) == ((4, 4) if shares else (0, 0))
 
 
 def test_a_server_refuses_a_context_its_layers_cannot_read():

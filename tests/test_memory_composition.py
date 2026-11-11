@@ -638,15 +638,19 @@ def test_a_cached_memorys_rounding_is_each_rows_own():
     assert not np.array_equal(np.asarray(decoded(keys, jax.random.key(6))), brought)
 
 
+@pytest.mark.parametrize("continuations", [1, 2])
 @pytest.mark.parametrize(("network", "weight_only", "stochastic"),
                          [(None, None, False), (None, False, True), ("dense-general", True, True)],
                          ids=["unquantized", "stochastic", "weight-only-dense-general"])
-def test_a_served_memorys_prefix_is_its_rounding_streams_alone(network, weight_only, stochastic):
+def test_a_served_memorys_prefix_is_its_rounding_streams_alone(network, weight_only, stochastic,
+                                                               continuations):
     """A paged server's prefix cache shares a memory decoder's prompt state across requests where the
     state is the tokens' alone: a memory that rounds deterministically (unquantized) keeps no rounding
     key, so a second key reuses the first's prefix; one whose quantized backward rounds stochastically,
     a weight-only rule's matmuls of any rank among them, keeps its request's key in the cache
-    (`dew.nn.kv_cache.ROUNDING_KEYS`) and serves, and only its own key reuses its prefix (ledger 2036)."""
+    (`dew.nn.kv_cache.ROUNDING_KEYS`) and serves, and only its own key reuses its prefix (ledger 2036): a
+    request's continuations past its first (`TextGeneration.n`) fold its key again, so each is a key of
+    its own, which reuses no other continuation's prefix."""
     from model_support import Digits
 
     from dew.inference import RunProcessor, TextGeneration
@@ -660,14 +664,16 @@ def test_a_served_memorys_prefix_is_its_rounding_streams_alone(network, weight_o
     model = decoder(memory).clone(max_seq_len=64)
     params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
     task = TextGeneration(model, params, RunProcessor(Digits()),
-                          sampling=Sampling(temperature=0, eos_token_ids=12))
+                          sampling=Sampling(temperature=0, eos_token_ids=12), n=continuations)
     if weight_only is not None:
         pytest.importorskip("qwix")
         from dew.quantization import Quantization
 
         task = task.quantized(Quantization(patterns=(INNER,), weight_only=weight_only, bwd_qtype="int8",
                                            bwd_stochastic_rounding="uniform"))
-    server = Server.from_task(task, slots=2, capacity=64, kv_cache=KVCache(page_size=16), prefix_cache=True)
+    # A slot, and the prefix state it keeps, a continuation of each of two keys: both keys' states held.
+    server = Server.from_task(task, slots=2 * continuations, capacity=64, kv_cache=KVCache(page_size=16),
+                              prefix_cache=True)
     prompt = "1" * 33
 
     def reused(key: int) -> int:
@@ -675,7 +681,7 @@ def test_a_served_memorys_prefix_is_its_rounding_streams_alone(network, weight_o
         server(prompt, 2, key=key)
         return server.prefix_hits - before
 
-    assert reused(1) == 0
+    assert (reused(1) > 0) == (continuations > 1 and not stochastic)
     assert (reused(2) > 0) is not stochastic
     assert reused(1) > 0
 

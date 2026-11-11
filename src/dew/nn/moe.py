@@ -45,7 +45,7 @@ from dew.nn.residuals import Residual
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
-from .kernels import gemm, generation
+from .kernels import formats, gemm, generation, projections
 from .precision import (
     at_least_fp32,
     capped_logits,
@@ -593,11 +593,11 @@ read where it lies (`Layered`)."""
 
 class Layered(struct.PyTreeNode):
     """An expert kernel read in place from a bank: the run's stack `[layers, experts, in, out]` (or a
-    packed load's stacked NVFP4 banks, `gemm.NvFp4.layer`) and the layer read, which the GEMM template
+    packed load's stacked NVFP4 banks, `formats.NvFp4.layer`) and the layer read, which the GEMM template
     reads where it lies (`gemm.gemm`'s `layer`) rather than as a slice copied out a layer at a time (1.2 GB
     a layer at Qwen3-30B-A3B's experts, half a decode step on an H100)."""
 
-    stack: "jax.Array | gemm.NvFp4"
+    stack: "jax.Array | formats.NvFp4"
     layer: jax.Array
 
     @property
@@ -662,7 +662,7 @@ def gathered(x: jax.Array | Gathered) -> jax.Array:
     return x.tokens[x.rows] if isinstance(x, Gathered) else x
 
 
-def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | gemm.NvFp4 | Layered,
+def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | formats.NvFp4 | Layered,
                       group_sizes: jax.Array, dtype: Dtype | None, implementation: str,
                       precision: PrecisionLike, bias: jax.Array | None = None,
                       scatter: jax.Array | None = None) -> jax.Array:
@@ -703,7 +703,7 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | gemm.NvFp4 | 
     layout.
     """
     stack, layer = (kernel.stack, kernel.layer) if isinstance(kernel, Layered) else (kernel, None)
-    packed = isinstance(stack, gemm.NvFp4)
+    packed = isinstance(stack, formats.NvFp4)
     tokens, rows = (x.tokens, x.rows) if isinstance(x, Gathered) else (x, None)
     compute = canonicalize_dtype(tokens, _held(stack), *(() if bias is None else (bias,)), dtype=dtype)
     # The run's low-precision recipe takes the experts' product where their role takes it, the matrices'
@@ -711,7 +711,7 @@ def expert_projection(x: jax.Array | Gathered, kernel: jax.Array | gemm.NvFp4 | 
     # layer is cut only for it: elsewhere the grouped matmul reads the layer in place. A packed bank is its
     # checkpoint's own codes, frozen, its product the NVFP4 one (`gemm.nvfp4_product`) under any recipe.
     with projection_role("experts"):
-        recipe = (None if recipe_role() is None or packed else gemm.recipe_projection(
+        recipe = (None if recipe_role() is None or packed else projections.recipe_projection(
             jnp.asarray(gathered(x), compute),
             rounded_operand(stack if layer is None else stack[layer], compute), group_sizes,
             out_dtype=compute, bias=None if bias is None else rounded_operand(bias, compute)))
@@ -756,8 +756,8 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
     tokens, rows = (x.tokens, x.rows) if isinstance(x, Gathered) else (x, None)
     compute = canonicalize_dtype(tokens, *(_held(kernel.stack if isinstance(kernel, Layered) else kernel)
                                            for kernel in (first, second)), dtype=dtype)
-    if (isinstance(first, Layered) or isinstance(second, Layered)
-            or isinstance(first, gemm.NvFp4) or isinstance(second, gemm.NvFp4) or recipe_role() is not None):
+    if (isinstance(first, Layered) or isinstance(second, Layered) or isinstance(first, formats.NvFp4)
+            or isinstance(second, formats.NvFp4) or recipe_role() is not None):
         # A stack's layer, a packed bank (its product the NVFP4 one, which pairs with none), or a run's
         # low-precision recipe, takes each product apart (`expert_projection`).
         return (expert_projection(x, first, group_sizes, compute, implementation, precision),
@@ -770,9 +770,9 @@ def paired_projections(x: jax.Array | Gathered, first: jax.Array | Layered, seco
 
 def _held(kernel):
     """What an expert matrix's compute dtype reads of `kernel` (`canonicalize_dtype`, which takes arrays): a
-    packed bank's dtype, the one its decode yields (`gemm.NvFp4.dtype`), as a scalar of it, else the
+    packed bank's dtype, the one its decode yields (`formats.NvFp4.dtype`), as a scalar of it, else the
     array."""
-    return jnp.zeros((), kernel.dtype) if isinstance(kernel, gemm.NvFp4) else kernel
+    return jnp.zeros((), kernel.dtype) if isinstance(kernel, formats.NvFp4) else kernel
 
 
 def _named(implementation: str) -> contextlib.AbstractContextManager:
@@ -935,7 +935,8 @@ def _stored(run, x, indices, parameters, input_weights):
     return run(x, indices, parameters, input_weights)
 
 
-def expert_compute_dtype(x: jax.Array, *parameters: "jax.Array | gemm.NvFp4", dtype: Dtype | None) -> Dtype:
+def expert_compute_dtype(x: jax.Array, *parameters: "jax.Array | formats.NvFp4",
+                         dtype: Dtype | None) -> Dtype:
     """The dtype an expert layer computes in: `dtype` when the model names
     one, else flax's promotion of the stream and the parameters, except that
     16-bit parameters are never widened. A wider stream then rounds to them
@@ -1206,13 +1207,13 @@ def _widened[Tree](parameters: Tree) -> Tree:
     """Floating parameters at least fp32, so a cotangent summed across
     devices is summed before its master dtype rounds it."""
     def widen(leaf):
-        if isinstance(leaf, gemm.NvFp4):
+        if isinstance(leaf, formats.NvFp4):
             # A packed bank is frozen: its codes, block scales and tensor scales are read as they are.
             return leaf
         if jnp.issubdtype(leaf.dtype, jnp.floating):
             return leaf.astype(at_least_fp32(leaf.dtype))
         return leaf
-    return jax.tree.map(widen, parameters, is_leaf=lambda leaf: isinstance(leaf, gemm.NvFp4))
+    return jax.tree.map(widen, parameters, is_leaf=lambda leaf: isinstance(leaf, formats.NvFp4))
 
 
 EXPERT_AXES: Mapping[str, LogicalAxes] = {

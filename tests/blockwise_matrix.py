@@ -26,7 +26,7 @@ from jax.sharding import Mesh
 from kernel_matrix import AXES
 from reference_error import assert_as_exact, without_ynn
 
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import gemm, generation, projections
 
 ROWS, DEPTH, WIDTH = 256, 512, 256
 """The product's rows, depth (four 128-deep blocks) and width."""
@@ -189,12 +189,12 @@ def step_operands(seed: int) -> tuple:
 
 
 def recipe_truth(group_blocks) -> callable:
-    """The blockwise FP8 recipe's training step in float64 (`gemm.blockwise_fp8_projection`'s truth):
-    `run(x, w)` quantizing as the recipe does (`gemm.rows_quantized`, `gemm.blocks_quantized`), each group's
-    product of the dequantized values in float64, and its gradients the recipe's: the cotangent quantized 1 x
-    128 along the width times the dequantized blocks transposed, and the rows and the cotangent each quantized
-    1 x 128 along the rows, their dequantized product; every product in float64 (a check-1 reference arm's
-    truth)."""
+    """The blockwise FP8 recipe's training step in float64 (`projections.blockwise_fp8_projection`'s truth):
+    `run(x, w)` quantizing as the recipe does (`projections.rows_quantized`, `projections.blocks_quantized`),
+    each group's product of the dequantized values in float64, and its gradients the recipe's: the cotangent
+    quantized 1 x 128 along the width times the dequantized blocks transposed, and the rows and the cotangent
+    each quantized 1 x 128 along the rows, their dequantized product; every product in float64 (a check-1
+    reference arm's truth)."""
     sizes = np.asarray(group_blocks) * 128
     starts = np.cumsum([0, *sizes])
 
@@ -202,23 +202,23 @@ def recipe_truth(group_blocks) -> callable:
         return codes.astype(jnp.float64) * jnp.repeat(scales.astype(jnp.float64), 128, axis=axis)
 
     def blocks(w):
-        codes, scales = gemm.blocks_quantized(w)
+        codes, scales = projections.blocks_quantized(w)
         return codes.astype(jnp.float64) * jnp.repeat(jnp.repeat(scales.astype(jnp.float64), 128, axis=1),
                                                       128, axis=2)
 
     @jax.custom_vjp
     def run(x, w):
-        return grouped(group_blocks, dequantized(*gemm.rows_quantized(x), axis=-1), blocks(w))
+        return grouped(group_blocks, dequantized(*projections.rows_quantized(x), axis=-1), blocks(w))
 
     def forward(x, w):
         return run(x, w), (x, w)
 
     def backward(residuals, cotangent):
         x, w = residuals
-        d_x = grouped(group_blocks, dequantized(*gemm.rows_quantized(cotangent), axis=-1),
+        d_x = grouped(group_blocks, dequantized(*projections.rows_quantized(cotangent), axis=-1),
                       jnp.swapaxes(blocks(w), 1, 2))
-        rows_t = dequantized(*gemm.rows_quantized(x.T), axis=-1)
-        dy_t = dequantized(*gemm.rows_quantized(cotangent.T), axis=-1)
+        rows_t = dequantized(*projections.rows_quantized(x.T), axis=-1)
+        dy_t = dequantized(*projections.rows_quantized(cotangent.T), axis=-1)
         d_w = jnp.stack([rows_t[:, first:last] @ dy_t[:, first:last].T
                          for first, last in itertools.pairwise(starts)])
         return d_x.astype(x.dtype), d_w.astype(w.dtype)
