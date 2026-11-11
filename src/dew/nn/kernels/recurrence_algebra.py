@@ -29,7 +29,14 @@ from dew.nn.kernels.generation import linear_map, unbroadcast
 from dew.nn.kernels.options import program
 from dew.nn.kernels.templates.attention_algebra import power2
 from dew.nn.kernels.templates.product import Blocks, Exact, Transposed
-from dew.nn.precision import compensated_add, compensated_sum, exact_float32, float32_matmul, two_product
+from dew.nn.precision import (
+    compensated_add,
+    compensated_sum,
+    exact_float32,
+    float32_einsum,
+    float32_matmul,
+    two_product,
+)
 
 Issue = Callable[[str, "Operand", "Operand"], jax.Array]
 """A mainloop's product: `issue(name, left, right)` is `left @ right` over the last two axes, the product
@@ -71,16 +78,29 @@ contractions (`paired`), which a mainloop issues as a product of the factored op
 decay's bound keeps exact, or as the weighed sum."""
 
 
+STATE_PRECISION = exact_float32(None)
+"""The precision the portable math's products take: a chunk's products carry the recurrent state, whose
+rounding every later chunk reads compounded, so IEEE float32 (`dew.nn.precision.exact_float32`) whatever JAX's
+configured precision, whose default runs an fp32 product as TF32 on a GPU (the derived scan's at post81 on an
+A100: 1823 times the fp32 recurrence's distance from float64, M-JS-96). It is the reference the template's
+forms are held to; TF32 stays where the run's default numerics put it, in the ports and the fast forms."""
+
+
 def portable(name: str, left, right):
-    """XLA's product, the portable math's issuer: `left @ right` in IEEE float32 where nothing states a
-    precision (`dew.nn.precision.exact_float32`), since a chunk's products carry the recurrent state,
-    whose rounding every later chunk reads compounded, summed as Dew sums a CPU's float32 products
-    (`float32_matmul`, which `accumulated`); the portable math takes its operands in at least float32
-    (`recurrence_chunk.xla_mainloop`), a `Transposed` one transposed."""
+    """XLA's product, the portable math's issuer: `left @ right` at `STATE_PRECISION`, summed as Dew sums a
+    CPU's float32 products (`float32_matmul`, which `accumulated`); the portable math takes its operands in
+    at least float32 (`recurrence_chunk.xla_mainloop`), a `Transposed` one transposed."""
     del name
     left, right = (jnp.swapaxes(x.value, -1, -2) if isinstance(x, Transposed) else
                    x.value if isinstance(x, Exact) else x for x in (left, right))
-    return float32_matmul(left, right, exact_float32(None))
+    return float32_matmul(left, right, STATE_PRECISION)
+
+
+def portable_einsum(subscripts: str, *operands):
+    """`portable`'s product written as an einsum (`float32_einsum`) at `STATE_PRECISION`: the portable math's
+    contractions that carry or read the recurrent state (the derived scan's pairs, a selective scan's read, a
+    sharded span's entering memory) where no `left @ right` states them."""
+    return float32_einsum(subscripts, *operands, precision=STATE_PRECISION)
 
 
 LOG2_E = math.log2(math.e)
