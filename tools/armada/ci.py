@@ -2076,21 +2076,29 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
     is red for what it lacks, never computing it on the GPU. A file with nothing to prepare starts no
     process; a file's process under other flags (`lane_units`) prepares apart, under them, as it runs. First
     the pinned fixtures the tests read offline are fetched, as the run fetches them
-    (tools/fetched_fixtures.py), so the run finds each whole and waits on no download with the GPU held."""
+    (tools/fetched_fixtures.py), so the run finds each whole and waits on no download with the GPU held.
+    `deadline` is the whole prepare's: each process is given what is left of it as its turn comes, its own
+    end's allowance kept back, so the prepare ends within it however many files and waves it holds, and a
+    file it leaves no time is a red row of its own (review: a deadline a process let five files outlast the
+    job's own prepare bound, whose session then ended the job and every file's prepare with it)."""
+    began = time.monotonic()
     subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch"], check=True)
     units = lane_units(python, tests)
     holding = collected(python, PREPARES, sorted({file for file, _, _ in units.values()}))
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(units)
                 if units[name][0] in holding}
     threads = str(max(1, len(os.sched_getaffinity(0)) // processes))
+
+    def prepared(name: str, verdict: Path) -> int:
+        left = max(1.0, deadline - (time.monotonic() - began) - session.GRACE - SETTLE)
+        return tested(python, [units[name][0]], units[name][1], verdict, left, "off", session.GRACE, "",
+                      {**PREPARING, "OMP_NUM_THREADS": threads,
+                       **(VARIANTS[units[name][2]][1] if units[name][2] else {})},
+                      recorded=False, variant=units[name][2])
+
     with concurrent.futures.ThreadPoolExecutor(processes) as pool:
-        for prepared in [pool.submit(tested, python, [units[name][0]], units[name][1], verdict, deadline,
-                                     "off", session.GRACE, "",
-                                     {**PREPARING, "OMP_NUM_THREADS": threads,
-                                      **(VARIANTS[units[name][2]][1] if units[name][2] else {})},
-                                     recorded=False, variant=units[name][2])
-                         for name, verdict in verdicts.items()]:
-            prepared.result()
+        for done in [pool.submit(prepared, name, verdict) for name, verdict in verdicts.items()]:
+            done.result()
     out.write_text(json.dumps({"rows": [row for verdict in verdicts.values()
                                         for row in json.loads(verdict.read_text())["rows"]]}))
     return 0
