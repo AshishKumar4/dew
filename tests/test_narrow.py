@@ -500,11 +500,11 @@ def test_a_plan_a_rung_above_its_dropped_copies_keeps_them_dropped(monkeypatch):
 
 @pytest.mark.check1_shards(seeds=8, per_task=2)
 def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads(monkeypatch):
-    """Each shape a run meets plans its copies itself (`StepCompiler.at_base_rung`): where a longer batch fits only
-    without them and a shorter one with them, the steps take turns, each reading the state as its own plan
-    compiled it, the copies dropped before the longer batch's step and built again before the shorter's
-    as the cast of the parameters the last update wrote (`_copies_of`), and under plain SGD the run lands
-    on par with the parameters and losses of one without copies (check 1)."""
+    """Each shape a run meets plans its copies itself (`StepCompiler.at_base_rung`): where a longer batch
+    fits only without them and a shorter one with them, the steps take turns, each reading the state as its
+    own plan compiled it, the copies dropped before the longer batch's step and built again before the
+    shorter's as the cast of the parameters the last update wrote (`_copies_of`), and under plain SGD the run
+    lands on par with the parameters and losses of one without copies (check 1)."""
     free = 2 ** 39
 
     def stats(device):
