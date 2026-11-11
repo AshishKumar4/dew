@@ -337,7 +337,7 @@ def test_an_lm_validation_of_metrics_alone_reports_each_pass():
     from dew.training.evaluation import Evaluation
 
     objective = LMObjective(looped(), 16, pass_weights="mean")
-    rows = np.random.default_rng(4).integers(0, 256, (2, 4, 17), dtype=np.int32)
+    rows = np.random.default_rng(4).integers(0, 256, (2, jax.device_count(), 17), dtype=np.int32)
     variables = objective.init(jax.random.key(0))
 
     def split(partition):
