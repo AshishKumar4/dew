@@ -1373,9 +1373,11 @@ def _fused_held(logits: tuple, dtype, *, dropped: bool) -> list:
     a dropping call's multipliers (`algebra.drawn`); fp16's parts formed at the running scale beside the tile
     and its scaled copy, the other left operand fp32 still live (`algebra.running_parts`: a 128-wide fused
     launch 281 registers live at its peak, the scale's exp2, and 2240 bytes spilled where one tile priced it
-    at 246, et-c7512). A score hook's output and slopes are its pullback's, held once: its later products
-    load their operands within their own loops (`Issuer.looped_products`), so none holds another's fragments,
-    which a second count of the slopes had covered (row 5477)."""
+    at 246, et-c7512). A score hook's output and slopes are its pullback's, held once: a bf16 step on mma.sync
+    issues its later products in loops of their own (`Issuer.looped_products`), so none holds another's
+    fragments, an overlap a second count of the slopes had covered (row 5477); an fp16 step's parts are priced
+    here, and a family reading its operands from shared memory holds its narrowed weights beside the pullback
+    (`backward_registers`)."""
     return (([logits] if dropped else [])
             + ([logits] * 3 if jnp.dtype(dtype) == jnp.dtype(jnp.float16) else []))
 
