@@ -59,16 +59,16 @@ from collections.abc import Mapping
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
+from flax.linen import linear
 from jax.custom_derivatives import zero_from_primal
 
-from dew._distributions import counter_key
 from dew.batch import Batch, Variables, leaves_by_path
 from dew.data.dataset import rows_of
 from dew.nn.derivatives import contracted, surrogate
 from dew.nn.kernels.generation import linear_map
 from dew.nn.precision import at_least_fp32, float32_einsum
 from dew.nn.protocols import OutputTable, RematChoosing, head_table
-from dew.objectives.base import Aux, Objective, Step, _has_aux, stream
+from dew.objectives.base import Aux, Objective, Step, _has_aux
 
 NOISE = jnp.float32
 """The dtype every jitter is drawn in, whatever its site's: a float64 twin of a run draws what the run
@@ -169,11 +169,11 @@ def _site(context, args, kwargs, output) -> Site | None:
     inputs = args[0] if args else next(iter(kwargs.values()))
     contracted: tuple[int, ...] = ()
     if kind == "dense":
-        rank = jnp.ndim(inputs)
-        axes = (-1,) if isinstance(module, nn.Dense) else (
-            tuple(module.axis) if isinstance(module.axis, tuple | list) else (module.axis,))
-        # Flax sorts the axes it contracts (`_normalize_axes`), and its kernel takes them in that order.
-        contracted = tuple(sorted(axis % rank for axis in axes))
+        # The axes the layer contracts as Flax reads them (`flax.linen.linear`): its axis canonicalized
+        # (`_canonicalize_tuple`, any sequence of ints or one) and normalized (`_normalize_axes`, sorted and
+        # non-negative), the order its kernel takes them in.
+        axes = (-1,) if isinstance(module, nn.Dense) else linear._canonicalize_tuple(module.axis)
+        contracted = linear._normalize_axes(axes, jnp.ndim(inputs))
     return Site(tuple(module.path), kind, inputs, tuple(jnp.shape(output)), jnp.result_type(output),
                 contracted)
 
@@ -301,11 +301,6 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
         stats, _ = self._objective_loss(variables, batch, step)
         return stats, None
 
-    def _update_key(self, step: Step, name: str) -> jax.Array:
-        """The update's key for the draws `name` names, the same for every microbatch the update pools."""
-        return jax.random.fold_in(counter_key(step.key if step.example_key is None else step.example_key),
-                                  stream(name))
-
     def _noise(self, step: Step, index: int, site: Site, draw: jax.Array, rows: int) -> jax.Array:
         """Site `index`'s jitter at `draw`, drawn in `NOISE` and cast to the site's output dtype: each
         example's own where the output's leading axis is the batch's rows, else the update's."""
@@ -318,7 +313,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
             noise = quiet.sample(f"node-perturbation/site/{index}", normal, site.shape[1:], dtype=NOISE,
                                  rows=rows)
         else:
-            key = jax.random.fold_in(jax.random.fold_in(self._update_key(step, "node-perturbation/sites"),
+            key = jax.random.fold_in(jax.random.fold_in(step.update_key("node-perturbation/sites"),
                                                         index), draw)
             noise = jax.random.normal(key, site.shape, NOISE)
         return noise.astype(site.dtype)
@@ -424,7 +419,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
         others = [path for path in flat if path not in gradients]
         if not others and not (tables and gradients):
             return gradients
-        key = self._update_key(step, "node-perturbation/weights")
+        key = step.update_key("node-perturbation/weights")
         shapes = [flat[path].shape for path in others] + [table.shape for table in tables]
         dtypes = [flat[path].dtype for path in others] + [table.dtype for table in tables]
 

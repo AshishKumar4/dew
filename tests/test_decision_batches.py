@@ -14,7 +14,7 @@ from reference_error import as_given, assert_as_exact, widened, without_ynn
 
 from dew.decision import Decide
 from dew.decision.images import Images
-from dew.decision.layout import DecisionInputs
+from dew.decision.inputs import DecisionInputs
 from dew.decision.model import DecisionModel
 from dew.decision.questions import ChoiceAnswer, Question
 

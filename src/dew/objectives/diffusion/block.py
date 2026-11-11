@@ -44,7 +44,7 @@ from dew.batch import (
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
-from dew.nn.inspection import INSPECTED
+from dew.nn.inspection import INSPECTED, QK
 from dew.nn.precision import at_least_fp32, weighted_total
 from dew.nn.progress import progressed
 from dew.nn.protocols import BlockDenoiser, CacheCapacity, Lacks, LayerScalars
@@ -522,7 +522,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         states, second_sown = denoise(sc_logits, "denoiser")
         qk = None
         if step.qk_stats:
-            qk = _observed_maxima(mutated["qk"], first_sown["qk"], second_sown["qk"])
+            qk = _observed_maxima(mutated[QK], first_sown[QK], second_sown[QK])
         # The encoder's pass and the denoiser's that carries the gradient, as the step watches them.
         inspected = None if step.watched is None else {
             "encoder": mutated.get(INSPECTED, {}), "denoiser": second_sown.get(INSPECTED, {})}

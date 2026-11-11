@@ -66,6 +66,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.batch import coordinates
 from dew.nn.dropout import Dropout
+from dew.nn.inspection import QK
 from dew.nn.progress import END, Progress, progressed
 
 from .activations import GatedActivation
@@ -221,16 +222,16 @@ def sow_context_logits(module: nn.Module, query: jax.Array, key: jax.Array, leng
     """A read of a context's per-head largest logit over the keys it sees (`context_mask`), sown in
     `module`'s `qk` collection (`CONTEXT_LOGITS`) where a caller opened it, so the layer's own call takes
     it in beside its own sequence's (`with_context_logits`) and the QK-Clip bounds both."""
-    if not module.is_initializing() and module.is_mutable_collection("qk"):
+    if not module.is_initializing() and module.is_mutable_collection(QK):
         seen = context_mask(query, key, lengths, queries, segments)
-        module.sow("qk", CONTEXT_LOGITS, max_attention_logits(query, key, mask=seen))
+        module.sow(QK, CONTEXT_LOGITS, max_attention_logits(query, key, mask=seen))
 
 
 def with_context_logits(module: nn.Module, found: jax.Array) -> jax.Array:
     """`found`, a layer's own call's per-head largest logits, beside those of a context the call read
     first through the same projections (`sow_context_logits`)."""
-    if module.has_variable("qk", CONTEXT_LOGITS):
-        return jnp.maximum(found, module.get_variable("qk", CONTEXT_LOGITS)[-1])
+    if module.has_variable(QK, CONTEXT_LOGITS):
+        return jnp.maximum(found, module.get_variable(QK, CONTEXT_LOGITS)[-1])
     return found
 
 

@@ -1289,7 +1289,8 @@ def test_gradients_at_a_scale_far_below_one_are_on_par(options, name, dtype):
     weighs about alike, and the reference's gradients are normal, dK the score cotangents at the whole scale
     times the queries. A template mainloop's output and gradients hold check 1: the queries take the scale's
     power of two for their logits alone, where taken for dK too its products fall 2^80 below the reference's
-    and flush to zero (row 1957's review)."""
+    and flush to zero (row 1957's review). The truth is the written-out attention in float64 (jax's softmaxes
+    its logits in fp32), its queries times the scale over the oracle's 1/sqrt(D), a power of two, exactly."""
     family = dataclasses.replace(SMALL_SCALE_FAMILY, dtype=dtype)
 
     def attend(query, key, value, extra):
@@ -1297,9 +1298,13 @@ def test_gradients_at_a_scale_far_below_one_are_on_par(options, name, dtype):
         return jax.nn.dot_product_attention(query, key, value, scale=SMALL_SCALE,
                                             implementation="xla").astype(query.dtype)
 
+    def exact(query, key, value, extra):
+        del extra
+        return exact_attention(query * (query.shape[-1] ** 0.5 * SMALL_SCALE), key, value, anchored=True)
+
     differentiated = jax.jit(with_gradients(_mainloops(family, {"scale": SMALL_SCALE, **options})[name]))
     assert_as_exact(differentiated, as_given(jax.jit(with_gradients(attend))), _cast(family, family.draw),
-                    f"{name} {options} {dtype} at scale 2^-80", seeds=8, truth_fn=with_gradients(attend))
+                    f"{name} {options} {dtype} at scale 2^-80", seeds=8, truth_fn=with_gradients(exact))
 
 
 DECODED = [(family, form) for family, form in FAMILY_RUNS

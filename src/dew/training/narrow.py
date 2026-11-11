@@ -33,7 +33,6 @@ The gradients are the cast's on split meshes as partitioned for the CPU
 (tests/test_narrow.py); a multi-GPU run over NCCL has not been measured, so
 its first should compare a few steps against copies off.
 """
-import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -110,15 +109,15 @@ def _cast_once(var, jaxpr, weights: frozenset) -> jnp.dtype | None:
         if stacked.aval.size != sum(aval.size for aval in sized):
             return None
         return _cast_once(stacked, jaxpr, weights | {stacked})
-    called = _inner(eqn, index)
-    if called is None:
+    callee = _inner(eqn, index)
+    if callee is None:
         return None
     # The weights the callee binds: each of the call's operands that is a weight read by the call
     # alone, where it is passed on unchanged.
     inner = frozenset(bound[1] for position, operand in enumerate(eqn.invars)
                       if isinstance(operand, core.Var) and operand in weights and _read_once(operand, jaxpr)
                       and (bound := _inner(eqn, position)) is not None)
-    return _cast_once(called[1], called[0], inner)
+    return _cast_once(callee[1], callee[0], inner)
 
 
 def narrowed_paths(loss, params: Variables, *rest) -> dict[tuple[str, ...], jnp.dtype]:
@@ -160,37 +159,18 @@ def forward_variables(variables: Variables, compute: Variables | None) -> Variab
     return variables if compute is None else merge(variables, compute)
 
 
-def narrow_copies(objective, state, batch, model_batch, *, composed: bool, window: int = 1,
-                  split: int = 1, traced: core.Jaxpr | None = None) -> dict:
-    """The parameters a step reads through narrow copies, by path under `params` (`narrowed_paths`):
-    on every GPU but one whose row measured them off, for a step the trainer composes (`composed`),
-    without a loss scale, whose state holds no frozen collection. `model_batch` is the trainer's
-    batch as the model reads it; the loss is the one its first attempt reads (`attempt_step`), its
-    update a `window` of microbatches, each step read in `split`, its committed updates among its
-    inputs, so a parameter the step computes on before its cast (a DEX lambda's anneal) is not
-    copied. `traced` is that loss as the trainer traced it for its shapes (`footprint.traced_loss`, the
-    state's variables its first inputs), whose casts are read in place of a trace of its own: a trace of
-    a Qwen3.5-4B step's loss is seconds of its compile (row 4260)."""
+def narrow_copies(state, traced: core.ClosedJaxpr) -> dict:
+    """The parameters a step the trainer composes reads through narrow copies, by path under `params`
+    (`cast_paths`): on every GPU but one whose row measured them off, for a state that holds no frozen
+    collection. `traced` is the loss its first attempt reads as the trainer traced it for its shapes
+    (`footprint.traced_loss`: its update a window of microbatches, each step read in its split, its
+    committed updates among its inputs, the state's variables its first inputs), whose casts are read in
+    place of a trace of its own, so a parameter the step computes on before its cast (a DEX lambda's
+    anneal) is not copied: a trace of a Qwen3.5-4B step's loss is seconds of its compile (row 4260)."""
     from dew.nn.kernels.generation import Choice, backend, chosen_kernel
-    from dew.training.transaction import attempt_step
 
     if (chosen_kernel(Choice.NARROW_COPIES, 'on' if backend() == 'gpu' else 'off') == 'off'
-            or not composed or FROZEN in state.variables):
+            or FROZEN in state.variables):
         return {}
     variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
-    if traced is not None:
-        return cast_paths(traced, variables, ("params",))
-
-    def loss(params, rest, batch, microstep, key, step, ema, updates):
-        # As the trainer's loss shape traces it, the averaged weights the step hands the objective
-        # included: a parameter read there is used twice.
-        variables = {**rest, "params": params}
-        current = dataclasses.replace(state, microstep=microstep, key=key, step=step, updates=updates)
-        read = model_batch(batch)
-        return objective._loss(variables, read, attempt_step(
-            current, variables, ema, read, split=split, slots=window, attempt=step * split, part=0,
-            slot=microstep % window))
-
-    rest = {name: tree for name, tree in variables.items() if name != "params"}
-    return narrowed_paths(loss, variables["params"], rest, batch, state.microstep, state.key, state.step,
-                          state.ema, state.updates)
+    return cast_paths(traced, variables, ("params",))

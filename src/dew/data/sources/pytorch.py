@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence, Sized
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import jax
 import numpy as np
 
 from dew.batch import Batch
@@ -68,12 +69,10 @@ class TorchRecords:
                     f"torchvision's (image, label)"
                 )
             named = dict(zip(self.names, values, strict=True))
-        return Formatting().map(
-            {
-                name: value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else value
-                for name, value in named.items()
-            }
-        )
+        # Every tensor of the sample, a nested field's too, as numpy: detached from its graph and on the
+        # host, in its nesting.
+        return Formatting().map(jax.tree.map(
+            lambda value: value.detach().cpu().numpy() if isinstance(value, torch.Tensor) else value, named))
 
 
 @dataclass(frozen=True)

@@ -60,7 +60,9 @@ class TokenModel(nn.Module):
         return self.logits_from_hidden(self.hidden_states(tokens, train=train, **fields))
 
     def logits_from_hidden(self, hidden):
-        return self.out(nn.gelu(self.widen(hidden))).astype(jnp.float32)
+        logits = self.out(nn.gelu(self.widen(hidden)))
+        # In float32 at least, its weights' own width where wider (a float64 truth's).
+        return logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
 
     def __call__(self, tokens, *, train=False, **fields):
         return self.logits(tokens, train=train, **fields)

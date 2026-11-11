@@ -47,7 +47,7 @@ RELEASES = [
       for mode in ("slot_lm", "head") for attention in ("causal", "block")),
     *(ReleaseParity(f"joint {site}", joint_release, JOINT / "parity.npz", site, JOINT / "requests.json",
                     every_slot=True, attention_impl="xla")
-      for site in ("joint", "joint_head")),
+      for site in ("joint", "joint_head", "joint_images")),
 ]
 """Every release declared, at every site its engine's recording holds."""
 

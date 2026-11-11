@@ -23,10 +23,10 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, bucket
     from dew.decision.data import Example, Group, GroupedExamples, corpus, decisions, mixture
     from dew.decision.head import DecisionHead, Head, JointSchemaHead, LabelReadout, SlotReadout
+    from dew.decision.inputs import DecisionInputs
     from dew.decision.layout import (
         Again,
         AnswerCue,
-        DecisionInputs,
         Encoded,
         Framing,
         Instructions,
@@ -96,7 +96,7 @@ _EXPORTS = {
     "Confidence": "dew.decision.questions",
     "Decide": "dew.decision.task",
     "DecisionHead": "dew.decision.head",
-    "DecisionInputs": "dew.decision.layout",
+    "DecisionInputs": "dew.decision.inputs",
     "DecisionModel": "dew.decision.model",
     "DecisionObjective": "dew.decision.objective",
     "Encoded": "dew.decision.layout",

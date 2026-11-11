@@ -4,6 +4,7 @@ References run Diffusers 0.34.0 / Transformers 4.49.0 in isolation. Tests here
 run Dew-native models, preprocessing, Process and solvers on the current stack.
 Each worker process releases its JAX executable caches after the comparison.
 """
+import functools
 import json
 import os
 import subprocess
@@ -348,16 +349,20 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     def truth(seed):
         # The seed's noise drawn once in float32, as the arms draw it, then widened: drawn under x64, the
         # process would draw other noise and walk another trajectory, and the gate runs every truth under
-        # x64 (`reference_error.truth_of`), so the draw turns it off (row 2064). The denoiser in float64
-        # over its weights widened; the text encoder and the decoder, whose roundings the evaluation and
-        # the reference make alike, stay as they are.
+        # x64 (`reference_error.truth_of`), so the draw turns it off (row 2064). The whole pipeline in
+        # float64, its denoiser, text encoder and decoder alike, over its weights widened.
         with jax.enable_x64(new_val=False):
             step, x_T = stepped(seed)
         assert x_T.dtype == jnp.float32, x_T.dtype
         with jax.enable_x64(new_val=True):
-            wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64))
+            wide = float64_source()
             return np.asarray(walked(wide, DiffusionObjective(wide, **settings), widened(variables), step,
                                      jnp.asarray(x_T, jnp.float64)))
+
+    @functools.cache
+    def float64_source():
+        return load_diffusion_source(str(directory), dtype="float64", param_dtype="float64",
+                                     attention_impl="xla")
 
     # On par with the solver's own walk from the same noise over the seeds' step keys (check 1).
     assert_as_exact(as_given(evaluation), as_given(reference), lambda seed: (np.int32(seed),),

@@ -18,7 +18,7 @@ def replica_key(args) -> dict:
     import jax
     from jax.sharding import NamedSharding, PartitionSpec
 
-    from dew.checkpoints._replicas import _from_replicas, _grid, _zeros
+    from dew.checkpoints._replicas import Grid, _from_replicas, _zeros
     from dew.distributed.placement import MeshSpec
 
     mesh = MeshSpec().build()
@@ -30,7 +30,9 @@ def replica_key(args) -> dict:
     template = {"key": key, "shape": shape}
     tree = ({"key": data, "shape": data} if jax.process_index() == 0
             else jax.tree.map(_zeros, template))
-    recovered = _from_replicas(tree, _grid(template), frozenset({0}))
+    grid = Grid.of(template)
+    assert grid is not None, "a template placed by name lies on one grid"
+    recovered = _from_replicas(tree, grid, frozenset({0}))
 
     def read(words, drawn) -> dict:
         # Each process's own copy of a value the pool replicates.

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 
-from dew._records import integer, record
+from dew._records import JSON, integer, record
 from dew.data.pipeline import (
     Artifact,
     Declares,
@@ -82,14 +82,13 @@ def merge_facts(facts: Iterable[Mapping[str, object]], *,
     # A fact of each member joined in a mapping of the merge's own, each corpus's added in place.
     joined: dict[str, PerMember] = {}
     conflicted: set[str] = set()
-    slots: dict[str, int] = {}
+    stated_slots: list[Mapping[str, object]] = []
     shapes: list[Mapping[str, object]] = []
     for given in facts:
         shapes.append(record(given.get("fields", {}), "fields"))
         for key, value in given.items():
             if key == "slots":
-                for name, size in record(value, "slots").items():
-                    slots[name] = max(slots.get(name, 0), integer(size, f"slots.{name}"))
+                stated_slots.append(record(value, "slots"))
             elif key == "fields":
                 continue
             elif key in measured:
@@ -108,9 +107,24 @@ def merge_facts(facts: Iterable[Mapping[str, object]], *,
             elif combined[key] != value:
                 conflicted.add(key)
     shared = {key: value for key, value in combined.items() if key not in conflicted}
+    slots = largest_bounds(stated_slots)
     shaped = ({name: shape for name, shape in shapes[0].items()
                if all(other.get(name) == shape for other in shapes[1:])} if shapes else {})
     return {**shared, **({"slots": slots} if slots else {}), **({"fields": shaped} if shaped else {})}
+
+
+def largest_bounds(stated: Iterable[Mapping[str, object]]) -> dict[str, JSON]:
+    """The bounds of rows read together: each bound the largest any of `stated` gives it, a nested
+    mapping's bounds each its own (a decision row's `slots.questions`, `slots.options`). The one
+    reduction of a slot bound, which a merge of facts and a measure of rows both read."""
+    bounds: dict[str, JSON] = {}
+    for given in stated:
+        for key, value in given.items():
+            if isinstance(value, Mapping):
+                bounds[key] = largest_bounds([record(bounds.get(key, {}), key), value])
+            else:
+                bounds[key] = max(integer(value, key), integer(bounds.get(key, 0), key))
+    return bounds
 
 
 def shaped(facts: Mapping[str, object], field: str, shape: list[int | None]) -> Mapping[str, object]:

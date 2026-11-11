@@ -126,11 +126,12 @@ def test_systemone_answers_what_layas_agent_answers(decide):
 @pytest.mark.parametrize("request_body, message", [
     ({"questions": CASES["quickstart"]["questions"]}, "state"),
     ({"state": "x", "questions": {}}, "at least one question"),
-    ({"state": "x", "questions": {"q": {"type": "rank", "instructions": "x"}}}, "noul, choice or score"),
+    ({"state": "x", "questions": {"q": {"type": "rank", "instructions": "x"}}}, "choice, noul, score"),
+    ({"state": "x", "questions": {"q": {"type": [], "instructions": "x"}}}, "type is its name"),
     ({"state": "x", "questions": CASES["quickstart"]["questions"], "stream": True}, "not \\['stream'\\]"),
 ])
 def test_systemone_refuses_a_request_jev_would_refuse(decide, request_body, message):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=message):
         decide.systemone(request_body)
 
 

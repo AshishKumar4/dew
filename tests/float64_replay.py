@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import FORMATTED
-from float64_terms import evaluated_on, walked
+from float64_terms import evaluated_on, lowered, walked
 from jax.extend.core import primitives
 from reference_error import _floating, as_given, equations
 
@@ -35,7 +35,8 @@ def float64_replay(fn, *, compiled: bool = False):
     and the uniform built from them are the program's own (`FORMATTED`); a float literal or constant
     is the program's value widened. The program is walked as the gate walks every program
     (`float64_terms.walked`, by `Replay`): its calls (`jit`), custom derivatives' calls, scans,
-    rematerialized calls (a remat module's init), the branch a conditional takes and a reduction's
+    rematerialized calls (a remat module's init), a high-level call's expansion (`float64_terms.lowered`:
+    one of Dew's linear maps under forward mode), the branch a conditional takes and a reduction's
     combining body inside, each equation under the context it was traced in; a float operation the replay
     does not evaluate (`_replayed`), a complex one, and any other call of a program refuse by name. Only
     what the results read is replayed: an initializer's forward pass, which a module's init traces and
@@ -61,7 +62,8 @@ def float64_replay(fn, *, compiled: bool = False):
                                                          else np.result_type(value))) for value in leaves))
         if signature not in traced:
             with jax.enable_x64(new_val=False):
-                traced[signature] = jax.make_jaxpr(fn, return_shape=True)(*arguments)
+                closed, made = jax.make_jaxpr(fn, return_shape=True)(*arguments)
+                traced[signature] = (lowered(closed), made)
         graph, shapes, *program = traced[signature]
         native = [value if jax.dtypes.issubdtype(aval.dtype, jax.dtypes.extended)
                   else np.asarray(value).astype(aval.dtype)

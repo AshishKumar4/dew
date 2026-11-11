@@ -41,13 +41,6 @@ a cache directory of their own. Its environment is pinned: torch 2.8.0 for
 CUDA 12.8, transformers 5.16.1 and fla-core 0.5.2, which `on_fla` checks
 before it runs.
 
-With `--images`, it reads that head back and runs the quickstart request
-with the backbone fixture's two images (images.npy) as the release's
-`systemone` runs one, its processor laying the images out before the state, and writes
-images.json (the row's token ids) and images.npz (each question's fp32
-logits under `<id>` and float64 ones under `<id>/f64`, the vision tower
-included).
-
 With `--parity`, it reads that head back and records the release over check 1's seeds
 (`recorded_references.record_case`), each seed's requests drawn (`drawn_requests`: states plain or
 structured, choice, score and noul questions of varied counts and options), for the release-parity
@@ -59,7 +52,7 @@ option order as `scores`, 0 where a question has no such option (check 1 judges 
 `options` marks the real ones); and requests.json, each seed's wire
 requests, a joint_images seed's with its pictures, the input `images`, besides.
 
-    PYTHONPATH=src:tools python tools/joint_checkpoint_reference.py [--fla | --images | --parity]
+    PYTHONPATH=src:tools python tools/joint_checkpoint_reference.py [--fla | --parity]
 """
 
 import json
@@ -251,31 +244,6 @@ def released():
             joint_twin(model_class, upstream, backbone, head, head_config))
 
 
-def images() -> None:
-    from PIL import Image
-
-    from _dew_torch.precision import float64
-
-    upstream, processor, _, _, model, exact = released()
-    request = json.loads((ROOT / "tests" / "fixtures" / "laya" / "cases.json").read_text())["quickstart"]
-    pictures = [Image.fromarray(array) for array in np.load(BACKBONE / "images.npy")]
-    encoded = upstream.encode_record(processor.tokenizer, {**as_upstream(request), "images": pictures},
-                                 processor=processor)
-    batch = upstream.collate_records([encoded], processor.tokenizer.pad_token_id, torch.device("cpu"))
-    with torch.no_grad():
-        found = model(batch)[0]
-    exact_batch = {**batch, "media": {key: value.double() if value.is_floating_point() else value
-                                      for key, value in batch["media"].items()}}
-    with float64(), torch.no_grad():
-        whole64 = exact(exact_batch)[0]
-    logits = {}
-    for question, fp32, whole in zip(encoded.questions, found, whole64, strict=True):
-        logits[question.question_id] = fp32.numpy()
-        logits[f"{question.question_id}/f64"] = whole.double().numpy()
-    (OUT / "images.json").write_text(json.dumps({"ids": list(encoded.input_ids)}) + "\n")
-    np.savez(OUT / "images.npz", **logits)
-
-
 ROWS, QUESTIONS, OPTIONS, WIDTH = 2, 3, 5, 1536
 """A parity seed's requests, the most questions a request asks and options a question offers, and the
 tokens a laid-out request is padded to."""
@@ -440,4 +408,4 @@ def parity() -> None:
 
 
 if __name__ == "__main__":
-    {"--images": images, "--fla": on_fla, "--parity": parity}.get(next(iter(sys.argv[1:]), ""), main)()
+    {"--fla": on_fla, "--parity": parity}.get(next(iter(sys.argv[1:]), ""), main)()

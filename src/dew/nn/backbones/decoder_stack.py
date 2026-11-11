@@ -31,6 +31,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from dew._cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.batch import Variables, merge, part
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
+from dew.nn.inspection import QK
 from dew.nn.protocols import StagedStacks
 
 from .. import in_backward
@@ -132,7 +133,7 @@ def _layer_slice(tree, index):
         lambda leaf: jax.lax.dynamic_index_in_dim(leaf, index, 0, keepdims=False), tree)
 
 
-WRITTEN = ('cache', ROUTER_COLLECTION, 'qk', INDEXER_COLLECTION)
+WRITTEN = ('cache', ROUTER_COLLECTION, QK, INDEXER_COLLECTION)
 """The collections a decoder block writes: its decode cache, and what its
 router, its attention and its sparse indexer sow, which a looped pass keeps
 apart per pass (`PassView`)."""

@@ -48,6 +48,12 @@ Velocity = Callable[[jax.Array, jax.Array], jax.Array]
 """A rectified-flow velocity v(x, rf) at rf time."""
 
 
+def trigflow_corrupted(clean, noise, t):
+    """rCM's TrigFlow corruption of `clean` by `noise` at time `t`: `cos(t) * clean + sin(t) * noise`, the
+    time broadcast over each sample (TrigFlow, Lu & Song 2024), the one path every loss here corrupts by."""
+    return expand(jnp.cos(t), clean) * clean + expand(jnp.sin(t), clean) * noise
+
+
 def trig_prediction(velocity: Velocity, x: jax.Array, t: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Return (x_0, F) of a velocity model at TrigFlow `(x, t)`.
 
@@ -125,7 +131,7 @@ def discrete_consistency_loss(student: Callable[[jax.Array, jax.Array], jax.Arra
         rf = jnp.clip(rf, 0.0, 1.0 - jnp.finfo(rf.dtype).eps)
         return jnp.arctan(rf / (1 - rf))
     times = [trig(k) for k in range(skip + 1)]
-    x = expand(jnp.cos(times[0]), x0) * x0 + expand(jnp.sin(times[0]), x0) * noise
+    x = trigflow_corrupted(x0, noise, times[0])
     predicted = student(x, times[0])
     walked = x
     for current, following in itertools.pairwise(times):
@@ -153,7 +159,7 @@ def backward_simulation(student: Callable[[jax.Array, jax.Array], jax.Array], x_
     for following, noise, active in zip(times, noises, live, strict=True):
         following = jnp.where(active, jnp.minimum(following, current), current)
         clean = jax.lax.stop_gradient(student(x, current))
-        renoised = expand(jnp.cos(following), clean) * clean + expand(jnp.sin(following), clean) * noise
+        renoised = trigflow_corrupted(clean, noise, following)
         x = jnp.where(active, renoised, x)
         current = following
     return (student if trained is None else trained)(x, current)
@@ -414,7 +420,7 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
             elif self.consistency_weight > 0:
                 t = self._times(draws.consistency_time, self.student_times)
                 noise = draws.consistency_noise
-                x = expand(jnp.cos(t), samples) * samples + expand(jnp.sin(t), samples) * noise
+                x = trigflow_corrupted(samples, noise, t)
                 _, teacher_F = self._teacher(params, given, blank, x, t)
                 warmup = self.tangent_warmup
                 ratio = 1.0 if warmup == 0 else jnp.minimum(1.0, iteration / warmup)
@@ -438,7 +444,7 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
                 self.model_variables(params), given, draws, iteration - effective - 1, recorded))
             t = self._times(draws.critic_time, self.critic_times)
             noise = draws.critic_noise
-            x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise
+            x = trigflow_corrupted(generated, noise, t)
             fake, _ = trig_prediction(self._network(self.fake_score, part(params, FAKE_SCORE), given, scored),
                                       x, t)
             return critic_loss(generated, fake, t), self._phase_sown(recorded, scored)
@@ -464,7 +470,7 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         generated = self._generated(student_params, given, draws, iteration, recorded)
         t = self._times(draws.critic_time, self.critic_times)
         noise = draws.critic_noise
-        x = expand(jnp.cos(t), generated) * generated + expand(jnp.sin(t), generated) * noise
+        x = trigflow_corrupted(generated, noise, t)
         frozen = jax.lax.stop_gradient(part(params, FAKE_SCORE))
         fake, _ = trig_prediction(self._network(self.fake_score, frozen, given, scored), x, t)
         teacher, _ = self._teacher(params, given, blank, x, t)

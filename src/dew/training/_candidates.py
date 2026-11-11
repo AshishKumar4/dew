@@ -255,9 +255,10 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
     prepared = windowed(lambda state, rows, *, shape_only: stepping.initialize_accumulation(
         state, rows, shapes, window=window, shape_only=shape_only), state, batch)
     # DiLoCo's groups read their own parameters, which no narrow copy shadows.
-    copies = (narrow_copies(trainer.objective, state, batch, stepping.model_batch, window=window, split=split,
-                            composed=trainer.step is None and not trainer.dynamic_scale, traced=traced)
-              if narrow and trainer.diloco is None else {})
+    # A step the trainer composes narrows, from the loss it traced; a custom step's traces none (`traced`
+    # None), and a scaled loss's copies none.
+    narrows = narrow and traced is not None and not trainer.dynamic_scale and trainer.diloco is None
+    copies = narrow_copies(state, traced) if narrows else {}
     prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
         lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
     return shapes, copies, prepared

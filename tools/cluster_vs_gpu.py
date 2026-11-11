@@ -61,9 +61,10 @@ def corpus(cache: Path) -> Path:
 
     from dew.data import ByteTokenizer
     from dew.data.sinks import export
+    from dew.data.storage import EXPORT_MANIFEST
 
     tokens = cache / "tokens"
-    if (tokens / "_dew_manifest.json").is_file():
+    if (tokens / EXPORT_MANIFEST).is_file():
         return tokens
     cache.mkdir(parents=True, exist_ok=True)
     text = cache / "TinyStories-valid.txt"
@@ -128,56 +129,14 @@ def mesh_of(layout: dict, devices: int) -> dict:
     return {axis: devices if size == -1 else size for axis, size in layout.items()}
 
 
-class Outer:
-    """DiLoCo's outer loop: the hosts' parameters averaged in one all-reduce of one flat buffer, and
-    one Nesterov SGD step on the mean change (the pseudo-gradient) that every host restarts from.
-    Each host keeps its own inner optimizer state."""
-
-    def __init__(self, params):
-        import jax
-        import numpy as np
-        import optax
-        from jax.flatten_util import ravel_pytree
-        from jax.sharding import Mesh, NamedSharding, PartitionSpec
-
-        hosts = Mesh(np.array(jax.devices()), ("hosts",))
-        self.rows = NamedSharding(hosts, PartitionSpec("hosts"))
-        self.mean = jax.jit(lambda rows: rows.mean(0), out_shardings=NamedSharding(hosts, PartitionSpec()))
-        self.optimizer = optax.sgd(0.7, momentum=0.9, nesterov=True)
-        self.params = ravel_pytree(params)[0]
-        self.state = self.optimizer.init(self.params)
-        self.synced: list[dict] = []
-
-    def sync(self, state, step: int, loss: float, stepped: float):
-        """`state` restarted from the outer step, the hosts' mean of `loss`, and the hosts' mean
-        seconds so far: `stepped` of steps and every sync's."""
-        import jax
-        import numpy as np
-        import optax
-        from jax.flatten_util import ravel_pytree
-
-        start = time.monotonic()
-        local, unravel = ravel_pytree(state.variables["params"])
-        spent = stepped + sum(row["sync_s"] for row in self.synced)
-        rows = jax.make_array_from_process_local_data(
-            self.rows, np.concatenate([np.asarray(local), [loss, spent]]).astype(np.float32)[None])
-        mean = np.asarray(self.mean(rows).addressable_data(0))
-        updates, self.state = self.optimizer.update(self.params - mean[:-2], self.state, self.params)
-        self.params = optax.apply_updates(self.params, updates)
-        params = jax.tree.map(lambda new, old: jax.device_put(new, old.sharding), unravel(self.params),
-                              state.variables["params"])
-        self.synced.append({"step": step, "loss": float(mean[-2]), "sync_s": time.monotonic() - start})
-        return (state.replace(variables={**state.variables, "params": params}), float(mean[-2]),
-                float(mean[-1]) + self.synced[-1]["sync_s"])
-
-
 def joined_pool(world: int, rank: int) -> float:
     """The seconds this process took to join a pool of `world`, one process a host at rank0, as
     `dew launch` leaves one; none on one host."""
     began = time.monotonic()
+    from dew.clusters import Launched
+
     if world > 1:
-        os.environ.update({"DEW_PROCESS_COUNT": str(world), "DEW_PROCESS_ID": str(rank),
-                           "JAX_COORDINATOR_ADDRESS": "rank0:8476",
+        os.environ.update({**Launched.environ_of("rank0:8476", world, rank),
                            "JAX_CPU_COLLECTIVES_IMPLEMENTATION": "gloo"})
     import jax
 
@@ -205,7 +164,8 @@ def arguments() -> argparse.Namespace:
                              "time")
     parser.add_argument("--diloco", type=int, metavar="H",
                         help="DiLoCo (Douillard et al. 2023): each host trains its own copy on its own "
-                             "share of every global batch, and every H steps the hosts sync (`Outer`)")
+                             "share of every global batch, and every H steps the hosts sync "
+                             "(`dew.training.diloco`, one group a host)")
     parser.add_argument("--cache", type=Path,
                         default=Path(os.environ.get("TMPDIR", "/tmp")) / "cluster-bench")
     parser.add_argument("--out", type=Path, required=True)
@@ -229,6 +189,7 @@ def main() -> None:
     from dew.objectives.lm import LMObjective
     from dew.training import Layout, MeshSpec, Trainer
     from dew.training.ahead import step_batch
+    from dew.training.diloco import DiLoCo
 
     shape = SHAPES[args.shape]
     platform = jax.devices()[0].platform
@@ -241,20 +202,18 @@ def main() -> None:
                               dtype=getattr(jnp, dtype), attention_impl="auto", scan_layers=args.scan_layers)
     trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=None),
                       optax.adamw(shape["lr"], weight_decay=0.1), key=jax.random.key(0),
-                      mesh=MeshSpec(**mesh_of(shape["mesh"], jax.device_count())),
-                      microbatches=shape.get("microbatches"), layout=Layout(), checkpoints=None, tracker=None)
-    if args.diloco:
-        # Each host's own devices: its steps sum nothing over the hosts.
-        trainer.device_mesh = MeshSpec().build(jax.local_devices())
-        partition = DataPartition(index=rank, count=world)
-    else:
-        # Each process reads its own rows of every global batch, which shard_batch assembles.
-        partition = DataPartition.of(trainer.device_mesh)
+                      # Under DiLoCo one group a host, the shape's layout over the host's devices.
+                      mesh=(MeshSpec(diloco=world, **mesh_of(shape["mesh"], jax.local_device_count()))
+                            if args.diloco else MeshSpec(**mesh_of(shape["mesh"], jax.device_count()))),
+                      microbatches=shape.get("microbatches"), layout=Layout(), checkpoints=None, tracker=None,
+                      diloco=DiLoCo(every=args.diloco) if args.diloco else None)
+    # Each process reads its own rows of every global batch, which shard_batch assembles: under DiLoCo a
+    # group's share.
+    partition = DataPartition.of(trainer.device_mesh)
     state, _, _ = trainer.place()
     parameters = sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"]))
     batches = iter(data.train(partition))
     compiled, losses, seconds, reached, compile_seconds = None, [], [], None, 0.0
-    outer = Outer(state.variables["params"]) if args.diloco else None
     for step in range(1, args.steps + 1):
         # The batch as `fit` hands it to its step (`step_batch`), so the step timed is a run's.
         batch = shard_batch(trainer.device_mesh, step_batch(trainer, next(batches)))
@@ -274,19 +233,11 @@ def main() -> None:
         losses.append(loss)
         if rank == 0 and (step % 10 == 0 or step < 5):
             print(f"step {step} loss {loss:.4f} {seconds[-1]:.3f} s", flush=True)
-        if outer is not None:
-            if step % args.diloco:
-                continue
-            state, loss, elapsed = outer.sync(state, step, np.mean(losses[-args.diloco:]), sum(seconds))
-            if rank == 0:
-                print(f"sync at step {step}: hosts' loss {loss:.4f} at {elapsed:.0f} s", flush=True)
-            if loss <= target:
-                reached = {"step": step, "seconds": elapsed}
-                break
-            if elapsed > args.seconds:
-                break
-            continue
-        if reached is None and len(losses) >= 10 and sum(losses[-10:]) / 10 <= target:
+        # The mean of the last 10 losses; under DiLoCo the outer model is what reaches the target, read at
+        # each meeting of the groups, every H steps, over the groups' mean losses since the last.
+        window = args.diloco or 10
+        meets = not args.diloco or step % args.diloco == 0
+        if meets and len(losses) >= window and sum(losses[-window:]) / window <= target:
             reached = {"step": step, "seconds": sum(seconds)}
             break
         # Rank 0's clock decides, so every process stops at the same step.
@@ -302,8 +253,7 @@ def main() -> None:
             "processes": jax.process_count(), "devices": jax.device_count(), "dtype": dtype,
             "parameters": int(parameters), "batch": batch_size, "seq_len": SEQ_LEN, "target": target,
             "join_seconds": joined, "compile_seconds": compile_seconds, "steps": len(losses),
-            "reached": reached, "losses": losses, "step_seconds": seconds,
-            "synced": None if outer is None else outer.synced}))
+            "reached": reached, "losses": losses, "step_seconds": seconds, "diloco": args.diloco}))
         print(json.dumps({"shape": args.shape, "devices": jax.device_count(), "reached": reached,
                           "median_step_s": sorted(seconds)[len(seconds) // 2]}), flush=True)
 

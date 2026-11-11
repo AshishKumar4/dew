@@ -83,16 +83,21 @@ import sys
 from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune
 from token_support import token_rows
 
+from dew.data import Memory
 from dew.training import Inspection, MeshSpec
 from dew.training.ahead import compile_ahead, compile_only_gpus
 
 generation, path, multiprocessors = sys.argv[1], sys.argv[2], int(sys.argv[3])
 target = MeshSpec().build(compile_only_gpus(generation, 1, multiprocessors=multiprocessors))
 trainer = fine_tune(target, xla=True, split=2, inspection=Inspection(every=2))
-compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1)).save(path)
+batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
+fit = {"steps": 6, "log_every": 5, "eval_every": 3, "validation": validation}
+compile_ahead(trainer, batch, fit=fit).save(path)
 """
 """A step of two microbatches, sampled every second step, compiled ahead for the GPU argv[1] names, with
-argv[3] multiprocessors, and saved at argv[2], in a process that sees no GPU."""
+argv[3] multiprocessors, with the programs of its fit's evaluations, and saved at argv[2], in a process
+that sees no GPU."""
 QUIET = """
 import sys
 
@@ -100,19 +105,23 @@ import jax
 from test_compile_ahead import BATCH, SEQ_LEN, VOCAB, fine_tune
 from token_support import token_rows
 
+from dew.data import Memory
 from dew.telemetry.compiles import Compiles
 from dew.training import Inspection, MeshSpec
 from dew.training.ahead import AheadOfTime
 
 run = fine_tune(MeshSpec().build(jax.devices()[:1]), ahead=AheadOfTime.load(sys.argv[1]), xla=True, split=2,
                 inspection=Inspection(every=2))
+validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
 with Compiles(None) as compiles:
-    assert int(run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=6, log_every=5).step) == 6
+    state = run.fit(token_rows(VOCAB, BATCH, SEQ_LEN + 1), steps=6, log_every=5, eval_every=3,
+                    validation=validation)
+assert int(state.step) == 6
 compiled = [(program.name, program.where) for program in compiles.programs if program.kind == "compiled"]
 assert not compiled, compiled
 """
 """A fresh process training six steps of two microbatches from the step at argv[1], sampled every second
-step, two samples to a log, compiling nothing on its GPU."""
+step, two samples to a log, evaluated every third step, compiling nothing on its GPU."""
 COMPUTING = "--xla_gpu_enable_fast_min_max=true"
 """An XLA flag that changes what a program computes, which a process loading programs compiled without it is
 refused for (`BuildTarget.held`)."""
@@ -167,11 +176,12 @@ def test_programs_built_with_no_gpu_run_on_this_gpu_with_nothing_compiled_bit_fo
 def test_a_run_compiled_ahead_for_this_gpu_compiles_nothing_on_it_and_is_refused_where_xla_computes_otherwise(
         tmp_path):
     """A run handed its step compiled ahead for this GPU where no GPU is visible, two microbatches a step and
-    sampled every second step, trains six steps logged twice in a fresh process compiling nothing on the
-    GPU: its start, its window's allocation, its split step's whole, its counters, its latest sample, its
-    log's copies and its logged tokens' sum were compiled with the step (`AheadOfTime.starts`; row 4752).
-    A fresh process whose XLA computes otherwise is refused that step by the trainer's loader: the one rule
-    every loader holds (row 3606)."""
+    sampled every second step, trains six steps logged twice and evaluated twice in a fresh process
+    compiling nothing on the GPU: its start, its window's allocation, its split step's whole, its counters,
+    its latest sample, its log's copies, its logged tokens' sum and its evaluations' keys, loss, sums and
+    reduction were compiled with the step (`AheadOfTime.starts`; row 4752). A fresh process whose XLA
+    computes otherwise is refused that step by the trainer's loader: the one rule every loader holds (row
+    3606)."""
     own = BuildTarget.of(jax.devices()[:1])
     for name, text in (("quiet_build.py", QUIET_BUILD), ("quiet.py", QUIET), ("refused.py", TRAIN_REFUSED)):
         (tmp_path / name).write_text(text)

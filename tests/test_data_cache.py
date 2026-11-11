@@ -18,7 +18,7 @@ import pytest
 from data_support import LATEST, Keeps
 from storage_support import moto_bucket
 
-from dew.data.cache import Abandoned, Cache
+from dew.data.cache import Cache
 from dew.data.pipeline import Rejected
 from dew.data.plan import Manifest, StepIdentity
 from dew.data.sources import Memory
@@ -1652,50 +1652,80 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
         rows.close()
 
 
-def test_training_close_abandons_a_stalled_upload_without_publishing_a_segment():
+def test_a_training_close_waits_out_an_upload_in_flight_which_publishes_its_segment():
+    """A training read closed while an upload is in flight waits for it to end, and the upload publishes
+    its segment as it would have: an upload begun is a fill's own, which a later read may reuse, and
+    the close counts nothing of it abandoned and raises nothing of its own."""
     from fsspec.implementations.memory import MemoryFileSystem
 
-    from dew.data.dataset import _QUIET_STOP_SECONDS
+    entered, closing = threading.Event(), threading.Event()
+    rows = None
 
-    entered, release = threading.Event(), threading.Event()
-    stored = []
+    class Slow(MemoryFileSystem):
+        """Memory objects behind a third-party conditional write whose shard upload ends only once the
+        reader's close has begun."""
 
-    class Stalled(MemoryFileSystem):
-        """Memory objects behind a third-party conditional write whose upload
-        hangs until the test releases it."""
-
-        protocol = "stalled"
+        protocol = "slow"
 
         @classmethod
         def _strip_protocol(cls, path):
-            return super()._strip_protocol(path.replace("stalled://", "memory://", 1))
+            return super()._strip_protocol(path.replace("slow://", "memory://", 1))
 
         def put_conditional(self, path, payload, version):
-            entered.set()
-            release.wait(15)
+            if "/shards/" in path:
+                entered.set()
+                assert closing.wait(10)
+                while not rows.writer.closing:
+                    time.sleep(0.01)
             if self.exists(path):
                 raise FileExistsError(path)
             self.pipe_file(path, payload)
-            stored.append(path)
             return hashlib.sha256(payload).hexdigest()
 
-    fsspec.register_implementation("stalled", Stalled, clobber=True)
-    source = Memory([{"id": 0}])
-    cache = Cache(f"stalled://cache-{uuid4().hex}", shard_bytes=1, retry=0)
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key())
-    try:
-        assert rows[0] == {"id": 0}
-        assert entered.wait(5)
-        started = time.monotonic()
-        rows.close()
-        assert time.monotonic() - started < _QUIET_STOP_SECONDS + 2
-        assert rows.metrics()["abandoned"] > 0
-    finally:
-        release.set()
-        for future in rows.writer.futures:
-            with contextlib.suppress(Abandoned):
-                future.result(timeout=5)
-    assert stored and not any("/segments/" in path for path in stored)
+    fsspec.register_implementation("slow", Slow, clobber=True)
+    root = f"cache-{uuid4().hex}"
+    rows = Cache(f"slow://{root}", shard_bytes=1, retry=0).mapped(
+        grain.MapDataset.source(Memory([{"id": 0}, {"id": 1}]).records("indexed")), _key())
+    assert rows[0] == {"id": 0}
+    assert entered.wait(5)
+    closing.set()
+    rows.close()
+    written = MemoryFileSystem().find(f"/{root}")
+    assert any("/shards/" in path for path in written)
+    assert any("/segments/" in path for path in written), written
+    assert rows.metrics()["abandoned"] == 0
+
+
+def test_a_training_close_ends_when_its_store_is_gone():
+    """A store that is gone fails an upload in flight by its transport's own timeout, so a close that
+    waits out its uploads ends, the upload counted abandoned and nothing of the fill published."""
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    entered = threading.Event()
+
+    class Gone(MemoryFileSystem):
+        """Memory objects behind a third-party conditional write whose store is gone: its transfer
+        fails as its transport's timeout ends it."""
+
+        protocol = "gone"
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(path.replace("gone://", "memory://", 1))
+
+        def put_conditional(self, path, payload, version):
+            entered.set()
+            raise TimeoutError("the transport's own timeout: no answer from the store")
+
+    fsspec.register_implementation("gone", Gone, clobber=True)
+    root = f"cache-{uuid4().hex}"
+    rows = Cache(f"gone://{root}", shard_bytes=1, retry=0).mapped(
+        grain.MapDataset.source(Memory([{"id": 0}]).records("indexed")), _key())
+    assert rows[0] == {"id": 0}
+    assert entered.wait(5)
+    rows.close()
+    assert rows.metrics()["abandoned"] > 0
+    assert not MemoryFileSystem().find(f"/{root}")
 
 
 @pytest.mark.network

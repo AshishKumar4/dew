@@ -49,7 +49,7 @@ def unpacked(read: Callable[[Mapping[str, object], Mapping[str, object]], dict],
     held = ocp.tree.to_flat_dict(read(
         reads_only, jax.tree.map(lambda _: ocp.ArrayRestoreArgs(restore_type=np.ndarray), reads_only)))
     for packed, (group, members) in reads.items():
-        parts = np.split(np.asarray(held[packed]), np.cumsum(group.widths)[:-1], axis=-1)
+        parts = group.split(np.asarray(held[packed]))
         for index, key in members.items():
             flat[key] = parts[index]
     return ocp.tree.from_flat_dict(flat, target=restored)

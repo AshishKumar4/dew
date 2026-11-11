@@ -108,7 +108,7 @@ from dew.checkpoints._payloads import (
     _refuse_profiles_alone,
     _StepFacts,
 )
-from dew.checkpoints._replicas import _covered, _from_replicas, _grid, _zeros
+from dew.checkpoints._replicas import Grid, _covered, _from_replicas, _zeros
 from dew.checkpoints._state_trees import (
     TreePath,
     _at,
@@ -137,6 +137,7 @@ from dew.mesh import LogicalAxes
 from dew.nn import sharding
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32
+from dew.registry import from_record, to_record
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
@@ -722,18 +723,28 @@ def _filled(template, restored: dict, step: int):
                             **{name: None for name in OPTIONAL if name not in restored})
 
 
+@dataclasses.dataclass(frozen=True)
+class _ArrayFacts:
+    """An array of a step's item metadata as a holder hands it to a process that lost its copy: its shape
+    and dtype, "key" for a key's, whose own dtype names its implementation, which no check of a restore
+    reads. Written and read by its fields (`dew.registry.to_record`, `from_record`)."""
+
+    shape: tuple[int, ...]
+    dtype: str
+
+
 def _tree_record(tree) -> JSON:
-    """A step's item metadata as JSON: its nesting, and each array's shape and dtype, which a process
-    that lost its local copy reads its restore's checks from (`_StepFacts`)."""
+    """A step's item metadata as JSON: its nesting ({"tree": {...}} a mapping's, {"list": [...]} a
+    sequence's), each array its facts (`_ArrayFacts`), which a process that lost its local copy reads its
+    restore's checks from (`_StepFacts`, `_from_tree_record`)."""
     if isinstance(tree, Mapping):
         return {"tree": {str(key): _tree_record(value) for key, value in tree.items()}}
     if isinstance(tree, (list, tuple)):
         return {"list": [_tree_record(value) for value in tree]}
     if tree is None:
         return None
-    # A key's own dtype names its implementation, which no check of a restore reads.
     key = jnp.issubdtype(tree.dtype, jax.dtypes.prng_key)
-    return {"shape": list(tree.shape), "dtype": "key" if key else str(np.dtype(tree.dtype))}
+    return to_record(_ArrayFacts(tuple(tree.shape), "key" if key else str(np.dtype(tree.dtype))), _ArrayFacts)
 
 
 def _from_tree_record(recorded: JSON):
@@ -748,9 +759,10 @@ def _from_tree_record(recorded: JSON):
         listed = entry["list"]
         assert isinstance(listed, list), "a list record holds a list"
         return [_from_tree_record(value) for value in listed]
-    dtype = _records.text(entry["dtype"], "dtype")
-    return jax.ShapeDtypeStruct(tuple(_records.integers(entry["shape"], "shape")),
-                                jax.random.key(0).dtype if dtype == "key" else np.dtype(dtype))
+    # Its dtype is the spelling a step's metadata holds ("key" a key's), read as written.
+    facts = from_record(_ArrayFacts, entry, dtypes=False)
+    return jax.ShapeDtypeStruct(facts.shape,
+                                jax.random.key(0).dtype if facts.dtype == "key" else np.dtype(facts.dtype))
 
 
 def _table_record(table: Mapping[str, np.ndarray]) -> JSON:
@@ -921,7 +933,7 @@ class Checkpoints:
         self._metadata: tuple[bool, int, _StepFacts] | None = None
         # The newest local step, the processes holding it and where its arrays lie, where some process
         # lost its copy and recovers it from them (`_local_latest`); None where every process holds it.
-        self._recovery: tuple[int, frozenset[int], Mapping[str, object]] | None = None
+        self._recovery: tuple[int, frozenset[int], Grid] | None = None
         # The digests the save still in flight records, which no kept step lists yet.
         self._frozen_pending: set[str] = set()
 
@@ -1225,7 +1237,9 @@ class Checkpoints:
         """
         if self.local_directory is None:
             return None
-        steps = from_every_process(self._open_local().latest_step())
+        # A process that holds no local directory holds no local step, and asking makes none (`_newest`).
+        unopened = self._local_manager is None and not epath.Path(self.local_path).is_dir()
+        steps = from_every_process(None if unopened else self._open_local().latest_step())
         self._recovery = None
         if None not in steps and len(set(steps)) == 1:
             return steps[0]
@@ -1237,7 +1251,7 @@ class Checkpoints:
         holders = frozenset(index for index, step in enumerate(steps) if step == newest)
         recorded = self._from_holder(holders, lambda: (self._open_local().metadata(newest).custom_metadata
                                                        or {}).get("grid"))
-        grid = None if recorded is None else record(recorded, "grid")
+        grid = None if recorded is None else from_record(Grid, recorded)
         if grid is None or not _covered(grid, holders):
             return None
         self._recovery = newest, holders, grid
@@ -1746,7 +1760,7 @@ class Checkpoints:
         """
         state_tree = self._item(state, saved, share, rollout)
         written = placement(state_tree)
-        grid = _grid({name: leaf for name, leaf in state_tree.items() if name != 'position'})
+        grid = Grid.of({name: leaf for name, leaf in state_tree.items() if name != 'position'})
         coded, deltas = _with_ema_deltas(state_tree)
         state_tree = dict(coded)
         if saved is not None:
@@ -1768,7 +1782,7 @@ class Checkpoints:
                     **step_record(deltas, control, rung, artifact, boxed, state_tree),
                     "processes": jax.process_count(),
                     "placement": written,
-                    "grid": grid,
+                    "grid": None if grid is None else to_record(grid, Grid),
                 },
             )
         if _written_in_place(state_tree):
@@ -2248,7 +2262,7 @@ class Checkpoints:
         recovery = self._recovery
         written = (self._step_metadata(step, local=True).custom_metadata or {})
         if recovery is not None and written.get('processes') == jax.process_count() and (
-                _grid(state_tree) == recovery[2]):
+                Grid.of(state_tree) == recovery[2]):
             return
         raise ValueError(
             f"This process lost its copy of local step {step}, which the processes "

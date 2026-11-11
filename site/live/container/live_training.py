@@ -11,7 +11,6 @@ run differs from the code on the page.
 """
 
 import ast
-import inspect
 
 BATCH, STEPS = 8, 20
 
@@ -26,14 +25,16 @@ def batch(asked):
 
 def fitted(steps, log_every):
     """A `fit` call's steps and log_every: more than STEPS steps lowered to STEPS, logging at least four
-    times."""
+    times, a call that names no log_every at that cadence (fit's own logs every 100 steps, past any live
+    run's)."""
     changed, cut = [], steps > STEPS
     if cut:
         changed.append(f"steps {steps} -> {STEPS}")
         steps = STEPS
-    if log_every > max(1, steps // 4):
-        changed.append(f"log_every {log_every} -> {max(1, steps // 4)}")
-        log_every = max(1, steps // 4)
+    cadence = max(1, steps // 4)
+    if log_every is None or log_every > cadence:
+        changed.append(f"log_every {'(its default)' if log_every is None else log_every} -> {cadence}")
+        log_every = cadence
     if changed:
         why = "so it finishes in about two minutes" if cut else "to log the run as it goes"
         print(f"Live run: {', '.join(changed)}, {why}.")
@@ -44,8 +45,8 @@ def capped(call):
     """What a cell's call of `call` reaches: `call` itself, so the call runs in the cell's own frame (a
     `locals()` or an `exec` reads the cell's, however it is named), unless `call` is a Dew function this
     caps, then one that caps its arguments first: a preset's batch (`batch`), called or through a
-    dataset's `pipe`, a dataset's `batch(n)` rows, a `fit`'s steps and log_every, the latter its own
-    default where the cell names none (`fitted`). Whatever name the cell calls it by, and however it
+    dataset's `pipe`, a dataset's `batch(n)` rows, a `fit`'s steps and log_every, the latter the live
+    cadence where the cell names none (`fitted`). Whatever name the cell calls it by, and however it
     passes them."""
     module = getattr(call, "__module__", None) or ""
     name = getattr(call, "__name__", "")
@@ -62,8 +63,7 @@ def capped(call):
             elif "size" in options:
                 options["size"] = batch(options["size"])
         elif name == "fit" and "steps" in options:
-            default = inspect.signature(call).parameters["log_every"].default
-            options.update(fitted(options["steps"], options.get("log_every", default)))
+            options.update(fitted(options["steps"], options.get("log_every")))
         return call(*args, **options)
 
     return capping

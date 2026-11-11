@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, NamedTuple, Protocol, TypedDict, runtime_checkable
 
+import aiohttp
 import fsspec
 from filelock import FileLock, Timeout
 from fsspec.implementations.cached import CachingFileSystem, WholeFileCacheFileSystem
@@ -47,6 +48,31 @@ class SourceChanged(OSError):
     """An object Dew's mirror downloaded holding other bytes than those it was to hold: the size and
     digest a caller named (`source_snapshot`), or its store's version of it as the download began."""
 
+
+READ_AFTER_WRITE = frozenset({"s3", "gs", "gcs", "file", "memory"})
+"""The stores a successful write is read back from at once, as their makers state it, so an object that
+reads back otherwise was written otherwise, and is refused at once (`Store.put_immutable`): S3, "strong
+read-after-write consistency for PUT and DELETE requests of objects in your Amazon S3 bucket in all AWS
+Regions" (docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html, its data consistency model);
+GCS, "the object is immediately available for reading and metadata operations as soon as you receive a
+success response to your write request" (cloud.google.com/storage/docs/consistency; read through its API,
+not a public cache, as gcsfs reads); this host's disk and memory. The Hugging Face Hub's documentation
+states none, nor does a store of a `ConditionalWrites` of its own: their objects are read again
+(`retries`)."""
+
+IDLE_SECONDS = 60
+"""How long a remote store's connection or read may go without a byte before its transfer fails: what a
+store that is gone produces, so a close that waits out its transfers ends (`dew.data.cache`). It is the
+bound botocore already holds every S3 transfer to (its connect and read timeouts, 60 s each, botocore's
+`Config`), so every store fails a silent peer alike: gcsfs, which bounds no request of its own
+(`requests_timeout=None`), is opened with it (`Store.resolve`). It bounds a silent read alone: S3's and GCS's
+transports (aiobotocore's and gcsfs's aiohttp sessions) start their read bound only once a request's body
+is written (aiohttp's `ClientRequest.write_bytes`), and an upload to a peer that takes the connection and
+reads none of the body waits without bound, a 64 MiB one to such a local endpoint on S3 and on GCS still
+waiting after 480 s (row 5402). The Hub is a boundary of its library
+(row 5402): huggingface_hub's JSON calls go through one process-wide client with no timeout, which no call
+or client of it bounds, and hf_xet, which carries the bytes, bounds its transfers (60 s connect, 300 s idle
+read) but not its shard upload's read."""
 
 STORED = {"s3": "etag", "gs": "generation", "gcs": "generation"}
 """The version each remote store names an object it holds by and changes as it is replaced
@@ -88,6 +114,11 @@ def matching(found: ObjectInfo, expected: Mapping[str, object], url: str) -> Non
                       f"sha256={expected['sha256']}")
 
 
+EXPORT_MANIFEST = "_dew_manifest.json"
+"""The file an export's manifest is committed in at its root (`commit_export`), which every reader of an
+export opens (`dew.data.sources.files`, `dew.data.sinks`)."""
+
+
 def commit_export(
     root: Store, *, format: str, codec: int | None, rows: int, files: list[Mapping[str, object]],
     metadata: Mapping[str, object] | None = None, certified: Mapping[str, JSON] | None = None,
@@ -100,16 +131,9 @@ def commit_export(
     manifest = {"schema": 1, "format": format, "codec": codec, "rows": rows, **(certified or {}),
                 "files": files, "metadata": dict(metadata or {})}
     encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-    root.child("_dew_manifest.json").put_if_absent(encoded)
+    root.child(EXPORT_MANIFEST).put_if_absent(encoded)
     root.child("_SUCCESS").put_if_absent(hashlib.sha256(encoded).hexdigest().encode())
     return manifest
-
-
-class TransportStats(TypedDict):
-    hits: int
-    misses: int
-    downloaded_bytes: int
-    wait_seconds: float
 
 
 def _byte_size(value: int | str) -> int:
@@ -170,7 +194,7 @@ class _PinnedReader(io.BufferedReader):
 
 
 _MIRRORS: weakref.WeakSet = weakref.WeakSet()
-"""Every mirror this process opened and still holds (`mirror_metrics`)."""
+"""Every mirror this process opened and still holds (`Mirrored`)."""
 
 
 class BoundedFileCache(WholeFileCacheFileSystem):
@@ -343,7 +367,9 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                 raise TypeError("dewcache binary read returned non-bytes")
             return payload
 
-    def metrics(self) -> TransportStats:
+    def metrics(self) -> dict[str, float]:
+        """Its counters by name: the reads it served from its files and those it downloaded, the bytes it
+        downloaded and the seconds its readers waited on downloads."""
         return {
             "hits": self._dew_hits,
             "misses": self._dew_misses,
@@ -352,18 +378,38 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         }
 
 
-def mirror_metrics() -> dict[str, float]:
-    """What this process's mirrors (`dewcache::`) did, summed over every one it opened, as a run logs it
-    beside its data metrics (`data/mirror/...`, row 4299): none where it opened none."""
-    held = [mirror.metrics() for mirror in _MIRRORS]
-    if not held:
-        return {}
-    return {f"data/mirror/{name}": float(sum(stats[name] for stats in held)) for name in held[0]}
+class Mirrored:
+    """What this process's mirrors (`dewcache::`) did from a moment on (`now`), or since the process began:
+    each mirror's counters less what it held at that moment, one opened since counted whole. A run's
+    statistics count from where its reader began and a loading worker's from where its iterator began, so a
+    run logs the mirror reads it made beside its data metrics (`data/mirror/...`, row 4299), never those an
+    earlier reader of its process made (rows 5220, 5221: a run that opened no mirror logged one a test
+    before it in its process had)."""
+
+    def __init__(self, held: Mapping[BoundedFileCache, Mapping[str, float]] | None = None):
+        self._held: weakref.WeakKeyDictionary[BoundedFileCache, Mapping[str, float]] = (
+            weakref.WeakKeyDictionary(held or {}))
+
+    @classmethod
+    def now(cls) -> Mirrored:
+        """The counters from this moment on."""
+        return cls({mirror: mirror.metrics() for mirror in _MIRRORS})
+
+    def metrics(self) -> dict[str, float]:
+        """Each counter's change since the moment, summed over this process's mirrors; none where none
+        moved."""
+        moved: dict[str, float] = {}
+        for mirror in _MIRRORS:
+            held = self._held.get(mirror, {})
+            for name, value in mirror.metrics().items():
+                key = f"data/mirror/{name}"
+                moved[key] = moved.get(key, 0.0) + value - held.get(name, 0.0)
+        return moved if any(moved.values()) else {}
 
 
 MIRRORED = "dew_mirror"
 """The key under which a loading worker's position carries its process's mirror counters
-(`dew.data.readers.WorkerMirrors`): `{"process": <its process>, "counts": mirror_metrics()}`."""
+(`dew.data.readers.WorkerMirrors`): `{"process": <its process>, "counts": <its Mirrored's metrics>}`."""
 
 MIRRORS = "dew_mirrors"
 """The key under which a position that reads its loading workers' positions without keeping them (an
@@ -392,7 +438,7 @@ def carried_mirrors(state: Mapping[str, object] | Sequence[object] | None) -> di
 
 
 def _counted(counts: object) -> dict[str, float]:
-    """Mirror counters as a position carries them (`mirror_metrics`), by name."""
+    """Mirror counters as a position carries them (`Mirrored`), by name."""
     if not isinstance(counts, Mapping):
         raise ValueError(f"a position's mirror counters are a mapping, not {counts!r}")
     return {str(name): float(value) for name, value in counts.items()}
@@ -570,6 +616,15 @@ class Store:
         for cache in ("dewcache", "filecache", "simplecache", "blockcache"):
             if cache not in layers[:-1]:
                 options.pop(cache, None)
+        scheme = layers[-1].split("://", 1)[0] if "://" in layers[-1] else "file"
+        if scheme in ("gs", "gcs"):
+            # A GCS request idle past `IDLE_SECONDS` fails, as every S3 request does, unless its options
+            # bound it otherwise.
+            idle = aiohttp.ClientTimeout(sock_connect=IDLE_SECONDS, sock_read=IDLE_SECONDS)
+            if len(layers) == 1:
+                options.setdefault("requests_timeout", idle)
+            else:
+                options[scheme] = {"requests_timeout": idle, **options.get(scheme, {})}
         return fsspec.core.url_to_fs(self.url, **options)
 
     def readable(self) -> Readable:
@@ -695,10 +750,12 @@ class Store:
         object an earlier attempt created, and return the stored version.
 
         Other bytes already at the URL are refused with a ValueError. An object
-        this call created that reads back otherwise is read again, up to
-        `retries` times, a longer wait before each, then an OSError: no
-        transport checks what a write left. A failed transfer raises at once,
-        after the transport's own retries (s3fs's, gcsfs's, huggingface_hub's).
+        this call created that reads back otherwise is an OSError: at once on a
+        store that states its writes are read back at once (`READ_AFTER_WRITE`),
+        and on any other after it is read again up to `retries` times, a longer
+        wait before each, as such a store states nothing of when a write is
+        read. A failed transfer raises at once, after the transport's own
+        retries (s3fs's, gcsfs's, huggingface_hub's).
         """
         try:
             self.put_if_absent(payload)
@@ -706,7 +763,8 @@ class Store:
             created = False
         else:
             created = True
-        for attempt in range(retries + 1):
+        _, _, scheme = self._backend()
+        for attempt in range(1 if scheme in READ_AFTER_WRITE else retries + 1):
             if attempt:
                 time.sleep(min(0.25 * 2 ** (attempt - 1), 10))
             found = self.get_versioned()

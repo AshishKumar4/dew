@@ -13,12 +13,13 @@ import grain.python as pygrain
 import numpy as np
 
 from dew._records import ADDED, integer, record
-from dew.batch import Batch, coordinates
+from dew.batch import Batch, coordinates, document_spans
 from dew.data.forked_rows import window_forks
 from dew.data.pipeline import Pack, Rejected, composed, cut_counts
 from dew.data.text import Tokenizer
 from dew.decision.data import Example, GroupedExamples
 from dew.decision.head import Head
+from dew.decision.inputs import compacted, labelled_rows, question_owners
 from dew.decision.layout import (
     OPTIONS,
     QUESTION_FIELDS,
@@ -28,11 +29,8 @@ from dew.decision.layout import (
     QuestionField,
     QuestionLayout,
     Specials,
-    compacted,
     context_tokens,
-    labelled_rows,
     question_fields,
-    question_owners,
     with_context,
 )
 from dew.decision.questions import Choice, Question
@@ -815,10 +813,13 @@ def _window_groups(element: Batch, owners: np.ndarray, options: np.ndarray
 
 def _row_starts(along: np.ndarray, owners: np.ndarray) -> np.ndarray:
     """Where the row each question of `owners` belongs to starts along a stream whose rows `along`
-    numbers in the order they stand (0 for padding), each padding question's 0."""
-    counts = np.bincount(along, minlength=int(owners.max(initial=0)) + 1)
-    starts = np.concatenate([[0], np.cumsum(counts[1:])]).astype(np.int32)
-    return np.where(owners > 0, starts[np.maximum(owners - 1, 0)], 0)
+    numbers in the order they stand (0 for padding): past the slots of the rows before it, as
+    `document_spans` extends each (a row with none of the stream's slots, an empty context, starts where
+    the next does), each padding question's 0."""
+    rows = int(max(along.max(initial=0), owners.max(initial=0)))
+    first, end = document_spans(along[None], rows, xp=np)
+    before = np.concatenate([[0], np.cumsum(end[0] - first[0])])
+    return np.concatenate([[0], before]).astype(np.int32)[owners]
 
 
 def forked_documents(layout: Layout, bounds: Bounds) -> int | None:

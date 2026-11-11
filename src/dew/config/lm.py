@@ -176,8 +176,6 @@ class PromptRollout:
 class LMRunConfig(DecoderRunConfig):
     """A decoder's run (`DecoderRunConfig`) plus the settings specific to language models."""
 
-    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {**DecoderRunConfig._FLAG_SELECTED, "rollout": "rollout",
-                                                   "rollout.served": "served"}
     RESUMABLE: ClassVar[tuple[str, ...]] = (*DecoderRunConfig.RESUMABLE, "prompt", "max_new_tokens",
                                             "sampling")
 

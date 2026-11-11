@@ -18,6 +18,7 @@ from xml.etree import ElementTree
 import jax
 import pytest
 import test_codec_checkpoints
+import test_host_placement
 import test_run_options
 from lane_environment import users_process
 from process_support import relayed
@@ -31,6 +32,8 @@ FLOWS = (
     test_run_options.test_a_kinds_run_set_on_the_command_line_pools_logs_scores_and_keeps_as_set,
     # A quantized checkpoint's products against its author's own forward.
     test_codec_checkpoints.test_a_quantized_checkpoint_computes_its_reference,
+    # A pool of two processes, whose ranks' output a user's arithmetic makes long (row 5434).
+    test_host_placement.test_a_pool_reads_its_own_shards_of_a_host_resident_bank,
 )
 """The flows, each another file's test function: every case of it runs."""
 

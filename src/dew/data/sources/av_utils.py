@@ -16,6 +16,13 @@ FPS = 25.0
 """The frame rate a clip is read at where none is asked for (`video.DecodeVideo`)."""
 
 
+def sample_count(seconds: float, rate: int) -> int:
+    """The samples `seconds` of audio hold at `rate`: their nearest whole count, the one sizing rule every
+    reader of an extent of audio reads (a declared shape, a decoded window, a silent row, a conditioner's
+    input)."""
+    return round(seconds * rate)
+
+
 def media_info(path: str) -> tuple[float, bool, bool]:
     """`path`'s duration in seconds and whether it holds a video and an audio stream, from ffmpeg's
     reading of the container, so a sound file answers too."""
@@ -58,7 +65,7 @@ def audio_window(path: str, start: float, duration: float, sample_rate: int) -> 
     if done.returncode:
         raise ValueError(f"ffmpeg could not read the audio of {path}: "
                          f"{done.stderr.decode(errors='replace').strip()[-2000:]}")
-    count = round(duration * sample_rate)
+    count = sample_count(duration, sample_rate)
     wave, held = np.zeros(count, np.float32), np.zeros(count, bool)
     first = re.search(rb"pts_time:(\S+)", done.stderr)
     if first is None:

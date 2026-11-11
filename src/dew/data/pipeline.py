@@ -1291,7 +1291,7 @@ class Dataset:
         from dew.data.mixing import data_metrics, state_counts
 
         chain = self._chain()
-        if any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
+        if chain.batched:
             raise ValueError("stats counts records; take them before the batch")
         if records < 0:
             raise ValueError("stats records must be nonnegative")
@@ -1357,7 +1357,7 @@ class Dataset:
         from dew.data.dataset import take_batch
 
         chain = self._chain()
-        batched = any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages)
+        batched = chain.batched
         # Device steps run here, on the batches read, as the compiled training step runs them.
         _, device = _batch_steps(chain)
         chain = dataclasses.replace(chain, stages=tuple(

@@ -758,7 +758,7 @@ def _token_spec(shape: tuple[int, ...]) -> P:
 
 
 def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
-                          tile: tuple[int, int] | None = (1024, 8192),
+                          tile: tuple[int, int] | None = chunked_tile(),
                           predict: bool = True, temperature: float = 1.0,
                           excluded: int | None = None) -> Terms:
     """Per-token cross entropy of `head.logits(hidden)`, its top-1 column
@@ -794,7 +794,7 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     test setting) the backward's running sums of the state and head gradients
     keep what each tile's addition drops (`dew.nn.precision.running_sum`),
     three times their bytes, so they round once as the whole head's products do.
-    The default is measured; a tile wider than the input is one
+    The default is the measured one (`chunked_tile`); a tile wider than the input is one
     tile. A `tile` of None keeps the whole fp32 logits for the backward
     instead of recomputing them, which is faster wherever they fit: on one
     A100, Qwen3-0.6B's head at 4096 tokens took 33.1 ms with the logits

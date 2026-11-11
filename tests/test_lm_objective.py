@@ -1145,3 +1145,20 @@ def test_the_token_batch_key_is_one_of_dew_batch_s_exports():
     names: dict = {}
     exec("from dew.batch import *", names)
     assert names.get("TEXT_KEY") == "text"
+
+
+def test_a_batch_with_a_sidecar_held_as_none_is_counted_as_its_loss_reads_it():
+    """A batch whose `ModelInputs` lay out its rows and whose `text_coordinates` sidecar is None: the loss
+    reads the None as no sidecar, and so do the host's counts of the tokens it scores, one reading of the
+    columns for both (`text_columns`), not a duplicate coordinate field."""
+    objective = make_objective()
+    tokens = token_batch()[TEXT_KEY]
+    laid = ModelInputs(jnp.asarray(tokens, jnp.int32),
+                       {"coordinates": coordinates(np.shape(tokens), xp=np)})
+    batch = {TEXT_KEY: laid, "text_coordinates": None}
+    params = decoder_init()(jax.random.key(0))
+
+    loss = objective.scalar_loss(params, batch, step_at())[0]
+
+    assert np.isfinite(float(loss))
+    assert int(np.sum(objective.scored_tokens(batch))) == tokens.shape[0] * (tokens.shape[1] - 1)

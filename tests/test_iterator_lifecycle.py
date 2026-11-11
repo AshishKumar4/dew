@@ -28,7 +28,6 @@ from dew.data import Loading, Rejected, from_grain, mix
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, mapped
 from dew.data.readers import _Host
-from dew.data.storage import mirror_metrics
 from dew.distributed.batches import DevicePrefetchIterator, batch_signature, shard_batch
 from dew.telemetry.records import FitEnded
 from dew.training import Checkpoints, MeshSpec, Trainer
@@ -217,15 +216,13 @@ def test_chain_statistics_publish_without_reading_the_workers_live_iterator(host
             np.testing.assert_array_equal(np.asarray(next(stream)["i"]), kept[:batch])
             assert source.entered.wait(5)
             states = tuple(source.states)
-            # Beside the corpus's counts, what this process's mirrors did, which a run logs with its data
-            # metrics whichever pipeline read through them (`mirror_metrics`, row 4299): none where the
-            # process opened none, an earlier test's where one did.
+            # The corpus's counts and no mirror's: the run reads through none, whatever an earlier reader of
+            # its process read through (`Mirrored`, rows 5220, 5258).
             logged = {
                 "data/rows/observed": batch,
                 "data/rejected/observed/third": attempted - batch,
                 "data/truncated/observed": 0.0,
                 "data/chunks_per_record/observed": 0.0,
-                **mirror_metrics(),
             }
             for _ in range(3):
                 assert data.statistics() == logged
@@ -640,14 +637,16 @@ def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
                       checkpoints=checkpoints)
     trainer.fit(Loader(lambda partition: Source(), None, None, 8), steps=1)
-    entered, stopped = threading.Event(), threading.Event()
+    stopped = threading.Event()
 
     class Restoring(Source):
         restoring = False
 
         def set_state(self, state):
             self.restoring = True
-            entered.set()
+            # Interrupted as restoration begins, however long the run took to reach it (rows 5215, 5229: a
+            # sender that gave up waiting for it sent nothing on a loaded host, and the restore waited on).
+            os.kill(os.getpid(), signal.SIGINT)
             stopped.wait()
             super().set_state(state)
             self.restoring = False
@@ -660,13 +659,6 @@ def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp
             super().close()
 
     source = Restoring()
-
-    def interrupt():
-        if entered.wait(10):
-            os.kill(os.getpid(), signal.SIGINT)
-
-    sender = threading.Thread(target=interrupt)
-    sender.start()
     try:
         with pytest.raises(KeyboardInterrupt):
             trainer.fit(Loader(lambda partition: source, None, None, 8), steps=2)
@@ -675,7 +667,41 @@ def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp
         assert source.owners[0] != threading.get_ident()
     finally:
         stopped.set()
-        sender.join(10)
+
+
+def test_a_fit_inside_an_asyncio_loop_leaves_the_loop_its_signals(tmp_path):
+    """A fit run inside an asyncio loop on the main thread takes the loop's wakeup fd for its waits on the
+    data's workers (`dew.training.runtime.signal_wake`) and hands every signal it took to the loop's: the
+    loop's own handler runs once the fit returns, and the loop's fd is set again, as it was."""
+    import asyncio
+
+    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0))
+    heard = []
+
+    class Signalling(Source):
+        def __next__(self):
+            if self.position == 1:
+                os.kill(os.getpid(), signal.SIGUSR1)
+            return super().__next__()
+
+    async def fitted():
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGUSR1, lambda: heard.append(signal.SIGUSR1))
+        try:
+            own = signal.set_wakeup_fd(-1)
+            signal.set_wakeup_fd(own)
+            trainer.fit(Loader(lambda partition: Signalling(), None, None, 8), steps=3)
+            after = signal.set_wakeup_fd(-1)
+            signal.set_wakeup_fd(after)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return own, after
+        finally:
+            loop.remove_signal_handler(signal.SIGUSR1)
+
+    own, after = asyncio.run(fitted())
+    assert own != -1 and after == own
+    assert heard == [signal.SIGUSR1]
 
 
 @pytest.mark.parametrize("host", [False, True])

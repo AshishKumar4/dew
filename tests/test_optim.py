@@ -22,7 +22,16 @@ from flax import linen as nn
 from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
 from model_support import largest_difference
-from optim_support import LR, decoder_draw, decoder_params, drawn_axes, drawn_tree
+from optim_support import (
+    FLOAT64,
+    LR,
+    WIDE_MOMENTS,
+    decoder_draw,
+    decoder_params,
+    drawn_axes,
+    drawn_tree,
+    in_float64,
+)
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -104,19 +113,24 @@ def axes_of_the_drawn_trees():
         yield
 
 
-def muon_solver(forms: str = "accurate", optimizer: str = "muon", **kwargs):
+def muon_solver(forms: str = "accurate", optimizer: str = "muon", *, wide: bool = False, **kwargs):
     """Dew's Muon, or `optimizer` its MuonClip, over the run's own build, its update traced under numerics
     in `forms` (`generation.run_precision`): the accurate forms' float32 Newton-Schulz where it is held to
-    optax's Muon, which iterates in its momentum's float32."""
+    optax's Muon, which iterates in its momentum's float32; `wide`, a float64 truth's, its moments in the
+    parameters' float64 (`WIDE_MOMENTS`) and its iteration in a float64 run's numerics (`FLOAT64`)."""
+    if wide:
+        kwargs = {**kwargs, "optimizer_opts": {**kwargs.get("optimizer_opts", {}), **WIDE_MOMENTS}}
     built = OptimConfig(optimizer=optimizer, learning_rate=LR, **kwargs).build(10)
-    return in_forms(built, forms)
+    return in_forms(built, forms, FLOAT64.dtypes if wide else None)
 
 
-def in_forms(solver: optax.GradientTransformation, forms: str) -> optax.GradientTransformation:
+def in_forms(solver: optax.GradientTransformation, forms: str, dtypes=None) -> optax.GradientTransformation:
     """`solver` whose update traces under numerics in `forms` (`generation.run_precision`), as a run's
-    step traces its optimizer's."""
+    step traces its optimizer's, at `dtypes` where given (a float64 truth's)."""
+    numerics = Numerics(forms=forms) if dtypes is None else Numerics(forms=forms, dtypes=dtypes)
+
     def update(updates, state, params=None, **extra):
-        with run_precision(Numerics(forms=forms)):
+        with run_precision(numerics):
             return solver.update(updates, state, params, **extra)
     return optax.GradientTransformationExtraArgs(solver.init, update)
 
@@ -575,6 +589,8 @@ def test_both_groups_step_with_the_one_schedule():
     cosine = Cosine(init_value=1e-4, peak_value=4e-3, end_value=1e-3, warmup_steps=1, decay_steps=4)
     scheduled = OptimConfig(optimizer='muon', learning_rate=cosine).build(4)
     unscaled = OptimConfig(optimizer='muon', learning_rate=1.0).build(4)
+    # The truth's: its moments in the parameters' float64, its iteration in float64 (`in_float64`).
+    wide = OptimConfig(optimizer='muon', learning_rate=1.0, optimizer_opts=WIDE_MOMENTS).build(4)
     rate = optax.warmup_cosine_decay_schedule(
         init_value=cosine.init_value, peak_value=cosine.peak_value,
         warmup_steps=cosine.warmup_steps, decay_steps=4, end_value=cosine.end_value)
@@ -597,7 +613,8 @@ def test_both_groups_step_with_the_one_schedule():
     assert_as_exact(steps(scheduled, lambda step: 1.0), steps(unscaled, lambda step: reported[step]),
                     lambda seed: drawn_tree(decoder_params(), seed), "one schedule over both groups",
                     seeds=UPDATE_SEEDS,
-                    truth_fn=jax.jit(steps(unscaled, lambda step: rate(jnp.asarray(step, jnp.float64)))))
+                    truth_fn=jax.jit(in_float64(
+                        steps(wide, lambda step: rate(jnp.asarray(step, jnp.float64))))))
 
 
 def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time():
@@ -1072,10 +1089,10 @@ def test_the_threshold_rides_optimizer_opts():
                 moved['layers_0']['self_attn'][proj]['kernel'], gamma, 4)} for proj in ('q_proj', 'k_proj')}}}
         return rescaled
 
-    # The truth's Muon keeps its momentum in the parameters' float64, where the config's holds float32.
-    wide = muon_solver(optimizer_opts={'mu_dtype': None})
+    # The truth's Muon keeps its moments in the parameters' float64 and iterates in it.
     assert_as_exact(clipped, paper(muon), lambda seed: qk_tree(seed=seed),
-                    "the clip at a configured threshold", seeds=THRESHOLD_SEEDS, truth_fn=paper(wide))
+                    "the clip at a configured threshold", seeds=THRESHOLD_SEEDS,
+                    truth_fn=paper(muon_solver(wide=True)))
 
 
 def tiny_decoder(**overrides):

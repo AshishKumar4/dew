@@ -86,8 +86,10 @@ def tokens():
 
 
 def torch_logits(model, ids) -> np.ndarray:
+    """`model`'s logits over `ids` at their own width in float64 numpy: a float32 model's exactly, a
+    float64 twin's unrounded."""
     with torch.no_grad():
-        return model(torch.from_numpy(np.asarray(ids, np.int64))).logits.float().numpy()
+        return model(torch.from_numpy(np.asarray(ids, np.int64))).logits.double().numpy()
 
 
 def objective_loss(objective, variables, tokens, *, scalar: bool = False):

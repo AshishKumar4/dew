@@ -118,16 +118,20 @@ type Artifacts = Artifact | tuple[Artifact, ...]
 """One artifact, or several."""
 
 
-def uint8_pixels(images: ArrayLike) -> NDArray[np.uint8]:
-    """Convert [-1, 1] pixels, as `ImageGrid` and `VideoGrid` hold them, to uint8 in [0, 255].
+def pixel_levels(images: ArrayLike, xp=np):
+    """[-1, 1] pixels, as `ImageGrid` and `VideoGrid` hold them, as their levels in [0, 255], in float32:
+    each value's nearest level, computed as `(x + 1) * 127.5` in float32 and rounded half to even, clipped
+    because a sample can leave the range. `xp` is the array library it computes in: numpy on the host
+    (`uint8_pixels`), `jax.numpy` inside a program (a pipeline's safety head reads these levels), one
+    conversion either way."""
+    levels = xp.round((xp.asarray(images, xp.float32) + 1.0) * 127.5)
+    return xp.clip(levels, 0, 255)
 
-    Each value maps to its nearest level, computed as `(x + 1) * 127.5` in
-    float32 and rounded half to even (`np.rint`). The result is clipped,
-    because a sample can leave the range. Metrics score these bytes and
-    trackers preview them, so both see the same image.
-    """
-    levels = np.rint((np.asarray(images, np.float32) + 1.0) * 127.5)
-    return np.clip(levels, 0, 255).astype(np.uint8)
+
+def uint8_pixels(images: ArrayLike) -> NDArray[np.uint8]:
+    """Convert [-1, 1] pixels to their uint8 levels in [0, 255] (`pixel_levels`). Metrics score these
+    bytes and trackers preview them, so both see the same image."""
+    return pixel_levels(images).astype(np.uint8)
 
 
 __all__ = [
@@ -138,5 +142,6 @@ __all__ = [
     "TextSamples",
     "TokenScores",
     "VideoGrid",
+    "pixel_levels",
     "uint8_pixels",
 ]

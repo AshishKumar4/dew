@@ -25,7 +25,8 @@ from dew.data.chat import ROLES_KEY, Role
 from dew.data.dataset import Loader, rows_of, take_batch
 from dew.data.text import ByteTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
-from dew.decision.layout import DecisionInputs, Specials, StateFirstLayout
+from dew.decision.inputs import DecisionInputs
+from dew.decision.layout import Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
 from dew.diffusion import presets
 from dew.distributed.batches import DevicePrefetchIterator

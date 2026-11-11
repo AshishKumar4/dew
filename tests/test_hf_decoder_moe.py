@@ -274,11 +274,23 @@ def _mxfp4_gpt_oss(directory: Path) -> Path:
     return directory / "mxfp4"
 
 
+def decoded_in_float64(source):
+    """The logits of the GPT-OSS at `source` loaded with its experts decoded, computed in float64 over the
+    stored values (each MXFP4 value exact in float32, as the packed bank holds it): the truth of a packed
+    or decoded load's."""
+    from arm_arithmetic import float64_held
+    from model_support import float64_twin
+
+    loaded = Pretrained.load(str(source), dtype="float32", attention_impl="xla")
+    model, variables = float64_twin(loaded.model), float64_held(loaded.variables)
+    return jax.jit(lambda tokens: model.apply(variables, tokens))
+
+
 def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
     """An MXFP4 GPT-OSS loaded with its experts packed (`Pretrained.load`'s `packed_experts`, row 4516):
     each expert matrix an NVFP4 bank in the `QUANTIZATION` collection, no parameter beside it, holding
     exactly the values the dequantizing load decodes; its logits on par with that load's, both bf16 with
-    the stored weights' own dtype (check 1, truth the decoded load in fp32); and its export the source's
+    the stored weights' own dtype (check 1, truth the decoded load in float64); and its export the source's
     MXFP4 values."""
     from dew.nn.kernels.gemm import NvFp4
     from dew.quantization import QUANTIZATION
@@ -298,8 +310,6 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
         held = flat_tree(decoded.variables["params"])[path]
         np.testing.assert_array_equal(values, np.asarray(held, np.float32))
 
-    wide = Pretrained.load(str(source), dtype="float32", attention_impl="xla")
-
     def draw(seed: int):
         return (jax.random.randint(jax.random.key(seed), (2, 8), 0, PACKED_CONFIG["vocab_size"]),)
 
@@ -307,7 +317,7 @@ def test_an_mxfp4_gpt_oss_served_packed_is_on_par_with_it_decoded(tmp_path):
         return jax.jit(lambda tokens: loaded.model.apply(loaded.variables, tokens))
 
     assert_as_exact(logits(packed), logits(decoded), draw, "packed GPT-OSS experts", seeds=8,
-                    truth_fn=logits(wide))
+                    truth_fn=decoded_in_float64(source))
     from safetensors.numpy import load_file
 
     stored = load_file(str(source / "model.safetensors"))
@@ -399,7 +409,8 @@ def test_an_mxfp4_gpt_oss_packed_on_a_mesh_places_each_bank_by_its_experts_axis(
     def logits(loaded):
         return jax.jit(lambda tokens: loaded.model.apply(loaded.variables, tokens))
 
-    assert_as_exact(logits(placed), logits(held), draw, "placed packed GPT-OSS", seeds=8)
+    assert_as_exact(logits(placed), logits(held), draw, "placed packed GPT-OSS", seeds=8,
+                    truth_fn=decoded_in_float64(source))
 
 
 def test_an_mxfp4_gpt_oss_scanned_packed_is_its_unscanned_packed_load():

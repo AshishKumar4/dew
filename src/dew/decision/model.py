@@ -7,13 +7,14 @@ import jax
 import jax.numpy as jnp
 
 from dew.batch import COORDINATES_FIELD, Variables, part, prefix_sum, thaw
-from dew.decision.head import Head
-from dew.decision.layout import DecisionInputs
+from dew.decision.head import Head, answer_states
+from dew.decision.inputs import DecisionInputs
+from dew.decision.layout import HOWS
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
+from dew.nn.inspection import QK
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import TokenModel, VocabularyRows
-from dew.nn.scatter import gather_positions
 from dew.nn.visibility import block_ends, block_starts
 from dew.nn.wrapping import HeadedModel
 from dew.objectives.base import joined
@@ -182,8 +183,8 @@ class DecisionModel(HeadedModel):
                                            progress=progress, opened=opened)
         logits, head_sown = self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs,
                                              opened=opened)
-        if "qk" in opened:
-            sown = {**sown, "qk": {"backbone": sown.get("qk", {}), "head": head_sown.get("qk", {})}}
+        if QK in opened:
+            sown = {**sown, QK: {"backbone": sown.get(QK, {}), "head": head_sown.get(QK, {})}}
         return logits, sown
 
     def head_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
@@ -195,13 +196,13 @@ class DecisionModel(HeadedModel):
         which reads its questions' spans from `spanned`, the pass that holds them, where the head pools
         them."""
         head = thaw(part(variables, "head"))
-        clipped = "qk" in opened
+        clipped = QK in opened
         head_sown: dict = {}
 
         def applied(*args, **kwargs) -> jax.Array:
             if not clipped:
                 return _array(self.head.apply(head, *args, **kwargs))
-            out, held = self.head.apply(head, *args, mutable=["qk"], **kwargs)
+            out, held = self.head.apply(head, *args, mutable=[QK], **kwargs)
             head_sown.update(held)
             return _array(out)
         # The questions' spans are pooled from the pass that holds them: the context's, where it holds
@@ -229,9 +230,7 @@ class DecisionModel(HeadedModel):
         """The backbone's own logits `[B, Q, K, V]` at each label's ids of each question's answer
         state (`DecisionInputs.readout`), its first `K` labels as many as its option slots
         (`HeadedModel.label_logits`)."""
-        if inputs.readout is None:
-            raise ValueError("a readout of labels reads rows whose options stand under labels (Labels)")
-        answers = gather_positions(states, inputs.readout)
+        answers = answer_states(states, inputs)
         return self.label_logits(variables, answers, labels)[:, :, :inputs.options.shape[-1]]
 
 
@@ -316,7 +315,8 @@ def stream_runs(streams: jax.Array, segments: jax.Array, reads: Sequence[Sequenc
     read = jnp.where(kind < 0, count_streams, kind)
     how = jnp.where(read == reader[..., None], table[reader, 0][..., None],
                     table[reader[..., None], 1 + read])
-    hi = jnp.where(how == 2, jnp.minimum(hi, index[None, :, None] + 1), hi)
+    # A causal read (`HOWS`) reads up to the token itself.
+    hi = jnp.where(how == HOWS["causal"], jnp.minimum(hi, index[None, :, None] + 1), hi)
     kept = (how > 0) & (hi > lo)
     return jnp.stack([jnp.where(kept, lo, 0), jnp.where(kept, hi, 0)], axis=-1).astype(jnp.int32)
 

@@ -384,8 +384,8 @@ class NvFp4:
         (`bits.nvfp4_quantized`, each matrix: its block scales and tensor scale, each value rounded to E2M1),
         its codes packed in the staged order."""
         def one(x):
-            words, scales, scale = bits.nvfp4_quantized(jnp.asarray(x, jnp.float32))
-            return _codes(words), scales, scale
+            codes, scales, scale = bits.nvfp4_coded(jnp.asarray(x, jnp.float32))
+            return _e2m1_values(codes), scales, scale
 
         return cls.of(*(jax.vmap(one) if x.ndim == 3 else one)(x))
 
@@ -461,6 +461,14 @@ def staged_rows(depth: int) -> np.ndarray:
     groups, within = np.divmod(np.arange(depth), group)
     word, code = np.divmod(within, 32 // bits.E2M1.width)
     return mosaic_gpu.nvfp4_staged_depth(groups, word, code)
+
+
+def _e2m1_values(codes: jax.Array) -> jax.Array:
+    """E2M1 codes' values (`bits.nvfp4_coded`'s uint32 codes), float32, read from the codes' table
+    (`fake_quant.E2M1`): a selection, no arithmetic."""
+    from dew.nn import fake_quant
+
+    return jnp.asarray(fake_quant.E2M1)[codes]
 
 
 def _codes(words: jax.Array, *, staged: bool = False) -> jax.Array:
@@ -972,26 +980,37 @@ class MxFp8:
         largest magnitude's exponent less E4M3's largest's (8), so that magnitude over the scale lies in
         [256, 512); each value over its scale rounded to E4M3, ties to even, saturating at +-448. A block of
         zeros takes the least scale. (A scale the ceiling of the largest magnitude over 448, DeepSeek's
-        rule, rounds a code up past the largest float32 at float32's top binade: 256 x 2^120.)"""
+        rule, rounds a code up past the largest float32 at float32's top binade: 256 x 2^120.) The largest
+        magnitude's exponent is its binary exponent read from its bits (`jnp.frexp`), exact where a float32
+        `log2` rounds a magnitude just under a power of two up onto it, and every step is exact or a rounding
+        to E4M3 at the operand's width (`at_least_fp32`): a float64 truth's float32 values quantize to the
+        same operand."""
         from dew.nn import fake_quant
 
-        x = jnp.asarray(x, jnp.float32)
+        x = jnp.asarray(x)
+        x = x.astype(at_least_fp32(x.dtype))
         per = formats_of.MXFP8.depth
         blocks = x.reshape(*x.shape[:-1], x.shape[-1] // per, per)
         largest = jnp.max(jnp.abs(blocks), axis=-1, keepdims=True)
-        exponent = jnp.where(largest > 0, jnp.floor(jnp.log2(jnp.where(largest > 0, largest, 1.0))), -119.0)
-        scale = jnp.exp2(jnp.clip(exponent - 8, -127, 127))
-        codes = fake_quant.fp8_codes(blocks / scale).reshape(x.shape)
-        return cls(codes.astype(jnp.float8_e4m3fn), scale[..., 0].astype(formats_of.MXFP8.scale))
+        # The largest magnitude is a fraction in [1/2, 1) times 2 to `binade`: its exponent is `binade` - 1.
+        binade = jnp.frexp(largest)[1]
+        top = jnp.finfo(jnp.float8_e4m3fn).maxexp - 1
+        bias = -jnp.finfo(jnp.float8_e8m0fnu).minexp
+        exponent = jnp.clip(jnp.where(largest > 0, binade - 1 - top, -bias), -bias, bias)
+        scales = jax.lax.bitcast_convert_type((exponent + bias).astype(jnp.uint8), jnp.float8_e8m0fnu)
+        codes = fake_quant.fp8_codes(blocks / scales.astype(x.dtype)).reshape(x.shape)
+        return cls(codes.astype(jnp.float8_e4m3fn), scales[..., 0])
 
-    def decoded(self) -> jax.Array:
-        """Its values, exactly, in float32 (`[..., depth]`): each code times its block's scale."""
-        return _block_values(self.codes, self.scales, formats_of.MXFP8.depth)
+    def decoded(self, dtype=jnp.float32) -> jax.Array:
+        """Its values, exactly, in `dtype` (`[..., depth]`, float32 or a float64 truth's): each code times
+        its block's scale."""
+        return _block_values(self.codes, self.scales, formats_of.MXFP8.depth, dtype)
 
 
-def _block_values(codes: jax.Array, scales: jax.Array, block: int) -> jax.Array:
-    """Block-scaled codes' values, exactly, in float32: each code times its `block` depths' scale."""
-    return codes.astype(jnp.float32) * jnp.repeat(scales.astype(jnp.float32), block, axis=-1)
+def _block_values(codes: jax.Array, scales: jax.Array, block: int, dtype) -> jax.Array:
+    """Block-scaled codes' values in `dtype`: each code times its `block` depths' scale, exact in float32
+    (a code's 4 bits times a power of two, or an E2M1 code times an E4M3 scale: 6 bits)."""
+    return codes.astype(dtype) * jnp.repeat(scales.astype(dtype), block, axis=-1)
 
 
 MXFP8_ROW = 'ledger 4519'
@@ -1133,11 +1152,13 @@ class NvFp4Block:
     def quantized(cls, x: jax.Array) -> "NvFp4Block":
         """`x` (`[..., depth]`) as NVFP4 along its depth, `bits.nvfp4_quantized`'s rule (one tensor scale,
         its largest magnitude over 6 x 448; each block's the least E4M3 at or above its largest magnitude
-        over 6 times it; each value rounded to E2M1, ties to even)."""
-        x = jnp.asarray(x, jnp.float32)
-        words, scales, scale = bits.nvfp4_quantized(x.reshape(-1, x.shape[-1]).T)
-        codes = _codes(words).T.reshape(x.shape).astype(jnp.float4_e2m1fn)
-        return cls(codes, scales.T.reshape(*x.shape[:-1], -1), scale)
+        over 6 times it; each value rounded to E2M1, ties to even), at the operand's width (`at_least_fp32`:
+        a float64 truth's float32 values quantize to the same operand)."""
+        x = jnp.asarray(x)
+        x = x.astype(at_least_fp32(x.dtype))
+        codes, scales, scale = bits.nvfp4_coded(x.reshape(-1, x.shape[-1]).T)
+        values = _e2m1_values(codes.T).reshape(x.shape).astype(jnp.float4_e2m1fn)
+        return cls(values, scales.T.reshape(*x.shape[:-1], -1), scale)
 
     @classmethod
     def of(cls, matrix: NvFp4) -> "NvFp4Block":
@@ -1146,10 +1167,10 @@ class NvFp4Block:
         return cls(matrix.codes().T.astype(jnp.float4_e2m1fn)[None], jnp.asarray(matrix.scales)[None],
                    jnp.asarray(matrix.scale))
 
-    def decoded(self) -> jax.Array:
-        """Its block-scaled values, exactly, in float32 (`[..., depth]`): each code times its block's scale,
-        the tensor's apart (`scale`)."""
-        return _block_values(self.codes, self.scales, formats_of.NVFP4.depth)
+    def decoded(self, dtype=jnp.float32) -> jax.Array:
+        """Its block-scaled values, exactly, in `dtype` (`[..., depth]`, float32 or a float64 truth's): each
+        code times its block's scale, the tensor's apart (`scale`)."""
+        return _block_values(self.codes, self.scales, formats_of.NVFP4.depth, dtype)
 
 
 NVFP4_BLOCK_OP: selection.Op[MxCase] = selection.Op(generation.Choice.NVFP4_BLOCK, (

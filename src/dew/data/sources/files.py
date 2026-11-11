@@ -39,6 +39,7 @@ from dew.data.once import locked_cached_property
 from dew.data.pipeline import Dataset
 from dew.data.steps.generic import Fields
 from dew.data.storage import (
+    EXPORT_MANIFEST,
     Readable,
     Store,
     commit_export,
@@ -443,14 +444,14 @@ class Files(Dataset):
         named = Store(str(self.url), self.storage_options)
         if self.file_info is not None or not isinstance(self.url, str):
             return named
-        fs, path = named.child("_dew_manifest.json").resolve()
+        fs, path = named.child(EXPORT_MANIFEST).resolve()
         return named.pinned() if fs.exists(path) else named
 
     @cached_property
     def committed(self) -> Mapping[str, object] | None:
         if self.file_info is not None or not isinstance(self.url, str):
             return None
-        store = self._root.child("_dew_manifest.json")
+        store = self._root.child(EXPORT_MANIFEST)
         fs, path = store.resolve()
         if not fs.exists(path):
             return None
@@ -473,8 +474,10 @@ class Files(Dataset):
         """`paths` whose names end in one of `suffixes`, all of them where it names none."""
         if self.suffixes is None:
             return tuple(paths)
-        wanted = {"." + suffix.lower().removeprefix(".") for suffix in self.suffixes}
-        return tuple(path for path in paths if PurePosixPath(path).suffix.lower() in wanted)
+        # A name's whole end, as every suffix here is read (`kind_of`): a compressed format's two parts
+        # (`jsonl.gz`) included.
+        wanted = tuple("." + suffix.lower().removeprefix(".") for suffix in self.suffixes)
+        return tuple(path for path in paths if path.lower().endswith(wanted))
 
     @cached_property
     def _listed(self) -> tuple[str, ...]:

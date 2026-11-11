@@ -28,9 +28,10 @@ def split_run(function, carried):
 
 
 def widened(h, a, b):
-    """Two products of float16 matrices with the state, each accumulated in float32, summed."""
-    return (jnp.matmul(a, h, preferred_element_type=jnp.float32)
-            + jnp.matmul(b, h, preferred_element_type=jnp.float32),)
+    """Two products of float16 matrices with the state, each accumulated in float32 (in its operands' own
+    dtype where that is wider: a float64 truth's run), summed."""
+    wide = jnp.promote_types(h.dtype, jnp.float32)
+    return (jnp.matmul(a, h, preferred_element_type=wide) + jnp.matmul(b, h, preferred_element_type=wide),)
 
 
 def test_products_accumulated_wide_keep_their_accumulation_through_the_split():

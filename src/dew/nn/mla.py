@@ -40,6 +40,7 @@ from dew.nn.inputs import (
     counted_places,
     document_reach,
 )
+from dew.nn.inspection import QK
 from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.attention import call_visibility, dense_visibility, group_fields
@@ -973,8 +974,8 @@ class MultiHeadLatentAttention(LinearProducts):
             # Beside a context this call read through the same projections first (`attend_context`).
             found = with_context_logits(self, max_attention_logits(query, key, causal=causal, mask=mask,
                                                                    bias=bias))
-            self.sow("qk", "max_logits", found)
-            self.sow("qk", "qk_nope", jnp.asarray(self.qk_nope_head_dim))
+            self.sow(QK, "max_logits", found)
+            self.sow(QK, "qk_nope", jnp.asarray(self.qk_nope_head_dim))
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=force_fp32_for_softmax,
@@ -986,7 +987,7 @@ class MultiHeadLatentAttention(LinearProducts):
         return self._output(attention, gating)
 
     def _qk_open(self) -> bool:
-        return not self.is_initializing() and self.is_mutable_collection("qk")
+        return not self.is_initializing() and self.is_mutable_collection(QK)
 
     def _attends_sparsely(self, selection, total: int) -> bool:
         """Whether a whole-sequence pass runs `sparse_latent_attention`: when the

@@ -278,6 +278,17 @@ def _windows(groups: Sequence[list[int]], lengths: Sequence[int], keys: Sequence
             for start, stop in itertools.pairwise(starts)]
 
 
+def over_prefix(prefix: int, sizes: Sequence[int]) -> list[tuple[int, int, int, int]]:
+    """Rows sharing their first `prefix` tokens, of `sizes` tokens each, as documents over that prefix laid
+    once: each `(row, begin, end, parent)`, the row it takes its tokens `begin:end` from and the document it
+    continues, numbered from 1 in this list's order (0 for none). The prefix is the first row's first
+    `prefix` tokens, continuing nothing, where it holds any; each row's rest past it continues it, a row
+    with none past it laying none."""
+    shared = [(0, 0, prefix, 0)] if prefix else []
+    rests = [(row, prefix, size, 1 if prefix else 0) for row, size in enumerate(sizes) if size > prefix]
+    return shared + rests
+
+
 @dataclasses.dataclass
 class _Layout:
     """The windows `ForkedRows.pack` writes, on the host."""
@@ -322,17 +333,12 @@ class _Layout:
             return first
 
         for prefix, group in groups:
-            root = 0
-            if prefix:
-                first = document(group[0], 0, prefix, 0)
-                root = number
-                for row in group:
-                    self.index[row, :prefix] = local * self.width + first + np.arange(prefix)
-            for row in group:
-                size = len(laid[row])
-                if size > prefix:
-                    first = document(row, prefix, size, root)
-                    self.index[row, prefix:size] = local * self.width + first + np.arange(size - prefix)
+            root = number
+            for member, begin, end, parent in over_prefix(prefix, [len(laid[row]) for row in group]):
+                first = document(group[member], begin, end, parent and root + parent)
+                # The prefix's slots are every row's of the group; a row's rest its own.
+                for row in (group if parent == 0 and prefix else (group[member],)):
+                    self.index[row, begin:end] = local * self.width + first + np.arange(end - begin)
 
     def forked(self, blocks: int, xp, continued: int | None = None) -> ForkedRows:
         """The windows as `ForkedRows`, in the array module `xp`, at most `continued` of a window's documents

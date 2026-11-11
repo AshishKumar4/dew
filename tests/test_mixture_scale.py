@@ -124,8 +124,9 @@ def test_a_thousand_sources_compile_and_step_without_a_cost_per_source(by, recor
     sources it does not draw, holds the threads ten do (its members read under their share of the
     loading, one after another on the thread that draws from them), and keeps no block a step, and
     compiling them costs memory linear in their count (row 4079: each document's capture asked and copied
-    every member's position and counts, and each member's shard read on sixteen threads of its own). A
-    step's time is recorded beside them (`step_ms`), a measurement, not a verdict (A33)."""
+    every member's position and counts, and each member's shard read on sixteen threads of its own), its
+    steps allocating at their most what ten's do, the positions a document's capture copies among it (row
+    4805). A step's time is recorded beside them (`step_ms`), a measurement, not a verdict (A33)."""
     measured = {}
     for count in (10, SOURCES):
         gc.collect()
@@ -139,9 +140,15 @@ def test_a_thousand_sources_compile_and_step_without_a_cost_per_source(by, recor
         try:
             drawn(stream, count)
             Documents.reads = 0
+            # What a window of steps allocates at its most, the positions each document's capture takes among
+            # it (row 4805: a capture of every member's position a document cost the members' count).
+            gc.collect()
+            tracemalloc.start()
             began = time.perf_counter()
             texts(stream, 64)
             stepped = (time.perf_counter() - began) / 64
+            _, allocated = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
             reads = Documents.reads
             # What steps keep, counted between two counts past the first window: a buffer it sized once
             # is in both, and whatever a step keeps grows with the steps between them.
@@ -155,13 +162,15 @@ def test_a_thousand_sources_compile_and_step_without_a_cost_per_source(by, recor
         finally:
             stream.close()
         measured[count] = {"compile_s": built, "compile_peak_mib": peak / 2**20, "step_ms": 1e3 * stepped,
-                           "reads_per_step": reads / 64, "threads": threads, "blocks_kept_per_step": kept}
+                           "reads_per_step": reads / 64, "threads": threads, "blocks_kept_per_step": kept,
+                           "step_peak_kib": allocated / 2**10}
         record_property(f"sources_{count}", measured[count])
         print(f"sources={count}", measured[count])
     few, many = measured[10], measured[SOURCES]
     assert many["reads_per_step"] < 2 * few["reads_per_step"], measured
     assert many["threads"] <= few["threads"], measured
     assert many["blocks_kept_per_step"] < 1, measured
+    assert many["step_peak_kib"] < 2 * few["step_peak_kib"], measured
     record_property("rss_mib", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
     print("rss_mib", resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)
 

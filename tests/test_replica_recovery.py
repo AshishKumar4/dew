@@ -1,12 +1,15 @@
 """Which replica gives a lost local checkpoint each of its shards (`dew.checkpoints._sources`), read
-from where a local save recorded its arrays (`_grid`): the pool's lifecycle is
+from where a local save recorded its arrays (`Grid`): the pool's lifecycle is
 tests/test_multiprocess.py's (`test_a_process_that_lost_its_local_copy_recovers_it_from_a_replica`)."""
+
+import dataclasses
 
 import numpy as np
 import pytest
 
-GRID = {"axes": ["data", "fsdp"], "shape": [2, 4], "devices": list(range(8)),
-        "split": {"['params']['w']": ["fsdp"], "['step']": []}}
+from dew.checkpoints._replicas import Grid
+
+GRID = Grid(("data", "fsdp"), (2, 4), tuple(range(8)), {"['params']['w']": ("fsdp",), "['step']": ()})
 """Eight devices, a data axis of two over two processes (devices 0 to 3 on process 0, 4 to 7 on
 process 1), fsdp of four within each."""
 PROCESS = {device: device // 4 for device in range(8)}
@@ -39,6 +42,7 @@ def test_a_save_whose_shards_have_no_copy_off_the_lost_process_is_not_covered():
     from dew.checkpoints._replicas import _covered
 
     assert _covered(GRID, frozenset({0}), PROCESS)
-    unreplicated = {**GRID, "split": {**GRID["split"], "['params']['x']": ["data", "fsdp"]}}
+    unreplicated = dataclasses.replace(GRID, split={**GRID.split, "['params']['x']": ("data", "fsdp")})
     assert not _covered(unreplicated, frozenset({0}), PROCESS)
     assert not _covered(None, frozenset({0}), PROCESS)
+

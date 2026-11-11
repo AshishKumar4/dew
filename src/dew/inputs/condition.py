@@ -18,6 +18,7 @@ from typing_extensions import TypeVar
 
 from dew import _records
 from dew.batch import Variables
+from dew.nn.sharding import boxed_axes
 from dew.registry import component, to_record
 
 Raw = TypeVar("Raw")
@@ -56,10 +57,12 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
 
     def parameter_axes(self) -> dict[tuple[str, ...], tuple[str | None, ...]]:
         """The axes each parameter of `params` is drawn in, by its path in `params`, read off its towers'
-        draws (`drawn`, `dew.nn.sharding.boxed_axes`): the table that places a run holding this encoder
-        frozen (`dew.objectives.diffusion.DiffusionObjective.parameter_axes`) and a pipeline loaded on a
-        mesh. An encoder whose towers name no axes holds none."""
-        return {}
+        draws as `params` lays them out (`drawn`, `dew.nn.sharding.boxed_axes`): the table that places a
+        run holding this encoder frozen (`dew.objectives.diffusion.DiffusionObjective.parameter_axes`) and
+        a pipeline loaded on a mesh, each path the one its parameter is held at, so no tower's declaration
+        is missed by a path its draw lays out otherwise (row 4407). An encoder whose towers name no axes
+        holds none."""
+        return boxed_axes(self.drawn())
 
     def drawn(self) -> Mapping:
         """Its towers' parameters as their draws make them, traced for shapes alone (`jax.eval_shape`, no

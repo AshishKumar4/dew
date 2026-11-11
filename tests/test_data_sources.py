@@ -33,7 +33,7 @@ from dew.data.dataset import DataPartition, Loading
 from dew.data.shards import streamed
 from dew.data.sinks import export
 from dew.data.sources import Files, Memory
-from dew.data.storage import Store
+from dew.data.storage import EXPORT_MANIFEST, Store
 
 
 def test_memory_columns_snapshot_changes_with_content():
@@ -556,7 +556,7 @@ def test_an_export_whose_writer_stops_commits_nothing_and_the_next_commits_only_
     rows = [{"id": index} for index in range(10)]
     with pytest.raises(RuntimeError):
         export(Memory(rows), str(tmp_path), format=ArrowFiles(stop=2), rows_per_shard=4)
-    assert not (tmp_path / "_dew_manifest.json").exists() and not (tmp_path / "_SUCCESS").exists()
+    assert not (tmp_path / EXPORT_MANIFEST).exists() and not (tmp_path / "_SUCCESS").exists()
     assert len(list(tmp_path.rglob("part-*.arrow"))) == 2
     with pytest.raises(ValueError):
         Files(str(tmp_path), format="arrow", spark=True).records("indexed")
@@ -635,7 +635,7 @@ def test_a_writer_of_a_format_no_reader_opens_is_refused_before_it_commits(tmp_p
     never be read, nor written again, there."""
     with pytest.raises(ValueError):
         export(Memory([{"text": "one"}]), str(tmp_path), format=LineOrTarFiles("tfrecord"))
-    assert not (tmp_path / "_dew_manifest.json").exists() and not list(tmp_path.rglob("part-*"))
+    assert not (tmp_path / EXPORT_MANIFEST).exists() and not list(tmp_path.rglob("part-*"))
 
 
 def ids_per_reader(path: Path, readers: int, kind: str = "jsonl") -> list[list[int]]:
@@ -706,7 +706,7 @@ def test_a_corrupt_export_manifest_is_refused_and_never_falls_back_to_raw_shards
     root = Store(f"memory://corrupt-export-{uuid4().hex}")
     export(Memory([{"id": 1}]), root.url)
     assert len(Files(root.url, format="parquet").records("indexed")) == 1
-    root.child("_dew_manifest.json").write(b"not-json")
+    root.child(EXPORT_MANIFEST).write(b"not-json")
     with pytest.raises(ValueError):
         Files(root.url, format="parquet").records("indexed")
 
@@ -717,9 +717,9 @@ def test_export_manifest_cannot_reference_an_object_outside_its_root():
     root = Store(f"memory://escaping-export-{uuid4().hex}/dataset")
     export(Memory([{"id": 1}]), root.url)
     assert len(Files(root.url).manifest(LATEST).shards) == 1
-    manifest = json.loads(root.child("_dew_manifest.json").read())
+    manifest = json.loads(root.child(EXPORT_MANIFEST).read())
     manifest["files"][0]["path"] = "../" + manifest["files"][0]["path"]
-    root.child("_dew_manifest.json").write(json.dumps(manifest).encode())
+    root.child(EXPORT_MANIFEST).write(json.dumps(manifest).encode())
     with pytest.raises(ValueError):
         Files(root.url).manifest(LATEST)
 
@@ -774,6 +774,55 @@ def test_a_listing_keeps_the_files_whose_names_end_in_its_suffixes_in_any_case(t
         listing = Files(url, format="files", suffixes=("mp4", ".WEBM"))
         names = sorted(row["path"].rsplit("/", 1)[-1] for row in listing.records("memory"))
         assert names == ["a.MP4", "b.webm"]
+
+
+def test_a_suffix_of_several_parts_keeps_the_names_ending_in_all_of_it(tmp_path):
+    """A suffix names the whole end of a file's name, a compressed format's two parts included
+    (`jsonl.gz`): the files ending in it are kept, whatever case, and a file of the last part alone
+    (`.gz`) is not."""
+    for name in ("part-0.jsonl.gz", "part-1.JSONL.GZ", "notes.gz", "list.jsonl"):
+        (tmp_path / name).write_bytes(b"")
+    listing = Files(str(tmp_path), format="files", suffixes=("jsonl.gz",))
+    names = sorted(row["path"].rsplit("/", 1)[-1] for row in listing.records("memory"))
+    assert names == ["part-0.jsonl.gz", "part-1.JSONL.GZ"]
+
+
+def test_a_webdataset_sample_holds_every_member_of_its_key_whatever_its_extensions():
+    """WebDataset's member names split at their basename's first dot (`base_plus_ext`): `a.image.jpg`
+    and `a.txt` are one sample keyed `a`, its fields `image.jpg` and `txt`."""
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        for name in ("a.image.jpg", "a.txt", "b.image.jpg", "b.txt"):
+            data = name.encode()
+            entry = tarfile.TarInfo(name)
+            entry.size = len(data)
+            archive.addfile(entry, io.BytesIO(data))
+    root = Store(f"memory://tar-{uuid4().hex}/data.tar")
+    root.write(buffer.getvalue())
+    files = Files(root.url)
+    rows = list(files.manifest(LATEST).reader(files.manifest(LATEST).shards[0]))
+    assert rows == [{"__key__": "a", "image.jpg": b"a.image.jpg", "txt": b"a.txt"},
+                    {"__key__": "b", "image.jpg": b"b.image.jpg", "txt": b"b.txt"}]
+
+
+def test_a_torch_sample_holding_a_nested_tensor_that_requires_gradients_reads():
+    """A Torch dataset's sample whose tensor sits in a nested field, one that requires gradients: it is
+    read as a top-level one is, its values numpy in the same nesting."""
+    import torch
+
+    from dew.data import from_torch
+
+    class Nested(torch.utils.data.Dataset):
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, index):
+            return {"features": {"x": torch.full((3,), float(index), requires_grad=True)},
+                    "label": torch.tensor(index)}
+
+    rows = list(from_torch(Nested(), identity="nested@1").records("memory"))
+    assert [row["features"]["x"].tolist() for row in rows] == [[0.0] * 3, [1.0] * 3]
+    assert [int(row["label"]) for row in rows] == [0, 1]
 
 
 def test_a_token_export_reads_as_its_one_split_and_refuses_another(tmp_path):
@@ -920,7 +969,7 @@ def test_each_token_document_is_checked_against_its_producer_length(token_span_s
 
     root = token_span_store
     TokenFiles(str(root)).provision()
-    manifest_path = root / "_dew_manifest.json"
+    manifest_path = root / EXPORT_MANIFEST
     manifest = json.loads(manifest_path.read_bytes())
     path = root / manifest["files"][1]["lengths"]["path"]
     columns = np.load(path, allow_pickle=False)

@@ -16,13 +16,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from arm_arithmetic import float64_held
 from reference_error import assert_as_exact
 from test_decision_objective import SPECIALS, TOKENIZER
 
 from dew.batch import part, thaw
 from dew.decision import Choice
 from dew.decision.head import LabelReadout, SlotReadout
-from dew.decision.layout import DecisionInputs, Labels, StateFirstLayout
+from dew.decision.inputs import DecisionInputs
+from dew.decision.layout import Labels, StateFirstLayout
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.interop import Pretrained
@@ -117,13 +119,16 @@ def test_a_lora_adapted_heads_readout_is_its_own_logits_at_the_labels():
                               initialized)
         return values, DecisionInputs.collate(rows_of(seed), SPECIALS.pad)
 
-    def full(values, batch):
-        logits = jnp.asarray(decision.backbone.apply(thaw(part(values, "backbone")), batch.tokens))
-        answer = jnp.take_along_axis(logits, batch.readout[..., None], axis=1)
-        return jnp.take(answer, jnp.asarray([label for (label,) in ids()]), axis=-1)
+    def full_of(backbone):
+        def full(values, batch):
+            logits = jnp.asarray(backbone.apply(thaw(part(values, "backbone")), batch.tokens))
+            answer = jnp.take_along_axis(logits, batch.readout[..., None], axis=1)
+            return jnp.take(answer, jnp.asarray([label for (label,) in ids()]), axis=-1)
+        return full
 
-    assert_as_exact(decision.logits, full, draw, "adapted readout",
-                    seeds=READOUT_SEEDS)
+    # The truth is the adapted backbone's full logits over a float64 clone of it.
+    assert_as_exact(decision.logits, full_of(decision.backbone), draw, "adapted readout",
+                    seeds=READOUT_SEEDS, truth_fn=full_of(decision.backbone.clone(dtype=jnp.float64)))
 
 
 QUANTIZER = InputQuantizer.fp8(0.01)
@@ -209,21 +214,31 @@ def test_a_slot_heads_scores_are_the_releases_law_with_its_query_and_key_trained
     def dew(trained, batch):
         return decision.logits({"params": {"backbone": params, "head": trained}}, batch)
 
-    def law(trained, batch):
-        states = decision.states({"params": {"backbone": params, "head": {}}}, batch)
-        states = states.astype(trained["q"].dtype)
-        answers = jnp.take_along_axis(states, batch.readout[..., None], axis=1)
-        positions = jnp.arange(states.shape[1])
-        spans = batch.option_spans
-        inside = (positions >= spans[..., :1]) & (positions < spans[..., 1:])
-        pooled = (jnp.einsum("bqkl,bld->bqkd", inside.astype(states.dtype), states)
-                  / jnp.maximum(inside.sum(-1, keepdims=True), 1))
-        score = jnp.einsum("bqd,kd->bqk", answers, trained["slots"])
-        query, key = answers @ trained["q"].T, pooled @ trained["k"].T
-        logits = score + jnp.einsum("bqh,bqkh->bqk", query, key) / np.sqrt(8)
-        return jnp.where(batch.options, logits, -jnp.inf)
+    def law_of(decision, params):
+        def law(trained, batch):
+            return written_law(decision, params, trained, batch)
+        return law
 
-    assert_as_exact(dew, law, draw, "slot head law", seeds=READOUT_SEEDS)
+    # The truth is the law over a float64 clone of the model, its backbone's parameters held in float64.
+    wide = DecisionModel(decision.backbone.clone(dtype=jnp.float64), decision.head.clone(dtype=jnp.float64))
+    assert_as_exact(dew, law_of(decision, params), draw, "slot head law", seeds=READOUT_SEEDS,
+                    truth_fn=law_of(wide, float64_held(params)))
+
+
+def written_law(decision, params, trained, batch):
+    """A release's slot head's scores as its law writes them out, over `decision`'s backbone at `params`."""
+    states = decision.states({"params": {"backbone": params, "head": {}}}, batch)
+    states = states.astype(trained["q"].dtype)
+    answers = jnp.take_along_axis(states, batch.readout[..., None], axis=1)
+    positions = jnp.arange(states.shape[1])
+    spans = batch.option_spans
+    inside = (positions >= spans[..., :1]) & (positions < spans[..., 1:])
+    pooled = (jnp.einsum("bqkl,bld->bqkd", inside.astype(states.dtype), states)
+              / jnp.maximum(inside.sum(-1, keepdims=True), 1))
+    score = jnp.einsum("bqd,kd->bqk", answers, trained["slots"])
+    query, key = answers @ trained["q"].T, pooled @ trained["k"].T
+    logits = score + jnp.einsum("bqh,bqkh->bqk", query, key) / np.sqrt(8)
+    return jnp.where(batch.options, logits, -jnp.inf)
 
 
 def test_a_slot_head_reads_none_of_the_tokens_its_options_lines_leave_out():

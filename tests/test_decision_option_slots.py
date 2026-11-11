@@ -34,7 +34,7 @@ from dew.decision import (
     Question,
     Specials,
 )
-from dew.decision.layout import compacted
+from dew.decision.inputs import compacted
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer

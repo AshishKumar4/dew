@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import functools
+import operator
 import os
 import sys
 import time
@@ -29,10 +30,11 @@ from dew._coordination import (
 )
 from dew.artifacts import Artifact, Artifacts, FixedRows
 from dew.batch import VALID_ROWS, Batch, Variables
-from dew.data.dataset import Closeable, DataPartition, Reader, rows_of, take_rows
+from dew.data.dataset import Closeable, DataPartition, Reader, row_field, rows_of, take_rows
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import (
     batch_signature,
+    placed_abstract,
     row_origins,
     shard_batch,
     shared_host_fields,
@@ -340,8 +342,7 @@ class Evaluation:
         preview_enabled = bool(broadcast_from_process_zero(root and preview))
         event_step, context, event_words, training_scores = _event(
             key, step, schedule_step, averaged, training, updates)
-        score_key = _folded(context.key, 0x53434F52)
-        preview_key = _folded(context.key, 0x50524556)
+        score_key, preview_key = _folded(context.key, _SCORE), _folded(context.key, _PREVIEW)
         scores: dict[str, float] = {}
         previews: tuple[Artifact, ...] = ()
         scored = records = 0
@@ -414,8 +415,9 @@ def _artifacts(value: Artifacts | None) -> tuple[Artifact, ...]:
 
 
 class _LossSums:
-    """The validation loss's statistics, summed on the devices in batch order,
-    and read once after the split, every rank agreeing on the value."""
+    """The validation loss's statistics, summed on the devices in batch order by a program of Dew's
+    (`_summed`), reduced there (`reduced`) and read once after the split, every rank agreeing on the
+    value: each a program a run compiled ahead takes (`warmed_ahead`)."""
 
     def __init__(self) -> None:
         self._total = None
@@ -423,11 +425,10 @@ class _LossSums:
     def add(self, statistics) -> None:
         if statistics is None:
             return
-        self._total = (statistics if self._total is None
-                       else jax.tree.map(lambda total, value: total + value, self._total, statistics))
+        self._total = statistics if self._total is None else _summed(self._total, statistics)
 
-    def value(self, objective: Objective[Loss, Effects]) -> float | None:
-        reduced = self.reduced(objective)
+    def value(self, objective: Objective[Loss, Effects], mesh: Mesh) -> float | None:
+        reduced = self.reduced(objective, mesh)
         if reduced is None:
             return None
         value, valid = reduced
@@ -435,12 +436,27 @@ class _LossSums:
             raise ValueError("validation loss has no finite statistical support")
         return float(value)
 
-    def reduced(self, objective: Objective[Loss, Effects]) -> tuple[np.ndarray, np.ndarray] | None:
-        """The sums' loss and whether it has support, unchecked; None where nothing was summed."""
+    def reduced(self, objective: Objective[Loss, Effects], mesh: Mesh
+                ) -> tuple[np.ndarray, np.ndarray] | None:
+        """The sums' loss and whether it has support, unchecked, reduced where the sums are (`reduction`)
+        and read home on every rank; None where nothing was summed."""
+        reduction = self.reduction(objective, mesh)
+        return None if reduction is None else collective_host(reduction, phase="validation loss")
+
+    def reduction(self, objective: Objective[Loss, Effects], mesh: Mesh):
+        """The sums reduced on the devices of `mesh` that hold them (`Objective.reduce_loss`), traced under
+        that mesh as the batches' scoring is, so its program is one whatever devices it is lowered for
+        (`warmed_ahead`), its shapes where the sums are shapes; None where nothing was summed."""
         if self._total is None:
             return None
-        hosted = collective_host(self._total, phase="validation loss")
-        return jax.device_get(objective._validation_reduction(jax.device_put(hosted)))
+        with jax.set_mesh(mesh):
+            return objective._validation_reduction(self._total)
+
+
+@program
+def _summed(total, statistics):
+    """Two batches' loss statistics summed, leaf by leaf (`_LossSums`)."""
+    return jax.tree.map(operator.add, total, statistics)
 
 
 class _Accumulators:
@@ -514,13 +530,9 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
     at, schedule_at, dtype, updates_at = broadcast_from_process_zero(agreed("evaluation clocks", root_clocks))
 
     def event() -> tuple[Step, jax.Array]:
-        event_key = _folded(_folded(key, 0x4556414C), at)
-        schedule = jax.device_put(np.asarray(schedule_at, np.dtype(dtype)))
-        committed = jax.device_put(np.asarray(updates_at, np.dtype(dtype)))
-        # An evaluation's model calls train nothing, its metrics, loss and preview alike, so a model that
-        # reads the run's progress reads its end (`Objective.progress`) whatever the pass reports.
-        return (Step(step=schedule, key=event_key, ema=averaged, training=False, committed=committed),
-                jax.random.key_data(event_key))
+        context = _context(key, at, jax.device_put(np.asarray(schedule_at, np.dtype(dtype))),
+                           jax.device_put(np.asarray(updates_at, np.dtype(dtype))), averaged)
+        return context, jax.random.key_data(context.key)
 
     context, event_data = agreed("evaluation context", event)
     event_words = agreed_same("evaluation key", lambda: [int(word) for word in np.asarray(collective_host(
@@ -528,12 +540,30 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
     return at, context, tuple(event_words), {name: float(value) for name, value in reports.items()}
 
 
-def _folded(key: jax.Array, word: int) -> jax.Array:
+_EVENT, _SCORE, _PREVIEW = 0x4556414C, 0x53434F52, 0x50524556
+"""The words an evaluation's keys fold in ('EVAL', 'SCOR', 'PREV'): its event's, from the run's key and its
+step (`_context`), and its scoring's and preview's, from the event's."""
+
+
+def _context(key: jax.Array, at: int, schedule: jax.Array, committed: jax.Array,
+             averaged: Variables | None) -> Step:
+    """The step an evaluation at step `at` hands its objective: its key folded from `key` with 'EVAL' and
+    `at`, the step its schedules read and the updates committed (`schedule`, `committed`, placed), and the
+    averaged weights. An evaluation's model calls train nothing, its metrics, loss and preview alike, so a
+    model that reads the run's progress reads its end (`Objective.progress`) whatever the pass reports."""
+    return Step(step=schedule, key=_folded(_folded(key, _EVENT), at), ema=averaged, training=False,
+                committed=committed)
+
+
+def _folded(key: jax.Array | jax.ShapeDtypeStruct, word: int) -> jax.Array:
     """`jax.random.fold_in(key, word)`, the host integer placed beside the
     key by name rather than moved there implicitly by the fold: on the key's
     devices, or uncommitted with an uncommitted key. Folded by a program of
     Dew's (`_fold`), as every program a run runs is, so one compiled ahead
-    runs in its place (`dew.nn.kernels.options.taking`)."""
+    runs in its place (`dew.nn.kernels.options.taking`); a key's shape, as
+    a pass compiled ahead holds it (`warmed_ahead`), folds over the word's."""
+    if isinstance(key, jax.ShapeDtypeStruct):
+        return _fold(key, jax.ShapeDtypeStruct((), np.uint32, sharding=key.sharding))
     return _fold(key, jax.device_put(np.uint32(word), key.sharding if key.committed else None))
 
 
@@ -630,10 +660,10 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
             sum(counts[1] for counts in pooled), sum(counts[2] for counts in pooled)]
         if scored and warm:
             # The reduction compiles here; a part of the split's loss is no score to check.
-            loss_sums.reduced(objective)
+            loss_sums.reduced(objective, mesh)
         elif scored:
             scores = _finalized(metrics, summaries, split=split, root=root)
-            loss_value = loss_sums.value(objective)
+            loss_value = loss_sums.value(objective, mesh)
             if loss_value is not None and f'{split}/loss' not in scores:
                 scores[f'{split}/loss'] = loss_value
     finally:
@@ -699,6 +729,45 @@ WARM_BATCHES = 2
 then a later one, which the accumulators pool into it."""
 
 
+def warmed_ahead(objective: Objective[Loss, Effects], variables: Variables, batches: Split | Dataset | None,
+                 mesh: Mesh, *, key: jax.Array, schedule: jax.Array,
+                 averaged: Variables | None, metrics: Sequence[Metric], loss: bool,
+                 kept: bool = False) -> None:
+    """The programs a warming pass over `batches` runs (`Evaluation.run`'s `warm`), called over shapes where
+    a run compiled ahead collects them (`dew.nn.kernels.options.collecting`, `dew.training.ahead.started`):
+    its event's context (`_context`) and scoring key, and over the split's first `WARM_BATCHES` batches as
+    this process reads and places them (`placed_abstract`), each batch's scoring (`_dispatched`) and the
+    loss's sum and reduction (`_LossSums`), each where `_score_split` calls it. `variables`, `averaged` and
+    `key` are the state's as placed, and `schedule` the shape of the step the objective's schedules read,
+    the committed updates' too; `kept`, a pass that writes what it scores (`scored_to`), which reports its
+    artifacts beside its loss, as `_score_split` scores it. The metrics' merges are the host's. A
+    scoring that runs an `evaluate` of the objective's own (`Objective._reports_by_program`), which may
+    read the batch on the host, a
+    preview, which a run compiled ahead has no tracker to show, and an episodic split's flights compile
+    where the run makes them."""
+    context = _context(key, 0, schedule, schedule, averaged)
+    evaluating = bool(metrics) or kept
+    if (batches is None or episodic(batches) or not (evaluating or loss)
+            or not objective._reports_by_program(loss=loss, evaluate=evaluating)):
+        return
+    if isinstance(batches, Dataset):
+        from dew.data.compile import held
+        batches = held(batches, objective=objective.data())
+    score_key = _folded(context.key, _SCORE)
+    sums = _LossSums()
+    iterator = iter(batches(DataPartition.of(mesh)))
+    try:
+        for index, batch in zip(range(WARM_BATCHES), iterator, strict=False):
+            with jax.set_mesh(mesh):
+                statistics, _ = _dispatched(objective, variables, placed_abstract(mesh, _validated(batch)),
+                                            context, index, loss=loss, evaluate=evaluating,
+                                            score_key=score_key)
+                sums.add(statistics)
+        sums.reduction(objective, mesh)
+    finally:
+        _close_source(iterator)
+
+
 def _next_batch(iterator: Iterator, index: int) -> tuple[Batch | None, int]:
     """Read one batch, and agree how many ranks still had one to read.
 
@@ -730,8 +799,7 @@ def _covered(mesh: Mesh, batch: Batch | None, last: Batch | None, index: int
     """
     def cover() -> tuple[Batch, Batch, Batch]:
         if batch is not None:
-            held = batch if VALID_ROWS in batch else {**batch, VALID_ROWS: np.ones(rows_of(batch), bool)}
-            kept = held
+            held = kept = _validated(batch)
         elif last is None:
             raise ValueError(
                 f"process {jax.process_index()}'s reader yields no batch while a peer's yields one; "
@@ -744,16 +812,18 @@ def _covered(mesh: Mesh, batch: Batch | None, last: Batch | None, index: int
     return agreed(f"batch cover and placement {index}", cover)
 
 
+def _validated(batch: Batch) -> Batch:
+    """`batch` carrying `VALID_ROWS`, every row real where the reader marked none."""
+    return batch if VALID_ROWS in batch else {**batch, VALID_ROWS: np.ones(rows_of(batch), bool)}
+
+
 def _cut(leaf, keep: np.ndarray):
     """`leaf` without the rows `keep` marks as repeats, when its leading axis
     is the batch's rows: an array, a per-row tuple of captions or texts, or a
     per-row list of opaque records (`dew.data.dataset.take_rows`)."""
-    if isinstance(leaf, list | tuple):
-        return take_rows(leaf, np.flatnonzero(keep)) if len(leaf) == keep.size else leaf
-    array = np.asarray(leaf) if isinstance(leaf, np.ndarray | jax.Array) else None
-    if array is None or not array.ndim or array.shape[0] != keep.size:
+    if not row_field(leaf, keep.size):
         return leaf
-    return take_rows(array, np.flatnonzero(keep))
+    return take_rows(leaf if isinstance(leaf, list | tuple) else np.asarray(leaf), np.flatnonzero(keep))
 
 
 def _real_artifact[A: Artifact](artifact: A, keep: np.ndarray) -> A:

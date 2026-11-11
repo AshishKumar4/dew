@@ -14,6 +14,7 @@ from test_plan import LIMIT, asked, free, needs, one_device
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
+from dew.nn.precision import WIDE_CPU_ARITHMETIC
 from dew.objectives.lm import LMObjective
 from dew.telemetry.compiles import Compiles
 from dew.training import MeshSpec, Trainer
@@ -90,10 +91,15 @@ def test_a_derivation_that_fits_the_base_rung_or_cannot_judge_starts_the_search_
     assert trainer.plan["probes"][0]["remat"] is None
 
 
-def test_a_run_that_starts_from_a_recorded_plan_compiles_it_first(monkeypatch, tmp_path, room):
+def test_a_run_that_starts_from_a_recorded_plan_compiles_it_first(monkeypatch, tmp_path):
     """A restart whose plan an earlier run recorded (beside the compilation cache) compiles that plan
-    first, with no derivation read, where its devices now hold room for full recomputation alone: the
-    compile, not the derivation, decides whether it fits, and a miss climbs from there."""
+    first, with no derivation read, where its devices now hold room for full recomputation alone, as its
+    compiles measure: the compile, not the derivation, decides whether it fits, and a miss climbs from
+    there to a plan that fits."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    recomputed, base = deep(REMAT_POLICIES["full"]), deep()
+    room = (needs(monkeypatch, recomputed, lambda: compiled(recomputed))
+            + needs(monkeypatch, base, lambda: compiled(base))) // 2
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
     free(monkeypatch, LIMIT)
     compiled(deep())
@@ -101,6 +107,7 @@ def test_a_run_that_starts_from_a_recorded_plan_compiles_it_first(monkeypatch, t
     again = deep()
     compiled(again)
     assert again.plan["derived"] == [] and again.plan["probes"][0]["remat"] is None
+    assert again.plan["probes"][-1]["fits"]
 
 
 def test_an_objective_that_trains_two_modules_unset_reads_the_derivation(monkeypatch, tmp_path):
@@ -177,7 +184,7 @@ def bare_search(objective):
     the test's to set (`judged_at`), and a compile it asks raises `Asked` naming the rung it asked at."""
     from dew.training.planning import FitSearch
 
-    def asked(split, narrow, footprint=None, derived=True):
+    def asked(split, narrow, footprint=None, *, derived=True, lowering=True):
         raise Asked(search.remat_rung())
 
     search = FitSearch(lower=asked, options=lambda candidate: None, objective=objective,
@@ -186,39 +193,94 @@ def bare_search(objective):
     return search
 
 
-def test_a_step_lowered_afresh_past_a_spilled_kernel_traces_its_footprint_again():
-    """The search's first lowering of a candidate the derivation read keeps the footprint it traced; one
-    lowered afresh past a kernel that spilled traces its own (`FitSearch.relowering`), as the kernel's next
-    config can change the buffers its first held (review of row 4261)."""
+def test_a_step_lowered_afresh_past_spilled_kernels_traces_the_footprint_of_the_one_it_keeps():
+    """The search's first lowering of a candidate the derivation read keeps the footprint it traced. A
+    step lowered afresh past a kernel that spilled is lowered with none and derives none
+    (`FitSearch.relowering`): a compile lowers one for each config it refuses and judges only the step it
+    keeps, whose footprint is then traced once, not lowered, at the configs its launches settled on
+    (`FitSearch.footprinted`), as a kernel's next config can change the buffers its first held (review of
+    row 4261; row 5361: twelve step-downs each traced a footprint to judge one)."""
+    from dew.training._lowering import KernelReport
     from dew.training.footprint import Footprint
+    from dew.training.planning import Candidate
 
-    handed = []
+    asked = []
+    kept = Footprint(residuals=4, gradients=5, held=6)
+
+    def lower(split, narrow, footprint=None, *, derived=True, lowering=True):
+        asked.append({"footprint": footprint, "derived": derived, "lowering": lowering})
+        traced = kept if derived and footprint is None else footprint
+        return Candidate({}, None, {}, None, None, 0, 0, None, "[]", KernelReport((), ()), traced)
+
     search = bare_search(deep(split=None).objective)
-    search.lower = lambda split, narrow, footprint, derived: handed.append(footprint)
-    derived = Footprint(residuals=1, gradients=2, held=3)
-    search.footprints[search.candidate_key(1, narrow=False)] = derived
-    search.lowering(1)
-    search.relowering(1)
-    assert handed == [derived, None]
+    search.lower = lower
+    first = Footprint(residuals=1, gradients=2, held=3)
+    search.footprints[search.candidate_key(1, narrow=False)] = first
+    assert search.lowering(1).footprint == first
+    relowered = [search.relowering(1) for _ in range(3)]
+    assert [candidate.footprint for candidate in relowered] == [None, None, None]
+    assert search.footprinted(1, relowered[-1]).footprint == kept
+    assert asked == [{"footprint": first, "derived": True, "lowering": True},
+                     *[{"footprint": None, "derived": False, "lowering": True}] * 3,
+                     {"footprint": None, "derived": True, "lowering": False}]
+
+
+def test_a_step_that_fits_at_its_fewest_microbatches_reads_one_derivation(monkeypatch, tmp_path):
+    """A run whose plan finds its split, with room for its step whole: the derivation reads the step at its
+    fewest microbatches, which fits, and nothing else, no rung walked and no other split read, and the
+    one compile is there (`FitSearch.fits_at_fewest`: the rung it stands on is the least-recompute one
+    and the fewest its fewest; the walk at its most microbatches and the halving read two derivations to
+    say so, row 5361)."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, LIMIT)
+    trainer = deep(split=None)
+    with Compiles("step") as compiles:
+        compiled(trainer)
+    [read] = trainer.plan["derived"]
+    assert read["label"] == "fits" and read["split"] == trainer.plan["split"] == 1
+    assert compiles.count == 1 and trainer.plan["probes"][0]["fits"]
 
 
 class Asked(Exception):
     """A compile `bare_search` was asked for, at the remat rung its argument names."""
 
 
-def test_a_compile_that_fits_past_the_derivations_corrected_refusal_lets_its_refusals_rule_nothing_out():
-    """A compile that fits where the derivation, as the search corrects it (`under`), judged it short means
-    its refusals at that remat rule no compile out: a miss at one microbatch past a judged fit raises the
-    correction above the judged headroom of two and four, a compile at eight fits short of the corrected
-    judgment, and two and four are compiled again, the compiles deciding (review of row 3341's search)."""
+def test_a_miss_orders_the_compiles_and_rules_out_only_what_the_derivation_itself_judges_short():
+    """A compile's miss past the derivation (`under`) makes a split it judges short of that correction
+    unlikely, which orders the compiles, and rules none out: a correction scaled from another split states
+    no bound on this one (row 5427). Only a split the derivation itself judges short is refused, until a
+    compile fits where it judged one short (`overstated`)."""
     search = bare_search(deep(split=None).objective)
     mib = 2**20
-    for split, headroom in ((1, 0), (2, 50 * mib), (4, 100 * mib), (8, 150 * mib)):
+    for split, headroom in ((1, -10 * mib), (2, 50 * mib), (4, 100 * mib), (8, 150 * mib)):
         search.judged_at[search.candidate_key(split, narrow=False)] = headroom
-    search.learned(0, -200 * mib, fit=False, split=1, temporaries=None)
-    assert search.refused(2) and search.refused(4)
-    search.learned(150 * mib, 100 * mib, fit=True, split=8, temporaries=None)
-    assert not search.refused(2) and not search.refused(4)
+    search.learned(50 * mib, -150 * mib, fit=False, temporaries=None)
+    assert not search.likely(2) and not search.refused(2)
+    assert search.refused(1)
+    search.learned(-10 * mib, 5 * mib, fit=True, temporaries=None)
+    assert not search.refused(1)
+
+
+def test_the_search_takes_the_fewest_microbatches_that_fit_however_a_miss_elsewhere_corrects_them(
+        monkeypatch, tmp_path):
+    """In the program a user's process runs (its CPU's products as XLA sums them), with room for the step at
+    the fewest microbatches its compiles measure fit, the search takes those, the step admitted with room to
+    spare: a miss at two, scaled to four, judged four short where four fit to the byte, and the search took
+    eight (row 5427)."""
+    monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "0")
+    need = {}
+    for split in (2, 4, 8):
+        monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / f"sizing-{split}"))
+        sizing = deep(split=split)
+        need[split] = needs(monkeypatch, sizing, lambda sizing=sizing: compiled(sizing))
+    room = need[4]
+    fewest = min(split for split, needed in need.items() if needed <= room)
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, room)
+    trainer = deep(split=None)
+    compiled(trainer)
+    assert trainer.plan["split"] == fewest, need
+    assert trainer.plan["probes"][-1]["fits"] and trainer.plan["probes"][-1]["headroom"] >= 0
 
 
 def test_a_miss_corrects_each_split_by_its_share_of_the_derived_temporaries():
@@ -236,7 +298,7 @@ def test_a_miss_corrects_each_split_by_its_share_of_the_derived_temporaries():
         key = search.candidate_key(split, narrow=False)
         search.judged_at[key] = headroom
         search.footprints[key] = Footprint(residuals=0, gradients=0, held=0, peak=temporaries)
-    search.learned(357 * kb, -606 * kb, fit=False, split=1, temporaries=1229 * kb)
+    search.learned(357 * kb, -606 * kb, fit=False, temporaries=1229 * kb)
     assert not search.refused(2) and search.likely(2)
     assert search.shortfall(2) == 963 * kb * 615 // 1229
 

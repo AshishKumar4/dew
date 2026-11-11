@@ -412,8 +412,9 @@ class DEIS:
         m0, m1 = history.outputs[-1], history.outputs[-2]
 
         def first(_):
-            safe_alpha_s0 = jnp.where(alpha_s0 == 0, 1.0, alpha_s0)
-            regular = (alpha_t / safe_alpha_s0) * x - sigma_t * (jnp.exp(h) - 1.0) * m0
+            # DPM-Solver's first-order step in eps (`_dpm_terms`), the clean endpoint where it reaches none.
+            scale, step, *_ = _dpm_terms("dpmsolver", alpha_s0, sigma_s0, alpha_t, sigma_t, h)
+            regular = scale * x + step * m0
             return jnp.where((alpha_s0 == 0) | terminal, alpha_t * denoised + sigma_t * eps, regular)
 
         def second(_):

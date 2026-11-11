@@ -29,9 +29,9 @@ class _Brownian(NamedTuple):
     high: jax.Array
 
 
-# A float32 position in [0, 1] carries 24 mantissa bits, so a descent deeper
-# than this cannot tell two positions apart and only pretends to refine.
-MAX_BROWNIAN_DEPTH = 24
+MAX_BROWNIAN_DEPTH = int(jnp.finfo(jnp.float32).nmant) + 1
+"""How deep a walk descends at most: a float32 position in [0, 1] carries this many significant bits
+(24), so a descent deeper cannot tell two positions apart and only pretends to refine."""
 
 
 def _brownian_walk(state: _Brownian, point, shape, depth: int) -> jax.Array:

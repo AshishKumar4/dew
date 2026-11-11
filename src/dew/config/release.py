@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import typing
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -30,9 +31,6 @@ from dew._files import write_atomically
 
 RELEASE_FILE = "dew_release.json"
 """The file an export of a run writes its release record in, beside its config."""
-
-_FIELDS = ("task", "layout", "max_length", "calibration")
-
 
 @dataclasses.dataclass(frozen=True)
 class Release:
@@ -54,21 +52,25 @@ class Release:
             raise ValueError(f"a release's max_length is a positive count of tokens, not {self.max_length!r}")
 
     def to_record(self) -> Mapping[str, object]:
-        """The record `read` rebuilds this release from: each field it states."""
-        return {name: value for name in _FIELDS if (value := getattr(self, name)) is not None}
+        """The record `read` rebuilds this release from: each field it declares and states, as it holds
+        it."""
+        return {field.name: value for field in dataclasses.fields(self)
+                if (value := getattr(self, field.name)) is not None}
 
     @classmethod
     def read(cls, record: Mapping[str, object]) -> Release:
-        """The release `record` states, a field it leaves out None: one that states a field a release does
-        not hold, or one of another shape, is refused."""
-        unknown = sorted(set(record) - set(_FIELDS))
+        """The release `record` states, each field it declares read as declared, a mapping kept as the
+        record it is (a model's fields among them, which only their own reader builds) and a field it leaves
+        out None: one that states a field a release does not hold, or one of another shape, is refused."""
+        hints = typing.get_type_hints(cls)
+        declared = [field.name for field in dataclasses.fields(cls)]
+        unknown = sorted(set(record) - set(declared))
         if unknown:
-            raise ValueError(f"a release states {', '.join(_FIELDS)}, not {unknown}")
-        return cls(
-            task=_stated(record, "task"), layout=_stated(record, "layout"),
-            max_length=None if record.get("max_length") is None else _records.integer(
-                record["max_length"], "max_length"),
-            calibration=_stated(record, "calibration"))
+            raise ValueError(f"a release states {', '.join(declared)}, not {unknown}")
+        readers = {name: _records.integer if int in typing.get_args(hints[name]) else _records.record
+                   for name in declared}
+        return cls(**{name: None if value is None else readers[name](value, name)
+                      for name, value in record.items()})
 
     @classmethod
     def load(cls, directory: str | Path) -> Release | None:
@@ -90,8 +92,3 @@ class Release:
         else:
             path.unlink(missing_ok=True)
 
-
-def _stated(record: Mapping[str, object], name: str) -> Mapping[str, object] | None:
-    """The record `record` states under `name`, or None where it states none."""
-    value = record.get(name)
-    return None if value is None else _records.record(value, name)

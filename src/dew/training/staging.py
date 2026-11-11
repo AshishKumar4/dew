@@ -23,7 +23,7 @@ import jax
 import jax.extend.core as jcore
 from jax.core import ShapedArray
 
-from dew.distributed.placement import placed_bytes
+from dew.distributed.placement import placed_bytes, placed_shapes
 from dew.nn.programs import computed, inlined, purely_called
 
 CHUNKS = 16
@@ -153,7 +153,10 @@ def on_device(placement):
 
 def fetched(tree, placement):
     """`tree`, host-resident leaves placed by `placement`, brought to the device whole (`on_device`): every
-    fetch of a layout's host fields (`Trainer._fetched`, `Transaction.fetched`)."""
+    fetch of a layout's host fields (`Trainer._fetched`, `Transaction.fetched`). A tree of shapes, a state
+    a run compiled ahead holds (`dew.training.ahead`), is its shapes placed there."""
+    if all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(tree)):
+        return placed_shapes(tree, on_device(placement))
     return jax.device_put(tree, on_device(placement))
 
 

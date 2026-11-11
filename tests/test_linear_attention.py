@@ -125,8 +125,10 @@ def portable(query, key, value, g, beta, state=None, starts=None, chunk: int = C
     (tests/test_fla_gdn.py). A decay a key dimension's `[..., K]`, a head's as given."""
     if g.ndim == 4 and g.shape[-1] == 1:
         g = g[..., 0]
+    # At its operands' width: fp32 over 16-bit or fp32 operands, float64 over a truth's.
+    work = jnp.promote_types(jnp.result_type(query, key, value), jnp.float32)
     return xla_mainloop(Tiles(chunk), query, key, value, g, beta, state, starts, scale=key.shape[-1] ** -0.5,
-                        delta=True, dtype=jnp.float32)
+                        delta=True, dtype=work)
 
 
 CHUNKED_SEEDS = 16

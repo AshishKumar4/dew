@@ -37,6 +37,7 @@ from interop_support import assert_same_stored_tensors, written_tensors
 from process_support import (
     ProcessGroup,
     free_port,
+    output,
     report_of,
     run_pool,
     run_pools,
@@ -652,7 +653,7 @@ def test_the_layouts_a_gang_crosses_hosts_with_match_one_device_across_four_proc
         judged = report_of(group.running[0], rows, timeout=1200, pool=group.running)
         # Every peer ends before the group's exit, which kills whatever still runs.
         for process in group.running[1:]:
-            process.communicate(timeout=120)
+            output(process, 120)
     assert [process.returncode for process in group.running] == [0] * 4
     statuses = [(row["layout"], row["status"]) for row in judged]
     assert statuses == [(layout, "works") for layout in POOLED_LAYOUTS], judged
@@ -1184,7 +1185,7 @@ def told(pool: list[tuple[subprocess.Popen, Path]], timeout: float = 600) -> lis
                     heard[waiting.pop(handle)] = int(os.read(handle, 64))
                 elif exits[handle] not in heard:
                     process = pool[exits[handle]][0]
-                    pytest.fail(f"a run ended before it blocked\n{process.communicate()[0]}")
+                    pytest.fail(f"a run ended before it blocked\n{output(process)}")
     finally:
         for handle in [*exits, *readers]:
             os.close(handle)
@@ -1361,7 +1362,7 @@ def test_a_local_save_that_fails_in_the_background_ends_the_pool(tmp_path):
     outputs = []
     for process in pool:
         try:
-            outputs.append(process.communicate(timeout=120)[0])
+            outputs.append(output(process, 120))
         except subprocess.TimeoutExpired:
             pytest.fail(stuck(pool, "end after a failed local save"))
     assert pool[1].returncode != 0 and "NotADirectoryError" in outputs[1], outputs[1][-4000:]

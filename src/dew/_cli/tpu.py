@@ -35,11 +35,8 @@ Positional = tyro.conf.Positional
 
 #: Optional flags, named so --help reads like documentation instead of {None}|STR.
 Zone = Annotated[str | None, tyro.conf.arg(metavar="ZONE")]
-Zones = Annotated[str | None, tyro.conf.arg(metavar="ZONES")]
-Project = Annotated[str | None, tyro.conf.arg(metavar="PROJECT")]
 Kind = Annotated[str | None, tyro.conf.arg(metavar="TYPE")]
 Version = Annotated[str | None, tyro.conf.arg(metavar="VERSION")]
-User = Annotated[str | None, tyro.conf.arg(metavar="USER")]
 Bucket = Annotated[str | None, tyro.conf.arg(metavar="BUCKET")]
 Disk = Annotated[str | None, tyro.conf.arg(metavar="DISK")]
 PyVersion = Annotated[str | None, tyro.conf.arg(metavar="X.Y")]
@@ -264,54 +261,42 @@ def _job(job: str, name: str) -> str:
 # -------------------------------------------------------------------- commands
 
 
-@dataclasses.dataclass
-class Init:
-    """Write ~/.config/dew/tpu.toml from flags, asking for what is missing."""
-
-    reads: ClassVar[tuple[str, ...]] = tuple(
-        field.name for field in dataclasses.fields(config.TpuConfig))
-
-    project: Project = None
-    """Google Cloud project that owns the TPUs."""
-    zones: Zones = None
-    """Zones to search, in order, comma separated."""
-    accelerator_type: Kind = None
-    """Default accelerator type, for example v5e-8."""
-    runtime_version: Version = None
-    """Runtime version, or auto to pick it from the accelerator generation."""
-    ssh_user: User = None
-    """User to log in as. Empty lets gcloud choose."""
-    gcs_bucket: Bucket = None
-    """Bucket to mount with gcsfuse during setup."""
-    data_disk: Disk = None
-    """Persistent disk to attach on create."""
-    python_version: PyVersion = None
-    """Python version of the venv on the workers."""
-    dry_run: bool = False
-    """Print the config that would be written, then exit."""
-
-    def run(self, rest: list[str]) -> int:
-        cfg = config.load()
-        answers: dict[str, object] = {}
-        for field in dataclasses.fields(config.TpuConfig):
-            given = getattr(self, field.name)
-            if given is None and sys.stdin.isatty():
-                current = getattr(cfg, field.name)
-                shown = ",".join(current) if isinstance(current, tuple) else current
-                given = input(f"{field.name} [{shown}]: ").strip() or None
-            if given is None:
-                continue
-            answers[field.name] = (
-                tuple(part.strip() for part in given.split(",") if part.strip())
-                if field.name == "zones" else given
-            )
-        new = dataclasses.replace(cfg, **answers)
-        if self.dry_run:
-            emit(f"# {config.config_path()}")
-            emit(config.dumps(new).rstrip())
-            return 0
-        emit(f"wrote {config.save(new)}")
+def _init_run(self, rest: list[str]) -> int:
+    """Write the config from the flags given, asking at a terminal for each one missing."""
+    cfg = config.load()
+    answers: dict[str, object] = {}
+    for field in dataclasses.fields(config.TpuConfig):
+        given = getattr(self, field.name)
+        if given is None and sys.stdin.isatty():
+            current = getattr(cfg, field.name)
+            shown = ",".join(current) if isinstance(current, tuple) else current
+            given = input(f"{field.name} [{shown}]: ").strip() or None
+        if given is None:
+            continue
+        answers[field.name] = (
+            tuple(part.strip() for part in given.split(",") if part.strip())
+            if field.metadata.get("listed") else given
+        )
+    new = dataclasses.replace(cfg, **answers)
+    if self.dry_run:
+        emit(f"# {config.config_path()}")
+        emit(config.dumps(new).rstrip())
         return 0
+    emit(f"wrote {config.save(new)}")
+    return 0
+
+
+Init = dataclasses.make_dataclass("Init", [
+    *((field.name, Annotated[str | None, tyro.conf.arg(metavar=field.metadata["metavar"],
+                                                       help=field.metadata["help"])], None)
+      for field in dataclasses.fields(config.TpuConfig)),
+    ("dry_run", Annotated[bool, tyro.conf.arg(help="Print the config that would be written, then exit.")],
+     False)],
+    namespace={"__doc__": "Write ~/.config/dew/tpu.toml from flags, asking for what is missing.",
+               "__module__": __name__,
+               "reads": tuple(field.name for field in dataclasses.fields(config.TpuConfig)),
+               "run": _init_run})
+"""`dew tpu init`: a flag for each setting `TpuConfig` declares (its metavar and help), and `--dry-run`."""
 
 
 @dataclasses.dataclass

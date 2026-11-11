@@ -126,7 +126,9 @@ def _reported(generation: str, layers: int = 1, *, scanned: bool = False):
     x, w = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16)
     sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
-    with assumed(generation), jax.sharding.use_abstract_mesh(mesh), routes() as found:
+    # The template's launches, by choice: a host holding dew_cutlass would route sm90's grouped GEMM there.
+    with (assumed(generation), jax.sharding.use_abstract_mesh(mesh), kernel_choices(grouped_matmul="mosaic"),
+          routes() as found):
         lowered = jax.jit(step).trace(x, w, sizes).lower(lowering_platforms=("cuda",))
     return lowered, found
 
@@ -189,7 +191,8 @@ def test_a_kernel_behind_a_loop_of_no_trips_is_compiled_and_launches_none(genera
     x, w = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16)
     sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
-    with assumed(generation), jax.sharding.use_abstract_mesh(mesh), routes() as found:
+    with (assumed(generation), jax.sharding.use_abstract_mesh(mesh), kernel_choices(grouped_matmul="mosaic"),
+          routes() as found):
         lowered = jax.jit(step).trace(x, w, sizes).lower(lowering_platforms=("cuda",))
     assert any(call.kind == "mosaic_gpu" for call in kernel_calls(lowered, unrun=True))
     assert not any(call.kind == "mosaic_gpu" for call in kernel_calls(lowered))
@@ -227,7 +230,8 @@ def test_a_conditional_launches_its_branch_of_the_most_stated_flops(generation):
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
 
     def lowered_report(fn, *shapes):
-        with assumed(generation), jax.sharding.use_abstract_mesh(mesh), routes() as found:
+        with (assumed(generation), jax.sharding.use_abstract_mesh(mesh),
+              kernel_choices(grouped_matmul="mosaic"), routes() as found):
             lowered = jax.jit(fn).trace(*shapes).lower(lowering_platforms=("cuda",))
         return lowered, kernel_report(found, lowered).record()
 
@@ -288,23 +292,24 @@ def test_a_cutlass_grouped_gemm_is_sized_by_its_shapes_and_an_unknown_call_is_un
     count and in the kernel report; a custom call nothing sizes counts as an unsized launch in both."""
     from dew.telemetry.instrumentation import hlo_flops
 
+    # The wheel's two targets as it states them: the grouped GEMM, then its weight gradient.
+    forward, weights = pytest.importorskip("dew_cutlass").TARGETS
     tokens, kernel = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 64),
                                                                                           jnp.bfloat16)
     cotangent, sizes = jax.ShapeDtypeStruct((256, 64), jnp.bfloat16), jax.ShapeDtypeStruct((2,), jnp.int32)
 
     def step(tokens, kernel, cotangent, sizes):
-        out = jax.ffi.ffi_call("dew_cutlass_grouped_gemm", jax.ShapeDtypeStruct((256, 64), jnp.bfloat16))(
+        out = jax.ffi.ffi_call(forward, jax.ShapeDtypeStruct((256, 64), jnp.bfloat16))(
             tokens, kernel, sizes, transpose_w=False)
-        gradient = jax.ffi.ffi_call("dew_cutlass_grouped_gemm_k", jax.ShapeDtypeStruct(
-            (2, 128, 64), jnp.bfloat16))(tokens, cotangent, sizes)
+        gradient = jax.ffi.ffi_call(weights, jax.ShapeDtypeStruct((2, 128, 64), jnp.bfloat16))(
+            tokens, cotangent, sizes)
         unknown = jax.ffi.ffi_call("an_unknown_kernel", jax.ShapeDtypeStruct((256, 64), jnp.bfloat16))(out)
         return unknown, gradient
 
     lowered = jax.jit(step).trace(tokens, kernel, cotangent, sizes).lower(lowering_platforms=("cuda",))
     record = kernel_report((), lowered).record()
     assert {(entry["kind"], entry["name"]): entry["calls"] for entry in record["launches"]} == {
-        (None, "an_unknown_kernel"): 1, ("grouped_gemm", "dew_cutlass_grouped_gemm"): 1,
-        ("grouped_gemm", "dew_cutlass_grouped_gemm_k"): 1}
+        (None, "an_unknown_kernel"): 1, ("grouped_gemm", forward): 1, ("grouped_gemm", weights): 1}
     assert record["unsized"] == 1
     flops = hlo_flops(lowered.as_text(dialect="hlo"))
     assert flops is not None

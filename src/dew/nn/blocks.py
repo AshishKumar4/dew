@@ -378,8 +378,10 @@ class Upsample(nn.Module):
 
     @nn.compact
     def __call__(self, x):
-        B, H, W, C = x.shape
-        out = jax.image.resize(x, (B, H * self.scale, W * self.scale, C), method="nearest")
+        # Each pixel repeated `scale` times along each spatial axis: nearest-neighbour upsampling by an
+        # integer factor, which moves values and computes no index (`jax.image.resize`'s nearest computes
+        # its source indices in float32, whatever the array's dtype).
+        out = jnp.repeat(jnp.repeat(x, self.scale, axis=1), self.scale, axis=2)
         return self._convolution()(out)
 
 

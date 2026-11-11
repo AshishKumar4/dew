@@ -16,6 +16,7 @@ import pytest
 from attention_oracle import attention_terms
 from decision_support import decision_rows
 from float64_terms import float64_terms
+from optim_support import in_float64
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact
 from torch_layout import node
@@ -35,7 +36,8 @@ from dew.decision import (
     StateFirstLayout,
 )
 from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
-from dew.decision.layout import OPTION_TILE, QUESTION_FIELDS, DecisionInputs, Labels, compacted
+from dew.decision.inputs import OPTION_TILE, DecisionInputs, compacted
+from dew.decision.layout import QUESTION_FIELDS, Labels
 from dew.decision.rows import TRAINING_FIELDS
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
@@ -479,13 +481,20 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 
     def alone(variables):
         return rows_alone(lambda one: decide(variables, one), batch)
 
+    # The rows' float fields (the targets a smoothed label reads) in float64, as the truth computes.
+    wide_rows = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64)
+                             if np.issubdtype(np.asarray(leaf).dtype, np.floating) else leaf, rows)
+
     @jax.jit
     def apart_in_float64(variables):
-        return wide.model.logits(variables, laid_out(rows, segments)), gradient(wide, variables, rows)
+        return (wide.model.logits(variables, laid_out(wide_rows, segments)),
+                gradient(wide, variables, wide_rows))
 
+    @in_float64
     def truth(variables):
         # A leaf zero by algebra (a key's bias, the scorer's shared bias under the loss) cancels in its
-        # sum, which the check sizes by the terms it adds (`terms`).
+        # sum, which the check sizes by the terms it adds (`terms`). Under a float64 run's numerics
+        # (`in_float64`), whose logits and losses are float64 where the run's output dtype is float32.
         logits, grads = apart_in_float64(variables)
         return jnp.asarray(logits)[rows["options"]], grads
 
