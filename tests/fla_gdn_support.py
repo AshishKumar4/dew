@@ -172,20 +172,6 @@ def wy(kc, vc, bc, gc):
     return inverse @ (kc * (bc * jnp.exp2(gc))[..., None]), inverse @ (vc * bc[..., None]), inverse
 
 
-def range_gradient(pairs, after):
-    """Each token's decay gradient from terms through ranges of its chunk's cumulated decay, by the
-    ranges' definition: `pairs` `[..., C, C]`, each `(i, j)` a term through `(j, i]`, and `after`
-    `[..., C]`, each `s` a term through `[0, s]`; token `t` sums the terms whose range holds it, every
-    `(i, j)` with `j < t <= i` and every `s >= t`, as one masked sum over the three indices. Written apart
-    from production's running-sum form (`fla_gdn._summed_back`), so it catches a defect there rather than
-    repeating it."""
-    index = jnp.arange(pairs.shape[-1])
-    t, i, j = index[:, None, None], index[None, :, None], index[None, None, :]
-    holds = (j < t) & (t <= i)
-    through = jnp.sum(jnp.where(holds, pairs[..., None, :, :], 0.0), axis=(-2, -1))
-    return through + jnp.sum(jnp.where(index[None, :] >= index[:, None], after[..., None, :], 0.0), axis=-1)
-
-
 def _slotted(passing, rows):
     """Memories passing between a row's chunks `[B, C - 1, ...]` and a row's own `[B, ...]` at their
     slots (`chunked_launch.Sequences`): the passing ones row by row, then the rows'."""

@@ -77,11 +77,11 @@ def packed_cache(decoder: CausalTransformer) -> str | None:
 def forked(decoder: CausalTransformer, train: bool = False, *, joint: bool = False) -> str | None:
     """Why a call over forks (`dew.batch.Forks`) would not compute each document over its ancestors as its
     own row does, or None (`dew.nn.protocols.ForkedCalls`): a bidirectional decoder, whose shared prefix
-    reads each branch's tokens; in training, dropout, which draws each row's
-    masks apart where a shared prefix draws them once; engram's n-gram hashes (`Engram.fork_refusal`),
-    its mixture's block routing or capacity (`Mixture.fork_refusal`), or a layer whose mixer reads no
-    forks (`MixerBase.fork_refusal`). Attention, the recurrent mixers and tokenwise layers read each
-    document from its ancestors alone; a learned position embedding reads the places forks give each
+    reads each branch's tokens; in training, dropout, which draws each row's masks apart where a shared
+    prefix draws them once; its mixture's block routing or capacity (`Mixture.fork_refusal`), or a layer
+    whose mixer reads no forks (`MixerBase.fork_refusal`). Attention, the recurrent mixers, engram's n-gram
+    hashes (over each chain, `dew.nn.engram._forked_lookback`) and tokenwise layers read each document
+    from its ancestors alone; a learned position embedding reads the places forks give each
     token; cross-attention reads each tree's own context (`Forks.trees`), a context a tree."""
     if not decoder.causal:
         return "a bidirectional decoder reads each token's later tokens, which a fork's branches hold apart"
@@ -89,8 +89,6 @@ def forked(decoder: CausalTransformer, train: bool = False, *, joint: bool = Fal
     if train and not joint and (decoder.dropout_rate or decoder.embedding_dropout_rate
                                 or decoder.attention_dropout_rate):
         return "dropout draws each row's masks apart, which a shared prefix draws once"
-    if decoder.engram is not None:
-        return decoder.engram.fork_refusal()
     if decoder.mixture is not None and (refusal := decoder.mixture.fork_refusal()) is not None:
         return refusal
     return _layer(decoder, lambda mixer, _: mixer.fork_refusal())

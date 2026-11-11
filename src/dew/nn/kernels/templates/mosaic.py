@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
 import jax
 from jax import lax, numpy as jnp
+from jax._src.lib.mlir.dialects import nvvm
 from jax._src.pallas import core as pallas_core
 from jax._src.pallas.mosaic_gpu import core as plgpu_core
 from jax._src.state import types as state_types
@@ -45,6 +46,7 @@ from dew.nn.kernels.templates import (
     product,
     report,
     resources,
+    shifted_rows,
     swizzling,
 )
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Ring, Turn, drain, loads, opaque, passed, streamed
@@ -446,6 +448,14 @@ def chunked(value: jax.Array, view, smem) -> list[tuple[jax.Array, Ref]]:
     return [(piece, view.at[..., pl.ds(first, width)]) for first, piece in column_chunks(value, width)]
 
 
+def _fenced(ctx) -> None:
+    """An inline body (`plgpu.inline_mgpu`) ordering the thread's global writes the async proxy made (TMA's)
+    before its generic loads (PTX's `fence.proxy.async.global`); it returns nothing, an inline body's
+    results its returned values alone."""
+    del ctx
+    nvvm.fence_proxy(nvvm.ProxyKind.async_global)
+
+
 def stored(parts, views, *, smem, wait: bool = True) -> None:
     """Each of `parts` written whole to its view of `views` through the shared buffer `smem`, in turn, a
     chunk of its columns at a time where `smem` is narrower (`chunked`), the buffer reused once its copy
@@ -717,6 +727,35 @@ class Issuer[Accumulator](abc.ABC):
         del rows, depth
         return 0
 
+    def row_shifted(self, tile, shift, *, period: int, interpret: bool) -> jax.Array:
+        """`tile` (a register tile in the accumulator's layout, `tile_of`'s) with each row `i` holding row
+        `i - shift`'s values within its `period`-row group, any value where that row leaves the group (a
+        caller's mask), `shift` traced: read at a row offset in registers, by the layout's own lane
+        permutation (`shifted_rows.row_shifted`, a warp's shuffles), not through shared memory, whose shifted
+        plain reads conflict on every bank (row 5305); interpreted, the tile's own rows gathered. A layout
+        whose warps hold no whole groups of `period` rows takes none (`shifted_rows.lanes`)."""
+        if interpret:
+            rows = lax.broadcasted_iota(jnp.int32, tile.shape, 0)
+            group = rows - rows % period
+            taken = group + jnp.clip(rows % period - shift, 0, period - 1)
+            return jnp.take_along_axis(tile, taken, axis=0)
+
+        def shifted(ctx, array, by):
+            del ctx
+            [value] = by.registers.flat
+            return shifted_rows.row_shifted(array, value, period)
+
+        returned = plgpu.ShapeDtypeStruct(tile.shape, tile.dtype, layout=self.layout)
+        return plgpu.inline_mgpu(arg_types=(self.layout, plgpu.Layout.WG_SPLAT(())), return_type=returned)(
+            shifted)(tile, jnp.asarray(shift, jnp.int32))
+
+    loads_past_floor: bool = False
+    """Whether this is an issuer on which some launches' producers hold more than `resources.producer_floor`'s
+    registers in their issue loop: each such launch states its floor where a receipt shows the need
+    (`Launch.producer`), and the compile gate holds the rest to the default (`producer_failures`, spills).
+    tcgen05's: the recurrence's states, solve and reverse walk spilled 52, 164 and 40 bytes at 24 on sm100
+    (row 5357), its other launches spill-free at 24; none of warpgroup MMA's or mma.sync's."""
+
     def entry_floor(self, tiles) -> int:
         """The least registers a thread a program issuing products into a consumer's fp32 `tiles` (each
         `(rows, columns, dtype)`, its accumulators among them) launches with (`resources.Launch.entry`). It
@@ -777,21 +816,32 @@ class Issuer[Accumulator](abc.ABC):
         replicated."""
         return 1
 
+    def for_dtype(self, dtype) -> Self:
+        """The issuer its products use for operands of `dtype`, whose instruction depths their model reads."""
+        del dtype
+        return self
+
+    operand_steps_ahead: int = 0
+    """The instruction slices loaded before the slice being consumed finishes."""
+
+    def operand_live_depth(self, depth: int, loaded: int, *, retained: bool = False) -> int:
+        """An operand's live depth: a retained value keeps its loaded granule and instruction lookahead;
+        otherwise only its consumed slices within that granule stay live."""
+        consumed = (1 + self.operand_steps_ahead) * self.fragment_depth(depth)
+        return min(depth, max(loaded, consumed)) if retained else min(loaded, consumed)
+
     def fragment_depth(self, depth: int) -> int:
-        """The depth of a step's right operand fragments a consumer holds at once, where its products read
-        registers (`operands_in_registers`): the step's, unless the family loads them a sub-step at a
-        time (the left operand's it holds a step deep)."""
+        """The depth consumed by one instruction: the step's where its issuer does not split products."""
         return depth
 
     def rhs_fragment_depth(self, depth: int, *, transposed: bool = False, swizzle: int | None = None) -> int:
-        """The right operand's depth held in registers, by its storage orientation and its stage's swizzle
-        (bytes; the family's default staging where None)."""
+        """The right operand's loaded depth at its storage orientation and swizzle (bytes). The model's
+        `operand_live_depth` reads which slices of that granule stay live."""
         del transposed, swizzle
         return self.fragment_depth(depth)
 
     def lhs_fragment_depth(self, depth: int, *, swizzle: int | None = None) -> int:
-        """The left operand's depth held in registers by a product, by its stage's swizzle (bytes; the
-        family's default staging where None)."""
+        """The left operand's load granule at its stage's swizzle (bytes; the family's default where None)."""
         del swizzle
         return depth
 
@@ -824,6 +874,12 @@ class Issuer[Accumulator](abc.ABC):
     """Whether its TF32 products take an operand read transposed (`takes_tf32`): mma.sync's, whose threads
     load each fragment's elements themselves; not warpgroup MMA's ('Only f16 WGMMA supports transposes'), so
     a product of transposed fp32 operands there takes bf16 parts."""
+
+    rounds_tf32: bool = False
+    """Whether its TF32 products round each fp32 operand to TF32 first (`takes_tf32`; `cvt.rna.tf32.f32`, to
+    nearest, a tie away from zero): mma.sync's, the fork's lane-level `mma` rounding it
+    (mosaic/gpu/mma.py `_rounded_to_tf32`); else the instruction reads the fp32 operand as TF32 itself, no
+    conversion stated (warpgroup MMA's)."""
 
     takes_prologue_tiles: bool = True
     """Whether its kernels lower a prologue over a side operand's tile (a SwiGLU gate's): mma.sync's do not
@@ -1496,7 +1552,7 @@ class Transport[Allocated, Opened](abc.ABC):
     @abc.abstractmethod
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
-                unrolled: bool = False, accumulators: tuple = ()) -> None:
+                unrolled: bool = False, accumulators: tuple = (), producer: int | None = None) -> None:
         """A persistent kernel's tiles, the grid `tiles` spread over the launch's programs along `axis`, its
         streams (`streams`, as `scoped` hands them) running on across them: `schedule(index)` gives a tile's
         `(active, steps, views, tile)`, whether it streams anything, its step count, each stream's view
@@ -1515,7 +1571,9 @@ class Transport[Allocated, Opened](abc.ABC):
         `schedule` gives each of them the same `active`, `steps` and view of it. `walk`'s `in_flight` and
         `unrolled` are its consumers' walks'. `accumulators` are the shapes of the fp32 accumulators a
         tile's walk issues into, which a family holding them outside its consumers' registers allocates
-        (tcgen05's tensor memory, read out by `Issuer.chunks`); a register family's walk carries its own."""
+        (tcgen05's tensor memory, read out by `Issuer.chunks`); a register family's walk carries its own. Its
+        producer lowers to `producer` registers a thread (`roles`' floor, `resources.producer_floor` where
+        None), the floor its launch plans with; a family without a producer role takes none."""
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
@@ -1638,6 +1696,20 @@ class Transport[Allocated, Opened](abc.ABC):
         """Waits until at most `pending` of this thread's deferred stores (`stored(wait=False)`) still read
         their shared tiles: a family that stores through registers has none."""
         del pending
+
+    def kept(self, parts, views, interpret: bool, *, smem) -> None:
+        """Each of `parts` written to its view of `views` in global memory for the program's own loads to read
+        back later (`tile_of`, a walk's table of memories): stored whole (`stored`, waited), its writes
+        visible to the warpgroup's loads past it (`visible`), its threads past them (`synced`); a thread
+        reads back what another wrote."""
+        self.stored(parts, views, smem=smem)
+        self.visible(interpret)
+        synced(interpret)
+
+    def visible(self, interpret: bool) -> None:
+        """The program's completed stores to global memory visible to its own loads: a family that stores
+        through its threads' writes needs nothing."""
+        del interpret
 
     def at_store(self, index: jax.Array) -> jax.Array:
         """A view's `index` (its first row) formed where a store reads it (`stored`): through an optimization
@@ -1943,14 +2015,14 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
-                unrolled: bool = False, accumulators: tuple = ()) -> None:
+                unrolled: bool = False, accumulators: tuple = (), producer: int | None = None) -> None:
         del accumulators  # its consumers' walks carry their own
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one (`_tiled`).
         rings = self.opened(streams)
         staging = self.output_staging(outputs, consumers)
 
-        def producer():
+        def loading():
             loaded, _ = persistent.tiled(tiles, schedule, functools.partial(loads, rings), axis=axis)
             drain(rings.values(), loaded)
 
@@ -1958,8 +2030,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             return self._tiled(rings, tiles, schedule, issue, finish, smems, axis=axis, interpret=interpret,
                                in_flight=in_flight, unrolled=unrolled)
 
-        pl.run_scoped(lambda *smems: self.scheduled(consumers, consuming(smems), producer), *staging,
-                      collective_axes="wg")
+        pl.run_scoped(lambda *smems: self.scheduled(consumers, consuming(smems), loading, floor=producer),
+                      *staging, collective_axes="wg")
 
     def _tiled(self, rings: dict[str, Ring], tiles: tuple[int, ...], schedule: Callable, issue: Callable,
                finish: Callable, smems, *, axis: str, interpret: bool, in_flight: int,
@@ -2107,6 +2179,12 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def store_wait(self, pending: int) -> None:
         plgpu.wait_smem_to_gmem(pending, wait_read_only=True)
+
+    def visible(self, interpret: bool) -> None:
+        # TMA wrote them in the async proxy; the threads' loads read in the generic one (PTX's proxy fence).
+        if interpret:
+            return
+        plgpu.inline_mgpu()(_fenced)()
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
         if interpret:

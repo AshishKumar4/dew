@@ -35,10 +35,12 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
 from dew.nn import derivatives
-from dew.nn.kernels import fla_gdn, launches, recurrence, recurrence_algebra as algebra
+from dew.nn.kernels import fla_gdn, launches, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
+    ChunkSpan,
     Sequences,
+    Span,
     Tiles,
     _aligned,
     _chunk_of,
@@ -160,12 +162,12 @@ def intra_rows(q, k, g, beta, *, scale: float, g_lo, chunk: int = 64, spans: Seq
 
 
 def _intra_solve_kernel(chunk_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *, chunk: int, aligned: bool,
-                        exact: bool, solve):
+                        exact: bool):
     """fla's `chunk_kda_fwd_kernel_inter_solve_fused` (chunk_intra.py:43-391), safe_gate off, from the
     rows `intra_rows` computed, for one chunk of one head in 16-row blocks: `Aqk` stored in the keys'
     dtype, and `I + Akk`'s diagonal blocks inverted by forward substitution and merged in fla's
     order, `X_IJ = -(X_II A_IJ) X_JJ` for neighbours and `-X_II (sum_M A_IM X_MJ)` beyond, at the
-    call's solve precision (`fla_gdn._dot`'s `solve`), the inverse stored in the keys' dtype; both
+    precision fla's are (`fla_gdn._dot`), the inverse stored in the keys' dtype; both
     zero above the diagonal. A chunk's rows past its end are none of them stored."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
 
@@ -185,7 +187,7 @@ def _intra_solve_kernel(chunk_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *, chun
             for j in range(count):
                 store(aqk_ref, i, j, part(aqkd_ref, i, j) if j <= i else zero)
         kks = {(i, j): part(akkd_ref, i, j) for i in range(count) for j in range(i + 1)}
-        inverse = algebra.inverted(kks, lambda name, a, b: _dot(a, b, exact=exact, solve=solve),
+        inverse = algebra.inverted(kks, lambda name, a, b: _dot(a, b, exact=exact),
                                    neighbours_first=True)
         for i in range(count):
             for j in range(count):
@@ -213,7 +215,7 @@ class IntraSolve(_Launch):
         shape = jax.ShapeDtypeStruct((tokens, value_heads, chunk), aqk.dtype)
         found = launches.pallas_call(
             functools.partial(_intra_solve_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
-                              exact=interpret, solve=aqk.dtype),
+                              exact=interpret),
             grid=(spans.chunks.shape[0], value_heads),
             in_specs=[_CHUNK, headed(chunk), headed(chunk)],
             out_specs=[headed(chunk), headed(chunk)], out_shape=[shape, shape],
@@ -350,7 +352,7 @@ def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, lo_ref, o_ref, *, ch
     them (`fla_gdn._o_kernel`), the memory the chunk enters read at its slot (`Sequences`); the queries'
     decay of the separated prefix (`algebra.raised`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entered = chunk_ref[2]
+    entered = chunk_ref[tables.column(ChunkSpan, "entered")]
 
     @pl.when(taken > 0)
     def _():
@@ -508,7 +510,8 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, beta_ref, a_r
     and `last`, each token's term through the range from it to the chunk's last (the keys' write into the
     memory leaving), which `bwd_intra` sums token by token with the chunk's pairs (row 551)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entered, left = chunk_ref[2], chunk_ref[3]
+    entered = chunk_ref[tables.column(ChunkSpan, "entered")]
+    left = chunk_ref[tables.column(ChunkSpan, "left")]
 
     @pl.when(taken > 0)
     def _():
@@ -693,7 +696,7 @@ class _SubChunk:
         return algebra.between(later, earlier)
 
     def solved(self, left_operand, right_operand):
-        return _dot(left_operand, right_operand, exact=self.exact, solve=self.refs["k"].dtype)
+        return _dot(left_operand, right_operand, exact=self.exact)
 
     def earlier(self, j):
         """Sub-chunk `j`'s keys decayed to this one's first row, `k_t exp2(g_first - g_t)`."""
@@ -943,20 +946,15 @@ def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: i
 
 def first_decay_grad(dg, h0, dh0, spans: Sequences):
     """`dg` `[B, T, HV, K]`, the decay's gradient summed back over each chunk, with each sequence's
-    first token's taken from the memory its decay scales: `<h0, dh0>` over the values for a sequence
-    that takes a memory (a row's first, or a document entering its own, `Sequences`), and exactly zero
-    for any other, which starts from no memory. Summed back, that
-    token's gradient is every term of its chunk, which cancel to fp32's residue where the memory is
-    zero (2.7e-11 on a zero initial memory, as a float64 recurrence and the portable math hold
-    exactly). The gated delta rule's port sums each token's own terms instead
-    (`fla_gdn._summed_back`), which give it exactly."""
+    first token's taken from the memory its decay scales (`algebra.first_decays`): `<h0, dh0>` over the
+    values for a sequence that takes a memory (a row's first, or a document entering its own,
+    `Sequences`), exactly zero for any other. The gated delta rule's port sums each token's own terms
+    instead (`fla_gdn._summed_back`), which give it exactly."""
     batch, length = dg.shape[:2]
-    first, count, memory, takes = (spans.spans[:, i] for i in (0, 1, 5, 6))
-    shared = jnp.sum(h0.astype(jnp.float32) * dh0, axis=-1)
-    value = jnp.where((takes == 1)[:, None, None], shared[memory], 0.0)
+    span = tables.unpacked(Span, lambda i: spans.spans[:, i])
     flat = dg.reshape(batch * length, *dg.shape[2:])
-    index = jnp.where(count > 0, first, batch * length)
-    return flat.at[index].set(value.astype(dg.dtype), mode='drop').reshape(dg.shape)
+    return algebra.first_decays(flat, h0, dh0, span.first, span.memory, span.takes == 1,
+                                span.tokens > 0).reshape(dg.shape)
 
 
 def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool, residual, cotangent):

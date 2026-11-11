@@ -5,11 +5,15 @@ import contextlib
 import functools
 import itertools
 import json
+import os
+import subprocess
+import tempfile
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from reference_error import with_gradients
 from tool_support import load
 
@@ -397,3 +401,65 @@ def mamba2_site(site):
     if site in LAYER_SITES:
         return mamba2_layer_site_draw, mamba2_layer_twin
     return mamba2_model_draw, mamba2_model_site_run
+
+
+MAMBA_SIDE = '''
+import sys, time, numpy as np, torch
+from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
+begun = time.perf_counter()
+given, chunk = np.load(sys.argv[1]), int(sys.argv[3])
+leaves = str(given["leaves"]).split(",")
+kinds = dict(zip(leaves, str(given["dtypes"]).split(",")))
+seq = torch.from_numpy(given["seq"]).to("cuda", torch.int32) if "seq" in given else None
+held = {name: torch.from_numpy(given[name]).to("cuda", getattr(torch, kinds[name])).requires_grad_()
+        for name in leaves}
+draws, rows, length = held["value"].shape[:3]
+def fold(x):
+    # [N, B, S, H, ...] to one call's rows, each draw's heads (groups) its own: [B, S, N H, ...].
+    x = x.movedim(0, 2)
+    return x.reshape(rows, length, -1, *x.shape[4:])
+state = held["state"].movedim(0, 1).reshape(rows, -1, *held["state"].shape[-2:]).transpose(-1, -2)
+torch.cuda.synchronize()
+staged = time.perf_counter()
+y, final = mamba_chunk_scan_combined(
+    fold(held["value"]), fold(held["beta"]), held["rate"].reshape(-1), fold(held["key"]), fold(held["query"]),
+    chunk, D=held["skip"].reshape(-1), initial_states=state, seq_idx=seq, return_final_states=True)
+y = y.reshape(rows, length, draws, -1, *y.shape[3:]).movedim(2, 0)
+final = final.transpose(-1, -2).reshape(rows, draws, -1, *final.shape[-2:][::-1]).movedim(1, 0)
+d_out, d_final = (torch.from_numpy(given[name]).to("cuda", torch.float32) for name in ("d_out", "d_final"))
+torch.autograd.backward((y.float(), final.float()), (d_out, d_final))
+torch.cuda.synchronize()
+ran = time.perf_counter()
+found = {"out": y, "final": final, **{f"d_{n}": held[n].grad for n in leaves}}
+np.savez(sys.argv[2], **{name: value.detach().float().cpu().numpy() for name, value in found.items()})
+print(f"K mamba_ssm {draws} draws: staged {staged - begun:.2f} s, kernels {ran - staged:.2f} s, "
+      f"back {time.perf_counter() - ran:.2f} s", flush=True)
+'''
+"""mamba_ssm's own `mamba_chunk_scan_combined`, in the interpreter `DEW_MAMBA_PYTHON` names, over a block of
+draws run as one call (each draw's heads and groups its own of one call's, its rate and skip per head) of
+Dew's rated scan (`recurrence_chunk.chunk`'s names: the values `x`, the keys `B`, the queries `C`,
+the write gate the step `dt`, the rate `A`, the skip `D` and the memory, keys by values, mamba_ssm's
+transposed), each leaf in its own dtype; a row's documents mamba_ssm's `seq_idx`."""
+
+
+def mamba_side(leaves: dict, cotangents: tuple, starts, chunk: int) -> dict:
+    """mamba_ssm's scan (`MAMBA_SIDE`) on draws stacked on a leading axis, `leaves` Dew's operands by name
+    `[N, B, S, ...]` and `cotangents` of its output and final memory: its outputs and every leaf's gradient
+    by name (`out`, `final`, `d_<leaf>`), each stacked. `starts` `[B, S]` marks the rows' documents (None:
+    one sequence a row): each token's document the starts before it, a row's first entering its memory."""
+    python = os.environ.get("DEW_MAMBA_PYTHON")
+    if not python:
+        pytest.fail("DEW_MAMBA_PYTHON names no interpreter with mamba_ssm 2.3.2 and torch: the GPU tier's "
+                    "reference, which a run asking for it gets")
+    given = {name: np.asarray(value, np.float32) for name, value in leaves.items()}
+    given |= {"leaves": np.asarray(",".join(leaves)), "dtypes": np.asarray(",".join(
+        jnp.dtype(value.dtype).name for value in leaves.values())),
+        "d_out": np.asarray(cotangents[0], np.float32), "d_final": np.asarray(cotangents[1], np.float32)}
+    if starts is not None:
+        given["seq"] = np.cumsum(np.asarray(starts, np.int32), axis=1).astype(np.int32)
+    with tempfile.TemporaryDirectory() as root:
+        np.savez(Path(root) / "in.npz", **given)
+        subprocess.run([python, "-c", MAMBA_SIDE, Path(root) / "in.npz", Path(root) / "out.npz", str(chunk)],
+                       check=True)
+        with np.load(Path(root) / "out.npz") as found:
+            return dict(found)

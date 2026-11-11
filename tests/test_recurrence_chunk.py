@@ -19,6 +19,7 @@ from reference_error import (
     FEWEST_SEEDS,
     assert_as_exact,
     assert_fp32_reduction_bound,
+    assert_rounds_where_the_reference_does,
     chain_roundings,
     widened,
     with_gradients,
@@ -278,90 +279,187 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
 DOCUMENTS = ((0, 23, 40), (0, 9, 48))
 """Each row's packed documents' first tokens under `draw`'s `packed`."""
 
-ENTERED = ((2, 0, 1), (3, 1, 2))
-"""The slot each row's document enters (one-based, zero a zero memory): a row's slots each entered once
-but the second row's first, and its third entered twice, so the slot's gradient sums two documents'."""
+GIVEN = 1
+"""The memories a row's table holds before its documents store theirs (`Chunk.loads`: a row's start, a
+cache)."""
+
+FORKED = (((1, 2, 2), (1, 0, 0)), ((1, 2, 3), (1, 2, 0)))
+"""Each row's documents' table slots and stored slots (`Chunk.loads`, `Chunk.stores`): the first row's start
+continued by its first document, whose final both later documents enter (a slot's gradient summing two
+documents'); the second row a chain from its start, each document entering its predecessor's final. Every
+memory is entered, so no gradient's row is float64 zero, whose terms the gate would trace each draw."""
+
+HELD = 2
+"""The stored slots a row's table holds (`Chunk.held`)."""
 
 
-def entered_draw(hooks, seed: int):
-    """`draw`'s packed operands, each document entering its `ENTERED` slot's memory of three a row, and
-    cotangents of the output and each document's final memory."""
+def entered_draw(hooks, seed: int, entries: bool = False):
+    """`draw`'s packed operands over a table of `GIVEN` memories a row, with `entries` an entry write a
+    document (`Chunk.entry_key`: two terms a document, a weight a value head), and cotangents of the output
+    and the row's last memory."""
     (operands,) = draw(hooks, packed=True, seed=seed)
-    keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 9), 3)
-    slots = 0.3 * jax.random.normal(keys[0], (ROWS, 3, *operands.state.shape[1:]))
+    keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 9), 6)
+    given = 0.3 * jax.random.normal(keys[0], (ROWS, GIVEN, *operands.state.shape[1:]))
     out = jax.random.normal(keys[1], operands.value.shape)
-    final = jax.random.normal(keys[2], slots.shape)
+    final = jax.random.normal(keys[2], operands.state.shape)
     # The documents' bounds and slots are the call's structure, which the arms close over: no gradient.
-    return dataclasses.replace(operands, state=slots, starts=None), (out, final)
+    drawn = dataclasses.replace(operands, state=given, starts=None)
+    if entries:
+        documents = len(DOCUMENTS[0])
+        drawn = dataclasses.replace(
+            drawn,
+            entry_key=0.3 * jax.random.normal(keys[3], (ROWS, documents, 2, *operands.key.shape[2:])),
+            entry_value=0.3 * jax.random.normal(keys[4], (ROWS, documents, 2, *operands.value.shape[2:])),
+            entry_weight=jax.random.uniform(keys[5], (ROWS, documents, operands.value.shape[2])))
+    return drawn, (out, final)
 
 
+def entry_write(operands, row: int, document: int):
+    """The entry write `operands` give a row's document (`Chunk.entry_key`), `[Hv, Dk, Dv]`: its weight
+    times its terms' summed outer products, each key head's keys read by its value heads."""
+    group = operands.entry_value.shape[3] // operands.entry_key.shape[3]
+    key = jnp.repeat(operands.entry_key[row, document], group, axis=1)
+    written = jnp.einsum('rhk,rhv->hkv', key, operands.entry_value[row, document])
+    return operands.entry_weight[row, document][:, None, None] * written
 
 
 def entering_documents(operands):
-    """`operands` with `draw`'s packed documents, each entering its `ENTERED` slot."""
+    """`operands` with `draw`'s packed documents a forked call's, each entering its `FORKED` table slot."""
     starts = jnp.zeros(operands.value.shape[:2], bool)
     for row, begins in enumerate(DOCUMENTS):
         starts = starts.at[row, jnp.asarray(begins)].set(True)
-    return dataclasses.replace(operands, starts=starts, entered=jnp.asarray(ENTERED, jnp.int32))
+    loads, stores = (jnp.asarray([row[part] for row in FORKED], jnp.int32) for part in (0, 1))
+    return dataclasses.replace(operands, starts=starts, loads=loads, stores=stores, held=HELD)
 
 
-def document_by_document(hooks, operands):
-    """Each document of `operands` a sequence of its own from its slot's memory through `token_by_token`,
-    its outputs back in place and its final memory its own `[B, D, Hv, Dk, Dv]`."""
+def document_by_document(hooks, operands, run=None):
+    """Each document of `operands` a sequence of its own through `run(hooks, piece)` (`token_by_token`
+    where None), in the row's order from its `FORKED` table slot's memory (a given one, or the final an
+    earlier document stored, with its entry write added where `operands` give one), its outputs back in
+    place, and each row's last memory."""
+    run = token_by_token if run is None else run
     tokens = ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'z')
-    outs, finals = [], []
-    for row, (begins, entered) in enumerate(zip(DOCUMENTS, ENTERED, strict=True)):
+    outs, lasts = [], []
+    for row, (begins, (loads, stores)) in enumerate(zip(DOCUMENTS, FORKED, strict=True)):
         ends = (*begins[1:], operands.value.shape[1])
-        pieces, kept = [], []
-        for begin, end, slot in zip(begins, ends, entered, strict=True):
-            state = (operands.state[row, slot - 1] if slot else jnp.zeros_like(operands.state[row, 0]))
+        table = list(operands.state[row]) + [None] * HELD
+        pieces, final = [], None
+        for document, (begin, end, load, store) in enumerate(zip(begins, ends, loads, stores, strict=True)):
+            state = table[load - 1] if load else jnp.zeros_like(operands.state[row, 0])
+            if operands.entry_key is not None:
+                state = state + entry_write(operands, row, document)
             fields = {name: getattr(operands, name)[row:row + 1, begin:end] for name in tokens
                       if getattr(operands, name) is not None}
-            piece = dataclasses.replace(operands, **fields, state=state[None], starts=None, entered=None)
-            out, final = token_by_token(hooks, piece)
+            piece = dataclasses.replace(operands, **fields, state=state[None], starts=None, loads=None,
+                                        stores=None, held=0, entry_key=None, entry_value=None,
+                                        entry_weight=None)
+            out, final = run(hooks, piece)
             pieces.append(out[0])
-            kept.append(final[0])
+            if store:
+                table[GIVEN + store - 1] = final[0]
         outs.append(jnp.concatenate(pieces))
-        finals.append(jnp.stack(kept))
-    return jnp.stack(outs), jnp.stack(finals)
+        lasts.append(final[0])
+    return jnp.stack(outs), jnp.stack(lasts)
 
 
-def assert_entering_on_par(kernel: str, hooks) -> None:
-    """Packed documents each entering a memory of its own (`Chunk.entered`, a request's shared prefix's final
-    memory for each of its questions) on `kernel`: its output, each document's final memory and every
-    operand's gradient, the slots' memories' included (a slot entered twice summing both documents'),
-    against each document a sequence of its own from its slot's memory, the recurrence a token at a time from
-    float64 (check 1)."""
+@pytest.mark.check1_shards(seeds=80, per_task=8)
+@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0]], ids=str)
+def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
+    """80 draws, 8 a task: at 40 a skip's and a gated decay's bias's gradients, two entries a head, were
+    inconclusive (intervals 1.58 and 1.56 wide, pooled 1.09 and 0.95; jsf-1506b); the gate holds a draw's
+    float64 terms of the walk and its table, 6.4 GB at 8 draws on armada (11-10), so 16 a task passed a
+    task's 12 GB.
+    The portable math's walk over a forked call, each document laid from a chunk's edge and its table slot's
+    memory taken up there, the stored finals kept in the walk's table (`xla_mainloop`, `_walk`), against
+    each document a sequence of its own the recurrence a token at a time (`assert_forked_on_par`): a slot
+    entered twice sums both documents' gradients."""
+    assert_forked_on_par('xla', hooks, functools.partial(entered_draw, hooks),
+                         f'xla {hooks} a forked call\'s documents', seeds=80)
+
+
+def test_fla_refuses_a_forked_call_named_or_handed_to_it():
+    """fla's varlen port runs a call's documents as sequences of their own in parallel, so no forked call
+    (`Chunk.loads`), whose documents enter earlier documents' finals, is one it takes (inherently). A forked
+    call naming it (`generation.chosen`), and its table of memories `[B, S', Hv, Dk, Dv]` handed to its rule
+    directly, are refused alike: the selector's typed refusal, its reason and row, never a shape's error."""
+    from dew.nn.kernels.selection import KernelRefused
+
+    hooks = HOOKS[4]
+    operands = entering_documents(entered_draw(hooks, 0)[0])
+    with pytest.raises(KernelRefused) as named:
+        chunk_on('fla', hooks, operands, chunk_size=CHUNK)
+    assert recurrence_chunk.PORT_FORKED in named.value.refusals
+    g = jnp.zeros(operands.value.shape[:3])
+    with pytest.raises(KernelRefused) as handed:
+        recurrence_chunk.fla_rule(operands.query, operands.key, operands.value, g, g, operands.state)
+    assert handed.value.refusals == [recurrence_chunk.PORT_FORKED]
+
+
+def assert_forked_on_par(kernel: str, hooks, draw, site: str, *, seeds: int, alone: bool = False) -> None:
+    """A forked call on `kernel` (`entering_documents` of `draw`'s operands; `Chunk.loads`: a request's
+    questions entering its shared part's final memory, a chain's each its predecessor's): its output, the
+    row's last memory and every operand's gradient, the given memories' included, against each document a
+    sequence of its own from its table slot's memory in the row's order (`document_by_document`), through
+    `kernel`'s call where `alone`, else the recurrence a token at a time, which in float64 is their truth
+    (check 1)."""
     def ours(operands):
         out, final = chunk_on(kernel, hooks, entering_documents(operands), chunk_size=CHUNK)
         return out.astype(jnp.float32), final.astype(jnp.float32)
 
+    def own(hooks, piece):
+        return chunk_on(kernel, hooks, piece, chunk_size=CHUNK)
+
     def theirs(operands):
-        out, final = document_by_document(hooks, operands)
-        return out.astype(jnp.promote_types(out.dtype, jnp.float32)), final
+        out, final = document_by_document(hooks, operands, own if alone else None)
+        return out.astype(jnp.float32), final.astype(jnp.float32)
 
-    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(theirs)),
-                    functools.partial(entered_draw, hooks),
-                    f'{kernel} {hooks} documents entering their own memories', seeds=80)
+    wide = jax.jit(with_gradients(lambda operands: document_by_document(hooks, operands)))
 
+    def widened(leaf):
+        floating = jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating)
+        return jnp.asarray(leaf, jnp.float64) if floating else leaf
 
-@pytest.mark.check1_shards(seeds=80, per_task=16)
-@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], HOOKS[6], FORMED[0]], ids=str)
-def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
-    """80 draws, 16 a task: at 40 a skip's and a gated decay's bias's gradients, two entries a head, were
-    inconclusive (intervals 1.58 and 1.56 wide, pooled 1.09 and 0.95; jsf-1506b), and 40 took up to 115 s.
-    The portable math's on the packed rows, each document laid from a chunk's edge and its memory taken up
-    there (`xla_mainloop`'s `_Aligned`, `_walk`; `assert_entering_on_par`)."""
-    assert_entering_on_par('xla', hooks)
+    def truth(operands, seeded):
+        with jax.enable_x64(new_val=True):
+            return wide(jax.tree.map(widened, operands), jax.tree.map(widened, seeded))
+
+    assert_as_exact(jax.jit(with_gradients(ours)), jax.jit(with_gradients(theirs)), draw, site, seeds=seeds,
+                    truth_fn=truth)
 
 
 @pytest.mark.check1_shards(seeds=80, per_task=8)
-@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[9], FORMED[0]], ids=str)
-def test_the_ports_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
-    """80 draws, 8 a task: one map task of both kernels' 16 draws held 11.5 GiB (jsf-r08own1). The port's,
-    the packed rows each document's sequence from its own memory (row 5288), over the delta rule's forms it
-    takes (`assert_entering_on_par`)."""
-    assert_entering_on_par('fla', hooks)
+@pytest.mark.parametrize('hooks', [FORMED[4], FORMED[5]], ids=str)
+def test_the_ssd_ports_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hooks):
+    """The port of mamba_ssm's kernels over a forked call, each document laid from a chunk's edge and the
+    state passing taking up its table slot's memory there with its entry write added (`Chunk.entry_key`),
+    keeping the finals its documents store (`_ported_documents`), as the port's call over each document
+    alone from its slot's memory and entry write (`assert_forked_on_par`). The port's own numbers
+    (mamba_ssm's) are tests/test_mamba_ssd.py's."""
+    assert_forked_on_par('pallas', hooks, functools.partial(entered_draw, hooks, entries=True),
+                         f'pallas {hooks} a forked call\'s documents, against each alone', seeds=80,
+                         alone=True)
+
+
+def narrowed_draw(hooks, seed: int):
+    """`entered_draw`'s operands with their queries, keys, values and write gate in bf16, a 16-bit call as the
+    recurrence template's fast backward trains it (`mainloop_backward.fast_backward_form`)."""
+    operands, seeded = entered_draw(hooks, seed)
+    return dataclasses.replace(operands, **{name: getattr(operands, name).astype(jnp.bfloat16)
+                                            for name in ('query', 'key', 'value', 'beta')
+                                            if getattr(operands, name) is not None}), seeded
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=1)
+@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[8], FORMED[4]], ids=str)
+def test_the_templates_forked_documents_are_as_exact_as_each_alone_interpreted(hooks):
+    """The recurrence template interpreted over a forked call in 16 bits, the gated delta rule, Kimi delta
+    attention and Mamba2's SSD: its walks take each document's memory up from the call's table and keep
+    the finals its documents store (`table.Taking`, `table.Returning`; ledger 5376), as its call over
+    each document alone (`assert_forked_on_par`), the same launches' arithmetic. A draw a task: four
+    took 287 to 381 s a task (jsf-table-phase at 693aa1c1c)."""
+    assert_forked_on_par('mosaic_gpu', hooks, functools.partial(narrowed_draw, hooks),
+                         f'mosaic_gpu {hooks} a forked call\'s documents, against each alone',
+                         seeds=8, alone=True)
 
 
 def edge_draw(hooks, seed: int):
@@ -478,8 +576,8 @@ def rated_draw(seed: int) -> tuple:
     return token, sequence
 
 
-def decayed(hooks, token: dict, sequence: dict) -> tuple:
-    """`hooks`' decode token on the launch and on its reference, and its chunked sequence on the portable
+def decayed(hooks, token: dict, sequence: dict, launch=recurrence.step) -> tuple:
+    """`hooks`' decode token on the `launch` and on its reference, and its chunked sequence on the portable
     math, `rated_draw`'s operands read as `hooks` reads them: a rated decay's rate, or that rate times the
     write gate given whole as the log decay."""
     def operands(given: dict, leading) -> dict:
@@ -488,7 +586,7 @@ def decayed(hooks, token: dict, sequence: dict) -> tuple:
         return given | ({'rate': rate} if hooks.rated else {'log_decay': rate[leading] * given['beta']})
 
     stepped = [step(hooks, recurrence.Step(**operands(token, (None, slice(None)))))[::2]
-               for step in (recurrence.step, recurrence.step_reference)]
+               for step in (launch, recurrence.step_reference)]
     chunked = chunk_on('xla', hooks, Chunk(**operands(sequence, (None, None, slice(None)))), chunk_size=CHUNK)
     return (*stepped, chunked)
 
@@ -496,9 +594,38 @@ def decayed(hooks, token: dict, sequence: dict) -> tuple:
 def test_a_rated_decay_is_its_log_decay():
     """A rated decay (`rate` times the write gate) steps a decode token, on the launch and on its reference,
     and a chunked sequence on the portable math as the same log decay given whole: on par with the whole
-    decay's from float64 over the site's seeds (check 1)."""
+    decay's from float64 over the site's seeds (check 1), whose truth is the reference's arithmetic in
+    float64: the launch takes no float64 operands (interpreted under x64, its key sums' loop failed to
+    lower, i32 against i64, once the interpreter joined two halves as a GPU does)."""
     assert_as_exact(functools.partial(decayed, RATED), functools.partial(decayed, WHOLE), rated_draw,
-                    'a rated decay against its log decay', seeds=RATED_SEEDS)
+                    'a rated decay against its log decay', seeds=RATED_SEEDS,
+                    truth_fn=functools.partial(decayed, WHOLE, launch=recurrence.step_reference))
+
+
+def test_a_value_read_by_the_write_and_the_skip_rounds_its_gradient_once():
+    """A 16-bit value both the recurrence writes and the skip adds (`D v`), their value gradients nearly
+    cancelling (`D` near -1 against a write gate near 1): its gradient sums both in the working precision and
+    rounds once, as the recurrence a token at a time does (`recurrence_chunk._read_once`). Rounded to bf16
+    apart and added in it, the sum kept neither's low bits: a write gate's value gradient's worst row 11.6
+    times the token recurrence's (row 5447)."""
+    hooks = recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True)
+    operands = Chunk(query=jnp.full((1, 1, 1, 1), 1.0078125, jnp.bfloat16),
+                     key=jnp.ones((1, 1, 1, 1), jnp.bfloat16), value=jnp.ones((1, 1, 1, 8), jnp.bfloat16),
+                     beta=jnp.full((1, 1, 1), 0.99609375, jnp.bfloat16),
+                     skip=jnp.array([-0.9999], jnp.float32), state=jnp.zeros((1, 1, 1, 8), jnp.float32))
+
+    def gradient(run, operands):
+        def loss(value):
+            out, _ = run(hooks, dataclasses.replace(operands, value=value))
+            return jnp.sum(out.astype(jnp.promote_types(out.dtype, jnp.float32)))
+
+        return jax.grad(loss)(operands.value)
+
+    dew = jax.jit(lambda x: gradient(lambda hooks, x: chunk_on('xla', hooks, x), x))(operands)
+    reference = jax.jit(lambda x: gradient(token_by_token, x))
+    with jax.enable_x64(new_val=True):
+        truth = reference(widened((operands,))[0])
+    assert_rounds_where_the_reference_does(dew, reference(operands), truth, 'a write and a skip of one value')
 
 
 def test_the_operands_are_checked_as_the_decode_steps():

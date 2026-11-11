@@ -47,6 +47,7 @@ from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS
 from dew.nn.progress import Progress
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import explicit_spec, rows_like
+from dew.nn.visibility import block_ends
 
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -687,14 +688,17 @@ class AttentionMetadata:
         return None if self.coordinates is None else self.coordinates.forks
 
 
-def fork_runs(metadata: AttentionMetadata, batch: int, queries: int, anchor=None):
+def fork_runs(metadata: AttentionMetadata, batch: int, queries: int, anchor=None,
+              groups: Sequence[str] = ()):
     """The key runs `[B, queries, R, 2]` a call's forks give its attention (`dew.batch.Forks.runs`), None
-    where it has none. An uncached call's runs are over its own tokens. A cached call's tokens follow the
-    row's cache (`anchor`, `(first, start)` `[B]` each: the slot the call's first real token is stored at,
-    its real tokens after it in their order as the cache compacts them (`cache_positions`), and the first
-    slot of the row's last cached document, the one the call's roots continue): each run's bounds move to
-    the slots its real tokens are stored at, a run of none empty, and a run of the cache's document,
-    `[start, first)`, comes before every token's chain."""
+    where it has none: the call's whole visibility, so a token of a group the layer reads both ways
+    (`groups`, the metadata's fields it reads, a prefix run's blocks) reaches its group's end within its
+    document (`dew.nn.visibility.block_ends`). An uncached call's runs are over its own tokens. A cached
+    call's tokens follow the row's cache (`anchor`, `(first, start)` `[B]` each: the slot the call's first
+    real token is stored at, its real tokens after it in their order as the cache compacts them
+    (`cache_positions`), and the first slot of the row's last cached document, the one the call's roots
+    continue): each run's bounds move to the slots its real tokens are stored at, a run of none empty, and
+    a run of the cache's document, `[start, first)`, comes before every token's chain."""
     forks = metadata.forks
     if forks is None:
         return None
@@ -702,7 +706,13 @@ def fork_runs(metadata: AttentionMetadata, batch: int, queries: int, anchor=None
     assert coordinates is not None
     segments = (jnp.ones((batch, queries), jnp.int32) if coordinates.segments is None
                 else jnp.asarray(coordinates.segments, jnp.int32))
-    runs = forks.runs(segments)
+    reach = None
+    for name in groups:
+        numbered = getattr(metadata, name)
+        if numbered is not None:
+            ends = jnp.where(jnp.asarray(numbered) >= 0, block_ends(numbered), 0)
+            reach = ends if reach is None else jnp.maximum(reach, ends)
+    runs = forks.runs(segments, reach)
     if anchor is None:
         return runs
     first, start = (jnp.asarray(x, jnp.int32)[:, None, None] for x in anchor)

@@ -214,8 +214,8 @@ def gated_rms(out, z, weight, norm: OutputNorm):
 
 
 ROW = {"rows": True}
-"""A field's metadata where it holds an entry a row (`Step`'s; a decode launch keys its rows' count bucketed,
-`StepLaunch.ROWS`)."""
+"""A field's metadata where it holds an entry a row (`Step`'s; the decode step shards those over the rows,
+`step`)."""
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -249,8 +249,8 @@ class Step(Gated):
     `weight` `[Dv]` the epilogue's, `rate` `[Hv]` a rated decay's, at most zero (`Hooks.rated`). `state` is
     `[rows, Hv, Dk, Dv]`, fp32 or bf16 (rounded by `round_to_bf16`), or wider for the reference. `active`
     `[rows]` marks the rows that draw. A pytree of its arrays, so it crosses `jit` and a transformation as a
-    token's operands do; the `Hooks` are its static form. Its fields are the decode launch's operands and
-    their names (`OPERANDS`, `StepLaunch`), those an entry a row marked (`ROW`)."""
+    token's operands do; the `Hooks` are its static form. Its fields are the decode launch's operands
+    (`templates.recurrence.step`), those an entry a row marked (`ROW`)."""
     state: jax.Array = dataclasses.field(metadata=ROW)
     query: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
     key: jax.Array | None = dataclasses.field(default=None, metadata=ROW)
@@ -271,10 +271,6 @@ def _pieces(hooks: Hooks, value_heads: int, key_width: int, value_width: int, ch
         raise ValueError(f'{channels} conv channels are not queries and keys of {key_width} and values of '
                          f'{value_width} over {value_heads} value heads')
     return key_heads
-
-
-OPERANDS = tuple(field.name for field in dataclasses.fields(Step) if field.name != 'active')
-"""`StepLaunch`'s array operands beside `active`, by name: `Step`'s fields."""
 
 
 def _names(hooks: Hooks) -> tuple[str, ...]:
@@ -479,7 +475,7 @@ def _one_tap(hooks: Hooks, conv: Conv, operands: Step, given: dict, dtype):
 
 def step(hooks: Hooks, operands: Step, *, dtype=None):
     """`(output [rows, Hv, Dv], history' or None, state')` of a decode token in one launch
-    (`StepLaunch`), `step_reference`'s arithmetic: the output in `dtype` (the value's, or the
+    (`templates.recurrence.step`), `step_reference`'s arithmetic: the output in `dtype` (the value's, or the
     token's with a conv), the history in its dtype, the state as it is held and updated in place
     where the caller lets it go. A row `active` marks False keeps its history and state, its output
     zeros. A one-tap conv holds no history, so its token is a channel-wise scale: it is taken here

@@ -44,8 +44,9 @@ from dew.nn.residuals import Residual
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, varying_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
+from .chunked_launch import AlignedDocuments, Forked, zero_padded
 from .generation import INHERENT, Choice, triton_runs
-from .selection import Kernel, KernelRefused, Op, Requirement, select, selected
+from .selection import Kernel, KernelRefused, Op, Refusal, Requirement, select, selected
 from .ssd import _chunk_scan, ssd_kernel_platform
 from .templates import base, scan as block_scan
 
@@ -68,7 +69,8 @@ def held_chunk(chunk_size: int, key_width: int) -> int:
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
                            starts=None, max_segments: int | None = None,
-                           write_bound: float | None = None, firsts=None, entered=None):
+                           write_bound: float | None = None, firsts=None, loads=None, stores=None,
+                           held: int = 0):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
     log decay per head, `g` `[B, S, H]`, or `chunk_kimi_delta_attention`
     (modeling_glm5_next.py:482-578) with one per key dimension, `[B, S, H,
@@ -92,11 +94,12 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     by that bound, and the portable math resets its recurrence at each start,
     which needs none. `write_bound` is the largest write gate the layer declares of keys it l2-normalized
     (`recurrence.Hooks.write_bound`), which the template's 16-bit solve reads (`mainloop._merged`).
+    `loads`, `stores` and `held` are a forked call's (`Chunk.loads`).
     """
     hooks = recurrence.Hooks(decay='vector' if g.ndim == 4 else 'scalar', scale=key.shape[-1] ** -0.5,
                              write_bound=write_bound)
     return chunk(hooks, Chunk(query, key, value, log_decay=g, beta=beta, state=state, starts=starts,
-                              firsts=firsts, entered=entered),
+                              firsts=firsts, loads=loads, stores=stores, held=held),
                  chunk_size=chunk_size, max_segments=max_segments)
 
 
@@ -115,18 +118,31 @@ class Chunk(recurrence.Gated):
     documents' first tokens, each from a zero memory, `firsts` their rows' documents' first slots as the
     batch built them (`dew.batch.Coordinates.firsts`; the kernels sort them from `starts` where None).
 
-    Where `entered` `[B, D]` int is given (a call over `dew.batch.Forks`, `dew.nn.linear.forked_scan`), each
-    packed document enters a memory of
-    its own: `state` is `[B, D, Hv, Dk, Dv]`, a memory a slot, and a row's `d`-th document enters its
-    `entered[d]`-th slot (one-based; zero, a zero memory); the final memory is each document's own, `[B, D,
-    Hv, Dk, Dv]` (`entered_memories`)."""
+    A forked call (`dew.batch.Forks`, `dew.nn.linear.forked_scan`) gives `loads` and `stores` `[B, D]` int,
+    each of a row's documents in the order of their first slots (`firsts`, else `starts`'s,
+    `dew.batch.document_firsts`), and `held`, the most of a row's documents another enters: the walk keeps
+    a table of memories, `state`'s `[B, S', Hv, Dk, Dv]` given ones first (a row's start, a cache), then
+    `held` it stores, and a document enters table slot `loads[d]` (one-based; zero, a zero memory) and, where
+    `stores[d]` is past zero, leaves its final memory in stored slot `stores[d]` (the table's `S' +
+    stores[d]`-th), which only a later document of the row enters. A document storing holds a token. One
+    walk over the row in order computes every document from the memory it enters, its parent's final among
+    them: the forks' depth costs nothing (kernel-templates.md section 3). The final memory is the row's
+    last, `[B, Hv, Dk, Dv]`. `entry_key` `[B, D, R, Hk, Dk]`, `entry_value` `[B, D, R, Hv, Dv]` and
+    `entry_weight` `[B, D, Hv]`, where given, add `entry_weight sum_r entry_key_r entry_value_r^T` to the
+    memory a document enters (Mamba-3's trapezoid: a document's first token writes its parent's last token
+    again at its own weight, `dew.nn.mixers.mamba3.entered_mamba3`)."""
     query: jax.Array
     key: jax.Array
     value: jax.Array
     state: jax.Array | None = None
     starts: jax.Array | None = None
     firsts: jax.Array | None = None
-    entered: jax.Array | None = None
+    loads: jax.Array | None = None
+    stores: jax.Array | None = None
+    entry_key: jax.Array | None = None
+    entry_value: jax.Array | None = None
+    entry_weight: jax.Array | None = None
+    held: int = dataclasses.field(default=0, metadata={'static': True})
 
 
 def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_SIZE,
@@ -175,17 +191,15 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     g = jnp.zeros(value.shape[:3], work) if g is None else g
     beta = jnp.ones(value.shape[:3], work) if beta is None else beta
     state, starts, firsts = operands.state, operands.starts, operands.firsts
-    documents = operands.entered is not None
-    if documents:
-        # Each document's own memory `[B, D, Hv, Dk, Dv]` beside the packed rows, which the template, the
-        # port and the portable walk walk (`chunk_forward.prepared`, `_blocked_rule`, `xla_mainloop`); the
-        # rated scan's ports take none (`ScanCase.documents`).
-        state, firsts = entered_memories(state, operands.entered, starts, firsts)
+    forked = None
+    if operands.loads is not None:
+        forked = Forked.of(operands, starts, firsts, work)
+        firsts = forked.firsts
         max_segments = firsts.shape[1]
     if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
         # Each of its routes adds the skip, the port in its kernels.
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, firsts, chunk_size,
-                                 work, dtype, max_segments=max_segments)
+                                 work, dtype, max_segments=max_segments, forked=forked)
     else:
         # The delta rule's selector decides every form (`GATED_DELTA`): the forms its kernels do not run hand
         # over to the portable math there, reported as the call's route. A kernel's output unrounded, as the
@@ -194,48 +208,39 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # numbers are read once, as the selector reads them: a remat's pullback runs the launch later, under
         # whatever precision its caller set then (a saved fp32 gradient under 'highest' took the accurate
         # forms' three parts, whose solve no sm90 thread holds, past the fast ones the selector gave it).
-        wide = hooks.skip or hooks.output is not None or dtype != jnp.result_type(query, key, value)
+        wide_out = hooks.skip or hooks.output is not None or dtype != jnp.result_type(query, key, value)
         rounded = chunk_rounding(hooks.delta, jnp.result_type(query, key, value))
 
         def product_kernel(product: str) -> str:
             return port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                               scale=scale, wide=wide, bound=hooks.inverse_bound,
-                               product=product,
-                               delta=hooks.delta, decayed=hooks.decay != 'none')
+                               scale=scale, wide=wide_out, bound=hooks.inverse_bound,
+                               product=product, forked=forked, delta=hooks.delta,
+                               decayed=hooks.decay != 'none')
 
-        def run(kernel, query, key, value, g, beta, state, starts, firsts):
-            # Every kernel walks the packed rows, each document from its own memory.
+        def run(kernel, query, key, value, g, beta, skip, state, starts, firsts, *walked):
+            # Every kernel walks the packed rows, each document from its own memory, its values read once
+            # with the skip's (`_read_once`).
+            carried = None if forked is None else forked.carrying(*walked)
+            wide, own = _read_once(value, work)
             if kernel == 'mosaic_gpu':
-                return template_rule(query, key, value, g, beta, state, starts, firsts,
-                                     max_segments=max_segments, scale=scale, delta=hooks.delta, wide=wide,
-                                     bound=hooks.inverse_bound, rounded=rounded)
-            if kernel == 'fla':
-                return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
-                                scale=scale, wide=wide, firsts=firsts)
-            size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
-            return xla_mainloop(Tiles(size), query, key, value, g, beta, state, starts, firsts, scale=scale,
-                                delta=hooks.delta, dtype=work, bound=hooks.inverse_bound)
+                out, final = template_rule(query, key, own, g, beta, state, starts, firsts, forked=carried,
+                                           max_segments=max_segments, scale=scale, delta=hooks.delta,
+                                           wide=wide_out, bound=hooks.inverse_bound, rounded=rounded)
+            elif kernel == 'fla':
+                out, final = fla_rule(query, key, own, g, beta, state, starts=starts,
+                                      max_segments=max_segments, scale=scale, wide=wide_out, firsts=firsts)
+            else:
+                size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
+                out, final = xla_mainloop(Tiles(size), query, key, wide, g, beta, state, starts, firsts,
+                                          scale=scale, delta=hooks.delta, dtype=work,
+                                          bound=hooks.inverse_bound, forked=carried)
+            return recurrence.skipped(hooks, out.astype(work), wide, {'skip': skip}, work), final
 
-        out, final = _per_product(product_kernel, run, query, key, value, g, beta, state, starts, firsts)
-        out = recurrence.skipped(hooks, out.astype(work), value, given, work)
+        out, final = _per_product(product_kernel, run, query, key, value, g, beta,
+                                  given['skip'] if hooks.skip else None, state, starts, firsts,
+                                  *(() if forked is None else forked.walked))
     # The epilogue in the working precision, and the output rounded once.
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
-
-
-def entered_memories(state, entered, starts, firsts=None):
-    """A packed call's documents entering memories of their own (`Chunk.entered`): each document's memory
-    `[B, D, ...]`, its `entered` slot's of `state` `[B, D', ...]` (one-based, zero a zero memory), and each
-    one's first slot `[B, D]` (`firsts`, else `starts`' documents, `dew.batch.document_firsts`), `S` past a
-    row's last."""
-    if state is None:
-        raise ValueError("documents entering memories of their own (`Chunk.entered`) read the slots' "
-                         "memories, `state` `[B, D, ...]`")
-    entered = jnp.asarray(entered, jnp.int32)
-    documents = entered.shape[1]
-    begins = document_firsts(starts, documents) if firsts is None else firsts[:, :documents]
-    picked = jax.vmap(lambda row, slots: row[jnp.maximum(slots - 1, 0)])(state, entered)
-    kept = (entered > 0).reshape(*entered.shape, *(1,) * (state.ndim - 2))
-    return jnp.where(kept, picked, jnp.zeros((), picked.dtype)), begins
 
 
 @dataclasses.dataclass(frozen=True)
@@ -248,8 +253,8 @@ class PortCase:
     product it is selected for (`product`: 'forward' where no gradient is taken, 'training' where one is,
     `_per_product`), and the recurrence's form: whether it is the delta rule (`delta`) and decays
     (`decayed`), the largest entry of its chunk inverse the form proves (`bound`,
-    `recurrence.Hooks.inverse_bound`; None where it proves none), and whether its decay is a key dimension's
-    (`per_key`)."""
+    `recurrence.Hooks.inverse_bound`; None where it proves none), whether its decay is a key dimension's
+    (`per_key`), and whether its documents enter earlier documents' finals (`forked`, `Chunk.loads`)."""
 
     varying: bool
     dtype: np.dtype
@@ -261,6 +266,7 @@ class PortCase:
     decayed: bool = True
     bound: float | None = None
     per_key: bool = False
+    forked: bool = False
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -296,6 +302,11 @@ _PORT_PRECISION = ("a product precision the run declares that the port's product
                    "narrows 16-bit ones")
 
 
+PORT_FORKED = Refusal('forked', "a forked call, whose documents enter earlier documents' finals of the same "
+                      "call (`Chunk.loads`): the port runs a call's documents as sequences of their own in "
+                      "parallel (fla's varlen), which no document's memory can wait on", row=INHERENT)
+"""Why fla's port takes no forked call, inherently: its documents run in parallel."""
+
 PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
     Requirement('gated', lambda case: case.delta and case.decayed,
                 "a recurrence other than the gated delta rule, which the rule's kernels run (fla's "
@@ -312,6 +323,7 @@ PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
                 "no GPU Dew's Triton kernels run on (sm80 or later): off one the port's kernels interpret, "
                 "as the CPU suite runs them where a call names the port", row=INHERENT, kind='measured'),
     Requirement('precision', _port_precision, _PORT_PRECISION, row=INHERENT, kind='handoff'),
+    Requirement('forked', lambda case: not case.forked, PORT_FORKED.detail, row=INHERENT),
 )
 """What the port (`fla_rule`) needs of a rule's call: the gated delta rule, a decay with the delta rule (the
 other forms hand over to the portable math, the call's route reporting it); a GPU Dew's Triton kernels run on,
@@ -409,11 +421,9 @@ call under either selector (`GATED_DELTA`, `SCAN`): its own launches' call (`Tem
 widths, a bundle for the device's family, a config that fits), a GPU, and for
 a training product its fast backward (`Mosaic.trains`; the rule's gradient takes no other, row 1926)."""
 
-MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
-    *PORT_SUPPORTS[1:2],
-    *TEMPLATE_SUPPORTS)
+MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (*PORT_SUPPORTS[1:2], *TEMPLATE_SUPPORTS)
 """What the recurrence template needs of a delta rule's call: the port's placement (a Pallas call's results),
-and `TEMPLATE_SUPPORTS`, in
+and `TEMPLATE_SUPPORTS`, a forked call's (`Chunk.loads`) as another's, its walk keeping the call's table, in
 every form its mainloop implements, the delta rule with a decay or without one and the forms without the
 delta rule alike (row 1963: the port's 'gated' form was the template's too). A declared port cell runs the
 port first where the port takes the call (`PORT_CELLS`, `GATED_DELTA`'s declared cells)."""
@@ -422,7 +432,8 @@ MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
 
 GATED_DELTA: Op[PortCase] = Op(Choice.GATED_DELTA_RULE,
-                               (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
+                               (MOSAIC, Kernel('fla', PORT_SUPPORTS, upstream='fla'),
+                                Kernel('xla', (), generic=True)),
                                declared=PORT_CELLS)
 """The delta rule's selector: on a declared port cell (`PORT_CELLS`) the port where it takes the call;
 otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the
@@ -473,7 +484,8 @@ def _chunked(named: dict, starts, chunk_size: int, work) -> dict:
 
 
 def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=None, firsts=None, *,
-                 scale: float, delta: bool, dtype=None, bound: float | None = None):
+                 scale: float, delta: bool, dtype=None, bound: float | None = None,
+                 forked: Forked | None = None):
     """The recurrence template's plain-JAX mainloop: the recurrence over `config.chunk`-token chunks by the
     forms derived from its token update (`dew.algebra.scan`, the compact
     WY form and its prefix derived, not written; each chunk's work that reads no memory at once, the memory's
@@ -484,22 +496,21 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     returns it; a caller's epilogue passes its working dtype, unrounded) and the memory in `work`, the memory
     entering `state` (zero where None). A length off the chunk grid is padded with tokens that leave the
     memory as it was (zero keys and write gates, a unit decay). `starts` `[B, S]`, where given, marks packed
-    documents' first tokens, each entering a zero memory (the forms' reset, `scan.Scan.reset`). A 5-D `state`
-    `[B, D, Hv, Dk, Dv]` is each of a row's `D` documents' own memory, the documents first at `firsts` `[B,
-    D]` (`S` for one the row holds none of): each document is laid from a chunk's edge (`_aligned`) and the
-    walk takes up its memory there (`_walk`), the final memory each document's `[B, D, Hv, Dk, Dv]`. `bound`,
+    documents' first tokens, each entering a zero memory (the forms' reset, `scan.Scan.reset`). A forked call
+    (`forked`, `Chunk.loads`) lays each document from a chunk's edge (`AlignedDocuments`), and its walk takes
+    up each document's memory there from its table, `state` `[B, S', Hv, Dk, Dv]`'s given ones then those
+    it stores at documents' last chunks (`_walk`), the final memory the row's last. `bound`,
     the layer's write gate's largest where its keys are of unit norm (`recurrence.Hooks.inverse_bound`), is
     the declaration's range facts (`scan.Scan.ranges`)."""
     from dew.algebra import SATURATION, scan
 
     dtype, work, query, key = _grouped(query, key, value, dtype)
     rows, length, heads, columns = value.shape
-    documents = None
-    if state is not None and state.ndim == 5:
-        assert firsts is not None, "documents entering memories of their own name their first slots"
-        aligned = AlignedDocuments.of(firsts[:, :state.shape[1]], length, config.chunk)
+    aligned = None
+    if forked is not None:
+        aligned = AlignedDocuments.of(forked, length, config.chunk)
         query, key, value, g, beta = aligned.laid(query, key, value, g, beta)
-        starts, documents = None, (aligned, state)
+        starts = None
     width = key.shape[-1]
     per_key = g.ndim == 4
 
@@ -523,20 +534,28 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     forms = scan.derive_scan(scan.Scan(update, readout, declared, walked="time",
                                        state=((width, columns), work), reset=reset, ranges=ranges),
                              saturation=SATURATION)
+    held = 0 if forked is None else forked.held
     given = dict(zip(axes, (query, key, value, g, beta), strict=True))
     operands = _chunked(given, starts, config.chunk, work)
     # The memory entering, and each carry below, typed as every operand varies (a checked `shard_map`'s
     # manual axes; an explicit axis's rows, as the portable math's): a step's outputs vary wherever its inputs
     # do, keys, gates or resets replicated or not.
     varying = (query, key, value, g, beta, starts)
-    if documents is not None:
-        # Each document's memory `[B, Hv, D, Dk, Dv]` and the document each chunk takes up, -1 for none.
-        aligned, memories = documents
-        entering = (varying_like(jnp.moveaxis(memories.astype(work), 1, 2), *varying),
-                    jnp.broadcast_to(aligned.loads[:, None], (rows, heads, aligned.loads.shape[-1])))
-        outputs, final = _walk(forms, width, recomputed_memory())(operands, entering)
+    if aligned is not None and forked is not None and state is not None:
+        # The table's given memories `[B, Hv, S', Dk, Dv]`, and the slot each chunk takes up and leaves its
+        # memory in, and its entry write `[B, Hv, chunks, Dk, Dv]`, where the call gives one.
+        chunks = aligned.loads.shape[-1]
+
+        def headed(x):
+            return jnp.broadcast_to(x[:, None], (rows, heads, chunks))
+
+        entries = aligned.entries(forked)
+        walked = (varying_like(jnp.moveaxis(state.astype(work), 1, 2), *varying), headed(aligned.loads),
+                  headed(aligned.stores),
+                  *(() if entries is None else (varying_like(jnp.moveaxis(entries, 2, 1), *varying),)))
+        outputs, final = _walk(forms, width, recomputed_memory(), held)(operands, walked)
         out = jnp.moveaxis(outputs.reshape(*outputs.shape[:2], -1, columns), 1, 2)
-        return aligned.unlaid(out).astype(dtype), jnp.moveaxis(final, 2, 1)
+        return aligned.unlaid(out).astype(dtype), final
     entering = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), work), value) if state is None
                             else state.astype(work), *varying)
 
@@ -545,52 +564,22 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     return jnp.moveaxis(out[:, :, :length], 1, 2).astype(dtype), final
 
 
-@dataclasses.dataclass(frozen=True)
-class AlignedDocuments:
-    """A packed call's documents laid from chunks' edges (`xla_mainloop`'s documents entering memories of
-    their own): each document's tokens moved past the tokens before it to the next multiple of the chunk,
-    the slots between tokens that leave the memory as it was (zero keys, values and write gates, a unit
-    decay), so the walk takes up each document's memory at its first chunk's edge. At most `chunk - 1` slots
-    a document, against a row of the call's length were each document laid out apart."""
+def table_read(given, table, slot):
+    """The memory at one-based table slot `slot` (`Chunk.loads`): `given`'s `[S', ...]` first, then
+    `table`'s `[held, ...]` stored ones, zero at slot zero."""
+    count = given.shape[0]
+    taken = given[jnp.clip(slot - 1, 0, count - 1)]
+    if table.shape[0]:
+        taken = jnp.where(slot > count, table[jnp.clip(slot - count - 1, 0, table.shape[0] - 1)], taken)
+    return jnp.where(slot > 0, taken, jnp.zeros((), taken.dtype))
 
-    slots: jax.Array
-    """Each token's slot on the aligned grid `[B, S]`."""
-    loads: jax.Array
-    """The document each aligned chunk takes up `[B, chunks]`, -1 for none."""
-    length: int
-    """The aligned grid's slots, the chunks' a row."""
 
-    @classmethod
-    def of(cls, firsts, length: int, chunk: int) -> "AlignedDocuments":
-        """`firsts` `[B, D]`' documents (`S` past a row's last) of a call of `length` tokens on `chunk`."""
-        firsts = jnp.asarray(firsts, jnp.int32)
-        documents = firsts.shape[1]
-        held = firsts < length
-        ends = jnp.concatenate([firsts[:, 1:], jnp.full_like(firsts[:, :1], length)], axis=1)
-        sizes = jnp.where(held, jnp.minimum(ends, length) - firsts, 0)
-        # Each document's aligned first slot: the chunks every document before it fills, whole.
-        chunks = -(-sizes // chunk)
-        opened = (jnp.cumsum(chunks, axis=1) - chunks) * chunk
-        total = -(-length // chunk) + documents
-        slots = jnp.arange(length, dtype=jnp.int32)[None, :]
-        document = jnp.clip(jnp.sum(slots[:, :, None] >= firsts[:, None, :], axis=-1) - 1, 0, documents - 1)
-        aligned = (jnp.take_along_axis(opened, document, axis=1)
-                   + slots - jnp.take_along_axis(firsts, document, axis=1))
-        loads = jnp.full((firsts.shape[0], total), -1, jnp.int32).at[
-            jnp.arange(firsts.shape[0])[:, None], jnp.where(held, opened // chunk, total)].set(
-            jnp.broadcast_to(jnp.arange(documents, dtype=jnp.int32), firsts.shape), mode="drop")
-        return cls(aligned.astype(jnp.int32), loads, total * chunk)
-
-    def laid(self, *operands):
-        """The operands `[B, S, ...]` on the aligned grid `[B, length, ...]`, zero between documents."""
-        def moved(x):
-            out = jnp.zeros((x.shape[0], self.length, *x.shape[2:]), x.dtype)
-            return jax.vmap(lambda row, at, values: row.at[at].set(values))(out, self.slots, x)
-        return tuple(moved(x) for x in operands)
-
-    def unlaid(self, out):
-        """`out` `[B, length, ...]` back at the call's slots `[B, S, ...]`."""
-        return jax.vmap(lambda row, at: row[at])(out, self.slots)
+def table_stored(table, slot, memory):
+    """`table` `[held, ...]` with `memory` in one-based stored slot `slot`, as it was at slot zero."""
+    if not table.shape[0]:
+        return table
+    at = jnp.maximum(slot - 1, 0)
+    return table.at[at].set(jnp.where(slot > 0, memory.astype(table.dtype), table[at]))
 
 
 def chunk_gated_oja_rule(query, key, value, gv, beta, state=None, starts=None, *, scale: float | None = None,
@@ -669,7 +658,100 @@ def recurrent_gated_oja_rule(query, key, value, gv, beta, state=None, *, starts=
     return jnp.moveaxis(out, 0, 1).astype(dtype), state
 
 
-def _walk(forms, width: int, recomputed: bool):
+def _taken_up(h):
+    """A walk's memory entering (`_walk`'s `h`), and its forked operands where it walks a forked call (`h` a
+    tuple: the given memories, the loads, the stores and, where given, the entry writes)."""
+    if isinstance(h, tuple):
+        given, loads, stores, *entries = h
+        return given, (loads, stores, entries[0] if entries else None)
+    return h, None
+
+
+def _opened(given, table, load, entry):
+    """The memory a walk's chunk taking a document up enters (`_walk`): its table slot's (`table_read`), its
+    entry write added where the call gives one."""
+    taken = table_read(given, table, load)
+    return taken if entry is None else taken + entry.astype(taken.dtype)
+
+
+def _forked_chunks(operands, forked):
+    """A forked walk's per-chunk operands (`_walk`): the chunks, their loads and stores, and their entry
+    writes, an empty column a chunk where the call gives none."""
+    loads, stores, entries = forked
+    return (operands, loads, stores, jnp.zeros((loads.shape[0], 0)) if entries is None else entries)
+
+
+def _forked_steps(step, prepared, memory, forked, held: int, decayed):
+    """A forked walk forward (`_walk`): each chunk's memory entering `(decay, memory)` and the row's last
+    memory, a chunk taking a document up entering its table slot's memory, the walk's decay from nothing,
+    and one ending a storing document leaving its memory in its stored slot."""
+    entries = forked[2]
+
+    def loading(carried, chunk):
+        (decay, h), table = carried
+        chunk, load, store, entry = chunk
+        taking = load >= 0
+        taken = (jnp.where(taking, jnp.zeros_like(decay), decay),
+                 jnp.where(taking, _opened(memory, table, load, None if entries is None else entry), h))
+        after = step(taken, chunk)
+        return (after, table_stored(table, store, after[1])), taken
+
+    table = jnp.zeros((held, *memory.shape[1:]), memory.dtype)
+    carried, entering = jax.lax.scan(loading, ((decayed, jnp.zeros_like(memory[0])), table),
+                                     _forked_chunks(prepared, forked))
+    return entering, carried[0][1]
+
+
+def _forked_replay(replay, operands, memory, forked, held: int):
+    """A forked walk token by token (`_walk`'s replay): its outputs and the row's last memory."""
+    entries = forked[2]
+
+    def loading(carried, chunk):
+        h, table = carried
+        chunk, load, store, entry = chunk
+        taken = jnp.where(load >= 0, _opened(memory, table, load, None if entries is None else entry), h)
+        outputs, after = replay(chunk, taken)
+        return (after, table_stored(table, store, after)), outputs
+
+    table = jnp.zeros((held, *memory.shape[1:]), memory.dtype)
+    (h, _), outputs = jax.lax.scan(loading, (jnp.zeros_like(memory[0]), table),
+                                   _forked_chunks(operands, forked))
+    return outputs, h
+
+
+def _forked_adjoint(backward, operands, memory, forked, held: int, entering, d_outputs, d_final):
+    """A forked walk backward (`_walk`'s adjoint), from the row's last memory: at a chunk that stored a
+    slot, the slot's cotangent (each later chunk that took it up's) joins the walk's; at a chunk taking a
+    document up, the cotangent of the memory it entered is its slot's (and its entry write's), and the walk
+    before it carries none. Returns the chunks' cotangents and the walk's operands' (`(given, loads, stores,
+    entries?)`, the integers held in their place)."""
+    loads, stores, entries = forked
+    count = memory.shape[0]
+
+    def loading(carried, chunk):
+        d_h, d_table, d_given = carried
+        chunk, h, d_out, load, store = chunk
+        if held:
+            at = jnp.maximum(store - 1, 0)
+            d_h = d_h + jnp.where(store > 0, d_table[at], 0)
+            d_table = d_table.at[at].set(jnp.where(store > 0, 0, d_table[at]))
+        d_entering, d_chunk = backward(chunk, (None, h), d_h, d_out)
+        taking = load >= 0
+        given_slot = taking & (load > 0) & (load <= count)
+        d_given = d_given.at[jnp.clip(load - 1, 0, count - 1)].add(jnp.where(given_slot, d_entering, 0))
+        if held:
+            d_table = d_table.at[jnp.clip(load - count - 1, 0, held - 1)].add(
+                jnp.where(taking & (load > count), d_entering, 0))
+        carried = (jnp.where(taking, 0, d_entering), d_table, d_given)
+        return carried, (d_chunk, jnp.where(taking, d_entering, 0))
+
+    start = (d_final, jnp.zeros((held, *memory.shape[1:]), d_final.dtype), jnp.zeros_like(memory))
+    (_, _, d_given), (d_operands, d_entered) = jax.lax.scan(
+        loading, start, (operands, entering, d_outputs, loads, stores), reverse=True)
+    return d_operands, (d_given, loads, stores, *(() if entries is None else (d_entered,)))
+
+
+def _walk(forms, width: int, recomputed: bool, held: int = 0):
     """`xla_mainloop`'s walk over every row's and head's chunks (`[rows, heads, chunks, C, ...]` operands and
     the memory entering), by the token update's derived `forms` (`dew.algebra.scan`): each chunk's values
     that read no memory at once, the memory alone in sequence, then each chunk's outputs from the memory
@@ -677,37 +759,28 @@ def _walk(forms, width: int, recomputed: bool):
     adjoint from the memory entering it. That memory is the backward's one checkpoint a chunk, kept but where
     the block's remat rung recomputes the delta rule's memory (`recomputed`, `recomputed_memory`, read as the
     call is traced: a scan differentiates its body's custom rules after the block's trace has left it), where
-    the adjoint forms it again, as the port and the template drop theirs."""
-    def taken_up(h):
-        """A walk's memory entering (`h`), and the document each chunk takes up (-1 for none, `[chunks]`)
-        where it walks documents entering memories of their own (`h` `(memories [D, Dk, Dv], loads)`)."""
-        if isinstance(h, tuple):
-            return h
-        return h, None
+    the adjoint forms it again, as the port and the template drop theirs.
 
+    A forked call's walk (`h` `(given [S', Dk, Dv], loads [chunks], stores [chunks], entries [chunks, Dk,
+    Dv]?)`, `AlignedDocuments`) holds a table of `held` stored memories beside the carry: a chunk that takes
+    a document up enters its table slot's memory (`table_read`, with the chunk's entry write added), and one
+    that ends a storing document leaves its memory in its stored slot (`table_stored`), which a later chunk
+    takes up. Backwards, a stored slot's cotangent gathers each chunk that took it up and joins the walk's at
+    the chunk that stored it; a given memory's is its own, the walk's last memory's cotangent the row's."""
     def entered(operands, h):
         prepared = jax.vmap(forms.prepare)(operands)
-        memories, loads = taken_up(h)
+        memory, forked = _taken_up(h)
         # The walk's decay in the forms' own carry dtype (`Derived.init`'s, the state's float32 at least).
         empty = forms.init({})[0]
         decayed = varying_like(jnp.zeros((width,), empty.dtype), *jax.tree.leaves(operands))
-        if loads is None:
+        if forked is None:
             def one(carried, chunk):
                 return forms.step(carried, chunk), carried
 
-            carried, entering = jax.lax.scan(one, (decayed, memories), prepared)
+            carried, entering = jax.lax.scan(one, (decayed, memory), prepared)
             return prepared, entering, carried[1]
-
-        def loading(carried, chunk):
-            chunk, load = chunk
-            # A chunk that takes a document up enters its memory, the walk's decay from nothing.
-            taken = (jnp.where(load >= 0, jnp.zeros_like(carried[0]), carried[0]),
-                     jnp.where(load >= 0, memories[jnp.maximum(load, 0)], carried[1]))
-            return forms.step(taken, chunk), (taken, carried[1])
-
-        carried, (entering, left) = jax.lax.scan(loading, (decayed, jnp.zeros_like(memories[0])),
-                                                 (prepared, loads))
-        return prepared, entering, document_finals(memories, loads, left, carried[1])
+        entering, last = _forked_steps(forms.step, prepared, memory, forked, held, decayed)
+        return prepared, entering, last
 
     def walking_one(operands, h):
         prepared, entering, last = entered(operands, h)
@@ -715,56 +788,28 @@ def _walk(forms, width: int, recomputed: bool):
 
     def replayed_one(operands, h):
         # The walk token by token (`Derived.replay`), the derivative's arithmetic at every order.
-        memories, loads = taken_up(h)
-        if loads is None:
+        memory, forked = _taken_up(h)
+        if forked is None:
             def one(h, chunk):
                 outputs, h = forms.replay(chunk, h)
                 return h, outputs
 
-            h, outputs = jax.lax.scan(one, memories, operands)
+            h, outputs = jax.lax.scan(one, memory, operands)
             return outputs, h
-
-        def loading(h, chunk):
-            chunk, load = chunk
-            taken = jnp.where(load >= 0, memories[jnp.maximum(load, 0)], h)
-            outputs, after = forms.replay(chunk, taken)
-            return after, (outputs, h)
-
-        h, (outputs, left) = jax.lax.scan(loading, jnp.zeros_like(memories[0]), (operands, loads))
-        return outputs, document_finals(memories, loads, left, h)
+        return _forked_replay(forms.replay, operands, memory, forked, held)
 
     def adjoint_one(operands, h, entering, d_outputs, d_final):
         if entering is None:
             entering = entered(operands, h)[1][1]
-        memories, loads = taken_up(h)
-        if loads is None:
+        memory, forked = _taken_up(h)
+        if forked is None:
             def one(d_h, chunk):
                 chunk, h, d_out = chunk
                 return forms.backward(chunk, (None, h), d_h, d_out)
 
             d_h, d_operands = jax.lax.scan(one, d_final, (operands, entering, d_outputs), reverse=True)
             return d_operands, d_h
-
-        # Back from the last document's final: at a chunk taking a document up, the cotangent of the memory
-        # it enters is that document's memory's, and the walk before it carries the previous document's
-        # final's; a document the row holds none of passes its memory through as its final.
-        last = jnp.max(loads)
-
-        def loading(carried, chunk):
-            d_h, d_memories = carried
-            chunk, h, d_out, load = chunk
-            d_entering, d_chunk = forms.backward(chunk, (None, h), d_h, d_out)
-            taking = load >= 0
-            d_memories = d_memories.at[jnp.maximum(load, 0)].add(jnp.where(taking, d_entering, 0))
-            before = jnp.where(load > 0, d_final[jnp.maximum(load - 1, 0)], 0)
-            return (jnp.where(taking, before, d_entering), d_memories), d_chunk
-
-        held = jnp.arange(memories.shape[0]) <= last
-        start = (d_final[jnp.maximum(last, 0)], jnp.where(held[:, None, None], 0, d_final))
-        (_, d_memories), d_operands = jax.lax.scan(loading, start, (operands, entering, d_outputs, loads),
-                                                   reverse=True)
-        # The loads' integers take no cotangent (never `live`), held in their place.
-        return d_operands, (d_memories, loads)
+        return _forked_adjoint(forms.backward, operands, memory, forked, held, entering, d_outputs, d_final)
 
     def each(function):
         # Over every row and head at once: the derivative's rule outside the batch, which a second order
@@ -783,21 +828,10 @@ def _walk(forms, width: int, recomputed: bool):
                                   live_cotangents=True))
 
 
-def document_finals(memories, loads, left, last):
-    """Each document's final memory `[D, Dk, Dv]` of a walk taking documents up (`_walk`): the memory the
-    walk leaves before the next document's first chunk (`left`, each chunk's entering memory as the walk
-    carried it), the last document's the walk's last, and one the row holds none of its own memory."""
-    documents = memories.shape[0]
-    previous = jnp.where(loads > 0, loads - 1, documents)
-    finals = memories.at[previous].set(left, mode="drop")
-    present = jnp.max(loads)
-    return finals.at[jnp.where(present >= 0, present, documents)].set(last, mode="drop")
-
-
 def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segments: int | None = None,
                 scale: float | None = None, wide: bool = False,
                 bound: float | None = None, product: str = 'forward', report: bool = True, delta: bool = True,
-                decayed: bool = True) -> str:
+                decayed: bool = True, forked: Forked | None = None) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
     ('forward', 'training'), of the form `delta` and `decayed` state and the chunk inverse's `bound` its form
     proves (`recurrence.Hooks.inverse_bound`; `PortCase`), the template's
@@ -810,12 +844,24 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
                      max_segments=max_segments, scale=scale, delta=delta, wide=wide, bound=bound,
                      rounded=chunk_rounding(delta, jnp.result_type(query, key, value)),
-                     recomputed=recomputed_memory())
+                     recomputed=recomputed_memory(), forked=forked)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(bound=bound, varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
-                    family=family, product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4)
+                    family=family, product=product, delta=delta, decayed=decayed, per_key=g.ndim == 4,
+                    forked=forked is not None)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
+
+
+def _read_once(value, work) -> tuple[jax.Array, jax.Array]:
+    """`value` read once in the working precision `work` and in its own dtype from that one read: where a
+    call reads its values twice, its recurrence's kernel and the skip's `D v` (`recurrence.skipped`), their
+    gradients sum in `work` and round to the values' dtype once. Each widening a 16-bit value apart, the two
+    rounded apart and added in it: a write gate's value gradient's worst row was 11.6 times the token
+    recurrence's on an A100 and a CPU alike, equal to it read once, its forward bitwise the same (row 5447,
+    M-MC-6-base-a100)."""
+    wide = value.astype(work)
+    return wide, wide.astype(value.dtype)
 
 
 def _per_product(kernel_of: Callable[[str], str], run, *operands):
@@ -938,6 +984,9 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     kernels' blocks (`_blocked_rule`) and cut back. Off a GPU its kernels
     interpret, as the CPU suite runs them.
     """
+    if state is not None and state.ndim == 5:
+        # A forked call's table (`Chunk.loads`) handed here, refused as the selector refuses the call.
+        raise KernelRefused(GATED_DELTA.choice, 'fla', PORT_FORKED, iter(()))
     dtype = jnp.result_type(query, key, value)
     query, key, value, beta = (x.astype(dtype) for x in (query, key, value, beta))
     g = g.astype(jnp.float32)
@@ -947,10 +996,7 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     segments = None if starts is None else query.shape[1] if max_segments is None else max_segments
     starts = jnp.zeros(query.shape[:2], bool) if starts is None else jnp.asarray(starts, bool)
     four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
-    if state.ndim == 5:
-        # Each document's own memory `[B, D, Hv, Dk, Dv]` (`chunk`'s), placed as a row's.
-        memory = jax.sharding.PartitionSpec(memory[0], None, *memory[1:])
-    elif segments is not None:
+    if segments is not None:
         # The kernels start each row from its memory; a first token that begins a document drops it.
         state = jnp.where(starts[:, 0, None, None, None], 0.0, state)
     if firsts is None:
@@ -974,32 +1020,40 @@ def _shard_specs(shape: tuple[int, ...], key_heads: int, decay_ndim: int) -> tup
     return four, P(rows, None, heads), P(rows, heads, None, None), P(*four[:decay_ndim]), P(rows, None)
 
 
-def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=None, skip=None, **options):
+def template_rule(query, key, value, g, beta, state=None, starts=None, firsts=None, skip=None,
+                  forked: Forked | None = None, **options):
     """The recurrence template's op (`templates.recurrence.template.MOSAIC`, its `mosaic_rule`) on each
     shard (`manual_map`), placed as `fla_rule`: its tiles derived from each shard's shapes, its forward and
     its gradient on each device's own rows. Called on the whole batch, every device of a 2xH100 FSDP run ran
     its launches on the global batch, layer 0's solve over 4 rows for its 2, beside 40 GB of gathers a
     microbatch (row 1897). `options` are the op's (`max_segments`, `scale`, `delta`, `wide`, `bound`,
     `rounded`); whether the block's remat rung recomputes the delta rule's memory is resolved as
-    the selectors' binds resolve it (`recomputed_memory`)."""
+    the selectors' binds resolve it (`recomputed_memory`). A `forked` call's documents (`Chunk.loads`), its
+    table's given memories `state` `[B, S', Hv, Dk, Dv]`, are each shard's rows'."""
     from .templates.recurrence import template
 
     four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
-    if state is not None and state.ndim == 5:
-        # Each document's own memory `[B, D, H, Dk, Dv]` (`chunk_forward.prepared`), placed as a row's.
-        memory = jax.sharding.PartitionSpec(memory[0], None, *memory[1:])
-    optional = [(state, memory), (starts, resets), (firsts, resets),
-                (skip, jax.sharding.PartitionSpec(four[2]))]
-    operands = (query, key, value, g, beta, *(x for x, _ in optional if x is not None))
-    specs = (four, four, four, decays, three, *(spec for x, spec in optional if x is not None))
+    P = jax.sharding.PartitionSpec
+    walked = ()
+    if forked is not None:
+        # The documents' slots a row's, and the entry write's key, value and weight its terms' heads.
+        memory = P(four[0], None, four[2], None, None)
+        walked = (resets,) * 3 + ((P(four[0], None, None, four[2], None),) * 2 + (three,)
+                                  if forked.entry is not None else ())
+    optional = [(state, memory), (starts, resets), (firsts, resets), (skip, P(four[2]))]
+    operands = (query, key, value, g, beta, *(x for x, _ in optional if x is not None),
+                *(() if forked is None else forked.walked))
+    specs = (four, four, four, decays, three, *(spec for x, spec in optional if x is not None),
+             *walked)
 
     def local(query, key, value, g, beta, *given):
         given = iter(given)
         state, starts, firsts, skip = (None if x is None else next(given) for x, _ in optional)
         return template.MOSAIC(query, key, value, g, beta, state, starts, firsts=firsts, skip=skip,
+                               forked=None if forked is None else forked.carrying(*given),
                                recomputed=recomputed_memory(), **options)
 
-    return manual_map(local, specs, (four, memory))(*operands)
+    return manual_map(local, specs, (four, P(four[0], four[2], None, None)))(*operands)
 
 
 RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())
@@ -1038,64 +1092,35 @@ def _blocked_rule(query, key, value, g, beta, state, starts, firsts=None, *, seg
     dimension with them. None of them changes a real output or gradient:
     every padded product is an exact zero. The outputs are cut back. Where
     `segments` bounds a row's packed documents, each begun at `starts`, each
-    is a sequence of its own (fla's varlen `cu_seqlens`); where `state` is
-    each document's own memory `[B, D, Hv, Dk, Dv]` (`chunk`'s, its first
-    slots `firsts`), each of a row's `D` documents' sequence takes and gives
-    back its own (`chunked_launch.Sequences`), a document past a row's last
-    giving back what it entered. The decay's shape picks
+    is a sequence of its own (fla's varlen `cu_seqlens`). The decay's shape picks
     the port: per head fla's gated delta rule, per key dimension its Kimi
     delta attention. It keeps its memory for the backward
     but where the block's remat rung recomputes it (`RECOMPUTED`)."""
     B, S, _, Dk = key.shape
     Hv, Dv = value.shape[2:]
     scale = Dk ** -0.5 if scale is None else scale
-    entering = state.reshape(-1, *state.shape[-3:])
-    memories = entering.shape[0]
-    # Each document's first slot `[B, D]` and whether a sequence takes its memory up, where each enters its
-    # own (a 5-D `state`).
-    documents = None
-    if state.ndim == 5:
-        assert firsts is not None, "documents entering memories of their own name their first slots"
-        begins = firsts[:, :state.shape[1]]
-        # A document past its row's last enters no sequence: its memory's slots are none of the kernels'.
-        documents = begins, (begins < S).reshape(-1, 1, 1, 1)
-        entering, state = jnp.where(documents[1], entering, 0.0), entering
     split = -(-Dv // fla_gdn.WIDEST)
     width = -(-Dv // split)
     if split > 1:
-        value = _padded(value, 3, split * width).reshape(B, S, Hv * split, width)
+        value = zero_padded(value, 3, split * width).reshape(B, S, Hv * split, width)
         g, beta = (jnp.repeat(x, split, axis=2) for x in (g, beta))
-        entering = jnp.moveaxis(_padded(entering, 3, split * width).reshape(memories, Hv, Dk, split, width),
-                                3, 2).reshape(memories, Hv * split, Dk, width)
+        state = jnp.moveaxis(zero_padded(state, 3, split * width).reshape(B, Hv, Dk, split, width),
+                             3, 2).reshape(B, Hv * split, Dk, width)
     blocks = (max(64, 1 << (Dk - 1).bit_length()), max(64, 1 << (value.shape[3] - 1).bit_length()))
-    query, key = (_padded(x, 3, blocks[0]) for x in (query, key))
+    query, key = (zero_padded(x, 3, blocks[0]) for x in (query, key))
     per_key = g.ndim == 4
-    g = _padded(g, 3, blocks[0]) if per_key else g
-    value = _padded(value, 3, blocks[1])
-    entering = _padded(_padded(entering, 2, blocks[0]), 3, blocks[1])
-    if documents is not None:
-        spans = cu_seqlens(starts, documents[0].size, documents[0])
-    else:
-        # A row's padding after its documents runs as one more sequence of its own.
-        spans = None if segments is None else cu_seqlens(starts, B * (segments + 1), firsts)
+    g = zero_padded(g, 3, blocks[0]) if per_key else g
+    value = zero_padded(value, 3, blocks[1])
+    state = zero_padded(zero_padded(state, 2, blocks[0]), 3, blocks[1])
+    # A row's padding after its documents runs as one more sequence of its own.
+    spans = None if segments is None else cu_seqlens(starts, B * (segments + 1), firsts)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
-    out, final = port(query, key, value, g, beta, entering, spans, scale, CHUNK_SIZE,
+    out, final = port(query, key, value, g, beta, state, spans, scale, CHUNK_SIZE,
                       not generation.triton_runs(), not recomputed_memory(), wide)
     out = out[..., :width].reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width]
-    final = jnp.moveaxis(final.reshape(memories, Hv, split, Dk, width), 2, 3).reshape(
-        memories, Hv, Dk, split * width)[..., :Dv]
-    if documents is None:
-        return out, final
-    begins, given = documents
-    return out, jnp.where(given, final, state).reshape(*begins.shape, Hv, Dk, Dv)
-
-
-def _padded(x, axis: int, size: int):
-    """`x` padded with zeros on the end of `axis` to `size`."""
-    if x.shape[axis] == size:
-        return x
-    return jnp.pad(x, [(0, size - x.shape[axis]) if i == axis else (0, 0) for i in range(x.ndim)])
+    final = jnp.moveaxis(final.reshape(B, Hv, split, Dk, width), 2, 3).reshape(B, Hv, Dk, split * width)
+    return out, final[..., :Dv]
 
 
 def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None):
@@ -1133,7 +1158,8 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None)
 
 
 def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict, state, starts, firsts,
-                chunk_size: int, work, dtype, *, max_segments: int | None = None):
+                chunk_size: int, work, dtype, *, max_segments: int | None = None,
+                forked: Forked | None = None):
     """`chunk` without the delta rule over a rated decay (Mamba2's SSD: `x` the values, `B` the keys,
     `C` the queries, `dt` the write gate and `A` the rate) on the kernel the scan's selector gives each
     product (`SCAN`, `scan_kernel`): the recurrence template; the port of mamba_ssm's kernels, which adds
@@ -1145,19 +1171,19 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     no real output or gradient, the outputs cut back: Nemotron-H 4B's 80-wide heads took the portable math,
     6.89 ms a forward against mamba_ssm's 0.89 (SE-ssd-mamba-h100-0428aad7b). Returns the output in `work`,
     rounded to no narrower than `dtype`, the caller's (unrounded where it asks it wide, Mamba-2's mixer for
-    the earlier shards' state it adds), and the memory `[B, Hv, Dk, Dv]`; documents entering memories of
-    their own (`state` each one's `[B, D, Hv, Dk, Dv]`, first at `firsts`) on the template's and the portable
-    math's packed rows, which the ports take no form of (`ScanCase.documents`)."""
+    the earlier shards' state it adds), and the memory `[B, Hv, Dk, Dv]`; a forked call (`forked`,
+    `Chunk.loads`) on the portable math's walk and the ports' state passing, each laid from chunks' edges
+    (`_ported_documents`), their table's given memories `state` `[B, S', Hv, Dk, Dv]`."""
     rate = given['rate'].astype(work)
     skip = given['skip'].astype(work) if hooks.skip else jnp.zeros(rate.shape, work)
-    # Under the fast forms the skip in the template's own output and walk (`mainloop._output`, `_reverse`),
-    # as mamba_ssm's kernels add it, the output in the operands' dtype where the caller asks it so and no
-    # epilogue reads it after (`hooks.output`'s norm), else wide: added after, its fp32 output's skip and cast
-    # took 0.045 ms past an H100's launches, and its gradient's 0.094 (ssd-rounded-h100-fdab2424c,
-    # window-h100-c70aaa8-b8109ee). Where the template holds no 16-bit values ungated
-    # (`mainloop.Call.gated_keys`: the accurate forms, or an fp32 call's two parts under the fast forms),
-    # the skip is added after. Decided once: the selector judges the call the run makes (its skip's reverse
-    # tile).
+    # Under the fast forms the skip in the template's own output and walk (`output.output_launch`,
+    # `_reverse`), as mamba_ssm's kernels add it, the output in the operands' dtype where the caller asks it
+    # so and no epilogue reads it after (`hooks.output`'s norm), else wide: added after, its fp32 output's
+    # skip and cast took 0.045 ms past an H100's launches, and its gradient's 0.094
+    # (ssd-rounded-h100-fdab2424c, window-h100-c70aaa8-b8109ee). Where the template holds no 16-bit values
+    # ungated (`mainloop.Call.gated_keys`: the accurate forms, or an fp32 call's two parts under the fast
+    # forms), the skip is added after. Decided once: the selector judges the call the run makes (its skip's
+    # reverse tile).
     operand = jnp.dtype(jnp.result_type(query, key, value))
     fast = fast_rounding(operand)
     fused = fast and hooks.skip and operand.itemsize == 2
@@ -1166,42 +1192,61 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     def product_kernel(product: str) -> str:
         return scan_kernel(query, key, value, g, beta, state, starts, chunk_size=chunk_size,
                            max_segments=max_segments, product=product, skip=skip if fused else None,
-                           wide=not narrow)
+                           wide=not narrow, forked=forked)
 
-    def run(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts):
-        return launched(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts)
+    def run(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts, *walked):
+        carried = None if forked is None else forked.carrying(*walked)
+        return launched(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts, carried)
 
-    def launched(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts):
+    def launched(kernel, query, key, value, g, beta, rate, skip, state, starts, firsts, forked):
+        # The values read once with the skip's where it is added here (`_read_once`), the ports' own.
+        wide, own = _read_once(value, work)
         if kernel == 'mosaic_gpu':
-            out, final = template_rule(query, key, value, g, beta, state, starts, firsts,
-                                       skip=skip if fused else None, max_segments=max_segments, scale=1.0,
-                                       delta=False, wide=not narrow, rounded=fast)
+            out, final = template_rule(query, key, own, g, beta, state, starts, firsts,
+                                       skip=skip if fused else None, forked=forked,
+                                       max_segments=max_segments, scale=1.0, delta=False, wide=not narrow,
+                                       rounded=fast)
             out = out.astype(work)
-            return (out if fused else recurrence.skipped(hooks, out, value, {'skip': skip}, work)), final
+            return (out if fused else recurrence.skipped(hooks, out, wide, {'skip': skip}, work)), final
         operand = jnp.result_type(query, key, value)
         x, B, C = (jnp.asarray(t, operand) for t in (value, key, query))
         batch, _, heads, head_dim = x.shape
         state_size = B.shape[-1]
         if kernel in ('pallas', 'tpu'):
             # The SSD's memory is `[P, N]`, values by keys: the template's `[N, P]` transposed.
-            carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x) if state is None
-                       else jnp.swapaxes(state, -1, -2).astype(work))
             columns, rows = _scan_widths(head_dim), _scan_widths(state_size)
-            wide_x, wide_B, wide_C = _padded(x, 3, columns), _padded(B, 3, rows), _padded(C, 3, rows)
-            wide_state = _padded(_padded(carried, 2, columns), 3, rows)
+            documents = aligned = None
+            if forked is not None and state is not None:
+                # Each document laid from a chunk's edge, taking its table slot's memory up there.
+                aligned, documents = _ported_documents(state, forked, x.shape[1], chunk_size, work,
+                                                       (columns, rows))
+                x, B, C, beta = aligned.laid(x, B, C, beta)
+                carried = rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x)
+                starts = None
+            else:
+                carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x)
+                           if state is None else jnp.swapaxes(state, -1, -2).astype(work))
+            wide_x = zero_padded(x, 3, columns)
+            wide_B, wide_C = zero_padded(B, 3, rows), zero_padded(C, 3, rows)
+            wide_state = zero_padded(zero_padded(carried, 2, columns), 3, rows)
+            held = 0 if forked is None else forked.held
             if kernel == 'pallas':
                 out, final = _ssd_ported(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size,
-                                         starts)
-                out, final = out.astype(work), final.astype(work)
+                                         starts, documents, held)
             else:
                 out, final = _ssd_tpu(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size,
-                                      starts, scan_case(x, B, chunk_size, padded=True).tpu, work)
-            return out[..., :head_dim], jnp.swapaxes(final[..., :head_dim, :state_size], -1, -2)
-        out, final = xla_mainloop(Tiles(chunk_size), query, key, value, g, beta, state, starts, firsts,
-                                  scale=1.0, delta=False, dtype=work)
-        return recurrence.skipped(hooks, out, value, {'skip': skip}, work), final
+                                      starts, scan_case(x, B, chunk_size, padded=True).tpu, work, documents,
+                                      held)
+            out, final = out.astype(work)[..., :head_dim], final.astype(work)
+            if aligned is not None:
+                out = aligned.unlaid(out)
+            return out, jnp.swapaxes(final[..., :head_dim, :state_size], -1, -2)
+        out, final = xla_mainloop(Tiles(chunk_size), query, key, wide, g, beta, state, starts, firsts,
+                                  scale=1.0, delta=False, dtype=work, forked=forked)
+        return recurrence.skipped(hooks, out, wide, {'skip': skip}, work), final
 
-    return _per_product(product_kernel, run, query, key, value, g, beta, rate, skip, state, starts, firsts)
+    return _per_product(product_kernel, run, query, key, value, g, beta, rate, skip, state, starts, firsts,
+                        *(() if forked is None else forked.walked))
 
 
 def _scan_widths(width: int) -> int:
@@ -1227,23 +1272,25 @@ def ssd_operands(x, dt, A, B, C, chunk_size: int, starts=None):
     return x * dt[..., None], B, C, a
 
 
-def _ssd_tpu(x, dt, A, B, C, D, carried, chunk_size: int, starts, platform, work):
+def _ssd_tpu(x, dt, A, B, C, D, carried, chunk_size: int, starts, platform, work, documents=None,
+             held: int = 0):
     """The rated scan on a TPU's Pallas kernel (`dew.nn.kernels.ssd`), on its operands in `work`
     (`ssd_operands`), per shard of rows and heads (`manual_map`). The skip `D x` is added after. Returns
-    the output and the memory `[B, H, P, N]`."""
+    the output and the memory `[B, H, P, N]`; a forked call's chunks take their table's memories up
+    (`documents`, `_ported_documents`, `held` stored)."""
     length = x.shape[1]
     x, B, C = (jnp.asarray(t, work) for t in (x, B, C))
     skip = D[None, None, :, None] * x
     scaled, B, C, a = ssd_operands(x, dt, A, B, C, chunk_size, starts)
 
-    def kernel(x, B, C, a, carried):
-        return _chunk_scan(x, B, C, a, carried, chunk_size, platform)
+    def kernel(x, B, C, a, carried, documents):
+        return _chunk_scan(x, B, C, a, carried, documents, chunk_size, platform, held)
 
     # The groups are expanded, so any split of the heads divides them.
     rows, split = grouped_heads(scaled.shape, scaled.shape[2])
-    four, held = P(rows, None, split, None), P(rows, split, None, None)
-    scanned, final = manual_map(kernel, (four, four, four, P(rows, None, split), held),
-                                (four, held))(scaled, B, C, a, carried)
+    four, state = P(rows, None, split, None), P(rows, split, None, None)
+    specs = (four, four, four, P(rows, None, split), state, _ported_specs(documents, rows, split))
+    scanned, final = manual_map(kernel, specs, (four, state))(scaled, B, C, a, carried, documents)
     return scanned[:, :length] + skip, final
 
 
@@ -1254,7 +1301,7 @@ class ScanCase:
     width and chunk (`widths`, padded, `_scan_widths`), the platform the TPU's Pallas scan builds for, None
     where it does not take the scan (`ssd_kernel_platform`), and as the delta rule's case reads them
     (`PortCase`) the recurrence template's implementations bound to the call (`call`), the device's
-    instruction family (`family`) and the product (`product`)."""
+    instruction family (`family`), the product (`product`) and whether it is forked (`forked`)."""
 
     varying: bool
     dtype: np.dtype
@@ -1263,19 +1310,13 @@ class ScanCase:
     call: base.Call | None = None
     family: str | None = None
     product: str = 'forward'
-    documents: bool = False
-    """Whether the call's documents enter memories of their own (`Chunk.entered`), which the template and
-    the portable math walk on the packed rows and the ports, walking each document from a zero memory, take
-    no form of."""
+    forked: bool = False
 
     @property
     def cell(self) -> tuple[str | None, str]:
         """The call's cell, its device's instruction family and its product (`SCAN_CELLS`)."""
         return self.family, self.product
 
-
-_DOCUMENTS = ("documents entering memories of their own (`Chunk.entered`), which the scan's ports walk "
-              "from zero memories alone: the template and the portable math walk them on the packed rows")
 
 SSD_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
     Requirement('varying', lambda case: not case.varying, _VARYING, row='ledger 822'),
@@ -1288,7 +1329,6 @@ SSD_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
                 "no GPU Dew's Triton kernels run on (sm80 or later): off one the port's kernels interpret, "
                 "as the CPU suite runs them where a call names the port", row=INHERENT, kind='measured'),
     Requirement('precision', _port_precision, _PORT_PRECISION, row=INHERENT, kind='handoff'),
-    Requirement('documents', lambda case: not case.documents, _DOCUMENTS, row='ledger 5288'),
 )
 """What mamba_ssm's kernels (`mamba_ssd.ssd_scan`) need of a scan: no caller's `shard_map` that checks
 varying axes over operands that vary,
@@ -1306,14 +1346,13 @@ TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
     Requirement('precision', lambda case: exact_products(None, at_least_fp32(case.dtype)),
                 "a dot algorithm the run declares that narrows the scan's fp32 products, which the TPU's "
                 "scan takes whole (`ssd._mm`, HIGHEST)", row=INHERENT, kind='handoff'),
-    Requirement('documents', lambda case: not case.documents, _DOCUMENTS, row='ledger 5288'),
 )
 """What the TPU's Pallas scan (`dew.nn.kernels.ssd`) needs: its tiling over the geometry
 (`ssd_kernel_runs`), and a declaration its whole fp32 products compute (`exact_products`)."""
 
 
 def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | None = None,
-              product: str = 'forward', documents: bool = False) -> ScanCase:
+              product: str = 'forward', forked: bool = False) -> ScanCase:
     """The `ScanCase` of a scan over values `x` `[B, S, H, P]` and keys `B` `[B, S, G, N]` in
     `chunk_size` chunks, their widths as the port and the TPU's scan take them where `padded`
     (`_scan_widths`, `_rated_scan`); on a TPU, the platform its Pallas scan builds for
@@ -1326,7 +1365,7 @@ def scan_case(x, B, chunk_size: int, *, padded: bool = False, call: base.Call | 
                     dtype=jnp.dtype(x.dtype), widths=widths,
                     tpu=(ssd_kernel_platform(chunk_size, widths[0], widths[1], dtype=at_least_fp32(x.dtype))
                          if generation.backend() == 'tpu' else None),
-                    call=call, family=family, product=product, documents=documents)
+                    call=call, family=family, product=product, forked=forked)
 
 
 def fast_rounding(dtype) -> bool:
@@ -1352,13 +1391,16 @@ def chunk_rounding(delta: bool, dtype) -> bool:
     it takes three; a 16-bit call's rounded numbers are mamba_ssm's, the SSD's, which its scan's route alone
     asks (`_rated_scan`). Rounded there, a write gate without the delta rule passed its values between
     launches in bf16, its final memory 2.1e4 times the portable math's distance from float64 under aligned
-    keys (interpreted at 2b595ff93, 9593 to 46978 times on an H100, gpuflow-a-abfff38d9)."""
+    keys (interpreted at 2b595ff93, 9593 to 46978 times on an H100, gpuflow-a-abfff38d9); passed in the fast
+    forms' two bf16 parts, 26 times (the stability suite's scalar write), and Mamba-3's bf16 layer's output
+    and final state 46 and 29 times (jsf-theme4-head at 269dc1a2a1a, audit A5): no fast form of these is
+    as exact as the portable math, so the fast forms leave them whole."""
     return fast_rounding(dtype) and delta
 
 
 def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_size: int,
                 max_segments: int | None = None, product: str = 'forward', skip=None,
-                wide: bool = True) -> str:
+                wide: bool = True, forked: Forked | None = None) -> str:
     """The kernel the scan's selector (`SCAN`) gives a rated scan over these operands (`_rated_scan`'s:
     `value` the SSD's `x`, `key` its `B`, `query` its `C`) for `product` ('forward', 'training'), the
     template's implementations bound to it as the run calls it (its fused `skip`, None where added after,
@@ -1369,13 +1411,13 @@ def scan_kernel(query, key, value, g, beta, state=None, starts=None, *, chunk_si
     call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
                      max_segments=max_segments, scale=1.0, delta=False, wide=wide,
                      rounded=fast_rounding(jnp.result_type(query, key, value)),
-                     skip=skip, recomputed=recomputed_memory())
+                     skip=skip, recomputed=recomputed_memory(), forked=forked)
     case = scan_case(value, key, chunk_size, padded=True, call=call, product=product,
-                     documents=state is not None and state.ndim == 5)
+                     forked=forked is not None)
     return select(SCAN, case).kernel
 
 
-SSD_PORT = Kernel[ScanCase]('pallas', SSD_SUPPORTS)
+SSD_PORT = Kernel[ScanCase]('pallas', SSD_SUPPORTS, upstream='mamba_ssm')
 """Dew's port of mamba_ssm's SSD kernels (`mamba_ssd.ssd_scan`)."""
 
 SCAN_CELLS: dict[tuple[str | None, str], tuple[Kernel[ScanCase], str]] = {
@@ -1412,23 +1454,58 @@ covers the geometry, else the portable math (a GPU no row named took it, 103 ms 
 Nemotron-H 30B's where the port took 2.58, template review 2026-10-26 P1-1)."""
 
 
-def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
+def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts, documents=None, held: int = 0):
     """The scan on mamba_ssm's kernels, each token's document counted from
-    `starts` (mamba_ssm's `seq_idx`). On a mesh it runs per shard
-    (`manual_map`): rows where the rules split them, and heads with their
-    groups where the head split divides the groups, the time axis whole;
-    off a GPU its kernels interpret, as the CPU suite runs them."""
+    `starts` (mamba_ssm's `seq_idx`), or a forked call's chunks taking their
+    table's memories up (`documents`, `_ported_documents`, `held` stored). On a
+    mesh it runs per shard (`manual_map`): rows where the rules split them, and
+    heads with their groups where the head split divides the groups, the time
+    axis whole; off a GPU its kernels interpret, as the CPU suite runs them."""
     interpret = not triton_runs()
     seq = None if starts is None else jnp.cumsum(starts, axis=1, dtype=jnp.int32)
+    rows, heads = grouped_heads(x.shape, B.shape[2])
+    four, carried = P(rows, None, heads, None), P(rows, heads, None, None)
+    if documents is not None:
+        def scan_documents(x, dt, A, B, C, D, state, documents):
+            return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, documents, chunk_size, interpret, held)
+
+        specs = (four, P(rows, None, heads), P(heads), four, four, P(heads), carried,
+                 _ported_specs(documents, rows, heads))
+        return manual_map(scan_documents, specs, (four, carried))(x, dt, A, B, C, D, state, documents)
 
     def scan(x, dt, A, B, C, D, state, *seq):
-        return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, *(seq or (None,)), chunk_size, interpret)
+        return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, *(seq or (None,)), None, chunk_size, interpret, 0)
 
     operands = (x, dt, A, B, C, D, state, *([] if seq is None else [seq]))
-    rows, heads = grouped_heads(x.shape, B.shape[2])
-    four, held = P(rows, None, heads, None), P(rows, heads, None, None)
-    specs = (four, P(rows, None, heads), P(heads), four, four, P(heads), held, P(rows, None))
-    return manual_map(scan, specs[:len(operands)], (four, held))(*operands)
+    specs = (four, P(rows, None, heads), P(heads), four, four, P(heads), carried, P(rows, None))
+    return manual_map(scan, specs[:len(operands)], (four, carried))(*operands)
+
+
+def _ported_documents(state, forked: Forked, length: int, chunk_size: int, work, widths: tuple[int, int]):
+    """A forked call's documents (`forked`, `Chunk.loads`) as the SSD ports take them: laid from chunks'
+    edges (`AlignedDocuments`), and `(given [B, S', H, P, N] float32, loads [B, NC], stores [B, NC],
+    entries [B, NC, H, P, N] float32 or None)`: the table's given memories (`state` `[B, S', H, N, P]`, the
+    SSD's `[P, N]` transposed), the table slot each chunk takes up (-1 none, zero a zero memory), the stored
+    slot it leaves its memory in (zero none), and each chunk's entry write added to the memory it takes up
+    (`AlignedDocuments.entries`, None where the call gives none), `held` stored slots (`forked.held`); the
+    memories padded with zero columns to the ports' `widths` (`_scan_widths`), heads' then states'."""
+    aligned = AlignedDocuments.of(forked, length, chunk_size)
+    entries = aligned.entries(forked, transposed=True)
+
+    def wide(memory):
+        return zero_padded(zero_padded(memory.astype(work), 3, widths[0]), 4, widths[1]).astype(jnp.float32)
+
+    return aligned, (wide(jnp.swapaxes(state, -1, -2)), aligned.loads, aligned.stores,
+                     None if entries is None else wide(entries))
+
+
+def _ported_specs(documents, rows, heads):
+    """`_ported_documents`' placements on a shard map (`manual_map`): the memories `[B, ., H, P, N]` by
+    rows and heads, the slots `[B, NC]` by rows, None for absent entries or documents."""
+    if documents is None:
+        return None
+    memories = P(rows, None, heads, None, None)
+    return memories, P(rows, None), P(rows, None), None if documents[3] is None else memories
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1496,8 +1573,9 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
                 "the run's accurate forms, whose sums the portable math compensates (row 1698); the template "
                 "sums at mamba_ssm's rounding, the fast forms' bar", row='ledger 2968', kind='measured'),
     Requirement('documents', lambda case: not case.documents,
-                "documents entering states of their own (`Chunk.entered`), which the template walks from a "
-                "zero state alone: the portable scan takes each up at its chunk's edge", row='ledger 5288'),
+                "a forked call (`Chunk.loads`), whose documents enter its table's states, which the template "
+                "walks from a zero state alone: the portable scan takes each up at its chunk's edge",
+                row='ledger 5288'),
 )
 """What the template's selective scan (`templates.recurrence.selective`) needs of a call: no caller's
 `shard_map` that checks varying axes, a GPU of a family its bundles cover, 16-bit or fp32 operands, whole
@@ -1534,29 +1612,31 @@ def selective_kernel(x, A, B, C, *, documents: bool = False) -> str:
     return select(SELECTIVE, case).kernel
 
 
-def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, entered=None):
+def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, loads=None, stores=None,
+                   held: int = 0):
     """Mamba's selective scan (`dew.nn.mixers.mamba.selective_scan`'s operands, `state` `[B, D, N]` or None)
     on the kernel its selector gives each product (`SELECTIVE`, `_per_product`): the recurrence template's
     scan, interpreted off a GPU (where a call names it), per shard of rows on a mesh (`manual_map`: B and C
     serve every channel, so the channels stay whole); or `portable(x, dt, A, B, C, D, state, starts)`,
-    the portable math. Where `entered` `[B, Dc]` is given, each of `starts`' documents enters its own
-    state, `state` `[B, Dc, D, N]` a state a slot, as `Chunk.entered` takes them, and the final state is
-    each document's: on the portable math's packed rows, each document laid from a chunk's edge and its
-    state taken up there (`portable`'s `firsts`, `AlignedDocuments`), which the template takes no form of
-    (`SelectiveCase.documents`).
+    the portable math. A forked call (`loads`, `stores`, `held`, as `Chunk.loads` takes them, `state` `[B,
+    S', D, N]` its table's given states) runs on the portable math, each document laid from a chunk's edge
+    and its state taken up there (`portable`'s `forked`, `AlignedDocuments`), which the template takes no
+    form of (`SelectiveCase.documents`); its final state is the row's last.
     """
-    firsts = None
-    if entered is not None:
-        state, firsts = entered_memories(state, entered, starts)
+    forked = None
+    if loads is not None:
+        loads = jnp.asarray(loads, jnp.int32)
+        forked = Forked(document_firsts(starts, loads.shape[1]), loads, jnp.asarray(stores, jnp.int32), None,
+                        held)
     from .templates.recurrence import selective
 
     def template(x, dt, A, B, C, D, state, *starts):
         return selective.SELECTIVE(x, dt, A, B, C, D, state, *(starts or (None,)),
                                    interpret=generation.backend() != 'gpu')
 
-    def run(kernel, x, dt, A, B, C, D, state):
+    def run(kernel, x, dt, A, B, C, D, state, *walked):
         if kernel != 'mosaic_gpu':
-            laid = {} if firsts is None else {'firsts': firsts}
+            laid = {} if forked is None else {'forked': forked.carrying(*walked)}
             return portable(x, dt, A, B, C, D, state, starts, **laid)
         rows, _ = grouped_heads((*x.shape[:2], 1, x.shape[-1]), 1)
         three = P(rows, None, None)
@@ -1565,5 +1645,5 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, ente
         specs = (three, three, P(None, None), three, three, P(None), three, P(rows, None))
         return manual_map(template, specs[:len(operands)], (three, three))(*operands)
 
-    return _per_product(lambda product: selective_kernel(x, A, B, C, documents=firsts is not None), run, x,
-                        dt, A, B, C, D, state)
+    return _per_product(lambda product: selective_kernel(x, A, B, C, documents=forked is not None), run, x,
+                        dt, A, B, C, D, state, *(() if forked is None else forked.walked))

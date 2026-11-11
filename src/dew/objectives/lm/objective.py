@@ -1005,10 +1005,9 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         """Each target's predecessor's slot among the inputs where the rows' coordinates carry forks or a
         tail of finals (`Coordinates.predecessors`), None where the ids shift by one."""
         before = _target_predecessors(laid_coordinates(prepared.token_fields))
-        if before is not None and (depths or self.adaptation is not None
-                                   or prepared.token_fields.get(BLOCKS_FIELD) is not None):
-            raise ValueError("prediction depths, blocks and in-context steps read a row's tokens in its "
-                             "order, which forks and a tail of finals do not lay out; lay the rows whole")
+        if before is not None and (depths or self.adaptation is not None):
+            raise ValueError("prediction depths and in-context steps read a row's tokens in its order, which "
+                             "forks and a tail of finals do not lay out; lay the rows whole")
         return before
 
     def _exit_scores(self, params, gathered, targets, losses, before=None):

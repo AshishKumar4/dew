@@ -1160,7 +1160,7 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
         batch = pair_windows(paired, np.ones_like(paired), count=rows)
         finals = objective.finals
         inputs = jnp.asarray(batch["input_ids"])[:, :-finals]
-        packing = {"coordinates": window_coordinates(batch, finals).along_tokens(
+        packing = {"coordinates": window_coordinates(batch, finals, objective.pairs).along_tokens(
             lambda leaf: leaf[:, :-finals], prefix=True)}
     else:
         mask = jnp.broadcast_to(jnp.arange(6) >= 3, ids.shape).astype(jnp.float32)
