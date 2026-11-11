@@ -46,6 +46,28 @@ def _table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
     return rows_taken(table, ids).astype(dtype)
 
 
+def token_table(model: object) -> tuple[int, frozenset[int]] | None:
+    """The embedding table a model reads its tokens through, which a token field indexes
+    (`dew.inputs.spec.Field.indexing`): the rows its declared vocabulary
+    (`dew.nn.protocols.Bounded`) builds, found on the model, the backbone a head reads
+    (`dew.nn.wrapping.HeadedModel`) or the decoder a wrapper holds (`DecoderWrapper.wraps`), and the
+    placeholder ids a multimodal model replaces before its table reads them (`image_token_id`,
+    `extra_placeholder_ids`), which hold no row of their own; None for a model of no stated vocabulary."""
+    from dew.nn.protocols import Bounded
+
+    replaced: set[int] = set()
+    seen: set[int] = set()
+    while model is not None and id(model) not in seen:
+        seen.add(id(model))
+        replaced |= {token for token in (getattr(model, "image_token_id", None),
+                                         *getattr(model, "extra_placeholder_ids", ())) if token is not None}
+        if isinstance(model, Bounded) and isinstance(model.vocab_size, int):
+            return model.vocab_size, frozenset(replaced)
+        wraps = getattr(model, "wraps", None)
+        model = getattr(model, wraps, None) if isinstance(wraps, str) else getattr(model, "backbone", None)
+    return None
+
+
 def table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
     """`table[ids]` in `dtype` (`_table_rows`) differentiated at every order (`generation.linear_tangent`):
     reverse mode adds each token's cotangent to its row in the table's dtype (`_table_rows_backward`), forward

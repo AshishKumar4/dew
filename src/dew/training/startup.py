@@ -76,6 +76,24 @@ class DataObjective(Protocol):
     def bind_widths(self, widths: Mapping[str, object]) -> None: ...
 
 
+def tokens_met(objective: object) -> None:
+    """Refuse a run whose objective places, inside its compiled step, an id its model's embedding table
+    holds no row for (`dew.nn.blocks.token_table`): a masked process's mask id, which corrupts its rows on
+    the device, where no host check of a batch sees it. The ids a run's rows hold are checked batch by
+    batch where they are read (`InputSpec.bounded`), so a tokenizer that holds ids its rows never use is
+    no reason to refuse a run."""
+    from dew.nn.blocks import token_table
+
+    table = token_table(getattr(objective, "model", None))
+    mask = getattr(getattr(objective, "process", None), "mask_id", None)
+    if table is None or not isinstance(mask, int):
+        return
+    rows, replaced = table
+    if not 0 <= mask < rows and mask not in replaced:
+        raise ValueError(f"a {type(objective).__name__} run masks its tokens to the id {mask}, outside the "
+                         f"{rows} rows of its model's embedding table")
+
+
 def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
              validation: Dataset | Mapping[str, Dataset | Split | EvalSuite] | None, *,
              steps: int | None, epochs: int | None, tokens: int | None, examples: int | None,
@@ -87,6 +105,7 @@ def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
     examples among them (`Loader.pass_examples`) (`run_tokens`, `run_steps`), each long phase reported
     (`Startup`)."""
     run_length(steps, epochs, tokens, examples, required=False)
+    tokens_met(objective)
     ready_process()
     with startup.phase("data", "preparing the data"):
         loader, validation = fitted(dataset, validation, objective=objective.data(), examples=examples,

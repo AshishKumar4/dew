@@ -254,7 +254,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         self.stop_gradient_from_denoiser_to_encoder = stop_gradient_from_denoiser_to_encoder
         self.encoder_loss_weight = encoder_loss_weight
         self.decoder_loss_weight = decoder_loss_weight
-        self.inputs = InputSpec(sample=Field("text", (self.sequence_length,)))
+        self.inputs = InputSpec(sample=Field.indexing("text", (self.sequence_length,), self.model))
         self.ema = EMASpec.constant(ema_decay)
         self.use_head(head_chunks, head_tile)
 
