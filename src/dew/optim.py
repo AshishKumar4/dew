@@ -1250,6 +1250,26 @@ def with_rates(opt_state: optax.OptState, rates: Mapping[str | None, Mapping[str
     return _rated(opt_state, wanted)
 
 
+def with_bounds(opt_state: optax.OptState, bounds: Mapping[str, tuple[float, float]]) -> optax.OptState:
+    """`opt_state` with each bounded param group's clamp (`BoundsState`) set to `bounds`' interval for its
+    group, by name, each leaf's in its own dtype and placement: a resumed run clamps to the interval it
+    states, as it steps at the rate it states (`with_rates`)."""
+    def put(path: jax.tree_util.KeyPath, node):
+        if not isinstance(node, BoundsState):
+            return node
+        group = next((entry.key for entry in path
+                      if isinstance(entry, jax.tree_util.DictKey) and entry.key in bounds), None)
+        if group is None:
+            return node
+        interval = np.asarray(bounds[group])
+        return node._replace(bounds={
+            name: jax.device_put(np.broadcast_to(interval.astype(held.dtype), held.shape), held.sharding)
+            for name, held in node.bounds.items()})
+
+    return jax.tree_util.tree_map_with_path(put, opt_state,
+                                            is_leaf=lambda node: isinstance(node, BoundsState))
+
+
 def held_rates(opt_state: optax.OptState) -> dict[jax.tree_util.KeyPath, dict[str, float]]:
     """Each injected solver's learning rate as `opt_state` holds it, on the host, by the solver's path
     (`_rated`): a schedule's rate-valued fields, or a constant under `CONSTANT`."""
@@ -2338,6 +2358,12 @@ class OptimConfig:
         if not self.param_groups:
             return {None: rates_of(self.rate)}
         return {group.name: group.rates(self.rate) for group in self.param_groups}
+
+    def bounds(self) -> dict[str, tuple[float, float]]:
+        """Each bounded param group's `[lower, upper]`, by name, which its clamp holds in its state
+        (`BoundsState`). A resumed run sets them over its checkpoint's (`with_bounds`), so the configured
+        interval is the one it clamps to."""
+        return {group.name: group.bounds for group in self.param_groups if group.bounds is not None}
 
 
 __all__ = [

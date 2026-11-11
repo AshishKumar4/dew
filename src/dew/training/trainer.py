@@ -80,7 +80,15 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import STACKED_OPTIMIZERS, declaring, held_rates, scaled_rates, settable_rates, with_rates
+from dew.optim import (
+    STACKED_OPTIMIZERS,
+    declaring,
+    held_rates,
+    scaled_rates,
+    settable_rates,
+    with_bounds,
+    with_rates,
+)
 from dew.registry import Unrecordable
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, kept_window, together
 from dew.telemetry import profile as telemetry_profile
@@ -742,8 +750,9 @@ class Trainer(Generic[Loss, Effects]):
         state = restored(state, resume, self._examples)
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         if (config := self._config) is not None:
-            # The rate this run configures, not the one its checkpoint holds.
-            state = rates_set(state, lambda held: with_rates(held, config.rates()))
+            # The rate and bounds this run configures, not the ones its checkpoint holds.
+            state = rates_set(state, lambda held: with_bounds(with_rates(held, config.rates()),
+                                                              config.bounds()))
         self._resume_rung(checkpoints.rung(resume))
         # A step an earlier Dew wrote records no key's implementation (`key_record`): its key data is the
         # run's own key's.
