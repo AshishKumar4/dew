@@ -382,6 +382,7 @@ markers = [
     "distributed: tests that need real processes with jax.distributed",
     "mesh(devices=8): tests that need that many devices; tests/conftest.py skips them, naming both device counts, on a run with fewer",
     "gpu(reason): tests only a cuda device runs; tests/conftest.py skips them on any other backend, and a GPU session runs them with -m gpu",
+    "users_process: a GPU test that runs in a process computing as a user's does (DEW_TEST_USERS_ARITHMETIC=1, tests/lane_environment.py: no deterministic ops or matmul precision of the suite's), which the GPU tier starts for it beside the lane's; tests/conftest.py skips it in any other process",
     "prepares: a GPU test its part's prepare runs on the node's CPU before the GPU run (DEW_TIER_PREPARE=1, tests/model_flows.py): its truths computed and its programs compiled for the node's GPU; under that prepare tests/conftest.py skips every other test",
     "tpu(reason): tests only a tpu runs; tests/conftest.py skips them on any other backend, and the TPU tier (dew-ops' dewops.node.tpu, a Colab TPU at main's tip after each train) runs them with -m tpu",
     "torchax: tests whose code imports torchax, which renames torch's privateuse1 backend process-wide; CI runs these files in tasks of their own (tools/armada/ci.py)",

@@ -4,11 +4,17 @@ its reference arm the reference path alone, and its truth computes in float64; a
 truths (`reference_error.stored_truths`) judge as the truths a site computes itself, a missing or stale
 one refused."""
 
+import os
+import sys
+from pathlib import Path
+
+import lane_environment
 import jax
 import jax.numpy as jnp
 import model_flows
 import numpy as np
 import pytest
+from process_support import relayed
 from reference_error import MissingTruth, assert_as_exact, stored_truths
 
 from dew.nn.kernels import generation
@@ -67,6 +73,48 @@ def test_a_flows_truth_computes_in_float64(name, tmp_path, monkeypatch):
     written = sorted((model_flows.store_of(flow) / "truths").iterdir())
     assert len(written) == 2
     assert all(len(list(site.glob("*.truth"))) == staged_units(flow.seeds) for site in written)
+
+
+@pytest.mark.parametrize("lane", [True, False], ids=["the lane's", "a user's"])
+def test_a_flow_holds_in_a_process_of_its_variant_alone(lane):
+    """A flow holds only in a process opened under its variant's XLA flags and matmul precision
+    (`model_flows.held_process`): a process started with them, the lane's or a user's
+    (`lane_environment.USERS_ARITHMETIC`), holds it, and this one, whose backend opened under neither, refuses
+    it, as a GPU lane's process of the other variant would."""
+    flow = next(flow for flow in model_flows.FLOWS if flow.lane == lane)
+    with pytest.raises(model_flows.WrongProcess):
+        model_flows.held_process(flow)
+    environment = dict(os.environ) if lane else lane_environment.configured(
+        lane_environment.users_process(os.environ))
+    tests = Path(__file__).resolve().parent
+    script = f"import model_flows; model_flows.held_process(model_flows.flow_named({flow.name!r}))"
+    ran = relayed([sys.executable, "-c", script], {
+        **environment, "XLA_FLAGS": model_flows.flow_flags(flow),
+        "PYTHONPATH": os.pathsep.join((str(tests.parent / "src"), str(tests)))}, timeout=600)
+    assert ran.returncode == 0, ran.output[-3000:]
+
+
+def test_a_parts_prepare_compiles_a_flows_programs_for_its_nodes_gpu_and_writes_its_truths(tmp_path,
+                                                                                          monkeypatch):
+    """A GPU part's prepare as its node's CPU runs it (`DEW_TIER_PREPARE=1`): a flow prepared in a process
+    of its own (`model_flows.prepared_apart`) over the node's serialized topology (here a compile-only
+    A100's, serialized as a host serializes its own), its Dew and reference programs compiled for that GPU
+    and its truths written to the tier's store, and what it took reported."""
+    from jax.experimental import topologies
+
+    from dew.training.ahead import compile_only_gpus
+
+    topology = tmp_path / "topology.bin"
+    topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
+    monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
+    monkeypatch.setenv(model_flows.TRUTHS, str(tmp_path / "tier"))
+    monkeypatch.setenv(model_flows.PREPARE, "1")
+    flow = model_flows.flow_named("selective scan")
+    took = model_flows.prepared_apart(flow)
+    store = model_flows.store_of(flow)
+    assert took is not None and took["written_bytes"] > 0 and took["seconds"] > 0
+    assert (store / "dew.programs").is_file() and (store / "reference.programs").is_file()
+    assert len(list((store / "truths").iterdir())) == 2
 
 
 def _site(salt: int = 5461):

@@ -13,8 +13,9 @@ MESH_DEVICES = 8
 
 USERS_ARITHMETIC = "DEW_TEST_USERS_ARITHMETIC"
 """The environment variable that, set to 1, has a lane configure its devices and threads and none of its
-arithmetic (`configure_lane`): no matmul precision of the suite's and no wide CPU arithmetic, so a test
-process computes as a library process does (`users_process`)."""
+arithmetic (`configure_lane`): no matmul precision of the suite's, no wide CPU arithmetic and, on a cuda
+lane, none of its deterministic ops (`USERS_GPU_FLAGS`), so a test process computes as a library process
+does (`users_process`)."""
 
 
 DETERMINISTIC_OPS = "--xla_gpu_deterministic_ops=true"
@@ -33,6 +34,12 @@ a user's process, which a flag of the lane's would override. Autotuning off
 leaves an fp8 convolution's emitted configuration,
 which cuDNN refuses on an H100, so that test compiles in its own process
 without it (tests/test_quantization.py)."""
+
+
+USERS_GPU_FLAGS = (f"{DETERMINISTIC_OPS.split('=')[0]}=false", "--xla_gpu_autotune_level=0")
+"""A user's process's flags on a cuda lane (`USERS_ARITHMETIC`): XLA's own schedules, its deterministic ops
+stated false so the process can show it opened its backend without them (`dew._devices.flags_set`), and
+autotuning off as the lane's, so a program compiled ahead for it is the one its run loads."""
 
 
 def without_flags(flags: str, *names: str) -> str:
@@ -59,7 +66,8 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     (`dew.distributed.host.companion_mesh`), so that backend holds one device
     per local accelerator device. A cuda lane's steps are made repeatable
     across processes (`REPEATABLE_GPU_FLAGS`), since exact state and
-    gradient checks require it.
+    gradient checks require it; a user's process there runs XLA's own
+    schedules (`USERS_GPU_FLAGS`).
     jax.devices() is still the accelerator's.
     """
     environ.setdefault("JAX_PLATFORMS", "cpu")
@@ -88,7 +96,7 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
         flags.append("--xla_cpu_scheduler_type=CPU_SCHEDULER_TYPE_MEMORY_OPTIMIZED")
     else:
         if accelerator == "cuda":
-            flags.extend(REPEATABLE_GPU_FLAGS)
+            flags.extend(USERS_GPU_FLAGS if environ.get(USERS_ARITHMETIC) == "1" else REPEATABLE_GPU_FLAGS)
         if "cpu" not in platforms:
             environ["JAX_PLATFORMS"] = ",".join([*platforms, "cpu"])
         cpu_devices = local[accelerator](environ)

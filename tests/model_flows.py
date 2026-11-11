@@ -99,11 +99,11 @@ class Flow:
     every GPU."""
 
     @property
-    def precision(self) -> str:
+    def precision(self) -> str | None:
         """The default matmul precision its programs trace at (`jax_default_matmul_precision`): the lane's,
-        whose fp32 products are whole (tests/lane_environment.py), or a user's default, under which a port
-        takes an fp32 call's products in TF32 (`recurrence_chunk._port_precision`)."""
-        return "highest" if self.lane else "default"
+        whose fp32 products are whole (tests/lane_environment.py), or a user's, JAX's own default (None),
+        under which a port takes an fp32 call's products in TF32 (`recurrence_chunk._port_precision`)."""
+        return "highest" if self.lane else None
 
     def native_on(self, target: str) -> dict[str, str]:
         """The choices the flow is for that take a native kernel on the GPU generation `target` (`families`),
@@ -283,14 +283,38 @@ program and part a prepare's CPU process from its run's GPU one."""
 
 def flow_flags(flow: Flow) -> str:
     """The XLA flags a flow compiles its programs under in its prepare and loads them under in its run, the
-    same in both (`BuildTarget.held` reads them, in their order): the session's and the lane's, but the host
-    backend's own (`HOST_FLAGS`), then the cuda lane's repeatable flags (`REPEATABLE_GPU_FLAGS`), its
-    deterministic ops set false where not `lane`, as a user's process runs."""
-    named = (*HOST_FLAGS, *(flag.split("=")[0] for flag in lane_environment.REPEATABLE_GPU_FLAGS))
+    same in both (`BuildTarget.held` reads them, in their order): the process's, but the host backend's own
+    (`HOST_FLAGS`), then its variant's on a cuda lane, the lane's repeatable flags where `lane`, else a
+    user's (`lane_environment.REPEATABLE_GPU_FLAGS`, `USERS_GPU_FLAGS`)."""
+    variant = lane_environment.REPEATABLE_GPU_FLAGS if flow.lane else lane_environment.USERS_GPU_FLAGS
+    named = (*HOST_FLAGS, *(flag.split("=")[0] for flag in variant))
     flags = lane_environment.without_flags(os.environ.get("XLA_FLAGS", ""), *named)
-    repeatable = [flag if flow.lane or flag != lane_environment.DETERMINISTIC_OPS
-                  else f"{flag.split('=')[0]}=false" for flag in lane_environment.REPEATABLE_GPU_FLAGS]
-    return " ".join([flags, *repeatable]).strip()
+    return " ".join([flags, *variant]).strip()
+
+
+def users_process() -> bool:
+    """Whether this process computes as a user's does (`lane_environment.USERS_ARITHMETIC`): the process a
+    flow not of the lane's runs in, prepared and run (`Flow.lane`)."""
+    return os.environ.get(lane_environment.USERS_ARITHMETIC) == "1"
+
+
+class WrongProcess(AssertionError):
+    """A flow in a process not opened under its variant's flags or matmul precision (`held_process`)."""
+
+
+def held_process(flow: Flow) -> None:
+    """Raise unless this process is of the flow's variant (row 5461): XLA parses its flags once a process and
+    JAX reads its precision as it starts, so a flow holds only where its process opened its backend under
+    the flow's flags, as XLA_FLAGS carried them while it was closed (`dew._devices.flags_set`), and multiplies
+    at the flow's precision (`Flow.precision`)."""
+    from dew._devices import flags_set
+
+    flags = flow_flags(flow)
+    if not flags_set(flags) or jax.config.jax_default_matmul_precision != flow.precision:
+        raise WrongProcess(f"{flow.name}: its process opened its backend under XLA_FLAGS "
+                           f"{os.environ.get('XLA_FLAGS', '')!r} at matmul precision "
+                           f"{jax.config.jax_default_matmul_precision!r}, not {flags!r} at "
+                           f"{flow.precision!r}")
 
 
 def store_of(flow: Flow) -> Path:
@@ -385,6 +409,7 @@ def prepare(flow: Flow) -> bool:
     Whether it prepared: none where the node's GPU does not run the flow (`Flow.runs_on`)."""
     from dew.training.ahead import compile_programs
 
+    held_process(flow)
     target = _target()
     if not flow.runs_on(target.generation):
         return False
@@ -405,14 +430,12 @@ def prepare(flow: Flow) -> bool:
 
 def prepared_apart(flow: Flow) -> dict | None:
     """The flow's prepare (`prepare`) in a process of its own, started under its XLA flags (`flow_flags`) and
-    its matmul precision (`Flow.precision`): XLA parses its flags once a process, as it starts, and the
-    programs it compiles state them (`BuildTarget`), a lane's flow's deterministic ops among them, which a
-    user's flow sets false. What it took where it prepared (`measured`), None where the node's GPU does not
-    run the flow."""
+    this process's arithmetic, its variant's (`users_process`): XLA parses its flags once a process, as it
+    starts, and the programs it compiles state them (`BuildTarget`). What it took where it prepared
+    (`measured`), None where the node's GPU does not run the flow."""
     from process_support import fresh
 
-    return fresh(Path(__file__), flow.name, flags=flow_flags(flow),
-                 variables={"JAX_DEFAULT_MATMUL_PRECISION": flow.precision})
+    return fresh(Path(__file__), flow.name, flags=flow_flags(flow))
 
 
 def loaded(flow: Flow) -> dict[str, Callable]:
