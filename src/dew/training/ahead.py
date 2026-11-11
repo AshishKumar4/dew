@@ -478,8 +478,10 @@ class BuildTarget:
     could not load, which then wrote none of its state; empty for a target of no CUDA GPU."""
     topology: str | None = None
     """The digest of the GPU topology the programs were compiled over (`dew._cache.topology_digest`): a
-    host's own GPUs, serialized (`host_gpus`, or the GPUs attached), None for a generation's canonical
-    ones (`compile_only_gpus`) and for any other platform's. It names the compile, which no loader holds
+    host's own GPUs as a file serialized them (`host_gpus`), None for a generation's canonical ones
+    (`compile_only_gpus`), for the GPUs attached and for any other platform's. The attached GPUs'
+    serialization differs call to call (two calls on one A100 differ from byte 207 on, probe UB-TOPO,
+    2026-11-11), so its digest names nothing. It names the compile, which no loader holds
     (`differences`)."""
 
     @staticmethod
@@ -510,10 +512,8 @@ class BuildTarget:
         limits = [stats["bytes_limit"] for device in devices
                   if "bytes_limit" in (stats := device.memory_stats() or {})]
         own = device_target(devices[0])
-        # Attached CUDA GPUs are their client's topology, as a host serializes it for a prepare (`host_gpus`).
-        attached = (topologies.get_attached_topology("cuda").serialize()
-                    if devices[0].platform == "gpu" and capability(own.generation) is not None else None)
-        built = BuildTarget.built(own, len(devices), min(limits, default=None), topology=attached)
+        # No topology: the attached GPUs' serialization differs call to call (`topology`).
+        built = BuildTarget.built(own, len(devices), min(limits, default=None))
         # A CPU's program is its host's code (`cpu`).
         return dataclasses.replace(built, cpu=host_cpu()) if devices[0].platform == "cpu" else built
 
