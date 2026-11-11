@@ -1382,8 +1382,7 @@ def _compile_phases(
         if not tokens:
             _updates_aligned(source.ends, batches, partition.window)
         if per_share:
-            return _step_phases([counted_as_read(loaded) for loaded, _ in built], source.ends, partition,
-                                loading.stop_seconds)
+            return _step_phases([counted_as_read(loaded) for loaded, _ in built], source.ends, partition)
 
         def global_reader(index: int, ends: tuple[int, ...]) -> GlobalReader:
             opened_reader = opened(index, ends).train(partition)
@@ -1420,14 +1419,14 @@ def _ordered(index: int, phase: _Staged) -> _Staged:
     return phase
 
 
-def _step_phases(loaders: Sequence[Loader], ends: Sequence[int | None], partition: DataPartition,
-                 stop_seconds: float) -> StepPhases:
+def _step_phases(loaders: Sequence[Loader], ends: Sequence[int | None],
+                 partition: DataPartition) -> StepPhases:
     """Phases on the step clock each read on its own stream (`StepPhases`): each loader's training read of
     `partition`, opened at the step the phase before it ends (`ends`), known by its plan."""
     readers = [functools.partial(lambda loader: loader.train(partition), loader) for loader in loaders]
     identities = [loader.plan.identity() if loader.plan is not None else repr(loader.batches)
                   for loader in loaders]
-    return StepPhases(readers, ends, identities, stop_seconds, batches=[loader.batch for loader in loaders])
+    return StepPhases(readers, ends, identities, batches=[loader.batch for loader in loaders])
 
 
 def _apart(phases: Phases) -> None:

@@ -1741,19 +1741,19 @@ class StepPhases(Forwarding):
     phase before it ends: a read per share among them, cut per share where its order is (a stream batched
     by its tokens after steps that drop rows), whose records no global count places. Phase `p` reads
     `ends[p] - ends[p - 1]` batches, one a step, its last running on (None); each batch says the phase it
-    was read in (`PHASE`). Its position is the phase it stands in, the steps the run has read, and that
+    was read in (`PHASE`); its stop, its stop's budget and its close are the open phase's stream's
+    (`Forwarding`). Its position is the phase it stands in, the steps the run has read, and that
     phase's stream's own position, which resumes it as its own; a phase the run completed is refused
     where this run's ends it elsewhere or reads it otherwise (`identities`). What a phase's stream read
     ahead of its end is never trained on: the next phase opens its own stream at its first step."""
 
     def __init__(self, phases: Sequence[Callable[[], Iterator[Batch]]], ends: Sequence[int | None],
-                 identities: Sequence[str], stop_seconds: float, *, batches: Sequence[int]):
+                 identities: Sequence[str], *, batches: Sequence[int]):
         if len(phases) != len(ends) or len(identities) != len(ends):
             raise ValueError(f"phases need one end and one identity each: {len(phases)} phases, "
                              f"{len(ends)} ends, {len(identities)} identities")
         self._open, self._ends, self._identities = list(phases), list(ends[:-1]), tuple(identities)
         self.batches, self.stages = tuple(batches), ()
-        self.stop_seconds = stop_seconds
         self._steps = 0
         self._current: int | None = None
         self._source: Iterator[Batch] | None = None
