@@ -104,22 +104,21 @@ def merged(rows: Sequence[Encoded], *, chained: bool = False, streamed: bool = F
     tokens: list[int] = []
     positions: list[int] = []
     documents: list[int] = []
-    questions = []
     for member, begin, end, parent in over_prefix(shared, [len(row.tokens) for row in rows]):
-        row = rows[member]
-        if shared and not parent:
-            document = 1
-        else:
-            moved = len(tokens) - shared
-            [laid] = row.questions
-            questions.append(dataclasses.replace(
-                laid, span=(laid.span[0] + moved, laid.span[1] + moved),
-                options=tuple((start + moved, end + moved) for start, end in laid.options),
-                readout=None if laid.readout is None else laid.readout + moved))
-            document = member + 2
-        tokens += row.tokens[begin:end]
+        tokens += rows[member].tokens[begin:end]
         positions += range(begin, end)
-        documents += [document] * (end - begin)
+        documents += [1 if shared and not parent else member + 2] * (end - begin)
+    # Each row's question, a row laying no token past the state's included (`over_prefix` lays none of
+    # it), moved past the rows' own tokens before it.
+    questions = []
+    moved = 0
+    for row in rows:
+        [laid] = row.questions
+        questions.append(dataclasses.replace(
+            laid, span=(laid.span[0] + moved, laid.span[1] + moved),
+            options=tuple((start + moved, end + moved) for start, end in laid.options),
+            readout=None if laid.readout is None else laid.readout + moved))
+        moved += len(row.tokens) - shared
     first = rows[0]
     row = Encoded(tuple(tokens), tuple(questions), tuple(positions), None, first.state_tokens,
                   first.state_kept, instructions_cut=sum(row.instructions_cut for row in rows),
