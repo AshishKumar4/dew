@@ -143,10 +143,13 @@ def stamps(root: str, hidden_inputs: tuple[str, ...]) -> dict[str, tuple[int, in
     whoever writes it and however (Python's open, a native library's, a rename over it, a truncation, a copy
     that puts its time back, a removal and a new file in its place). The checkout's hidden entries but
     `hidden_inputs`, bytecode caches and installed packages are none of it, as a record keeps none of them
-    (followed.py's `placed`); a directory reached twice through links is walked once."""
+    (followed.py's `placed`); a directory reached twice through links is walked once. Each directory is read
+    through its own descriptor, held while it is listed (`os.fwalk`), so one another process removes meanwhile
+    (a sibling test process's records, a test's own scratch) is read as it stood, never a crash (2026-11-11:
+    test_gpu_lane's processes beside one another); a file gone before its reading is none."""
     found, walked = {}, set()
-    for directory, names, files in os.walk(root, followlinks=True):
-        held = os.stat(directory)
+    for directory, names, files, descriptor in os.fwalk(root, follow_symlinks=True):
+        held = os.fstat(descriptor)
         if (held.st_dev, held.st_ino) in walked:
             names[:] = []
             continue
@@ -157,13 +160,12 @@ def stamps(root: str, hidden_inputs: tuple[str, ...]) -> dict[str, tuple[int, in
         for name in files:
             if top and name.startswith(".") and name not in hidden_inputs:
                 continue
-            path = os.path.join(directory, name)
             try:
-                held = os.stat(path)
-            except FileNotFoundError:  # a link to nothing names no file
+                held = os.stat(name, dir_fd=descriptor)
+            except FileNotFoundError:  # removed since its listing, or a link to nothing: no file
                 continue
-            found[os.path.relpath(path, root)] = (held.st_ino, held.st_size, held.st_mtime_ns,
-                                                  held.st_ctime_ns)
+            found[os.path.relpath(os.path.join(directory, name), root)] = (
+                held.st_ino, held.st_size, held.st_mtime_ns, held.st_ctime_ns)
     return found
 
 
