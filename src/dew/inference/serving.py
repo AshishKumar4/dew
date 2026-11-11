@@ -360,8 +360,10 @@ class DenseRows:
     def refuse(self, length: int, budget: int) -> None:
         """The capacity check `check_inputs` makes covers a dense row."""
 
-    def seat(self, queue: deque[_Row], free: list[list[int]], admission: int) -> list[tuple[int, _Row]]:
-        """Seat queued requests in order; `free` is each group's free slots."""
+    def seat(self, queue: deque[_Row], free: list[list[int]], admission: int,
+             claimed: Callable[[_Row], bool]) -> list[tuple[int, _Row]]:
+        """Seat queued requests in order; `free` is each group's free slots. A request whose ticket is no
+        longer `claimed` (cancelled while it waited) leaves the queue unseated."""
         seated: list[tuple[int, _Row]] = []
         taken = [0] * len(free)
         while queue:
@@ -370,7 +372,9 @@ class DenseRows:
             if not open_groups:
                 break
             group = max(open_groups, key=lambda group: len(free[group]) - taken[group])
-            seated.append(_seated_in(group, free, taken, queue.popleft()))
+            row = queue.popleft()
+            if claimed(row):
+                seated.append(_seated_in(group, free, taken, row))
         return seated
 
     def table(self, row: _Row) -> list[int]:
@@ -461,10 +465,13 @@ class PagedRows:
             where = "" if len(self.pages) == 1 else f" in each of its {len(self.pages)} groups"
             raise ValueError(f"the request needs {needed} pages; the pool holds {part.count}{where}")
 
-    def seat(self, queue: deque[_Row], free: list[list[int]], admission: int) -> list[tuple[int, _Row]]:
+    def seat(self, queue: deque[_Row], free: list[list[int]], admission: int,
+             claimed: Callable[[_Row], bool]) -> list[tuple[int, _Row]]:
         """Seat queued requests in order while some group's part of the pool covers the next one. A row
         prefilling the rest of its prompt in the step it is seated in writes its full prompt pages in it,
-        which a prompt seated after it in the step names at once (`Pages.reserve`'s `whole`)."""
+        which a prompt seated after it in the step names at once (`Pages.reserve`'s `whole`); so a request
+        whose ticket is no longer `claimed` (cancelled while it waited) gives its reservation back before
+        any later prompt names its pages, and leaves the queue unseated."""
         seated: list[tuple[int, _Row]] = []
         taken = [0] * len(free)
         for row in list(queue):
@@ -490,7 +497,11 @@ class PagedRows:
                 break
             # By identity: a row is one request, and its arrays compare by value.
             queue.remove(row)
-            seated.append(_seated_in(group, free, taken, row))
+            row.group = group
+            if claimed(row):
+                seated.append(_seated_in(group, free, taken, row))
+            else:
+                self.release(row)
         return seated
 
     def table(self, row: _Row) -> list[int]:
@@ -972,7 +983,7 @@ class Server:
                   fold: int, adapter: str | None = None) -> Ticket:
         """A request queued: one row, or where the task draws `n` continuations of a prompt, `n` rows, each
         a continuation (`_Row.continuation`) with its own tokens and pages, all on the request's one ticket,
-        which the first seated claims (`_seat`) and the last finished settles with their generations in
+        which the first seated claims (`_claimed`) and the last finished settles with their generations in
         order (`_finish`)."""
         first = self._prepared(prompt, max_new_tokens, seed, fold, adapter)
         ticket = self._queued(first)
@@ -1333,6 +1344,18 @@ class Server:
         self.run()
         return [ticket.result() for ticket in tickets]
 
+    def _claimed(self, row: _Row) -> bool:
+        """Whether the row runs as it is seated: a request's first seated continuation claims its ticket,
+        which can no longer be cancelled. One cancelled while it waited is dropped, its slot free and its
+        reservation back, and so is each of its continuations, its ticket told once."""
+        if row.ticket not in self._dropped and (row.ticket.running()
+                                                or row.ticket.set_running_or_notify_cancel()):
+            return True
+        self._dropped[row.ticket] += 1
+        if self._dropped[row.ticket] == self.n:
+            del self._dropped[row.ticket]
+        return False
+
     def _seated(self) -> tuple[list[list[tuple[int, _Row]]], dict]:
         """Seat queued requests in free slots, then pick this step's prompt pieces: each group's rows
         still prefilling, oldest first, its share of `admission` a step; and what every process agrees
@@ -1345,22 +1368,11 @@ class Server:
         # Another process's groups hold no slot this one seats.
         free = [[slot for slot in range(group * size, (group + 1) * size) if slot not in self._rows]
                 if group in self._local else [] for group in range(self.groups)]
-        # The seating runs each request it seats and leaves one cancelled while it waited unseated.
-        seated = self.rows.seat(self._waiting.queue, free, share)
+        seated = self.rows.seat(self._waiting.queue, free, share, self._claimed)
         # After seating: a request another thread submitted while the queue
         # was read is seated too, and is admitted after it was submitted.
         now = time.perf_counter()
         for slot, row in seated:
-            # A request's first seated continuation claims its ticket, which can no longer be cancelled.
-            if row.ticket in self._dropped or (not row.ticket.running()
-                                               and not row.ticket.set_running_or_notify_cancel()):
-                # Cancelled while it waited: its slot stays free, and its reservation goes back; each of its
-                # continuations is dropped so, its ticket told once.
-                self._dropped[row.ticket] += 1
-                if self._dropped[row.ticket] == self.n:
-                    del self._dropped[row.ticket]
-                self.rows.release(row)
-                continue
             self.prefix_hits += row.prefilled
             if row.ticket.admitted is None:
                 row.ticket.admitted = now
