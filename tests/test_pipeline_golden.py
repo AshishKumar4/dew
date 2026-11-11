@@ -7,7 +7,9 @@ token, where 7ad0d4079 lost each piece's first next-token target. The other case
 host batch's documents' firsts (`Coordinates.firsts`, row 1923), which no old loader built, are Dew's
 own, recorded beside the frozen fields they derive from (its starts), every other field unchanged. So
 are its finals (`Coordinates.finals`: the trailing slots of a row that hold targets alone), recorded as
-the 1 every old loader's rows had (its last id alone a target).
+the 1 every old loader's rows had (its last id alone a target). So is the data phase a phased read says
+each batch was read in (`dew.batch.PHASE`), which the trainer reads its step's pass count by and no old
+loader carried: recorded beside the phased cases' frozen text, phase 0 for their first three batches.
 """
 
 import functools
