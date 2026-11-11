@@ -198,8 +198,13 @@ def summed(hooks: recurrence.Hooks):
     return run
 
 
-@pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=hook_id)
-def test_every_hook_combination_steps_as_its_float64_form(hooks):
+DRAWN_APART = recurrence.Hooks(conv=recurrence.Conv('silu'), decay='none', delta=False)
+"""The hook combination whose check draws past 120 s in one task (`check1_shards`): a conv's interpreted step
+costs 1.2 s a call, the Mosaic GPU interpreter's 10,000 memory callbacks a token (cProfile at ed9f379ff:
+523,710 of the check's 640,068), and its 64 declared seeds took 119.7 s (armada jsf-profile-hook)."""
+
+
+def assert_steps_as_its_float64_form(hooks) -> None:
     """A decode token through the launch, the recurrence template's step on Mosaic GPU
     (`templates.recurrence.step`, interpreted off a GPU), within tests/reference_error.py's rule of the XLA
     form's fp32 run against its float64 run: its output, its state and, under a conv, its moved history,
@@ -217,6 +222,20 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
         moved = recurrence.step_reference(hooks, given)[1]
         np.testing.assert_array_equal(np.asarray(history), np.asarray(moved))
         np.testing.assert_array_equal(np.asarray(history)[1], np.asarray(given.held)[1])
+
+
+@pytest.mark.parametrize('hooks', [hooks for hooks in HOOKS + FORMED if hooks != DRAWN_APART], ids=hook_id)
+def test_every_hook_combination_steps_as_its_float64_form(hooks):
+    """Every hook combination's decode token as its float64 form steps it
+    (`assert_steps_as_its_float64_form`), but the one whose draws run apart (`DRAWN_APART`)."""
+    assert_steps_as_its_float64_form(hooks)
+
+
+@pytest.mark.check1_shards(seeds=64, per_task=32)
+def test_a_conv_without_a_decay_or_the_delta_rule_steps_as_its_float64_form():
+    """`DRAWN_APART`'s decode token as its float64 form steps it, its 64 seeds drawn by armada's map tasks 32
+    at a time (`check1_shards`)."""
+    assert_steps_as_its_float64_form(DRAWN_APART)
 
 
 NARROW = {recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True): 8,
