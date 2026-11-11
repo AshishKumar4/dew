@@ -303,11 +303,15 @@ def _last_hidden_state(model, features, *, key: str):
     return model(**{key: features}).last_hidden_state
 
 
-_AUDIO_FILES = ("config.json", "config.*.json", "preprocessor_config.json", "processor_config.json")
-"""The files an audio tower's configuration and feature extractor are read from (transformers'
-`CONFIG_NAME` and the versioned configurations it names, of which `PreTrainedConfig.get_config_dict`
-reads one; `FEATURE_EXTRACTOR_NAME`; and `PROCESSOR_NAME`, whose nested extractor settings
-`FeatureExtractionMixin.get_feature_extractor_dict` reads first)."""
+def _audio_files() -> tuple[str, ...]:
+    """The files an audio tower's configuration and feature extractor are read from, as transformers names
+    them: `CONFIG_NAME` and the versioned configurations beside it (`config.*.json`), of which
+    `PreTrainedConfig.get_config_dict` reads one; `FEATURE_EXTRACTOR_NAME`; and `PROCESSOR_NAME`, whose
+    nested extractor settings `FeatureExtractionMixin.get_feature_extractor_dict` reads first."""
+    from transformers.utils import CONFIG_NAME, FEATURE_EXTRACTOR_NAME, PROCESSOR_NAME
+
+    versioned = CONFIG_NAME.replace(".json", ".*.json")
+    return (CONFIG_NAME, versioned, FEATURE_EXTRACTOR_NAME, PROCESSOR_NAME)
 
 
 @dataclass(frozen=True, eq=False)
@@ -370,7 +374,7 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
         # The configuration and extractor read from one commit's files, whose hashes the identity holds,
         # and the weights from that commit.
         hub = revision is not None and not Path(checkpoint).is_dir()
-        files, directory = pin_files(f"{checkpoint}@{revision}" if hub else checkpoint, _AUDIO_FILES)
+        files, directory = pin_files(f"{checkpoint}@{revision}" if hub else checkpoint, _audio_files())
         if params is None:
             model = AutoModel.from_pretrained(checkpoint, revision=files["revision"],
                                               dtype=getattr(torch, param_dtype))
