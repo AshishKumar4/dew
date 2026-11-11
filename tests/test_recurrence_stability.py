@@ -444,8 +444,11 @@ def _mamba_ssm(regime: str, draws, seeds: int, *, gradients: bool):
     """mamba_ssm's own scan (`ssd_support.mamba_side`) on the regime's draws in the port's chunks, the SSD
     port's reference: a port is held to its upstream's own code at its dtype (testing.md), whose fp32
     products are one TF32 as the port's are (`fla_gdn._dot`); an arm the gate runs as given
-    (`upstream_support.upstream_arm`), the declared seeds and their redraw a block. Its results are the
-    port's tree: the output and final memory, and where `gradients` every operand's gradient."""
+    (`upstream_support.upstream_arm`), its declared seeds a block and their redraw in later blocks: a
+    block's draws are one call's heads (`mamba_side`), whose state passing launches a program each head on
+    CUDA's grid z, at most 65,535 (a 512-seed block of `RATED_HEADS` 32,768; the staged 2,560 seeds' 163,840
+    exceeded it). Its results are the port's tree: the output and final memory, and where `gradients`
+    every operand's gradient."""
 
     def run_block(drawn):
         operands = [args[0] for args in drawn]
@@ -470,7 +473,7 @@ def _mamba_ssm(regime: str, draws, seeds: int, *, gradients: bool):
                                                       for name in names}))
                 for index, (output, each) in enumerate(zip(outputs, operands, strict=True))]
 
-    return upstream_arm(run_block, draws, staged_units(seeds), most=staged_units(seeds),
+    return upstream_arm(run_block, draws, seeds, most=staged_units(seeds),
                         keyed=lambda operands, *cotangents: operands)
 
 
