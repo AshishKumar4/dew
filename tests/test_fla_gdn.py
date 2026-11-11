@@ -929,17 +929,15 @@ def _lowered_dot(product, default: str) -> list:
 
 
 def test_an_fp32_port_dot_names_its_products_whatever_the_global_precision():
-    """The port's fp32 dots lower alike under a run's default precision and the suite's 'highest':
-    BF16x6, six bf16 products, or one IEEE where fla asks for it, never the global setting's (which made
-    the sm80 WY backward an IEEE kernel ptxas compiled for minutes). A dot that names nothing follows the
-    setting."""
+    """The port's fp32 dots lower alike under a run's default precision and the suite's 'highest', at
+    fla's own precision: one TF32, or one IEEE where fla turns TF32 off, never the global setting's (which
+    made the sm80 WY backward an IEEE kernel ptxas compiled for minutes). A dot that names nothing follows
+    the setting."""
     from jaxlib.triton.dialect import InputPrecision
 
-    for ieee, dots in ((False, 6), (True, 1)):
+    for ieee, named in ((False, InputPrecision.TF32), (True, InputPrecision.IEEE)):
         product = functools.partial(fla_gdn._dot, exact=False, ieee=ieee)
-        lowered = _lowered_dot(product, "default")
-        assert lowered == _lowered_dot(product, "highest") and len(lowered) == dots
-        assert not ieee or lowered == [InputPrecision.IEEE]
+        assert _lowered_dot(product, "default") == _lowered_dot(product, "highest") == [named]
 
     def unnamed(a, b):
         return jnp.dot(a, b, preferred_element_type=jnp.float32)

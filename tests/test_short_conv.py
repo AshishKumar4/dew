@@ -12,11 +12,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from fla_gdn_support import CONV_SHAPES
 from forks_support import LAYOUTS, assert_forks_as_own_rows
 from reference_error import (
     FACTOR,
-    as_given,
     assert_as_exact,
     assert_rounds_where_the_reference_does,
     chain_roundings,
@@ -283,44 +281,6 @@ def test_a_conv_the_kernels_do_not_take_runs(dtype, out, parts, taps):
         assert_as_exact(jax.jit(loss(causal_conv1d)), jax.jit(loss(xla_conv1d)), draw,
                         f"a conv the kernels do not take: {jnp.dtype(dtype)}, {parts}, {taps} taps",
                         seeds=REFUSED_SEEDS, truth_fn=loss(xla_conv1d, out=jnp.float64))
-
-
-TRAINING_SEEDS = {(model, dtype, packed): 8 for model in CONV_SHAPES for dtype in ("bfloat16", "float32")
-                  for packed in (False, True)}
-"""The training shapes' declared draws against XLA's conv (check 1), by model, dtype and packing: sized by
-`seeds_for` paired with the kernels on a GPU."""
-
-
-def the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed):
-    """A delta net's conv at its training width and length, bf16 projections into the bf16 operands
-    fla's rule takes, and fp32 into fp32, whole rows and packed ones: each piece and the gradients of the
-    projection and the taps on par (check 1) with XLA's own conv from float64, at each launch's config at
-    that model's shapes, over drawn rows, taps and cotangents. Two rows: a row's tokens are the distances'
-    terms, and the 0.8b's eight held 28 GiB of an H100 at the float64 truth, two 7."""
-    (_, length), parts = CONV_SHAPES[model]
-    segments = documents(2, length) if packed else None
-
-    draw = functools.partial(training_draw, length, parts, dtype)
-
-    def conv(fn):
-        def pieces_and_gradients(x, weights, grads):
-            # The gradients of the projection and the taps; there is no bias.
-            out, found = run(fn, x, weights, None, None, parts, dtype, grads, segments=segments)
-            return out, found[:2]
-        return pieces_and_gradients
-
-    @as_given
-    def exact(x, weights, grads):
-        # A row at a time on the host (`row_truth`): the 9b's packed rows peaked at 9.2 GiB of an A100, past
-        # a packed job's 8.9 GiB share where main's GPU tier ran them (row 1724,
-        # SE-conv1724-a100-fd8508b5a), 8.85 with the arrays on the host alone (SE-conv1724-a100-9419b90c1).
-        # A host loop, so run as given (`as_given`): traced, its NumPy read a tracer (main's GPU tier).
-        pieces, gradients = row_truth(x, weights, parts, grads, segments)
-        return pieces, gradients[:2]
-
-    assert_as_exact(conv(kernel_conv), conv(xla_conv1d), draw,
-                    f"{model} {jnp.dtype(dtype).name}{' packed' if packed else ''}",
-                    seeds=TRAINING_SEEDS[model, jnp.dtype(dtype).name, packed], truth_fn=as_given(exact))
 
 
 @pytest.mark.mesh(devices=2)

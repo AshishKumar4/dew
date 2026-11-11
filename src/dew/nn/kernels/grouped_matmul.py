@@ -651,7 +651,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         hooks = ba.arguments['hooks']
         stored = hooks.out_dtypes or (ba.arguments['out_dtype'],)
         plain = resources.tile_registers(family, config.warpgroups, block, dtype, stored=stored,
-                                        rhs_transposed=self._matrix_transposed(ba))
+                                        rhs_transposed=self._matrix_transposed(ba),
+                                        lhs_retained=ba.arguments.get('paired') is not None)
         accumulator = -(-config.block_m * columns // config.warpgroups // resources.THREADS)
         # A kernel gradient's consumer prepares its depth half of each step's rows stage in registers (the
         # neighbouring groups' rows zeroed: `mosaic_gpu._staged_halves`), apart from the products, which

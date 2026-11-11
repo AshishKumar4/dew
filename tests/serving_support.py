@@ -23,13 +23,11 @@ SERVED_BUDGET = 3
 @dataclasses.dataclass(frozen=True)
 class Served:
     """One served request: its prompt's first `length` tokens of the draw's row, with `flipped` places
-    changed, carrying the groups `groups` names (a field's group of each token, -1 for none), its first
-    `shared` tokens a segment it declares shared (`Server.submit`'s), None for none."""
+    changed, carrying the groups `groups` names (a field's group of each token, -1 for none)."""
 
     length: int
     groups: Mapping[str, tuple[int, ...]] = dataclasses.field(default_factory=dict)
     flipped: tuple[int, ...] = ()
-    shared: int | None = None
 
 
 def served_inputs(row: np.ndarray, request: Served, vocab: int) -> ModelInputs:
@@ -100,8 +98,7 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
             return services[key]
         tickets, shared, before = [], [], server.prefix_hits
         for end in itertools.accumulate(rounds):
-            tickets.extend(server.submit(served_inputs(row, requests[index], vocab), budget, key=index,
-                                         shared=requests[index].shared)
+            tickets.extend(server.submit(served_inputs(row, requests[index], vocab), budget, key=index)
                            for index in range(len(tickets), end))
             server.run()
             shared.append(server.prefix_hits - before)

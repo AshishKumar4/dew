@@ -16,17 +16,7 @@ import pytest
 from fla_sites import the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU, runs
 from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import (
-    ROUTES,
-    chunk_on,
-    cotangents,
-    entered_draw,
-    entering_documents,
-    formed,
-    on_route,
-    routed,
-    token_by_token,
-)
+from test_recurrence_chunk import ROUTES, chunk_on, cotangents, formed, on_route, routed, token_by_token
 from test_recurrence_mosaic import (
     DTYPES,
     PACKED_DOCUMENTS,
@@ -41,7 +31,6 @@ from test_recurrence_mosaic import (
     template_call,
 )
 
-from dew.batch import document_firsts
 from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, recomputing
@@ -411,126 +400,6 @@ def test_a_decay_a_key_dimensions_first_token_takes_no_gradient_where_its_sequen
     later[:, 0] = False
     dg = np.asarray(grads[1].log_decay)
     assert later.any() and np.all(dg[later] == 0.0)
-
-
-ENTERING = {'the gated delta rule': recurrence.Hooks(decay='scalar', scale=16 ** -0.5, write_bound=1.0),
-            "Kimi delta attention's": recurrence.Hooks(decay='vector', scale=16 ** -0.5, write_bound=1.0),
-            "Mamba-2's SSD": recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)}
-"""The forms whose documents enter memories of their own on the template: a decay a head and a key
-dimension under the delta rule, and the rated scan's."""
-
-
-@dataclasses.dataclass(frozen=True)
-class DocumentRows:
-    """A packed call's documents each a row of its own, `[B * D, S]`, the row's tokens from a document's
-    first, past its end written nothing (its decay one, its write gate zero), so its final memory is the
-    document's: the reference a packed walk of documents entering memories of their own is held to, each
-    document a row of its own entering its memory as a call's `state`."""
-
-    begins: jax.Array
-    """Each row's documents' first slots `[B, D]` (`dew.batch.document_firsts`), `S` past its last."""
-    ends: jax.Array
-    """Each document's end `[B, D]`, the next one's first slot or the row's length."""
-    entered: jax.Array
-    """The slot each document enters `[B, D]`, one-based, zero for a zero memory."""
-
-    @classmethod
-    def of(cls, starts, entered, firsts=None) -> "DocumentRows":
-        """`starts` `[B, S]`' documents (or their first slots, `firsts`), each entering its `entered` slot."""
-        documents = entered.shape[1]
-        begins = document_firsts(starts, documents) if firsts is None else firsts[:, :documents]
-        length = starts.shape[1]
-        ends = jnp.concatenate([begins[:, 1:], jnp.full_like(begins[:, :1], length)], axis=1)
-        return cls(begins, jnp.minimum(ends, length), jnp.asarray(entered, jnp.int32))
-
-    def _index(self, length: int):
-        """Each document row's token's slot in its packed row `[B, D, S]` and whether it is the document's."""
-        offsets = jnp.arange(length, dtype=jnp.int32)
-        slots = self.begins[..., None] + offsets
-        return jnp.minimum(slots, length - 1), slots < self.ends[..., None]
-
-    def laid(self, *operands):
-        """The operands `[B, S, ...]` as the documents' rows `[B * D, S, ...]`, zero past a document's end:
-        a decay one (`g` zero, a step zero), a write gate zero, its queries, keys and values zero."""
-        slots, own = self._index(operands[0].shape[1])
-
-        def taken(x):
-            picked = jax.vmap(lambda row, at: row[at])(x, slots)
-            kept = own.reshape(*own.shape, *(1,) * (picked.ndim - own.ndim))
-            picked = jnp.where(kept, picked, jnp.zeros((), x.dtype))
-            return picked.reshape(-1, *picked.shape[2:])
-
-        return tuple(taken(x) for x in operands)
-
-    def entering(self, state):
-        """Each document row's memory `[B * D, ...]`: its slot's of `state` `[B, D, ...]` (`[B, D, Hv, Dk,
-        Dv]`, a selective scan's `[B, D, C, N]`), zero for slot zero."""
-        if state is None:
-            raise ValueError("documents entering memories of their own (`Chunk.entered`) read the slots' "
-                             "memories, `state` `[B, D, Hv, Dk, Dv]`")
-        picked = jax.vmap(lambda row, slots: row[jnp.maximum(slots - 1, 0)])(state, self.entered)
-        kept = (self.entered > 0).reshape(*self.entered.shape, *(1,) * (state.ndim - 2))
-        return jnp.where(kept, picked, 0.0).reshape(-1, *state.shape[2:])
-
-    def unlaid(self, out):
-        """The documents' rows' output `[B * D, S, ...]` back as the packed rows' `[B, S, ...]`: each token's
-        its document's row's at its offset from the document's first."""
-        rows, documents = self.begins.shape
-        length = out.shape[1]
-        out = out.reshape(rows, documents, *out.shape[1:])
-        offsets = jnp.arange(length, dtype=jnp.int32)
-        document = jnp.sum(offsets[None, :, None] >= self.begins[:, None, :], axis=-1) - 1
-        document = jnp.clip(document, 0, documents - 1)
-        at = offsets[None, :] - jnp.take_along_axis(self.begins, document, axis=1)
-        return jax.vmap(lambda row, d, t: row[d, t])(out, document, jnp.clip(at, 0, length - 1))
-
-    def leaving(self, final):
-        """The documents' rows' final memories `[B * D, ...]` as each document's, `[B, D, ...]`."""
-        return final.reshape(*self.begins.shape, *final.shape[1:])
-
-
-@pytest.mark.parametrize('form', ENTERING)
-def test_documents_entering_memories_of_their_own_walk_the_packed_rows_as_each_its_own_row(form):
-    """Packed bf16 documents each entering a memory of its own (`Chunk.entered`, a request's shared prefix's
-    final memory for each of its questions) on the template: walked on the packed rows, each document's
-    sequence from its own memory (`chunk_forward.prepared`), the output, each document's final memory and the
-    gradient of each token's operands and each memory, bit for bit what each document laid out as a row of
-    its own gives (`DocumentRows`), whose launches did a row's work for each of a row's documents (row
-    5288)."""
-    hooks = ENTERING[form]
-    operands, (d_out, d_final) = entered_draw(hooks, 3)
-    # The delta rule's write gate in the operands' dtype, as its layer holds it; the SSD's `dt` its own.
-    rounded = ('query', 'key', 'value') + (('beta',) if hooks.delta else ())
-    given = entering_documents(dataclasses.replace(operands, **{
-        name: getattr(operands, name).astype(jnp.bfloat16) for name in rounded}))
-    cotangent = (d_out.astype(jnp.bfloat16), d_final)
-    # Differentiated in each token's and each memory's operands: a head's parameter's gradient (the SSD's
-    # rate and skip) sums every token's term, in the order of the layout it is summed over.
-    names = [name for name in ('query', 'key', 'value', 'log_decay', 'beta', 'state')
-             if getattr(given, name) is not None]
-
-    def walked(fields: dict):
-        return chunk_on('mosaic_gpu', hooks, dataclasses.replace(given, **fields))
-
-    def apart(fields: dict):
-        call = dataclasses.replace(given, **fields)
-        rows = DocumentRows.of(call.starts, call.entered, None)
-        # A rated decay's log decay its rate's and `dt`'s (`recurrence.log_gates`): zero past a document.
-        decay = jnp.zeros(call.beta.shape) if call.log_decay is None else call.log_decay
-        query, key, value, decay, beta = rows.laid(call.query, call.key, call.value, decay, call.beta)
-        own = dataclasses.replace(call, query=query, key=key, value=value, beta=beta,
-                                  log_decay=None if call.log_decay is None else decay,
-                                  state=rows.entering(call.state), starts=None, entered=None)
-        out, final = chunk_on('mosaic_gpu', hooks, own)
-        return rows.unlaid(out), rows.leaving(final)
-
-    fields = {name: getattr(given, name) for name in names}
-    # Under the run's fast forms, whose numbers the template's fast backward trains a 16-bit SSD by.
-    with generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')):
-        found, expected = (jax.device_get(with_gradients(rule)(fields, cotangent))
-                           for rule in (walked, apart))
-    for leaf, other in zip(jax.tree.leaves(found), jax.tree.leaves(expected), strict=True):
-        np.testing.assert_array_equal(leaf, other)
 
 
 @COMPILES_ON_CPU

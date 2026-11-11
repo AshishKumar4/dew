@@ -173,7 +173,7 @@ def jax_parts(shape: Shape, host: bool = False) -> tuple[dict, dict, tuple, obje
                 return out, jnp.swapaxes(final, -1, -2)
 
             def hand(x, dt, A, B, C, D):
-                return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, shape.chunk,
+                return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, None, shape.chunk,
                                           not generation.triton_runs())
 
             # What the kernels take, whatever this GPU's row prefers.

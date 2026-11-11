@@ -40,7 +40,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
-from dew.batch import Coordinates, Forks, document_ranks, prefix_sum, valid_order
+from dew.batch import Coordinates, Forks, document_ranks, prefix_sum, real_bounds, valid_order
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused, MeshAxes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
@@ -294,10 +294,8 @@ def document_tails(x, valid, documents, width: int, count: int):
     convolves after (`entered_conv1d`)."""
     batch, length, _ = x.shape
     real = jnp.asarray(valid, bool) & (documents > 0)
-    slots = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
     rows = jnp.arange(batch)[:, None]
-    ends = jnp.full((batch, count), -1, jnp.int32).at[rows, jnp.maximum(documents - 1, 0)].max(
-        jnp.where(real, slots, -1))
+    _, ends = real_bounds(documents, real, count)
     places = ends[:, :, None] - width + 1 + jnp.arange(width)[None, None, :]
     inside = jnp.clip(places, 0, length - 1)
     owner = documents[rows[:, :, None], inside]
@@ -414,9 +412,10 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     final state)`; the cache stays this function's either way.
 
     A call over forks (`coordinates.forks`) runs each document after its chain's conv history and from the
-    state its parent leaves, a root from the row's start (`forked_conv`, `forked_scan`), `scan` taking each
-    document's own entering slot of `held` (`entered`, `recurrence_chunk.Chunk.entered`) in a state at
-    least fp32 (`state_dtype` widened); a cached one starts from the cache and leaves it as it was."""
+    state its parent leaves, a root from the row's start (`forked_conv`, `forked_scan`), `scan` taking a
+    forked call's table (`forked` its `(loads, stores, held)`, `held` its given memories,
+    `recurrence_chunk.Chunk.loads`) in a state at least fp32 (`state_dtype` widened); a cached one starts
+    from the cache and leaves it as it was."""
     batch = mixed.shape[0]
     if coordinates.forks is not None:
         return _forked(module, mixed, taps, bias, scan, state_shape, decode=decode, coordinates=coordinates,
@@ -525,73 +524,67 @@ def fork_start(held, shape: tuple[int, ...], dtype):
 
 def forked_scan(convolved, rule, coordinates: Coordinates, start):
     """The recurrence of a call over forks (`Coordinates.forks`) after its conv (`forked_conv`): each
-    document from the state its parent's tokens leave, a root from the row's start (`start`, a pytree of
+    document from the memory its parent's tokens leave, a root from the row's start (`start`, a pytree of
     `[B, ...]` leaves: a cached call's state or zero, `fork_start`; Mamba-3's carry, four), as its own row of
-    its ancestors and itself runs it. One call of `rule` a level of the forks' chains, roots first, over the
-    whole row: `rule(convolved, *, valid, starts, state, entered)` runs the tokens `valid` marks, each
-    document numbered by its first slot among the call's `starts` (the row's first slot beginning one), the
-    `d`-th entering slot `entered[d]` of `state` (`start`'s leaves `[B, slots, ...]`, one-based) and its
-    final state its own (`recurrence_chunk.Chunk.entered`), returning `(output, finals)`, `finals` as `state`
-    a document a slot. The gradient of a state entered sums over the documents continuing it. A cached call
-    leaves the cache as it was: no document's final state is the row's."""
+    its ancestors and itself runs it, in one call of `rule` over the row, whatever the forks' depth:
+    `rule(convolved, *, valid, starts, state, loads, stores, held)` runs the tokens `valid` marks, each
+    document numbered by its first slot among the call's `starts` (the row's first slot beginning one), its
+    walk keeping a table of memories, `state`'s leaves `[B, 1, ...]` (the start) first, then the `held`
+    final memories the documents another continues leave (`recurrence_chunk.Chunk.loads`): a document
+    enters table slot `loads[d]` and leaves its final in stored slot `stores[d]`, returning `(output,
+    final)`. A document holding no real token passes its parent's memory on, so its children enter that.
+    The gradient of a memory entered sums over the documents continuing it. A cached call leaves the cache
+    as it was: no document's final is the row's."""
     forks = coordinates.forks
     assert forks is not None and coordinates.segments is not None
+    if forks.held is None:
+        raise ValueError("a recurrent layer reads a call over forks by the final memories its documents "
+                         "another continues leave, which its layout bounds (`Forks.held`), and this one "
+                         "states no bound")
     documents = jnp.asarray(coordinates.segments, jnp.int32)
     batch, length = documents.shape
     count = forks.count
     real = (jnp.ones((batch, length), bool) if coordinates.valid is None
             else jnp.asarray(coordinates.valid, bool)) & (documents > 0)
-    states = jax.tree.map(lambda leaf: jnp.concatenate(
-        [leaf[:, None], jnp.zeros((batch, count, *leaf.shape[1:]), leaf.dtype)], axis=1), start)
     rows = jnp.arange(batch)[:, None]
     number = jnp.maximum(documents - 1, 0)
-    levels = forks.levels()
-    level_of = jnp.where(documents > 0, jnp.take_along_axis(levels, number, axis=1), -1)
     slots_of = jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length))
-    # Each document's first real slot, `length` for one holding none, which passes its parent's state on
-    # as a padded token passes its own.
-    firsts = jnp.full((batch, count), length, jnp.int32).at[rows, number].min(
-        jnp.where(real, slots_of, length))
+    # Each document's first real slot, `length` for one holding none.
+    firsts, _ = real_bounds(documents, real, count)
     holding = firsts < length
     begins = real & (slots_of == jnp.take_along_axis(firsts, number, axis=1))
-    at = jnp.minimum(firsts, length - 1)
+    # Each document's source: its parent, or past a parent holding no token the memory that one passes on.
+    parents = jnp.asarray(forks.parents, jnp.int32)
+    source = parents
+    for _ in range(forks.depth):
+        empty = (source > 0) & ~jnp.take_along_axis(holding, jnp.maximum(source - 1, 0), axis=1)
+        source = jnp.where(empty, jnp.take_along_axis(parents, jnp.maximum(source - 1, 0), axis=1), source)
+    # The documents a holding document enters, each a stored slot in the row's order.
+    continued = jnp.zeros((batch, count + 1), bool).at[rows, jnp.where(holding, source, 0)].set(True)[:, 1:]
+    continued = continued & holding
+    stored = jnp.where(continued, jnp.cumsum(continued, axis=1, dtype=jnp.int32), 0)
+    # The table holds the start, then the stored: a root enters the start, a child its source's slot.
+    entering = jnp.where(source > 0, 1 + jnp.take_along_axis(stored, jnp.maximum(source - 1, 0), axis=1), 1)
     # A call numbers its documents by their first slots in the row, the row's first slot beginning one
     # whatever it holds (`dew.batch.document_firsts`): as many as the row has slots.
-    slots = min(count + 1, length)
-    parents = jnp.asarray(forks.parents, jnp.int32)
-
-    def lifted(mask, leaf):
-        return mask.reshape(batch, count, *(1,) * (leaf.ndim - 2))
-
-    out = None
-    for level in range(forks.depth + 1):
-        valid = real & (level_of == level)
-        begun = (begins & valid).at[:, 0].set(True).astype(jnp.int32)
-        slot = jnp.take_along_axis(jnp.cumsum(begun, axis=1) - begun, at, axis=1)
-        here = (levels == level) & holding
-        entering = jnp.zeros((batch, slots), jnp.int32).at[rows, jnp.where(here, slot, slots)].set(
-            parents + 1, mode="drop")
-        found, finals = rule(convolved, valid=valid, starts=begins & valid, state=states, entered=entering)
-        passed = (levels == level) & ~holding
-
-        def settled(leaf, final, slot=slot, here=here, passed=passed):
-            # A document holding real tokens its final; one holding none its parent's state passed on.
-            taken = jnp.take_along_axis(final, lifted(jnp.minimum(slot, slots - 1), final), axis=1)
-            prior = jnp.take_along_axis(leaf, lifted(parents, leaf), axis=1)
-            return leaf.at[:, 1:].set(jnp.where(lifted(here, leaf), taken.astype(leaf.dtype),
-                                                jnp.where(lifted(passed, leaf), prior, leaf[:, 1:])))
-
-        states = jax.tree.map(settled, states, finals)
-        out = found if out is None else jnp.where(valid.reshape(*valid.shape, *(1,) * (found.ndim - 2)),
-                                                  found, out)
+    called = min(count + 1, length)
+    begun = begins.at[:, 0].set(True).astype(jnp.int32)
+    slot = jnp.take_along_axis(jnp.cumsum(begun, axis=1) - begun, jnp.minimum(firsts, length - 1), axis=1)
+    at = jnp.where(holding, slot, called)
+    loads = jnp.zeros((batch, called), jnp.int32).at[rows, at].set(entering, mode="drop")
+    stores = jnp.zeros((batch, called), jnp.int32).at[rows, at].set(stored, mode="drop")
+    given = jax.tree.map(lambda leaf: leaf[:, None], start)
+    out, _ = rule(convolved, valid=real, starts=begins, state=given, loads=loads, stores=stores,
+                  held=forks.held)
     return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
 
 
 def _forked(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
             coordinates: Coordinates, state: str, wide, parts, dtype):
     """`held_scan` of a call over forks: its conv (`forked_conv`) and its scan a level of the forks' chains
-    at a time (`forked_scan`), `scan(convolved, *, starts, valid, held, entered)` running each document
-    from its entering slot of `held`; a cached call from the layer's held conv history and state, read and
+    in one pass (`forked_scan`), `scan(convolved, *, starts, valid, held, forked)` running each document from
+    its table slot (`forked` its `(loads, stores, held)`, `held` its given memories, `Chunk.loads`); a cached
+    call from the layer's held conv history and state, read and
     left as they were (a forks call continues a cache a decode call allocated)."""
     if sequence_shards() > 1:
         raise LayoutRefused("documents that continue another are read whole in their rows; a sequence axis "
@@ -604,8 +597,8 @@ def _forked(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, 
         history, held = module.get_variable('cache', 'conv_state'), module.get_variable('cache', state)
     convolved = forked_conv(mixed, taps, coordinates, history=history, bias=bias, parts=parts, dtype=dtype)
 
-    def rule(convolved, *, valid, starts, state, entered):
-        return scan(convolved, starts=starts, valid=valid, held=state, entered=entered)
+    def rule(convolved, *, valid, starts, state, loads, stores, held):
+        return scan(convolved, starts=starts, valid=valid, held=state, forked=(loads, stores, held))
 
     return forked_scan(convolved, rule, coordinates, fork_start(held, (mixed.shape[0], *state_shape), wide))
 
@@ -1202,11 +1195,17 @@ class GatedDeltaNet(nn.Module):
                                      self._stored(operand)[0])
         return decode_kernel(state, groups=self.num_k_heads, fuses=True)
 
+    @property
+    def _gates(self) -> recurrence.Gates:
+        """The layer's gates from their pre-activations, the fused token's and the sequence's alike: a
+        sigmoid write gate and the softplus step's log decay (`recurrence.gated`)."""
+        return recurrence.Gates()
+
     def _fused_hooks(self) -> recurrence.Hooks:
         """The decode token whole in the recurrence's step: the conv and its silu, the queries' and
         keys' l2 norm, the gates from their pre-activations, the delta rule and the gated norm."""
         return recurrence.Hooks(conv=recurrence.Conv('silu'), l2norm=True, decay='scalar',
-                                gates=recurrence.Gates(),
+                                gates=self._gates,
                                 output=recurrence.OutputNorm(self.norm_eps, self.gate_activation))
 
     def _fused_token(self, z, b, a, valid):
@@ -1241,8 +1240,8 @@ class GatedDeltaNet(nn.Module):
         # underflow to -inf (modeling_qwen3_next.py:652-653); at least fp32,
         # so a float64 model's stays float64 (`at_least_fp32`).
         wide = at_least_fp32(operand)
-        beta = nn.sigmoid(b.astype(wide))
-        g = -jnp.exp(self.A_log.astype(wide)) * nn.softplus(a.astype(wide) + self.dt_bias.astype(wide))
+        g, beta = recurrence.gated(self._gates, a.astype(wide), self.A_log.astype(wide),
+                                   self.dt_bias.astype(wide), b.astype(wide))
         if valid is not None:
             # exp(0)=1 and beta=0 preserve recurrent memory for invalid input.
             beta = jnp.where(valid[:, :, None], beta, 0.0)
@@ -1256,24 +1255,25 @@ class GatedDeltaNet(nn.Module):
         # beta a sigmoid's, of the queries and keys the conv l2-normalized (`causal_conv1d`'s pieces).
         ported = S > 1 and kernel_routed(rows, keys, values, g, beta, write_bound=1.0)
 
-        def scan(convolved, *, starts, valid, held, entered=None):
+        def scan(convolved, *, starts, valid, held, forked=None):
             query, key, value = (self._split_heads(part, width)
                                  for part, width in zip(convolved, widths, strict=True))
             state = None if held is None else held.astype(wide)
-            if S > 1 or entered is not None:
+            if S > 1 or forked is not None:
                 # fla's layer hands its rule the projections' dtype, the
                 # queries and keys on their own heads and beta beside them. A
                 # held history can make the convolved operands vary where the
                 # projections did not, so the route is asked again of them.
-                # The batch's documents' firsts, built once with it (`Coordinates.firsts`); documents each
-                # from a memory of their own (a call over forks, `held_scan`) name theirs (`entered`), a
-                # call's other tokens keeping its memory, as padding does (exp(0)=1, beta=0).
-                kept = None if entered is None else valid[:, :, None]
+                # The batch's documents' firsts, built once with it (`Coordinates.firsts`); a forked call's
+                # documents from its table (`held_scan`, `Chunk.loads`), its padded tokens keeping the
+                # memory (exp(0)=1, beta=0).
+                kept = None if forked is None else valid[:, :, None]
+                loads, stores, held = (None, None, 0) if forked is None else forked
                 return chunk_gated_delta_rule(
                     query, key, value, g if kept is None else jnp.where(kept, g, 0.0),
                     beta if kept is None else jnp.where(kept, beta, 0.0), state, self.chunk_size,
                     starts=starts, max_segments=tokens.max_segments, write_bound=1.0,
-                    firsts=tokens.firsts if entered is None else None, entered=entered)
+                    firsts=tokens.firsts if forked is None else None, loads=loads, stores=stores, held=held)
             # One key head serves `per_v` value heads, the reference's `repeat_interleave`.
             query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
             if stepped and held is not None:

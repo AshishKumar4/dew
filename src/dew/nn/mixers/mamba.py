@@ -44,7 +44,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
-from dew.nn.kernels import recurrence_algebra, recurrence_chunk
+from dew.nn.kernels import chunked_launch, recurrence_algebra, recurrence_chunk
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
@@ -60,28 +60,28 @@ not depend on it."""
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int = CHUNK_SIZE, *,
-                   firsts=None):
+                   forked: chunked_launch.Forked | None = None):
     """`mamba_selective_scan` (modeling_mamba.py:175-282) after the softplus.
 
     `x` and `dt` `[B, S, D]`, `A` `[D, N]`, `B` and `C` `[B, S, N]`, `D` `[D]`;
     returns `(output [B, S, D], state [B, D, N])` computed in `at_least_fp32`
     and cast back. `starts` `[B, S]` marks packed documents' first tokens,
     whose entering state drops. A call shorter than a chunk scans its own
-    length, so a decode step is the recurrence's one step. A 4-D `state`
-    `[B, Dc, D, N]` is each of a row's documents' own, each first at `firsts`
-    `[B, Dc]`: each document is laid from a chunk's edge and the scan takes up
-    its state there (`AlignedDocuments`), the final state each document's
-    `[B, Dc, D, N]`.
+    length, so a decode step is the recurrence's one step. A forked call
+    (`forked`, `recurrence_chunk.Chunk.loads`; `state` `[B, S', D, N]` its
+    table's given states) lays each document from a chunk's edge, and the scan
+    takes each one's state up there from its table, the given ones then those
+    it stores at documents' last chunks (`AlignedDocuments`); the final state is
+    the row's last.
     """
     dtype, work = x.dtype, at_least_fp32(x.dtype)
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, channels = x.shape
-    # Documents entering states of their own: their layout from each chunk's edge, and the skip each
-    # token adds at its own slot.
+    # A forked call's documents: their layout from each chunk's edge, and the skip each token adds at its
+    # own slot.
     entered = None
-    if state is not None and state.ndim == 4:
-        assert firsts is not None, "documents entering states of their own name their first slots"
-        aligned = recurrence_chunk.AlignedDocuments.of(firsts, length, chunk_size)
+    if forked is not None:
+        aligned = chunked_launch.AlignedDocuments.of(forked, length, chunk_size)
         entered = (aligned, x * D)
         x, dt, B, C = aligned.laid(x, dt, B, C)
         starts, length = None, aligned.length
@@ -114,22 +114,22 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         out = jnp.moveaxis(out, 0, 1).reshape(batch, length + pad, channels)[:, :length] + x * D
         return out.astype(dtype), final.astype(dtype)
     aligned, skipped = entered
-    memories = jnp.asarray(state, work)
+    given = jnp.asarray(state, work)
+    assert forked is not None
 
-    def loading(h, step):
-        step, load = step
-        # A chunk that takes a document up enters its state; each row's documents in turn.
-        at = jnp.maximum(load, 0)[:, None, None, None]
-        taken = jnp.where((load >= 0)[:, None, None], jnp.take_along_axis(memories, at, axis=1)[:, 0], h)
-        after, read = scanned(taken, step)
-        return after, (read, h)
+    def loading(carried, step):
+        h, table = carried
+        step, load, store = step
+        # A chunk that takes a document up enters its table slot's state; each row's documents in turn.
+        taken = jax.vmap(recurrence_chunk.table_read)(given, table, load)
+        after, read = scanned(jnp.where((load >= 0)[:, None, None], taken, h), step)
+        return (after, jax.vmap(recurrence_chunk.table_stored)(table, store, after)), read
 
-    last, (out, left) = jax.lax.scan(loading, jnp.zeros_like(memories[:, 0]),
-                                     (steps, jnp.moveaxis(aligned.loads, 1, 0)))
+    table = jnp.zeros((batch, forked.held, *given.shape[2:]), work)
+    (last, _), out = jax.lax.scan(loading, (jnp.zeros_like(given[:, 0]), table),
+                                  (steps, *(jnp.moveaxis(t, 1, 0) for t in (aligned.loads, aligned.stores))))
     out = jnp.moveaxis(out, 0, 1).reshape(batch, length, channels)
-    finals = jax.vmap(recurrence_chunk.document_finals)(memories, aligned.loads, jnp.moveaxis(left, 0, 1),
-                                                        last)
-    return (aligned.unlaid(out) + skipped).astype(dtype), finals.astype(dtype)
+    return (aligned.unlaid(out) + skipped).astype(dtype), last.astype(dtype)
 
 
 class Mamba(nn.Module):
@@ -248,12 +248,12 @@ class Mamba(nn.Module):
         gated = out * nn.silu(gate.astype(wide))
         return self.out_proj(gated.astype(gate.dtype))
 
-    def _scan(self, convolved, *, starts, valid, held, entered=None):
+    def _scan(self, convolved, *, starts, valid, held, forked=None):
         """The selective scan of the convolved `[B, S, D]` inner channels:
         the raw step, B and C from `x_proj`, then the step through
         `dt_proj`. Returns `[B, S, D]` before the gate and the state leaving
-        it; with `entered`, each of `starts`' documents from its own slot of
-        `held` and each one's final state (`recurrence_chunk.selective_scan`)."""
+        it; a forked call's documents from its table (`forked` its `(loads,
+        stores, held)`, `held` its given states, `recurrence_chunk.selective_scan`)."""
         xs = convolved
         if valid is not None:
             xs = jnp.where(valid[:, :, None], xs, 0)
@@ -269,7 +269,8 @@ class Mamba(nn.Module):
         # The scan on the kernel its selector gives each product (`recurrence_chunk.SELECTIVE`).
         return recurrence_chunk.selective_scan(
             xs, step, -jnp.exp(jnp.asarray(self.A_log, wide)), B, C, jnp.asarray(self.D, wide), held, starts,
-            portable=functools.partial(selective_scan, chunk_size=self.chunk_size), entered=entered)
+            portable=functools.partial(selective_scan, chunk_size=self.chunk_size),
+            **({} if forked is None else dict(zip(("loads", "stores", "held"), forked, strict=True))))
 
 
 class _StepProjection(nn.Module):

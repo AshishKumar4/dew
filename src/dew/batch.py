@@ -190,6 +190,14 @@ def document_spans(segments, count: int, *, xp=jnp):
     return first, xp.where(end > 0, end, length)
 
 
+def real_bounds(segments, real, count: int, *, xp=jnp):
+    """Each of a row's `count` documents' first and last real slot `[B, D]` (`document_spans` over
+    `segments` kept where `real` `[B, S]` marks a token), `S` and -1 for one holding no real token."""
+    held = xp.asarray(real, bool) & (xp.asarray(segments) > 0)
+    first, end = document_spans(xp.where(held, xp.asarray(segments, np.int32), 0), count, xp=xp)
+    return first, xp.where(first < held.shape[1], end - 1, -1)
+
+
 @struct.dataclass
 class Forks:
     """A row's documents of which some continue another: a forest of shared prefixes. `parents` `[B, D]`
@@ -204,7 +212,13 @@ class Forks:
     (`positions`). So a document computes what its own row of its ancestors and itself computes, and a
     prefix that several continue is computed once: a request's questions over its state, a prompt's
     completions, a speculative tree's candidates (each a document of one token). `dew.batch.ForkedRows`
-    packs rows that share prefixes into such documents."""
+    packs rows that share prefixes into such documents. A document's parent is laid before it in its row,
+    so one walk over the row in order computes every parent before its children.
+
+    `held`, static, is the most of a row's documents that another continues, which a recurrent layer
+    keeps the final memories of (`dew.nn.linear.forked_scan`): its layout's own bound, one value a run (a
+    request's shared part a window's row, a pair's prompt, a tree's inner nodes), never the documents bound;
+    None where it states none, which a recurrent layer refuses."""
 
     parents: jax.Array | np.ndarray
     depth: int = struct.field(pytree_node=False, default=1)
@@ -212,6 +226,7 @@ class Forks:
     """Whether each tree's documents are one row's, read together, its dropout drawn once (a decision
     row's questions with siblings, `QuestionLayout.siblings`), rather than rows a shared prefix stands in
     for, each of which would draw its own (`dew.nn.backbones.decoder_refusals.forked`)."""
+    held: int | None = struct.field(pytree_node=False, default=None)
 
     @property
     def count(self) -> int:
@@ -306,11 +321,13 @@ class Forks:
         before = xp.where(opening, xp.where(parent > 0, last, -1), slots - 1)
         return xp.where(segments > 0, before, -1).astype(np.int32)
 
-    def runs(self, segments):
+    def runs(self, segments, reach=None):
         """Each token's key runs `[B, S, depth + 1, 2]` over the call's own slots
         (`dew.nn.inputs.AttentionMetadata.key_runs`): its ancestors whole, its root's first, then its own
-        document up to itself, empty runs `(0, 0)` past a shallower chain; a padding slot reads itself
-        alone. A cached call's attention places them after the row's cache (`fork_runs`)."""
+        document up to itself, or up to `reach` `[B, S]` (the slot past the last it reads, a bidirectional
+        group's end) within its document, empty runs `(0, 0)` past a shallower chain; a
+        padding slot reads itself alone. A cached call's attention places them after the row's cache
+        (`fork_runs`)."""
         segments = jnp.asarray(segments, jnp.int32)
         batch, length = segments.shape
         first, end = self.spans(segments)
@@ -319,6 +336,8 @@ class Forks:
         # Each token's document's ancestors `[B, S, depth]`, nearest first.
         chain = jnp.take_along_axis(self.ancestors(), number[:, :, None], axis=1)
         level = jnp.sum(chain > 0, axis=-1)
+        reached = slots + 1 if reach is None else jnp.clip(
+            jnp.asarray(reach, jnp.int32), slots + 1, jnp.take_along_axis(end, number, axis=1))
         runs = []
         for index in range(self.depth + 1):
             # Run `index` is the ancestor `level - index` above the token's document, its own at `level`.
@@ -329,13 +348,20 @@ class Forks:
             hi = jnp.take_along_axis(end, jnp.maximum(ancestor - 1, 0), axis=1)
             own = distance == 0
             lo = jnp.where(own, jnp.take_along_axis(first, number, axis=1), lo)
-            hi = jnp.where(own, slots + 1, hi)
+            hi = jnp.where(own, reached, hi)
             kept = (distance >= 0) & (segments > 0)
             pad = segments == 0
             lo = jnp.where(kept, lo, jnp.where(pad & (index == 0), slots, 0))
             hi = jnp.where(kept, hi, jnp.where(pad & (index == 0), slots + 1, 0))
             runs.append(jnp.stack([lo, hi], axis=-1))
         return jnp.stack(runs, axis=2).astype(jnp.int32)
+
+    @staticmethod
+    def held_of(parents) -> int:
+        """The most of a row's documents another continues, of `parents` `[B, D]` (host arrays): the
+        `held` a layout packed ahead states, its plan's whole."""
+        parents = np.asarray(parents, np.int64)
+        return max((len(set(row[row > 0].tolist())) for row in parents), default=0)
 
     @staticmethod
     def depth_of(parents) -> int:
@@ -833,8 +859,9 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
     `token_scores` refuses depths with blocks. With `predecessors` (`Coordinates.predecessors`, at
     `depth` 0, where its rows carry forks or a tail of finals), each target is its own token's, scored from
     its predecessor's state: it counts where it has one and both are real, a document's first token from
-    its parent's last."""
+    its parent's last, and a block's from the predecessor's block."""
     span = depth + 1
+    before = None
     if predecessors is not None:
         if depth or segment_ids is None:
             raise ValueError("a target scored from its predecessor is its own token's, at depth 0 over the "
@@ -852,8 +879,10 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
     if role is not None and roles is not None:
         counted = counted & (roles[:, span:] == role)
     if blocks is not None:
-        # The state's block holds the target (`dew.nn.visibility.same_group`, which this module sits below).
-        source = blocks[:, :-span]
+        # The state's block holds the target (`dew.nn.visibility.same_group`, which this module sits below):
+        # the state at the target's predecessor where the rows carry forks.
+        source = (blocks[:, :-span] if before is None
+                  else xp.take_along_axis(xp.asarray(blocks), xp.maximum(before, 0), axis=1))
         counted = counted & ~((source == blocks[:, span:]) & (source >= 0))
     return counted
 

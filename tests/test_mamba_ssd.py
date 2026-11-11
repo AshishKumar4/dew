@@ -159,7 +159,7 @@ def _port_holds_check_1(case):
         inputs = tuple(jnp.asarray(arrays[name], dtype if name in ("x", "B", "C") else jnp.float32)
                        for name in names)
         seq = arrays.get("seq")
-        return ssd_value_and_grad(lambda *values: mamba_ssd.ssd_scan(*values, seq, chunk, INTERPRETED),
+        return ssd_value_and_grad(lambda *values: mamba_ssd.ssd_scan(*values, seq, None, chunk, INTERPRETED),
                                   inputs, jnp.asarray(arrays["dy"], dtype), jnp.asarray(arrays["dfinal"]))
 
     _, inputs = draw(0)
