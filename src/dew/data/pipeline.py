@@ -1330,10 +1330,12 @@ class Dataset:
         return dataclasses.replace(chain, mode=mode)
 
     def threads(self, count: int) -> Pipeline:
-        """Read with `count` threads a worker, rather than the measured default."""
+        """Read with `count` threads a worker, rather than the measured default, every other setting the
+        chain's, or where it names none the one a chain naming none reads with: automatic workers, which
+        a training read sizes and any other read takes none of (`Loading.resolved`, unsized)."""
         from dew.data.dataset import Loading
 
-        loading = self._chain()._loading or Loading()
+        loading = self._chain()._loading or Loading(workers="auto")
         return self.loading(dataclasses.replace(loading, threads=count,
                                                 read_buffer=max(loading.read_buffer, count)))
 

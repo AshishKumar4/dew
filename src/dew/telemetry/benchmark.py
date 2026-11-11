@@ -3,7 +3,8 @@ calls with, `carried`, which times calls that carry a state from one to the next
 which lays out many calls' timings as a table, and `compared`, which reads two calls against each
 other by their paired ratio; a GPU call's own kernels' device time, as CUPTI reads it
 (`device_time`), which the kernel tuner and the kernel benchmarks read; the process's resident
-memory as the kernel reports it (`resident_memory`), which the memory benchmarks read; and
+memory as the kernel counts it page by page (`resident_memory`) and the most a region holds
+(`resident_peak`), which the memory benchmarks read; and
 `exclusive_window`, which holds a job's measured region alone on its node's GPUs where a node's
 session runs the job.
 
@@ -24,6 +25,7 @@ import math
 import os
 import select
 import statistics
+import threading
 import time
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from fractions import Fraction
@@ -94,20 +96,61 @@ class Benchmark[T]:
 
 
 def resident_memory() -> dict[str, int]:
-    """This process's memory fields of Linux's /proc/self/status (VmRSS, RssAnon, RssFile, VmHWM,
-    ...), each in bytes, under the kernel's names; a benchmark keeps the fields and unit it reports.
-
-    The resident counts are the kernel's running counters, which since Linux 6.2 each CPU batches
-    before they reach the process's total: a reading lags the pages just written by up to a batch
-    for each CPU the writing threads ran on, on a machine of many CPUs tens of MiB."""
+    """This process's resident memory as the kernel counts it page by page, /proc/self/smaps_rollup's
+    fields (Rss, Anonymous, Pss_File, Swap, ...), each in bytes under the kernel's names: a walk of its
+    page tables, exact where /proc/self/status's running counters (VmRSS, RssAnon) lag the pages just
+    written, since Linux 6.2 by a batch for each CPU the writing threads ran on, on a machine of many CPUs
+    tens of MiB (a 31 MB tree held home read as 9 MB, train 742). A benchmark keeps the fields and unit
+    it reports; the most a region holds is `resident_peak`'s."""
     fields = {}
-    with open("/proc/self/status") as handle:
-        for line in handle:
-            name, _, value = line.partition(":")
-            match value.split():
-                case [amount, "kB"]:
-                    fields[name] = int(amount) * 1024
+    for line in Path("/proc/self/smaps_rollup").read_text().splitlines():
+        name, _, value = line.partition(":")
+        match value.split():
+            case [amount, "kB"]:
+                fields[name] = int(amount) * 1024
     return fields
+
+
+@dataclasses.dataclass
+class ResidentPeak:
+    """What `resident_peak` read of the process's resident memory (`resident_memory`'s fields): at the
+    block's start (`before`), and the most of each field it saw within it (`most`), whole once the
+    block ends."""
+
+    before: dict[str, int]
+    most: dict[str, int]
+
+    def rise(self, field: str = "Rss") -> int:
+        """How far `field` rose above the block's start at its most."""
+        return self.most[field] - self.before[field]
+
+
+@contextlib.contextmanager
+def resident_peak(interval: float = 0.002) -> Iterator[ResidentPeak]:
+    """The process's resident memory at the block's start and the most of each field within it
+    (`ResidentPeak`), read exactly (`resident_memory`) every `interval` seconds on a thread of its own and
+    once as the block ends, however it ends: a region's high-water, which the kernel's own (VmHWM) keeps
+    for the process's whole life alone. What the region holds for less than an interval may be missed."""
+    before = resident_memory()
+    peak = ResidentPeak(before, dict(before))
+    finished = threading.Event()
+
+    def held() -> None:
+        now = resident_memory()
+        peak.most.update({name: max(peak.most.get(name, value), value) for name, value in now.items()})
+
+    def sample() -> None:
+        while not finished.wait(interval):
+            held()
+
+    sampler = threading.Thread(target=sample, daemon=True)
+    sampler.start()
+    try:
+        yield peak
+    finally:
+        finished.set()
+        sampler.join()
+        held()
 
 
 def largest_difference(left, right) -> float:
@@ -502,5 +545,5 @@ def benchmark[T](calls: Mapping[Hashable, Callable[[], T]], *, warmup: int = 1,
 
 
 __all__ = ["EVICTION_BYTES", "Benchmark", "Comparison", "CuptiHeld", "DeviceTime", "KernelTime", "NoKernels",
-           "WindowRefused", "behind", "benchmark", "carried", "compared", "device_time", "eviction",
-           "exclusive_window", "samples"]
+           "ResidentPeak", "WindowRefused", "behind", "benchmark", "carried", "compared", "device_time",
+           "eviction", "exclusive_window", "resident_memory", "resident_peak", "samples"]

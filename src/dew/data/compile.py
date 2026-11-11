@@ -781,6 +781,7 @@ def compile(
     epochs: int | None = None,
     plan_version: int = PLAN_VERSIONS[-1],
     steps: int | None = None,
+    tokens: int | None = None,
 ) -> Loader:
     """Check every leaf before opening readers, then build both branches; `widths` are the run's
     static widths its steps bind to (`run_widths`), and `measured` its training branch as their
@@ -792,7 +793,9 @@ def compile(
     holds once it is prepared (`_staged`, `Loader.pass_examples`). `plan_version` is the data plan version
     it reads by (`dew.data.plan.PLAN_VERSIONS`): this Dew's, or the one a resumed run saved under, which
     reads its order as it did (`dew.config.RunConfig.data_plan_version`), refused before anything is
-    provisioned where this Dew reads by none of it (`dew.data.plan.read_by`)."""
+    provisioned where this Dew reads by none of it (`dew.data.plan.read_by`). `steps` or `tokens` is the
+    run's length where it is no bound of the read's own, which automatic loading sizes its workers for
+    (`_run_batches`)."""
     read_by(plan_version)
     # The objective's data and each chain's calls as the plan's version reads them (`ObjectiveData.at`,
     # `Pipeline.at`).
@@ -816,12 +819,12 @@ def compile(
             resume=resume,
             plan_version=plan_version,
             steps=steps,
+            budget=tokens,
         )
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured,
                      epochs=epochs, version=plan_version)
-    # Automatic loading sizes its workers for the run's batches: its `steps`, else an `examples` bound's.
-    batches = steps if steps is not None or examples is None else -(-examples // staged.build.batch)
+    batches = _run_batches(staged, steps=steps, examples=examples, epochs=epochs, tokens=tokens)
     loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume, batches=batches)
     if staged.passes is not None and epochs is not None:
         return dataclasses.replace(loader, examples=epochs * staged.passes, epochs=epochs,
@@ -1075,6 +1078,39 @@ def _output_batch(pipeline: Pipeline) -> int:
     return next(stage.size for stage in pipeline.stages if isinstance(stage, BatchStage))
 
 
+def _validation_build(build: _Build, validation: Pipeline, read: Read) -> _Build:
+    """The build a validation pass of `validation` reads by: training's loading as the chain states it,
+    not as training resolved it, sized for its own pass (`_Build.tuned` over `pass_batches`): a reader opens
+    each pass afresh and starts its workers again, so a pass whose Python pays for no start reads in the
+    process, where training's count started up to a worker a batch of every pass (train 746's review)."""
+    held = dataclasses.replace(build, lowering=_analyzed(validation, read, validation=True), training=False,
+                               batch=_output_batch(validation), named=_own_key(validation))
+    passed = held.pass_batches(validation) if held.loading.workers == "auto" else None
+    return held.tuned(validation, batches=passed)
+
+
+def _run_batches(staged: _Staged, *, steps: int | None, examples: int | None, epochs: int | None,
+                 tokens: int | None) -> int | None:
+    """The batches a run reads, which automatic loading sizes its workers for (`Loading.resolved`): its
+    `steps`; an `examples` bound's batches; `epochs` passes over its records, or over the source examples
+    a pass holds where its read counts no records (`_Staged.passes`); a `tokens` budget over the most a
+    batch holds (its stated token batch, else its rows times the tokens a row holds, `_row_tokens`), the
+    fewest batches it may take; None where nothing states its length, which reads in the process."""
+    batch = staged.build.batch
+    if steps is not None:
+        return steps
+    if examples is not None:
+        return -(-examples // batch)
+    if epochs is not None:
+        records = staged.passes if staged.passes is not None else _epoch_records(staged.train, staged.build)
+        return None if records is None else epochs * -(-records // batch)
+    if tokens is not None:
+        row = _row_tokens(staged.train)
+        held = staged.batch_tokens or (None if row is None else batch * row)
+        return None if not held else -(-tokens // held)
+    return None
+
+
 def _compiled(
     staged: _Staged,
     packed: tuple[Coordinated, ...],
@@ -1142,11 +1178,7 @@ def _compiled(
         else functools.partial(
             _validation_reader,
             pipeline=validation,
-            build=dataclasses.replace(
-                tuned, lowering=_analyzed(validation, read, validation=True), training=False,
-                batch=_output_batch(validation),
-                named=_own_key(validation),
-            ).tuned(validation),
+            build=_validation_build(staged.build, validation, read),
             host=_held_coordinated(validation, packed) + _held_steps(validation) + host,
         )
     )
@@ -1267,6 +1299,26 @@ def _held_steps(pipeline: Pipeline) -> tuple[HostStep, ...]:
     return host
 
 
+def _phase_batches(source: Phases, index: int, phase: _Staged, *, steps: int | None, budget: int | None,
+                   tokens: bool) -> int | None:
+    """The batches phase `index` of `source` reads, which automatic loading sizes its workers for
+    (`Loading.resolved`): of a run of `steps`, its own steps on the step clock, else the run's; of a run of
+    `budget` tokens, its own span of them on the token clock (`tokens`), else the run's, over the most a
+    batch of it holds (`_run_batches`)."""
+    start = (source.ends[index - 1] if index else 0) or 0
+    until = source.ends[index]
+
+    def span(length: int) -> int:
+        return max(0, (length if until is None else min(until, length)) - start)
+
+    if steps is not None:
+        return steps if tokens else span(steps)
+    if budget is None:
+        return None
+    return _run_batches(phase, steps=None, examples=None, epochs=None,
+                        tokens=span(budget) if tokens else budget)
+
+
 def _compile_phases(
     train: Pipeline,
     *,
@@ -1281,19 +1333,12 @@ def _compile_phases(
     resume: Literal["exact", "non-exact"],
     plan_version: int = PLAN_VERSIONS[-1],
     steps: int | None = None,
+    budget: int | None = None,
 ) -> Loader:
     source = train.source
     if not isinstance(source, Phases):
         raise TypeError("phased compilation needs a Phases source")
 
-    def planned(index: int) -> int | None:
-        """The batches phase `index` reads of a run of `steps`, which automatic loading sizes its workers
-        for (`Loading.resolved`): its own steps on the step clock, else the run's."""
-        if steps is None or tokens:
-            return steps
-        start = source.ends[index - 1] if index else 0
-        until = source.ends[index]
-        return max(0, (steps if until is None else min(until, steps)) - (start or 0))
     _tokenizer_contract((train,) if validation is None else (train, validation))
 
     def staged_at(index: int, consumed: Mapping[str, int]) -> _Staged:
@@ -1338,7 +1383,8 @@ def _compile_phases(
     packed = _coordinated(*(phase.train for phase, _ in staged))
     built: list[tuple[Loader, int | None]] = []
     for index, (phase, end) in enumerate(staged):
-        loaded = _compiled(phase, packed, host=host, resume=resume, batches=planned(index))
+        batches = _phase_batches(source, index, phase, steps=steps, budget=budget, tokens=tokens)
+        loaded = _compiled(phase, packed, host=host, resume=resume, batches=batches)
         if built and loaded.device != built[0][0].device:
             # The run applies one set of device steps to every batch (`Loader.device`), so a phase
             # whose own differ would run the first phase's.
@@ -1367,8 +1413,9 @@ def _compile_phases(
         if tokens and index:
             consumed = consumed_by([phase for phase, _ in staged[:index]], ends)
             if any(consumed.get(_name(chain), 0) for chain, _ in _leaves(source.pipelines[index])):
-                loader = _compiled(staged_at(index, consumed), packed, host=host, resume=resume,
-                                   batches=planned(index))
+                phase = staged_at(index, consumed)
+                batches = _phase_batches(source, index, phase, steps=steps, budget=budget, tokens=tokens)
+                loader = _compiled(phase, packed, host=host, resume=resume, batches=batches)
         return counted(loader)
 
     batches = tuple(phase.build.batch for phase, _ in staged)
@@ -1676,7 +1723,7 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     eager memory transforms, and leaves its counters in the Grain state.
     """
     read = pipeline.mode or _preferred_read((pipeline,), provision=True)
-    loading = pipeline._loading or _DEFAULT_LOADING
+    loading = (pipeline._loading or _DEFAULT_LOADING).unsized()
     if records is not None:
         pipeline = pipeline._then(Limit(records))
         loading = dataclasses.replace(loading, workers=0, threads=0, read_buffer=0)
@@ -1722,9 +1769,10 @@ def iterate(
     plan_version: int = PLAN_VERSIONS[-1],
 ) -> pygrain.IterDataset:
     """A finite record pass through the same lowering, for publication and export, read by data plan
-    `plan_version` (`compile`'s)."""
+    `plan_version` (`compile`'s), automatic workers read in the process (`Loading.unsized`)."""
     read_by(plan_version)
     pipeline = pipeline.at(plan_version)
+    loading = loading.unsized()
     if any(
         isinstance(stage, (RandomMap, BatchStage, MapBatch, Workers, Repeat)) for stage in _steps(pipeline)
     ):
@@ -1873,6 +1921,7 @@ def fitted[Entry](
     epochs: int | None = None,
     plan_version: int = PLAN_VERSIONS[-1],
     steps: int | None = None,
+    tokens: int | None = None,
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
     compiled with the objective's own stages and the run's data `seed`,
@@ -1929,7 +1978,7 @@ def fitted[Entry](
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
                          widths=widths, read=read, measured=measured,
                          epochs=epochs if examples is None else None, plan_version=plan_version,
-                         steps=steps)
+                         steps=steps, tokens=tokens)
     else:
         widths = run_widths(list(scored.values()), objective) if scored else {}
         loader = dataset

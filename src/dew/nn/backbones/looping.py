@@ -62,6 +62,27 @@ def exit_log_distribution(logits: Sequence[jax.Array]) -> jax.Array:
     return before + jnp.concatenate([jax.nn.log_sigmoid(hazards), jnp.zeros_like(before[:1])])
 
 
+EXIT_ENTROPY = 0.1
+"""The exit objective's entropy weight β (`exit_objective`) a run that draws a fresh exit gate trains it under
+where it states none: Ouro's for its first pretraining stage, which trained its gates from their
+initialization, before it lowered β to 0.05 for the stages after (arXiv 2510.25741 v4, section 4.3.1 and its
+training table)."""
+
+
+def exit_objective(pass_losses: Sequence[jax.Array], logits: Sequence[jax.Array], entropy_weight: float,
+                   dtype: jnp.dtype) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Ouro's exit objective (arXiv 2510.25741) per token, in `dtype`, from each pass's loss `[B, S]` and
+    every pass's exit-gate logit `[B, S, 1]`: the loss expected under the exit distribution
+    (`exit_log_distribution`) less `entropy_weight` times that distribution's entropy, the expectation
+    and the entropy. Read from the log probabilities, so a hazard that rounds to one leaves every gradient
+    finite. Every objective that trains a looped decoder's gate weighs its passes so."""
+    log_chances = exit_log_distribution(logits).astype(dtype)
+    chances = jnp.exp(log_chances)
+    expected = jnp.sum(chances * jnp.stack(pass_losses).astype(dtype), axis=0)
+    entropy = -jnp.sum(chances * log_chances, axis=0)
+    return expected - jnp.asarray(entropy_weight, dtype) * entropy, expected, entropy
+
+
 def exit_choice(logits: Sequence[jax.Array], threshold: float) -> jax.Array:
     """The pass each token exits at under `threshold` (`Loop.exit_threshold`), from the exit-gate logits
     of every pass before the last: the first whose cumulative exit probability

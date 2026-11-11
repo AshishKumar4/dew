@@ -290,7 +290,7 @@ class LMRunConfig(DecoderRunConfig):
             # A rollout's method fixes the objective settings it names (`PromptRollout.method`).
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
-                samples=samples, processor=self.processor(),
+                samples=samples, processor=self.processor(), **self.exit_settings(),
                 **({} if self.rollout is None else self.rollout.objective_settings()))
         # Compiled once: the run's length and its cadences are read off this loader, which `train` trains on.
         loaded, held = self.compiled(objective.data(), self.chain(), self.validation)

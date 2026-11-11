@@ -90,7 +90,7 @@ def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
     ready_process()
     with startup.phase("data", "preparing the data"):
         loader, validation = fitted(dataset, validation, objective=objective.data(), examples=examples,
-                                    epochs=epochs, steps=steps)
+                                    epochs=epochs, steps=steps, tokens=tokens)
     # The plan version the data reads its rows by, a loader's own where it was compiled already (handed
     # data reads by none), then the widths it bound: what a saved run of the objective records.
     if loader.plan is not None:

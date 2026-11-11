@@ -4,57 +4,39 @@
 
 Loads `repo` in bfloat16 onto the default device (the mesh load streams, so
 the host holds no model afterwards), then saves it with `max_shard_size`.
-Prints one JSON line: RSS before the save, the highest RSS a 2 ms sampler
-saw during it and its rise, the same of anonymous memory alone (`anon_*`: the
-memory the process allocated, without the pages of files it maps, which the
-page cache and the host's load move), the export's weight bytes and the shard
-count. A save that gathers the model to the host first rises one model above
-the baseline; a streamed one, a few shards. `main` as the shard size calls `save` without one,
-for the writer before sharding.
+Prints one JSON line: RSS before the save, the highest RSS a 2 ms sampler of
+the exact page counts saw during it (`dew.telemetry.benchmark.resident_peak`)
+and its rise, the same of anonymous memory alone (`anon_*`: the memory the
+process allocated, without the pages of files it maps, which the page cache
+and the host's load move), the export's weight bytes and the shard count. A
+save that gathers the model to the host first rises one model above the
+baseline; a streamed one, a few shards. `main` as the shard size calls `save`
+without one, for the writer before sharding.
 """
 
 import json
 import sys
-import threading
 import time
 from pathlib import Path
 
 from dew.distributed.placement import MeshSpec
 from dew.interop import Pretrained
-from dew.telemetry.benchmark import resident_memory
-
-
-def _resident_gb() -> tuple[float, float]:
-    """The process's resident memory and its anonymous part, in GiB."""
-    memory = resident_memory()
-    return memory["VmRSS"] / 2**30, memory["RssAnon"] / 2**30
+from dew.telemetry.benchmark import resident_peak
 
 
 def main() -> None:
     repo, shard_size, out = sys.argv[1], sys.argv[2], Path(sys.argv[3])
     revision = sys.argv[4] if len(sys.argv) > 4 else None
     loaded = Pretrained.load(repo, revision=revision, param_dtype="bfloat16", mesh=MeshSpec())
-    before = _resident_gb()
-    highest = list(before)
-    done = threading.Event()
-
-    def sample() -> None:
-        while not done.wait(0.002):
-            highest[:] = map(max, highest, _resident_gb())
-
-    sampler = threading.Thread(target=sample)
-    sampler.start()
-    try:
+    with resident_peak() as peak:
         start = time.perf_counter()
         if shard_size == "main":
             loaded.save(out)
         else:
             loaded.save(out, max_shard_size=int(shard_size) if shard_size.isdigit() else shard_size)
         seconds = time.perf_counter() - start
-    finally:
-        # The sampler ends however the save does: a failed one raises its own error, not a hang at exit.
-        done.set()
-        sampler.join()
+    before = (peak.before["Rss"] / 2**30, peak.before["Anonymous"] / 2**30)
+    highest = (peak.most["Rss"] / 2**30, peak.most["Anonymous"] / 2**30)
     files = sorted(out.rglob("*.safetensors"))
     print(json.dumps({"repo": repo, "max_shard_size": shard_size, "rss_before_gb": round(before[0], 2),
                       "rss_peak_during_save_gb": round(highest[0], 2),

@@ -32,7 +32,7 @@ from dew.decision import (
 )
 from dew.decision.laya import LAYA_BUDGETS
 from dew.decision.rows import Encoding, Fit, QuestionRows, _encoded_unit, _window_groups
-from dew.decision.task import laid_out
+from dew.decision.task import laid_out, whole_blocks_of
 from dew.nn import categorical
 from dew.objectives.base import Ratio, Step, Weighted
 
@@ -106,6 +106,67 @@ def test_a_weight_of_zero_reads_no_groups_and_a_weight_adds_the_term_beside_the_
     value, _ = weighted.reduce_loss(stats)
     assert np.array_equal(np.asarray(value), np.asarray(label + 0.5 * term))
     assert "consistency" in aux.metrics
+
+
+def test_a_looped_backbones_exit_gate_trains_under_ouros_exit_objective_over_each_passs_answers():
+    """A decision over a backbone whose loop has an exit gate trains the gate under Ouro's exit objective
+    (`exit_entropy`): each question's label loss at each pass, its answers read off that pass's states by
+    the same head, weighted by the chance it exits there at the token its answer is read from, less β times
+    that distribution's entropy (`looping.exit_objective`), reported as `exit_ce` and `exit_entropy`; the
+    expectation equals the same weighting of the label losses of the backbone stopped at each pass
+    (`with_passes`), each of which holds that pass's states. The gate takes a gradient from the term, and
+    none without it, where it stays at its draw (the train review of trains 734-740: a decision run's gate
+    trained under no objective)."""
+    from dew.nn.backbones.decoder_stack import Loop
+
+    backbone = tiny_backbone().clone(max_seq_len=LAYOUT.max_len, loop=Loop(steps=3, exit_gate=True))
+    head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
+    gated = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT, head=head,
+                              exit_entropy=0.1)
+    plain = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT, head=head)
+    reader = decision_rows([NEGATED, NEGATED], None, objective=gated.data(), tokens=LAYOUT.max_len)
+    [batch] = list(itertools.islice(reader.train(DataPartition()), 1))
+    variables = gated.init(jax.random.key(0))
+    # A gate drawn off its zeros, so the passes' exit chances differ.
+    def drawn(path, leaf):
+        moved = 0.3 * jax.random.normal(jax.random.key(len(str(path))), leaf.shape, leaf.dtype)
+        return leaf + moved if "early_exit_gate" in jax.tree_util.keystr(path) else leaf
+
+    params = jax.tree_util.tree_map_with_path(drawn, variables["params"])
+    variables = {**variables, "params": params}
+    step = Step(jnp.asarray(0), jax.random.key(1), None)
+    _, aux = gated.loss(variables, batch, step)
+    assert {"exit_ce", "exit_entropy"} <= set(aux.metrics)
+
+    inputs = laid_out(batch, gated.bounds.segments, spans_in_context=gated.spans_in_context,
+                      whole_blocks=whole_blocks_of(gated.layout), attention=gated.layout.attention)
+    scored = np.asarray(batch["scored"], np.float64)
+    charges = []
+    for steps in (1, 2, 3):
+        stopped = dataclasses.replace(backbone, loop=Loop(steps=steps, exit_gate=True))
+        model = dataclasses.replace(gated.model, backbone=stopped)
+        charge, _ = gated._charge(model.logits(variables, inputs), inputs, batch)
+        charges.append(np.asarray(charge, np.float64))
+
+    def scored_mean(values) -> float:
+        return float(np.sum(values * scored) / np.sum(scored))
+
+    # The expectation under each question's exit distribution lies between its passes' least and most
+    # losses, and is no one pass's: the gate drawn off its zeros weighs them apart.
+    stacked = np.stack(charges)
+    expected = float(aux.metrics["exit_ce"])
+    assert scored_mean(stacked.min(axis=0)) <= expected <= scored_mean(stacked.max(axis=0))
+    assert all(expected != scored_mean(charge) for charge in charges)
+    assert float(aux.metrics["exit_entropy"]) > 0
+
+    def gate_gradient(objective):
+        gradient = jax.grad(lambda params: objective.reduce_loss(objective.loss(
+            {**variables, "params": params}, batch, step)[0])[0])(variables["params"])
+        return [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(gradient)
+                if "early_exit_gate" in jax.tree_util.keystr(path)]
+
+    assert all(np.any(np.asarray(leaf) != 0) for leaf in gate_gradient(gated))
+    assert all(not np.any(np.asarray(leaf)) for leaf in gate_gradient(plain))
 
 
 PARAPHRASED = GroupedExamples(

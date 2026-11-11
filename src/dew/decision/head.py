@@ -91,6 +91,16 @@ class Head(nn.Module):
     checkpoint, the joint head's or the slot readout's; None where no format holds it."""
 
     @nn.nowrap
+    def answered(self, inputs: DecisionInputs) -> jax.Array:
+        """Each question's place `[B, Q]` in its row that the head reads its answer from, which a looped
+        backbone's exit there decides (`DecisionObjective.exit_entropy`): its row's answer cue
+        (`DecisionInputs.readout`) for a head that reads one."""
+        if inputs.readout is None:
+            raise ValueError("a head reading each question's answer at its row's answer cue reads rows "
+                             "whose options stand under labels (Labels)")
+        return inputs.readout
+
+    @nn.nowrap
     def tied_labels(self) -> tuple[tuple[int, ...], ...] | None:
         """The label ids, `[K][V]`, at which the head reads the backbone's own logits (`tied`), or
         None where it reads none."""
@@ -190,6 +200,12 @@ class DecisionHead(Head):
         self.scorer_hidden = Dense(self.features, dtype=self.dtype, precision=self.precision,
                                    name="scorer_hidden")
         self.scorer_out = Dense(1, dtype=self.dtype, precision=self.precision, name="scorer_out")
+
+    @nn.nowrap
+    def answered(self, inputs: DecisionInputs) -> jax.Array:
+        """Each question's row's last token (`row_ends`): the head's blocks read the whole row before it
+        scores the markers, so the answer is the whole row's (`Head.answered`)."""
+        return row_ends(inputs)
 
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table: jax.Array | None = None,
                  train: bool = False) -> jax.Array:
@@ -411,6 +427,12 @@ class JointSchemaHead(Head):
         self.joint_logit_scale = self.param("joint_logit_scale", nn.initializers.zeros_init(), ())
         self.residual_gate = self.param("residual_gate", nn.initializers.zeros_init(), ())
 
+    @nn.nowrap
+    def answered(self, inputs: DecisionInputs) -> jax.Array:
+        """Each question's row's last token, which has read its whole row (`row_ends`): the head reads
+        the question's answer there (`Head.answered`)."""
+        return row_ends(inputs)
+
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table: jax.Array | None = None,
                  train: bool = False, spanned: jax.Array | None = None) -> jax.Array:
         """The `[B, Q, K]` logits of each question's options over the row's final `states`. Where the
@@ -437,9 +459,7 @@ class JointSchemaHead(Head):
         memory = self.memory_projection(hidden)
         # Each question reads its own row of the window: that row's last token, and its tokens alone.
         rows = inputs.question_segments
-        own = (rows[:, :, None] == inputs.segments[:, None, :]) | (rows[:, :, None] == 0)
-        last = jnp.max(jnp.where(own, jnp.arange(inputs.tokens.shape[1]), 0), axis=-1)
-        last_state = gather_positions(hidden, last)
+        last_state = gather_positions(hidden, self.answered(inputs))
         questions = span_means(pooled, inputs.spans)
         count, width = inputs.options.shape[1:]
         # The option slots computed, `[B, P]` flat indices into the grid, and each one's question.
@@ -488,6 +508,14 @@ class JointSchemaHead(Head):
         joint = jnp.exp(jnp.minimum(self.joint_logit_scale, math.log(100.0))) * cosine + residual
         scores = prior + jax.nn.sigmoid(self.residual_gate) * joint
         return _laid_back(scores.astype(at_least_fp32(scores.dtype)), inputs)
+
+
+def row_ends(inputs: DecisionInputs) -> jax.Array:
+    """Each question's row's last token `[B, Q]` in the window, which has read its whole row; a padding
+    question's, the window's first."""
+    rows = inputs.question_segments
+    own = (rows[:, :, None] == inputs.segments[:, None, :]) | (rows[:, :, None] == 0)
+    return jnp.max(jnp.where(own, jnp.arange(inputs.tokens.shape[1]), 0), axis=-1)
 
 
 def answer_states(states: jax.Array, inputs: DecisionInputs) -> jax.Array:

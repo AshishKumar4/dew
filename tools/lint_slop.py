@@ -1384,6 +1384,38 @@ EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "re
 notebook's frontend, which IPython's display functions publish to over the kernel's socket; its
 representations, such as `HTML`, are built in the process; a process group `dew._cleanup` signals)."""
 
+KERNEL_FILES = "/proc/"
+"""The kernel's own accounting of a process, read from its files (the pages it holds,
+/proc/self/smaps_rollup): outside the process as a subprocess is, no work of the process orders or wakes
+it, so a region's high-water of it is sampled. A function deals with it where it opens or reads such a
+file by a path it spells (`_kernel_read`), not where it names one."""
+
+KERNEL_OPENERS = frozenset({"builtins.open", "io.open", "os.open"})
+"""What opens a file by the path it is given."""
+
+PATH_READS = frozenset({"open", "read_text", "read_bytes"})
+"""What of a `pathlib.Path` opens or reads the file it names: making one reads nothing."""
+
+
+def _kernel_read(node: ast.AST, table: Mapping[str, str]) -> bool:
+    """Whether `node` opens or reads one of the kernel's files (`KERNEL_FILES`) by a path it spells: an
+    opener's call on it (`KERNEL_OPENERS`, the builtin `open` unimported), or a `Path` of it opened or
+    read (`PATH_READS`)."""
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if isinstance(func, ast.Attribute) and func.attr in PATH_READS and isinstance(func.value, ast.Call):
+        return _spells_kernel_file(func.value) and scopes.resolved(func.value.func, table) == "pathlib.Path"
+    builtin = isinstance(func, ast.Name) and func.id not in table
+    opener = f"builtins.{func.id}" if isinstance(func, ast.Name) and builtin else scopes.resolved(func, table)
+    return _spells_kernel_file(node) and opener in KERNEL_OPENERS
+
+
+def _spells_kernel_file(call: ast.Call) -> bool:
+    """Whether `call`'s first argument spells a path among the kernel's files (`KERNEL_FILES`)."""
+    return bool(call.args) and isinstance(call.args[0], ast.Constant) and str(
+        call.args[0].value).startswith(KERNEL_FILES)
+
 
 WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}
 """The methods that block on in-process synchronization (an event, a condition, a lock, a queue, a
@@ -1705,14 +1737,16 @@ class _Calls:
 
 def _leaves(function: ast.FunctionDef | ast.AsyncFunctionDef, tables: Mapping[int, Mapping[str, str]],
             calls: _Calls, seen: set[int]) -> bool:
-    """Whether `function` deals with what leaves the process (`EXTERNAL`): what it runs names such
-    a module, or calls a function of the module (`_Calls`) that does."""
+    """Whether `function` deals with what leaves the process (`EXTERNAL`, `KERNEL_FILES`): what it runs
+    names such a module or reads such a file, or calls a function of the module (`_Calls`) that does."""
     seen.add(id(function))
     for node, scope in _executed_in(function.body, function):
         if isinstance(node, ast.Name | ast.Attribute):
             path = scopes.resolved(node, tables.get(id(node), {}))
             if path and f"{path}.".startswith(EXTERNAL):
                 return True
+        if _kernel_read(node, tables.get(id(node), {})):
+            return True
         if isinstance(node, ast.Call):
             for helper in calls.reached(scope, node):
                 if (isinstance(helper, ast.FunctionDef | ast.AsyncFunctionDef) and id(helper) not in seen
