@@ -545,16 +545,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _programs(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,
                   target: generation.GpuTarget, *, training: bool = True) -> int:
-        """The states launch's programs at `tiles`: a value block of each sequence and head, a forward's
-        values padded as it pads them (`_widths`)."""
-        family = bundle(target, _dtype(ba))
-        assert family is not None
-        _, columns, _ = _widths(ba, family, training=training)
-        arguments = ba.arguments
-        batch, length, heads, _ = arguments["value"].shape
-        sequences = batch * (1 if arguments.get("starts") is None
-                             else arguments.get("max_segments") or length)
-        return columns // tiles.block_v * sequences * heads
+        """The walk's value blocks at `tiles`, its launch's grid as planned (`_states`): a block of each laid
+        sequence and head, `tiles.walkers` of them a program, a forward's values padded as it pads them;
+        a forked call's sequences its laid rows, each walking its documents in turn (`forked_laid`)."""
+        return self._states(ba, tiles, target, training=training).programs * tiles.walkers
 
     def _one_wave(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,
                   target: generation.GpuTarget, *, training: bool = False) -> bool:
@@ -680,7 +674,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         held = self.states_held(ba, tiles, target, training=training)
         if target.multiprocessors is None:
             return held
-        programs = self._programs(ba, tiles, target, training=training) // tiles.walkers
+        programs = self._states(ba, tiles, target, training=training).programs
         return min(held, -(-programs // target.multiprocessors))
 
     def neighbours(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> list[mainloop.Tiles]:
