@@ -2315,9 +2315,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
             # The chunk's own pairs' scores staged for its local product (`output_launch`'s first step's).
             scores = algebra.chunk_scores(queries.__getitem__, keyed.__getitem__, slices, gate, low,
                                           held.dtype, Issuer(call), laid=laid, column_scale=column_scale)
-            pieces = (product.formed(scores.astype(jnp.float32), held.parts) if held.parts > 1 else (scores,))
-            for piece, buffer in zip(pieces, scored, strict=True):
-                family.staged(piece, buffer)
+            operands.staged(family, scores, scored)
             corrected = _scan_corrected(call, slots, tile, bv, state, (gate, low), betas, issue)
             # The memory the chunk enters, in its registers, staged as the memories' form for its product.
             out = algebra.chunk_output(queries.__getitem__, state.__getitem__, slices, gate, low,

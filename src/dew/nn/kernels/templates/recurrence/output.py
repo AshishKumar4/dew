@@ -10,7 +10,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import recurrence_algebra as algebra
-from dew.nn.kernels.templates import mosaic, product, resources, swizzling
+from dew.nn.kernels.templates import mosaic, operands, product, resources, swizzling
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.mainloop import (
@@ -61,7 +61,8 @@ def _gated_queries(call: Call, refs: tuple, row, h, scale: float, staged) -> Non
     into its staging tile of `staged`, a decay a key dimension's at the first step: the queries and the
     prefix's halves (`refs`, the launch's queries and its high and low prefixes) read from global memory a key
     block at a time in the accumulator's layout (`Family.tile_of`), each operand's parts summed as its tiles'
-    (`Parts.value`), no slot held past the step."""
+    (`Parts.value`), no slot held past the step, and staged as the parts the products read (`operands.staged`:
+    an fp32 call's two under the fast forms, whose first alone staged left the second's buffer unwritten)."""
     family, width, chunk = call.family, call.width, call.chunk
     q_ref, hi_ref, lo_ref = refs
 
@@ -75,7 +76,7 @@ def _gated_queries(call: Call, refs: tuple, row, h, scale: float, staged) -> Non
         column = c * call.block
         query = read(call.given, q_ref, h // call.group * width + column)
         decays = tuple(read(call.gates, ref, h * width + column) for ref in (hi_ref, lo_ref))
-        family.staged(algebra.key_gated(query, decays, scale), tile[0])
+        operands.staged(family, algebra.key_gated(query, decays, scale), tile)
 
 
 def _output_swizzle(call: Call, bv: int, staging: tuple, landing: dict) -> int:
@@ -245,10 +246,7 @@ def output_launch(q, k, h, corrected, hi, lo, taken, beta, call: Call, tiles: Ti
                     scored = algebra.chunk_scores(
                         queries.__getitem__, keys.__getitem__, width // call.block, gate, low, held.dtype,
                         Issuer(call), laid=laid, column_scale=gated)
-                    pieces = (product.formed(scored.astype(jnp.float32), held.parts) if held.parts > 1
-                              else (scored,))
-                    for piece, buffer in zip(pieces, staged, strict=True):
-                        family.staged(piece, buffer)
+                    operands.staged(family, scored, staged)
 
                 out = algebra.chunk_output(queries.__getitem__, entered, width // call.block, gate, low,
                                            Parts(staged, held.dtype), value, scale, Issuer(call))
