@@ -221,9 +221,14 @@ def test_a_file_with_tests_for_a_users_process_runs_them_in_a_process_of_their_o
     assert rows == {"3.12:tests/test_flows.py#1/2": 0, "3.12:tests/test_flows.py#1/2@users": 0,
                     "3.12:tests/test_flows.py#2/2": 0, "3.12:tests/test_flows.py#2/2@users": 0,
                     "3.12:tests/test_plain.py": 0}
-    # Its records are its own: a later lane reuses each process's row apart, and runs none again.
-    assert ci.gpu_lane("3.12", groups, out, cache="on", processes=2, deadline=600.0) == 0
-    assert said("ran") == [] and len(json.loads(out.read_text())["rows"]) == 4
+    # Its records are its own: the file whole (a group of a file no durations record names keeps no key), a
+    # later lane reuses each process's row apart and runs none again.
+    whole = ["tests/test_flows.py"]
+    assert ci.gpu_lane("3.12", whole, out, cache="on", processes=2, deadline=600.0) == 0
+    assert said("ran") == every
+    assert ci.gpu_lane("3.12", whole, out, cache="on", processes=2, deadline=600.0) == 0
+    assert said("ran") == [] and {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
+        "3.12:tests/test_flows.py": 0, "3.12:tests/test_flows.py#@users": 0}
 
 
 def test_a_gpu_lane_names_its_files_but_with_network(ci, monkeypatch):
