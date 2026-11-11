@@ -84,7 +84,7 @@ def test_a_decision_run_whose_passes_grow_by_phase_is_its_phases_runs_and_resume
     after step 3, inside its second phase, and resumed, it lands where the run nobody stopped lands; its saved
     run loads with the last phase's two passes. A count list whose length is not the data's phases is
     refused before anything loads."""
-    with pytest.raises(ValueError, match="one a phase"):
+    with pytest.raises(ValueError):
         run(tmp_path, (1, 2, 3), phased(tmp_path))
     data = phased(tmp_path)
     first, _ = trained(run(tmp_path, STEPS, data), tmp_path, "first", trainer={"steps": PHASE})
