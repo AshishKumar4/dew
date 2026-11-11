@@ -91,8 +91,8 @@ INTERPRETED_FORWARD = {('one sequence', 'fp32'), ('a ragged length', 'bf16'), ('
                        ('a decay a key dimension, packed', 'fp32')}
 """The forward's cases the CPU interprets: each launch in each arithmetic (an fp32 call's three parts, a
 16-bit call's), over key blocks and key heads' groups, a ragged chunk, packed documents, a decay a key
-dimension's launches packed and not, and an fp32 call's refusal under one. Interpreted, the whole grid took
-3.5 times these (2838 against 805 seconds)."""
+dimension's launches packed and not, in fp32 too (refused at exact products). Interpreted, the whole grid
+took 3.5 times these (2838 against 805 seconds)."""
 
 def interpreted(grid: list[tuple], chosen: set[tuple]) -> list:
     """`grid`'s parameters the CPU interprets, those in `chosen`, each id its values joined by '-'; the rest
@@ -223,8 +223,8 @@ def taken(given: Chunk, hooks: recurrence.Hooks) -> bool:
 
 REFUSED = (Unfitted, NotImplementedError, KernelRefused)
 """The template's refusals: no config whose launches the device holds, a call its mainloop does not take
-(an fp32 call's decay a key dimension, `mainloop.per_key_refusal`), or a requirement of its route's the named
-template fails (`selection.KernelRefused`)."""
+(an fp32 call's decay a key dimension at exact products, `mainloop.per_key_refusal`), or a requirement of
+its route's the named template fails (`selection.KernelRefused`)."""
 
 
 def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fast'):
@@ -233,16 +233,17 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     the selectors, at its derived tiles);
     else, the route refusing them (a launch's registers past a thread's), the mainloop's rule at its narrowest
     value block, one chunk in flight (`mosaic_rule`), whose arithmetic is the same at any tiles. None where
-    the mainloop's rule refuses the call too (checked): an fp32 call's decay a key dimension
-    (`mainloop.per_key_refusal`); and on a GPU where its launches at those tiles pass the device's shared
-    memory (an fp32 call's solve on an A100's block), whose arithmetic the CPU interprets."""
+    the mainloop's rule refuses the call too (checked): an fp32 call's decay a key dimension at exact
+    products (the accurate forms, `mainloop.per_key_refusal`); and on a GPU where its launches at those
+    tiles pass the device's shared memory (an fp32 call's solve on an A100's block), whose arithmetic the
+    CPU interprets."""
     (operands,) = draw(dtype, 0, **geometry(case))
     if formed(forms, taken)(operands, hooks):
         return formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks))
     with pytest.raises(REFUSED):
         jax.eval_shape(formed(forms, functools.partial(chunk_on, 'mosaic_gpu', hooks)), operands)
     family, _ = mainloop.issued()
-    if SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype):
+    if SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype, rounded=forms == 'fast'):
         # The portable math's arm is test_recurrence_chunk's.
         with pytest.raises(NotImplementedError):
             jax.eval_shape(functools.partial(mosaic_rule, tiles=NARROW),
@@ -267,19 +268,13 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype, forms: str = 'fas
     return rule
 
 
-DRAWN_FORWARD: set[tuple] = set()
-"""The interpreted forward's drawn cases, each a test of its own (`drawn_forward`); the rest of
-`INTERPRETED_FORWARD` the template refuses (the refusal test below)."""
-
-
 def drawn_forward(case: str, dtype: str) -> Callable:
-    """A drawn forward case's test: the case taken out of the refused ones (`DRAWN_FORWARD`) and
+    """A drawn forward case's test, each case of `INTERPRETED_FORWARD` one:
     `the_mosaic_forward_is_as_exact_as_its_reference` run by the test it decorates, a check-1 site of its own
     (its `check1_shards` mark). A map task of 128 seeds of the three 256-seed cases took 1045 to 1071 s on
     main's CI (Main, 2026-11-02); the 128-seed cases under a decay a key dimension 250 s and past 600 s whole
     (int-g1-each at 7683420535), a task of 8 seeds of both 117 to 125 s, half of it their compiles
     (keyed-shards at 7e3a5fb48); on each route (`routed`)."""
-    DRAWN_FORWARD.add((case, dtype))
     return routed(lambda: the_mosaic_forward_is_as_exact_as_its_reference(case, DTYPES[dtype]))
 
 
@@ -315,14 +310,20 @@ def test_the_packed_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_i
     key dimension."""
 
 
-@pytest.mark.parametrize(('case', 'dtype'), interpreted(FORWARD_GRID, INTERPRETED_FORWARD - DRAWN_FORWARD))
-def test_an_fp32_call_under_a_decay_a_key_dimension_is_refused_by_the_mainloop(case, dtype):
-    """An fp32 call under a decay a key dimension: the template's route and the mainloop's rule both refuse
-    it, under either forms (`on_the_mainloop`, `mainloop.per_key_refusal`); its arm is the portable math's
-    (test_recurrence_chunk's)."""
-    hooks = case_hooks(case)
-    assert on_the_mainloop(hooks, case, dtype, forms='accurate') is None
-    assert on_the_mainloop(hooks, case, dtype) is None
+@pytest.mark.check1_shards(seeds=32, per_task=8)
+@drawn_forward('a decay a key dimension', 'fp32')
+def test_the_mosaic_forward_over_an_fp32_decay_a_key_dimension_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at an fp32 call under a decay a key dimension:
+    refused at exact products (the accurate forms, `mainloop.per_key_refusal`), its arm the portable math's
+    (test_recurrence_chunk's); under the fast forms held to recorded fla-core's fp32 at its 32 seeds."""
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=8)
+@drawn_forward('a decay a key dimension, packed', 'fp32')
+def test_the_packed_mosaic_forward_over_an_fp32_decay_a_key_dimension_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at an fp32 call of packed documents under a decay a
+    key dimension, as `test_the_mosaic_forward_over_an_fp32_decay_a_key_dimension_is_as_exact_as_its_
+    reference`, recorded fla-core's at its 128 seeds."""
 
 
 def the_mosaic_forward_is_as_exact_as_its_reference(case: str, dtype) -> None:

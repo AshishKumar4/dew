@@ -161,14 +161,17 @@ class Tiles:
         return self.block_v if self.block_o is None else self.block_o
 
 
-def per_key_refusal(dtype) -> str | None:
+def per_key_refusal(dtype, *, rounded: bool) -> str | None:
     """Why the mainloop refuses a call of `dtype` under a decay a key dimension, None where it takes it: its
     intra launch factors each pair of sub-chunks' decay (`algebra.key_block_pairs`), each sub-chunk's own
-    pairs each their own decay (`algebra.key_diagonal_pairs`), and rounds each
-    side's gate once, where the fp32 recurrence rounds each pair's (1.98 times its distance from float64 in
-    an fp32 call, fam-t)."""
-    if jnp.dtype(dtype) == jnp.float32:
-        return "an fp32 call's decay a key dimension is the portable math's"
+    pairs each their own decay (`algebra.key_diagonal_pairs`), and rounds each side's gate once, where the
+    fp32 recurrence rounds each pair's (1.98 times its distance from float64 in an fp32 call, fam-t). That
+    bars an fp32 call at its exact products (the accurate forms, the portable math's at IEEE, the owner's
+    "fp32 if accurate"), not one under the run's fast forms (`rounded`, `recurrence_chunk.chunk_rounding`),
+    whose bar is fla's TF32 (fla_kda 1,887 to 4,849 times the fp32 recurrence's distance on an A100 and a
+    GH200, M-JS-90)."""
+    if jnp.dtype(dtype) == jnp.float32 and not rounded:
+        return "an fp32 call's decay a key dimension at exact products is the portable math's"
     return None
 
 

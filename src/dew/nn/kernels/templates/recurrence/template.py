@@ -698,7 +698,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         """Whether the mainloop runs the call on `target`: 16-bit or fp32 operands, a decay a key dimension's
-        in a 16-bit call (`mainloop.per_key_refusal`), a
+        in a 16-bit call or one under the run's fast forms (`mainloop.per_key_refusal`), a
         16-bit delta rule's solve at fp32's range where its form proves no bound (`ranged`), a bundle for the
         target's family, the tensor rate its cost model reads, and a config whose launches the device holds
         at the call's widths (`fits`: their shared memory and registers). Off a GPU (a CPU's), where the rule
@@ -709,7 +709,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
         if dtype not in (jnp.bfloat16, jnp.float16, jnp.float32):
             return False
-        taken = arguments["g"].ndim == 3 or mainloop.per_key_refusal(dtype) is None
+        taken = (arguments["g"].ndim == 3
+                 or mainloop.per_key_refusal(dtype, rounded=arguments.get("rounded", False)) is None)
         if not (taken and bundle(target, dtype) is not None and target.tensor_rate("16bit") is not None):
             return False
         return bool(self.fits(ba, target))
