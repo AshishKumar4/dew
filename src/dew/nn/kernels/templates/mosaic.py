@@ -46,10 +46,9 @@ from dew.nn.kernels.templates import (
     product,
     report,
     resources,
-    shifted_rows,
     swizzling,
 )
-from dew.nn.kernels.templates.rings import CLUSTER, Ref, Ring, Turn, drain, loads, opaque, passed, streamed
+from dew.nn.kernels.templates.rings import CLUSTER, Ref, Ring, Turn, drain, loads, passed, streamed
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 if TYPE_CHECKING:
@@ -731,9 +730,10 @@ class Issuer[Accumulator](abc.ABC):
         """`tile` (a register tile in the accumulator's layout, `tile_of`'s) with each row `i` holding row
         `i - shift`'s values within its `period`-row group, any value where that row leaves the group (a
         caller's mask), `shift` traced: read at a row offset in registers, by the layout's own lane
-        permutation (`shifted_rows.row_shifted`, a warp's shuffles), not through shared memory, whose shifted
-        plain reads conflict on every bank (row 5305); interpreted, the tile's own rows gathered. A layout
-        whose warps hold no whole groups of `period` rows takes none (`shifted_rows.lanes`)."""
+        permutation (Mosaic GPU's `FragmentedArray.row_shifted`, a warp's shuffles, the fork's from
+        0.12.0.1.post79), not through shared memory, whose shifted plain reads conflict on every bank (row
+        5305); interpreted, the tile's own rows gathered. A layout whose warps hold no whole groups of
+        `period` rows takes none (the fork refuses it)."""
         if interpret:
             rows = lax.broadcasted_iota(jnp.int32, tile.shape, 0)
             group = rows - rows % period
@@ -743,7 +743,7 @@ class Issuer[Accumulator](abc.ABC):
         def shifted(ctx, array, by):
             del ctx
             [value] = by.registers.flat
-            return shifted_rows.row_shifted(array, value, period)
+            return array.row_shifted(value, period)
 
         returned = plgpu.ShapeDtypeStruct(tile.shape, tile.dtype, layout=self.layout)
         return plgpu.inline_mgpu(arg_types=(self.layout, plgpu.Layout.WG_SPLAT(())), return_type=returned)(
@@ -825,10 +825,18 @@ class Issuer[Accumulator](abc.ABC):
     """The instruction slices loaded before the slice being consumed finishes."""
 
     def operand_live_depth(self, depth: int, loaded: int, *, retained: bool = False) -> int:
-        """An operand's live depth: a retained value keeps its loaded granule and instruction lookahead;
-        otherwise only its consumed slices within that granule stay live."""
+        """An operand's live depth: a retained value keeps its loaded granule and instruction lookahead; a
+        granule of several instructions that another granule of the product follows (`loaded` short of its
+        `depth`) its whole granule, loaded ahead of the later one's first product while the last slice of
+        the one before is in flight; otherwise only its consumed slices within that granule. An sm86 decode
+        step's keys, two granules of 64 at width 128, held at two instructions priced 80 registers where
+        ptxas spilled 12 bytes at 80 and held at 88 (the decode gate red at the promotion's composed tip);
+        one granule at a product's whole depth (a GEMM step's transposed weight at 64) holds at two
+        instructions, its whole granule refusing 19 picks ptxas holds (the gates both ways, 432 cells)."""
         consumed = (1 + self.operand_steps_ahead) * self.fragment_depth(depth)
-        return min(depth, max(loaded, consumed)) if retained else min(loaded, consumed)
+        if retained:
+            return min(depth, max(loaded, consumed))
+        return loaded if depth > loaded > self.fragment_depth(depth) else min(loaded, consumed)
 
     def fragment_depth(self, depth: int) -> int:
         """The depth consumed by one instruction: the step's where its issuer does not split products."""
@@ -1414,10 +1422,13 @@ class Transport[Allocated, Opened](abc.ABC):
         family streams from a role of its own (`roles`)."""
         return self.roles(consumers).warpgroups()
 
-    def program_index(self, name: str) -> jax.Array:
+    def program_index(self, name: str, *, fresh: bool = False) -> jax.Array:
         """The program's coordinate on its launch grid's axis `name` (`kernel`'s `grid_names`): Mosaic GPU
-        names a grid's axes as a mesh's, read by `lax.axis_index`."""
-        return lax.axis_index(name)
+        names a grid's axes as a mesh's, read by `lax.axis_index`; read afresh where it is used where `fresh`
+        (`plgpu.fresh_axis_index`, a read the compiler neither merges with another nor moves), so a late use
+        holds no earlier read live: a B200's forward at width 256 held its query tile's index from before
+        the walk to its rows' stores and spilled it across its producer's register drop (row 5466)."""
+        return plgpu.fresh_axis_index(name) if fresh else lax.axis_index(name)
 
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
@@ -1710,13 +1721,6 @@ class Transport[Allocated, Opened](abc.ABC):
         """The program's completed stores to global memory visible to its own loads: a family that stores
         through its threads' writes needs nothing."""
         del interpret
-
-    def at_store(self, index: jax.Array) -> jax.Array:
-        """A view's `index` (its first row) formed where a store reads it (`stored`): through an optimization
-        barrier (`opaque`) on a GPU, whose copy is addressed by a 64-bit offset the compiler would otherwise
-        form wherever the index is first known, before a walk that reads it too, and hold across the walk
-        (16 bytes spilled of an H100's fp32 attention forward at its raise of 160, et-zerorow's SASS)."""
-        return opaque(index)
 
     @abc.abstractmethod
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:

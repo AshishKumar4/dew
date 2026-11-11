@@ -63,42 +63,86 @@ def test_a_blockwise_fp8_kernel_gradient_through_the_template_is_on_par():
         a_blockwise_kernel_gradient_is_on_par(interpret=True)
 
 
+GRADIENT_BLOCKS = (1, 0, 2, 1)
+"""The kernel gradient cells' groups' 128-row blocks: an empty group among them."""
+GRADIENT_DEPTH, GRADIENT_WIDTH = 256, 256
+
+
+def _gradient_operands(seed: int) -> tuple:
+    """A kernel gradient's FP8 operands (rows contiguous: `[depth, rows]`, `[width, rows]`) and each 128-row
+    block's depth rows' and columns' scales."""
+    rng = np.random.default_rng(seed)
+    rows = 128 * sum(GRADIENT_BLOCKS)
+    return (jnp.asarray(rng.normal(size=(GRADIENT_DEPTH, rows)), jnp.float8_e4m3fn),
+            jnp.asarray(rng.normal(size=(GRADIENT_WIDTH, rows)), jnp.float8_e4m3fn),
+            jnp.asarray(rng.uniform(0.5, 2.0, size=(rows // 128, GRADIENT_DEPTH)), jnp.float32),
+            jnp.asarray(rng.uniform(0.5, 2.0, size=(rows // 128, GRADIENT_WIDTH)), jnp.float32))
+
+
+def _gradient(kernel: str, interpret: bool = False):
+    """The blockwise FP8 kernel gradient of `_gradient_operands`, its selector naming `kernel`."""
+    blocks = jnp.asarray(GRADIENT_BLOCKS, jnp.int32)
+
+    def gradient(*operands):
+        with generation.chosen(blockwise_fp8=kernel):
+            return gemm.blockwise_fp8_kernel_gradient(*operands[:2], blocks, *operands[2:],
+                                                      out_dtype=jnp.float32, interpret_on_cpu=interpret)
+    return gradient
+
+
+def _blocked(lhs_t, rhs_t, row_scales, column_scales, wide, precision=None):
+    """Each 128-row block's partial in `wide` at `precision`, times its scales, added in order into its
+    group's sum: the kernel gradient's definition, written out (a truth's in float64)."""
+    out = jnp.zeros((len(GRADIENT_BLOCKS), GRADIENT_DEPTH, GRADIENT_WIDTH), wide)
+    owners = np.repeat(np.arange(len(GRADIENT_BLOCKS)), np.asarray(GRADIENT_BLOCKS))
+    for block, owner in enumerate(owners):
+        rows = slice(128 * block, 128 * (block + 1))
+        partial = jnp.dot(lhs_t[:, rows], rhs_t[:, rows].T, precision=precision, preferred_element_type=wide)
+        out = out.at[owner].add(partial * row_scales[block, :, None].astype(wide)
+                                * column_scales[block, None, :].astype(wide))
+    return out
+
+
+def _gradient_truth(lhs_t, rhs_t, *scales):
+    wide = jnp.float64
+    return _blocked(lhs_t.astype(wide), rhs_t.astype(wide), *scales, wide)
+
+
+def _gradient_cublaslt(*operands):
+    """cuBLASLt's FP8 GEMM on the kernel gradient's codes a block at a time (`blockwise_matrix.cublaslt_arm`:
+    its blocks' dots of the FP8 codes into fp32), each partial scaled and added in order."""
+    return _blocked(*operands, jnp.float32)
+
+
 def a_blockwise_kernel_gradient_is_on_par(interpret: bool = False):
     """Each group's rows of FP8 operands (rows contiguous) contracted over its whole 128-row blocks, each
     block's partial times its depth rows' and its columns' scales before it is added to its group's sum,
-    through the template named (`mosaic_gpu.tgmm`'s `k_major` and `step_scales`), on par with XLA's (check 1),
-    from float64; an empty group's gradient is zero. On this GPU, or `interpret`ed (test_gpu_gemm's cell)."""
-    group_blocks = jnp.asarray([1, 0, 2, 1], jnp.int32)
-    depth, width, blocks = 256, 256, 4
-
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return (jnp.asarray(rng.normal(size=(depth, 128 * blocks)), jnp.float8_e4m3fn),
-                jnp.asarray(rng.normal(size=(width, 128 * blocks)), jnp.float8_e4m3fn),
-                jnp.asarray(rng.uniform(0.5, 2.0, size=(blocks, depth)), jnp.float32),
-                jnp.asarray(rng.uniform(0.5, 2.0, size=(blocks, width)), jnp.float32))
-
-    def gradient(kernel, *operands):
-        with generation.chosen(blockwise_fp8=kernel):
-            return gemm.blockwise_fp8_kernel_gradient(*operands[:2], group_blocks, *operands[2:],
-                                                      out_dtype=jnp.float32, interpret_on_cpu=interpret)
-
-    def truth(lhs_t, rhs_t, row_scales, column_scales):
-        wide = jnp.float64
-        out = jnp.zeros((len(group_blocks), depth, width), wide)
-        owners = np.repeat(np.arange(len(group_blocks)), np.asarray(group_blocks))
-        for block, owner in enumerate(owners):
-            rows = slice(128 * block, 128 * (block + 1))
-            partial = lhs_t[:, rows].astype(wide) @ rhs_t[:, rows].astype(wide).T
-            out = out.at[owner].add(partial * row_scales[block, :, None].astype(wide)
-                                    * column_scales[block, None, :].astype(wide))
-        return out
-
+    through the template named (`mosaic_gpu.tgmm`'s `k_major` and `step_scales`), on par with cuBLASLt's FP8
+    GEMM on the same codes a block at a time (check 1, `_gradient_cublaslt`: block-scaled FP8 on Hopper is
+    held at parity with cuBLASLt), from float64; an empty group's gradient is zero. On this GPU, or
+    `interpret`ed (test_gpu_gemm's cell)."""
+    reference = blockwise_matrix.cublaslt_arm(_gradient_cublaslt, _gradient_operands(0))
     with generation.routes() as routes:
-        assert_as_exact(jax.jit(functools.partial(gradient, "mosaic")),
-                        jax.jit(functools.partial(gradient, "xla")), draw, "blockwise kernel gradient",
-                        seeds=blockwise_matrix.SEEDS, truth_fn=truth)
+        assert_as_exact(jax.jit(_gradient("mosaic", interpret)), reference, _gradient_operands,
+                        "blockwise kernel gradient", seeds=blockwise_matrix.SEEDS, truth_fn=_gradient_truth)
     assert ("blockwise_fp8", "mosaic") in {(route.choice, route.kernel) for route in routes}
+
+
+def a_blockwise_kernel_gradients_portable_arm_sums_exactly():
+    """On this GPU, under its lane's flags (the CUDA lane's deterministic ops, which keep XLA's Triton GEMMs
+    off), the kernel gradient's portable arm (`blockwise_fp8` chosen `xla`, `gemm._blocks_summed`) on par
+    with the FP8 codes' values multiplied in fp32 at the highest precision (check 1), from float64: each
+    block's products exact and summed into fp32, as the FP8 contract's reference arm states them
+    (docs/design/testing.md, "FP8 products"). Its dot of the widened codes was XLA's to fold into cuBLASLt's
+    FP8 GEMM there, 4.43e-5 from float64 against 4.05e-8 on a GH200 (M-EM-17c)."""
+    def values(*operands):
+        lhs_t, rhs_t, *scales = operands
+        return _blocked(lhs_t.astype(jnp.float32), rhs_t.astype(jnp.float32), *scales, jnp.float32,
+                        jax.lax.Precision.HIGHEST)
+
+    assert_as_exact(jax.jit(_gradient("xla")), jax.jit(values), _gradient_operands,
+                    "blockwise kernel gradient's portable arm", seeds=blockwise_matrix.SEEDS,
+                    truth_fn=_gradient_truth)
 
 
 def test_a_blockwise_fp8_projections_training_step_is_on_par():

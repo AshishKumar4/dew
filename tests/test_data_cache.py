@@ -309,6 +309,40 @@ def test_a_remote_generation_of_more_shards_than_its_mirror_holds_reads_every_re
         generation.close()
 
 
+def test_a_cache_writer_rereads_more_uploaded_shards_than_its_mirror_holds(tmp_path):
+    """A fill reads again records it already uploaded, from more shards than Dew's mirror holds at once:
+    each shard read closes another's reader, so its room in the mirror is free before the next is
+    admitted, and every record reads back as written, past what a mirror of two shards holds. One upload
+    worker that blocks when its spool is full has uploaded every shard before the one it is writing, so
+    the records read again are the uploaded ones."""
+    blob = 1 << 16
+    count = 12
+    source = Memory([{"id": index, "blob": np.full(blob, index % 251, np.uint8)} for index in range(count)])
+    with moto_bucket("cache") as (bucket, options):
+        # The shards' size, read off a generation of the same records published first.
+        measured = Cache(f"s3://{bucket}/measured", storage_options=options, shard_bytes=1)
+        filled = measured.mapped(grain.MapDataset.source(source.records("indexed")), _key())
+        for index in range(count):
+            filled[index]
+        filled.finish()
+        filled.close()
+        measured.publish(_key(), source)
+        shard = max(entry["bytes"] for entry in measured.generation(_key()).manifest["shards"].values())
+        mirror = {"dewcache": {"cache_storage": str(tmp_path / "mirror")}}
+        cache = Cache(f"s3://{bucket}/cache", storage_options={**options, **mirror}, shard_bytes=1,
+                      upload_workers=1, on_full="block", spool_bytes=3 * shard,
+                      mirror_bytes=2 * shard + shard // 2)
+        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), _key())
+        try:
+            for index in range(count - 2):
+                rows[index]
+            for index in (0, 1, 2, 3, 6, 7):
+                again = rows[index]
+                assert again["id"] == index and (np.asarray(again["blob"]) == index % 251).all()
+        finally:
+            rows.close()
+
+
 def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
     import fsspec
 
@@ -1378,6 +1412,27 @@ def test_published_generation_exposes_only_declared_order_metadata_and_plan():
     from dew.data.plan import fingerprint
 
     assert generation.plan_hash("offsets") == fingerprint(np.arange(5))
+
+
+@pytest.mark.parametrize("dtype", ["bfloat16", "float8_e4m3fn", "int32"])
+def test_a_published_plan_of_a_numeric_ml_dtype_reads_back_as_that_dtype(dtype):
+    """A packing plan of bfloat16 or a float8, whose NPY pages hold voids of their width, reads back as
+    the numbers it was published as, in its dtype, page by page and whole, as a plain one does."""
+    import ml_dtypes
+    import numpy as np
+
+    source = Memory([{"id": index} for index in range(4)])
+    cache, key = _cache(), _key()
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
+    for index in range(len(rows)):
+        rows[index]
+    rows.finish()
+    rows.close()
+    numbers = np.arange(5, dtype=np.float32).astype(np.dtype(getattr(ml_dtypes, dtype, dtype)))
+    generation = cache.publish(key, source, plan=lambda ready: {"scores": numbers})
+    assert generation.plan("scores").dtype == numbers.dtype
+    np.testing.assert_array_equal(generation.plan("scores"), numbers)
+    assert generation.plan_at("scores", 3).dtype == numbers.dtype and generation.plan_at("scores", 3) == 3
 
 
 def test_transient_failures_never_certify_cache_coverage_but_permanent_rejections_do():

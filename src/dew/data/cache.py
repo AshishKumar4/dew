@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import bisect
-import itertools
 import json
 import logging
 import os
@@ -17,7 +15,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from dataclasses import dataclass, field
-from functools import cached_property, lru_cache
+from functools import cached_property
 from pathlib import Path
 from typing import Literal, TypedDict, overload
 
@@ -26,7 +24,7 @@ import numpy as np
 
 from dew._builds import dew_cache_dir
 from dew.data.concurrent import Concurrently
-from dew.data.dataset import Loading
+from dew.data.dataset import Loading, Ranges
 from dew.data.declared import Declared
 from dew.data.generation import (
     GENERATION_SCHEMA,
@@ -50,7 +48,7 @@ from dew.data.retention import LocalRetention
 from dew.data.sinks import write_array_record
 from dew.data.sources.base import Shard, ShardOpener, Source
 from dew.data.sources.codec import Unencodable, encode
-from dew.data.sources.records import ArrayRecords
+from dew.data.sources.records import ArrayRecords, ShardReaders
 from dew.data.storage import PreconditionFailed, Store, _byte_size
 
 _log = logging.getLogger(__name__)
@@ -362,15 +360,15 @@ class _Published:
 @dataclass(frozen=True)
 class _Parted:
     """A shard's records read from a generation a read of its parts filled (`_CachedIter._parted`): each
-    record its part's (`ids`, which start at `starts` among the shard's records), at its place there."""
+    record its part's (`ids`, which hold `parts`' ranges of the shard's records), at its place there."""
 
     published: _Published
-    starts: tuple[int, ...]
+    parts: Ranges
+    """The parts' records, one part's after another's."""
     ids: tuple[str, ...]
 
     def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
-        part = bisect.bisect_right(self.starts, ordinal) - 1
-        place = ordinal - self.starts[part]
+        part, place = self.parts.locate(ordinal)
         return self.published.process((self.ids[part], place), place, value, transform)
 
     def finish(self) -> None:
@@ -435,19 +433,18 @@ class _Writer:
         self.abandoned = 0
         self.expected = expected
         self.seal_future: Future | None = None
+        # The uploaded shards a record is read again from, two open at once, each closed as another needs
+        # its room in Dew's mirror and all as the writer lets go (`_release`).
+        self.uploaded = ShardReaders(self._uploaded, limit=2)
 
-    @cached_property
-    def _records(self):
-        @lru_cache(maxsize=2)
-        def opened(shard: int) -> ArrayRecords:
-            # Read once its upload completed, by the declaration its segment published, so Dew's mirror
-            # holds the copy the publication checks (`dew.data.generation._sealed`), not another beside it.
-            declaration = json.loads(_checked(self.root, self.futures[shard].result()))["shard"]
-            # The mirror's own options, its budget among them, on the declared store as on the reader.
-            store = Store(self.root.child(declaration["path"]).url, self.cache._mirror_options())
-            return ArrayRecords((store.url,), store.storage_options, declared=(Declared(store, declaration),))
-
-        return opened
+    def _uploaded(self, shard: int) -> ArrayRecords:
+        """Uploaded shard `shard`'s records, read by the declaration its segment published once its upload
+        completed, so Dew's mirror holds the copy the publication checks (`dew.data.generation._sealed`),
+        not another beside it."""
+        declaration = json.loads(_checked(self.root, self.futures[shard].result()))["shard"]
+        # The mirror's own options, its budget among them, on the declared store as on the reader.
+        store = Store(self.root.child(declaration["path"]).url, self.cache._mirror_options())
+        return ArrayRecords((store.url,), store.storage_options, declared=(Declared(store, declaration),))
 
     def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
         self._completed()
@@ -467,7 +464,7 @@ class _Writer:
         if completed is not None and self.futures[completed[0]].done():
             uploaded = self.futures[completed[0]]
             if uploaded.exception() is None:
-                payload = self._records(completed[0])[completed[1]]
+                payload = self.uploaded.read(completed[0], completed[1])
                 if not isinstance(payload, bytes) or _hash(payload) != completed[2]:
                     raise ValueError(f"cache writer record is corrupt for row {row_key}")
                 values = _decode_outputs(payload)
@@ -758,6 +755,7 @@ class _Writer:
     def _release(self) -> None:
         """The writer's local spool and its pin let go, once no upload reads them: the one release
         every way a writer ends takes, whichever drains or abandons its uploads first."""
+        self.uploaded.close()
         self.directory.cleanup()
         if self.pin is not None:
             self.pin.close()
@@ -979,8 +977,8 @@ class _CachedIter(grain.IterDataset):
         if not parts or any(part.rows is None or (part.rows and not published.generation.holds((part.id, 0)))
                             for part in parts):
             return None
-        starts = tuple(itertools.accumulate((part.rows or 0 for part in parts), initial=0))[:-1]
-        return _Parted(published, starts, tuple(part.id for part in parts))
+        return _Parted(published, Ranges(tuple(part.rows or 0 for part in parts)),
+                       tuple(part.id for part in parts))
 
 
 class _CachedIterator(grain.DatasetIterator):

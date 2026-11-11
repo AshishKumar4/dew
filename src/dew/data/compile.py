@@ -138,7 +138,7 @@ from dew.data.pipeline import (
     with_stores,
 )
 from dew.data.plan import PLAN_VERSIONS, Plan, StepIdentity, fingerprint, read_by, unplaced
-from dew.data.readers import Opener, _CanonicalPass, _Host, _PerShare, _Statistics
+from dew.data.readers import Opener, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
     Read,
     Rows,
@@ -1309,13 +1309,23 @@ def _compile_phases(
             _delivered(phase.train, end - start, consumed)
         return consumed
 
+    def ordered(index: int, phase: _Staged) -> _Staged:
+        """Phase `index`, refused where it reads in no global order: a phase after it continues each corpus
+        past the records it read by its order's shares (`consumed_by`), which a read streamed, rejecting
+        or packed online has none of."""
+        if not phase.build.global_order:
+            raise ValueError(f"phase {index} needs a global order; "
+                             "streamed, rejecting and online-packed phases are refused")
+        return phase
+
     tokens = source.clock == "tokens"
     staged: list[tuple[_Staged, int | None]] = []
     for index, until in enumerate(source.ends):
         # A phase on the token clock ends where the run reaches it, so it is staged as it reads first,
         # and again with the ends of the phases before it once the run reaches them (`opened`).
         ends = [end for _, end in staged if end is not None]
-        phase = staged_at(index, {} if tokens else consumed_by([phase for phase, _ in staged], ends))
+        phase = ordered(index, staged_at(index, {} if tokens
+                                         else consumed_by([phase for phase, _ in staged], ends)))
         # A phase on the step clock ends at its step's record: the records of the phases before it, and its
         # own steps in its own rows (row 4812).
         before, started = (ends[-1] if ends else 0), (source.ends[index - 1] or 0) if index else 0
@@ -1326,11 +1336,6 @@ def _compile_phases(
     built: list[tuple[Loader, int | None]] = []
     for index, (phase, end) in enumerate(staged):
         loaded = _compiled(phase, packed, host=host, resume=resume, batches=planned(index))
-        if loaded.plan is None or loaded.plan.lowering != "global":
-            raise ValueError(
-                f"phase {index} needs a global order; "
-                "streamed, rejecting and online-packed phases are refused"
-            )
         if built and loaded.device != built[0][0].device:
             # The run applies one set of device steps to every batch (`Loader.device`), so a phase
             # whose own differ would run the first phase's.
@@ -1338,16 +1343,30 @@ def _compile_phases(
                              f"a run runs the same ones, written after the phases")
         built.append((loaded, end))
 
+    # The loaders the run's reads opened, in the order they opened them, whose counts its statistics are
+    # (`statistics_of`): the first phase's from the start, each later one's as the run reaches it.
+    reading: dict[int, _Statistics] = {}
+
+    def counted(loader: Loader) -> Loader:
+        """`loader`, its counts among the run's from now on."""
+        if not isinstance(loader.statistics, _Statistics):
+            raise TypeError(f"a phase's loader counts by {type(loader.statistics).__name__}, not its reads")
+        reading.setdefault(id(loader.statistics), loader.statistics)
+        return loader
+
+    counted(built[0][0])
+
     @functools.cache
     def opened(index: int, ends: tuple[int, ...]) -> Loader:
         """Phase `index` as it reads where the phases before it ended at `ends`, in records: as staged,
         unless a corpus it reads continues from theirs."""
-        if not tokens or not index:
-            return built[index][0]
-        consumed = consumed_by([phase for phase, _ in staged[:index]], ends)
-        if not any(consumed.get(_name(chain), 0) for chain, _ in _leaves(source.pipelines[index])):
-            return built[index][0]
-        return _compiled(staged_at(index, consumed), packed, host=host, resume=resume, batches=planned(index))
+        loader = built[index][0]
+        if tokens and index:
+            consumed = consumed_by([phase for phase, _ in staged[:index]], ends)
+            if any(consumed.get(_name(chain), 0) for chain, _ in _leaves(source.pipelines[index])):
+                loader = _compiled(staged_at(index, consumed), packed, host=host, resume=resume,
+                                   batches=planned(index))
+        return counted(loader)
 
     batches = tuple(phase.build.batch for phase, _ in staged)
     stages = () if tokens else phase_stages(batches, (0, *(end for _, end in staged[:-1] if end is not None)))
@@ -1369,7 +1388,11 @@ def _compile_phases(
                             tokens=source.ends if tokens else None)
 
     # Only the last phase's order can end, so its batch decides what an epoch's short batch does.
-    return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None,
+    def statistics() -> Mapping[str, float]:
+        return statistics_of(tuple(reading.values()))
+
+    return dataclasses.replace(built[0][0], train=training, statistics=statistics, tail=built[-1][0].tail,
+                               order_records=None,
                                token_ends=source.ends if tokens else None, batches=batches, stages=stages,
                                token_batches=tuple(loaded.batch_tokens for loaded, _ in built),
                                widths=merge_facts(loaded.widths for loaded, _ in built))

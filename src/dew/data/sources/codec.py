@@ -47,10 +47,22 @@ class Unencodable(TypeError):
     """A value the artifact codec has no encoding for, as a record a cache keeps meets it."""
 
 
+def dtype_name(dtype: np.dtype) -> str:
+    """The name `np.dtype` restores `dtype` from exactly: its array-protocol string, where that names it,
+    else its name (an ML dtype's, bfloat16 or a float8, whose protocol string is a void of its width)."""
+    return dtype.str if dtype.fields is not None or np.dtype(dtype.str) == dtype else dtype.name
+
+
+def as_named(value: np.ndarray, name: str) -> np.ndarray:
+    """`value`, an array NPY saved, as the dtype `name` (`dtype_name`) names: an ML dtype's bytes, which NPY
+    reads back as a void of their width, viewed as it."""
+    dtype = np.dtype(name)
+    return value if value.dtype == dtype else value.view(dtype)
+
+
 def _dtype(value: np.ndarray) -> dict[str, str]:
-    if value.dtype.fields is None and np.dtype(value.dtype.str) != value.dtype:
-        return {"dtype": value.dtype.name}
-    return {}
+    name = dtype_name(value.dtype)
+    return {} if name == value.dtype.str else {"dtype": name}
 
 
 _NPY_HEADER = re.compile(rb"\{'descr': '([<>|=][a-zA-Z][0-9]*)', 'fortran_order': (True|False), "
@@ -85,9 +97,7 @@ def _saved(encoded: bytes) -> np.ndarray:
 
 def _array(node: dict, leaves: Mapping[str, bytes], kind: str) -> np.ndarray:
     value = _saved(leaves[str(node[kind])])
-    if "dtype" in node:
-        value = value.view(np.dtype(node["dtype"]))
-    return value
+    return as_named(value, node["dtype"]) if "dtype" in node else value
 
 
 _LENGTH = struct.Struct("<I")

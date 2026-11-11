@@ -123,19 +123,20 @@ class Exponents:
 
 
 def raised_exponent(exponents: Iv, lane: Lane) -> Iv:
-    """`exp2` of a base-2 exponent within `exponents` as `algebra.raised` forms it: its integer part's power
-    of two exact, its fraction's exp2 at the lane's reach (`exp2`, the fraction an fp32 under 2), each end at
-    its own floor (`exp2(x)` is monotone in `x`), zero where it may fall below fp32's normal range. Taken as
-    one fp32 operand of exp2, an exponent near -40 sat on a grid 2^-18 apart, past the fraction's own: legal
-    decays the algebra forms between its points lay outside (778 of 1024 at decays down to -3 a token, row
-    5412's witness)."""
+    """`exp2` of a base-2 exponent within `exponents` as `algebra.raised` forms it: its fraction's exp2 at the
+    lane's reach (`exp2`, the fraction an fp32 under 2) scaled by its integer part's power of two
+    (`attention_algebra.power2`), whose last product rounds once to nearest on fp32's grid, below its normal
+    range among its subnormals unless the lane flushes them (`fp32`); each end at its own floor (`exp2(x)` is
+    monotone in `x`). Taken as one fp32 operand of exp2, an exponent near -40 sat on a grid 2^-18 apart, past
+    the fraction's own: legal decays the algebra forms between its points lay outside (778 of 1024 at decays
+    down to -3 a token, row 5412's witness). Scaled exactly, a decay past -149 left its subnormal rounding
+    out: a query's memory gradient at a subnormal decay lay one subnormal step past it (M-MC-7)."""
     def scaled(at, side):
         whole = np.floor(at)
         fraction = exp2(Iv(at - whole, at - whole), lane)
         return np.ldexp(getattr(fraction, side), whole.astype(np.int32))
 
-    lo, hi = scaled(exponents.lo, "lo"), scaled(exponents.hi, "hi")
-    return Iv(np.where(lo < 2.0 ** FLOAT32.emin, 0.0, lo), hi)
+    return fp32(Iv(scaled(exponents.lo, "lo"), scaled(exponents.hi, "hi")), lane)
 
 
 def between(later, later_bound, earlier, earlier_bound, lane: Lane) -> Iv:
@@ -544,6 +545,9 @@ class Run:
     tf32: Literal["plain", "rna", "read"]
     """How a one-part fp32 operand reaches its product (`Lane.tf32`): its family's issuer's, or plain where
     the launches were interpreted."""
+    trained: bool
+    """Whether the template trains the call (`Mosaic.trains`): its records the training forward's, the primal
+    of the route's VJP, and its fast backward the template's; else the inference forward's."""
 
     @property
     def chunks(self) -> int:
@@ -570,6 +574,29 @@ class Run:
         return Step(self.q[rows, key], self.k[rows, key], self.v[rows, head], self.g[rows, head],
                     self.beta[rows, head], self.a[n, head], self.w[n, head], self.h[n, head], self.c[n, head],
                     point(self.entered(n, head)) if carry is None else carry)
+
+
+def _route_forward(route, operands: tuple, walked: bool) -> tuple:
+    """The forward of `route` over `operands` as a training step runs it, the template's (`chosen`):
+    `(output, final memory, tiles, trained)`. The training forward, the primal of the route's VJP, where
+    the template trains the call (`Mosaic.trains`, `trained`); else, or where no gradient follows
+    (`walked`), the inference forward: a training step takes another kernel for a call the template does
+    not train (an fp32 call's backward on an A100's registers, 264 to 328 a thread)."""
+    import jax
+
+    from dew.nn.kernels import tuning
+
+    with tuning.seen() as launches:
+        o, final = jax.jit(route)(*operands)
+    [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
+                        zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
+    trained = template.MOSAIC.trains(bound, template.Mosaic.launched())
+    if not walked and trained:
+        with tuning.seen() as launches:
+            o, final = jax.jit(lambda *x: jax.vjp(route, *x)[0])(*operands)
+        [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
+                   if isinstance(op, template.Mosaic)]
+    return o, final, tiles, trained
 
 
 def route_rounding(delta: bool, dtype) -> bool:
@@ -650,7 +677,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     import jax
     import jax.numpy as jnp
 
-    from dew.nn.kernels import generation, recurrence_chunk, tuning
+    from dew.nn.kernels import generation, recurrence_chunk
 
     operands = (q, k, v, g, beta, h0)
     dtype = jnp.result_type(q, k, v)
@@ -670,19 +697,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                                                        write_bound=1.0)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
-        with tuning.seen() as launches:
-            o, final = jax.jit(route)(*operands)
-        [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
-                            zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
-        # The training forward, the primal of the route's VJP as a training step runs it, where the template
-        # trains the call (`Mosaic.trains`); else, or where no gradient follows (`walked`), the inference
-        # forward: a training step takes another kernel for a call the template does not train (an fp32
-        # call's backward on an A100's registers, 264 to 328 a thread).
-        if not walked and template.MOSAIC.trains(bound, template.Mosaic.launched()):
-            with tuning.seen() as launches:
-                o, final = jax.jit(lambda *x: jax.vjp(route, *x)[0])(*operands)
-            [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-                       if isinstance(op, template.Mosaic)]
+        o, final, tiles, trained = _route_forward(route, operands, walked)
         # The fused walk where the forward runs one (`chunk_forward.walks_once`): an mma.sync family's
         # inference forward runs its states and output launches, whose records it keeps.
         walked = walked and chunk_forward.walks_once(dtype, per_key=g.ndim == 4, family=family, keeps=False)
@@ -743,7 +758,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     return Run(**hosted_operands, a=chunked(a, chunk), w=chunked(w, key_width), h=memories, scale=scale,
                write=write, held=held, given=given, wide=bool(wide), walked=walked,
                pairing=mainloop.pairing_parts(family, held),
-               tf32=tf32_conversion(family),
+               tf32=tf32_conversion(family), trained=bool(trained),
                c=chunked(c, value_width), o=output.transpose(0, 2, 1, 3), carries=np.stack(carries),
                begins=begins)
 
@@ -1266,13 +1281,14 @@ class BackRun(NamedTuple):
                         records["local"][n, head], records["dv"][n, head], scores, dw)
 
 
-def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda prepared: ()) -> tuple:
+def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda prepared: (),
+                       run: Run | None = None) -> tuple:
     """The fast backward of a call over one row (`draw`'s `operands`; under the `delta` rule, or without it
     the SSD's route's under the run's fast forms), run as a training step runs it (the route's VJP), and the
     same build's `mainloop_backward.kept_backward` at the forward's kept values, checked to give the step's
     gradients bit for bit: its forward's run (`recorded`), the output and final memory gradients `seed`
     draws, the launches' outputs as stored (`Kept`, its prepared run left in the program) and `extras` of
-    that prepared run, as the program returns them."""
+    that prepared run, as the program returns them. `run` is the forward's recording where taken already."""
     import jax
     import jax.numpy as jnp
 
@@ -1281,7 +1297,7 @@ def _captured_backward(operands: tuple, seed: int, *, delta: bool, extras=lambda
 
     q, k, v, _, _, h0 = operands
     dtype = jnp.result_type(q, k, v)
-    run = recorded(*operands, delta=delta)
+    run = recorded(*operands, delta=delta) if run is None else run
     rng = np.random.default_rng([2084, seed])
     do = jnp.asarray(rng.standard_normal(v.shape), dtype)
     dfinal = jnp.asarray(rng.standard_normal(h0.shape), jnp.float32)
@@ -1334,10 +1350,12 @@ def _back_run(run, do, dfinal, saved, named: dict, laid: int, dh: np.ndarray) ->
                    _chunked(named, laid, chunks, chunk), dtypes)
 
 
-def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True) -> BackRun:
-    """The fast backward of a call over one row as its launches kept it (`_captured_backward`), each launch's
-    outputs laid a chunk and value head at a time (their parts summed)."""
-    run, do, dfinal, saved, _ = _captured_backward(operands, seed, delta=delta)
+def recorded_backward(operands: tuple, seed: int = 0, *, delta: bool = True,
+                      run: Run | None = None) -> BackRun:
+    """The fast backward of a call over one row as its launches kept it (`_captured_backward`, from the
+    forward's recording `run` where taken already), each launch's outputs laid a chunk and value head at a
+    time (their parts summed)."""
+    run, do, dfinal, saved, _ = _captured_backward(operands, seed, delta=delta, run=run)
     _, _, heads, value_width = do.shape
     key_width, chunk = operands[1].shape[-1], run.chunk
     # The chunks the launches lay, of the memories' rows a part (`Run.held` of them stacked).
@@ -1401,15 +1419,18 @@ the given gradients enter them."""
 def assert_backward_witnessed(lane: Lane, heads: int = 1) -> None:
     """The step witness of the fast backward (`back_enclosures`), each form it takes: a bf16 call of three
     chunks under the delta rule and without it (the SSD's, its keys taking the gate), and an fp32 call under
-    the delta rule (its values in parts), every record each launch keeps inside its step's enclosure; and a
-    backward that read another output's and final memory's gradients refused (`CARRIED_GRADIENT_SHARES`):
-    its records, claimed for those given."""
+    the delta rule (its values in parts), each where the template trains it on the device (`Run.trained`: an
+    A100's registers hold no fp32 call's, 264 to 328 a thread, whose training step takes another kernel),
+    every record each launch keeps inside its step's enclosure; and a backward that read another output's
+    and final memory's gradients refused (`CARRIED_GRADIENT_SHARES`): its records, claimed for those
+    given."""
     import jax.numpy as jnp
 
     operands = draw(0, "mild", heads=heads)
     wide = draw(0, "mild", heads=heads, dtype=jnp.float32)
-    for back in (recorded_backward(operands), recorded_backward(operands, delta=False),
-                 recorded_backward(wide)):
+    forms = ((operands, True), (operands, False), (wide, True))
+    runs = [(x, delta, recorded(*x, delta=delta)) for x, delta in forms]
+    for back in (recorded_backward(x, delta=delta, run=run) for x, delta, run in runs if run.trained):
         held = back_witnessed(back, lane)
         for name, inside in held.items():
             assert np.all(inside), (back.run.write, back.run.held, name, np.mean(inside))

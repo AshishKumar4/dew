@@ -7,12 +7,14 @@ rows its workers expand (`_Spread`), and the repeat of a worker's inputs that en
 from __future__ import annotations
 
 import dataclasses
+import typing
 from collections.abc import Mapping, Sequence
+from typing import NamedTuple
 
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import boolean, integer, record
+from dew._records import boolean, record
 from dew.batch import Batch
 from dew.data.analysis import _drops
 from dew.data.dataset import _column, _shareable, _stacked
@@ -39,9 +41,10 @@ from dew.data.sources.urls import Fetch
 from dew.data.text import Chunks
 
 type RecordStage = Map | RandomMap | MapWithIndex | Filter | FlatMap
+"""The stages that each read a record and give what it makes of it."""
 
-
-_RECORD = (Map, RandomMap, MapWithIndex, Filter, FlatMap)
+_RECORD = typing.get_args(RecordStage.__value__)
+"""`RecordStage`'s kinds, for a stage's isinstance."""
 
 
 def _threads(stages: Sequence[Stage]) -> int | None:
@@ -64,7 +67,7 @@ def _carried(pipeline: Pipeline, consumed: int, *, marked: bool, windows: bool =
     (`lowering._Build.in_order`). Every other stage lays out, mixes or batches several records into
     one and ends it."""
     for at, stage in enumerate(pipeline.stages[consumed:], start=consumed):
-        if isinstance(stage, (Map, RandomMap, MapWithIndex, Filter, FlatMap)):
+        if isinstance(stage, _RECORD):
             marked = marked or _drops(stage)
         elif isinstance(stage, Repeat) or (isinstance(stage, Native) and not marked):
             # The caller's Grain step reads no marker: it runs in the workers before any.
@@ -162,6 +165,19 @@ class _Unspread:
         return tuple(element) if isinstance(element, _Spread) else (element,)
 
 
+class Packet(NamedTuple):
+    """A loading worker's group of inputs as it crosses to the reading process (`_Grouped` makes it,
+    `_Ungrouped` reads it): `held`, the records by field where they hold the same fields (`alike`), a
+    column a field, else the records as they are; `rows`, how many; `markers`, those of the records its
+    steps dropped. A named tuple, which Grain's worker queue walks as it walks a batch, its stacked
+    columns crossing in shared memory."""
+
+    held: Mapping[str, np.ndarray | list] | list
+    alike: bool
+    rows: int
+    markers: list[Rejected]
+
+
 @dataclasses.dataclass
 class _Grouped:
     """A loading worker's records and the markers of those its steps dropped, a batch's count at a
@@ -175,7 +191,7 @@ class _Grouped:
     def enable_shared_memory_output(self) -> None:
         self.shared = True
 
-    def __call__(self, elements: Sequence[Record | None]) -> Batch:
+    def __call__(self, elements: Sequence[Record | None]) -> Packet:
         # A record a store read by index misses is none, which the read leaves out, as Grain's iterating
         # a dataset of them does.
         elements = consumed_forward([element for element in elements if element is not None])
@@ -188,7 +204,7 @@ class _Grouped:
         # the integers they are, which the reading process counts (`_Ungrouped`, `Accepted`).
         held = ({name: [row[name] for row in records] if name in ACCOUNTS else
                  self.column([row[name] for row in records]) for name in records[0]} if alike else rows)
-        return {"held": held, "alike": alike, "rows": len(rows), "markers": markers}
+        return Packet(held, alike, len(rows), markers)
 
     def column(self, values: list[Field]) -> np.ndarray | list[Field]:
         """One field's values across the group: stacked where they are arrays of one shape and type,
@@ -212,20 +228,19 @@ class _Ungrouped:
 
     max_fan_out: int
 
-    def flat_map(self, group: Batch) -> Sequence[Record]:
-        markers = [marker for marker in group["markers"] if not marker.consumed]
+    def flat_map(self, group: Packet) -> Sequence[Record]:
+        markers = [marker for marker in group.markers if not marker.consumed]
         # A marker of the examples the group's last rows were the last of follows its rows.
-        trailing = [marker for marker in group["markers"] if marker.consumed]
-        held, count = group["held"], integer(group["rows"], "grouped rows")
-        if not group["alike"]:
-            return [*markers, *held, *trailing]
+        trailing = [marker for marker in group.markers if marker.consumed]
+        if not group.alike:
+            return [*markers, *group.held, *trailing]
         columns: dict[str, np.ndarray | list] = {}
-        for name, column in record(held, "grouped records").items():
+        for name, column in record(group.held, "grouped records").items():
             # A batch's column: an array, or a list of a field's values that don't stack.
             if not isinstance(column, (np.ndarray, list)):
                 raise TypeError(f"a grouped column {name!r} is a {type(column).__name__}, not a batch column")
             columns[name] = column
-        rows = ({name: column[index] for name, column in columns.items()} for index in range(count))
+        rows = ({name: column[index] for name, column in columns.items()} for index in range(group.rows))
         return [*markers, *rows, *trailing]
 
 

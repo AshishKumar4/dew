@@ -17,6 +17,7 @@ from types import ModuleType
 from typing import NamedTuple
 
 import jax
+import jax.extend
 import jax.numpy as jnp
 import numpy as np
 from jax.scipy.ndimage import map_coordinates
@@ -31,6 +32,11 @@ class ImageParameters(NamedTuple):
     factors: ArrayLike
     order: ArrayLike
 
+
+AUGMENTATION_KEYS = jax.extend.random.threefry_prng_impl
+"""The PRNG a record's augmentation key is drawn for (`dew.data.images.AugmentationKey`) and read as
+(`augment_batch`): Threefry, whatever `jax_default_prng_impl` is, its key data of its own shape
+(`key_shape`)."""
 
 _GREY = (0.2989, 0.587, 0.114)
 """torchvision's `rgb_to_grayscale` weights, which its contrast and
@@ -189,10 +195,10 @@ def augment_batch(images: ArrayLike, raw_keys: ArrayLike, *, size: int, flip: bo
                   crop_scale: tuple[float, float]) -> jax.Array:
     """Augment a dense uint8 batch on its device, one Threefry key per record."""
     images = jnp.asarray(images)
-    # Each record's key is two words its own generator drew (`AugmentationKey`), Threefry's key data, so a
+    # Each record's key is the words its own generator drew (`AugmentationKey`), Threefry's key data, so a
     # record draws the same augmentation at any split, pool or resume; read as `jax_default_prng_impl`'s,
     # the words would be another implementation's key, of another shape where it is not Threefry.
-    keys = jax.random.wrap_key_data(jnp.asarray(raw_keys, jnp.uint32), impl="threefry2x32")
+    keys = jax.random.wrap_key_data(jnp.asarray(raw_keys, jnp.uint32), impl=AUGMENTATION_KEYS)
 
     def one(image, key):
         parameters = draw_device(key, image.shape, flip=flip, jitter=jitter, crop_scale=crop_scale)

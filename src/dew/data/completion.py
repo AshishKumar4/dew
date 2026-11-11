@@ -17,8 +17,10 @@ which it can read twice, by a table of the place its shuffle draws each unit (`r
 from __future__ import annotations
 
 import collections
+import copy
 import dataclasses
 import heapq
+import typing
 from collections.abc import Mapping, Sequence
 
 import grain.experimental as gx
@@ -117,16 +119,48 @@ class Completed(pygrain.IterDataset):
         return _CompletedIterator(self._rows.__iter__())
 
 
+_TRANSIENT = "transient"
+"""The metadata key of a `_Held` field a saved position holds none of: the iterator derives it again as
+it restores (`_CompletedIterator._wait`)."""
+
+
 @dataclasses.dataclass
 class _Held:
     """A unit's counts, held until every unit from `since` through it is drawn, `missing` of them not yet,
-    a mixture's by member (`MEMBERS`)."""
+    a mixture's by member (`MEMBERS`). A saved position holds each but `missing` (`saved`, `restored`)."""
 
     since: int
     consumed: int
     refused: int
     members: dict[str, int] = dataclasses.field(default_factory=dict)
-    missing: int = 0
+    missing: int = dataclasses.field(default=0, metadata={_TRANSIENT: True})
+
+    def saved(self) -> dict[str, int | dict[str, int]]:
+        """Its counts as a position saves them, by name."""
+        return {field.name: copy.copy(getattr(self, field.name)) for field in _saved_fields()}
+
+    @classmethod
+    def restored(cls, saved: Mapping[str, object]) -> _Held:
+        """The counts a position saved (`saved`), each read as its field's type."""
+        names = [field.name for field in _saved_fields()]
+        if sorted(saved) != sorted(names):
+            raise ValueError(f"a held count holds {names}, not {sorted(saved)}")
+        hints = typing.get_type_hints(cls)
+        return cls(**{name: _read(hints[name], saved[name], f"a held count's {name}") for name in names})
+
+
+def _saved_fields() -> tuple[dataclasses.Field, ...]:
+    """The fields of `_Held` a position saves, in their declared order."""
+    return tuple(field for field in dataclasses.fields(_Held) if not field.metadata.get(_TRANSIENT))
+
+
+def _read(hint: object, value: object, what: str) -> int | dict[str, int]:
+    """`value` as a `_Held` field of type `hint` holds it: a count, or counts by member."""
+    if hint is int:
+        return integer(value, what)
+    if typing.get_origin(hint) is dict:
+        return {member: integer(count, what) for member, count in record(value, what).items()}
+    raise TypeError(f"no reading of a held count's {what} as {hint}")
 
 
 class _CompletedIterator(pygrain.DatasetIterator):
@@ -184,8 +218,7 @@ class _CompletedIterator(pygrain.DatasetIterator):
         released.add(held.consumed, held.refused, held.members)
 
     def get_state(self) -> Mapping[str, object]:
-        held = [[unit, counts.since, counts.consumed, counts.refused, dict(counts.members)]
-                for unit, counts in self._held.items()]
+        held = [[unit, counts.saved()] for unit, counts in self._held.items()]
         return {"parent": self._rows.get_state(), "floor": self._floor, "drawn": sorted(self._drawn),
                 "held": held}
 
@@ -196,15 +229,17 @@ class _CompletedIterator(pygrain.DatasetIterator):
         self._held, self._waiting, self._floored = {}, {}, []
         for entry in listed(state["held"], "held counts", read=json_value, what="a list of held counts"):
             match entry:
-                case [unit, since, consumed, refused, dict(split)]:
-                    members = {member: integer(count, "a held member's examples")
-                               for member, count in split.items()}
-                    at = integer(unit, "a held count's unit")
-                    counts = integer(consumed, "a held count"), integer(refused, "a held refusal")
-                    self._held[at] = _Held(integer(since, "a held count's first unit"), *counts, members)
-                    self._wait(at)
+                case [unit, dict(saved)]:
+                    held = _Held.restored(saved)
+                case [unit, *saved] if len(saved) == len(_saved_fields()):
+                    # A position saved before its counts were saved by name: its fields in their order.
+                    held = _Held.restored(dict(zip((field.name for field in _saved_fields()), saved,
+                                                   strict=True)))
                 case _:
-                    raise ValueError(f"a held count is its unit, first unit, counts and members: {entry!r}")
+                    raise ValueError(f"a held count is its unit and its counts: {entry!r}")
+            at = integer(unit, "a held count's unit")
+            self._held[at] = held
+            self._wait(at)
 
     def close(self) -> None:
         self._rows.close()

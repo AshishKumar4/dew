@@ -2133,6 +2133,21 @@ def test_an_offloaded_cache_serves_what_a_resident_one_serves(kv_cache):
         assert_same_generation(mine, theirs)
 
 
+def test_a_cache_config_beside_an_offloaded_cache_configures_nothing():
+    """transformers reads a generation config's `cache_config` only for its quantized cache, which Dew
+    refuses by `cache_implementation`: beside an offloaded cache the source decodes, and a quantized one
+    is refused, with its `cache_config` or without."""
+    from dew.interop.generation_config import source_decoding
+
+    model = task().model
+    settings = {"backend": "quanto", "nbits": 4}
+    source_decoding({}, {"cache_implementation": "offloaded", "cache_config": settings}, model, 1, None)
+    for controls in ({"cache_implementation": "quantized"},
+                     {"cache_implementation": "quantized", "cache_config": settings}):
+        with pytest.raises(ValueError):
+            source_decoding({}, controls, model, 1, None)
+
+
 def test_a_sources_offloaded_cache_generates_what_a_resident_one_does():
     """A source whose generation config names Hugging Face's offloaded cache (`cache_implementation`
     "offloaded") generates over a cache whose keys and values live in host memory

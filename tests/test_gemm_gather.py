@@ -58,10 +58,11 @@ def a_deep_gathered_step_reads_its_rows_as_their_copy_would(interpret):
 def a_gathered_product_is_on_par(interpret=False, *, paired: bool = False, scattered: bool = False):
     """A grouped product whose rows are gathered from the tokens by a table (`gmm`'s `gather`: a MoE's sort
     fused into the rows' loads, row 1376), its groups ragged, one empty, rows past them, a token read by
-    several slots and some by none, on par with XLA's ragged dot of the gathered rows (check 1), from
-    float64: on this GPU (test_gpu_gemm's cell, the producer's cp.async gather), or `interpret`ed; `paired`,
-    a second matrix's product beside it; `scattered`, each row stored at its entry of a permutation (`gmm`'s
-    `scatter`: the MoE's un-permute fused into the stores)."""
+    several slots and some by none, on par with the arm Dew's selector runs for the same call where the
+    template is not taken (check 1: `gemm.gemm` with `grouped_matmul` chosen `xla`, the gathered rows' ragged
+    dot), from float64: on this GPU (test_gpu_gemm's cell, the producer's cp.async gather), or `interpret`ed;
+    `paired`, a second matrix's product beside it; `scattered`, each row stored at its entry of a permutation
+    (`gmm`'s `scatter`: the MoE's un-permute fused into the stores)."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
     sizes, depth = jnp.asarray([70, 0, 129, 51], jnp.int32), 128
 
@@ -81,15 +82,21 @@ def a_gathered_product_is_on_par(interpret=False, *, paired: bool = False, scatt
                               paired=matrices[1] if paired else None, scatter=slots if scattered else None)
         return jnp.stack(outs) if paired else outs
 
-    def plain(tokens, table, matrices, slots, wide=jnp.float32):
-        rows = tokens[table].astype(wide)
-        outs = [jax.lax.ragged_dot(rows, matrix.astype(wide), sizes, preferred_element_type=wide)
-                for matrix in matrices[:2 if paired else 1]]
-        outs = [jnp.zeros_like(out).at[slots].set(out) if scattered else out for out in outs]
-        return jnp.stack(outs) if paired else outs[0]
+    def selected(tokens, table, matrices, slots):
+        # The arm Dew's selector runs for the same call where the template is not taken (`grouped_matmul`
+        # chosen `xla`): the gathered rows' ragged dot as they are (`grouped_matmul.xla_ragged_dot`, bf16
+        # products summed into fp32), its rows stored at their slots; the float64 truth the same call over
+        # the gate's widened draws.
+        wide = jnp.promote_types(tokens.dtype, jnp.float32)
+        with generation.chosen(grouped_matmul="xla"):
+            two = (wide,) * 2 if paired else None
+            outs = gemm.gemm(tokens, matrices[0], sizes, out_dtype=wide, out_dtypes=two,
+                             paired=matrices[1] if paired else None, gather=table,
+                             scatter=slots if scattered else None)
+        return jnp.stack(outs) if paired else outs
 
-    assert_as_exact(jax.jit(dew), jax.jit(plain), draw, "a gathered grouped product", seeds=SEEDS,
-                    truth_fn=functools.partial(plain, wide=jnp.float64))
+    assert_as_exact(jax.jit(dew), jax.jit(selected), draw, "a gathered grouped product", seeds=SEEDS,
+                    truth_fn=selected)
 
 
 @pytest.mark.parametrize("paired", [False, True])

@@ -303,3 +303,24 @@ def test_batch_statistics_update_as_the_model_trains_and_reload_from_its_checkpo
     assert json.loads(restored.stdout.splitlines()[-1]) == {
         jax.tree_util.keystr(path): np.asarray(leaf).tobytes().hex()
         for path, leaf in jax.tree_util.tree_leaves_with_path(trained)}
+
+
+def test_a_run_restores_its_parameters_in_the_dtype_asked_or_refuses_one_this_process_cannot_hold(tmp_path):
+    """A run's variables restore in an explicit `param_dtype`: float64 under x64 holds float64, and where
+    x64 is off, which would hold it in float32 unseen, the restore is refused rather than narrowed (the
+    train review of trains 741-746: `Checkpoints.materialized` canonicalized an asked float64 to float32);
+    a stored dtype with no `param_dtype` asked restores as this process holds it."""
+    from dew.checkpoints import Checkpoints
+
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    Trainer(Supervised(Normed(), squared, inputs=INPUTS), optax.adam(0.05), key=jax.random.key(0),
+            checkpoints=checkpoints).fit(dataset(), steps=1, log_every=1, checkpoint_every=1)
+    checkpoints.wait()
+    with pytest.raises(ValueError):
+        Checkpoints(str(tmp_path / "run")).variables(param_dtype="float64")
+    with jax.enable_x64(new_val=True):
+        wide = Checkpoints(str(tmp_path / "run")).variables(param_dtype="float64")
+    assert {leaf.dtype for leaf in jax.tree.leaves(wide["params"])} == {np.dtype(np.float64)}
+    held = Checkpoints(str(tmp_path / "run")).variables()
+    assert {leaf.dtype for leaf in jax.tree.leaves(held["params"])} == {np.dtype(np.float32)}
+

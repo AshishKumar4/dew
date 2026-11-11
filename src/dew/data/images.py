@@ -17,7 +17,7 @@ from numpy.typing import ArrayLike
 from dew._records import record
 from dew.batch import Batch
 from dew.data.facts import resized, shaped, unshaped
-from dew.data.image_augmentation import JITTER
+from dew.data.image_augmentation import AUGMENTATION_KEYS, JITTER
 from dew.data.image_codec import as_rgb, decode_image
 from dew.data.pipeline import DeviceStep, Rejected
 from dew.data.plan import callable_name
@@ -613,8 +613,8 @@ class ConfigureCaption:
     caption: Caption
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        """A caption, a string of no fixed shape, in place of any the record held, beside the rest."""
-        return unshaped(facts, "caption")
+        """What the caption step it configures declares (`Caption.declared`)."""
+        return self.caption.declared(facts)
 
     def __call__(self, metadata: Mapping[str, object]) -> Caption:
         from dew._records import strings
@@ -632,10 +632,11 @@ class AugmentationKey(grain.RandomMapTransform):
     """The key `DeviceAugment` augments the record with, drawn from the record's generator."""
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        return shaped(facts, "image_augmentation_key", [2])
+        return shaped(facts, "image_augmentation_key", list(AUGMENTATION_KEYS.key_shape))
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        return {**element, "image_augmentation_key": rng.integers(0, 2**32, size=2, dtype=np.uint32)}
+        drawn = rng.integers(0, 2**32, size=AUGMENTATION_KEYS.key_shape, dtype=np.uint32)
+        return {**element, "image_augmentation_key": drawn}
 
 
 CAPTIONS = "captions"

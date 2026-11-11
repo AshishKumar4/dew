@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 import lane_environment
+import apart_records
 
 # The lane's environment, before JAX reads it.
 os.environ.update(lane_environment.configured(os.environ))
@@ -108,6 +109,18 @@ def pytest_runtestloop(session):
     collects (CI's planner, a job's prepare) opens no backend and starts none of its threads."""
     if not session.config.option.collectonly:
         jax.jit(lambda x: x + 1)(0).block_until_ready()
+
+
+def pytest_collection_finish(session):
+    """The session's tests, of which a compile gate's process of its own runs those of one capability
+    (`kernel_compile.compiled_apart`)."""
+    apart_records.SESSION[:] = session.items
+
+
+def pytest_runtest_logreport(report):
+    """In a compile gate's process of its own, each test's outcome beside its records
+    (`apart_records.reported`)."""
+    apart_records.reported(report)
 
 
 def pytest_collectstart(collector):

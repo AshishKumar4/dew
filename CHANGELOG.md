@@ -7,6 +7,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- An fp32 call that runs on the gated delta rule's, Kimi delta attention's or the SSD's port on a GPU (Dew's
+  ports of fla's and mamba_ssm's kernels; the SSD's training takes its port on an A100 and an H100) under the
+  default numerics multiplies its fp32 products in one TF32, as fla's and mamba_ssm's own kernels do, where it
+  took an fp32 product's accuracy (BF16x6): its state is about 2^13 further from float64 than before, as its
+  upstream's is. A run whose configured precision is above the default (`dew.nn.precision.ACCURATE`'s
+  'highest') is declined by the ports and trains on the portable math in IEEE float32, as before.
+
 - A shared prefix is computed once in the backbone call (`dew.batch.Forks`): a row's documents may continue
   another, each reading its chain of ancestors as its own beginning, attention their keys and every recurrent
   mixer (gated delta net, Kimi delta attention, Mamba, Mamba-2, the short conv) the state and conv history
@@ -29,6 +36,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   teacher crossed to the device every step. Its checkpoints store the teacher banked (`layers_0_2`): a
   host-layout distillation saved before this keeps its teacher per layer (`layers_0` to `layers_2`) and
   does not restore into it; start such a run afresh from its teacher.
+- Dew requires its JAX build 0.12.0.1.post79, its CUDA and PJRT plugins post79's on every machine: under
+  deterministic ops XLA makes no Triton GEMM fusion its autotuner cannot serve, so a dot compiles on cuBLAS
+  where it failed ("No supported config found for HLO"), with a device or without one, and a process without
+  deterministic ops compiles as before; the compile gate's lowerings, their resource estimates dumped, are
+  cached; `FragmentedArray.row_shifted` and `plgpu.fresh_axis_index` join Mosaic GPU; and the GPU interpreter's
+  loads and stores pass their indices as one vector.
 - Dew requires its JAX build 0.12.0.1.post78, its CUDA and PJRT plugins post75's on every machine: a compile
   ahead takes the kernels its GPU runs or refuses the program, naming it, as no kernel lowers in another's
   place (cuDNN's fused attention compiles for a host's own GPUs with none attached; for a canonical target

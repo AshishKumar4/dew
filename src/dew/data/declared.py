@@ -3,7 +3,6 @@ its store published it at, checked against its digest, or read at a commit its U
 
 from __future__ import annotations
 
-import hashlib
 import io
 import os
 from collections.abc import Mapping
@@ -24,6 +23,8 @@ from dew.data.storage import (
     content_version,
     in_memory,
     local,
+    matching,
+    object_info,
     pinned_by_url,
 )
 
@@ -110,8 +111,10 @@ def checked_open(fs: AbstractFileSystem, path: str, size: int, digest: str) -> B
     it reads (`_checked_local`); an in-memory one read whole and checked."""
     if not local(fs):
         payload = fs.cat_file(path)
-        if hashlib.sha256(payload).hexdigest() != digest:
-            raise Replaced(f"{path} holds other bytes than the {size} its producer declared")
+        try:
+            matching(object_info(payload), {"bytes": size, "sha256": digest}, path)
+        except OSError as changed:
+            raise Replaced(f"{path} holds other bytes than the {size} its producer declared") from changed
         return io.BytesIO(payload)
     return _checked_local(fs, path, size, digest)[0]
 

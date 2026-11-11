@@ -136,13 +136,11 @@ def test_a_framing_reads_a_chat_template_of_its_own_and_its_variables_and_its_re
 def test_a_framing_refuses_what_it_would_otherwise_leave_unread():
     """A template variable that names one of the template call's own controls, a framing's own
     template over a tokenizer that renders none, and a framing's own template with templates off are
-    each refused, rather than overridden or left unread; a template's variables keep their order."""
+    each refused, rather than overridden or left unread; a template's variables keep their order. Dew's
+    own control (thinking) is refused as the framing is made; the renderer's own (its template, its
+    keyword arguments), as its tokenizer's renderer declares them, where the framing renders."""
     with pytest.raises(ValueError):
         Framing(options={"enable_thinking": True})
-    with pytest.raises(ValueError):
-        Framing(options={"chat_template": "{{ messages }}"})
-    with pytest.raises(ValueError):
-        Framing(options={"tokenizer_kwargs": {}})
     with pytest.raises(ValueError):
         Framing(chat_template="{{ messages }}", template=False)
     with pytest.raises(ValueError):
@@ -152,6 +150,10 @@ def test_a_framing_refuses_what_it_would_otherwise_leave_unread():
     from dew.data.chat import CONTENT, framed
 
     templated = HFTokenizer(str(LOCAL["qwen3.5"]), local_files_only=True)
+    for owned in ({"chat_template": "{{ messages }}"}, {"tokenizer_kwargs": {}}):
+        framing = Framing(options=owned)
+        with pytest.raises(ValueError, match="own controls"):
+            framing.around(templated)
     with pytest.raises(ValueError):
         framed(templated.tokenizer, JOINT_SYSTEM, where="direct", options={"tokenizer_kwargs": {}})
     rendered = []

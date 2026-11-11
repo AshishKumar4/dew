@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import os
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from types import MappingProxyType
 from typing import Literal
 
@@ -31,7 +32,17 @@ from dew.data.dataset import (
 )
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
-from dew.data.plan import COUNTERS, FILE_SHARDS, IN_ORDER, Plan, earlier_position, read_otherwise_at_11
+from dew.data.plan import (
+    COUNTERS,
+    DECLARED_MIX,
+    FILE_SHARDS,
+    IN_ORDER,
+    SHARED_STATE,
+    Plan,
+    earlier_position,
+    read_otherwise_at_11,
+    read_otherwise_at_13,
+)
 from dew.data.shared import SharedMapping
 from dew.data.storage import MIRRORED, Mirrored, PositionText, carried_mirrors
 
@@ -318,19 +329,25 @@ class _PerShare(Forwarding):
         self._statistics.publish(None)
 
     def resumed_at(self, decoded: Mapping[str, object]) -> None:
-        """Read on as the saved position `decoded` was read where it is one a Dew of version `FILE_SHARDS`
-        reads (`earlier_position`) and `IN_ORDER` reads otherwise (`read_otherwise_at_11`): its share in the
-        workers it names, its order as 10 reads it, which this Dew reads by. A run saved under 10 resumes as
-        10 read it, and goes on under 10; any other position is translated and checked as it was."""
-        if self._saved_as is None or self._plan.version < IN_ORDER:
+        """Read on as the saved position `decoded` was read where a later Dew reads it otherwise: one a Dew
+        of version `FILE_SHARDS` saved that `IN_ORDER` reads otherwise (`read_otherwise_at_11`), its share
+        in the workers it names; and one of `SHARED_STATE` that `DECLARED_MIX` reads otherwise
+        (`read_otherwise_at_13`), its mixes in their keys' order. A run so saved resumes as its version
+        read it, and goes on under it; any other position is translated and checked as it was."""
+        if self._saved_as is None:
             return
-        written, _ = earlier_position(decoded, dataclasses.replace(self._plan, version=FILE_SHARDS))
-        if written.get("version") != FILE_SHARDS or read_otherwise_at_11(written) is None:
+        for saved, later, otherwise in ((FILE_SHARDS, IN_ORDER, read_otherwise_at_11),
+                                        (SHARED_STATE, DECLARED_MIX, read_otherwise_at_13)):
+            if self._plan.version < later:
+                continue
+            written, _ = earlier_position(decoded, dataclasses.replace(self._plan, version=saved))
+            if written.get("version") != saved or otherwise(written) is None:
+                continue
+            topology = record(written.get("topology", {}), "saved data plan topology")
+            workers = integer(topology.get("workers", 0), "saved per-share workers")
+            self._open, self._plan = self._saved_as(saved, workers)
+            self._plan_record = SharedMapping.of(self._plan.record())
             return
-        topology = record(written.get("topology", {}), "saved data plan topology")
-        workers = integer(topology.get("workers", 0), "saved per-share workers")
-        self._open, self._plan = self._saved_as(FILE_SHARDS, workers)
-        self._plan_record = SharedMapping.of(self._plan.record())
 
     def identity(self) -> str:
         """What every share of the pool reads, which the pool agrees before it
@@ -369,23 +386,59 @@ class _Statistics:
         self._mirrored.append(published)
         return published.publish
 
+    def prefix(self) -> Mapping[str, CorpusCounts]:
+        """Each corpus's counts of the prefix a memory read ran, by name."""
+        return self._counts
+
+    def read(self) -> dict[str, CorpusCounts]:
+        """Each corpus's counts the latest reader published of what it read past that prefix, by name."""
+        return {name: counts for published in self._published for name, counts in published.counts.items()}
+
+    def workers_mirrors(self) -> list[Mapping[str, float]]:
+        """Each loading worker's mirror counters, which its readers' positions carried (`WorkerMirrors`,
+        row 4339): another process's, never this one's, which `Mirrored` counts."""
+        return [counts for published in (*self._published, *self._mirrored)
+                for process, counts in published.mirrors.items() if not process.startswith(f"{os.getpid()}:")]
+
     def __call__(self) -> Mapping[str, float]:
-        """The metrics of every corpus: the counts of the prefix a memory read ran, followed by
-        those the latest reader published of the rest (`CorpusCounts.followed`), which a reader
-        restored from another's position carries on from."""
-        read = {name: counts for published in self._published for name, counts in published.counts.items()}
-        merged = {name: counts.followed(read.pop(name)) if name in read else counts
-                  for name, counts in self._counts.items()}
-        # What this process's mirrors did since the run began beside them (`Mirrored`, row 4299), and each
-        # loading worker's, which its readers' positions carried (`WorkerMirrors`, row 4339).
-        mirrored = [self._own.metrics(), *(counts for published in (*self._published, *self._mirrored)
-                                        for process, counts in published.mirrors.items()
-                                        if not process.startswith(f"{os.getpid()}:"))]
-        summed: dict[str, float] = {}
-        for counts in mirrored:
-            for name, value in counts.items():
-                summed[name] = summed.get(name, 0.0) + float(value)
-        return {**data_metrics([*merged.values(), *read.values()]), **summed}
+        return statistics_of((self,))
+
+
+def statistics_of(sources: Sequence[_Statistics]) -> Mapping[str, float]:
+    """The metrics of a run read by the loaders `sources` count, in the order it read them (a phased run's
+    phases): each corpus's counts of the prefix a memory read ran, a measurement two loaders made alike
+    counted once (a corpus a later phase reads as the first prepares it, from its start) and one a later
+    loader made otherwise (its phase's own steps over the corpus) counted beside it, followed by what
+    each loader's readers read past it, summed over the loaders (a later phase reads on from where the
+    one before it stopped, `CorpusCounts.followed`, `CorpusCounts.add`); and what this process's mirrors
+    did since the first began (`Mirrored`, row 4299), once, beside every loading worker's."""
+    prefix: dict[str, CorpusCounts] = {}
+    read: dict[str, CorpusCounts] = {}
+    measured: dict[str, list[CorpusCounts]] = {}
+    for source in sources:
+        for name, counts in source.prefix().items():
+            if counts in measured.setdefault(name, []):
+                continue
+            measured[name].append(counts)
+            if name in prefix:
+                combined = copy.deepcopy(prefix[name])
+                combined.add(counts)
+                counts = combined
+            prefix[name] = counts
+        for name, counts in source.read().items():
+            if name in read:
+                summed = copy.deepcopy(read[name])
+                summed.add(counts)
+                counts = summed
+            read[name] = counts
+    corpora = {name: counts.followed(read.pop(name)) if name in read else counts
+               for name, counts in prefix.items()}
+    totals: dict[str, float] = {}
+    workers = [counts for source in sources for counts in source.workers_mirrors()]
+    for counts in (sources[0]._own.metrics(), *workers):
+        for name, value in counts.items():
+            totals[name] = totals.get(name, 0.0) + float(value)
+    return {**data_metrics([*corpora.values(), *read.values()]), **totals}
 
 
 @dataclasses.dataclass(frozen=True)

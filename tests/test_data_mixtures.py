@@ -2218,3 +2218,92 @@ def test_a_token_mixture_logs_the_tokens_it_drew_of_each_member_through_a_resume
     for name, tag, targets, after in (("short", 1, 1, 0), ("long", 2, 9, refused)):
         drawn = sum(value // 1000 == tag for value in read_ids) + after
         assert statistics[f"data/weighed_tokens/{name}"] == targets * drawn
+
+
+def _named(name: str, tag: int) -> Pipeline:
+    """A corpus of 64 records named `name`, each saying it is the `tag`th corpus's."""
+    return Pipeline(Memory(Indexed(tag, 64)), name=name)
+
+
+@pytest.mark.parametrize("read", ["streamed", "indexed"])
+def test_an_unseeded_mix_reads_its_members_in_the_order_it_declares_them(read):
+    """A mix of no seed reads its members in the order it declares them, 'z' before 'a', streamed as it
+    is read by index and as every prefix of it is counted (`Proportions`); a plan of version 12 streamed
+    them in their keys' sorted order, as Grain's mix of a mapping does, and a run it saved reads so still."""
+    chain = mix([_named("z", 1).repeat(), _named("a", 2).repeat()]).batch(4)
+    first = compile(chain, read=read, loading=READ).train(DataPartition())
+    try:
+        assert ids(itertools.islice(first, 2)) == [[1000, 2000, 1001, 2001], [1002, 2002, 1003, 2003]]
+    finally:
+        first.close()
+    if read == "streamed":
+        earlier = compile(chain, read=read, loading=READ, plan_version=12).train(DataPartition())
+        try:
+            assert ids(itertools.islice(earlier, 1)) == [[2000, 1000, 2001, 1001]]
+        finally:
+            earlier.close()
+
+
+def test_a_phased_runs_statistics_count_each_phase_it_reached(tmp_path):
+    """A run's statistics count every phase it has opened: a corpus its second phase adds to the first's
+    is counted beside it, where only the first phase's loader was counted, its corpus alone; the corpus
+    both phases read is counted once, as a run of the first phase alone counts it, where each phase's
+    loader measures the same prefix of it."""
+    _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    data = phased_packed((first, 3), ({first: 1.0, second: 1.0}, None))
+    stream = data.train(DataPartition())
+    try:
+        list(itertools.islice(stream, 4))
+        rows = {name: count for name, count in data.statistics().items() if name.startswith("data/rows/")}
+    finally:
+        stream.close()
+    alone = phased_packed((first, None))
+    (counted,) = [count for name, count in alone.statistics().items() if name.startswith("data/rows/")]
+    assert len(rows) == 2 and counted in rows.values() and all(count > 0 for count in rows.values()), rows
+
+
+@pytest.mark.parametrize(("read", "version"), [("indexed", 13), ("streamed", 12)])
+def test_a_mix_saved_under_plan_version_12_resumes_as_12_read_it(read, version):
+    """A mix of no seed whose members are named out of their sorted order, saved under plan version 12,
+    resumes under this Dew's on the batches 12's read goes on to: read by index, its order the same at
+    both, its position goes on as 13's; streamed, which 12 mixed in its keys' sorted order, as 12's."""
+    chain = mix([_named("z", 1).repeat(), _named("a", 2).repeat()]).batch(4)
+    earlier = compile(chain, read=read, loading=READ, plan_version=12)
+    now = compile(chain, read=read, loading=READ)
+
+    def listed(stream, count):
+        return ids(itertools.islice(stream, count))
+
+    reader = earlier.train(DataPartition())
+    try:
+        whole = listed(reader, 6)
+    finally:
+        reader.close()
+    reader = earlier.train(DataPartition())
+    try:
+        head, saved = listed(reader, 3), reader.get_state()
+    finally:
+        reader.close()
+    resumed = now.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert head + listed(resumed, 3) == whole
+        state = resumed.get_state()
+        plan = _position.read(state).plan if read == "indexed" else json.loads(state)["dew_data_plan"]
+        assert plan["version"] == version
+    finally:
+        resumed.close()
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_phase_on_the_step_clock_of_a_mix_weighed_by_tokens_streamed_is_refused_as_one(read):
+    """Phases that end at steps continue each corpus past what the phases before read of it, by their
+    order's shares: a phase whose mix weighs its members' rows by their targets as they stream in (rows
+    a step rejects), which has no shares to continue by, is refused for that, as any phase of no global
+    order is."""
+    def members():
+        return mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat()], by="tokens")
+
+    chain = phases((members(), 3), (members(), None)).batch(1)
+    with pytest.raises(ValueError, match="phase 0 needs a global order"):
+        compile(chain, read=read, loading=READ)

@@ -11,7 +11,7 @@ from contextlib import ExitStack, closing
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
 import numpy as np
 
@@ -23,10 +23,10 @@ from dew.data.pipeline import Record, Rejected
 from dew.data.plan import array_digest, filled_version
 from dew.data.retention import LocalRetention
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _indexed_manifest, _uncounted, url_label
-from dew.data.sources.codec import decode, encode, encoded_fingerprint
+from dew.data.sources.codec import as_named, decode, dtype_name, encode, encoded_fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords, ShardReaders
-from dew.data.storage import Store, Versioned, local, object_info
+from dew.data.storage import ObjectInfo, Store, Versioned, local, object_info
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache
@@ -189,14 +189,12 @@ def _publish(
     for page, values in pages.items():
         payload = _json(values)
         path = f"index/inputs-{page}.json"
-        target.child(path).verified(payload)
-        indexes[page] = {"path": path, "bytes": len(payload), "sha256": _hash(payload)}
+        indexes[page] = {"path": path, **_facts(target.child(path).verified(payload))}
     row_pages = []
     for offset in range(0, len(dense), ROW_PAGE):
         payload = _json(dense[offset : offset + ROW_PAGE])
         path = f"index/rows-{len(row_pages):06d}.json"
-        target.child(path).verified(payload)
-        row_pages.append({"path": path, "bytes": len(payload), "sha256": _hash(payload)})
+        row_pages.append({"path": path, **_facts(target.child(path).verified(payload))})
     metadata = {}
     lengths = [entry["length"] for entry in dense]
     if all(length is not None for length in lengths):
@@ -234,16 +232,22 @@ def _publish(
             if not name.replace("_", "").isalnum():
                 raise ValueError(f"invalid packing-plan field {name!r}")
             definition["plan"][name] = _write_plan(target, name, array)
-    payload = _json(definition)
-    target.child("manifest.json").verified(payload)
+    published = _facts(target.child("manifest.json").verified(_json(definition)))
     reference = _json(
-        {"generation": generation, "manifest": key.key, "sha256": _hash(payload), "bytes": len(payload)}
+        {"generation": generation, "manifest": key.key, "sha256": published["sha256"],
+         "bytes": published["bytes"]}
     )
     if current is None:
         root.child("CURRENT").put_if_absent(reference)
     else:
         root.child("CURRENT").put_if_match(reference, current.version)
     return opened
+
+
+def _facts(verified: Mapping[str, JSON]) -> ObjectInfo:
+    """The size and digest of an object `Store.verified` published, as a reference to it states them
+    (`ObjectInfo`): the version a remote store holds it at is the reader's, not the reference's."""
+    return cast(ObjectInfo, {name: verified[name] for name in ObjectInfo.__annotations__})
 
 
 def _write_plan(root: Store, name: str, array: np.ndarray) -> Mapping[str, object]:
@@ -262,7 +266,7 @@ def _write_plan(root: Store, name: str, array: np.ndarray) -> Mapping[str, objec
         path = f"plan/{name}/{len(pages):06d}.npy"
         pages.append({"path": path, **root.child(path).verified(encoded.getvalue())})
     return {
-        "dtype": array.dtype.str,
+        "dtype": dtype_name(array.dtype),
         "shape": list(array.shape),
         "rows": len(rows),
         "page_rows": page_rows,
@@ -541,9 +545,16 @@ class Generation:
     def _plan_page(self):
         @lru_cache(maxsize=4)
         def opened(name: str, page: int) -> np.ndarray:
-            reference = self.manifest["plan"][name]["pages"][page]
-            encoded = _checked(Store(self.url, self.storage_options), reference)
-            return np.load(io.BytesIO(encoded), allow_pickle=False)
+            plan = self.manifest["plan"][name]
+            encoded = _checked(Store(self.url, self.storage_options), plan["pages"][page])
+            loaded = np.load(io.BytesIO(encoded), allow_pickle=False)
+            stated = np.dtype(plan["dtype"])
+            if stated.kind == "V" and stated.fields is None and plan["dtype"] == stated.str:
+                # A plan written before its dtype was named exactly (`dtype_name`): an ML dtype's pages
+                # stated as a void of its width, which names no number to read them as.
+                raise ValueError(f"packing plan {name!r} states its dtype as {plan['dtype']}, which names "
+                                 "no numeric dtype: publish the generation again")
+            return as_named(loaded, plan["dtype"])
 
         return opened
 

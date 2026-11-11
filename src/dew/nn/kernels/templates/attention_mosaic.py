@@ -69,6 +69,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle,
     bundle_of,
     extents,
+    few_rows,
     fewer_rows,
     fuses,
     hook_reduces,
@@ -164,6 +165,12 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     # Twice the unit where the held rows take it, padding them by no more than an eighth beyond the unit's.
     candidates = [2 * unit] if wide and padded(2 * unit, 1) - padded(unit, 1) <= held // 8 else []
     found = [config for config in map(first, [*candidates, unit]) if config is not None]
+    if not found and rows is None and few_rows(family, held):
+        # A call of fewer rows than a role's at fewer of them a tile, its issuer's rows at least, where no
+        # tile of them all holds: a 48-row training walk's scaled op on mma.sync held 278 registers of 255
+        # at 48 x 64, the least key tile so few rows take (`_least_keys`), and derived none (et-sm86scaled).
+        found = [config for config in map(first, range(unit - family.rows, 0, -family.rows))
+                 if config is not None][:1]
     if not found:
         return None
     return max(found, key=lambda config: (config.block_q * config.block_k * config.consumers, config.block_q))
@@ -504,7 +511,10 @@ class MosaicForward(_Mainloop[Tiles]):
         plain one's, TWOPASS4-h100: 1.05 ms at 64 x 64 on two consumers against 1.41 at 64 x 128 on one,
         causal llama-d128 2 x 4096 on an H100 PCIe). Its family the first of the device's bundles, ranked
         by the share of their rows its queries fill (`layouts`: a decode step's few rows mma.sync's before
-        wgmma's, row 4042), that takes the call and derives a config."""
+        wgmma's, row 4042), that takes the call and derives a config: a config legal with its natural
+        rewalk's tiles (`_relaunched`), so a tile whose rewalk no tile holds gives way to a smaller (a 48-row
+        training walk's scaled op on an A100 at width 32, legal at 48 x 64 and its rewalk not, derived none
+        where 32 x 64 holds both, et-why48)."""
         query = ba.arguments["query"]
         for family in layouts(target.generation, query.dtype, query.shape[1]):
             if self.refusal(ba, family) is not None:
@@ -513,12 +523,15 @@ class MosaicForward(_Mainloop[Tiles]):
                 def tiles(rows: int, walked: int, consumers: int, family=family, columns=columns) -> Tiles:
                     return Tiles(rows, walked, 2, consumers, family=family.name, columns=columns)
 
-                config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles,
-                                  lambda config: self._launch_legal(ba, config, target), overlapped=True,
-                                  walks=walked_extents, least_walked=functools.partial(_least_keys, family))
-                # With its natural rewalk's tiles, where they derive (`_relaunched`); else the next block.
-                if config is not None and (relaunched := self._relaunched(ba, config, target)) is not None:
-                    return relaunched
+                def fits(config: Tiles) -> bool:
+                    return (self._launch_legal(ba, config, target)
+                            and self._relaunched(ba, config, target) is not None)
+
+                config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles, fits,
+                                  overlapped=True, walks=walked_extents,
+                                  least_walked=functools.partial(_least_keys, family))
+                if config is not None:
+                    return self._relaunched(ba, config, target)
         return None
 
     def streaming(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> Tiles:

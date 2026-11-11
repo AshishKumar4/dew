@@ -114,6 +114,24 @@ def test_a_declared_line_file_replaced_under_its_facts_is_refused_where_it_is_re
         Files((root.url,), format="jsonl", file_info=facts).provision()
 
 
+def test_an_object_in_memory_of_its_declared_digest_and_another_size_is_refused():
+    """An in-memory object is checked against both facts its producer declared, as a stored one is: its
+    bytes with their own digest, declared at another size, are refused where a read opens them."""
+    root = Store(f"memory://declared-size-{uuid4().hex}/rows.jsonl")
+    root.write(b'{"id":0}\n{"id":1}\n')
+    held = root.read()
+    digest = hashlib.sha256(held).hexdigest()
+
+    def rows(size: int) -> list[int]:
+        files = Files((root.url,), format="jsonl", file_info={root.url: {"bytes": size, "sha256": digest}})
+        manifest = files.manifest(LATEST)
+        return [row["id"] for part in manifest.shards for row in manifest.reader(part)]
+
+    assert rows(len(held)) == [0, 1]
+    with pytest.raises(Replaced):
+        rows(len(held) + 1)
+
+
 def test_a_declared_archive_replaced_under_its_facts_is_refused_where_it_is_read():
     """A WebDataset archive read under facts its publisher declared (its bytes and digest) is checked
     where a read opens it: replaced by another valid archive, it is refused, not read under them."""

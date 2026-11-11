@@ -8,7 +8,7 @@ from __future__ import annotations
 import collections
 import itertools
 from collections.abc import Callable, Mapping, Sequence
-from typing import overload
+from typing import TYPE_CHECKING, NamedTuple, overload
 
 import grain.python as pygrain
 
@@ -16,7 +16,18 @@ from dew._records import integer, record
 from dew.batch import Batch
 from dew.data.storage import MIRRORS, carried_mirrors
 
-type Grouping = Callable[[], Callable[[Sequence], Batch]]
+if TYPE_CHECKING:
+    from dew.data.handoff import Packet
+
+class Positioned(NamedTuple):
+    """A worker's group of an elastic stream's inputs (`handoff.Packet`), with the stream's position past
+    it, which the reading process resumes from once it has taken the group whole."""
+
+    packet: Packet
+    position: Mapping[str, object]
+
+
+type Grouping = Callable[[], Callable[[Sequence], Packet]]
 """What makes a worker's group of inputs one element (`handoff._Grouped`): called once a read opens."""
 
 
@@ -126,7 +137,7 @@ class _StreamOrder(pygrain.IterDataset):
 
     def __init__(self, rows: pygrain.IterDataset, size: int,
                  read: Callable[[pygrain.IterDataset], pygrain.IterDataset], grouping: Grouping,
-                 ungrouped: Callable[[Batch], Sequence], *, alone: bool = False):
+                 ungrouped: Callable[[Packet], Sequence], *, alone: bool = False):
         super().__init__([])
         self.rows, self.size, self.read, self.grouping, self.ungrouped = rows, size, read, grouping, ungrouped
         self.alone = alone
@@ -161,9 +172,9 @@ class _StreamOrderIterator(pygrain.DatasetIterator):
 
     def _read(self) -> None:
         """The next group's rows pending, and those of them a resume has passed already taken off."""
-        group = dict(next(self._opened()))
-        self._after = record(group.pop("position"), "an elastic stream's position")
-        self._pending.extend(self._ordered.ungrouped(group))
+        positioned = next(self._opened())
+        self._after = record(positioned.position, "an elastic stream's position")
+        self._pending.extend(self._ordered.ungrouped(positioned.packet))
         self._length = len(self._pending)
         while self._skip and self._pending:
             self._pending.popleft()
@@ -237,7 +248,7 @@ class _KeptIterator(pygrain.DatasetIterator):
                 raise StopIteration
             number, self._number = self._number, self._number + 1
             if number % kept.step == kept.first:
-                return {**self._grouped(group), "position": self._rows.get_state()}
+                return Positioned(self._grouped(group), self._rows.get_state())
 
     def get_state(self) -> Mapping[str, object]:
         return {"group": self._number, "rows": self._rows.get_state()}

@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
@@ -1219,12 +1220,15 @@ class Unstacked(ValueError):
 
 
 def _stacked(value) -> bool:
-    """Whether Grain stacks `value` into one array: numbers, strings and bytes,
-    and mappings of them; not lists, object arrays or other records."""
+    """Whether Grain stacks `value` into one array: numbers of any dtype JAX counts as one (bfloat16 and
+    the float8s among them, which NumPy kinds as voids), booleans, strings and bytes, and mappings of
+    them; not lists, object arrays, structured records or other records."""
     if isinstance(value, Mapping):
         return bool(value) and all(_stacked(field) for field in value.values())
-    return (isinstance(value, (np.ndarray, np.generic, jax.Array, int, float, complex, str, bytes))
-            and np.asarray(value).dtype.kind in "biufcSU")
+    if not isinstance(value, (np.ndarray, np.generic, jax.Array, int, float, complex, str, bytes)):
+        return False
+    dtype = np.asarray(value).dtype
+    return dtype.kind in "SU" or jnp.issubdtype(dtype, jnp.bool_) or jnp.issubdtype(dtype, jnp.number)
 
 
 SHARED_BYTES = 1 << 16
@@ -1261,21 +1265,12 @@ def record_batch(rows: Sequence[Batch], *, shared: bool = False) -> Batch:
 
 def _column(values: Sequence[object], *, shared: bool):
     """`values`, one field's across a batch's records, stacked along a new leading axis, a mapping
-    of them field by field, as Grain batches them: into Grain's shared memory with `shared`, which
-    `_shareable` gives only a numeric column."""
-    if len(values) == 1:
-        return jax.tree.map(lambda leaf: np.expand_dims(leaf, 0), values[0])
-
-    from grain.multiprocessing import SharedMemoryArray
-
-    def stack(*leaves):
-        if not shared:
-            return np.stack(leaves)
-        first = np.asanyarray(leaves[0])
-        return np.stack(leaves, out=SharedMemoryArray((len(leaves), *first.shape), dtype=first.dtype))
+    of them field by field, by Grain's own batching (`make_batch`): into Grain's shared memory with
+    `shared`, which `_shareable` gives only a numeric column."""
+    from grain._src.python.dataset.transformations.batch import make_batch
 
     try:
-        return jax.tree.map(stack, *values)
+        return make_batch(values, output_to_shared_memory=shared)
     except ValueError as error:
         shapes = sorted({str(jax.tree.map(np.shape, value)) for value in values})
         raise Unstacked(f"the field's records do not stack: {'; '.join(shapes[:6])}") from error
