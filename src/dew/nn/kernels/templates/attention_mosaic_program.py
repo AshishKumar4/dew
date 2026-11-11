@@ -103,6 +103,44 @@ def layouts(generation_name: str | None, dtype, rows: int | None = None) -> tupl
                  if qualified(family))
 
 
+def runs_backward(family: mosaic.Family) -> bool:
+    """Whether the attention backward's launches run on `family`: one the mainloop qualifies (`qualified`)
+    whose issuer keeps no product scratch a launch scopes (`scopes_products` not: the backward's launches
+    scope none; its tcgen05 form is row 4839's tensor-memory backward). Its dQ launch streams through a
+    producer, which a family whose consumers feed their own rings has not (`split_queries`): there the one
+    launch, queries first, alone (`MosaicBackward.legal`)."""
+    return qualified(family) and not scopes_products(family)
+
+
+def fuses(accurate: bool, parametrized: bool) -> bool:
+    """Whether the backward's one launch takes a call of its form: the fast form's under no score hook with
+    parameters, whose gradients no launch writes (`MosaicBackward.legal`); the accurate form and a hook with
+    parameters take the two launches alone, the dQ launch's producer among them."""
+    return not accurate and not parametrized
+
+
+def backward_layouts(generation_name: str | None, dtype) -> tuple[mosaic.Family, ...]:
+    """The bundles the backward's launches take on a device of `generation_name` for operands of `dtype`, in
+    preference order (`bundles.layouts`, unscoped, `runs_backward`): a B200's and consumer Blackwell's the
+    mma.sync rings their consumers feed alone; none where the device has none."""
+    if generation_name is None:
+        return ()
+    return tuple(filter(runs_backward, bundles.layouts(generation_name, dtype, tpu=True)))
+
+
+def backward_bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
+    """The bundle the backward's dQ launch, or its one launch, runs on (`backward_layouts`' first), None
+    where the device has none."""
+    return next(iter(backward_layouts(generation_name, dtype)), None)
+
+
+def loads_parts(family: mosaic.Family) -> bool:
+    """Whether a forward's fp32 parts load on `family`: a copy each into a slot's rows (`rings.Pieces`), which
+    a producer's loads take (`Transport.copies_in_pieces`) and neither a consumer's own ring
+    (`Transport.feeds_itself`) nor cp.async's pipeline does."""
+    return family.copies_in_pieces and not family.feeds_itself
+
+
 def query_rows(family: mosaic.Family, dtype, rows: int) -> int:
     """The least query tile a launch of `rows` rows takes on `family`: a role's whole swizzled rows
     (`extents`), or the issuer's rows where the launch's rows are fewer than a role's (`few_rows`)."""

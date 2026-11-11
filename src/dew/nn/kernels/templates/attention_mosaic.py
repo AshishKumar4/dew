@@ -64,18 +64,21 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _block,
     _padded,
     _width,
+    backward_bundle,
+    backward_layouts,
     bundle,
     bundle_of,
     extents,
     fewer_rows,
+    fuses,
     hook_reduces,
     launch_scope,
     layouts,
+    loads_parts,
     most_consumers,
     query_rows,
     reducing,
     refused,
-    scopes_products,
     split_queries,
     stagings,
     varying_slopes,
@@ -222,6 +225,19 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """The call's spans from its arrays and the op's static form, key count and queries an interval."""
         return KeySpans(start, end, query_ids, key_ids, self.keys, self.form, self.per_span)
 
+    UNBUNDLED: ClassVar[str] = "the Mosaic mainloop has no bundle for {name} yet"
+    """Why a launch runs on no device of a family it has no bundle of (`declined`)."""
+
+    @staticmethod
+    def _bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
+        """The bundle the launch runs on (`bundle`)."""
+        return bundle(generation_name, dtype)
+
+    @staticmethod
+    def _layouts(generation_name: str | None, dtype, rows: int | None = None) -> tuple[mosaic.Family, ...]:
+        """The bundles the launch takes (`layouts`)."""
+        return layouts(generation_name, dtype, rows)
+
     def padded(self, ba: tokamax.BoundArguments, config: Config) -> float | None:
         """The share of the score grid, each head's queries by its keys, that the launch's blocks pad
         past the call's (`_padded`, `tuning.KernelOp.padded`): its query and key blocks' tails."""
@@ -245,9 +261,9 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         GPU process's lowering cannot carry), or no config fits the device (`derived`)."""
         name = generation.family(target.generation)
         query = ba.arguments["query"]
-        family = bundle(target.generation, query.dtype)
+        family = self._bundle(target.generation, query.dtype)
         if family is None:
-            return Refusal('family', f"the Mosaic mainloop has no bundle for {name or target.generation} yet")
+            return Refusal('family', self.UNBUNDLED.format(name=name or target.generation))
         if (reason := self.refusal(ba, family)) is not None:
             return reason
         if ba.arguments["interpret"] and jax.default_backend() != "cpu":
@@ -262,7 +278,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         tiles its program takes (`whole_tiles`), a call the launch takes (`refusal`), and the block and
         registers `Template.legal` holds it to. A pinned or stored config is held to it as a derived one."""
         query = ba.arguments["query"]
-        found = {family.name: family for family in layouts(target.generation, query.dtype, query.shape[1])}
+        found = {family.name: family
+                 for family in self._layouts(target.generation, query.dtype, query.shape[1])}
         family = found.get(config.family)
         # A forward's and a dQ launch's layout streams through a producer (`Family.stream`); a layout whose
         # consumers feed their own rings (`split_queries`) runs the dK/dV launches alone, the keys-first one
@@ -281,7 +298,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
         """The target's family's bundle where the launch takes the call there, else None."""
         query = ba.arguments["query"]
-        family = bundle(target.generation, query.dtype)
+        family = self._bundle(target.generation, query.dtype)
         return None if family is None or self.refusal(ba, family) is not None else family
 
     WALKED: ClassVar[str] = "block_k"
@@ -308,7 +325,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         target = generation.gpu_target()
         query = ba.arguments["query"]
-        family = bundle(target.generation, query.dtype)
+        family = self._bundle(target.generation, query.dtype)
         if family is not None and (reason := self.refusal(ba, family)):
             raise NotImplementedError(reason)
         config = self.derived(ba, target)
@@ -713,10 +730,7 @@ class MosaicForward(_Mainloop[Tiles]):
             # 64: 48 bytes on two consumers, 24 on one): the Pallas-Triton mainloop's.
             return Refusal('dtype', "the Mosaic mainloop's fp32 parts walk an inference call over dense "
                            "operands, no dropout")
-        if self.parts > 1 and (family.feeds_itself or not family.copies_in_pieces):
-            # Its parts a copy each into a slot's rows (`rings.Pieces`), which a producer's loads take and
-            # neither a consumer's own ring nor cp.async's pipeline (`mosaic.Transport.copies_in_pieces`)
-            # does.
+        if self.parts > 1 and not loads_parts(family):
             return Refusal('dtype', f"the Mosaic mainloop's fp32 parts load in pieces, which {family.name}'s "
                            "pipeline does not")
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
@@ -938,6 +952,21 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         return gradients(launch, query, key, value, spans, hooks, dout, residuals,
                          block=_block(config), scale=self.scale, rounded=self.rounded), None
 
+    UNBUNDLED: ClassVar[str] = ("the Mosaic backward runs on no bundle of {name}'s: its launches scope no "
+                                "issuer's product scratch, which tcgen05's chunks keep (row 4839, its "
+                                "tensor-memory form)")
+
+    @staticmethod
+    def _bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
+        """The bundle the backward's dQ launch runs on (`backward_bundle`)."""
+        return backward_bundle(generation_name, dtype)
+
+    @staticmethod
+    def _layouts(generation_name: str | None, dtype, rows: int | None = None) -> tuple[mosaic.Family, ...]:
+        """The bundles the backward's launches take (`backward_layouts`), whatever its rows."""
+        del rows
+        return backward_layouts(generation_name, dtype)
+
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
         # The one launch adds each tile's dQ under the first pass's D: the fast form's, a call's of equal
         # head widths, its dK/dV program queries first on the dQ launch's layout or keys first on
@@ -956,15 +985,22 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         if config.fused and dropped and config.shared_keys:
             return False
-        found = {family.name: family for family in layouts(target.generation, ba.arguments["query"].dtype)}
+        found = {family.name: family
+                 for family in self._layouts(target.generation, ba.arguments["query"].dtype)}
         dkv_family = found.get(config.dkv.family)
+        # A family the device has no bundle of (a pin of an H100's wgmma on an A100) is not read here: the
+        # mainloop's legality refuses it (`_Mainloop.legal`).
         if dkv_family is None or not whole_tiles(dkv_family, config.dkv):
             return False
-        # The backward's launches scope no issuer's product scratch (tcgen05's chunks'); row 4839's
-        # tensor-memory backward is their tcgen05 form. A family the device has no bundle of (a pin of an
-        # H100's wgmma on an A100) is not read here: the mainloop's legality refuses it (`_Mainloop.legal`).
-        scoped = [found[tiles.family] for tiles in (config, config.dkv) if tiles.family in found]
-        if any(map(scopes_products, scoped)):
+        # The one launch's tiles a role's rows at least (`_role_rows`): no issuer specializes it below them
+        # (`fewer_rows` the two launches' alone), its 32 x 32 tile on an sm120's fed mma.sync and an sm86's
+        # mma.sync "cannot relayout" (et-sm120fused). The dQ launch streams through a producer
+        # (`runs_backward`), which a family whose consumers feed their own rings has not: the one launch
+        # there, queries first.
+        if config.fused and min(config.block_q, config.block_k) < dkv_family.role_rows:
+            return False
+        dq_family = found.get(config.family)
+        if not config.fused and dq_family is not None and split_queries(dq_family):
             return False
         keys_first = config.dkv_apart
         if config.fused and (ba.arguments["query"].shape[-1] != ba.arguments["value"].shape[-1] or (
@@ -979,7 +1015,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # each consumer its own keys or its share of a block they share (`attention_mosaic_coop`'s, every
         # share's scale joined): row 3886, its two launches 4.1 times the bf16 step on an H100.
         sixteen = jnp.dtype(dtype) == jnp.dtype(jnp.float16) and not config.queries_first
-        if (config.fused and (self.accurate or hooked or sixteen)) or not super().legal(ba, config, target):
+        if ((config.fused and (not fuses(self.accurate, hooked) or sixteen))
+                or not super().legal(ba, config, target)):
             return False
         family = bundle_of(config, dtype)
         # Deterministic mode takes no one launch: its programs add into dQ (and grouped dK and dV) across
@@ -1061,7 +1098,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
         # The dK/dV launch on the layout whose consumers feed their rings where one is, its two consumers
         # splitting each slot's queries (`split_queries`); else on the dQ launch's.
-        fed = [layout for layout in layouts(target.generation, query.dtype) if split_queries(layout)]
+        fed = [layout for layout in self._layouts(target.generation, query.dtype) if split_queries(layout)]
         # The dK/dV launch's consumers a backward's at most (`BACKWARD_CONSUMERS`), whatever its layout's.
         dkv = ({"dkv_family": fed[0].name, "dkv_consumers": min(fed[0].consumers, BACKWARD_CONSUMERS)}
                if fed else {})
@@ -1212,6 +1249,12 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         query, value = ba.arguments["query"], ba.arguments["value"]
         hooks = Hooks(self.score_mod, tuple(map(Param, ba.arguments["score_params"], self.score_kinds)),
                       ba.arguments["initial"], drop=ba.arguments["drop"])
+        if split_queries(family) and not fuses(self.accurate, bool(self.score_kinds)):
+            # A device whose backward bundle's consumers feed their own rings (a B200's, consumer
+            # Blackwell's) runs the one launch alone, which this form does not take (`fuses`).
+            form = "accurate form" if self.accurate else "hook"
+            return Refusal('family', f"the backward's {form} takes two launches, whose dQ launch streams "
+                           f"through a producer {family.name} has not")
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=True, family=family)
 
 
