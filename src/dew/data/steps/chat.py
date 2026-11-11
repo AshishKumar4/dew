@@ -26,6 +26,7 @@ from dew.data.prompts import (
     SOURCE_KEY,
     TRUTH_KEY,
     PromptRecord,
+    RewardWidth,
     _prompt_ids,
     _utf8,
 )
@@ -161,7 +162,7 @@ class ConfigurePrompt:
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """What the step it binds makes: its reward width the facts state, else measured."""
-        width = facts.get("reward_bytes")
+        width = facts.get(RewardWidth.fact)
         stated = width if isinstance(width, int) else None
         return prompt_facts(facts, self.tokenizer, self.max_prompt_len, stated)
 
@@ -170,7 +171,7 @@ class ConfigurePrompt:
             self.tokenizer,
             self.max_prompt_len,
             self.pad_id,
-            integer(metadata["reward_bytes"], "reward_bytes"),
+            integer(metadata[RewardWidth.fact], RewardWidth.fact),
             self.long,
             self.thinking,
         )
