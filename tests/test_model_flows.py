@@ -6,6 +6,7 @@ one refused."""
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 import lane_environment
@@ -85,12 +86,21 @@ def test_the_reference_arm_runs_each_choices_generic_kernel_that_takes_every_cal
     assert chosen["attention"] == chosen["decode"] == "reference"
 
 
+@pytest.fixture
+def store():
+    """A tier's store for one test, removed as the test ends: a flow's store holds every draw's float64
+    gradients, about 2 GB a flow, which a file's tests would otherwise all keep to its session's end
+    (`tmp_path`), past a CPU task's disk (the candidate's whole CPU suite at 173b183813a)."""
+    with tempfile.TemporaryDirectory() as directory:
+        yield Path(directory)
+
+
 @pytest.mark.parametrize("name", [flow.name for flow in model_flows.FLOWS])
-def test_a_flows_truth_computes_in_float64(name, tmp_path, monkeypatch):
+def test_a_flows_truth_computes_in_float64(name, store, monkeypatch):
     """The flow's truths prepared on a CPU as its node prepares them, its first draw's of each program held to
     float64 (check 1's `_of_float64`), every draw its two stages may take written to the store."""
     flow = model_flows.flow_named(name)
-    monkeypatch.setenv(model_flows.TRUTHS, str(tmp_path))
+    monkeypatch.setenv(model_flows.TRUTHS, str(store))
     monkeypatch.setenv(model_flows.PREPARE, "1")
     for kind in model_flows.KINDS:
         model_flows.judge(flow, {}, kind)
@@ -118,7 +128,7 @@ def test_a_flow_holds_in_a_process_of_its_variant_alone(lane):
     assert ran.returncode == 0, ran.output[-3000:]
 
 
-def test_a_parts_prepare_compiles_a_flows_programs_for_its_nodes_gpu_and_writes_its_truths(tmp_path,
+def test_a_parts_prepare_compiles_a_flows_programs_for_its_nodes_gpu_and_writes_its_truths(store,
                                                                                           monkeypatch):
     """A GPU part's prepare as its node's CPU runs it (`DEW_TIER_PREPARE=1`): a flow prepared in a process
     of its own (`model_flows.prepared_apart`) over the node's serialized topology (here a compile-only
@@ -128,10 +138,10 @@ def test_a_parts_prepare_compiles_a_flows_programs_for_its_nodes_gpu_and_writes_
 
     from dew.training.ahead import compile_only_gpus
 
-    topology = tmp_path / "topology.bin"
+    topology = store / "topology.bin"
     topology.write_bytes(topologies.TopologyDescription(list(compile_only_gpus("sm80", 1))).serialize())
     monkeypatch.setenv(model_flows.TOPOLOGY, str(topology))
-    monkeypatch.setenv(model_flows.TRUTHS, str(tmp_path / "tier"))
+    monkeypatch.setenv(model_flows.TRUTHS, str(store / "tier"))
     monkeypatch.setenv(model_flows.PREPARE, "1")
     flow = model_flows.flow_named("selective scan")
     took = model_flows.prepared_apart(flow)
