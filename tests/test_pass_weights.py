@@ -14,7 +14,7 @@ from flax import linen as nn
 from model_support import float64_twin
 from reference_error import assert_as_exact
 
-from dew.batch import PHASE, Phase
+from dew.batch import PHASE, VALID_ROWS, Phase
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
@@ -163,11 +163,13 @@ def test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_wei
                     seeds=PASS_SEEDS, truth_fn=jax.jit(apart(float64_twin(model), float64_twin(head))))
 
 
-def test_a_validation_reports_each_pass_beside_the_run():
-    """A pass-weighed run's validation reports each pass's metrics and loss under `val/pass_<k>/` beside the
-    run's own, whose metrics stay the last pass's: the last pass's accuracy is the run's, and each pass's
-    the accuracy of that pass's own model (`with_passes(k)`). Each pass's loss is the training loss's
-    term, which `test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_weight` holds."""
+@pytest.mark.parametrize("loss", [False, True], ids=["metrics alone", "with the loss"])
+def test_a_validation_reports_each_pass_beside_the_run(loss):
+    """A pass-weighed run's validation reports each pass's metrics under `val/pass_<k>/` beside the run's
+    own, whether or not it scores the loss (each pass's loss too where it does), the run's metrics staying
+    the last pass's: the last pass's accuracy is the run's, and each pass's the accuracy of that pass's own
+    model (`with_passes(k)`). Each pass's loss is the training loss's term, which
+    `test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_weight` holds."""
     from dew.decision import Accuracy
     from dew.training.evaluation import Evaluation
 
@@ -176,13 +178,13 @@ def test_a_validation_reports_each_pass_beside_the_run():
     data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
     variables = objective.init(jax.random.key(0))
     metrics = (Accuracy(),)
-    scores = Evaluation.run(objective, variables, data.val, key=0, metrics=metrics, loss=True).scores
-    assert {f"val/pass_{k}/loss" for k in range(1, STEPS + 1)} <= set(scores)
+    scores = Evaluation.run(objective, variables, data.val, key=0, metrics=metrics, loss=loss).scores
+    assert ({f"val/pass_{k}/loss" for k in range(1, STEPS + 1)} <= set(scores)) == loss
     assert {f"val/pass_{k}/accuracy" for k in range(1, STEPS + 1)} <= set(scores)
     assert scores[f"val/pass_{STEPS}/accuracy"] == scores["val/accuracy"]
     for k in range(1, STEPS + 1):
         own = decision_objective(model.with_passes(k, exits=False), None)
-        alone = Evaluation.run(own, variables, data.val, key=0, metrics=metrics, loss=True).scores
+        alone = Evaluation.run(own, variables, data.val, key=0, metrics=metrics, loss=loss).scores
         assert scores[f"val/pass_{k}/accuracy"] == alone["val/accuracy"]
 
 
@@ -326,3 +328,61 @@ def test_a_phased_fit_steps_each_phase_as_a_run_of_its_own_pass_count_does(tmp_p
     apart = trainer_of(model, tmp_path / "apart").fit(data, steps=4, log_every=100, checkpoint_every=1)
     assert int(apart.step) == 4
     assert_same(parameters(whole), parameters(apart), "the phased fit is not its phases' runs")
+
+
+def test_an_lm_validation_of_metrics_alone_reports_each_pass():
+    """A pass-weighed LM's validation of its perplexity alone (no loss asked) reports each pass's under
+    `val/pass_<k>/perplexity`, the last pass's the run's own."""
+    from dew.objectives.lm.objective import Perplexity
+    from dew.training.evaluation import Evaluation
+
+    objective = LMObjective(looped(), 16, pass_weights="mean")
+    rows = np.random.default_rng(4).integers(0, 256, (2, 4, 17), dtype=np.int32)
+    variables = objective.init(jax.random.key(0))
+
+    def split(partition):
+        return iter([{"text": rows[index]} for index in range(2)])
+
+    scores = Evaluation.run(objective, variables, split, key=1, metrics=(Perplexity(),)).scores
+    assert {f"val/pass_{k}/perplexity" for k in range(1, STEPS + 1)} <= set(scores)
+    assert scores[f"val/pass_{STEPS}/perplexity"] == scores["val/perplexity"]
+
+
+def test_a_qk_clip_reads_every_scored_exits_head():
+    """A decision loss weighing a looped backbone's passes, the first weighed and the last not, sows for
+    QK-Clip its head's logit maxima over every scored exit: each row and head's the largest any pass count's
+    own model's head reads (`with_passes(k)`), on par from float64 (check 1), the first pass's among them."""
+    from flax.traverse_util import flatten_dict
+
+    from dew.decision.task import laid_out
+    from dew.nn.inspection import QK
+
+    model = looped()
+    weighed = decision_objective(model, (1.0, 0.0, 0.0))
+    (batch,) = list(decision_rows(EXAMPLES, 8, EXAMPLES, objective=weighed.data()).val(DataPartition()))
+    batch = {name: value for name, value in batch.items() if name != VALID_ROWS}
+    inputs = laid_out(batch, weighed.bounds.segments)
+    step = Step(jnp.asarray(0), jax.random.key(0), None, qk_stats=True)
+
+    def maxima(tree):
+        """The logit maxima a QK-Clip reads of the head's attention layers, by their paths."""
+        return {"/".join(path): leaf for path, leaf in flatten_dict(tree).items() if path[-1] == "max_logits"}
+
+    def sown(variables):
+        _, aux = weighed.loss(variables, batch, step)
+        return maxima(aux.qk_stats["head"])
+
+    def apart(backbone):
+        def run(variables):
+            found = [decision_objective(backbone.with_passes(k, exits=False), None).model.observed_logits(
+                variables, inputs, opened=[QK])[1][QK]["head"] for k in range(1, STEPS + 1)]
+            return jax.tree.map(lambda *leaves: jnp.max(jnp.stack(leaves), axis=0), *map(maxima, found))
+        return run
+
+    init = jax.jit(weighed.init)
+
+    def draw(seed):
+        return (nn.unbox(init(jax.random.key(seed))),)
+
+    assert_as_exact(jax.jit(sown), jax.jit(apart(model)), draw, "every exit's head QK maxima",
+                    seeds=PASS_SEEDS, truth_fn=jax.jit(apart(float64_twin(model))))
