@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     import grain.python as pygrain
     import numpy as np
 
+    from dew.batch import Batch
     from dew.data.dataset import Records
     from dew.data.pipeline import Stage
 
@@ -393,3 +394,14 @@ class _IndexedSlice:
 
 
 __all__ = ["READS", "Consumed", "Read", "Shard", "ShardManifest", "Source"]
+
+
+def source_record(value: object) -> Batch | bytes | None:
+    """`value` as a source's record: a mapping of named fields, bytes, or None for a missing one; any other
+    refused. The one rule every source boundary reads (memory, Hugging Face, TFDS, an iterator's rows, a
+    decoded ArrayRecord)."""
+    if value is None or isinstance(value, bytes):
+        return value
+    if isinstance(value, Mapping) and all(isinstance(key, str) for key in value):
+        return value
+    raise TypeError(f"source feature record must have named fields or bytes, got {type(value).__name__}")

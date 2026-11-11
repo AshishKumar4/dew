@@ -15,10 +15,9 @@ from dew.batch import Batch
 from dew.data.dataset import Closeable, Records
 from dew.data.pipeline import Dataset
 
-from .base import Read, Shard, ShardManifest
+from .base import Read, Shard, ShardManifest, source_record
 from .codec import Value
 from .iterator import _StreamIterator
-from .memory import _record
 
 if TYPE_CHECKING:
     import datasets
@@ -137,9 +136,9 @@ class HF(Dataset):
 
 def arrow_rows(dataset: datasets.Dataset) -> grain.MapDataset:
     """An Arrow dataset's rows by index, as Dew reads them: its image columns undecoded, which Dew's
-    own steps decode, and each row a record (`_record`). A Hugging Face dataset and a prepared Hub
+    own steps decode, and each row a record (`source_record`). A Hugging Face dataset and a prepared Hub
     split read their rows through it."""
-    return grain.MapDataset.source(_undecoded(dataset)).map(_record)
+    return grain.MapDataset.source(_undecoded(dataset)).map(source_record)
 
 
 def _undecoded[D: (datasets.Dataset, datasets.IterableDataset)](dataset: D) -> D:

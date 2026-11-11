@@ -19,6 +19,7 @@ from dew.data.declared import Declared, Unmirrored, mirrored
 from dew.data.once import locked_cached_property
 from dew.data.storage import Store, local, on_gcs
 
+from .base import source_record
 from .codec import decode
 
 _MAX_OPEN_SHARDS = Loading().threads
@@ -281,10 +282,7 @@ class ArrayRecords:
         payload = self.reader[index]
         if not self.record_codec:
             return payload
-        value = decode(payload)
-        if not isinstance(value, (Mapping, bytes)) and value is not None:
-            raise TypeError("an exported ArrayRecord source must hold records or bytes")
-        return value
+        return source_record(decode(payload))
 
     def __getstate__(self) -> Mapping[str, object]:
         return {

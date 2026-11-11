@@ -15,7 +15,7 @@ from dew.data.compilation import once
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
-from .base import Read, ShardManifest, _indexed_manifest
+from .base import Read, ShardManifest, _indexed_manifest, source_record
 from .codec import fingerprint
 
 
@@ -35,14 +35,6 @@ class DataFrame(Protocol):
 
 class SparkFrame(Protocol):
     def toArrow(self) -> DataFrame: ...
-
-
-def _record(value: object) -> Batch | bytes | None:
-    if value is None or isinstance(value, bytes):
-        return value
-    if isinstance(value, Mapping) and all(isinstance(key, str) for key in value):
-        return value
-    raise TypeError(f"source feature record must have named fields or bytes, got {type(value).__name__}")
 
 
 @runtime_checkable
@@ -70,7 +62,7 @@ def _table_records(table: DataFrame) -> list[Batch]:
         arrow = from_dataframe(table, allow_copy=True)
     rows = arrow.to_pylist()
     for row in rows[:1]:
-        _record(row)
+        source_record(row)
     return rows
 
 

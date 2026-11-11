@@ -25,7 +25,7 @@ from dew.batch import Batch
 from dew.data.pipeline import Dataset
 
 from ..dataset import Records
-from .base import Read, ShardManifest, _indexed_manifest, preparing
+from .base import Read, ShardManifest, _indexed_manifest, preparing, source_record
 
 if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import
     from tensorflow_datasets import DecoderTree
@@ -408,9 +408,8 @@ class TFDS(Dataset):
         import grain.python as grain
         import tensorflow_datasets as tfds
 
-        from .memory import _record
 
-        indexed = grain.MapDataset.source(rows).map(_record)
+        indexed = grain.MapDataset.source(rows).map(source_record)
         features = self.builder.info.features
         texts = (tuple(name for name, feature in features.items() if isinstance(feature, tfds.features.Text))
                  if isinstance(features, tfds.features.FeaturesDict) else ())

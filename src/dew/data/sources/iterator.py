@@ -13,9 +13,8 @@ from dew.batch import Batch
 from dew.data.dataset import Closeable, Records, Replayed, Stoppable
 from dew.data.pipeline import Dataset
 
-from .base import Read, Shard, ShardManifest, unnamed
+from .base import Read, Shard, ShardManifest, source_record, unnamed
 from .codec import Value, decode, encode
-from .memory import _record
 
 
 @dataclass(frozen=True, eq=False)
@@ -104,7 +103,7 @@ class _StreamIterator[Rows: Iterator[Batch]](grain.DatasetIterator):
     def __next__(self) -> Batch | bytes:
         row = None
         while row is None:
-            row = _record(next(self._rows))
+            row = source_record(next(self._rows))
             self._read += 1
         return row
 
