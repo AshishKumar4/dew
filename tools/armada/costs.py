@@ -4,9 +4,9 @@ paid once a task, and each unit it draws after, as its map tasks' own records sa
 standard library alone, loaded by ci.py by its path."""
 
 import dataclasses
-import math
 import statistics
 from collections.abc import Mapping, Sequence
+from typing import TypedDict
 
 SITE_COSTS = ("setup", "unit", "weighed_unit")
 """What a site's judge times of its map tasks' records (ci.py's `site_costs`), each under the site's task
@@ -69,19 +69,31 @@ def fitted(timed: Sequence[tuple[int, float]]) -> Cost | None:
         0.0, statistics.linear_regression(sizes, seconds, proportional=True).slope)
 
 
-def timed(task: str, records: Sequence[Mapping], units: int) -> dict[str, float]:
-    """`SITE_COSTS` of site task `task` from its map tasks' `records` (map_judge's: each a span's `start`,
-    `stop`, `before` and `draws`, one a label of the site's that span drew): of each span, its least seconds
-    before a draw (its task's setup) and its labels' draws summed, over its units; each the median of the
-    spans, those past `units` (its weighed check's) apart. Nothing where no record is given."""
+class Drawn(TypedDict):
+    """One label's record of a site's map task (map_judge's `record_units`): the plan's span its task draws
+    (`task_start` to `task_stop`), the seconds from its process's start to its draws (`before`) and its draws'
+    (`draws`)."""
+
+    task_start: int
+    task_stop: int
+    before: float
+    draws: float
+
+
+def timed(task: str, records: Sequence[Drawn], units: int) -> dict[str, float]:
+    """`SITE_COSTS` of site task `task` from its map tasks' `records`, a label's each: of each map task (the
+    plan's span it drew), what it paid outside its draws up to its last label's end (its setup: its imports,
+    collection and every compile, a layout's between two labels' draws among them) and its labels' draws over
+    its units; each the median of its tasks, those past `units` (its weighed check's) apart. Nothing where no
+    record is given."""
     spans: dict[tuple[int, int], tuple[float, float]] = {}
     for record in records:
-        span = (record["start"], record["stop"])
-        before, draws = spans.get(span, (math.inf, 0.0))
-        spans[span] = (min(before, record["before"]), draws + record["draws"])
+        span = (record["task_start"], record["task_stop"])
+        end, draws = spans.get(span, (0.0, 0.0))
+        spans[span] = (max(end, record["before"] + record["draws"]), draws + record["draws"])
     if not spans:
         return {}
-    found = {costed(task, "setup"): statistics.median(before for before, _ in spans.values())}
+    found = {costed(task, "setup"): statistics.median(end - draws for end, draws in spans.values())}
     for word, weighed in (("unit", False), ("weighed_unit", True)):
         rates = [draws / (stop - start) for (start, stop), (_, draws) in spans.items()
                  if (start >= units) == weighed]

@@ -276,12 +276,10 @@ def marked_setups(name: str, text: str) -> dict[str, str]:
     return found
 
 
-def units(nodes: list[str], recorded: Container[str] | None = None) -> list[list[int]]:
+def units(nodes: list[str]) -> list[list[int]]:
     """The indexes of `nodes` (test node ids, in node-id order) a cut keeps together: each test alone, but
-    those of one file marked with one `SHARED_SETUP`, together, whether the durations record names them yet
-    or not, at the place of the first of them `recorded` names (the nodes the record names, where given),
-    else of the first: the plan, which sees the recorded tests alone, then orders the units as a task does.
-    Each file's marks are read once."""
+    those of one file marked with one `SHARED_SETUP`, together, at the place of the first of them. Each
+    file's marks are read once."""
     marks: dict[str, dict[str, str]] = {}
     held: dict[tuple[str, str] | int, list[int]] = {}
     for index, node in enumerate(nodes):
@@ -290,11 +288,7 @@ def units(nodes: list[str], recorded: Container[str] | None = None) -> list[list
             marks[name] = shared_setups(name)
         setup = marks[name].get(test_name(node))
         held.setdefault(index if setup is None else (name, setup), []).append(index)
-
-    def place(unit: list[int]) -> int:
-        return next((index for index in unit if recorded is None or nodes[index] in recorded), unit[0])
-
-    return sorted(held.values(), key=place)
+    return list(held.values())
 
 
 def unit_seconds(nodes: list[str], seconds: list[float]) -> list[float]:
@@ -331,7 +325,7 @@ def kept(nodes: list[str], planned: list[list[str]], mean: float) -> list[list[s
     group_of = {node: index for index, members in enumerate(planned) for node in members}
     held: list[list[str]] = [[] for _ in planned]
     new: list[list[str]] = []
-    for unit in units(nodes, group_of):
+    for unit in units(nodes):
         placed = next((group_of[nodes[index]] for index in unit if nodes[index] in group_of), None)
         if placed is None:
             new.append([nodes[index] for index in unit])
