@@ -46,24 +46,32 @@ def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monk
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
     with generation.assumed(target), jax.default_matmul_precision(flow.precision):
-        dew = [route for kind in model_flows.KINDS for route in _routes(programs[f"{kind} dew"])]
+        dew = {kind: _routes(programs[f"{kind} dew"]) for kind in model_flows.KINDS}
         reference = [route for kind in model_flows.KINDS
                      for route in _routes(programs[f"{kind} reference"], reference=True)]
         model_flows.held_routes(flow, dew, target)
         model_flows.held_reference(flow, reference)
 
 
-def test_an_attention_flow_on_the_templates_plain_jax_mainloop_does_not_reach_its_route():
-    """An attention flow whose template call runs the plain-JAX mainloop (`generation.chosen`'s
-    `attention_mainloop='portable'`, as a GPU's mainloops declining it would) does not hold: its route is the
-    GPU's own mainloop (`model_flows.TEMPLATE`), not the template's outer call alone."""
+def test_a_training_step_on_the_templates_plain_jax_mainloop_does_not_reach_its_route():
+    """An attention flow whose training step runs the template on the plain-JAX mainloop
+    (`generation.chosen`'s `attention_mainloop='portable'`, as a GPU's mainloops declining it would), its
+    decode loop on the GPU's own, does not hold: each program is held to its own routes, and the template's
+    every pass to a GPU's mainloop (`model_flows.EVERY`), so a training step whose one pass, its backward,
+    took the plain-JAX one beside a native forward does not hold either."""
     flow = model_flows.flow_named("dense bf16, the lane's")
     programs = model_flows.programs_of(flow)
     with generation.assumed("sm90"), jax.default_matmul_precision(flow.precision):
+        native = {kind: _routes(programs[f"{kind} dew"]) for kind in model_flows.KINDS}
         with generation.chosen(attention_mainloop="portable"):
-            found = [route for kind in model_flows.KINDS for route in _routes(programs[f"{kind} dew"])]
-        with pytest.raises(model_flows.Unreached):
-            model_flows.held_routes(flow, found, "sm90")
+            portable = _routes(programs["train dew"])
+    model_flows.held_routes(flow, native, "sm90")
+    with pytest.raises(model_flows.Unreached):
+        model_flows.held_routes(flow, {**native, "train": portable}, "sm90")
+    one_pass = [route for route in portable if str(route.choice) == "attention_mainloop"][:1]
+    assert one_pass
+    with pytest.raises(model_flows.Unreached):
+        model_flows.held_routes(flow, {**native, "train": [*native["train"], *one_pass]}, "sm90")
 
 
 def test_the_reference_arm_runs_each_choices_generic_kernel_that_takes_every_call():

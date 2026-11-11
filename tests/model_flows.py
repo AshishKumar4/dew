@@ -81,8 +81,8 @@ def preparing() -> bool:
 @dataclasses.dataclass(frozen=True)
 class Flow:
     """One model family's flow: the released config of `fixture` with `widths` set (its text config's for a
-    wrapper), computing in `dtype`; `native` each choice its training step or decode runs on a GPU and the
-    kernel it must take there (a name, or `NATIVE`: any kernel off the reference path); under the lane's
+    wrapper), computing in `dtype`; `native` each program's (`KINDS`: its training step, its decode loop)
+    choices on a GPU and the kernel each must take there (a name, `NATIVE` or `EVERY`); under the lane's
     deterministic ops and matmul precision where `lane`, as a user's process runs otherwise, without them
     and at the default precision (`precision`); `rows` sequences of `length` tokens, decoded from `prefill`
     of them a token a step."""
@@ -91,7 +91,7 @@ class Flow:
     fixture: str
     widths: Mapping[str, object]
     dtype: str
-    native: Mapping[str, str]
+    native: Mapping[str, Mapping[str, str]]
     lane: bool = True
     rows: int = 2
     length: int = 256
@@ -109,17 +109,18 @@ class Flow:
         under which a port takes an fp32 call's products in TF32 (`recurrence_chunk._port_precision`)."""
         return "highest" if self.lane else None
 
-    def native_on(self, target: str) -> dict[str, str]:
-        """The choices the flow is for that take a native kernel on the GPU generation `target` (`families`),
-        each with the kernel it must take there."""
+    def native_on(self, target: str) -> dict[str, dict[str, str]]:
+        """Each program's choices that take a native kernel on the GPU generation `target` (`families`), each
+        with the kernel it must take there."""
         family = generation.family(target)
-        return {choice: kernel for choice, kernel in self.native.items()
-                if family in self.families.get(choice, (family,))}
+        return {kind: {choice: kernel for choice, kernel in choices.items()
+                       if family in self.families.get(choice, (family,))}
+                for kind, choices in self.native.items()}
 
     def runs_on(self, target: str) -> bool:
         """Whether the flow runs on the GPU generation `target`: where a choice it is for is native there, or
         where it is for none (a precision's flow on its declared routes)."""
-        return not self.native or bool(self.native_on(target))
+        return not any(self.native.values()) or any(self.native_on(target).values())
 
     @cached_property
     def config(self) -> dict:
@@ -199,12 +200,22 @@ class Flow:
         return truth
 
 
-NATIVE = "native"
-"""A flow's route taken by any kernel off the reference path (`generic_kernels`)."""
+KINDS = ("train", "decode")
+"""A flow's programs: its training step's loss and gradients, and its decode loop's logits."""
 
-TEMPLATE = {"attention": NATIVE, "attention_mainloop": NATIVE}
-"""An attention flow's routes on the template: its attention off the reference path, and the template's
-passes on a GPU's own mainloop, not its plain-JAX one (`templates.attention_route.MAINLOOP`), which a
+
+NATIVE = "native"
+"""A program's route taken by a kernel off the reference path (`generic_kernels`), among the kernels its
+choice's selections report: a recurrence's reports its forward's and its training's kernels alike, whichever
+runs, so a route set cannot tell one pass from another (check 1 judges the passes that run)."""
+
+EVERY = "every"
+"""A program's route whose every selection is off the reference path: a choice each pass selects as it runs
+(the template's mainloop, its forward's and its backward's alike), so a pass on the plain-JAX path is seen."""
+
+TEMPLATE = {"attention": NATIVE, "attention_mainloop": EVERY}
+"""An attention program's routes on the template: its attention off the reference path, and every pass of
+the template on a GPU's own mainloop, not its plain-JAX one (`templates.attention_route.MAINLOOP`), which a
 template call would otherwise take unseen."""
 
 DENSE = {"hidden_size": 512, "num_attention_heads": 4, "num_key_value_heads": 4, "head_dim": 128,
@@ -254,25 +265,39 @@ LIGHTNING = {"hidden_size": 512, "num_hidden_layers": 2, "head_dim": 128, "num_a
 """MiniMax-Text-01's lightning attention, then its softmax layer, every token routed to both its experts."""
 
 FLOWS = (
-    Flow("dense bf16, the lane's", "llama-tiny", DENSE, "bfloat16", {**TEMPLATE, "decode": NATIVE}),
-    Flow("dense bf16, a user's", "llama-tiny", DENSE, "bfloat16", {"attention": "flash", "decode": NATIVE},
-         lane=False),
-    Flow("dense fp32", "llama-tiny", DENSE, "float32", {}),
-    Flow("window and softcap, the lane's", "gemma2-tiny", GEMMA2, "bfloat16", TEMPLATE),
-    Flow("window and softcap, a user's", "gemma2-tiny", GEMMA2, "bfloat16", TEMPLATE, lane=False),
-    Flow("sinks, the lane's", "gpt-oss-tiny", GPT_OSS, "bfloat16", TEMPLATE),
-    Flow("sinks, a user's", "gpt-oss-tiny", GPT_OSS, "bfloat16", TEMPLATE, lane=False),
-    Flow("latent attention, the lane's", "deepseek-v2-tiny", MLA, "bfloat16", TEMPLATE),
-    Flow("latent attention, a user's", "deepseek-v2-tiny", MLA, "bfloat16", {"attention": NATIVE},
-         lane=False),
-    Flow("delta attention (KDA)", "kimi-linear-tiny", KDA, "bfloat16", {"gated_delta_rule": NATIVE}),
+    Flow("dense bf16, the lane's", "llama-tiny", DENSE, "bfloat16",
+         {"train": TEMPLATE, "decode": {**TEMPLATE, "decode": NATIVE}}),
+    Flow("dense bf16, a user's", "llama-tiny", DENSE, "bfloat16",
+         {"train": {"attention": "flash"}, "decode": {"attention": "flash", "decode": NATIVE}}, lane=False),
+    Flow("dense fp32", "llama-tiny", DENSE, "float32", {"train": {}, "decode": {}}),
+    Flow("window and softcap, the lane's", "gemma2-tiny", GEMMA2, "bfloat16",
+         {"train": TEMPLATE, "decode": {**TEMPLATE, "decode": NATIVE}}),
+    Flow("window and softcap, a user's", "gemma2-tiny", GEMMA2, "bfloat16",
+         {"train": TEMPLATE, "decode": {**TEMPLATE, "decode": NATIVE}}, lane=False),
+    Flow("sinks, the lane's", "gpt-oss-tiny", GPT_OSS, "bfloat16",
+         {"train": TEMPLATE, "decode": {**TEMPLATE, "decode": NATIVE}}),
+    Flow("sinks, a user's", "gpt-oss-tiny", GPT_OSS, "bfloat16",
+         {"train": TEMPLATE, "decode": {**TEMPLATE, "decode": NATIVE}}, lane=False),
+    Flow("latent attention, the lane's", "deepseek-v2-tiny", MLA, "bfloat16",
+         {"train": TEMPLATE, "decode": {}}),
+    Flow("latent attention, a user's", "deepseek-v2-tiny", MLA, "bfloat16",
+         {"train": {"attention": "flash"}, "decode": {}}, lane=False),
+    Flow("delta attention (KDA)", "kimi-linear-tiny", KDA, "bfloat16",
+         {"train": {**TEMPLATE, "gated_delta_rule": NATIVE, "short_conv": NATIVE},
+          "decode": {"gated_delta_rule": NATIVE, "short_conv": NATIVE, "delta_decode": "step"}}),
     Flow("gated delta net and its short conv", "qwen3-next-tiny", GDN, "bfloat16",
-         {"gated_delta_rule": NATIVE, "short_conv": NATIVE, "delta_decode": "step"}),
-    Flow("state-space duality (SSD), bf16", "mamba2-tiny", SSD, "bfloat16", {"ssd": NATIVE}),
-    Flow("state-space duality (SSD), fp32, a user's", "mamba2-tiny", SSD, "float32", {"ssd": NATIVE},
-         lane=False),
-    Flow("selective scan", "mamba-tiny", SELECTIVE, "bfloat16", {"selective_scan": NATIVE}),
-    Flow("lightning attention", "minimax-tiny", LIGHTNING, "bfloat16", {"gated_delta_rule": NATIVE},
+         {"train": {**TEMPLATE, "gated_delta_rule": NATIVE, "short_conv": NATIVE},
+          "decode": {**TEMPLATE, "decode": NATIVE, "gated_delta_rule": NATIVE, "short_conv": NATIVE,
+                     "delta_decode": "step"}}),
+    Flow("state-space duality (SSD), bf16", "mamba2-tiny", SSD, "bfloat16",
+         {kind: {"ssd": NATIVE, "short_conv": NATIVE} for kind in KINDS}),
+    Flow("state-space duality (SSD), fp32, a user's", "mamba2-tiny", SSD, "float32",
+         {kind: {"ssd": NATIVE, "short_conv": NATIVE} for kind in KINDS}, lane=False),
+    Flow("selective scan", "mamba-tiny", SELECTIVE, "bfloat16",
+         {kind: {"selective_scan": NATIVE, "short_conv": NATIVE} for kind in KINDS}),
+    Flow("lightning attention", "minimax-tiny", LIGHTNING, "bfloat16",
+         {"train": {**TEMPLATE, "gated_delta_rule": NATIVE},
+          "decode": {**TEMPLATE, "decode": NATIVE, "gated_delta_rule": NATIVE}},
          families={"gated_delta_rule": ("wgmma",)}),
 )
 """Every model flow, by the route it is for (docs/design/testing.md: a kernel's native run is a flow's
@@ -282,7 +307,9 @@ library's fused kernel where one takes the call, FlashAttention among them, whic
 dense fp32 flow on XLA's declared fp32 route, and the SSD port in fp32 too, as a user's process runs it (its
 products in TF32 at the default precision, which the lane's whole fp32 products refuse).
 Lightning attention's decay without the delta rule takes the recurrence template on a Hopper GPU alone: fla's
-port hands it to the portable math (`recurrence_chunk.PORT_SUPPORTS`)."""
+port hands it to the portable math (`recurrence_chunk.PORT_SUPPORTS`). A latent attention flow's decode loop
+attends in XLA (the latent decode's own form), and a KDA flow's decode step's softmax layer too: no native
+attention route of theirs there."""
 
 
 def flow_named(name: str) -> Flow:
@@ -362,9 +389,10 @@ def _flat(flow: Flow, program: Callable):
 
 
 def _target():
-    """The node's GPU (`TOPOLOGY`): its generation and multiprocessors, its kind's as the targets' table
-    states them (`generation.gpu_target`), read with no GPU visible, as a prepare runs; its run's load holds
-    them to the GPU's own (`BuildTarget.held`)."""
+    """The node's GPU (`TOPOLOGY`): its generation, its kind's (`generation.gpu_target`), and the facts its
+    serialized device states of itself, its multiprocessors and its block's shared memory among them
+    (`generation.runtime_facts`), read with no GPU visible, as a prepare runs, so nothing of the CUDA
+    driver's: what its run's load holds the programs to (`BuildTarget.held`)."""
     from jax.experimental import topologies
 
     from dew.training.ahead import compile_only_gpus
@@ -373,7 +401,8 @@ def _target():
     # client (`dew.training.ahead.host_gpus`).
     compile_only_gpus("sm80", 1)
     device = topologies.TopologyDescription.deserialize(Path(os.environ[TOPOLOGY]).read_bytes()).devices[0]
-    return generation.gpu_target(device.device_kind)
+    return generation.runtime_facts(generation.gpu_target(device.device_kind), device,
+                                    read=lambda ordinal, attribute: None)
 
 
 def programs_of(flow: Flow) -> dict[str, tuple[Callable, list]]:
@@ -389,28 +418,31 @@ class Unreached(AssertionError):
     portable (`held_routes`)."""
 
 
-def held_routes(flow: Flow, found: list, target: str) -> None:
-    """Raise unless the flow's Dew arm, traced for the GPU generation `target`, took every route it is for
-    there (`Flow.native_on`): a kernel off the reference path, or the one it names, among the kernels its
-    choice ran (a decode's prefill over its cache's keys may run another); and the portable math alone on a
-    choice native on other GPUs only (`Flow.families`), so a kernel that comes to take it is a flow's to
-    cover."""
-    taken = {}
-    for route in found:
-        taken.setdefault(str(route.choice), set()).add(route.kernel)
+def held_routes(flow: Flow, found: Mapping[str, list], target: str) -> None:
+    """Raise unless each of the flow's programs, traced for the GPU generation `target` (`found`, each
+    program's routes by its kind), took every route it is for there (`Flow.native_on`): a kernel off the
+    reference path among its choice's routes (`NATIVE`), every one of them so (`EVERY`), or the kernel it
+    names; and the portable math alone on a choice native on other GPUs only (`Flow.families`), so a kernel
+    that comes to take it is a flow's to cover."""
+    generic = generic_kernels()
     native = flow.native_on(target)
-    for choice, kernel in flow.native.items():
-        kernels = taken.get(choice, set())
-        if choice not in native:
-            if kernels - generic_kernels()[choice]:
-                raise Unreached(f"{flow.name}: its {choice} took {sorted(kernels)} on {target}, where the "
-                                "flow holds it portable (`Flow.families`): name "
-                                f"{generation.family(target)} there")
-            continue
-        held = kernels - generic_kernels()[choice] if kernel == NATIVE else kernels & {kernel}
-        if not held:
-            raise Unreached(f"{flow.name}: its {choice} took {sorted(kernels) or 'nothing'} on {target}, not "
-                            f"{kernel}: the flow does not reach the route it is for")
+    for kind, choices in flow.native.items():
+        taken = {}
+        for route in found[kind]:
+            taken.setdefault(str(route.choice), set()).add(route.kernel)
+        for choice, kernel in choices.items():
+            kernels = taken.get(choice, set())
+            if choice not in native[kind]:
+                if kernels - generic[choice]:
+                    raise Unreached(f"{flow.name}: its {kind}'s {choice} took {sorted(kernels)} on {target}, "
+                                    "where the flow holds it portable (`Flow.families`): name "
+                                    f"{generation.family(target)} there")
+                continue
+            held = (kernels - generic[choice] if kernel == NATIVE else
+                    kernels if kernel == EVERY and not kernels & generic[choice] else kernels & {kernel})
+            if not held or (kernel not in (NATIVE, EVERY) and kernels - {kernel}):
+                raise Unreached(f"{flow.name}: its {kind}'s {choice} took {sorted(kernels) or 'nothing'} on "
+                                f"{target}, not {kernel}: the flow does not reach the route it is for")
 
 
 def held_reference(flow: Flow, found: list) -> None:
@@ -421,12 +453,24 @@ def held_reference(flow: Flow, found: list) -> None:
         raise AssertionError(f"{flow.name}: its reference arm ran {native}, not its reference path")
 
 
+def _compiled(named: Mapping[str, tuple[Callable, list]], arm: str, target):
+    """The arm's programs of `named` (`programs_of`) compiled for `target` (`compile_programs`), one a call so
+    each program's routes are its own, and each program's routes by its kind."""
+    from dew.training.ahead import AheadPrograms, compile_programs
+
+    compiled, found = {}, {}
+    for kind in KINDS:
+        name = f"{kind} {arm}"
+        with generation.routes() as found[kind]:
+            compiled[kind] = compile_programs({name: named[name]}, target.generation, target.multiprocessors)
+    return AheadPrograms(compiled[KINDS[0]].target, {
+        name: program for each in compiled.values() for name, program in each.programs.items()}), found
+
+
 def prepare(flow: Flow) -> bool:
     """The flow's prepare: its programs compiled for the node's GPU into its store, Dew's arm's routes held
     to the ones it is for, the reference arm's to its reference path; then every draw's truth (`judge`).
     Whether it prepared: none where the node's GPU does not run the flow (`Flow.runs_on`)."""
-    from dew.training.ahead import compile_programs
-
     held_process(flow)
     target = _target()
     if not flow.runs_on(target.generation):
@@ -435,14 +479,13 @@ def prepare(flow: Flow) -> bool:
     directory.mkdir(parents=True, exist_ok=True)
     (directory / PARAMS).write_bytes(pickle.dumps(flow.params))
     named = programs_of(flow)
-    with generation.routes() as found:
-        compile_programs({name: program for name, program in named.items() if name.endswith("dew")},
-                         target.generation, target.multiprocessors).save(directory / "dew.programs")
+    dew, found = _compiled(named, "dew", target)
+    dew.save(directory / "dew.programs")
     held_routes(flow, found, target.generation)
-    with generation.routes() as found, generation.chosen(**reference_kernels()):
-        compile_programs({name: program for name, program in named.items() if name.endswith("reference")},
-                         target.generation, target.multiprocessors).save(directory / "reference.programs")
-    held_reference(flow, found)
+    with generation.chosen(**reference_kernels()):
+        reference, found = _compiled(named, "reference", target)
+    reference.save(directory / "reference.programs")
+    held_reference(flow, [route for kind in KINDS for route in found[kind]])
     for kind in KINDS:
         judge(flow, {}, kind)
     return True
@@ -486,10 +529,6 @@ def loaded(flow: Flow) -> dict[str, Callable]:
             for name, program in AheadPrograms.load(directory / f"{arm}.programs").loaded().items()}
     return {name: as_given(lambda params, ids, program=program: program(*jax.tree.leaves(params), ids))
             for name, program in held.items()}
-
-
-KINDS = ("train", "decode")
-"""A flow's programs: its training step's loss and gradients, and its decode loop's logits."""
 
 
 def judge(flow: Flow, programs: Mapping[str, Callable], kind: str) -> None:
