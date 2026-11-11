@@ -4,9 +4,10 @@ Each family declares its axes (`AXES`) and one matrix cell function (`CELLS`): a
 the forward and its backward in one program as a user calls them, held to check 1 with the float64 terms,
 its launch form pinned. Its cells cover every pair of axis values the family's route serves
 (docs/design/testing.md's covering scenarios): what it serves is read from the route's own analyses
-(`supported`, the cell module's), never a second list. Main's GPU tier runs `FLOWS` on an H100 and an A100
-after a publish whose diff reaches the kernels, and tests/test_kernel_matrix.py holds each family's cells to
-its supported pairs (`covered`). Nothing here needs a GPU.
+(`supported`, the cell module's), never a second list. A TPU tier runs `TPU_FLOWS`; the GPU tier runs no
+matrix since the owner's ruling of 2026-11-11 (row 5461): a GPU's native routes are its model flows' and its
+bare cells' (tests/test_gpu_flows.py), a family's pairs the CPU's. tests/test_kernel_matrix.py holds each
+family's cells to its supported pairs (`covered`). Nothing here needs a GPU.
 """
 
 import functools
@@ -237,26 +238,6 @@ CELLS: dict[str, tuple[str, str]] = {
     "narrow_copies": ("narrow_copies_matrix", "a_narrow_copy_training_run_is_on_par"),
 }
 """Each family's matrix cell function, by its module and name (`gpu_flow.cell`)."""
-
-FLOWS: tuple[str, ...] = (
-    "tests/test_gpu_attention.py::test_the_attention_matrix_holds_on_this_gpu",
-    "tests/test_gpu_attention.py::test_the_attention_kernels_matrix_holds_on_this_gpu",
-    "tests/test_gpu_attention.py::test_the_decode_matrix_holds_on_this_gpu",
-    "tests/test_gpu_gemm.py::test_the_gemm_matrix_holds_on_this_gpu",
-    "tests/test_gpu_gemm.py::test_the_fused_gemm_matrix_holds_on_this_gpu",
-    "tests/test_gpu_gemm.py::test_the_join_matrix_holds_on_this_gpu",
-    "tests/test_gpu_gemm.py::test_the_low_rank_matrix_holds_on_this_gpu",
-    "tests/test_gpu_gemm.py::test_the_nvfp4_matrix_holds_on_this_gpu",
-    "tests/test_gpu_gemm.py::test_the_blockwise_matrix_holds_on_this_gpu",
-    "tests/test_gpu_gemm.py::test_the_mx_matrix_holds_on_this_gpu",
-    "tests/test_gpu_recurrence.py::test_the_recurrence_matrix_holds_on_this_gpu",
-    "tests/test_gpu_recurrence.py::test_the_short_conv_matrix_holds_on_this_gpu",
-    "tests/test_gpu_recurrence.py::test_the_selective_scan_matrix_holds_on_this_gpu",
-    "tests/test_gpu_recurrence.py::test_the_recurrent_decode_matrix_holds_on_this_gpu",
-    "tests/test_gpu_numerics.py::test_the_norm_swiglu_matrix_holds_on_this_gpu",
-    "tests/test_gpu_numerics.py::test_the_narrow_copies_matrix_holds_on_this_gpu",
-)
-"""The flows that run the matrices' cells on the GPU tier, by pytest node id."""
 
 TPU_FLOWS: tuple[str, ...] = (
     "tests/test_attention_splash.py::test_the_attention_kernels_matrix_holds_on_this_tpu",

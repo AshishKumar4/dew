@@ -250,6 +250,12 @@ def pytest_runtest_setup(item):
     if jax.device_count() < needed:
         pytest.skip(f"needs a {needed}-device mesh; this run has "
                     f"{jax.device_count()} {jax.default_backend()} device(s)")
+    if os.environ.get("DEW_TIER_PREPARE") == "1" and item.get_closest_marker("gpu"):
+        # A GPU part's prepare, on its node's CPU (tests/model_flows.py): a flow prepares there, every other
+        # GPU test has nothing to prepare.
+        if item.get_closest_marker("prepares") is None:
+            pytest.skip("a GPU tier's prepare runs the flows that prepare alone")
+        return
     for backend, device in (("gpu", "a cuda device"), ("tpu", "a tpu")):
         marker = item.get_closest_marker(backend)
         if marker and jax.default_backend() != backend:

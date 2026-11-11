@@ -1,9 +1,6 @@
 """The recurrences on the GPU (G14, the owner's rule: no unit tests on GPUs): each native recurrence route's
 cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its own file's property:
 
-- The Mosaic mainloop's forward and gradient on par from float64 with their references at the cases the
-  CPU leaves to a GPU (test_recurrence_mosaic's `native`, test_recurrence_mosaic_gradient), every hook
-  it takes token by token, and a two-role walk's training on an H100.
 - The template finite and on par where chunked forms break, every form, regime and product
   (test_recurrence_template_stability).
 - The portable backward as a GPU compiles it, and the SSD port's forward and gradient, finite and on par
@@ -19,32 +16,26 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
 - The decode launches as a server runs them (test_linear_attention): the step kernel leaving an idle row's
   state and output alone, bit for bit; the fused step's bits the same however its launches are timed; and
   a layer choosing the fused step decoding over two GPUs, its rows or its heads split, as on one device.
-- The check-1 matrices of the recurrence's choices (tests/kernel_matrix.py): the chunked op on each kernel
-  against its form's port (recurrence_matrix), the short conv against XLA's (short_conv_matrix), the
-  selective scan against recorded mamba_ssm (selective_matrix), and the decode tokens on each decode kernel
-  against the portable step (delta_decode_matrix).
+
+The Mosaic mainloop's forward and gradient, and each recurrence's chunked op, short conv and decode on its
+default kernels, are the model flows' (tests/test_gpu_flows.py, row 5461's covering set); their shapes and
+hooks past these are the CPU's, interpreted and through the compile gate.
 """
 
 import functools
 
-import delta_decode_matrix
 import gpu_flow
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import recurrence_matrix
-import selective_matrix
-import short_conv_matrix
 import test_fla_gdn as fla_gdn
 import test_mamba_ssd as mamba_ssd
-import test_recurrence_mosaic as forward
-import test_recurrence_mosaic_gradient as gradient
 import test_recurrence_stability as stability
 import test_recurrence_template_stability as template_stability
 import test_selective_template as selective_template
 from delta_rule_support import fused_step
-from gpu_flow import Cell, cells_of, run_cells, when
+from gpu_flow import Cell, run_cells, when
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import decode_through
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
@@ -54,18 +45,11 @@ from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates.recurrence import mainloop
 from dew.nn.linear import GatedDeltaNet, decode_gated_delta_rule
 from dew.training import MeshSpec
 
-pytestmark = pytest.mark.gpu(reason="each recurrence route's native kernel: the Mosaic mainloop, the ports")
-
-
-def on_its_family(check):
-    """`check` where this GPU is of a family the mainloop's bundles claim (an A100's, an H100's), else
-    skipped (`when`)."""
-    return when(mainloop.family_of() is not None,
-                "the mainloop's bundles run compiled on a GPU of the family each claims", check)
+pytestmark = pytest.mark.gpu(reason="each recurrence route's native kernel no model flow reaches: the ports, "
+                                    "the template at its edges")
 
 
 PORT_KERNELS = {
@@ -198,33 +182,6 @@ def a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device(axis: str
                     truth_fn=module.clone(dtype=jnp.float64).apply)
 
 
-def mainloop_forward_cells() -> list[Cell]:
-    """The Mosaic mainloop's forward at the cases the CPU leaves to a GPU, and every hook it takes."""
-    return [
-        *(Cell(f"the Mosaic forward is as exact as its reference: {name}",
-               functools.partial(forward.the_mosaic_forward_is_as_exact_as_its_reference, *values))
-          for name, values in forward.native(forward.FORWARD_GRID, forward.INTERPRETED_FORWARD)),
-        *(Cell(f"every hook the Mosaic mainloop takes is as exact as the recurrence: {hooks} {packed}",
-               on_its_family(functools.partial(
-                   forward.every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token,
-                   hooks, packed)))
-          for hooks in forward.TAKEN for packed in (False, True)),
-    ]
-
-
-def mainloop_gradient_cells() -> list[Cell]:
-    """The Mosaic mainloop's gradient at the cases the CPU leaves to a GPU, and a two-role walk's."""
-    return [
-        *(Cell(f"the Mosaic gradient is as exact as its reference: {name}",
-               functools.partial(gradient.the_mosaic_gradient_is_as_exact_as_its_reference, *values))
-          for name, values in forward.native(gradient.GRADIENT_GRID, gradient.INTERPRETED_GRADIENT)),
-        *(Cell(f"a walk of two roles is as exact as its reference: {name}",
-               functools.partial(gradient.test_a_walk_of_two_roles_is_as_exact_as_its_reference, *values),
-               "sm90")
-          for name, values in forward.native(gradient.WALK_GRID, gradient.INTERPRETED_WALKS)),
-    ]
-
-
 def template_stability_cells() -> list[Cell]:
     """The template finite and on par where chunked forms break, every form, regime and product."""
     finite = template_stability.the_template_stays_finite_and_on_par_where_chunked_forms_break
@@ -298,43 +255,18 @@ def decode_cells() -> list[Cell]:
     ]
 
 
-FAMILIES = {"mainloop": lambda: [*mainloop_forward_cells(), *mainloop_gradient_cells()],
-            "template stability": template_stability_cells,
+FAMILIES = {"template stability": template_stability_cells,
             "portable and SSD port": portable_and_ssd_port_cells, "selective scan": selective_cells,
             "port training and decode": lambda: [*port_training_cells(), *decode_cells()]}
 """The recurrence cells by family, each family a test of its own: the planner times and packs each, and one
-family's failure hides no other's (a single flow of every family ran past a GPU job's 50 minutes). The
-mainloop's forward and gradient run as one flow over the same launches (selected by `-k mainloop`), and a
-layer's port training and its decode as another."""
+family's failure hides no other's (a single flow of every family ran past a GPU job's 50 minutes). A
+layer's port training and its decode run as one flow. The Mosaic mainloop's forward and gradient on a GPU are
+the model flows' (tests/test_gpu_flows.py: Kimi's delta attention, Qwen3-Next's gated delta net, MiniMax's
+lightning attention), its cases the CPU's, interpreted and through the compile gate (row 5461)."""
 
 
 @pytest.mark.parametrize("family", list(FAMILIES))
 def test_the_recurrences_run_on_this_gpu(family):
     """A family's recurrence cells on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
-    together; every direct mainloop call keeps its own bound."""
+    together."""
     run_cells(FAMILIES[family]())
-
-
-def test_the_recurrence_matrix_holds_on_this_gpu():
-    """The recurrence's check-1 matrix (tests/kernel_matrix.py): the chunked op's training step, its kernel
-    named, on par with its form's port's, or the portable math's where no port takes it, at every pair of
-    axis values the route serves, each cell on its own GPU."""
-    run_cells(cells_of(recurrence_matrix.a_recurrences_training_step_is_on_par))
-
-
-def test_the_short_conv_matrix_holds_on_this_gpu():
-    """The short conv's check-1 matrix: a delta net's conv at its training shapes on the kernels, on par with
-    XLA's conv, each cell on its own GPU."""
-    run_cells(cells_of(short_conv_matrix.a_short_convs_training_step_is_on_par))
-
-
-def test_the_selective_scan_matrix_holds_on_this_gpu():
-    """The selective scan's check-1 matrix: each recorded case on the template, on par with recorded
-    mamba_ssm, each cell on its own GPU."""
-    run_cells(cells_of(selective_matrix.a_selective_scan_is_as_exact_as_mamba_ssm))
-
-
-def test_the_recurrent_decode_matrix_holds_on_this_gpu():
-    """The recurrent decode's check-1 matrix: a gated delta net's decode tokens on each decode kernel, on par
-    with the portable step's, each cell on its own GPU."""
-    run_cells(cells_of(delta_decode_matrix.a_decode_token_is_on_par))

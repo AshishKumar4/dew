@@ -1,10 +1,10 @@
 """Attention on the GPU (G14, the owner's rule: no unit tests on GPUs): each attention route whose kernel
-runs on a GPU alone, run in one process (`gpu_flow`), each cell its own file's property:
+runs on a GPU alone and no model flow reaches (tests/test_gpu_flows.py, row 5461's covering set), run in one
+process (`gpu_flow`), each cell its own file's property; a route's shapes and hooks past these are the CPU's,
+interpreted and through the compile gate:
 
-- The Pallas-Triton template at every tile its forward's and its backward's derivations step through, bf16,
-  every hook, over causal documents under a window and the irregular calls (test_attention_triton); its
-  default form finite where the reference is at fp32's edges for the families too slow to interpret
-  (test_attention_stability).
+- The Pallas-Triton template's default form finite where the reference is at fp32's edges for the families
+  too slow to interpret (test_attention_stability), and its prescaled backward on an H100.
 - The Mosaic mainloop's default form, and its backward in two launches, finite where the reference is at
   fp32's edges over every family it takes, on an H100 (test_attention_stability).
 - A dropping route call on a GPU runs finite (test_attention_dropout).
@@ -14,24 +14,23 @@ runs on a GPU alone, run in one process (`gpu_flow`), each cell its own file's p
   decode kernel's attention differentiates as the folded attention (test_decode_attention).
 - Fused routes, without XLA's deterministic ops, which Dew refuses them under: flash reads a cache call's
   documents as exactly as jax.nn reads its mask (test_decode_attention), and packed windowed bf16
-  attention runs its band on par (test_local_attention); flash, cuDNN and the Triton kernel train, take
-  packed and odd-length calls, sinks, windows and empty contexts on par with XLA from float64, and each
-  kernel's requirements are what it takes on this GPU (test_kernels); a row that sees no key reads
-  nothing on the fused kernels (test_attention_masked_rows).
-- The Mosaic template on an H100, each test its own cells: forward, training forward, natural forward
-  and backward over every call form, head width, hook and run (test_attention_mosaic); an fp16 call
-  through the route, and a long sequence on par with the reference path (test_attention_route); the fast
-  form's default route not on par with IEEE fp32, the accurate form's control (test_attention_accurate_form).
+  attention runs its band on par (test_local_attention); cuDNN and the Triton kernel train, flash and the
+  others take packed and odd-length calls, sinks, windows and empty contexts on par with XLA from float64,
+  and each kernel's requirements are what it takes on this GPU (test_kernels); a row that sees no key
+  reads nothing on the fused kernels (test_attention_masked_rows). Flash's plain training step is the
+  dense flow's, a user's.
+- The Mosaic template on an H100: its backward over the call forms and score hooks no flow trains
+  (`UNREACHED_FORMS`, `UNREACHED_HOOKS`), its natural form, a call over runs, its one launch backward and a
+  span call's (test_attention_mosaic, attention_inplace_operands); an fp16 call through the route
+  (test_attention_route); the fast form's default route not on par with IEEE fp32, the accurate form's
+  control (test_attention_accurate_form).
 """
 
 import dataclasses
 import functools
 
 import attention_inplace_operands as inplace
-import attention_kernels_matrix as kernels_matrix
-import attention_matrix as matrix
 import attention_triton_stages as triton_stages
-import decode_matrix
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -43,27 +42,26 @@ import test_attention_masked_rows as masked_rows
 import test_attention_mosaic as mosaic
 import test_attention_route as route
 import test_attention_stability as stability
-import test_attention_triton as triton
 import test_contracts_attention as contracts
 import test_decode_attention as decode
 import test_kernels as kernels
 import test_local_attention as local
-from gpu_flow import BF16_PRODUCTS, Cell, cells_of, in_parts, parted, repeats_bit_for_bit, run_cells, when
+from gpu_flow import (
+    BF16_PRODUCTS,
+    Cell,
+    cells_of,
+    cells_where,
+    in_parts,
+    parted,
+    repeats_bit_for_bit,
+    run_cells,
+    when,
+)
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.generation import bf16_dot_runs
 
 pytestmark = pytest.mark.gpu(reason="each route's GPU kernel: Triton, Mosaic, flash and the band")
-
-CASES = ("causal-documents-window", *triton.IRREGULAR)
-"""The Triton sweeps' calls (`triton.every_config_on_a_gpu`)."""
-
-
-def sweep(check) -> list[Cell]:
-    """`check` over every call of CASES, each call's every config in one cell (one check of them all)."""
-    name = check.__name__.replace('_', ' ')
-    return [Cell(f"{name}: {case}", functools.partial(check, case)) for case in CASES]
-
 
 def a_shared_bias_step_repeats_bit_for_bit(bias_shape: tuple, kv_heads: int = 8) -> None:
     """A bf16 causal training step through the template at a sequence of 2048, its bias of `bias_shape`
@@ -103,8 +101,6 @@ def test_the_attention_kernels_run_on_this_gpu(part):
     """Every kernel cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
     together, a part's share of them (`in_parts`); the Mosaic cells on an H100 alone."""
     run_cells(parted([
-        *sweep(triton.every_config_on_a_gpu),
-        *sweep(triton.every_backward_config_on_a_gpu),
         # The Pallas-Triton dK/dV launch's prescaled query on an H100: right and repeating (the pipeliner's
         # race, attention_triton_stages).
         *cells_of(triton_stages.a_prescaled_tritons_backward_is_on_par_and_repeats_on_an_h100, "sm90"),
@@ -174,26 +170,25 @@ def test_the_fused_attention_routes_run_on_this_gpu(without_deterministic_ops):
     ])
 
 
-MOSAIC_CELLS = (mosaic.the_forward_is_on_par_on_an_h100, mosaic.the_training_forward_is_on_par_on_an_h100,
-                mosaic.the_natural_forward_is_on_par_on_an_h100,
-                mosaic.the_forward_is_on_par_over_every_call_form_on_an_h100,
-                mosaic.the_forward_is_on_par_at_head_widths_on_an_h100,
-                mosaic.the_forward_is_on_par_under_every_hook_on_an_h100,
-                mosaic.the_backward_is_on_par_on_an_h100,
-                mosaic.the_backward_is_on_par_at_head_widths_on_an_h100,
-                mosaic.the_backward_is_on_par_over_every_call_form_on_an_h100,
-                mosaic.the_backward_is_on_par_under_every_score_hook_on_an_h100,
-                mosaic.a_call_over_runs_is_on_par_on_an_h100,
-                mosaic.a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100)
-"""The Mosaic template's H100 checks, each test its own cells, so a red names its form."""
+UNREACHED_FORMS = frozenset({"full", "two-sided-window", "causal-chunk", "documents",
+                             "causal-documents-window", "cross-causal", "cross-causal-lengths-starts",
+                             "lengths-starts"})
+"""The template's call forms no model flow's training step reaches (tests/model_flows.py: the dense, windowed,
+sink and latent flows reach causal, causal window and softcap, causal sinks and causal of unequal value
+widths): an encoder's full call, a two-sided window, Llama 4's chunked local, a packed step's documents with
+and without a causal window, a cross attention's, and a serving prefill's over ragged cache rows; each one
+backward on an H100 (row 5461's covering set)."""
 
+UNREACHED_HOOKS = frozenset({"alibi", "temperature", "key-bias", "tile-bias", "resumed", "custom-vjp",
+                             "row-indexed", "softcap-sinks-alibi"})
+"""The score hooks no model flow's training step reaches (`test_attention_triton.SCORE_HOOKS`): each one
+backward on an H100."""
 KERNEL_CELLS = (kernels.flash_through_dews_attention_refuses_rows_it_would_misread,
                 kernels.a_fused_kernel_takes_forward_mode_through_the_reference,
                 kernels.cudnn_trains_odd_lengths_and_agrees_with_xla,
                 kernels.triton_trains_and_agrees_with_xla,
                 kernels.triton_trains_at_large_logits_on_par_with_xla,
                 kernels.triton_at_saturated_large_logits_is_finite_where_xla_is,
-                kernels.flash_trains_and_agrees_with_xla,
                 kernels.a_mapped_flash_call_is_each_rows_own,
                 kernels.a_fold_holds_the_kernels_grid_and_its_offsets,
                 kernels.packed_sequences_attend_within_themselves_as_far_from_float64_as_one_at_a_time,
@@ -228,54 +223,33 @@ def test_the_fused_kernels_hold_on_this_gpu(without_deterministic_ops, part):
     ], part, FUSED_PARTS))
 
 
-MATRIX_PARTS = 2
-"""The attention matrix's parts (`in_parts`): 124 s whole on a GH200 (MAINGPU-709ddea7a)."""
-
-
-@pytest.mark.usefixtures("without_deterministic_ops")
-@in_parts(MATRIX_PARTS)
-def test_the_attention_matrix_holds_on_this_gpu(part):
-    """Attention's check-1 matrix (tests/kernel_matrix.py): the route's training step on par with the
-    reference path at every pair of axis values the route serves, each cell on its own GPU, without XLA's
-    deterministic ops (a deterministic run never derives the one launch its cells pin), a part's share."""
-    run_cells(parted(cells_of(matrix.a_routes_training_step_is_on_par), part, MATRIX_PARTS))
-
-
-@pytest.mark.usefixtures("without_deterministic_ops")
-def test_the_attention_kernels_matrix_holds_on_this_gpu():
-    """The attention op's kernels' check-1 matrix (tests/kernel_matrix.py): each GPU kernel's training step
-    through the public call on par with the reference path at every pair of axis values it serves, each cell
-    on its own GPU, without XLA's deterministic ops (FlashAttention's and cuDNN's refuse a deterministic
-    call)."""
-    run_cells(cells_of(kernels_matrix.a_kernels_training_step_is_on_par))
-
-
-def test_the_decode_matrix_holds_on_this_gpu():
-    """Decode's check-1 matrix (tests/kernel_matrix.py): a serving step's decode, dense and paged, on par with
-    the reference path at every pair of axis values its selectors serve, each cell on its own GPU, under the
-    lane's deterministic ops."""
-    run_cells(cells_of(decode_matrix.a_decode_step_is_on_par))
-
-
-MOSAIC_PARTS = 8
-"""The Mosaic flow's parts (`in_parts`): past the 3600 s deadline whole on a GH200 (MAINGPU-df3e6ac66), its
-cells' kernels' compiles most of it."""
+MOSAIC_PARTS = 2
+"""The Mosaic flow's parts (`in_parts`)."""
 
 
 @pytest.mark.usefixtures("without_deterministic_ops")
 @in_parts(MOSAIC_PARTS)
 def test_the_mosaic_template_holds_on_an_h100(part):
-    """Every Mosaic template cell above on an H100 (`gpu_flow.cells_of`), and the route's fp16 call and
-    long sequence, each one's failure kept and all raised together, a part's share of them, without XLA's
-    deterministic ops: the fused backward forms its cells pin add dQ atomically, which a deterministic run
-    never derives (`MosaicBackward.derived`), so held to a bitwise repeat there (check 1's
-    `_repeat_promised`) they failed as unpaired draws (row 3171)."""
+    """The Mosaic template's cells no model flow reaches on an H100 (row 5461): its backward over each call
+    form and under each score hook no flow takes (`UNREACHED_FORMS`, `UNREACHED_HOOKS`), its fast form;
+    its natural form; a call over a decision row's runs and a span call's one launch, which no flow forks;
+    its one launch backward each way on wgmma; an fp16 call through the route; and the fast form's default
+    route not on par with IEEE fp32, the accurate form's control. Each one's failure kept and all raised
+    together, a part's share of them, without XLA's deterministic ops: the fused backward forms its cells pin
+    add dQ atomically, which a deterministic run never derives (`MosaicBackward.derived`), so held to a
+    bitwise repeat there (check 1's `_repeat_promised`) they failed as unpaired draws (row 3171). Their
+    head widths, other forms and hooks' forwards are the CPU's, interpreted and through the compile gate."""
     run_cells(parted([
-        *(cell for check in MOSAIC_CELLS for cell in cells_of(check, "sm90")),
+        *cells_where(mosaic.the_backward_is_on_par_over_every_call_form_on_an_h100,
+                     lambda case, form: case in UNREACHED_FORMS and form == "default", "sm90"),
+        *cells_where(mosaic.the_backward_is_on_par_under_every_score_hook_on_an_h100,
+                     lambda hooks, form: hooks in UNREACHED_HOOKS and form == "default", "sm90"),
+        *cells_where(mosaic.the_natural_forward_is_on_par_on_an_h100,
+                     lambda call, dtype: call == "causal" and dtype == jnp.bfloat16, "sm90"),
+        *cells_where(mosaic.a_call_over_runs_is_on_par_on_an_h100,
+                     lambda case, form: form in ("forward", "default"), "sm90"),
         *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90"),
-        *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path),
         *cells_of(accurate_form.the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32, "sm90"),
         *cells_of(inplace.a_routes_one_launch_backward_is_on_par_on_an_h100, "sm90"),
         *cells_of(inplace.a_span_calls_one_launch_is_on_par_on_an_h100, "sm90"),
     ], part, MOSAIC_PARTS))
-

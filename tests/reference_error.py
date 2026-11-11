@@ -63,12 +63,15 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
+import contextlib
 import dataclasses
 import functools
 import hashlib
 import os
+import pickle
 import time
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -665,6 +668,104 @@ def _of_its_inputs(label: str, name: str, fn, inputs, first) -> None:
                            f"depends on more than them")
 
 
+class MissingTruth(AssertionError):
+    """A check-1 site under a store of prepared truths (`stored_truths`) whose truth its prepare did not
+    write, or wrote for another commit or other inputs: a red with its reason, never a truth computed here
+    in its place (the GPU tier's run computes none, row 5461)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class TruthStore:
+    """Prepared float64 truths (`stored_truths`): each check-1 site's under `directory`, one file a site
+    by its label's digest, holding the truth and its terms of every draw its two stages may take, keyed by
+    the digest of the draw's widened inputs, and the `stamp` it was prepared under (the commit), which a
+    run reads against its own."""
+
+    directory: Path
+    prepare: bool
+    stamp: str
+
+    def path(self, label: str) -> Path:
+        return self.directory / f"{hashlib.sha256(label.encode()).hexdigest()[:32]}.truths"
+
+    def write(self, label: str, terms: bool, held: dict) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.path(label).write_bytes(pickle.dumps({"stamp": self.stamp, "label": label, "terms": terms,
+                                                   "truths": held}))
+
+    def site(self, label: str) -> tuple[Callable, Callable | bool]:
+        """The site's truth and its terms as the gate takes them (`assert_as_exact`'s `truth_fn`, run as
+        given, and `terms`): each the prepared value of the draw's widened inputs; refused, as a red
+        (`MissingTruth`), where the site has none prepared for this stamp or for a draw it takes."""
+        path = self.path(label)
+        if not path.is_file():
+            raise MissingTruth(f"{label}: no truth prepared under {self.directory} (the tier's prepare did "
+                               f"not reach this site)")
+        stored = pickle.loads(path.read_bytes())
+        if stored["stamp"] != self.stamp:
+            raise MissingTruth(f"{label}: its truths were prepared at {stored['stamp']}, not this run's "
+                               f"{self.stamp}")
+        held = stored["truths"]
+
+        def prepared(inputs, part: int):
+            found = held.get(_inputs_digest(inputs))
+            if found is None:
+                raise MissingTruth(f"{label}: no truth prepared for these inputs (its prepare drew others)")
+            return found[part]
+
+        truth = as_given(lambda *inputs: prepared(inputs, 0))
+        return truth, (as_given(lambda *inputs: prepared(inputs, 1)) if stored["terms"] else False)
+
+
+_STORES: list[TruthStore] = []
+"""The truth store open (`stored_truths`), innermost last."""
+
+
+@contextlib.contextmanager
+def stored_truths(directory: str | Path, *, prepare: bool, stamp: str):
+    """Check 1's float64 truths prepared ahead of the run that judges them (the GPU tier, row 5461): within
+    the block, a site prepared (`prepare`) computes and writes the truth and terms of every draw its two
+    stages may take (`staged_units`), held to float64 on its first draw (`_of_float64`), and runs no arm;
+    a site run reads them (`TruthStore.site`) where it would compute them, its terms the ones its prepare
+    sized it by, and fails where they are missing (`MissingTruth`). Truths and terms are computed as the
+    gate computes them (`_truth_and_terms`), so a prepared site judges as one that computes its own."""
+    _STORES.append(TruthStore(Path(directory), prepare, stamp))
+    try:
+        yield _STORES[-1]
+    finally:
+        _STORES.pop()
+
+
+def _inputs_digest(inputs) -> str:
+    """The digest of a draw's widened inputs: each leaf's path, dtype by name, shape and bytes."""
+    digest = hashlib.sha256()
+    for path, leaf in jax.tree_util.tree_leaves_with_path(jax.device_get(inputs)):
+        value = np.asarray(leaf)
+        digest.update(f"{jax.tree_util.keystr(path)}:{value.dtype}:{value.shape};".encode())
+        digest.update(np.ascontiguousarray(value).tobytes())
+    return digest.hexdigest()
+
+
+def _prepare_site(store: TruthStore, dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn,
+                  terms) -> None:
+    """`assert_as_exact`'s site prepared into `store` (`stored_truths`): its truth program and terms as
+    `_site_judged` decides them, every draw its stages may take computed and written, no arm run."""
+    terms_fn, _ = _site(dew_fn, reference_fn, label, seeds=seeds, truth_fn=truth_fn, library_fn=None,
+                        library_row=None, library_leaves=(), also=None, terms=terms)
+    truth_program = _truth_program(truth_fn if truth_fn is not None else reference_fn)
+    terms_fn = _site_terms(terms_fn, terms, draw, truth_fn if truth_fn is not None else reference_fn,
+                           truth_program)
+    held = {}
+    for seed in range(staged_units(seeds)):
+        inputs = draw(seed)
+        truth, found = _truth_and_terms(truth_program, terms_fn, inputs)
+        if not seed:
+            _of_float64(label, truth_program, inputs, truth)
+        with jax.enable_x64(new_val=True):
+            held[_inputs_digest(widened(inputs))] = jax.device_get((truth, found))
+    store.write(label, terms_fn is not None, held)
+
+
 class NarrowTruth(TypeError):
     """A check-1 site whose truth is not float64's (`_of_float64`): `leaf`, the path of the first leaf that
     is narrower than float64 or fed by a narrower value."""
@@ -1233,6 +1334,15 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/certified.py)."""
+    if _STORES:
+        if conditioning is not None or library_fn is not None:
+            raise ValueError(f"{label}: a weighed or library site reads its reference's own rounding and "
+                             "arms at its truth's inputs, which no prepared truth holds")
+        if _STORES[-1].prepare:
+            _prepare_site(_STORES[-1], dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn,
+                          terms=terms)
+            return
+        truth_fn, terms = _STORES[-1].site(label)
     if conditioning is not None:
         _deferred(dew_fn, reference_fn, draw, label, seeds=seeds, conditioning=conditioning,
                   truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,

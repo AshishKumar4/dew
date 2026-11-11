@@ -40,12 +40,11 @@ def test_a_familys_cells_cover_every_pair_of_axis_values_its_route_serves_and_no
                          f"kernel_matrix.covering({family!r})")
 
 
-@pytest.mark.parametrize(("flows", "tier"), [(kernel_matrix.FLOWS, "gpu"), (kernel_matrix.TPU_FLOWS, "tpu")],
-                         ids=["gpu", "tpu"])
+@pytest.mark.parametrize(("flows", "tier"), [(kernel_matrix.TPU_FLOWS, "tpu")], ids=["tpu"])
 def test_every_matrix_flow_is_a_test_its_tier_selects(flows, tier):
-    """Each of a tier's flows (`FLOWS`, `TPU_FLOWS`: node ids) is a test pytest collects under the tier's
-    selection (`-m gpu`, `-m tpu`), whole or in parts, so the tier runs what the matrix declares (review: a
-    helper's name, or an unmarked test, would run nothing)."""
+    """Each of a tier's flows (`TPU_FLOWS`: node ids) is a test pytest collects under the tier's selection
+    (`-m tpu`), whole or in parts, so the tier runs what the matrix declares (review: a helper's name, or an
+    unmarked test, would run nothing)."""
     command = [sys.executable, "-m", "pytest", "--collect-only", "-q", "-p", "no:cacheprovider", "-m", tier]
     collected = subprocess.run([*command, *flows], cwd=TESTS.parent, capture_output=True, text=True,
                                check=False)

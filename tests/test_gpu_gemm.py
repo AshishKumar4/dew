@@ -25,27 +25,17 @@ one process (`gpu_flow`), each cell its own file's property:
   512, its sums the tensor cores' own at the default precision (test_grouped_gemm; M-EM-3).
 - The toolkit's warpgroup scan walks a linear recurrence forward and reversed, each position's state or
   the one before it, as float64 does (test_warpgroup_scan).
-- GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the reference
-  path's, dense and grouped, each matrix layout, hook and dtype its served pairs name (gemm_matrix).
-- The fused GEMM's check-1 matrix (tests/kernel_matrix.py): a region's training step through the fuser's
-  prologue and epilogue on par with the same region's stages in XLA (fused_gemm_matrix).
-- The joined projections' check-1 matrix (tests/kernel_matrix.py): a gated MLP's gate and up projections, or a
-  gated delta net's b and a, run as one GEMM, the layer's training step on par with the projections apart
-  (join_matrix).
+
+GEMM's check-1 matrices swept on the GPU are gone (row 5461's covering set): a product's layouts, hooks and
+dtypes are the CPU's, interpreted and through the compile gate, and a model flow's projections on its GPU
+are the model flows' (tests/test_gpu_flows.py).
 """
 
 import functools
 
-import blockwise_matrix
-import fused_gemm_matrix as fused_matrix
-import gemm_matrix as matrix
 import jax
 import jax.numpy as jnp
-import join_matrix
-import low_rank_matrix
-import mx_matrix
 import numpy as np
-import nvfp4_matrix
 import pytest
 import test_contracts_gemm as contracts_gemm
 import test_gemm_blockwise as gemm_blockwise
@@ -56,7 +46,7 @@ import test_gemm_widths as gemm_widths
 import test_grouped_gemm as grouped_gemm
 import test_mosaic_toolkit as mosaic_toolkit
 import test_warpgroup_scan as warpgroup_scan
-from gpu_flow import Cell, cells_of, run_cells, when
+from gpu_flow import Cell, run_cells, when
 from jax.experimental.pallas import fuser
 from reference_error import assert_as_exact
 
@@ -191,52 +181,3 @@ def test_the_gemm_kernels_run_on_this_gpu():
           for positions in warpgroup_scan.POSITIONS for reverse in (False, True)
           for exclusive in (False, True)),
     ])
-
-
-def test_the_gemm_matrix_holds_on_this_gpu():
-    """GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the
-    reference path's (XLA's ragged dot) at every pair of axis values the route serves, each cell on its own
-    GPU."""
-    run_cells(cells_of(matrix.a_gemm_training_step_is_on_par))
-
-
-def test_the_fused_gemm_matrix_holds_on_this_gpu():
-    """The fused GEMM's check-1 matrix (tests/kernel_matrix.py): a region's training step with its producer
-    and consumers fused into the template's stages on par with the same region's stages and product in XLA at
-    every pair of axis values the fusion serves, each cell on its own GPU."""
-    run_cells(cells_of(fused_matrix.a_fused_gemm_training_step_is_on_par))
-
-
-def test_the_nvfp4_matrix_holds_on_this_gpu():
-    """The NVFP4 product's check-1 matrix (tests/kernel_matrix.py): its training step with the matrix decoded
-    in the mainloop on par with it decoded once a call, at every pair of axis values the packed kernel
-    serves, each cell on its own GPU."""
-    run_cells(cells_of(nvfp4_matrix.an_nvfp4_products_training_step_is_on_par))
-
-
-def test_the_mx_matrix_holds_on_this_gpu():
-    """The MX product's check-1 matrix (tests/kernel_matrix.py): its forward through the template's
-    block-scaled products on par with the decoded operands' product in XLA, at every pair of axis values the
-    template serves, each cell on its own GPU."""
-    run_cells(cells_of(mx_matrix.an_mxfp8_product_is_on_par))
-
-
-def test_the_blockwise_matrix_holds_on_this_gpu():
-    """The blockwise-scaled FP8 product's check-1 matrix (tests/kernel_matrix.py): its forward through the
-    template's step-scaled walk on par with the scaled blocks summed in XLA, at every pair of axis values the
-    template serves, each cell on its own GPU."""
-    run_cells(cells_of(blockwise_matrix.a_blockwise_fp8_product_is_on_par))
-
-
-def test_the_low_rank_matrix_holds_on_this_gpu():
-    """The adapted product's check-1 matrix (tests/kernel_matrix.py): a LoRA-adapted projection's training
-    step with its base product and update fused on par with them apart at every pair of axis values the fused
-    form serves, each cell on its own GPU."""
-    run_cells(cells_of(low_rank_matrix.an_adapted_projections_training_step_is_on_par))
-
-
-def test_the_join_matrix_holds_on_this_gpu():
-    """The joined projections' check-1 matrix (tests/kernel_matrix.py): a layer's training step with two of
-    its projections run as one GEMM on par with the projections apart at every pair of axis values the join
-    serves, each cell on its own GPU."""
-    run_cells(cells_of(join_matrix.a_joined_layers_training_step_is_on_par))
