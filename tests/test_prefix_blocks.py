@@ -663,35 +663,65 @@ CONTEXT = 5
 """The context ids of each harness row, its continuation the rest."""
 
 
+def harness_batches(ids, xp=np) -> list[list[tuple]]:
+    """Two batches of requests `(context, continuation)` from one drawn row `ids` of `ROW` ids (in `xp`),
+    each with a request of the row's length that shares nothing, its window's width: the continuation's
+    halves after the context, which share it once (`ForkedRows`, its blocks inside it); and the first half
+    beside a request whose context differs at its last id, alike up to there: under a prompt's block, which
+    their contexts' last ids lie inside, they share none of it (`token_keys`), under a shorter prefix's
+    their ids before it."""
+    context, rest = ids[:CONTEXT], ids[CONTEXT:]
+    other = xp.concatenate([context[:-1], (context[-1:] + 1) % VOCAB])
+    alone = ((context + 1) % VOCAB, rest)
+    return [[alone, (context, rest[:2]), (context, rest[2:])],
+            [alone, (context, rest[:2]), (other, rest[:1])]]
+
+
 @pytest.mark.parametrize("prefix", [PREFIX, "prompt"])
 def test_a_prefix_runs_harness_scores_a_continuation_as_its_generation_reads_it(prefix):
     """lm-eval's likelihood of a prefix run's continuation is read through the blocks a server makes of
-    its context (`served_blocks`), each continuation token in none: on par from float64 with an explicit
-    forward of the decoder over those blocks (check 1), where a causal read of the context, which the
-    run's generation never makes, is far off."""
+    its context (`served_blocks`), each continuation token in none, requests alike up to a block's end
+    sharing that context once (`ForkedRows`) and none of a block they differ inside (`token_keys`): on par
+    from float64 with an explicit forward of the decoder over each request whole and its blocks (check 1),
+    where a causal read of the context, which the run's generation never makes, is far off."""
     from dew.data.text import ByteTokenizer
-    from dew.eval.harness import DewLM
+    from dew.eval.harness import DewLM, _scoring_inputs
     from dew.inference.tasks import RunProcessor
+    from dew.objectives.lm.objective import LMObjective
 
     decoder = blocky()
+    assert LMObjective(decoder, 1).shares_prefixes()
     wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
-    draw = model_draw(decoder, (BATCH, ROW), VOCAB)
-    context = np.broadcast_to(np.arange(ROW) < CONTEXT, (BATCH, ROW))
-    blocks = jnp.asarray(np.where(context, served_blocks(context, prefix), -1), jnp.int32)
+    draw = model_draw(decoder, (1, ROW), VOCAB)
+    def forked(requests) -> bool:
+        _, forks = _scoring_inputs([[*context.tolist(), *rest.tolist()] for context, rest in requests],
+                                   [len(context) for context, _ in requests], prefix, share=True,
+                                   size=len(requests))
+        return forks.coordinates.forks is not None
+
+    shared, split = harness_batches(np.arange(ROW))
+    assert forked(shared) and forked(split) == (prefix != "prompt")
 
     def explicit(model):
-        def scored(variables, tokens):
-            logits = model.apply(variables, tokens[:, :-1], block_groups=blocks[:, :-1])
-            picked = jnp.take_along_axis(jax.nn.log_softmax(logits), tokens[:, 1:, None], axis=-1)[..., 0]
-            return picked[:, CONTEXT - 1:].sum(axis=-1)
+        def scored(variables, ids):
+            found = []
+            for context, rest in (request for batch in harness_batches(ids[0], jnp) for request in batch):
+                tokens = jnp.concatenate([context, rest]).astype(jnp.int32)[None]
+                given = np.arange(tokens.shape[1])[None] < len(context)
+                blocks = jnp.asarray(np.where(given, served_blocks(given, prefix), -1), jnp.int32)
+                logits = model.apply(variables, tokens[:, :-1], block_groups=blocks[:, :-1])
+                picked = jnp.take_along_axis(jax.nn.log_softmax(logits), tokens[:, 1:, None], axis=-1)[..., 0]
+                found.append(picked[0, len(context) - 1:].sum())
+            return jnp.stack(found)
         return scored
 
     @as_given
-    def harness(variables, tokens):
+    def harness(variables, ids):
         task = TextGeneration(decoder, variables, RunProcessor(ByteTokenizer()), prefix=prefix)
-        rows = [(None, row[:CONTEXT].tolist(), row[CONTEXT:].tolist()) for row in np.asarray(tokens)]
-        return np.asarray([value for value, _ in DewLM(task, batch_size=BATCH)._loglikelihood_tokens(rows)],
-                          np.float32)
+        scores = [score for batch in harness_batches(np.asarray(ids)[0])
+                  for score in DewLM(task, batch_size=len(batch))._loglikelihood_tokens(
+                      [(None, context.tolist(), rest.tolist()) for context, rest in batch])]
+        return np.asarray([value for value, _ in scores], np.float32)
 
     seeds = seeds_for(explicit(decoder), draw, f"prefix {prefix} harness likelihood", truth_fn=explicit(wide))
     assert_as_exact(harness, explicit(decoder), draw, f"prefix {prefix} harness likelihood", seeds=seeds,

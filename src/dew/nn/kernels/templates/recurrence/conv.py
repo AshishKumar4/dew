@@ -22,6 +22,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import short_conv, tuning
 from dew.nn.kernels.templates import mosaic, scan
+from dew.nn.precision import compensated_add
 
 TOKENS = 64
 """The most tokens a program walks: a backward program computes K-1 past them, `(K - 1) / TOKENS` extra."""
@@ -270,7 +271,9 @@ def _backward_walk(piece: _Piece, dy_ref, outs, exchanged, *, head: int | None, 
                    tokens: int, interpret: bool):
     """A program's tokens' gradients, walked from its block's last and the K-1 past it which the next block
     owns, carrying the pre-activation gradients of the K-1 tokens after a token: its input's gradient written
-    once at its channels (`piece.columns`), its tap and bias gradients summed over its own tokens."""
+    once at its channels (`piece.columns`), its tap and bias gradients summed over its own tokens compensated
+    (`precision.compensated_add`), each block's rounded once: summed plainly a token at a time, the taps'
+    gradient was 1.36 times XLA's conv's distance from float64 interpreted and 1.51 natively (row 5441)."""
     dx_ref, dw_ref, db_ref = outs
     count, length = piece.count, piece.length
     block = lax.axis_index("tokens")
@@ -309,9 +312,8 @@ def _backward_walk(piece: _Piece, dy_ref, outs, exchanged, *, head: int | None, 
             window = piece.window(read)
             grad, document = gradient(t, window, dy), read[-1][1]
             owned = (t < piece.start + tokens) & (t < length)
-            sums = [*(total + _kept(owned, grad * inputs)
-                      for total, inputs in zip(sums[:-1], window, strict=True)),
-                    sums[-1] + _kept(owned, grad)]
+            sums = [compensated_add(total, (_kept(owned, term), zero))
+                    for total, term in zip(sums, [*(grad * inputs for inputs in window), grad], strict=True)]
             dx = zero
             reads = zip([grad, *later], [document, *owners], strict=True)
             for shift, (value, theirs) in enumerate(reads):
@@ -321,8 +323,8 @@ def _backward_walk(piece: _Piece, dy_ref, outs, exchanged, *, head: int | None, 
         return held, later, owners, sums
 
     held = [piece.read(last - count + 2 + j) for j in range(count - 1)]
-    carry = (held, [zero] * (count - 1), [jnp.int32(-2)] * (count - 1), [zero] * (count + 1))
+    carry = (held, [zero] * (count - 1), [jnp.int32(-2)] * (count - 1), [(zero, zero)] * (count + 1))
     *_, sums = lax.fori_loop(0, steps // unrolled, turn, carry)
     for tap in range(count):
-        plgpu.store(dw_ref.at[piece.row, block, tap, piece.columns], sums[tap], optimized=False)
-    plgpu.store(db_ref.at[piece.row, block, piece.columns], sums[count], optimized=False)
+        plgpu.store(dw_ref.at[piece.row, block, tap, piece.columns], sum(sums[tap]), optimized=False)
+    plgpu.store(db_ref.at[piece.row, block, piece.columns], sum(sums[count]), optimized=False)

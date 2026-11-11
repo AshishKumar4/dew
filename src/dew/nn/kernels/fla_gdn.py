@@ -30,11 +30,12 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
 from dew.nn import derivatives
-from dew.nn.kernels import launches, recurrence, recurrence_algebra as algebra
+from dew.nn.kernels import launches, recurrence, recurrence_algebra as algebra, tables
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
-    SPAN,
+    ChunkSpan,
     Sequences,
+    Span,
     Tiles,
     _aligned,
     _chunk_of,
@@ -53,6 +54,7 @@ from dew.nn.kernels.chunked_launch import (
     spanned,
     write_rows,
 )
+from dew.nn.kernels.templates.product import Product, interpreted
 from dew.nn.residuals import Residual
 
 RCP_LN2 = 1 / math.log(2)
@@ -87,49 +89,33 @@ def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, b
         write_rows(_rows(u_ref, start, chunk, columns), taken, _dot(inverse, scaled, exact=exact, ieee=ieee))
 
 
-def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = None):
-    """`a @ b`, same-dtype operands, with fp32 accumulation; reject mismatches before any interpret-mode
-    widening, so CPU tests catch dots Triton rejects. Exact interpretation widens bf16/fp16 inputs
-    for CPUs without narrow-input/fp32-accumulating dots.
-
-    Each operand dtype names its products, so no global `jax_default_matmul_precision` changes the
-    kernel (the suite's 'highest' made every fp32 product IEEE):
+def _dot(a, b, *, exact: bool, ieee: bool = False):
+    """`a @ b`, same-dtype operands, with fp32 accumulation, at fla's own precision; reject mismatches
+    before any interpreted product, so CPU tests catch dots Triton rejects. Each operand dtype names its
+    products, so no global `jax_default_matmul_precision` changes the kernel (the suite's 'highest' made
+    every fp32 product IEEE):
     - bf16 or fp16: exact products summed in fp32 (fla's `tl.dot` of narrow operands); no precision.
     - fp32 with `ieee`: IEEE products, fla's `allow_tf32=False` dots (`recompute_w_u`'s `A @ v`).
-    - fp32 otherwise: BF16x6 (`DotAlgorithmPreset.BF16_BF16_F32_X6`), six bf16 products, an fp32
-      product's accuracy where fla's own dots take one TF32 (Triton's default `input_precision` for fp32,
-      and `SOLVE_TRIL_DOT_PRECISION`, chunk_fwd.py:21). TF32x3 drops the low parts' product: an
-      A100 gave (1 + 2^-11)^2 as 1.0009765625, its fp32 1.0009768 (SE-dbg-kda-dot-redgreen-3f3c64bb2),
-      which put Kimi delta attention's fp32 rule past check 1 against fla's recorded torch. jax 0.11's
-      Pallas lowers `Precision.HIGH` as plain TF32 (pallas/triton/lowering.py `_TF32_PRECISIONS`), so
-      the preset is named. IEEE there lowers on sm80 to FMA loops ptxas took 3.5 to over 15 minutes to
-      compile for the WY backward; the presets compile in seconds.
-    - fp32 with `solve`, the call's dtype, at the solves' products of fp32 intermediates (the kkt and
-      KDA sub-chunk merges and products, fla's SOLVE_TRIL_DOT_PRECISION): BF16x6 in an fp32 call,
-      where one TF32 put a Kimi linear layer's logits 100 times the reference's distance from
-      float64 on an H100; one TF32, fla's, in a 16-bit call, whose operands' rounding it stays under
-      and where an fp32 product's three-part form cost Kimi Linear's bf16 layer 17% on an H100 and 19%
-      on an A100.
-    - interpreted (`exact`): an fp32 product summed in float64 and rounded once, as the interpreted
-      template's (`product.interpreted`) and the portable math's on a CPU (`precision.accumulated`), where
-      XLA's CPU dot picks its fp32 accumulation by shape: it put 20 of the stability suite's port arms 1.5 to
-      2.7 times the portable math's distance from float64 (row 2321); a narrow one's exact products summed
-      in fp32."""
+    - fp32 otherwise: one TF32, fla's, its `tl.dot`'s default `input_precision` for fp32 and its
+      `SOLVE_TRIL_DOT_PRECISION` on a GPU that runs TF32 (fla 0.5.2 gated_delta_rule/chunk_fwd.py), held
+      to fla's own kernels (the recurrence matrix's upstream oracle). An fp32 call took BF16x6 here, an
+      fp32 product's accuracy fla's dots do not take.
+    - interpreted (`exact`): the product as the interpreted template issues it (`product.interpreted`):
+      an IEEE one summed in float64 and rounded once, every other one as Dew sums an fp32 contraction
+      (`precision.accumulated`), its products exact; XLA's CPU dot, which picks its fp32 accumulation by
+      shape, put the stability suite's port arms 1.5 to 2.7 times the portable math's distance from
+      float64 (row 2321), and 1.5 to 2.3 times on the delta rule's and the gated net's sites in a user's
+      process at 4c884d57b89 (jsf-a3-dot)."""
     if jnp.dtype(a.dtype) != jnp.dtype(b.dtype):
         raise TypeError(f"Pallas dot operands must have the same dtype, got {a.dtype} and {b.dtype}")
-    wide = jnp.dtype(a.dtype) == jnp.float32
-    if exact and wide:
-        with jax.enable_x64(new_val=True):
-            return jnp.dot(a.astype(jnp.float64), b.astype(jnp.float64)).astype(jnp.float32)
     if exact:
-        a, b = a.astype(jnp.float32), b.astype(jnp.float32)
-        precision = None
-    elif wide:
-        narrow_call = solve is not None and jnp.dtype(solve).itemsize < 4
-        precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT if narrow_call
-                     else jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6)
-    else:
-        precision = None
+        # A 16-bit product's terms exact in fp32, its operands widened first: XLA's CPU dot takes no bf16
+        # operands into an fp32 result (`DotThunk`).
+        product = Product(jnp.dtype(jnp.float32), promoted=ieee, refusal=None)
+        return interpreted(product, a.astype(jnp.float32), b.astype(jnp.float32),
+                           (((a.ndim - 1,), (0,)), ((), ())))
+    wide = jnp.dtype(a.dtype) == jnp.float32
+    precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT) if wide else None
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
 
 
@@ -167,8 +153,7 @@ def _kkt_solve_chunk(k_ref, g_ref, gl_ref, beta_ref, a_ref, start, taken, *, chu
         return part(k_ref, i, pl.ds(c * bk, bk))
 
     def issue(name, a, b):
-        # The keys' products at the call's precision, the merges at its solve precision (`_dot`).
-        return _dot(a, b, exact=exact, solve=k_ref.dtype if name == "merge" else None)
+        return _dot(a, b, exact=exact)
 
     def decay(i, j):
         """The pairs' decays of sub-chunks `i` and `j` (`_paired`)."""
@@ -326,7 +311,9 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, gl_ref, h_ref, corre
     `per_key` is fla's USE_GK branch: `g_ref` holds a decay per key dimension `[T, K]`, which gates
     the memory's rows by `exp2(g_last)` and not the values, whose keys carry their own decay. A row's
     first sequence starts from its initial memory and its last stores the final one."""
-    start, count, base, entered, _, memory, takes, gives = _span(span_ref, length, chunk, aligned)
+    span = _span(span_ref, length, chunk, aligned)
+    start, count, base, entered = span.first, span.tokens, span.base, span.entered
+    memory, takes, gives = span.memory, span.takes, span.gives
     slices = k_ref.shape[-1] // 64
 
     @pl.when(count > 0)
@@ -395,17 +382,15 @@ class ChunkFwdH(_Launch):
             return sh % value_heads
 
         per_key = g.ndim == 4
-        # The call's memories: a row's each, or each of its documents' (`Sequences`).
-        memories = h0.shape[0]
-        rows = pl.BlockSpec((memories, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
+        rows = pl.BlockSpec((batch, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
         gated = (pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)) if per_key
                  else pl.BlockSpec((tokens, None), lambda i_v, sh: (0, head(i_v, sh))))
-        held = slots(spans, batch, length, chunk, memories)
+        held = slots(spans, batch, length, chunk)
         h, corrected, final = launches.pallas_call(
             functools.partial(_h_kernel, chunk=chunk, aligned=aligned, length=length, exact=interpret,
                               **({"per_key": True} if per_key else {})),
             grid=(columns // bv, spans.spans.shape[0] * value_heads),
-            in_specs=[pl.BlockSpec((None, SPAN), lambda i_v, sh: (sh // value_heads, 0)),
+            in_specs=[pl.BlockSpec((None, len(Span._fields)), lambda i_v, sh: (sh // value_heads, 0)),
                       pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh) // group, 0)),
                       pl.BlockSpec((tokens, None, bv), lambda i_v, sh: (0, head(i_v, sh), i_v)),
                       pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)),
@@ -415,7 +400,7 @@ class ChunkFwdH(_Launch):
                        rows],
             out_shape=[jax.ShapeDtypeStruct((held, value_heads, width, columns), k.dtype),
                        jax.ShapeDtypeStruct((tokens, value_heads, columns), u.dtype),
-                       jax.ShapeDtypeStruct((memories, value_heads, width, columns), jnp.float32)],
+                       jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32)],
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_chunk_fwd_h",
         )(spans.spans, *_flat(k, u, w, g), h0, *_flat(g_lo))
@@ -453,7 +438,9 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, g
     and neither `dv2` nor the queries, which carry their own decay, are gated; the query product
     stays in q's dtype. A row's last sequence starts from the final
     memory's gradient and its first stores the initial memory's."""
-    start, count, base, _, left, memory, takes, gives = _span(span_ref, length, chunk, aligned)
+    span = _span(span_ref, length, chunk, aligned)
+    start, count, base, left = span.first, span.tokens, span.base, span.left
+    memory, takes, gives = span.memory, span.takes, span.gives
     slices = k_ref.shape[-1] // 64
     chunks = -(-count // chunk)
 
@@ -555,16 +542,14 @@ class ChunkBwdDhu(_Launch):
         bv, warps, stages = config.bv, config.warps, config.stages
         spans, batch, length, _, width, value_heads, columns, group, tokens, aligned = laid(
             q, do, chunk_spans, sequence_spans, chunk)
-        # The call's memories: a row's each, or each of its documents' (`Sequences`).
-        memories = dht.shape[0]
-        held = slots(spans, batch, length, chunk, memories)
+        held = slots(spans, batch, length, chunk)
 
         def head(i_v, sh):
             return sh % value_heads
 
         keys = pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh) // group, 0))
         values = pl.BlockSpec((tokens, None, bv), lambda i_v, sh: (0, head(i_v, sh), i_v))
-        rows = pl.BlockSpec((memories, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
+        rows = pl.BlockSpec((batch, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v))
         per_key = g.ndim == 4
         gated = (pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)) if per_key
                  else pl.BlockSpec((tokens, None), lambda i_v, sh: (0, head(i_v, sh))))
@@ -573,14 +558,14 @@ class ChunkBwdDhu(_Launch):
                               exact=interpret,
                               **({"per_key": True} if per_key else {})),
             grid=(columns // bv, spans.spans.shape[0] * value_heads),
-            in_specs=[pl.BlockSpec((None, SPAN), lambda i_v, sh: (sh // value_heads, 0)), keys, keys,
-                      pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)),
+            in_specs=[pl.BlockSpec((None, len(Span._fields)), lambda i_v, sh: (sh // value_heads, 0)), keys,
+                      keys, pl.BlockSpec((tokens, None, width), lambda i_v, sh: (0, head(i_v, sh), 0)),
                       gated, rows, values, values, gated],
             out_specs=[pl.BlockSpec((held, None, width, bv), lambda i_v, sh: (0, head(i_v, sh), 0, i_v)),
                        rows,
                        values],
             out_shape=[jax.ShapeDtypeStruct((held, value_heads, width, columns), q.dtype),
-                       jax.ShapeDtypeStruct((memories, value_heads, width, columns), jnp.float32),
+                       jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32),
                        jax.ShapeDtypeStruct((tokens, value_heads, columns), dv.dtype)],
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="fla_chunk_bwd_dhu",
@@ -720,7 +705,8 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, 
     are a loop, not unrolled, so a program holds one head's accumulators at a time. The memory the
     chunk enters and its gradient where it leaves are read at their slots (`Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entered, left = chunk_ref[2], chunk_ref[3]
+    entered = chunk_ref[tables.column(ChunkSpan, "entered")]
+    left = chunk_ref[tables.column(ChunkSpan, "left")]
 
     @pl.when(taken > 0)
     def _():
@@ -1038,11 +1024,11 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, gl_ref, o_ref, *, ch
     `BV` value columns: `o = scale * ((q h) exp2(g) + tril((q k^T) exp2(g_s - g_t)) v)`, the key
     columns walked `bk` at a time into fp32 accumulators, `A` cast to the values' dtype for its
     product, as fla does. fp32 products are IEEE here (`_dot`'s `ieee`), where the other kernels take
-    BF16x6: the output reads them directly, and at TF32x3, the others' products before, a Qwen3.5
+    fla's one TF32: the output reads them directly, and at TF32x3, the others' products before, a Qwen3.5
     hybrid's fp32 scores on an H100 sat 2.03 times their fp32 reference's distance from float64, 1.17
     at IEEE. The memory the chunk enters is read at its slot (`Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    entered = chunk_ref[2]
+    entered = chunk_ref[tables.column(ChunkSpan, "entered")]
 
     @pl.when(taken > 0)
     def _():
@@ -1146,12 +1132,8 @@ def prefixed_fwd(cumulated, q, k, v, g, beta, h0, cu_seqlens, scale: float, chun
     cumulated in base 2 within each chunk (`recurrence.cumulated`, compensated: its `(hi, lo)` halves,
     separated into the prefix's whole part and fraction, `algebra.separated`, whose differences every
     decay takes exactly), named 'delta_decay' for a block's remat policy, then the port's `cumulated`
-    forward on it (this module's `cumulated_fwd`, or `fla_kda`'s). Where `h0` holds more memories than
-    the rows, each of a row's documents takes and gives back its own (`Sequences`, `cu_seqlens` a row's
-    documents' each)."""
-    rows = q.shape[0]
-    documents = None if h0.shape[0] == rows else h0.shape[0] // rows
-    spans = sequences(rows, q.shape[1], cu_seqlens, chunk=chunk, documents=documents)
+    forward on it (this module's `cumulated_fwd`, or `fla_kda`'s)."""
+    spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
     g = checkpoint_name(recurrence.cumulated(g, scale=RCP_LN2, chunk=chunk, spans=spans, compensated=True,
                                              interpret=interpret),
                         Residual.DELTA_DECAY)

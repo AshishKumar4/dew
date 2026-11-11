@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -45,11 +46,11 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.batch import Coordinates, document_ranks, prefix_sum, real_places, valid_order
+from dew.batch import Coordinates, Forks, document_ranks, prefix_sum, real_places, valid_order
 from dew.nn.dense import Dense
 
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
-from .linear import DepthwiseConv1d, held_conv1d
+from .linear import DepthwiseConv1d, _stream_order, fork_histories, forked_conv, held_conv1d
 from .norms import RMSNorm
 from .precision import at_least_fp32, float32_dot_general, rms_statistics
 from .sharding import declared
@@ -197,14 +198,6 @@ class Engram:
         ids = jnp.concatenate(hashes, axis=-1).astype(jnp.int32)
         return ids + jnp.asarray(offsets, jnp.int32)
 
-    @staticmethod
-    def fork_refusal() -> str:
-        """Why engram's lookups would not compute a document over its ancestors (`dew.batch.Forks`) as
-        its own row does: each token's n-gram hashes the ids before it in the row's order
-        (`EngramHashes`), and a branch's first tokens stand after another document's in a window of
-        forks, where its own row holds its parent's last tokens."""
-        return "engram's n-gram hashes read the ids before each token in the row's order"
-
 
 _MASK64 = (1 << 64) - 1
 _GAMMA = 0x9E3779B97F4A7C15
@@ -278,6 +271,46 @@ def _lookback(compressed, valid, positions, size: int, history=None, stop=None):
     return ids, blocked, history
 
 
+def _forked_lookback(compressed, laid: Coordinates, forks: Forks, size: int, history=None, stop=None):
+    """`_lookback` of a call over `forks` (its `Coordinates.forks`): each real token's compressed id and its
+    `size - 1` predecessors in its chain, its document's real tokens before it, then its ancestors' last
+    (`fork_histories`, the history `forked_conv` reads), a root's the row's start's: `history` `[B, size -
+    1]` (a cached call's, which the call leaves as it was) or none. Returns `([B, S, size] ids, [B, S, size]
+    blocked)`; a padded slot's are blocked."""
+    batch = compressed.shape[0]
+    segments = jnp.asarray(laid.segments, jnp.int32)
+    real = (jnp.ones(segments.shape, bool) if laid.valid is None
+            else jnp.asarray(laid.valid, bool)) & (segments > 0)
+    # The real tokens gathered to the front, each document's a run (`forked_conv`'s order).
+    rank, source = _stream_order(real)
+    compact = jnp.take_along_axis(compressed, source, axis=1, mode='fill', fill_value=_DEAD)
+    documents = jnp.take_along_axis(segments, source, axis=1, mode='fill', fill_value=0)
+    start = (jnp.full((batch, size - 1), _DEAD, jnp.int32) if history is None else history)[..., None]
+    held = fork_histories(compact[..., None], documents, documents > 0, forks, size - 1, start)[..., 0]
+    parents = jnp.asarray(forks.parents, jnp.int32)
+    # Each compact token's document's entering history: its parent's chain's (`Forks.parents`, numbered from
+    # 1, the row's start's 0), as `fork_histories` holds them.
+    document = jnp.maximum(documents - 1, 0)
+    entered = jnp.take_along_axis(held, jnp.take_along_axis(parents, document, axis=1)[..., None], axis=1)
+    columns = jnp.arange(compact.shape[1])[None, :]
+    rows = jnp.arange(batch)[:, None]
+    first = jnp.full(parents.shape, compact.shape[1], jnp.int32).at[rows, document].min(
+        jnp.where(documents > 0, columns, compact.shape[1]))
+    within = columns - jnp.take_along_axis(first, document, axis=1)
+    shifts = jnp.arange(size)
+    own = jnp.take_along_axis(compact[:, None, :], jnp.maximum(columns[..., None] - shifts, 0), axis=2)
+    before = jnp.take_along_axis(entered, jnp.clip(size - 1 + within[..., None] - shifts, 0, size - 2),
+                                 axis=2)
+    ids = jnp.where(within[..., None] >= shifts, own, before)
+    dead = ids == _DEAD
+    if stop is not None:
+        dead = dead | ((ids == stop) & (shifts > 0))
+    blocked = jnp.cumsum(dead, axis=-1) > 0
+    back = jnp.maximum(rank, 0)[..., None]
+    ids, blocked = (jnp.take_along_axis(x, back, axis=1) for x in (ids, blocked))
+    return ids, blocked | ~real[..., None]
+
+
 class EngramHashes(nn.Module):
     """Every engram layer's bucket ids for a call's tokens,
     `[B, S, layers, columns]` (engram.py:153-180).
@@ -288,7 +321,9 @@ class EngramHashes(nn.Module):
     before it, skipping padding and stopping at a row's start, a packed
     document's (its rank in its document, `Coordinates.starts`, whatever logical
     positions the call gives), a `media` position (engram.py:164-166) and, while
-    decoding, where the cached history runs out.
+    decoding, where the cached history runs out. A call over forks hashes each
+    token with its chain's (`_forked_lookback`), a cached one leaving its history
+    as it was.
     """
 
     spec: Engram
@@ -309,6 +344,12 @@ class EngramHashes(nn.Module):
         size = spec.max_ngram_size
         history = held = None
         allocated = False
+        stop = None if spec.stop_token_id is None else table[spec.stop_token_id]
+        if laid.forks is not None:
+            cached = decode and self.has_variable('cache', 'history')
+            history = self.get_variable('cache', 'history') if cached else None
+            ids, blocked = _forked_lookback(compressed, laid, laid.forks, size, history, stop)
+            return spec.hash_ids(ids, blocked, table[spec.pad_token_id])
         if decode:
             allocated = self.has_variable('cache', 'history')
             held = self.variable('cache', 'history', jnp.full, (tokens.shape[0], size - 1), _DEAD, jnp.int32)
@@ -320,7 +361,6 @@ class EngramHashes(nn.Module):
             # Each token's rank in its document bounds its lookback, the packed documents' by their starts.
             real = valid if laid.segments is None else valid & (jnp.asarray(laid.segments) != 0)
             positions = real_places(valid) if laid.starts is None else document_ranks(real, laid.starts)
-        stop = None if spec.stop_token_id is None else table[spec.stop_token_id]
         ids, blocked, history = _lookback(compressed, valid, jnp.asarray(positions), size, history, stop)
         if held is not None and allocated:
             held.value = history
@@ -422,10 +462,13 @@ class PLELayer(nn.Module):
     three norms take each stream's own statistics under one `(1 + w)` weight
     (`RMSNorm(groups=hc_mult)`). The call's padded slots (`call.metadata`) add
     nothing and the conv steps over them and across no document's start
-    (modeling_qwen4_exp.py:1176-1190); under `call.decode` the conv's last
+    (modeling_qwen4_exp.py:1176-1190), a call over forks each document's after
+    its chain's (`forked_conv`); under `call.decode` the conv's last
     `(kernel_size - 1) * dilation` inputs wait in the `cache` collection's
     `conv_state`, which the first decode call only allocates.
     """
+
+    reads: ClassVar[frozenset[str]] = frozenset({"forks"})
 
     rows: int
     head_dim: int
@@ -475,10 +518,16 @@ class PLELayer(nn.Module):
                                  normed.dtype)
             if not allocated:
                 return streams
-        convolved, history = held_conv1d(normed, dilated.astype(normed.dtype), token_mask,
-                                         None if held is None else held.value, segments=segments)
-        if held is not None:
-            held.value = history.astype(held.value.dtype)
+        if tokens.forks is not None:
+            # Each document after its chain's last inputs, a root after the held history; a cached call's
+            # cache left as it was (`forked_conv`).
+            convolved = forked_conv(normed, dilated.astype(normed.dtype), tokens,
+                                    history=None if held is None else held.value)
+        else:
+            convolved, history = held_conv1d(normed, dilated.astype(normed.dtype), token_mask,
+                                             None if held is None else held.value, segments=segments)
+            if held is not None:
+                held.value = history.astype(held.value.dtype)
         return streams + (gated + jnp.asarray(convolved)).reshape(streams.shape).astype(streams.dtype)
 
 

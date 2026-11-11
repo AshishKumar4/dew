@@ -326,7 +326,8 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,
-                unrolled: bool = False, accumulators: tuple = ()) -> None:
+                unrolled: bool = False, accumulators: tuple = (), producer: int | None = None) -> None:
+        del producer  # no producer role of its own
         # A launch's tiles round-robin over its programs, each tile's outputs staged in VMEM and copied out
         # before the next tile's walk.
         del in_flight, unrolled, accumulators

@@ -131,8 +131,8 @@ class DecisionInputs:
         assert self.parents is not None, "a window's documents come with the documents they continue"
         laid = coordinates(segments=self.documents, positions=self.positions,
                            max_segments=self.parents.shape[1], right_padded=True)
-        return dataclasses.replace(laid, forks=Forks(self.parents, depth=self.fork_depth,
-                                                     joint=self.joint_forks))
+        held = self.max_segments * self.fork_depth  # a shared part, or with siblings a chain, a row
+        return dataclasses.replace(laid, forks=Forks(self.parents, self.fork_depth, self.joint_forks, held))
 
     @property
     def question_segments(self) -> jnp.ndarray:

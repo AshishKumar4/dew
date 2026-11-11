@@ -13,10 +13,9 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import recurrence_algebra as algebra
-from dew.nn.kernels.templates import mosaic, resources, swizzling
+from dew.nn.kernels.templates import mosaic, resources
 from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,
@@ -38,29 +37,21 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
 )
 
 
-def shifted_keys(call: Call, tile, keys: jax.Array, prefix: tuple):
-    """A key block's keys and separated prefix (`algebra.separated` of its halves `prefix`) staged in `tile`
-    `[3, SUB + C, block]` below `SUB` rows of any values (a pair they reach is masked), each offset's reads
-    its loads shifted by it (`algebra.Shifted`): rows other threads wrote, so the writes waited on before and
-    after (`mosaic.synced`), and unoptimized, as the reads are (a plain tile takes no optimized transfer from
-    a warpgroup MMA's layout)."""
-    chunk = call.chunk
-    mosaic.synced(call.interpret)
-    for i, value in enumerate((keys, *algebra.separated(*prefix))):
-        plgpu.store(tile.at[i, pl.ds(algebra.SUB, chunk)], value, optimized=False)
-    mosaic.synced(call.interpret)
-    return lambda e: tuple(call.family.tile_of(tile.at[i, pl.ds(algebra.SUB - e, chunk)]) for i in range(3))
+def shifted_keys(call: Call, keys: jax.Array, prefix: tuple):
+    """A key block's keys and separated prefix (`algebra.separated` of its halves `prefix`), each offset's
+    reads them shifted by it (`algebra.Shifted`) in registers (`Issuer.row_shifted`, a sub-chunk a group:
+    the pairs a sub-chunk's own), any value where a row's source precedes its sub-chunk (masked). Staged in
+    shared memory and read shifted, an A100's own pairs lost 74% of their loads' wavefronts to bank
+    conflicts (M-JS-62, row 5305)."""
+    held = (keys, *algebra.separated(*prefix))
+    return lambda e: tuple(call.family.row_shifted(value, e, period=algebra.SUB, interpret=call.interpret)
+                           for value in held)
 
 
-def shifted_up(call: Call, tile, e, value: jax.Array) -> jax.Array:
-    """`value`'s row `i` at row `i - e` (`algebra.key_diagonal_pairs_back`'s `lower`): staged in `tile`
-    `[C + SUB, block]` above `SUB` rows of any values and read shifted, its writes waited on and unoptimized
-    as `shifted_keys`' are."""
-    chunk = call.chunk
-    mosaic.synced(call.interpret)
-    plgpu.store(tile.at[pl.ds(0, chunk)], value, optimized=False)
-    mosaic.synced(call.interpret)
-    return call.family.tile_of(tile.at[pl.ds(e, chunk)])
+def shifted_up(call: Call, e, value: jax.Array) -> jax.Array:
+    """`value`'s row `i` at row `i - e` (`algebra.key_diagonal_pairs_back`'s `lower`), in registers as
+    `shifted_keys`' are, any value where a row's source leaves its sub-chunk (masked)."""
+    return call.family.row_shifted(value, -e, period=algebra.SUB, interpret=call.interpret)
 
 
 def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: tuple[str, ...]) -> tuple:
@@ -90,7 +81,7 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
         views = stream_views(lambda i: (0, i), keys=call.given.views(k_ref, row, chunk, keyed, width),
                              **halves, **({"queries": call.given.views(q_ref, row, chunk, keyed, width)}
                                           if scored else {}))
-        (padded,) = staging
+        del staging
 
         def step(index, slots, bands, accumulators):
             slots.acquire_all()
@@ -101,7 +92,7 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
             prefix = tuple(stream_tile(slots, name, gates).value() for name in ("highs", "lows"))
             found = algebra.key_diagonal_bands(
                 [intra_rows(call, name, operand, beta_ref.at[h, span]) for name in products],
-                shifted_keys(call, padded, operand("keys"), prefix), algebra.separated(*prefix))
+                shifted_keys(call, operand("keys"), prefix), algebra.separated(*prefix))
             bands = tuple(band + more for band, more in zip(bands, found, strict=True))
 
             @pl.when(index == steps - 1)
@@ -140,22 +131,26 @@ def _own_streamed(call: Call, keys: int, *, queries: bool) -> dict:
 
 
 def _own_staged(call: Call, keys: int, *, products: tuple[str, ...]) -> tuple:
-    """`intra_own`'s staging at key block `keys`: the keys and separated prefix below a sub-chunk's rows
-    (`shifted_keys`, read at row offsets no tiling divides, so plain), and each output's store's landing."""
+    """`intra_own`'s staging at key block `keys`: none (its shifted reads in registers, `shifted_keys`), and
+    each output's store's landing."""
+    del keys
     chunk = call.chunk
     landing = {**({"square": dataclasses.replace(call.held, rows=call.rows).landing(chunk, chunk)}
                   if "scores" in products else {}),
                **({"system": systems(call).landing(chunk, chunk)} if "system" in products else {})}
-    return (swizzling.plain((3, algebra.SUB + chunk, keys), jnp.float32),), landing
+    return (), landing
 
 
 def _own_held(call: Call, block: int, outputs: int = 1) -> Held:
     """`intra_own`'s consumer thread at key block `block` forming `outputs` outputs' bands, carried across
     the key blocks: an offset's rows, keys and separated prefix as read, the row's prefix, the decay and a
-    term; at the last step one output's pairs placed `[C, C]` and the placing grids."""
+    term, beside the keys and separated prefix held across the offsets (`shifted_keys`, `Issuer.row_shifted`:
+    ptxas's least spill-free cap at a Kimi Linear call's blocks 200 on an A100 and 184 on an H100 at 3
+    tiles more, 248 and 232 at none, jsf-ownneed); at the last step one output's pairs placed `[C, C]` and
+    the placing grids."""
     chunk = call.chunk
     return Held(carried=[f32(chunk, algebra.SUB)] * outputs, phases=(
-        [f32(chunk, block)] * (outputs + 8),
+        [f32(chunk, block)] * (outputs + 11),
         [f32(chunk, chunk)] * 4))
 
 
@@ -204,7 +199,7 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
     def program(at, q_ref, k_ref, hi_ref, lo_ref, beta_ref, ds_ref, da_ref, taken_ref, dq_ref, dk_ref, dg_ref,
                 db_ref, *, streams, staging, landing):
         del taken_ref
-        behind, ahead = staging
+        del staging
         n, h = at["chunks"], at["heads"]
         row, span = n * chunk, pl.ds(n * chunk, chunk)
         views = pairs_back_views(call, row, h, q_ref, k_ref, hi_ref, lo_ref, ds_ref, da_ref)
@@ -228,7 +223,7 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
             (d_query, d_keyed), d_key = algebra.key_diagonal_pairs_back(
                 d_loads, [functools.partial(rows, "queries"), lambda: rows("keys") * betas[:, None]],
                 algebra.separated(*prefix),
-                shifted_keys(call, behind, key, prefix), functools.partial(shifted_up, call, ahead),
+                shifted_keys(call, key, prefix), functools.partial(shifted_up, call),
                 (zero, zero), zero)
             d_betas = d_betas + pairs_back_stored(
                 call, (dq_ref, dk_ref, dg_ref), (row, h * width + index * keys), keys, landing["block"],
@@ -266,19 +261,18 @@ def _key_own_streamed(call: Call, keys: int) -> dict:
 
 
 def _key_own_staged(call: Call, keys: int) -> tuple:
-    """`key_pairs_own`'s staging at key block `keys`: the keys and separated prefix below a sub-chunk's rows
-    (`shifted_keys`) and a tile above them (`shifted_up`), read at row offsets no tiling
-    divides, so plain; a key block's landing."""
-    chunk = call.chunk
-    return ((swizzling.plain((3, algebra.SUB + chunk, keys), jnp.float32),
-             swizzling.plain((chunk + algebra.SUB, keys), jnp.float32)),
-            {"block": fp32_operand(call).landing(chunk, keys)})
+    """`key_pairs_own`'s staging at key block `keys`: none (its shifted reads in registers, `shifted_keys`,
+    `shifted_up`); a key block's landing."""
+    return (), {"block": fp32_operand(call).landing(call.chunk, keys)}
 
 
 def _key_own_held(call: Call, keys: int) -> Held:
     """`key_pairs_own`'s consumer thread at key block `keys`, as an sm100's lowered peak counts it (row 5298,
     jsf-sm100-backward): the write gates' terms carried, a row's vector; at an offset's shifted loads the
-    three gradients carried, the separated prefix's two tiles and the three shifted loads, the queries and
+    three gradients carried, the separated prefix's two tiles and the three shifted reads (`shifted_keys`:
+    their sources held across the offsets in the registers the shared memory's loads took, ptxas's least
+    spill-free cap at a Kimi Linear call's block within this count, 224 on a B200, 160 on an H100,
+    jsf-ownneed), the queries and
     keys as read, the square bands' coordinates and masks and a row's vector; at its bands' reads seven of
     those tiles, a pairs' gradient `[C, C]` where products read shared memory (beside them in registers
     where they read registers), the queries and keys and three row vectors."""

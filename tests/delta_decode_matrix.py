@@ -30,14 +30,16 @@ from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation
 from dew.nn.kernels.selection import KernelRefused
-from dew.nn.linear import decode_kernel
+from dew.nn.linear import DELTA_DECODE, decode_kernel
 from dew.nn.mixers.mamba2 import Mamba2
 
-CHOICES = frozenset({"delta_decode"})
-"""The generation.CHOICES entries the family's cells run (row 184)."""
+CHOICES = frozenset({DELTA_DECODE.choice})
+"""The generation.CHOICES entries the family's cells run (row 184): the decode selector's."""
 
-KERNELS = {"delta_decode": frozenset({"fused", "step"})}
-"""The kernels each choice's cells run under test (row 4513): the fused step and the step."""
+KERNELS = {DELTA_DECODE.choice: frozenset(kernel.name for kernel in DELTA_DECODE.kernels
+                                          if not kernel.generic)}
+"""The kernels each choice's cells run under test (row 4513), its selector's every kernel but the generic
+one each is held to: the fused step and the step."""
 
 REFERENCES = {"grouped_matmul": "xla", "rms_norm": "xla", "short_conv": "xla", "delta_gates": "apart"}
 """The other choices a layer's decode token reaches, each at its generic kernel: its projections, its
@@ -181,21 +183,36 @@ def a_decode_token_is_on_par(case: tuple[str, ...]) -> None:
     on_par(case)
 
 
-def on_par(case: tuple[str, ...]) -> None:
+def initialized(name: str, **fields) -> Layer:
+    """`LAYERS[name]`, a layer its draw initializes (`_drawn_of`), with its module's `fields` replaced: a
+    configuration the matrix's axes do not span (Mamba-2 without its conv's bias)."""
+    layer = LAYERS[name]
+
+    def make(*args, **options):
+        return layer.make(*args, **options).clone(**fields)
+
+    return dataclasses.replace(layer, make=make, drawn=_drawn_of(make))
+
+
+def on_par(case: tuple[str, ...], layer: Layer | None = None) -> None:
     """A layer's `DECODED` decode tokens of `case` on its kernel (interpreted off a GPU), on par with the
     portable step's (check 1, the layer in float64 the truth: a bf16 layer on widened arguments fixes its
     projections and norm in bf16 and casts its state back, so only the stored state's rounding is the
     contract's); the routes its tokens took, each choice and kernel, its family's (`CHOICES`) at the case's
-    kernel and every other choice's at its reference (`REFERENCES`)."""
+    kernel and every other choice's at its reference (`REFERENCES`). `layer` the case's own where None, else
+    another configuration of it (`initialized`)."""
     named = dict(zip(AXES["delta_decode"], case, strict=True))
-    layer = LAYERS[named["layer"]]
+    layer = LAYERS[named["layer"]] if layer is None else layer
     held = jnp.dtype(named["state"])
     module = layer.make()
+    draw = functools.partial(layer.drawn, held=held)
+    # Its routes read from one draw's tokens: a check-1 site's judge pools its map tasks' records, running
+    # none.
     found = []
-    assert_as_exact(_decoded(module, named["kernel"], layer.state, found),
-                    _decoded(module, "xla", layer.state), functools.partial(layer.drawn, held=held),
-                    "-".join(case), seeds=FEWEST_SEEDS,
-                    truth_fn=_decoded(module.clone(dtype=jnp.float64), "xla", layer.state))
+    _decoded(module, named["kernel"], layer.state, found)(*draw(0))
     taken = _choices(found)
     assert all(choice in CHOICES or REFERENCES.get(choice) == kernel for choice, kernel in taken), taken
-    assert ("delta_decode", named["kernel"]) in taken
+    assert (DELTA_DECODE.choice, named["kernel"]) in taken
+    assert_as_exact(_decoded(module, named["kernel"], layer.state), _decoded(module, "xla", layer.state),
+                    draw, "-".join(case), seeds=FEWEST_SEEDS,
+                    truth_fn=_decoded(module.clone(dtype=jnp.float64), "xla", layer.state))

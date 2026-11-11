@@ -93,7 +93,7 @@ class TreeBlock(NamedTuple):
         segments = jnp.broadcast_to(jnp.arange(1, fed + 1, dtype=jnp.int32), (rows, fed))
         parents = np.asarray([0, *(parent + 2 for parent in self.shape.parents)], np.int32)
         forks = Forks(jnp.broadcast_to(jnp.asarray(parents), (rows, fed)),
-                      depth=Forks.depth_of(parents[None]))
+                      depth=Forks.depth_of(parents[None]), held=Forks.held_of(parents[None]))
         laid = coordinates(segments=segments, valid=valid,
                            positions=forks.positions(segments, self.base, valid), max_segments=fed)
         return dataclasses.replace(laid, forks=forks)

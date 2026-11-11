@@ -162,11 +162,12 @@ class LightningAttention(nn.Module):
         if tokens.forks is not None:
             # Each document from the memory its parent leaves, a root from the row's; a cached call's memory
             # left as it was.
-            def forked_rule(heads, *, valid, starts, state, entered):
+            def forked_rule(heads, *, valid, starts, state, loads, stores, held):
                 queries, keys, values = heads
                 return chunk(LIGHTNING, Chunk(queries, keys, jnp.where(valid[:, :, None, None], values, 0),
                                               log_decay=jnp.where(valid[:, :, None], log_decay, 0.0),
-                                              state=state, starts=starts, entered=entered),
+                                              state=state, starts=starts, loads=loads, stores=stores,
+                                              held=held),
                              chunk_size=self.chunk_size, max_segments=tokens.max_segments)
 
             start = fork_start(None if held is None else held.value,

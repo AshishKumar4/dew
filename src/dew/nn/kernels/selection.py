@@ -111,12 +111,14 @@ def analysed[C](code: str, analysis: Callable[[C], Refusal | None], row: str,
 
 @dataclasses.dataclass(frozen=True)
 class Kernel[C]:
-    """A kernel an op may run: `supports`, its requirements in the order a refusal names them, and
-    whether it is `generic`, a path that takes what the others turn down."""
+    """A kernel an op may run: `supports`, its requirements in the order a refusal names them, whether
+    it is `generic`, a path that takes what the others turn down, and the `upstream` library whose kernels
+    it reproduces where it is a port (its contract: 'fla', 'mamba_ssm'), None for Dew's own."""
 
     name: str
     supports: tuple[Requirement[C], ...]
     generic: bool = False
+    upstream: str | None = None
 
     def refusals(self, case: C, forced: bool = False) -> Iterator[Refusal]:
         """The refusals `case` gets of the kernel's requirements, in their order, each requirement evaluated

@@ -15,8 +15,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels import recurrence_algebra as algebra
-from dew.nn.kernels.templates import mosaic, product, swizzling
+from dew.nn.kernels import recurrence_algebra as algebra, tables
+from dew.nn.kernels.templates import mosaic, product, resources, swizzling
 from dew.nn.kernels.templates.cost import Work
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence import own_pairs
@@ -25,18 +25,19 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     Call,
     Held,
     Operand,
+    Walked,
     chunk_liveness,
     column_sums,
     column_sums_scratch,
     column_tile,
     f32,
     fp32_operand,
-    fragments,
     held_tile,
     key_block,
     launch_kernel,
     lowered_once,
     masks,
+    product_fragments,
     product_results,
     staged_parts,
     staging_tiles,
@@ -44,6 +45,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     stream_tile,
     stream_views,
 )
+from dew.nn.kernels.templates.resources import largest_live_set
 
 
 def _parted(call: Call) -> Operand:
@@ -109,10 +111,13 @@ def _key_scores_back(scores, do, corrected, taken, call: Call):
     # (jsf-three-back: 90 registers against an H100's need of 112), a tensor memory read's beside them, and
     # mma.sync's two (one stated, an A100 claimed 3 programs at 152 registers, whose cap spilled, jsf-owncap).
     accumulators = {"fragments": 2, "registers": 2, "tensor": 3}[product_results(call)]
+    # The output's gradient against the corrected values read transposed ('values_ds'); then the scores
+    # (read transposed) against it ('local_dv', `algebra.key_scores_back`).
     held_tiles = Held(carried=[f32(chunk, chunk)], phases=(
-        masks(chunk, chunk) + fragments(call, (given, chunk, vb), (held, chunk, vb)),
+        masks(chunk, chunk)
+        + product_fragments(call, (given, chunk, vb), (held, vb, chunk), rhs_transposed=True),
         [f32(chunk, vb)] * accumulators + held_tile(grads, chunk, vb)
-        + fragments(call, (held, chunk, chunk), (given, chunk, vb))))
+        + product_fragments(call, (held, chunk, chunk), (given, chunk, vb))))
     return launch_kernel(program, call,
                          out_type=(square.shape(call.heads * chunk), grads.shape(call.heads * value_width)),
                          grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=tiles,
@@ -301,11 +306,20 @@ def _key_values_held(call: Call) -> Held:
     (`algebra.key_system_back`)."""
     chunk, vb = call.chunk, call.value_block
     held = dataclasses.replace(call.held, rows=call.rows)
+    # In turn: the inverse (read transposed) against a value block's gradient, that gradient against the
+    # gated values read transposed ('values_merge'); then the system's gradient against the inverse read
+    # transposed, the inverse (read transposed) against their product ('system_merge').
     return Held(phases=(
-        [f32(chunk, chunk)] * 2 + [f32(chunk, vb)] * 3 + held_tile(held, chunk, vb)
-        + fragments(call, (held, chunk, chunk), (held, chunk, vb)),
-        [f32(chunk, chunk)] * 3 + masks(chunk, chunk) + held_tile(held, chunk, chunk)
-        + fragments(call, (held, chunk, chunk), (held, chunk, chunk))))
+        [f32(chunk, chunk)] * 2 + [f32(chunk, vb)] * 3
+        + largest_live_set(
+            product_fragments(call, (held, chunk, chunk), (held, chunk, vb)),
+            product_fragments(call, (held, chunk, vb), (held, vb, chunk), rhs_transposed=True,
+                              rhs_staged=True)),
+        [f32(chunk, chunk)] * 3 + masks(chunk, chunk)
+        + largest_live_set(
+            product_fragments(call, (held, chunk, chunk), (held, chunk, chunk), rhs_transposed=True,
+                              lhs_staged=True),
+            product_fragments(call, (held, chunk, chunk), (held, chunk, chunk), rhs_staged=True))))
 
 
 def _key_memory_held(call: Call, keys: int) -> Held:
@@ -318,11 +332,22 @@ def _key_memory_held(call: Call, keys: int) -> Held:
     # The system's update a second square around the merge where warpgroup accumulators hold it
     # (jsf-three-back: 208 registers against an H100's need of 240).
     merged = 2 if product_results(call) == "registers" else 1
+    from dew.nn.kernels.templates.recurrence.mainloop_backward import _value_grads
+
+    vb = call.value_block
+    # In turn: the output's gradient, the corrected values and their gradient against the memories entered
+    # and leaving, read transposed ('memory_dq', 'memory_dk', 'memory_dw'); then the inverse (read
+    # transposed) against the weights' gradient, that against the gated keys read transposed
+    # ('weights_merge', `algebra.key_memory_block`).
+    memory = largest_live_set(
+        *(product_fragments(call, (operand, chunk, vb), (memories, vb, keys), rhs_transposed=True)
+          for operand in (given, held, _value_grads(call))))
+    merging = largest_live_set(
+        product_fragments(call, (held, chunk, chunk), (held, chunk, keys)),
+        product_fragments(call, (held, chunk, keys), (held, keys, chunk), rhs_transposed=True))
     return Held(carried=[f32(chunk, chunk), f32(chunk, 1)], phases=(
-        [f32(chunk, keys)] * 3
-        + fragments(call, (given, chunk, call.value_block), (memories, keys, call.value_block)),
-        [f32(chunk, keys)] * 7 + held_tile(held, chunk, keys) * 2 + [f32(chunk, chunk)] * merged
-        + fragments(call, (held, chunk, chunk), (held, chunk, keys))))
+        [f32(chunk, keys)] * 3 + memory,
+        [f32(chunk, keys)] * 7 + held_tile(held, chunk, keys) * 2 + [f32(chunk, chunk)] * merged + merging))
 
 
 def _square_landing(call: Call, keys: int) -> str:
@@ -463,9 +488,17 @@ def _key_pairs_held(call: Call, keys: int) -> Held:
     parted = _parted(call)
     # As an sm100's lowered peak counts it (row 5298, jsf-sm100-backward): nine tiles a block, their masks,
     # the rows' parts, and a product's fragments with mma.sync's right operand loaded ahead.
+    # In turn: a pair's gradient against the keys raised; a sub-chunk's (read transposed) against its gated
+    # rows (`algebra.key_decayed_pairs_back`); with the first's right operand loaded ahead.
+    ahead = resources.operand_fragments(call.family, chunk, chunk, keys,
+                                        resources.OperandRead(parted.stored, parts=0),
+                                        resources.OperandRead.of(parted))
     return Held(carried=[f32(chunk, 1)], phases=(
         [f32(chunk, keys)] * 9 + masks(chunk, keys) * 2 + held_tile(parted, chunk, keys)
-        + fragments(call, (parted, chunk, chunk), (parted, chunk, keys), (parted, chunk, keys)),))
+        + largest_live_set(
+            product_fragments(call, (parted, chunk, chunk), (parted, chunk, keys)),
+            product_fragments(call, (parted, chunk, algebra.SUB), (parted, algebra.SUB, keys)))
+        + ahead,))
 
 
 class KeyKept(NamedTuple):
@@ -502,19 +535,45 @@ class KeyKept(NamedTuple):
     through the pairs, summed."""
 
 
-def _first_decays(dg, run, dh0):
-    """`dg` `[R, HV * Dk]` with each sequence's first token's taken from the memory its decay scales, as
-    fla_kda's port takes it (`fla_kda.first_decay_grad`): `<h0, dh0>` over the values for a sequence that
-    takes its memory (begins its row, or a document entering its own), exactly zero for any other, which
-    starts from no memory. Cumulated from its chunk's end, that token's gradient is every term of its chunk,
-    which cancel to fp32's residue where the memory is zero: rows of float64 zero 1.5e-7 from it against fla's
-    3.3e-9 (row 5194, M-JS-26-a100)."""
+def _first_decays(dg, run, dh0, taken=None):
+    """`dg` `[R, HV * Dk]` with each sequence's first token's taken from the memory its decay scales
+    (`algebra.first_decays`, as fla_kda's port takes it): `<h0, dh0>` for a sequence that takes its memory
+    (begins its row), at its first chunk's first row. A forked call's documents each take theirs up at a
+    chunk's first token (`table.Table.loads`): `<h, taken>` there, the memory the chunk took up in fp32
+    (`_taken_memories`, as the walk took it, not its 16-bit copy the states launch stored) and its gradient
+    (`taken`, the reverse walk's)."""
     call = run.call
-    shared = jnp.sum(run.h0 * dh0, axis=-1).reshape(run.memories, -1)
-    first, sizes, row, begins = (run.sequences[:, i] for i in range(4))
-    value = jnp.where((begins == 1)[:, None], shared[row], 0.0)
-    index = jnp.where(sizes > 0, first * call.chunk, call.rows)
-    return dg.at[index].set(value.astype(dg.dtype), mode="drop")
+    walked = tables.unpacked(Walked, lambda i: run.sequences[:, i])
+    dg = algebra.first_decays(dg, run.h0, dh0, walked.first * call.chunk, walked.row, walked.takes == 1,
+                              walked.chunks > 0)
+    if taken is None:
+        return dg
+    chunks = jnp.arange(call.chunks)
+    took = run.table.loads >= 0
+    return algebra.first_decays(dg, _taken_memories(run), taken, chunks * call.chunk, chunks, took, took)
+
+
+def _taken_memories(run) -> jax.Array:
+    """The memory each chunk of a forked call took up `[chunks * HV * Dk, Dv]` fp32, as its walk formed it
+    (`table.Taking`): its given or stored slot's (`table.Table.loads`; the forward's stored finals,
+    `run.stored`), its entry write added; zero at a chunk that took none up."""
+    call, table = run.call, run.table
+    slots = call.heads * call.width
+    per_row = call.chunks // run.batch
+
+    def by_row(memories):
+        return memories.reshape(run.batch, -1, slots, memories.shape[-1])
+
+    held = [] if run.stored is None else [by_row(run.stored)]
+    given = by_row(table.given)
+    # Slot zero a zero memory, then the given slots and the stored ones, one-based as `loads` counts them.
+    slotted = jnp.concatenate([jnp.zeros_like(given[:, :1]), given, *held], axis=1)
+    loads = table.loads.reshape(run.batch, per_row)
+    memories = jnp.take_along_axis(slotted, jnp.maximum(loads, 0)[..., None, None], axis=1)
+    memories = memories.reshape(-1, memories.shape[-1])
+    if table.entries is not None:
+        memories = memories + table.entries
+    return jnp.where((table.loads >= 0).repeat(slots)[:, None], memories, 0.0)
 
 
 def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
@@ -525,7 +584,8 @@ def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
     (XLA's, `algebra.key_gated`'s), the memory's and WY part and the pairs' part, summed; the log decay's
     gradient each token's terms, the memory decay's on each chunk's last token (`_reverse`'s fourth),
     cumulated from the chunk's end (its prefix is the chunk's own), a key head's value heads' queries' and
-    keys' gradients summed. Returns them with each launch's outputs as stored (`KeyKept`)."""
+    keys' gradients summed. Returns them, and a forked call's gradient of the memory each chunk takes up
+    (`_reverse`'s table output, None for another), with each launch's outputs as stored (`KeyKept`)."""
     from dew.nn.kernels.templates.recurrence.mainloop_backward import _reverse
 
     call = run.call
@@ -535,8 +595,10 @@ def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
     query = jnp.repeat(query.reshape(rows, heads // group, width), group, axis=1).reshape(rows, heads * width)
     gated = held.split(algebra.key_gated(query, (run.hi, run.lo), run.scale))
     d_scores, local = _key_scores_back(run.scores, laid_do, run.corrected, run.taken, call)
-    dh, dv2, dh0, decayed = _reverse(gated, run.keys, run.w, laid_do, local, run.hi, run.lo, dht,
-                                     run.sequences, None, None, call, tiles, scale=run.scale, memory=run.h)
+    dh, dv2, dh0, decayed, *taken = _reverse(gated, run.keys, run.w, laid_do, local, run.hi, run.lo, dht,
+                                             run.sequences, None, None, call, tiles, scale=run.scale,
+                                             memory=run.h, table=run.table)
+    taken = taken[0] if taken else None
     dq_m, dk_m, dg_m, d_weights, dbeta_m = _key_memory_back(
         run.q, run.k, run.hi, run.lo, laid_do, run.corrected, dv2, run.h, dh, run.a, run.beta, run.taken,
         call, scale=run.scale)
@@ -552,7 +614,7 @@ def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
     last = tuple(x.reshape(call.chunks, call.chunk, heads * width)[:, -1] for x in (run.hi, run.lo))
     terms = terms.at[:, -1].add(decayed.sum(0).reshape(call.chunks, -1) * algebra.raised(*last))
     dg = jnp.flip(jnp.cumsum(jnp.flip(terms, 1), 1), 1).reshape(rows, heads * width)
-    dg = _first_decays(dg, run, dh0)
+    dg = _first_decays(dg, run, dh0, taken)
 
     def keyed(x):
         """A value head's gradient `[R, HV * Dk]` summed onto its key head's `[R, H * Dk]`."""
@@ -560,4 +622,4 @@ def gradients(run, laid_do, dht, tiles) -> tuple[tuple, KeyKept]:
 
     kept = KeyKept(run, d_scores, local, dh, dv2, dh0, decayed, dq_m, dk_m, dg_m, d_weights, dbeta_m, dv,
                    d_system, dbeta_v, dq_p, dk_p, dg_p, dbeta_p)
-    return (keyed(dq_m + dq_p), keyed(dk_m + dk_p), dv, dg, (dbeta_m + dbeta_v + dbeta_p).T, dh0), kept
+    return (keyed(dq_m + dq_p), keyed(dk_m + dk_p), dv, dg, (dbeta_m + dbeta_v + dbeta_p).T, dh0, taken), kept
