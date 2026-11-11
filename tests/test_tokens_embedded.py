@@ -135,13 +135,18 @@ def test_a_masked_run_whose_mask_id_is_outside_its_models_table_is_refused_as_it
 def test_rows_given_already_placed_are_bounded_where_they_lie():
     """A batch a caller places itself (device arrays, an in-memory run's) is bounded as a host batch is
     (`Field.bounded`): an id outside the table refused, naming it, every id within it passing, and an id
-    the model replaces before its table reads it passing too."""
+    the model replaces before its table reads it passing too, the valid batch read back by its two bounds
+    alone."""
     import jax.numpy as jnp
 
     from dew.inputs import Field
 
     field = Field("tokens", (4,), rows=ROWS, replaced=frozenset({ROWS + 7}))
-    field.bounded(jnp.asarray([[1, 2, ROWS - 1, ROWS + 7]], jnp.int32))
+    valid = jnp.asarray([[1, 2, ROWS - 1, ROWS + 7]], jnp.int32)
+    # A valid batch, a replaced id past the table among it, reads back its two bounds alone (explicitly),
+    # never the batch whole (an implicit read-back, which the guard refuses).
+    with jax.transfer_guard_device_to_host("disallow"):
+        field.bounded(valid)
     with pytest.raises(OutsideTable) as refused:
         field.bounded(jnp.asarray([[1, ROWS + 3, 2, 3]], jnp.int32))
     assert (refused.value.token, refused.value.rows) == (ROWS + 3, ROWS)

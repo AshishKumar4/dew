@@ -108,7 +108,10 @@ class Field:
         if isinstance(held, jax.Array):
             if held.size == 0 or not jnp.issubdtype(held.dtype, jnp.integer):
                 return
-            low, high = (int(bound) for bound in jax.device_get((jnp.min(held), jnp.max(held))))
+            # The ids its model replaces counted as a row's, so a valid batch reads back two scalars alone.
+            kept = (held if not self.replaced
+                    else jnp.where(jnp.isin(held, jnp.asarray(sorted(self.replaced), held.dtype)), 0, held))
+            low, high = (int(bound) for bound in jax.device_get((jnp.min(kept), jnp.max(kept))))
             if low >= 0 and high < self.rows:
                 return
         ids = np.asarray(held)
