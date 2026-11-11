@@ -508,7 +508,9 @@ def test_a_tier_cut_groups_green_row_is_reused_while_its_cut_holds_the_same_test
     # it read and wrote, and its row would keep no key.
     (tmp_path / "tests/test_long.py").write_text("import os\nfrom pathlib import Path\n" + "".join(
         f"def test_{name}():\n    Path(f'ran-{name}-{{os.getpid()}}').write_text('')\n" for name in names))
-    weights = tmp_path / "gpu-seconds.json"
+    # The tier's seconds, outside the checkout as a node's session keeps them: within it, the record a run's
+    # split read would be an input of its row, and other seconds another key.
+    weights = tmp_path.with_name(f"{tmp_path.name}-gpu-seconds.json")
     monkeypatch.setenv("DEW_SPLIT_DURATIONS", str(weights))
     interpreter(tmp_path, "3.12")
     fetcher(tmp_path)
