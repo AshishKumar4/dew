@@ -5,6 +5,7 @@ whose barriers count the arrivals of the roles that fill and give back each."""
 from __future__ import annotations
 
 import dataclasses
+import itertools
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -165,7 +166,7 @@ class Schedule:
                         body()
 
         if not exclusive:
-            for start, bound, branch in zip((0, *bounds[:-1]), bounds, branches, strict=True):
+            for (start, bound), branch in zip(itertools.pairwise((0, *bounds)), branches, strict=True):
                 pl.when(wg < bound if start == 0 else (wg >= start) & (wg < bound))(branch)
             if lowered:
                 pl.when(wg == first)(lower)
