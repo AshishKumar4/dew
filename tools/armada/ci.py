@@ -171,6 +171,9 @@ host = _loaded(HERE / "host.py")
 stalls = _loaded(HERE / "stalls.py")
 costs = _loaded(HERE / "costs.py")
 command_line = _loaded(HERE / "arguments.py")
+rows = _loaded(HERE / "rows.py")
+row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
+VARIED, varied, cut_of = rows.VARIED, rows.varied, rows.cut_of
 # The names the land queue's tools read from this module at every commit they run (land.sh's `ci.STALE`,
 # run_tests.py's `node_of`), older commits' and newer alike.
 STALE, node_of = grading.STALE, grading.node_of
@@ -473,16 +476,6 @@ def record_key(python: str, row_name: str, held: str, inputs: str | None = None)
     return f"{at}/{row_place(row_name, held)}"
 
 
-def row_place(row_name: str, held: str) -> str:
-    """Row `row_name`'s place on class `held` under a record prefix: `<class>/<test file>/<group>`, a group
-    `whole` or a split's `<index>-of-<count>` (`key_parts`), a process variant's (`varied`) with
-    `-as-<variant>` after it, in the Worker's key alphabet."""
-    _, name, split = parsed_row(row_name)
-    variant = split.partition(VARIED)[2]
-    return (f"{held}/{name}/" + ("-of-".join(cut.split("/")) if (cut := cut_of(split)) else "whole")
-            + (f"-as-{variant}" if variant else ""))
-
-
 def green_key(python: str, row_name: str, held: str, key: str) -> str:
     """Where row `row_name`'s green run on class `held` whose inputs hash to `key` (`cache_key`) is kept,
     apart from the last run's record (`record_key`): every green run of a row on any inputs stays found by
@@ -492,14 +485,6 @@ def green_key(python: str, row_name: str, held: str, key: str) -> str:
     before them and so their keys (`executed.py`): kept by the key alone, one file's run stood for each of
     them (2026-10-30: a kept task reported one file's row for six files)."""
     return f"{CACHE_PREFIX}-green/{python}/{row_place(row_name, held)}/{key}"
-
-
-def key_parts(key: str) -> tuple[str, str, str]:
-    """A record's key under its Python's prefix (`record_key`'s `<class>/<test file>/<group>`) as its class,
-    its test file and its group (`whole`, or a split's `<index>-of-<count>`)."""
-    held, rest = key.split("/", 1)
-    name, group = rest.rsplit("/", 1)
-    return held, name, group
 
 
 def recorded(key: str, token: str) -> dict | None:
@@ -750,32 +735,6 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
     slower = ratios[len(ratios) // 2] if ratios else 1.0
     return {name: max(measured[name], recorded.get(name, 0.0)) if name in measured
             else recorded[name] * slower if name in recorded else None for name in files}
-
-
-def row(python: str, name: str, split: str) -> str:
-    return f"{python}:{name}" + (f"#{split}" if split else "")
-
-
-def parsed_row(row_name: str) -> tuple[str, str, str]:
-    """`row`'s (python, name, split) back from its name."""
-    python, rest = row_name.split(":", 1)
-    name, _, split = rest.partition("#")
-    return python, name, split
-
-
-VARIED = "@"
-"""What sets a process variant's name apart in a GPU lane's test name and in its rows' group (`varied`,
-`lane_units`): `<file>#G/N@users`, a whole file's `<file>#@users`."""
-
-
-def varied(group: str, variant: str) -> str:
-    """A row's group (`row`) for the process `variant` of it: the group's own, the lane's process."""
-    return f"{group}{VARIED}{variant}" if variant else group
-
-
-def cut_of(group: str) -> str:
-    """The cut a row's group names ("G/N"; none, a whole file's), whichever process ran it (`varied`)."""
-    return group.partition(VARIED)[0]
 
 
 def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> list[float]:
@@ -2030,12 +1989,16 @@ def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
     return share, min(share * (1 + recorded.get("shares", 0)) + recorded.get("pools", 0), budget)
 
 
-def borrowed_records(names: list[str], python: str, held: str, token: str) -> dict[str, dict]:
+def borrowed_records(names: list[str], python: str, held: str, token: str,
+                     strict: bool = False) -> dict[str, dict]:
     """For each of `names`, test files no run on class `held` measured, the last record of the whole
     file on another class whose run measured its GPU peak, the one that holds the most
     (`gpu_needs`): what a file has taken on a GPU, which a first lane on a class takes as its share.
     One no class measured is absent, as every one is where the Worker does not list its records. Its run on
-    `held` records its own, which every later lane reads."""
+    `held` records its own, which every later lane reads. With `strict`, a read the Worker does not answer is
+    an `r2.R2Error`, never a file taken for unmeasured: what sizes a job before it runs (gpu_holds.py) is read
+    whole or not at all (2026-11-11: one record's read did not come back as a GPU tier was composed, its part
+    took the default for a file measured at 5.9 GiB, and the file ran out of a 4 GiB lane)."""
     if not names:
         return {}
     prefix = f"{CACHE_PREFIX}/{python}/"
@@ -2045,6 +2008,8 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
     # The Worker did not list its records: borrowing only packs a lane, so each such file runs alone with the
     # lane's whole share, as one measured on no class does.
     except r2.R2Error as error:
+        if strict:
+            raise
         print(f"the test cache did not list {prefix}: {error}; files unmeasured here run alone",
               file=sys.stderr)
         return {}
@@ -2052,6 +2017,9 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
             if (parts := key_parts(key))[0] != held and parts[2] == "whole" and parts[1] in wanted]
 
     def read(key: str) -> tuple[str, dict | None]:
+        if strict:
+            found = store(token).get(f"{prefix}{key}")
+            return key_parts(key)[1], None if found is None else json.loads(found)
         return key_parts(key)[1], recorded(f"{prefix}{key}", token)
 
     def holds(found: dict) -> float:
