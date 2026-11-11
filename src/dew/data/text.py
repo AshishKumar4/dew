@@ -723,12 +723,10 @@ class Decontaminated(Curated):
 
     def curator(self) -> BaseFilter:
         from datatrove.pipeline.decont import NGramsDecontConfig, NGramsDecontFilter
-        from datatrove.utils.hashes.xxhash import xxhash64
         from datatrove.utils.text import ngrams, simplify_text
 
         from dew._files import write_atomically
 
-        # DataTrove's default hash, xxhash at 64 bits, which the filter hashes each n-gram with.
         config = NGramsDecontConfig(n_grams=self.n)
         held = hashlib.sha256(json.dumps([self.n, self.against]).encode()).hexdigest()
         folder = Path(tempfile.gettempdir()) / "dew-decontamination" / held
@@ -736,7 +734,8 @@ class Decontaminated(Curated):
         # The index the filter reads, each n-gram split, joined and hashed as its own filter reads a document.
         words = [decontaminate.tokenizer.word_tokenize(simplify_text(text, config.norm_config))
                  for text in self.against]
-        hashes = {xxhash64(" ".join(gram)) for row in words for gram in ngrams(row, self.n)}
+        # Each hashed by the function the filter hashes a document's n-grams with (`hash_func`).
+        hashes = {decontaminate.hash_func(" ".join(gram)) for row in words for gram in ngrams(row, self.n)}
         folder.mkdir(parents=True, exist_ok=True)
         write_atomically(folder / "against.index.hashes",
                          np.array(sorted(hashes), dtype=config.hash_config.np_descr).tobytes())
