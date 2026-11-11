@@ -404,7 +404,9 @@ def test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted(device, page
     """A decode step over a quantized cache (`dew.nn.kv_cache.quantize`: codes a token and head, each with its
     fp32 scale), its codes read and dequantized in the walk (`attention_decode.attend`'s `scales`, ledger
     3624), dense or paged (`QUANTIZED`), on par with the reference path over the keys and values the cache
-    dequantizes them to (check 1), as an H100 and an A100 run it."""
+    dequantizes them to (check 1), as an H100 and an A100 run it. The cache's codes and scales are drawn, the
+    format's own (`quantize` of drawn keys and values): the truth reads them as they lie, each value its
+    code times its scale."""
     from dew.nn.kv_cache import dequantize, quantize
 
     positions, heads, kv_heads = CALLS["one-query"]
@@ -420,8 +422,7 @@ def test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted(device, page
         pool = jnp.zeros((kv_heads, 2 * per_row, page, *rows.shape[3:]), rows.dtype)
         return pool.at[:, table].set(held)
 
-    def ours(query, key, value):
-        (k_codes, k_scale), (v_codes, v_scale) = (quantize(array, stored) for array in (key, value))
+    def ours(query, k_codes, k_scale, v_codes, v_scale):
         scales = tuple(jnp.swapaxes(scale, 1, 2) for scale in (k_scale, v_scale))
         with generation.assumed(device):
             if layout == "dense":
@@ -429,13 +430,13 @@ def test_a_decode_step_over_a_quantized_cache_is_on_par_interpreted(device, page
             return attention_decode.attend(query, pooled(k_codes), pooled(v_codes), spans, interpret=True,
                                            table=table, scales=scales)
 
-    def reference(query, key, value):
-        dequantized = (dequantize(*quantize(array, stored), query.dtype) for array in (key, value))
-        return template.reference(query, *dequantized, spans)
+    def reference(query, k_codes, k_scale, v_codes, v_scale):
+        return template.reference(query, dequantize(k_codes, k_scale, query.dtype),
+                                  dequantize(v_codes, v_scale, query.dtype), spans)
 
     def draw(seed: int):
         query, key, value, _ = _drawn(positions, heads, kv_heads, jnp.bfloat16)(seed)
-        return query, key, value
+        return query, *quantize(key, stored), *quantize(value, stored)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
                     f"quantized decode {layout} {page} {stored} {device}", seeds=SEEDS)

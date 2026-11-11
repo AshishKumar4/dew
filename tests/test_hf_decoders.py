@@ -1336,10 +1336,9 @@ def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, de
                                                  variables['params'], gradients)}
     before = model.apply(variables, ids, **fields)
     after = model.apply(trained, ids, **fields)
-    with pytest.raises(AssertionError):
-        assert_as_exact(lambda seed: after, lambda seed: before,
-                        lambda seed: (np.asarray(seed, np.int32),), name + ' update negative control',
-                        truth_fn=lambda seed: np.asarray(before, np.float64), seeds=8)
+    # The update moves the logits, so the reload below, the trained model's bit for bit, could not pass
+    # holding the source's values.
+    assert not np.array_equal(np.asarray(after), np.asarray(before))
     if derived:
         PretrainedDecoder.from_model(model, trained).save(tmp_path)
     else:

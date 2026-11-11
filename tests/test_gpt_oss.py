@@ -84,48 +84,66 @@ def _experts_draw(seed: int):
               "gate_up_proj_bias": jnp.zeros((experts, 2 * intermediate), jnp.float32),
               "down_proj": jnp.asarray(rng.normal(size=(experts, intermediate, hidden)), jnp.float32),
               "down_proj_bias": jnp.zeros((experts, hidden), jnp.float32)}
+    # Each expert's down product in float64 on the activations the layer rounds.
     with jax.enable_x64(new_val=True):
-        products = np.stack([np.asarray(_expert_slots(x, jnp.full_like(indices, e), params,
-                                                      down=jnp.float64)[0, 0]) for e in range(experts)])
+        products = np.stack([np.asarray(_down(_activated(x, every, params), every, params, jnp.float64)[0, 0])
+                             for every in (jnp.full_like(indices, e) for e in range(experts))])
     delta = rng.normal(scale=1e-2, size=products.shape) * np.abs(np.asarray(products))
     params["down_proj_bias"] = jnp.asarray(jnp.asarray(-products + delta, jnp.bfloat16), jnp.float32)
     return x, weights, indices, params
 
 
-def _expert_slots(x, indices, params, *, down=jnp.float32, compute=jnp.bfloat16):
-    """Each slot's expert output as GPT-OSS computes it, each projection's operands rounded to `compute`,
-    summed in fp32 and its bias added before one rounding to `compute`; the down projection summed in `down`
-    (float64 for the truth, on the activations the layer rounds)."""
-    def operand(value, wide):
-        return value.astype(compute).astype(wide)
-
+def _activated(x, indices, params, *, wide=jnp.float32, compute=jnp.bfloat16):
+    """Each slot's activation as GPT-OSS computes it: the gate-up projection's operands rounded to
+    `compute`, summed in `wide` and its bias added before one rounding to `compute`, the activation in
+    `compute`; in float64 on that rounding where `wide` is (the truth's)."""
     rows = jnp.broadcast_to(x[:, None], (*indices.shape, x.shape[-1]))
-    projected = (jnp.einsum("tkh,tkhn->tkn", operand(rows, jnp.float32),
-                            operand(params["gate_up_proj"], jnp.float32)[indices])
-                 + operand(params["gate_up_proj_bias"], jnp.float32)[indices]).astype(compute)
+    projected = (jnp.einsum("tkh,tkhn->tkn", _operand(rows, wide, compute),
+                            _operand(params["gate_up_proj"], wide, compute)[indices])
+                 + _operand(params["gate_up_proj_bias"], wide, compute)[indices]).astype(compute)
+    if wide == jnp.float64:
+        projected = projected.astype(wide)
     gate, up = swiglu_clamped(projected[..., ::2], projected[..., 1::2], 7.0)
-    activated = (up + 1) * quick_gelu(gate)
-    out = (jnp.einsum("tkn,tknh->tkh", activated.astype(down), operand(params["down_proj"], down)[indices])
-           + operand(params["down_proj_bias"], down)[indices])
-    return out if down == jnp.float64 else out.astype(compute)
+    return (up + 1) * quick_gelu(gate)
+
+
+def _operand(value, wide, compute):
+    """A projection's operand rounded to `compute`, held in `wide`."""
+    return value.astype(compute).astype(wide)
+
+
+def _down(activated, indices, params, wide, compute=jnp.bfloat16):
+    """Each slot's down projection of its `activated`, its operands rounded to `compute`, summed in `wide`
+    with its bias."""
+    weights = _operand(params["down_proj"], wide, compute)[indices]
+    return (jnp.einsum("tkn,tknh->tkh", activated.astype(wide), weights)
+            + _operand(params["down_proj_bias"], wide, compute)[indices])
+
+
+def _expert_slots(x, indices, params, *, wide=jnp.float32, compute=jnp.bfloat16):
+    """Each slot's expert output as GPT-OSS computes it (`_activated`, `_down`), rounded to `compute`; a
+    float64 `wide` is the truth: every operation in float64, the roundings GPT-OSS states (its operands',
+    the gate-up projection's one) kept."""
+    out = _down(_activated(x, indices, params, wide=wide, compute=compute), indices, params, wide, compute)
+    return out if wide == jnp.float64 else out.astype(compute)
 
 
 def test_expert_biases_are_added_before_the_products_one_rounding():
     """GPT-OSS's experts add each projection's bias to its fp32 sums before their one rounding to bf16
     (the GEMM template's epilogue, row 3963), on par with that program (check 1) where the down bias nearly
-    cancels its product, truth the down projection in float64 on the activations both round alike. Added
+    cancels its product, truth that program in float64 with its stated roundings. Added
     after the product's rounding, the bias meets that rounding's error at the product's scale."""
     module = GptOssExperts(EXPERTS["hidden"], EXPERTS["intermediate"], EXPERTS["experts"], dtype=jnp.bfloat16)
 
     def dew(x, weights, indices, params):
         return jnp.asarray(module.apply({"params": params}, x, weights, indices))
 
-    def plain(x, weights, indices, params, *, down=jnp.float32):
-        slots = _expert_slots(x, indices, params, down=down)
+    def plain(x, weights, indices, params, *, wide=jnp.float32):
+        slots = _expert_slots(x, indices, params, wide=wide)
         return jnp.sum(slots * weights[..., None].astype(slots.dtype), axis=-2)
 
     assert_as_exact(jax.jit(dew), jax.jit(plain), _experts_draw, "GPT-OSS expert biases", seeds=8,
-                    truth_fn=functools.partial(plain, down=jnp.float64))
+                    truth_fn=functools.partial(plain, wide=jnp.float64))
 
 
 def test_gpt_oss_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
@@ -134,6 +152,7 @@ def test_gpt_oss_experts_served_from_packed_banks_are_on_par_with_their_values_d
     `quantization.expert_matrix`), their biases parameters: on par with the layer holding the banks' values
     as dense parameters in the same compute dtype, bf16 (check 1, truth the values in float64), the
     interleaved gate and up read off the packed bank's product as off the dense one's."""
+    from arm_arithmetic import float64_held
     from packed_experts import packed_banks
 
     from dew.quantization import QUANTIZATION
@@ -158,7 +177,8 @@ def test_gpt_oss_experts_served_from_packed_banks_are_on_par_with_their_values_d
         return x, jnp.full((tokens, 2), 0.5, jnp.bfloat16), indices
 
     def wide(*inputs):
-        return GptOssExperts(hidden, intermediate, experts).apply(dense, *inputs)
+        return GptOssExperts(hidden, intermediate, experts, dtype=jnp.float64).apply(float64_held(dense),
+                                                                                     *inputs)
 
     assert_as_exact(jax.jit(lambda *inputs: module.apply(packed, *inputs)),
                     jax.jit(lambda *inputs: module.apply(dense, *inputs)), draw, "packed GPT-OSS experts",

@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import unrewritten
 from jax.extend.core import primitives
+from jax.interpreters import partial_eval as pe
 
 from dew.nn import programs
 from dew.nn.precision import correctly_rounded_divide_p
@@ -236,6 +237,16 @@ def _traced(fn, args):
         closed, shapes = jax.make_jaxpr(unrewritten(fn), return_shape=True)(*args)
         traces[key] = (closed, jax.tree.structure(shapes))
     return traces[key]
+
+
+def lowered(closed):
+    """`closed`, a traced program, as lowering receives it. Where it holds calls of JAX's high-level
+    primitives (hijax's: one of Dew's linear maps under forward mode, `dew.nn.kernels.generation.linear_map`;
+    a checkpoint's recomputation), it is JAX's own lowering of the program
+    (`jax.interpreters.partial_eval.lower_jaxpr2`), each such call written as the program it expands to,
+    which a walk reads as any call's (`dew.nn.programs.called`), with the constants that program holds: the
+    traced ones and those an expansion closes over. Any other program is itself."""
+    return pe.lower_jaxpr2(closed.jaxpr) if closed.jaxpr.is_high else closed
 
 
 def released() -> None:

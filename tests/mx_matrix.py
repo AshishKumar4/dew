@@ -30,6 +30,7 @@ from reference_error import assert_as_exact
 
 from dew.nn.kernels import gemm, generation
 from dew.nn.kernels.templates import product
+from dew.nn.precision import at_least_fp32
 
 DEPTH = 256
 """The product's depth: eight 32-deep scale blocks."""
@@ -128,14 +129,16 @@ def an_mxfp8_product_is_on_par(case: tuple[str, ...]) -> None:
 
 
 def mx_values(x: jax.Array) -> jax.Array:
-    """`x` quantized to MXFP8 along its last axis (`gemm.MxFp8`), its values."""
-    return gemm.MxFp8.quantized(x).decoded()
+    """`x` quantized to MXFP8 along its last axis (`gemm.MxFp8`), its values at `x`'s width (a float64
+    truth's, or float32)."""
+    return gemm.MxFp8.quantized(x).decoded(at_least_fp32(x.dtype))
 
 
 def nvfp4_values(x: jax.Array) -> jax.Array:
-    """`x` quantized to NVFP4 along its last axis (`gemm.NvFp4Block`), its values, the tensor scale too."""
-    operand = gemm.NvFp4Block.quantized(x)
-    return operand.decoded() * operand.scale
+    """`x` quantized to NVFP4 along its last axis (`gemm.NvFp4Block`), its values, the tensor scale too, at
+    `x`'s width: a float64 truth's exact, float32's rounded once."""
+    operand, wide = gemm.NvFp4Block.quantized(x), at_least_fp32(x.dtype)
+    return operand.decoded(wide) * operand.scale.astype(wide)
 
 
 def recipe_truth(group_blocks, wide=jnp.float64, quantized=mx_values) -> callable:

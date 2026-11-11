@@ -410,6 +410,7 @@ def test_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
     beside them (a served 4-bit checkpoint's, row 4516: `quantization.expert_matrix`), multiplied as NVFP4
     products (`gemm.nvfp4_product`): on par with the layer holding the banks' values as dense parameters in
     the same compute dtype, bf16 (check 1, truth the values in float64)."""
+    from arm_arithmetic import float64_held
     from packed_experts import packed_banks
     from reference_error import assert_as_exact
 
@@ -433,7 +434,8 @@ def test_experts_served_from_packed_banks_are_on_par_with_their_values_dense():
 
     assert_as_exact(jax.jit(lambda *inputs: layer(None).apply(packed, *inputs)),
                     jax.jit(lambda *inputs: layer(jnp.bfloat16).apply(dense, *inputs)), draw,
-                    "packed experts", seeds=8, truth_fn=lambda *inputs: layer(None).apply(dense, *inputs))
+                    "packed experts", seeds=8,
+                    truth_fn=lambda *inputs: layer(None).apply(float64_held(dense), *inputs))
 
 
 def test_a_scanned_runs_stacked_packed_banks_are_read_at_its_layer_as_that_layers_banks():

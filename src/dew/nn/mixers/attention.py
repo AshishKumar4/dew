@@ -544,12 +544,15 @@ class CausalSelfAttention(nn.Module):
             raise ValueError("an nGPT attention unit-norms its own rotated queries and keys: it takes no "
                              "q/k norm, shared or value keys, or unrotated heads")
         width = self.ctx.num_heads * self.ctx.head_dim
-        self.sqk = self.param('sqk', nn.initializers.constant(ngpt.start), (width,), jnp.float32)
+        # Float32 whatever the compute dtype, a float64 model's float64 (`at_least_fp32`), as DEX's are.
+        self.sqk = self.param('sqk', nn.initializers.constant(ngpt.start), (width,),
+                              at_least_fp32(self.ctx.dtype))
         if self.ctx.output_gate:
             if self.gate_projection != 'own':
                 raise ValueError("an nGPT attention gates its output by a projection of its own "
                                  "(gate_projection='own')")
-            self.s_gate = self.param('s_gate', nn.initializers.constant(ngpt.start), (width,), jnp.float32)
+            self.s_gate = self.param('s_gate', nn.initializers.constant(ngpt.start), (width,),
+                                     at_least_fp32(self.ctx.dtype))
 
     def _ngpt_rotated(self, ngpt: NGPT, query, key):
         """The rotated query and key heads on the unit sphere, the query times the square of its
@@ -628,15 +631,16 @@ class CausalSelfAttention(nn.Module):
             return self.variable(DEX_COLLECTION, name, declared(drawn, (None,) * rank)).value
 
         # DEX's projections of a chosen subset of heads, which no head split divides, and its lambda: whole on
-        # every device (`dew.nn.dex`).
+        # every device (`dew.nn.dex`), float32 whatever the compute dtype, a float64 model's float64.
         self.dex_projection = self.param(
             'dex_projection', declared(nn.initializers.lecun_normal(in_axis=-2, out_axis=-1, batch_axis=(0,)),
                                        (None, None, None)),
-            (dex.count, self.value_dim, self.value_dim), jnp.float32)
-        self.dex_lambda = self.param('dex_lambda', declared(nn.initializers.zeros, ()), (), jnp.float32)
+            (dex.count, self.value_dim, self.value_dim), at_least_fp32(self.ctx.dtype))
+        self.dex_lambda = self.param('dex_lambda', declared(nn.initializers.zeros, ()), (),
+                                     at_least_fp32(self.ctx.dtype))
         self.dex_heads = held('dex_heads', () if start is None else start.heads, jnp.int32)
         self.dex_lambda_init = held('dex_lambda_init', 0.0 if start is None else start.lambda_init,
-                                    jnp.float32)
+                                    at_least_fp32(self.ctx.dtype))
 
     @nn.nowrap
     def _dex_flops(self, lengths) -> float:

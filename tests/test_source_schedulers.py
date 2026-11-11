@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from diffusion_support import SourceOracle, relative_gap, source_final, walk
+from float64_replay import float64_replay
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -334,9 +335,10 @@ def test_the_brownian_walk_descends_every_level_as_levys_construction_unrolled()
     loop iteration: on par with the construction unrolled level by level in Python (check 1), at the
     full depth and at one level, over drawn keys and queries of a grid's interval, its ends, its
     middle and points between. A loop and its unrolled levels fuse apart, so they round apart. The
-    truth is the construction in float64 on the same float32 draws, its position and the branch
-    each level takes read in float64 too: the path is continuous, so where float32's rounding of the
-    position crosses a cell's end, the cell beside it meets it at the node they share."""
+    truth is the construction replayed in float64 (`float64_replay`): the same draws' random bits, each
+    normal computed from them in float64, its position and the branch each level takes read in float64
+    too: the path is continuous, so where float32's rounding of the position crosses a cell's end, the
+    cell beside it meets it at the node they share."""
     from dew.sampling.solvers.brownian import MAX_BROWNIAN_DEPTH, _Brownian, _brownian_walk
 
     low, high, shape = np.float32(0.03), np.float32(14.6), (3, 4)
@@ -382,4 +384,4 @@ def test_the_brownian_walk_descends_every_level_as_levys_construction_unrolled()
     for depth in (1, MAX_BROWNIAN_DEPTH):
         assert_as_exact(without_ynn(walked(depth)), without_ynn(unrolled(depth)), draw,
                         f"the Brownian walk at depth {depth}", seeds=BROWNIAN_SEEDS,
-                        truth_fn=jax.jit(unrolled(depth)))
+                        truth_fn=float64_replay(unrolled(depth)))

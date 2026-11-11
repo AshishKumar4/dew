@@ -53,7 +53,10 @@ def _saved(model, variables, inputs, **apply) -> int:
 def _stepped(model, variables, inputs, **apply) -> dict:
     """A step's gradient in every floating parameter, along a cotangent drawn at its output's shape."""
     output = jax.eval_shape(lambda: _call(model, variables, inputs, **apply))
-    cotangent = jax.random.normal(jax.random.key(1), output.shape, jnp.float32).astype(output.dtype)
+    # One draw every arm reads as its value, a constant of each program: a float64 truth widens it exactly.
+    with jax.ensure_compile_time_eval():
+        drawn = jax.random.normal(jax.random.key(1), output.shape, jnp.float32)
+    cotangent = drawn.astype(output.dtype)
     return floating_gradient(lambda held: _call(model, held, inputs, **apply), variables, cotangent)
 
 
