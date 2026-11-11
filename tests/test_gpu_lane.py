@@ -625,13 +625,22 @@ def test_a_tier_cut_group_is_admitted_on_its_files_whole_measure_and_no_need_is_
     share = lane_runs(tmp_path, "test_long")[-1][0]
     assert float(share) == 0.5
     assert "admitted at 40.0 GiB, below its measured need of 61.0 GiB" in row["output"]
+    # A whole run measured before the file gained a test holds less than that test does: the most any run of the
+    # file on this class held is its measure, a group's of any cut among them (2026-11-11: a recurrence file's
+    # whole run, 3.92 GiB from before its short conv matrix test, gave that test alone a 5.9 GiB lane, which ran
+    # out at 5.38 GiB in use, twice).
+    measured("3.12:tests/test_long.py", 4 * gib)
+    measured("3.12:tests/test_long.py#3/3", 6 * gib)
+    assert ci.gpu_lane("3.12", ["tests/test_long.py#1/2"], out, cache="off", processes=1, deadline=600.0) == 0
+    [share, *_] = lane_runs(tmp_path, "test_long")[-1]
+    assert float(share) * total == 6 * gib * 1.25 + gib, "the largest of the file's measured runs"
 
 
 def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measured_class_held_it(
         ci, tmp_path, monkeypatch, cache_worker, capsys):
-    """`gpu_holds.py` says, for each test file (a group as its file), the most any GPU class's last whole run
-    of it held with its children (`gpu_needs`), in bytes, so a GPU tier sizes each part's job by what its
-    lane will admit its files at (2026-11-10: a part given a default 8 GiB had a 4 GiB lane for a file
+    """`gpu_holds.py` says, for each test file (a group as its file), the most any GPU class's last run of
+    it held with its children (`gpu_needs`), whole or a group's, in bytes, so a GPU tier sizes each part's job
+    by what its lane will admit its files at (2026-11-10: a part given a default 8 GiB had a 4 GiB lane for a file
     measured at 5.9 GiB); a file no class measured is absent."""
     url, stored, _ = cache_worker
     cached(monkeypatch, url)
@@ -653,6 +662,16 @@ def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measur
                                 "peak": 6 * gib, "shares": 1, "pools": 0}).encode()
     assert holds.main() == 0
     assert json.loads(capsys.readouterr().out) == {"tests/test_wide.py": 2 * (6 * gib * 1.25 + gib)}
+    # And a group's run that held more than any whole one: the file's need is the group's, as its lane's is.
+    group = "/" + ci.record_key("3.12", ci.row("3.12", "tests/test_wide.py", "2/5"), "NVIDIA-H100-80GB-HBM3-x86")
+    stored[group] = json.dumps({"key": None, "depends": ["tests/test_wide.py"], "row": {}, "reads": [],
+                                "peak": 9 * gib, "shares": 0, "pools": 0}).encode()
+    assert holds.main() == 0
+    assert json.loads(capsys.readouterr().out) == {"tests/test_wide.py": 2 * (6 * gib * 1.25 + gib)}
+    stored[group] = json.dumps({"key": None, "depends": ["tests/test_wide.py"], "row": {}, "reads": [],
+                                "peak": 20 * gib, "shares": 0, "pools": 0}).encode()
+    assert holds.main() == 0
+    assert json.loads(capsys.readouterr().out) == {"tests/test_wide.py": 20 * gib * 1.25 + gib}
     # The cache not answering (here, refusing the token) fails the tool, which sizes a job by what it says:
     # read as files no class measured, a part took the default (2026-11-11: a file measured at 5.9 GiB ran
     # out of the 4 GiB lane of a part composed while a read of its record did not come back). A lane on its
