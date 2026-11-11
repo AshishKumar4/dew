@@ -435,8 +435,11 @@ class TFDS(Dataset):
         root = epath.Path(os.path.expanduser(self.directory))
         if not root.is_dir() or (self.remote and not Path(self.directory, "READY").is_file()):
             return {}
-        # A prepared directory holds the split's metadata, or a data directory the dataset's own.
-        if not ((root / self.name).is_dir() or all((root / name).is_file() for name in metadata_files())):
+        # A prepared directory holds the split's metadata, or a data directory the dataset's own; without
+        # TFDS, whose names its metadata are (`metadata_files`), there is no prepared split to state.
+        if not (root / self.name).is_dir() and (
+                importlib.util.find_spec("tensorflow_datasets") is None
+                or not all((root / name).is_file() for name in metadata_files())):
             return {}
         described = self.builder.info
         splits = described.splits

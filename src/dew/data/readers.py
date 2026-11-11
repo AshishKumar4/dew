@@ -370,14 +370,13 @@ class _Statistics:
         self._mirrored.append(published)
         return published.publish
 
-    def corpora(self) -> dict[str, CorpusCounts]:
-        """Every corpus's counts by name: the counts of the prefix a memory read ran, followed by those
-        the latest reader published of the rest (`CorpusCounts.followed`), which a reader restored from
-        another's position carries on from."""
-        read = {name: counts for published in self._published for name, counts in published.counts.items()}
-        merged = {name: counts.followed(read.pop(name)) if name in read else counts
-                  for name, counts in self._counts.items()}
-        return {**merged, **read}
+    def prefix(self) -> Mapping[str, CorpusCounts]:
+        """Each corpus's counts of the prefix a memory read ran, by name."""
+        return self._counts
+
+    def read(self) -> dict[str, CorpusCounts]:
+        """Each corpus's counts the latest reader published of what it read past that prefix, by name."""
+        return {name: counts for published in self._published for name, counts in published.counts.items()}
 
     def workers_mirrors(self) -> list[Mapping[str, float]]:
         """Each loading worker's mirror counters, which its readers' positions carried (`WorkerMirrors`,
@@ -391,23 +390,30 @@ class _Statistics:
 
 def statistics_of(sources: Sequence[_Statistics]) -> Mapping[str, float]:
     """The metrics of a run read by the loaders `sources` count, in the order it read them (a phased run's
-    phases): each corpus's counts, summed over the loaders that read it (a later phase reads on past
-    what the one before it read, `CorpusCounts.add`); and what this process's mirrors did since the
-    first began (`Mirrored`, row 4299), once, beside every loading worker's."""
-    corpora: dict[str, CorpusCounts] = {}
+    phases): each corpus's counts of the prefix a memory read ran, the first loader's that holds it (every
+    loader of a corpus measures the same prefix, from its start), followed by what each loader's readers
+    read past it, summed over the loaders (a later phase reads on from where the one before it stopped,
+    `CorpusCounts.followed`, `CorpusCounts.add`); and what this process's mirrors did since the first
+    began (`Mirrored`, row 4299), once, beside every loading worker's."""
+    prefix: dict[str, CorpusCounts] = {}
+    read: dict[str, CorpusCounts] = {}
     for source in sources:
-        for name, counts in source.corpora().items():
-            if name in corpora:
-                summed_counts = copy.deepcopy(corpora[name])
-                summed_counts.add(counts)
-                counts = summed_counts
-            corpora[name] = counts
-    summed: dict[str, float] = {}
+        for name, counts in source.prefix().items():
+            prefix.setdefault(name, counts)
+        for name, counts in source.read().items():
+            if name in read:
+                summed = copy.deepcopy(read[name])
+                summed.add(counts)
+                counts = summed
+            read[name] = counts
+    corpora = {name: counts.followed(read.pop(name)) if name in read else counts
+               for name, counts in prefix.items()}
+    totals: dict[str, float] = {}
     workers = [counts for source in sources for counts in source.workers_mirrors()]
     for counts in (sources[0]._own.metrics(), *workers):
         for name, value in counts.items():
-            summed[name] = summed.get(name, 0.0) + float(value)
-    return {**data_metrics(corpora.values()), **summed}
+            totals[name] = totals.get(name, 0.0) + float(value)
+    return {**data_metrics([*corpora.values(), *read.values()]), **totals}
 
 
 @dataclasses.dataclass(frozen=True)

@@ -496,22 +496,20 @@ def test_distinct_transport_misses_download_concurrently_within_the_shared_budge
     assert cache.metrics()["downloaded_bytes"] == sum(len(path) for path in paths)
 
 
-def test_a_chained_url_keeps_each_protocols_options_under_dews_mirror(tmp_path):
-    """A chained store (`simplecache::file://...`) read through Dew's mirror keeps each protocol's options
-    as fsspec reads a chain's: the inner filesystem its own, the cache its own, the unscoped ones the
-    store's first protocol's, as an unchained store's are its own."""
+@pytest.mark.parametrize("outer", ["simplecache", "simplecache://"])
+def test_a_chained_url_keeps_each_protocols_options_under_dews_mirror(tmp_path, outer):
+    """A chained store (`simplecache::file://...`, its outer link bare or spelled as a URL) read through Dew's
+    mirror keeps each link's options as fsspec reads a chain's: the inner filesystem its own, as an
+    unchained store's are its own."""
     from dew.data.storage import backing
 
     target = tmp_path / "nested" / "object"
-    chained = Store(f"simplecache::file://{target}", {
-        "simplecache": {"cache_storage": str(tmp_path / "simple")}, "file": {"auto_mkdir": True},
-        "dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": 1 << 20}}).cached()
-    fs, _ = chained.resolve()
-    assert backing(fs).auto_mkdir
-    plain = Store(f"file://{target}", {"auto_mkdir": True,
-                                       "dewcache": {"cache_storage": str(tmp_path / "plain"),
-                                                    "max_bytes": 1 << 20}}).cached()
-    assert backing(plain.resolve()[0]).auto_mkdir
+    mirror = {"cache_storage": str(tmp_path / "mirror"), "max_bytes": 1 << 20}
+    chained = Store(f"{outer}::file://{target}", {"file": {"auto_mkdir": True}, "dewcache": mirror}).cached()
+    assert backing(chained.resolve()[0]).auto_mkdir
+    plain = Store(f"file://{target}",
+                  {"auto_mkdir": True, "dewcache": {**mirror, "cache_storage": str(tmp_path / "plain")}})
+    assert backing(plain.cached().resolve()[0]).auto_mkdir
 
 
 def test_url_chain_reads_and_writes_memory(tmp_path):

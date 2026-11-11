@@ -2246,7 +2246,9 @@ def test_an_unseeded_mix_reads_its_members_in_the_order_it_declares_them(read):
 
 def test_a_phased_runs_statistics_count_each_phase_it_reached(tmp_path):
     """A run's statistics count every phase it has opened: a corpus its second phase adds to the first's
-    is counted beside it, where only the first phase's loader was counted, its corpus alone."""
+    is counted beside it, where only the first phase's loader was counted, its corpus alone; the corpus
+    both phases read is counted once, as a run of the first phase alone counts it, where each phase's
+    loader measures the same prefix of it."""
     _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     data = phased_packed((first, 3), ({first: 1.0, second: 1.0}, None))
     stream = data.train(DataPartition())
@@ -2255,4 +2257,6 @@ def test_a_phased_runs_statistics_count_each_phase_it_reached(tmp_path):
         rows = {name: count for name, count in data.statistics().items() if name.startswith("data/rows/")}
     finally:
         stream.close()
-    assert len(rows) == 2 and all(count > 0 for count in rows.values()), rows
+    alone = phased_packed((first, None))
+    (counted,) = [count for name, count in alone.statistics().items() if name.startswith("data/rows/")]
+    assert len(rows) == 2 and counted in rows.values() and all(count > 0 for count in rows.values()), rows
