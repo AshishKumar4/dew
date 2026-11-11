@@ -4,6 +4,8 @@ it holds red, and says where every thread of its pytest stood."""
 import base64
 import hashlib
 import json
+import subprocess
+import sys
 import time
 import zipfile
 from pathlib import Path
@@ -113,11 +115,37 @@ def test_a_task_past_its_deadline_says_where_every_thread_of_its_pytest_was(ci, 
 def test_each_stall_of_a_tasks_runs_of_the_same_rows_keeps_its_own_record(ci, tmp_path):
     """A task's two runs of the same rows past their deadlines (a rerun after a deadline) each keep their own
     stall record (`stalls.kept`), neither the other's."""
-    first, second = (ci.stalls.kept(tmp_path, "3.12-same", f"stacks of run {run}", time.time(), "host")
+    first, second = (ci.stalls.kept(tmp_path, "3.12-same", f"stacks of run {run}", time.time())
                      for run in (1, 2))
     assert first != second
-    assert first.read_text().startswith("stacks of run 1")
-    assert second.read_text().startswith("stacks of run 2")
+    assert first.read_text().endswith("stacks of run 1")
+    assert second.read_text().endswith("stacks of run 2")
+
+
+def test_a_stalled_pytests_threads_say_which_still_compute(ci, tmp_path):
+    """A stalled pytest's record tells a process still computing from a stalled one (`stalls.activity`): its
+    main thread waiting on another's result, as pytest waits on an XLA computation's buffer, uses no CPU over
+    the watch, the thread computing it does (rows 5452, 5454: a dump of Python threads alone showed the
+    wait, never whether XLA's threads computed)."""
+    # The computing thread named by prctl's PR_SET_NAME (15), as the kernel names it.
+    source = ("import ctypes, sys, threading\n\n\ndef spin(started):\n"
+              "    ctypes.CDLL(None).prctl(15, b'computing')\n    started.set()\n"
+              "    while True:\n        pass\n\n\n"
+              "started = threading.Event()\n"
+              "threading.Thread(target=spin, args=(started,), daemon=True).start()\n"
+              "started.wait()\nprint('ready', flush=True)\nsys.stdin.read()\n")
+    process = subprocess.Popen([sys.executable, "-c", source], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               text=True)
+    try:
+        assert process.stdout.readline() == "ready\n"
+        pid = tmp_path / "pid"
+        pid.write_text(str(process.pid))
+        threads = {thread.tid: thread for thread in ci.stalls.activity(pid)}
+    finally:
+        process.kill()
+        process.wait()
+    [computing] = [thread for thread in threads.values() if thread.name == "computing"]
+    assert computing.cpu > 0 and threads[process.pid].cpu == 0
 
 
 def test_a_task_within_its_deadline_writes_no_stacks(ci, tmp_path):
