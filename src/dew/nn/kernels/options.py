@@ -585,7 +585,8 @@ class OuterProgram:
         if owner:
             try:
                 handed = self._handed(key, args, kwargs)
-                self._keep(key, pending, handed if handed is not None else self.compiled(*args, **kwargs), [])
+                compiled = handed if handed is not None else self._compiled_here(*args, **kwargs)
+                self._keep(key, pending, compiled, [])
             except BaseException as error:
                 self._released(key, pending, error)
         return pending.result()
@@ -650,7 +651,19 @@ class OuterProgram:
         if not pending.done():
             pending.set_exception(failure)
 
+    def handed(self, *args, **kwargs) -> jax.stages.Compiled | None:
+        """The executable a block hands a call over these arguments (`handing`), None outside one or where
+        it holds none of the call."""
+        return self._handed(self.key_of(args, kwargs)[0], args, kwargs)
+
     def compiled(self, *args, **kwargs) -> jax.stages.Compiled:
+        """The program over these arguments: the executable a block hands its call (`handed`), tracing
+        nothing, else compiled here (`_compiled_here`): a caller that compiles a call itself (a server
+        choosing its state's layout) is handed it as a call is."""
+        handed = self.handed(*args, **kwargs)
+        return handed if handed is not None else self._compiled_here(*args, **kwargs)
+
+    def _compiled_here(self, *args, **kwargs) -> jax.stages.Compiled:
         """The program over these arguments compiled through the kernel templates' reports, lowered
         afresh where a kernel spills."""
         from dew.nn.kernels.templates import report

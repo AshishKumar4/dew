@@ -2255,13 +2255,15 @@ if mode == "keep":
     with keeping() as programs:
         tokens = served()
     saved = programs.save(path)
-    # Each kept program by the name its compile reports (`jit(<function>)`).
-    found = {"kept": sorted({f"jit({program.call['function'][2]})" for program in saved.kept.values()}),
+    # Each kept program by its function's name.
+    found = {"kept": sorted({program.call["function"][2] for program in saved.kept.values()}),
              "refused": sorted(programs.refused.values())}
 else:
     with kept(path), Compiles(None) as compiles:
         tokens = served()
-    found = {"compiled": sorted(program.name for program in compiles.programs)}
+    # Each program traced or compiled, by its function's name (a compile reports `jit(<function>)`).
+    found = {"compiled": sorted({program.name.removeprefix("jit(").removesuffix(")")
+                                 for program in compiles.programs})}
 print(json.dumps({"tokens": tokens, **found}))
 """
 """A process that serves one request from a text server, keeping its programs (`keep`) or handed them
@@ -2272,7 +2274,8 @@ def test_a_text_server_serving_under_keeping_keeps_every_program_it_compiles(tmp
     """A text server built and serving within `keeping` keeps each program it compiles and refuses none: the
     server's own context, its stack and sequences whole (`dew.nn.sharding.whole`), is part of what each
     call's identity states, its formats' chosen layouts too, and its checks' tracebacks are held as their
-    frames (`HeldTraceback`). A fresh process handed them serves the same tokens compiling none of them."""
+    frames (`HeldTraceback`). A fresh process handed them serves the same tokens tracing and compiling
+    none of them, the step that chooses its state's layout among them (`OuterProgram.handed`)."""
     import process_support
 
     path = str(tmp_path / "text.dew-aot")
