@@ -689,6 +689,7 @@ class TruthStore:
     directory: Path
     prepare: bool
     stamp: str
+    prepared: set[str] = dataclasses.field(default_factory=set, compare=False)
 
     SITE = "site.json"
 
@@ -701,7 +702,12 @@ class TruthStore:
         return site / f"{int(_inputs_digest(inputs)):016x}.truth"
 
     def begun(self, label: str) -> Path:
-        """The site's directory, emptied of an earlier prepare's draws."""
+        """The site's directory, emptied of an earlier prepare's draws; refused for a label this store has
+        prepared already, whose truths a second site of it would replace."""
+        if label in self.prepared:
+            raise ValueError(f"{label}: two sites of one label in one store of prepared truths, where the "
+                             "second would replace the first's: each needs its own")
+        self.prepared.add(label)
         site = self.path(label)
         if site.exists():
             shutil.rmtree(site)

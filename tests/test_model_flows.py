@@ -18,6 +18,7 @@ from process_support import relayed
 from reference_error import MissingTruth, assert_as_exact, stored_truths
 
 from dew.nn.kernels import generation
+from dew.parity import GateFailure
 from dew.parity_stages import staged_units
 
 
@@ -142,6 +143,8 @@ def test_a_prepared_site_judges_as_one_that_computes_its_truth_and_refuses_a_mis
     dew, reference, draw = _site()
     with stored_truths(tmp_path, prepare=True, stamp="a"):
         assert_as_exact(None, reference, draw, "a prepared product", seeds=8)
+        with pytest.raises(ValueError):
+            assert_as_exact(None, reference, draw, "a prepared product", seeds=8)
     assert len(list(tmp_path.iterdir())) == 1
     assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
     with stored_truths(tmp_path, prepare=False, stamp="a"):
@@ -160,7 +163,8 @@ def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
     """A site whose truth holds rows that cancel (its last rows a product less the same product summed in
     two halves, zero in float64 but for its rounding) is sized by its terms (check 1's `_cancelling_terms`):
     prepared, its store holds the terms its truth program gave beside the truth, and judged from the store
-    it reads them as a site's own terms program (`_SiteTerms.of`), passing as it passes computing them."""
+    it reads them as a site's own terms program (`_SiteTerms.of`): it passes as it passes computing them,
+    and an arm that leaves a term in a cancelling row fails by the same rule."""
     def draw(seed):
         rng = np.random.default_rng([5463, seed])
         return (rng.standard_normal((16, 32)).astype(np.float32),
@@ -170,9 +174,19 @@ def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
         whole = a @ b
         return jnp.concatenate([whole, whole - (a[:, :16] @ b[:16] + a[:, 16:] @ b[16:])])
 
+    def leaving_a_term(a, b):
+        return cancelling(a, b).at[16].add(a[0, 0] * b[0, :])
+
     with stored_truths(tmp_path, prepare=True, stamp="a"):
         assert_as_exact(None, cancelling, draw, "a cancelling product", seeds=8)
     assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
-    with stored_truths(tmp_path, prepare=False, stamp="a") as store:
-        assert callable(store.site("a cancelling product")[1])
+    with pytest.raises(GateFailure) as computing:
+        assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product", seeds=8)
+    with stored_truths(tmp_path, prepare=False, stamp="a"):
         assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
+        with pytest.raises(GateFailure) as stored:
+            assert_as_exact(leaving_a_term, cancelling, draw, "a cancelling product", seeds=8)
+    # Sized by its terms the row fails the sized rows' rule; read without them it would fail the rule of
+    # rows of float64 zero.
+    assert [finding.rule for finding in stored.value.findings] == [
+        finding.rule for finding in computing.value.findings]
