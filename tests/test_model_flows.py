@@ -86,7 +86,7 @@ def _site(salt: int = 5461):
         return jnp.dot(a.astype(jnp.bfloat16), b.astype(jnp.bfloat16), preferred_element_type=jnp.float32)
 
     def reference(a, b):
-        narrow = (operand.astype(jnp.bfloat16).astype(jnp.float32) for operand in (a, b))
+        narrow = (operand.astype(jnp.bfloat16).astype(operand.dtype) for operand in (a, b))
         return jnp.dot(*narrow)
 
     return dew, reference, draw
@@ -114,10 +114,10 @@ def test_a_prepared_site_judges_as_one_that_computes_its_truth_and_refuses_a_mis
 
 
 def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
-    """A site whose truth holds rows that cancel (its second half a product less the same product summed in
-    two halves, exactly zero in float64) is sized by its terms (check 1's `_cancelling_terms`): prepared, its
-    store holds the terms its truth program gave beside the truth, and judged from the store it reads them
-    as a site's own terms program (`_SiteTerms.of`), passing as it passes computing them."""
+    """A site whose truth holds rows that cancel (its last rows a product less the same product summed in
+    two halves, zero in float64 but for its rounding) is sized by its terms (check 1's `_cancelling_terms`):
+    prepared, its store holds the terms its truth program gave beside the truth, and judged from the store
+    it reads them as a site's own terms program (`_SiteTerms.of`), passing as it passes computing them."""
     def draw(seed):
         rng = np.random.default_rng([5463, seed])
         return (rng.standard_normal((16, 32)).astype(np.float32),
@@ -125,7 +125,7 @@ def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
 
     def cancelling(a, b):
         whole = a @ b
-        return jnp.concatenate([whole, whole - (a[:, :16] @ b[:16] + a[:, 16:] @ b[16:])], axis=1)
+        return jnp.concatenate([whole, whole - (a[:, :16] @ b[:16] + a[:, 16:] @ b[16:])])
 
     with stored_truths(tmp_path, prepare=True, stamp="a"):
         assert_as_exact(None, cancelling, draw, "a cancelling product", seeds=8)
