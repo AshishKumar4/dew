@@ -109,7 +109,7 @@ def main() -> None:
 
     import numpy as np
     from fetched_fixtures import save
-    from saved_run_kinds import SAVED_KINDS
+    from saved_run_kinds import SAVED_KINDS, trained_finite
 
     kinds = sorted(SAVED_KINDS) if args.kinds is None else args.kinds
     unknown = sorted(set(kinds) - set(SAVED_KINDS))
@@ -137,6 +137,8 @@ def main() -> None:
                 held = (ROOT / run.pretrained).resolve()
                 run = dataclasses.replace(run, pretrained=held.relative_to(ROOT).as_posix())
             state = run.prepare().train(kind)
+            # A run that trained to a loss not finite is no reference (`trained_finite`).
+            trained_finite(root / "runs" / kind)
             seen = evidence(run, state, root / "runs" / kind)
             packed = anonymous(root / "runs" / kind, kind, {str(root): ".", str(ROOT): "."})
             save(written / f"{kind}.npz", {"run": np.frombuffer(packed, np.uint8)},

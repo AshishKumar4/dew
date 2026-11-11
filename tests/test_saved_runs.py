@@ -22,7 +22,7 @@ import jax
 import pytest
 from process_support import assert_exits_cleanly
 from reference_error import recording
-from saved_run_kinds import SAVED_KINDS, answered, computed
+from saved_run_kinds import SAVED_KINDS, answered, computed, trained_finite
 from saved_run_products import unpacked
 
 from dew.checkpoints import Checkpoints
@@ -111,6 +111,30 @@ def extracted(tmp_path: Path, recorded: str, kind: str) -> Path:
     with archived(recorded, kind) as packed:
         packed.extractall(tmp_path / "runs", filter="data")
     return tmp_path / "runs" / kind
+
+
+@pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
+def test_a_run_an_earlier_main_saved_trained_to_finite_losses(tmp_path, recorded, kind):
+    """Each run of the corpus logged finite losses and gradient norms at every step it logged them
+    (`saved_run_kinds.trained_finite`): a run trained to NaN is no reference, and every later main's reads
+    of it would compare NaN to NaN."""
+    trained_finite(extracted(tmp_path, recorded, kind))
+
+
+def test_a_run_that_logged_a_loss_not_finite_is_refused_as_a_reference(tmp_path):
+    """`trained_finite` refuses a run whose logged loss or gradient norm is NaN or infinite, at any step,
+    and one that logged none, which no reference can be; a run of finite ones reads back its steps'."""
+    for logged in ({1: {"train/loss": 1.4}, 2: {"train/loss": float("nan")}},
+                   {1: {"train/loss": 1.4, "train/grad_norm": float("inf")}}, {1: {"train/accuracy": 0.5}}):
+        run = tmp_path / f"run-{len(list(tmp_path.iterdir()))}"
+        with LocalTracker(run / "tracking") as tracker:
+            for step, scalars in logged.items():
+                tracker.log(scalars, step)
+        with pytest.raises(ValueError, match="not finite losses"):
+            trained_finite(run)
+    with LocalTracker(tmp_path / "finite" / "tracking") as tracker:
+        tracker.log({"train/loss": 1.4, "train/grad_norm": 0.45, "train/accuracy": 0.3}, 1)
+    assert trained_finite(tmp_path / "finite") == {1: {"train/loss": 1.4, "train/grad_norm": 0.45}}
 
 
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)

@@ -180,6 +180,24 @@ def stored(root: Path, drawn: bool) -> RunConfig:
     return dataclasses.replace(over(QWEN, root, drawn), source=SourceOptions(param_dtype="bfloat16"))
 
 
+def trained_finite(run: Path) -> dict[int, dict[str, float]]:
+    """Raise unless the saved run at `run` trained to finite numbers: every loss and gradient norm its steps
+    and evaluations logged (`LocalTracker.scalars`, each a `loss` or `grad_norm` scalar); each step's of
+    them otherwise. A run whose loss is not finite is no reference: two such runs compare equal as NaN
+    does to an array comparison (a fixture tokenizer's id past its model's table, the table's gather
+    filling it with NaN). Its writer refuses to save one, and the corpus's reader to read one."""
+    from dew.training import LocalTracker
+
+    found = {}
+    for step, scalars in LocalTracker(run / "tracking").scalars():
+        kept = {name: value for name, value in scalars.items() if name.endswith(("loss", "grad_norm"))}
+        if kept:
+            found.setdefault(step, {}).update(kept)
+    if not found or not all(np.isfinite(value) for held in found.values() for value in held.values()):
+        raise ValueError(f"{run.name}: its run logged {found or 'no loss'}, not finite losses")
+    return found
+
+
 def computed(directory: Path | str, step: int | None = None, *, wide: bool = False
              ) -> dict[str, dict[str, list[str]]]:
     """Each module's dtypes, by its variable scope's path, that one request of the task a saved run at
