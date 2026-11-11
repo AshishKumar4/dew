@@ -2062,7 +2062,13 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     the lane before any file runs."""
     subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch"], check=True)
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
-    [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
+    # The memory the GPU gives a process: all of it less what its driver and firmware keep, the total XLA
+    # takes a pool's fraction of (within nvidia-smi's rounding to a MiB), and the one a node's session gave
+    # this lane its fraction of. Counted of the GPU's whole memory, a file's share was a pool short of it by
+    # what the driver keeps (2026-11-11: a GH200's 1,103 of 97,871 MiB made a 5.91 GiB share a 5.84 GiB pool,
+    # which ran out).
+    [total] = ((int(whole) - int(kept)) * 2 ** 20 for whole, kept in
+               (answer.split(",") for answer in gpu_query("memory.total,memory.reserved")))
     # A job holding the whole GPU is given no fraction (a node sets one for a part of a GPU alone, dew-ops'
     # session `settings`): its processes may take what one process takes by JAX's own default (row 2570).
     budget = float(os.environ.get("XLA_PYTHON_CLIENT_MEM_FRACTION", WHOLE_GPU)) * total

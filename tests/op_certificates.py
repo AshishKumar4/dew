@@ -204,15 +204,24 @@ def stepped(x, fmt: Format, direction: float) -> np.ndarray:
 
 
 def below(x, fmt: Format) -> np.ndarray:
-    """The greatest value of `fmt` at or below each `x`."""
-    found = nearest(x, fmt)
-    return np.where(found > x, stepped(found, fmt, -np.inf), found)
+    """The greatest value of `fmt` at or below each `x`, found on `fmt`'s grid by the grid's spacing at it
+    (`_quantum`: a power of two, so the scaling is exact), and so of any format, one no array holds too
+    (TF32). Past `fmt`'s range it is the largest value above and minus infinity below; a non-finite `x` is
+    itself."""
+    x = np.asarray(x, np.float64)
+    finite = np.isfinite(x)
+    held = np.where(finite, x, 0.0)
+    quantum = _quantum(held, fmt)
+    # A float64 near its own largest steps to an infinity, which is past every format's range below.
+    with np.errstate(over="ignore"):
+        found = np.floor(held / quantum) * quantum
+    found = np.where(found > fmt.largest, fmt.largest, np.where(found < -fmt.largest, -np.inf, found))
+    return np.where(finite, found, x)
 
 
 def above(x, fmt: Format) -> np.ndarray:
-    """The least value of `fmt` at or above each `x`."""
-    found = nearest(x, fmt)
-    return np.where(found < x, stepped(found, fmt, np.inf), found)
+    """The least value of `fmt` at or above each `x`: `below`'s mirror."""
+    return -below(-np.asarray(x, np.float64), fmt)
 
 
 def grid_index(x) -> np.ndarray:

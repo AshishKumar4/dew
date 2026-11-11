@@ -146,10 +146,13 @@ def fetcher(root: Path, *, due: bool = False) -> Path:
 
 
 def gpu_driver(root: Path, monkeypatch) -> None:
-    """nvidia-smi as the driver answers it for an 80 GiB GPU, first on PATH."""
+    """nvidia-smi as the driver answers it, first on PATH, for a GPU that gives a process 80 GiB: 82,488 MiB
+    in all, of which its driver keeps 568."""
     tools = root / "bin"
     tools.mkdir()
-    (tools / "nvidia-smi").write_text("#!/bin/sh\necho 81920\n")
+    (tools / "nvidia-smi").write_text(
+        "#!/bin/sh\ncase \"$*\" in *memory.total,memory.reserved*) echo '82488, 568';; "
+        "*memory.total*) echo 82488;; *) echo 81920;; esac\n")
     (tools / "nvidia-smi").chmod(0o755)
     monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
 
