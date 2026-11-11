@@ -241,6 +241,25 @@ def test_a_division_dew_rounds_to_float32_replays_as_the_float64_quotient():
     np.testing.assert_array_equal(np.asarray(float64_replay(program)(x, y)), np.asarray(wide))
 
 
+def test_a_float64_jax_array_is_replayed_as_the_float32_program_reads_it():
+    """A draw's leaves a GPU holds reach the replay as float64 JAX arrays (`arm_arithmetic.widened` widens
+    them where they lie), which JAX keeps at 64 bits even where x64 is off: the replay traces the program
+    as a process without x64 holds its arguments, so a program that reads its argument's dtype (a model's
+    promotions, here the format's epsilon and a buffer of that dtype) is the float32 one, the same as for
+    the host array a CPU's draw arrives as. Traced on the float64 array instead, the program was a float64
+    one read with x64 off, and its requests for that dtype were refused as errors (a MeanFlow step's truth
+    on an A100)."""
+    def program(x):
+        return jnp.cumsum(x) * jnp.finfo(x.dtype).eps + jnp.zeros(x.shape, x.dtype)
+
+    x = np.random.default_rng(3).normal(size=7).astype(np.float32)
+    replay = float64_replay(program)
+    with jax.enable_x64(new_val=True):
+        held_on_a_device = jnp.asarray(x, jnp.float64)
+        np.testing.assert_array_equal(np.asarray(replay(held_on_a_device)),
+                                      np.asarray(replay(np.asarray(x, np.float64))))
+
+
 def test_a_scans_gradient_replays_in_float64():
     """The gradient of a scan stacks its steps' cotangents into an array made to be written over, which
     states no arithmetic: the replay evaluates it with the rest, the gradient what the same scan gives on
