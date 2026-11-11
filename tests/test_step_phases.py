@@ -20,6 +20,7 @@ from dew.batch import PHASE, VALID_ROWS, Phase
 from dew.data import Memory, phases
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
+from dew.mesh import LayoutRefused
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, Trainer
 
@@ -40,13 +41,11 @@ def fits(row) -> bool:
     return int(row["length"]) % 5 != 0
 
 
-def source(tag: int, count: int = 48):
-    """A corpus of `count` rows whose ids say they are the `tag`th source's, of uneven lengths, some
-    dropped, batched by a budget of 128 tokens (eight rows, which a mesh of eight devices divides): read
-    per share."""
-    rows = [{"id": np.int32(1000 * tag + index), "length": np.int32(3 + index % 11)}
-            for index in range(count)]
-    return Memory(rows).map(Tokens()).filter(fits, reason="too_long").repeat().batch(tokens=128)
+def source(tag: int):
+    """A corpus of 48 rows whose ids say they are the `tag`th source's, of uneven lengths, some dropped,
+    batched by a budget of 128 tokens (eight rows, which a mesh of eight devices divides): read per
+    share."""
+    return _budget(tag, 128)
 
 
 def chain(*ends):
@@ -100,9 +99,28 @@ def test_a_resume_into_phases_that_moved_an_end_the_run_passed_is_refused():
 
 def test_phases_read_each_on_its_own_stream_refuse_a_corpus_two_of_them_read():
     """Phases read each on its own stream open each corpus at its first record, so a corpus two of them read
-    would be read again from its start: refused, as reading one global order is what continues it."""
+    would be read again from its start: refused, as reading one global order is what continues it, whatever
+    each phase names it."""
     with pytest.raises(ValueError, match="both read"):
         compile(phases((source(1), 3), (source(1), None)), read="indexed", loading=READ)
+    with pytest.raises(ValueError, match="both read"):
+        compile(phases((source(1).named("early"), 3), (source(1).named("late"), None)), read="indexed",
+                loading=READ)
+
+
+@pytest.mark.parametrize(("repeats", "ends"), [(None, "never"), (1, "apart")])
+def test_phases_say_where_they_end_before_any_is_read(repeats, ends):
+    """A read of phases each on its own stream says where it ends before it reads a batch, as the run asks
+    it as it opens: never where every phase's corpus repeats, apart where one may run out on a share."""
+    def finite(tag):
+        rows = [{"id": np.int32(1000 * tag + index), "length": np.int32(3 + index % 11)}
+                for index in range(48)]
+        return Memory(rows).map(Tokens()).filter(fits, reason="too_long").repeat(repeats).batch(tokens=128)
+
+    stream = compile(phases((finite(1), 3), (finite(2), None)), read="indexed", loading=READ).train(
+        DataPartition())
+    assert stream.ends == ends
+    stream.close()
 
 
 class Counted(Objective):
@@ -134,3 +152,32 @@ def test_a_run_over_phases_cut_per_share_stopped_in_either_phase_lands_where_the
         resumed = trainer(tmp_path / "resumed").fit(data, steps=stop, log_every=100, checkpoint_every=1)
     assert int(resumed.step) == 6
     assert_same(parameters(whole), parameters(resumed), "the resumed phases did not land on the whole run")
+
+
+def test_a_run_over_phases_of_other_batches_lays_each_update_out_in_its_own_phase(tmp_path):
+    """Phases of other token budgets, sixteen rows then eight, under updates of two steps: the run lays each
+    update's window out in its phase's batch, the second phase beginning where an update does, and stopped
+    in it and resumed lands where the run nobody stopped lands. A later phase whose batch the mesh cannot
+    divide is refused before any step trains."""
+    data = compile(phases((_budget(1, 256), 2), (_budget(2, 128), None)), read="indexed", loading=READ)
+
+    def accumulating(directory):
+        return Trainer(Counted(), optax.sgd(0.1), key=jax.random.key(0), accumulation=2,
+                       layout=Layout(min_shard=1, tolerance=1.0),
+                       checkpoints=Checkpoints(str(directory), keep=8))
+
+    whole = accumulating(tmp_path / "whole").fit(data, steps=6, log_every=100, checkpoint_every=None)
+    accumulating(tmp_path / "resumed").fit(data, steps=4, log_every=100, checkpoint_every=2)
+    resumed = accumulating(tmp_path / "resumed").fit(data, steps=6, log_every=100, checkpoint_every=2)
+    assert int(resumed.step) == 6
+    assert_same(parameters(whole), parameters(resumed), "the resumed phases did not land on the whole run")
+    indivisible = compile(phases((_budget(1, 128), 2), (_budget(2, 64), None)), read="indexed", loading=READ)
+    with pytest.raises(LayoutRefused):
+        trainer(tmp_path / "indivisible").fit(indivisible, steps=4, log_every=100, checkpoint_every=1)
+    assert not (tmp_path / "indivisible").exists() or not any((tmp_path / "indivisible").iterdir())
+
+
+def _budget(tag: int, tokens: int):
+    """`source(tag)`'s rows batched by a budget of `tokens` tokens."""
+    rows = [{"id": np.int32(1000 * tag + index), "length": np.int32(3 + index % 11)} for index in range(48)]
+    return Memory(rows).map(Tokens()).filter(fits, reason="too_long").repeat().batch(tokens=tokens)

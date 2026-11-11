@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import itertools
+import json
 import os
 import threading
 import typing
@@ -1358,10 +1359,6 @@ def _compile_phases(
 
     counted(built[0][0])
 
-    def counted_as_read(loader: Loader) -> Loader:
-        """`loader`, its counts among the run's once a read opens it."""
-        return dataclasses.replace(loader, train=lambda partition: counted(loader).train(partition))
-
     @functools.cache
     def opened(index: int, ends: tuple[int, ...]) -> Loader:
         """Phase `index` as it reads where the phases before it ended at `ends`, in records: as staged,
@@ -1377,12 +1374,15 @@ def _compile_phases(
     batches = tuple(phase.build.batch for phase, _ in staged)
     stages = () if tokens or per_share else phase_stages(
         batches, (0, *(end for _, end in staged[:-1] if end is not None)))
+    # A read of phases each on its own stream states its own (`StepPhases.stages`).
 
     def training(partition: DataPartition) -> Iterator[Batch]:
         if not tokens:
             _updates_aligned(source.ends, batches, partition.window)
         if per_share:
-            return _step_phases([counted_as_read(loaded) for loaded, _ in built], source.ends, partition)
+            readers = [functools.partial(loaded.train, partition) for loaded, _ in built]
+            return StepPhases(readers, source.ends, batches=batches,
+                              opened=lambda index: counted(built[index][0]) and None)
 
         def global_reader(index: int, ends: tuple[int, ...]) -> GlobalReader:
             opened_reader = opened(index, ends).train(partition)
@@ -1419,28 +1419,21 @@ def _ordered(index: int, phase: _Staged) -> _Staged:
     return phase
 
 
-def _step_phases(loaders: Sequence[Loader], ends: Sequence[int | None],
-                 partition: DataPartition) -> StepPhases:
-    """Phases on the step clock each read on its own stream (`StepPhases`): each loader's training read of
-    `partition`, opened at the step the phase before it ends (`ends`), known by its plan."""
-    readers = [functools.partial(lambda loader: loader.train(partition), loader) for loader in loaders]
-    identities = [loader.plan.identity() if loader.plan is not None else repr(loader.batches)
-                  for loader in loaders]
-    return StepPhases(readers, ends, identities, batches=[loader.batch for loader in loaders])
-
-
 def _apart(phases: Phases) -> None:
     """Refuse phases read each on its own stream (`StepPhases`) where two read one corpus: the later
     opens it at its first record, where phases in one global order continue it from where the one before
     left it, so it would read the records the earlier phase read again."""
-    seen: dict[str, int] = {}
+    seen: dict[str, tuple[int, str]] = {}
     for index, pipeline in enumerate(phases.pipelines):
-        for chain, _ in _leaves(pipeline):
-            name = _name(chain)
-            if seen.setdefault(name, index) != index:
-                raise ValueError(f"phases {seen[name]} and {index} both read {name}, each phase on its own "
-                                 "stream as a read per share is, which opens the corpus at its first record "
-                                 "again; read each corpus in one phase, or make the phases one global order")
+        for chain, corpus in _leaves(pipeline):
+            # A corpus is its store's content (`Source.fingerprint`), whatever a chain names it.
+            key = json.dumps(corpus.fingerprint(), sort_keys=True, default=str)
+            earlier, named = seen.setdefault(key, (index, _name(chain)))
+            if earlier != index:
+                raise ValueError(f"phases {earlier} and {index} both read one corpus ({named}, "
+                                 f"{_name(chain)}), each phase on its own stream as a read per share is, "
+                                 "which opens the corpus at its first record again; read each corpus in one "
+                                 "phase, or make the phases one global order")
 
 
 def _updates_aligned(ends: Sequence[int | None], batches: Sequence[int], window: int = 1) -> None:

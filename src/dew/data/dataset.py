@@ -1741,19 +1741,29 @@ class StepPhases(Forwarding):
     phase before it ends: a read per share among them, cut per share where its order is (a stream batched
     by its tokens after steps that drop rows), whose records no global count places. Phase `p` reads
     `ends[p] - ends[p - 1]` batches, one a step, its last running on (None); each batch says the phase it
-    was read in (`PHASE`); its stop, its stop's budget and its close are the open phase's stream's
-    (`Forwarding`). Its position is the phase it stands in, the steps the run has read, and that
-    phase's stream's own position, which resumes it as its own; a phase the run completed is refused
-    where this run's ends it elsewhere or reads it otherwise (`identities`). What a phase's stream read
-    ahead of its end is never trained on: the next phase opens its own stream at its first step."""
+    was read in (`PHASE`). Each phase's reader is made where the run first asks of it (its identity,
+    where it ends) and read from its phase's first step (`opened`, which a run's statistics count it
+    from); its stop, its stop's budget and its close are the open phase's (`Forwarding`). Its position is
+    the phase it stands in, the steps the run has read, and that phase's reader's own position, which
+    resumes it as its own; a phase the run completed is refused where this run's ends it elsewhere or
+    reads it otherwise. What a phase's reader read ahead of its end is never trained on: the next phase
+    reads its own from its first step. Its stages (`stages`, `phase_stages`) state each phase of another
+    batch than the one before it, from its first step, as `PhasedStream`'s do."""
 
-    def __init__(self, phases: Sequence[Callable[[], Iterator[Batch]]], ends: Sequence[int | None],
-                 identities: Sequence[str], *, batches: Sequence[int]):
-        if len(phases) != len(ends) or len(identities) != len(ends):
-            raise ValueError(f"phases need one end and one identity each: {len(phases)} phases, "
-                             f"{len(ends)} ends, {len(identities)} identities")
-        self._open, self._ends, self._identities = list(phases), list(ends[:-1]), tuple(identities)
-        self.batches, self.stages = tuple(batches), ()
+    def __init__(self, readers: Sequence[Callable[[], Iterator[Batch]]], ends: Sequence[int | None], *,
+                 batches: Sequence[int], opened: Callable[[int], None] = lambda phase: None):
+        if len(readers) != len(ends) or len(batches) != len(ends):
+            raise ValueError(f"phases need one end and one batch each: {len(readers)} phases, {len(ends)} "
+                             f"ends, {len(batches)} batches")
+        self._make, self._ends, self._opened = list(readers), list(ends[:-1]), opened
+        self.batches = tuple(batches)
+        steps = (0, *(end for end in self._ends if end is not None))
+        # A step's records as `stages` count them: a phase's steps of its own batch.
+        starts = tuple(itertools.accumulate(
+            ((after - before) * batch
+             for before, after, batch in zip(steps, steps[1:], batches, strict=False)), initial=0))
+        self.stages = phase_stages(self.batches[:len(starts)], starts)
+        self._readers: dict[int, Iterator[Batch]] = {}
         self._steps = 0
         self._current: int | None = None
         self._source: Iterator[Batch] | None = None
@@ -1766,12 +1776,20 @@ class StepPhases(Forwarding):
         return next((index for index, end in enumerate(self._ends) if end is None or steps < end),
                     len(self._ends))
 
+    def _reader(self, phase: int) -> Iterator[Batch]:
+        if phase not in self._readers:
+            self._readers[phase] = self._make[phase]()
+        return self._readers[phase]
+
     def _stream(self, phase: int) -> Iterator[Batch]:
-        """Phase `phase`'s stream, opened where it starts, the one open before it closed."""
+        """Phase `phase`'s reader, read from here on, the one read before it closed."""
         if phase != self._current:
-            super().close()
-            self._source, self._current = None, None
-            self._source, self._current = self._open[phase](), phase
+            if self._current is not None:
+                closing = self._readers.pop(self._current)
+                if isinstance(closing, Closeable):
+                    closing.close()
+            self._source, self._current = self._reader(phase), phase
+            self._opened(phase)
         assert self._source is not None
         return self._source
 
@@ -1790,7 +1808,7 @@ class StepPhases(Forwarding):
         own = stream.get_state()
         return json.dumps({STEP_PHASES: {
             "steps": self._steps, "phase": phase, "ends": self._ends[:phase],
-            "identities": list(self._identities[:phase + 1]),
+            "identities": [self._identity(index) for index in range(phase + 1)],
             "position": base64.b64encode(own if isinstance(own, bytes)
                                          else json.dumps(own).encode()).decode(),
             "encoded": isinstance(own, bytes)}}).encode()
@@ -1801,12 +1819,11 @@ class StepPhases(Forwarding):
         phase = integer(saved["phase"], "the saved phase")
         ends = list(listed(saved["ends"], "saved phase ends", read=integer, what="a list of steps"))
         identities = list(strings(saved["identities"], "saved phase identities"))
-        if phase >= len(self._open) or ends != self._ends[:phase] or identities[:phase] != list(
-                self._identities[:phase]):
-            raise ValueError(f"the saved run finished phases ending at steps {ends}, read as "
-                             f"{identities[:phase]}, and this run's phases end at {self._ends[:phase]}, read "
-                             f"as {list(self._identities[:phase])}; a phase the run has read cannot change "
-                             "under it")
+        if phase >= len(self._make) or ends != self._ends[:phase] or identities[:phase] != [
+                self._identity(index) for index in range(phase)]:
+            raise ValueError(f"the saved run finished phases ending at steps {ends}, and this run's phases "
+                             f"end at {self._ends[:phase]}, or read them otherwise; a phase the run has read "
+                             "cannot change under it")
         steps = integer(saved["steps"], "the saved steps")
         end = self._ends[phase] if phase < len(self._ends) else None
         if end is not None and steps > end:
@@ -1820,16 +1837,27 @@ class StepPhases(Forwarding):
         stream.set_state(own if encoded else json.loads(own))
         self._steps = steps
 
+    def _identity(self, phase: int) -> str:
+        """What phase `phase`'s reader reads, as the pool agrees it (`stream_identity`): its plan as this
+        share reads it, its topology among it."""
+        return stream_identity(self._reader(phase))
+
     def identity(self) -> str:
-        return "; ".join([*self._identities, f"phases ending at steps {list(self._ends)}"])
+        return "; ".join([*(self._identity(index) for index in range(len(self._make))),
+                          f"phases ending at steps {list(self._ends)}"])
 
     @property
     def ends(self) -> Ends:
-        # The last phase's stream ends the run's data where it ends.
-        return stream_ends(self._source) if self._current == len(self._open) - 1 else "never"
+        # Any phase's reader may run out before its end, as the last may: the run ends where the first
+        # one does, on every share together only where each phase's does.
+        stated = {stream_ends(self._reader(index)) for index in range(len(self._make))}
+        return "apart" if "apart" in stated else "together" if "together" in stated else "never"
 
     def close(self) -> None:
-        super().close()
+        for reader in self._readers.values():
+            if isinstance(reader, Closeable):
+                reader.close()
+        self._readers.clear()
         self._source, self._current = None, None
 
 

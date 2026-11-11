@@ -46,6 +46,7 @@ from dew.data.dataset import (
     PhasedStream,
     RampedStream,
     Stage,
+    StepPhases,
     stream_identity,
 )
 from dew.data.pipeline import Dataset, DeviceStep
@@ -1645,7 +1646,8 @@ class Trainer(Generic[Loss, Effects]):
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
-            stages = run.source.stages if isinstance(run.source, RampedStream | PhasedStream) else ()
+            staged = isinstance(run.source, RampedStream | PhasedStream | StepPhases)
+            stages = run.source.stages if staged else ()
             self._ramp = stages if isinstance(run.source, RampedStream) else ()
             # The steps a stage after the first begins at, each where an update does (`Ramp.stages`): a
             # ramp's and phases' of other batches here (`PhasedStream.stages`), a schedule's as each begins
