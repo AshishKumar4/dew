@@ -62,6 +62,7 @@ class Dataset()  [dew.data.pipeline]
   .map_with_index(self, step: Callable[[int, Batch], Batch | Rejected], *, identity: str | None = None) -> Pipeline
   .named(self, name: str) -> Pipeline
   .pack(self, seq_len: int, *, fields: tuple[str, ...] = ('text',), bins: int = 32, policy: Literal['first-fit', 'best-fit', 'concat'] = 'first-fit', segments: int | None = None, along: tuple[tuple[str, int], ...] = (), overlap: int = 0) -> Pipeline
+  .phase_count: property -> int
   .pipe(self, stages: Callable[Concatenate[Dataset, Options], Dataset], *args: Options.args, **kwargs: Options.kwargs) -> Dataset
   .prefetch(self, buffer: int = 64) -> Pipeline
   .random_filter_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline
@@ -177,6 +178,7 @@ class Objective()  [dew.objectives.base]
   .served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]
   .stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]
   .substitute(self, modules: Sequence[nn.Module]) -> None
+  .substituted(self, modules: Sequence[nn.Module]) -> Self
   .task_settings(self) -> DataclassInstance | None
   .tile_head(self, tile: tuple[int, int] | None = None) -> str | None
   .tower_axes(self) -> dict[tuple[str, ...], LogicalAxes]
@@ -276,6 +278,7 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]
   .stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]
   .substitute(self, modules: Sequence[nn.Module]) -> None
+  .substituted(self, modules: Sequence[nn.Module]) -> Self
   .task_settings(self) -> DataclassInstance | None
   .tile_head(self, tile: tuple[int, int] | None = None) -> str | None
   .tower_axes(self) -> dict[tuple[str, ...], LogicalAxes]
@@ -310,21 +313,26 @@ class TrainState(step: jax.Array, microstep: jax.Array, updates: jax.Array, vari
   .replace(self, **updates)
   .window: property -> Accumulation | None
   .with_window(self, window: Accumulation | None) -> TrainState
-class Trainer(objective: Objective[Loss, Effects], optimizer: optax.GradientTransformation | OptimConfig, *, key: int | jax.Array, mesh: MeshSpec | Mesh = MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, diloco=1, explicit=()), layout: Layout = Layout(rules=(('vocab', ('fsdp', 'tensor')), ('mlp', 'tensor'), ('mlp', 'fsdp'), ('modulation', 'fsdp'), ('attention', 'tensor'), ('attention', 'fsdp'), ('linear', 'fsdp'), ('embed', 'fsdp'), ('head_dim', 'fsdp'), ('heads', ('fsdp', 'tensor')), ('kv', ('fsdp', 'tensor')), ('index', 'fsdp'), ('kvlora', 'fsdp'), ('qlora', 'fsdp'), ('output', 'fsdp'), ('exp', 'expert'), ('heads', 'tensor'), ('kv', 'tensor'), ('activation_batch', ('data', 'expert', 'fsdp')), ('activation_length', 'sequence'), ('activation_spread', ('sequence', 'tensor')), ('activation_spread', 'sequence'), ('activation_heads', 'tensor'), ('activation_kv', 'tensor'), ('activation_mlp', 'tensor'), ('activation_vocab', 'tensor'), ('pages', ('data', 'expert', 'fsdp')), ('activation_batch', ('data', 'expert')), ('activation_batch', 'data')), min_shard=65536, tolerance=0.02, host=(), host_parameters=(), frozen_whole=False, stage_local=True, data_axes=()), microbatches: int | None = None, accumulation: int = 1, split: int | None = None, dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False, checkpoints: Checkpoints | None = None, tracker: Tracker | None = None, step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None, rollout: Rollout | None = None, profile: ProfileWindow | None = None, lower_for: str | None = None, ahead: AheadOfTime | None = None, tune_kernels: bool = False, record: bool = False, links: Mapping[str, Link] | None = None, inspection: Inspection | None = None, param_dtype: str | None = None, diloco: DiLoCo | None = None)  [dew.training.trainer]
+class Trainer(objective: Objective[Loss, Effects], optimizer: optax.GradientTransformation | OptimConfig, *, key: int | jax.Array, mesh: MeshSpec | Mesh = MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, diloco=1, explicit=()), layout: Layout = Layout(rules=(('vocab', ('fsdp', 'tensor')), ('mlp', 'tensor'), ('mlp', 'fsdp'), ('modulation', 'fsdp'), ('attention', 'tensor'), ('attention', 'fsdp'), ('linear', 'fsdp'), ('embed', 'fsdp'), ('head_dim', 'fsdp'), ('heads', ('fsdp', 'tensor')), ('kv', ('fsdp', 'tensor')), ('index', 'fsdp'), ('kvlora', 'fsdp'), ('qlora', 'fsdp'), ('output', 'fsdp'), ('exp', 'expert'), ('heads', 'tensor'), ('kv', 'tensor'), ('activation_batch', ('data', 'expert', 'fsdp')), ('activation_length', 'sequence'), ('activation_spread', ('sequence', 'tensor')), ('activation_spread', 'sequence'), ('activation_heads', 'tensor'), ('activation_kv', 'tensor'), ('activation_mlp', 'tensor'), ('activation_vocab', 'tensor'), ('pages', ('data', 'expert', 'fsdp')), ('activation_batch', ('data', 'expert')), ('activation_batch', 'data')), min_shard=65536, tolerance=0.02, host=(), host_parameters=(), frozen_whole=False, stage_local=True, data_axes=()), microbatches: int | None = None, accumulation: int = 1, split: int | None = None, dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False, checkpoints: Checkpoints | None = None, tracker: Tracker | None = None, step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None, rollout: Rollout | None = None, profile: ProfileWindow | None = None, lower_for: str | None = None, ahead: AheadOfTime | None = None, tune_kernels: bool = False, record: bool = False, links: Mapping[str, Link] | None = None, inspection: Inspection | None = None, param_dtype: str | None = None, diloco: DiLoCo | None = None, phase_passes: Sequence[int] | None = None)  [dew.training.trainer]
   .compile(self, state: TrainState, batch: Batch, trials: Trials | None = None, *, capacity: int | None = None) -> CompiledStep
   .device_mesh: cached property -> Mesh
+  .executable: property -> jax.stages.Compiled | None
   .fit(self, dataset: Dataset | Loader | Handed, *, state: TrainState | None = None, resume: Resume = 'auto', **asked: Unpack[FitArguments]) -> TrainState
   .host_master: property -> bool
   .initial_state(self, initializer: Initializer | None = None, key: int | jax.Array | None = None) -> TrainState
   .key: property -> jax.Array
+  .links: property -> Mapping[str, Link]
+  .memory: property -> JSON
   .microbatches: property -> int
   .optimizer: property -> optax.GradientTransformation
   .place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]
+  .plan: property -> JSON
   .reading(self, loader: Loader, prefetch: int = 2, *, examples=None, steps=None) -> None
   .scheduled(self, updates: int | None) -> None
   .shardings(self, state: TrainState) -> Placement[TrainState]
   .staged(self, state: TrainState) -> TrainState
   .state_mesh: cached property -> Mesh
+  .step_flops: property -> StepFlops | None
   .stored(self, state: TrainState) -> TrainState
   .validate(self, batch: Batch | None = None, *, steps: int | None = None, capacity: int | None = None) -> Validation
 class VideoGrid(videos: jax.Array, captions: tuple[str, ...] = ()) -> None  [dew.artifacts]
@@ -366,15 +374,15 @@ dew.config.DecoderRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
-  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: dew.config.ObjectiveConfig | None = None
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
-  loop_steps: int | None = None
+  loop_steps: int | tuple[int, ...] | None = None
   loop_layers: tuple[int, int] | None = None
   loop_backprop_steps: int | None = None
   loop_remat: bool = False
@@ -406,69 +414,14 @@ dew.config.RunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
-  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: dew.config.ObjectiveConfig | None = None
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
-dew.config.SourceOptions
-  text_only: bool = False
-  prediction_depths: int | None = None
-  attention: dict[str, Literal['causal', 'block_bidirectional']] | None = None
-  dex: Annotated[dew.nn.dex.DifferentialExtension, PrimitiveConstructorSpec] | None = None
-  scan_layers: bool = False
-  packed_experts: bool = False
-  param_dtype: str | None = None
-  step: int | str | None = None
-  ema: bool | None = None
-dew.config.TrainerConfig
-  name: str | None = None
-  checkpoint_dir: str = './checkpoints'
-  keep: Annotated[int | dew.checkpoints.Keep, PrimitiveConstructorSpec] = 2
-  resume: Literal['auto', 'require', 'never'] = 'auto'
-  best: Annotated[str | dew.training.selection.Best | tuple[dew.training.selection.Best, ...] | None, PrimitiveConstructorSpec] = None
-  update_tokens: int | None = None
-  key: int = 0
-  steps: int | None = None
-  epochs: int | None = None
-  tokens: int | None = None
-  examples: int | None = None
-  stop: Annotated[dew.training.budget.Pause, _SubcommandConfig] | Annotated[dew.training.budget.Plateau, _SubcommandConfig] | None = None
-  restore_best: bool = False
-  cooldowns: Annotated[dew.training.cooldown.Cooldowns, _SubcommandConfig] | None = None
-  log_every: Annotated[int | str, PrimitiveConstructorSpec] = 100
-  eval_every: Annotated[int | str | None, PrimitiveConstructorSpec] = 'epoch'
-  checkpoint_every: Annotated[int | str | datetime.timedelta | None, PrimitiveConstructorSpec] = 'epoch'
-  checkpoint_final: bool = True
-  local_directory: str | None = None
-  local_every: int | str | None = None
-  scored_to: str | None = None
-  accumulation: int = 1
-  split: int | None = None
-  batch_ramp: dew.data.dataset.Ramp | None = None
-  dynamic_scale: bool | None = None
-  precision: Annotated[dew.nn.precision.Numerics, PrimitiveConstructorSpec] = dew.nn.precision.Numerics()
-  mesh: dew.distributed.placement.MeshSpec = dew.distributed.placement.MeshSpec()
-  microbatches: int | None = None
-  layout: dew.distributed.placement.Layout = dew.distributed.placement.Layout()
-  profile: dew.training.profiling.ProfileWindow | None = None
-  run_profile: dew.training.profiling.RunProfile | None = dew.training.profiling.RunProfile()
-  compilation_cache_dir: str | None = None
-  wandb: dew.training.tracker.Wandb | None = None
-  publish: bool = False
-  multi_host: bool | None = None
-  xla_flags: str | None = None
-  quantization: dew.quantization.Quantization | None = None
-  lower_for: str | None = None
-  compile_ahead: Annotated[dew.training.ahead.AheadTarget, _SubcommandConfig] | None = None
-  ahead: str | None = None
-  inspection: Annotated[dew.training.inspection.Inspection, _SubcommandConfig] | None = None
-  diloco: Annotated[dew.training.diloco.DiLoCo, _SubcommandConfig] | None = None
-  links: Annotated[collections.abc.Mapping[str, dew.nn.sharding.Link], PrimitiveConstructorSpec] = builtins.dict()
-  tune_kernels: bool = False
 dew.config.diffusion.DiffusionRunConfig
   model: ModelConfig = (lambda: ModelConfig('unet', dict(DEFAULT_MODEL_CONFIG)))()
   data: Annotated[dew.data.pipeline.Dataset | None, Suppress] = None
@@ -476,9 +429,9 @@ dew.config.diffusion.DiffusionRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
-  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('diffusion', {'solver': to_record(EulerAncestral(), Solver)}))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
@@ -510,7 +463,7 @@ dew.config.env.EnvRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
   trainer: TrainerConfig = (lambda: TrainerConfig(eval_every=None, checkpoint_every=None))()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('dew.objectives.rl.dreamer:DreamerV3Objective'))()
@@ -543,9 +496,9 @@ dew.config.jepa.JepaRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.001))()
-  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('jepa'))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
@@ -564,15 +517,15 @@ dew.config.lm.LMRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=0.0006, weight_decay=0.1, clip_grads=1.0))()
-  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('lm'))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
-  loop_steps: int | None = None
+  loop_steps: int | tuple[int, ...] | None = None
   loop_layers: tuple[int, int] | None = None
   loop_backprop_steps: int | None = None
   loop_remat: bool = False
@@ -613,6 +566,61 @@ dew.config.sweep.OptunaSearch
   seed: int = 0
 dew.config.sweep.RandomSearch
   seed: int = 0
+dew.config.trainer.SourceOptions
+  text_only: bool = False
+  prediction_depths: int | None = None
+  attention: dict[str, Literal['causal', 'block_bidirectional']] | None = None
+  dex: Annotated[DifferentialExtension, record_argument(DifferentialExtension)] | None = None
+  scan_layers: bool = False
+  packed_experts: bool = False
+  param_dtype: str | None = None
+  step: int | str | None = None
+  ema: bool | None = None
+dew.config.trainer.TrainerConfig
+  name: str | None = None
+  checkpoint_dir: str = './checkpoints'
+  keep: Annotated[int | Keep, _keep_argument()] = 2
+  resume: Resume = 'auto'
+  best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
+  update_tokens: int | None = None
+  key: int = 0
+  steps: int | None = None
+  epochs: int | None = None
+  tokens: int | None = None
+  examples: int | None = None
+  stop: Annotated[Pause, tyro.conf.subcommand('pause')] | Annotated[Plateau, tyro.conf.subcommand('plateau')] | None = None
+  restore_best: bool = False
+  cooldowns: Annotated[Cooldowns, tyro.conf.subcommand('cooldowns')] | None = None
+  log_every: Annotated[int | str, _cadence_argument(timed=False)] = 100
+  eval_every: Annotated[int | str | None, _cadence_argument(timed=False)] = 'epoch'
+  checkpoint_every: Annotated[int | str | datetime.timedelta | None, _cadence_argument()] = 'epoch'
+  checkpoint_final: bool = True
+  local_directory: str | None = None
+  local_every: int | str | None = None
+  scored_to: str | None = None
+  accumulation: int = 1
+  split: int | None = None
+  batch_ramp: Ramp | None = None
+  dynamic_scale: bool | None = None
+  precision: Annotated[Numerics, _numerics_argument()] = dew.nn.precision.Numerics()
+  mesh: MeshSpec = dew.distributed.placement.MeshSpec()
+  microbatches: int | None = None
+  layout: Layout = dew.distributed.placement.Layout()
+  profile: ProfileWindow | None = None
+  run_profile: RunProfile | None = dew.training.profiling.RunProfile()
+  compilation_cache_dir: str | None = None
+  wandb: Wandb | None = None
+  publish: bool = False
+  multi_host: bool | None = None
+  xla_flags: str | None = None
+  quantization: Quantization | None = None
+  lower_for: str | None = None
+  compile_ahead: Annotated[AheadTarget, tyro.conf.subcommand('ahead')] | None = None
+  ahead: str | None = None
+  inspection: Annotated[Inspection, tyro.conf.subcommand('inspect')] | None = None
+  diloco: Annotated[DiLoCo, tyro.conf.subcommand('diloco')] | None = None
+  links: Annotated[Mapping[str, Link], record_argument(Mapping[str, Link])] = builtins.dict()
+  tune_kernels: bool = False
 dew.config.world_model.TokenizerConfig
   run: str
   step: int | str | None = None
@@ -623,9 +631,9 @@ dew.config.world_model.WorldModelRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
   optim: dew.optim.OptimConfig = dew.optim.OptimConfig()
-  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('dew.objectives.world_model:TokenizerObjective'))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
@@ -643,15 +651,15 @@ dew.decision.config.DecisionRunConfig
   data_seed: int = 0
   kernels: dict[str, str] = builtins.dict()
   data_plan_version: int | None = None
-  source: dew.config.SourceOptions = dew.config.SourceOptions()
+  source: dew.config.trainer.SourceOptions = dew.config.trainer.SourceOptions()
   optim: OptimConfig = (lambda: OptimConfig(learning_rate=2.5e-05))()
-  trainer: dew.config.TrainerConfig = dew.config.TrainerConfig()
+  trainer: dew.config.trainer.TrainerConfig = dew.config.trainer.TrainerConfig()
   objective: ObjectiveConfig = (lambda: ObjectiveConfig('decision'))()
   lora: Annotated[dew.lora.LoRA, _SubcommandConfig] | None = None
   val_metrics: Annotated[tuple[dew.config.MetricConfig, ...], PrimitiveConstructorSpec] | None = None
   val_every: Annotated[collections.abc.Mapping[str, int | str], PrimitiveConstructorSpec] = builtins.dict()
   val_summaries: Annotated[tuple[dew.training.evaluation.Summary, ...], PrimitiveConstructorSpec] = ()
-  loop_steps: int | None = None
+  loop_steps: int | tuple[int, ...] | None = None
   loop_layers: tuple[int, int] | None = None
   loop_backprop_steps: int | None = None
   loop_remat: bool = False
