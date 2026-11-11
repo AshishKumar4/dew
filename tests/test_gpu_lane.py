@@ -196,7 +196,8 @@ def test_a_file_with_tests_for_a_users_process_runs_them_in_a_process_of_their_o
         "def said(name):\n"
         "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
         # A file a run of its own, written whole: nothing a later run reads, so no record's input.
-        "    Path(f'{kind}-{name}-{os.getpid()}').write_text(os.environ.get('DEW_TEST_USERS_ARITHMETIC', '0'))\n"
+        "    users = os.environ.get('DEW_TEST_USERS_ARITHMETIC', '0')\n"
+        "    Path(f'flow-{kind}-{name}-{os.getpid()}').write_text(users)\n"
         + "".join(f"@pytest.mark.prepares\n{'@pytest.mark.users_process' + chr(10) if index % 3 == 0 else ''}"
                   f"def test_{index}():\n    said('test_{index}')\n" for index in range(6)))
     (tmp_path / "tests/test_plain.py").write_text(LANE_TEST)
@@ -204,8 +205,8 @@ def test_a_file_with_tests_for_a_users_process_runs_them_in_a_process_of_their_o
     def said(kind: str) -> list[tuple[str, str]]:
         """Each test a `kind` of process ran since the last look, and the word it ran under."""
         found = []
-        for path in sorted(tmp_path.glob(f"{kind}-test_*")):
-            found.append((path.name.split("-")[1], path.read_text()))
+        for path in sorted(tmp_path.glob(f"flow-{kind}-*")):
+            found.append((path.name.split("-")[2], path.read_text()))
             path.unlink()
         return sorted(found)
 
