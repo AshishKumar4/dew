@@ -741,7 +741,9 @@ def test_a_run_counts_its_own_mirror_reads_never_an_earlier_readers_of_its_proce
                     {"dewcache": {"cache_storage": str(tmp_path / "earlier"), "max_bytes": 1024}})
     earlier.put_if_absent(b"read before the run")
     assert earlier.read() == b"read before the run"
-    loader = compile(Memory([{"id": index} for index in range(8)]).batch(2), loading=Loading(workers=0))
+    # One pass: a training read of a chain that states no repeat reads it endlessly.
+    loader = compile(Memory([{"id": index} for index in range(8)]).repeat(1).batch(2),
+                     loading=Loading(workers=0))
     reader = loader.train(DataPartition())
     try:
         assert len(list(reader)) == 4
