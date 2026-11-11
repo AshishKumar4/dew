@@ -443,7 +443,7 @@ def test_the_tpu_ssd_scan_holds_its_orders(edge):
     (x, steps, decay, b, c, _, state), direction, cotangent = ssd_draw(2677, EDGES[edge])
 
     def tpu(x, b, c, a, state):
-        return ssd._chunk_scan(x, b, c, a, state, 64, "tpu")
+        return ssd._chunk_scan(x, b, c, a, state, None, 64, "tpu")
 
     heads = tuple(jnp.repeat(t, 2, axis=2) for t in (b, c))
     primals = (x * steps[..., None], *heads, steps * decay, state)

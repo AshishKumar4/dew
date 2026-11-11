@@ -21,7 +21,7 @@ def packed(record: NamedTuple, xp=jnp):
     return xp.stack(record, axis=1).astype(np.int32)
 
 
-def unpacked(declared: type, at: Callable[[int], jax.Array]):
+def unpacked(declared: type, at: Callable[[int], "Column"]):
     """A table's row as its declaration `declared` (a `NamedTuple` of its columns, `packed`), each field
     read by `at(column)`: a ref's row's scalar loads in a kernel, or an array's columns."""
     return declared(*(at(i) for i in range(len(declared._fields))))

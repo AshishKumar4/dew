@@ -551,13 +551,17 @@ def test_documents_that_continue_another_read_its_state_and_history_as_their_own
                                layout, "Mamba-2")
 
 
-def test_a_decode_token_on_the_fused_step_is_the_layers_own():
+@pytest.mark.check1_shards(seeds=8, per_task=2)
+@pytest.mark.parametrize("conv_bias", [True, False])
+def test_a_decode_token_on_the_fused_step_is_the_layers_own(conv_bias):
     """A Mamba-2 mixer's decode tokens through the recurrence's fused step (the decode kernel
     named 'fused', interpreted on a CPU, its conv, gates and update in one launch), on par (check 1) with the
     layer's own unfused tokens, from the float64 layer's: the decode matrix's cell on a CPU
-    (`delta_decode_matrix.on_par`)."""
+    (`delta_decode_matrix.on_par`), with its conv's bias and without it (`use_conv_bias`), whose fused step
+    read a bias the module has none of."""
     import delta_decode_matrix
 
-    delta_decode_matrix.on_par(('sm90', 'mamba2', 'fused', 'float32'))
+    delta_decode_matrix.on_par(('sm90', 'mamba2', 'fused', 'float32'),
+                               delta_decode_matrix.initialized('mamba2', use_conv_bias=conv_bias))
 
 

@@ -39,12 +39,12 @@ from delta_rule_support import fused_step, recurrence, through
 from flax import linen as nn
 from forks_support import LAYOUTS, assert_forks_as_own_rows
 from model_support import as_stepped, decode_through, float64_twin
-from reference_error import as_given, assert_as_exact, widened, without_ynn
+from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, widened, without_ynn
 
 from dew.algebra.scan import _decays_of
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
-from dew.nn.kernels import recurrence as kernel
+from dew.nn.kernels import generation, recurrence as kernel
 from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, Tiles, chunk_gated_delta_rule, fla_rule, xla_mainloop
 from dew.nn.linear import (
     GatedDeltaNet,
@@ -1099,53 +1099,92 @@ def test_a_layer_choosing_the_fused_step_allocates_its_cache_as_the_unfused_one(
     assert described(fused) == described(unfused)
 
 
-@pytest.mark.parametrize("value_width", [128, 512, 64])
-def test_a_gated_delta_nets_decode_token_takes_the_step_wherever_its_value_heads_fit_it(value_width):
-    """A gated delta net's decode token with a conv, gates and a gated norm on an H100's route (`assumed`):
-    the step takes it wherever its own widths hold (`step.fits` not whole), the fused step's (a value head a
-    warpgroup, its norm reading a head whole) no rule of the step's: at fla's default value heads of 512 or
-    64 the step takes the token, as main's step kernel did, not the portable math."""
-    from dew.nn.kernels.generation import assumed
-    from dew.nn.kernels.selection import select
-    from dew.nn.linear import DELTA_DECODE, DecodeCase
-
-    with assumed("sm90"):
-        chosen = select(DELTA_DECODE, DecodeCase((8, 16, 128, value_width), jnp.dtype(jnp.bfloat16),
-                                                 fuses=True)).kernel
-    assert chosen == "step"
+def _widths_draw(rows: int, heads: int, key_width: int, value_width: int):
+    """`decode_operands` at `key_width` keys and `value_width` values a head, by seed."""
+    def draw(seed):
+        rng = np.random.default_rng(5 + seed)
+        query, key, value, g, beta, state = decode_operands(rng, rows, heads, max(key_width, value_width))
+        return (query[..., :key_width] / jnp.linalg.norm(query[..., :key_width], axis=-1, keepdims=True),
+                key[..., :key_width] / jnp.linalg.norm(key[..., :key_width], axis=-1, keepdims=True),
+                value[..., :value_width], g, beta, state[..., :key_width, :value_width])
+    return draw
 
 
-@pytest.mark.parametrize("value_width", [128, 512, 64])
-def test_a_token_with_nothing_to_fuse_naming_the_fused_step_takes_the_step_at_its_widths(value_width):
-    """A decode token whose caller has no conv, gates or gated norm to fuse naming the fused step
-    (`generation.chosen`) on an H100's route: the fused step hands it to the step wherever the step's own
-    widths hold, refusing it by no width the fused step's gated norm alone asks."""
-    from dew.nn.kernels.generation import assumed, chosen
-    from dew.nn.kernels.selection import select
-    from dew.nn.linear import DELTA_DECODE, DecodeCase
+def _stepped(kernel: str):
+    """A decode token `[B, 1, H, D]` through `linear.decode_step`, which asks the decode selector for its
+    kernel (`decode_kernel`, a caller with nothing to fuse), `kernel` named (`generation.chosen`)."""
+    from dew.nn.linear import STEP, decode_step
 
-    with assumed("sm90"), chosen(delta_decode="fused"):
-        kernel = select(DELTA_DECODE, DecodeCase((8, 16, 128, value_width), jnp.dtype(jnp.bfloat16),
-                                                 fuses=False)).kernel
-    assert kernel == "step"
+    def decoded(query, key, value, g, beta, state):
+        query, key, value = (x[:, 0] for x in (query, key, value))
+        with generation.chosen(delta_decode=kernel):
+            out, final = decode_step(STEP, state, query * key.shape[-1] ** -0.5, key, value, g[:, 0],
+                                     beta[:, 0], None)
+        return out[:, None], final
+    return decoded
 
 
-@pytest.mark.parametrize(("value_heads", "kernel"), [(2, "xla"), (4, "step")])
-def test_a_decode_token_over_a_tensor_mesh_takes_the_step_where_each_shards_heads_fit_it(value_heads, kernel):
-    """A gated delta net's decode token of 64-wide value heads over two key heads on an H100's route, its
-    heads split over a two-way tensor mesh (`stepped_per_shard`): the step's programs take two such heads
-    each (`step.fits`), so a shard of one head is no launch of the step's and the token takes the portable
-    math, a shard of two the step."""
-    from jax.sharding import AbstractMesh, AxisType
+@as_given
+def _widths_exact(query, key, value, g, beta, state):
+    """The recurrence one token on in float64 (`recurrent_gated_delta_rule`)."""
+    out, final = recurrent_gated_delta_rule(query, key, value, g, beta, state)
+    return np.asarray(out), np.asarray(final)
 
-    from dew.nn.kernels.generation import assumed
-    from dew.nn.linear import decode_kernel
 
-    mesh = AbstractMesh((2,), ("tensor",), axis_types=(AxisType.Explicit,))
-    with assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        chosen = decode_kernel(jax.ShapeDtypeStruct((8, value_heads, 128, 64), jnp.bfloat16), groups=2,
-                               fuses=True)
-    assert chosen == kernel
+@pytest.mark.check1_shards(seeds=8, per_task=1)
+@pytest.mark.parametrize("value_width", [512, 64])
+def test_a_gated_delta_nets_decode_token_runs_the_step_at_fla_value_widths(value_width):
+    """A gated delta net's decode token, its conv, gates and gated norm the fused step's to take, on an
+    H100's route with the step named (`generation.chosen`, interpreted), at fla's default value heads of 512
+    and of 64 over keys of 128 (two value heads over one key head): on par with the portable token (check 1,
+    the layer in float64 the truth), the step's own widths holding where the fused step's (a value head a
+    warpgroup, its norm reading a head whole) do not (`delta_decode_matrix.on_par`)."""
+    import delta_decode_matrix
+
+    layer = delta_decode_matrix.initialized("gated delta net", num_k_heads=1, num_v_heads=2,
+                                            head_v_dim=value_width)
+    with generation.assumed("sm90", interpreted=True):
+        delta_decode_matrix.on_par(("sm90", "gated delta net", "step", "bfloat16"), layer)
+
+
+@pytest.mark.parametrize("value_width", [512, 64])
+def test_a_token_with_nothing_to_fuse_naming_the_fused_step_runs_the_step(value_width):
+    """A decode token with no conv, gates or gated norm to fuse (`_stepped`, `linear.decode_step`) naming
+    the fused step, on an H100's route (interpreted), at value heads of `value_width` over keys of 128: the
+    fused step hands it to the step, which runs it on par with the portable token (check 1, the recurrence
+    in float64 the truth), refusing it by no width the fused step's norm alone asks."""
+    with generation.assumed("sm90", interpreted=True):
+        assert_as_exact(_stepped("fused"), _stepped("xla"), _widths_draw(2, 2, 128, value_width),
+                        "nothing to fuse", seeds=FEWEST_SEEDS, truth_fn=_widths_exact)
+
+
+@pytest.mark.check1_shards(seeds=128, per_task=16)
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("value_heads", [4, 2])
+def test_a_decode_token_over_a_tensor_mesh_runs_the_step_where_each_shards_heads_fit_it(value_heads):
+    """A decode token of 64-wide value heads over keys of 128 on an H100's route (interpreted), its heads
+    split over a two-way tensor mesh (`stepped_per_shard`), the step named: the step's programs take two
+    such heads each (`step.fits` on each shard's state), so a shard of two runs it per shard on par with the
+    recurrence (`sharded.assert_runs_per_shard`), and a shard of one, no launch of the step's, refuses it."""
+    from jax.sharding import Mesh, PartitionSpec
+    from sharded import assert_runs_per_shard
+
+    from dew.nn.kernels.selection import KernelRefused
+
+    stepped = _stepped("step")
+    heads = PartitionSpec(None, None, "tensor", None)
+    specs = [heads] * 3 + [PartitionSpec(None, None, "tensor")] * 2 + [
+        PartitionSpec(None, "tensor", None, None)]
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("tensor",))
+    draw = _widths_draw(2, value_heads, 128, 64)
+    with generation.assumed("sm90", interpreted=True):
+        if value_heads == 2:
+            placed = jax.device_put(draw(0), tuple(jax.NamedSharding(mesh, spec) for spec in specs))
+            with pytest.raises(KernelRefused), jax.set_mesh(mesh):
+                jax.jit(stepped)(*placed)
+            return
+        assert_runs_per_shard(stepped, draw, specs, mesh, "64-wide heads split over tensor",
+                              seeds=SHARDED_SEEDS, truth_fn=_widths_exact, donate=(5,))
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm90"])

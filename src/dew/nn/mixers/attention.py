@@ -175,19 +175,21 @@ class CallVisibility(NamedTuple):
 
 def call_visibility(metadata: AttentionMetadata, rotary_positions, *, batch: int, queries: int, keys: int,
                     key_places, sliding_window: int | None, cached: bool = False,
-                    anchor: tuple[jax.Array, jax.Array] | None = None) -> CallVisibility | None:
+                    anchor: tuple[jax.Array, jax.Array] | None = None,
+                    groups: tuple[str, ...] = ()) -> CallVisibility | None:
     """A call's own visibility, None where it states none: its pairwise mask
     (`AttentionMetadata.pairwise_mask`), a windowed layer keeping each query to the keys within its
     window of the query's rotary position where the call gives the keys' positions; its key runs
     (`AttentionMetadata.key_runs`), a windowed layer windowing each run over the key positions the call
     gives, its queries read at them too where they are its own tokens, or a cached call's at its rotary
     positions through a mask; and its forks' runs (`dew.nn.inputs.fork_runs`): each token its ancestors'
-    keys and its own, a cached call's after the row's cache at `anchor` (`fork_anchor`). A query reads a
+    keys and its own, a cached call's after the row's cache at `anchor` (`fork_anchor`), a token of a group
+    the layer reads both ways (`groups`) its group whole. A query reads a
     key where every one of them it states lets it. An uncached call's forks window their runs over the
     tokens' places, which their positions give; a cached call's over the key positions it gives, which a
     windowed layer's cached keys need, held at their slots. `key_places` are where the keys are read
     otherwise."""
-    forked = fork_runs(metadata, batch, queries, anchor if cached else None)
+    forked = fork_runs(metadata, batch, queries, anchor if cached else None, groups)
     if metadata.pairwise_mask is None and metadata.key_runs is None and forked is None:
         # A validity alone hides its keys from the layer's own visibility (`_masking`), no call's.
         return None
@@ -1300,8 +1302,10 @@ class CausalSelfAttention(nn.Module):
                                                key_places, implementation, masked, decode, anchor)
         if own is not None:
             mask, runs, window, key_places, query_places, valid = own
-            causal, documents, groups, places = False, None, _Groups(), (
-                key_places if query_places is None else query_places)
+            # The call's runs are its visibility, each token's own group reached (`fork_runs`); an uncached
+            # call's blocks read whole past its window within them (the spans' `_whole_blocks`).
+            causal, documents, places = False, None, key_places if query_places is None else query_places
+            groups = _Groups() if decode else _Groups(block_groups=groups.block_groups)
         elif attention_metadata is not None and attention_metadata.key_valid is not None:
             # The call's keys' validity alone hides the keys it marks out from every query of the layer's own
             # visibility (row 4771): a mask's keys taken from it (a decode step's or a prefix's, read by the
@@ -1427,7 +1431,7 @@ class CausalSelfAttention(nn.Module):
         call's runs the one the layer chooses ('auto')."""
         own = None if metadata is None else call_visibility(
             metadata, rotary_positions, batch=B, queries=S, keys=keys, key_places=key_places,
-            sliding_window=self.ctx.sliding_window, cached=decode, anchor=anchor)
+            sliding_window=self.ctx.sliding_window, cached=decode, anchor=anchor, groups=self._group_fields())
         if own is not None and (own.mask is not None or decode or self.ctx.attention_impl != 'auto'):
             implementation = masked()
         return own, implementation

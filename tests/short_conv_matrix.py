@@ -17,20 +17,27 @@ from fla_gdn_support import CONV_SHAPES
 from gpu_flow import cell
 from kernel_matrix import AXES
 from reference_error import as_given, assert_as_exact
-from test_short_conv import TRAINING_SEEDS, documents, row_truth, run, training_draw
+from test_short_conv import documents, row_truth, run, training_draw
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, short_conv
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.linear import causal_conv1d
 
-CHOICES = frozenset({"short_conv"})
-"""The generation.CHOICES entries the family's cells run (row 184)."""
+CHOICES = frozenset({short_conv.CONV.choice})
+"""The generation.CHOICES entries the family's cells run (row 184): the conv's selector's."""
 
-KERNELS = {"short_conv": frozenset({"mosaic_gpu"})}
-"""The kernels each choice's cells run under test (row 4513): the recurrence template's conv."""
+KERNELS = {short_conv.CONV.choice: frozenset(kernel.name for kernel in short_conv.CONV.kernels
+                                             if not kernel.generic)}
+"""The kernels each choice's cells run under test (row 4513), its selector's every kernel but the generic
+one each is held to: the recurrence template's conv."""
 
-KERNEL = "mosaic_gpu"
+(KERNEL,) = KERNELS[short_conv.CONV.choice]
 """The conv's kernel each cell holds to XLA's: the recurrence template's (`short_conv.conv`)."""
+
+TRAINING_SEEDS = {(model, dtype, packed): 8 for model in CONV_SHAPES for dtype in ("bfloat16", "float32")
+                  for packed in (False, True)}
+"""The training shapes' declared draws against XLA's conv (check 1), by model, dtype and packing: sized by
+`seeds_for` paired with the kernels on a GPU."""
 
 
 def _routed(kernel: str):
@@ -79,12 +86,12 @@ def supported(case: dict[str, str]) -> bool:
 
 
 CASES = (
-    ('sm90', '0.8b', 'bfloat16', 'one'),
-    ('sm90', '9b', 'float32', 'packed'),
     ('sm80', '0.8b', 'bfloat16', 'packed'),
-    ('sm80', '9b', 'float32', 'one'),
+    ('sm90', '0.8b', 'bfloat16', 'one'),
     ('sm90', '0.8b', 'float32', 'one'),
     ('sm90', '9b', 'bfloat16', 'one'),
+    ('sm80', '9b', 'float32', 'one'),
+    ('sm90', '9b', 'float32', 'packed'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the selector serves
 (`kernel_matrix.covering("short_conv")`, regenerated where the axes or the selector's support change)."""
