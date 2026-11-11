@@ -2228,3 +2228,35 @@ def test_a_sources_offloaded_cache_generates_what_a_resident_one_does():
         mine, theirs = offloaded(prompt, budget, key=index), bound(prompt, budget, key=index)
         assert mine.text == theirs.text
         assert_same_generation(mine, theirs)
+
+
+KEPT_TEXT = """
+import json, sys
+import jax
+import numpy as np
+from dew.inference.serving import Server
+from dew.inference.tasks import TextGeneration
+from dew.registry import models
+from dew.training.ahead import keeping
+
+model = models.build("causal_transformer", vocab_size=64, emb_features=32, num_layers=1, num_heads=2,
+                     mlp_features=64, max_seq_len=64)
+variables = model.init(jax.random.key(0), np.zeros((1, 4), np.int32))
+with keeping() as programs:
+    server = Server.from_task(TextGeneration(model, variables, None), slots=1, capacity=32)
+    server([[4, 5, 6]], 2, key=0)
+saved = programs.save(sys.argv[1])
+print(json.dumps({"kept": len(saved.kept), "refused": sorted(programs.refused.values())}))
+"""
+"""A process that serves one request from a text server under `keeping`, printing what it kept and
+refused."""
+
+
+def test_a_text_server_serving_under_keeping_keeps_every_program_it_compiles(tmp_path):
+    """A text server built and serving within `keeping` keeps each program it compiles and refuses none: the
+    server's own context, its stack and sequences whole (`dew.nn.sharding.whole`), is part of what each
+    call's identity states."""
+    import process_support
+
+    found = process_support.fresh(KEPT_TEXT, str(tmp_path / "text.dew-aot"))
+    assert found["refused"] == [] and found["kept"] > 0

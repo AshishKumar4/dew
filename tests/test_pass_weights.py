@@ -290,17 +290,24 @@ def test_a_phases_objective_is_its_own_whatever_objectives_it_holds():
     run = DistillationObjective(LMObjective(looped(), 16, ema_decay=None),
                                 LMObjective(teacher, 16, ema_decay=None), alpha=0.5, temperature=1.0)
     phases = PhasePasses.of(run, (1, STEPS))
-    phases.current = 1
-    first = phases.objective_for(run)
+    first = phases.objective_for(1)
     assert first.student.model.loop.steps == 1 and run.student.model.loop.steps == STEPS
     assert first.student is not run.student and first.teacher is not run.teacher
-    assert phases.objective_for(run) is first
+    assert phases.objective_for(1) is first
 
 
-def test_a_phased_fit_steps_each_phase_as_a_run_of_its_own_pass_count_does(tmp_path):
+def remade(state, batch, key):
+    """A rollout that makes its batch afresh of the rows it reads, as a sampler's does: none of the read's
+    own fields (its phase among them) on what it makes."""
+    return {"text": np.asarray(batch["text"])}
+
+
+@pytest.mark.parametrize("rollout", [None, remade], ids=["read", "rollout"])
+def test_a_phased_fit_steps_each_phase_as_a_run_of_its_own_pass_count_does(tmp_path, rollout):
     """A fit over two phases of data on the step clock, its loop one pass in the first (two steps) and
     three in the second (`phase_passes`), each step's count read off its batch's phase: its parameters
-    after four steps are the same bits as a one-pass run's two steps resumed by a three-pass run's two."""
+    after four steps are the same bits as a one-pass run's two steps resumed by a three-pass run's two. A
+    rollout's batch, made afresh of the read's rows, is stepped at the phase its read was (`carried`)."""
     import optax
     from test_data_mixtures import READ, assert_same, parameters
 
@@ -317,7 +324,7 @@ def test_a_phased_fit_steps_each_phase_as_a_run_of_its_own_pass_count_does(tmp_p
 
     def trainer_of(model, directory, **phased):
         return Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0),
-                       layout=Layout(min_shard=1, tolerance=1.0),
+                       layout=Layout(min_shard=1, tolerance=1.0), rollout=rollout,
                        checkpoints=Checkpoints(str(directory), keep=8), **phased)
 
     whole = trainer_of(model, tmp_path / "phased", phase_passes=(1, STEPS)).fit(
@@ -326,3 +333,49 @@ def test_a_phased_fit_steps_each_phase_as_a_run_of_its_own_pass_count_does(tmp_p
     apart = trainer_of(model, tmp_path / "apart").fit(data, steps=4, log_every=100, checkpoint_every=1)
     assert int(apart.step) == 4
     assert_same(parameters(whole), parameters(apart), "the phased fit is not its phases' runs")
+
+
+class Flops:
+    """A tracker of each logged step's `train/flops`."""
+
+    def __init__(self):
+        self.at: dict[int, float] = {}
+
+    def log(self, scalars, step: int) -> None:
+        if "train/flops" in scalars:
+            self.at[step] = scalars["train/flops"]
+
+    def artifact(self, value, step: int) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_phased_runs_work_counts_each_step_at_its_phases_pass_count():
+    """A fit over two phases, its loop one pass in the first and three in the second (`phase_passes`),
+    counts each step's work (`train/flops`, which train/mfu divides) as a run of its phase's pass count
+    counts the same step: the first phase's at one pass, not the model the run hands on."""
+    import optax
+    from test_data_mixtures import READ
+
+    from dew.data import Memory, phases
+    from dew.data.compile import compile
+    from dew.training import Layout, Trainer
+
+    def corpus(tag: int):
+        rows = [{"text": (np.arange(17, dtype=np.int32) * (tag + 3) + index) % 256} for index in range(32)]
+        return Memory(rows).repeat().batch(8)
+
+    def counted(model, data, steps, **phased):
+        flops = Flops()
+        Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0), tracker=flops,
+                layout=Layout(min_shard=1, tolerance=1.0), **phased).fit(
+            compile(data, read="indexed", loading=READ), steps=steps, log_every=1, checkpoint_every=None)
+        return flops.at
+
+    phased = counted(looped(), phases((corpus(1), 2), (corpus(2), None)), 4, phase_passes=(1, STEPS))
+    one = counted(looped().with_passes(1), corpus(1), 1)
+    three = counted(looped(), corpus(2), 1)
+    assert one[1] < three[1]
+    assert [phased[step] for step in (1, 2, 3, 4)] == [one[1], one[1], three[1], three[1]]
