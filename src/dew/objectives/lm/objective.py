@@ -371,7 +371,7 @@ def _unpadded(values: jax.Array, padding: jax.Array) -> tuple[jax.Array, jax.Arr
     return restored, valid
 
 
-def text_columns(batch) -> dict[str, object]:
+def text_columns(batch) -> dict[str, jax.Array | np.ndarray | Coordinates]:
     """The packing columns a batch carries beside its `text` rows, by the token field each is: its
     `text_coordinates` and `text_block_groups`, a column the batch leaves out or holds as None absent. The
     one reading of them, which the loss (`batch_text`) and the host's counts (`_token_geometry`) convert
