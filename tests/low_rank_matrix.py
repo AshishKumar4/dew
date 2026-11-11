@@ -1,5 +1,5 @@
 """The adapted product's check-1 matrix (tests/kernel_matrix.py): a LoRA-adapted projection's training step
-with its base product and its update as one template product (`gemm.low_rank`, row 1304) on par with the
+with its base product and its update as one template product (`low_rank.low_rank`, row 1304) on par with the
 adapter's own program, its base product and update apart.
 
 Each cell runs a plain Dense projection adapted by `dew.lora.LoRA` as a model's block does, the forward and
@@ -9,9 +9,9 @@ projection with the selector's other kernel named, `xla`, the base product and u
 (`generation.chosen`, check 1), from the projection's program in float64.
 
 The kernel under test is the adapted product's `fused` form, named where the cells run it (no receipt yet
-qualifies it, so its selector, `gemm.LOW_RANK`, takes it by name alone): the cells' `CHOICES` are `low_rank`.
-The product it runs is one GEMM, whose route, `grouped_matmul`, runs at XLA, named in the cell (`XLA`), so the
-template's launches leave this check to their own family's (tests/gemm_matrix.py).
+qualifies it, so its selector, `low_rank.LOW_RANK`, takes it by name alone): the cells' `CHOICES` are
+`low_rank`. The product it runs is one GEMM, whose route, `grouped_matmul`, runs at XLA, named in the cell
+(`XLA`), so the template's launches leave this check to their own family's (tests/gemm_matrix.py).
 
 What the route serves is read from the adapter's own selector: the projection traced for its shapes as the
 case's generation with `fused` named, the route its choice reports for the site the `fused` kernel.

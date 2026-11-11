@@ -954,10 +954,10 @@ def test_an_hoppers_blockwise_fp8_product_runs_the_template_named_for_it():
 def _nvfp4_projected(rows: int, named: str | None):
     """An NVFP4 projection of `rows` rows (`gemm.nvfp4_product`, Llama-3-8B's up: 4096 deep, 14336 wide),
     its kernel `named`, else the selector's."""
-    from dew.nn.kernels import gemm
+    from dew.nn.kernels import formats, gemm
 
-    matrix = gemm.NvFp4.of(jnp.zeros((4096, 14336), jnp.float32), jnp.ones((256, 14336), jnp.float8_e4m3fn),
-                           1.0)
+    matrix = formats.NvFp4.of(jnp.zeros((4096, 14336), jnp.float32),
+                              jnp.ones((256, 14336), jnp.float8_e4m3fn), 1.0)
 
     def product(lhs):
         with generation.chosen(**({} if named is None else {"nvfp4": named})):
@@ -1099,11 +1099,11 @@ def _assert_launches(target: str, name: str, case, operands: int, launch: str):
 def _mx_projection():
     """An MX MoE projection (`gemm.mxfp8_product`: 2048 deep, 768 wide, eight experts of whole 128-row
     blocks) through the template named."""
-    from dew.nn.kernels import gemm
+    from dew.nn.kernels import formats, gemm
 
     def product(rows, matrices):
         with generation.chosen(mxfp8="mosaic"):
-            return gemm.mxfp8_product(gemm.MxFp8.quantized(rows), gemm.MxFp8.quantized(matrices),
+            return gemm.mxfp8_product(formats.MxFp8.quantized(rows), formats.MxFp8.quantized(matrices),
                                       jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]), out_dtype=jnp.bfloat16)
 
     f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
@@ -1120,11 +1120,11 @@ def test_a_blackwells_mx_product_runs_the_template_named_for_it():
 def _nvfp4_block_projection():
     """An NVFP4 MoE projection, both operands E2M1 (`gemm.nvfp4_block_product`: 2048 deep, 768 wide, eight
     experts of whole 128-row blocks) through the template named."""
-    from dew.nn.kernels import gemm
+    from dew.nn.kernels import formats, gemm
 
     def product(rows, matrices):
         with generation.chosen(nvfp4_block="mosaic"):
-            operands = (gemm.NvFp4Block.quantized(rows), gemm.NvFp4Block.quantized(matrices))
+            operands = (formats.NvFp4Block.quantized(rows), formats.NvFp4Block.quantized(matrices))
             return gemm.nvfp4_block_product(*operands, jnp.asarray([4, 12, 8, 4, 4, 8, 8, 16]),
                                             out_dtype=jnp.bfloat16)
 

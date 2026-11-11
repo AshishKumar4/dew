@@ -269,7 +269,7 @@ def mxfp4_as_nvfp4(blocks: ArrayLike, scales: ArrayLike, powers: np.ndarray
     are `powers` (`mxfp4_tensor_powers`), as NVFP4's parts, exactly and with no value decoded: each code's
     E2M1 nibble `[expert, input, output]` uint8 (sign bit 3, as stored), each sixteen inputs' E4M3 block
     scale `[expert, input / 16, output]` (its group's power less its expert's) and each expert's float32
-    tensor scale `2**k` `[expert]`, which `dew.nn.kernels.gemm.NvFp4.of` packs: every value its code times
+    tensor scale `2**k` `[expert]`, which `dew.nn.kernels.formats.NvFp4.of` packs: every value its code times
     its block's scale times its expert's, the MXFP4 value, the 0x00 byte's group's at 2**-127 as any
     other's; a group of zeros, signed or not, under E4M3's largest power, which holds its zeros as they
     are. A slice of a bank's experts reads its own (a placement's shard)."""

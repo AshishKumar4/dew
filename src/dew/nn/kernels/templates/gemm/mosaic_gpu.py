@@ -614,7 +614,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     product whose rows are the call's weight (its swapped orientation, `Tiles.swapped`). With `first`, an
     int32 scalar, `rhs` is a stack of more matrices than `group_sizes` has groups, group `g` reading matrix
     `first + g` where it lies (a banked layer's experts); the grid and the tile table are the groups'.
-    With `scales`, `rhs` is an NVFP4 matrix's (`gemm.NvFp4`), read transposed: its E2M1 codes eight a
+    With `scales`, `rhs` is an NVFP4 matrix's (`formats.NvFp4`), read transposed: its E2M1 codes eight a
     uint32 in the staged order (`[groups, width, depth / 8]`) and `scales` its blocks' E4M3 scales
     (`[groups, width, depth / 16]`); each step decodes its stage exactly into bfloat16 (each code times its
     block's scale over `bits.NVFP4_OWED`, `_stage_decoded`), so the product is the rows times those values,
@@ -719,7 +719,7 @@ decode, code by code, into its eight sixteen-depth slices."""
 
 
 def nvfp4_staged_depth(group, word, code):
-    """Dew: the depth the staged order (`gemm.staged_rows`, the stage decode's `_stage_decoded`) gives word
+    """Dew: the depth the staged order (`formats.staged_rows`, the stage decode's `_stage_decoded`) gives word
     `word`'s code `code` of group `group`: each code's sixteen-depth slice (an NVFP4 block's,
     `product.NVFP4`) holds the group's words in order, the one layout the packer writes and the decode
     reads."""
@@ -1592,7 +1592,7 @@ past Mosaic GPU's own (0, the block's; 1 on, a warpgroup's)."""
 
 def _stage_decoded(words, scales, out, interpret: bool) -> None:
     """Dew: a stage of an NVFP4 matrix (`words`, each 128 depths' `[columns, 16]` uint32 in the staged order,
-    `gemm.staged_rows`; `scales` `[columns, depth / 16]` E4M3) decoded into `out` (`[columns, depth]`
+    `formats.staged_rows`; `scales` `[columns, depth / 16]` E4M3) decoded into `out` (`[columns, depth]`
     bfloat16): each 128 depths' sixteen words a column give, code by code, its eight sixteen-depth slices
     (`bits.NVFP4_BFLOAT16_FORM`'s registers, each split into its two bfloat16 lanes, `_nvfp4_lanes`), each
     times its block's scale over `bits.NVFP4_OWED`, exactly: every value of an E2M1 code times a power-of-two

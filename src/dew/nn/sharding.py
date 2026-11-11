@@ -602,7 +602,7 @@ def per_shard(kernel: str) -> None:
 
 def parameter_path(path) -> Suffix:
     """The parameter's own path: the trailing run of dict keys under a leaf, and where the leaf is a field
-    of a registered dataclass held in that run (a packed bank's, `dew.nn.kernels.gemm.NvFp4`: its leaves
+    of a registered dataclass held in that run (a packed bank's, `dew.nn.kernels.formats.NvFp4`: its leaves
     its fields), the field's name last.
 
     An optimizer state nests a copy of the parameter tree inside its own
