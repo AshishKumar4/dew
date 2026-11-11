@@ -17,9 +17,9 @@ from dew.interop.decoder_parts import (
     HeadRows,
     Packed,
     Renames,
-    fixed_attention_buffer,
     refuse,
     spelled,
+    without_fixed_buffers,
 )
 from dew.interop.layouts import (
     ConfigField,
@@ -34,7 +34,6 @@ from dew.interop.layouts import (
     one_of,
     unread,
 )
-from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.registry import Configured
@@ -210,11 +209,8 @@ _GPTJ_ROWS = HeadRows(('.attn.q_proj.weight', '.attn.k_proj.weight'), _gptj_rota
 rotates halves."""
 
 
-def _gptj_prepare(tensors: Mapping[str, Stored],
-                  config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
-    """Check and drop the fixed attention buffers."""
-    return {name: tensor for name, tensor in tensors.items()
-            if not fixed_attention_buffer(name, tensor, 'attn', (-1e9,))}
+_gptj_prepare = without_fixed_buffers('attn', (-1e9,))
+"""GPT-J's fixed attention buffers checked and dropped."""
 
 
 def _buffers(*names: str) -> Route:
@@ -228,12 +224,9 @@ _GPTJ_ROUTES = Table(_buffers('attn.bias', 'attn.masked_bias'), spelled(_GPTJ_NA
 """GPT-J's names: GPT-2's trunk, its own block's (`_GPTJ_NAMES`); its buffers fill no leaf."""
 
 
-def _gpt2_prepare(tensors: Mapping[str, Stored],
-                   _config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
-    """Check and drop the fixed attention buffers, which the original gpt2 safetensors stores beside the
-    bare GPT2Model (`_GPT2_BARE`)."""
-    return {name: tensor for name, tensor in tensors.items()
-            if not fixed_attention_buffer(name, tensor, 'attn', (-1e4,))}
+_gpt2_prepare = without_fixed_buffers('attn', (-1e4,))
+"""GPT-2's fixed attention buffers checked and dropped, which the original gpt2 safetensors stores beside the
+bare GPT2Model (`_GPT2_BARE`)."""
 
 
 GPT2_NAMES: Renames = (('attn.c_proj', 'self_attn.o_proj'), *GPT_TRUNK, *GPT_MLP)
@@ -292,11 +285,8 @@ norming its stream after each sublayer joins it (`n = ln_1(x + a)`, `h = ln_2(n 
 in no norm. Its `afn` 'gelu' is OpenAI's tanh GELU (`ACT_FNS`, gelu_new)."""
 
 
-def _openai_gpt_prepare(tensors: Mapping[str, Stored],
-                        _config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
-    """Check and drop the fixed causal masks."""
-    return {name: tensor for name, tensor in tensors.items()
-            if not fixed_attention_buffer(name, tensor, 'attn', ())}
+_openai_gpt_prepare = without_fixed_buffers('attn', ())
+"""GPT-1's fixed causal masks checked and dropped."""
 
 
 OPENAI_GPT_NAMES: Renames = (

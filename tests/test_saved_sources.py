@@ -82,6 +82,7 @@ def test_a_decision_run_starts_from_a_saved_run_whose_export_is_its_native_relea
     from dew.decision import Choice, Decide
     from dew.decision.formats import format_unstated
     from dew.inference.tasks import saved_model
+    from dew.interop import Pretrained
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     decoder = Path(__file__).parent / "fixtures" / "hf" / "qwen38-moe-tiny"
@@ -89,6 +90,9 @@ def test_a_decision_run_starts_from_a_saved_run_whose_export_is_its_native_relea
     state, _ = trained(first, tmp_path, "first", trainer={"checkpoint_final": True})
     source = tmp_path / "runs" / "first"
     assert format_unstated("laya", saved_model(SavedRun.pinned(str(source)).record, None).build()) is not None
+    # Its release loaded without its weights holds their shapes, its projections packed as its weights are.
+    shapes = Pretrained.load(str(source), weights=False)
+    assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(shapes.variables))
     run = DecisionRunConfig.cli(["--pretrained", str(source), "--source.step", "latest"], default=first)
     started = run.prepare().objective.init(jax.random.key(0))
     leaves_alike(started["params"], state.variables["params"])
