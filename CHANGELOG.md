@@ -48,6 +48,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   teacher crossed to the device every step. Its checkpoints store the teacher banked (`layers_0_2`): a
   host-layout distillation saved before this keeps its teacher per layer (`layers_0` to `layers_2`) and
   does not restore into it; start such a run afresh from its teacher.
+- Dew requires its JAX build 0.12.0.1.post81, its CUDA and PJRT plugins post81's on every machine: under
+  deterministic ops XLA makes its GEMM fusions and keeps Triton's GEMMs, whatever the client states of
+  `--xla_gpu_experimental_deterministic_ops_triton` (post80's default never reached the compiler), and the
+  fork's audit fixes: staged custom-JVP outputs refused as shared through call and control-flow batching,
+  the functional GPU interpreter's TMA windows before their buffers, while conditions and predicated
+  copies, scaled-MMA race checks, TMEM load register limits and deviceless capture operands.
 - Dew requires its JAX build 0.12.0.1.post80, its CUDA and PJRT plugins post80's on every machine: under
   deterministic ops XLA keeps Triton's GEMM fusions by default, whose sums are ordered and repeat, where
   post79 routed every fused dot to cuBLASLt, whose chain of small batched products did not repeat its bits
