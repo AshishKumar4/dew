@@ -1008,13 +1008,70 @@ def _dead_mma(instruction: str) -> bool:
     return len(words) > 1 and words[0].split(".")[0] in WARPGROUP_MMAS and words[1].rstrip(",") == "RZ"
 _LABEL = re.compile(r"^\s*(\.L_\w+):")
 _WATERFALL = re.compile(r"\bBRA\.U\.ANY\s+`?\(?(\.L_\w+)\)?`?")
+_BRANCH = re.compile(r"\bBRA(?:\.\S+)?\s+`?\(?(\.L_\w+)\)?`?")
+_REGISTER = re.compile(r"R(\d+)")
+REGISTER_A = 4
+"""The registers a thread holds a warpgroup MMA's register operand A in (its 64-row fragment's: eight 16-bit
+values, or sixteen 8-bit)."""
+
+
+def _parsed(instruction: str) -> tuple[str, list[str]]:
+    """A SASS instruction's opcode and its operands, its predicate (`@P0`) apart."""
+    words = instruction.split()
+    if words and words[0].startswith("@"):
+        words = words[1:]
+    return (words[0] if words else ""), " ".join(words[1:]).split(", ")
+
+
+def _written(opcode: str, operands: list[str]) -> set[int]:
+    """The registers a SASS instruction writes: its destination, the first operand, and the ones after it
+    that its width takes (a 128-bit load's or a four-matrix `LDSM`'s four, a 64-bit one's, a two-matrix
+    `LDSM`'s or a `.WIDE` product's two)."""
+    if not (target := _REGISTER.fullmatch(operands[0])):
+        return set()
+    matrices = opcode.startswith("LDSM")
+    pair = ".64" in opcode or ".WIDE" in opcode or opcode.startswith("CS2R") or (matrices and ".2" in opcode)
+    count = 4 if ".128" in opcode or (matrices and ".4" in opcode) else 2 if pair else 1
+    return set(range(int(target.group(1)), int(target.group(1)) + count))
+
+
+def _reused_register_a(instructions: list[str], labels: dict[str, int]) -> int:
+    """The writes in a loop (a backward branch's body, walked over two trips) to the registers of a warpgroup
+    MMA's register operand A whose group is still pending: PTX leaves an operand A read until a
+    `wgmma.wait_group` retires its group (PTX ISA, "wgmma.mma_async"), so a write before it is undefined
+    behaviour, the product reading whichever value its warp reached (row 5416: a prologue's next step
+    rewrote A under `wait_group 1`, its forward differing run to run on a GH200)."""
+    reused = 0
+    for at, text in enumerate(instructions):
+        head = labels.get(branch.group(1)) if (branch := _BRANCH.search(text)) else None
+        if head is None or head > at:
+            continue
+        body = [(*_parsed(instruction), instruction) for instruction in instructions[head:at + 1]]
+        if not any(opcode.split(".")[0] in WARPGROUP_MMAS for opcode, _, _ in body):
+            continue
+        committed: list[set[int]] = []
+        issuing: set[int] = set()
+        for _ in range(2):
+            for opcode, operands, instruction in body:
+                if opcode.split(".")[0] in WARPGROUP_MMAS:
+                    if len(operands) > 1 and (left := _REGISTER.fullmatch(operands[1])):
+                        issuing |= set(range(int(left.group(1)), int(left.group(1)) + REGISTER_A))
+                    if "gsb0" in instruction:
+                        committed, issuing = [*committed, issuing], set()
+                elif opcode == "WARPGROUP.DEPBAR.LE":
+                    pending = int(operands[-1], 0)
+                    committed = committed[len(committed) - pending:] if pending else []
+                else:
+                    reused += bool(_written(opcode, operands) & set().union(issuing, *committed))
+    return reused
 
 
 def sass_findings_of(listing: str) -> tuple[str, ...]:
     """What nvdisasm's `listing` of a kernel breaks of the kernel challenge's SASS rules (row 4071, its
     harness/ptxas checks; notes/ptxas-re.md §2): an elect waterfall (a backward BRA.U.ANY) holding an R2UR, a
-    copy issued lane by lane because ptxas could not prove its operand uniform; and a warpgroup MMA writing
-    no register (`_dead_mma`), a product ptxas dropped as never read (row 4346)."""
+    copy issued lane by lane because ptxas could not prove its operand uniform; a warpgroup MMA writing
+    no register (`_dead_mma`), a product ptxas dropped as never read (row 4346); and a loop writing a
+    pending warpgroup MMA's register operand A (`_reused_register_a`, row 5416)."""
     instructions, labels, pending = [], {}, []
     for line in listing.splitlines():
         if label := _LABEL.match(line):
@@ -1029,9 +1086,12 @@ def sass_findings_of(listing: str) -> tuple[str, ...]:
         if head is not None and head <= at:
             serialized += any("R2UR" in held for held in instructions[head:at + 1])
     dead = sum(1 for text in instructions if _dead_mma(text))
+    reused = _reused_register_a(instructions, labels)
     found = []
     if serialized:
         found.append(f"{serialized} elect waterfall holding an R2UR, a copy issued lane by lane")
     if dead:
         found.append(f"{dead} warpgroup MMA writing no register, its products dropped as never read")
+    if reused:
+        found.append(f"{reused} write to a warpgroup MMA's register operand A before its group retired")
     return tuple(found)
