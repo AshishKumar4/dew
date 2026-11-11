@@ -586,8 +586,8 @@ def test_a_tier_cut_group_is_admitted_on_the_most_its_file_held_and_no_need_is_c
     that name did not, so its admission reads the most any run of its file on the class held, whole or a
     group of any cut, never the group's own record (2026-11-10: a recurrence file's group 1/3, measured when
     it held forward and decode alone at 0.29 GiB, was given a 1.36 GiB pool when it held port training too,
-    which asked 1.52 GiB). And a file whose measured need passes the lane's share is given the whole share and said to
-    be, never cut to it without a word (the same day: a 5.9 GiB need cut to a 4 GiB lane)."""
+    which asked 1.52 GiB). And a file whose measured need passes the lane's share is given the whole share and
+    said to be, never cut to it without a word (the same day: a 5.9 GiB need cut to a 4 GiB lane)."""
     url, stored, _ = cache_worker
     gpu_lane_at(tmp_path, monkeypatch, url, 0)
     (tmp_path / "tests/test_long.py").write_text(LANE_TEST.replace("def test_runs", "def test_a") + "\n"

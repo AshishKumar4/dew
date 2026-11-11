@@ -2101,21 +2101,21 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     checkpoints' parity tests).
 
     A file's process is given the share its last run on this GPU's class measured, green or red (a group
-    the tier cut, the most any run of its file on the class did), and files start heaviest first while what
-    they hold with their children (`gpu_needs`) fits the share this process was given
-    (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file that runs out of a measured share is red: it took more than
-    its last run, whose peak its next run is given. A file no run on this class measured borrows its
-    share from the largest any other GPU class's last run measured (`borrowed`), so a first lane on
-    a class packs its files as a measured one does; one red under it is red, run once, as every red is
-    (owner, 2026-11-07: a red under sharing is a red), and its measured peak is the next lane's. A file
-    given the lane's whole share (measured on no class, measured that large, or with a child the lane
-    did not follow, as the fla reference's in another environment's Python) grows its pool as it uses
-    it rather than taking the share at its first GPU op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a
-    child has what the file has not yet taken; a file that grows to the whole share still leaves its
-    child none. Each file's process takes its share of the CPUs this process may use, as of the files
-    that run at once (`OMP_NUM_THREADS`): a torch reference arm's small ops on all of a node's 30 CPUs
-    ran 13 times slower than on 4 (test_gemma3n's gradient reference on an A100 node, 1175 s against
-    armada's 326 s), and the more so as files share them.
+    the tier cut, the most any run of its file on the class did), and files start heaviest first while
+    what they hold with their children (`gpu_needs`) fits the share this process was given
+    (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file that runs
+    out of a measured share is red: it took more than its last run, whose peak its next run is given. A
+    file no run on this class measured borrows its share from the largest any other GPU class's last run
+    measured (`borrowed`), so a first lane on a class packs its files as a measured one does; one red
+    under it is red, run once, as every red is (owner, 2026-11-07: a red under sharing is a red), and its
+    measured peak is the next lane's. A file given the lane's whole share (measured on no class, measured
+    that large, or with a child the lane did not follow, as the fla reference's in another environment's
+    Python) grows its pool as it uses it rather than taking the share at its first GPU op
+    (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a child has what the file has not yet taken; a file that
+    grows to the whole share still leaves its child none. Each file's process takes its share of the CPUs
+    this process may use, as of the files that run at once (`OMP_NUM_THREADS`): a torch reference arm's
+    small ops on all of a node's 30 CPUs ran 13 times slower than on 4 (test_gemma3n's gradient reference
+    on an A100 node, 1175 s against armada's 326 s), and the more so as files share them.
 
     First the pinned fixtures the tests read offline are fetched while the Hub is reachable
     (tools/fetched_fixtures.py): a store file already whole is kept, and a pin whose upload is due stops
