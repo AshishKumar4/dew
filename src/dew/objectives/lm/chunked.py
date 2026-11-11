@@ -238,6 +238,24 @@ def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
                       precision=precision, preferred_element_type=at_least_fp32(states.dtype))
 
 
+def _online_softmax(first, second):
+    """The online softmax's combine of two parts of a row, each `(maximum, total, rest)`: the larger
+    maximum, and each part's two sums of exponentials rescaled to it and added. A function of the module,
+    the one object every row's `jax.lax.reduce` carries as its combine: JAX traces it once a type, and what
+    reads the reduction's equation knows it by this function (check 2's contract, tests/certified.py)."""
+    larger = jnp.maximum(first[0], second[0])
+    total = rescaled(first[0], first[1], larger) + rescaled(second[0], second[1], larger)
+    beside = rescaled(first[0], first[2], larger) + rescaled(second[0], second[2], larger)
+    return larger, total, beside
+
+
+def _online_softmax_predicted(first, second):
+    """`_online_softmax` with the maximum's column riding fourth, the lesser column on a tie."""
+    combined = _online_softmax(first, second)
+    keep = (first[0] > second[0]) | ((first[0] == second[0]) & (first[3] < second[3]))
+    return (*combined, jnp.where(keep, first[3], second[3]))
+
+
 def _row_terms(logits, predict: bool, labels) -> tuple[
         jax.Array, tuple[jax.Array, jax.Array] | None, tuple[jax.Array, jax.Array, jax.Array]]:
     """Each row's logsumexp, with `predict` its maximum and the first
@@ -252,15 +270,7 @@ def _row_terms(logits, predict: bool, labels) -> tuple[
     logits of 4096 x 151936 took 3.9 ms against `jax.nn.logsumexp` and
     `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against 5.0.
     """
-    def combine(first, second):
-        larger = jnp.maximum(first[0], second[0])
-        total = rescaled(first[0], first[1], larger) + rescaled(second[0], second[1], larger)
-        beside = rescaled(first[0], first[2], larger) + rescaled(second[0], second[2], larger)
-        if not predict:
-            return larger, total, beside
-        keep = (first[0] > second[0]) | ((first[0] == second[0]) & (first[3] < second[3]))
-        return larger, total, beside, jnp.where(keep, first[3], second[3])
-
+    combine = _online_softmax_predicted if predict else _online_softmax
     axis = logits.ndim - 1
     # A vocabulary column is int32 whatever the run's default integer width.
     columns = jax.lax.broadcasted_iota(jnp.int32, logits.shape, axis)
