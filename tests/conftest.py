@@ -251,11 +251,12 @@ def pytest_runtest_setup(item):
         pytest.skip(f"needs a {needed}-device mesh; this run has "
                     f"{jax.device_count()} {jax.default_backend()} device(s)")
     users = os.environ.get(lane_environment.USERS_ARITHMETIC) == "1"
-    if item.get_closest_marker("users_process") and not users:
-        # A flow of a user's process (tests/model_flows.py): XLA parses a process's flags once, so it runs in
-        # a process the tier starts computing as a user's does, never in the lane's.
-        pytest.skip("runs in a process that computes as a user's does "
-                    f"({lane_environment.USERS_ARITHMETIC}=1)")
+    if item.get_closest_marker("gpu") and users != bool(item.get_closest_marker("users_process")):
+        # A GPU test runs in the process of its variant alone (tests/model_flows.py): XLA parses a process's
+        # flags once, so a user's runs in the process the tier starts computing as a user's does, and every
+        # other in the lane's; both select a file's tests alike, so the tier cuts its groups alike.
+        pytest.skip("runs in the lane's process" if users else
+                    f"runs in a process that computes as a user's does ({lane_environment.USERS_ARITHMETIC}=1)")
     if os.environ.get("DEW_TIER_PREPARE") == "1":
         # A GPU part's prepare, on its node's CPU (tests/model_flows.py): a flow prepares there; every other
         # test of the part, a GPU's or not, has nothing to prepare and runs in the part's run.
