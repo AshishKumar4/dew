@@ -22,9 +22,15 @@ SEEDS = 8
 
 def test_an_nvfp4_operand_is_its_values_again_and_its_stored_matrix():
     """An NVFP4 operand's values quantize to themselves (`NvFp4Block.quantized`), its codes E2M1 values and
-    its blocks' largest code at most 6; and a stored NVFP4 matrix (`gemm.NvFp4`) read as the block-scaled
-    products read it (`NvFp4Block.of`) holds its values, its depths in their own order."""
-    operand = gemm.NvFp4Block.quantized(spread(0, (64, 256), product.NVFP4.depth))
+    its blocks' largest code at most 6, where its tensor scale is a power of two, so each value (a code
+    times its block's scale and the tensor's) is exact in fp32; and a stored NVFP4 matrix (`gemm.NvFp4`)
+    read as the block-scaled products read it (`NvFp4Block.of`) holds its values, its depths in their own
+    order. Values rounded to fp32 under another tensor scale need not: a block's largest over the tensor
+    scale may round above its scale, which takes the next (row 5456)."""
+    drawn = spread(0, (64, 256), product.NVFP4.depth)
+    # Its largest magnitude 6 x 448 / 8, so its tensor scale is 1/8.
+    operand = gemm.NvFp4Block.quantized(drawn / jnp.max(jnp.abs(drawn)) * np.float32(6 * 448 / 8))
+    assert float(operand.scale) == 1 / 8
     values = operand.decoded() * operand.scale
     again = gemm.NvFp4Block.quantized(values)
     np.testing.assert_array_equal(np.asarray(again.decoded() * again.scale), np.asarray(values))

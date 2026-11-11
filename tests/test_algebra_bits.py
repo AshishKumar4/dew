@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from low_precision_support import spread
 from map_judge import sharded
 
 from dew.algebra import bits
@@ -339,20 +340,39 @@ def test_an_nvfp4_tile_packed_from_its_encode_decodes_to_its_rounded_values():
     np.testing.assert_array_equal(decoded, rounded)
 
 
-def test_an_nvfp4_quantized_tile_takes_each_blocks_least_scale_and_decodes_to_its_rounding():
-    """An fp32 tile quantized to NVFP4 (`bits.nvfp4_quantized`), a block of zeros and a block whose values
-    span six decades among them: its tensor scale its largest magnitude over 6 * 448, each block's scale the
-    least e4m3 at or above the block's largest over it over 6 (at most e4m3's largest), and its decode
-    (`nvfp4_decoded`, times `NVFP4_OWED`) each value over the tensor scale over its block's scale rounded to
-    e2m1 times its block's scale, exactly (row 4050)."""
+def _spread_tile() -> np.ndarray:
+    """A tile whose values span six decades, a block of zeros among them."""
     rng = np.random.default_rng(4050)
     x = (rng.standard_normal((64, 8)) * 10.0 ** rng.integers(-3, 3, (64, 8))).astype(np.float32)
     x[16:32, 3] = 0
+    return x
+
+
+def _quantized_values() -> np.ndarray:
+    """An NVFP4 tile's values (each code times its block's scale and the tensor scale, rounded to fp32):
+    quotients on and beside e2m1's midpoints and e4m3's values, where an inexact division lands across (XLA's
+    took 186 of its 1024 scales a step and 2760 of its codes across a midpoint)."""
+    drawn = np.asarray(spread(0, (256, 64), 16), np.float32)
+    words, scales, tensor = bits.nvfp4_quantized(jnp.asarray(drawn))
+    owed = np.float32(bits.NVFP4_OWED) * np.asarray(tensor)
+    return np.asarray(bits.nvfp4_decoded(words, scales), np.float32) * owed
+
+
+@pytest.mark.parametrize("tile", [_spread_tile, _quantized_values], ids=["spread", "quantized values"])
+def test_an_nvfp4_quantized_tile_takes_each_blocks_least_scale_and_decodes_to_its_rounding(tile):
+    """An fp32 tile quantized to NVFP4 (`bits.nvfp4_quantized`): its tensor scale its largest magnitude over
+    6 * 448, each block's scale the least e4m3 at or above the block's largest over it over 6 (at most
+    e4m3's largest), and its decode (`nvfp4_decoded`, times `NVFP4_OWED`) each value over the tensor scale
+    over its block's scale rounded to e2m1 times its block's scale, exactly, every quotient IEEE fp32
+    division's as NumPy divides (row 4050; row 5456: an NVFP4 tile's own values, whose quotients land on
+    the formats' boundaries, took codes and scales across them by XLA's inexact division)."""
+    x = tile()
     words, scales, tensor = bits.nvfp4_quantized(jnp.asarray(x))
     largest = np.float32(np.abs(x).max())
     np.testing.assert_array_equal(np.asarray(tensor), largest / np.float32(6 * 448))
     table = np.arange(0x7F, dtype=np.uint8).view(ml_dtypes.float8_e4m3fn).astype(np.float32)
-    ratio = np.abs(x).reshape(4, 16, 8).max(axis=1) / np.asarray(tensor) / np.float32(6)
+    blocks = np.abs(x).reshape(x.shape[0] // 16, 16, x.shape[1]).max(axis=1)
+    ratio = blocks / np.asarray(tensor) / np.float32(6)
     # The largest block's ratio is 448 up to its rounding, which may pass it: its scale is e4m3's largest.
     least = table[np.minimum(np.searchsorted(table, ratio), table.size - 1)]
     np.testing.assert_array_equal(np.asarray(scales, np.float32), least)
