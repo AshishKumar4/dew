@@ -375,6 +375,10 @@ class Reading:
                 self.cuts[(name, count)] = session.cut(list(own), list(own.values()), count)
             return self.cuts[(name, count)]
 
+    def named(self, name: str) -> list[str]:
+        """Every test of file `name` the cut's record names (`cut`), whatever group holds it."""
+        return [node for group in self.cut(name, 1) for node in group]
+
     def part(self, path: str) -> bytes:
         """Input `path`'s part of a key: a unit's digest (`unit`), or its contents' (`digests.contents`)."""
         found = self.parts.get(path)
@@ -399,9 +403,10 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
               reading: Reading | None = None) -> str:
     """The key of test file `name`'s row in `split`'s group whose run executed or read `depends`
     (executed.py): its `inputs`' contents, its directories' entries, `common`, and for a group of a split
-    file, the group and the tests split.py cuts into it from the durations record (`members`), the record's
-    only part a run's outcome depends on: not their seconds, which each train's fold of main's durations
-    moves (the maintainer, 2026-10-28: every train re-keyed its split files and reran them cold, row 2000).
+    file, the group, the tests split.py cuts into it from the durations record (`members`) and the names of
+    all it holds for the file (`Reading.named`), the record's only part a run's outcome depends on: not
+    their seconds, which each train's fold of main's durations moves (the maintainer, 2026-10-28: every
+    train re-keyed its split files and reran them cold, row 2000).
     A check-1 site's judge is keyed by its test, its inputs its map tasks' with its own (`site_inputs`): the
     site's key; a map task's, by its seeds besides (`sites`). The inputs as `reading` finds them: the keys of
     one reading read each input once, however many rows name it."""
@@ -413,8 +418,11 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
         digest.update(split.encode())
     elif split and split != COLLECT:
         # A process variant's (`varied`) by its name beside its cut's tests; a whole file's variant, its name.
+        # And every test its record names for the file: one it drops joins a group by the collection alone
+        # (`session.kept`), a group whose own tests, and key, stood (review: its row reused, the test unrun).
         cut = cut_of(split)
-        digest.update(split.encode() + (json.dumps(members(name, cut, reading)).encode() if cut else b""))
+        held = [members(name, cut, reading), reading.named(name)] if cut else []
+        digest.update(split.encode() + (json.dumps(held).encode() if cut else b""))
     return digest.hexdigest()
 
 
