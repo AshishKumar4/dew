@@ -87,7 +87,7 @@ from arm_forms import (
     windows as windows,
 )
 from check1_wire import CENSUS, DRAWS, STAGES
-from float64_terms import evaluated_on, float64_terms, lowered
+from float64_terms import evaluated_on, float64_terms, lowered, scan_groups
 from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
 
@@ -736,7 +736,7 @@ def _within(equation, outs: list[bool], lowering: str, found: dict) -> list[bool
         each = [read(branch, outs) for branch in taken]
         return [False, *(any(reads) for reads in zip(*each, strict=True))]
     if primitive is jax.lax.scan_p:
-        return carried(programs.scan_body(equation), outs, params["num_consts"], params["num_carry"])
+        return carried(programs.scan_body(equation), outs, *scan_groups(equation))
     if primitive is jax.lax.while_p:
         _, body = programs.loop_programs(equation)
         return [False] * params["cond_nconsts"] + carried(body, outs, params["body_nconsts"], len(outs))
