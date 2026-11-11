@@ -60,7 +60,7 @@ from dew.nn.derivatives import (
     surrogate,
 )
 from dew.nn.nested import nested
-from dew.nn.programs import equations, purely_called, ragged_layout
+from dew.nn.programs import UNROUNDED, equations, purely_called, ragged_layout
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -1366,6 +1366,8 @@ mlir.register_lowering(correctly_rounded_divide_p,
                        mlir.lower_fun(_correctly_rounded_divide, multiple_results=False))
 batching.defbroadcasting(correctly_rounded_divide_p)
 correctly_rounded_divide_p.elementwise = True
+# It rounds the quotient to float32 whatever its operands' dtype: at a wider width it is the quotient.
+UNROUNDED[correctly_rounded_divide_p] = jnp.divide
 
 
 @contracted("test_the_precision_seams_hold_every_order")

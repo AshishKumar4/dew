@@ -224,6 +224,23 @@ def test_a_program_holding_a_linear_map_replays_in_float64():
     np.testing.assert_array_equal(np.asarray(float64_replay(program)(x)), np.asarray(wide))
 
 
+def test_a_division_dew_rounds_to_float32_replays_as_the_float64_quotient():
+    """Dew's correctly rounded division rounds to float32 whatever its operands' dtype, so bound on widened
+    operands it would hand the replay a float32 quotient widened: an fp32 operation inside a float64 truth.
+    The replay evaluates the quotient it rounds, in float64 (`programs.UNROUNDED`)."""
+    from dew.nn.precision import correctly_rounded_divide
+
+    def program(x, y):
+        return jnp.cumsum(correctly_rounded_divide(x, y) * x)
+
+    rng = np.random.default_rng(1)
+    x, y = (rng.uniform(1.0, 2.0, size=64).astype(np.float32) for _ in range(2))
+    with jax.enable_x64(new_val=True):
+        wide_x, wide_y = jnp.asarray(x, jnp.float64), jnp.asarray(y, jnp.float64)
+        wide = jnp.cumsum(wide_x / wide_y * wide_x)
+    np.testing.assert_array_equal(np.asarray(float64_replay(program)(x, y)), np.asarray(wide))
+
+
 def test_a_padded_product_replays_in_float64():
     """A program that pads a float before it multiplies and sums, as Dew's blocked CPU product pads a depth
     to whole blocks in a library process's arithmetic, replays in float64: what the program computes on

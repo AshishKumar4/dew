@@ -18,7 +18,7 @@ public call."""
 import jax
 import jax.numpy as jnp
 import numpy as np
-from float64_terms import float64_magnitudes
+from float64_terms import float64_signed_sums
 from reference_error import widened
 
 LEAST = float(np.finfo(np.float32).tiny) * (1 + 2.0**-16)
@@ -121,11 +121,15 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     """Every order of `fn` runs at the draw, and each leaf is finite at every position the contract holds:
     where the same order of its float64 run is a normal float32; where, given `plain_fn` (the plain float32
     formula, JAX's own derivatives of it), the plain formula's is finite; and where no order of summation
-    can overflow, the magnitudes of the terms the float64 run's sums add (`float64_magnitudes`, a sum behind
-    a sum at its own) summing inside float32's range. So a form that overflows where the plain formula's
-    own operations stay in range fails (row 1768, a contraction Dew summed before the division that brought
-    it back), and a sum whose terms float32 can overflow in one order and not another is held to neither
-    order (row 5426: Dew's blocked sum and XLA's chain each overflow partials the other does not). The
+    can overflow: of the terms the float64 run's sums add (`float64_signed_sums`, a sum behind a sum at its
+    own), the positive ones' sum and the size of the negative ones' sum each inside float32's range, the
+    largest any order of them passes through (the owner's choice of 2026-11-10, row 5426: finiteness held
+    only where no summation order can overflow). So a form that overflows where the plain formula's own
+    operations stay in range fails (row 1768, a contraction Dew summed before the division that brought it
+    back), as does one that overflows over terms that cancel inside the range in every order (2^126 twice
+    and its negative twice); and a sum whose terms float32 can overflow in one order and not another is
+    held to neither order (row 5426: Dew's blocked sum and XLA's chain each overflow partials the other
+    does not). The
     float64 run is `fn`'s own, or `truth_fn`'s, the plain float64 formula, where `fn` computes in a fixed
     precision whatever its inputs' (a declared dot algorithm). `without` names orders the contract does not
     take yet, each joining with its row's fix (a row's head brings its own test)."""
@@ -157,8 +161,9 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
         if lost:
             # The float64 run's terms, read only for an order with a value to lose: its program walked once.
             with jax.enable_x64(new_val=True):
-                reach = jax.tree.leaves(float64_magnitudes(wide[name])[1])
-            lost = {index: where & (np.asarray(reach[index]) <= MOST) for index, where in lost.items()}
+                _, positive, negative = map(jax.tree.leaves, float64_signed_sums(wide[name]))
+            lost = {index: where & (positive[index] <= MOST) & (negative[index] <= MOST)
+                    for index, where in lost.items()}
         broken = [f"{label}, {name}, leaf {index}: {int(where.sum())} values not finite where float64's are "
                   f"normal float32s and no order of their sums overflows, e.g. {values[index][where][:3]}"
                   for index, where in lost.items() if where.any()]

@@ -22,7 +22,8 @@ def _replayed(primitive) -> bool:
     padding among them, which Dew's blocked CPU product puts in a library process's every contraction),
     reduces or scans an axis, or scatters; and the contractions and `iota`, which state no such fact and are
     their dtype's too. Any other operation on a float refuses: a decomposition, another library's
-    primitive."""
+    primitive. A primitive that rounds to a format of its own whatever its operands' is never bound on
+    them widened: the replay evaluates the operation it states (`programs.UNROUNDED`)."""
     return (programs.entrywise(primitive) or programs.rearranges(primitive) or programs.reduction(primitive)
             or programs.cumulative(primitive) or programs.scatter(primitive)
             or primitive in (primitives.dot_general_p, primitives.conv_general_dilated_p, primitives.iota_p))
@@ -139,6 +140,10 @@ class Replay:
             outputs = equation.primitive.bind(*traced, **equation.primitive.get_bind_params(params))
             outputs = outputs if equation.primitive.multiple_results else [outputs]
             return [_widened(output) if _floating(output.dtype) else output for output in outputs]
+        unrounded = programs.UNROUNDED.get(equation.primitive)
+        if unrounded is not None:
+            # A primitive that rounds to a format of its own: the operation it rounds, at float64.
+            return [unrounded(*values)]
         if not _replayed(equation.primitive):
             raise NotImplementedError(f"float64_replay has no float64 rule for {name}")
         widened = {key: jnp.float64 if key in ("dtype", "new_dtype", "preferred_element_type")

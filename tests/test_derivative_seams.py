@@ -55,6 +55,19 @@ def test_the_contract_holds_a_sum_only_where_no_order_of_it_can_overflow():
                     "alternate terms first", plain_fn=lambda x: jnp.sum(jnp.sum(x.reshape(4, 2), axis=1)))
 
 
+def test_the_contract_holds_terms_that_cancel_inside_the_range_in_every_order():
+    """Of 2^126 twice and its negative twice every partial sum, in every order, stays within 2^127, inside
+    float32, though their magnitudes sum to 2^128. The position is held: the plain sum is finite there, and
+    a form that scales its terms up before it sums them and back down after overflows and is refused.
+    Judged by the magnitudes' sum the position was dropped, and that form passed (row 5426)."""
+    x = (jnp.asarray([2.0**126, 2.0**126, -(2.0**126), -(2.0**126)], jnp.float32),)
+    direction, cotangent = (jnp.ones((4,), jnp.float32),), jnp.ones((), jnp.float32)
+    assert_contract(jnp.sum, x, direction, cotangent, "the plain sum", plain_fn=jnp.sum)
+    with pytest.raises(LessFinite):
+        assert_contract(lambda x: jnp.sum(x * 4) / 4, x, direction, cotangent, "terms scaled up first",
+                        plain_fn=jnp.sum)
+
+
 def test_the_contract_reads_a_contraction_behind_a_mask_by_its_own_terms():
     """A plain formula that selects each row's product by a mask sums its groups last, the contraction
     behind that sum: the position is held by the contraction's own terms. Where they cancel past float32's

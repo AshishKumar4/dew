@@ -35,6 +35,7 @@ from float64_terms import SUMS, _static, _target, evaluated_on, walked
 from jax.extend.core import primitives
 
 from _dew_torch.rounding import DRAWS, ULPS
+from dew.nn import programs
 from dew.nn.precision import compensated_add, correctly_rounded_divide_p
 
 COLLECTED = {jax.lax.psum_p: "axes", primitives.psum_invariant_p: "axes",
@@ -264,9 +265,11 @@ def _bound(equation, params, operands) -> list:
     """`equation`'s primitive applied to `operands`, widened past its program's dtypes, with `params`: a
     scatter's combining computation, traced for its program's dtype, built again for theirs (`SCATTERS`)."""
     primitive = equation.primitive
-    if primitive is correctly_rounded_divide_p:
-        # Its float32 rounding is what it is weighed for (`ONCE`): the replay's quotient is float64's.
-        return [operands[0] / operands[1]]
+    unrounded = programs.UNROUNDED.get(primitive)
+    if unrounded is not None:
+        # Its rounding to its own format is what it is weighed for (`ONCE`): widened, it is the operation
+        # it rounds.
+        return [unrounded(*operands)]
     if primitive is jax.lax.reduce_p:
         # Its combining computation, traced for its program's dtypes, is called again on theirs.
         count = len(operands) // 2

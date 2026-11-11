@@ -211,6 +211,16 @@ def purely_called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     return called(equation) if equation.primitive.transparent_call else None
 
 
+UNROUNDED: dict[jcore.Primitive, Callable] = {}
+"""Each primitive whose implementation rounds to a format of its own whatever its operands' dtype, to the
+operation it rounds: a function of its operands that computes at their width. JAX's own primitives compute at
+the dtype they are given, so none is here; one of Dew's that fixes a format states its operation where it is
+defined, as it states its derivative there (`dew.nn.precision.correctly_rounded_divide_p`: the quotient).
+What evaluates a traced program wider than it was traced reads this in place of the primitive (a float64
+replay, the rounding model's tapped run): bound on wider operands, the primitive itself would still round
+to its format."""
+
+
 def own_derivative(primitive: jcore.Primitive) -> bool:
     """Whether `primitive` is a call whose derivative is a rule of its own (`jax.custom_jvp`'s,
     `jax.custom_vjp`'s): its cotangents and tangents are the rule's, not its program's."""

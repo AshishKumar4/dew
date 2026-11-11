@@ -121,6 +121,27 @@ def float64_magnitudes(fn, *args):
     return tree.unflatten(values), tree.unflatten(sizes)
 
 
+def float64_signed_sums(fn, *args):
+    """`fn(*args)` evaluated as `float64_terms` evaluates it, and for each output leaf the sum of its
+    positive terms and the size of the sum of its negative ones, the terms `float64_magnitudes` reads:
+    every partial sum of those terms, in every order, lies between the one and the other's negative, and
+    some order reaches each, so they are the largest a summation of them can pass through on its way to
+    the value. The value is the positive terms less the negative and the magnitudes are the two together,
+    so each is half the magnitudes with half the value added or taken away. A complex leaf's terms have no
+    sign, and both are its magnitudes."""
+    def halves(value, magnitudes):
+        value, magnitudes = np.asarray(value), np.asarray(magnitudes)
+        if np.iscomplexobj(value):
+            return magnitudes, magnitudes
+        return (magnitudes + value) / 2, (magnitudes - value) / 2
+
+    values, magnitudes = float64_magnitudes(fn, *args)
+    tree = jax.tree.structure(values)
+    pairs = list(map(halves, jax.tree.leaves(values), jax.tree.leaves(magnitudes)))
+    return (values, tree.unflatten([positive for positive, _ in pairs]),
+            tree.unflatten([negative for _, negative in pairs]))
+
+
 def _termed(fn, args, *, power: int):
     """`fn(*args)`'s outputs' tree, their values and each one's terms summed at `power` (`POWER`: their
     squares, or their magnitudes), the evaluation `float64_terms` describes."""
