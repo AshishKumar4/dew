@@ -42,10 +42,11 @@ def fits(row) -> bool:
 
 def source(tag: int, count: int = 48):
     """A corpus of `count` rows whose ids say they are the `tag`th source's, of uneven lengths, some
-    dropped, batched by a budget of 64 tokens: read per share."""
+    dropped, batched by a budget of 128 tokens (eight rows, which a mesh of eight devices divides): read
+    per share."""
     rows = [{"id": np.int32(1000 * tag + index), "length": np.int32(3 + index % 11)}
             for index in range(count)]
-    return Memory(rows).map(Tokens()).filter(fits, reason="too_long").repeat().batch(tokens=64)
+    return Memory(rows).map(Tokens()).filter(fits, reason="too_long").repeat().batch(tokens=128)
 
 
 def chain(*ends):
