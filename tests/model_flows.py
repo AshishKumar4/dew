@@ -167,12 +167,17 @@ class Flow:
         return self.params, ids
 
     def train(self, model) -> Callable:
-        """`model`'s training step: its next-token loss and every parameter's gradient."""
+        """`model`'s training step: each token's next-token loss, `[rows, length - 1]`, and every parameter's
+        gradient of their mean: the losses its loss sums, each an element of a row, where their mean alone is
+        one value a draw, which no count of draws check 1 takes resolves (a GH200's flows were Inconclusive on
+        it at 40 draws, every gradient on par)."""
         def step(params, ids):
             def loss(params):
                 logits = model.apply({"params": params}, ids)
-                return -jnp.mean(token_log_probs(logits[:, :-1], ids[:, 1:]))
-            return jax.value_and_grad(loss)(params)
+                losses = -token_log_probs(logits[:, :-1], ids[:, 1:])
+                return jnp.mean(losses), losses
+            (_, losses), gradients = jax.value_and_grad(loss, has_aux=True)(params)
+            return losses, gradients
         return step
 
     def decode(self, model) -> Callable:
