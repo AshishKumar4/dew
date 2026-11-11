@@ -801,11 +801,13 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
         # sinks among its operands, at the kernel's arithmetic (IEEE products for fp32 operands, 16-bit
         # ones summed in fp32, logits fp32: `scale_logits`) on the reference path, not the folded form,
         # whose products read the keys across heads: an H100's fp32 gradients through it held 1.82 to 2.08
-        # times the reference's error, through the reference path 1.00 (M-ET-62, row 5268); a differentiated
-        # call's output the reference's too, one forward (`primal_alone`; the kernel's a second, rCM's).
+        # times the reference's error, through the reference path 1.00 (M-ET-62, row 5268). A differentiated
+        # call's output stays the kernel's: the reference path divides its weights before the values'
+        # product, the kernel its output after it, and an A100's fp32 decode value through the reference
+        # held 1.53 times the folded attention's error (the composed tier at 475913063).
         kernel_precision = "highest" if query.dtype == jnp.float32 else None
         out = forward_differentiable(decoded, decoded_reference, query, key, value, key_value_seq_lengths,
-                                     *rest.values(), precision=kernel_precision, primal_alone=True)
+                                     *rest.values(), precision=kernel_precision)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
         # kernel takes the call the two forms agree bitwise. Its derivative is the reference path's, as
