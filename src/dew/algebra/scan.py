@@ -470,11 +470,16 @@ def _chunk(form: linear_scan.Form, held: tuple, values_read: bool, h, entering, 
 
 def _plain(name: str, left, right):
     """A chunk's products as the language's plain ones, `dot_general`s, as the trace `carry.split` derives
-    from takes them (`_chunk`): the split's forms issue every product themselves (its roles), so this trace
-    states only which. `float32_matmul` here traced a float64 run's product inside a protected span the
-    language cannot read, and the split refused the state it read (Kimi Linear's float64 truth)."""
+    from takes them (`_chunk`): a mainloop's forms issue every product themselves (its roles); where none
+    issues it, the portable walk's, the split's evaluator takes the product at the precision this trace
+    states (`forms.evaluator`'s `float32_dot_general`), the portable math's (`_portable`): stated nowhere,
+    the walk's state products ran at JAX's configured precision, TF32 on an A100 (M-JS-96). `float32_matmul`
+    here traced a float64 run's product inside a protected span the language cannot read, and the split
+    refused the state it read (Kimi Linear's float64 truth)."""
     del name
-    return jnp.matmul(left, right)
+    from dew.nn.kernels import recurrence_algebra
+
+    return jnp.matmul(left, right, precision=recurrence_algebra.STATE_PRECISION)
 
 
 def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays, issue: Callable) -> dict:
