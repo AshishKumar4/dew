@@ -12,7 +12,9 @@ nothing of its own and computes no truth. Under the lane's deterministic ops che
 its own bits on the same draw (`reference_error._of_its_inputs`)."""
 
 import dataclasses
+import functools
 import hashlib
+import importlib.metadata
 import json
 import os
 import subprocess
@@ -23,6 +25,7 @@ from pathlib import Path
 import lane_environment
 import jax
 import jax.numpy as jnp
+import kernel_matrix
 import numpy as np
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact, stored_truths
@@ -43,15 +46,26 @@ TOPOLOGY = "DEW_NODE_TOPOLOGY"
 """The node's GPUs' serialized topology (dew-ops' session hands a prepare its node's): the GPU a flow's
 programs are compiled for."""
 
-PORTABLE = frozenset({"xla", "reference", "gathered", "portable", "step_reference", "off", "inference"})
-"""The kernels of the reference path: no native kernel of a GPU's own."""
+@functools.cache
+def generic_kernels() -> dict[str, frozenset[str]]:
+    """Each choice's kernels of the reference path: its ops' generic ones (`selection.Kernel.generic`), read
+    from Dew's ops as they define them (`kernel_matrix.ops`)."""
+    return {str(choice): frozenset(kernel.name for op in ops for kernel in op.kernels if kernel.generic)
+            for choice, ops in kernel_matrix.ops().items()}
 
-REFERENCE = {"attention": "reference", "decode": "reference", "paged_decode": "gathered",
-             "gated_delta_rule": "xla", "ssd": "xla", "selective_scan": "xla", "short_conv": "xla",
-             "rms_norm": "xla", "swiglu": "xla", "grouped_matmul": "xla", "gemm_prologue": "xla",
-             "gemm_epilogue": "xla"}
-"""The reference arm's choices (`generation.chosen`): every kernel the flows' models reach, on its
-reference path."""
+
+@functools.cache
+def reference_kernels() -> dict[str, str]:
+    """The reference arm's choices (`generation.chosen`): each choice's generic kernel that requires nothing,
+    the path that takes every call its op's others turn down."""
+    found = {}
+    for choice, ops in kernel_matrix.ops().items():
+        names = {kernel.name for op in ops for kernel in op.kernels if kernel.generic and not kernel.supports}
+        if len(names) != 1:
+            raise ValueError(f"{choice}'s ops hold {sorted(names) or 'no'} generic kernel requiring nothing: "
+                             "the reference arm runs one")
+        found[str(choice)] = names.pop()
+    return found
 
 
 def preparing() -> bool:
@@ -153,7 +167,7 @@ class Flow:
 
 
 NATIVE = "native"
-"""A flow's route taken by any kernel off the reference path (`PORTABLE`)."""
+"""A flow's route taken by any kernel off the reference path (`generic_kernels`)."""
 
 DENSE = {"hidden_size": 512, "num_attention_heads": 4, "num_key_value_heads": 4, "head_dim": 128,
          "intermediate_size": 1024, "num_hidden_layers": 2, "vocab_size": 512,
@@ -232,10 +246,21 @@ def flow_named(name: str) -> Flow:
     return next(flow for flow in FLOWS if flow.name == name)
 
 
+HOST_FLAGS = ("--xla_force_host_platform_device_count", "--xla_cpu_scheduler_type")
+"""The lane's flags of the host's own backend (tests/lane_environment.py), which compute nothing of a GPU's
+program and part a prepare's CPU process from its run's GPU one."""
+
+
 def flow_flags(flow: Flow) -> str:
-    """The XLA flags a flow compiles and runs under: the lane's, its deterministic ops only where `lane`."""
-    flags = lane_environment.without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
-    return f"{flags} {lane_environment.DETERMINISTIC_OPS}".strip() if flow.lane else flags
+    """The XLA flags a flow compiles its programs under in its prepare and loads them under in its run, the
+    same in both (`BuildTarget.held` reads them, in their order): the session's and the lane's, but the host
+    backend's own (`HOST_FLAGS`), then the cuda lane's repeatable flags (`REPEATABLE_GPU_FLAGS`), its
+    deterministic ops only where `lane`."""
+    named = (*HOST_FLAGS, *(flag.split("=")[0] for flag in lane_environment.REPEATABLE_GPU_FLAGS))
+    flags = lane_environment.without_flags(os.environ.get("XLA_FLAGS", ""), *named)
+    repeatable = [flag for flag in lane_environment.REPEATABLE_GPU_FLAGS
+                  if flow.lane or flag != lane_environment.DETERMINISTIC_OPS]
+    return " ".join([flags, *repeatable]).strip()
 
 
 def store_of(flow: Flow) -> Path:
@@ -247,9 +272,11 @@ def store_of(flow: Flow) -> Path:
 
 
 def stamp() -> str:
-    """The commit the flows are prepared and run at: a truth or program of another is never read."""
-    return subprocess.run(["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
-                          check=True, capture_output=True, text=True).stdout.strip()
+    """The commit and JAX the flows' truths are prepared and read at: a truth another computed is never
+    read (`reference_error.stored_truths`)."""
+    commit = subprocess.run(["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
+                            check=True, capture_output=True, text=True).stdout.strip()
+    return f"{commit} jax {jax.__version__} jaxlib {importlib.metadata.version('jaxlib')}"
 
 
 def _flat(flow: Flow, program: Callable):
@@ -286,18 +313,27 @@ def programs_of(flow: Flow) -> dict[str, tuple[Callable, list]]:
 
 
 def held_routes(flow: Flow, found: list) -> None:
-    """Raise unless the flow's Dew arm took every route it is for (`Flow.native`): its native kernels, not
-    the reference path's."""
+    """Raise unless the flow's Dew arm took every route it is for (`Flow.native`): a kernel off the reference
+    path, or the one it names, among the kernels its choice ran (a decode's prefill over its cache's keys
+    may run another)."""
     taken = {}
     for route in found:
         taken.setdefault(str(route.choice), set()).add(route.kernel)
     for choice, kernel in flow.native.items():
         kernels = taken.get(choice, set())
-        held = kernels - PORTABLE if kernel == NATIVE else kernels & {kernel}
-        if not held or (kernel != NATIVE and kernels - {kernel}):
+        held = kernels - generic_kernels()[choice] if kernel == NATIVE else kernels & {kernel}
+        if not held:
             raise AssertionError(f"{flow.name}: its {choice} took {sorted(kernels) or 'nothing'} on "
                                  f"{generation.device_generation()}, not {kernel}: the flow does not reach "
                                  "the route it is for")
+
+
+def held_reference(flow: Flow, found: list) -> None:
+    """Raise unless the flow's reference arm ran the reference path alone (`generic_kernels`)."""
+    generic = generic_kernels()
+    if native := sorted({(str(route.choice), route.kernel) for route in found
+                         if route.kernel not in generic.get(str(route.choice), ())}):
+        raise AssertionError(f"{flow.name}: its reference arm ran {native}, not its reference path")
 
 
 def prepare(flow: Flow) -> None:
@@ -313,11 +349,10 @@ def prepare(flow: Flow) -> None:
         compile_programs({name: program for name, program in named.items() if name.endswith("dew")},
                          target.generation, target.multiprocessors).save(directory / "dew.programs")
     held_routes(flow, found)
-    with generation.routes() as found, generation.chosen(**REFERENCE):
+    with generation.routes() as found, generation.chosen(**reference_kernels()):
         compile_programs({name: program for name, program in named.items() if name.endswith("reference")},
                          target.generation, target.multiprocessors).save(directory / "reference.programs")
-    if native := sorted({route.kernel for route in found} - PORTABLE):
-        raise AssertionError(f"{flow.name}: its reference arm ran {native}, not its reference path")
+    held_reference(flow, found)
     judge(flow, {})
 
 

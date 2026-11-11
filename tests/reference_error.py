@@ -64,6 +64,7 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import contextlib
+import contextvars
 import dataclasses
 import functools
 import hashlib
@@ -717,8 +718,9 @@ class TruthStore:
         return truth, (as_given(lambda *inputs: prepared(inputs, 1)) if stored["terms"] else False)
 
 
-_STORES: list[TruthStore] = []
-"""The truth store open (`stored_truths`), innermost last."""
+STORE: contextvars.ContextVar[TruthStore | None] = contextvars.ContextVar("reference_error_store",
+                                                                         default=None)
+"""The truth store open (`stored_truths`), None outside one."""
 
 
 @contextlib.contextmanager
@@ -727,23 +729,25 @@ def stored_truths(directory: str | Path, *, prepare: bool, stamp: str):
     the block, a site prepared (`prepare`) computes and writes the truth and terms of every draw its two
     stages may take (`staged_units`), held to float64 on its first draw (`_of_float64`), and runs no arm;
     a site run reads them (`TruthStore.site`) where it would compute them, its terms the ones its prepare
-    sized it by, and fails where they are missing (`MissingTruth`). Truths and terms are computed as the
-    gate computes them (`_truth_and_terms`), so a prepared site judges as one that computes its own."""
-    _STORES.append(TruthStore(Path(directory), prepare, stamp))
+    sized it by, and fails where they are missing or made at another `stamp` (the commit and JAX that
+    computed them; `MissingTruth`). Truths and terms are computed as the gate computes them
+    (`_truth_and_terms`), so a prepared site judges as one that computes its own. A recorded reference
+    (`indexed_recording`) is the other store and answers another question: a reference that cannot run in
+    the test, committed and pinned, its count sized on it; a prepared truth's reference runs live beside
+    it, on the GPU it judges. A site that reads a truth at inputs its prepare does not draw (a weighed or
+    library site, a sizing's) is refused within the block."""
+    store = TruthStore(Path(directory), prepare, stamp)
+    token = STORE.set(store)
     try:
-        yield _STORES[-1]
+        yield store
     finally:
-        _STORES.pop()
+        STORE.reset(token)
 
 
-def _inputs_digest(inputs) -> str:
-    """The digest of a draw's widened inputs: each leaf's path, dtype by name, shape and bytes."""
-    digest = hashlib.sha256()
-    for path, leaf in jax.tree_util.tree_leaves_with_path(jax.device_get(inputs)):
-        value = np.asarray(leaf)
-        digest.update(f"{jax.tree_util.keystr(path)}:{value.dtype}:{value.shape};".encode())
-        digest.update(np.ascontiguousarray(value).tobytes())
-    return digest.hexdigest()
+def _inputs_digest(inputs) -> np.uint64:
+    """The digest of a draw's widened inputs, each leaf by its path, as a recording's (`input_digest`)."""
+    held = jax.device_get(inputs)
+    return input_digest(dict(zip(_leaf_paths(held), jax.tree.leaves(held), strict=True)))
 
 
 def _prepare_site(store: TruthStore, dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn,
@@ -1334,15 +1338,15 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/certified.py)."""
-    if _STORES:
+    if (store := STORE.get()) is not None:
         if conditioning is not None or library_fn is not None:
             raise ValueError(f"{label}: a weighed or library site reads its reference's own rounding and "
                              "arms at its truth's inputs, which no prepared truth holds")
-        if _STORES[-1].prepare:
-            _prepare_site(_STORES[-1], dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn,
+        if store.prepare:
+            _prepare_site(store, dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn,
                           terms=terms)
             return
-        truth_fn, terms = _STORES[-1].site(label)
+        truth_fn, terms = store.site(label)
     if conditioning is not None:
         _deferred(dew_fn, reference_fn, draw, label, seeds=seeds, conditioning=conditioning,
                   truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
@@ -1654,6 +1658,9 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     against its second), and the reference on the same inputs runs once. `orders` sizes a site whose
     verdict sweeps them (`assert_as_exact`'s `orders`): each seed's evidence is its draw's over every
     order, as the verdict reads it. `examples` sizes a site that stacks them as its verdict judges it."""
+    if STORE.get() is not None:
+        raise ValueError(f"{label}: a sizing draws seeds past a prepared site's, whose truths no prepare "
+                         "holds")
     if dew_fn is not None and getattr(reference_fn, "recorded", False):
         pilots = getattr(reference_fn, "pilots", None)
         if pilots is None:

@@ -14,12 +14,13 @@ from reference_error import MissingTruth, assert_as_exact, stored_truths
 from dew.nn.kernels import generation
 
 
-def _routes(flow, program, *, reference: bool = False) -> list:
-    """The routes `program` (of the flow's `programs_of`) takes traced for this process's assumed target."""
+def _routes(program, *, reference: bool = False) -> list:
+    """The routes `program` (of the flow's `programs_of`) takes traced for this process's assumed target, as
+    the reference arm's where `reference` (`model_flows.reference_kernels`)."""
     flat, shapes = program
     with generation.routes() as found:
         if reference:
-            with generation.chosen(**model_flows.REFERENCE):
+            with generation.chosen(**model_flows.reference_kernels()):
                 jax.jit(flat).trace(*shapes)
         else:
             jax.jit(flat).trace(*shapes)
@@ -29,24 +30,29 @@ def _routes(flow, program, *, reference: bool = False) -> list:
 @pytest.mark.parametrize("target", ["sm80", "sm90"])
 @pytest.mark.parametrize("name", [flow.name for flow in model_flows.FLOWS])
 def test_a_flows_model_takes_the_routes_it_is_for_on_each_gpu(name, target, monkeypatch):
-    """The flow's training step and decode loop traced as `target`'s GPU chooses (`generation.assumed`):
-    every route the flow is for taken off the reference path, a library's kernel (FlashAttention) chosen
-    there though a CPU lowers none (its route's `preferred`; the node's prepare holds the kernel itself,
-    `model_flows.held_routes`); its reference arm on the reference path alone."""
+    """The flow's training step and decode loop traced as `target`'s GPU chooses (`generation.assumed`) and
+    held as its prepare holds them: every route the flow is for taken off the reference path or by the
+    kernel it names (`model_flows.held_routes`), its reference arm on the reference path alone
+    (`model_flows.held_reference`)."""
     flow = model_flows.flow_named(name)
     monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     programs = model_flows.programs_of(flow)
     with generation.assumed(target):
-        found = [route for kind in ("train", "decode") for route in _routes(flow, programs[f"{kind} dew"])]
+        dew = [route for kind in ("train", "decode") for route in _routes(programs[f"{kind} dew"])]
         reference = [route for kind in ("train", "decode")
-                     for route in _routes(flow, programs[f"{kind} reference"], reference=True)]
-    for choice, kernel in flow.native.items():
-        taken = {route.kernel if kernel == model_flows.NATIVE else route.preferred
-                 for route in found if str(route.choice) == choice}
-        held = taken - model_flows.PORTABLE if kernel == model_flows.NATIVE else taken & {kernel}
-        assert held, f"{name}: its {choice} took {sorted(taken)} on {target}, not {kernel}"
-    assert not {route.kernel for route in reference} - model_flows.PORTABLE, sorted(
-        {(str(route.choice), route.kernel) for route in reference})
+                     for route in _routes(programs[f"{kind} reference"], reference=True)]
+        model_flows.held_routes(flow, dew)
+        model_flows.held_reference(flow, reference)
+
+
+def test_the_reference_arm_runs_each_choices_generic_kernel_that_takes_every_call():
+    """The reference arm's choices (`model_flows.reference_kernels`) are every choice Dew's ops serve, each a
+    generic kernel of its op that requires nothing (the reference path); attention's and the decode's are
+    their plain-JAX reference, never jax.nn's xla attention, which hands sinks and softcaps on."""
+    chosen = model_flows.reference_kernels()
+    assert set(chosen) == set(model_flows.generic_kernels())
+    assert all(kernel in model_flows.generic_kernels()[choice] for choice, kernel in chosen.items())
+    assert chosen["attention"] == chosen["decode"] == "reference"
 
 
 @pytest.mark.parametrize("name", [flow.name for flow in model_flows.FLOWS])
@@ -61,11 +67,11 @@ def test_a_flows_truth_computes_in_float64(name, tmp_path, monkeypatch):
     assert len(written) == 2
 
 
-def _site():
-    """A bf16 product against its fp32 reference, by seed: a check-1 site small enough to prepare, then
-    judge."""
+def _site(salt: int = 5461):
+    """A bf16 product against its fp32 reference, by seed (of the stream `salt` names): a check-1 site small
+    enough to prepare, then judge."""
     def draw(seed):
-        rng = np.random.default_rng([5461, seed])
+        rng = np.random.default_rng([salt, seed])
         return (rng.standard_normal((16, 32)).astype(np.float32),
                 rng.standard_normal((32, 8)).astype(np.float32))
 
@@ -94,3 +100,29 @@ def test_a_prepared_site_judges_as_one_that_computes_its_truth_and_refuses_a_mis
         assert_as_exact(dew, reference, draw, "a prepared product", seeds=8)
     with stored_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
         assert_as_exact(dew, reference, draw, "another product", seeds=8)
+    # The same site over another seed stream: draws its prepare did not make.
+    _, _, other = _site(5462)
+    with stored_truths(tmp_path, prepare=False, stamp="a"), pytest.raises(MissingTruth):
+        assert_as_exact(dew, reference, other, "a prepared product", seeds=8)
+
+
+def test_a_prepared_site_sized_by_its_terms_reads_them_from_its_store(tmp_path):
+    """A site whose truth holds rows that cancel (its second half a product less the same product summed in
+    two halves, exactly zero in float64) is sized by its terms (check 1's `_cancelling_terms`): prepared, its
+    store holds the terms its truth program gave beside the truth, and judged from the store it reads them
+    as a site's own terms program (`_SiteTerms.of`), passing as it passes computing them."""
+    def draw(seed):
+        rng = np.random.default_rng([5463, seed])
+        return (rng.standard_normal((16, 32)).astype(np.float32),
+                rng.standard_normal((32, 8)).astype(np.float32))
+
+    def cancelling(a, b):
+        whole = a @ b
+        return jnp.concatenate([whole, whole - (a[:, :16] @ b[:16] + a[:, 16:] @ b[16:])], axis=1)
+
+    with stored_truths(tmp_path, prepare=True, stamp="a"):
+        assert_as_exact(None, cancelling, draw, "a cancelling product", seeds=8)
+    assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
+    with stored_truths(tmp_path, prepare=False, stamp="a") as store:
+        assert callable(store.site("a cancelling product")[1])
+        assert_as_exact(cancelling, cancelling, draw, "a cancelling product", seeds=8)
