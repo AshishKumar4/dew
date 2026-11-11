@@ -183,6 +183,15 @@ def test_a_file_that_does_not_collect_is_its_own_red_row_and_the_lanes_other_fil
     rows = {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]}
     assert rows == {"3.12:tests/test_broken.py": 1, "3.12:tests/test_whole.py": 0}
     assert ci.collected("3.12", "users_process", []) == {}
+    # A reading that was interrupted is no reading: the lane stops, where one that went on would run its files
+    # with no second process and leave green rows of tests that ran nowhere (review).
+    (tmp_path / "tests/conftest.py").write_text(
+        "import pytest\n"
+        "def pytest_collection_modifyitems(config, items):\n"
+        "    if config.option.markexpr == 'users_process':\n"
+        "        pytest.exit('interrupted', returncode=2)\n")
+    with pytest.raises(SystemExit):
+        ci.gpu_lane("3.12", ["tests/test_whole.py"], out, cache="on", processes=1, deadline=600.0)
 
 
 def test_a_lanes_prepare_ends_within_its_one_deadline_however_many_files_it_holds(
