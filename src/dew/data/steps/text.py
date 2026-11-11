@@ -9,7 +9,7 @@ from typing import Literal
 import grain.python as grain
 import numpy as np
 
-from dew._records import boolean, integer, record, text
+from dew._records import boolean, json_value
 from dew.batch import Batch
 from dew.data.pipeline import Rejected, cut
 
@@ -247,17 +247,16 @@ class LayoutRule:
         return document
 
     def state(self) -> Mapping[str, object]:
-        return {"seen": self.seen, "rule": None if self.rule is None else dataclasses.asdict(self.rule)}
+        from dew.registry import to_record
+
+        return {"seen": self.seen, "rule": None if self.rule is None else to_record(self.rule, CountRule)}
 
     def restore(self, state: Mapping[str, object]) -> None:
+        from dew.registry import from_record
+
         self.seen = boolean(state["seen"], "seen count rule")
-        if state["rule"] is None:
-            self.rule = None
-            return
-        rule = record(state["rule"], "count rule")
-        role, pad_id = (None if rule[name] is None else integer(rule[name], name)
-                        for name in ("role", "pad_id"))
-        self.rule = CountRule(role, pad_id, text(rule["roles"], "roles"))
+        rule = state["rule"]
+        self.rule = None if rule is None else from_record(CountRule, json_value(rule, "count rule"))
 
 
 @dataclasses.dataclass(frozen=True)
