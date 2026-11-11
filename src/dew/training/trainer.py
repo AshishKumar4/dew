@@ -1673,8 +1673,8 @@ class Trainer(Generic[Loss, Effects]):
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
-            staged = isinstance(run.source, RampedStream | PhasedStream | StepPhases)
-            stages = run.source.stages if staged else ()
+            source = run.source
+            stages = source.stages if isinstance(source, RampedStream | PhasedStream | StepPhases) else ()
             self._ramp = stages if isinstance(run.source, RampedStream) else ()
             # The steps a stage after the first begins at, each where an update does (`Ramp.stages`): a
             # ramp's and phases' of other batches here (`PhasedStream.stages`), a schedule's as each begins
@@ -1769,8 +1769,16 @@ class Trainer(Generic[Loss, Effects]):
                 f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
         run.opened(source, self._examples)
         self._marked = marked(run.partition, self._counted_batch)
-        prepare = self._marked if self.rollout is None else functools.partial(
+        counted = self._marked if self.rollout is None else functools.partial(
             consumption_counted, clocked=self._examples is not None, marks_rows=False)
+        inputs = self.objective.inputs
+
+        def prepare(batch: Batch) -> Batch:
+            # Every batch's token ids within its model's table, on the prefetch worker before it is placed
+            # (`InputSpec.bounded`): an id past the table reads no row, and its gather fills NaN.
+            if inputs is not None:
+                inputs.bounded(batch)
+            return counted(batch)
         if run.pooled:
             run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), self._marked,
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))

@@ -1103,8 +1103,10 @@ class Server:
             raise ValueError("submit takes one prompt; call the server with a batch")
         # Sized before the padding goes, by the rows' width, as the task sizes the same rows.
         budget = generation_budget(max_new_tokens, self.default_budget, self.max_length, ids.shape[1])
-        valid = check_inputs(self.model, ids, fields, budget, self.sampling, 1,
-                             capacity=self.capacity).astype(bool)
+        processor = self.processor
+        spelling = None if processor is None else (lambda token: processor.spelling([token]))
+        valid = check_inputs(self.model, ids, fields, budget, self.sampling, 1, capacity=self.capacity,
+                             spelling=spelling).astype(bool)
         if positions is not None and (positions.shape != valid.shape or not np.array_equal(
                 positions[valid], (np.cumsum(valid, axis=1) - 1)[valid])):
             raise ValueError("a served prompt cannot carry noncanonical positions")

@@ -125,13 +125,23 @@ VIDEO_METADATA = {'total_num_frames': 2, 'fps': 2.0, 'width': 32, 'height': 32, 
 """A drawn video's own metadata, which its prompt's timestamps read (Qwen3VLProcessor)."""
 
 
+def native_processor(directory: Path) -> None:
+    """qwen4-exp-native-tiny's Qwen3-VL processor (`multimodal_reference.qwen3_vl_processor`), saved to
+    `directory`, its video frames kept at their 32 pixels a side, the test's draws, rather than grown to
+    the processor's default."""
+    from multimodal_reference import qwen3_vl_processor
+
+    processor, _ = qwen3_vl_processor(directory)
+    processor.video_processor.size = {'shortest_edge': 32 * 32, 'longest_edge': 32 * 32}
+    processor.save_pretrained(directory)
+
+
 def write_native() -> None:
     """qwen4-exp-native-tiny: a random Qwen4ExpForConditionalGeneration (`NATIVE_TEXT`, `NATIVE_VISION`)
     beside its Qwen3-VL processor (`multimodal_reference.qwen3_vl_processor`), and the prompts a test
     reads an image and a video through (prompts.json, the video's metadata among them), which it runs
     against transformers' own class live."""
     import torch
-    from multimodal_reference import qwen3_vl_processor
     from transformers.models.qwen4_exp.configuration_qwen4_exp import Qwen4ExpConfig
     from transformers.models.qwen4_exp.modeling_qwen4_exp import Qwen4ExpForConditionalGeneration
 
@@ -144,10 +154,7 @@ def write_native() -> None:
     model = Qwen4ExpForConditionalGeneration(config).float().eval()
     scatter_weights(model, 1234)
     model.save_pretrained(directory, safe_serialization=True)
-    processor, _ = qwen3_vl_processor(directory)
-    # Frames kept at their 32 pixels a side, the test's draws, rather than grown to the processor's default.
-    processor.video_processor.size = {'shortest_edge': 32 * 32, 'longest_edge': 32 * 32}
-    processor.save_pretrained(directory)
+    native_processor(directory)
     (directory / 'prompts.json').write_text(json.dumps({
         'image': 'token7 <start_of_image><image_soft_token><end_of_image> token9',
         'video': 'token4 <start_of_image><video><end_of_image> token6',

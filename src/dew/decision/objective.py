@@ -442,7 +442,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         # longer; none where its rows carry no context.
         self.context_window = (None if held_context is None
                                else context_window or max(self.layout.max_len, held_context))
-        self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,)))
+        self.inputs = InputSpec(sample=Field.indexing("tokens", (self.layout.max_len,), self.model))
         self.pass_weights = self._passes_weighed(PassWeights.of(pass_weights))
         self.exit_entropy = self._exit_weighed(exit_entropy)
 

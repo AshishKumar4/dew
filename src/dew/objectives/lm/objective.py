@@ -631,7 +631,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         self.use_head(head_chunks, head_tile)
         self.samples = samples
         self.balance = balance
-        self.inputs = InputSpec(sample=Field(TEXT_KEY, (self.context + 1,), variable_axes=(0,)))
+        self.inputs = InputSpec(sample=Field.indexing(TEXT_KEY, (self.context + 1,), self.model,
+                                                      variable_axes=(0,)))
         if samples is not None and samples.max_new_tokens > 0:
             self._prompt = prompt_batch(samples.prompt)
 

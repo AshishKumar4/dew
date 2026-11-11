@@ -572,15 +572,6 @@
     },
     {
       "id": 63,
-      "content": "token63",
-      "single_word": true,
-      "lstrip": false,
-      "rstrip": false,
-      "normalized": false,
-      "special": false
-    },
-    {
-      "id": 64,
       "content": "<mask>",
       "single_word": false,
       "lstrip": false,
@@ -686,7 +677,7 @@
       "<image_soft_token>": 60,
       "<start_of_image>": 61,
       "<end_of_image>": 62,
-      "token63": 63
+      "<mask>": 63
     },
     "unk_token": "<unk>"
   }
