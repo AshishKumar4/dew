@@ -9,14 +9,20 @@ GPU_HEADROOM = (1.25, 2 ** 30)
 fragmentation, which can leave a share its own size short of a block it needs."""
 
 
+def measured(recorded: dict | None) -> bool:
+    """Whether `recorded`, a run's record, measured what its file held on the GPU: a run that followed every
+    process it started and left its report."""
+    return recorded is not None and recorded.get("depends") is not None and recorded.get("peak") is not None
+
+
 def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
     """The GPU share a test file's process is given, as `XLA_PYTHON_CLIENT_MEM_FRACTION` of it, and what
     the file holds with its children, by its last run's `recorded` peak (tools/armada/executed.py's
     `gpu_peak`, or a child's that took its fraction, the larger) and `GPU_HEADROOM`: a child that took
     the share's fraction holds one more share, and one that named its own fraction the pool it held.
     A file no run measured, one that started a process it did not follow, and one whose last run left
-    no report take all of `budget`."""
-    if recorded is None or recorded["depends"] is None or recorded["peak"] is None:
+    no report (`measured`) take all of `budget`."""
+    if not measured(recorded):
         return budget, budget
     factor, slack = GPU_HEADROOM
     share = min(recorded["peak"] * factor + slack, budget)
@@ -26,18 +32,17 @@ def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
 def largest(keys: Iterable[str], read: Callable[[str], dict | None],
             measures: Callable[[str], Hashable | None]) -> dict:
     """Of the records at `keys` (`read`: one's record, None where there is none), for each thing a record
-    `measures` (None: nothing asked for), the one whose run measured its GPU peak that holds the most
-    with its children (`gpu_needs`). A thing no such record measures is absent."""
+    `measures` (None: nothing asked for), the most those whose runs measured it held (`measured`), as one
+    record `gpu_needs` reads: the largest peak, the most children that took its fraction, and the largest
+    pools its children named, each of whichever run, so its process is given no less than any run's and holds
+    no less with its children (one record chosen by what it held gave a process the 6 GiB of a run with a
+    child over the 11 GiB of a run without). A thing no such record measures is absent."""
     asked = [(key, of) for key in keys if (of := measures(key)) is not None]
-
-    def holds(found: dict) -> float:
-        return gpu_needs(found, float("inf"))[1]
-
     most: dict = {}
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         for (_, of), found in zip(asked, pool.map(read, [key for key, _ in asked]), strict=True):
-            if found is None or found.get("depends") is None or found.get("peak") is None:
-                continue
-            if of not in most or holds(found) > holds(most[of]):
-                most[of] = found
+            if measured(found):
+                held = most.setdefault(of, {"depends": [], "peak": 0, "shares": 0, "pools": 0})
+                for each in ("peak", "shares", "pools"):
+                    held[each] = max(held[each], found.get(each, 0))
     return most

@@ -600,11 +600,12 @@ def test_a_tier_cut_group_is_admitted_on_the_most_its_file_held_and_no_need_is_c
     gib, total = 2 ** 30, 81920 * 2 ** 20
     common = ci.lane_inputs("3.12")
 
-    def measured(row_name: str, peak: int) -> None:
+    def measured(row_name: str, peak: int, shares: int = 0, followed: bool = True) -> None:
         for inputs in (None, common):
             at = "/" + ci.record_key("3.12", row_name, ci.device_class(), inputs)
-            stored[at] = json.dumps({"key": None, "depends": ["tests/test_long.py"], "row": {}, "reads": [],
-                                     "peak": peak, "shares": 0, "pools": 0}).encode()
+            stored[at] = json.dumps({"key": None, "depends": ["tests/test_long.py"] if followed else None,
+                                     "row": {}, "reads": [], "peak": peak, "shares": shares,
+                                     "pools": 0}).encode()
 
     out = tmp_path / "verdict.json"
     # Each lane here runs its file (the cache off): a row reused is admitted nothing.
@@ -634,6 +635,18 @@ def test_a_tier_cut_group_is_admitted_on_the_most_its_file_held_and_no_need_is_c
     assert ci.gpu_lane("3.12", ["tests/test_long.py#1/2"], out, cache="off", processes=1, deadline=600.0) == 0
     [share, *_] = lane_runs(tmp_path, "test_long")[-1]
     assert float(share) * total == 6 * gib * 1.25 + gib, "the largest of the file's measured runs"
+    # The most of each run's measure, not one run's: a group's run with a child that took its fraction held
+    # more than the whole run of a larger peak, whose share the process is given all the same.
+    measured("3.12:tests/test_long.py", 8 * gib)
+    measured("3.12:tests/test_long.py#3/3", 4 * gib, shares=1)
+    assert ci.gpu_lane("3.12", ["tests/test_long.py#1/2"], out, cache="off", processes=1, deadline=600.0) == 0
+    [share, *_] = lane_runs(tmp_path, "test_long")[-1]
+    assert float(share) * total == 8 * gib * 1.25 + gib, "the largest peak's share, whichever run held most"
+    # A whole run that started a process it did not follow measured nothing: the file takes the lane's whole
+    # share, whatever a group's run measured before.
+    measured("3.12:tests/test_long.py", 2 * gib, followed=False)
+    assert ci.gpu_lane("3.12", ["tests/test_long.py#1/2"], out, cache="off", processes=1, deadline=600.0) == 0
+    assert float(lane_runs(tmp_path, "test_long")[-1][0]) == 0.5
 
 
 def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measured_class_held_it(
@@ -662,18 +675,18 @@ def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measur
                                 "peak": 6 * gib, "shares": 1, "pools": 0}).encode()
     assert holds.main() == 0
     assert json.loads(capsys.readouterr().out) == {"tests/test_wide.py": 2 * (6 * gib * 1.25 + gib)}
-    # A group's run is one too: where it held more than any whole one, the file's need is the group's, as its
-    # lane's is.
+    # A group's run is one too, and the file's need the most of each measure: its larger peak, and the child a
+    # whole run had beside it.
     group = "/" + ci.record_key("3.12", ci.row("3.12", "tests/test_wide.py", "2/5"),
                                 "NVIDIA-H100-80GB-HBM3-x86")
     stored[group] = json.dumps({"key": None, "depends": ["tests/test_wide.py"], "row": {}, "reads": [],
                                 "peak": 9 * gib, "shares": 0, "pools": 0}).encode()
     assert holds.main() == 0
-    assert json.loads(capsys.readouterr().out) == {"tests/test_wide.py": 2 * (6 * gib * 1.25 + gib)}, "less"
+    assert json.loads(capsys.readouterr().out) == {"tests/test_wide.py": 2 * (9 * gib * 1.25 + gib)}
     stored[group] = json.dumps({"key": None, "depends": ["tests/test_wide.py"], "row": {}, "reads": [],
                                 "peak": 20 * gib, "shares": 0, "pools": 0}).encode()
     assert holds.main() == 0
-    assert json.loads(capsys.readouterr().out) == {"tests/test_wide.py": 20 * gib * 1.25 + gib}
+    assert json.loads(capsys.readouterr().out) == {"tests/test_wide.py": 2 * (20 * gib * 1.25 + gib)}
     # The cache not answering (here, refusing the token) fails the tool, which sizes a job by what it says:
     # read as files no class measured, a part took the default (2026-11-11: a file measured at 5.9 GiB ran
     # out of the 4 GiB lane of a part composed while a read of its record did not come back). A lane on its

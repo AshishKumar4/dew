@@ -1968,7 +1968,7 @@ def collected(python: str, marks: str, files: list[str] | None = None,
 def largest_records(python: str, token: str, measures, under: str = "", strict: bool = False) -> dict:
     """For each thing `measures` says a record's class, test file and group (`key_parts`) measures (None:
     nothing asked for), of this Python's last records under `under` (a class's `<class>/`; none, every
-    class's), the one whose run measured its GPU peak that holds the most (measures.py's `largest`); none
+    class's), the most those whose runs measured it held, as one record (measures.py's `largest`); none
     where the Worker does not list its records. With `strict`, a read the Worker does not answer is an
     `r2.R2Error`, never a file taken for unmeasured: what sizes a job before it runs (gpu_holds.py) is read
     whole or not at all (2026-11-11: one record's read did not come back as a GPU tier was composed, its part
@@ -1996,10 +1996,10 @@ def largest_records(python: str, token: str, measures, under: str = "", strict: 
 
 def borrowed_records(names: list[str], python: str, held: str, token: str,
                      strict: bool = False) -> dict[str, dict]:
-    """For each of `names`, test files no run on class `held` measured, of its last records on the other
-    classes, any group's and any of its processes' (`varied`: a file's process under a user's flags may hold
-    more than the lane's own), the one that holds the most (`largest_records`): what a file has taken on a
-    GPU, which a first lane on a class takes as its share. One no class measured is absent. Its run on `held`
+    """For each of `names`, test files no run on class `held` measured, the most its last records on the
+    other classes measured (`largest_records`), any group's and any of its processes' (`varied`: a file's
+    process under a user's flags may hold more than the lane's own): what a file has taken on a GPU, which
+    a first lane on a class takes as its share. One no class measured is absent. Its run on `held`
     records its own, which every later lane reads."""
     wanted = set(names)
     return largest_records(python, token, lambda at, name, _: name if at != held and name in wanted else None,
@@ -2140,23 +2140,28 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     units = lane_units(python, tests)
     tests = list(units)
 
-    def needs(name: str) -> dict | None:
-        file, group, variant = units[name]
-        return recorded(record_key(python, row(python, file, varied(group, variant)), held), token)
-
     # A group the tier cut by its own seconds holds tests another cut's group of its name did not, so its own
     # last record is not its measure (2026-11-10: a group measured holding two tests was given their pool when
-    # it held five, one asking more than the pool). Nor is the file's whole run alone, which a test added
-    # since has outgrown (2026-11-11: a whole run's 3.92 GiB gave a newer test a 5.9 GiB lane, which ran out):
-    # its measure is the most any run of its file's process on this class held, whole or a group of any cut.
-    if os.environ.get("DEW_SPLIT_DURATIONS"):
+    # it held five, one asking more than the pool): it reads its file's whole run's.
+    cut = bool(os.environ.get("DEW_SPLIT_DURATIONS"))
+
+    def needs(name: str) -> dict | None:
+        file, group, variant = units[name]
+        return recorded(record_key(python, row(python, file, varied("" if cut else group, variant)), held),
+                        token)
+
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        records = dict(zip(tests, pool.map(needs, tests), strict=True))
+    # Nor is the whole run alone such a group's measure, which a test added since has outgrown (2026-11-11: a
+    # whole run's 3.92 GiB gave a newer test a 5.9 GiB lane, which ran out): it is the most the runs of its
+    # file's process on this class measured, whole or a group of any cut. A whole run that measured nothing (a
+    # child it did not follow, no report) stays the file's, which so takes the lane's whole share.
+    if cut:
         files = {file for file, _, _ in units.values()}
         most = largest_records(python, token, under=f"{held}/", measures=lambda _, name, group: (
             (name, place_variant(group)) if name in files else None))
-        records = {name: most.get((file, variant)) for name, (file, _, variant) in units.items()}
-    else:
-        with concurrent.futures.ThreadPoolExecutor(32) as pool:
-            records = dict(zip(tests, pool.map(needs, tests), strict=True))
+        records = {name: found if found is not None and not gpu_measures.measured(found)
+                   else most.get((units[name][0], units[name][2]), found) for name, found in records.items()}
     # A group no run on this class measured borrows the most its file held on another, which holds at least
     # its own; a file's process under other flags, its tests a part of the file's, the lane's own's first.
     borrowed = borrowed_records(sorted({units[name][0] for name, found in records.items() if found is None}),
