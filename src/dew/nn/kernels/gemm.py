@@ -995,9 +995,10 @@ class MxFp8:
         # The largest magnitude is a fraction in [1/2, 1) times 2 to `binade`: its exponent is `binade` - 1.
         binade = jnp.frexp(largest)[1]
         top = jnp.finfo(jnp.float8_e4m3fn).maxexp - 1
-        bias = -jnp.finfo(jnp.float8_e8m0fnu).minexp
+        scale = formats_of.MXFP8.scale
+        bias = -jnp.finfo(scale).minexp
         exponent = jnp.clip(jnp.where(largest > 0, binade - 1 - top, -bias), -bias, bias)
-        scales = jax.lax.bitcast_convert_type((exponent + bias).astype(jnp.uint8), jnp.float8_e8m0fnu)
+        scales = jax.lax.bitcast_convert_type((exponent + bias).astype(jnp.uint8), scale)
         codes = fake_quant.fp8_codes(blocks / scales.astype(x.dtype)).reshape(x.shape)
         return cls(codes.astype(jnp.float8_e4m3fn), scales[..., 0])
 
