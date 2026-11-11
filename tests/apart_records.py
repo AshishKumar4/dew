@@ -26,16 +26,19 @@ def written(directory: Path, test: str, call: int, found: list[dict]) -> None:
 
 
 def reported(report) -> None:
-    """In a process of its own (`RECORDS`), a test's outcome beside its records: failed, with its report,
-    where a phase of it failed; passed once its teardown passed after phases that did."""
+    """In a process of its own (`RECORDS`), a test's outcome beside its records: passed once its call passed,
+    failed, with its report, where a phase of it failed, and failed where it ended with no call that passed
+    (a skip)."""
     if RECORDS not in os.environ:
         return
     outcome = Path(os.environ[RECORDS]) / f"{_named(report.nodeid)}.outcome"
     if report.failed:
         outcome.write_text(json.dumps({"passed": False, "when": report.when,
                                        "report": str(report.longrepr)[-3000:]}))
-    elif report.when == "teardown" and not outcome.exists():
+    elif report.when == "call" and report.passed:
         outcome.write_text(json.dumps({"passed": True}))
+    elif report.when == "teardown" and not outcome.exists():
+        outcome.write_text(json.dumps({"passed": False, "when": "call", "report": "no call of it passed"}))
 
 
 def ran(directory: Path, test: str) -> bool:

@@ -1190,7 +1190,8 @@ def test_records_a_failed_process_of_their_own_wrote_are_refused():
 def test_a_capabilitys_cells_compile_in_one_process_of_their_own(monkeypatch, tmp_path):
     """Every cell of the session that states a capability other than the one the process compiles for
     (`kernel_compile.Gated`) runs in one pytest process of its own, the first to ask starting it, and each
-    reads its own records from it; a test that states none runs in one of its own (`compiled_apart`)."""
+    reads its own records from it, none where its call did not pass there (a skip); a test that states none
+    runs in one of its own (`compiled_apart`)."""
     from types import SimpleNamespace
 
     import apart_records
@@ -1202,7 +1203,8 @@ def test_a_capabilitys_cells_compile_in_one_process_of_their_own(monkeypatch, tm
 
     session = [cell("a", generation_name=Gated("sm90"), index=0),
                cell("b", generation_name=Gated("sm90"), index=1),
-               cell("c", generation_name=Gated("sm100"), index=0), SimpleNamespace(nodeid="d")]
+               cell("c", generation_name=Gated("sm100"), index=0), SimpleNamespace(nodeid="d"),
+               cell("e", generation_name=Gated("sm90"), index=2)]
     started = []
 
     def ran_apart(tests):
@@ -1212,7 +1214,10 @@ def test_a_capabilitys_cells_compile_in_one_process_of_their_own(monkeypatch, tm
         monkeypatch.setenv(apart_records.RECORDS, str(directory))
         for test in tests:
             apart_records.written(directory, test, 0, [{"name": test}])
-            apart_records.reported(SimpleNamespace(nodeid=test, failed=False, when="teardown"))
+            skipped = test == "e"
+            for when in ("setup", "teardown") if skipped else ("setup", "call", "teardown"):
+                passed = not (skipped and when == "setup")
+                apart_records.reported(SimpleNamespace(nodeid=test, failed=False, passed=passed, when=when))
         monkeypatch.delenv(apart_records.RECORDS)
         return directory
 
@@ -1222,7 +1227,9 @@ def test_a_capabilitys_cells_compile_in_one_process_of_their_own(monkeypatch, tm
     assert kernel_compile.compiled_apart((9, 0), "a", 0) == [{"name": "a"}]
     assert kernel_compile.compiled_apart((9, 0), "b", 0) == [{"name": "b"}]
     assert kernel_compile.compiled_apart((9, 0), "d", 0) == [{"name": "d"}]
-    assert started == [["a", "b"], ["d"]]
+    with pytest.raises(RuntimeError):
+        kernel_compile.compiled_apart((9, 0), "e", 0)
+    assert started == [["a", "b", "e"], ["d"]]
 
 
 def test_the_resource_gate_refuses_spills_and_invalid_allocations():
