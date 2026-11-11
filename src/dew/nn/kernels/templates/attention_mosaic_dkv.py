@@ -713,8 +713,13 @@ def _dkv_views(named: dict, stat_refs: list, positions_ref, place: tuple, *, sha
 
 def _statistics_of(family: mosaic.Family, stat_refs: list, place: tuple, q_first, rows: int) -> tuple:
     """`rows` queries' statistics from `q_first` of a batch row and head (`place`) in a column's layout, the
-    tiles' queries its columns."""
-    return tuple(family.columns_of(ref.at[*place, pl.ds(q_first, rows)]) for ref in stat_refs)
+    tiles' queries its columns: each a reader the scores call where they use it (`_scores`' `read`), as a
+    shared dQ's streamed statistics are. Loaded at once ahead of the score hook's inputs, an sm86's and an
+    sm89's dK/dV at width 64 spilled 80 bytes under a row-indexed hook and 8 under a tile bias, where an
+    sm80's spilled none with the same geometry and PTX; read where used, none spills on any of the three
+    (row 5467, ptxas 12.9.86)."""
+    return tuple(functools.partial(family.columns_of, ref.at[*place, pl.ds(q_first, rows)])
+                 for ref in stat_refs)
 
 
 def _dkv_producer(walk: _Backward, streams, views: dict, streamed: tuple, dq_ref, place: tuple,

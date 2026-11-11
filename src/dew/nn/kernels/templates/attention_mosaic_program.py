@@ -1067,9 +1067,12 @@ class _Program[T: (Tiles, BackwardTiles)]:
         return operands.Parts(tuple(tile.at[pl.ds(part * rows, rows)] for part in range(self.parts)),
                               jnp.float32)
 
-    def split(self):
-        """This program's slice of its query tile's keys (`splits`), 0 of one."""
-        return lax.rem(self.family.program_index("q_tiles"), self.splits) if self.splits > 1 else jnp.int32(0)
+    def split(self, *, fresh: bool = False):
+        """This program's slice of its query tile's keys (`splits`), 0 of one; its grid coordinate read where
+        it is used where `fresh` (`Family.program_index`)."""
+        if self.splits == 1:
+            return jnp.int32(0)
+        return lax.rem(self.family.program_index("q_tiles", fresh=fresh), self.splits)
 
     def padded(self, first) -> jax.Array | bool:
         """Whether the query tile from `first` holds padding rows past the call's queries, some or all of
@@ -1078,11 +1081,12 @@ class _Program[T: (Tiles, BackwardTiles)]:
             return False
         return first + self.tiles.block_q > self.queries
 
-    def query_tile(self, count: int):
+    def query_tile(self, count: int, *, fresh: bool = False):
         """This program's query tile of the grid's `count`: a causal call's longest first (its last query
         tiles see the most keys), so the grid's tail holds its shortest programs, as FlashAttention-3's
-        scheduler orders them; a full call's in order."""
-        index = self.family.program_index("q_tiles")
+        scheduler orders them; a full call's in order. Its grid coordinate read where it is used where
+        `fresh` (`Family.program_index`)."""
+        index = self.family.program_index("q_tiles", fresh=fresh)
         if self.splits > 1:
             index = lax.div(index, self.splits)
         return count - 1 - index if self.causal else index

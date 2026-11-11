@@ -8,7 +8,7 @@ import dataclasses
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from jax import lax
+from jax import lax, numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -120,8 +120,11 @@ class Schedule:
         """Each role's body by its name: on a schedule of one role, `body(index)` on every warpgroup, its
         index along `axis` (the value it returns, a program's whose consumers keep theirs); otherwise each
         raised role's `body(index)` on its warpgroups, its index among them, their registers raised to its
-        share at the launch's residency (`registers`, `bodies.RESIDENT`), then the last warpgroup's, lowered
-        to the least, its role's `body()` or each warp role's on its warp."""
+        share at the launch's residency (`registers`, `bodies.RESIDENT`), and the last warpgroup's, lowered
+        to the least, its role's `body()` or each warp role's on its warp: each role a branch of one switch
+        on the warpgroup, its register instruction first. Two conditionals, one a role, are two regions the
+        compiler allocates apart around the producer's register drop: a B200's forward at width 256 held
+        the consumers' values across it and spilled 172 bytes, 112 in one switch (row 5466)."""
         if set(bodies) != {role.name for role in self.roles}:
             raise ValueError(f"a schedule of {[role.name for role in self.roles]} given bodies for "
                              f"{sorted(bodies)}")
@@ -130,35 +133,37 @@ class Schedule:
             return bodies[role.name](0 if self.axis is None else lax.axis_index(self.axis))
         wg = lax.axis_index(self.axis)
         budgets = self.registers(RESIDENT.get())
-        first = 0
+        branches, bounds, first = [], [], 0
         for role in self.raised:
-            # The first role's warpgroups are those below its count, each its own index: no bound and no
-            # shift is traced for it, so a one-role table builds the kernel a producer beside consumers
-            # always built (an attention forward's spill-free registers on an H100 turn on it,
-            # test_attention_mosaic's compile gate).
-            within = wg < first + role.count if first == 0 else (wg >= first) & (wg < first + role.count)
-
-            @pl.when(within)
-            def _(role=role, first=first):
+            def raised(role=role, first=first):
                 plgpu.set_max_registers(budgets[role.name], action="increase")
+                # The first role's warpgroups are those below its count, each its own index: no shift is
+                # traced for it (an attention forward's spill-free registers on an H100 turn on it,
+                # test_attention_mosaic's compile gate).
                 bodies[role.name](wg if first == 0 else wg - first)
 
+            branches.append(raised)
             first += role.count
+            bounds.append(first)
+        index = sum((wg >= bound).astype(jnp.int32) for bound in bounds[:-1])
         lowered = [role for role in self.roles if not role.weight]
-        if not lowered:
-            return None
+        if lowered:
+            def lower():
+                plgpu.set_max_registers(budgets[lowered[0].name], action="decrease")
+                if not lowered[0].warp:
+                    bodies[lowered[0].name]()
+                    return
 
-        @pl.when(wg == first)
-        def _():
-            plgpu.set_max_registers(budgets[lowered[0].name], action="decrease")
-            if not lowered[0].warp:
-                bodies[lowered[0].name]()
-                return
+                @plgpu.warp_map
+                def _(warp):
+                    for place, role in enumerate(lowered):
+                        @pl.when(warp == place)
+                        def _(body=bodies[role.name]):
+                            body()
 
-            @plgpu.warp_map
-            def _(warp):
-                for index, role in enumerate(lowered):
-                    @pl.when(warp == index)
-                    def _(body=bodies[role.name]):
-                        body()
+            # The lowered role's branch first: Mosaic lowers a switch's first branch twice (once for its
+            # results' types), the producer's the cheaper.
+            branches.insert(0, lower)
+            index = jnp.where(wg >= first, 0, index + 1)
+        lax.switch(index, branches)
         return None

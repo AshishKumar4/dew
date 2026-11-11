@@ -48,7 +48,7 @@ from dew.nn.kernels.templates import (
     resources,
     swizzling,
 )
-from dew.nn.kernels.templates.rings import CLUSTER, Ref, Ring, Turn, drain, loads, opaque, passed, streamed
+from dew.nn.kernels.templates.rings import CLUSTER, Ref, Ring, Turn, drain, loads, passed, streamed
 from dew.telemetry.instrumentation import MODEL_FLOPS
 
 if TYPE_CHECKING:
@@ -1422,10 +1422,13 @@ class Transport[Allocated, Opened](abc.ABC):
         family streams from a role of its own (`roles`)."""
         return self.roles(consumers).warpgroups()
 
-    def program_index(self, name: str) -> jax.Array:
+    def program_index(self, name: str, *, fresh: bool = False) -> jax.Array:
         """The program's coordinate on its launch grid's axis `name` (`kernel`'s `grid_names`): Mosaic GPU
-        names a grid's axes as a mesh's, read by `lax.axis_index`."""
-        return lax.axis_index(name)
+        names a grid's axes as a mesh's, read by `lax.axis_index`; read afresh where it is used where `fresh`
+        (`plgpu.fresh_axis_index`, a read the compiler neither merges with another nor moves), so a late use
+        holds no earlier read live: a B200's forward at width 256 held its query tile's index from before
+        the walk to its rows' stores and spilled it across its producer's register drop (row 5466)."""
+        return plgpu.fresh_axis_index(name) if fresh else lax.axis_index(name)
 
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
@@ -1718,13 +1721,6 @@ class Transport[Allocated, Opened](abc.ABC):
         """The program's completed stores to global memory visible to its own loads: a family that stores
         through its threads' writes needs nothing."""
         del interpret
-
-    def at_store(self, index: jax.Array) -> jax.Array:
-        """A view's `index` (its first row) formed where a store reads it (`stored`): through an optimization
-        barrier (`opaque`) on a GPU, whose copy is addressed by a 64-bit offset the compiler would otherwise
-        form wherever the index is first known, before a walk that reads it too, and hold across the walk
-        (16 bytes spilled of an H100's fp32 attention forward at its raise of 160, et-zerorow's SASS)."""
-        return opaque(index)
 
     @abc.abstractmethod
     def added(self, value: jax.Array, view, interpret: bool, *, smem, pending: int = 0) -> None:
