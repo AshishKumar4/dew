@@ -137,6 +137,12 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         return lines
 
     out, marked = tmp_path / "verdict.json", {"test_1", "test_3", "test_5"}
+    # A recalled attempt's progress, naming a test it passed: a prepare sets nothing aside by it, and keeps none.
+    resume = tmp_path / "resume"
+    resume.mkdir()
+    (resume / "progress.jsonl").write_text(
+        json.dumps({"node": "tests/test_flows.py::test_1", "seconds": 1.0}) + "\n")
+    monkeypatch.setenv("ARMADA_RESUME", str(resume))
     prepared = {}
     for group in ("1/2", "2/2"):
         name = f"tests/test_flows.py#{group}"
@@ -148,6 +154,8 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
         prepared[group] = {line[0] for line in lines}
     assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "nothing to prepare starts no process"
     assert not stored, "a prepare records no row"
+    assert not (tmp_path / "artifacts" / "progress.jsonl").exists(), "nor any test as passed (review)"
+    monkeypatch.delenv("ARMADA_RESUME")
     assert prepared["1/2"] | prepared["2/2"] == marked and not prepared["1/2"] & prepared["2/2"]
     for group in ("1/2", "2/2"):
         assert ci.gpu_lane("3.12", [f"tests/test_flows.py#{group}"], out, cache="on", processes=1,

@@ -1642,8 +1642,10 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     run = session.selected(session.pytest_run(python, report, *measured), network, whole, bool(release),
                    site is not None)
     # A resuming task keeps its progress and sets aside the tests its recalled attempt passed (`resumed`,
-    # SET_ASIDE); a site's map task (its artifacts its judge's draws), a release and a trace resume none.
-    resumes = site is None and not release and coverage is None
+    # SET_ASIDE); a site's map task (its artifacts its judge's draws), a release and a trace resume none, nor
+    # does a run that records none (a prepare's: a test it prepared has not passed, and a test an earlier
+    # attempt passed still prepares into this one's store).
+    resumes = recorded and site is None and not release and coverage is None
     done_before = resumed(tests) if resumes else {}
     aside = out.with_name(f"{out.name}.set-aside.json")
     aside.write_text(json.dumps(sorted(done_before)))
