@@ -754,12 +754,30 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         (one pass, or `exit_entropy`, whose exit objective weighs the label loss's passes itself)."""
         return terms[-1] if len(terms) == 1 or self._weights is None else weighed(self._weights, terms)
 
-    def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
+    def evaluate(self, params: Variables, batch: Batch, step: Step
+                 ) -> Decisions | tuple[Decisions, PassReports]:
+        """The batch's decisions, and each pass's beside them where the loss weighs a looped backbone's
+        passes (`_reported`), its loss not asked: a validation of metrics alone reports each pass's."""
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.spans_in_context,
                           whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention, fork_depth=self._fork_depth,
                           joint_forks=self._joint_forks)
-        return self._decisions(self._logits(self.evaluation_variables(params, step), inputs), inputs, batch)
+        weights = self.evaluation_variables(params, step)
+        if self._weights is None and self.exit_entropy is None:
+            return self._decisions(self._logits(weights, inputs), inputs, batch)
+        return self._reported(self._passes(weights, inputs), inputs, batch)
+
+    def _reported(self, passes: tuple[jax.Array, ...], inputs: DecisionInputs, batch: Batch,
+                  losses: Sequence[Ratio | Weighted | None] | None = None
+                  ) -> Decisions | tuple[Decisions, PassReports]:
+        """The last pass's decisions, and where there are several passes each pass's beside them
+        (`PassReports`): its `losses`' term, none where the caller asked for no loss, and its decisions."""
+        decisions = self._decisions(passes[-1], inputs, batch)
+        if len(passes) == 1:
+            return decisions
+        losses = [None] * len(passes) if losses is None else losses
+        return decisions, PassReports(tuple((loss, self._decisions(logits, inputs, batch))
+                                            for loss, logits in zip(losses, passes, strict=True)))
 
     def _validation_scores(self, params: Variables, batch: Batch, step: Step
                            ) -> tuple[Ratio | Weighted, Decisions | tuple[Decisions, PassReports]]:
@@ -773,12 +791,9 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         passes, gates, _ = self._pass_logits(params, inputs)
         term = self.input_terms(params, inputs, batch, step) if self.input_lm else None
         loss = self._with_input_term(self._charged(passes, inputs, batch, gates)[0], term)
-        decisions = self._decisions(passes[-1], inputs, batch)
-        if len(passes) == 1:
-            return loss, decisions
-        return loss, (decisions, PassReports(tuple(
-            (self._with_input_term(self._charged((logits,), inputs, batch)[0], term),
-             self._decisions(logits, inputs, batch)) for logits in passes)))
+        losses = [self._with_input_term(self._charged((logits,), inputs, batch)[0], term)
+                  for logits in passes]
+        return loss, self._reported(passes, inputs, batch, losses if len(passes) > 1 else None)
 
     def _decisions(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch) -> Decisions:
         """The questions' option probabilities, each at its type's temperature, with what scores them."""
@@ -812,6 +827,11 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     @property
     def _logits(self):
         return self.program('logits', lambda variables, inputs: self.model.logits(variables, inputs))
+
+    @property
+    def _passes(self):
+        """Each scored pass's option logits (`_pass_logits`), one program."""
+        return self.program('pass logits', lambda variables, inputs: self._pass_logits(variables, inputs)[0])
 
     @property
     def _fork_depth(self) -> int:

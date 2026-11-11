@@ -47,7 +47,7 @@ from typing_extensions import TypeIs, TypeVar
 
 from dew._distributions import counter_key
 from dew._records import JSON
-from dew.artifacts import Artifact, Artifacts, TokenScores
+from dew.artifacts import Artifact, Artifacts
 from dew.batch import (
     EXAMPLE_ROWS,
     FROZEN,
@@ -1560,10 +1560,12 @@ class Objective(ABC, Generic[Loss, Effects]):
             return None
         return self._compiled_scores(self.evaluation_variables(params, step), batch, replace(step, ema=None))
 
-    _evaluation_scores: Callable[..., TokenScores] | None = None
+    _evaluation_scores: Callable[..., Artifacts] | None = None
     """The per-token scores of one evaluation batch, a pure function of the
     weights, the batch and the pass's step, whose draws are its examples'
-    (`Step.sample`), or None when the objective scores no tokens."""
+    (`Step.sample`), each pass's beside them where a loss weighs a looped
+    model's (`dew.objectives.passes.PassReports`), or None when the objective
+    scores no tokens."""
 
     _validation_scores: Callable[..., tuple[Loss, Artifacts]] | None = None
     """One validation batch's loss statistics and the artifacts `evaluate`
@@ -1598,7 +1600,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         return not evaluate or (loss and self._validation_scores is not None)
 
     @property
-    def _compiled_scores(self) -> Callable[..., TokenScores]:
+    def _compiled_scores(self) -> Callable[..., Artifacts]:
         """`_evaluation_scores` compiled for the current modules. Run op by op, the
         model's forward would dispatch every operation of every validation
         batch from the host, and jax's eager shard_map refuses the chunked

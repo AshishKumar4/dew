@@ -1830,10 +1830,29 @@ class LMObjective(TokenScorer):
         prepared = {TEXT_KEY: self._text(batch), ROLES_KEY: self._batch_roles(batch)}
         return super().evaluate(params, prepared, step)
 
-    def _evaluation_scores(self, params, batch, step) -> TokenScores:
-        scores = self.token_scores(params, batch[TEXT_KEY], roles=batch[ROLES_KEY], predict=True)
+    def _evaluation_scores(self, params, batch, step) -> TokenScores | tuple[TokenScores, PassReports]:
+        """The batch's token scores, each pass's beside them where the loss weighs a looped decoder's
+        passes (`_reported`), no loss asked: a validation of metrics alone reports each pass's."""
+        weighed = self.pass_weights is not None and self._reads_exits(self.model)
+        scores = self.token_scores(params, batch[TEXT_KEY], roles=batch[ROLES_KEY], predict=True,
+                                   exits=weighed)
+        return self._reported(scores, batch, losses=False)
+
+    def _reported(self, scores, batch, *, losses: bool) -> TokenScores | tuple[TokenScores, PassReports]:
+        """`scores`' last pass's token scores, and where the loss weighs the passes and `scores` read them
+        each pass's beside them (`PassReports`): its cross entropy over the counted targets where `losses`
+        asks for it (as `ce` is the last pass's), and its tokens' scores."""
         assert scores.correct is not None
-        return TokenScores(scores.losses, scores.weights, scores.correct)
+        scored = TokenScores(scores.losses, scores.weights, scores.correct)
+        if self.pass_weights is None or scores.exits is None:
+            return scored
+        terms, _, right = scores.exits
+        assert right is not None, "a scoring predicts every pass"
+        mass = jax.lax.stop_gradient(self.row_mean(scores.weights, batch).total) if losses else None
+        return scored, PassReports(tuple(
+            (None if mass is None else Ratio(self.row_mean(term, batch, weights=scores.weights).total, mass),
+             TokenScores(term, scores.weights, correct))
+            for term, correct in zip(terms, right, strict=True)))
 
     def _validation_scores(self, params, batch, step: Step) -> tuple[
             Ratio | RoutedStatistics, TokenScores | tuple[TokenScores, PassReports]]:
@@ -1849,17 +1868,7 @@ class LMObjective(TokenScorer):
             statistics, _ = self._warmup_statistics(scores.indexer, prepared, batch)
         else:
             statistics, _, scores, _ = self._scored_loss(params, batch, step, train=False, predict=True)
-        assert scores.correct is not None
-        scored = TokenScores(scores.losses, scores.weights, scores.correct)
-        if self.pass_weights is None or scores.exits is None:
-            return statistics, scored
-        losses, _, right = scores.exits
-        assert right is not None, "a validation predicts every pass"
-        mass = jax.lax.stop_gradient(self.row_mean(scores.weights, batch).total)
-        return statistics, (scored, PassReports(tuple(
-            (Ratio(self.row_mean(loss, batch, weights=scores.weights).total, mass),
-             TokenScores(loss, scores.weights, correct))
-            for loss, correct in zip(losses, right, strict=True))))
+        return statistics, self._reported(scores, batch, losses=True)
 
 
 class Perplexity:

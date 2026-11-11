@@ -896,7 +896,7 @@ def _as_placed(leaf) -> np.ndarray:
     return host.astype(jax.dtypes.canonicalize_dtype(host.dtype), copy=False)
 
 
-def _pass_reports(produced) -> tuple[tuple[Ratio | Weighted, Artifacts], ...]:
+def _pass_reports(produced) -> tuple[tuple[Ratio | Weighted | None, Artifacts], ...]:
     """Each pass's `(loss statistics, artifacts)` an objective's report holds (`PassReports`), none where
     it reports its model's output alone."""
     return next((artifact.passes for artifact in _artifacts(produced) if isinstance(artifact, PassReports)),

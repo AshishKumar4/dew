@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, Literal
 import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
-from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.artifacts import TokenScores
 from dew.batch import (
@@ -44,7 +43,7 @@ from dew.batch import (
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
-from dew.nn.inspection import INSPECTED, QK
+from dew.nn.inspection import INSPECTED, QK, observed_maxima
 from dew.nn.precision import at_least_fp32, weighted_total
 from dew.nn.progress import progressed
 from dew.nn.protocols import BlockDenoiser, CacheCapacity, Lacks, LayerScalars
@@ -151,21 +150,6 @@ def _row_losses(losses: jax.Array, mask: jax.Array, batch: Batch) -> Ratio:
     return Objective.row_mean(total / jnp.maximum(mass, 1), batch)
 
 
-def _observed_maxima(*passes: Variables) -> Variables:
-    """The attention logit maxima of several passes, merged by module path (`Aux.qk_stats`).
-
-    A module that more than one pass observed keeps the elementwise maximum of what each sowed: a logit is
-    bounded by the largest any of them reads. A module only one pass observed keeps what it sowed, as an
-    image's vision tower does, since the encoder pass alone runs it.
-    """
-    found: dict[tuple[str, ...], list[object]] = {}
-    for tree in passes:
-        for path, sown in flatten_dict(tree).items():
-            found.setdefault(path, []).append(sown)
-    return unflatten_dict({path: jax.tree.map(lambda *leaves: jnp.max(jnp.stack(leaves), axis=0), *sown)
-                           for path, sown in found.items()})
-
-
 class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
     """Fine-tunes DiffusionGemma on clean ``text`` rows split into a prompt and canvases.
 
@@ -196,7 +180,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
 
     A step whose optimizer clips by the attention logit maxima (`Step.qk_stats`, a QK-Clip) gets the
     maxima of the attention its passes run through the trained projections, merged by module path
-    (`_observed_maxima`): a module several passes observe keeps their elementwise maximum, and one only
+    (`observed_maxima`): a module several passes observe keeps their elementwise maximum, and one only
     the encoder reaches keeps its own (`Aux.qk_stats`).
     """
 
@@ -522,7 +506,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         states, second_sown = denoise(sc_logits, "denoiser")
         qk = None
         if step.qk_stats:
-            qk = _observed_maxima(mutated[QK], first_sown[QK], second_sown[QK])
+            qk = observed_maxima(mutated[QK], first_sown[QK], second_sown[QK])
         # The encoder's pass and the denoiser's that carries the gradient, as the step watches them.
         inspected = None if step.watched is None else {
             "encoder": mutated.get(INSPECTED, {}), "denoiser": second_sown.get(INSPECTED, {})}
