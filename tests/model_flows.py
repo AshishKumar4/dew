@@ -255,15 +255,16 @@ LIGHTNING = {"hidden_size": 512, "num_hidden_layers": 2, "head_dim": 128, "num_a
 
 FLOWS = (
     Flow("dense bf16, the lane's", "llama-tiny", DENSE, "bfloat16", {**TEMPLATE, "decode": NATIVE}),
-    Flow("dense bf16, a user's", "llama-tiny", DENSE, "bfloat16",
-         {"attention": "flash", "attention_mainloop": NATIVE, "decode": NATIVE}, lane=False),
+    Flow("dense bf16, a user's", "llama-tiny", DENSE, "bfloat16", {"attention": "flash", "decode": NATIVE},
+         lane=False),
     Flow("dense fp32", "llama-tiny", DENSE, "float32", {}),
     Flow("window and softcap, the lane's", "gemma2-tiny", GEMMA2, "bfloat16", TEMPLATE),
     Flow("window and softcap, a user's", "gemma2-tiny", GEMMA2, "bfloat16", TEMPLATE, lane=False),
     Flow("sinks, the lane's", "gpt-oss-tiny", GPT_OSS, "bfloat16", TEMPLATE),
     Flow("sinks, a user's", "gpt-oss-tiny", GPT_OSS, "bfloat16", TEMPLATE, lane=False),
     Flow("latent attention, the lane's", "deepseek-v2-tiny", MLA, "bfloat16", TEMPLATE),
-    Flow("latent attention, a user's", "deepseek-v2-tiny", MLA, "bfloat16", TEMPLATE, lane=False),
+    Flow("latent attention, a user's", "deepseek-v2-tiny", MLA, "bfloat16", {"attention": NATIVE},
+         lane=False),
     Flow("delta attention (KDA)", "kimi-linear-tiny", KDA, "bfloat16", {"gated_delta_rule": NATIVE}),
     Flow("gated delta net and its short conv", "qwen3-next-tiny", GDN, "bfloat16",
          {"gated_delta_rule": NATIVE, "short_conv": NATIVE, "delta_decode": "step"}),
@@ -276,9 +277,10 @@ FLOWS = (
 )
 """Every model flow, by the route it is for (docs/design/testing.md: a kernel's native run is a flow's
 cell): each family that takes a distinct default route on a GPU, its bf16 attention flows twice, under the
-lane's deterministic ops (the template) and as a user's process runs it (FlashAttention, which refuses
-them), the dense fp32 flow on XLA's declared fp32 route, and the SSD port in fp32 too, as a user's process
-runs it (its products in TF32 at the default precision, which the lane's whole fp32 products refuse).
+lane's deterministic ops (the template on a GPU's own mainloop) and as a user's process runs it (a
+library's fused kernel where one takes the call, FlashAttention among them, which refuses the lane's), the
+dense fp32 flow on XLA's declared fp32 route, and the SSD port in fp32 too, as a user's process runs it (its
+products in TF32 at the default precision, which the lane's whole fp32 products refuse).
 Lightning attention's decay without the delta rule takes the recurrence template on a Hopper GPU alone: fla's
 port hands it to the portable math (`recurrence_chunk.PORT_SUPPORTS`)."""
 
