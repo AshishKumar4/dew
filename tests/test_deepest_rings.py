@@ -75,10 +75,14 @@ def _recurrence(name: str, dtype):
 
 ATTENTION = gate_generations(scoped=True, tpu=True,
                              needs=lambda family, architecture: attention_mosaic_program.qualified(family))
+ATTENTION_BACKWARD = gate_generations(tpu=True, needs=lambda family, architecture: (
+    attention_mosaic_program.runs_backward(family)))
+"""The GPUs the attention forward and backward run on, each as the compile gate takes them (its `GATED` and
+`BACKWARD_GATED`: the backward on the bundles its launches take, `runs_backward`)."""
 RECURRENCE = gate_generations(scoped=True)
 CELLS = {"attention forward 64": (lambda: _attention("forward", 64), ATTENTION),
          "attention forward 128": (lambda: _attention("forward", 128), ATTENTION),
-         "attention backward 64": (lambda: _attention("backward", 64), ATTENTION),
+         "attention backward 64": (lambda: _attention("backward", 64), ATTENTION_BACKWARD),
          "recurrence qwen3.5-27b-gdn": (lambda: _recurrence("qwen3.5-27b-gdn", jnp.bfloat16), RECURRENCE),
          "recurrence kimi-linear-kda": (lambda: _recurrence("kimi-linear-kda", jnp.bfloat16), RECURRENCE)}
 """Each cell's op and the GPUs its template runs on (`kernel_compile.gate_generations`, the template's launch
