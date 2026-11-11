@@ -50,7 +50,8 @@ def release_arguments(planning: argparse.ArgumentParser, checking: argparse.Argu
 
 
 def tier_arguments(choosing: argparse.ArgumentParser) -> None:
-    """`gpu-tier`'s arguments: the tier it names is the checkout's gpu-marked files (`gpu_tier`)."""
+    """`gpu-tier`'s arguments: the tier it names is the checkout's gpu-marked files (`gpu_tier`), each shard's
+    on a line, then each file's pinned GPU generations on a line of JSON (`marked`)."""
     choosing.add_argument("--evidence", action="store_true",
                           help="each file of the tier with its marked tests and its records' backend reads")
     choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
