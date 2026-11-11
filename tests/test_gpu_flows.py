@@ -18,12 +18,15 @@ pytestmark = [pytest.mark.gpu(reason="each family's own GPU kernels, from progra
 
 @pytest.mark.parametrize("name", [flow.name for flow in model_flows.FLOWS])
 def test_a_model_trains_and_decodes_on_its_gpu_routes(name, monkeypatch, record_property):
-    """The flow `name` (`model_flows.FLOWS`): prepared where this process prepares, else run, its device's
-    peak bytes reported (`peak_bytes`)."""
+    """The flow `name` (`model_flows.FLOWS`): prepared where this process prepares, what its prepare took
+    reported (`prepare_seconds`, `prepare_peak_bytes`, `prepare_written_bytes`), else run, its device's peak
+    bytes reported (`peak_bytes`)."""
     flow = model_flows.flow_named(name)
     if model_flows.preparing():
-        if not model_flows.prepared_apart(flow):
+        if (took := model_flows.prepared_apart(flow)) is None:
             pytest.skip(f"{flow.name}: the node's GPU runs its routes on the portable math (`Flow.families`)")
+        for name, value in took.items():
+            record_property(f"prepare_{name}", value)
         return
     if not flow.runs_on(generation.device_generation()):
         pytest.skip(f"{flow.name}: this GPU runs its routes on the portable math (`Flow.families`)")

@@ -386,11 +386,12 @@ def prepare(flow: Flow) -> bool:
     return True
 
 
-def prepared_apart(flow: Flow) -> bool:
+def prepared_apart(flow: Flow) -> dict | None:
     """The flow's prepare (`prepare`) in a process of its own, started under its XLA flags (`flow_flags`) and
     its matmul precision (`Flow.precision`): XLA parses its flags once a process, as it starts, and the
     programs it compiles state them (`BuildTarget`), a lane's flow's deterministic ops among them, which a
-    user's flow sets false. Whether it prepared."""
+    user's flow sets false. What it took where it prepared (`measured`), None where the node's GPU does not
+    run the flow."""
     from process_support import fresh
 
     return fresh(Path(__file__), flow.name, flags=flow_flags(flow),
@@ -426,5 +427,20 @@ def run(flow: Flow) -> int:
     return int((jax.devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0))
 
 
+def measured(flow: Flow, began: float) -> dict:
+    """What a prepare since `began` took (`prepared_apart`): its seconds, its process's peak resident bytes
+    and the bytes it wrote to the flow's store, which size a tier part's prepare on its node."""
+    import resource
+    import time
+
+    written = sum(path.stat().st_size for path in store_of(flow).rglob("*") if path.is_file())
+    return {"seconds": time.perf_counter() - began, "written_bytes": written,
+            "peak_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024}
+
+
 if __name__ == "__main__":
-    print(json.dumps(prepare(flow_named(sys.argv[1]))))
+    import time
+
+    began = time.perf_counter()
+    flow = flow_named(sys.argv[1])
+    print(json.dumps(measured(flow, began) if prepare(flow) else None))
