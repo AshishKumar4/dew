@@ -7,6 +7,7 @@
     python3 tools/armada/ci.py gpu-tier [--evidence] [--shards=N]
     python3 tools/armada/ci.py gpu-lane --tests="tests/b.py#1/2" --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py gpu-lane --network [--tests=...] --out=FILE --cache=on --processes=N
+    python3 tools/armada/ci.py gpu-lane --prepare --tests="tests/b.py#1/2" --out=FILE --processes=N
     python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE > ITEMS
     python3 tools/armada/ci.py coverage report DIR
     python3 tools/armada/ci.py gangs
@@ -88,7 +89,10 @@ marked to run on a GPU (`gpu-tier --evidence` reports it); `gpu-tier` names the
 files marked to run on a GPU, a day's and a batch's alike: the behavioural flows
 (tests/test_gpu_*.py; no unit test runs on a GPU, ledger 2452). A GPU
 node runs them with `gpu-lane`, each as a task of a CUDA lane, whose rows are
-recorded and reused on the GPU's class as a CPU task's are on the CPU's. With `--network`, a GPU node that
+recorded and reused on the GPU's class as a CPU task's are on the CPU's. With `--prepare`, a lane's files
+run first on the node's CPU, no GPU drawn, for what their GPU run reads and must not compute while it holds
+the GPU (`gpu_prepared`: the tests marked `prepares`, their float64 truths and their programs compiled for
+the node's GPU), nothing of it recorded. With `--network`, a GPU node that
 reaches the Hub runs every file's network-marked tests, which every other task sets aside, as one lane of
 their own, recorded on a class of their own, so each train reruns only the files whose inputs changed.
 
@@ -1600,12 +1604,12 @@ def stall_evidence(python: str, tests: list[str], group: str, dump: str, began: 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
            network: bool = False, whole: bool = False, release: str = "",
-           kept: Mapping[str, tuple[str, str]] | None = None) -> int:
+           kept: Mapping[str, tuple[str, str]] | None = None, recorded: bool = True) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`); `release`, a release check's. A check-1
     site's map task (`session.SITE`) is never reused: its draws, among its artifacts, are what its judge
-    reads."""
+    reads. A run that is no test of its files (a GPU lane's prepare, `recorded` false) records no row."""
     began = time.monotonic()
     group = split or (f"{RELEASE}{release}" if release else "")
     site = session.SITE.fullmatch(group)
@@ -1706,11 +1710,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                     else {})}, **cause, **asked(site),
                      **later_judged(site)})
     out.write_text(json.dumps({"rows": rows + ran}))
-    if (coverage is None and not release and not (environ and check1_wire().CENSUS in environ)
+    if (recorded and coverage is None and not release and not (environ and check1_wire().CENSUS in environ)
             and not done_before):
         # A traced run's rows, timed under tracing, are no rows to reuse, nor a release check's, which runs
         # under its requirement's overlay and on the whole suite's run alone, nor the census's, nor a resumed
-        # one's, whose earlier attempt's opens no record holds.
+        # one's, whose earlier attempt's opens no record holds, nor a prepare's, which ran no test to its end.
         record(python, ran, log, common, network, opened,
                set(json.loads(unrecorded.read_text())) if unrecorded.is_file() else set(), wrote)
     return 0
@@ -1954,10 +1958,11 @@ def network_files(python: str) -> dict[str, int]:
     return collected(python, "network")
 
 
-def collected(python: str, marks: str) -> dict[str, int]:
-    """Each test file of this checkout with tests pytest's `-m marks` selects, and how many, as pytest
-    collects it on the CPU."""
-    every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
+def collected(python: str, marks: str, files: list[str] | None = None) -> dict[str, int]:
+    """Each test file of this checkout (of `files`, where given) with tests pytest's `-m marks` selects, and
+    how many, as pytest collects it on the CPU."""
+    every = sorted(str(path) for path in Path("tests").glob("test_*.py")
+                   if str(path) not in SKIPPED) if files is None else files
     done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-m", marks,
                            *every], capture_output=True, text=True,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
@@ -2025,6 +2030,41 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
             if name not in borrowed or holds(found) > holds(borrowed[name]):
                 borrowed[name] = found
     return borrowed
+
+
+PREPARES = "prepares"
+"""The mark of a GPU test whose part's prepare runs it first, on the node's CPU (`gpu_prepared`)."""
+PREPARING = {"DEW_TIER_PREPARE": "1", "JAX_PLATFORMS": "cpu"}
+"""What a lane's prepare runs its files under: the word tests/conftest.py reads to skip every test but those
+marked `PREPARES`, each of which then prepares rather than runs (tests/model_flows.py), on the CPU alone."""
+
+
+def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, deadline: float) -> int:
+    """A GPU lane's prepare, on its node's CPU before its files' GPU run (`gpu_lane`) and with no GPU drawn:
+    each of `tests` that holds a test marked `PREPARES` run once in a process of its own under `PREPARING`,
+    at most `processes` at once, as its run will select and cut it (a group `<file>#G/N` holds in its prepare
+    the tests it holds in its run: the same selection, the same weights, DEW_SPLIT_DURATIONS), so each such
+    test computes what its run reads and must not compute while it holds the GPU, its float64 truths and
+    its programs compiled for the GPU the node's topology names (DEW_NODE_TOPOLOGY), into the store its
+    environment names (DEW_TIER_TRUTHS), which the run is given too. Their rows are written to `out` and
+    nothing is recorded, no test having run to its end: a prepare that fails is said in its row, and its run
+    is red for what it lacks, never computing it on the GPU. A file with nothing to prepare starts no
+    process. First the pinned fixtures the tests read offline are fetched, as the run fetches them
+    (tools/fetched_fixtures.py), so the run finds each whole and waits on no download with the GPU held."""
+    subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch"], check=True)
+    parts = {name: name.partition("#")[::2] for name in tests}
+    holding = collected(python, PREPARES, sorted({file for file, _ in parts.values()}))
+    verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)
+                if parts[name][0] in holding}
+    environ = {**PREPARING, "OMP_NUM_THREADS": str(max(1, len(os.sched_getaffinity(0)) // processes))}
+    with concurrent.futures.ThreadPoolExecutor(processes) as pool:
+        for prepared in [pool.submit(tested, python, [parts[name][0]], parts[name][1], verdict, deadline,
+                                     "off", session.GRACE, "", environ, recorded=False)
+                         for name, verdict in verdicts.items()]:
+            prepared.result()
+    out.write_text(json.dumps({"rows": [row for verdict in verdicts.values()
+                                        for row in json.loads(verdict.read_text())["rows"]]}))
+    return 0
 
 
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,
@@ -2362,6 +2402,23 @@ def tier_arguments(choosing: argparse.ArgumentParser) -> None:
     choosing.add_argument("--shards", type=int, default=1, help="how many GPUs share the tier")
 
 
+def lane_asked(parser: argparse.ArgumentParser, args: argparse.Namespace) -> int:
+    """`gpu-lane` as its arguments ask: a lane's prepare, the network lane, or a CUDA lane over its files."""
+    if args.tests is None and not args.network:
+        parser.error("gpu-lane names its --tests; only the network lane (--network) takes every file "
+                     "holding a network-marked test by default")
+    if args.prepare:
+        if args.network or args.cache is not None:
+            parser.error("gpu-lane --prepare names its --tests, and takes neither --network nor --cache")
+        return gpu_prepared(PYTHONS[0], args.tests.split(), args.out, processes=args.processes,
+                            deadline=args.deadline)
+    if args.cache is None:
+        parser.error("gpu-lane names the test cache's policy (--cache)")
+    tests = args.tests.split() if args.tests is not None else list(network_files(PYTHONS[0]))
+    return gpu_lane(PYTHONS[0], tests, args.out, cache=args.cache, processes=args.processes,
+                    deadline=args.deadline, network=args.network)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="tools/armada/ci.py")
     operations = parser.add_subparsers(dest="operation", required=True)
@@ -2393,8 +2450,10 @@ def main() -> int:
                                        "network-marked test by default (`network_files`)")
     lane.add_argument("--network", action="store_true",
                       help="the network-marked tests alone, with the Hub open, on the network lane's class")
+    lane.add_argument("--prepare", action="store_true",
+                      help="the files' prepare on the node's CPU, before their GPU run (`gpu_prepared`)")
     lane.add_argument("--out", type=Path, required=True)
-    lane.add_argument("--cache", required=True, help="the test cache's policy (`policy`)")
+    lane.add_argument("--cache", help="the test cache's policy (`policy`): every lane's but a prepare's")
     lane.add_argument("--processes", type=int, required=True, help="the most test files running at once")
     lane.add_argument("--deadline", type=float, default=3600.0, help="seconds a file may run")
     operations.add_parser("gangs")
@@ -2452,12 +2511,7 @@ def main() -> int:
         arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
         return targeted(args.python, arguments, args.report, args.tests.split(), args.split, args.whole)
     if args.operation == "gpu-lane":
-        if args.tests is None and not args.network:
-            parser.error("gpu-lane names its --tests; only the network lane (--network) takes every file "
-                         "holding a network-marked test by default")
-        tests = args.tests.split() if args.tests is not None else list(network_files(PYTHONS[0]))
-        return gpu_lane(PYTHONS[0], tests, args.out, cache=args.cache, processes=args.processes,
-                        deadline=args.deadline, network=args.network)
+        return lane_asked(parser, args)
     if args.operation == "coverage":
         if args.stage == "report":
             return coverage_report.report(args.directory)
