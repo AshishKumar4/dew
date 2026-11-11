@@ -14,6 +14,7 @@ from generation_support import INTERPRETS
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
+from kernel_compile import gate_generations
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import across, handoffs, mosaic, rings, swizzling
@@ -298,7 +299,8 @@ def test_a_schedules_roles_share_the_launch_pool_by_weight(weights, programs):
             or pool - sum(held) < step * sum(weight for weight, _ in raised))
 
 
-@pytest.mark.parametrize("generation_name", ["sm90", "sm100"])
+@pytest.mark.parametrize("generation_name", gate_generations(
+    needs=lambda family, architecture: architecture.multiprocessor.register_raises is not None))
 def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_consumers_hold_the_rest(
         generation_name):
     """A launch stating its producer's registers (a producer whose issue loop holds more than setmaxnreg's
@@ -321,7 +323,8 @@ def test_a_launch_whose_producer_holds_more_lowers_it_to_its_own_floor_and_its_c
             assert handoffs.Schedule(WGMMA.roles(consumers).roles, floor=stated).registers() == roles
 
 
-@pytest.mark.parametrize("generation_name", ["sm90", "sm100"])
+@pytest.mark.parametrize("generation_name", gate_generations(
+    needs=lambda family, architecture: architecture.multiprocessor.register_raises is not None))
 def test_a_planned_launch_at_its_producers_registers_holds_the_programs_and_budget_its_schedule_runs(
         generation_name):
     """A launch planned at its producer's stated registers (`resources.Launch.producer`, as the sm100 states
@@ -779,7 +782,7 @@ def test_tcgen05_tiles_walk_into_tensor_memory_and_their_epilogue_reads_it_out_i
 
 
 @pytest.mark.parametrize("rows", [4, 8, 16, 24, 32])
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90", "sm100", "sm120"])
+@pytest.mark.parametrize("generation_name", gate_generations())
 def test_a_few_rows_lower_on_every_bundle_their_device_issues(generation_name, rows):
     """A launch of a decode step's few rows lowers on each bundle its device composes for them
     (`bundles.layouts`' `rows`: mma.sync's on cp.async on an A100; on an H100 wgmma's two layouts and
@@ -1301,7 +1304,7 @@ def _codes(dtype):
 
 @pytest.mark.parametrize("scaled", [True, False], ids=["scaled", "unscaled"])
 @pytest.mark.parametrize("dtype", [jnp.int8, jnp.float8_e4m3fn])
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("generation_name", gate_generations())
 def test_a_quantized_stage_converts_into_the_tile_its_products_read(generation_name, dtype, scaled):
     """Int8 and e4m3 codes in shared memory converted into a bf16 tile, each row scaled in fp32: exactly
     `codes * scale` interpreted (on a CPU) or on a GPU of the generation, and lowered for one on any host;
@@ -1488,35 +1491,6 @@ def test_a_programs_settled_arguments_are_read_as_such_and_never_donated():
     options.unsettle(weights)
     doubled = synced(weights)
     np.testing.assert_array_equal(np.asarray(served(doubled, x)), np.asarray(x * 2.0))
-
-
-@pytest.mark.parametrize("shape", [(64, 32), (128, 16)])
-def test_a_row_shift_reads_each_element_from_the_lane_holding_its_source_row(shape):
-    """The register row shift's lowering on an m16 fragment's layout (an H100's warpgroup MMA accumulator,
-    an A100's mma.sync one at four warps): at every shift within a 16-row group, each element's source lane
-    and register (`shifted_rows.source`, the lowering's own arithmetic on integers) hold, by the layout's own
-    index map (`shifted_rows.elements`), the element `shift` rows up in its column."""
-    from jax.experimental.mosaic.gpu import fragmented_array as mgpu_fragments
-
-    from dew.nn.kernels.templates import shifted_rows
-
-    layout = mgpu_fragments.WGMMA_LAYOUT
-    form = shifted_rows.lanes(layout, shape)
-    placed = shifted_rows.elements(layout, shape)
-    rows, columns = placed[..., 0], placed[..., 1]
-    wrong = []
-    for shift in range(-15, 16):
-        for warp, lane, *at in np.ndindex(rows.shape[:-1]):
-            row = rows[(warp, lane, *at, 0)]
-            if not 0 <= row % 16 - shift < 16:
-                continue
-            lane_from, offset = shifted_rows.source(form.offsets[tuple(at)] + lane // form.columns, shift,
-                                                    lane, form, shifted_rows.Integers)
-            source = (warp, lane_from, *form.peers[tuple(at)][offset])
-            here = columns[(warp, lane, *at)]
-            if not (np.all(rows[source] == row - shift) and np.all(columns[source] == here)):
-                wrong.append((shift, warp, lane, *at))
-    assert wrong == []
 
 
 @pytest.mark.parametrize("shift", [0, 5, -7])

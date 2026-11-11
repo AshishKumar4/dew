@@ -643,7 +643,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post78
+jax==0.12.0.1.post79
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -654,11 +654,11 @@ jax==0.12.0.1.post78
     #   orbax-checkpoint
     #   qwix
     #   tokamax
-jax-cuda13-pjrt==0.12.0.1.post75
+jax-cuda13-pjrt==0.12.0.1.post79
     # via
     #   dewml (pyproject.toml)
     #   jax-cuda13-plugin
-jax-cuda13-plugin==0.12.0.1.post75
+jax-cuda13-plugin==0.12.0.1.post79
     # via dewml (pyproject.toml)
 jaxlib==0.12.0.1
     # via

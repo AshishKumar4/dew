@@ -9,26 +9,30 @@ GPU's own refusal included. A host without the plugin fails here rather than ski
 verdict on everything else.
 """
 
+import atexit
 import contextlib
 import dataclasses
 import functools
 import importlib.util
 import io
-import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import MappingProxyType
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
+import apart_records
 import compile_evidence
 import jax
 import jax.experimental.topologies as topologies
+import jax.numpy as jnp
 import numpy as np
 from jax.experimental.mosaic.gpu import core as mgpu_core
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
@@ -465,15 +469,41 @@ def _printed(**switches: str):
             printed += [python.getvalue(), native.read().decode(errors="replace")]
 
 
-OWN_PROCESS = "DEW_MOSAIC_RECORDS"
-"""Where a test re-run in a process of its own (`compile_mosaic_kernels`) writes its records."""
-
 _BINARY_CAPABILITY: list[tuple[int, int]] = []
 """The compute capability this process's Mosaic GPU binary pass is registered with: the first kernel's it
 compiled. jaxlib registers the pass once a process and assembles every later kernel for that capability
 (custom_call.cc's GetPassPipeline; an sm_90a kernel after an sm80 one fails in ptxas, 'SM version
 specified by .target is higher than default SM version assumed', and an sm80 kernel after an sm90 one is
 assembled for sm90). Production compiles for one GPU a process; the gates compile for several."""
+
+
+class Gated(str):
+    """A generation a compile gate's cell compiles for (`gate_generations`): the typed fact a process of its
+    own gathers the session's cells of one capability by (`compiled_apart`)."""
+
+
+def gate_generations(dtype=jnp.bfloat16, *, stated: bool = False, scoped: bool = False, tpu: bool = False,
+                     needs: Callable[[Any, Any], bool] | None = None) -> tuple[Gated, ...]:
+    """The generations a compile gate's cells take for a template's launches of `dtype` (its launch's
+    `stated`, `scoped` and `tpu`, as it asks `bundles.of`): one for each CUDA architecture Dew names a device
+    of whose bundles serve the launch (`bundles.of` not None), the earliest named, so its register and
+    residency models are held to ptxas on every family its launches run on (each architecture's
+    multiprocessor and issuers, `generation.architecture`), never on a typed list (a recurrence gate of
+    sm80 and sm90 alone left seven sm100 residency undercounts unseen). `needs(family, architecture)` is the
+    typed fact a cell that is one family's by nature needs of it (an issuer, an instruction); every family's
+    where None."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import bundles
+
+    found: list[tuple[Any, str]] = []
+    for name in sorted((name for name in generation.TARGETS if capability(name) is not None), key=capability):
+        architecture = generation.architecture(name)
+        family = bundles.of(name, dtype, stated=stated, scoped=scoped, tpu=tpu)
+        if family is None or any(architecture == seen for seen, _ in found):
+            continue
+        if needs is None or needs(family, architecture):
+            found.append((architecture, name))
+    return tuple(Gated(name) for _, name in found)
 
 
 def compile_mosaic_kernels(cases, generation: str, *, least: bool = False) -> list[dict]:
@@ -483,33 +513,66 @@ def compile_mosaic_kernels(cases, generation: str, *, least: bool = False) -> li
     (`GpuTarget.tmem_columns`, 0 where it has none), and each of its kernels' report (`mosaic_kernels`),
     or the error; with `least`, each kernel's least spill-free cap too (`register_need`, its `least`), a scan
     of ptxas at each cap. In a process that compiled Mosaic kernels for another capability
-    (`_BINARY_CAPABILITY`) the calling test runs again in a process of its own, and these are its records
-    there."""
+    (`_BINARY_CAPABILITY`) these are the records its process of its own gives (`compiled_apart`)."""
     wanted = capability(generation)
-    if _BINARY_CAPABILITY and _BINARY_CAPABILITY[0] != wanted and OWN_PROCESS not in os.environ:
-        return compiled_apart()
+    test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" ", 1)[0]
+    call = _CALLS[test]
+    _CALLS[test] += 1
+    if _BINARY_CAPABILITY and _BINARY_CAPABILITY[0] != wanted and apart_records.RECORDS not in os.environ:
+        return compiled_apart(wanted, test, call)
     _BINARY_CAPABILITY[:] = _BINARY_CAPABILITY or [wanted]
     found = _compiled_here(cases, generation, least=least)
-    if OWN_PROCESS in os.environ:
-        Path(os.environ[OWN_PROCESS]).write_text(json.dumps(found))
+    if apart_records.RECORDS in os.environ:
+        apart_records.written(Path(os.environ[apart_records.RECORDS]), test, call, found)
     return found
 
 
-def compiled_apart() -> list[dict]:
-    """The records the calling test's `compile_mosaic_kernels` call gives in a pytest process of its own, its
-    first Mosaic GPU compile its generation's: read only from a process that passed, as its records are
-    written before its test's own checks and teardown, which a nonzero exit says failed (row 1877)."""
-    test = os.environ["PYTEST_CURRENT_TEST"].rsplit(" ", 1)[0]
-    with tempfile.TemporaryDirectory(prefix="dew-mosaic-apart-") as directory:
-        records = Path(directory) / "records.json"
-        ran = subprocess.run([sys.executable, "-m", "pytest", test, "-q", "-p", "no:cacheprovider"],
-                             cwd=Path(__file__).parent.parent, env={**os.environ, OWN_PROCESS: str(records)},
-                             capture_output=True, text=True, check=False)
-        if ran.returncode != 0 or not records.exists():
-            raise RuntimeError(f"{test} in a process of its own exited {ran.returncode}"
-                               f"{'' if records.exists() else ', its records unwritten'}:\n"
-                               f"{(ran.stdout + ran.stderr)[-3000:]}")
-        return json.loads(records.read_text())
+_CALLS: Counter[str] = Counter()
+"""Each test's `compile_mosaic_kernels` calls so far, by node id: a process of its own keeps a test's records
+by their order."""
+
+_APART: dict[tuple[int, int] | str, Path] = {}
+"""The directory each process of its own wrote, by the capability whose cells it ran, or by the one test it
+ran where that test states no capability of the gate's (`compiled_apart`)."""
+
+
+def compiled_apart(wanted: tuple[int, int], test: str, call: int) -> list[dict]:
+    """The records of `test`'s `call`-th Mosaic GPU compile, for a capability other than the one this process
+    compiles for, from a pytest process of its own: one a capability, the first test to ask it starting it
+    with every test of the session whose cells state it (`_stated`), so a test of another capability costs
+    no process of its own; a test it did not run (one that states no capability of the gate's) its own.
+    Read only where the test passed there, as its records are written before its own checks and teardown
+    (row 1877)."""
+    if wanted not in _APART:
+        _APART[wanted] = _ran_apart([test, *(item.nodeid for item in apart_records.SESSION
+                                             if item.nodeid != test and _stated(item) == wanted)])
+    directory = _APART[wanted]
+    if not apart_records.ran(directory, test):
+        if test not in _APART:
+            _APART[test] = _ran_apart([test])
+        directory = _APART[test]
+    return apart_records.read(directory, test, call)
+
+
+def _stated(item) -> tuple[int, int] | None:
+    """The capability a session's test compiles for, where its cell states one generation of the gate's
+    (`Gated`); None for any other test."""
+    stated = {capability(value) for value in getattr(getattr(item, "callspec", None), "params", {}).values()
+              if isinstance(value, Gated)}
+    return stated.pop() if len(stated) == 1 else None
+
+
+def _ran_apart(tests: list[str]) -> Path:
+    """The directory a pytest process of its own wrote running `tests`: their records, their outcomes and its
+    output (`apart_records`), kept until this process exits."""
+    directory = Path(tempfile.mkdtemp(prefix="dew-mosaic-apart-"))
+    atexit.register(shutil.rmtree, directory, ignore_errors=True)
+    ran = subprocess.run([sys.executable, "-m", "pytest", *tests, "-q", "-p", "no:cacheprovider"],
+                         cwd=Path(__file__).parent.parent,
+                         env={**os.environ, apart_records.RECORDS: str(directory)},
+                         capture_output=True, text=True, check=False)
+    (directory / "output.txt").write_text(ran.stdout + ran.stderr)
+    return directory
 
 
 COMPILED: dict[str, dict] = {}

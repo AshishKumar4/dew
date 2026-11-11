@@ -23,10 +23,12 @@ import optax
 import pytest
 from lane_environment import without_flags
 from jax.extend import custom_call_targets, xla
+from kernel_compile import gate_generations
 from model_support import TINY_DECODER
 from token_support import token_rows
 
 from dew._records import listed, record
+from dew.nn.kernels.generation import capability
 from dew.nn.sharding import Link
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig
@@ -668,7 +670,7 @@ generation, in a process of its own: its checkout and the generation are its arg
 kernel its routes took."""
 
 
-@pytest.mark.parametrize("generation", ["sm80", "sm90", "sm100"])
+@pytest.mark.parametrize("generation", gate_generations())
 def test_a_step_running_every_template_compiles_ahead_over_two_compile_only_gpus(generation):
     """A bf16 hybrid decoder's training step, a gated delta net's layer beside attention and a routed
     experts' feed-forward under RMS norms and SwiGLU, its dense feed-forward wide enough that a kernel
@@ -721,7 +723,8 @@ def test_tokamaxs_triton_attention_compiles_ahead_for_a_gpu_with_none_attached(g
 
 
 @pytest.mark.parametrize("implementation", ["auto", "template"])
-@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+@pytest.mark.parametrize("generation", gate_generations(
+    scoped=True, tpu=True, needs=lambda family, architecture: family.issues_in_consumers))
 def test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_runs(generation,
                                                                                     implementation):
     """A training step compiled ahead for a compile-only GPU of `generation` on this host, which has no GPU
@@ -770,7 +773,7 @@ def test_a_program_holding_a_kernel_this_host_cannot_lower_is_refused_ahead_nami
                                                                                   "attention")
 
 
-@pytest.mark.parametrize("generation", ["sm90", "sm100", "sm120"])
+@pytest.mark.parametrize("generation", [name for name in gate_generations() if capability(name) >= (9, 0)])
 def test_a_compile_only_gpu_assembles_mosaic_gpus_architecture_specific_code(generation):
     """A Mosaic GPU kernel compiled for a compile-only GPU of each generation from Hopper on, in a process
     that assembles for that generation alone (`compile_mosaic_kernels`): its PTX targets the
