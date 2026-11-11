@@ -806,7 +806,11 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
 
     def read(parameter) -> Hashable:
         # A parameter as the algebra pass keys it, an object no structural key reads by its type alone: the
-        # same in every process (`terms.opaque`).
+        # same in every process (`terms.opaque`). A mesh (a call's `ctx_mesh`, an equation's context) by its
+        # axes, not the kind of device it was made of, which a step compiled ahead for one GPU and the run on
+        # another of its target share no name of.
+        if isinstance(parameter, jax.sharding.AbstractMesh):
+            parameter = parameter.update(abstract_device=None)
         return opaque(parameter_key(parameter))
 
     def constants(values) -> None:
@@ -834,12 +838,10 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
             context = equation.ctx
             update(equation.primitive.name, tuple(atom(value) for value in equation.invars),
                    tuple((bound(var), str(var.aval)) for var in equation.outvars),
-                   # The configuration an equation evaluates and lowers under (a key's bits' construction):
-                   # its mesh's axes, not the kind of device the mesh was made of, which a step compiled
-                   # ahead for one GPU and the run on another of its target share no name of.
-                   read((context.compute_type, context.threefry_partitionable, context.xla_metadata,
-                         str(context.cur_abstract_mesh.update(abstract_device=None)),
-                         str(context.cur_layout_mode), context.remove_size_one_mesh_axis)))
+                   # The configuration an equation evaluates and lowers under (a key's bits' construction).
+                   read((context.compute_type, context.threefry_partitionable, context.xla_metadata)),
+                   read(context.cur_abstract_mesh),
+                   read((str(context.cur_layout_mode), context.remove_size_one_mesh_axis)))
             for name, parameter in sorted(equation.params.items()):
                 for inner in parameter if isinstance(parameter, (tuple, list)) else (parameter,):
                     # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).
