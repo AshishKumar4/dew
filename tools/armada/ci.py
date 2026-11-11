@@ -1569,8 +1569,9 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
     try:
         done.wait(deadline)
     except subprocess.TimeoutExpired:
-        # Every thread's stack as pytest stands at its deadline, before the interrupt below.
-        expired, dump = True, stalls.dumped(pid, spy)
+        # pytest as it stands at its deadline, before the interrupt below: its threads' activity, every
+        # thread's stack and the host it stood on (`stalls.stood`).
+        expired, dump = True, stalls.stood(pid, spy, host.state)
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
     if left := child_groups.stop(done, grace=grace if expired else 0.0, interrupt=signal.SIGINT,
@@ -1589,8 +1590,7 @@ def stall_evidence(python: str, tests: list[str], group: str, dump: str, began: 
     lane's) each keep their own. `began` is the run's monotonic start."""
     root = armada_dir("ARMADA_ARTIFACTS", ARTIFACTS)
     graded = hashlib.sha256("\n".join(row(python, name, group) for name in tests).encode()).hexdigest()[:16]
-    kept = stalls.kept(root, f"{python}-{graded}", dump, time.time() - (time.monotonic() - began),
-                       host.state())
+    kept = stalls.kept(root, f"{python}-{graded}", dump, time.time() - (time.monotonic() - began))
     return str(kept.relative_to(root))
 
 
