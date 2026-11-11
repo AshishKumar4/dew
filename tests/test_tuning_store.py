@@ -306,6 +306,26 @@ def test_two_hooks_share_an_identity_only_where_they_lower_to_one_program():
             assert_computes_the_oracle(one(tile), other(tile), f"{one} and {other}", roundings=0)
 
 
+def test_a_hooks_program_is_one_key_under_meshes_of_one_shape_whatever_their_devices():
+    """A hook traced under meshes of the same axes, made of different kinds of device (a compile-only H100's
+    for a step compiled ahead, a GH200's for the run it is handed to), keys one program (`tuning.program`),
+    so the launch's kernels carry one name in both processes and the run lowers the program compiled ahead;
+    under meshes of other axes, apart."""
+    def hook(gate, up):
+        return jax.nn.silu(gate) * up
+
+    tile = jax.ShapeDtypeStruct((8, 16), jnp.bfloat16)
+
+    def keyed(sizes, kind):
+        device = jax.sharding.AbstractDevice(device_kind=kind, num_cores=None, platform="gpu")
+        mesh = jax.sharding.AbstractMesh(sizes, ("data", "tensor"), abstract_device=device)
+        with jax.sharding.use_abstract_mesh(mesh):
+            return tuning.program(hook, tile, tile)
+
+    assert keyed((1, 1), "NVIDIA H100 80GB HBM3") == keyed((1, 1), "NVIDIA GH200 480GB")
+    assert keyed((1, 1), "NVIDIA H100 80GB HBM3") != keyed((2, 1), "NVIDIA H100 80GB HBM3")
+
+
 def _traced(block: compiles.Compiles) -> int:
     """The programs JAX traced while `block` was open (its trace events): what an identity's analysis cost."""
     return sum(program.kind == "traced" for program in block.programs)
