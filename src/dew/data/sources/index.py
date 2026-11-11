@@ -56,3 +56,16 @@ class ArrayIndex:
 
     def __getstate__(self) -> Mapping[str, object]:
         return {"url": self.url, "storage_options": self.storage_options, "declared": self.declared}
+
+
+def length_index(lengths: np.ndarray) -> np.ndarray:
+    """A token export's producer index of documents of `lengths`: `[N, 2]` int64, each document's length
+    then its cumulative end (`LENGTH`, `END`), the one layout its publisher writes (`dew.data.sinks`) and its
+    reader reads (`dew.data.sources.tokens`)."""
+    sizes = np.asarray(lengths, np.int64)
+    return np.column_stack((sizes, np.cumsum(sizes)))
+
+
+LENGTH, END = 0, 1
+"""A length index's columns (`length_index`)."""
+LENGTH_INDEX_WIDTH = len((LENGTH, END))

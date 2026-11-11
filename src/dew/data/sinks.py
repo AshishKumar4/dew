@@ -25,6 +25,7 @@ from dew.data.dataset import Closeable
 from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
 from dew.data.sources.files import Format, _arrow_filesystem, declared_format
+from dew.data.sources.index import length_index
 from dew.data.steps.text import count_rules, stated_rules
 from dew.data.storage import EXPORT_MANIFEST, Store, commit_export
 
@@ -99,8 +100,7 @@ def _length_index(root: Store, writer: str, number: int, batch,
             raise ValueError(f"export row is missing length_field={field!r}")
         lengths.append(len(row[field]))
     encoded = io.BytesIO()
-    sizes = np.asarray(lengths, np.int64)
-    np.save(encoded, np.column_stack((sizes, np.cumsum(sizes))), allow_pickle=False)
+    np.save(encoded, length_index(lengths), allow_pickle=False)
     path = f"_dew_indexes/{writer}/part-{number:06d}.lengths.npy"
     return {"path": path, **root.child(path).verified(encoded.getvalue())}
 

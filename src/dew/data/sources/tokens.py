@@ -22,7 +22,7 @@ from dew.data.storage import Store, local
 
 from .base import Read, ShardManifest, _indexed_manifest, url_label
 from .files import Files, export_content
-from .index import ArrayIndex
+from .index import END, LENGTH, LENGTH_INDEX_WIDTH, ArrayIndex
 
 _SPLIT = "train"
 """The split a token export's description, fingerprint, shards and document index have always named
@@ -40,7 +40,7 @@ class _TokenShard:
 
     @property
     def ends(self) -> np.ndarray:
-        return self.columns[:, 1]
+        return self.columns[:, END]
 
 
 @dataclass(frozen=True)
@@ -115,7 +115,7 @@ class TokenRecords:
                 if row_start >= stop:
                     break
                 tokens = self._document(shard.row_start + row)
-                if len(tokens) != int(shard.columns[row, 0]):
+                if len(tokens) != int(shard.columns[row, LENGTH]):
                     raise ValueError("token document differs from the producer's length index")
                 pieces.append(tokens[max(start - row_start, 0) : stop - row_start])
         return np.concatenate(pieces) if pieces else np.empty(0, dtype=self.dtype)
@@ -192,7 +192,7 @@ class TokenFiles(Dataset):
                 )
             lengths = root.child(entry["lengths"]["path"])
             index = ArrayIndex(lengths.url, self.storage_options, Declared(lengths, entry["lengths"]))
-            if index.values.ndim != 2 or index.values.shape[1] != 2:
+            if index.values.ndim != 2 or index.values.shape[1] != LENGTH_INDEX_WIDTH:
                 raise ValueError("token export index needs length and cumulative end columns")
             indexes.append(index)
             paths.append(root.child(entry["path"]).url)
