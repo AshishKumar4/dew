@@ -703,30 +703,38 @@ class _Block(NamedTuple):
     state: tuple
 
     @classmethod
-    def of(cls, program: _Program, row, head, first, queries: int) -> "_Block":
-        at = pl.ds(program.split() * queries + first, program.tiles.block_q)
+    def of(cls, program: _Program, row, head, first, queries: int, *, fresh: bool = False) -> "_Block":
+        at = pl.ds(program.split(fresh=fresh) * queries + first, program.tiles.block_q)
         return cls(first, (row, at, head), (row, head, at))
 
-    def status(self, ref, family: mosaic.Family) -> tuple | None:
+    @classmethod
+    def afresh(cls, program: _Program, row, head, consumer: int, queries: int) -> "_Block":
+        """Consumer `consumer`'s block formed where a row output is stored, its query tile's grid coordinate
+        read there (`Family.program_index`'s `fresh`): formed before the walk, its first query was held
+        across it and spilled (row 5466)."""
+        tiles = program.tiles
+        pair = tiles.consumers * tiles.block_q
+        first = program.query_tile(queries // pair, fresh=True) * pair + consumer * tiles.block_q
+        return cls.of(program, row, head, first, queries, fresh=True)
+
+    def status(self, ref) -> tuple | None:
         """Its rows' maxima in a launch's status `ref` (`walked_launches`), and where the launch flags its
         rows their rewalk and their block's beside them (`_Flags`); None where the launch gives none (a launch
-        into the plain launch's outputs, `_Read.into`). Their first query is formed where the status is
-        stored (`Family.at_store`): a row's store is a contiguous bulk copy addressed by its first element's
-        64-bit offset, which the compiler formed from the block's first query (the walk reads that too)
-        before the walk and held across it, 16 bytes spilled of an H100's fp32 forward at width 64 on three
-        consumers (et-zerorow's SASS: the offset's STL.64 before the walk, its LDL.64 at the store)."""
+        into the plain launch's outputs, `_Read.into`). Formed at the block a store forms (`afresh`): a
+        row's store is a contiguous bulk copy addressed by its first element's 64-bit offset, which the
+        compiler formed from the block's first query (the walk reads that too) before the walk and held
+        across it, 16 bytes spilled of an H100's fp32 forward at width 64 on three consumers (et-zerorow's
+        SASS: the offset's STL.64 before the walk, its LDL.64 at the store)."""
         if ref is None:
             return None
-        row, head, at = self.state
-        places = (row, head, pl.ds(family.at_store(at.start), at.size))
-        return tuple(ref.at[place, *places] for place in range(ref.shape[0]))
+        return tuple(ref.at[place, *self.state] for place in range(ref.shape[0]))
 
-    def inference(self, written: tuple, finishes: bool, family: mosaic.Family) -> tuple:
+    def inference(self, written: tuple, finishes: bool) -> tuple:
         """Its status, output and (where the launch `finishes` them) finished rows' views in an inference
         launch's outputs (`_out_types`)."""
         status_ref, out_ref, *finished = written
         rows = tuple(finished[0].at[place, *self.state] for place in range(2)) if finishes else None
-        return self.status(status_ref, family), out_ref.at[self.rows], rows
+        return self.status(status_ref), out_ref.at[self.rows], rows
 
     def certified(self, written: tuple) -> tuple:
         """Its views of a certify form's state after each key tile (`_out_types`' last two): the rows'
@@ -940,23 +948,23 @@ def _dot(family: mosaic.Family, interpret: bool, lhs: jax.Array, rhs) -> jax.Arr
         return _parted_products(family, None, None, lhs, rhs, interpret, shape=(lhs.shape[0], rhs.shape[1]))
     return family.registers_product(lhs, rhs)
 
-def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
-              q_loaded, out_stage: Callable, row_smem, streams, views: dict, turn, streamed: tuple, first,
-              spans: _Spans | None, hooked: _Hooked, place: tuple, *, hooks: Hooks,
-              residuals: _Residuals | None, anchors: tuple | None = None, interpret: bool,
-              finished: tuple | None = None, certified: tuple | None = None, kept=None, relay=None,
-              codes: _Codes | None = None, value_width: int):
+def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, stored: Callable,
+              q_smem, q_loaded, out_stage: Callable, row_smem, streams, views: dict, turn, streamed: tuple,
+              first, spans: _Spans | None, hooked: _Hooked, place: tuple, *, hooks: Hooks, training: bool,
+              anchors: tuple | None = None, interpret: bool, certified: tuple | None = None, kept=None,
+              relay=None, codes: _Codes | None = None, value_width: int):
     """A consumer's query block (batch row, head and key head `place`): its walk of the key tiles it reads
     through the family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook
     on each tile, passing those of the program's `streamed` range its partner alone reads; then its output
     under the output hook, `value_width` wide, stored through its stage (`out_stage(store)`: the query's
     where the widths agree, one scoped after the walks where the family scopes them apart), and its rows'
-    maxima through `row_smem` to `status_views` (`algebra.walked_launches`' fold guard). The walk's running
-    sums are the family's accumulator, issued into in place, at its rows' scale where they could pass fp32's
-    largest (`algebra.SCALED_WALK`). With `residuals` the walk is the training step's at the `anchors` a
-    peak walk found (`algebra.anchored_step`): the accumulator holds the split sums, every key's weighted
-    values but the anchor's, which it stores with the rows' sums and status, no output (the output's anchor
-    term joins in XLA, `_trained_forward`). With `certified` (its views and an fp32 stage,
+    maxima through `row_smem` to its status (`algebra.walked_launches`' fold guard), each row output into
+    views `stored()` forms where it is stored (`_written_views`' at the block formed there). The walk's
+    running sums are the family's accumulator, issued into in place, at its rows' scale where they could
+    pass fp32's largest (`algebra.SCALED_WALK`). `training`, the walk is the training step's at the
+    `anchors` a peak walk found (`algebra.anchored_step`): the accumulator holds the split sums, every
+    key's weighted values but the anchor's, which it stores with the rows' sums and status, no output (the
+    output's anchor term joins in XLA, `_trained_forward`). With `certified` (its views and an fp32 stage,
     `_Block.certified`), the plain walk stores its state after each key tile (`certified_walk`). With `kept`
     (a launch into the plain launch's outputs, `_Read.kept`), it writes its rows `kept` alone, every other
     row of its views as it was (`_kept_rows`). With `relay` (its own tile, `relays`), its weights reach the
@@ -973,7 +981,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     # state's where there is one; the walk carries the maxima and denominators, the state's `acc` an empty
     # place the algebra passes through (`algebra.Keys.accumulate`), a constant no loop may carry.
     state_rows = (row, head, pl.ds(first, tiles.block_q))
-    start, merged = _started(program, spec, hooked, state_rows, value_width, training=residuals is not None)
+    start, merged = _started(program, spec, hooked, state_rows, value_width, training=training)
     # Every consumer but the first takes a turn ahead, which the first's closing turn matches: each makes
     # as many arrivals as the others at any count of consumers (three take one fewer than the first and
     # second, and its partners' last turn waited forever: the interpreted hang of row 4840).
@@ -984,7 +992,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     def scored(index, slots, product=None):
         return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
                        hooks=hooks, drawn=hooked.drop is not None, held=held, product=product,
-                       interpret=interpret, codes=codes, training=residuals is not None)
+                       interpret=interpret, codes=codes, training=training)
 
     # The values' tiles as the products read them: a quantized call's in the query's dtype (`_Codes`), an
     # fp32 call's its parts (`_Program.parted`).
@@ -1015,7 +1023,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         return algebra.imported((acc, *rows)), None
 
     def walked(streams, lo, hi, counted):
-        if residuals is None:
+        if not training:
             return inference(_walk_of(family, streams, lo, hi, counted, interpret=interpret))
         assert anchors is not None
         known = algebra.Argmax(family.rows_of(anchors[0].at[state_rows]),
@@ -1031,34 +1039,43 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     if merged:
         state = algebra.merge(spec, _initial(family, spec, hooked, state_rows), state)
     keep = None if kept is None else _kept_of(program, kept, rows=(row, head, first))
-    if residuals is not None:
+    if training:
         # The split sums as the walk left them (at its rows' scale, `algebra.split_residuals`).
-        out_stage(lambda stage: family.stored((_kept_rows(family, keep, state.acc, residuals.others),),
-                                              (residuals.others,), smem=stage))
+        def split_sums(stage):
+            others = stored().residuals.others
+            family.stored((_kept_rows(family, keep, state.acc, others),), (others,), smem=stage)
+
+        out_stage(split_sums)
     pl.when(consumer == 0)(turn)
-    _status_stored(family, spec, state, status_views, row_smem)
-    _stored_walk(program, spec, state, trained, hooked, (row, head, first), hooks=hooks, residuals=residuals,
-                 out=(out_view, out_stage), rows=(finished, row_smem), keep=keep)
+    _status_stored(family, spec, state, stored().status, row_smem)
+    _stored_walk(program, spec, state, trained, hooked, (row, head, first), hooks=hooks, training=training,
+                 out=(out_view, out_stage), rows=(stored, row_smem), keep=keep)
+
+
+class _Written(NamedTuple):
+    """A consumer's views of its launch's outputs (`_written_views`), None for each it does not write."""
+    status: tuple | None
+    out: object
+    finished: tuple | None
+    residuals: _Residuals | None
+    certify: tuple | None
 
 
 def _written_views(family: mosaic.Family, block: _Block, written: tuple, stages: tuple, *, training: bool,
-                   finishes: bool, columns_at, certified: bool) -> tuple:
-    """A consumer's views of its launch's outputs `written` (`_launched`'s), its `stages` its scratch:
-    a training launch's status and residuals; an inference launch's status, output (its block of the
-    columns, `columns_at`) and finished rows and a certified launch's certificate. None for each it does
-    not write."""
-    out_view = finished = residuals = certify = None
+                   finishes: bool, columns_at, certified: bool) -> _Written:
+    """A consumer's views of its launch's outputs `written` (`_launched`'s) at `block`, its `stages` its
+    scratch: a training launch's status and residuals; an inference launch's status, output (its block of
+    the columns, `columns_at`) and finished rows and a certified launch's certificate."""
     if training:
         status_ref, rows_ref, keys_ref, others_ref = written
         residuals = _Residuals(tuple(rows_ref.at[place, *block.state] for place in range(5)),
                                keys_ref.at[block.state], others_ref.at[block.state], stages[0])
-        return block.status(status_ref, family), out_view, finished, residuals, certify
-    status, out_view, finished = block.inference(written, finishes, family)
-    if certified:
-        certify = (*block.certified(written), stages[-1])
+        return _Written(block.status(status_ref), None, None, residuals, None)
+    status, out_view, finished = block.inference(written, finishes)
+    certify = (*block.certified(written), stages[-1]) if certified else None
     if columns_at is not None:
         out_view = out_view.at[:, columns_at]
-    return status, out_view, finished, residuals, certify
+    return _Written(status, out_view, finished, None, certify)
 
 
 def _kept_of(program: _Program, kept, *, rows: tuple) -> jax.Array:
@@ -1127,17 +1144,18 @@ def certified_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
 
 
 def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partial, trained: tuple | None,
-                 hooked: _Hooked, place: tuple, *, hooks: Hooks, residuals: _Residuals | None, out: tuple,
-                 rows: tuple, keep: jax.Array | None = None) -> None:
+                 hooked: _Hooked, place: tuple, *, hooks: Hooks, training: bool, out: tuple, rows: tuple,
+                 keep: jax.Array | None = None) -> None:
     """A consumer's walk's result stored (`_consumer`): its output under the output hook through `out` (its
-    view and its stage's `out_stage`), its finished rows through `rows` (their views, None where the launch
-    finishes none, and their stage); a training walk's (`trained`, its anchor's terms) its residual rows and
-    anchor keys instead, no output. `place` its batch row, head and first query; with `keep`, each written
+    view and its stage's `out_stage`), its finished rows through `rows` (the views `stored()` forms where
+    each is stored, `_written_views`', its finished rows None where the launch finishes none, and their
+    stage); a training walk's (`trained`, its anchor's terms) its residual rows and anchor keys instead, no
+    output. `place` its batch row, head and first query; with `keep`, each written
     at those rows alone, every other row of its view as it was (`_kept_rows`)."""
     family = program.family
     row, head, first = place
-    (out_view, out_stage), (finished, row_smem) = out, rows
-    if residuals is None or trained is None:
+    (out_view, out_stage), (stored, row_smem) = out, rows
+    if not training or trained is None:
         out_params = tuple(_param(family, ref, param.kind, row, head, first, state.acc)
                            for ref, param in zip(hooked.output, hooks.output_params, strict=True))
 
@@ -1145,6 +1163,7 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
                                                       output_mod=hooks.output_mod, output_params=out_params)
         out_stage(lambda stage: family.stored((_kept_rows(family, keep, output, out_view),), (out_view,),
                                               smem=stage))
+        finished = stored().finished
         if finished is not None:
             # Its rows as the backward reads them beside the output (`Output`): the maximum and denominator
             # `finish` leaves.
@@ -1158,9 +1177,11 @@ def _stored_walk(program: _Program, spec: algebra.Forward, state: algebra.Partia
     # (`algebra.split_residuals`).
     shift = family.zeros((program.tiles.block_q,)) if state.scale is None else state.scale.exponent
     parts = (maximum, denominator, own, others_total, shift)
+    residual_rows = stored().residuals.rows
     family.stored(tuple(_kept_rows(family, keep, family.as_row(part), view)
-                        for part, view in zip(parts, residuals.rows, strict=True)), residuals.rows,
+                        for part, view in zip(parts, residual_rows, strict=True)), residual_rows,
                   smem=row_smem)
+    residuals = stored().residuals
     family.stored((_kept_rows(family, keep, family.as_row(key), residuals.keys),), (residuals.keys,),
                   smem=residuals.keys_smem)
 
@@ -1307,14 +1328,15 @@ def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partia
             (own, others_total, arg.key))
 
 
-def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, peak_views: tuple, q_smem,
+def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, stored: Callable, q_smem,
                    q_loaded, row_smem, keys_smem, streams, views: dict, turn, streamed: tuple, first,
                    spans: _Spans | None, hooked: _Hooked, place: tuple, *, hooks: Hooks,
                    interpret: bool) -> None:
     """A peak walk's query block (batch row, head and key head `place`): each row's keys' largest logit, in
     the walk's units, and the first key that holds it (`algebra.argmax`, the training walk's anchor,
     `algebra.anchored`), over the key tiles it reads through the family's key stream, the logits under the
-    score hook as the training walk forms them (`_scored`), stored through the row stages to `peak_views`.
+    score hook as the training walk forms them (`_scored`), stored through the row stages to the views
+    `stored()` forms where each is stored.
     Its turns on the tensor cores and the slots its partner alone reads are the training walk's own
     (`_consumer`)."""
     family, tiles = program.family, program.tiles
@@ -1343,8 +1365,8 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
         between=lambda: (turn(), turn()))
     pl.when(consumer == 0)(turn)
     arg = walked
-    family.stored((family.as_row(arg.peak),), (peak_views[0],), smem=row_smem)
-    family.stored((family.as_row(arg.key),), (peak_views[1],), smem=keys_smem)
+    family.stored((family.as_row(arg.peak),), (stored()[0],), smem=row_smem)
+    family.stored((family.as_row(arg.key),), (stored()[1],), smem=keys_smem)
 
 
 def _key_views(named: dict, row, head, sources, table, *, page: int | None, block_k: int,
@@ -1566,23 +1588,25 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
     def body(*refs, streams, after=None):
         refs = layout.unpacked(*refs)
         read = refs.read
-        row, head, column, views = _program_views(family, refs, read, peaks=peaks, group=group, page=page,
-                                                  block_k=block_k, column_blocks=column_blocks, batch=batch,
-                                                  parts=parts)
-        streams = family.opened(streams, views)
-        pair_first = program.query_tile(queries // pair) * pair
-        streamed = _streamed([program.reach(pair_first + index * block_q, read.spans, row)[:2]
-                              for index in range(consumers)])
+        located = functools.partial(_program_views, family, refs, read, peaks=peaks, group=group, page=page,
+                                    block_k=block_k, column_blocks=column_blocks, batch=batch, parts=parts)
+        # The rings opened once, before the roles' split (a gathered ring's barriers set once).
+        streams = family.opened(streams, located()[3])
         turn = functools.partial(family.turn, refs.schedule, consumers)
 
+        placed = functools.partial(_placed, program, located, read.spans, queries=queries)
+
         def consumer(index):
+            row, head, column, views, pair_first, streamed = placed()
             block = _Block.of(program, row, head, pair_first + index * block_q, queries)
+            afresh = functools.partial(_Block.afresh, program, row, head, index, queries)
+
             stages = (refs.q_smem.at[index], _query_barriers(refs.q_loaded, index, parts))
             # The query block's view, an fp32 call's its parts' (`_query_view`).
             q_view = _query_view(refs.q, row, pl.ds(block.first, block_q), head, batch=batch, parts=parts)
             if peaks:
                 _peak_consumer(program, spec, index, q_view,
-                               tuple(ref.at[block.state] for ref in refs.written), *stages,
+                               lambda: tuple(ref.at[afresh().state] for ref in refs.written), *stages,
                                refs.row_smem.at[index], refs.stages[0].at[index], streams, views, turn,
                                streamed, block.first, read.spans, read.hooked,
                                (row, head, lax.div(head, group)), hooks=hooks, interpret=interpret)
@@ -1591,15 +1615,19 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
             # A block of the columns writes its own of the output's, the whole call's in place.
             columns_at = (pl.ds(column * value_width, value_width)
                           if column is not None and (column_blocks > 1 or read.into is not None) else None)
-            status, out_view, finished, residuals, certify = _written_views(
-                family, block, written, tuple(stage.at[index] for stage in refs.stages), training=training,
-                finishes=finishes, columns_at=columns_at, certified=certified)
+            viewed = functools.partial(_written_views, family, written=written,
+                                       stages=tuple(stage.at[index] for stage in refs.stages),
+                                       training=training, finishes=finishes, columns_at=columns_at,
+                                       certified=certified)
+            # The output's tile view and a certified walk's, read through the walk, formed with it; its rows'
+            # outputs each formed where it is stored (`afresh`).
+            ahead = viewed(block)
             out_stage = functools.partial(staged_after, after, None if after else refs.out_smem, index)
-            _consumer(program, spec, index, q_view, out_view,
-                      status, *stages, out_stage, refs.row_smem.at[index], streams, views, turn,
-                      streamed, block.first, read.spans, read.hooked,
-                      (row, head, lax.div(head, group)), hooks=hooks, residuals=residuals,
-                      anchors=read.anchors, interpret=interpret, finished=finished, certified=certify,
+            _consumer(program, spec, index, q_view, ahead.out,
+                      lambda: viewed(afresh()), *stages, out_stage, refs.row_smem.at[index], streams, views,
+                      turn, streamed, block.first, read.spans, read.hooked,
+                      (row, head, lax.div(head, group)), hooks=hooks, training=training,
+                      anchors=read.anchors, interpret=interpret, certified=ahead.certify,
                       kept=read.kept,
                       relay=None if refs.relay is None else refs.relay.at[index],
                       codes=None if refs.converted is None or read.hooked.scales is None else _Codes.of(
@@ -1608,11 +1636,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                               tiles.block_k, interpret), value_width=value_width)
 
         def producer():
-            # Its streamed range formed where it streams: captured before the roles' split, the range's
-            # bounds stayed live past the producer's register drop and spilled 16 bytes of an H100's fp32
-            # decode step (et-lowreg-m).
-            own = _streamed([program.reach(pair_first + index * block_q, read.spans, row)[:2]
-                             for index in range(consumers)])
+            *_, views, _, own = placed()
             family.stream(streams, views, *own)
 
         # A family that keeps its products' accumulators in the program's scratch, a role's own share
@@ -1650,13 +1674,29 @@ def _written_refs(written: tuple, read: _Read) -> tuple:
     return written
 
 
+def _placed(program: _Program, located: Callable, spans: _Spans | None, *, queries: int) -> tuple:
+    """A role's place: its batch row, head, column block and key views (`located`, `_program_views`), its
+    pair's first query and their streamed range, formed in the role that reads them, its grid coordinates
+    read there (`Family.program_index`'s `fresh`): read before the roles' split, they were live across the
+    producer's register drop (an H100's fp32 decode step's streamed range spilled 16 bytes, et-lowreg-m; a
+    B200's forward at width 256, row 5466)."""
+    tiles = program.tiles
+    pair = tiles.consumers * tiles.block_q
+    row, head, column, views = located(fresh=True)
+    pair_first = program.query_tile(queries // pair, fresh=True) * pair
+    streamed = _streamed([program.reach(pair_first + index * tiles.block_q, spans, row)[:2]
+                          for index in range(tiles.consumers)])
+    return row, head, column, views, pair_first, streamed
+
+
 def _program_views(family: mosaic.Family, refs, read: _Read, *, peaks: bool, group: int, page: int | None,
-                   block_k: int, column_blocks: int, batch: int, parts: int) -> tuple:
+                   block_k: int, column_blocks: int, batch: int, parts: int, fresh: bool = False) -> tuple:
     """A forward program's place and the key views it streams (`_launched`'s): its batch row, the query head
     and column block of the values it walks (a launch of several column blocks a program a block along its
     heads' grid axis, else the block `read` names), and its key and value views
-    (`_key_views`; a peak walk's keys alone, an fp32 call's its parts', `_parted_views`)."""
-    row, axis = family.program_index("batch"), family.program_index("heads")
+    (`_key_views`; a peak walk's keys alone, an fp32 call's its parts', `_parted_views`); its grid
+    coordinates read where they are used where `fresh` (`Family.program_index`)."""
+    row, axis = family.program_index("batch", fresh=fresh), family.program_index("heads", fresh=fresh)
     if column_blocks > 1:
         head, column = lax.div(axis, column_blocks), lax.rem(axis, column_blocks)
     else:
