@@ -2486,3 +2486,59 @@ def test_a_declared_cell_compiles_nothing_for_the_template_it_prefers(monkeypatc
     with generation.assumed("sm80"):
         jax.jit(lambda x, dy: gemm.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16)).trace(x, dy)
     assert not (tmp_path / "dew" / "kernel-reports").exists()
+
+
+@pytest.mark.parametrize(("generation_name", "family"), [("sm80", "mma.sync"), ("sm90", "wgmma"),
+                                                         ("sm100", "tcgen05")])
+@pytest.mark.parametrize("product", ["forward", "kernel gradient"])
+def test_each_familys_deepest_ring_compiles_within_its_resources(generation_name, family, product):
+    """A 128 x 64 x 64 product (`mosaic_gpu.gmm`'s forward, `tgmm`'s dense kernel gradient) on each family
+    at the deepest ring its multiprocessor's shared memory holds, compiled by Mosaic for a compile-only GPU
+    through ptxas (tests/kernel_compile.py): no spill, the predicate file's among them (P2R and STL), which an
+    eight-slot tcgen05 kernel gradient spilled where its producer drained its two rings one after the other,
+    one predicate a slot held past a thread's seven (row 5358)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    multiprocessors = generation.gpu_target(generation_name).multiprocessors
+
+    def case(stages):
+        tiles = mosaic_gpu.Tiles(128, 64, 64, stages, 1, family=family)
+
+        def call():
+            if product == "forward":
+                def run(lhs, rhs, sizes):
+                    return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=tiles, transpose_rhs=False,
+                                          out_dtype=jnp.bfloat16, multiprocessors=multiprocessors)
+                return run, (jax.ShapeDtypeStruct((4096, 4096), jnp.bfloat16),
+                             jax.ShapeDtypeStruct((4, 4096, 1024), jnp.bfloat16),
+                             jax.ShapeDtypeStruct((4,), jnp.int32))
+
+            def run(lhs, rhs, sizes):
+                return mosaic_gpu.tgmm(lhs, rhs, sizes, tiles=tiles, out_dtype=jnp.float32,
+                                       multiprocessors=multiprocessors, dense=True)
+            return run, (jax.ShapeDtypeStruct((28672, 1024), jnp.bfloat16),
+                         jax.ShapeDtypeStruct((28672, 1024), jnp.bfloat16),
+                         jax.ShapeDtypeStruct((1,), jnp.int32))
+
+        return KernelCase(f"{family} {product} 128x64x64 at {stages} stages", call)
+
+    # The deepest ring the launch's resource model holds in one program's shared memory (`resources.plan`),
+    # compiled: any compile failure there is the test's, never a reason to try a shallower ring.
+    shapes = case(2).call()[1]
+    launch = grouped_matmul.MosaicGmm() if product == "forward" else grouped_matmul.MosaicTgmm()
+    options = ({"out_dtype": "bfloat16", "trans_rhs": False} if product == "forward"
+               else {"out_dtype": "float32", "dense": True})
+    tiles = mosaic_gpu.Tiles(128, 64, 64, 2, 1, family=family)
+    target = generation.gpu_target(generation_name)
+    with generation.assumed(generation_name):
+        bound = launch.bind(*shapes, interpret=False, **options)
+        planned = resources.plan([launch.launch_of(bound, tiles)], mosaic_gpu.family_of(tiles, jnp.bfloat16),
+                                 target, programs=1)
+    assert planned is not None, f"no plan of {tiles} on {generation_name}"
+    stages = planned[0].stages
+    assert stages > 2, f"{generation_name}'s shared memory holds no ring deeper than two stages: {planned}"
+    found = compile_mosaic_kernels([case(stages)], generation_name)
+    assert found[0].get("kernels"), found
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+

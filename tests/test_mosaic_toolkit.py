@@ -16,7 +16,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import across, handoffs, mosaic, swizzling
+from dew.nn.kernels.templates import across, handoffs, mosaic, rings, swizzling
 
 pytestmark = pytest.mark.kernel
 
@@ -38,11 +38,11 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
     columns = BLOCK[1] // consumers
 
     def body(x_gmem, out_gmem):
-        @functools.partial(pl.run_scoped, **mosaic.ring(BLOCK, x.dtype, STAGES, consumers=consumers),
+        @functools.partial(pl.run_scoped, **rings.ring(BLOCK, x.dtype, STAGES, consumers=consumers),
                            out_smem=plgpu.SMEM((consumers, BLOCK[0], columns), jnp.float32),
                            collective_axes="wg")
         def _(smem, full, consumed, out_smem):
-            ring = mosaic.Ring(smem, full, consumed)
+            ring = rings.Ring(smem, full, consumed)
 
             def producer():
                 @plgpu.nd_loop((TILES,), collective_axes="sm")
@@ -55,7 +55,7 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                         block = x_gmem.at[pl.ds((first + step) * BLOCK[0], BLOCK[0])]
                         ring.load(ring.turn(first + step), block)
 
-                mosaic.drain((ring,), jnp.int32(_first_step(TILES)))
+                rings.drain((ring,), jnp.int32(_first_step(TILES)))
 
             def consumer(wg):
                 @plgpu.nd_loop((TILES,), collective_axes="sm")
@@ -345,7 +345,7 @@ def test_a_planned_launch_at_its_producers_registers_holds_the_programs_and_budg
 
 
 def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_configs():
-    """A pair's step (`mosaic.Paired` indices) is the pair's block, the slot's twice along the axis its CTAs
+    """A pair's step (`rings.Paired` indices) is the pair's block, the slot's twice along the axis its CTAs
     split, at the indices in the pair's blocks (`viewed`'s `Split`), where a plain step is the slot's block;
     and the pair's bundle (`mosaic_sm100.PAIR`, its products over a cluster of two, each CTA a half of
     tcgen05's widest product's columns) is composed for a Blackwell launch stating its accumulators and
@@ -354,10 +354,10 @@ def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_conf
 
     ref = jax.new_ref(jnp.arange(256 * 512, dtype=jnp.float32).reshape(256, 512))
     block = (64, 128)
-    split = mosaic.viewed((ref, lambda step: mosaic.Paired((1, step), along=0)), block, 2)
-    assert isinstance(split, mosaic.Split) and split.along == 0 and split.ref.shape == (128, 128)
+    split = rings.viewed((ref, lambda step: rings.Paired((1, step), along=0)), block, 2)
+    assert isinstance(split, rings.Split) and split.along == 0 and split.ref.shape == (128, 128)
     np.testing.assert_array_equal(np.asarray(split.ref[...]), np.asarray(ref[128:256, 256:384]))
-    plain = mosaic.viewed((ref, lambda step: (1, step)), block, 2)
+    plain = rings.viewed((ref, lambda step: (1, step)), block, 2)
     np.testing.assert_array_equal(np.asarray(plain[...]), np.asarray(ref[64:128, 256:384]))
 
     pair = mosaic_sm100.PAIR
@@ -825,7 +825,7 @@ def _relayed_products(q, k, v, *, interpret):
             p = mosaic_sm100.Accumulator(p_tmem, (rows, k.shape[1]), dtype=jnp.bfloat16)
             o = mosaic_sm100.Accumulator(o_tmem, (rows, columns))
             scored, weighed, summed = (family.signals().opened(each) for each in (scored, weighed, summed))
-            first = mosaic.Turn.of(0, 1)
+            first = rings.Turn.of(0, 1)
 
             def relay(index):
                 del index
@@ -1263,8 +1263,8 @@ CODES = (64, 64)
 
 
 def _converted(codes, scale, *, generation_name: str, interpret, scaled: bool = True):
-    """`codes` (int8 or e4m3) converted into a bf16 tile through a family's `converted`, each row scaled by
-    `scale`, and copied out: on an A100's mma.sync and an H100's fed warpgroup MMA."""
+    """`codes` (int8 or e4m3) converted into a bf16 tile through the generation's family's `converted`, each
+    row scaled by `scale`, and copied out."""
     from dew.nn.kernels.templates import bundles, resources
 
     family = bundles.of(generation_name, jnp.bfloat16)
@@ -1280,10 +1280,10 @@ def _converted(codes, scale, *, generation_name: str, interpret, scaled: bool = 
             mosaic.store_rows(into, out_gmem, 0, 0, jnp.int32(CODES[0]), 0, CODES[0],
                               copy=swizzling.coalesced, widest=resources.copied_rows(CODES[1], jnp.bfloat16))
 
-        # A fed family's kernel runs on a thread axis, which its scoped allocations name.
-        threaded = {"collective_axes": "wg"} if generation_name == "sm90" else {}
-        pl.run_scoped(scoped, swizzling.plain(CODES, codes.dtype), swizzling.plain(CODES, jnp.bfloat16),
-                      **threaded)
+        # Scoped as the family scopes a program's allocations (`Family.program_scoped`: across its thread
+        # axis where its kernel runs on one).
+        family.program_scoped(lambda *refs, streams: scoped(*refs), swizzling.plain(CODES, codes.dtype),
+                              swizzling.plain(CODES, jnp.bfloat16), streams={})
 
     out = jax.ShapeDtypeStruct(CODES, jnp.bfloat16)
     return family.kernel(body, out_type=out, grid=(1,), grid_names=("programs",), consumers=1,

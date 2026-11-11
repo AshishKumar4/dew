@@ -95,9 +95,9 @@ def supported(case: dict[str, str]) -> bool:
 
 
 CASES = (
+    ('sm80', '8', 'bias', 'float32'),
     ('sm90', '8', 'none', 'bfloat16'),
     ('sm90', '16', 'bias', 'float16'),
-    ('sm80', '8', 'bias', 'float32'),
     ('sm80', '16', 'none', 'bfloat16'),
     ('sm90', '16', 'none', 'float32'),
     ('sm80', '8', 'none', 'float16'),
@@ -140,14 +140,19 @@ def an_adapted_projections_training_step_is_on_par(case: tuple[str, ...]) -> Non
     projection in float64. The routes it records run `low_rank` `fused` and every other choice at XLA."""
     combination = dict(zip(AXES["low_rank"], case, strict=True))
     model, variables = _adapted(combination)
-    # The truth is the same projection in float64: the measured arms' frozen base weights and bias widened,
-    # not another projection initialised in float64.
-    wide_model, _ = _adapted(combination, jnp.float64)
-    wide_variables = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), variables)
+
+    def truth(*inputs):
+        # The same projection in float64: the measured arms' frozen base weights and bias widened, not
+        # another projection initialised in float64, both formed within the truth's x64 scope
+        # (`assert_as_exact`), where float64 exists.
+        wide_model, _ = _adapted(combination, jnp.float64)
+        wide_variables = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), variables)
+        return _step(wide_model, wide_variables, "xla")(*inputs)
+
     draw = _drawn(combination, variables)
     with generation.routes() as routes:
         assert_as_exact(jax.jit(_step(model, variables, "fused")), jax.jit(_step(model, variables, "xla")),
-                        draw, "-".join(case), seeds=SEEDS, truth_fn=_step(wide_model, wide_variables, "xla"))
+                        draw, "-".join(case), seeds=SEEDS, truth_fn=truth)
     recorded = {(found.choice, found.kernel) for found in routes}
     unnamed = sorted(pair for pair in recorded if pair[0] not in CHOICES and pair[1] != "xla")
     assert ("low_rank", "fused") in recorded and not unnamed, (sorted(recorded), unnamed)

@@ -182,6 +182,23 @@ SEEDED: dict[str, tuple[tuple[int, tuple[str, ...]], ...]] = {
         (5268, ("sm90", "dense", "mha-8", "plain", "float32", "64", "decode")),
         (5404, ("sm80", "dense", "gqa-16-8", "softcap", "float32", "128", "template")),
     ),
+    "gemm": (
+        (5406, ("sm80", "triton", "grouped", "n-major", "row-scale", "float16")),
+    ),
+    "fused_gemm": (
+        (5416, ("sm90", "both", "silu-residual", "bfloat16")),
+    ),
+    "low_rank": (
+        (5407, ("sm80", "8", "bias", "float32")),
+        (5418, ("sm90", "8", "none", "bfloat16")),
+    ),
+    "nvfp4": (
+        (5408, ("sm80", "128", "256", "bfloat16")),
+        (5419, ("sm90", "128", "256", "float32")),
+    ),
+    "blockwise_fp8": (
+        (5415, ("sm90", "128", "1", "float32")),
+    ),
 }
 """Each family's cases a ledger row names, by the row, its axis values in `AXES`' order: its cells take them
 whatever the covering takes besides (`covering`), so the row's own case proves it closed."""

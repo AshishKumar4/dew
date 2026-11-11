@@ -498,9 +498,10 @@ class OuterProgram:
         ready = self._ready.get(key)
         return self._kept(key, args, kwargs) if ready is None else ready
 
-    def _kept(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled:
-        """The executable kept under `key`, compiled where none is (`compiled`): the map alone is held,
-        each key's compile a future its first caller sets, so calls of other keys compile at once."""
+    def _reserved(self, key: Hashable) -> tuple[Future[jax.stages.Compiled], bool]:
+        """The compile kept under `key` and whether this caller owns it: a future its owner settles
+        (`_keep`, `_released`), reserved where none is, the least recently used key's evicted past
+        `CACHED`; the map alone held, so calls of other keys compile at once."""
         with self._compiling:
             pending = self._executables.get(key)
             owner = pending is None
@@ -509,17 +510,17 @@ class OuterProgram:
                 if len(self._executables) > self.CACHED:
                     self._ready.pop(self._executables.popitem(last=False)[0], None)
             self._executables.move_to_end(key)
+        return pending, owner
+
+    def _kept(self, key: Hashable, args: tuple, kwargs: dict) -> jax.stages.Compiled:
+        """The executable kept under `key`, compiled where none is (`compiled`), by the caller owning its
+        reservation (`_reserved`)."""
+        pending, owner = self._reserved(key)
         if owner:
             try:
-                executable = self.compiled(*args, **kwargs)
-                pending.set_result(executable)
-                with self._compiling:
-                    if key in self._executables:
-                        self._ready[key] = executable
+                self._keep(key, pending, self.compiled(*args, **kwargs), [])
             except BaseException as error:
-                with self._compiling:
-                    self._executables.pop(key, None)
-                pending.set_exception(error)
+                self._released(key, pending, error)
         return pending.result()
 
     def _relowered(self, args: tuple, kwargs: dict, relowered: Relowered) -> jax.stages.Lowered:
@@ -532,19 +533,12 @@ class OuterProgram:
 
     def _together(self, together: dict[tuple[int, Hashable], _Lowering], key: Hashable, args: tuple,
                   kwargs: dict):
-        """A call within `compiled_together`: its results' shapes, its executable reserved as `_kept`
-        reserves one and its lowering kept for the block's compile where it owns the reservation; the
+        """A call within `compiled_together`: its results' shapes, its executable reserved (`_reserved`) and
+        its lowering kept for the block's compile where it owns the reservation; the
         shapes of a compile another owns, once it is done; one this block lowered, its lowering's."""
         if (lowering := together.get((id(self), key))) is not None:
             return shapes_of(lowering.lowered.out_info)
-        with self._compiling:
-            pending = self._executables.get(key)
-            owner = pending is None
-            if owner:
-                pending = self._executables[key] = Future()
-                if len(self._executables) > self.CACHED:
-                    self._ready.pop(self._executables.popitem(last=False)[0], None)
-            self._executables.move_to_end(key)
+        pending, owner = self._reserved(key)
         if not owner:
             # Another's compile, done or not: its shapes as the call traces, none waited for.
             return shapes_of(pending.result().out_info if pending.done() and pending.exception() is None
@@ -563,8 +557,8 @@ class OuterProgram:
 
     def _keep(self, key: Hashable, pending: Future[jax.stages.Compiled], executable: jax.stages.Compiled,
               relowered: Relowered) -> None:
-        """Settle the compile reserved under `key` (`_together`) with `executable`, kept as `_kept` keeps
-        the one it compiles; later calls trace as its last relowering did."""
+        """Settle the compile reserved under `key` (`_reserved`) with `executable`, kept for later calls;
+        later calls trace as its last relowering did."""
         if relowered:
             self.jitted = relowered[-1][0]
         pending.set_result(executable)
@@ -573,8 +567,7 @@ class OuterProgram:
                 self._ready[key] = executable
 
     def _released(self, key: Hashable, pending: Future[jax.stages.Compiled], failure: BaseException) -> None:
-        """Fail the compile reserved under `key` (`_together`), the program keeping none, as `_kept` fails
-        one it could not compile."""
+        """Fail the compile reserved under `key` (`_reserved`), the program keeping none."""
         with self._compiling:
             self._executables.pop(key, None)
         if not pending.done():

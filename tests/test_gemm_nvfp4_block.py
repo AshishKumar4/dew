@@ -15,6 +15,7 @@ from low_precision_support import spread
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import gemm, generation
+from dew.nn.kernels.templates import product
 
 SEEDS = 8
 
@@ -23,12 +24,12 @@ def test_an_nvfp4_operand_is_its_values_again_and_its_stored_matrix():
     """An NVFP4 operand's values quantize to themselves (`NvFp4Block.quantized`), its codes E2M1 values and
     its blocks' largest code at most 6; and a stored NVFP4 matrix (`gemm.NvFp4`) read as the block-scaled
     products read it (`NvFp4Block.of`) holds its values, its depths in their own order."""
-    operand = gemm.NvFp4Block.quantized(spread(0, (64, 256), gemm.NVFP4_BLOCK))
+    operand = gemm.NvFp4Block.quantized(spread(0, (64, 256), product.NVFP4.depth))
     values = operand.decoded() * operand.scale
     again = gemm.NvFp4Block.quantized(values)
     np.testing.assert_array_equal(np.asarray(again.decoded() * again.scale), np.asarray(values))
     assert float(jnp.max(jnp.abs(operand.codes.astype(jnp.float32)))) <= 6
-    stored = gemm.NvFp4.quantized(spread(1, (64, 256), gemm.NVFP4_BLOCK).T)
+    stored = gemm.NvFp4.quantized(spread(1, (64, 256), product.NVFP4.depth).T)
     read = gemm.NvFp4Block.of(stored)
     np.testing.assert_array_equal(np.asarray(read.decoded()[0].T * read.scale),
                                   np.asarray(stored.decoded().astype(jnp.float32) * stored.factor))
@@ -36,7 +37,7 @@ def test_an_nvfp4_operand_is_its_values_again_and_its_stored_matrix():
 
 def _operands(seed: int, shapes: tuple) -> tuple:
     """`low_precision_support.spread`'s draws of each of `shapes`, from `seed` on."""
-    return tuple(spread(seed + index, shape, gemm.NVFP4_BLOCK) for index, shape in enumerate(shapes))
+    return tuple(spread(seed + index, shape, product.NVFP4.depth) for index, shape in enumerate(shapes))
 
 
 GROUP_BLOCKS = (1, 0, 2, 1)
@@ -76,7 +77,7 @@ def test_an_nvfp4_quantized_projection_is_its_quantized_rows_product():
     """An inference projection of a stored NVFP4 matrix with its rows quantized as it runs
     (`gemm.nvfp4_quantized_product`), rows no whole 128s: bitwise the NVFP4 block product of its rows,
     padded, and the matrix as one group (XLA's arm on a CPU)."""
-    x, w = spread(4, (200, 256), gemm.NVFP4_BLOCK), spread(5, (256, 128), gemm.NVFP4_BLOCK)
+    x, w = spread(4, (200, 256), product.NVFP4.depth), spread(5, (256, 128), product.NVFP4.depth)
     matrix = gemm.NvFp4.quantized(w)
     out = gemm.nvfp4_quantized_product(x, matrix, out_dtype=jnp.float32)
     padded = jnp.pad(x, ((0, 56), (0, 0)))

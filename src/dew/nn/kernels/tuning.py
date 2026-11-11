@@ -359,40 +359,53 @@ def _launch(entry: object) -> tokamax.BoundArguments:
     return ba
 
 
-TIMING_FIELDS = tuple(field.name for field in dataclasses.fields(tokamax.BenchmarkData))
-"""Every field of `tokamax.BenchmarkData`, which a launch's stored timings keep."""
+def _metadata(value: _records.JSON, key: str) -> dict:
+    found = decoded(value)
+    if not isinstance(found, dict):
+        raise Unreadable(f"a stored timing's {key} is no mapping: {found!r}")
+    return found
+
+
+def _as_is(value: object) -> object:
+    return value
+
+
+TIMING_CODEC: dict[str, tuple[Callable[[object], _records.JSON], Callable[[_records.JSON, str], object]]] = {
+    "compile_time_ms": (_as_is, functools.partial(_field, _records.number)),
+    "lower_time_ms": (_as_is, functools.partial(_field, _records.number)),
+    "evaluation_times_ms": (list, functools.partial(_field, _records.numbers)),
+    "metadata": (lambda value: encoded(dict(value)), _metadata),
+    "peak_memory_mb": (_as_is, lambda value, key: None if value is None
+                       else _field(_records.number, value, key)),
+}
+"""Each field of `tokamax.BenchmarkData` a launch's stored timings keep, its writer to JSON and its reader
+back (`_timings_json`, `_timings`): the one codec of both directions, which every field of the dependency's
+dataclass has one of."""
+if set(TIMING_CODEC) != {field.name for field in dataclasses.fields(tokamax.BenchmarkData)}:
+    raise ImportError(f"tokamax.BenchmarkData's fields are {dataclasses.fields(tokamax.BenchmarkData)}, and "
+                      f"the stored timings' codec names {sorted(TIMING_CODEC)}")
 
 
 def _timings_json(timings: Timings) -> list[JSON]:
-    """The configs that ran and every field of their times (`TIMING_FIELDS`), as JSON (`_timings`): its
-    numbers as they are, its evaluation times a list and its metadata `encoded`."""
-    return [[encoded(config), {**dataclasses.asdict(timing),
-                               "evaluation_times_ms": list(timing.evaluation_times_ms),
-                               "metadata": encoded(dict(timing.metadata))}]
+    """The configs that ran and every field of their times, as JSON (`TIMING_CODEC`'s writers), which
+    `_timings` reads back."""
+    return [[encoded(config), {name: write(getattr(timing, name))
+                               for name, (write, _) in TIMING_CODEC.items()}]
             for config, timing in timings.prune_errors().items()]
 
 
 def _timings(entries: object) -> Timings:
-    """The timings `_timings_json` wrote; `Unreadable` where they are not."""
+    """The timings `_timings_json` wrote (`TIMING_CODEC`'s readers); `Unreadable` where they are not."""
     if not isinstance(entries, list):
         raise Unreadable(f"stored timings are no list: {entries!r}")
     measured: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     for pair in entries:
         if not (isinstance(pair, list) and len(pair) == 2 and isinstance(pair[1], dict)
-                and set(pair[1]) == set(TIMING_FIELDS)):
+                and set(pair[1]) == set(TIMING_CODEC)):
             raise Unreadable(f"a stored timing is not this checkout's: {pair!r}")
         config, fields = pair
-        metadata = decoded(fields["metadata"])
-        if not isinstance(metadata, dict):
-            raise Unreadable(f"a stored timing's metadata is no mapping: {metadata!r}")
-        peak = fields["peak_memory_mb"]
         measured[_key(decoded(config))] = tokamax.BenchmarkData(
-            compile_time_ms=_field(_records.number, fields["compile_time_ms"], "compile_time_ms"),
-            lower_time_ms=_field(_records.number, fields["lower_time_ms"], "lower_time_ms"),
-            evaluation_times_ms=_field(_records.numbers, fields["evaluation_times_ms"],
-                                       "evaluation_times_ms"),
-            metadata=metadata,
-            peak_memory_mb=None if peak is None else _field(_records.number, peak, "peak_memory_mb"))
+            **{name: read(fields[name], name) for name, (_, read) in TIMING_CODEC.items()})
     return Timings(measured)
 
 
@@ -784,9 +797,8 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
     traced (a value of the enclosing computation) is data the compiled launch reads, so it keys by its shape
     and dtype alone."""
     # A fresh function, which JAX's tracing cache keys by its identity: it keys a callable by equality, so an
-    # equal hook of another call would take this one's program. Traced on its call's mesh (`_keyed_mesh`).
-    with jax.sharding.use_abstract_mesh(_keyed_mesh(jax.sharding.get_abstract_mesh())):
-        closed = jax.make_jaxpr(lambda *values: function(*values))(*arguments)
+    # equal hook of another call would take this one's program.
+    closed = jax.make_jaxpr(lambda *values: function(*values))(*arguments)
     digest = hashlib.sha256()
 
     def update(*parts) -> None:
@@ -840,19 +852,6 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
     constants(closed.consts)
     walk(closed.jaxpr)
     return "traced:" + digest.hexdigest()[:16]
-
-
-def _keyed_mesh(mesh: jax.sharding.AbstractMesh) -> jax.sharding.AbstractMesh:
-    """`mesh` as `program` traces a function on it: its axes and its devices' platform and architecture,
-    which its lowering reads, not their kind or core count, which every equation's context and a jit's mesh
-    and shardings would carry into the key, where the target a launch derives for, keyed beside it, states
-    the GPU: one hook traced under one assumed H100 on an H100's mesh and on a GH200's keyed apart (row
-    5187)."""
-    device = mesh.abstract_device
-    if device is None:
-        return mesh
-    keyed = dataclasses.replace(device, device_kind=device.platform, num_cores=None)
-    return mesh.update(abstract_device=keyed)
 
 
 def _host(value) -> np.ndarray:

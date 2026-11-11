@@ -30,7 +30,7 @@ CASES = [case for case in ring_protocol.configurations(**BOUNDS) if case["in_fli
 
 STREAMS = ("a", "b")
 """The streams a two-ring walk reads, each step a slot of each (a GEMM's operands), drained together
-(`mosaic.drain`)."""
+(`rings.drain`)."""
 
 TWO_RING_CASES = [
     {**case, "streams": STREAMS} for case in ring_protocol.configurations(
@@ -109,7 +109,7 @@ def test_the_ring_familys_walk_holds_every_property_in_every_interleaving(case):
     f"-{'unrolled' if c['unrolled'] else 'stepped'}" for c in TWO_RING_CASES])
 def test_two_rings_drained_together_hold_every_property_in_every_interleaving(case):
     """Two rings' persistent walk, each step a slot of each and the producer's drain a slot of both at a time
-    (`mosaic.drain`): every interleaving explored, each property held, the producer's last waits each
+    (`rings.drain`): every interleaving explored, each property held, the producer's last waits each
     ring's last releases."""
     threads, arrivals = walked(**case)
     loads = sum(event.kind == "load" for event in threads[-1])
@@ -200,7 +200,7 @@ def test_a_missing_arrival_is_caught():
 
 @pytest.mark.parametrize("streams", [("a",), STREAMS])
 def test_a_missing_drain_is_caught(streams):
-    """The producer's drain of its last ring dropped (`mosaic.drain`): the last releases of that ring's slots
+    """The producer's drain of its last ring dropped (`rings.drain`): the last releases of that ring's slots
     never waited for, a slot freed while its release is unseen, which the checker gives."""
     threads, arrivals = walked(2, 1, (5,), 0, unrolled=False, streams=streams)
     producer = threads[-1]

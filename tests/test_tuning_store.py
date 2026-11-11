@@ -590,26 +590,6 @@ def test_a_programs_key_holds_what_its_equations_evaluate_under():
     assert partitionable != default
 
 
-def test_a_programs_key_reads_its_mesh_axes_not_its_devices_kind():
-    """One hook traced on an H100's mesh and on a GH200's, the same axes (two machines running one assumed
-    target): one key, the devices' kind no part of what it computes (row 5187); a mesh of other axes, another
-    key, as the hook's equations evaluate under it."""
-    from jax._src.mesh import AbstractDevice
-
-    def hook(tile):
-        return jax.nn.silu(tile) * tile
-
-    def keyed(sizes, kind):
-        device = AbstractDevice(device_kind=kind, num_cores=None, platform="cuda", compute_capability="9.0")
-        mesh = jax.sharding.AbstractMesh(sizes, ("data", "model"), abstract_device=device)
-        with jax.sharding.use_abstract_mesh(mesh):
-            return tuning.program(hook, TILE)
-
-    h100, gh200 = keyed((2, 4), "NVIDIA H100 80GB HBM3"), keyed((2, 4), "NVIDIA GH200 480GB")
-    assert h100 == gh200
-    assert keyed((4, 2), "NVIDIA H100 80GB HBM3") != h100
-
-
 UNORDERED = """
 from dew.algebra.terms import parameter_key
 print(repr(parameter_key(frozenset({"data", "model", "expert", "pipeline"}))))

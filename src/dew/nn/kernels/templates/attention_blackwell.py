@@ -43,6 +43,7 @@ from dew.nn.kernels.templates import (
     mosaic,
     mosaic_sm100,
     resources,
+    rings,
     swizzling,
 )
 from dew.nn.kernels.templates.attention import NATURAL, Hooks, KeySpans, padded_call, prescaled
@@ -163,14 +164,14 @@ class _Scratch(NamedTuple):
     signal, and the epilogue's stages, which it writes by item (`ref[...] = `, which no static type of JAX's
     refs declares)."""
 
-    q_smem: mosaic.Ref
-    q_loaded: mosaic.Ref
-    keys: mosaic.Ring
-    values: mosaic.Ring
+    q_smem: rings.Ref
+    q_loaded: rings.Ref
+    keys: rings.Ring
+    values: rings.Ring
     scores: mosaic_sm100.Tensor
-    p_tmems: tuple[mosaic.Ref, mosaic.Ref]
+    p_tmems: tuple[rings.Ref, rings.Ref]
     p_full: mosaic_sm100.Signal
-    acc_tmem: mosaic.Ref
+    acc_tmem: rings.Ref
     o_done: mosaic_sm100.Signal
     scales: Any
     scaled: mosaic_sm100.Signal
@@ -221,8 +222,8 @@ def _load(block: _Block, scratch: _Scratch, k_ref, v_ref, *, group: int, tiles: 
             scratch.keys.load(scratch.keys.turn(index), k_ref.at[tile])
             scratch.values.load(scratch.values.turn(index), v_ref.at[tile])
 
-    # Each slot's last releases, observed so its barriers end where they began (`mosaic.drain`).
-    mosaic.drain((scratch.keys, scratch.values), block.steps)
+    # Each slot's last releases, observed so its barriers end where they began (`rings.drain`).
+    rings.drain((scratch.keys, scratch.values), block.steps)
 
 
 def _products(block: _Block, scratch: _Scratch, q_ref) -> None:
@@ -268,7 +269,7 @@ def _products(block: _Block, scratch: _Scratch, q_ref) -> None:
     scratch.scores.drain(block.steps)
 
 
-def _released(ring: mosaic.Ring, turn: mosaic.Turn):
+def _released(ring: rings.Ring, turn: rings.Turn):
     """The barrier a product reading `turn`'s slot of `ring` releases it at, by its commit
     (`mosaic_sm100.CommittedRing`: the slot's consumed barrier, tensor-core ordered)."""
     return ring.consumed.at[turn.slot]

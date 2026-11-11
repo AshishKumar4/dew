@@ -11,6 +11,7 @@ from low_precision_support import spread
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.kernels import gemm, generation
+from dew.nn.kernels.templates import product
 
 SEEDS = 8
 
@@ -19,10 +20,11 @@ def test_an_mxfp8_operand_holds_each_blocks_largest_code_in_its_scales_binade():
     """Each 32-depth block's scale puts its largest magnitude in [256, 512) (OCP MX's rule), so its code,
     rounded to E4M3 and saturating at 448, lies in [256, 448]; a block at float32's top binade decodes
     finite; and its values are an MXFP8 operand's already, quantizing them again giving them back."""
-    operand = gemm.MxFp8.quantized(spread(0, (64, 256), gemm.MX_BLOCK))
-    largest = jnp.max(jnp.abs(operand.codes.astype(jnp.float32)).reshape(64, -1, gemm.MX_BLOCK), axis=-1)
+    operand = gemm.MxFp8.quantized(spread(0, (64, 256), product.MXFP8.depth))
+    per = product.MXFP8.depth
+    largest = jnp.max(jnp.abs(operand.codes.astype(jnp.float32)).reshape(64, -1, per), axis=-1)
     assert bool(jnp.all((largest >= 256) & (largest <= 448))), largest
-    top = jnp.full((1, gemm.MX_BLOCK), jnp.finfo(jnp.float32).max * 0.99, jnp.float32)
+    top = jnp.full((1, product.MXFP8.depth), jnp.finfo(jnp.float32).max * 0.99, jnp.float32)
     assert bool(jnp.all(jnp.isfinite(gemm.MxFp8.quantized(top).decoded())))
     again = gemm.MxFp8.quantized(operand.decoded())
     np.testing.assert_array_equal(np.asarray(again.decoded()), np.asarray(operand.decoded()))
@@ -43,8 +45,8 @@ def test_an_mxfp8_grouped_product_is_its_decoded_values_product(kernel):
     rows, depth, width = 128 * sum(GROUP_BLOCKS), 256, 128
 
     def draw(seed):
-        return (spread(seed, (rows, depth), gemm.MX_BLOCK),
-                spread(seed + 1, (len(GROUP_BLOCKS), width, depth), gemm.MX_BLOCK))
+        return (spread(seed, (rows, depth), product.MXFP8.depth),
+                spread(seed + 1, (len(GROUP_BLOCKS), width, depth), product.MXFP8.depth))
 
     def dew(x, w):
         with generation.chosen(mxfp8=kernel):

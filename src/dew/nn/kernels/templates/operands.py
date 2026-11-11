@@ -7,7 +7,7 @@ template's own parts move onto it."""
 import functools
 import itertools
 from collections.abc import Callable, Iterable
-from typing import Protocol
+from typing import Any, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +24,21 @@ class Issuing(Protocol):
 
     @property
     def interpret(self) -> bool: ...
+
+
+def staged(family: mosaic.Family, value: jax.Array, buffers, *,
+           before: Callable[[Any], None] | None = None) -> "Parts":
+    """`value` staged once in shared memory as the parts its products take, one a buffer of `buffers`: its
+    16-bit parts where they are more than one (`product.formed`), itself in one (`Family.staged`), each
+    after `before(buffer)` (an issuer's wait for the products in flight that may read it): an issuer's
+    operands' staging (`Issuer._operand`)."""
+    values = product.formed(value, len(buffers)) if len(buffers) > 1 else (value,)
+    refs = []
+    for part, buffer in zip(values, buffers, strict=True):
+        if before is not None:
+            before(buffer)
+        refs.append(family.staged(part, buffer))
+    return Parts(refs, value.dtype)
 
 
 class Parts:
@@ -88,8 +103,8 @@ class Issuer:
             return x.refs
         if isinstance(x, product.Exact):
             # One part, in the product's own tile for exact operands (`{name}.exact`).
-            (buffer,) = self.buffers[f"{name}.exact"]
-            return (self._staged(x.value, buffer, read),)
+            return staged(self.call.family, x.value, self.buffers[f"{name}.exact"],
+                          before=functools.partial(self._settle, read=read)).refs
         if isinstance(x, product.Transposed):
             # Staged as it is and read transposed (`product.Transposed`).
             return tuple(ref.T for ref in self._operand(x.value, name, other, read))
@@ -105,18 +120,16 @@ class Issuer:
             place = min(free, key=lambda place: held[place][1])
             held[place] = [x, uses]
             buffers = buffers[place]
-        values = product.formed(x, len(buffers)) if len(buffers) > 1 else (x,)
-        return tuple(self._staged(value, buffer, read) for value, buffer in zip(values, buffers, strict=True))
+        return staged(self.call.family, x, buffers, before=functools.partial(self._settle, read=read)).refs
 
-    def _staged(self, value, buffer, read: list | None):
-        """`value` staged into `buffer` (`Family.staged`), the products in flight done first where one may
-        read it (`read`, then emptied), and `buffer` added to `read` for the products after it."""
+    def _settle(self, buffer, read: list | None) -> None:
+        """Ahead of a staging into `buffer`: the products in flight done first where one may read it (`read`,
+        then emptied), and `buffer` added to `read` for the products after it."""
         if read is not None:
             if any(buffer is tile for tile in read):
                 self.call.family.settled(0)
                 read.clear()
             read.append(buffer)
-        return self.call.family.staged(value, buffer)
 
     def summed(self, products: Iterable, shape: tuple[int, int] | None = None, *, retired: bool = False,
                into=None):

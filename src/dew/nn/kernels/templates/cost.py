@@ -14,18 +14,19 @@ import dataclasses
 import functools
 import math
 
-import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
+from dew.nn.kernels.templates import resources
 
 
 def estimate(flops: float, *arrays, transcendentals: float = 0) -> pl.CostEstimate:
     """A launch's cost as it states it to XLA and to Dew's FLOP count (the custom call's cost estimate,
-    `dew.telemetry.instrumentation.sizes`): its `flops`, its `transcendentals`, and the bytes of each of
-    `arrays`, its operands and outputs, once."""
+    `dew.telemetry.instrumentation.sizes`): its `flops`, its `transcendentals`, and the bytes each of
+    `arrays`, its operands and outputs, takes in memory once (`resources.stored_bytes`: a packed dtype's two
+    elements a byte)."""
     return pl.CostEstimate(flops=int(flops), transcendentals=int(transcendentals), bytes_accessed=int(sum(
-        math.prod(array.shape) * jnp.dtype(array.dtype).itemsize for array in arrays)))
+        resources.stored_bytes(array.shape, array.dtype) for array in arrays)))
 
 
 @dataclasses.dataclass(frozen=True)

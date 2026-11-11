@@ -994,7 +994,7 @@ class Uncounted(grouped_matmul.MosaicGmm):
     256, two accumulators of 128 registers a thread, which spills in every compile whatever its walk's
     addresses take (the paired 128 x 128 tile this launch took first spilled 16 bytes in the process's own
     compile only while its walk held a stage's addresses in registers, and none since the walk forms them
-    where it uses them: `mosaic.opaque`); a narrower tile comes once a compile has refused a tile of its
+    where it uses them: `rings.opaque`); a narrower tile comes once a compile has refused a tile of its
     launch (`report.refused_launches`, the relowering's proposals included)."""
 
     def registers(self, ba, config):

@@ -44,9 +44,9 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_a_kernel_report_keeps_distinct_refusals_with_the_same_message():
     first = Route("ssd", "xla", "pallas", Refusal("width", "unsupported", "workspace"),
-                  "xla", "sm90", "training", forced="pallas")
+                  "sm90", "training", forced="pallas")
     second = Route("ssd", "xla", "pallas", Refusal("dtype", "unsupported", "arithmetic"),
-                   "xla", "sm90", "training")
+                   "sm90", "training")
     counted = {}
     for entry in KernelReport((first, second, first), ()).record()["routes"]:
         count = entry.pop("count")
@@ -1082,7 +1082,8 @@ def test_a_mamba2_forward_runs_its_template_scan_on_each_devices_own_rows():
     ("sm80", False), ("sm86", False), ("sm89", True), ("sm90", True), ("sm100", True), ("sm120", True),
     ("v6e", False), ("cpu", False)])
 def test_fp8_tensor_cores_are_a_fact_of_the_compute_capability(generation, cores):
-    """Capability 8.9 and later multiplies FP8, whether or not the target table names the generation."""
+    """Capability 8.9 and later multiplies FP8 (its architecture states an 8-bit rate), whether or not the
+    target table names the generation."""
     assert fp8_tensor_cores(generation) is cores
 
 
@@ -1297,20 +1298,20 @@ def test_a_choice_no_dispatch_reads_is_refused_by_name():
 def test_a_route_records_the_targets_decision_where_its_dispatch_reports_it():
     """`route` records a dispatch's decision in every `routes` block open, an inner block's in the
     outer's too, as the target decides it: its generation within `assumed`, the kernel `chosen` prefers
-    (else the one it ran), a refusal's stable code and the row that tracks it, what the host ran, and the
-    reporting function."""
-    def dispatch(kernel, refusal=None, ran=None):
-        return route("ssd", kernel=kernel, refusal=refusal, ran=ran)
+    (else the one it ran), a refusal's stable code and the row that tracks it, and the reporting
+    function."""
+    def dispatch(kernel, refusal=None):
+        return route("ssd", kernel=kernel, refusal=refusal)
 
     with assumed("sm90"), routes() as outer:
         assert dispatch("pallas").kernel == "pallas"
         head_dim = Refusal("head_dim", "a 320-wide head", "inherent")
         with kernel_choices(ssd="pallas"), routes() as inner:
-            dispatch("xla", head_dim, ran="xla")
+            dispatch("xla", head_dim)
     test = test_a_route_records_the_targets_decision_where_its_dispatch_reports_it
     site = f"{__name__}:{test.__qualname__}.<locals>.dispatch"
-    assert inner == [Route("ssd", "xla", "pallas", head_dim, "xla", "sm90", site)]
-    assert outer == [Route("ssd", "pallas", "pallas", None, "pallas", "sm90", site), *inner]
+    assert inner == [Route("ssd", "xla", "pallas", head_dim, "sm90", site)]
+    assert outer == [Route("ssd", "pallas", "pallas", None, "sm90", site), *inner]
 
 
 def test_a_route_off_its_preferred_kernel_is_logged_once_at_info_and_one_on_it_not_at_all():
@@ -1540,12 +1541,13 @@ def test_a_resumed_run_compiles_ahead_for_a_tpu_topology_where_its_checkpoint_le
     assert ended.ahead.plan is not None and ended.ahead.devices == 4
 
 
-def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_path, monkeypatch):
-    """The executable a TPU topology's compile makes loads onto no client here, so the persistent cache
-    is out of its way (`dew._cache.uncached`): a cache that a program here writes to gains nothing from
-    the topology's compile, and the next program here writes to it again. The trainer is built before
-    the cache is read, as its key is drawn by a program of this host's, which the cache keeps (ledger
-    3174: alone in its process the test saw that program's entries)."""
+def test_a_topology_compile_writes_the_persistent_cache_and_compiles_again_past_its_entry(
+        tmp_path, monkeypatch):
+    """A TPU topology's compile ahead with the persistent cache on writes its executable's entry, keyed by
+    the topology, for a process of its devices to read, and a second compile ahead of the same step in this
+    process compiles again past it: a compile-only client reads no entry back, as it has no device to load
+    one onto (Dew's JAX build, post75), where reading one failed ("PjRtCompiler must be constructed with a
+    Client") and each compile ahead ran with the cache turned off."""
     from jax.experimental.compilation_cache import compilation_cache
 
     from dew._cache import enable_compilation_cache
@@ -1560,14 +1562,12 @@ def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_pa
         enable_compilation_cache(str(tmp_path / "cache"))
         compilation_cache.reset_cache()
         trainer = _topology_trainer("v5e:2x2")
-        jax.jit(lambda x: x * 3.0).lower(1.0).compile()
-        written = sorted((tmp_path / "cache").iterdir())
-        assert written
         rows = np.zeros((trainer.device_mesh.devices.size, 65), np.int32)
+        before = set((tmp_path / "cache").iterdir())
         assert compile_ahead(trainer, {"text": rows}).executable
-        assert sorted((tmp_path / "cache").iterdir()) == written
-        jax.jit(lambda x: x * 5.0).lower(1.0).compile()
-        assert len(list((tmp_path / "cache").iterdir())) > len(written)
+        written = set((tmp_path / "cache").iterdir()) - before
+        assert written
+        assert compile_ahead(trainer, {"text": rows}).executable
     finally:
         for name, value in previous.items():
             jax.config.update(name, val=value)
