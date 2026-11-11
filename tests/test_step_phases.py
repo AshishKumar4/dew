@@ -181,3 +181,24 @@ def _budget(tag: int, tokens: int):
     """`source(tag)`'s rows batched by a budget of `tokens` tokens."""
     rows = [{"id": np.int32(1000 * tag + index), "length": np.int32(3 + index % 11)} for index in range(48)]
     return Memory(rows).map(Tokens()).filter(fits, reason="too_long").repeat().batch(tokens=tokens)
+
+
+def test_phases_name_what_each_shares_reader_reads_as_a_pool_agrees_it():
+    """A read of phases each on its own stream names each phase as that phase's reader names itself, its
+    plan as this share reads it, its loading workers among it: shares whose streamed phases are read in other
+    workers, and so in other orders, name other reads, as a share of a read of one phase does, where the
+    loader's own plan, which states no workers, named them alike."""
+    def named(workers: int) -> tuple[str, str]:
+        loading = dataclasses.replace(READ, workers=workers)
+        phased = compile(chain(3), read="streamed", loading=loading).train(DataPartition())
+        alone = compile(source(1), read="streamed", loading=loading).train(DataPartition())
+        try:
+            return phased.identity(), alone.identity()
+        finally:
+            phased.close()
+            alone.close()
+
+    (phased_none, alone_none), (phased_two, alone_two) = named(0), named(2)
+    assert alone_none != alone_two, "a share's read names its workers"
+    assert phased_none != phased_two
+    assert alone_none in phased_none and alone_two in phased_two
