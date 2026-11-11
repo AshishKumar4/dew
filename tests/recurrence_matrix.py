@@ -330,7 +330,7 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> No
     reference = _reference(named)
     upstream = reference.removeprefix("upstream ") if reference.startswith("upstream ") else None
     if upstream is not None and not os.environ.get(INTERPRETERS[upstream]):
-        _on_par_recorded(named, step, with_gradients(truth), upstream)
+        _on_par_recorded(named, step, with_gradients(truth), upstream, seeds)
         return
     oracle = jax.jit(with_gradients(truth)) if upstream is None else _upstream(named, (1 + REDRAW) * seeds)
     assert_as_exact(step, oracle, functools.partial(_drawn, named), "-".join(case), seeds=seeds,
@@ -340,11 +340,12 @@ def _on_par(family: str, case: tuple[str, ...], seeds: int = FEWEST_SEEDS) -> No
               f"own chunk math's: {_deficit(named, FEWEST_SEEDS, with_gradients(truth))}", flush=True)
 
 
-def _on_par_recorded(named: dict[str, str], step, truth, upstream: str) -> None:
-    """`_on_par` of a cell on a host without its upstream's GPU tier reference: held to the upstream's
-    recording of it (`RECORDED`, a summary at the seeds it declares), its draws drawn again on this host
-    (`_inputs`, NumPy's) and Dew's float64 truth held to the recorded truth's sketch (`indexed_recording`);
-    a recording of another release than the tier's pin is stale, refused."""
+def _on_par_recorded(named: dict[str, str], step, truth, upstream: str, seeds: int) -> None:
+    """`_on_par` of a cell on a host without its upstream's GPU tier reference, over its declared `seeds`:
+    held to the upstream's recording of it (`RECORDED`, a summary over at least their staged draws, which
+    `indexed_recording` refuses short of), its draws drawn again on this host (`_inputs`, NumPy's) and Dew's
+    float64 truth held to the recorded truth's sketch; a recording of another release than the tier's pin
+    is stale, refused."""
     from tool_support import load
 
     site = "-".join(named.values())
@@ -355,7 +356,6 @@ def _on_par_recorded(named: dict[str, str], step, truth, upstream: str) -> None:
     recorded = json.loads(str(stored["provenance"]))["revision"]
     pinned = load("reference_releases").RELEASES[upstream][f"{upstream}-core"]
     assert recorded == pinned, f"{site}: recorded on {upstream} {recorded}, the tier pins {pinned}: stale"
-    seeds = int(stored[f"{site}.seeds"])
     drawn, reference, recorded_truth = indexed_recording(
         stored, site, seeds, inputs_of=functools.partial(_inputs, named),
         truth_fn=lambda inputs: _leaves(truth(*_split(named, inputs))))
