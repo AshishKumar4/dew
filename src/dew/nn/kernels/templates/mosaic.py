@@ -825,10 +825,18 @@ class Issuer[Accumulator](abc.ABC):
     """The instruction slices loaded before the slice being consumed finishes."""
 
     def operand_live_depth(self, depth: int, loaded: int, *, retained: bool = False) -> int:
-        """An operand's live depth: a retained value keeps its loaded granule and instruction lookahead;
-        otherwise only its consumed slices within that granule stay live."""
+        """An operand's live depth: a retained value keeps its loaded granule and instruction lookahead; a
+        granule of several instructions that another granule of the product follows (`loaded` short of its
+        `depth`) its whole granule, loaded ahead of the later one's first product while the last slice of
+        the one before is in flight; otherwise only its consumed slices within that granule. An sm86 decode
+        step's keys, two granules of 64 at width 128, held at two instructions priced 80 registers where
+        ptxas spilled 12 bytes at 80 and held at 88 (the decode gate red at the promotion's composed tip);
+        one granule at a product's whole depth (a GEMM step's transposed weight at 64) holds at two
+        instructions, its whole granule refusing 19 picks ptxas holds (the gates both ways, 432 cells)."""
         consumed = (1 + self.operand_steps_ahead) * self.fragment_depth(depth)
-        return min(depth, max(loaded, consumed)) if retained else min(loaded, consumed)
+        if retained:
+            return min(depth, max(loaded, consumed))
+        return loaded if depth > loaded > self.fragment_depth(depth) else min(loaded, consumed)
 
     def fragment_depth(self, depth: int) -> int:
         """The depth consumed by one instruction: the step's where its issuer does not split products."""
