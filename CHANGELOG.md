@@ -17,10 +17,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - A paged `Server` keeps a prefix cache by default (`prefix_cache=None` derives it on wherever the layout pages,
   the rows sample a token a step on the server's own mesh and the model computes a split prompt as a whole
   one); a request draws what it draws without it. Pass `prefix_cache=False` to keep pages private. A
-  finished request names its whole history's full pages, so a later prompt that continues it prefills only
-  what follows, a hybrid reading the state its rows were left in where the history ends at a page's end.
-  `EpisodeCollector(kv_cache=KVCache(page_size=...))` runs a cohort's turns through the server in process,
-  each turn prefilling only its new tokens.
+  finished request names its whole history's full pages, so a later prompt that continues it prefills what
+  follows the last of them, a hybrid reading the state its rows were left in where the history ends at a
+  page's end. `EpisodeCollector(kv_cache=KVCache(page_size=...))` runs a cohort's turns through the server
+  in process, each turn reading its row's history from the cache.
 - A DiffusionGemma run exports in transformers' DiffusionGemmaForBlockDiffusion layout where that class
   builds the model, and its native release, stating why, where it cannot. A native release, any token
   task's, is the source a run starts from (`--pretrained <run>`, `Pretrained.load(run)`), its model in Dew's

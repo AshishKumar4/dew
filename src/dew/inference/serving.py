@@ -1051,7 +1051,7 @@ class Server:
         first = self._prepared(prompt, max_new_tokens, seed, fold, adapter)
         ticket = self._queued(first)
         for continuation in range(1, self.n):
-            row = self._prepared(prompt, max_new_tokens, seed, fold, adapter)
+            row = self._prepared(prompt, max_new_tokens, seed, fold, adapter, continuation)
             self._queued(dataclasses.replace(row, ticket=ticket, continuation=continuation))
         return ticket
 
@@ -1066,7 +1066,7 @@ class Server:
         return row.ticket
 
     def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int,
-                  adapter: str | None = None) -> _Row:
+                  adapter: str | None = None, continuation: int = 0) -> _Row:
         names = adapter_names(self.model)
         if adapter is not None and adapter not in names:
             raise ValueError(f"this server's model holds no adapter named {adapter!r}"
@@ -1124,9 +1124,12 @@ class Server:
                 hasher.update(b"adapter" + np.int32(chosen).tobytes())
             if self.keyed:
                 # A cached memory rounds by the request's own key (`dew.nn.kv_cache.ROUNDING_KEYS`), so the
-                # state after a prefix is that key's: the prefix is shared only under one key.
+                # state after a prefix is that key's: the prefix is shared only under one key, a
+                # continuation's past its first folded again (`_row_keys`).
                 hasher.update(b"seed" if isinstance(seed, int) else b"key")
                 hasher.update(np.asarray(seed).tobytes() + np.int64(fold).tobytes())
+                if continuation:
+                    hasher.update(b"continuation" + np.int64(continuation).tobytes())
             if context is not None:
                 # The context's dtype too, so equal bytes of another dtype salt apart.
                 array_fingerprint(hasher, np.asarray(context))
@@ -1418,9 +1421,10 @@ class Server:
         batch through `TextGeneration` would where it is a pool's rows from
         global row `first` on. Each row is validated as `submit` validates
         one. A prompt that continues an earlier request's whole history reads
-        the pages that request named of it (`PagedRows.finished`), and its
-        state at the history's end where rows hold state, so a turn of a
-        conversation prefills only what follows its last.
+        the full pages that request named of it (`PagedRows.finished`), and
+        its state at the history's end where rows hold state and the history
+        ends at a page's end, so a turn of a conversation prefills what
+        follows its last full page.
         """
         base = _seed(key, self.prng)
         inputs = prepared_inputs(self.processor, prompts, images=None)

@@ -400,9 +400,11 @@ class EpisodeCollector:
     """A paged cache layout (`dew.nn.kv_cache.KVCache` with a `page_size`) the cohort's turns are served over:
     its `TextGeneration` policy, bound to the snapshot, becomes a `dew.inference.serving.Server` in process,
     one a cohort, whose prefix cache keeps each row's history, so a turn whose context continues its row's
-    last prefills only what follows it, a group's shared prompt once, and a row whose context does not
-    continue its last prefills it whole, saying so (a warning naming the row); its pages and states are the
-    server's, released when the cohort's collection returns. None draws each turn from the policy whole. A
+    last reads that history's full pages from the cache and prefills only the rest (the history's tokens
+    past its last full page among them, and, over a recurrent mixer, those past the last page its state is
+    held at), a group's shared prompt once, and a row whose context does not continue its last prefills it
+    whole, saying so (a warning naming the row); its pages and states are the server's, released when the
+    cohort's collection returns. None draws each turn from the policy whole. A
     served turn draws what the policy's draws: every row's tokens and likelihoods, the key folded by its
     global row."""
 
@@ -760,9 +762,9 @@ class _ServedTurns:
     """A cohort's turns served in process (`EpisodeCollector.kv_cache`): its bound `TextGeneration` as a
     `dew.inference.serving.Server` over the paged layout, each turn a call of every row, row `i` folding the
     turn's key by its global row as the policy's own call folds it: where its context continues the history
-    its last turn left, the server reads that history's pages and state, which it named as the turn
-    finished (`PagedRows.finished`), and prefills only the rest; a row whose context does not continue it
-    is prefilled whole, the reset logged as a warning naming the row."""
+    its last turn left, the server reads that history's full pages and its state where it ends at a page's
+    end, which it named as the turn finished (`PagedRows.finished`), and prefills the rest; a row whose
+    context does not continue it is prefilled whole, the reset logged as a warning naming the row."""
 
     def __init__(self, server: Server, collector: EpisodeCollector, first: int) -> None:
         self.server, self.collector, self.first = server, collector, first
@@ -780,6 +782,11 @@ class _ServedTurns:
 
         if not isinstance(policy, TextGeneration):
             raise TypeError(f"a served cohort serves a TextGeneration policy, not a {type(policy).__name__}")
+        if policy.n != 1:
+            # `_advance`'s rule, which the cohort's server would otherwise meet only after drawing n rows a
+            # slot.
+            raise TypeError(f"tool episodes require one autoregressive Generation row per slot; this policy "
+                            f"draws {policy.n} continuations a prompt (TextGeneration.n)")
         # The task as a call under the collector's sampling runs it (`TextGeneration._controls`): its ids
         # filled from the task's policy, and no logits chain of the task's, which an overriding call drops.
         task = replace(policy, sampling=with_ids_of(collector.sampling, policy.sampling), logits=None)
