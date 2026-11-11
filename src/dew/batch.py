@@ -108,6 +108,20 @@ class ConsumedCount:
     examples: int
 
 
+PHASE = "data_phase"
+"""A training batch's host field of the data phase it was read in (`Phase`), which a phased stream sets on
+every batch it delivers (`dew.data.dataset.PhasedStream`), so a step knows its phase on the host whoever
+read the batch ahead of it; a batch of a run in no phases holds none, its phase the first."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Phase:
+    """The data phase a training batch was read in, by its place among the run's phases (`PHASE`): an
+    object no device holds (`dew.distributed.batches.split_fields`)."""
+
+    index: int
+
+
 def padded_rows(rows: int, count: int) -> tuple[np.ndarray, np.ndarray]:
     """The rows `count` places hold of `rows` real ones, cycling through them, and which places hold
     a repeat: the rule a batch filled out with its own rows (`dew.data.dataset.FilledBatch`) and a
@@ -1118,6 +1132,7 @@ __all__ = [
     "EXAMPLE_ROWS",
     "FROZEN",
     "PARAMETER_ROOTS",
+    "PHASE",
     "SCAN_BLOCKS",
     "TEXT_KEY",
     "VALIDITY_FIELD",
@@ -1126,6 +1141,7 @@ __all__ = [
     "Coordinates",
     "Path",
     "PathFilter",
+    "Phase",
     "Variables",
     "coordinates",
     "dicts",

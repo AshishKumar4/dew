@@ -946,6 +946,13 @@ class Dataset:
     stands or refuses it before a reader opens.
     """
 
+    @property
+    def phase_count(self) -> int:
+        """The phases a run reads this dataset in: its `Phases`' pipelines (`phases`, `schedule`), one for a
+        dataset read whole."""
+        source = self._chain().source
+        return len(source.pipelines) if isinstance(source, Phases) else 1
+
     def _then(self, *stages: Stage) -> Pipeline:
         """This dataset with `stages` after its own."""
         return dataclasses.replace(self._chain(), stages=(*self._chain().stages, *stages))
