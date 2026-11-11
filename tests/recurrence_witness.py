@@ -576,6 +576,29 @@ class Run:
                     point(self.entered(n, head)) if carry is None else carry)
 
 
+def _route_forward(route, operands: tuple, walked: bool) -> tuple:
+    """The forward of `route` over `operands` as a training step runs it, the template's (`chosen`):
+    `(output, final memory, tiles, trained)`. The training forward, the primal of the route's VJP, where
+    the template trains the call (`Mosaic.trains`, `trained`); else, or where no gradient follows
+    (`walked`), the inference forward: a training step takes another kernel for a call the template does
+    not train (an fp32 call's backward on an A100's registers, 264 to 328 a thread)."""
+    import jax
+
+    from dew.nn.kernels import tuning
+
+    with tuning.seen() as launches:
+        o, final = jax.jit(route)(*operands)
+    [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
+                        zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
+    trained = template.MOSAIC.trains(bound, template.Mosaic.launched())
+    if not walked and trained:
+        with tuning.seen() as launches:
+            o, final = jax.jit(lambda *x: jax.vjp(route, *x)[0])(*operands)
+        [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
+                   if isinstance(op, template.Mosaic)]
+    return o, final, tiles, trained
+
+
 def route_rounding(delta: bool, dtype) -> bool:
     """The rounding a witnessed call's route resolves at JAX's own default precision, as a model trains and
     the witnessed routes run (an fp32 call's rounds by the precision, `recurrence_chunk.fast_rounding`): the
@@ -654,7 +677,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
     import jax
     import jax.numpy as jnp
 
-    from dew.nn.kernels import generation, recurrence_chunk, tuning
+    from dew.nn.kernels import generation, recurrence_chunk
 
     operands = (q, k, v, g, beta, h0)
     dtype = jnp.result_type(q, k, v)
@@ -674,20 +697,7 @@ def recorded(q, k, v, g, beta, h0, *, starts=None, max_segments: int | None = No
                                                        write_bound=1.0)
 
     with jax.default_matmul_precision(None), generation.chosen(gated_delta_rule="mosaic_gpu"):
-        with tuning.seen() as launches:
-            o, final = jax.jit(route)(*operands)
-        [(bound, tiles)] = [(keyed, config) for (op, keyed), (config, _) in
-                            zip(launches, launches.taken, strict=True) if isinstance(op, template.Mosaic)]
-        # The training forward, the primal of the route's VJP as a training step runs it, where the template
-        # trains the call (`Mosaic.trains`); else, or where no gradient follows (`walked`), the inference
-        # forward: a training step takes another kernel for a call the template does not train (an fp32
-        # call's backward on an A100's registers, 264 to 328 a thread).
-        trained = template.MOSAIC.trains(bound, template.Mosaic.launched())
-        if not walked and trained:
-            with tuning.seen() as launches:
-                o, final = jax.jit(lambda *x: jax.vjp(route, *x)[0])(*operands)
-            [tiles] = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
-                       if isinstance(op, template.Mosaic)]
+        o, final, tiles, trained = _route_forward(route, operands, walked)
         # The fused walk where the forward runs one (`chunk_forward.walks_once`): an mma.sync family's
         # inference forward runs its states and output launches, whose records it keeps.
         walked = walked and chunk_forward.walks_once(dtype, per_key=g.ndim == 4, family=family, keeps=False)
