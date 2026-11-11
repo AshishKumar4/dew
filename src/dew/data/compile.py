@@ -1299,6 +1299,26 @@ def _held_steps(pipeline: Pipeline) -> tuple[HostStep, ...]:
     return host
 
 
+def _phase_batches(source: Phases, index: int, phase: _Staged, *, steps: int | None, budget: int | None,
+                   tokens: bool) -> int | None:
+    """The batches phase `index` of `source` reads, which automatic loading sizes its workers for
+    (`Loading.resolved`): of a run of `steps`, its own steps on the step clock, else the run's; of a run of
+    `budget` tokens, its own span of them on the token clock (`tokens`), else the run's, over the most a
+    batch of it holds (`_run_batches`)."""
+    start = (source.ends[index - 1] if index else 0) or 0
+    until = source.ends[index]
+
+    def span(length: int) -> int:
+        return max(0, (length if until is None else min(until, length)) - start)
+
+    if steps is not None:
+        return steps if tokens else span(steps)
+    if budget is None:
+        return None
+    return _run_batches(phase, steps=None, examples=None, epochs=None,
+                        tokens=span(budget) if tokens else budget)
+
+
 def _compile_phases(
     train: Pipeline,
     *,
@@ -1318,24 +1338,6 @@ def _compile_phases(
     source = train.source
     if not isinstance(source, Phases):
         raise TypeError("phased compilation needs a Phases source")
-
-    def planned(index: int, phase: _Staged) -> int | None:
-        """The batches phase `index` reads, which automatic loading sizes its workers for
-        (`Loading.resolved`): of a run of `steps`, its own steps on the step clock, else the run's; of a
-        run of `budget` tokens, its own span of them on the token clock, else the run's, over the most a
-        batch of it holds (`_run_batches`)."""
-        start = (source.ends[index - 1] if index else 0) or 0
-        until = source.ends[index]
-
-        def span(length: int) -> int:
-            return max(0, (length if until is None else min(until, length)) - start)
-
-        if steps is not None:
-            return steps if tokens else span(steps)
-        if budget is None:
-            return None
-        return _run_batches(phase, steps=None, examples=None, epochs=None,
-                            tokens=span(budget) if tokens else budget)
 
     _tokenizer_contract((train,) if validation is None else (train, validation))
 
@@ -1381,7 +1383,8 @@ def _compile_phases(
     packed = _coordinated(*(phase.train for phase, _ in staged))
     built: list[tuple[Loader, int | None]] = []
     for index, (phase, end) in enumerate(staged):
-        loaded = _compiled(phase, packed, host=host, resume=resume, batches=planned(index, phase))
+        batches = _phase_batches(source, index, phase, steps=steps, budget=budget, tokens=tokens)
+        loaded = _compiled(phase, packed, host=host, resume=resume, batches=batches)
         if built and loaded.device != built[0][0].device:
             # The run applies one set of device steps to every batch (`Loader.device`), so a phase
             # whose own differ would run the first phase's.
@@ -1411,7 +1414,8 @@ def _compile_phases(
             consumed = consumed_by([phase for phase, _ in staged[:index]], ends)
             if any(consumed.get(_name(chain), 0) for chain, _ in _leaves(source.pipelines[index])):
                 phase = staged_at(index, consumed)
-                loader = _compiled(phase, packed, host=host, resume=resume, batches=planned(index, phase))
+                batches = _phase_batches(source, index, phase, steps=steps, budget=budget, tokens=tokens)
+                loader = _compiled(phase, packed, host=host, resume=resume, batches=batches)
         return counted(loader)
 
     batches = tuple(phase.build.batch for phase, _ in staged)

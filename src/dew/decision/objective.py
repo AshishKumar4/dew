@@ -444,17 +444,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                                else context_window or max(self.layout.max_len, held_context))
         self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,)))
         self.pass_weights = self._passes_weighed(PassWeights.of(pass_weights))
-        if exit_entropy is not None:
-            backbone = self.model.backbone
-            loop = backbone.loop if isinstance(backbone, Looped) else None
-            if loop is None or not loop.exit_gate or not 0 <= exit_entropy < float("inf"):
-                raise ValueError(f"exit_entropy weighs the entropy of a looped backbone's exit distribution: "
-                                 f"a backbone whose loop has an exit gate, and a finite nonnegative weight, "
-                                 f"got {exit_entropy}")
-            if self.pass_weights is not None:
-                raise ValueError("pass_weights and exit_entropy each weigh a looped backbone's passes; "
-                                 "state one")
-        self.exit_entropy = exit_entropy
+        self.exit_entropy = self._exit_weighed(exit_entropy)
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The backbone, then the head, both trained."""
@@ -686,6 +676,21 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                              "would, and a row whose context the backbone encodes in its own passes reads "
                              "the last pass's context at every pass")
         return weights
+
+    def _exit_weighed(self, exit_entropy: float | None) -> float | None:
+        """`exit_entropy` checked: a finite nonnegative weight over a backbone whose loop has an exit gate,
+        and no `pass_weights` beside it, which weigh the same passes."""
+        if exit_entropy is None:
+            return None
+        backbone = self.model.backbone
+        loop = backbone.loop if isinstance(backbone, Looped) else None
+        if loop is None or not loop.exit_gate or not 0 <= exit_entropy < float("inf"):
+            raise ValueError(f"exit_entropy weighs the entropy of a looped backbone's exit distribution: "
+                             f"a backbone whose loop has an exit gate, and a finite nonnegative weight, "
+                             f"got {exit_entropy}")
+        if self.pass_weights is not None:
+            raise ValueError("pass_weights and exit_entropy each weigh a looped backbone's passes; state one")
+        return exit_entropy
 
     @property
     def _weights(self) -> tuple[float, ...] | None:
