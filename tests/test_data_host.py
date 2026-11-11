@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from dew.data.compile import compile
-from dew.data.dataset import GRAIN_KILL_SECONDS, DataPartition, Loading
+from dew.data.dataset import DataPartition, Loading, grain_kill_seconds
 from dew.data.pipeline import Pipeline
 from dew.data.sources import Memory
 
@@ -33,7 +33,7 @@ def test_automatic_loading_starts_no_more_workers_than_the_hosts_cpus_and_memory
     data = compile(Pipeline(source(64)).repeat().batch(8), loading=loading)
     reader = data.train(DataPartition())
     try:
-        workers = reader.stop_seconds / GRAIN_KILL_SECONDS - 1
+        workers = reader.stop_seconds / grain_kill_seconds() - 1
     finally:
         reader.close()
     assert workers <= 2

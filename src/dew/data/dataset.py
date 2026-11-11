@@ -300,9 +300,12 @@ _QUIET_STOP_SECONDS = 5.0
 (`Loading.announced_stop`)."""
 
 
-GRAIN_KILL_SECONDS = 25
-"""How long Grain waits for a stopped worker process to exit before it kills it, which it publishes
-no setting or reading of: 25 s in grain 0.2.18 (process_prefetch.py), the release tested."""
+def grain_kill_seconds() -> float:
+    """How long Grain waits for a stopped worker process to exit before it kills it, as Grain states it
+    (`process_prefetch._PROCESS_KILL_TIMEOUT_S`, the value its stop passes to `Process.join`)."""
+    from grain._src.python.dataset.transformations import process_prefetch
+
+    return process_prefetch._PROCESS_KILL_TIMEOUT_S
 
 
 WORKER_BUFFER = 1
@@ -540,7 +543,7 @@ class Loading:
         """
         # The 5.1 to 7.4 s stop was examples/sft_gemma4.py's four workers.
         return float(
-            GRAIN_KILL_SECONDS
+            grain_kill_seconds()
             * (1 + (self.max_workers or Host.current().cpus) if self.workers == "auto" else 1 + self.workers)
         )
 
@@ -568,7 +571,7 @@ class Loading:
             return None
         line = (
             f"waiting for {self.workers} grain workers to stop, "
-            f"up to {self.workers * GRAIN_KILL_SECONDS} s"
+            f"up to {self.workers * grain_kill_seconds()} s"
         )
         timer = threading.Timer(_QUIET_STOP_SECONDS, _log.warning, (line,))
         timer.daemon = True
