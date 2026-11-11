@@ -14,7 +14,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import unrewritten
-from jax.extend import core as jcore
 from jax.extend.core import primitives
 from jax.interpreters import partial_eval as pe
 
@@ -245,9 +244,9 @@ def lowered(closed):
     primitives (hijax's: one of Dew's linear maps under forward mode, `dew.nn.kernels.generation.linear_map`;
     a checkpoint's recomputation), it is JAX's own lowering of the program
     (`jax.interpreters.partial_eval.lower_jaxpr2`), each such call written as the program it expands to,
-    which a walk reads as any call's (`dew.nn.programs.called`); any other program is itself."""
-    jaxpr = closed.jaxpr
-    return closed if not jaxpr.is_high else jcore.ClosedJaxpr(pe.lower_jaxpr2(jaxpr), closed.consts)
+    which a walk reads as any call's (`dew.nn.programs.called`), with the constants that program holds: the
+    traced ones and those an expansion closes over. Any other program is itself."""
+    return pe.lower_jaxpr2(closed.jaxpr) if closed.jaxpr.is_high else closed
 
 
 def released() -> None:

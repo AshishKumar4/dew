@@ -72,8 +72,11 @@ def stored_as(value, dtype):
     and states the format's rounding here, a cast, which the truth rule keeps
     (`reference_error._read_through_floats`), where the same arithmetic run in the format is refused as a
     second fp32 run. One sum, difference, product, quotient or square root of the format's values so
-    declared is the format's own result bit for bit: float64's 53 bits round twice to float32's 24, or to
-    fewer, as once."""
+    declared is the format's own correctly rounded result bit for bit, inside the format's normal range:
+    float64's 53 bits round twice to float32's 24, or to fewer, as once. A backend's own operation need
+    not be that one: XLA divides by a constant as a product with its rounded reciprocal, and a GPU's
+    division is not IEEE's (`dew.nn.fake_quant`'s E2M1 quotient), so a format whose values a backend's
+    plain operation defines is declared by what the format's definition says, not by this identity."""
     wide = jnp.result_type(value)
     return jnp.asarray(value).astype(dtype).astype(wide)
 

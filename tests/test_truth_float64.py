@@ -80,6 +80,24 @@ def dropped_out_by_a_call(x, weight):
     return jnp.where(draw < 0.5, product, 0)
 
 
+def dropped_out_past_a_barrier(x, weight):
+    """The product and the draw cross one barrier; the draw is read only by a comparison."""
+    product, draw = jax.lax.optimization_barrier(drawn_beside(x, weight))
+    return jnp.where(draw < 0.5, product, 0)
+
+
+def through_a_kernel(x, weight):
+    """The product of rows a native kernel gains: the kernel computes in float32 and stores at its
+    output's width."""
+    from jax.experimental import pallas as pl
+
+    def kernel(rows, out):
+        out[...] = jnp.tanh(rows[...].astype(jnp.float32)).astype(out.dtype)
+
+    gained = pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype), interpret=True)(x)
+    return gained @ weight
+
+
 def weighed_by_a_call(x, weight):
     """The same call, its draw read as a value."""
     product, draw = jax.jit(drawn_beside)(x, weight)
@@ -152,6 +170,7 @@ NULL = {
     "a decision drawn in float32": (dropped_out, drawn, None),
     "a decision a call draws beside a value": (dropped_out_by_a_call, drawn, None),
     "a decision a scan's step draws beside a value": (dropped_out_by_a_scan, drawn, None),
+    "a decision whose draw crosses a barrier beside a value": (dropped_out_past_a_barrier, drawn, None),
     "complex operands, widened to complex128": (product, turned, None),
     "an fp32 value no output reads": (product, drawn, with_a_dropped_value),
     "an integer leaf beside": (with_its_place, drawn, None),
@@ -170,6 +189,7 @@ INJECTED = {
         1 + jax.random.uniform(jax.random.key(5430), (16, 8), jnp.float32) * 0).astype(jnp.float64), ""),
     "a call's fp32 draw read as a value": (product, drawn, weighed_by_a_call, ""),
     "a scan's fp32 carry weighing a later step": (product, drawn, weighed_by_a_carry, ""),
+    "a native kernel's result": (product, drawn, through_a_kernel, ""),
     "a NumPy truth in float32": (product, drawn, as_given(in_numpy(np.float32)), ""),
 }
 """Truths that are a second fp32 run, each with the leaf its refusal names."""
@@ -180,7 +200,8 @@ def test_a_truth_that_computes_in_float64_is_judged(name):
     """The null control: a site whose truth is float64's (the reference on widened inputs, a formula of its
     own, parameters held in float64 or left float32 and read exactly, a stated rounding and what is selected
     of it, a format's own division declared (`stored_as`), a float32 draw read only by a comparison (at
-    the top, from a call that returns it beside a value, from a scan's step), complex operands (widened to
+    the top, from a call that returns it beside a value, from a scan's step, past a barrier), complex
+    operands (widened to
     complex128), a dead fp32 value, an integer leaf, a float32 leaf of no entries, a float64 NumPy truth)
     is judged as before, its arm on par with itself."""
     arm, draw, truth = NULL[name]
@@ -191,7 +212,8 @@ def test_a_truth_that_computes_in_float64_is_judged(name):
 def test_a_truth_that_is_a_second_fp32_run_is_refused_by_its_leaf(name):
     """The injected faults: a truth that computes in fp32 (a model of a fixed dtype, an fp32 product
     widened at the end, a float32 leaf, the same float32 draw read as a value at the top or from a call, a
-    scan's float32 carry that weighs a later step, a float32 NumPy truth) is refused before any verdict,
+    scan's float32 carry that weighs a later step, a native kernel's result, a float32 NumPy truth) is
+    refused before any verdict,
     naming the leaf, where an arm on par with itself would otherwise pass against it."""
     arm, draw, truth, leaf = INJECTED[name]
     with pytest.raises(NarrowTruth) as refused:
@@ -204,10 +226,10 @@ def test_a_truth_that_is_a_second_fp32_run_is_refused_by_its_leaf(name):
                          ids=["sum", "difference", "product", "quotient", "square root"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=str)
 def test_one_operation_declared_a_formats_is_the_formats_own_result(operation, dtype):
-    """What a truth declares a format's own (`stored_as`) is that format's result bit for bit: one sum,
-    difference, product, quotient or square root of the format's values, computed in float64 and rounded
-    once to the format, is the operation run in the format, over a million pairs across the format's
-    range."""
+    """What a truth declares a format's own (`stored_as`) is that format's correctly rounded result bit for
+    bit: one sum, difference, product, quotient or square root of the format's values, computed in float64
+    and rounded once to the format, is the operation run in the format over two arrays on this host, over a
+    million pairs inside the format's normal range (no result near its least or its largest value)."""
     rng = np.random.default_rng(5430)
     a, b = (jnp.asarray(rng.standard_normal(1 << 20) * 2.0 ** rng.integers(-40, 40, 1 << 20), dtype)
             for _ in range(2))

@@ -203,18 +203,24 @@ def test_a_float_operation_without_a_float64_rule_refuses(name):
 def test_a_program_holding_a_linear_map_replays_in_float64():
     """A program holding one of Dew's linear maps (`generation.linear_map`, a high-level call of JAX's, which
     a model's kernels bind under forward mode) replays in float64: the map's own program, expanded as
-    lowering expands it, each operation in float64. The replay refused the call by name (a meanflow
-    update's truth, which is a replay for its float32 draws)."""
+    lowering expands it with the array it closes over, each operation in float64. The replay refused the
+    call by name (a meanflow update's truth, which is a replay for its float32 draws)."""
     from dew.nn.kernels import generation
 
-    def program(x):
-        gained = generation.linear_map(lambda gain, moving: jnp.tanh(gain) * moving,
-                                       lambda gain, cotangent: jnp.tanh(gain) * cotangent, x[:1], x)
-        return jnp.cumsum(gained)
+    rng = np.random.default_rng(0)
+    table = jnp.asarray(rng.normal(size=11), jnp.float32)
 
-    x = np.random.default_rng(0).normal(size=11).astype(np.float32)
+    # The map closes over an array, a constant its expansion alone brings into the program.
+    def program(x):
+        def scaled(gain, moving):
+            return jnp.tanh(gain) * table * moving
+
+        return jnp.cumsum(generation.linear_map(scaled, scaled, x[:1], x))
+
+    x = rng.normal(size=11).astype(np.float32)
     with jax.enable_x64(new_val=True):
-        wide = jnp.cumsum(jnp.tanh(jnp.asarray(x[:1], jnp.float64)) * jnp.asarray(x, jnp.float64))
+        wide = jnp.cumsum(jnp.tanh(jnp.asarray(x[:1], jnp.float64)) * np.asarray(table, np.float64)
+                          * jnp.asarray(x, jnp.float64))
     np.testing.assert_array_equal(np.asarray(float64_replay(program)(x)), np.asarray(wide))
 
 

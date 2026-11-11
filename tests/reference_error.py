@@ -684,7 +684,9 @@ def _read_through_floats(program, fed: Sequence[bool], lowering: str, found: dic
     negation): a truth that states a rounding (a quantized weight, a bf16 output) keeps it and what it
     selects of it, and one that computes in fp32 does not. A constant or a literal is its exact value
     whatever its format, as JAX promotes it where a float64 operation reads it: a parameter left float32
-    under a float64 run is no rounding."""
+    under a float64 run is no rounding. A native kernel whose result an output reads is refused whatever
+    its results' dtype: its body writes through references and runs in its own format, which this walk
+    does not read (`programs.opaque`); a truth is the portable arithmetic."""
     jaxpr = getattr(program, "jaxpr", program)
     feeding = {var for var, read in zip(jaxpr.outvars, fed, strict=True)
                if read and programs.computed(var) and _inexact(var)}
@@ -699,10 +701,15 @@ def _read_through_floats(program, fed: Sequence[bool], lowering: str, found: dic
                     if read and _below_float64(var.aval.dtype)]
             formats = (primitive is jax.lax.convert_element_type_p or primitive in FORMATTED
                        or rounds_nothing(primitive))
-            if made and not formats:
-                found[f"`{primitive.name}` computed in {made[0].str_short()} in "
-                      f"{equation.source_info.name_stack or 'the truth itself'}"] = None
-            reads = [True] * len(equation.invars)
+            where = equation.source_info.name_stack or "the truth itself"
+            if programs.opaque(equation):
+                found[f"a native kernel (`{primitive.name}`) in {where}, whose arithmetic is its own and is "
+                      f"not read here"] = None
+            elif made and not formats:
+                found[f"`{primitive.name}` computed in {made[0].str_short()} in {where}"] = None
+            # A barrier hands each operand on as the result at its place; any other operation's results
+            # read its every operand.
+            reads = outs if primitive is jax.lax.optimization_barrier_p else [True] * len(equation.invars)
         feeding.update(var for var, read in zip(equation.invars, reads, strict=True)
                        if read and programs.computed(var) and _inexact(var))
     return [var in feeding for var in jaxpr.invars]
