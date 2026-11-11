@@ -335,6 +335,11 @@ DERIVED = jax.make_user_context(default_value=False)
 hand-written ones, keyed on as `ALGEBRA` is: a program traced under one set of forms is never run under the
 other, and check 1 drives both (docs/design/algebra.md §6.9)."""
 
+WHOLE = jax.make_user_context(default_value=False)
+"""Whether a model runs its layer stack and sequences whole (`dew.nn.sharding.whole`), keyed on as `ALGEBRA`
+is: a trace reads it, so a call's identity states it with JAX's trace context, and a program traced whole
+is never run staged."""
+
 KERNEL_SEEN = jax.make_user_context(default_value=None)
 """The collection a lowering records its kernel launches into as it traces them
 (`dew.nn.kernels.tuning.seen`): JAX keys its trace caches on its identity, so a

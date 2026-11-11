@@ -12,7 +12,15 @@ import jax
 import numpy as np
 from jax.sharding import Mesh
 
-from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
+from dew.batch import (
+    CLOSES_WINDOW,
+    CONSUMED_COUNT,
+    EXAMPLES_CONSUMED,
+    PHASE,
+    VALID_ROWS,
+    Batch,
+    ConsumedCount,
+)
 from dew.data.dataset import rows_of
 from dew.nn.inputs import local_rows
 from dew.objectives.base import Metric, Shown
@@ -81,12 +89,12 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
     """`batch` sampled through `rollout` from `state`, as the run holds it, which its policy reads off
     the mesh (`decoder_stack.off_stages`), its host preparation `marked` and placed on `mesh`
     (`shard_batch`), its seconds counted in `interval`, `run`'s stream placing nothing meanwhile
-    (`FitRun.held`); without a rollout, the batch as it is. In a run on the examples clock the
-    batch it makes consumes the examples of the batches it read, its step's and each it drew further
-    (`clocked_rollout`). Where it `closes` a step of the run bounded to `examples`, the batch is closed
-    (`FitRun.closing`) after the rollout's last draw, so the look-ahead that finds the stream's end, and
-    the position the step saves, come after every batch it read, in a pool each a pooled read
-    (`FitRun.further`). With the batch, the position the step saves, or None.
+    (`FitRun.held`); without a rollout, the batch as it is. The batch it makes carries the run's metadata of
+    the read (`carried`): the data phase its step's batch was read in, and in a run on the examples clock the
+    examples of the batches it read, its step's and each it drew further. Where it `closes` a step of the run
+    bounded to `examples`, the batch is closed (`FitRun.closing`) after the rollout's last draw, so the
+    look-ahead that finds the stream's end, and the position the step saves, come after every batch it read,
+    in a pool each a pooled read (`FitRun.further`). With the batch, the position the step saves, or None.
 
     Host-side and untraceable: sampling, scoring, advantages. The key folds the
     step key once more, keeping the rollout's draws off the step's stream; both
@@ -102,7 +110,7 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
     consumed = _Consumed(batch)
     further = {"further": consumed.reading(run.further(interval))} if _draws_further(rollout) else {}
     with run.held():
-        made = clocked_rollout(rollout(state, _unclocked(batch), key, **further), batch, consumed)
+        made = carried(rollout(state, _unread(batch), key, **further), batch, consumed)
         prepared = marked(made)
         # The count the rollout's batch consumes is what it read, as `ConsumedCount`s count it.
         batch = shard_batch(mesh, prepared if CONSUMED_COUNT not in made else {
@@ -112,14 +120,15 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
     return run.closing(interval, batch, examples) if closes else (batch, None)
 
 
-CLOCK = (EXAMPLES_CONSUMED, CONSUMED_COUNT, CLOSES_WINDOW)
-"""The fields a batch of a run on the examples clock carries for the run's progress, which the batch it
-makes of it carries instead (`clocked_rollout`): none reaches the rollout."""
+READ = (EXAMPLES_CONSUMED, CONSUMED_COUNT, CLOSES_WINDOW, PHASE)
+"""The fields a read batch carries of its read for the run, not for its rows: its progress on the examples
+clock and the data phase it was read in, which the batch a rollout makes of it carries instead
+(`carried`): none reaches the rollout."""
 
 
-def _unclocked(batch: Batch) -> Batch:
-    """`batch` as a rollout reads it: without the fields of the run's clock (`CLOCK`)."""
-    return {name: value for name, value in batch.items() if name not in CLOCK}
+def _unread(batch: Batch) -> Batch:
+    """`batch` as a rollout reads it: without the run's fields of its read (`READ`)."""
+    return {name: value for name, value in batch.items() if name not in READ}
 
 
 class _Consumed:
@@ -137,25 +146,27 @@ class _Consumed:
             self.count += batch[CONSUMED_COUNT].examples
 
     def reading(self, read: Callable[[], Batch | None]) -> Callable[[], Batch | None]:
-        """`read`, each batch it reads added and handed on without the clock's fields."""
+        """`read`, each batch it reads added and handed on without the run's fields of its read."""
         def drawn() -> Batch | None:
             batch = read()
             if batch is None:
                 return None
             self.add(batch)
-            return _unclocked(batch)
+            return _unread(batch)
         return drawn
 
 
-def clocked_rollout(made: Batch, read: Batch, consumed: _Consumed) -> Batch:
-    """The batch a rollout `made` of the batch it `read` and those it drew further, as a run on the
-    examples clock steps it: consuming the examples they consumed (`consumed`), all on its first row, as a
-    step sums them over its rows, counted as they counted them (`ConsumedCount`), and closing the update
-    window where the read batch does (`CLOSES_WINDOW`), where the run closed it before the rollout; a
-    batch with no real row on this process (a pool's share whose stream ran out,
-    `dew.training._fit.pooled_read`) makes one with none. Each process counts the rows it holds, so the
-    step's sum over the pool's rows counts each once. A run on another clock reads no count: its
-    rollout's batch is as made."""
+def carried(made: Batch, read: Batch, consumed: _Consumed) -> Batch:
+    """The batch a rollout `made` of the batch it `read` and those it drew further, carrying the run's
+    fields of the read (`READ`): the data phase `read` was read in, which the step's pass count reads
+    (`dew.training.phase_passes`), and as a run on the examples clock steps it: consuming the examples they
+    consumed (`consumed`), all on its first row, as a step sums them over its rows, counted as they counted
+    them (`ConsumedCount`), and closing the update window where the read batch does (`CLOSES_WINDOW`), where
+    the run closed it before the rollout; a batch with no real row on this process (a pool's share whose
+    stream ran out, `dew.training._fit.pooled_read`) makes one with none. Each process counts the rows it
+    holds, so the step's sum over the pool's rows counts each once. A run on another clock reads no
+    count."""
+    made = {**made, PHASE: read[PHASE]} if PHASE in read else made
     if not consumed.clocked:
         return made
     held = np.zeros(rows_of(made), np.int32)

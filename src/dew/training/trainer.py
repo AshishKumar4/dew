@@ -2243,12 +2243,16 @@ class Trainer(Generic[Loss, Effects]):
         log, and trains on. Its batches keep their work columns, as unknown work (`uncounted`), so every
         process runs one step program and the step's global sum leaves train/mfu unreported pool-wide. One
         thread prepares batches, the prefetch worker or a rollout's caller, and only it writes the reason.
-        A count asked of the objective directly stays strict.
+        A count asked of the objective directly stays strict. A phased run's batch is counted at its
+        phase's model (`phase_passes`).
         """
         batch = consumption_counted(batch, clocked=self._examples is not None)
         if self._refusal is None:
+            # The model the batch's step runs: its phase's pass count (`phase_passes`), read off the batch,
+            # since this thread prepares it ahead of the step that takes the count.
+            objective = self.phase_passes.objective_for(self.phase_passes.count(batch))
             try:
-                return prepare_counts(self.objective, batch, count_model=True)
+                return prepare_counts(objective, batch, count_model=True)
             except MissingFlopsCount as missing:
                 self._refusal = str(missing)
                 _log.debug("train/mfu is not reported for %s: %s", type(self.objective).__name__, missing)

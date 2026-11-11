@@ -540,7 +540,7 @@ def clocked(examples: int | None, steps: int | None, *, custom_progress: bool = 
     a run counted otherwise. The transaction hands the run's optimizer that progress, which a custom
     step's update is not handed: one whose schedule reads it (`custom_progress`, a schedule over the
     whole run) is refused. A rollout's batch consumes what the batches it read did
-    (`dew.training.rollout.clocked_rollout`), the run reading ahead for its stream's end after the
+    (`dew.training.rollout.carried`), the run reading ahead for its stream's end after the
     rollout's last draw. Its progress reaches its end where its read ends at its bound
     (`Loader.bound_ends`), so a
     take or slice after the bound, which would end it first, is refused, as is a bound past what the
