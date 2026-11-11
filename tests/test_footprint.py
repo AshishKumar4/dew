@@ -793,7 +793,8 @@ def test_a_ragged_product_on_a_gpu_holds_at_least_its_output():
 
 def test_a_gradient_states_its_peak_a_bound_from_below_where_a_nested_ragged_product_runs():
     """A gradient whose program runs a ragged product on a GPU, in a loop's body as an expert stack's
-    scan holds one, or in an interpreted Pallas kernel, whose interpreter's program XLA compiles, states
+    scan holds one, or in an interpreted Pallas kernel, a grid's or a core map's, whose interpreter's
+    program XLA compiles, states
     its peak a bound from below (`Peak.exact` False); on a CPU, or with no ragged product, its peak is
     the program's own."""
     rows, sizes = jax.ShapeDtypeStruct((64, 16), jnp.float32), jax.ShapeDtypeStruct((4,), jnp.int32)
@@ -816,8 +817,18 @@ def test_a_gradient_states_its_peak_a_bound_from_below_where_a_nested_ragged_pro
         ragged = pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct((64, 16), jnp.float32), interpret=True)
         return jnp.sum(ragged(rows, jnp.ones((4, 16, 16)), sizes) * (rows @ weights[0, 0])), ()
 
+    def mapped(weights, rows, sizes):
+        """The same product in an interpreted Mosaic GPU kernel (a core map), which JAX lowers through its
+        interpreter."""
+        from jax.experimental.pallas import mosaic_gpu as plgpu
+
+        def kernel(rows, kernels, sizes, out):
+            out[...] = jax.lax.ragged_dot(rows[...], kernels[...], sizes[...])
+        ragged = plgpu.kernel(kernel, out_type=jax.ShapeDtypeStruct((64, 16), jnp.float32), interpret=True)
+        return jnp.sum(ragged(rows, jnp.ones((4, 16, 16)), sizes) * (rows @ weights[0, 0])), ()
+
     none = Workspace(0, 0)
-    for ragged in (experts, interpreted):
+    for ragged in (experts, interpreted, mapped):
         assert not gradient_peak(ragged, weights, (rows, sizes), platform="gpu", workspace=none).exact
     assert gradient_peak(experts, weights, (rows, sizes), platform="cpu", workspace=Workspace(0, 0)).exact
     assert gradient_peak(dense, weights, (rows, sizes), platform="gpu", workspace=Workspace(0, 0)).exact

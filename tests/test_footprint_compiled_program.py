@@ -231,6 +231,22 @@ def test_a_pallas_kernel_holds_what_its_lowering_holds():
         held.output_size_in_bytes + held.temp_size_in_bytes)
 
 
+def test_a_mosaic_gpu_kernel_holds_its_outputs_alone():
+    """A native Mosaic GPU kernel (`plgpu.kernel`, a core map's `mpmd_map`) is one custom call to XLA, as a
+    grid's Pallas call is (`mpmd_map_mgpu_lowering_rule`, jax/_src/pallas/mosaic_gpu/
+    pallas_call_registration.py): its body's values in registers and shared memory, so the call holds its
+    output alone, whatever its body computes."""
+    from jax.experimental.pallas import mosaic_gpu as plgpu
+
+    shape = jax.ShapeDtypeStruct((256, 256), jnp.float32)
+
+    def body(rows, out):
+        out[...] = jnp.tanh(rows[...] @ rows[...]) @ rows[...]
+
+    program = jax.make_jaxpr(plgpu.kernel(body, out_type=shape))(shape).jaxpr
+    assert peak_bytes(compiled(program, "cuda"), "gpu", Workspace(0, 0)) == 256 * 256 * 4
+
+
 @pytest.mark.parametrize("order", ["cuda-first", "rocm-first"])
 def test_a_platform_dependent_program_holds_the_branch_its_platform_lowers(order):
     """A `platform_dependent` conditional lowers to the branch of the platform it is lowered for, inline,

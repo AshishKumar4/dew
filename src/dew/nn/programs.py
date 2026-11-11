@@ -50,8 +50,8 @@ def platform_branch(platforms: Sequence[Sequence[str] | None], lowering: str) ->
 
 
 NATIVE_KERNELS = (pallas_call_p, mpmd_map_p)
-"""The primitives a native Pallas kernel binds: a grid's call (`pallas_call`), and a core map's
-(`pallas.core_map`, which a Mosaic GPU kernel, `plgpu.kernel`, runs through), each one custom call
+"""The primitives a Pallas kernel binds: a grid's call (`pallas_call`), and a core map's (`pallas.core_map`,
+which a Mosaic GPU kernel, `plgpu.kernel`, runs through), each one custom call where it runs natively
 (`pallas_call_lowering`, jax/_src/pallas/triton/pallas_call_registration.py; `_mpmd_map_lowering`,
 jax/_src/pallas/mpmd.py)."""
 
@@ -60,8 +60,12 @@ def opaque(equation: jcore.JaxprEqn) -> bool:
     """Whether XLA sees nothing of `equation`'s body: a native Pallas kernel's (`NATIVE_KERNELS`), one
     custom call whose results are its outputs alone, its body's values in registers and shared memory,
     its products Triton's or Mosaic GPU's. A program `dew.training.compiled_program.compiled` reads holds
-    no interpreted one: it is its interpreter's program (`dew.training.compiled_program.interpreter`)."""
-    return equation.primitive in NATIVE_KERNELS
+    no interpreted grid call: it is its interpreter's program (`dew.training.compiled_program.interpreter`).
+    An interpreted core map is no native kernel: JAX lowers it through its interpreter
+    (`_mpmd_map_fallback_lowering`), so its body is read as XLA runs it."""
+    if equation.primitive is mpmd_map_p:
+        return not equation.params["interpret"]
+    return equation.primitive is pallas_call_p
 
 
 def bodies(equation: jcore.JaxprEqn) -> list[jcore.Jaxpr]:
