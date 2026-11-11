@@ -58,7 +58,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tables, tuning
-from dew.nn.kernels.templates import bundles, mosaic, product, resources, swizzling
+from dew.nn.kernels.templates import bundles, mosaic, operands, product, resources, swizzling
 from dew.nn.kernels.templates.cost import Work, estimate
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.table import (
@@ -1379,7 +1379,8 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
             pairs = algebra.key_block_pairs([functools.partial(rows, name) for name in products],
                                             operand("keys"), prefix, at_token,
                                             Issuer(call, {"pairs": gated}).summed,
-                                            lambda up: staged_parts(family, up, keyed),
+                                            lambda up: operands.staged(family, up.astype(jnp.float32),
+                                                                       keyed),
                                             _placed(call, placing), chunk=chunk, right=_pairs_right(call))
             masked = []
             for name, found in zip(products, pairs, strict=True):
@@ -1514,14 +1515,6 @@ def pairing_parts(family: mosaic.Family, held: int) -> int:
 def _pairing_operand(call: Call) -> Operand:
     """The form the factored pairs' fp32 operands take (`pairing_parts`)."""
     return Operand(call.rows, pairing_parts(call.family, call.held.parts), jnp.dtype(jnp.float32))
-
-
-def staged_parts(family: mosaic.Family, value: jax.Array, buffers) -> Parts:
-    """`value` staged once in shared memory as its parts in `buffers` (`product.formed`, itself in one), a
-    block of whose rows a product takes (`Parts.rows`, `algebra.Staged`)."""
-    parts = product.formed(value, len(buffers)) if len(buffers) > 1 else (value,)
-    return Parts(tuple(family.staged(part, buffer) for part, buffer in zip(parts, buffers, strict=True)),
-                 jnp.float32)
 
 
 def _pairs_right(call: Call) -> int:

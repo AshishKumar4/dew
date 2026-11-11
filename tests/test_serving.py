@@ -517,23 +517,26 @@ def test_a_request_of_several_continuations_keeps_its_tickets_contract():
     assert waiting.cancelled()
 
 
-def test_a_failure_between_a_cancelled_requests_dropped_continuations_settles_every_other_request():
-    """A request of three continuations cancelled while it waits, one of them dropped by a step, then the
-    server failing: the cancelled request stays cancelled, told once, another cancelled one never seated is
-    told, and a waiting request settles with the failure."""
+def test_a_failure_after_a_cancelled_requests_dropped_continuations_settles_every_other_request():
+    """A request of three continuations cancelled while it waits is dropped by a step, each continuation,
+    none taking the one slot, which the next request takes; then the server failing: the dropped request
+    stays cancelled, told once, another cancelled one never seated is told, and the running and waiting
+    requests settle with the failure."""
     from dataclasses import replace
 
     server = Server.from_task(replace(task(), n=3), slots=1, capacity=128)
     dropping = server.submit(PROMPTS[0], 4, key=0)
     assert dropping.cancel()
-    never = server.submit(PROMPTS[1], 4, key=1)
-    waiting = server.submit(PROMPTS[2], 4, key=2)
+    running = server.submit(PROMPTS[1], 4, key=1)
+    never = server.submit(PROMPTS[2], 4, key=2)
+    waiting = server.submit(PROMPTS[3], 4, key=3)
     server.step()
+    assert running.running()
     assert never.cancel()
     failure = RuntimeError("the serving thread stopped")
     server.fail(failure)
     assert dropping.cancelled() and never.cancelled()
-    assert waiting.exception() is failure
+    assert running.exception() is failure and waiting.exception() is failure
 
 
 def test_submission_keeps_device_keys_on_device_until_admission():
