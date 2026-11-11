@@ -1907,28 +1907,42 @@ def fitted[Entry](
 
 def _endless(chain: Pipeline, version: int = PLAN_VERSIONS[-1]) -> Pipeline:
     """`chain` read endlessly: a repeat before its batch where it has none and its read can end. A
-    chain of phases reads each phase through the chain's own stages before its batch, and each phase that
-    does not read on already (`_reads_on`, as Grain refuses to repeat an order without end) is read
-    endlessly itself, its repeat before its own batch as a single stream's is, the chain's batch after
-    the phases; a mixture whose members all read on is read as it is. A plan of a version before
-    `DECLARED_MIX` read a phase that batches inside itself with the repeat after its batch, so a pass
-    holding less than a batch never yielded one and each pass dropped what was left of its last; such a
-    plan reads so still, as a run saved under it read."""
+    chain of phases reads each phase through the chain's own stages, and where one of them already
+    reads on (`_reads_on`), as Grain refuses to repeat an order without end, each other phase repeats
+    at the place the chain's own repeat takes, its share of the chain's stages before the batch moved
+    into it; a mixture whose members all read on is read as it is. A phase that batches inside itself and
+    states no repeat reads on with its repeat before its own batch (`_repeated_inside`), from plan version
+    `DECLARED_MIX`."""
+    source = chain.source
+    if isinstance(source, Phases) and version >= DECLARED_MIX:
+        chain = dataclasses.replace(chain, source=dataclasses.replace(
+            source, pipelines=tuple(map(_repeated_inside, source.pipelines))))
+        source = chain.source
     if any(isinstance(stage, Repeat) for stage in chain.stages) or _reads_on(chain):
         return chain
     batching = [index for index, stage in enumerate(chain.stages)
                 if isinstance(stage, (BatchStage, TokenBudget))]
     at = batching[0] if batching else len(chain.stages)
-    source = chain.source
     if isinstance(source, Phases):
         read = [child._then(*chain.stages[:at]) for child in source.pipelines]
-        if version >= DECLARED_MIX or any(map(_reads_on, read)):
-            each = tuple(phase if _reads_on(phase) else
-                         _endless(phase, version) if version >= DECLARED_MIX else phase.repeat()
-                         for phase in read)
+        if any(map(_reads_on, read)):
+            each = tuple(phase if _reads_on(phase) else phase.repeat() for phase in read)
             return dataclasses.replace(chain, source=dataclasses.replace(source, pipelines=each),
                                        stages=chain.stages[at:])
     return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
+
+
+def _repeated_inside(phase: Pipeline) -> Pipeline:
+    """`phase` read on with its repeat before its own batch, as a single stream's is, where it batches
+    inside itself and states no repeat: a repeat after its batch, the chain's, dropped what each pass left
+    of its last batch, and a pass holding less than a batch never yielded one (12 read it so, and a run
+    saved under it reads so still). A phase that states a repeat, or batches outside itself, as it is."""
+    batching = [index for index, stage in enumerate(phase.stages)
+                if isinstance(stage, (BatchStage, TokenBudget))]
+    if not batching or _reads_on(phase) or any(isinstance(stage, Repeat) for stage in phase.stages):
+        return phase
+    return dataclasses.replace(phase, stages=(*phase.stages[:batching[0]], Repeat(None),
+                                              *phase.stages[batching[0]:]))
 
 
 def _reads_on(chain: Pipeline) -> bool:
