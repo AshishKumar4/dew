@@ -13,6 +13,7 @@ per-share state and refuse changed topology before a reader opens.
 
 from __future__ import annotations
 
+import base64
 import bisect
 import contextlib
 import dataclasses
@@ -38,8 +39,8 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import _position
-from dew._records import record
-from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch, padded_rows
+from dew._records import boolean, integer, listed, record, strings, text
+from dew.batch import EXAMPLES_CONSUMED, PHASE, VALID_ROWS, Batch, Phase, padded_rows
 from dew.data import cgroups
 from dew.mesh import LayoutRefused, batch_axes
 
@@ -1614,7 +1615,7 @@ class PhasedStream:
                 f"a step of {read} records crossed the phase boundary at record "
                 f"{end}; phases end on step boundaries"
             )
-        return batch
+        return {**batch, PHASE: Phase(phase)}
 
     def get_state(self) -> bytes:
         # The phase of the last record read: at a boundary nothing of the next
@@ -1729,6 +1730,135 @@ class PhasedStream:
         if self._current is not None:
             self._streams[self._current].close()
         self._current = None
+
+
+STEP_PHASES = "dew_step_phases"
+"""The key a read of phases each its own stream writes its position under (`StepPhases`)."""
+
+
+class StepPhases(Forwarding):
+    """Reads phases on the step clock one after another, each its own stream, opened at the step the
+    phase before it ends: a read per share among them, cut per share where its order is (a stream batched
+    by its tokens after steps that drop rows), whose records no global count places. Phase `p` reads
+    `ends[p] - ends[p - 1]` batches, one a step, its last running on (None); each batch says the phase it
+    was read in (`PHASE`). Each phase's reader is made where the run first asks of it (its identity,
+    where it ends) and read from its phase's first step (`opened`, which a run's statistics count it
+    from); its stop, its stop's budget and its close are the open phase's (`Forwarding`). Its position is
+    the phase it stands in, the steps the run has read, and that phase's reader's own position, which
+    resumes it as its own; a phase the run completed is refused where this run's ends it elsewhere or
+    reads it otherwise. What a phase's reader read ahead of its end is never trained on: the next phase
+    reads its own from its first step. Its stages (`stages`, `phase_stages`) state each phase of another
+    batch than the one before it, from its first step, as `PhasedStream`'s do."""
+
+    def __init__(self, readers: Sequence[Callable[[], Iterator[Batch]]], ends: Sequence[int | None], *,
+                 batches: Sequence[int], opened: Callable[[int], None] = lambda phase: None):
+        if len(readers) != len(ends) or len(batches) != len(ends):
+            raise ValueError(f"phases need one end and one batch each: {len(readers)} phases, {len(ends)} "
+                             f"ends, {len(batches)} batches")
+        self._make, self._ends, self._opened = list(readers), list(ends[:-1]), opened
+        self.batches = tuple(batches)
+        steps = (0, *(end for end in self._ends if end is not None))
+        # A step's records as `stages` count them: a phase's steps of its own batch.
+        starts = tuple(itertools.accumulate(
+            ((after - before) * batch
+             for before, after, batch in zip(steps, steps[1:], batches, strict=False)), initial=0))
+        self.stages = phase_stages(self.batches[:len(starts)], starts)
+        self._readers: dict[int, Iterator[Batch]] = {}
+        self._steps = 0
+        self._current: int | None = None
+        self._source: Iterator[Batch] | None = None
+
+    def __iter__(self) -> Iterator[Batch]:
+        return self
+
+    def _phase(self, steps: int) -> int:
+        """The phase that reads step `steps`: the first whose end is past it."""
+        return next((index for index, end in enumerate(self._ends) if end is None or steps < end),
+                    len(self._ends))
+
+    def _reader(self, phase: int) -> Iterator[Batch]:
+        if phase not in self._readers:
+            self._readers[phase] = self._make[phase]()
+        return self._readers[phase]
+
+    def _stream(self, phase: int) -> Iterator[Batch]:
+        """Phase `phase`'s reader, read from here on, the one read before it closed."""
+        if phase != self._current:
+            if self._current is not None:
+                closing = self._readers.pop(self._current)
+                if isinstance(closing, Closeable):
+                    closing.close()
+            self._source, self._current = self._reader(phase), phase
+            self._opened(phase)
+        assert self._source is not None
+        return self._source
+
+    def __next__(self) -> Batch:
+        phase = self._phase(self._steps)
+        batch = next(self._stream(phase))
+        self._steps += 1
+        return {**batch, PHASE: Phase(phase)}
+
+    def get_state(self) -> bytes:
+        # The phase of the last step read: at a boundary nothing of the next phase is read yet.
+        phase = self._phase(self._steps - 1) if self._steps else 0
+        stream = self._stream(phase)
+        if not isinstance(stream, Checkpointable):
+            raise TypeError(f"phase {phase}'s stream keeps no position")
+        own = stream.get_state()
+        return json.dumps({STEP_PHASES: {
+            "steps": self._steps, "phase": phase, "ends": self._ends[:phase],
+            "identities": [self._identity(index) for index in range(phase + 1)],
+            "position": base64.b64encode(own if isinstance(own, bytes)
+                                         else json.dumps(own).encode()).decode(),
+            "encoded": isinstance(own, bytes)}}).encode()
+
+    def set_state(self, state: bytes) -> None:
+        saved = record(record(json.loads(state), "saved phases' position").get(STEP_PHASES),
+                       "saved phases' position")
+        phase = integer(saved["phase"], "the saved phase")
+        ends = list(listed(saved["ends"], "saved phase ends", read=integer, what="a list of steps"))
+        identities = list(strings(saved["identities"], "saved phase identities"))
+        if phase >= len(self._make) or ends != self._ends[:phase] or identities[:phase] != [
+                self._identity(index) for index in range(phase)]:
+            raise ValueError(f"the saved run finished phases ending at steps {ends}, and this run's phases "
+                             f"end at {self._ends[:phase]}, or read them otherwise; a phase the run has read "
+                             "cannot change under it")
+        steps = integer(saved["steps"], "the saved steps")
+        end = self._ends[phase] if phase < len(self._ends) else None
+        if end is not None and steps > end:
+            raise ValueError(f"the saved run has read {steps} steps, past this run's end of phase {phase} "
+                             f"at {end}")
+        own = base64.b64decode(text(saved["position"], "the saved phase's position"))
+        stream = self._stream(phase)
+        if not isinstance(stream, Checkpointable):
+            raise TypeError(f"phase {phase}'s stream keeps no position")
+        encoded = boolean(saved["encoded"], "the saved position's encoding")
+        stream.set_state(own if encoded else json.loads(own))
+        self._steps = steps
+
+    def _identity(self, phase: int) -> str:
+        """What phase `phase`'s reader reads, as the pool agrees it (`stream_identity`): its plan as this
+        share reads it, its topology among it."""
+        return stream_identity(self._reader(phase))
+
+    def identity(self) -> str:
+        return "; ".join([*(self._identity(index) for index in range(len(self._make))),
+                          f"phases ending at steps {list(self._ends)}"])
+
+    @property
+    def ends(self) -> Ends:
+        # Any phase's reader may run out before its end, as the last may: the run ends where the first
+        # one does, on every share together only where each phase's does.
+        stated = {stream_ends(self._reader(index)) for index in range(len(self._make))}
+        return "apart" if "apart" in stated else "together" if "together" in stated else "never"
+
+    def close(self) -> None:
+        for reader in self._readers.values():
+            if isinstance(reader, Closeable):
+                reader.close()
+        self._readers.clear()
+        self._source, self._current = None, None
 
 
 @runtime_checkable

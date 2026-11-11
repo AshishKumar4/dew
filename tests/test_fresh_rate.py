@@ -236,6 +236,36 @@ def test_a_resumed_run_trains_in_the_groups_it_names_refused_a_changed_partition
 
 
 @pytest.mark.mesh(devices=8)
+def test_a_resumed_run_clamps_to_the_bounds_it_names_refused_bounds_its_state_lacks(tmp_path):
+    """A run resumed naming a bounded group's new interval clamps its parameters to that interval from its
+    next step, not to the one its checkpoint's clamp holds; one that bounds a group its record left
+    unbounded, whose clamp its optimizer state does not hold, is refused by name before it restores (the
+    delta review of row 5246's resume fix: the record said the new interval and the run clamped to the
+    old)."""
+    from run_kinds import trained
+
+    run = dataclasses.replace(context_run(tmp_path), validation=None)
+    loose = dataclasses.replace(BASE, bounds=(-10.0, 10.0))
+    trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(FRESH, loose))),
+            tmp_path, "bounded", trainer=SAVING)
+    tight = dataclasses.replace(BASE, bounds=(-1e-3, 1e-3))
+    resumed, _ = trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(
+        FRESH, tight))), tmp_path, "bounded", trainer={**SAVING, "steps": 2})
+    assert int(resumed.step) == 2 and groups(tmp_path, "bounded")[1].bounds == (-1e-3, 1e-3)
+    params = resumed.variables["params"]
+    based = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(params)
+             if labelled(groups(tmp_path, "bounded"), params)[
+                 tuple(getattr(entry, "key", entry) for entry in path)] == "base"]
+    # The interval as each leaf's dtype holds it (float32's 1e-3 a hair above Python's).
+    assert based and all(float(jnp.max(jnp.abs(leaf))) <= float(np.asarray(1e-3, leaf.dtype))
+                         for leaf in based)
+    fenced = dataclasses.replace(FRESH, bounds=(-1.0, 1.0))
+    with pytest.raises(ValueError, match="bounds added or dropped"):
+        trained(dataclasses.replace(run, optim=dataclasses.replace(run.optim, param_groups=(fenced, tight))),
+                tmp_path, "bounded", trainer={**SAVING, "steps": 3})
+
+
+@pytest.mark.mesh(devices=8)
 def test_a_run_naming_groups_none_of_them_fresh_steps_its_fresh_modules_at_the_fresh_rate(tmp_path):
     """A run that names its groups but none that claims the modules it draws fresh, as a decision context
     arm did with a base group of every parameter, steps its cross-attention block and its head at the

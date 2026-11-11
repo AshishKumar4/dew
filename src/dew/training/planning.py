@@ -665,6 +665,11 @@ class FitSearch[LossT, EffectsT]:
     footprint (`dew.training.footprint`), which picks the search's first rung (`derived_start`); None
     for a run that starts from a plan, recorded, compiled ahead or resumed, which the search tries first."""
     derived: list[dict[str, JSON]] = dataclasses.field(default_factory=list)
+    split_stated: bool = False
+    """Whether the run states its split (`Trainer(split=...)`), which the search then reads alone."""
+    stated: bool = False
+    """Whether the run states its split (`split_stated`) and its remat (`remat_set`): nothing is left for
+    the derivation to choose, so it derives no footprint and the compile decides (`admitted`)."""
     """Each rung the derivation read before the first compile: its rung, terms, headroom and label."""
     judged_at: dict[tuple[str, int], int | None] = dataclasses.field(default_factory=dict)
     """The derived headroom of each candidate the derivation read, by its rung (`rung`) and split: what
@@ -709,6 +714,15 @@ class FitSearch[LossT, EffectsT]:
         """The first fitting plan found by the split-and-rung search, and every compile it made, its
         first rung the one the derivation picks (`derived_start`). Once admission succeeds, no optional
         alternate policy is compiled."""
+        # A run that states its split (one candidate) and its remat leaves the derivation nothing to
+        # choose: it reads no footprint, and the compile at that plan decides (a 4B decoder's derivation
+        # held its first step for 47 minutes at a split and remat the run had stated, row 5479).
+        self.stated = self.split_stated and self.remat_set
+        if self.stated and self.derive is not None:
+            self.derived.append({**self.current(), "narrow": self.narrow, "split": candidates[0],
+                                 "headroom": None, "label": "stated", "terms": None})
+            _log.info("the run states its split %d and remat %s, so no footprint is derived and the compile "
+                      "decides", candidates[0], self.remat_rung())
         # A rung fits where its most microbatches do; the derivation then finds its split there, which
         # alone is compiled where it is right (`derived_split`). A step that fits at its fewest fits at
         # every split, at the rung it stands on: one derivation says so, and no rung is walked.
@@ -784,7 +798,7 @@ class FitSearch[LossT, EffectsT]:
         stands. False where the search reads no derivation first (`derived_start`,
         `derived_split`), judges none, or the fewest does not fit: the walk and the halving then read what
         they did, the halving from this judgment where the walk ends on this rung."""
-        if self.derive is None or self.resumed is not None or first != 0 or not self.judging():
+        if not self.deriving() or self.resumed is not None or first != 0 or not self.judging():
             return False
         headroom = self.judged(candidates[0], self.narrow)
         return headroom is not None and headroom >= 0
@@ -798,7 +812,7 @@ class FitSearch[LossT, EffectsT]:
         started, at the base rung, as does a ladder no rung of which fits. A run that sets its remat
         compiles at it alone; its split is read there (`derived_split`). A 'fits' is the derivation's
         judgment, which the one compile confirms."""
-        if self.derive is None or self.resumed is not None or self.remat_set:
+        if not self.deriving() or self.resumed is not None or self.remat_set:
             return
         base = self.configuration()
         label, narrow = self.walked(split)
@@ -862,7 +876,7 @@ class FitSearch[LossT, EffectsT]:
         footprint the derivation traced of it where it read it (`footprints`); one the step compiled ahead
         serves (`ahead`) derives none, its compile having judged the derivation where it was compiled."""
         return self.lower(split, self.narrow, self.footprints.get(self.candidate_key(split, self.narrow)),
-                          derived=self.ahead is None)
+                          derived=self.ahead is None and not self.stated)
 
     def relowering(self, split: int) -> Candidate:
         """The step at `split` lowered afresh past a kernel that spilled (`Relowered`), with no footprint:
@@ -891,7 +905,7 @@ class FitSearch[LossT, EffectsT]:
         derivation trusted where it refuses one, so the one compile at the most performant plan it admits
         decides (row 3341). `first` where the run starts from a plan (a recorded one, or a checkpoint's
         rung), where the derivation cannot judge the step, or where no candidate it reads fits."""
-        if self.derive is None or self.resumed is not None or first != 0:
+        if not self.deriving() or self.resumed is not None or first != 0:
             return first
         if not self.judging():
             if not self.derived:
@@ -923,7 +937,7 @@ class FitSearch[LossT, EffectsT]:
         """The derivation's headroom of the step at `split` at the objective's rung, traced where the search
         has not judged it yet (a trace, where a compile it saves is a minute and more), None where it
         cannot judge."""
-        if self.derive is not None and self.judging():
+        if self.deriving() and self.judging():
             return self.judged(split, self.narrow)
         return self.judged_at.get(self.candidate_key(split, self.narrow))
 
@@ -975,6 +989,11 @@ class FitSearch[LossT, EffectsT]:
             return False
         derived = self.judgment(split)
         return derived is not None and derived < 0
+
+    def deriving(self) -> bool:
+        """Whether the search derives footprints: it has the step to trace (`derive`), and the run left it
+        something to choose (`stated`)."""
+        return self.derive is not None and not self.stated
 
     def judging(self) -> bool:
         """Whether every process's devices judge a derived footprint (`memory.judged`) at the search's
@@ -1052,7 +1071,8 @@ class FitSearch[LossT, EffectsT]:
                 # A spill's refusal changes the configs every derivation traced: each is traced again, the
                 # kept step's here.
                 self.footprints.clear()
-                candidate = self.footprinted(split, candidate)
+                if not self.stated:
+                    candidate = self.footprinted(split, candidate)
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
         self.sampled = None
         if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:

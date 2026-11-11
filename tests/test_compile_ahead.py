@@ -484,7 +484,9 @@ def test_a_run_compiled_ahead_on_gpus_given_no_capacity_hears_they_state_no_memo
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
-    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), remat=REMAT_POLICIES["full"])
+    # Its split left to the plan: a run that states both derives nothing whatever its devices state.
+    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), remat=REMAT_POLICIES["full"],
+                        split=None)
     with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
         ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
     plan = record(ahead.plan, "plan")

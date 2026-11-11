@@ -283,10 +283,12 @@ def recorded_param_groups(saved: epath.Path) -> tuple[ParamGroup, ...] | None:
     return from_record(tuple[ParamGroup, ...], groups)
 
 
-def partitioned(groups: Sequence[ParamGroup]) -> tuple[tuple[str, tuple[str, ...]], ...]:
-    """What of `groups` partitions a run's parameters, and so its optimizer state: each group's name and
-    patterns, in order (a parameter belongs to the first group it matches)."""
-    return tuple((group.name, group.patterns) for group in groups)
+def partitioned(groups: Sequence[ParamGroup]) -> tuple[tuple[str, tuple[str, ...], bool], ...]:
+    """What of `groups` shapes a run's optimizer state: each group's name and patterns, in order (a
+    parameter belongs to the first group it matches), and whether it is bounded, its clamp a state of its
+    own (`dew.optim.BoundsState`); a bounded group's interval is not, which a resume sets anew
+    (`dew.optim.with_bounds`)."""
+    return tuple((group.name, group.patterns, group.bounds is not None) for group in groups)
 
 
 def trained_modules(objective: Objective[Loss, Effects],
@@ -2142,8 +2144,9 @@ class RunConfig:
         own, or its named ones with the fresh group beside them, or none named, the default groups
         (`OptimConfig.fresh_groups`). A resumed run that names no groups trains in those its record names,
         as its optimizer state holds them (none for a record written before runs took them); one that
-        names some trains in its own, their rates and bounds as it states them, refused where their names
-        or patterns are not the record's, which partition the optimizer state it resumes. Every process
+        names some trains in its own, their rates and a bounded group's interval as it states them,
+        refused where their names, patterns or which of them are bounded are not the record's, which
+        shape the optimizer state it resumes (`partitioned`). Every process
         agrees on the groups before any records them."""
         def resolved() -> JSON:
             named = self.optim.param_groups
@@ -2162,9 +2165,10 @@ class RunConfig:
             claimed = dataclasses.replace(self.optim, param_groups=groups).with_fresh(modules, leaves)
             if recorded is not None and partitioned(claimed.param_groups) != partitioned(recorded):
                 raise ValueError(f"run {name!r} resumes an optimizer state partitioned by the groups "
-                                 f"{partitioned(recorded)} (names and patterns), and names "
-                                 f"{partitioned(claimed.param_groups)}: change only a group's rate, decay, "
-                                 "schedule or bounds on a resume, or start a new run")
+                                 f"{partitioned(recorded)} (names, patterns and whether each is bounded), "
+                                 f"and names {partitioned(claimed.param_groups)}: a group's bounds added or "
+                                 "dropped change the state it holds; change only a group's rate, decay, "
+                                 "schedule or a bounded group's interval on a resume, or start a new run")
             return to_record(claimed.param_groups, tuple[ParamGroup, ...])
         groups = from_record(tuple[ParamGroup, ...], agreed_same("run param groups", resolved))
         return self.optim if groups == self.optim.param_groups else dataclasses.replace(
@@ -2274,9 +2278,11 @@ class DecoderRunConfig(RunConfig):
     block, the passes trained through and their recomputation (`CausalTransformer.with_passes`), each
     the run's choice over the checkpoint's own. The language-model and the decision runs take it."""
 
-    loop_steps: int | None = None
+    loop_steps: int | tuple[int, ...] | None = None
     """The passes a looped checkpoint runs its block (`CausalTransformer.loop`), such
-    as Ouro's at 1, 2 or 4; None keeps the checkpoint's own."""
+    as Ouro's at 1, 2 or 4; or one count a phase of the run's data (`dew.data.phases`,
+    `Trainer`'s `phase_passes`), a pass count that grows over the run, each phase's step
+    compiled with its own and the run handing on the last; None keeps the checkpoint's own."""
     loop_layers: tuple[int, int] | None = None
     """The block of layers [first, end) that `loop_steps` repeats: a pretrained
     decoder with no loop gains one over its own layers, as Qwen 3.5's middle block
@@ -2299,6 +2305,28 @@ class DecoderRunConfig(RunConfig):
     """Exit each token at the first pass whose cumulative exit probability reaches this
     (`Loop.exit_threshold`); None keeps a checkpoint's own choice."""
 
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if isinstance(self.loop_steps, tuple) and self.data is not None:
+            # Refused before anything loads: a count a phase the data reads in.
+            phases = self.data.phase_count
+            if len(self.loop_steps) != phases:
+                raise ValueError(f"loop_steps names {len(self.loop_steps)} pass counts, one a phase, and the "
+                                 f"run's data reads {phases} phase(s)")
+
+    @property
+    def handed_passes(self) -> int | None:
+        """The pass count the run's model holds and hands on: the last phase's, where the run names one a
+        phase (`loop_steps`), else `loop_steps`."""
+        return self.loop_steps[-1] if isinstance(self.loop_steps, tuple) else self.loop_steps
+
+    def built[LossT, EffectsT](self, objective: Objective[LossT, EffectsT],
+                               mesh: MeshSpec | jax.sharding.Mesh, rollout: Rollout | None,
+                               **resources) -> "Trainer[LossT, EffectsT]":
+        """`RunConfig.built`, its steps run each phase's pass count where the run names one a phase."""
+        phased = {"phase_passes": self.loop_steps} if isinstance(self.loop_steps, tuple) else {}
+        return super().built(objective, mesh, rollout, **phased, **resources)
+
     @property
     def loops(self) -> bool:
         """Whether the run asks anything of a loop (`looped`)."""
@@ -2310,7 +2338,7 @@ class DecoderRunConfig(RunConfig):
         """`start` with its block run as the run asks (`looping`), as loaded where it asks nothing."""
         if not self.loops:
             return start
-        return looping(start, self.loop_steps, self.loop_layers, backprop_steps=self.loop_backprop_steps,
+        return looping(start, self.handed_passes, self.loop_layers, backprop_steps=self.loop_backprop_steps,
                        remat=self.loop_remat or None, implicit=self.loop_implicit or None,
                        exit_gate=self.loop_exit_gate or None, exit_threshold=self.loop_exit_threshold,
                        key=self.trainer.key)

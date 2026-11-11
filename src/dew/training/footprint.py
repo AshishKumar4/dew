@@ -18,7 +18,6 @@ from __future__ import annotations
 import collections
 import contextlib
 import dataclasses
-import itertools
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import NamedTuple
@@ -581,60 +580,63 @@ def siblings(frontier: Frontier, program: jcore.Jaxpr) -> tuple[dict[int, int], 
     made = {index: unfused(frontier, equation) for index, equation in enumerate(program.eqns)
             if not frontier.fusing(equation)}
     position = {out: index for index, equation in enumerate(program.eqns) for out in equation.outvars}
+    # The products each value is made for, in their order.
+    making: dict[jcore.Var, list[int]] = {}
+    for index, values in made.items():
+        for value in values:
+            making.setdefault(value, []).append(index)
 
-    # Each value's storage and element count are read once: a program's products pair their operands by
-    # the thousand (a hybrid MoE step asked 1.2 million pairs, each walking its two values' storage anew:
-    # 2.5 million walks, 552 s of a 633 s derivation, row 5360).
-    stored: dict[jcore.Var, frozenset[jcore.Var]] = {}
-    counted: dict[jcore.Var, int] = {}
+    # Each value's storage, element count and readiness are read once, and its possible siblings found from
+    # the storage it reads, never by pairing every operand with every other: a program's products pair
+    # their operands by the thousand (a hybrid MoE step asked 1.2 million pairs, each walking its two
+    # values' storage anew, 552 s of a 633 s derivation, row 5360; a 4B decoder's step at full remat held
+    # its first step 45 minutes, row 5479).
+    elements = {value: math.prod(dimensions(value)) for value in making}
+    roots = {value: frontier.root_set(value) for value in making}
+    ready = {value: max((position.get(root, -1) for root in roots[value]), default=-1) for value in making}
+    sharing: dict[tuple[jcore.Var, int], list[jcore.Var]] = {}
+    for value in making:
+        for root in roots[value]:
+            if math.prod(dimensions(root)) > 1:
+                sharing.setdefault((root, elements[value]), []).append(value)
+    partners = {value: {other for root in roots[value] for other in sharing.get((root, elements[value]), ())
+                        if other is not value} for value in making}
 
-    def roots(value) -> frozenset[jcore.Var]:
-        """The storage `value` reads (`Frontier.roots`)."""
-        if value not in stored:
-            stored[value] = frozenset(frontier.roots([value]))
-        return stored[value]
-
-    def elements(value) -> int:
-        if value not in counted:
-            counted[value] = math.prod(dimensions(value))
-        return counted[value]
+    # What each value is computed from, among the values that have a partner: one pass over the program in
+    # its order, each value's set the union of its operands' and the operands themselves.
+    paired = [value for value, others in partners.items() if others]
+    bit = {value: 1 << place for place, value in enumerate(paired)}
+    ancestry: dict[jcore.Var, int] = {}
+    for equation in program.eqns:
+        reached = 0
+        for read in equation.invars:
+            if computed(read):
+                reached |= ancestry.get(read, 0) | bit.get(read, 0)
+        for out in equation.outvars:
+            ancestry[out] = reached
 
     def computed_from(value, other) -> bool:
         """Whether `value` is computed from `other` through any equation."""
-        seen, pending = set(), [value]
-        while pending:
-            equation = frontier.producers.get(pending.pop())
-            for read in [] if equation is None else equation.invars:
-                if computed(read) and read not in seen:
-                    if read is other:
-                        return True
-                    seen.add(read)
-                    pending.append(read)
-        return False
-
-    def ready(*values) -> int:
-        """The index past which every value the storage `values` read is made."""
-        return max((position.get(root, -1) for value in values for root in roots(value)), default=-1)
-
-    def sibling(left, right) -> bool:
-        return (elements(left) == elements(right)
-                and any(elements(held) > 1 for held in roots(left) & roots(right))
-                and not computed_from(left, right) and not computed_from(right, left))
+        return bool(ancestry.get(value, 0) & bit[other])
 
     beside: dict[int, set] = {}
     first: dict = {}
-    for later, values in made.items():
-        for earlier, others in made.items():
-            if earlier >= later:
+    for value in paired:
+        for other in partners[value]:
+            if computed_from(value, other) or computed_from(other, value):
                 continue
-            for other, value in itertools.product(others - values, values):
-                if not sibling(value, other):
-                    continue
-                if ready(value, other) < earlier:
-                    # Made before the earlier product, beside its operand, and held to its own reader.
-                    first[value] = min(first.get(value, earlier), earlier)
-                else:
-                    beside.setdefault(later, set()).add(other)
+            at = max(ready[value], ready[other])
+            for later in making[value]:
+                for earlier in making[other]:
+                    if earlier >= later:
+                        break
+                    if other in made[later]:
+                        continue
+                    if at < earlier:
+                        # Made before the earlier product, beside its operand, and held to its own reader.
+                        first[value] = min(first.get(value, earlier), earlier)
+                    else:
+                        beside.setdefault(later, set()).add(other)
     # A product reading an operand before the fusion that makes it beside its sibling makes its own.
     spanned = {index: kept for index, values in made.items()
                if (kept := {value for value in values & first.keys() if index >= first[value]})}
@@ -799,6 +801,8 @@ class Frontier:
                                            for value in {read for read in equation.invars if computed(read)})
         self.readers.update({value for value in program.outvars if computed(value)})
         self.reads: dict[jcore.Var, frozenset[jcore.Var]] = {}
+        self.rooted: dict[jcore.Var, frozenset[jcore.Var]] = {}
+        self.fusions: dict[jcore.Var, bool] = {}
         # An optimization barrier defines no value: its results are its operands' own
         # (`HloDataflowAnalysis::UpdateOptimizationBarrierValueSet`,
         # xla/hlo/analysis/hlo_dataflow_analysis.cc).
@@ -831,7 +835,13 @@ class Frontier:
     def fused(self, value) -> bool:
         """Whether `value` holds no buffer of its own: recomputed where it is read, or a view; a value an
         optimization barrier reads is computed into a buffer of its own, which the barrier's result is
-        and every other reader reads (`forwards`), unless it is a view of another's (`view`)."""
+        and every other reader reads (`forwards`), unless it is a view of another's (`view`). Each value's
+        answered once (`fusions`)."""
+        if value not in self.fusions:
+            self.fusions[value] = self._fused(value)
+        return self.fusions[value]
+
+    def _fused(self, value) -> bool:
         if not computed(value) or value in self.inputs:
             return False
         if value in self.barred:
@@ -871,19 +881,33 @@ class Frontier:
         """The buffers reading `values` holds (`reading`) and the inputs they are computed from or view: what
         they depend on, the program's inputs among it."""
         found: set[jcore.Var] = set()
-        pending = [value for value in values if computed(value)]
-        seen: set[jcore.Var] = set()
-        while pending:
-            value = pending.pop()
-            if value in seen:
-                continue
-            seen.add(value)
-            if value in self.inputs or not self.fused(value):
-                found.add(value)
-                continue
-            read = [self.forwards[value]] if value in self.forwards else self.producers[value].invars
-            pending.extend(each for each in read if computed(each))
+        for value in values:
+            if computed(value):
+                found |= self.root_set(value)
         return found
+
+    def root_set(self, value: jcore.Var) -> frozenset[jcore.Var]:
+        """`roots` of `value` alone, each value's found once (`rooted`) from its operands' own: a fused value
+        reads what its operands read, every other its own storage."""
+        pending = [value]
+        while pending:
+            current = pending[-1]
+            if current in self.rooted:
+                pending.pop()
+                continue
+            if current in self.inputs or not self.fused(current):
+                self.rooted[current] = frozenset([current])
+                pending.pop()
+                continue
+            read = [each for each in ([self.forwards[current]] if current in self.forwards
+                                      else self.producers[current].invars) if computed(each)]
+            waiting = [each for each in read if each not in self.rooted]
+            if waiting:
+                pending.extend(waiting)
+                continue
+            self.rooted[current] = frozenset().union(*(self.rooted[each] for each in read))
+            pending.pop()
+        return self.rooted[value]
 
     def reading(self, values: Iterable) -> set[jcore.Var]:
         """The buffers reading `values` holds: each value's own, or for one fused, those it is

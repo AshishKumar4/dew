@@ -43,7 +43,8 @@ from dew.distributed.batches import (
 )
 from dew.distributed.placement import MeshSpec
 from dew.nn.kernels.options import program
-from dew.objectives.base import Effects, Loss, Metric, Objective, Shown, Step, TrainingScalar
+from dew.objectives.base import Effects, Loss, Metric, Objective, Ratio, Shown, Step, TrainingScalar, Weighted
+from dew.objectives.passes import PassReports
 from dew.training.cadence import Counted
 from dew.training.tracker import Tracker, write_artifact
 
@@ -590,10 +591,14 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
     of its last batch whose rows are all repeats (`_covered`), so it meets
     its peers at every collective. Where the pool keeps the pass's decisions
     (`kept`, root's ask), every rank scores each batch and root writes it
-    to `written`.
+    to `written`. Where the objective reports each pass of a looped model
+    (`PassReports`), every metric and the loss score each pass too, under
+    `<split>/pass_<k>/`.
     """
     summaries = _Accumulators()
     loss_sums = _LossSums()
+    # Each pass's metrics and loss where the objective reports its passes, as many as its first report holds.
+    passes: list[tuple[_Accumulators, _LossSums]] = []
     scores: dict[str, float] = {}
     previews: tuple[Artifact, ...] = ()
     source = iterator = None
@@ -638,10 +643,15 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                             objective, variables, batch, context, scored,
                             loss=loss, evaluate=evaluating, score_key=score_key))
                     loss_sums.add(statistics)
+                    reported = _pass_reports(produced)
+                    passes.extend((_Accumulators(), _LossSums()) for _ in range(len(reported) - len(passes)))
+                    for (pass_statistics, _), (_, sums) in zip(reported, passes, strict=True):
+                        sums.add(pass_statistics)
                     if evaluating:
                         produced = _merged(produced, batch, held, scored, mesh=mesh, metrics=metrics,
                                            written=written,
-                                           summaries=summaries, root=root)
+                                           summaries=summaries, root=root,
+                                           passes=tuple(held for held, _ in passes))
             if scored == 0 and preview_enabled:
                 previews = _previewed(objective, variables, batch, context, preview_key=preview_key,
                                       scored=produced, root=root)
@@ -660,12 +670,19 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
             sum(counts[1] for counts in pooled), sum(counts[2] for counts in pooled)]
         if scored and warm:
             # The reduction compiles here; a part of the split's loss is no score to check.
-            loss_sums.reduced(objective, mesh)
+            for sums in (loss_sums, *(sums for _, sums in passes)):
+                sums.reduced(objective, mesh)
         elif scored:
             scores = _finalized(metrics, summaries, split=split, root=root)
             loss_value = loss_sums.value(objective, mesh)
             if loss_value is not None and f'{split}/loss' not in scores:
                 scores[f'{split}/loss'] = loss_value
+            for at, (held, sums) in enumerate(passes, start=1):
+                named = f"{split}/pass_{at}"
+                scores.update(_finalized(metrics, held, split=named, root=root))
+                pass_loss = sums.value(objective, mesh)
+                if pass_loss is not None:
+                    scores[f"{named}/loss"] = pass_loss
     finally:
         _close_source(iterator if iterator is not None else source)
     share = None if tokens is None or not tokens[1] else tokens[0] / tokens[1]
@@ -855,6 +872,14 @@ def _dispatched(objective: Objective[Loss, Effects], variables: Variables, batch
     return objective._validation_report(variables, device, keyed, loss=loss, evaluate=evaluate)
 
 
+def _model_output(produced):
+    """An objective's report without its passes' (`PassReports`): what it scored of its model's output."""
+    if not isinstance(produced, tuple):
+        return produced
+    kept = tuple(artifact for artifact in produced if not isinstance(artifact, PassReports))
+    return kept[0] if len(kept) == 1 else kept
+
+
 def _as_placed(leaf) -> np.ndarray:
     """`leaf` as placing it and reading it back gives it: in JAX's canonical
     dtype, where float64 is float32 unless x64 is on."""
@@ -862,10 +887,19 @@ def _as_placed(leaf) -> np.ndarray:
     return host.astype(jax.dtypes.canonicalize_dtype(host.dtype), copy=False)
 
 
+def _pass_reports(produced) -> tuple[tuple[Ratio | Weighted, Artifacts], ...]:
+    """Each pass's `(loss statistics, artifacts)` an objective's report holds (`PassReports`), none where
+    it reports its model's output alone."""
+    return next((artifact.passes for artifact in _artifacts(produced) if isinstance(artifact, PassReports)),
+                ())
+
+
 def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metrics: Sequence[Metric],
-            summaries: _Accumulators, root: bool, written: Path | None = None):
-    """Merge one batch into every metric's accumulator on root, returning what
-    the objective produced, hosted.
+            summaries: _Accumulators, root: bool, written: Path | None = None,
+            passes: Sequence[_Accumulators] = ()):
+    """Merge one batch into every metric's accumulator on root, and each pass's artifacts into that pass's
+    (`passes`, where the objective reports them, `PassReports`), returning what the objective produced
+    about its model's output, hosted.
 
     The artifacts come home, and so does the batch the metrics read: on one
     process that is the host batch it was placed from, as the devices hold
@@ -889,6 +923,9 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metr
         else:
             produced, home = collective_host((produced, device), phase=f"scoring batch {index}")
 
+    reported = _pass_reports(produced)
+    produced = _model_output(produced)
+
     def merge() -> None:
         if not root:
             return
@@ -899,6 +936,10 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metr
         real = _real_batch(home, keep)
         for metric in metrics:
             summaries.add(metric, metric(_pick(artifacts, metric.reads), real))
+        for (_, pass_artifacts), held_pass in zip(reported, passes, strict=True):
+            cut = tuple(_real_artifact(artifact, keep) for artifact in _artifacts(pass_artifacts))
+            for metric in metrics:
+                held_pass.add(metric, metric(_pick(cut, metric.reads), real))
         if written is not None:
             # Every batch's scoring artifacts, its real rows alone, for pooling a pass offline.
             written.parent.mkdir(parents=True, exist_ok=True)

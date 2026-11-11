@@ -864,3 +864,41 @@ def test_a_derived_peak_is_of_the_program_the_algebra_pass_makes_of_the_step():
         plain = derived()
     assert (rewritten[0], plain[0]) == (1, 2), (rewritten, plain)
     assert rewritten[1:] == plain[1:], (rewritten, plain)
+
+
+def test_a_steps_derivation_reads_its_program_in_proportion_to_its_layers(monkeypatch):
+    """A decoder's derived peak on a GPU reads each value of its step's program a bounded number of times
+    however deep it is: its products' operands are paired by the storage each reads, never each with every
+    other, so twice the layers is about twice the reading (row 5479: a 4B decoder's derivation held its
+    first step 45 minutes, its operands paired by the million). Read as the values the derivation asks
+    whether the program computes."""
+    import optax
+
+    from dew.registry import models
+    from dew.training import footprint
+
+    real = footprint.computed
+    asked = [0]
+
+    def computed(value):
+        asked[0] += 1
+        return real(value)
+
+    monkeypatch.setattr(footprint, "computed", computed)
+
+    def reads(layers: int) -> int:
+        model = models.build("causal_transformer", vocab_size=128, emb_features=64, num_layers=layers,
+                             num_heads=4, num_kv_heads=2, mlp_features=128, max_seq_len=128)
+        tokens = jnp.zeros((2, 129), jnp.int32)
+        params = jax.eval_shape(lambda: model.init(jax.random.key(0), tokens[:, :-1]))["params"]
+
+        def loss(params, tokens):
+            logits = model.apply({"params": params}, tokens[:, :-1])
+            return optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:]).mean(), ()
+
+        asked[0] = 0
+        gradient_peak(loss, params, (tokens,), platform="gpu", workspace=Workspace(0, 0))
+        return asked[0]
+
+    shallow, deep = reads(4), reads(8)
+    assert deep < 2.5 * shallow, (shallow, deep)

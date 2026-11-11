@@ -45,6 +45,7 @@ from dew.nn import categorical
 from dew.nn.cross_attention import ContextEncoder, crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
+from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import (
     CountedDecisions,
     CountedLogits,
@@ -68,6 +69,7 @@ from dew.objectives.base import (
     joined,
     model_rngs,
 )
+from dew.objectives.passes import PassReports, PassWeighting, PassWeights, exiting, weighed
 
 if TYPE_CHECKING:
     from dew.state import TrainState
@@ -145,6 +147,20 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     tiled head scores them (`chunked_tile`). The pass reads no context and no images, the row's
     tokens alone. At 0 there is no second pass.
 
+    `pass_weights` trains every pass count of a looped backbone at once
+    (`dew.objectives.passes.PassWeights`): "mean", or one weight a pass
+    summing to one, each pass's term the decision loss of its exit, its state
+    run through the coda and the final norm to the head (no exit gate
+    needed), so with no cut the loss is what each `with_passes(k)` model's
+    would be, weighed (under a cut each term is the cut loop's exit,
+    `PassWeights`), the consistency term each pass's as the label loss is and
+    `input_lm` once. A validation that scores metrics reports each pass's and
+    its loss under `pass_<k>/` beside the run's, which stay the last pass's. None, or weights
+    all on the last pass, trains the last pass alone. A row whose context the
+    backbone encodes in its own passes (`context_encoder="backbone"`, a schema
+    in context) is refused under it: each pass would read the last pass's
+    context, which no `with_passes(k)` model reads.
+
     Evaluation returns the model's `Decisions` on the validation rows, which
     `Accuracy`, `ECE`, `AURC` and the scoring rules read, its probabilities
     divided by `temperatures` (none by default: a `Decide`'s calibration fits
@@ -183,10 +199,27 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         `input_lm` the backbone's second pass over the rows (`input_terms`). Forming the vocabulary
         rows a head reads (an adapter's update merged into them) is execution, as recompute is."""
         model = self.model if model is None else model
-        passes = 2 if self.input_lm else 1
-        return (passes * counted_flops(model.backbone, self.real_lengths(batch))
-                + self._context_flops(model, batch) + self._cross_flops(model, batch)
-                + self._head_flops(model, batch) + self._input_head_flops(model, batch))
+        lengths = self.real_lengths(batch)
+        return (sum(counted_flops(backbone, lengths) for backbone in self._reads(model))
+                + self._context_flops(model, batch) + self._cross_flops(self._exits(model), batch)
+                + self._heads(model) * self._head_flops(model, batch) + self._input_head_flops(model, batch))
+
+    def _exits(self, model: DecisionModel) -> DecisionModel:
+        """`model` as the loss runs it: its backbone's every pass exiting where the loss weighs its passes
+        (`pass_weights`), else as it is."""
+        if self.pass_weights is None or self.pass_weights.of_model(model.backbone) is None:
+            return model
+        return replace(model, backbone=exiting(model.backbone))
+
+    def _reads(self, model: DecisionModel) -> tuple[nn.Module, ...]:
+        """The backbone passes a step runs over the rows: the decision pass (`_exits`), and with `input_lm`
+        the rows' own causal pass (`input_terms`), the backbone as it is."""
+        return (self._exits(model).backbone, *((model.backbone,) if self.input_lm else ()))
+
+    def _heads(self, model: DecisionModel) -> int:
+        """How many passes' states the head reads: each pass's where the loss weighs them, else the last's."""
+        exits = self._exits(model)
+        return model.backbone.loop.steps if exits is not model else 1
 
     def _input_head_flops(self, model, batch: Batch, *, training: bool = False) -> float:
         """The vocabulary head's work on the rows' own next tokens (`input_terms`), each row's tokens after
@@ -262,22 +295,23 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         model = self.model if model is None else model
         lengths = self.real_lengths(batch)
         context = self._context_lengths(batch)
-        trained = 3 * (self._cross_flops(model, batch) + self._head_flops(model, batch))
-        # The rows' second pass where `input_lm` reads them again (`input_terms`), trained as the first.
-        passes = 2 if self.input_lm else 1
+        # The rows' passes (`_reads`): the decision pass, every exit where the loss weighs them, and the
+        # second pass where `input_lm` reads them again (`input_terms`), trained as the first.
+        reads, exits = self._reads(model), self._exits(model)
+        trained = 3 * (self._cross_flops(exits, batch) + self._heads(model) * self._head_flops(model, batch))
         if isinstance(model.backbone, CountedTraining):
             # An adapter trains through the context's pass too.
             own = 0.0 if context is None else model.backbone.training_flops(context)
-            return (passes * model.backbone.training_flops(lengths) + own + trained
+            return (sum(backbone.training_flops(lengths) for backbone in reads) + own + trained
                     + self._input_head_flops(model, batch, training=True))
         if self._backbone_frozen():
             # A context's pass trains nothing, so it runs forward alone (`encode_context`); a block's
             # reads through the backbone's own matrices take no weight gradient (`held_flops`).
-            forward = counted_flops(model.backbone, lengths)
-            held = self._cross_flops(model, batch, held=True)
+            held = self._cross_flops(exits, batch, held=True)
             # The vocabulary head is the backbone's, frozen with it: its input's gradient, no weight's.
             head = self._input_head_flops(model, batch)
-            return (passes * frozen_training_flops(forward, parameter_flops(model.backbone, lengths))
+            return (sum(frozen_training_flops(counted_flops(backbone, lengths),
+                                              parameter_flops(backbone, lengths)) for backbone in reads)
                     + frozen_training_flops(head, head) + self._context_flops(model, batch) + trained - held)
         return super().training_flops(model, batch)
 
@@ -297,7 +331,8 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
                  segments: int | None = 16, context_encoder: ContextEncoder | None = None,
                  consistency: float = 0.0, context_window: int | None = None,
-                 none_of_the_above_options: int = 3, input_lm: float = 0.0):
+                 none_of_the_above_options: int = 3, input_lm: float = 0.0,
+                 pass_weights: PassWeighting | None = None):
         held: Variables | None = None
         widths: tuple[int | None, int] | None = None
         self.image_processor = None
@@ -375,14 +410,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         # A held tree enters plain: a draw's boxes (`nn.with_logical_partitioning`) are its table's.
         self.variables = dicts(unboxed(held))
         self.label_smoothing = label_smoothing
-        if not consistency >= 0.0:
-            raise ValueError(f"consistency weighs a divergence, so it is nonnegative, got {consistency}")
-        self.consistency = consistency
-        if not input_lm >= 0.0:
-            raise ValueError(f"input_lm weighs a cross entropy, so it is nonnegative, got {input_lm}")
-        self.input_lm = input_lm
-        if input_lm:
-            self._causal_backbone()
+        self._weigh_terms(consistency, input_lm)
         self.shuffle_options = shuffle_options
         self.none_of_the_above = none_of_the_above
         self.none_of_the_above_options = none_of_the_above_options
@@ -402,6 +430,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         self.context_window = (None if held_context is None
                                else context_window or max(self.layout.max_len, held_context))
         self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,)))
+        self.pass_weights = self._passes_weighed(PassWeights.of(pass_weights))
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The backbone, then the head, both trained."""
@@ -504,25 +533,25 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                           whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention, fork_depth=self._fork_depth,
                           joint_forks=self._joint_forks)
-        logits, sown = self.model.observed_logits(
+        passes, sown = self._pass_logits(
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
             progress=self.progress(step), opened=step.sown())
-        loss, aux = self._charged(logits, inputs, batch)
-        loss, term = self._with_input_term(loss, variables, inputs, batch, step)
+        loss, aux = self._charged(passes, inputs, batch)
+        term = self.input_terms(variables, inputs, batch, step) if self.input_lm else None
+        loss = self._with_input_term(loss, term)
         if term is not None:
             aux = replace(aux, metrics={**aux.metrics, "input_ce": term.mean()[0]})
         qk, inspected = step.observed(sown)
         return loss, replace(aux, qk_stats=qk, inspected=inspected)
 
-    def _with_input_term(self, loss: Ratio | Weighted, variables: Variables, inputs: DecisionInputs,
-                         batch: Batch, step: Step) -> tuple[Ratio | Weighted, Ratio | None]:
-        """`loss` with the rows' own next-token term beside it at `input_lm`'s weight, and the term;
-        `loss` alone at 0. A validation's loss weighs it as training's does (`_validation_scores`)."""
-        if not self.input_lm:
-            return loss, None
-        term = self.input_terms(variables, inputs, batch, step)
+    def _with_input_term(self, loss: Ratio | Weighted, term: Ratio | None) -> Ratio | Weighted:
+        """`loss` with the rows' own next-token term (`input_terms`) beside it at `input_lm`'s weight;
+        `loss` alone at 0, where there is no term. A validation's loss weighs it as training's does
+        (`_validation_scores`)."""
+        if term is None:
+            return loss
         terms, weights = (loss.terms, loss.weights) if isinstance(loss, Weighted) else ((loss,), (1.0,))
-        return Weighted((*terms, term), (*weights, self.input_lm)), term
+        return Weighted((*terms, term), (*weights, self.input_lm))
 
     def _causal_backbone(self) -> nn.Module:
         """The backbone the rows' own next-token term reads (`input_terms`): itself where it attends
@@ -597,18 +626,67 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                                           predict=False)
         return self.row_mean(losses, batch, weights=scored)
 
-    def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch
+    def _pass_logits(self, variables: Variables, inputs: DecisionInputs, **read
+                     ) -> tuple[tuple[jax.Array, ...], Variables]:
+        """The option logits of each pass the loss weighs (`pass_weights`), in order, its last the model's
+        own, else the model's alone (`DecisionModel.observed_logits`), and what the pass sowed."""
+        if self._weights is None:
+            logits, sown = self.model.observed_logits(variables, inputs, **read)
+            return (logits,), sown
+        exits = replace(self.model, backbone=exiting(self.model.backbone))
+        return exits.pass_logits(variables, inputs, **read)
+
+    def _weigh_terms(self, consistency: float, input_lm: float) -> None:
+        """Keep the loss's terms beside the label loss, each checked: the groups' divergence at `consistency`,
+        the rows' own next-token term at `input_lm`, whose causal pass the backbone must read."""
+        if not consistency >= 0.0:
+            raise ValueError(f"consistency weighs a divergence, so it is nonnegative, got {consistency}")
+        self.consistency = consistency
+        if not input_lm >= 0.0:
+            raise ValueError(f"input_lm weighs a cross entropy, so it is nonnegative, got {input_lm}")
+        self.input_lm = input_lm
+        if input_lm:
+            self._causal_backbone()
+
+    def _passes_weighed(self, weights: PassWeights | None) -> PassWeights | None:
+        """`weights` checked against the backbone's loop (`PassWeights.of_model`) and its rows: a row whose
+        context the backbone encodes in its own passes is refused, its every pass reading the last pass's
+        context, which no `with_passes(k)` backbone reads."""
+        if weights is None:
+            return None
+        weights.of_model(self.model.backbone)
+        encoded = self.spans_in_context or self.model.context_encoder == "backbone"
+        if self.context_length is not None and encoded:
+            raise ValueError("pass_weights scores each pass's exit as the backbone run that many times "
+                             "would, and a row whose context the backbone encodes in its own passes reads "
+                             "the last pass's context at every pass")
+        return weights
+
+    @property
+    def _weights(self) -> tuple[float, ...] | None:
+        """Each pass's weight in the loss (`PassWeights.of_model`), None where it scores the last alone."""
+        return None if self.pass_weights is None else self.pass_weights.of_model(self.model.backbone)
+
+    def _charged(self, passes: tuple[jax.Array, ...], inputs: DecisionInputs, batch: Batch
                  ) -> tuple[Ratio | Weighted, Aux]:
-        """The loss and its accuracy report over the questions' option logits: where it adds a consistency
-        term, the label loss and the groups' divergence, each its own `Ratio`, `consistency` weighing the
-        divergence (`Weighted`)."""
-        options, scored = inputs.options, jnp.asarray(batch["scored"]).astype(jnp.float32)
+        """The loss and its accuracy report over the questions' option logits at each pass the loss weighs
+        (`passes`, the last the model's own, at `pass_weights`): where it adds a consistency term, the
+        label loss and the groups' divergence, each its own `Ratio`, `consistency` weighing the divergence
+        (`Weighted`). Each pass's charge and divergence are weighed before their means, whose masses every
+        pass shares; the accuracy is the last pass's."""
+        # The questions' mask in the logits' precision, so a float64 run's masses sum in float64.
+        options = inputs.options
+        scored = jnp.asarray(batch["scored"]).astype(at_least_fp32(passes[-1].dtype))
         # A padding question has no options; it is scored nothing over a
         # finite, even distribution, so no NaN reaches its gradient.
         empty = ~jnp.any(options, axis=-1, keepdims=True)
-        logits, options = jnp.where(empty, 0.0, logits), options | empty
-        target = categorical.smoothed(jnp.asarray(batch["targets"]), options, self.label_smoothing)
-        charge = self.loss_rule.charge(logits, target, options, inputs.kinds == _SCORE)
+        passes, options = tuple(jnp.where(empty, 0.0, logits) for logits in passes), options | empty
+        # The gold distribution smoothed in the loss's precision, as its mask is.
+        target = categorical.smoothed(jnp.asarray(batch["targets"]).astype(scored.dtype), options,
+                                      self.label_smoothing)
+        charge = self._weighed([self.loss_rule.charge(logits, target, options, inputs.kinds == _SCORE)
+                                for logits in passes])
+        logits = passes[-1]
         correct = (jnp.argmax(logits, axis=-1) == batch["labels"]).astype(jnp.float32)
         accuracy, _ = self.accuracy(correct, batch, scored).mean()
         loss = Ratio(self.row_mean(charge * scored, batch).total, self.row_mean(scored, batch).total)
@@ -616,11 +694,16 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             return loss, Aux(metrics={"accuracy": accuracy})
         # Each question's group in its window, and each option slot's canonical option: the group's
         # members' answers over the canonical options (`categorical.group_divergence`).
-        divergence, members = categorical.group_divergence(logits, jnp.asarray(batch["groups"]),
-                                                           jnp.asarray(batch["canonical"]), options)
+        groups, canonical = jnp.asarray(batch["groups"]), jnp.asarray(batch["canonical"])
+        divided = [categorical.group_divergence(logits, groups, canonical, options) for logits in passes]
+        divergence, members = self._weighed([divergence for divergence, _ in divided]), divided[-1][1]
         term = Ratio(self.row_mean(divergence, batch).total, self.row_mean(members, batch).total)
         return (Weighted((loss, term), (1.0, self.consistency)),
                 Aux(metrics={"accuracy": accuracy, "consistency": term.mean()[0]}))
+
+    def _weighed(self, terms: list[jax.Array]) -> jax.Array:
+        """The passes' terms at their weights (`passes.weighed`), the one term of a loss of the last pass."""
+        return terms[0] if len(terms) == 1 else weighed(self._weights or (), terms)
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.spans_in_context,
@@ -630,14 +713,23 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         return self._decisions(self._logits(self.evaluation_variables(params, step), inputs), inputs, batch)
 
     def _validation_scores(self, params: Variables, batch: Batch, step: Step
-                           ) -> tuple[Ratio | Weighted, Decisions]:
+                           ) -> tuple[Ratio | Weighted, Decisions | tuple[Decisions, PassReports]]:
+        """The validation loss and decisions, as training weighs its passes, with each pass's beside them
+        where it weighs them (`PassReports`): its loss as the run's would be weighing it alone, and its
+        decisions."""
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.spans_in_context,
                           whole_blocks=whole_blocks_of(self.layout),
                           attention=self.layout.attention, fork_depth=self._fork_depth,
                           joint_forks=self._joint_forks)
-        logits = self.model.logits(params, inputs)
-        loss, _ = self._with_input_term(self._charged(logits, inputs, batch)[0], params, inputs, batch, step)
-        return loss, self._decisions(logits, inputs, batch)
+        passes, _ = self._pass_logits(params, inputs)
+        term = self.input_terms(params, inputs, batch, step) if self.input_lm else None
+        loss = self._with_input_term(self._charged(passes, inputs, batch)[0], term)
+        decisions = self._decisions(passes[-1], inputs, batch)
+        if len(passes) == 1:
+            return loss, decisions
+        return loss, (decisions, PassReports(tuple(
+            (self._with_input_term(self._charged((logits,), inputs, batch)[0], term),
+             self._decisions(logits, inputs, batch)) for logits in passes)))
 
     def _decisions(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch) -> Decisions:
         """The questions' option probabilities, each at its type's temperature, with what scores them."""
