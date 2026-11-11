@@ -13,6 +13,7 @@ per-share state and refuse changed topology before a reader opens.
 
 from __future__ import annotations
 
+import base64
 import bisect
 import contextlib
 import dataclasses
@@ -38,8 +39,8 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import _position
-from dew._records import record
-from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch, padded_rows
+from dew._records import boolean, integer, listed, record, strings, text
+from dew.batch import EXAMPLES_CONSUMED, PHASE, VALID_ROWS, Batch, Phase, padded_rows
 from dew.data import cgroups
 from dew.mesh import LayoutRefused, batch_axes
 
@@ -1614,7 +1615,7 @@ class PhasedStream:
                 f"a step of {read} records crossed the phase boundary at record "
                 f"{end}; phases end on step boundaries"
             )
-        return batch
+        return {**batch, PHASE: Phase(phase)}
 
     def get_state(self) -> bytes:
         # The phase of the last record read: at a boundary nothing of the next
@@ -1729,6 +1730,107 @@ class PhasedStream:
         if self._current is not None:
             self._streams[self._current].close()
         self._current = None
+
+
+STEP_PHASES = "dew_step_phases"
+"""The key a read of phases each its own stream writes its position under (`StepPhases`)."""
+
+
+class StepPhases(Forwarding):
+    """Reads phases on the step clock one after another, each its own stream, opened at the step the
+    phase before it ends: a read per share among them, cut per share where its order is (a stream batched
+    by its tokens after steps that drop rows), whose records no global count places. Phase `p` reads
+    `ends[p] - ends[p - 1]` batches, one a step, its last running on (None); each batch says the phase it
+    was read in (`PHASE`). Its position is the phase it stands in, the steps the run has read, and that
+    phase's stream's own position, which resumes it as its own; a phase the run completed is refused
+    where this run's ends it elsewhere or reads it otherwise (`identities`). What a phase's stream read
+    ahead of its end is never trained on: the next phase opens its own stream at its first step."""
+
+    def __init__(self, phases: Sequence[Callable[[], Iterator[Batch]]], ends: Sequence[int | None],
+                 identities: Sequence[str], stop_seconds: float, *, batches: Sequence[int]):
+        if len(phases) != len(ends) or len(identities) != len(ends):
+            raise ValueError(f"phases need one end and one identity each: {len(phases)} phases, "
+                             f"{len(ends)} ends, {len(identities)} identities")
+        self._open, self._ends, self._identities = list(phases), list(ends[:-1]), tuple(identities)
+        self.batches, self.stages = tuple(batches), ()
+        self.stop_seconds = stop_seconds
+        self._steps = 0
+        self._current: int | None = None
+        self._source: Iterator[Batch] | None = None
+
+    def __iter__(self) -> Iterator[Batch]:
+        return self
+
+    def _phase(self, steps: int) -> int:
+        """The phase that reads step `steps`: the first whose end is past it."""
+        return next((index for index, end in enumerate(self._ends) if end is None or steps < end),
+                    len(self._ends))
+
+    def _stream(self, phase: int) -> Iterator[Batch]:
+        """Phase `phase`'s stream, opened where it starts, the one open before it closed."""
+        if phase != self._current:
+            super().close()
+            self._source, self._current = None, None
+            self._source, self._current = self._open[phase](), phase
+        assert self._source is not None
+        return self._source
+
+    def __next__(self) -> Batch:
+        phase = self._phase(self._steps)
+        batch = next(self._stream(phase))
+        self._steps += 1
+        return {**batch, PHASE: Phase(phase)}
+
+    def get_state(self) -> bytes:
+        # The phase of the last step read: at a boundary nothing of the next phase is read yet.
+        phase = self._phase(self._steps - 1) if self._steps else 0
+        stream = self._stream(phase)
+        if not isinstance(stream, Checkpointable):
+            raise TypeError(f"phase {phase}'s stream keeps no position")
+        own = stream.get_state()
+        return json.dumps({STEP_PHASES: {
+            "steps": self._steps, "phase": phase, "ends": self._ends[:phase],
+            "identities": list(self._identities[:phase + 1]),
+            "position": base64.b64encode(own if isinstance(own, bytes)
+                                         else json.dumps(own).encode()).decode(),
+            "encoded": isinstance(own, bytes)}}).encode()
+
+    def set_state(self, state: bytes) -> None:
+        saved = record(record(json.loads(state), "saved phases' position").get(STEP_PHASES),
+                       "saved phases' position")
+        phase = integer(saved["phase"], "the saved phase")
+        ends = list(listed(saved["ends"], "saved phase ends", read=integer, what="a list of steps"))
+        identities = list(strings(saved["identities"], "saved phase identities"))
+        if phase >= len(self._open) or ends != self._ends[:phase] or identities[:phase] != list(
+                self._identities[:phase]):
+            raise ValueError(f"the saved run finished phases ending at steps {ends}, read as "
+                             f"{identities[:phase]}, and this run's phases end at {self._ends[:phase]}, read "
+                             f"as {list(self._identities[:phase])}; a phase the run has read cannot change "
+                             "under it")
+        steps = integer(saved["steps"], "the saved steps")
+        end = self._ends[phase] if phase < len(self._ends) else None
+        if end is not None and steps > end:
+            raise ValueError(f"the saved run has read {steps} steps, past this run's end of phase {phase} "
+                             f"at {end}")
+        own = base64.b64decode(text(saved["position"], "the saved phase's position"))
+        stream = self._stream(phase)
+        if not isinstance(stream, Checkpointable):
+            raise TypeError(f"phase {phase}'s stream keeps no position")
+        encoded = boolean(saved["encoded"], "the saved position's encoding")
+        stream.set_state(own if encoded else json.loads(own))
+        self._steps = steps
+
+    def identity(self) -> str:
+        return "; ".join([*self._identities, f"phases ending at steps {list(self._ends)}"])
+
+    @property
+    def ends(self) -> Ends:
+        # The last phase's stream ends the run's data where it ends.
+        return stream_ends(self._source) if self._current == len(self._open) - 1 else "never"
+
+    def close(self) -> None:
+        super().close()
+        self._source, self._current = None, None
 
 
 @runtime_checkable

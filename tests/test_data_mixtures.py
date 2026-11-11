@@ -2296,14 +2296,16 @@ def test_a_mix_saved_under_plan_version_12_resumes_as_12_read_it(read, version):
 
 
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
-def test_a_phase_on_the_step_clock_of_a_mix_weighed_by_tokens_streamed_is_refused_as_one(read):
-    """Phases that end at steps continue each corpus past what the phases before read of it, by their
+def test_a_phase_on_the_token_clock_of_a_mix_weighed_by_tokens_streamed_is_refused_as_one(read):
+    """Phases on the token clock continue each corpus past what the phases before read of it, by their
     order's shares: a phase whose mix weighs its members' rows by their targets as they stream in (rows
     a step rejects), which has no shares to continue by, is refused for that, as any phase of no global
-    order is."""
+    order on that clock is (on the step clock, each such phase reads its own stream, `StepPhases`)."""
+    from dew.data import schedule
+
     def members():
         return mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat()], by="tokens")
 
-    chain = phases((members(), 3), (members(), None)).batch(1)
+    chain = schedule([(members(), 40), (members(), None)]).batch(1)
     with pytest.raises(ValueError, match="phase 0 needs a global order"):
         compile(chain, read=read, loading=READ)
