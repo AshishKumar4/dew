@@ -8,13 +8,14 @@ its own gate's; these are the attention's and the recurrence's, whose producers 
 (`rings.drain`'s every site)."""
 
 import dataclasses
+import functools
 
 import jax
 import jax.numpy as jnp
 import pytest
 from fla_gdn_support import KernelCase
 from generation_support import COMPILES_ON_CPU
-from kernel_compile import compile_mosaic_kernels, gate_generations, mosaic_failures
+from kernel_compile import capability, compile_mosaic_kernels, gate_generations, mosaic_failures
 from test_attention_mosaic import _residuals
 from test_recurrence_mosaic import resource_operands
 
@@ -25,7 +26,7 @@ from dew.nn.kernels.templates import (
     attention_mosaic,
     attention_mosaic_program,
 )
-from dew.nn.kernels.templates.recurrence import template as recurrence
+from dew.nn.kernels.templates.recurrence import mainloop, template as recurrence
 
 pytestmark = pytest.mark.kernel
 
@@ -86,12 +87,33 @@ ATTENTION_BACKWARD = gate_generations(tpu=True, needs=lambda family, architectur
     attention_mosaic_program.runs_backward(family)))
 """The GPUs the attention forward and backward run on, each as the compile gate takes them (its `GATED` and
 `BACKWARD_GATED`: the backward on the bundles its launches take, `runs_backward`)."""
-RECURRENCE = gate_generations(scoped=True)
+def _named(architecture) -> str:
+    """The earliest generation Dew names of `architecture`, the one `gate_generations` takes for it."""
+    return min((name for name in generation.TARGETS if capability(name) is not None
+                and generation.architecture(name) == architecture), key=capability)
+
+
+def _takes(name: str):
+    """The typed fact a recurrence cell of `name`'s geometry needs of a GPU (`gate_generations`' `needs`):
+    the template takes its call there (`Template.eligible`, every launch at its derived tiles within the
+    block's shared memory and its threads' registers), where its route hands it to the port otherwise
+    (`recurrence_chunk.TEMPLATE_SUPPORTS`' 'launch')."""
+    def needs(family, architecture) -> bool:
+        del family
+        with generation.assumed(_named(architecture)):
+            op, ba, _ = _recurrence(name, jnp.bfloat16)
+            return op.eligible(ba, recurrence.Mosaic.launched())
+    return needs
+
+
+RECURRENCE = {name: gate_generations(scoped=True, needs=_takes(name))
+              for name in ("qwen3.5-27b-gdn", "kimi-linear-kda")}
+"""The GPUs each recurrence geometry's call runs on the template (`_takes`)."""
 CELLS = {"attention forward 64": (lambda: _attention("forward", 64), ATTENTION),
          "attention forward 128": (lambda: _attention("forward", 128), ATTENTION),
          "attention backward 64": (lambda: _attention("backward", 64), ATTENTION_BACKWARD),
-         "recurrence qwen3.5-27b-gdn": (lambda: _recurrence("qwen3.5-27b-gdn", jnp.bfloat16), RECURRENCE),
-         "recurrence kimi-linear-kda": (lambda: _recurrence("kimi-linear-kda", jnp.bfloat16), RECURRENCE)}
+         **{f"recurrence {name}": (functools.partial(_recurrence, name, jnp.bfloat16), generations)
+            for name, generations in RECURRENCE.items()}}
 """Each cell's op and the GPUs its template runs on (`kernel_compile.gate_generations`, the template's launch
 flags and qualification)."""
 
@@ -146,3 +168,22 @@ def test_a_blackwell_attention_at_its_deepest_ring_compiles_within_its_resources
     assert len(held) < len(found), f"{generation_name} holds every ring to {STAGES[-1]} stages"
     failed = mosaic_failures(held)
     assert not failed, "\n".join(failed)
+
+
+@pytest.mark.parametrize(("name", "generation_name"), [
+    (name, gated) for name, generations in RECURRENCE.items() for gated in gate_generations(scoped=True)
+    if gated not in generations])
+def test_a_recurrence_call_the_template_does_not_take_is_past_the_blocks_shared_memory(name, generation_name):
+    """A recurrence geometry's call on a GPU the template does not take it on (`_takes`, its deepest-ring
+    cells') is refused by the block's shared memory: at the narrowest tiles its family stages (the narrowest
+    value and output blocks, one stage, the chunk at a role's rows, the derivation's floor) a launch stages
+    past the block (Kimi delta attention's output launch on a 99 KB part)."""
+    with generation.assumed(generation_name):
+        op, ba, _ = _recurrence(name, jnp.bfloat16)
+        target = recurrence.Mosaic.launched()
+        family = recurrence.bundle(target, jnp.bfloat16)
+        narrowest = family.narrowest_columns(jnp.bfloat16)
+        tiles = mainloop.Tiles(block_v=narrowest, stages=1, block_o=narrowest, walkers=1,
+                               chunk=family.role_rows)
+        staged = {launch.name: launch.shared for launch in op.launches(ba, tiles, target, backward=False)}
+        assert max(staged.values()) > generation.shared_budget(target), (generation_name, staged)
