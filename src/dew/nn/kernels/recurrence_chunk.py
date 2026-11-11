@@ -1440,8 +1440,10 @@ template wins its cells. An A100's forward is the template's: 1.418 ms against t
 0.211 ms against 0.241 on 30B's and 0.522 against 0.617 on 4B's, on a GH200 480GB 0.207 against 0.225 and
 0.509 against 0.595 (FS-RECROUTES-h100 and -gh200 at 26d3fdf5df: cold, exclusive, two rounds alternating the
 arms' order). The template trains the rated scan under
-the fast forms (`mainloop_backward.fast_backward_form`); under the accurate ones its training is the port's by
-the template's refusal, not a cell."""
+the fast forms (`mainloop_backward.fast_backward_form`); under the accurate ones it does not, by its refusal,
+not a cell: at the default precision the port then trains an fp32 call, its products one TF32 as
+mamba_ssm's, and at a precision above it (the accurate numerics', `dew.nn.precision.ACCURATE`) the port
+declines too (`_port_precision`) and the portable math trains it at that precision."""
 
 SCAN: Op[ScanCase] = Op(Choice.SSD, (Kernel('mosaic_gpu', (*SSD_SUPPORTS[:3], *TEMPLATE_SUPPORTS)),
                                SSD_PORT, Kernel('tpu', TPU_SCAN_SUPPORTS),
