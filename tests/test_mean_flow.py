@@ -6,7 +6,7 @@ built around it."""
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import float64_held
+from float64_replay import float64_replay
 from reference_error import as_given, assert_as_exact, widened
 
 from dew.diffusion import presets
@@ -120,10 +120,13 @@ TL-h100-sizing-1851-679), the largest declared as docs/design/testing.md's check
 
 def agrees_with_xla(kernel: str) -> None:
     """A MeanFlow step through the fused attention `kernel` runs, and its loss and every parameter's
-    gradient are on par with the xla kernel's (check 1), both in bf16, the truth the step of the
-    model in float64 on xla. Each draw holds its own weights, images and the step's key, which draws
-    the step's times and noise: adaLN-Zero's gates and output start at zero, where attention reaches
-    neither the output nor any gradient (ledger 789), and drawn weights let every parameter take part."""
+    gradient are on par with the xla kernel's (check 1), both in bf16, the truth the xla step's program
+    replayed in float64 (`float64_replay`): the same draws of the step's times and noise, every operation
+    of the step in float64, its times' arithmetic in the target's derivative among them, which a float64
+    clone of the model would leave in the draws' float32. Each draw holds its own weights, images and the
+    step's key, which draws the step's times and noise: adaLN-Zero's gates and output start at zero, where
+    attention reaches neither the output nor any gradient (ledger 789), and drawn weights let every
+    parameter take part."""
     def over(implementation: str, dtype: str) -> MeanFlowObjective:
         model = SimpleDiT(patch_size=2, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=1,
                           interval=True, attention_impl=implementation, dtype=dtype)
@@ -131,9 +134,8 @@ def agrees_with_xla(kernel: str) -> None:
                            {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
         return MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
 
-    fused, xla, wide = over(kernel, "bfloat16"), over("xla", "bfloat16"), over("xla", "float64")
+    fused, xla = over(kernel, "bfloat16"), over("xla", "bfloat16")
     template = xla.init(jax.random.PRNGKey(0))
-    held = float64_held(template)
     tokens = xla.inputs.tokenize(["a", "b", "c", "d"] * 4)
 
     def draw(seed):
@@ -158,7 +160,7 @@ def agrees_with_xla(kernel: str) -> None:
         return run
 
     assert_as_exact(stepped(fused, template), stepped(xla, template), draw, f"MeanFlow step on {kernel}",
-                    seeds=MEANFLOW_SEEDS, truth_fn=stepped(wide, held))
+                    seeds=MEANFLOW_SEEDS, truth_fn=float64_replay(stepped(xla, template), compiled=True))
 
 
 def meanflow_trains_through_a_fused_attention_kernel():
