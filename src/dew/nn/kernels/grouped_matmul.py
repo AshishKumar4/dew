@@ -179,12 +179,6 @@ def _hooks_lower(ba, dtype, rules) -> bool:
                         tiles('epilogue_operands', hooks.epilogue_axes), rules))
 
 
-def _output_bytes(ba) -> int:
-    """The bytes of one output element of each of the launch's outputs, together."""
-    return sum(jnp.dtype(dtype).itemsize
-               for dtype in (ba.arguments['hooks'].out_dtypes or (ba.arguments['out_dtype'],)))
-
-
 def _side_tile_bytes(operands, axes_of, extents: dict) -> int:
     """The bytes of one tile of each side operand at the block `extents` per launch axis, one group's of an
     operand by group (`axes.held`)."""
@@ -942,9 +936,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if steps is not None:
             # A ring deeper than its contraction's steps holds no more of them.
             most = min(most, max(2, steps))
-        # A family fixing its rings' slots streams them whatever the stages (`mosaic.Transport.ring_slots`);
-        # one whose deeper rings spill takes no more than it holds (`mosaic.Transport.most_stages`).
-        most = family.ring_slots or min(most, family.most_stages or most)
+        # A family fixing its rings' slots streams them whatever the stages (`mosaic.Transport.ring_slots`).
+        most = family.ring_slots or most
         # A family rewriting the staged rows in a role of its own runs it beside the consumers
         # (`mosaic_gpu.tgmm`'s `roles`).
         roles = config.warpgroups + self.rewritten(ba, family)
@@ -954,9 +947,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`): its
         own loads' rows, never rows its tables gather (`mosaic_gpu.tgmm`'s `gather`, which a consumer's
         cp.async gather stages: the fed rings'), nor rows read as loaded (`unstaged`)."""
-        tabled = ba.arguments.get('gather') is not None or ba.arguments.get('scatter') is not None
-        return (self.STAGED_ROWS and not self.K_MAJOR and family.rewrites_in_persist and not tabled
-                and not self.unstaged(ba))
+        tables = (ba.arguments.get('gather'), ba.arguments.get('scatter'))
+        return self.STAGED_ROWS and mosaic_gpu.rewrites(family, self.K_MAJOR, tables, self.unstaged(ba))
 
     def unstaged(self, ba) -> bool:
         """Whether a kernel gradient's rows stage is read as loaded (`mosaic_gpu.rows_unstaged`): a dense call
@@ -979,11 +971,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         copy's extent along its axis (`mosaic.Family.copy_extent`); none a compile of this process found
         spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
         family = next((bundle for bundle in self._families(ba, target) if bundle.name == config.family), None)
-        # No deeper ring than its family's launches hold (`mosaic.Transport.most_stages`), a pin or a
-        # tuning neighbour's as the derivation's.
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
-                or not self._divides(ba, config) or config.stages > (family.most_stages or config.stages)
-                or report.refused(self, ba, config)):
+                or not self._divides(ba, config) or report.refused(self, ba, config)):
             return False
         # A family fixing its accumulator's rows takes a tile of exactly them a consumer, and one holding its
         # accumulators in tensor memory a tile whose accumulators it holds (a paired product's two).
@@ -1016,7 +1005,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         whole units of its family's tiles where they are not (its depth to the least step,
         `Family.depths`, or a tile's rows where the depth is a tile's; its width to whole column units,
         `Family.column_unit`), the output sliced back; the call itself where they are. A width of 100
-        columns, which no tile divides, so runs on 128, the template's where Triton's masked tiles ran it."""
+        columns, which no tile divides, so runs on 128, the template's where Triton's masked tiles ran it.
+        The padding stands where the loads cannot bound a partial tile: Mosaic GPU's TMA view of a partial
+        dimension is refused ("dimension 1 must have size smaller or a multiple of its tiling 64, but got
+        100", a022d3abb83), which the fork's row 5299 takes; its cost is the padded operands' copy."""
         layouts = self._families(ba, generation.gpu_target())
         if not layouts:
             return ba
@@ -1477,16 +1469,40 @@ class MosaicTgmm(_Mosaic):
                  _side_dims(ba.arguments['prologue_operands'], hooks.prologue_axes, {'depth': 'depth'}))]
 
     def derived(self, ba, target) -> mosaic_gpu.Tiles | None:
-        # The derived tile, its contraction split where its output tiles underfill a wave
-        # (`mosaic_gpu.split_count`) at the tile the split's own call, writing fp32 partials, derives. An
-        # exact sum splits too, its runs summed exactly and their partials by IEEE adds (`mosaic_gpu.tgmm`):
-        # unsplit, Qwen3.5-4B's key kernel gradient ran 2.03-2.06x the tensor cores' split sums on a GH200
+        # The derived tile, split where its output tiles underfill a wave (`_split_tile`). An exact sum splits
+        # too, its runs summed exactly and their partials by IEEE adds (`mosaic_gpu.tgmm`): unsplit,
+        # Qwen3.5-4B's key kernel gradient ran 2.03-2.06x the tensor cores' split sums on a GH200
         # (W123-gh200, W124-gh200).
-        tile = super().derived(ba, target)
+        tile = self._split_tile(ba, target)
+        # A call whose programs fill less than a wave (its output tiles, each split as deep as its ring
+        # allows) takes as long as its busiest program's walk, not its reads a FLOP, which the derived width
+        # balances for a full wave: its width narrows while that walk, its partials' passes and their sum's
+        # launch take less (`mosaic_gpu.SplitWalk`). An A100's 64 x 256 gradient over 4096 rows split 16
+        # ways at 64 x 128 ran 1.06x its time at 64 x 64 split 11 ways, and four groups' 200 x 100 ones over
+        # 1024 rows a group 1.10x unsplit at 64 x 128 against 64 x 64 split 3 ways (M-JS-88-gemm-picks-a100).
+        while tile is not None and not self._balances(ba, tile, target):
+            walk = self._walk(ba, tile, target)
+            if walk is None or not walk.underfills(tile.splits):
+                break
+            narrower = self._split_tile(ba, target, below=tile.block_n)
+            if narrower is None:
+                break
+            walked = self._walk(ba, narrower, target)
+            if walked is None or walked.seconds(narrower.splits) >= walk.seconds(tile.splits):
+                break
+            tile = narrower
+        return tile
+
+    def _split_tile(self, ba, target, below: int | None = None) -> mosaic_gpu.Tiles | None:
+        """The derived tile (narrower than `below` columns where given), its contraction split where its
+        output tiles underfill a wave (`mosaic_gpu.split_count`) at the tile the split's own call, writing
+        fp32 partials, derives."""
+        admits = None if below is None else (lambda tile: tile.block_n < below)
+        tile = self._derived(ba, target, admits)
         if tile is None or self._balances(ba, tile, target) or self._splits(ba, tile, target) == 1:
             return tile
         partials = self._partials(ba)
-        sliced = super().derived(partials, target)
+        sliced = self._derived(partials, target, admits)
         if sliced is None or (splits := self._splits(partials, sliced, target)) == 1:
             return tile
         split = dataclasses.replace(sliced, splits=splits)
@@ -1499,6 +1515,7 @@ class MosaicTgmm(_Mosaic):
         partials added by IEEE adds, `mosaic_gpu.tgmm`), its tail balanced."""
         if not (ba.arguments['dense'] and mosaic_gpu.fixes_up(tile, ba.arguments['tokens'].dtype)):
             return False
+        ba = self._aligned(ba)
         depth, _, width = self._generated_extents(ba)
         tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
         steps = -(-tokens.shape[0] // tile.block_k)
@@ -1507,14 +1524,26 @@ class MosaicTgmm(_Mosaic):
                                         _multiprocessors(target) * tile.programs) is not None
 
     def _splits(self, ba, tile: mosaic_gpu.Tiles, target) -> int:
+        return mosaic_gpu.split_count(tile, **self._contraction(ba, tile, target))
+
+    def _walk(self, ba, tile: mosaic_gpu.Tiles, target) -> mosaic_gpu.SplitWalk | None:
+        """The walk `tile` runs the call in (`mosaic_gpu.split_walk`): a split tile's over the partials' call
+        its slices run (`_partials`)."""
+        call = ba if tile.splits == 1 else self._partials(ba)
+        return mosaic_gpu.split_walk(tile, **self._contraction(call, tile, target))
+
+    def _contraction(self, ba, tile: mosaic_gpu.Tiles, target) -> dict:
+        """The call's contraction as the split prices it at `tile` (`mosaic_gpu.split_walk`'s facts): the call
+        as the launch runs it (`_aligned`), its depth and width padded to whole tiles (a 100-wide gradient's
+        128 columns)."""
+        ba = self._aligned(ba)
         depth, _, width = self._generated_extents(ba)
         tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
-        return mosaic_gpu.split_count(tile, groups=ba.arguments['sizes'].shape[0],
-                                      rows=_rows_of(_TGMMS, ba.args), depth=depth, width=width,
-                                      itemsizes=(tokens.dtype.itemsize, cotangent.dtype.itemsize),
-                                      multiprocessors=_multiprocessors(target),
-                                      step_seconds=mosaic_gpu.step_seconds(tile, target),
-                                      bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
+        return {'groups': ba.arguments['sizes'].shape[0], 'rows': _rows_of(_TGMMS, ba.args), 'depth': depth,
+                'width': width, 'itemsizes': (tokens.dtype.itemsize, cotangent.dtype.itemsize),
+                'multiprocessors': _multiprocessors(target),
+                'step_seconds': mosaic_gpu.step_seconds(tile, target), 'bandwidth': target.memory_rate,
+                'launch_seconds': target.launch_seconds}
 
     def _partials(self, ba):
         """The call `ba` writing fp32 partials, as a split's slices do (`mosaic_gpu.tgmm`): each slice a group
@@ -1582,13 +1611,6 @@ class MosaicTgmm(_Mosaic):
 
 
 @functools.cache
-def cutlass_architectures() -> tuple[str, ...]:
-    """The GPU generations the installed dew_cutlass holds code for, or none where it is not installed."""
-    if importlib.util.find_spec('dew_cutlass') is None:
-        return ()
-    return importlib.import_module('dew_cutlass').ARCHITECTURES
-
-
 @functools.cache
 def _cutlass_registered() -> None:
     """dew_cutlass's FFI targets, registered with jax once, at the first launch that runs one."""
@@ -1597,7 +1619,27 @@ def _cutlass_registered() -> None:
 
 
 @dataclasses.dataclass(frozen=True)
-class MosaicStepScaledGmm(MosaicGmm):
+class _ScaledGmm(MosaicGmm):
+    """`MosaicGmm` of a product whose rows' and matrix's scales its binding takes as one operand (`scales`),
+    reaching the mainloop as the keyword of `mosaic_gpu.gmm`'s its subclass names (`SCALES`)."""
+
+    SCALES: ClassVar[str]
+
+    def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array, prologue_operands: tuple = (),
+             epilogue_operands: tuple = (), paired: jax.Array | None = None, first: jax.Array | None = None,
+             gather: jax.Array | None = None, scatter: jax.Array | None = None, *, out_dtype: str,
+             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
+             dense: bool = False, scales: tuple = (), config: mosaic_gpu.Tiles,
+             return_residuals: bool = False):
+        del return_residuals
+        return self._forward(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
+                             gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret,
+                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config,
+                             formats={self.SCALES: tuple(scales)})
+
+
+@dataclasses.dataclass(frozen=True)
+class MosaicStepScaledGmm(_ScaledGmm):
     """`MosaicGmm` of a blockwise-scaled FP8 product (`gemm.blockwise_fp8_product`, row 4518), planned on the
     call it is: each exactly summed `SCALE_DEPTH`-deep step's partial times its rows' and
     columns' scales before its add (`mosaic_gpu.gmm`'s `step_scales`), its rows' scales streamed beside its
@@ -1606,19 +1648,7 @@ class MosaicStepScaledGmm(MosaicGmm):
 
     STEPS: ClassVar[tuple[int, ...] | None] = (SCALE_DEPTH,)
     STEP_SCALED: ClassVar[bool] = True
-
-    def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array, prologue_operands: tuple = (),
-             epilogue_operands: tuple = (), paired: jax.Array | None = None, first: jax.Array | None = None,
-             gather: jax.Array | None = None, scatter: jax.Array | None = None, *, out_dtype: str,
-             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
-             dense: bool = False, step_scales: tuple = (), config: mosaic_gpu.Tiles,
-             return_residuals: bool = False):
-        # Its rows' and its matrix's scales, the binding's operand, reach the mainloop as its `step_scales`.
-        del return_residuals
-        return self._forward(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                             gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret,
-                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config,
-                             formats={'step_scales': tuple(step_scales)})
+    SCALES: ClassVar[str] = 'step_scales'
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         within = SCALE_DEPTH % config.block_n == 0
@@ -1634,33 +1664,20 @@ class MosaicStepScaledGmm(MosaicGmm):
 
 
 @dataclasses.dataclass(frozen=True)
-class MosaicMxGmm(MosaicGmm):
+class MosaicMxGmm(_ScaledGmm):
     """`MosaicGmm` of a block-scaled product (`gemm.mxfp8_product`, `gemm.nvfp4_block_product`, row 4519),
     planned on the call it is: FP8 or E2M1 rows times a K-major matrix of theirs, each block of each scaled
-    by its scale in the products (`mosaic_gpu.block_format`)
+    by its scale in the products (`product.block_format`)
     (`mosaic_gpu.gmm`'s `mx_scales`, `mosaic.Issuer.scaled_products`), its block scales streamed beside its
     rings (`gmm_allocations`' `block_scaled`) on a family whose products take them (tcgen05's), its tiles
     whole 128s of rows, columns and depth, and no split, swap, hook or exact sums."""
 
     BLOCK_SCALED: ClassVar[bool] = True
-
-    def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array, prologue_operands: tuple = (),
-             epilogue_operands: tuple = (), paired: jax.Array | None = None, first: jax.Array | None = None,
-             gather: jax.Array | None = None, scatter: jax.Array | None = None, *, out_dtype: str,
-             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
-             dense: bool = False, mx_scales: tuple = (), config: mosaic_gpu.Tiles,
-             return_residuals: bool = False):
-        # Its rows' and its matrix's block scales, the binding's operand in the products' tiles, reach the
-        # mainloop as its `mx_scales`.
-        del return_residuals
-        return self._forward(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
-                             gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret,
-                             hooks=hooks, exact_sums=exact_sums, dense=dense, config=config,
-                             formats={'mx_scales': tuple(mx_scales)})
+    SCALES: ClassVar[str] = 'mx_scales'
 
     def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
         # Its products scale each block in the instruction, which sums in fp32 itself: no step promoted. Its
-        # operands FP8 (MXFP8) or E2M1 (NVFP4), `mosaic_gpu.block_format`'s.
+        # operands FP8 (MXFP8) or E2M1 (NVFP4), `product.block_format`'s.
         return (jnp.dtype(dtype) in (*EIGHT, jnp.dtype(jnp.float4_e2m1fn)) and family.takes_block_scales
                 and ba.arguments['trans_rhs'] and ba.arguments['hooks'] == NO_HOOKS
                 and ba.arguments.get('paired') is None and not ba.arguments.get('exact_sums'))
@@ -1743,16 +1760,14 @@ def cutlass_tile(architecture: str, out_dtype) -> mosaic_gpu.Tiles:
                             family=kernel.instructions)
 
 
-def cutlass_built_for(generation_name: str, built: tuple[str, ...]) -> str | None:
-    """The architecture of the dew_cutlass kernels `built` (`cutlass_architectures`, the installed wheel's) a
-    GPU of `generation_name` runs (kernels/cutlass's ffi.cu dispatch): its own, or an sm80 build on any
-    capability 8.x, whose plain SASS every later minor of its major runs (CUDA's binary compatibility);
-    sm90a's kernels, of Hopper's arch-specific instructions, run on 9.0 alone. None where `built` holds none
-    it runs."""
-    if generation_name in built:
-        return generation_name
+def cutlass_built_for(generation_name: str) -> str | None:
+    """The generation of the installed dew_cutlass's kernels a GPU of `generation_name` runs, as the wheel
+    dispatches on its compute capability (`dew_cutlass.architecture`, the one statement of it); None where
+    the wheel is not installed or runs none there."""
     capability = generation.capability(generation_name)
-    return 'sm80' if capability is not None and capability[0] == 8 and 'sm80' in built else None
+    if capability is None or importlib.util.find_spec('dew_cutlass') is None:
+        return None
+    return importlib.import_module('dew_cutlass').architecture(*capability)
 
 
 class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
@@ -1766,12 +1781,12 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
     config_cls: ClassVar[type[mosaic_gpu.Tiles]] = mosaic_gpu.Tiles
 
     def eligible(self, ba, target) -> bool:
-        return cutlass_built_for(target.generation, cutlass_architectures()) is not None and self.takes(ba)
+        return cutlass_built_for(target.generation) is not None and self.takes(ba)
 
     def tile(self, ba) -> mosaic_gpu.Tiles | None:
         """The record of the kernel the build holds for the GPU being selected for (`generation.gpu_target`,
         `cutlass_built_for`) writing the call's output (`cutlass_tile`); None where it holds none."""
-        built = cutlass_built_for(generation.gpu_target().generation, cutlass_architectures())
+        built = cutlass_built_for(generation.gpu_target().generation)
         return None if built is None else cutlass_tile(built, ba.arguments['out_dtype'])
 
     @staticmethod
@@ -2293,14 +2308,14 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike, out_
     output = jnp.asarray(portable_projection(x, kernel, group_sizes, dtype, precision, out_dtype))
     work = at_least_fp32(jnp.result_type(output.dtype, x.dtype, kernel.dtype))
     compute = jnp.dtype(dtype) if dtype is not None else jnp.result_type(x.dtype, kernel.dtype)
-    # A symbolic zero tangent contributes no term. Only the others pass the
-    # barrier: jax 0.11.2 cannot transpose one that holds a constant zero.
+    # A symbolic zero tangent contributes no term, so none is formed.
     live = [(name, tangent) for name, tangent in (('x', dx), ('kernel', dkernel))
             if not isinstance(tangent, SymbolicZero)]
     if not live:
         return output, SymbolicZero(jax.typeof(output))
-    # The tangents keep their dtypes to this point whatever produced them, so
-    # an activation's bf16 cotangent is not fused into a wider expression.
+    # The tangents keep their dtypes to this point whatever produced them, so an activation's bf16 cotangent
+    # is not fused into a wider expression: XLA's excess-precision simplification (`SimplifyFPConversions`,
+    # on under `xla_allow_excess_precision`, its default) drops a round trip through bf16 a fusion forms.
     held = dict(zip((name for name, _ in live),
                     jax.lax.optimization_barrier(tuple(tangent for _, tangent in live)),
                     strict=True))

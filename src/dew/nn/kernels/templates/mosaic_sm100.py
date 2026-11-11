@@ -318,13 +318,46 @@ class PairedRing(CommittedRing):
         plgpu.tcgen05_commit_arrive(self.consumed.at[rings.opaque(turn.slot)], **self.topology.issued())
 
 
-BLOCK_SCALED_COLUMNS = 128
-"""The columns of one block-scale tile's rows (`SCALE_TILE`): a block-scaled product's tile is whole 128s."""
+SCALE_ROWS = 128
+"""The rows of one block-scale tile (`scale_tiles`): tensor memory's lanes, one row's scales a lane
+(`tcgen05.scales_layout`), so a block-scaled product's tile is whole 128s of rows and of columns."""
+
+BLOCK_SCALED_COLUMNS = SCALE_ROWS
+"""The columns of a block-scaled product's tile: its matrix's columns are its scales' rows (`SCALE_ROWS`)."""
+
+SCALES_A_ROW = 4
+"""Each row's scales one block-scale tile holds (`scale_tiles`): `.scale_vec::1X`'s four a 32-bit lane."""
 
 SCALE_TILE = (32, 16)
-"""A block-scale stream's tile (`Tcgen05Rings.streams`): a block-scaled product's scales (an MX product's
-E8M0, an NVFP4 one's E4M3), tiled in shared memory as `tcgen05.scales_layout` lays them out, `[rows / 128,
-scale tiles, 32, 16]` a step's block, four scales of each of 128 rows a tile."""
+"""A block-scale tile's shared-memory extent (`scale_tiles`, `tcgen05.scales_layout`'s): its 128 rows' four
+scales each as 32 rows of 16, row `i`'s scale `j` at `[i % 32, (i // 32) % 4 * 4 + j]`, each warp's quarter
+of the lanes a group of four columns."""
+
+
+def scale_tiles(rows: int, scales: int) -> tuple[int, int, int, int]:
+    """The shared-memory shape of `rows` rows' `scales` scales each as the block-scaled products read them
+    (`tcgen05.scales_layout`; `async_copy_scales_to_tmem`'s `(MN // 128, K // 4, 32, 16)`): a tile
+    (`SCALE_TILE`) each 128 rows' four scales."""
+    return (rows // SCALE_ROWS, scales // SCALES_A_ROW, *SCALE_TILE)
+
+
+def scales_tiled(scales: jax.Array) -> jax.Array:
+    """Block scales `[..., rows, scales]` laid out in their tiles (`scale_tiles`): row `i`'s scale `j` at
+    `[i // 128, j // 4, i % 32, (i // 32) % 4 * 4 + j % 4]`, as `async_copy_scales_to_tmem` documents their
+    preparation."""
+    *lead, rows, columns = scales.shape
+    lanes = SCALE_TILE[0]
+    tiled = scales.reshape(*lead, rows // SCALE_ROWS, SCALE_ROWS // lanes, lanes, columns // SCALES_A_ROW,
+                           SCALES_A_ROW)
+    order = tuple(range(len(lead)))
+    tiled = jnp.transpose(tiled, (*order, *(len(lead) + axis for axis in (0, 3, 2, 1, 4))))
+    return tiled.reshape(*lead, *scale_tiles(rows, columns))
+
+
+def scale_memory(tiles: tuple[int, ...], stages: int) -> tuple[int, int]:
+    """The tensor memory a ring of `stages` slots of block-scale tiles `tiles` (`scale_tiles`' shape) is
+    copied to: a row a lane, each slot's scales its own columns (`ScaleRing._scales`)."""
+    return (tiles[0] * SCALE_ROWS, stages * tiles[1] * SCALES_A_ROW)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -367,10 +400,6 @@ class Tcgen05Issuer(mosaic.Issuer[Accumulator]):
     issues_in_consumers = False
 
     takes_pairs = False
-
-    # Eight stages spilled 16 bytes at every cap to 224 where two to six held at 64-80 registers, a
-    # 128 x 64 x 64 kernel gradient's, split or not (the GEMM compile gate's caps, EM-s8).
-    most_stages = 6
 
     takes_register_left = False
 
@@ -595,11 +624,11 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
                    rings.ring(shape, dtype, stages, swizzle=(swizzles or {}).get(name),
                                copies=(copies or {}).get(name, 1), released_by_products=True)
                    for name, (shape, dtype) in blocks.items()}
-        # A block-scale stream's slots each pair with the tensor memory its products read them from: its
-        # block's rows (`[rows / 128, depth / 128, 32, 16]`) by its depth's scales, a slot's columns each.
+        # A block-scale stream's slots each pair with the tensor memory its products read them from
+        # (`scale_memory`).
         for name, (shape, dtype) in blocks.items():
             if tuple(shape[-2:]) == SCALE_TILE:
-                streams[name]['tmem'] = plgpu.TMEM((shape[0] * 128, stages * shape[1] * 4), dtype,
+                streams[name]['tmem'] = plgpu.TMEM(scale_memory(shape, stages), dtype,
                                                    layout=plgpu.TMEMLayout.SCALES_LAYOUT)
         return streams
 

@@ -1326,9 +1326,6 @@ class Transport[Allocated, Opened](abc.ABC):
     """Whether its walks scope their streams apart, each in its own scope (`emit_pipeline`'s slots): a tile
     scoped after a walk then takes the larger of the two (`resources.shared_bytes`)."""
 
-    most_stages: int | None = None
-    """The deepest ring its launches take where ptxas spills past it (tcgen05's), None where unbounded."""
-
     ring_slots: int | None = None
     """The slots each stream's ring holds whatever stages a launch asks (`streams`), where it fixes them (a
     TPU core's two); None where the ring is the launch's stages."""

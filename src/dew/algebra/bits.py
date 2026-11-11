@@ -695,14 +695,23 @@ def nvfp4_decoded(words: jax.Array, scales: jax.Array) -> jax.Array:
 
 
 def _restored(decoded: jax.Array) -> jax.Array:
-    """A decode's bfloat16 values (`NVFP4_BFLOAT16_FORM.values`, each `code 2^-126`) times 2^126, in float32,
-    by integer arithmetic: a subnormal (a code of 0 or 0.5) as its mantissa's integer times 2^-7, every other
-    value's exponent raised by 126, so no lane that flushes subnormals (XLA:CPU's) zeroes a code of 0.5."""
-    bits = jax.lax.bitcast_convert_type(decoded, jnp.uint16).astype(jnp.uint32)
-    raised = jax.lax.bitcast_convert_type(((bits + (126 << 7)) & 0xFFFF).astype(jnp.uint16), jnp.bfloat16)
-    mantissa = (bits & 0x7F).astype(jnp.float32) * np.float32(2.0 ** -7)
-    subnormal = jnp.where(bits & 0x8000 != 0, -mantissa, mantissa)
-    return jnp.where(bits & 0x7F80 == 0, subnormal, raised.astype(jnp.float32))
+    """A decode's bfloat16 values (`NVFP4_BFLOAT16_FORM.values`, each `code 2^-126`) times 2^126, in float32
+    (`restored`)."""
+    return restored(jax.lax.bitcast_convert_type(decoded, jnp.uint16).astype(jnp.uint32))
+
+
+def restored(pattern: jax.Array) -> jax.Array:
+    """The NVFP4 form's decoded value (`NVFP4_BFLOAT16_FORM`: each code times 2^-126 as a bfloat16) of each of
+    `pattern` (uint32, a bfloat16's 16 bits in its low half), restored to the code in float32 by integer
+    arithmetic: a subnormal (a code of 0 or 0.5) as its mantissa's integer times 2^-7 with its sign, every
+    other value's exponent raised by 126 (its bits moved to a float32's high half), so no lane that flushes
+    subnormals (XLA:CPU's, a GPU's) zeroes a code of 0.5. The one definition of the decoded value: the
+    portable decode's (`nvfp4_decoded`) and the native staged decode's, whatever lanes each extracts."""
+    sign = pattern & jnp.uint32(0x8000)
+    normal = jax.lax.bitcast_convert_type((pattern << jnp.uint32(16)) + jnp.uint32(126 << 23), jnp.float32)
+    mantissa = (pattern & jnp.uint32(0x7F)).astype(jnp.float32) * jnp.float32(2.0 ** -7)
+    subnormal = jnp.where(sign != 0, -mantissa, mantissa)
+    return jnp.where(pattern & jnp.uint32(0x7F80) == 0, subnormal, normal)
 
 
 class Minifloat(NamedTuple):
@@ -735,6 +744,23 @@ E5M2 = Minifloat(exponent=5, mantissa=2, bias=15, largest=0x7B, nan=0x7F)
 
 E2M1 = Minifloat(exponent=2, mantissa=1, bias=1, largest=0x7, nan=None)
 """FP4 e2m1 (NVFP4's code): its largest 6 (0x7), no NaN."""
+
+
+def decoded(codes: jax.Array, minifloat: Minifloat) -> jax.Array:
+    """`minifloat` codes (uint32 a code) as float32, exactly, by integer arithmetic: a normal code's exponent
+    (rebiased to fp32's) and mantissa moved into an fp32 pattern, a subnormal code's mantissa times its
+    place (2^(1 - bias - mantissa bits)), its sign kept, each field read from the format. No conversion
+    instruction, which an older family lacks (an A100's ptxas refused the FP8 cvt, sm89's
+    `cvt ... .e4m3x2`). A NaN code reads as the largest exponent's value it spells (e4m3fn's 0x7F as 480)."""
+    word = jnp.uint32
+    exponent = (codes >> word(minifloat.mantissa)) & word((1 << minifloat.exponent) - 1)
+    mantissa = codes & word((1 << minifloat.mantissa) - 1)
+    sign = (codes >> word(minifloat.exponent + minifloat.mantissa)) << word(31)
+    raised = (exponent + word(127 - minifloat.bias)) << word(23)
+    normal = jax.lax.bitcast_convert_type(sign | raised | (mantissa << word(23 - minifloat.mantissa)),
+                                          jnp.float32)
+    subnormal = mantissa.astype(jnp.float32) * jnp.float32(2.0 ** (1 - minifloat.bias - minifloat.mantissa))
+    return jnp.where(exponent == 0, jnp.where(sign != 0, -subnormal, subnormal), normal)
 
 
 def encoded[Words: (np.ndarray, jax.Array)](x: Words, minifloat: Minifloat, xp=jnp) -> Words:

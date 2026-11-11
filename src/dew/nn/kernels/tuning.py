@@ -797,9 +797,8 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
     traced (a value of the enclosing computation) is data the compiled launch reads, so it keys by its shape
     and dtype alone."""
     # A fresh function, which JAX's tracing cache keys by its identity: it keys a callable by equality, so an
-    # equal hook of another call would take this one's program. Traced on its call's mesh (`_keyed_mesh`).
-    with jax.sharding.use_abstract_mesh(_keyed_mesh(jax.sharding.get_abstract_mesh())):
-        closed = jax.make_jaxpr(lambda *values: function(*values))(*arguments)
+    # equal hook of another call would take this one's program.
+    closed = jax.make_jaxpr(lambda *values: function(*values))(*arguments)
     digest = hashlib.sha256()
 
     def update(*parts) -> None:
@@ -853,19 +852,6 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
     constants(closed.consts)
     walk(closed.jaxpr)
     return "traced:" + digest.hexdigest()[:16]
-
-
-def _keyed_mesh(mesh: jax.sharding.AbstractMesh) -> jax.sharding.AbstractMesh:
-    """`mesh` as `program` traces a function on it: its axes and its devices' platform and architecture,
-    which its lowering reads, not their kind or core count, which every equation's context and a jit's mesh
-    and shardings would carry into the key, where the target a launch derives for, keyed beside it, states
-    the GPU: one hook traced under one assumed H100 on an H100's mesh and on a GH200's keyed apart (row
-    5187)."""
-    device = mesh.abstract_device
-    if device is None:
-        return mesh
-    keyed = dataclasses.replace(device, device_kind=device.platform, num_cores=None)
-    return mesh.update(abstract_device=keyed)
 
 
 def _host(value) -> np.ndarray:
