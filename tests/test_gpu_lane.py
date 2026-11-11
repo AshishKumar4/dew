@@ -156,7 +156,9 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert [grown for *_, grown in first] == ["false"] * len(every)
     assert overlapping(first) == 1
     assert len(ran("test_red")) == 1, "a red row stays red: its file is not run again"
-    # Measured peaks of 4 GiB: each file then holds 6 GiB of the 40, and four run at once. Records without
+    # Measured peaks of 4 GiB: each file then holds 6 GiB of the 40, and four run at once, each given its
+    # 6 GiB as a fraction of the memory the GPU gives a process, which is what its pool is taken of, not of
+    # the GPU's whole memory, some of which its driver keeps. Records without
     # a key, as a run on these inputs leaves to be run again, under the last run's and these inputs'.
     # The spawner's child took its fraction, so it holds two shares: 12 GiB beside the others' 24.
     common = ci.lane_inputs("3.12")

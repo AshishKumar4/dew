@@ -109,14 +109,20 @@ def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk
     gives it shifted down `e` rows, zeros above (a padded tile's): the same exact terms as `prefix`'s, summed
     in another association, a difference of two positions as precise as its own range either way. The
     prefix a launch's own: as its own XLA scan, thirteen launches took 0.30 ms of Kimi Linear's 1.57 ms
-    template forward on an H100 (prefix-probe-h100-9e3be6213, kda-profile-h100-69233abb8)."""
+    template forward on an H100 (prefix-probe-h100-9e3be6213, kda-profile-h100-69233abb8). Each step adds the
+    pairs as staged, its own rows read back (`stage(pair)(0)`) beside the shifted ones: a token's rounded
+    product `g log2(e)` held in its registers met the first step's TwoSum, where the compiler contracted the
+    product into the sum (`fma(g, log2(e), shifted)`), its rounding counted twice beside the Dekker residual
+    that keeps it: the native prefix lay 1.9e-6 from exact where the interpreted one lay 1e-12 (M-MC-9), a
+    key's gated write one bf16 step from the witness's at a tie (M-MC-8)."""
     # The factor split where it is known (`two_product` of a constant), `g` by its bits in the launch.
     scale = np.float32(LOG2_E)
     scaled, error = two_product(g, scale, bit_split=True)
     pair = scaled, error + g * float(np.float32(LOG2_E - float(scale)))
     shift = 1
     while shift < chunk:
-        pair = compensated_add(pair, stage(pair)(shift))
+        staged = stage(pair)
+        pair = compensated_add(staged(0), staged(shift))
         shift *= 2
     return pair
 

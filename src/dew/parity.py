@@ -1195,30 +1195,40 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     if not paired:
         return (mine.mse, theirs.mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
                 mine.finite and theirs.finite, (mine.share, theirs.share))
-    at_zero = dict(zip(theirs.zero_rows.tolist(), theirs.zero_errors.tolist(), strict=True))
-    unrecorded = [at for at in mine.zero_rows.tolist() if at not in at_zero]
-    if unrecorded:
+    # Each of Dew's rows of float64 zero against the reference's same row, every row at once (up to 283k a
+    # draw at 2469's chunk sites, which a loop of scalar logs held for a fifth of a GPU attention file's
+    # time, row 5461): aligned in any order, a repeated row read at its last, as a mapping of rows reads it.
+    rows = np.asarray(mine.zero_rows, np.int64)
+    recorded = np.asarray(theirs.zero_rows, np.int64)
+    known = np.isin(rows, recorded)
+    if not known.all():
         raise AssertionError(f"{name}: the truth holds rows of float64 zero the reference's did not, "
-                             f"{unrecorded[:4]}")
-    sizes = (dict(zip(theirs.zero_rows.tolist(), theirs.zero_sizes.tolist(), strict=True))
-             if theirs.zero_sizes is not None else {})
-    worst, their_worst, zero = mine.log_worst, theirs.log_worst, []
-    for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True):
-        size = sizes.get(at, 0.0)
-        if at_zero[at] < size:
-            worst = max(worst, float(log_over(error, size)))
-            their_worst = max(their_worst, float(log_over(at_zero[at], size)))
-        elif error or at_zero[at]:
-            # A row both arms hold exactly scales both pooled errors alike and passes on every seed: no
-            # evidence, not carried (a window's untouched embedding rows, 283k a draw at 2469's chunk sites).
-            zero.append((at, error, at_zero[at]))
-    rows, errors, their_errors = (np.asarray(column, dtype) for column, dtype in zip(
-        zip(*zero, strict=True) if zero else ((), (), ()), (np.int64, np.float64, np.float64), strict=True))
+                             f"{rows[~known][:4].tolist()}")
+    order = np.argsort(recorded, kind="stable")
+    at = order[np.searchsorted(recorded, rows, side="right", sorter=order) - 1]
+    errors = np.asarray(mine.zero_errors, np.float64)
+    their_errors = np.asarray(theirs.zero_errors, np.float64)[at]
+    sizes = (np.asarray(theirs.zero_sizes, np.float64)[at] if theirs.zero_sizes is not None
+             else np.zeros(rows.shape, np.float64))
+    measured = their_errors < sizes
+    worst = _at_least(mine.log_worst, log_over(errors[measured], sizes[measured]))
+    their_worst = _at_least(theirs.log_worst, log_over(their_errors[measured], sizes[measured]))
+    # A row both arms hold exactly scales both pooled errors alike and passes on every seed: no evidence,
+    # not carried (a window's untouched embedding rows).
+    carried = ~measured & ((errors != 0) | (their_errors != 0))
+    rows, errors, their_errors = rows[carried], errors[carried], their_errors[carried]
     # A measured row of float64 zero that became an arm's worst keeps no share of its own: unknown.
     shares = (mine.share if worst == mine.log_worst else None,
               theirs.share if their_worst == theirs.log_worst else None)
     return (mine.mse, theirs.mse, worst, their_worst, (rows, errors, their_errors),
             mine.finite and theirs.finite, shares)
+
+
+def _at_least(worst: float, logs: np.ndarray) -> float:
+    """`worst` raised to the largest of `logs` as Python's `max` folds them in turn: a log that is not a
+    number never replaces it, and a `worst` that is not a number stays."""
+    logs = logs[~np.isnan(logs)]
+    return worst if math.isnan(worst) or logs.size == 0 else max(worst, float(logs.max()))
 
 
 def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)

@@ -1898,13 +1898,18 @@ class Checkpoints:
         target = resolve_dtype(param_dtype)
         selected = set()
         if target is not None:
+            if jax.dtypes.canonicalize_dtype(target) != np.dtype(target):
+                raise ValueError(f"param_dtype {np.dtype(target).name} is wider than this process holds "
+                                 f"(jax_enable_x64 is off, so it restores as "
+                                 f"{jax.dtypes.canonicalize_dtype(target).name}): enable x64 or ask for that")
             selected = {path for path, leaf in jax.tree_util.tree_flatten_with_path(template["variables"])[0]
                         if jnp.issubdtype(leaf.dtype, jnp.floating) and under_roots(path, parameter_roots)}
-        # Each leaf in the dtype this process holds it in: a stored float64 a float32 where x64 is off.
+        # Each leaf in the dtype it is asked in, or else in the dtype this process holds its stored one in: a
+        # stored float64 a float32 where x64 is off.
         typed = jax.tree_util.tree_map_with_path(
             lambda path, leaf, sharding: jax.ShapeDtypeStruct(
-                leaf.shape, jax.dtypes.canonicalize_dtype(target if path[1:] in selected else leaf.dtype,
-                                                          allow_extended_dtype=True), sharding=sharding),
+                leaf.shape, target if path[1:] in selected else jax.dtypes.canonicalize_dtype(
+                    leaf.dtype, allow_extended_dtype=True), sharding=sharding),
             dict(template), dict(placement))
         values, _ = self.restore(typed, step=step)
         params = values.pop("variables")

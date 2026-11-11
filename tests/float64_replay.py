@@ -7,7 +7,7 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 import numpy as np
-from arm_arithmetic import FORMATTED
+from arm_arithmetic import FORMATTED, rounds_nothing
 from float64_terms import evaluated_on, lowered, walked
 from jax.extend.core import primitives
 from reference_error import _floating, as_given, equations
@@ -17,18 +17,18 @@ from dew.nn import programs
 
 def _replayed(primitive) -> bool:
     """Whether `float64_replay` evaluates `primitive` on floats in float64, bound on its operands widened:
-    an operation whose arithmetic is its dtype's at any width, as JAX states where it defines each
-    (`dew.nn.programs`): one that computes each entry from its operands' entries, only moves entries (a
-    padding among them, which Dew's blocked CPU product puts in a library process's every contraction),
-    reduces or scans an axis, or scatters; and the contractions, `iota` and `empty2` (the placeholder buffer
-    a scan's derivative allocates, JAX's own `empty_like_shaped_array`), which state no such fact and are
-    their dtype's too. Any other operation on a float refuses: a decomposition, another library's
-    primitive. A primitive that rounds to a format of its own whatever its operands' is never bound on
-    them widened: the replay evaluates the operation it states (`programs.UNROUNDED`)."""
-    return (programs.entrywise(primitive) or programs.rearranges(primitive) or programs.reduction(primitive)
+    an operation whose arithmetic is its dtype's at any width. JAX states it where it defines each
+    (`dew.nn.programs`): one that computes each entry from its operands' entries, reduces or scans an axis,
+    or scatters. The gate's exact operations are so too (`arm_arithmetic.rounds_nothing`, the one list of
+    them: a move of entries, a padding among them, which Dew's blocked CPU product puts in a library
+    process's every contraction; `iota`; a selection; `empty2`, the placeholder buffer a scan's derivative
+    allocates), and the contractions, which state no such fact. Any other operation on a float refuses: a
+    decomposition, another library's primitive. A primitive that rounds to a format of its own whatever its
+    operands' is never bound on them widened: the replay evaluates the operation it states
+    (`programs.UNROUNDED`)."""
+    return (programs.entrywise(primitive) or rounds_nothing(primitive) or programs.reduction(primitive)
             or programs.cumulative(primitive) or programs.scatter(primitive)
-            or primitive in (primitives.dot_general_p, primitives.conv_general_dilated_p, primitives.iota_p,
-                             primitives.empty2_p))
+            or primitive in (primitives.dot_general_p, primitives.conv_general_dilated_p))
 
 
 def float64_replay(fn, *, compiled: bool = False):
