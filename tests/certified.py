@@ -712,41 +712,68 @@ def _ragged_dot(params, operands, result, fmt):
     return _terms_hold(native, products, fmt, flushes).reshape(np.shape(result))
 
 
-def _integer_power(params, operands, result, fmt):
-    """An integer_pow's result: x^y by repeated multiplications (a square and multiply per bit of |y|), and
-    a reciprocal of them where y is negative, each a rounding, so within γ_r of the exact power relative to
-    it (Higham, Accuracy and Stability of Numerical Algorithms, 2002, §3.1: r roundings of relative error at
-    most the unit roundoff), plus what underflow loses at each rounding; an exactly infinite or undefined
-    power the lane's same, and one past the format's range infinite. Integers wrap to the result's width."""
-    import fractions
+def _power_ends(size: float, power: int, fmt: Format, lost: float) -> tuple[float, float]:
+    """The least and the greatest magnitude the lane's `|x|^y` can take for `size = |x|`, finite and not
+    zero, as JAX computes it: `acc = x^|y|` by squarings and multiplies from the low bit of `|y|`, and
+    `1 / acc` where `y` is negative.
 
+    A squaring's rounding is squared again by every squaring after it, so the j-th squaring's relative
+    error enters the bit k's power with multiplicity 2^(k-j), and enters `acc` once for every set bit of
+    `|y|` above it: `|y| >> j` times. Over the squarings that is `|y|` less its set bits (Legendre), and the
+    multiplies of the set bits' powers add those bits less one: `|y| - 1` factors `(1 + δ)`, `|δ| ≤ u`, as
+    `|y| - 1` plain multiplications make, so `acc` is within γ_(|y|-1) of the exact power (Higham,
+    Accuracy and Stability of Numerical Algorithms, 2002, Lemma 3.1), plus what underflow loses at each
+    multiplication, which no later one grows (a chain that underflows multiplies by magnitudes below one).
+    The count of instructions, a square and a multiply a bit, undercounts it: x^8 is three squarings and
+    seven factors.
+
+    The reciprocal is one more rounding of `1 / acc` for whatever `acc` the chain made: the ends are the
+    reciprocals of `acc`'s, each a rounding off, and so follow `acc` where it left the range, which a bound
+    relative to the exact power does not: an `acc` that can round to an infinity (`Format.overflow`) has a
+    reciprocal as small as zero, and one lost to underflow a reciprocal as large as an infinity. The ends
+    carry 2^-50 for float64's own roundings in forming them."""
+    count = max(abs(power) - 1, 0)
+    try:
+        exact = float(fractions.Fraction(size) ** abs(power))
+    except OverflowError:
+        exact = math.inf
+    slack = allowance(exact, count, fmt, lost) if math.isfinite(exact) else 0.0
+    low, high = max(exact - slack, 0.0), exact + slack
+    if power < 0:
+        near = 0.0 if high >= fmt.overflow else 1.0 / high
+        far = 1.0 / low if low > 0 else math.inf
+        low = max(near - allowance(near, 1, fmt, lost), 0.0)
+        high = far + allowance(far, 1, fmt, lost) if math.isfinite(far) else math.inf
+    return low * (1 - 2.0 ** -50), high * (1 + 2.0 ** -50)
+
+
+def _integer_power(params, operands, result, fmt):
+    """An integer_pow's result: each magnitude within what the lane's chain of multiplications, and its
+    reciprocal where y is negative, can make of the operand's (`_power_ends`), an infinity where the chain
+    can pass the format's range, and the power's sign exactly, a zero's among them; a zero's or a
+    non-finite operand's power the lane's same (a pole of the zero's sign where the power is odd), an
+    undefined one undefined. Integers wrap to the result's width."""
     (value,) = operands
     power = params["y"]
     if fmt is None:
         powered = _wrapping(lambda a: a ** abs(power))
         return _bits(result) == _bits(powered(result, value))
-    flushes = lane().flushes
-    read = _read(value, flushes)
-    magnitude = abs(power)
-    roundings = max(magnitude.bit_length() - 1 + bin(magnitude).count("1") - 1, 0) + (power < 0)
-    exact = np.empty(read.shape)
+    read = _read(value, lane().flushes)
+    lost = _underflow(fmt)
+    low, high = np.empty(read.shape), np.empty(read.shape)
     for index, element in enumerate(read.flat):
-        # A zero's or a non-finite value's power is exact in float64 (a pole of the zero's sign where the
-        # power is odd); every other one a fraction's, rounded once.
         if np.isfinite(element) and element != 0:
-            exact.flat[index] = float(fractions.Fraction(float(element)) ** power)
+            low.flat[index], high.flat[index] = _power_ends(abs(float(element)), power, fmt, lost)
         else:
+            # A zero's or a non-finite value's power is exact in float64.
             with np.errstate(divide="ignore"):
-                exact.flat[index] = np.float64(element) ** power
+                low.flat[index] = high.flat[index] = abs(np.float64(element) ** power)
     native = np.asarray(result, np.float64)
-    underflow = 2.0 ** fmt.emin if flushes else 2.0 ** (fmt.emin - fmt.precision)
-    slack = allowance(np.abs(exact), roundings, fmt, underflow)
-    finite = np.isfinite(exact) & (np.abs(exact) <= fmt.largest)
-    # A power's sign is exact, a zero's among them.
-    held = (finite & np.isfinite(native) & (np.abs(native - exact) <= np.nextafter(slack, np.inf))
-            & (np.signbit(native) == np.signbit(exact)))
-    beyond = ~finite & ~np.isnan(exact) & (native == np.copysign(np.inf, exact))
-    return held | beyond | (np.isnan(exact) & np.isnan(native))
+    size = np.abs(native)
+    undefined = np.isnan(low)
+    within = ((size >= low) & (size <= high)) | (np.isinf(size) & (high >= fmt.overflow))
+    signed = np.signbit(native) == (np.signbit(read) & (power % 2 == 1))
+    return np.where(undefined, np.isnan(native), within & signed)
 
 
 def _keyed(value) -> bool:
@@ -754,28 +781,6 @@ def _keyed(value) -> bool:
 
     dtype = getattr(value, "dtype", None)
     return dtype is not None and jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key)
-
-
-@functools.cache
-def _combiner(which: str, dtype: str) -> str:
-    """The combine jaxpr, as printed, of one of Dew's variadic reductions over `dtype` operands: a
-    compensated sum's (`dew.nn.precision.compensated_add`), or a row's online softmax's with or without
-    its maximum's column (`dew.objectives.lm.chunked._row_terms`, `"softmax"` and `"softmax predicted"`):
-    what a `reduce` equation is recognized as by its own combine."""
-    import jax
-    import jax.numpy as jnp
-
-    from dew.nn import programs
-    from dew.nn.precision import compensated_add
-    from dew.objectives.lm.chunked import _row_terms
-
-    scalar = jax.ShapeDtypeStruct((), dtype)
-    if which == "compensated":
-        return str(jax.make_jaxpr(lambda a, b, c, d: compensated_add((a, b), (c, d)))(*[scalar] * 4))
-    traced = jax.make_jaxpr(lambda x, labels: _row_terms(x, which == "softmax predicted", labels))(
-        jax.ShapeDtypeStruct((1, 3), dtype), jax.ShapeDtypeStruct((1,), jnp.int32))
-    reduces = [eqn for eqn in programs.equations(traced.jaxpr) if eqn.primitive.name == "reduce"]
-    return str(reduces[0].params["jaxpr"])
 
 
 def _underflow(fmt: Format) -> float:
@@ -861,20 +866,28 @@ def _softmax_held(params, operands, results, fmt) -> list[np.ndarray]:
     return held
 
 
-REDUCTIONS = {"compensated": _pair_held, "softmax": _softmax_held, "softmax predicted": _softmax_held}
-"""Dew's variadic reductions check 2 holds, each recognized by its combine (`_combiner`), and its contract
-over all its results together."""
+@functools.cache
+def _reductions() -> dict:
+    """Dew's variadic reductions check 2 holds, each by its combine, to its contract over all its results
+    together. A `reduce` equation carries the combine it was given (its `computation`, the function its
+    owner handed `jax.lax.reduce`), and each of these owners hands a function of its module: the
+    compensated pair sum (`dew.nn.precision.compensated_add`) and a row's online softmax with and without
+    its maximum's column (`dew.objectives.lm.chunked`). A reduction is one of these where its combine is
+    that function, whatever its traced program prints as."""
+    from dew.nn.precision import compensated_add
+    from dew.objectives.lm import chunked
+
+    return {compensated_add: _pair_held, chunked._online_softmax: _softmax_held,
+            chunked._online_softmax_predicted: _softmax_held}
 
 
 def _reduced(eqn, operands, results) -> list[np.ndarray]:
-    """A variadic `reduce`'s held results, by the contract of the reduction its combine is (`REDUCTIONS`);
-    a TypeError for one it is none of."""
-    dtype = str(np.asarray(operands[0]).dtype)
-    combine = str(eqn.params["jaxpr"])
-    for which, contract in REDUCTIONS.items():
-        if np.issubdtype(np.dtype(dtype), np.floating) and combine == _combiner(which, dtype):
-            return contract(eqn.params, operands, results, _format(np.asarray(results[0]).dtype))
-    raise TypeError("a reduction of none of Dew's combines")
+    """A variadic `reduce`'s held results, by the contract of the reduction its combine is (`_reductions`);
+    a TypeError for one it is none of, and for one of operands that are no floats."""
+    contract = _reductions().get(eqn.params["computation"])
+    if contract is None or not np.issubdtype(np.asarray(operands[0]).dtype, np.floating):
+        raise TypeError("a reduction of none of Dew's combines")
+    return contract(eqn.params, operands, results, _format(np.asarray(results[0]).dtype))
 
 
 def _moved(oracle):

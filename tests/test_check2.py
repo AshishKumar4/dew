@@ -229,7 +229,7 @@ def test_a_ragged_dot_holds_each_groups_bound_and_an_element_twice_past_it_break
     assert not held[at] and held.sum() == held.size - 1
 
 
-@pytest.mark.parametrize("power", [-2, 3])
+@pytest.mark.parametrize("power", [-7, -2, 3, 8])
 def test_an_integer_power_holds_its_chain_of_roundings_and_a_value_twice_past_it_breaks_it(power):
     """x to an integer power, by squarings and multiplies and a reciprocal where the power is negative: the
     lane's own result holds within its roundings' bound of the exact power, a zero's pole and an infinity's
@@ -243,7 +243,7 @@ def test_an_integer_power_holds_its_chain_of_roundings_and_a_value_twice_past_it
     params = {"y": power}
     assert np.all(contract(params, [x], native, oc.FLOAT32))
     off = native.copy()
-    off[5] = np.float32(float(off[5]) * (1 + 2 * oc.gamma(4, oc.FLOAT32)))
+    off[5] = np.float32(float(off[5]) * (1 + 2 * oc.gamma(abs(power) + 1, oc.FLOAT32)))
     held = contract(params, [x], off, oc.FLOAT32)
     assert not held[5] and held.sum() == held.size - 1
     # A negative zero's power, of its sign or a pole of it, with its sign flipped.
@@ -251,6 +251,26 @@ def test_an_integer_power_holds_its_chain_of_roundings_and_a_value_twice_past_it
     off[2] = -off[2]
     held = contract(params, [x], off, oc.FLOAT32)
     assert not held[2] and held.sum() == held.size - 1
+
+
+def test_an_integer_power_is_held_through_its_squarings_and_its_reciprocal():
+    """x^8 is three squarings, and each squaring's rounding is squared again by those after it: seven
+    factors of rounding, where its three instructions count three. The lane's own eighth power of a value
+    whose error is past three roundings' bound holds (1.2637746: 6.5066457 against the exact 6.5066444,
+    1.295e-6 off where three roundings allow 1.163e-6). A negative power is the reciprocal of what the chain
+    made, so it follows the chain out of the range: of a square past the format's largest, a zero, where
+    the exact power is a small number; of a square below the normal range, whatever that square's own loss
+    makes of it."""
+    contract = ct.CONTRACTS["integer_pow"]
+    x = np.float32([1.2637746334075928])
+    native = np.asarray(jax.lax.integer_pow(x, 8))
+    assert contract({"y": 8}, [x], native, oc.FLOAT32).all()
+    past = np.float32([1e20, -3e19])
+    native = np.asarray(jax.lax.integer_pow(past, -2))
+    assert np.all(native == 0) and contract({"y": -2}, [past], native, oc.FLOAT32).all()
+    below = np.float32(np.random.default_rng(11).uniform(2.0 ** -64, 2.0 ** -63, 256))
+    native = np.asarray(jax.lax.integer_pow(below, -2))
+    assert contract({"y": -2}, [below], native, oc.FLOAT32).all()
 
 
 def test_a_computation_is_certified_through_its_calls_and_a_primitive_without_a_contract_refused():
@@ -593,6 +613,23 @@ def test_a_compensated_sum_holds_its_pairs_and_a_pair_a_step_off_breaks():
     for wrong in (np.inf, -np.inf):
         held = ct._pair_held(params, given, [np.float32([wrong]), native[1]], oc.FLOAT32)
         assert not held[0].any(), wrong
+
+
+def test_a_variadic_reduction_is_held_by_the_combine_it_was_given():
+    """A variadic reduction is one of Dew's where its combine is the function its owner hands
+    `jax.lax.reduce`: a pair sum over `compensated_add` certifies, and the same sum given another function
+    that computes as it does has no contract, a finding at that reduction and never a result passed
+    unheld."""
+    from dew.nn.precision import compensated_add
+
+    values = np.float32(np.random.default_rng(12).standard_normal((3, 64)))
+
+    def summed(combine):
+        zero = np.float32(0)
+        return lambda x: jax.lax.reduce((x, jnp.zeros_like(x)), (zero, zero), combine, (1,))
+
+    assert ct.certified(summed(compensated_add), values)[1] == []
+    assert len(ct.certified(summed(lambda left, right: compensated_add(left, right)), values)[1]) == 1
 
 
 @pytest.mark.parametrize("predict", [False, True])
