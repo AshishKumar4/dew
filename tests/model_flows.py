@@ -18,6 +18,7 @@ import importlib.metadata
 import json
 import os
 import subprocess
+import sys
 from collections.abc import Callable, Mapping
 from functools import cached_property
 from pathlib import Path
@@ -255,11 +256,11 @@ def flow_flags(flow: Flow) -> str:
     """The XLA flags a flow compiles its programs under in its prepare and loads them under in its run, the
     same in both (`BuildTarget.held` reads them, in their order): the session's and the lane's, but the host
     backend's own (`HOST_FLAGS`), then the cuda lane's repeatable flags (`REPEATABLE_GPU_FLAGS`), its
-    deterministic ops only where `lane`."""
+    deterministic ops set false where not `lane`, as a user's process runs."""
     named = (*HOST_FLAGS, *(flag.split("=")[0] for flag in lane_environment.REPEATABLE_GPU_FLAGS))
     flags = lane_environment.without_flags(os.environ.get("XLA_FLAGS", ""), *named)
-    repeatable = [flag for flag in lane_environment.REPEATABLE_GPU_FLAGS
-                  if flow.lane or flag != lane_environment.DETERMINISTIC_OPS]
+    repeatable = [flag if flow.lane or flag != lane_environment.DETERMINISTIC_OPS
+                  else f"{flag.split('=')[0]}=false" for flag in lane_environment.REPEATABLE_GPU_FLAGS]
     return " ".join([flags, *repeatable]).strip()
 
 
@@ -356,6 +357,15 @@ def prepare(flow: Flow) -> None:
     judge(flow, {})
 
 
+def prepared_apart(flow: Flow) -> None:
+    """The flow's prepare (`prepare`) in a process of its own, started under its XLA flags (`flow_flags`):
+    XLA parses them once a process, as it starts, and the programs it compiles state them (`BuildTarget`), a
+    lane's flow's deterministic ops among them, which a user's flow sets false."""
+    from process_support import fresh
+
+    fresh(Path(__file__), flow.name, flags=flow_flags(flow))
+
+
 def loaded(flow: Flow) -> dict[str, Callable]:
     """The flow's programs its prepare compiled, loaded onto this GPU, each a function of the parameters and
     the ids."""
@@ -383,3 +393,8 @@ def run(flow: Flow) -> int:
     peak bytes after them, which the test reports."""
     judge(flow, loaded(flow))
     return int((jax.devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0))
+
+
+if __name__ == "__main__":
+    prepare(flow_named(sys.argv[1]))
+    print(json.dumps(None))

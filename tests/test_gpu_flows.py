@@ -1,10 +1,11 @@
 """The GPU tier's model flows (G14, the owner's rule: no unit tests on GPUs; row 5461's covering set): each
 model family that takes a distinct default route on a GPU, its training step and decode loop on par with
-the reference path's against float64 truths, one process a flow (tests/model_flows.py).
+the reference path's against float64 truths (tests/model_flows.py).
 
 Each flow runs twice in the tier: in its part's prepare (`DEW_TIER_PREPARE=1`, on the node's CPU), which
-computes its truths and compiles its programs for the node's GPU, and in its part's run, which loads them
-and judges; a flow whose prepare did not write them is red, naming what is missing."""
+computes its truths and compiles its programs for the node's GPU in a process of the flow's own, started
+under its XLA flags (`model_flows.prepared_apart`), and in its part's run, which loads them and judges; a
+flow whose prepare did not write them is red, naming what is missing."""
 
 import model_flows
 import pytest
@@ -18,8 +19,9 @@ def test_a_model_trains_and_decodes_on_its_gpu_routes(name, monkeypatch, record_
     """The flow `name` (`model_flows.FLOWS`): prepared where this process prepares, else run, its device's
     peak bytes reported (`peak_bytes`)."""
     flow = model_flows.flow_named(name)
-    monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     if model_flows.preparing():
-        model_flows.prepare(flow)
+        model_flows.prepared_apart(flow)
         return
+    # Its programs, compiled ahead, compile nothing here: the flags a load holds them to (`BuildTarget.held`).
+    monkeypatch.setenv("XLA_FLAGS", model_flows.flow_flags(flow))
     record_property("peak_bytes", model_flows.run(flow))
