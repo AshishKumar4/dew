@@ -228,7 +228,8 @@ def test_a_file_with_tests_for_a_users_process_runs_them_in_a_process_of_their_o
     assert said("ran") == every
     assert ci.gpu_lane("3.12", whole, out, cache="on", processes=2, deadline=600.0) == 0
     reused = {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]}
-    assert said("ran") == [] and reused == {"3.12:tests/test_flows.py": 0, "3.12:tests/test_flows.py#@users": 0}
+    assert said("ran") == []
+    assert reused == {"3.12:tests/test_flows.py": 0, "3.12:tests/test_flows.py#@users": 0}
 
 
 def test_a_gpu_lane_names_its_files_but_with_network(ci, monkeypatch):
