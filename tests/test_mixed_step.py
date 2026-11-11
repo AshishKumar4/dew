@@ -140,10 +140,11 @@ def test_a_mixed_call_through_one_template_work_list_is_on_par_interpreted(conti
             cache = prefilled(model, params)
             admitted = Admitted(slots=jnp.asarray([3, ROWS]), cursors=jnp.asarray([0, 0]),
                                 continuing=continuing, tables=tables_of(cache, [3, 0]) if paged else None)
-            # An H100's choices, its norms', feed-forwards' and decode rows' Pallas kernels aside (this host
-            # interprets the attention template's alone).
-            with generation.assumed("sm90"), generation.chosen(rms_norm="xla", swiglu="xla", decode="xla",
-                                                              paged_decode="gathered"):
+            # An H100's choices interpreted on this CPU (`generation.assumed`'s `interpreted`: a prompt's mask
+            # takes xla, cuDNN running on no GPU this process places), its norms', feed-forwards' and decode
+            # rows' Pallas kernels aside (this host interprets the attention template's alone).
+            with (generation.assumed("sm90", interpreted=True),
+                  generation.chosen(rms_norm="xla", swiglu="xla", decode="xla", paged_decode="gathered")):
                 return model.apply({**params, "cache": cache}, tokens, picked, decode=True, mutable=["cache"],
                                    coordinates=coordinates(valid.shape, valid=valid), admitted=admitted,
                                    method=CausalTransformer.states_and_logits_at)[0][1]
