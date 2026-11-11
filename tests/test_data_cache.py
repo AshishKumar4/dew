@@ -1652,10 +1652,10 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
         rows.close()
 
 
-def test_a_training_close_waits_out_an_upload_in_flight_and_publishes_no_segment_or_seal():
-    """A training read closed while an upload is in flight waits for it to end, and what the upload would
-    have published after the close began, its segment and the fill's seal, is not: the shard it wrote
-    stays unreferenced, the fill counted abandoned, and the close raises nothing of its own."""
+def test_a_training_close_waits_out_an_upload_in_flight_which_publishes_its_segment():
+    """A training read closed while an upload is in flight waits for it to end, and the upload publishes
+    its segment as it would have: an upload begun is a fill's own, which a later read may reuse, and
+    the close counts nothing of it abandoned and raises nothing of its own."""
     from fsspec.implementations.memory import MemoryFileSystem
 
     entered, closing = threading.Event(), threading.Event()
@@ -1675,7 +1675,7 @@ def test_a_training_close_waits_out_an_upload_in_flight_and_publishes_no_segment
             if "/shards/" in path:
                 entered.set()
                 assert closing.wait(10)
-                while not rows.writer.closed:
+                while not rows.writer.closing:
                     time.sleep(0.01)
             if self.exists(path):
                 raise FileExistsError(path)
@@ -1685,15 +1685,15 @@ def test_a_training_close_waits_out_an_upload_in_flight_and_publishes_no_segment
     fsspec.register_implementation("slow", Slow, clobber=True)
     root = f"cache-{uuid4().hex}"
     rows = Cache(f"slow://{root}", shard_bytes=1, retry=0).mapped(
-        grain.MapDataset.source(Memory([{"id": 0}]).records("indexed")), _key())
+        grain.MapDataset.source(Memory([{"id": 0}, {"id": 1}]).records("indexed")), _key())
     assert rows[0] == {"id": 0}
     assert entered.wait(5)
     closing.set()
     rows.close()
     written = MemoryFileSystem().find(f"/{root}")
     assert any("/shards/" in path for path in written)
-    assert not any("/segments/" in path for path in written), written
-    assert rows.metrics()["abandoned"] > 0
+    assert any("/segments/" in path for path in written), written
+    assert rows.metrics()["abandoned"] == 0
 
 
 def test_a_training_close_ends_when_its_store_is_gone():

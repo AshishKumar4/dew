@@ -89,8 +89,6 @@ def _opened_writer(cache: Cache, key: DependencyManifest, *, expected: int | Non
         return _Computed()
 
 
-class Abandoned(RuntimeError):
-    """An upload or a seal the cache's writer was closed before, which it counts (`abandoned`)."""
 type Transform = Callable[[int, Record], Outputs]
 type CachedValue = Record | Outputs
 
@@ -431,7 +429,6 @@ class _Writer:
         self.dropped = False
         """Whether the fill was dropped where its storage or its codec failed an optional cache
         (`_stopped`), so it ends unsealed, unlike a full one's stop, which seals what it admitted."""
-        self.closed = False
         self.closing = False
         self.uploaded_bytes = 0
         self.upload_seconds = 0.0
@@ -630,8 +627,6 @@ class _Writer:
         # (`Store.put_immutable`); a local disk's failure, or its retention refusing room
         # (`LocalRetention`), is the cache's error at once.
         retries = self.cache.retry if self.root.remote else 0
-        if self.closed:
-            raise Abandoned("cache upload was cancelled")
         self.root.child(shard).put_immutable(payload, retries=retries)
         encoded = _json(
             {
@@ -640,8 +635,6 @@ class _Writer:
                 "completions": entries,
             }
         )
-        if self.closed:
-            raise Abandoned(f"cache upload abandoned before segment publication: {shard}")
         self.root.child(segment).put_immutable(encoded, retries=retries)
         with self.lock:
             self.spool_bytes -= used
@@ -669,8 +662,6 @@ class _Writer:
         self.segments = [future.result() for future in self.futures]
         sealed = seal_facts(self.segments, (_checked(self.root, entry) for entry in self.segments))
         payload = _json(sealed)
-        if self.closed:
-            raise Abandoned(f"cache writer was abandoned before its seal: {self.writer}")
         try:
             self.root.child(f"segments/{self.writer}/seal.json").put_if_absent(payload)
         except PreconditionFailed:
@@ -727,9 +718,7 @@ class _Writer:
         observed once, so a reader that never runs out sees it too."""
         with self.lock:
             completion = self.seal_future
-            # A completion a closing reader abandoned ends `Abandoned`, and was counted (`abandoned`).
-            if (completion is None or not completion.done() or completion.cancelled()
-                    or isinstance(completion.exception(), Abandoned)):
+            if completion is None or not completion.done() or completion.cancelled():
                 return
             self.seal_future = None
         self._settled(completion.result)
@@ -748,7 +737,6 @@ class _Writer:
                 # fill has sealed, by whichever seals last (row 4211).
                 self._settled(self._published)
         finally:
-            self.closed = True
             self.pool.shutdown(wait=True, cancel_futures=True)
             self.index.close()
             self._release()
@@ -779,16 +767,16 @@ class _Writer:
             if self.closing:
                 return
             self.closing = True
-            # Each upload in flight publishes no segment and the writer no seal from here (`Abandoned`).
-            self.closed = True
+            # The records no upload took yet are dropped, and counted (`abandoned`).
             pending = len(self.pending)
             self.pending.clear()
             self.spool_bytes -= self.pending_bytes
             self.pending_bytes = 0
         tasks = [*self.futures, *([self.seal_future] if self.seal_future is not None else [])]
-        # The uploads in flight end as each transfer does, abandoned before what they would publish, or
-        # failed, none left running past its writer: a silent read fails by its transport's bound
-        # (`dew.data.storage.IDLE_SECONDS`), and a body a peer stops reading waits on it (row 5402).
+        # The uploads in flight and a seal a fill already began run to their end, publishing what they
+        # publish (a fill read whole seals and publishes its generation), or fail, none left running past
+        # its writer: a silent read fails by its transport's bound (`dew.data.storage.IDLE_SECONDS`), and a
+        # body a peer stops reading waits on it (row 5402). No upload starts after these.
         wait(tasks)
         failed = sum(1 for task in tasks if not task.cancelled() and task.exception() is not None)
         with self.lock:
