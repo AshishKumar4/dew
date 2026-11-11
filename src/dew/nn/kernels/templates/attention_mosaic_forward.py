@@ -1197,11 +1197,12 @@ def _parted_products(family: mosaic.Family, acc, scale, weights: jax.Array, valu
     the remainder past the last (`product.bf16_parts`; a weight is at most 1, no part of it saturating), so a
     consumer holds that remainder and one part beside the sums."""
     count = len(values.refs)
+    taken = set(product.terms(count, count))
 
     def pairs():
+        # Each weight part's pairs as it is formed, the largest part first, as `terms` takes them.
         for i, part in enumerate(product.bf16_parts(weights, count, saturating=0)):
-            for j in range(count - i):
-                yield part, values.refs[j]
+            yield from ((part, values.refs[j]) for j in range(count) if (i, j) in taken)
 
     if acc is None:
         return issued_pairs(family, None, pairs(), interpret, shape=shape)

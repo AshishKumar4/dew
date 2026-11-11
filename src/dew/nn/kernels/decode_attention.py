@@ -292,7 +292,7 @@ def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, summed, 
         return jax.ShapeDtypeStruct(shape, dtype), spec
     split = (*shape[:at], splits, *shape[at:])
     sums, rows = jax.ShapeDtypeStruct(split, jnp.float32), jax.ShapeDtypeStruct(split[:-1], jnp.float32)
-    count = 4 if scaled else 2
+    count = algebra.exported_rows(scaled)
     return [sums, *[rows] * count], [summed, *[reduced] * count]
 
 

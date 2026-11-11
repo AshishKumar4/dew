@@ -484,7 +484,9 @@ def key_tiles(form: str, first_query, block_q: int, block_k: int, keys: int) -> 
     last query, else every tile of the `keys`. A call of spans walks its `BlockMap`'s (`block_map`)."""
     tiles = -(-keys // block_k)
     if form == "causal":
-        return 0, jnp.minimum(-(-(first_query + block_q) // block_k), tiles)
+        # Its queries' first place is no negative number: a truncating division rounds it up, as every
+        # kernel language lowers.
+        return 0, jnp.minimum(jax.lax.div(first_query + block_q + block_k - 1, block_k), tiles)
     return 0, tiles
 
 

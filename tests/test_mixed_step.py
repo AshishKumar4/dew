@@ -159,6 +159,25 @@ def test_a_mixed_call_through_one_template_work_list_is_on_par_interpreted(conti
                     truth_fn=mixed(float64_twin(model.clone(attention_impl="xla"))))
 
 
+
+def test_a_mixed_call_stating_its_keys_validity_is_refused():
+    """A serving step's mixed call reads each row's cache as a decode step does, its rows' caches its
+    whole visibility, so a call that also hides keys (`AttentionMetadata.key_valid`) is refused
+    (`AttentionMixer.honours`), as its pairwise mask would be, rather than run reading the keys it hides."""
+    model = tiny()
+    params = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    cache = prefilled(model, params)
+    tokens = jnp.concatenate([jnp.asarray([7, 9, 0, 0, 0, 0, 11, 12, 13, 14], jnp.int32),
+                              jnp.zeros(WIDTH, jnp.int32)])[None]
+    valid = tokens > 0
+    with pytest.raises(ValueError):
+        model.apply({**params, "cache": cache}, tokens, jnp.asarray([[0, 1]]),
+                    coordinates=coordinates(valid.shape, valid=valid), decode=True, mutable=["cache"],
+                    attention_key_valid=valid.at[0, 6].set(False),
+                    admitted=Admitted(slots=jnp.asarray([3, ROWS]), cursors=jnp.asarray([0, 0]),
+                                      continuing=True),
+                    method=CausalTransformer.states_and_logits_at)
+
 REFUSALS = {"plain": {}, "alibi": {"position_embedding": "alibi"}, "shared keys": {"kv_shared_layers": (1,)},
             "grouped pool": {"kv_cache": KVCache(page_size=4, pages=ROWS * 4, groups=2)}}
 

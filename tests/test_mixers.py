@@ -571,20 +571,30 @@ def test_wide_logits_reach_the_reference_attention_and_are_refused_elsewhere():
     assert refused.value.names == ("wide_logits",)
 
 
-def test_a_blocks_call_stating_its_keys_validity_alone_hides_those_keys():
+LOCAL_SPANS = {"causal": ({}, np.ones((4, 4), bool)),
+               "window": ({"sliding_window": 2}, np.subtract.outer(np.arange(4), np.arange(4)) < 2),
+               "chunk": ({"attention_chunk": 2}, np.equal.outer(np.arange(4) // 2, np.arange(4) // 2))}
+"""A causal block's own visibility beyond causality, by its context's entries: none, a window of two keys,
+chunks of two places, each over four tokens; a windowed or chunked block runs `local_attention`."""
+
+
+@pytest.mark.parametrize("span", list(LOCAL_SPANS))
+def test_a_blocks_call_stating_its_keys_validity_alone_hides_those_keys(span):
     """A causal attention block called with its keys' validity (`AttentionMetadata.key_valid`) and no
     pairwise mask or key runs hides the keys it marks out from every query of the block's own causal
-    visibility (row 4771): bit for bit the call over the pairwise mask they mean, causal and valid, and
-    not the call that states no validity."""
+    visibility (row 4771), a windowed or chunked one's local attention too: bit for bit the call over the
+    pairwise mask they mean, causal, within the span and valid, and not the call that states no
+    validity."""
     from dew.nn.mixers.attention import CausalSelfAttention
 
+    entries, within = LOCAL_SPANS[span]
     context = MixerContext(emb_features=64, num_heads=2, num_kv_heads=2, head_dim=32, max_seq_len=8,
-                           attention_impl="reference")
+                           attention_impl="reference", **entries)
     layer = CausalSelfAttention(ctx=context)
     x = jax.random.normal(jax.random.key(23), (2, 4, 64))
     variables = layer.init(jax.random.key(22), x)
     valid = jnp.asarray([[True, False, True, True], [True, True, True, False]])
-    seen = jnp.tril(jnp.ones((4, 4), bool))[None] & valid[:, None, :]
+    seen = (jnp.tril(jnp.ones((4, 4), bool)) & within)[None] & valid[:, None, :]
 
     def call(**metadata):
         return np.asarray(layer.apply(variables, x, MixerCall(AttentionMetadata(**metadata))))

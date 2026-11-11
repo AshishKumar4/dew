@@ -400,18 +400,28 @@ def no_scale(rows: int) -> Scale:
     return Scale(nothing, nothing)
 
 
+ROWS = ("m", "total")
+"""A state's row arrays a launch writes after its sums (`exported`), `Partial`'s fields in their order: its
+maximum and denominator, and after them its scale's (`Scale`'s fields) where its walk is scaled."""
+
+
+def exported_rows(scaled: bool) -> int:
+    """The row arrays a launch writes of a state (`exported`): `ROWS`, and its scale's where `scaled`."""
+    return len(ROWS) + (len(Scale._fields) if scaled else 0)
+
+
 def exported(state: Partial) -> tuple[jax.Array, ...]:
-    """A state's arrays as a launch writes them: its sums, maximum and denominator, and its scale's where it
+    """A state's arrays as a launch writes them: its sums, then its rows (`ROWS`) and its scale's where it
     holds one (`Scale`), which a merge takes (`merge`)."""
-    if state.scale is None:
-        return state.acc, state.m, state.total
-    return state.acc, state.m, state.total, *state.scale
+    return state.acc, *(getattr(state, name) for name in ROWS), *(state.scale or ())
 
 
 def imported(parts: tuple[jax.Array, ...]) -> Partial:
     """A state from the arrays a launch wrote (`exported`)."""
-    acc, m, total = parts[:3]
-    return Partial(acc, m, total, None if len(parts) == 3 else Scale(*parts[3:]))
+    acc, *rows = parts
+    named = dict(zip(ROWS, rows[:len(ROWS)], strict=True))
+    scale = rows[len(ROWS):]
+    return Partial(acc, **named, scale=Scale(*scale) if scale else None)
 
 
 LEAST = float(jnp.finfo(jnp.float32).min)
@@ -1449,7 +1459,7 @@ def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Gathered) -> tu
     from the anchor key's (`B`, with the initial state's), the anchor key, its own weight, and the other
     keys' weights' sum (keys alone). Where the anchor moved to this tile, the old anchor's term (its weight
     times its value row, `rows(key)` each row's at its key `[bq]`) joins `B` and the sum before the rescale
-    (`split_taken`, `split_rows`), and the new anchor's weight is the tile's; the tile's other keys add their
+    (`split_term`, `split_rows`), and the new anchor's weight is the tile's; the tile's other keys add their
     product and their narrowed weights. So neither is summed with a key's weight cancelled out of it. On the
     scaled walk every split sum is at its rows' scale (`scaled_step`). Where the mainloop holds the sums
     (`Keys.accumulate`), they take the tile there. Returns the carry and `rows`."""
@@ -1470,7 +1480,7 @@ def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Gathered) -> tu
         drop = None if held is None else held.drop
         accumulate = keys.accumulate
         if accumulate is None:
-            # `B` takes the old anchor's term before the factor (`split_taken`), its rounding kept where the
+            # `B` takes the old anchor's term before the factor (`split_term`), its rounding kept where the
             # walk compensates (`kept_in_turn`), then the tile's other keys' products as a step takes them.
             low = state.low
             if low is None:
@@ -1634,15 +1644,6 @@ def anchor_split(narrowed: jax.Array, at_anchor: jax.Array) -> tuple[jax.Array, 
     zero = jnp.zeros_like(narrowed)
     return (jnp.where(at_anchor, zero, narrowed),
             jnp.where(at_anchor, narrowed, zero).astype(jnp.float32).sum(axis=-1))
-
-
-def split_taken(others: jax.Array, own: jax.Array, alpha: jax.Array, moved: jax.Array, old_value: jax.Array,
-                old_multiplier: jax.Array | None = None, drop: jax.Array | None = None) -> jax.Array:
-    """A training step's split sums before the tile's product joins them (`training_step`): where the
-    anchor moved, the old anchor's term joined (`split_term`), then taken to the new maximum by `alpha` (and
-    a scaled tile's change of scale `drop`, `carry_factor`). A mainloop that accumulates the product in
-    place applies this to its accumulator first."""
-    return carry_factor(others + split_term(own, moved, old_value, old_multiplier), alpha, drop)
 
 
 def split_term(own: jax.Array, moved: jax.Array, old_value: jax.Array,
