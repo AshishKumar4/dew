@@ -241,6 +241,25 @@ def test_a_sites_map_tasks_are_cut_by_what_their_records_say_they_paid_whatever_
         ("test_site.draws-0-4", 300.0), ("test_site.draws-4-12", 320.0), ("test_site.draws-12-20", 320.0)]
 
 
+def test_a_sites_cost_counts_what_its_map_tasks_paid_between_draws_and_their_weighed_draws_apart(ci):
+    """A site's cost from its map tasks' records (`costs.timed`), each a label's draws within its task's
+    planned span: a task's setup is all it paid outside its draws, so a layout compiled between two labels'
+    draws is setup (tools/layout_parity.py compiles each layout's step before its draws); and a weighed
+    check's records, written at their own units (map_judge's `offset`), cost its weighed units by the span
+    its task drew, apart from the unweighted ones whose local units they repeat (review of the site costs)."""
+    def drawn(task: tuple[int, int], local: tuple[int, int], before: float, draws: float) -> dict:
+        return {"site": "3.12::tests/test_site.py::test_site::label", "start": local[0], "stop": local[1],
+                "task_start": task[0], "task_stop": task[1], "before": before, "draws": draws}
+
+    found = ci.costs.timed("task", [
+        # A task of 4 units: 30 s before its first label's draws (8 s), its second layout compiled for 50 s
+        # before its second label's (12 s).
+        drawn((0, 4), (0, 4), 30.0, 8.0), drawn((0, 4), (0, 4), 88.0, 12.0),
+        # A weighed task drawing the plan's units 20 to 22, written at its check's own 0 to 2.
+        drawn((20, 22), (0, 2), 40.0, 30.0)], units=20)
+    assert found == {"task.setup": 60.0, "task.unit": 5.0, "task.weighed_unit": 15.0}
+
+
 def test_a_site_whose_map_tasks_armada_has_no_measure_of_weighs_the_target_not_its_judges_record(
         ci, tmp_path):
     """A site the last run reused ran no map task, so armada keeps no measure of any (it keeps what a run
