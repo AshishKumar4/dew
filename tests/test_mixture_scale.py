@@ -138,16 +138,22 @@ def test_a_thousand_sources_compile_and_step_without_a_cost_per_source(by, recor
         tracemalloc.stop()
         stream = data.train(DataPartition())
         try:
+            # Traced from the read's start, so what a step frees of what the read held is counted freed: each
+            # member's position the mix holds is made again as the member is read (`_MixReads.state`), the
+            # same bytes in place of its last, which a trace begun after it would count as the step's own.
+            tracemalloc.start()
             drawn(stream, count)
             Documents.reads = 0
-            # What a window of steps allocates at its most, the positions each document's capture takes among
-            # it (row 4805: a capture of every member's position a document cost the members' count).
+            # What a window of steps allocates at its most past what the read held as it began, the positions
+            # each document's capture takes among it (row 4805: a capture of every member's position a
+            # document cost the members' count).
             gc.collect()
-            tracemalloc.start()
+            held = tracemalloc.get_traced_memory()[0]
+            tracemalloc.reset_peak()
             began = time.perf_counter()
             texts(stream, 64)
             stepped = (time.perf_counter() - began) / 64
-            _, allocated = tracemalloc.get_traced_memory()
+            allocated = tracemalloc.get_traced_memory()[1] - held
             tracemalloc.stop()
             reads = Documents.reads
             # What steps keep, counted between two counts past the first window: a buffer it sized once
