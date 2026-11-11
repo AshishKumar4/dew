@@ -50,21 +50,20 @@ def token_table(model: nn.Module) -> tuple[int, frozenset[int]] | None:
     """The embedding table a model reads its tokens through, which a token field indexes
     (`dew.inputs.spec.Field.indexing`): the rows its declared vocabulary
     (`dew.nn.protocols.Bounded`) builds, found on the model, the backbone a head reads
-    (`dew.nn.wrapping.HeadedModel`) or the decoder a wrapper holds (`DecoderWrapper.wraps`), and the
-    placeholder ids a multimodal model replaces before its table reads them (`image_token_id`,
-    `extra_placeholder_ids`), which hold no row of their own; None for a model of no stated vocabulary."""
-    from dew.nn.multimodal import MultimodalTransformer
-    from dew.nn.protocols import Bounded
-    from dew.nn.wrapping import DecoderWrapper, HeadedModel
+    (`dew.nn.wrapping.HeadedModel`) or the decoder a wrapper holds (`WrapsDecoder`), and the
+    placeholder ids a multimodal model replaces before its table reads them (`ReplacesTokens`), which
+    hold no row of their own; None for a model of no stated vocabulary."""
+    from dew.nn.protocols import Bounded, ReplacesTokens, WrapsDecoder
+    from dew.nn.wrapping import HeadedModel
 
     replaced: set[int] = set()
     while True:
-        if isinstance(model, MultimodalTransformer):
+        if isinstance(model, ReplacesTokens):
             replaced |= {*model.extra_placeholder_ids,
                          *(() if model.image_token_id is None else (model.image_token_id,))}
         if isinstance(model, Bounded) and isinstance(model.vocab_size, int):
             return model.vocab_size, frozenset(replaced)
-        if isinstance(model, DecoderWrapper):
+        if isinstance(model, WrapsDecoder):
             model = getattr(model, model.wraps)
         elif isinstance(model, HeadedModel):
             model = model.backbone
