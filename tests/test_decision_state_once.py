@@ -478,3 +478,22 @@ def test_a_row_over_one_state_writes_its_state_before_its_question_and_its_instr
     assert not MarkerLayout().shares and not dataclasses.replace(OWN, shared_state=None).shares
     assert dataclasses.replace(OWN, shared_state=2).shares
 
+
+
+def test_a_question_laid_at_the_end_of_the_shared_state_keeps_its_place_once_merged():
+    """Rows sharing a state, one whose question lays no token past it (its span empty at the state's end):
+    merged as one row, every row's question stays, each moved past the rows before it, and the tokens are
+    the state once, then each row's own."""
+    from dew.decision.layout import Encoded, Laid
+    from dew.decision.shared_state import merged
+
+    def row(own: tuple[int, ...], name: str) -> Encoded:
+        span = (3, 3 + len(own))
+        laid = Laid(name, 0, span, ((span[0], span[1]),) if own else ((3, 3),), (0,))
+        return Encoded((7, 8, 9, *own), (laid,), None, None, 3, 3)
+
+    rows = [row((1, 2), "a"), row((), "b"), row((4,), "c")]
+    one = merged(rows)
+    assert one.tokens == (7, 8, 9, 1, 2, 4)
+    assert [laid.name for laid in one.questions] == ["a", "b", "c"]
+    assert [laid.span for laid in one.questions] == [(3, 5), (5, 5), (5, 6)]
