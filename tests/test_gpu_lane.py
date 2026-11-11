@@ -165,6 +165,33 @@ def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_noth
     assert stored, "its run's rows are recorded as any lane's"
 
 
+def test_a_lanes_prepare_ends_within_its_one_deadline_however_many_files_it_holds(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A lane's prepare is given one deadline for all of it: each file's process has what is left of it as
+    its turn comes (its own end's allowance kept back), so more files than processes cannot outlast it, and
+    a file it leaves too little is a red row of its own, the files before it prepared (a deadline a process
+    let a part's files run in waves past its job's prepare bound, and the node's session ended the job
+    whole)."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    (tmp_path / "tests/conftest.py").write_text(
+        "def pytest_configure(config):\n"
+        "    config.addinivalue_line('markers', 'prepares: prepared on the CPU before its GPU run')\n")
+    names = [f"tests/test_slow_{index}.py" for index in range(3)]
+    for name, seconds in zip(names, (2, 2, 25), strict=True):
+        (tmp_path / name).write_text("import pytest, time\n@pytest.mark.prepares\n"
+                                     f"def test_prepares():\n    time.sleep({seconds})\n")
+    # One process at a time, and twenty seconds for all three beside the allowance a process keeps back for
+    # its own end: the first two prepare, and the third, which needs more than is left, is cut at what is
+    # left, where a deadline of its own would have let it end.
+    out = tmp_path / "verdict.json"
+    assert ci.gpu_prepared("3.12", names, out, processes=1, deadline=ci.session.GRACE + ci.SETTLE + 20.0) == 0
+    rows = {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]}
+    assert rows == {f"3.12:{names[0]}": 0, f"3.12:{names[1]}": 0, f"3.12:{names[2]}": 1}
+
+
 def test_a_file_with_tests_for_a_users_process_runs_them_in_a_process_of_their_own(
         ci, tmp_path, monkeypatch, cache_worker):
     """XLA reads a process's flags once, so a file's tests that must open under a user's flags (the mark
