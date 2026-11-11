@@ -238,35 +238,48 @@ def _stepped(state, prepared: Prepared, issue=None):
     return Walk(decay, leaving, transfer)
 
 
-def _token_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping) -> tuple:
-    """A chunk's tokens' exponents and the affine map's parts at each (`_token`), the exponents in float32
-    at least: a narrower prefix loses a decay's digits to its partials' magnitude, and float16's overflows
-    past six resets (65504); a reset token's decay `RESET_DECAY`."""
-    # An operand with no walked axis (a rate, a skip) is every token's.
-    axes = [declaration.operands[name].index(declaration.walked)
-            if declaration.walked in declaration.operands[name] else None for name in names]
-    exponent, *values = jax.vmap(lambda *xs: _token(affine, xs), in_axes=axes)(
-        *[chunk[name] for name in names])
+def _at_token(declaration: Scan, names: Sequence[str], affine, token: Mapping) -> tuple:
+    """One token's exponent and the affine map's parts at it (`_token`), `token` its operands without the
+    walked axis, the exponent in float32 at least: a narrower prefix loses a decay's digits to its partials'
+    magnitude, and float16's overflows past six resets (65504); a reset token's decay `RESET_DECAY`."""
+    exponent, *values = _token(affine, tuple(token[name] for name in names))
     exponent = exponent.astype(at_least_fp32(exponent.dtype))
     if declaration.reset is not None:
-        exponent = jnp.where(chunk[declaration.reset][:, None], RESET_DECAY, exponent)
+        exponent = jnp.where(token[declaration.reset], RESET_DECAY, exponent)
     return exponent, *values
+
+
+def _walked_tokens(declaration: Scan, chunk: Mapping) -> tuple[dict, dict]:
+    """`chunk`'s operands split by the walked axis: those along it, the axis first, a token each; and those
+    with none (a rate, a skip), every token's."""
+    along = {name: jnp.moveaxis(chunk[name], axes.index(declaration.walked), 0)
+             for name, axes in declaration.operands.items() if declaration.walked in axes}
+    return along, {name: chunk[name] for name in declaration.operands if name not in along}
+
+
+def _token_parts(declaration: Scan, names: Sequence[str], affine, chunk: Mapping) -> tuple:
+    """A chunk's tokens' exponents and the affine map's parts at each (`_at_token`), every token at once."""
+    along, every = _walked_tokens(declaration, chunk)
+    return jax.vmap(lambda token: _at_token(declaration, names, affine, {**token, **every}))(along)
 
 
 def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h) -> tuple:
     """`chunk` walked token by token from the state `h` entering it by the affine map's parts at each token
-    (`_token_parts`): `(outputs, h)`, each token's output and the state leaving the chunk, in the state's
+    (`_at_token`): `(outputs, h)`, each token's output and the state leaving the chunk, in the state's
     carried dtype. A scalar decay follows the transition, so its cotangent reads the corrected state; a
     per-key decay's correction and update read one decayed state, `D h`, so a state's cotangent meets the
     decay once, summed before it does. The scalar reader contracts each outer product before it is formed,
     so its gradient's tangent avoids a state's overflowing unscaled contraction. A token whose exponent
     vanishes (a reset's, `RESET_DECAY`) enters a zero state, selected, so no NaN of the state before it
-    reaches the one after (row 1966's overflow orders)."""
-    exponent, B, U, s, C, Q, R = _token_parts(declaration, names, affine, chunk)
-    floor = vanishing(exponent.dtype, affine.base2)
+    reaches the one after (row 1966's overflow orders). Each token's parts are formed inside its step
+    (`_at_token`), as the token's own update forms them: a factor applied to an operand (a reader's scale,
+    a write's gate) then meets the operand's cotangent inside the step, so a second derivative applies it
+    before the step's products, never after them, which near float32's largest overflowed (row 5426)."""
+    along, every = _walked_tokens(declaration, chunk)
 
-    def token(h, parts):
-        z, b, u, strength, c, q, r = parts
+    def token(h, step):
+        z, b, u, strength, c, q, r = _at_token(declaration, names, affine, {**step, **every})
+        floor = vanishing(z.dtype, affine.base2)
         h = jnp.where((z <= floor)[:, None], 0.0, h)
         decay = jnp.broadcast_to(_exp(affine.base2, z), (h.shape[0],))
         if not affine.per_key:
@@ -286,7 +299,7 @@ def _replayed(declaration: Scan, names: Sequence[str], affine, chunk: Mapping, h
         return h, output
 
     carried = at_least_fp32(h.dtype)
-    h, outputs = lax.scan(token, h.astype(carried), (exponent, B, U, s, C, Q, R))
+    h, outputs = lax.scan(token, h.astype(carried), along)
     return outputs, h
 
 
