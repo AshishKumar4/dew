@@ -496,13 +496,13 @@ def test_gpu_holds_says_what_a_lane_needs_to_run_each_file_as_its_largest_measur
     monkeypatch.setattr(sys, "argv", ["gpu_holds.py", "--tests=tests/test_wide.py#2/3 tests/test_new.py"])
     assert holds.main() == 0
     assert json.loads(capsys.readouterr().out) == {"tests/test_wide.py": 2 * (4 * gib * 1.25 + gib)}
-    # A record the cache does not give whole fails the tool, which sizes a job by what it says: read as a
-    # file no class measured, its part took the default (2026-11-11: a file measured at 5.9 GiB ran out of
-    # the 4 GiB lane of a part composed while one read of its record did not come back). A lane on its node,
-    # which only packs by it, still runs: the file alone, with the whole share.
-    cut = "/" + ci.record_key("3.12", ci.row("3.12", "tests/test_wide.py", ""), "NVIDIA-GH200-480GB-aarch64")
-    stored[cut] = b'{"key": null, "depends": ["tests/test_wide.py"], "peak": 6'
-    with pytest.raises(ValueError):
+    # The cache not answering (here, refusing the token) fails the tool, which sizes a job by what it says:
+    # read as files no class measured, a part took the default (2026-11-11: a file measured at 5.9 GiB ran
+    # out of the 4 GiB lane of a part composed while a read of its record did not come back). A lane on its
+    # node, which only packs by it, still runs: each file alone, with the whole share.
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "another")
+    with pytest.raises(Exception) as unanswered:
         holds.main()
+    assert "R2Error" in {base.__name__ for base in type(unanswered.value).__mro__}
     assert capsys.readouterr().out == ""
-    assert set(ci.borrowed_records(["tests/test_wide.py"], "3.12", "", "token")) == {"tests/test_wide.py"}
+    assert ci.borrowed_records(["tests/test_wide.py"], "3.12", "", "another") == {}
