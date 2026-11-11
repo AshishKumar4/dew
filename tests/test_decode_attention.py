@@ -820,8 +820,7 @@ a program shape each, so every case compiles one kernel (row 2123: a kernel's tw
 @pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])
 def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(target, kernel, variant,
                                                                               splits):
-    """The dense kernel under a decode step's attention (a differentiated step's forward and derivatives
-    the reference path's, `forward_differentiable`'s `primal_alone`), in bf16 and fp32 at Qwen3.5-0.8B's
+    """The dense kernel under a decode step's attention, its forward, in bf16 and fp32 at Qwen3.5-0.8B's
     widths (4 query positions over 2 key heads of 256, a 1024-slot cache), and the
     paged kernel at Qwen3-0.6B's (16 query heads over 8 of 128) with pages of 16 and 32 keys over 1024
     keys a row, each at every slice count (`tuning.pinned`), which their 8 rows' 32 steps take on

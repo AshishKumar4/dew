@@ -33,6 +33,7 @@ import numpy as np
 import pytest
 from port_support import row_names_port
 from reference_error import assert_as_exact, widened, with_gradients
+from ssd_support import mamba_side
 from test_recurrence_chunk import (
     CHUNK,
     KEY_WIDTH,
@@ -46,9 +47,11 @@ from test_recurrence_chunk import (
     token_by_token,
     unit,
 )
+from upstream_support import upstream_arm
 
 from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.parity_stages import staged_units
 
 SITES = {'scalar delta': recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5, write_bound=1.0),
          'vector delta': recurrence.Hooks(decay='vector', scale=KEY_WIDTH ** -0.5, write_bound=1.0),
@@ -330,10 +333,12 @@ def restarting(fn, regime: str):
     return lambda operands: fn(_reset(operands))
 
 
-def assert_finite_and_on_par(dew, reference, draws, label: str, *, seeds: int, finite_seeds: int) -> None:
+def assert_finite_and_on_par(dew, reference, draws, label: str, *, seeds: int, finite_seeds: int,
+                             upstream=None) -> None:
     """A scan path's claim here: every leaf of `dew` finite wherever the float64 `reference`'s is over
-    `finite_seeds` draws, and on par with `reference`'s from float64 over `seeds` (check 1). Plain
-    functions: the gate compiles both arms alike (`reference_error._arms`)."""
+    `finite_seeds` draws, and on par with `reference`'s from float64 over `seeds` (check 1), or where an
+    `upstream` arm is given (a port's own library, `_mamba_ssm`), with that arm's, the float64 `reference`
+    the truth. Plain functions: the gate compiles both arms alike (`reference_error._arms`)."""
     for seed in range(finite_seeds):
         drawn = draws(seed)
         mine = jax.jit(dew)(*drawn)
@@ -344,7 +349,10 @@ def assert_finite_and_on_par(dew, reference, draws, label: str, *, seeds: int, f
             finite = np.isfinite(np.asarray(exact))
             assert np.all(np.isfinite(np.asarray(ours))[finite]), (
                 f'{label}{jax.tree_util.keystr(path)}: not finite where float64 is, seed {seed}')
-    assert_as_exact(dew, reference, draws, label, seeds=seeds)
+    if upstream is None:
+        assert_as_exact(dew, reference, draws, label, seeds=seeds)
+    else:
+        assert_as_exact(dew, upstream, draws, label, seeds=seeds, truth_fn=reference)
 
 
 CASES = [pytest.param(name, regime, id=f'{name}-{regime}') for name in SITES for regime in REGIMES]
@@ -432,24 +440,63 @@ PORT_GRADIENT_SEEDS = {
 }
 """Each regime's declared seeds for the SSD port's gradient (check 1), sized as `PORT_SEEDS` are."""
 
+def _mamba_ssm(regime: str, draws, seeds: int, *, gradients: bool):
+    """mamba_ssm's own scan (`ssd_support.mamba_side`) on the regime's draws in the port's chunks, the SSD
+    port's reference: a port is held to its upstream's own code at its dtype (testing.md), whose fp32
+    products are one TF32 as the port's are (`fla_gdn._dot`); an arm the gate runs as given
+    (`upstream_support.upstream_arm`), its declared seeds a block and their redraw in later blocks: a
+    block's draws are one call's heads (`mamba_side`), whose state passing launches a program each head on
+    CUDA's grid z, at most 65,535 (a 512-seed block of `RATED_HEADS` 32,768; the staged 2,560 seeds' 163,840
+    exceeded it). Its results are the port's tree: the output and final memory, and where `gradients`
+    every operand's gradient."""
+
+    def run_block(drawn):
+        operands = [args[0] for args in drawn]
+        # The documents' starts are no operand of the scan's: the regime's own (`restarting`), mamba_ssm's
+        # `seq_idx`.
+        starts = restarting(lambda given: given.starts, regime)(operands[0])
+        names = [path[0].name for path, _ in
+                 jax.tree_util.tree_leaves_with_path(dataclasses.replace(operands[0], starts=None))]
+        batch, _, heads, width = operands[0].value.shape
+        given = (tuple(np.stack(parts) for parts in zip(*(args[1] for args in drawn), strict=True))
+                 if gradients else
+                 (np.zeros((len(drawn), *operands[0].value.shape), np.float32),
+                  np.zeros((len(drawn), batch, heads, operands[0].key.shape[-1], width), np.float32)))
+        found = mamba_side({name: np.stack([getattr(each, name) for each in operands]) for name in names},
+                           given, starts, CHUNK)
+        outputs = [(jnp.asarray(found["out"][index]), jnp.asarray(found["final"][index]))
+                   for index in range(len(drawn))]
+        if not gradients:
+            return outputs
+        return [(output, dataclasses.replace(each, **{name: jnp.asarray(found[f"d_{name}"][index],
+                                                                       getattr(each, name).dtype)
+                                                      for name in names}))
+                for index, (output, each) in enumerate(zip(outputs, operands, strict=True))]
+
+    return upstream_arm(run_block, draws, seeds, most=staged_units(seeds),
+                        keyed=lambda operands, *cotangents: operands)
+
+
 def the_ssd_port_stays_finite_and_exact_where_chunked_forms_break(regime):
     """The rated scan on the SSD port (row 1341: the suite held the portable math alone): its output and
-    final memory finite wherever the float64 reference's are on every declared seed, and on par with the
-    token-by-token recurrence's from float64 (check 1), as the portable math's are."""
+    final memory finite wherever the float64 token-by-token recurrence's are on every declared seed, and
+    on par with mamba_ssm's own (`_mamba_ssm`) from that float64 truth (check 1)."""
     hooks = SITES['rated']
+    draws, seeds = functools.partial(stressed, hooks, regime, value_heads=RATED_HEADS), PORT_SEEDS[regime]
     assert_finite_and_on_par(functools.partial(ssd_port, hooks, chunk_size=CHUNK),
-                             functools.partial(token_by_token, hooks),
-                             functools.partial(stressed, hooks, regime, value_heads=RATED_HEADS),
-                             f'the SSD port under {regime}', seeds=PORT_SEEDS[regime],
-                             finite_seeds=PORT_SEEDS[regime])
+                             functools.partial(token_by_token, hooks), draws, f'the SSD port under {regime}',
+                             seeds=seeds, finite_seeds=seeds,
+                             upstream=_mamba_ssm(regime, draws, seeds, gradients=False))
 
 
 def the_ssd_ports_gradient_is_as_exact_as_the_recurrences(regime):
-    """The SSD port's gradient (its custom VJP's) finite wherever the reference's in float64 is, and on par
-    with the token-by-token recurrence's from float64 (check 1) over the regime's declared seeds."""
+    """The SSD port's gradient (its custom VJP's) finite wherever the float64 token-by-token recurrence's
+    is, and on par with mamba_ssm's own (`_mamba_ssm`) from that float64 truth (check 1) over the regime's
+    declared seeds."""
     hooks = SITES['rated']
+    draws, seeds = functools.partial(cotangents, hooks, regime), PORT_GRADIENT_SEEDS[regime]
     assert_finite_and_on_par(
         with_gradients(restarting(functools.partial(ssd_port, hooks, chunk_size=CHUNK), regime)),
-        with_gradients(restarting(functools.partial(token_by_token, hooks), regime)),
-        functools.partial(cotangents, hooks, regime), f"the SSD port's gradient under {regime}",
-        seeds=PORT_GRADIENT_SEEDS[regime], finite_seeds=2)
+        with_gradients(restarting(functools.partial(token_by_token, hooks), regime)), draws,
+        f"the SSD port's gradient under {regime}", seeds=seeds, finite_seeds=2,
+        upstream=_mamba_ssm(regime, draws, seeds, gradients=True))

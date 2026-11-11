@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import importlib.util
 import json
@@ -61,8 +62,13 @@ def _decoder_record(value: object) -> Mapping[str, object] | None:
     return {"class": f"{type(value).__module__}.{type(value).__qualname__}", "config": settings}
 
 
-METADATA = ("dataset_info.json", "features.json")
-"""What a prepared version directory holds beside its shards."""
+@functools.cache
+def metadata_files() -> tuple[str, str]:
+    """What a prepared version directory holds beside its shards: its info and its features, as TFDS names
+    them (`tensorflow_datasets.core.constants`), read where a directory is there to look in."""
+    from tensorflow_datasets.core import constants
+
+    return constants.DATASET_INFO_FILENAME, constants.FEATURES_FILENAME
 
 PREPARE = (
     "Prepare it in a separate environment with "
@@ -169,7 +175,7 @@ def read_only_builder(path: str, *, name: str | None, config: str | None, versio
     root = epath.Path(os.path.expanduser(path))
     if not root.is_dir():
         raise FileNotFoundError(f"No prepared TFDS data at {path!r}. " + PREPARE)
-    if all((root / name).is_file() for name in METADATA):
+    if all((root / name).is_file() for name in metadata_files()):
         # A resolved directory needs no names to find it. A caller who gives
         # them anyway is constraining what it must hold, which the metadata
         # answers below.
@@ -303,7 +309,7 @@ class TFDS(Dataset):
             **({} if mounted else {"directory": self.path if self.remote else directory}),
             # dataset_info.json's digest among the definitions, kept under its own key too, as every saved
             # TFDS fingerprint holds it.
-            "metadata_sha256": definitions["dataset_info.json"],
+            "metadata_sha256": definitions[metadata_files()[0]],
             "definitions": definitions,
             "files": files,
             "decoders": _decoder_record(self.decoders),
@@ -352,7 +358,7 @@ class TFDS(Dataset):
                 return False
             root = Store(str(self.path))
             fs, path = root.resolve()
-            if not fs.exists(path.rstrip("/") + "/dataset_info.json"):
+            if not fs.exists(path.rstrip("/") + "/" + metadata_files()[0]):
                 raise FileNotFoundError(
                     f"remote TFDS path {self.path!r} must name one prepared version directory"
                 )
@@ -427,10 +433,13 @@ class TFDS(Dataset):
         names, and the split's rows the info counts. A split not prepared here, or a remote one not
         mirrored yet, states nothing: a run's record and model are built where its data may not be."""
         root = epath.Path(os.path.expanduser(self.directory))
-        # A prepared directory holds the split's metadata, or a data directory the dataset's own.
-        prepared = all((root / name).is_file() for name in METADATA)
-        here = root.is_dir() and (prepared or (root / self.name).is_dir())
-        if not here or (self.remote and not Path(self.directory, "READY").is_file()):
+        if not root.is_dir() or (self.remote and not Path(self.directory, "READY").is_file()):
+            return {}
+        # A prepared directory holds the split's metadata, or a data directory the dataset's own; without
+        # TFDS, whose names its metadata are (`metadata_files`), there is no prepared split to state.
+        if not (root / self.name).is_dir() and (
+                importlib.util.find_spec("tensorflow_datasets") is None
+                or not all((root / name).is_file() for name in metadata_files())):
             return {}
         described = self.builder.info
         splits = described.splits

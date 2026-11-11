@@ -3,7 +3,6 @@ windowed shuffle, its windows read as the one before is given (`WindowShuffle`).
 
 from __future__ import annotations
 
-import copy
 import threading
 from collections.abc import Mapping
 from typing import overload
@@ -11,8 +10,8 @@ from typing import overload
 import grain.experimental as gx
 import grain.python as grain
 import numpy as np
+from grain._src.python.dataset.transformations.shuffle import _reshuffle_window, _WindowShuffleDatasetIterator
 
-from dew._records import integer, record
 from dew.batch import Batch
 from dew.data.dataset import Ranges
 
@@ -97,13 +96,13 @@ class WindowShuffle(grain.IterDataset[Batch]):
         return _WindowShuffled(self._rows.__iter__(), window=self._window, seed=self._seed)
 
 
-class _WindowShuffled(grain.DatasetIterator[Batch]):
+class _WindowShuffled(_WindowShuffleDatasetIterator):
+    """Grain's window shuffle (`_WindowShuffleDatasetIterator`: its permutation, `_reshuffle_window`, and
+    the position it saves), each window after the first read as the one before is given, a record of it
+    for each record given (`_read_ahead`); Grain's own reads a window whole as its first record is asked."""
+
     def __init__(self, parent: grain.DatasetIterator[Batch], *, window: int, seed: int):
-        super().__init__(parent)
-        self._read, self._size, self._seed = parent, window, seed
-        self._index = self._given = 0
-        self._window: list[Batch] = []
-        self._start: Mapping[str, object] = parent.get_state()
+        super().__init__(parent, window_size=window, seed=seed)
         # The next window's start, captured once the current one is read, and its records read so far, one
         # a record given; None where the parent ended or no window was read yet.
         self._next: Mapping[str, object] | None = None
@@ -113,58 +112,29 @@ class _WindowShuffled(grain.DatasetIterator[Batch]):
     def _read_ahead(self, count: int) -> None:
         while count > 0 and not self._ended:
             try:
-                self._ahead.append(next(self._read))
+                self._ahead.append(next(self._parent))
             except StopIteration:
                 self._ended = True
             count -= 1
 
-    def _drawn(self, records: list[Batch]) -> list[Batch]:
-        """`records` in window `_index`'s order, Grain's (`_reshuffle_window`)."""
-        last = len(records) - 1
-        return [records[gx.index_shuffle(position, max_index=last, seed=self._seed + self._index, rounds=4)]
-                for position in range(len(records))]
-
-    def _opened(self) -> None:
-        """The next window, read whole where none was read ahead (the first, a restored one's next)."""
-        if self._next is None:
-            self._start = self._read.get_state()
-            self._read_ahead(self._size)
-        else:
-            self._start = self._next
-            self._read_ahead(self._size - len(self._ahead))
+    def _fill_and_shuffle_window(self) -> None:
+        # A window read ahead starts where the one before it ended, not where the parent stands now.
+        if self._next is not None:
+            self._parent_window_start_iter_state = self._next
+        self._read_ahead(self._window_size - len(self._ahead))
         records, self._ahead = self._ahead, []
-        self._window, self._given = self._drawn(records), 0
-        self._next = None if self._ended else self._read.get_state()
+        # As Grain's: the parent exhausted where this window holds its last records.
+        self._parent_exhausted = self._ended
+        self._window = _reshuffle_window(window=records, seed=self._global_seed + self._window_index)
+        self._next = None if self._ended else self._parent.get_state()
 
     def __next__(self) -> Batch:
-        if not self._window:
-            if self._ended and self._next is None and not self._ahead:
-                raise StopIteration
-            self._opened()
-            if not self._window:
-                raise StopIteration
+        given = super().__next__()
         if self._next is not None:
             self._read_ahead(1)
-        self._given += 1
-        record = self._window.pop()
-        if not self._window:
-            self._index += 1
-        return record
-
-    def get_state(self) -> Mapping[str, object]:
-        return {"parent_window_start_state": copy.deepcopy(self._start), "window_index": self._index,
-                "pos_in_window": self._given}
+        return given
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self._start = copy.deepcopy(record(state["parent_window_start_state"], "window start position"))
-        self._read.set_state(self._start)
-        self._index = integer(state["window_index"], "window_index")
-        self._given = integer(state["pos_in_window"], "pos_in_window")
         self._ended, self._ahead, self._next = False, [], None
-        self._read_ahead(self._size)
-        records, self._ahead = self._ahead, []
-        self._window = self._drawn(records)
-        for _ in range(min(self._given, len(self._window))):
-            self._window.pop()
-        self._next = None if self._ended else self._read.get_state()
+        super().set_state(state)
 

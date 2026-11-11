@@ -224,9 +224,6 @@ def holdout(dataset: Dataset, fraction: float | None = None, *, key: str | None 
     return (trained, *(with_stores(chain, part) for part in held))
 
 
-_SELECTIONS = (HashPart, RecordSlice)
-
-
 def selecting(source: Source) -> Iterator[tuple[tuple[RecordSlice | HashPart, ...], Source]]:
     """`source`, then each source its holdout selections select from, down to their store, each with
     the selections above it, outermost first."""

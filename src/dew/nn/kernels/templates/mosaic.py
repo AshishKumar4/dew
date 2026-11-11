@@ -46,7 +46,6 @@ from dew.nn.kernels.templates import (
     product,
     report,
     resources,
-    shifted_rows,
     swizzling,
 )
 from dew.nn.kernels.templates.rings import CLUSTER, Ref, Ring, Turn, drain, loads, opaque, passed, streamed
@@ -731,9 +730,10 @@ class Issuer[Accumulator](abc.ABC):
         """`tile` (a register tile in the accumulator's layout, `tile_of`'s) with each row `i` holding row
         `i - shift`'s values within its `period`-row group, any value where that row leaves the group (a
         caller's mask), `shift` traced: read at a row offset in registers, by the layout's own lane
-        permutation (`shifted_rows.row_shifted`, a warp's shuffles), not through shared memory, whose shifted
-        plain reads conflict on every bank (row 5305); interpreted, the tile's own rows gathered. A layout
-        whose warps hold no whole groups of `period` rows takes none (`shifted_rows.lanes`)."""
+        permutation (Mosaic GPU's `FragmentedArray.row_shifted`, a warp's shuffles, the fork's from
+        0.12.0.1.post79), not through shared memory, whose shifted plain reads conflict on every bank (row
+        5305); interpreted, the tile's own rows gathered. A layout whose warps hold no whole groups of
+        `period` rows takes none (the fork refuses it)."""
         if interpret:
             rows = lax.broadcasted_iota(jnp.int32, tile.shape, 0)
             group = rows - rows % period
@@ -743,7 +743,7 @@ class Issuer[Accumulator](abc.ABC):
         def shifted(ctx, array, by):
             del ctx
             [value] = by.registers.flat
-            return shifted_rows.row_shifted(array, value, period)
+            return array.row_shifted(value, period)
 
         returned = plgpu.ShapeDtypeStruct(tile.shape, tile.dtype, layout=self.layout)
         return plgpu.inline_mgpu(arg_types=(self.layout, plgpu.Layout.WG_SPLAT(())), return_type=returned)(
@@ -825,10 +825,18 @@ class Issuer[Accumulator](abc.ABC):
     """The instruction slices loaded before the slice being consumed finishes."""
 
     def operand_live_depth(self, depth: int, loaded: int, *, retained: bool = False) -> int:
-        """An operand's live depth: a retained value keeps its loaded granule and instruction lookahead;
-        otherwise only its consumed slices within that granule stay live."""
+        """An operand's live depth: a retained value keeps its loaded granule and instruction lookahead; a
+        granule of several instructions that another granule of the product follows (`loaded` short of its
+        `depth`) its whole granule, loaded ahead of the later one's first product while the last slice of
+        the one before is in flight; otherwise only its consumed slices within that granule. An sm86 decode
+        step's keys, two granules of 64 at width 128, held at two instructions priced 80 registers where
+        ptxas spilled 12 bytes at 80 and held at 88 (the decode gate red at the promotion's composed tip);
+        one granule at a product's whole depth (a GEMM step's transposed weight at 64) holds at two
+        instructions, its whole granule refusing 19 picks ptxas holds (the gates both ways, 432 cells)."""
         consumed = (1 + self.operand_steps_ahead) * self.fragment_depth(depth)
-        return min(depth, max(loaded, consumed)) if retained else min(loaded, consumed)
+        if retained:
+            return min(depth, max(loaded, consumed))
+        return loaded if depth > loaded > self.fragment_depth(depth) else min(loaded, consumed)
 
     def fragment_depth(self, depth: int) -> int:
         """The depth consumed by one instruction: the step's where its issuer does not split products."""

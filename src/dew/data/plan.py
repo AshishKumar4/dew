@@ -21,7 +21,7 @@ import numpy as np
 from dew import _checkout
 from dew._hashing import array_header
 from dew._position import PER_SHARE
-from dew._records import ADDED, JSON, integer, json_value, listed, record, set_added, without_removed
+from dew._records import ADDED, JSON, integer, json_value, listed, record, set_added, strings, without_removed
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 
@@ -747,12 +747,44 @@ def read_otherwise_at_11(saved: Mapping[str, object]) -> str | None:
             "their order, so this position goes on only as 10 read it")
 
 
+def read_otherwise_at_13(saved: Mapping[str, object]) -> str | None:
+    """Why version 13 reads a version 12 data plan's order otherwise, None where it reads it alike: where it
+    holds a mixture of no seed whose members' keys (`dew.data.analysis._member_keys`) are not in their sorted
+    order, which 12's iterator mixes read them in and 13's in the order the mixture declares them
+    (`DECLARED_MIX`). Any read's, nested ones too: a streamed read mixes by iterator, and so does an indexed
+    per-share read of members that reject rows (`Accepted`); a global read by index mixes its members by
+    Grain's selection over their records in their declared order at both, so it reads alike."""
+    from dew.data.analysis import _member_keys
+
+    order = record(saved.get("order", {}), "saved order")
+    if saved.get("lowering") == "global" and order.get("read") in ("indexed", "memory"):
+        return None
+
+    def mixes(node: object) -> Iterator[Mapping[str, object]]:
+        if isinstance(node, Mapping):
+            if "corpora" in node and "members" in node:
+                yield node
+            for value in node.values():
+                yield from mixes(value)
+        elif isinstance(node, list):
+            for value in node:
+                yield from mixes(value)
+
+    for mix in mixes(order):
+        keys = _member_keys(strings(mix["members"], "a saved mix's members"))
+        if mix.get("shares") == "accepted rows" and "selection_seed" not in mix and keys != sorted(keys):
+            return ("version 12 read this streamed mix's members in their keys' sorted order, and version 13 "
+                    "in the order it declares them, so this position goes on only as 12 read it")
+    return None
+
+
 def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
     """`saved`, a data plan a saved position records, as `plan`, this run's, reads it (`Plan.check`): the
     position's one translation, where a reader's `set_state` decodes it. A plan of version 7 reads as 8, one
     of 8 as 9, one of 9 as 10 and one of 10 as 11, where the later reads its order alike
     (`read_otherwise_at_8`, `read_otherwise_at_9`, `read_otherwise_at_10`, `read_otherwise_at_11`), and one
-    of 11 as 12, which reads every plan as 11 does (`SHARED_STATE`). A
+    of 11 as 12, which reads every plan as 11 does (`SHARED_STATE`), and one of 12 as 13 where it reads
+    its mixes alike (`read_otherwise_at_13`). A
     token store a Dew before row 3028
     named without saying how its documents are read is named as today's names it where that Dew read the
     same documents of it (`_named_as_today`); its derived order holds today's lengths (`plan`'s) of each
@@ -773,6 +805,9 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     # plan, refused by its steps (`Plan.check`).
     if saved.get("version") == IN_ORDER and plan.version >= SHARED_STATE:
         saved = {**saved, "version": SHARED_STATE}
+    if (saved.get("version") == SHARED_STATE and plan.version >= DECLARED_MIX
+            and read_otherwise_at_13(saved) is None):
+        saved = {**saved, "version": DECLARED_MIX}
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:
         return saved
@@ -969,7 +1004,16 @@ PAIR_WINDOWS = 12
 (`dew.objectives.base.Objective.bind_plan`). The same version as `SHARED_STATE`, each naming what it
 changed: no Dew published one without the other."""
 
-PLAN_VERSIONS = (8, 9, FILE_SHARDS, IN_ORDER, SHARED_STATE)
+DECLARED_MIX = 13
+"""The plan version from which a streamed mixture's unseeded mix (`dew.data.mixing.KeyedMix`) reads its
+members in the order the mixture declares them, the order its every prefix is counted in
+(`dew.data.mixing.Proportions`; a later phase's continuation, `dew.data.compile._delivered`): 12's read
+them in their keys' sorted order, as Grain's mix of a mapping does, so where the two orders differ
+(members named out of sorted order, or more than ten unnamed) a later phase read on past records the
+mix had not given and gave again ones it had. A position 12 saved goes on under 13 where its mixes'
+orders are one (`read_otherwise_at_13`)."""
+
+PLAN_VERSIONS = (8, 9, FILE_SHARDS, IN_ORDER, SHARED_STATE, DECLARED_MIX)
 """The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a corpus's key, its name
 in the mixture that reads it or a named chain's own, into each shuffle of its own, so corpora of one length
 shuffled by one seed read in orders of their own and a named corpus reads one order mixed or alone (row

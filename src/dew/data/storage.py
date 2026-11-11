@@ -656,15 +656,15 @@ class Store:
     def cached(self) -> Store:
         if self.url.startswith("dewcache::"):
             return self
-        scheme = self.url.split("::", 1)[0] if "::" in self.url else self.url.split("://", 1)[0]
-        if "://" not in self.url and "::" not in self.url:
-            scheme = "file"
         options = dict(self.storage_options or {})
         transport = options.pop("dewcache", {})
-        backend = options.pop(scheme, {})
-        if not isinstance(backend, Mapping):
-            raise ValueError(f"storage options for {scheme!r} must be a mapping")
-        return Store("dewcache::" + self.url, {scheme: {**backend, **options}, "dewcache": transport})
+        # Each link of the chain keeps the options fsspec gives it (`fsspec.core._un_chain`: a protocol's
+        # own under its name, the unscoped ones its first link's), each under its protocol's name once
+        # Dew's mirror leads the chain, as fsspec reads them there.
+        from fsspec.core import _un_chain
+
+        links = {protocol: kwargs for _, protocol, kwargs in _un_chain(self.url, options)}
+        return Store("dewcache::" + self.url, {**links, "dewcache": transport})
 
     def child(self, path: str) -> Store:
         path = path.rstrip("/")

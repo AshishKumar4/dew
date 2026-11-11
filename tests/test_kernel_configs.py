@@ -20,7 +20,7 @@ import pytest
 from fla_gdn_support import CONV_SHAPES, conv_training_cases, kda_training_cases
 from generation_support import COMPILES_FOR_TPU, generations, lowers
 from jax.sharding import PartitionSpec
-from kernel_compile import Uncounted, compile_kernels, failures
+from kernel_compile import Uncounted, compile_kernels, failures, gate_generations
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
 from dew.nn.kernels.templates import bundles, report, resources
@@ -154,7 +154,7 @@ def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_g
     assert not failures(found), "\n".join(failures(found))
 
 
-@pytest.mark.parametrize("target", ["sm80", "sm90"])
+@pytest.mark.parametrize("target", gate_generations(scoped=True))
 def test_the_short_convs_kernels_compile_within_each_gpus_resources(target):
     """Each of the short conv's training cases (the recurrence template's conv, `templates.recurrence.conv`)
     lowered as on the GPU and compiled by Mosaic for a compile-only device on this CPU through ptxas
@@ -645,7 +645,7 @@ def _emitted_forms(family) -> set[str]:
 
 
 @pytest.mark.parametrize("shape", GEMM_SHAPES)
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"))
+@pytest.mark.parametrize("generation_name", generations(*gate_generations(stated=True)))
 def test_every_gemm_form_derives_a_tile_at_every_shape(generation_name, shape):
     """Every GEMM Mosaic GPU launch form a generation emits derives a tile at every real projection
     (`_gemm_mainloop_cases`), each on the most capable issuer whose bundle takes it (`bundles.groups`, its
@@ -688,7 +688,7 @@ def _gated(names: tuple[str, ...], cases: Callable[[str], list]) -> list:
 
 
 @pytest.mark.parametrize(("generation_name", "index"),
-                         _gated(("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"), _gate_cases))
+                         _gated(gate_generations(stated=True), _gate_cases))
 def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name, index):
     """Every distinct GEMM Mosaic GPU kernel a generation runs at a real projection (`_gate_cases`), a test
     each, at the tile its launch derives from the generation's facts and at each tile the derivation refused
@@ -729,7 +729,7 @@ def _family_cases(generation_name: str) -> list:
     return [case for case in _contract_cases(generation_name) if _kernel_of(case.name) not in held]
 
 
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+@pytest.mark.parametrize("generation_name", generations(*gate_generations()))
 def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_name):
     """The whole contract a Mosaic GPU Family bundle offers its templates is present: every launch form it
     emits (`_emitted_forms`: plain and transposed right operands, 16-bit and fp32 stores, fixed and streamed
@@ -744,7 +744,7 @@ def test_each_family_emits_every_launch_form_at_each_consumer_count(generation_n
     assert got == expected, (sorted(expected - got), sorted(got - expected))
 
 
-@pytest.mark.parametrize(("generation_name", "index"), _gated(("sm80", "sm90"), _family_cases))
+@pytest.mark.parametrize(("generation_name", "index"), _gated(gate_generations(), _family_cases))
 def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name, index):
     """Each launch of the contract a Mosaic GPU Family bundle offers its templates that the compile gate
     does not hold (`_family_cases`), a test each, compiled through ptxas for a compile-only GPU of the
@@ -1175,14 +1175,61 @@ def test_each_triton_call_needs_a_launch_of_its_own():
 def test_records_a_failed_process_of_their_own_wrote_are_refused():
     """A test that compiles Mosaic GPU kernels after another capability's runs again in a pytest process of
     its own (`kernel_compile.compiled_apart`), whose records are written before its own checks and teardown:
-    a process that wrote them and then failed gives none (row 1877)."""
-    from kernel_compile import OWN_PROCESS, compiled_apart
+    a test that wrote them there and then failed gives none (row 1877)."""
+    import apart_records
+    from kernel_compile import compiled_apart
 
-    if OWN_PROCESS in os.environ:
-        Path(os.environ[OWN_PROCESS]).write_text("[]")
-        pytest.fail("this process failed after it wrote its records, as a failed teardown does")
+    test = os.environ["PYTEST_CURRENT_TEST"].rsplit(" ", 1)[0]
+    if apart_records.RECORDS in os.environ:
+        apart_records.written(Path(os.environ[apart_records.RECORDS]), test, 0, [])
+        pytest.fail("this test failed after it wrote its records, as a failed teardown does")
     with pytest.raises(RuntimeError):
-        compiled_apart()
+        compiled_apart((9, 0), test, 0)
+
+
+def test_a_capabilitys_cells_compile_in_one_process_of_their_own(monkeypatch, tmp_path):
+    """Every cell of the session that states a capability other than the one the process compiles for
+    (`kernel_compile.Gated`) runs in one pytest process of its own, the first to ask starting it, and each
+    reads its own records from it, none where its call did not pass there (a skip); a test that states none
+    runs in one of its own (`compiled_apart`)."""
+    from types import SimpleNamespace
+
+    import apart_records
+    import kernel_compile
+    from kernel_compile import Gated
+
+    def cell(nodeid, **params):
+        return SimpleNamespace(nodeid=nodeid, callspec=SimpleNamespace(params=params))
+
+    session = [cell("a", generation_name=Gated("sm90"), index=0),
+               cell("b", generation_name=Gated("sm90"), index=1),
+               cell("c", generation_name=Gated("sm100"), index=0), SimpleNamespace(nodeid="d"),
+               cell("e", generation_name=Gated("sm90"), index=2)]
+    started = []
+
+    def ran_apart(tests):
+        started.append(tests)
+        directory = tmp_path / str(len(started))
+        directory.mkdir()
+        monkeypatch.setenv(apart_records.RECORDS, str(directory))
+        for test in tests:
+            apart_records.written(directory, test, 0, [{"name": test}])
+            skipped = test == "e"
+            for when in ("setup", "teardown") if skipped else ("setup", "call", "teardown"):
+                passed = not (skipped and when == "setup")
+                apart_records.reported(SimpleNamespace(nodeid=test, failed=False, passed=passed, when=when))
+        monkeypatch.delenv(apart_records.RECORDS)
+        return directory
+
+    monkeypatch.setattr(apart_records, "SESSION", session)
+    monkeypatch.setattr(kernel_compile, "_APART", {})
+    monkeypatch.setattr(kernel_compile, "_ran_apart", ran_apart)
+    assert kernel_compile.compiled_apart((9, 0), "a", 0) == [{"name": "a"}]
+    assert kernel_compile.compiled_apart((9, 0), "b", 0) == [{"name": "b"}]
+    assert kernel_compile.compiled_apart((9, 0), "d", 0) == [{"name": "d"}]
+    with pytest.raises(RuntimeError):
+        kernel_compile.compiled_apart((9, 0), "e", 0)
+    assert started == [["a", "b", "e"], ["d"]]
 
 
 def test_the_resource_gate_refuses_spills_and_invalid_allocations():

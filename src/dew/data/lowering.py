@@ -145,7 +145,7 @@ from dew.data.pipeline import (
     member_record,
     members_held,
 )
-from dew.data.plan import IN_ORDER, PLAN_VERSIONS, Manifest
+from dew.data.plan import DECLARED_MIX, IN_ORDER, PLAN_VERSIONS, Manifest
 from dew.data.readers import WorkerMirrors, _FillShare
 from dew.data.shards import bounded as shards_bounded, bounded_places, cut, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
@@ -1433,7 +1433,7 @@ class _Build:
                 names=[_name(child) for child in source.pipelines],
                 labels=[_label(child) for child in source.pipelines],
             )
-        return KeyedMix(streams, source.weights, keys, source.seed)
+        return KeyedMix(streams, source.weights, keys, source.seed, declared=self.version >= DECLARED_MIX)
 
     def counted_members(self, pipeline: Pipeline) -> tuple[tuple[str, str, str], ...]:
         """The members of `pipeline`'s mixture, each's key (`_member_keys`), name and label, where a read

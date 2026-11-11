@@ -5,32 +5,65 @@ registers as its model states them and spill-free; and an A100's launches counti
 lowering asks for. The mainloop's values are tests/test_attention_mosaic.py's."""
 
 
+import dataclasses
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 import pytest
 from generation_support import COMPILES_ON_CPU, INTERPRETS
+from kernel_compile import gate_generations
 from test_attention_mosaic import BACKWARD_HOOKS, SHAPES, _check_backward, _residuals
 from test_attention_triton import SCORE_HOOKS, score_hooks
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_mosaic, bundles
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_mosaic,
+    attention_mosaic_program,
+    bundles,
+)
 
 pytestmark = pytest.mark.kernel
 
 
-GATED = ("sm90", "sm80")
-"""The GPUs whose launches the resource gates compile (`attention_mosaic_program.qualified`, a family whose
-consumers issue their products): an H100's wgmma and an A100's mma.sync staged by cp.async. Consumer
-Blackwell's mma.sync fed by TMA (`bundles.MmaFed`) runs the mainloop too, but derives no tile within its
-99 KB block yet (every sm120 case None at 3569816c26, lean1b)."""
+GATED = gate_generations(scoped=True, tpu=True,
+                         needs=lambda family, architecture: attention_mosaic_program.qualified(family))
+"""The GPUs whose launches the resource gates compile: one of each architecture whose bundle the mainloop
+runs on (`kernel_compile.gate_generations`, its launches' flags, the bundle qualified for it,
+`attention_mosaic_program.qualified`: a family whose consumers issue their products)."""
 
-BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in GATED
+BACKWARD_GATED = gate_generations(tpu=True, needs=lambda family, architecture: (
+    attention_mosaic_program.runs_backward(family)))
+"""The GPUs whose backward launches the gate compiles: one of each architecture with a bundle the backward
+runs on (its launches scope no product scratch: `runs_backward`), a B200's and consumer Blackwell's the
+mma.sync rings their consumers feed, the one launch's alone."""
+
+FP32_GATED = gate_generations(scoped=True, tpu=True, needs=lambda family, architecture: (
+    attention_mosaic_program.qualified(family) and attention_mosaic_program.loads_parts(family)))
+"""The GPUs whose fp32 forwards the gate compiles: one of each architecture whose bundle the mainloop runs on
+and loads a forward's fp32 parts (`loads_parts`); every other's fp32 call takes another mainloop."""
+
+
+def _takes(generation_name: str, accurate: bool, hooks: str) -> bool:
+    """Whether the backward takes a gate call of `accurate`'s form under `hooks` on `generation_name`: every
+    form where its bundle's dQ launch has a producer, the one launch's forms (`fuses`) where it has none."""
+    family = attention_mosaic_program.backward_bundle(generation_name, jnp.bfloat16)
+    parametrized = hooks != "none" and bool(score_hooks(SCORE_HOOKS[hooks], 8, 8, 64, rows=1, heads=4)[1])
+    return not attention_mosaic_program.split_queries(family) or attention_mosaic_program.fuses(accurate,
+                                                                                                 parametrized)
+
+
+BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in BACKWARD_GATED
                  for width in (64, 128, 256) for accurate in (False, True)]
-BACKWARD_GATE += [(generation_name, width, accurate, hooks) for generation_name in GATED
+BACKWARD_GATE += [(generation_name, width, accurate, hooks) for generation_name in BACKWARD_GATED
                   for width in (64, 128) for accurate in (False, True)
                   for hooks in BACKWARD_HOOKS if hooks != "none"]
 BACKWARD_GATE += [("sm90", 256, False, "softcap")]
-"""The backward resource gate's cases: each GPU whose family the mainloop qualifies (`GATED`), a causal
+BACKWARD_GATE = [case for case in BACKWARD_GATE if _takes(case[0], case[2], case[3])]
+"""The backward resource gate's cases, each a form its GPU's bundles take (`_takes`; a form of two
+launches refused by its typed fact where the bundle's dQ launch has no producer): each GPU whose family the
+backward runs on (`BACKWARD_GATED`), a causal
 call's head widths, each form, hookless; each score hook at the widths a hooked call's derivation takes
 whole, in each form (row 2281: its live set beside the step's; FS-A100CHECK1d: the accurate form under a
 row-indexed hook failed an A100's layout inference, a case no fast-form gate lowered); and Gemma 2's, a
@@ -66,6 +99,31 @@ def _gated_backward(generation_name: str, width: int, accurate: bool, hooks: str
                                                    natural=attention_mosaic.NATURAL)
         ba = op.bind(*args, interpret=False)
         return op, ba, op.derived(ba, generation.gpu_target())
+
+
+def _least_beyond(op, ba, generation_name: str):
+    """The tile `op`'s derivation takes for `ba` on `generation_name` grown by the least factor that holds one
+    (its block's shared memory and its consumers' registers each that many times their own, bisected up to
+    four), or None where none at four holds one: the least the model says its launches stage and hold."""
+    with generation.assumed(generation_name):
+        target = generation.gpu_target()
+        own = generation.shared_budget(target)
+    budget = type(op).register_budget
+
+    def derived(factor: float):
+        grown = dataclasses.replace(target, shared_limit=int(own * factor))
+        with (generation.assumed(generation_name),
+              mock.patch.object(type(op), "register_budget",
+                                lambda self, config: int(budget(self, config) * factor))):
+            return op.derived(ba, grown)
+
+    low, high = 1.0, 4.0
+    if derived(high) is None:
+        return None
+    while high - low > 1 / 256:
+        middle = (low + high) / 2
+        low, high = (low, middle) if derived(middle) is not None else (middle, high)
+    return derived(high)
 
 
 FORWARD_GATE = [(generation_name, width, training, "none") for generation_name in GATED
@@ -363,7 +421,7 @@ def test_the_forward_compiles_spill_free_as_its_model_decides(generation_name, w
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [64, 128])
-@pytest.mark.parametrize("generation_name", ["sm90"])
+@pytest.mark.parametrize("generation_name", FP32_GATED)
 def test_an_fp32_forward_compiles_spill_free_as_its_model_decides(generation_name, width):
     """An fp32 call's inference forward (`MosaicForward.parts`: its operands bf16 parts) at its derived tiles
     of a causal call `width` wide, lowered and compiled by ptxas for `generation_name` on this CPU: every
@@ -458,11 +516,26 @@ def test_the_backward_compiles_spill_free_as_its_model_decides(generation_name, 
                                           accurate=accurate)
         return grads.query, grads.key, grads.value
 
-    config = _gated_backward(generation_name, width, accurate, hooks)[2]
+    op, ba, config = _gated_backward(generation_name, width, accurate, hooks)
     if config is None and accurate and hooks != "none":
         pytest.skip(f"the accurate form under {hooks} derives no tile {width} wide on {generation_name}: "
                     "its registers hold none, and the Pallas-Triton mainloop takes the call")
-    assert config is not None, f"the Mosaic backward derives no config {width} wide on {generation_name}"
+    if config is None:
+        # No tile its block and registers hold: the least the model takes past them (`_least_beyond`) fails
+        # the compile for them too, past the block or spilling, the refusal true (an sm86's 64 x 64 dQ launch
+        # 101,392 bytes at width 128 under a score hook, its dK/dV 131,088, of 101,376; the Pallas-Triton
+        # backward takes the call).
+        least = _least_beyond(op, ba, generation_name)
+        assert least is not None, f"the Mosaic backward derives no config {width} wide on {generation_name}"
+        with generation.assumed(generation_name):
+            found = compile_mosaic_kernels([KernelCase("backward", lambda: op.lowering(ba, least))],
+                                           generation_name)
+        # Past the block (its lowering's or XLA's asked bytes) or spilling, each record: an error of another
+        # kind is no proof of either.
+        assert found and all(record.get("shared", 0) > record["limit"]
+                             or any(kernel.get("spilled") for kernel in record.get("kernels", ()))
+                             for record in found), found
+        return
     with generation.assumed(generation_name):
         shapes = jax.tree.map(lambda array: jax.ShapeDtypeStruct(array.shape, array.dtype), residuals)
         found = compile_mosaic_kernels(

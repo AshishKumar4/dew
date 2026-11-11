@@ -14,12 +14,17 @@ import jax.numpy as jnp
 import pytest
 from fla_gdn_support import KernelCase
 from generation_support import COMPILES_ON_CPU
-from kernel_compile import compile_mosaic_kernels, mosaic_failures
+from kernel_compile import compile_mosaic_kernels, gate_generations, mosaic_failures
 from test_attention_mosaic import _residuals
 from test_recurrence_mosaic import resource_operands
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_blackwell, attention_mosaic
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_blackwell,
+    attention_mosaic,
+    attention_mosaic_program,
+)
 from dew.nn.kernels.templates.recurrence import template as recurrence
 
 pytestmark = pytest.mark.kernel
@@ -44,7 +49,8 @@ def deepest(op, ba, config, target):
 
 def _attention(pass_: str, width: int):
     """The attention template's forward or backward op of a causal call of `QUERIES` queries, four query heads
-    over two key heads `width` wide in bf16, its bound arguments, and its derived config, on an H100."""
+    over two key heads `width` wide in bf16, its bound arguments, and its derived config, on the GPU
+    assumed."""
     spans = template.spans(QUERIES, QUERIES, 1, causal=True)
     query = jnp.zeros((1, QUERIES, 4, width), jnp.bfloat16)
     key = jnp.zeros((1, QUERIES, 2, width), jnp.bfloat16)
@@ -62,44 +68,56 @@ def _attention(pass_: str, width: int):
 
 def _recurrence(name: str, dtype):
     """The recurrence template's op of `name`'s geometry over one row of 4096 tokens in `dtype`, its bound
-    arguments and its derived config, on an H100."""
+    arguments and its derived config, on the GPU assumed."""
     ba = recurrence.MOSAIC.bind(*resource_operands(name, dtype, 1, 4096), None, bound=1.0)
     return recurrence.MOSAIC, ba, recurrence.MOSAIC.derived(ba, recurrence.Mosaic.launched())
 
 
-CELLS = {"attention forward 64": lambda: _attention("forward", 64),
-         "attention forward 128": lambda: _attention("forward", 128),
-         "attention backward 64": lambda: _attention("backward", 64),
-         "recurrence qwen3.5-27b-gdn": lambda: _recurrence("qwen3.5-27b-gdn", jnp.bfloat16),
-         "recurrence kimi-linear-kda": lambda: _recurrence("kimi-linear-kda", jnp.bfloat16)}
+ATTENTION = gate_generations(scoped=True, tpu=True,
+                             needs=lambda family, architecture: attention_mosaic_program.qualified(family))
+ATTENTION_BACKWARD = gate_generations(tpu=True, needs=lambda family, architecture: (
+    attention_mosaic_program.runs_backward(family)))
+"""The GPUs the attention forward and backward run on, each as the compile gate takes them (its `GATED` and
+`BACKWARD_GATED`: the backward on the bundles its launches take, `runs_backward`)."""
+RECURRENCE = gate_generations(scoped=True)
+CELLS = {"attention forward 64": (lambda: _attention("forward", 64), ATTENTION),
+         "attention forward 128": (lambda: _attention("forward", 128), ATTENTION),
+         "attention backward 64": (lambda: _attention("backward", 64), ATTENTION_BACKWARD),
+         "recurrence qwen3.5-27b-gdn": (lambda: _recurrence("qwen3.5-27b-gdn", jnp.bfloat16), RECURRENCE),
+         "recurrence kimi-linear-kda": (lambda: _recurrence("kimi-linear-kda", jnp.bfloat16), RECURRENCE)}
+"""Each cell's op and the GPUs its template runs on (`kernel_compile.gate_generations`, the template's launch
+flags and qualification)."""
 
 
 @COMPILES_ON_CPU
-@pytest.mark.parametrize("cell", list(CELLS))
-def test_an_hoppers_launch_at_its_deepest_ring_compiles_within_its_resources(cell):
-    """`cell`'s launches at the deepest ring the H100's shared memory holds them at (`deepest`), lowered and
+@pytest.mark.parametrize(("cell", "generation_name"),
+                         [(cell, name) for cell, (_, names) in CELLS.items() for name in names])
+def test_a_launch_at_its_deepest_ring_compiles_within_its_resources(cell, generation_name):
+    """`cell`'s launches at the deepest ring the GPU's shared memory holds them at (`deepest`), lowered and
     compiled by ptxas for it: every launch within its shared memory, spilling nothing."""
-    with generation.assumed("sm90"):
-        op, ba, config = CELLS[cell]()
-        assert config is not None, f"{cell} derives no config on an H100"
+    with generation.assumed(generation_name):
+        op, ba, config = CELLS[cell][0]()
+        assert config is not None, f"{cell} derives no config on {generation_name}"
         at = deepest(op, ba, config, generation.gpu_target())
         case = KernelCase(f"{cell} at {at.stages} stages", lambda: op.lowering(ba, at))
-        found = compile_mosaic_kernels([case], "sm90")
+        found = compile_mosaic_kernels([case], generation_name)
     failed = mosaic_failures(found)
     assert not failed, "\n".join(failed)
 
 
 STAGES = range(2, 11)
-"""The Blackwell forward's rings a cell lowers: from the least to past what a B200's block holds."""
+"""The Blackwell forward's rings a cell lowers: from the least to past what its block holds."""
 
 
 @COMPILES_ON_CPU
 @pytest.mark.parametrize("width", [64, 128])
-def test_a_b200s_attention_at_its_deepest_ring_compiles_within_its_resources(width):
-    """The Blackwell forward of a causal call `width` wide at each ring of `STAGES`, lowered for a B200 on
-    this CPU: those its block's shared memory holds compiled by ptxas within its resources and spilling
-    nothing, the deepest of them among them, the rest refused at their lowering by the bytes they ask past
-    the block's."""
+@pytest.mark.parametrize("generation_name", gate_generations(
+    stated=True, needs=lambda family, architecture: "tcgen05" in architecture.issuers))
+def test_a_blackwell_attention_at_its_deepest_ring_compiles_within_its_resources(generation_name, width):
+    """The Blackwell forward (tcgen05's, one warp issuing into tensor memory) of a causal call `width` wide
+    at each ring of `STAGES`, lowered for each GPU issuing tcgen05 on this CPU: those its block's shared
+    memory holds compiled by ptxas within its resources and spilling nothing, the deepest of them among them,
+    the rest refused at their lowering by the bytes they ask past the block's."""
     spans = template.spans(QUERIES, QUERIES, 1, causal=True)
 
     def case(stages: int) -> KernelCase:
@@ -115,9 +133,9 @@ def test_a_b200s_attention_at_its_deepest_ring_compiles_within_its_resources(wid
 
         return KernelCase(f"blackwell attention {width} at {stages} stages", call)
 
-    with generation.assumed("sm100"):
-        found = compile_mosaic_kernels([case(stages) for stages in STAGES], "sm100")
+    with generation.assumed(generation_name):
+        found = compile_mosaic_kernels([case(stages) for stages in STAGES], generation_name)
     held = [record for record in found if "error" in record or record.get("shared", 0) <= record["limit"]]
-    assert len(held) < len(found), f"a B200 holds every ring to {STAGES[-1]} stages"
+    assert len(held) < len(found), f"{generation_name} holds every ring to {STAGES[-1]} stages"
     failed = mosaic_failures(held)
     assert not failed, "\n".join(failed)

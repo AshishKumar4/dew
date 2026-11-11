@@ -33,8 +33,9 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import inspect
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
@@ -216,10 +217,6 @@ class ToolCall:
         return call
 
 
-RESERVED = ("role", "content", "tool_calls", "tool_call_id", "name")
-"""The message keys the boundary types; every other key rides in `extra`."""
-
-
 @dataclasses.dataclass(frozen=True)
 class Message:
     """One turn of a conversation, in the shape the chat template reads.
@@ -291,6 +288,10 @@ class Message:
             row["name"] = self.name
         row.update(self.extra)
         return row
+
+
+RESERVED = tuple(field.name for field in dataclasses.fields(Message) if field.name != "extra")
+"""The message keys the boundary types (`Message`'s fields); every other key rides in `extra`."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -390,19 +391,27 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
     return ids
 
 
-RENDERER_KEYS = frozenset({"conversation", "tools", "documents", "tokenize", "return_dict", "return_tensors",
-                           "add_generation_prompt", "continue_final_message", "chat_template",
-                           "enable_thinking", "padding", "truncation", "max_length", "tokenizer_kwargs",
-                           "return_assistant_tokens_mask"})
-"""The keywords the template call itself owns (`apply_chat_template`'s and this module's own
-controls), which a template's variables (`options`) never set: each has its own field."""
+DEW_CONTROLS = frozenset({"enable_thinking"})
+"""The template call's controls Dew owns beside the renderer's own (`renderer_controls`): thinking, which
+`_rendered` switches."""
 
 
-def template_options(options: Mapping[str, JSON], *, where: str) -> Mapping[str, JSON]:
+def renderer_controls(render: Callable[..., object]) -> frozenset[str]:
+    """The keywords the template call `render` itself owns, which a template's variables (`options`)
+    never set: its own named parameters, as the bound renderer declares them, and Dew's
+    (`DEW_CONTROLS`)."""
+    named = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    return frozenset(name for name, parameter in inspect.signature(render).parameters.items()
+                     if parameter.kind in named) | DEW_CONTROLS
+
+
+def template_options(options: Mapping[str, JSON], *, where: str,
+                     render: Callable[..., object] | None = None) -> Mapping[str, JSON]:
     """`options` as a chat template's own variables, refused (ValueError) where one names a keyword
-    the template call owns (`RENDERER_KEYS`): thinking, the template and the rest have their own
-    fields, so an option never overrides one silently or collides with it."""
-    owned = sorted(set(options) & RENDERER_KEYS)
+    the template call owns: Dew's (`DEW_CONTROLS`), checked as a run is configured, and with the renderer
+    `render` its own (`renderer_controls`), checked where it renders, so an option never overrides one
+    silently or collides with it."""
+    owned = sorted(set(options) & (DEW_CONTROLS if render is None else renderer_controls(render)))
     if owned:
         raise ValueError(f"{where}: {owned} are the chat template call's own controls, not template "
                          "variables; set them through their own fields")
@@ -421,7 +430,7 @@ def _rendered(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping[
             tokenizer.apply_chat_template, rows, tools=[dict(tool) for tool in tools] or None,
             tokenize=tokenize, return_dict=False, add_generation_prompt=generation_prompt,
             **({} if chat_template is None else {"chat_template": chat_template}),
-            **template_options(options or {}, where=where))
+            **template_options(options or {}, where=where, render=tokenizer.apply_chat_template))
         return render() if thinking is None else render(enable_thinking=thinking)
     except (TemplateError, TypeError) as exc:
         raise ValueError(f"{where}: the chat template refused the conversation: {exc}") from exc
