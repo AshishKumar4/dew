@@ -1,5 +1,5 @@
-"""The NVFP4 product's check-1 matrix (tests/kernel_matrix.py): a product of an NVFP4 matrix (`gemm.NvFp4`, a
-quantized checkpoint's frozen weights) with its matrix decoded stage by stage in the template's mainloop
+"""The NVFP4 product's check-1 matrix (tests/kernel_matrix.py): a product of an NVFP4 matrix (`formats.NvFp4`,
+a quantized checkpoint's frozen weights) with its matrix decoded stage by stage in the template's mainloop
 (`gemm.nvfp4_product`'s packed kernel, row 3621) on par with its matrix decoded once a call and multiplied.
 
 Each cell runs the product's forward and its reverse mode in one program: the output and the rows' gradient
@@ -26,7 +26,7 @@ from kernel_matrix import AXES
 from low_precision_support import nvfp4
 from reference_error import assert_as_exact, with_gradients
 
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import formats, gemm, generation
 
 ROWS = 192
 """The product's rows."""
@@ -38,7 +38,7 @@ KERNELS = {"nvfp4": frozenset({"packed"})}
 """The kernels under test of each choice the cells run: the template's in-stage decode."""
 XLA = {"grouped_matmul": "xla"}
 """The product's other choice, named XLA in every cell."""
-def _matrix(case: dict[str, str]) -> tuple[gemm.NvFp4, np.ndarray]:
+def _matrix(case: dict[str, str]) -> tuple[formats.NvFp4, np.ndarray]:
     """`case`'s NVFP4 matrix (`low_precision_support.nvfp4`, tensor scale 0.75) and its values in float64."""
     depth, width = int(case["depth"]), int(case["width"])
     return nvfp4(depth + width, depth, width, scale=0.75)
@@ -69,7 +69,7 @@ CASES = (
 (`kernel_matrix.covering("nvfp4")`, regenerated where the axes or the route's support change)."""
 
 
-def _step(matrix: gemm.NvFp4, out_dtype: str, kernel: str):
+def _step(matrix: formats.NvFp4, out_dtype: str, kernel: str):
     """The product's training step as `run(rows, cotangent)`, `nvfp4` named `kernel`."""
     def product(rows):
         with generation.chosen(**XLA, nvfp4=kernel):

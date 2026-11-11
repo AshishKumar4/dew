@@ -606,7 +606,7 @@ def _refuse_reshaped(template, stored, where: str) -> None:
 
 def _paths(tree) -> set[str]:
     """`tree`'s leaves' paths by their names alone (`keystr`'s simple form): a registered dataclass's
-    fields (a packed bank's, `dew.nn.kernels.gemm.NvFp4`) are attributes in a tree and keys in Orbax's
+    fields (a packed bank's, `dew.nn.kernels.formats.NvFp4`) are attributes in a tree and keys in Orbax's
     metadata of it, the same leaves at the same paths."""
     return {jax.tree_util.keystr(path, simple=True, separator="/")
             for path, _ in jax.tree_util.tree_flatten_with_path(tree)[0]}

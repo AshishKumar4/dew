@@ -55,6 +55,12 @@ class Format:
     def largest(self) -> float:
         return (2.0 - 2.0 ** (1 - self.precision)) * 2.0 ** self.emax
 
+    @property
+    def overflow(self) -> float:
+        """The least magnitude round to nearest takes to infinity: the largest finite value plus half its
+        spacing (its tie goes up, the largest significand being odd)."""
+        return self.largest + 2.0 ** (self.emax - self.precision)
+
 
 DTYPES = {"float32": np.float32, "bfloat16": ml_dtypes.bfloat16, "float16": np.float16}
 """Each format's NumPy type, by name."""
@@ -110,7 +116,7 @@ def rounded(hi: np.ndarray, lo: np.ndarray, fmt: Format) -> np.ndarray:
     result = np.copysign(nearest * quantum, hi)
     # Overflow: past the largest finite value plus half its spacing, or on it unless lo pulls the
     # exact value back below (the largest significand is odd, so its tie goes to the next binade).
-    edge = fmt.largest + 2.0 ** (fmt.emax - fmt.precision)
+    edge = fmt.overflow
     inward = (lo != 0) & ((lo > 0) != (hi > 0))
     beyond = (np.abs(hi) > edge) | ((np.abs(hi) == edge) & ~inward)
     return np.where(~finite, hi, np.where(beyond, np.copysign(np.inf, hi), result))

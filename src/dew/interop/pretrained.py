@@ -93,7 +93,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.backbones.layer_names import group_layers
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.kernels.gemm import NvFp4
+from dew.nn.kernels.formats import NvFp4
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.precision import Numerics, numerics_of
 from dew.nn.protocols import MediaWrapper
@@ -570,7 +570,7 @@ class Pretrained:
         config. `dex` attaches DEX (`with_dex`) from key 0; `scan_layers` scans like layers (`Scanning`).
         `packed_experts` serves an MXFP4 source's routed experts as their codes (row 4516,
         `quantized_loads.packed_banks`): each bank one tensor scale an expert holds is packed
-        (`dew.nn.kernels.gemm.NvFp4`, exactly its MXFP4 values) in the `QUANTIZATION` collection, which
+        (`dew.nn.kernels.formats.NvFp4`, exactly its MXFP4 values) in the `QUANTIZATION` collection, which
         the expert layers read and an export decodes, placed and scanned as its dense matrix; one that is
         not stays dense, named in the load's log. Refused beside another source format. A saved Dew run
         loads as `dew export` writes it, at `step` with `ema` (`released_run`).

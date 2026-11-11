@@ -1,7 +1,7 @@
-"""The NVFP4 operand as Blackwell's block-scaled tensor cores read it (`gemm.NvFp4Block`: E2M1 codes, an E4M3
-scale every 16 depths under a tensor scale), its grouped product (`gemm.nvfp4_block_product`), the
+"""The NVFP4 operand as Blackwell's block-scaled tensor cores read it (`formats.NvFp4Block`: E2M1 codes, an
+E4M3 scale every 16 depths under a tensor scale), its grouped product (`gemm.nvfp4_block_product`), the
 inference projection quantizing its rows (`gemm.nvfp4_quantized_product`) and the NVFP4 recipe
-(`gemm.nvfp4_projection`), row 4519's NVFP4 arm, on the CPU."""
+(`projections.nvfp4_projection`), row 4519's NVFP4 arm, on the CPU."""
 
 import functools
 
@@ -14,7 +14,7 @@ from blockwise_matrix import step_operands
 from low_precision_support import spread
 from reference_error import assert_as_exact, with_gradients
 
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import formats, gemm, generation, projections
 from dew.nn.kernels.templates import product
 
 SEEDS = 8
@@ -23,20 +23,20 @@ SEEDS = 8
 def test_an_nvfp4_operand_is_its_values_again_and_its_stored_matrix():
     """An NVFP4 operand's values quantize to themselves (`NvFp4Block.quantized`), its codes E2M1 values and
     its blocks' largest code at most 6, where its tensor scale is a power of two, so each value (a code
-    times its block's scale and the tensor's) is exact in fp32; and a stored NVFP4 matrix (`gemm.NvFp4`)
+    times its block's scale and the tensor's) is exact in fp32; and a stored NVFP4 matrix (`formats.NvFp4`)
     read as the block-scaled products read it (`NvFp4Block.of`) holds its values, its depths in their own
     order. Values rounded to fp32 under another tensor scale need not: a block's largest over the tensor
     scale may round above its scale, which takes the next (row 5456)."""
     drawn = spread(0, (64, 256), product.NVFP4.depth)
     # Its largest magnitude 6 x 448 / 8, so its tensor scale is 1/8.
-    operand = gemm.NvFp4Block.quantized(drawn / jnp.max(jnp.abs(drawn)) * np.float32(6 * 448 / 8))
+    operand = formats.NvFp4Block.quantized(drawn / jnp.max(jnp.abs(drawn)) * np.float32(6 * 448 / 8))
     assert float(operand.scale) == 1 / 8
     values = operand.decoded() * operand.scale
-    again = gemm.NvFp4Block.quantized(values)
+    again = formats.NvFp4Block.quantized(values)
     np.testing.assert_array_equal(np.asarray(again.decoded() * again.scale), np.asarray(values))
     assert float(jnp.max(jnp.abs(operand.codes.astype(jnp.float32)))) <= 6
-    stored = gemm.NvFp4.quantized(spread(1, (64, 256), product.NVFP4.depth).T)
-    read = gemm.NvFp4Block.of(stored)
+    stored = formats.NvFp4.quantized(spread(1, (64, 256), product.NVFP4.depth).T)
+    read = formats.NvFp4Block.of(stored)
     np.testing.assert_array_equal(np.asarray(read.decoded()[0].T * read.scale),
                                   np.asarray(stored.decoded().astype(jnp.float32) * stored.factor))
 
@@ -64,7 +64,7 @@ def test_an_nvfp4_grouped_product_is_its_decoded_values_product(kernel):
 
     def dew(x, w):
         with generation.chosen(nvfp4_block=kernel):
-            operands = (gemm.NvFp4Block.quantized(x), gemm.NvFp4Block.quantized(w))
+            operands = (formats.NvFp4Block.quantized(x), formats.NvFp4Block.quantized(w))
             return gemm.nvfp4_block_product(*operands, blocks, out_dtype=jnp.float32,
                                             interpret_on_cpu=kernel == "mosaic")
 
@@ -80,23 +80,24 @@ def test_an_nvfp4_quantized_projection_is_its_quantized_rows_product():
     (`gemm.nvfp4_quantized_product`), rows no whole 128s: bitwise the NVFP4 block product of its rows,
     padded, and the matrix as one group (XLA's arm on a CPU)."""
     x, w = spread(4, (200, 256), product.NVFP4.depth), spread(5, (256, 128), product.NVFP4.depth)
-    matrix = gemm.NvFp4.quantized(w)
+    matrix = formats.NvFp4.quantized(w)
     out = gemm.nvfp4_quantized_product(x, matrix, out_dtype=jnp.float32)
     padded = jnp.pad(x, ((0, 56), (0, 0)))
-    expected = gemm.nvfp4_block_product(gemm.NvFp4Block.quantized(padded), gemm.NvFp4Block.of(matrix),
+    expected = gemm.nvfp4_block_product(formats.NvFp4Block.quantized(padded), formats.NvFp4Block.of(matrix),
                                         jnp.asarray([2], jnp.int32), out_dtype=jnp.float32)[:200]
     np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
 
 
 def test_an_nvfp4_projections_training_step_is_on_par():
-    """One training step through the NVFP4 recipe (`gemm.nvfp4_projection`: its output and both gradients),
-    the decoded arms in XLA, on par with the recipe in float64 (tests/mx_matrix.py's `recipe_truth` of NVFP4
-    values) over the draws (check 1), against the same step's float32 sums of the decoded operands."""
+    """One training step through the NVFP4 recipe (`projections.nvfp4_projection`: its output and both
+    gradients), the decoded arms in XLA, on par with the recipe in float64 (tests/mx_matrix.py's
+    `recipe_truth` of NVFP4 values) over the draws (check 1), against the same step's float32 sums of the
+    decoded operands."""
     blocks = jnp.asarray([1, 0, 2], jnp.int32)
 
     def projection(x, w):
         with generation.chosen(nvfp4_block="xla"):
-            return gemm.nvfp4_projection(x, w, blocks, out_dtype=jnp.float32)
+            return projections.nvfp4_projection(x, w, blocks, out_dtype=jnp.float32)
 
     plain = mx_matrix.recipe_truth(blocks, jnp.float32, quantized=mx_matrix.nvfp4_values)
     assert_as_exact(jax.jit(with_gradients(projection)), jax.jit(with_gradients(plain)), step_operands,
