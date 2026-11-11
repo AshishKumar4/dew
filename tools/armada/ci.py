@@ -2087,6 +2087,42 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
     return 0
 
 
+def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str,
+                  token: str) -> dict[str, dict | None]:
+    """What each of a GPU lane's processes (`lane_units`: its file, group and variant) has held on class
+    `held`, a record `gpu_needs` reads: its last run's there, a group the tier cut the most its file's runs
+    measured there; else its file's on the other classes (`borrowed_records`); None where no run measured
+    it."""
+    # A group the tier cut by its own seconds holds tests another cut's group of its name did not, so its own
+    # last record is not its measure (2026-11-10: a group measured holding two tests was given their pool when
+    # it held five, one asking more than the pool): it reads its file's whole run's.
+    cut = bool(os.environ.get("DEW_SPLIT_DURATIONS"))
+
+    def needs(name: str) -> dict | None:
+        file, group, variant = units[name]
+        return recorded(record_key(python, row(python, file, varied("" if cut else group, variant)), held),
+                        token)
+
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        records = dict(zip(units, pool.map(needs, units), strict=True))
+    # Nor is the whole run alone such a group's measure, which a test added since has outgrown (2026-11-11: a
+    # whole run's 3.92 GiB gave a newer test a 5.9 GiB lane, which ran out): it is the most the runs of its
+    # file's process on this class measured, whole or a group of any cut. A whole run that measured nothing (a
+    # child it did not follow, no report) stays the file's, which so takes the lane's whole share.
+    if cut:
+        files = {file for file, _, _ in units.values()}
+        most = largest_records(python, token, under=f"{held}/", measures=lambda _, name, group: (
+            (name, place_variant(group)) if name in files else None))
+        records = {name: found if found is not None and not gpu_measures.measured(found)
+                   else most.get((units[name][0], units[name][2]), found) for name, found in records.items()}
+    # A group no run on this class measured borrows the most its file held on another, which holds at least
+    # its own; a file's process under other flags, its tests a part of the file's, the lane's own's first.
+    borrowed = borrowed_records(sorted({units[name][0] for name, found in records.items() if found is None}),
+                                python, held, token)
+    return {name: records[name] or records.get(f"{file}#{group}" if group else file) or borrowed.get(file)
+            for name, (file, group, _) in units.items()}
+
+
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,
              deadline: float, network: bool = False) -> int:
     """Run `tests` on this process's share of the one GPU it sees, each once, as a task of its own
@@ -2140,34 +2176,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     units = lane_units(python, tests)
     tests = list(units)
 
-    # A group the tier cut by its own seconds holds tests another cut's group of its name did not, so its own
-    # last record is not its measure (2026-11-10: a group measured holding two tests was given their pool when
-    # it held five, one asking more than the pool): it reads its file's whole run's.
-    cut = bool(os.environ.get("DEW_SPLIT_DURATIONS"))
-
-    def needs(name: str) -> dict | None:
-        file, group, variant = units[name]
-        return recorded(record_key(python, row(python, file, varied("" if cut else group, variant)), held),
-                        token)
-
-    with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        records = dict(zip(tests, pool.map(needs, tests), strict=True))
-    # Nor is the whole run alone such a group's measure, which a test added since has outgrown (2026-11-11: a
-    # whole run's 3.92 GiB gave a newer test a 5.9 GiB lane, which ran out): it is the most the runs of its
-    # file's process on this class measured, whole or a group of any cut. A whole run that measured nothing (a
-    # child it did not follow, no report) stays the file's, which so takes the lane's whole share.
-    if cut:
-        files = {file for file, _, _ in units.values()}
-        most = largest_records(python, token, under=f"{held}/", measures=lambda _, name, group: (
-            (name, place_variant(group)) if name in files else None))
-        records = {name: found if found is not None and not gpu_measures.measured(found)
-                   else most.get((units[name][0], units[name][2]), found) for name, found in records.items()}
-    # A group no run on this class measured borrows the most its file held on another, which holds at least
-    # its own; a file's process under other flags, its tests a part of the file's, the lane's own's first.
-    borrowed = borrowed_records(sorted({units[name][0] for name, found in records.items() if found is None}),
-                                python, held, token)
-    measures = {name: records[name] or records.get(f"{file}#{group}" if group else file)
-                or borrowed.get(file) for name, (file, group, _) in units.items()}
+    measures = lane_measures(python, units, held, token)
     needed = {name: gpu_needs(measures[name], budget) for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
