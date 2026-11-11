@@ -70,7 +70,7 @@ from dew.data.plan import PLAN_VERSIONS, SHARED_STATE
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.backbones.looping import exit_log_distribution
+from dew.nn.backbones.looping import exit_objective
 from dew.nn.continuum import feedforward_levels
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
@@ -1396,7 +1396,7 @@ class LMObjective(TokenScorer):
 
     `exit_entropy` β trains a looped decoder's exit gate as Ouro does (arXiv
     2510.25741): each token's loss is its cross entropy at each pass weighted
-    by the probability it exits there (`looping.exit_log_distribution`, from the
+    by the probability it exits there (`looping.exit_objective`, from the
     gate's hazards, the last pass taking the rest), less β times that
     distribution's entropy. Every pass's states are scored through the head
     as the last pass's are, the gate's hazards and the passes' states all
@@ -1763,15 +1763,10 @@ class LMObjective(TokenScorer):
             term = weighed(self._weights_over(self.model), passes[0])
             units = shares(term, weights)
             prediction = Ratio(self.row_mean(term, batch, weights=weights).total, mass)
-        elif passes is not None:
+        elif passes is not None and self.exit_entropy is not None:
             # Ouro's exit objective in the cross entropy's place, over the same counted targets.
             pass_losses, gates, _ = passes
-            # From the log probabilities, so a hazard that rounds to one leaves every gradient finite.
-            log_chances = exit_log_distribution(gates).astype(width)
-            chances = jnp.exp(log_chances)
-            expected = jnp.sum(chances * jnp.stack(pass_losses).astype(width), axis=0)
-            entropy = -jnp.sum(chances * log_chances, axis=0)
-            term = expected - jnp.asarray(self.exit_entropy, width) * entropy
+            term, expected, entropy = exit_objective(pass_losses, gates, self.exit_entropy, width)
             units = shares(term, weights)
             prediction = Ratio(self.row_mean(term, batch, weights=weights).total, mass)
             reported["exit_ce"], _ = Ratio(self.row_mean(expected, batch, weights=weights).total, mass).mean()

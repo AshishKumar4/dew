@@ -845,6 +845,40 @@ def test_a_pretrained_run_loops_its_decoder_as_a_decision_run_does(tmp_path):
         LMRunConfig(loop_steps=2)
 
 
+def test_a_pretrained_run_trains_the_exit_gate_its_loop_draws_in_its_fresh_group(tmp_path):
+    """`--loop-exit-gate` gives a --pretrained decoder a gate its checkpoint holds none of, drawn fresh
+    (`Pretrained.with_model`): the LM objective names it among what it trains fresh (`fresh_modules`, the
+    source's `Pretrained.fresh`), so the run records a fresh group that claims the gate alone, ahead of
+    the base that holds the checkpoint's weights (the train review of trains 707-732: an LM run trained
+    its fresh parameters at the base rate)."""
+    from dew.optim import param_labels, parameter_name
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
+    config = Started.cli(recipe_args(tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
+                                     "--max-new-tokens", "0", "--loop-steps", "2", "--loop-layers", "0", "1",
+                                     "--loop-exit-gate"),
+                         default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
+    objective = config.prepare().train("gated")
+    gate = ("early_exit_gate/bias", "early_exit_gate/kernel")
+    assert objective.fresh_modules() == gate
+    groups = config.grouped(objective, "gated").param_groups
+    from dew.nn.backbones.looping import EXIT_ENTROPY
+
+    # The gate trains under the exit objective at its default weight, the run stating none.
+    assert objective.exit_entropy == EXIT_ENTROPY
+    untrained = dataclasses.replace(config, objective=dataclasses.replace(
+        config.objective, fields={**config.objective.fields, "exit_entropy": None}))
+    with pytest.raises(ValueError):
+        untrained.exit_settings()
+    labels = param_labels(groups)(objective.held_variables()["params"])
+    fresh = {parameter_name(path) for path, label in jax.tree_util.tree_leaves_with_path(labels)
+             if label == groups[0].name}
+    # The fresh group at the fresh rate on the run's schedule (`fresh_groups`), the gate alone in it.
+    assert groups[0].learning_rate_multiplier == config.optim.fresh_groups()[0].learning_rate_multiplier
+    assert fresh == set(gate) and len(groups) == 2
+
+
 def test_a_run_that_names_no_metrics_and_validates_nothing_trains(tmp_path):
     """`--val-metrics '[]'` scores no metric: a run whose data holds no validation split trains with no
     suite at all, as one that names none does, rather than an empty set of splits."""

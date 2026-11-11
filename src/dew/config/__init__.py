@@ -1808,14 +1808,15 @@ class RunConfig:
         stages, `data_seed` and `data_plan_version`, the training read bounded to `trainer.examples` where
         the run counts them, or to `trainer.epochs` passes over its source examples where its read has no
         record count, so its length is read off the loader this returns; its loading workers sized for
-        `trainer.steps` (`dew.data.Loading.resolved`)."""
+        the run's length, its `trainer.steps`, `epochs` or `tokens` (`dew.data.Loading.resolved`)."""
         # At the version `resumed` resolves (itself where `prepare` or `readied` resolved it; a run built
         # alone, `build_run`, resolves it here), which it always states.
         planned = self.resumed(("data_plan_version",)).data_plan_version
         assert planned is not None
         trainer = self.trainer
         return fitted(dataset, validation, objective=objective, seed=self.data_seed, plan_version=planned,
-                      examples=trainer.examples, epochs=trainer.epochs, steps=trainer.steps)
+                      examples=trainer.examples, epochs=trainer.epochs, steps=trainer.steps,
+                      tokens=trainer.tokens)
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
@@ -2299,8 +2300,9 @@ class DecoderRunConfig(RunConfig):
     at zero (`Loop.implicit`), so the looped decoder starts as the one loaded
     computes; False keeps a checkpoint's own choice."""
     loop_exit_gate: bool = False
-    """Weigh each pass's exit by a gate drawn at zeros over its states (`Loop.exit_gate`), which an
-    objective's `exit_entropy` trains as Ouro does; False keeps a checkpoint's own choice."""
+    """Weigh each pass's exit by a gate drawn at zeros over its states (`Loop.exit_gate`), which the
+    objective's `exit_entropy` trains as Ouro does, at `EXIT_ENTROPY` where the run states none
+    (`exit_settings`); False keeps a checkpoint's own choice."""
     loop_exit_threshold: float | None = None
     """Exit each token at the first pass whose cumulative exit probability reaches this
     (`Loop.exit_threshold`); None keeps a checkpoint's own choice."""
@@ -2333,6 +2335,24 @@ class DecoderRunConfig(RunConfig):
         return (self.loop_steps is not None or self.loop_layers is not None
                 or self.loop_backprop_steps is not None or self.loop_remat or self.loop_implicit
                 or self.loop_exit_gate or self.loop_exit_threshold is not None)
+
+    def exit_settings(self) -> dict[str, float]:
+        """The exit objective's weight an objective that trains a gate the run draws (`loop_exit_gate`)
+        takes: `EXIT_ENTROPY` (`dew.nn.backbones.looping`) where the run's objective states none, none
+        derived where it states one; refused where it states None, which would leave the gate at its draw
+        (a hazard of one half every pass), trained by nothing. None where the run draws no gate."""
+        from dew.nn.backbones.looping import EXIT_ENTROPY
+
+        if not self.loop_exit_gate:
+            return {}
+        stated = {} if self.objective is None else self.objective.fields
+        if "exit_entropy" not in stated:
+            return {"exit_entropy": EXIT_ENTROPY}
+        if stated["exit_entropy"] is None:
+            raise ValueError("--loop-exit-gate draws a gate the objective's exit_entropy trains, and the run "
+                             "sets it to None, which trains nothing: state a weight, or leave it out for "
+                             f"{EXIT_ENTROPY}")
+        return {}
 
     def looped(self, start: "Pretrained") -> "Pretrained":
         """`start` with its block run as the run asks (`looping`), as loaded where it asks nothing."""

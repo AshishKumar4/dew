@@ -79,7 +79,7 @@ from dew.nn.linear import (
 )
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step, log_index
-from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum, rms_statistics, rms_weighted
+from dew.nn.precision import at_least_fp32, float32_dot_general, rms_statistics, rms_weighted
 from dew.nn.residuals import Residual
 from dew.nn.sharding import sequence_shards
 
@@ -466,7 +466,7 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
         entering = entering.reshape(batch, n_groups, num_heads // n_groups, state_size, head_dim)
         decayed = jnp.exp(jnp.cumsum(log_decay, axis=1)).reshape(
             batch, length, n_groups, num_heads // n_groups)
-        carried = float32_einsum('bsgn,bgknp,bsgk->bsgkp', C, entering, decayed)
+        carried = recurrence_algebra.portable_einsum('bsgn,bgknp,bsgk->bsgkp', C, entering, decayed)
         out = out + carried.reshape(batch, length, num_heads, head_dim)
     return out.reshape(batch, length, intermediate), final
 

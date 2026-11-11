@@ -527,6 +527,12 @@ class Loading:
                   "%.2f GiB", workers, read_buffer, host.cpus, budget / 2**30)
         return dataclasses.replace(self, workers=workers, read_buffer=read_buffer)
 
+    def unsized(self) -> Loading:
+        """This loading for a read automatic loading sizes nothing for, a pass that is no run's training
+        read (a record pass, a snapshot, `iterate`): automatic workers read in the process, every other
+        setting as it is (a chain that sets its threads alone, `Pipeline.threads`)."""
+        return dataclasses.replace(self, workers=0) if self.workers == "auto" else self
+
     @property
     def worker_count(self) -> int:
         if self.workers == "auto":

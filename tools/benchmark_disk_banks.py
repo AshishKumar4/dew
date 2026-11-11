@@ -15,7 +15,6 @@ import contextlib
 import dataclasses
 import json
 import math
-import resource
 import sys
 import time
 from dataclasses import dataclass
@@ -32,7 +31,7 @@ from dew.interop.hf_decoders import translate_config
 from dew.nn.inputs import ModelInputs
 from dew.registry import models
 from dew.sampling.text import decode_ops, prefill_state
-from dew.telemetry.benchmark import resident_memory
+from dew.telemetry.benchmark import resident_memory, resident_peak
 from dew.telemetry.profile import Profiler
 from dew.training import Layout, MeshSpec
 
@@ -57,8 +56,11 @@ class DiskConfig:
 
 
 def resident_status():
+    """This process's resident bytes as the kernel counts them page by page (`resident_memory`): its
+    whole, its anonymous and its file-backed pages."""
     memory = resident_memory()
-    return {name: memory[name] for name in ("VmRSS", "RssAnon", "RssFile", "VmHWM")}
+    return {"Rss": memory["Rss"], "Anonymous": memory["Anonymous"],
+            "File": memory["Rss"] - memory["Anonymous"]}
 
 
 def storage_reads():
@@ -153,7 +155,8 @@ def measure(config: DiskConfig):
         before = source.stats()
         before_io = storage_reads()
         # The trace alone, which XProf opens as it is; the bank reads annotate it (`SafetensorsBanks`).
-        with Profiler(config.trace, reports=False) if config.trace else contextlib.nullcontext():
+        with Profiler(config.trace, reports=False) if config.trace else contextlib.nullcontext(), \
+                resident_peak() as peak:
             runs = [run() for _ in range(config.repeats)]
         after = source.stats()
         after_io = storage_reads()
@@ -171,7 +174,8 @@ def measure(config: DiskConfig):
                   "storage_reads": {name: after_io[name] - before_io[name] for name in before_io},
                   "tokens": [run[2].tolist() for run in runs], "host": resident_status(),
                   "device_memory": device.memory_stats(),
-                  "host_peak_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024}
+                  # The most the generation held, as the kernel counts its pages (`resident_peak`).
+                  "host_peak_bytes": peak.most["Rss"]}
         # Probe after recording peaks: these are isolated costs, not generation's memory accounting.
         if config.probe_layers:
             report["serial_probe"] = serial_probe(source, min(config.probe_layers, model.num_layers), device)

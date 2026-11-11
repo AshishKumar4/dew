@@ -47,7 +47,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.registry import models
 from dew.sampling.text import decode_ops, prefill_state
-from dew.telemetry.benchmark import resident_memory
+from dew.telemetry.benchmark import resident_memory, resident_peak
 from dew.training import Layout, MeshSpec
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -146,9 +146,9 @@ class SyntheticBanks(LayerBanks):
 
 
 def status() -> dict[str, int]:
-    """This process's resident memory, in bytes, as the kernel reports it."""
+    """This process's resident memory, in bytes, as the kernel counts it page by page (`resident_memory`)."""
     memory = resident_memory()
-    return {"rss": memory["VmRSS"], "rss_anon": memory["RssAnon"], "rss_peak": memory["VmHWM"]}
+    return {"rss": memory["Rss"], "rss_anon": memory["Anonymous"]}
 
 
 def plan(compiled) -> dict[str, int]:
@@ -332,7 +332,9 @@ def main(config: OffloadConfig) -> None:
     records = []
     for depth in config.depths:
         for offload in (False, True):
-            record = measure(config, depth, offload)
+            with resident_peak() as peak:
+                record = measure(config, depth, offload)
+            record["rss_peak"] = peak.most["Rss"]
             records.append(record)
             print(json.dumps(record, default=float))
     if config.out is not None:

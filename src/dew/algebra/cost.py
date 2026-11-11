@@ -158,11 +158,12 @@ def _mode(precision, dtypes: set) -> tuple[str, int]:
     return "fp32", 1
 
 
-def product_work(rows: int, depth: int, columns: int, *, count: int = 1, dtype=jnp.float32) -> Work:
-    """`count` products of `[rows, depth] @ [depth, columns]` operands of `dtype` at the default precision,
-    in their mode (`_mode`), each a kernel of XLA's fusion, its root (`work`'s products): a chunk form's
-    products (`dew.algebra.linear_scan`), Dew's fp32 products."""
-    mode, passes = _mode(None, {jnp.dtype(dtype)})
+def product_work(rows: int, depth: int, columns: int, *, count: int = 1, dtype=jnp.float32,
+                 precision: jax.lax.PrecisionLike = None) -> Work:
+    """`count` products of `[rows, depth] @ [depth, columns]` operands of `dtype` at `precision` (the default
+    where unstated), in their mode (`_mode`), each a kernel of XLA's fusion, its root (`work`'s products): a
+    chunk form's products (`dew.algebra.linear_scan`, at the precision they run at), Dew's fp32 products."""
+    mode, passes = _mode(precision, {jnp.dtype(dtype)})
     return Work(kernels=float(count), **{_MODES[mode]: 2.0 * rows * depth * columns * count * passes})
 
 

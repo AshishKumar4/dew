@@ -190,16 +190,19 @@ class DecisionModel(HeadedModel):
     def pass_logits(self, variables: Variables, inputs: DecisionInputs, *,
                     media: ModelInputs | None = None, train: bool = False,
                     rngs: dict[str, jax.Array] | None = None, progress: Progress = END,
-                    opened: Sequence[str] = ()) -> tuple[tuple[jax.Array, ...], Variables]:
+                    opened: Sequence[str] = ()
+                    ) -> tuple[tuple[jax.Array, ...], tuple[jax.Array, ...], Variables]:
         """Each pass's option logits of a looped backbone whose every pass exits (`Loop.exiting`), in
         order, the last pass's `observed_logits`': each earlier pass's exit states as the backbone's forward
-        gathered them (`Looped.exit_passes`) read by the head as the last pass's states are; and what the
-        rows' pass sowed into the `opened` collections, as `observed_logits` gives it."""
+        gathered them (`Looped.exit_passes`) read by the head as the last pass's states are; every pass's
+        exit-gate logits `[B, L, 1]`, none without a gate, which Ouro's exit objective weighs
+        (`DecisionObjective.exit_entropy`); and what the rows' pass sowed into the `opened` collections, as
+        `observed_logits` gives it."""
         states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
                                            progress=progress, opened=[*opened, EXITS])
         backbone = self.backbone
         assert isinstance(backbone, Looped), "a looped backbone's exits"
-        earlier, _ = backbone.exit_passes(sown)
+        earlier, gates = backbone.exit_passes(sown)
         last, head_sown = self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs,
                                            opened=opened)
         logits = (*(self.head_logits(variables, state, inputs, spanned, train=train, rngs=rngs)[0]
@@ -207,7 +210,7 @@ class DecisionModel(HeadedModel):
         sown = {name: value for name, value in sown.items() if name != EXITS}
         if QK in opened:
             sown = {**sown, QK: {"backbone": sown.get(QK, {}), "head": head_sown.get(QK, {})}}
-        return logits, sown
+        return logits, gates, sown
 
     def head_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
                     spanned: jax.Array | None = None, *, train: bool = False,

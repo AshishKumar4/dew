@@ -234,15 +234,10 @@ NEIGHBOURED = """
 import ctypes
 import json
 import mmap
-import os
 
 import numpy as np
 
-from dew.telemetry.benchmark import resident_memory
-
-# The resident counters lag by a batch for each CPU the writer ran on (`resident_memory`): written from
-# one CPU, the pages reach the reading but for one CPU's batch, however many CPUs the machine has.
-os.sched_setaffinity(0, {min(os.sched_getaffinity(0))})
+from dew.telemetry.benchmark import resident_memory, resident_peak
 
 # The heap serves 64 MiB (glibc's M_MMAP_THRESHOLD, -3), and a freed 64 MiB block stays resident under
 # a live one: memory a process's earlier work left for its allocator to hand out again.
@@ -251,31 +246,35 @@ held = np.ones(64 * 2**20, np.uint8)
 guard = np.ones(2**20, np.uint8)
 del held
 # A new private mapping is pages no allocator held: the kernel hands each in as it is written.
-with mmap.mmap(-1, 64 * 2**20, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS) as pages:
+size = 64 * 2**20
+with mmap.mmap(-1, size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS) as pages, resident_peak() as peak:
     before = resident_memory()
-    for offset in range(0, len(pages), mmap.PAGESIZE):
+    for offset in range(0, size, mmap.PAGESIZE):
         pages[offset] = 1
     after = resident_memory()
-    print(json.dumps({"before": before, "after": after, "size": len(pages)}))
+print(json.dumps({"before": before, "after": after, "size": size, "rise": peak.rise("Anonymous"),
+                  "ended": resident_memory()["Anonymous"] - peak.before["Anonymous"]}))
 """
 
 
 def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation():
-    """Each of the kernel's memory fields in bytes under its own name: 64 MiB of new pages written
-    through, from one CPU so the kernel's per-CPU batching holds back one CPU's batch at most, raises
-    the anonymous resident memory by more than half its size, which a field read in the kernel's KiB
-    would not show, even in a process whose allocator holds a freed block of that size resident,
-    which an array of that size would be served from without a new page."""
+    """Each of the kernel's page-counted memory fields in bytes under its own name: 64 MiB of new pages
+    written through raise the anonymous resident memory by all of it, read exactly however many CPUs the
+    writer ran on (where the kernel's running counters lagged by a batch a CPU), even in a process whose
+    allocator holds a freed block of that size resident, which an array of that size would be served from
+    without a new page; and a region's peak (`resident_peak`) holds the pages it holds as it ends, which
+    the reading after they are unmapped no longer does."""
     import json
     import subprocess
     import sys
 
     measured = json.loads(subprocess.run([sys.executable, "-c", NEIGHBOURED], check=True, capture_output=True,
                                          text=True).stdout.splitlines()[-1])
-    before, after = measured["before"], measured["after"]
-    assert {"VmRSS", "RssAnon", "RssFile", "VmHWM"} <= set(before)
-    assert after["RssAnon"] > before["RssAnon"] + measured["size"] // 2
-    assert after["VmHWM"] >= after["VmRSS"] >= after["RssAnon"]
+    before, after, size = measured["before"], measured["after"], measured["size"]
+    assert {"Rss", "Anonymous"} <= set(before)
+    assert after["Anonymous"] >= before["Anonymous"] + size
+    assert after["Rss"] >= after["Anonymous"]
+    assert measured["rise"] >= size > measured["ended"]
 
 
 @pytest.mark.gpu(reason="CUPTI times a GPU's kernels")
