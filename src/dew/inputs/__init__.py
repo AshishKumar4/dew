@@ -16,6 +16,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         Condition,
         Field,
         InputSpec,
+        OutsideTable,
         TextCondition,
         encode_conditions,
         unit_range,
@@ -26,6 +27,7 @@ _EXPORTS = {
     "CharTable": "dew.inputs.encoders", "Condition": "dew.inputs.spec",
     "ConditionEncoder": "dew.inputs.condition", "DiffusionConditioner": "dew.inputs.diffusion",
     "Field": "dew.inputs.spec", "HFAudio": "dew.inputs.encoders", "InputSpec": "dew.inputs.spec",
+    "OutsideTable": "dew.inputs.spec",
     "T5Text": "dew.inputs.encoders", "TextCondition": "dew.inputs.spec",
     "encode_conditions": "dew.inputs.spec", "unit_range": "dew.inputs.spec",
 }
@@ -41,6 +43,7 @@ __all__ = [
     "Field",
     "HFAudio",
     "InputSpec",
+    "OutsideTable",
     "T5Text",
     "TextCondition",
     "encode_conditions",

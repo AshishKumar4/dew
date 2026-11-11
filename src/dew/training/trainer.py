@@ -1772,14 +1772,12 @@ class Trainer(Generic[Loss, Effects]):
         counted = self._marked if self.rollout is None else functools.partial(
             consumption_counted, clocked=self._examples is not None, marks_rows=False)
         inputs = self.objective.inputs
-        tokenizer = getattr(self.objective, "tokenizer", None)
-        spelling = None if tokenizer is None else (lambda token: tokenizer.decode([token]))
 
         def prepare(batch: Batch) -> Batch:
             # Every batch's token ids within its model's table, on the prefetch worker before it is placed
             # (`InputSpec.bounded`): an id past the table reads no row, and its gather fills NaN.
             if inputs is not None:
-                inputs.bounded(batch, spelling)
+                inputs.bounded(batch)
             return counted(batch)
         if run.pooled:
             run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), self._marked,
