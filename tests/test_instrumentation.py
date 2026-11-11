@@ -5,6 +5,7 @@ the same treatment as the training maths.
 """
 
 import itertools
+import json
 import os
 import pathlib
 import threading
@@ -275,6 +276,40 @@ def test_a_packed_attention_is_counted_as_unsized_work_never_as_zero():
         counted = hlo_flops(_flash_module(target, stated))
         assert counted is not None and (counted.model, counted.hardware, counted.unsized) == (0, 0, 1), target
         assert set(counted.utilizations(1, 1.0, peak=1.0)) == {"train/unsized_kernels"}, target
+
+
+def _cudnn_attention(config: str) -> str:
+    """A module of one cuDNN fused attention forward over `[1, 256, 2, 128]` query, key and value, its backend
+    config `config`."""
+    return f"""HloModule step
+
+ENTRY %main () -> f32[] {{
+  %q = bf16[1,256,2,128]{{3,2,1,0}} parameter(0)
+  %k = bf16[1,256,2,128]{{3,2,1,0}} parameter(1)
+  %v = bf16[1,256,2,128]{{3,2,1,0}} parameter(2)
+  %attention = (bf16[1,2,256,128]{{3,1,2,0}}, u8[0]{{0}}) custom-call(%q, %k, %v), \
+custom_call_target="__cudnn$fmhaSoftmax", backend_config={config}
+  ROOT %zero = f32[] constant(0)
+}}
+"""
+
+
+@pytest.mark.parametrize("spaced", [False, True], ids=["as written", "as an executable states it"])
+@pytest.mark.parametrize("window", [None, 64])
+def test_a_cudnn_attention_counts_the_pairs_its_stated_mask_computes(window, spaced):
+    """cuDNN's fused attention states its mask in its JSON backend config, `mask_type` and a
+    `sliding_window_length` of the window's left side and the query's own key: a causal call counts the
+    keys up to each query, a windowed one those within its window, whether its JSON is compact, as a module
+    is written, or spaced, as XLA prints the proto an executable's module holds (`ProtoToHumanReadableJson`;
+    an A100's and a GH200's causal calls counted their whole square, row 5256)."""
+    length = 256
+    stated = {"cudnn_fmha_backend_config": {"mask_type": "CAUSAL",
+                                            "sliding_window_length": 0 if window is None else window + 1}}
+    config = json.dumps(stated, indent=1 if spaced else None, separators=None if spaced else (",", ":"))
+    counted = hlo_flops(_cudnn_attention(config))
+    pairs = sum(min(row, length if window is None else window) + 1 for row in range(length))
+    product = 2 * 2 * pairs * 128
+    assert counted is not None and (counted.model, counted.hardware) == (2 * product, 2 * product)
 
 
 def test_a_library_call_is_counted_by_what_its_target_computes():
