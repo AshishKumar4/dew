@@ -493,6 +493,84 @@ def test_a_gpu_lanes_groups_run_each_test_of_the_tips_file_once_their_rows_their
     assert {name: (tmp_path / f"ran-{name}").read_text() for name in names} == dict.fromkeys(names, "11")
 
 
+def test_a_tier_cut_groups_green_row_is_reused_while_its_cut_holds_the_same_tests(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A group the tier cuts by its GPUs' own seconds (DEW_SPLIT_DURATIONS) keeps its green row under a key,
+    as a CPU group cut by the durations record does, and a later lane on unchanged inputs reuses it: the
+    key holds the tests that cut gives the group, so a row stands for its group only while the cut gives it
+    the same tests, whatever their seconds, and a cut that moves a test between groups runs both again, each
+    test once (a tier's cut files, most of its minutes, ran whole every time: under the tier's cut a group
+    read no row and kept none)."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    names = ("a", "b", "c", "d")
+    (tmp_path / "tests/test_long.py").write_text("".join(
+        f"def test_{name}():\n    with open('ran-{name}', 'a') as ran:\n        ran.write('1')\n"
+        for name in names))
+    weights = tmp_path / "gpu-seconds.json"
+    monkeypatch.setenv("DEW_SPLIT_DURATIONS", str(weights))
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    out = tmp_path / "verdict.json"
+    groups = ["tests/test_long.py#1/2", "tests/test_long.py#2/2"]
+
+    def lane(**seconds: float) -> tuple[dict[str, str], list[set[str]]]:
+        """The lane over both groups, cut by `seconds`: how often each test has run, and each row's tests."""
+        weights.write_text(json.dumps({f"tests/test_long.py::test_{name}": seconds[name] for name in names}))
+        assert ci.gpu_lane("3.12", groups, out, cache="on", processes=2, deadline=600.0) == 0
+        rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+        assert sorted(rows) == [f"3.12:{group}" for group in groups]
+        assert all(row["exitCode"] == 0 for row in rows.values()), rows
+        return ({name: (tmp_path / f"ran-{name}").read_text() for name in names},
+                [{node.rpartition("::test_")[2] for node in rows[f"3.12:{group}"]["tests"]} for group in groups])
+
+    assert lane(a=30.0, b=30.0, c=30.0, d=30.0) == (dict.fromkeys(names, "1"), [{"a", "b"}, {"c", "d"}])
+    # The same cut again, and one of other seconds that gives each group the same tests: no test runs, and
+    # each row is the one its group left.
+    assert lane(a=30.0, b=30.0, c=30.0, d=30.0) == (dict.fromkeys(names, "1"), [{"a", "b"}, {"c", "d"}])
+    assert lane(a=33.0, b=30.0, c=30.0, d=31.0) == (dict.fromkeys(names, "1"), [{"a", "b"}, {"c", "d"}])
+    # A cut that gives the groups other tests: neither row stands for its group, and each test runs once.
+    assert lane(a=300.0, b=30.0, c=30.0, d=30.0) == (dict.fromkeys(names, "11"), [{"a"}, {"b", "c", "d"}])
+    # The first cut again: its rows, kept under their own keys, are found, and no test runs.
+    assert lane(a=30.0, b=30.0, c=30.0, d=30.0) == (dict.fromkeys(names, "11"), [{"a", "b"}, {"c", "d"}])
+
+
+def test_a_tiers_files_are_named_with_the_generations_their_tests_are_pinned_to(ci, tmp_path, monkeypatch):
+    """`gpu-tier` names each GPU-marked file with the GPU generations its tests are pinned to, read from their
+    marks as pytest collects them (`generations`, on a test, a parameter of it, or its module), and with none
+    where any test of it is pinned to none: a tier's composer gives a kind every file but those pinned to
+    other generations, so a file that names no generation runs on every kind (2026-11-11: chosen by the sm90
+    words in a file's text, the tier's Hopper side ran none of the model flows, whose file names no
+    generation)."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "tests").mkdir()
+    interpreter(tmp_path, "3.12")
+    (tmp_path / "tests/conftest.py").write_text(
+        "def pytest_configure(config):\n"
+        "    for mark in ('gpu', 'generations'):\n"
+        "        config.addinivalue_line('markers', mark + ': a GPU mark')\n")
+    (tmp_path / "tests/test_every.py").write_text(
+        "import pytest\npytestmark = pytest.mark.gpu\n"
+        "@pytest.mark.generations('sm90')\ndef test_hopper():\n    pass\n"
+        "def test_anywhere():\n    pass\n")
+    (tmp_path / "tests/test_hopper.py").write_text(
+        "import pytest\npytestmark = [pytest.mark.gpu, pytest.mark.generations('sm90')]\n"
+        "def test_one():\n    pass\n"
+        "@pytest.mark.parametrize('cell', [1, 2])\ndef test_cells(cell):\n    pass\n")
+    (tmp_path / "tests/test_either.py").write_text(
+        "import pytest\npytestmark = pytest.mark.gpu\n"
+        "@pytest.mark.parametrize('cell', [pytest.param(1, marks=pytest.mark.generations('sm80')),\n"
+        "                                  pytest.param(2, marks=pytest.mark.generations('sm90', 'sm100'))])\n"
+        "def test_cells(cell):\n    pass\n")
+    # A file with a pinned test no GPU runs is none of the tier's.
+    (tmp_path / "tests/test_cpu.py").write_text(
+        "import pytest\n@pytest.mark.generations('sm90')\ndef test_lowers():\n    pass\n")
+    counts, pinned = ci.marked("3.12")
+    assert counts == {"tests/test_either.py": 2, "tests/test_every.py": 2, "tests/test_hopper.py": 3}
+    assert pinned == {"tests/test_either.py": ["sm100", "sm80", "sm90"], "tests/test_every.py": [],
+                      "tests/test_hopper.py": ["sm90"]}
+
+
 def test_a_tier_cut_group_is_admitted_on_its_files_whole_measure_and_no_need_is_cut_to_the_lane(
         ci, tmp_path, monkeypatch, cache_worker):
     """A group the tier cut by its own seconds (DEW_SPLIT_DURATIONS) holds tests another cut's group of
