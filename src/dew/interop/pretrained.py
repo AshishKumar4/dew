@@ -1847,10 +1847,13 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
     # derived-export family binds too; `save` picks its writer by
     # preserve_source_layout and quantization, not by whether bindings exist.
     # A family whose tensors are rewritten before the path map reads them
-    # (GPT-2's and GPT-NeoX's prepare) has no raw-name bindings.
+    # (GPT-2's and GPT-NeoX's prepare), or whose names a checkpoint may spell
+    # otherwise (a bare GPT2Model's or ModernBertModel's, `DecoderFamily.spelling`),
+    # has no raw-name bindings.
     entry = decoders.family_entry(family)
     layouts, retained = ((), {})
-    if entry.preserve_source_layout or entry.prepare is decoder_parts.DecoderFamily.prepare:
+    if entry.preserve_source_layout or (entry.prepare is decoder_parts.DecoderFamily.prepare
+                                        and entry.spelling is decoder_parts.as_stored):
         layouts, retained = decoder_layouts(readings, record, family, variables)
     if media:
         retained = {**retained, **{name: held[name] for name in sorted(media)}}

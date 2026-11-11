@@ -239,8 +239,9 @@ def _joined(variables: Variables, groups: Sequence[ProjectionGroup],
         node = packed["params"]
         for part in group.path:
             node = node[part]
-        node[group.packed] = {field: join([node[projection][field] for projection in group.members])
-                              for field in node[group.members[0]]}
+        node[group.packed] = {
+            field: _packed_leaf([node[projection][field] for projection in group.members], join)
+            for field in node[group.members[0]]}
         for projection in group.members:
             del node[projection]
         quantized = _node(packed, QUANTIZATION, group.path)
@@ -249,6 +250,22 @@ def _joined(variables: Variables, groups: Sequence[ProjectionGroup],
             for projection in group.members:
                 del quantized[projection]
     return packed
+
+
+def _packed_leaf(leaves: Sequence[_Array | jax.ShapeDtypeStruct],
+                 join: Callable[[Sequence[_Array]], _Array]) -> _Array | jax.ShapeDtypeStruct:
+    """A group's members' `leaves` packed on their last axis by `join`; members held as their shapes alone (a
+    load without its weights) pack to the shape of that packed leaf, in their placement, joining nothing."""
+    arrays = [leaf for leaf in leaves if not isinstance(leaf, jax.ShapeDtypeStruct)]
+    shapes = [leaf for leaf in leaves if isinstance(leaf, jax.ShapeDtypeStruct)]
+    if not arrays:
+        first = shapes[0]
+        return jax.ShapeDtypeStruct((*first.shape[:-1], sum(leaf.shape[-1] for leaf in shapes)), first.dtype,
+                                    sharding=first.sharding)
+    if len(arrays) != len(leaves):
+        # `_placed_alike` packs no group of both.
+        raise ValueError("a group packs its members' arrays or their shapes, never some of each")
+    return join(arrays)
 
 
 def pending(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:

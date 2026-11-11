@@ -136,6 +136,30 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     assert all(entry["split"] != ci.COLLECT and entry["cache"] == "off" for entry in daily)
 
 
+def test_a_split_groups_weight_covers_its_recorded_nodes_when_collection_has_new_tests(ci, tmp_path):
+    """A new node before a slow recorded node must not move that slow node into a group weighed for
+    other tests. Recurrence's 963.595 s node ran in group 16/137, weighed at 76.919 s, after two new
+    parameters changed the task's cut from the plan's recorded-node cut."""
+    interpreter(tmp_path, "3.12")
+    name = "tests/test_heavy.py"
+    tests = ("a", "b", "bb_new", "c", "d", "e", "f", "g", "h")
+    (tmp_path / name).write_text("".join(f"def test_{test}(): pass\n" for test in tests))
+    recorded = {f"{name}::test_{test}": 963.595 if test == "c" else 50.0
+                for test in tests if test != "bb_new"}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(recorded))
+    timings = {"files": {ci.row("3.12", name, ""): sum(recorded.values())},
+               "rows": {ci.row("3.12", name, ""): sum(recorded.values())}}
+    planned = [entry for entry in ci.plan(120.0, timings) if entry["python"] == "3.12"]
+    observed = []
+    for index, entry in enumerate(planned):
+        report = tmp_path / f"report-{index}.xml"
+        assert ci.targeted("3.12", [], report, [name], entry["split"]) == 0
+        nodes = [ci.node_of(case) for case in ET.parse(report).getroot().iter("testcase")]
+        assert entry["weight"] >= sum(recorded.get(node, 0.0) for node in nodes), (entry, nodes)
+        observed.extend(nodes)
+    assert sorted(observed) == sorted(f"{name}::test_{test}" for test in tests)
+
+
 def test_a_task_states_the_same_key_in_every_plan_that_cuts_it_whatever_its_name_and_weight(ci, tmp_path,
                                                                                            monkeypatch):
     """Armada keeps a task's recorded use under the key its entry states (its `keyOf`), so a task the next
@@ -968,9 +992,10 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     plan, 45-95 s each, paid twice where a cut parted their tests). A marked test the record does not name
     yet joins its setup's tests all the same (Main, 2026-11-02: a marked pair waited on the record to share
     its fixture), its setup's group keeping the place of its first recorded test, where the plan has it,
-    though the new test comes first. A test the record lacks, alone or a new setup's, weighs its file's mean,
-    so the task's cut may part from the plan's: each test still runs in one group, and its file's groups run,
-    never reused, until the record names it (`record`'s `unkeyed`). A mark written
+    though the new test comes first. A test the record lacks, alone or a new setup's, joins the plan's groups
+    without moving a recorded test from its planned group (`session.kept`), the new tests cut by the file's
+    mean across them: each test still runs in one group, and its file's groups run, never reused, until the
+    record names it (`record`'s `unkeyed`). A mark written
     elsewhere than a test's own decorator, or of a name not a literal string, refuses the file, naming its
     line, as the plan cannot read it."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
@@ -1008,8 +1033,8 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
         "3.12:tests/test_order.py#3/3": [order["3c"]]}
     assert [ci.members("tests/test_order.py", f"{group}/3") for group in (1, 2, 3)] == [
         [order["1b"]], [order["2a"]], [order["3c"]]]
-    # A new lone test, or a new setup's pair, before recorded a, b, c weighs their mean: the task cuts the
-    # file by it, the plan by the record, and the file's groups are not reused.
+    # A new lone test, or a new setup's pair, before recorded a, b, c joins the first group, a, b and c each
+    # staying in its planned group, and the file's groups are not reused.
     files = {"lone": ("0x", "1a", "2b", "3c"), "group": ("0y", "0z", "1a", "2b", "3c")}
     for name, tests in files.items():
         (tmp_path / f"tests/test_{name}.py").write_text(
@@ -1023,7 +1048,7 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     commit(tmp_path, "files whose new tests come before their recorded ones")
     rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
     assert all(row["exitCode"] == 0 for row in rows)
-    cuts = {"lone": (("0x", "1a"), ("2b", "3c"), ()), "group": (("0y", "0z"), ("1a", "2b"), ("3c",))}
+    cuts = {"lone": (("0x", "1a"), ("2b",), ("3c",)), "group": (("0y", "0z", "1a"), ("2b",), ("3c",))}
     for name, cut in cuts.items():
         assert {row["name"]: sorted(row["tests"]) for row in rows if f"test_{name}" in row["name"]} == {
             f"3.12:tests/test_{name}.py#{group}/3": sorted(node[name, test] for test in tests)

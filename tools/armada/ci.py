@@ -123,7 +123,6 @@ import os
 import re
 import shutil
 import signal
-import statistics
 import subprocess
 import sys
 import threading
@@ -166,6 +165,7 @@ digests = _loaded(HERE / "digests.py")
 grading = _loaded(HERE / "grading.py")
 host = _loaded(HERE / "host.py")
 stalls = _loaded(HERE / "stalls.py")
+costs = _loaded(HERE / "costs.py")
 # The names the land queue's tools read from this module at every commit they run (land.sh's `ci.STALE`,
 # run_tests.py's `node_of`), older commits' and newer alike.
 STALE, node_of = grading.STALE, grading.node_of
@@ -706,8 +706,7 @@ def parted_record() -> dict[str, dict[str, float]]:
 
 def own_tests(name: str, tests: dict[str, float]) -> dict[str, float]:
     """Of file `name`'s recorded `tests`, those but its check-1 sites', which run apart (`sites`)."""
-    held = sites(name)
-    return {node: seconds for node, seconds in tests.items() if session.site_name(node, held) not in held}
+    return session.own(tests, sites(name))
 
 
 def durations_record() -> dict[str, float]:
@@ -990,29 +989,7 @@ def draws_of(mark: Mark, per_task: int | None = None, weighed_per_task: int | No
     return spans + [(start, min(start + weighed, end)) for start in range(mark.units, end, weighed)]
 
 
-@dataclasses.dataclass(frozen=True)
-class Cost:
-    """What a site's map task takes as armada measured them (`rate`): its setup, once a task (its
-    environment, imports and compiles before its first draw), and each unit it draws after (2026-11-09: a
-    task of one draw and one of two both took 516 s, so task seconds over units charged each draw the setup
-    a task pays once)."""
-
-    setup: float
-    unit: float
-
-    def seconds(self, units: int) -> float:
-        """A task's seconds drawing `units`."""
-        return self.setup + self.unit * units
-
-    def fitting(self, declared: int, target: float) -> int:
-        """The most units a task draws within `target` past its setup, at most `declared`, at least one; where
-        its setup alone fills the target, the declared cut, as every finer task pays the setup again."""
-        if not self.unit or self.setup >= target:
-            return declared
-        return max(1, min(declared, int((target - self.setup) // self.unit)))
-
-
-def cut_draws(mark: Mark, rates: Mapping[bool, Cost | None], target: float) -> list[tuple[int, int]]:
+def cut_draws(mark: Mark, rates: Mapping[bool, costs.Cost | None], target: float) -> list[tuple[int, int]]:
     """The spans of a site's map tasks (`draws_of`): its declared per_task each, or fewer where its
     measured cost (`site_rate`, the unweighted check's and the weighed check's apart, `rates` by whether
     weighed) puts a task of its declared cut past `target`: as many as `target` holds past its setup
@@ -1021,7 +998,7 @@ def cut_draws(mark: Mark, rates: Mapping[bool, Cost | None], target: float) -> l
     the cost measures, so a cut converges from above on the one that fills the target. A kind whose finer
     cut would pass what its judges' job takes (`MAX_INPUTS`, the two kinds' tasks together) keeps the finest
     of its own within it."""
-    def fitting(units: int, declared: int, cost: Cost | None) -> int:
+    def fitting(units: int, declared: int, cost: costs.Cost | None) -> int:
         return declared if cost is None else max(1, min(units, cost.fitting(declared, target)))
 
     per_task = fitting(mark.units, mark.per_task, rates[False])
@@ -1060,38 +1037,51 @@ def site_task(python: str, name: str, test: str, span: tuple[int, int] | None = 
     return f"{python}-{Path(name).stem[:40]}-{digest}{drawn}"
 
 
-def rate(python: str, name: str, test: str, spans: Sequence[tuple[int, int]],
-         measured: Mapping[str, float]) -> Cost | None:
-    """What a map task of test file `name`'s site `test` takes under `python` (`Cost`), over those of its map
-    tasks' `spans` that armada measured (under their task names, `site_task`); None where it measured none.
-    Tasks of two sizes or more tell its setup from its draws (a least-squares line of seconds over units, its
-    setup and draws none below zero); tasks of one size alone tell no setup, their seconds all the draws'.
-    Once a site runs as map tasks, the durations record holds no whole run of it (its test's seconds are one
-    task's, its judge's pooling among them), so its map tasks are what tell its cost."""
-    timed = [(stop - start, seconds) for start, stop in spans
-             if (seconds := measured.get(site_task(python, name, test, (start, stop))))]
-    if not timed:
-        return None
-    sizes, seconds = [count for count, _ in timed], [taken for _, taken in timed]
-    if len(set(sizes)) < 2:
-        return Cost(0.0, sum(seconds) / sum(sizes))
-    unit, setup = statistics.linear_regression(sizes, seconds)
-    if unit < 0:
-        return Cost(statistics.fmean(seconds), 0.0)
-    # A line through the origin where the fit's setup falls below zero: no task pays less than its draws.
-    return Cost(setup, unit) if setup >= 0 else Cost(
-        0.0, statistics.linear_regression(sizes, seconds, proportional=True).slope)
+def rate(python: str, name: str, test: str, spans: Sequence[tuple[int, int]], measured: Mapping[str, float],
+         timings: Mapping[str, float], *, weighed: bool) -> costs.Cost | None:
+    """What a map task of test file `name`'s site `test` takes under `python`: its setup and a unit's draws as
+    its last judge timed them from its map tasks' records (`timings`, armada's file timings, `site_costs`),
+    whatever their sizes; else over those of its map tasks' `spans` that armada measured (under their task
+    names, `site_task`, `costs.fitted`); None where it measured none. Tasks of one size, cut by their seconds
+    over units, charged each draw the setup, so a site was cut finer and measured at one size again, run after
+    run (2026-11-11: 565 map tasks to 1,344), which the records' setup ends. Once a site runs as map tasks,
+    the durations record holds no whole run of it (its test's seconds are one task's, its judge's pooling
+    among them), so its map tasks are what tell its cost."""
+    found = costs.recorded(site_task(python, name, test), timings, weighed=weighed)
+    return found or costs.fitted([(stop - start, seconds) for start, stop in spans
+                                  if (seconds := measured.get(site_task(python, name, test, (start, stop))))])
 
 
-def site_rate(python: str, name: str, test: str, mark: Mark, measured: Mapping[str, float], *,
-              weighed: bool) -> Cost | None:
-    """What a map task of test file `name`'s site `test` takes under `python` (`rate`), over its map tasks
-    of any cut armada measured, by their names (`site_task`), each span read from its name's end: its weighed
-    check's units apart from the rest (`weighed`), as they cost their own."""
+def site_rate(python: str, name: str, test: str, mark: Mark, timings: Mapping[str, Mapping[str, float]], *,
+              weighed: bool) -> costs.Cost | None:
+    """What a map task of test file `name`'s site `test` takes under `python` (`rate`), by its judge's records
+    of its map tasks (`timings`' files), else over its map tasks of any cut armada measured, by their names
+    (`site_task`), each span read from its name's end: its weighed check's units apart from the rest
+    (`weighed`), as they cost their own."""
+    measured = timings.get("rows", {})
     prefix = f"{site_task(python, name, test)}-draws-"
     spans = [(int(start), int(stop)) for task in measured if task.startswith(prefix)
              for start, _, stop in [task[len(prefix):].partition("-")]]
-    return rate(python, name, test, [span for span in spans if (span[0] >= mark.units) == weighed], measured)
+    return rate(python, name, test, [span for span in spans if (span[0] >= mark.units) == weighed], measured,
+                timings.get("files", {}), weighed=weighed)
+
+
+def site_costs(python: str, name: str, test: str) -> dict[str, float]:
+    """A judge's timings of its site's map tasks (`costs.timed`), from the records each wrote among its
+    artifacts beside its draws (map_judge's `record_units`: `<site>.<start>-<stop>.seconds.json`), which its
+    inputs hold (ARMADA_INPUTS); nothing where they hold none of the site's."""
+    held = sites(name)
+    if test not in held:
+        return {}
+    records = []
+    for path in armada_dir("ARMADA_INPUTS", INPUTS).rglob("*.seconds.json"):
+        record = json.loads(path.read_text())
+        python_, _, rest = record["site"].partition("::")
+        node = rest.rpartition("::")[0]
+        if (python_, node.split("::")[0]) == (python, name) and session.site_name(node, held) == test:
+            records.append(costs.Drawn(task_start=record["task_start"], task_stop=record["task_stop"],
+                                       before=record["before"], draws=record["draws"]))
+    return costs.timed(site_task(python, name, test), records, held[test].units)
 
 
 def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
@@ -1122,7 +1112,7 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
             if (name, test) in kept:
                 continue
             mark = held[test]
-            rates = {weighed: site_rate(python, name, test, mark, measured, weighed=weighed)
+            rates = {weighed: site_rate(python, name, test, mark, timings, weighed=weighed)
                      for weighed in (False, True)}
             spans = cut_draws(mark, rates, target)
             maps = []
@@ -1706,7 +1696,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                      # Its whole_suite cells, every one collected, run or set aside (executed.py).
                      **{key: cells for key, cells in counts.get(name, {}).items() if key in MARKED},
                      "ynn_switched": ynn_switched(own), "cells": flow_cells(own),
-                     "timings": {row(python, name, group if site else ""): seconds}, **cause, **asked(site),
+                     # A judge's, beside its pooling, what its map tasks' records say they paid
+                     # (`site_costs`).
+                     "timings": {row(python, name, group if site else ""): seconds,
+                                 **(site_costs(python, name, site["test"]) if site and site["start"] is None
+                                    else {})}, **cause, **asked(site),
                      **later_judged(site)})
     out.write_text(json.dumps({"rows": rows + ran}))
     if (coverage is None and not release and not (environ and check1_wire().CENSUS in environ)

@@ -102,6 +102,22 @@ def ungated_mlp(activation: str, accepted: Collection[str], field: str, family: 
     return UNGATED_ACTIVATIONS[activation]
 
 
+def as_stored(name: str) -> str:
+    """A family's spelling of a stored tensor's name where it reads every name as stored
+    (`DecoderFamily.spelling`'s default): the name itself."""
+    return name
+
+
+def without_fixed_buffers(attention: str, sentinels: Collection[float]) -> "WeightPreparer":
+    """A classic family's `prepare`: a source's tensors with its fixed attention buffers under its `attention`
+    modules checked and dropped (`fixed_attention_buffer`, `sentinels` its releases' mask sentinels)."""
+    def prepare(tensors: Mapping[str, Stored],
+                _config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
+        return {name: tensor for name, tensor in tensors.items()
+                if not fixed_attention_buffer(name, tensor, attention, sentinels)}
+    return prepare
+
+
 def fixed_attention_buffer(name: str, tensor: Stored, attention: str,
                            sentinels: Collection[float]) -> bool:
     """Whether `name` is one of a classic family's fixed attention buffers,
@@ -1965,11 +1981,12 @@ class DecoderFamily:
     DeepSeek V4's grouped output projection. A quantized format is undone
     before this, by `Pretrained.load`, which records what it undid for the
     export."""
-    spelling: Callable[[str], str] = field(default=lambda name: name)
+    spelling: Callable[[str], str] = field(default=as_stored)
     """The name the family's encoder writes a stored tensor under, where a checkpoint may store it as
     another its `routes` read too: a bare GPT2Model leaves out GPT-2's `transformer.` (`Spelled.leading`
-    of the routes' own respelling). A quantized source whose `prepare` rewrites its tensors, so binds
-    none, is written back under its own names by it (`Pretrained.export`)."""
+    of the routes' own respelling). A family that spells names otherwise, or whose `prepare` rewrites its
+    tensors, binds no raw names, and a quantized source of it is written back under its own names by its
+    spelling (`Pretrained.export`)."""
     packed: tuple[Packed, ...] = ()
     """Source tensors that hold several the path map reads, split on load and
     packed again on export: fused experts and GPT-2's Conv1D projections."""

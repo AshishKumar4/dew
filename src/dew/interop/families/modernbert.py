@@ -201,11 +201,11 @@ _HEAD: Leaves = {
 
 _MASKED_LM_ROUTES = spelled(_MODERNBERT_NAMES, leaves=_HEAD)
 
-_MODERNBERT_ROUTES = Table(
-    _MASKED_LM_ROUTES,
-    # A bare `ModernBertModel` checkpoint's names, which a load reads as the masked LM nests them.
-    Spelled((('embeddings', 'model.embeddings'), ('layers', 'model.layers'),
-             ('final_norm', 'model.final_norm')), _MASKED_LM_ROUTES))
+_MODERNBERT_BARE = Spelled((('embeddings', 'model.embeddings'), ('layers', 'model.layers'),
+                            ('final_norm', 'model.final_norm')), _MASKED_LM_ROUTES)
+"""A bare `ModernBertModel` checkpoint's names, which a load reads as the masked LM nests them."""
+
+_MODERNBERT_ROUTES = Table(_MASKED_LM_ROUTES, _MODERNBERT_BARE)
 """ModernBERT's names: the masked LM's (`_MODERNBERT_NAMES`, its head's `_HEAD`), which an export writes, and
 a bare encoder's, which a load reads too."""
 
@@ -215,7 +215,7 @@ MODERNBERT = DecoderFamily(
     lambda fields: not fields.causal and fields.embedding_norm and not fields.first_attention_norm,
     'modernbert', 'ModernBertForMaskedLM',
     routes=_MODERNBERT_ROUTES,
-    packed=_MODERNBERT_PACKED, preserve_source_layout=False,
+    spelling=_MODERNBERT_BARE.leading, packed=_MODERNBERT_PACKED, preserve_source_layout=False,
     tied_head_names=('decoder.weight', 'model.embeddings.tok_embeddings.weight'),
     defaults={'pad_token_id': 50283},
     padding_idx=True,
