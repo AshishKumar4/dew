@@ -65,8 +65,9 @@ def record_units(label: str, payload: Callable[[int, int], object], upto: int | 
     task whose range starts past it records nothing. With `offset`, where its units start in the plan's (a
     weighed check's past its unweighted one's, tools/armada/ci.py `draws_of`): DRAWS is read that far on, a
     task before them recording nothing. Beside
-    it, the seconds from the task's process's start to its units (`before`: its imports, collection, the
-    site's setup and compiles) and those its units took (`draws`), so a run's map tasks say what each paid
+    it, the plan's span its task draws (`task_start`, `task_stop`, DRAWS's), the seconds from the task's
+    process's start to its units (`before`: its imports, collection, the site's setup and compiles) and those
+    its units took (`draws`), so a run's map tasks say what each paid
     before any draw (Main, 2026-11-02: the map task's fixed cost measured before it is cut), and the
     seconds of each named phase within its units' (`phases`, read once they are done)."""
     span = os.environ.get(DRAWS)
@@ -85,8 +86,11 @@ def record_units(label: str, payload: Callable[[int, int], object], upto: int | 
     # The process's start is on the wall clock; the draws' seconds on one that only moves forward.
     began, drawing = time.time(), time.perf_counter()
     found = payload(start, stop)
-    seconds = {"site": site, "start": start, "stop": stop, "draws": time.perf_counter() - drawing,
-               "before": began - psutil.Process().create_time(), **(phases() if phases else {})}
+    # Beside its own units, the plan's span its task draws (DRAWS), which a weighed check's units sit past.
+    task_start, task_stop = (int(part) for part in span.split(":"))
+    seconds = {"site": site, "start": start, "stop": stop, "task_start": task_start, "task_stop": task_stop,
+               "draws": time.perf_counter() - drawing, "before": began - psutil.Process().create_time(),
+               **(phases() if phases else {})}
     path = Path(records) / f"{_file(site)}.{start}-{stop}.pkl"
     path.parent.mkdir(parents=True, exist_ok=True)
     _published(path.with_suffix(".seconds.json"), json.dumps(seconds).encode())

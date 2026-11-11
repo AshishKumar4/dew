@@ -19,6 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.kernels.templates.product import NVFP4
 from dew.nn.precision import correctly_rounded_divide
 
 WORD = 32
@@ -687,13 +688,14 @@ def nvfp4_decoded(words: jax.Array, scales: jax.Array) -> jax.Array:
     """An NVFP4 tile in bfloat16, each value its E2M1 code times its block's E4M3 scale over `NVFP4_OWED`,
     exactly: `words` `[depth / 8, columns]` uint32, each the stored (`BitForm.prepared`) word of a column's
     eight consecutive codes along the depth, and `scales` `[depth / 16, columns]` float8_e4m3fn, one for
-    each sixteen; `[depth, columns]`: the code restored from its decode (`_restored`) times its scale over
-    2^8 in float32, exact (at most six significant bits) and within bfloat16's normal range, as a GPU's
-    prologue forms it in one multiply per value (`NVFP4_OWED`), a GEMM operand prologue's per stage (the
-    template's matrix-operand hook, algebra.md 7.4)."""
+    each sixteen (`product.NVFP4.depth`, the format's one statement of its block); `[depth, columns]`: the
+    code restored from its decode (`_restored`) times its scale over 2^8 in float32, exact (at most six
+    significant bits) and within bfloat16's normal range, as a GPU's prologue forms it in one multiply per
+    value (`NVFP4_OWED`), a GEMM operand prologue's per stage (the template's matrix-operand hook,
+    algebra.md 7.4)."""
     codes = _restored(NVFP4_BFLOAT16_FORM.values(words.T, jnp.bfloat16).T)
     owed = scales.astype(jnp.float32) * np.float32(1 / NVFP4_OWED)
-    return (codes * jnp.repeat(owed, 16, axis=0)).astype(jnp.bfloat16)
+    return (codes * jnp.repeat(owed, NVFP4.depth, axis=0)).astype(jnp.bfloat16)
 
 
 def _restored(decoded: jax.Array) -> jax.Array:
@@ -886,7 +888,7 @@ def nvfp4_coded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     least_normal = np.float32(np.finfo(np.float32).tiny)
     tensor = jnp.where(largest > 0, jnp.maximum(quotient(largest, np.float32(6 * 448)), least_normal),
                        np.float32(1))
-    blocks = jnp.max(magnitude.reshape(-1, 16, x.shape[-1]), axis=1)
+    blocks = jnp.max(magnitude.reshape(-1, NVFP4.depth, x.shape[-1]), axis=1)
     ratio = quotient(quotient(blocks, tensor, jnp.divide), np.float32(6))
     nearest = encoded(jax.lax.bitcast_convert_type(ratio, jnp.uint32), E4M3)
 
@@ -897,7 +899,7 @@ def nvfp4_coded(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     codes = jnp.where(value(nearest) < ratio, jnp.minimum(nearest + jnp.uint32(1), jnp.uint32(E4M3.largest)),
                       nearest)
     scales = jax.lax.bitcast_convert_type(codes.astype(jnp.uint8), jnp.float8_e4m3fn)
-    each = jnp.repeat(value(codes), 16, axis=0)
+    each = jnp.repeat(value(codes), NVFP4.depth, axis=0)
     scaled = jnp.where(each > 0, quotient(quotient(x, tensor, jnp.divide), jnp.where(each > 0, each, 1),
                                           jnp.divide), 0)
     return encoded(jax.lax.bitcast_convert_type(scaled, jnp.uint32), E2M1), scales, tensor

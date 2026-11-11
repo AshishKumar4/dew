@@ -8,7 +8,7 @@ import mpmath
 import numpy as np
 import pytest
 from attention_oracle import anchored_softmax
-from float64_terms import float64_magnitudes, float64_terms
+from float64_terms import float64_magnitudes, float64_signed_sums, float64_terms
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import Mesh, PartitionSpec as P
 
@@ -88,6 +88,22 @@ def test_a_sums_magnitudes_are_its_terms_sizes_summed_beside_their_root_sum_of_s
     np.testing.assert_allclose(terms, 0.25 * np.sqrt((products**2).sum(axis=1)), rtol=1e-12)
     np.testing.assert_array_equal(again, terms)
     assert np.all(np.abs(np.asarray(value)) <= magnitudes) and np.all(terms <= magnitudes)
+
+
+def test_a_sums_signed_sums_are_its_positive_terms_and_its_negative_terms():
+    """A scaled product's terms split by sign: the sum of its positive products and the size of the sum of
+    its negative ones, each scaled as the value is (a negative scale exchanging them), which every partial
+    sum of the products lies between."""
+    rng = np.random.default_rng(5426)
+    rows, weights = rng.normal(size=(4, 16)), rng.normal(size=(16, 3))
+    scale = np.asarray([0.25, -3.0, 1.0])
+
+    with jax.enable_x64(new_val=True):
+        _, positive, negative = float64_signed_sums(lambda rows, weights: (rows @ weights) * scale, rows,
+                                                    weights)
+    products = rows[:, :, None] * weights[None, :, :] * scale
+    np.testing.assert_allclose(positive, np.where(products > 0, products, 0).sum(axis=1), rtol=1e-12)
+    np.testing.assert_allclose(negative, -np.where(products < 0, products, 0).sum(axis=1), rtol=1e-12)
 
 
 def test_a_sum_behind_a_sum_carries_its_magnitudes_and_not_its_squares():
