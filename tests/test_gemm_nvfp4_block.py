@@ -62,14 +62,10 @@ def test_an_nvfp4_grouped_product_is_its_decoded_values_product(kernel):
             return gemm.nvfp4_block_product(*operands, blocks, out_dtype=jnp.float32,
                                             interpret_on_cpu=kernel == "mosaic")
 
-    def decoded(x, w, wide=jnp.float32):
-        x, w = mx_matrix.nvfp4_values(x), mx_matrix.nvfp4_values(w)
-        return jax.lax.ragged_dot(x.astype(wide), jnp.swapaxes(w, 1, 2).astype(wide), sizes,
-                                  precision=jax.lax.Precision.HIGHEST, preferred_element_type=wide)
-
     with generation.assumed("sm100"), generation.routes() as routes:
-        assert_as_exact(jax.jit(dew), jax.jit(decoded), draw, f"an nvfp4 grouped product, {kernel}",
-                        seeds=SEEDS, truth_fn=lambda x, w: decoded(x, w, jnp.float64))
+        assert_as_exact(jax.jit(dew), jax.jit(mx_matrix.values_product(mx_matrix.nvfp4_values, sizes)), draw,
+                        f"an nvfp4 grouped product, {kernel}", seeds=SEEDS,
+                        truth_fn=mx_matrix.values_product(mx_matrix.nvfp4_values, sizes, jnp.float64))
     assert ("nvfp4_block", kernel) in {(route.choice, route.kernel) for route in routes}
 
 

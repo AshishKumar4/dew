@@ -147,6 +147,8 @@ def test_the_gemm_kernels_run_on_this_gpu():
           for depth, width in gemm_widths.WIDTHS),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90"),
+        Cell("the blockwise FP8 kernel gradient's portable arm sums exactly",
+             gemm_blockwise.a_blockwise_kernel_gradients_portable_arm_sums_exactly),
         *(Cell(f"a gathered grouped product is on par{': paired and scattered' if paired else ''}",
                functools.partial(gemm_gather.a_gathered_product_is_on_par, paired=paired, scattered=paired),
                "sm90")

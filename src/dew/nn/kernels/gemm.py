@@ -943,20 +943,23 @@ def _planned(launch, bound) -> mosaic_gpu.Tiles | None:
 
 
 def _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales) -> jax.Array:
-    """`blockwise_fp8_kernel_gradient`'s portable arm: each 128-row block's product in fp32 (FP8 values exact
-    in bfloat16, their products in fp32), times its scales, added in order into its group's fp32 sum."""
+    """`blockwise_fp8_kernel_gradient`'s portable arm: each 128-row block's scaled partial as the blockwise
+    product's portable arm forms one (`grouped_matmul.step_scaled`: the block's FP8 values' products,
+    exact in bfloat16, summed into fp32 by the ragged dot XLA folds into no FP8 GEMM, then its depth rows'
+    and columns' scales), added in order into its group's fp32 sum. A dot of the widened codes was folded
+    by XLA into cuBLASLt's narrower-summing FP8 GEMM under deterministic ops (4.43e-5 from float64 against
+    4.05e-8 on a GH200, M-EM-17c)."""
     depth, width, blocks = lhs_t.shape[0], rhs_t.shape[0], row_scales.shape[0]
     groups = group_blocks.shape[0]
     owner = jnp.repeat(jnp.arange(groups), group_blocks, total_repeat_length=blocks)
+    every_row = jnp.asarray([depth], jnp.int32)
 
     def block(index, total):
-        rows = jax.lax.dynamic_slice_in_dim(lhs_t, index * SCALE_DEPTH,
-                                            SCALE_DEPTH, axis=1)
-        columns = jax.lax.dynamic_slice_in_dim(rhs_t, index * SCALE_DEPTH,
-                                               SCALE_DEPTH, axis=1)
-        partial = jax.lax.dot_general(rows.astype(jnp.bfloat16), columns.astype(jnp.bfloat16),
-                                      (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
-        scaled = partial * row_scales[index][:, None] * column_scales[index][None, :]
+        rows = jax.lax.dynamic_slice_in_dim(lhs_t, index * SCALE_DEPTH, SCALE_DEPTH, axis=1)
+        columns = jax.lax.dynamic_slice_in_dim(rhs_t, index * SCALE_DEPTH, SCALE_DEPTH, axis=1)
+        # The block as a one-block product: the depth's rows its rows, the block's columns its one matrix.
+        scaled = grouped_matmul.step_scaled(rows, columns.T[None], every_row, row_scales[index][None],
+                                            column_scales[index][None, None])
         return total.at[owner[index]].add(scaled)
 
     return jax.lax.fori_loop(0, blocks, block, jnp.zeros((groups, depth, width), jnp.float32))
@@ -995,9 +998,10 @@ class MxFp8:
         # The largest magnitude is a fraction in [1/2, 1) times 2 to `binade`: its exponent is `binade` - 1.
         binade = jnp.frexp(largest)[1]
         top = jnp.finfo(jnp.float8_e4m3fn).maxexp - 1
-        bias = -jnp.finfo(jnp.float8_e8m0fnu).minexp
+        scale = formats_of.MXFP8.scale
+        bias = -jnp.finfo(scale).minexp
         exponent = jnp.clip(jnp.where(largest > 0, binade - 1 - top, -bias), -bias, bias)
-        scales = jax.lax.bitcast_convert_type((exponent + bias).astype(jnp.uint8), jnp.float8_e8m0fnu)
+        scales = jax.lax.bitcast_convert_type((exponent + bias).astype(jnp.uint8), scale)
         codes = fake_quant.fp8_codes(blocks / scales.astype(x.dtype)).reshape(x.shape)
         return cls(codes.astype(jnp.float8_e4m3fn), scales[..., 0])
 

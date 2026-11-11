@@ -98,14 +98,19 @@ def _product(format_: str, groups: int, out_dtype: str, kernel: str):
 
 def _truth(format_: str, groups: int):
     """The decoded operands' grouped product in float64."""
-    values = mx_values if format_ == "mxfp8" else nvfp4_values
+    return values_product(mx_values if format_ == "mxfp8" else nvfp4_values, 128 * _blocks(groups),
+                          jnp.float64)
 
-    def truth(rows, matrices):
-        wide = jnp.float64
+
+def values_product(values, sizes, wide=jnp.float32):
+    """`run(rows, matrices)`: each group's rows (`sizes` of them) times its matrix, each operand quantized
+    to its format's values (`values`: `mx_values`, `nvfp4_values`), summed in `wide` at the highest
+    precision (the reference's float32, or a truth's float64)."""
+    def run(rows, matrices):
         x, w = values(rows), values(matrices)
-        return jax.lax.ragged_dot(x.astype(wide), jnp.swapaxes(w, 1, 2).astype(wide), 128 * _blocks(groups),
+        return jax.lax.ragged_dot(x.astype(wide), jnp.swapaxes(w, 1, 2).astype(wide), sizes,
                                   precision=jax.lax.Precision.HIGHEST, preferred_element_type=wide)
-    return truth
+    return run
 
 
 @cell("mxfp8", covers=lambda case: dict(zip(AXES["mxfp8"], case, strict=True)))
