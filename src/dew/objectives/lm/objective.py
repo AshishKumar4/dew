@@ -66,6 +66,7 @@ from dew.batch import (
     token_positions,
 )
 from dew.data.chat import ROLES_KEY, Role
+from dew.data.plan import PLAN_VERSIONS, SHARED_STATE
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
@@ -892,14 +893,22 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                              "blocks beyond its own source, so depths are refused with blocks")
         refuse_block_reading(self.model, "a batch's blocks")
 
+    plan: int = PLAN_VERSIONS[-1]
+    """The data plan version the run's rows are read by (`bind_plan`), a new run's where it binds none."""
+
+    def bind_plan(self, version: int) -> None:
+        """Take the run's data plan version (`Objective.bind_plan`): a run of a plan before `SHARED_STATE`
+        laid every row whole, and resumes so (`shares_prefixes`)."""
+        self.plan = version
+
     def shares_prefixes(self, train: bool = False) -> bool:
         """Whether rows that begin alike are scored over one copy of their prefix (`token_scores` of rows
         whose coordinates carry forks, `dew.data.forked_rows.ForkedRows`): where the model computes each
         document over its ancestors as its own row does
-        (`ForkedCalls`; in a training step with `train`, no dropout drawing) and no in-context step reads
-        a row's tokens in its order."""
-        return (self.adaptation is None and isinstance(self.model, ForkedCalls)
-                and self.model.fork_refusal(train) is None)
+        (`ForkedCalls`; in a training step with `train`, no dropout drawing), no in-context step reads
+        a row's tokens in its order, and the run's plan is one that shares (`SHARED_STATE`, `bind_plan`)."""
+        return (self.plan >= SHARED_STATE and self.adaptation is None
+                and isinstance(self.model, ForkedCalls) and self.model.fork_refusal(train) is None)
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      coordinates: Coordinates | None = None, routing: bool = False,

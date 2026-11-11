@@ -70,7 +70,7 @@ def test_label_scores_refuse_a_prompt_with_no_token_to_score_a_label_from():
     the scores refuse it, where a score read from position -1, the row's last, left the first token of
     every label unscored and a one-token label scored 0 (row 3941)."""
     with pytest.raises(ValueError):
-        label_scores(lambda tokens, _: jnp.zeros(tokens.shape, jnp.float32), [[]], [[1], [2, 3]])
+        label_scores(lambda tokens, _: jnp.zeros(tokens.shape, jnp.float32), [[]], [[1], [2, 3]], share=True)
 
 
 @pytest.mark.parametrize("adapted", [False, True], ids=["plain", "in-context"])

@@ -589,6 +589,13 @@ def _within[T](mesh, phase: str, operation: Callable[[], T]) -> T:
     return operation() if mesh is None else agreed(phase, operation)
 
 
+class Scorer(Protocol):
+    """The objective a rollout's packed rows train (`RolloutScheduler.scorer`): whether its model computes a
+    prefix rows share as each row's own, in a training step (`TokenScorer.shares_prefixes`)."""
+
+    def shares_prefixes(self, train: bool = False) -> bool: ...
+
+
 class RolloutScheduler:
     """Admits complete groups of rollouts from `acquisition` and packs them into the trainer's batches.
 
@@ -614,9 +621,11 @@ class RolloutScheduler:
       estimator compares returns: the packed rows are scored under its
       reference, the state's frozen starting policy, and repacked with
       `sessions.reference_penalties`.
-    - `share` packs the prompt a group's chains begin with once (`pack`'s `share`), which a policy whose
-      model computes a shared prefix as each chain's own takes (`TokenScorer.shares_prefixes`); `sampled`
-      and `served` derive it from their objective.
+    - `scorer` is the objective that trains on the packed rows: where its model computes a shared prefix
+      as each chain's own, as each call packs them (`shares_prefixes(train=True)`, its run's plan bound
+      by then, `TokenScorer.bind_plan`), the prompt a group's chains begin with is packed once (`pack`'s
+      `share`); None packs each chain whole. `sampled`, `served` and `episodes` name their objective,
+      `PPORollout` its own.
 
     `metrics` holds the latest call's numbers, which the trainer logs as
     `rollout/<name>`.
@@ -635,7 +644,7 @@ class RolloutScheduler:
                  credit: str = "session", support_capacity: int | None = None,
                  log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
                  overlong: tuple[int, int] | None = None, reference: GRPOObjective | None = None,
-                 generation_batches: int = 1, share: bool = False):
+                 generation_batches: int = 1, scorer: Scorer | None = None):
         for name, value, least in (("groups", groups, 2), ("oversample", oversample, 0),
                                    ("generation_batches", generation_batches, 1)):
             if type(value) is not int or value < least:
@@ -658,7 +667,7 @@ class RolloutScheduler:
                              "rewards pay, and this one's is 0")
         self.reference = reference
         self.generation_batches = generation_batches
-        self.share = share
+        self.scorer = scorer
         self.metrics: dict[str, float] = {}
         self._branch: str | None = None
         self._owned: tuple[Callable[[], None], ...] = ()
@@ -695,7 +704,7 @@ class RolloutScheduler:
                    truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
                    reference=objective if isinstance(objective, GRPOObjective) and objective.reward_kl > 0
                    else None, generation_batches=generation_batches,
-                   share=objective.shares_prefixes(train=True))
+                   scorer=objective)
 
     @classmethod
     def served(cls, objective: GRPOObjective, reward: Reward, *, tasks: int, slots: int,
@@ -714,8 +723,10 @@ class RolloutScheduler:
         at the run's progress at its updates (`LMObjective.policy`). The proximal policy is rescored
         under the trainer's weights, so a `max_lag` above 0 needs `objective.behavior_importance`. A
         reward-side reference penalty (`GRPOObjective.reward_kl`) is `objective`'s own, as `sampled`'s.
-        With `page_size` the server pages its cache in pages of that many slots and shares prompt pages,
-        so a group's samples of one prompt prefill it once (`dew.inference.pages.Pages.waits`). A run over
+        With `page_size` the server pages its cache in pages of that many slots and shares prompt pages
+        where the model admits it, as a paged server does by default (`Server.from_task`'s
+        `prefix_cache`), so a group's samples of one prompt prefill it once
+        (`dew.inference.pages.Pages.waits`). A run over
         several processes serves from one server over its mesh, each process's rows seated on its own
         devices, which every process steps together as it admits each call's groups and reloads at each
         push (`NativeRolloutServer.waited`): its draws run between the trainer's steps, not beside them."""
@@ -735,7 +746,8 @@ class RolloutScheduler:
                 return Server.from_task(policy, slots=slots, capacity=width)
             # The policy's own cache layout, its format kept, in pages.
             declared = policy.model.kv_cache if isinstance(policy.model, Layered) else KVCache()
-            return Server.from_task(policy, slots=slots, capacity=width, prefix_cache=True,
+            # Its prefix cache as the server keeps one by default, wherever the model admits it.
+            return Server.from_task(policy, slots=slots, capacity=width,
                                     kv_cache=dataclasses.replace(declared, page_size=page_size))
 
         server = NativeRolloutServer.deferred(built, drawing)
@@ -745,22 +757,28 @@ class RolloutScheduler:
         scheduler = cls(acquisition, tasks=prompt_tasks, groups=groups, estimator=estimator,
                         truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
                         reference=objective if objective.reward_kl > 0 else None,
-                        generation_batches=generation_batches, share=objective.shares_prefixes(train=True))
+                        generation_batches=generation_batches, scorer=objective)
         # The source and the server it built end with it: the reward pool, then the engine.
         scheduler._owned = (source.close, server.close)
         return scheduler
 
     @classmethod
     def episodes(cls, policy: EpisodeInference, environment: EnvironmentFactory, verifier: Verifier, *,
-                 max_prompt_tokens: int, max_new_tokens: int, max_turns: int, sampling: Sampling,
-                 groups: int = 2, credit: str = "session", record: EpisodeRecorder | None = None,
-                 journal: EpisodeJournal | None = None,
+                 objective: Scorer, max_prompt_tokens: int, max_new_tokens: int, max_turns: int,
+                 sampling: Sampling, groups: int = 2, credit: str = "session",
+                 record: EpisodeRecorder | None = None, journal: EpisodeJournal | None = None,
                  log: Callable[[SchedulerRecord], None] | None = None) -> RolloutScheduler:
         """Collect `groups` tool episodes of each `task_id` row at every call, in lock step under the
-        step's variables, and train on them (`EpisodeCollector`; truncated episodes are masked)."""
+        step's variables, and train `objective` on them (`EpisodeCollector`; truncated episodes are
+        masked), a group's prompt packed once where it shares (`scorer`)."""
         collector = EpisodeCollector(policy, environment, verifier, max_prompt_tokens, max_new_tokens,
                                      max_turns, sampling, record, journal)
-        return cls(Synchronous(collector), groups=groups, credit=credit, log=log)
+        return cls(Synchronous(collector), groups=groups, credit=credit, log=log, scorer=objective)
+
+    @property
+    def share(self) -> bool:
+        """Whether this call packs a group's prompt once (`scorer`'s `shares_prefixes(train=True)`)."""
+        return self.scorer is not None and self.scorer.shares_prefixes(train=True)
 
     def tasks(self, dataset: Loader) -> Loader:
         """`dataset` as the acquisition reads it: asynchronously, a stream that registers each task

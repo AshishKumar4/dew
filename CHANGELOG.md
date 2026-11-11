@@ -14,6 +14,18 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   upstream's is. A run whose configured precision is above the default (`dew.nn.precision.ACCURATE`'s
   'highest') is declined by the ports and trains on the portable math in IEEE float32, as before.
 
+- A paged `Server` keeps a prefix cache by default (`prefix_cache=None` derives it on wherever the layout pages,
+  the rows sample a token a step on the server's own mesh and the model computes a split prompt as a whole
+  one); a request draws what it draws without it. Pass `prefix_cache=False` to keep pages private. A
+  finished request names its whole history's full pages, so a later prompt that continues it prefills only
+  what follows, a hybrid reading the state its rows were left in where the history ends at a page's end.
+  `EpisodeCollector(kv_cache=KVCache(page_size=...))` runs a cohort's turns through the server in process,
+  each turn prefilling only its new tokens.
+- A DiffusionGemma run exports in transformers' DiffusionGemmaForBlockDiffusion layout where that class
+  builds the model, and its native release, stating why, where it cannot. A native release, any token
+  task's, is the source a run starts from (`--pretrained <run>`, `Pretrained.load(run)`), its model in Dew's
+  own layout, whose export refuses with the layout's reason.
+
 - A shared prefix is computed once in the backbone call (`dew.batch.Forks`): a row's documents may continue
   another, each reading its chain of ancestors as its own beginning, attention their keys and every recurrent
   mixer (gated delta net, Kimi delta attention, Mamba, Mamba-2, the short conv) the state and conv history
