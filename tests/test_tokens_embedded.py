@@ -90,8 +90,8 @@ def test_a_decision_run_whose_rows_place_a_token_outside_its_backbones_table_is_
     trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0))
     with pytest.raises(OutsideTable) as raised:
         trainer.fit(data, steps=1)
-    [token] = tokenizer.encode("token250", add_special_tokens=False)
-    assert outside(raised) == (token, ROWS)
+    # The row's own token past the table, whichever id its tokenizer gives it.
+    assert outside(raised) == (max(tokenizer.encode("token7 token250", add_special_tokens=False)), ROWS)
 
 
 def test_a_request_holding_an_id_outside_its_models_table_is_refused_by_a_task_and_a_server():
