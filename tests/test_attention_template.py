@@ -1036,3 +1036,40 @@ def test_a_training_step_on_the_plain_jax_mainloop_states_its_flops(call):
         compiled = jax.jit(jax.grad(loss, argnums=(0, 1, 2))).lower(query, key, value).compile()
     flops = hlo_flops(compiled.as_text())
     assert flops is not None and flops.model > 0
+
+
+def test_the_reference_arithmetic_multiplies_ieee_float32_as_an_a100_runs_it():
+    """The template's reference arithmetic over fp32 operands, traced as an A100 runs it under JAX's default
+    precision: the reference's training step (`template.reference` and its derivative) and the algebra's
+    forward and backward declarations (`softmax_of`, `softmax_gradients`), every fp32 product IEEE float32
+    (`template.REFERENCE_PRECISION`), never JAX's configured precision, whose default an A100's compiler ran
+    as TF32 in a Triton fusion (post81)."""
+    from reference_error import dot_precisions
+
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.templates import attention_algebra, attention_backward_algebra
+
+    query, key, value = (jax.random.normal(jax.random.key(seed), (1, 16, heads, 8), jnp.float32)
+                         for seed, heads in ((0, 4), (1, 2), (2, 2)))
+    spans = template.spans(16, 16, 1, causal=True)
+
+    def step(query, key, value):
+        out, pull = jax.vjp(lambda *operands: template.reference(*operands, spans), query, key, value)
+        return out, pull(jnp.ones_like(out))
+
+    logits = jax.random.normal(jax.random.key(3), (16, 16), jnp.float32)
+    rows, keys = (jax.random.normal(jax.random.key(seed), (16, 8), jnp.float32) for seed in (4, 5))
+    peak, total, anchor, delta = (jnp.ones(16, jnp.float32) * value for value in (1.0, 2.0, 0.0, 0.5))
+
+    def declared(logits, rows, keys):
+        forward = attention_algebra.softmax_of(logits, keys, base2=False)
+        backward = attention_backward_algebra.softmax_gradients(logits, rows, keys, keys, rows, peak, total,
+                                                                anchor, delta, scale=0.5)
+        return forward, backward
+
+    with generation.assumed("sm80"):
+        precisions = dot_precisions(step, query, key, value) + dot_precisions(declared, logits, rows, keys)
+    highest = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
+    narrowed = {(str(stated), shapes) for stated, dtype, shapes in precisions
+                if dtype == jnp.float32 and stated != highest}
+    assert precisions and not narrowed, narrowed

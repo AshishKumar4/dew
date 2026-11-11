@@ -38,6 +38,7 @@ from dew.nn.kernels.templates.attention import (
     LN2,
     LOG2E,
     NATURAL,
+    REFERENCE_PRECISION,
     Capped,
     Draw,
     Dropout,
@@ -2034,7 +2035,8 @@ def softmax_of(logits: jax.Array, values: jax.Array, *, base2: bool, keys_first:
     total = jnp.sum(p, axis=keys_axis)
     over = jnp.where(total == 0, 1.0, total) if guarded else total
     subscripts, per_query = ("kq,kd->dq", over[None, :]) if keys_first else ("qk,kd->qd", over[:, None])
-    summed = float32_einsum(subscripts, p.astype(values.dtype), values, preferred_element_type=jnp.float32)
+    summed = float32_einsum(subscripts, p.astype(values.dtype), values, precision=REFERENCE_PRECISION,
+                            preferred_element_type=jnp.float32)
     return summed / per_query
 
 

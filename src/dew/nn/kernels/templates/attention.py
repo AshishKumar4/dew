@@ -38,7 +38,7 @@ import jax.numpy as jnp
 from dew._hashing import fmix32
 from dew.nn.derivatives import Protected, contracted
 from dew.nn.kernels import generation, tuning
-from dew.nn.precision import at_least_fp32, compensated_sum, float32_einsum
+from dew.nn.precision import at_least_fp32, compensated_sum, exact_float32, float32_einsum
 
 
 @jax.tree_util.register_dataclass
@@ -974,6 +974,16 @@ def prescaled(query: jax.Array, scale: float | None) -> tuple[jax.Array, float, 
     return by_power(query, power), left, power
 
 
+REFERENCE_PRECISION = exact_float32(None)
+"""The precision the template's reference arithmetic multiplies at (`scores`, `reference` and the algebra's
+declarations, `attention_algebra.softmax_of` and `attention_backward_algebra.softmax_gradients`): the arm
+every gate holds the template's kernels to, so IEEE float32 (`dew.nn.precision.exact_float32`) whatever JAX's
+configured precision, whose default runs an fp32 product as TF32 on an A100 where its compiler fuses the
+product into Triton (post81 under deterministic ops: the recurrence's portable math 1823 times its fp32
+distance from float64, M-JS-96). The mainloops' own products (`interpreted_dot`, each kernel's) follow the
+run's precision, as every product Dew's runs issue does."""
+
+
 def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | None = None, *,
            scale: float | None = None) -> jax.Array:
     """The scores `[B, H, Q, K]` the template's softmax takes, as `reference` computes them: the products
@@ -986,7 +996,7 @@ def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | Non
     scale = logit_scale(width, scale)
     seen = dense(spans)
     grouped = query.reshape(batch, queries, kv_heads, heads // kv_heads, width)
-    products = float32_einsum("bqhgd,bkhd->bhgqk", grouped, key,
+    products = float32_einsum("bqhgd,bkhd->bhgqk", grouped, key, precision=REFERENCE_PRECISION,
                               preferred_element_type=wide).reshape(batch, heads, queries, spans.keys)
     products = products * jnp.asarray(scale, wide)
     return jnp.where(seen[:, None], score_modded(products, hooks), -jnp.inf)
@@ -1049,7 +1059,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     def valued(weights: jax.Array) -> jax.Array:
         # The weights narrowed to the values' dtype times the values, a query group's over its key head.
         grouped = weights.astype(value.dtype).reshape(batch, kv_heads, heads // kv_heads, queries, spans.keys)
-        return float32_einsum("bhgqk,bkhd->bhgqd", grouped, value,
+        return float32_einsum("bhgqk,bkhd->bhgqd", grouped, value, precision=REFERENCE_PRECISION,
                               preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
 
     drop = hooks.drop
