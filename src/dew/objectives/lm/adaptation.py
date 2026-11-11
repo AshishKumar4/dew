@@ -37,7 +37,6 @@ import dataclasses
 import functools
 import itertools
 import math
-import re
 from collections.abc import Mapping
 
 import jax
@@ -45,7 +44,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.batch import document_ranks, document_starts, prefix_sum, real_slots, token_layout
-from dew.nn.continuum import HeadTerms, LevelTerms
+from dew.nn.continuum import HeadTerms, LevelTerms, level_names
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import SteppedInContext
@@ -411,7 +410,7 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields
     the other levels as it read them (`_Chain`). A damped window's bound reads its slots' terms at the
     states and versions they read (`_slot_terms`), gathered over the window as the scan reads them."""
     start = _start(model, variables, adaptation)
-    names = _level_names(start)
+    names = level_names(start)
     starts = [start] if not names else [start[name] for name in names]
     windows = adaptation.windows(len(starts))
     rows, length = targets.shape
@@ -662,15 +661,6 @@ def _chosen_by(chosen: jax.Array, values) -> jax.Array:
         kept = jnp.where((chosen == at).reshape(*chosen.shape, *[1] * (alternative.ndim - chosen.ndim)),
                          alternative, kept)
     return kept
-
-
-def _level_names(start: Mapping) -> tuple[str, ...]:
-    """A chain's levels' names in its order (`dew.nn.continuum.level_parameters`: `continuum_0` on), a
-    chain of one among them; none for one level's own tree, which holds its maps."""
-    names = [name for name in start if re.fullmatch(r"continuum_\d+", name)]
-    if not names or len(names) != len(start):
-        return ()
-    return tuple(sorted(names, key=lambda name: int(name.rsplit("_", 1)[1])))
 
 
 def _laid_out(fields, weights, rows: int, length: int, adaptation: ChunkAdaptation,

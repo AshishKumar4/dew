@@ -201,7 +201,7 @@ def continuum_modules(continuum: Levels, features: int, dtype: Dtype | None, pre
     `continuum`, or a chain's `ContinuumLink`s, `continuum_0` on."""
     if isinstance(continuum, ContinuumLevel):
         return Continuum(continuum, features, dtype=dtype, precision=precision, name="continuum")
-    return tuple(ContinuumLink(level, features, dtype=dtype, precision=precision, name=f"continuum_{index}")
+    return tuple(ContinuumLink(level, features, dtype=dtype, precision=precision, name=level_name(index))
                  for index, level in enumerate(continuum))
 
 
@@ -224,13 +224,24 @@ def chain_states(modules, x: jax.Array, index: int | None = None) -> jax.Array:
     return x
 
 
+def level_name(index: int) -> str:
+    """Level `index`'s scope name in a chain (`ContinuumLink`): `continuum_0` on, its order the chain's."""
+    return f"continuum_{index}"
+
+
+def level_names(levels: Mapping) -> tuple[str, ...]:
+    """A chain's levels' names in its order where `levels` is a chain's trees by their scope names
+    (`level_parameters`), a chain of one among them; none for one level's own tree."""
+    names = tuple(level_name(index) for index in range(len(levels)))
+    return names if levels and set(levels) == set(names) else ()
+
+
 def level_parameters(continuum: Levels, params: Mapping):
     """A model's continuum levels' parameters in its `params`: one level's tree, or a chain's trees by
-    their scopes' names, `continuum_0` on (`ContinuumLink`)."""
+    their scopes' names (`level_name`)."""
     if isinstance(continuum, ContinuumLevel):
         return params["continuum"]
-    return {f"continuum_{index}": params[f"continuum_{index}"]["continuum"]
-            for index in range(len(continuum))}
+    return {level_name(index): params[level_name(index)]["continuum"] for index in range(len(continuum))}
 
 
 def with_level_parameters(continuum: Levels | None, params: Mapping, levels) -> dict:
