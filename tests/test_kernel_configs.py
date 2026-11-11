@@ -1175,14 +1175,54 @@ def test_each_triton_call_needs_a_launch_of_its_own():
 def test_records_a_failed_process_of_their_own_wrote_are_refused():
     """A test that compiles Mosaic GPU kernels after another capability's runs again in a pytest process of
     its own (`kernel_compile.compiled_apart`), whose records are written before its own checks and teardown:
-    a process that wrote them and then failed gives none (row 1877)."""
-    from kernel_compile import OWN_PROCESS, compiled_apart
+    a test that wrote them there and then failed gives none (row 1877)."""
+    import apart_records
+    from kernel_compile import compiled_apart
 
-    if OWN_PROCESS in os.environ:
-        Path(os.environ[OWN_PROCESS]).write_text("[]")
-        pytest.fail("this process failed after it wrote its records, as a failed teardown does")
+    test = os.environ["PYTEST_CURRENT_TEST"].rsplit(" ", 1)[0]
+    if apart_records.RECORDS in os.environ:
+        apart_records.written(Path(os.environ[apart_records.RECORDS]), test, 0, [])
+        pytest.fail("this test failed after it wrote its records, as a failed teardown does")
     with pytest.raises(RuntimeError):
-        compiled_apart()
+        compiled_apart((9, 0), test, 0)
+
+
+def test_a_capabilitys_cells_compile_in_one_process_of_their_own(monkeypatch, tmp_path):
+    """Every cell of the session that states a capability other than the one the process compiles for
+    (`kernel_compile.Gated`) runs in one pytest process of its own, the first to ask starting it, and each
+    reads its own records from it; a test that states none runs in one of its own (`compiled_apart`)."""
+    from types import SimpleNamespace
+
+    import apart_records
+    import kernel_compile
+    from kernel_compile import Gated
+
+    def cell(nodeid, **params):
+        return SimpleNamespace(nodeid=nodeid, callspec=SimpleNamespace(params=params))
+
+    session = [cell("a", generation_name=Gated("sm90"), index=0),
+               cell("b", generation_name=Gated("sm90"), index=1),
+               cell("c", generation_name=Gated("sm100"), index=0), SimpleNamespace(nodeid="d")]
+    started = []
+
+    def ran_apart(tests):
+        started.append(tests)
+        directory = tmp_path / str(len(started))
+        directory.mkdir()
+        monkeypatch.setenv(apart_records.RECORDS, str(directory))
+        for test in tests:
+            apart_records.written(directory, test, 0, [{"name": test}])
+            apart_records.reported(SimpleNamespace(nodeid=test, failed=False, when="teardown"))
+        monkeypatch.delenv(apart_records.RECORDS)
+        return directory
+
+    monkeypatch.setattr(apart_records, "SESSION", session)
+    monkeypatch.setattr(kernel_compile, "_APART", {})
+    monkeypatch.setattr(kernel_compile, "_ran_apart", ran_apart)
+    assert kernel_compile.compiled_apart((9, 0), "a", 0) == [{"name": "a"}]
+    assert kernel_compile.compiled_apart((9, 0), "b", 0) == [{"name": "b"}]
+    assert kernel_compile.compiled_apart((9, 0), "d", 0) == [{"name": "d"}]
+    assert started == [["a", "b"], ["d"]]
 
 
 def test_the_resource_gate_refuses_spills_and_invalid_allocations():
