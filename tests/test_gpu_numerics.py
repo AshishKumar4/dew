@@ -102,11 +102,11 @@ def grouped_cells(_) -> list[Cell]:
 
 
 def vocabulary_cells(_) -> list[Cell]:
-    """A Gemma-sized vocabulary's chunked cross entropy."""
+    """A Gemma-sized vocabulary's chunked cross entropy, every chunking in one check."""
     check = chunked_cross_entropy.a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits
-    return [Cell(f"a Gemma-sized vocabulary is as exact as the whole logits: {chunks} chunks, {softcap}",
-                 functools.partial(check, chunks, softcap))
-            for chunks in (4, 16) for softcap in (None, 30.0)]
+    return [Cell(f"a Gemma-sized vocabulary is as exact as the whole logits at "
+                 f"{chunked_cross_entropy.CHUNKS} chunks: {softcap}", functools.partial(check, softcap))
+            for softcap in (None, 30.0)]
 
 
 GROUPS = {"numerics": numerics_cells, "norms": norm_cells, "grouped": grouped_cells,

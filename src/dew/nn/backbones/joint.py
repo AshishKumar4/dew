@@ -63,12 +63,6 @@ def embedding(owner: nn.Module, x, features: int, name: str, *, bias: bool = Tru
     return mlp(x)
 
 
-def embedding_axes(*names: str) -> dict[tuple[str, ...], tuple[str | None, ...]]:
-    """The logical axes of the two layers `embedding` builds under each of
-    `names`: each shards its output, the model's width."""
-    return {(f"{name}_linear_{index}",): (None, "embed") for name in names for index in (1, 2)}
-
-
 class TextStream:
     """What a transformer that runs its text as a second stream beside the
     image declares (SD3, Flux, FLUX.2): its width is its heads' together,

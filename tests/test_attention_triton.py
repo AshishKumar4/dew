@@ -128,15 +128,20 @@ def gate_of(queries: int, value_width: int) -> jax.Array:
     return jax.random.normal(jax.random.key(99), (ROWS, queries, 4, value_width), jnp.float32)
 
 
-def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *, residuals: bool = False,
-          width: int = 32, value_width: int = 32, natural: bool = template.NATURAL, mainloop: str = "triton"):
-    """`attention_triton.forward` pinned at `config` (or with `mainloop` "portable" the plain-JAX mainloop's
-    `attend` at its tiles) on par with `template.reference` over `case`'s keys and the hooks `names`, at the
-    site's declared seeds, its exponent `natural` or the fold."""
+def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, **options):
+    """`check_each` at the one `config`."""
+    check_each(case, names, dtype, (config,), **options)
+
+
+def check_each(case: dict, names: frozenset, dtype, configs, *, residuals: bool = False, width: int = 32,
+               value_width: int = 32, natural: bool = template.NATURAL, mainloop: str = "triton"):
+    """`attention_triton.forward` pinned at each of `configs` (or with `mainloop` "portable" the plain-JAX
+    mainloop's `attend` at their tiles) on par with `template.reference` over `case`'s keys and the hooks
+    `names`, at the site's declared seeds, its exponent `natural` or the fold: one check of every config,
+    each its own leaves, so each draw's reference and its float64 truth are computed once for all."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     hooks = hooks_for(names, queries, value_width, gate_of(queries, value_width))
-    pin = {attention_triton.TritonForward: config}
 
     # The maxima are in the logits' own units, raw products in the raw form (`algebra.Forward.raw`), the
     # query's taken by its scale's power of two (`template.prescale`), taken to the reference's natural ones
@@ -146,13 +151,13 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
                            score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None,
                            prescale=power)
 
-    def ours(query, key, value):
+    def at(config, query, key, value):
         if mainloop == "portable":
             tiles = attention_portable.Tiles(config.block_q, config.block_k, attention_triton.BLOCK)
             out = attention_portable.xla_mainloop(tiles, query, key, value, spans, hooks, residuals=residuals,
                                                   natural=natural)
         else:
-            with tuning.pinned(pin):
+            with tuning.pinned({attention_triton.TritonForward: config}):
                 out = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
                                                natural=natural, interpret=not ON_GPU)
         # The maxima and denominators the reference keeps too; the anchor keys only the backward reads,
@@ -161,11 +166,15 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
             return out
         return out[0], spec.naturalized(out[1]) if spec.raw else out[1], out[2]
 
+    def ours(query, key, value):
+        return {str(config): at(config, query, key, value) for config in configs}
+
     def xla(query, key, value):
-        return template.reference(query, key, value, spans, hooks, residuals=residuals)
+        return dict.fromkeys(map(str, configs), template.reference(query, key, value, spans, hooks,
+                                                                   residuals=residuals))
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), drawing(queries, keys, dtype, width, value_width),
-                    f"{mainloop} forward {case} {sorted(names)} {jnp.dtype(dtype).name} {config} "
+                    f"{mainloop} forward {case} {sorted(names)} {jnp.dtype(dtype).name} {list(configs)} "
                     f"natural {natural}",
                     seeds=ALL_HOOKS_SEEDS if names == HOOKS["all"] else SEEDS)
 
@@ -230,10 +239,10 @@ def test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two(width, val
     check(CASES["causal"], HOOKS["none"], jnp.bfloat16, PINNED[0], width=width, value_width=value_width)
 
 
-def every_config_on_a_gpu(config, case):
-    """Every tile a derivation or a pin may run (`FORWARD_TILES`), bf16, every hook: over causal
-    documents under a window, and over the irregular full and causal calls (`IRREGULAR`)."""
-    check({**CASES, **IRREGULAR}[case], HOOKS["all"], jnp.bfloat16, config, residuals=True)
+def every_config_on_a_gpu(case):
+    """Every tile a derivation or a pin may run (`FORWARD_TILES`), bf16, every hook, in one check: over
+    causal documents under a window, and over the irregular full and causal calls (`IRREGULAR`)."""
+    check_each({**CASES, **IRREGULAR}[case], HOOKS["all"], jnp.bfloat16, FORWARD_TILES, residuals=True)
 
 
 @pytest.mark.parametrize("case", IRREGULAR)
@@ -360,16 +369,22 @@ def joint(config: attention_triton.Tiles, dkv_config: attention_triton.Tiles | N
                                           other.warps, other.stages)
 
 
-def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, width: int = 32,
-                   value_width: int = 32, natural: bool = template.NATURAL,
-                   accurate: bool = template.ACCURATE, mainloop: str = "triton"):
-    """`attention_triton.backward` with its dQ launch at `config` and its dK/dV launch at `dkv_config`
-    (`config` too by default; its tiles are always the dQ launch's), or with `mainloop` "portable" the
-    plain-JAX mainloop's `backward` at `config`'s tiles, its every gradient (queries, keys,
-    values, each score parameter, the initial state's) on par with `jax.vjp` of the template's XLA
-    arithmetic, from float64: the hooks' parameters and initial state are drawn with the operands, so
-    their gradients' truth is float64 too; its exponent `natural` or the fold, and its backward `accurate`
-    or the fast form."""
+def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, **options):
+    """`check_backward_each` at the one `config` pair."""
+    check_backward_each(case, names, dtype, ((config, dkv_config),), **options)
+
+
+def check_backward_each(case: dict, names: tuple, dtype, configs, *, width: int = 32, value_width: int = 32,
+                        natural: bool = template.NATURAL, accurate: bool = template.ACCURATE,
+                        mainloop: str = "triton"):
+    """`attention_triton.backward` at each `(config, dkv_config)` of `configs`, its dQ launch at `config`
+    and its dK/dV launch at `dkv_config` (`config` too where None; its tiles are always the dQ launch's), or
+    with `mainloop` "portable" the plain-JAX mainloop's `backward` at `config`'s tiles, its every gradient
+    (queries, keys, values, each score parameter, the initial state's) on par with `jax.vjp` of the
+    template's XLA arithmetic, from float64: the hooks' parameters and initial state are drawn with the
+    operands, so their gradients' truth is float64 too; its exponent `natural` or the fold, and its backward
+    `accurate` or the fast form. One check of every pair, each its own leaves, so each draw's reference and
+    its float64 truth are computed once for all."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     score_mod, kinds, draw_hooks = score_hooks(names, queries, keys, value_width)
@@ -384,28 +399,29 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
         return template.Hooks(score_mod, tuple(template.Param(value, kind)
                                                for value, kind in zip(params, kinds, strict=True)), initial)
 
-    pins = {attention_triton.TritonBackward: joint(config, dkv_config)}
-
-    def ours(query, key, value, dout, params, initial):
+    def at(config, dkv_config, query, key, value, dout, params, initial):
         if mainloop == "portable":
             tiles = attention_portable.Tiles(config.block_q, config.block_k, attention_triton.BLOCK)
             grads = attention_portable.backward(tiles, query, key, value, spans, hooked(params, initial),
                                                 dout, natural=natural, accurate=accurate)
         else:
-            with tuning.pinned(pins):
+            with tuning.pinned({attention_triton.TritonBackward: joint(config, dkv_config)}):
                 grads = attention_triton.backward(query, key, value, spans, hooked(params, initial), dout,
                                                   natural=natural, accurate=accurate, interpret=not ON_GPU)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
+
+    def ours(*arguments):
+        return {str(pair): at(*pair, *arguments) for pair in configs}
 
     def xla(query, key, value, dout, params, initial):
         def attend(query, key, value, params, initial):
             return template.reference(query, key, value, spans, hooked(params, initial))
 
         _, pull = jax.vjp(attend, query, key, value, params, initial)
-        return pull(dout.astype(query.dtype))
+        return dict.fromkeys(map(str, configs), pull(dout.astype(query.dtype)))
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw,
-                    f"{mainloop} backward {case} {names} {jnp.dtype(dtype).name} {config} {dkv_config} "
+                    f"{mainloop} backward {case} {names} {jnp.dtype(dtype).name} {list(configs)} "
                     f"{width}/{value_width} natural {natural} accurate {accurate}",
                     seeds=BACKWARD_SEEDS.get((names, jnp.dtype(dtype).name), SEEDS))
 
@@ -674,12 +690,12 @@ def test_the_backward_walks_many_key_tiles(case):
     check_backward(IRREGULAR[case], SCORE_HOOKS["softcap-sinks-alibi"], jnp.float32, PINNED[0])
 
 
-def every_backward_config_on_a_gpu(config, case):
+def every_backward_config_on_a_gpu(case):
     """Every tile a derivation or a pin may run (`BACKWARD_TILES`), bf16, a softcap, sinks and
     ALiBi, over causal documents under a window and over the irregular full and causal calls (`IRREGULAR`):
-    each the launch holds at the call (`TritonBackward.legal`: its threads within their registers, its
-    programs within a block's shared memory) on par with the reference, and each other refused where it is
-    pinned (`tuning.Unpinnable`), so no call runs it."""
+    those the launch holds at the call (`TritonBackward.legal`: its threads within their registers, its
+    programs within a block's shared memory) on par with the reference in one check, and each other
+    refused where it is pinned (`tuning.Unpinnable`), so no call runs it."""
     import tokamax
 
     from dew.nn.kernels import generation
@@ -691,19 +707,23 @@ def every_backward_config_on_a_gpu(config, case):
               "key": jax.ShapeDtypeStruct((ROWS, keys, 2, 32), jnp.bfloat16),
               "value": jax.ShapeDtypeStruct((ROWS, keys, 2, 32), jnp.bfloat16)}
     op = attention_triton.TritonBackward()
-    takes = op.legal(tokamax.BoundArguments(op, arrays), config, generation.gpu_target())
     tiles = attention_triton.Tiles
 
-    def run():
-        check_backward(call, SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16,
-                       tiles(config.block_q, config.block_k, config.dq_warps, config.dq_stages),
-                       tiles(config.block_q, config.block_k, config.dkv_warps, config.dkv_stages))
+    def pair(config):
+        return (tiles(config.block_q, config.block_k, config.dq_warps, config.dq_stages),
+                tiles(config.block_q, config.block_k, config.dkv_warps, config.dkv_stages))
 
-    if takes:
-        run()
-    else:
-        with pytest.raises(tuning.Unpinnable):
-            run()
+    def run(configs):
+        check_backward_each(call, SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16, configs)
+
+    target = generation.gpu_target()
+    taken = [config for config in BACKWARD_TILES
+             if op.legal(tokamax.BoundArguments(op, arrays), config, target)]
+    run([pair(config) for config in taken])
+    for config in BACKWARD_TILES:
+        if config not in taken:
+            with pytest.raises(tuning.Unpinnable):
+                run([pair(config)])
 
 
 STAGED_CALLS = {

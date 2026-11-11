@@ -18,8 +18,9 @@ from pathlib import Path
 from dew.config.release import Release
 from dew.decision.calibration import Calibration
 from dew.decision.layout import Layout
+from dew.interop.release import ReleaseDtypes, ReleaseTask
 from dew.nn.precision import Numerics
-from dew.registry import from_record, to_record
+from dew.registry import dtype_name, from_record, to_record
 
 
 def decision_envelope(held: Release, layout: Layout | None = None, calibration: Calibration | None = None, *,
@@ -33,9 +34,8 @@ def decision_envelope(held: Release, layout: Layout | None = None, calibration: 
     builds the task in (`dew.interop.release.released`). A task declaration `held` states stays as it is."""
     stated = None if layout is None else _record(to_record(layout, Layout))
     calibrated = None if calibration is None else _record(to_record(calibration, Calibration))
-    task = held.task if held.task is not None or compute is None else {
-        "numerics": None if numerics is None else to_record(numerics, Numerics),
-        "dtypes": {"compute": compute}}
+    task = held.task if held.task is not None or compute is None else ReleaseTask(
+        numerics=numerics, dtypes=ReleaseDtypes(dtype_name(compute))).record()
     return replace(held, task=task, layout=stated, max_length=max_length, calibration=calibrated)
 
 

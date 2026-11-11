@@ -138,20 +138,19 @@ class PolicyCollector:
     def rows(self, tasks: int, samples: int) -> int:
         return tasks * samples
 
-    def _prepared(self, tasks: Sequence[Task]) -> tuple[list[PromptTask], int, ModelInputs]:
-        """The tasks' prompts, the width they pad to and the inputs the policy is given."""
+    def _prepared(self, tasks: Sequence[Task]) -> tuple[list[PromptTask], ModelInputs]:
+        """The tasks' prompts and the inputs the policy is given, padded to the widest."""
         prompts = [PromptTask.of(task) for task in tasks]
-        width = max(prompt.width for prompt in prompts)
         rows, fields = pad_token_rows([prompt.ids for prompt in prompts], pad_id=self.sampling.pad,
-                                      width=width)
-        return prompts, width, ModelInputs(jnp.asarray(rows), {name: jnp.asarray(value)
-                                                               for name, value in fields.items()})
+                                      width=max(prompt.width for prompt in prompts))
+        return prompts, ModelInputs(jnp.asarray(rows), {name: jnp.asarray(value)
+                                                        for name, value in fields.items()})
 
     def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> list[list[Session]]:
         # Every process of the mesh validates its prompts before generation enters its collectives.
         mesh = mesh_of(snapshot.variables)
-        prompts, width, inputs = (self._prepared(tasks) if mesh is None
-                                  else agreed("rollout input preparation", lambda: self._prepared(tasks)))
+        prompts, inputs = (self._prepared(tasks) if mesh is None
+                           else agreed("rollout input preparation", lambda: self._prepared(tasks)))
         # The policy the step's loss reads, at the updates the run committed (`Objective.progress`), whose
         # likelihoods are the proximal column's.
         progress = Progress(jnp.asarray(snapshot.updates, jnp.int32))
@@ -161,23 +160,13 @@ class PolicyCollector:
             # A share's later reader drew its part of the program; the first reader scores the share.
             return []
 
-        def grouped(values: np.ndarray) -> np.ndarray:
-            return values.reshape(len(prompts), samples, *values.shape[1:])
-
-        sampled = grouped(generated.tokens[:, width:])
-        counts, terminated = grouped(generated.lengths), grouped(generated.terminated)
-        raw, behavior = grouped(generated.raw_log_probs), grouped(generated.behavior_log_probs)
         collected = []
         for row, (task, prompt) in enumerate(zip(tasks, prompts, strict=True)):
             sessions = []
             for sample in range(samples):
-                count = int(counts[row, sample])
-                tokens = tuple(int(token) for token in sampled[row, sample, :count])
-                drawn, proximal = (tuple(float(value) for value in values[row, sample, :count])
-                                   for values in (behavior, raw))
-                finish = "stop" if terminated[row, sample] else "length"
-                draw = Draw(prompt.ids, tokens, drawn, finish, snapshot.updates, proximal)
-                text = self.decode(list(response(tokens, self.sampling)))
+                # A prompt's `samples` continuations are consecutive rows (`Generation`).
+                draw = Draw.generated(prompt.ids, generated, row * samples + sample, snapshot.updates)
+                text = self.decode(list(response(draw.tokens, self.sampling)))
                 sessions.append(scored_draw(task.id, sample, Call.of(draw), text, prompt.record, self.reward))
             collected.append(sessions)
         return collected

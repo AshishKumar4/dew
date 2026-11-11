@@ -1190,12 +1190,17 @@ TILE = (1024, 8192)
 
 # A Gemma-sized vocabulary's float64 truth over the seeds its softcapped cases need is numeric work at
 # model size, a GPU's: on a CPU each case takes about eleven minutes.
-def a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits(chunks, softcap):
+CHUNKS = (4, 16)
+"""The chunk counts the Gemma-sized head is held at, each its own kernels' launches."""
+
+
+def a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits(softcap):
     """Losses, log partitions and the gradients of both the states and the head of a weighted loss,
-    chunked, on par with the full-vocabulary pass's from float64 over drawn heads and targets, the
-    first seven on the chunks' boundaries (check 1). The head's logits have a standard deviation of
-    3, so the partition is carried by a few hundred columns scattered over every chunk rather than
-    by all of them equally or by one."""
+    chunked at each of `CHUNKS`, on par with the full-vocabulary pass's from float64 over drawn heads and
+    targets, the first seven on the chunks' boundaries (check 1): one check of every chunking at once,
+    so each draw's whole-vocabulary pass and its float64 truth are computed once for all of them. The
+    head's logits have a standard deviation of 3, so the partition is carried by a few hundred columns
+    scattered over every chunk rather than by all of them equally or by one."""
     tokens, features = 32, 64
 
     def draw(seed):
@@ -1216,10 +1221,18 @@ def a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits(chunks, softcap):
             return jnp.sum(weights * losses), (losses, log_z)
         return loss
 
+    def each(run):
+        # The whole pass is the same for every chunking: computed once, read at each one's leaves.
+        def ran(*arguments):
+            outputs = run(*arguments)
+            return dict.fromkeys(CHUNKS, outputs)
+        return ran
+
     # The weights are the loss's; its cotangent, a scalar's, the draw's.
-    assert_as_exact(jax.jit(pulled(scored(chunks), has_aux=True)),
-                    jax.jit(pulled(scored(None), has_aux=True)),
-                    with_cotangent(draw, scored(None), has_aux=True), f"{chunks} {softcap} gemma vocabulary",
+    assert_as_exact(jax.jit(lambda *arguments: {count: pulled(scored(count), has_aux=True)(*arguments)
+                                                for count in CHUNKS}),
+                    jax.jit(each(pulled(scored(None), has_aux=True))),
+                    with_cotangent(draw, scored(None), has_aux=True), f"{softcap} gemma vocabulary",
                     seeds=SEEDS["gemma"])
 
 

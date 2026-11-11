@@ -46,7 +46,7 @@ from dew.nn.kernels.templates.attention import (
     whole,
 )
 from dew.nn.kernels.templates.cost import estimate
-from dew.nn.programs import CALLS, called, equations
+from dew.nn.programs import called, equations
 
 
 def few_rows(family: mosaic.Family, rows: int | None) -> bool:
@@ -102,6 +102,44 @@ def layouts(generation_name: str | None, dtype, rows: int | None = None) -> tupl
         return ()
     return tuple(family for family in bundles.layouts(generation_name, dtype, rows, scoped=True, tpu=True)
                  if qualified(family))
+
+
+def runs_backward(family: mosaic.Family) -> bool:
+    """Whether the attention backward's launches run on `family`: one the mainloop qualifies (`qualified`)
+    whose issuer keeps no product scratch a launch scopes (`scopes_products` not: the backward's launches
+    scope none; its tcgen05 form is row 4839's tensor-memory backward). Its dQ launch streams through a
+    producer, which a family whose consumers feed their own rings has not (`split_queries`): there the one
+    launch, queries first, alone (`MosaicBackward.legal`)."""
+    return qualified(family) and not scopes_products(family)
+
+
+def fuses(accurate: bool, parametrized: bool) -> bool:
+    """Whether the backward's one launch takes a call of its form: the fast form's under no score hook with
+    parameters, whose gradients no launch writes (`MosaicBackward.legal`); the accurate form and a hook with
+    parameters take the two launches alone, the dQ launch's producer among them."""
+    return not accurate and not parametrized
+
+
+def backward_layouts(generation_name: str | None, dtype) -> tuple[mosaic.Family, ...]:
+    """The bundles the backward's launches take on a device of `generation_name` for operands of `dtype`, in
+    preference order (`bundles.layouts`, unscoped, `runs_backward`): a B200's and consumer Blackwell's the
+    mma.sync rings their consumers feed alone; none where the device has none."""
+    if generation_name is None:
+        return ()
+    return tuple(filter(runs_backward, bundles.layouts(generation_name, dtype, tpu=True)))
+
+
+def backward_bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
+    """The bundle the backward's dQ launch, or its one launch, runs on (`backward_layouts`' first), None
+    where the device has none."""
+    return next(iter(backward_layouts(generation_name, dtype)), None)
+
+
+def loads_parts(family: mosaic.Family) -> bool:
+    """Whether a forward's fp32 parts load on `family`: a copy each into a slot's rows (`rings.Pieces`), which
+    a producer's loads take (`Transport.copies_in_pieces`) and neither a consumer's own ring
+    (`Transport.feeds_itself`) nor cp.async's pipeline does."""
+    return family.copies_in_pieces and not family.feeds_itself
 
 
 def query_rows(family: mosaic.Family, dtype, rows: int) -> int:
@@ -497,8 +535,9 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     return None
 
 
-APPROXIMATED = frozenset({"exp", "exp2", "log", "log2", "log1p", "tanh", "logistic", "sin", "cos", "sqrt",
-                          "rsqrt", "pow"})
+APPROXIMATED = frozenset({jax.lax.exp_p, jax.lax.exp2_p, jax.lax.log_p, jax.lax.log2_p, jax.lax.log1p_p,
+                          jax.lax.tanh_p, jax.lax.logistic_p, jax.lax.sin_p, jax.lax.cos_p, jax.lax.sqrt_p,
+                          jax.lax.rsqrt_p, jax.lax.pow_p})
 """The operations Mosaic GPU computes in the hardware's approximate forms under `approx_math` (its lowering's
 exp, exp2, log, log2, tanh, sin, cos, sqrt and rsqrt; jax's logistic, log1p and pow lower through them)."""
 
@@ -560,8 +599,8 @@ def _off_tile(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
         if any(getattr(var.aval, "shape", ()) not in ((), tile) for var in (*eqn.invars, *eqn.outvars)):
             return True
         nested = list(jax_core.jaxprs_in_params(eqn.params))
-        called = ("jaxpr" in eqn.params or "call_jaxpr" in eqn.params) and len(nested) == 1
-        if nested and not (called and not _off_tile(nested[0], tile)):
+        on_tile = eqn.primitive.inlined_call and len(nested) == 1 and not _off_tile(nested[0], tile)
+        if nested and not on_tile:
             return True
     return False
 
@@ -713,7 +752,7 @@ def _tangent_reach(jaxpr: jax_core.Jaxpr, starts: set) -> tuple[bool, set]:
     for equation in jaxpr.eqns:
         hit = [index for index, var in enumerate(equation.invars)
                if not isinstance(var, jax_core.Literal) and var in reached]
-        if not hit or equation.primitive.name == "stop_gradient":
+        if not hit or equation.primitive is jax_core.primitives.stop_gradient_p:
             continue
         if equation.primitive is jax_core.primitives.custom_vjp_call_p:
             return True, set()
@@ -726,7 +765,7 @@ def _tangent_reach(jaxpr: jax_core.Jaxpr, starts: set) -> tuple[bool, set]:
             reached.update(out for out, inner_out in zip(equation.outvars, inner[0].outvars, strict=True)
                            if inner_out in outputs)
             continue
-        if any(jax_core.primitives.custom_vjp_call_p.name in _primitives(program) for program in inner):
+        if any(jax_core.primitives.custom_vjp_call_p in _primitives(program) for program in inner):
             return True, set()
         reached.update(equation.outvars)
     return False, {var for var in jaxpr.outvars if not isinstance(var, jax_core.Literal) and var in reached}
@@ -773,7 +812,7 @@ def _transposable(score_mod, params: tuple) -> bool:
 
 def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -> bool:
     """Whether every operation of `jaxpr` that reads its `inputs` (by place) acts one entry at a time
-    (`dew.nn.programs.ENTRYWISE`, a scalar's broadcast, a nested call's own operations so), each value it
+    (`dew.nn.programs.entrywise`, a scalar's broadcast, a nested call's own operations so), each value it
     reads of them and each it gives a scalar or the `tile`."""
     tainted = {jaxpr.invars[index] for index in inputs}
     for eqn in jaxpr.eqns:
@@ -786,11 +825,10 @@ def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -
                   for var in (*(eqn.invars[index] for index in read), *eqn.outvars)]
         if any(shape not in ((), tile) for shape in shapes):
             return False
-        name = eqn.primitive.name
         nested = list(jax_core.jaxprs_in_params(eqn.params))
         if nested:
             # A call or a custom derivative's primal (whose rule `layout.transposed` checks).
-            if name not in CALLS or not all(
+            if not eqn.primitive.inlined_call or not all(
                     _entrywise(inner, set(read), tile) for inner in nested):
                 return False
         elif not layout.entrywise(eqn):
@@ -799,9 +837,9 @@ def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -
     return True
 
 
-def _primitives(jaxpr: jax_core.Jaxpr) -> set[str]:
-    """The names of the operations of `jaxpr` and of every jaxpr inside it (`dew.nn.programs.equations`)."""
-    return {eqn.primitive.name for eqn in equations(jaxpr)}
+def _primitives(jaxpr: jax_core.Jaxpr) -> set[jax_core.Primitive]:
+    """The operations of `jaxpr` and of every jaxpr inside it (`dew.nn.programs.equations`)."""
+    return {eqn.primitive for eqn in equations(jaxpr)}
 
 
 def _columns(array: jax.Array, unit: int) -> jax.Array:

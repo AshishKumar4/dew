@@ -72,7 +72,7 @@ import hashlib
 import logging
 import math
 import time
-from collections import deque
+from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
@@ -259,9 +259,9 @@ def _seed(key: int | jax.Array, impl: str) -> int | jax.Array:
     return jax.random.key_data(typed)
 
 
-@functools.partial(outer_program, static_argnums=(4,))
+@functools.partial(outer_program, static_argnums=(5,))
 def _row_keys(keys: tuple[jax.Array | np.ndarray, ...], seeds: jax.Array, seeded: jax.Array,
-              folds: jax.Array, impl: str) -> jax.Array:
+              folds: jax.Array, continuations: jax.Array, impl: str) -> jax.Array:
     """One fixed-width admission's key data, without a device-to-host read:
     each row's key, `key(seed)` where it came as an integer seed, folded by
     the row's index in the batch it came in, all of the server's PRNG
@@ -269,12 +269,16 @@ def _row_keys(keys: tuple[jax.Array | np.ndarray, ...], seeds: jax.Array, seeded
     the default one). A key made here has the bits an eager
     `jax.random.key(seed)` has, so a request draws as it would alone, and
     submitting it launched nothing (each submit's own small programs left
-    the RTX 4080 idle between serving steps)."""
-    def folded(row: jax.Array, fold: jax.Array) -> jax.Array:
-        return jax.random.key_data(jax.random.fold_in(jax.random.wrap_key_data(row, impl=impl), fold))
+    the RTX 4080 idle between serving steps). A row that is a request's
+    continuation `c` past its first (`TextGeneration.n`) folds its key by
+    `c` again, as `continuation_keys` folds a call's row's."""
+    def folded(row: jax.Array, fold: jax.Array, continuation: jax.Array) -> jax.Array:
+        key = jax.random.fold_in(jax.random.wrap_key_data(row, impl=impl), fold)
+        again = jax.random.key_data(jax.random.fold_in(key, continuation))
+        return jnp.where(continuation > 0, again, jax.random.key_data(key))
 
     made = jax.vmap(lambda seed: jax.random.key_data(jax.random.key(seed, impl=impl)))(seeds)
-    return jax.vmap(folded)(jnp.where(seeded[:, None], made, jnp.stack(keys)), folds)
+    return jax.vmap(folded)(jnp.where(seeded[:, None], made, jnp.stack(keys)), folds, continuations)
 
 
 @dataclass(eq=False)
@@ -288,6 +292,9 @@ class _Row:
     fold: int
     """What the row's key is folded by: its index in the batch it came in."""
     ticket: Ticket
+    continuation: int = 0
+    """Which of its request's continuations the row draws (`TextGeneration.n`), its key folded by it past
+    the first (`_row_keys`)."""
     tokens: list[int] = field(default_factory=list)
     behavior: list[float] = field(default_factory=list)
     raw: list[float] = field(default_factory=list)
@@ -533,20 +540,20 @@ Rows = DenseRows | PagedRows
 
 
 def _refuse_unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bool = False,
-                           prefix: bool = False, mixed: bool = False) -> None:
+                           prefix: bool = False) -> None:
     """Refuse the serving modes that would change what `model` computes: a prompt prefilled in
     pieces or after a reused prefix where the model takes each prompt whole
-    (`Serving.split_prefill_refusal`), and a paged or mixed cache where LongRoPE rebuilds a crossing
-    request's (`rebuild_position`)."""
+    (`Serving.split_prefill_refusal`), and a paged cache where LongRoPE rebuilds a crossing request's
+    (`rebuild_position`). A mixed admitting step it takes only where the model's own mixed refusal
+    says none (`mixed_refusal`, LongRoPE's among them)."""
     whole = model.split_prefill_refusal() if isinstance(model, Serving) else None
     split = [name for name, active in (('chunked prefill', chunked), ('prefix reuse', prefix)) if active]
     if whole is not None and split:
         raise ValueError(f'{" and ".join(split)} would change what this model computes: {whole}')
     position = rebuild_position(model)
-    rebuilt = [name for name, active in (('paged', paged), ('mixed admission', mixed)) if active]
-    if position is not None and rebuilt:
-        raise ValueError(f'LongRoPE crossing position {position} cannot rebuild {", ".join(rebuilt)} '
-                         'serving; use whole-prompt dense admission')
+    if position is not None and paged:
+        raise ValueError(f'LongRoPE crossing position {position} cannot rebuild paged serving; use '
+                         'whole-prompt dense admission')
 
 
 def _served_mesh(task: TextGeneration) -> Mesh | None:
@@ -582,13 +589,14 @@ class Server:
                  grammar: Grammar | None, rows: Rows, slots: int, capacity: int, admission: int,
                  default_budget: int | None, max_length: int | None, decode_steps: int,
                  prefix: int | Literal["prompt"] | None = None, precision: Numerics | None = None,
-                 progress: Progress = END, prefill_mesh: Mesh | None = None) -> None:
+                 progress: Progress = END, prefill_mesh: Mesh | None = None, n: int = 1) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
+        # The continuations a request draws (`TextGeneration.n`), each a row of its own.
+        self.n = _counted(n)
         _refuse_unserved_modes(
             model, paged=isinstance(rows, PagedRows), chunked=rows.chunk is not None,
-            prefix=isinstance(rows, PagedRows) and any(part.prefix_cache for part in rows.pages),
-            mixed=rows.placement.mixed)
+            prefix=isinstance(rows, PagedRows) and any(part.prefix_cache for part in rows.pages))
         if type(decode_steps) is not int or decode_steps < 1:
             raise ValueError("decode_steps must be a positive number of iterations per device call")
         variables = resident(model, variables)
@@ -726,6 +734,12 @@ class Server:
         """The (slot, entry) pairs the next call restores before it runs: rows seated after a prefix, up
         to every slot, whether or not their first piece goes in that call."""
         self._captures: list[tuple[int, int]] = []
+        self._dropped: Counter[Ticket] = Counter()
+        """Each request cancelled while it waited whose continuations are not all dropped yet: how many are
+        (`_seat`)."""
+        self._gathering: dict[Ticket, dict[int, Generation[np.ndarray]]] = {}
+        """Each request drawing several continuations whose rows are not all finished: their generations
+        by continuation (`_finish`)."""
         """The (slot, entry) pairs whose state the last call left at a kept boundary."""
         rows = self.rows
         if isinstance(rows, PagedRows) and rows.stateful:
@@ -843,8 +857,6 @@ class Server:
         run's, and `reload` moves it to the version it serves.
         """
         mesh = _served_mesh(task)
-        if task.n != 1:
-            raise ValueError("a served request draws one continuation; submit a prompt once per draw")
         policy, chain, criteria = task._controls(None, None, None)
         transforms, stopping, strategy = resolve(policy, chain, criteria, task.strategy)
         plan = _served_plan(strategy, mesh, chunk, prefix_cache)
@@ -883,7 +895,7 @@ class Server:
             default_budget=task.max_new_tokens,
             max_length=task.max_length,
             decode_steps=decode_steps, prefix=task.prefix, precision=task.precision, progress=task.progress,
-            prefill_mesh=prefill_mesh,
+            prefill_mesh=prefill_mesh, n=task.n,
         )
 
     @property
@@ -977,7 +989,18 @@ class Server:
 
     def _enqueued(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array,
                   fold: int, adapter: str | None = None, shared: int | None = None) -> Ticket:
-        row = self._prepared(prompt, max_new_tokens, seed, fold, adapter, shared)
+        """A request queued: one row, or where the task draws `n` continuations of a prompt, `n` rows, each
+        a continuation (`_Row.continuation`) with its own tokens and pages, all on the request's one ticket,
+        which the first seated claims (`_seat`) and the last finished settles with their generations in
+        order (`_finish`)."""
+        first = self._prepared(prompt, max_new_tokens, seed, fold, adapter, shared)
+        ticket = self._queued(first)
+        for continuation in range(1, self.n):
+            row = self._prepared(prompt, max_new_tokens, seed, fold, adapter, shared)
+            self._queued(dataclasses.replace(row, ticket=ticket, continuation=continuation))
+        return ticket
+
+    def _queued(self, row: _Row) -> Ticket:
         if row.budget:
             self._waiting.append(row)
         else:
@@ -1381,12 +1404,19 @@ class Server:
         # was read is seated too, and is admitted after it was submitted.
         now = time.perf_counter()
         for slot, row in seated:
-            if not row.ticket.set_running_or_notify_cancel():
-                # Cancelled while it waited: its slot stays free, and its reservation goes back.
+            # A request's first seated continuation claims its ticket, which can no longer be cancelled.
+            if row.ticket in self._dropped or (not row.ticket.running()
+                                               and not row.ticket.set_running_or_notify_cancel()):
+                # Cancelled while it waited: its slot stays free, and its reservation goes back; each of its
+                # continuations is dropped so, its ticket told once.
+                self._dropped[row.ticket] += 1
+                if self._dropped[row.ticket] == self.n:
+                    del self._dropped[row.ticket]
                 self.rows.release(row)
                 continue
             self.prefix_hits += row.prefilled
-            row.ticket.admitted = now
+            if row.ticket.admitted is None:
+                row.ticket.admitted = now
             self._rows[slot] = row
             if row.restore is not None:
                 self._restores.append((slot, row.restore))
@@ -1431,6 +1461,7 @@ class Server:
         seeds = np.zeros((count,), np.int64)
         seeded = np.zeros((count,), bool)
         folds = np.zeros((count,), np.int32)
+        continuations = np.zeros((count,), np.int32)
         tables = np.zeros((count, self.rows.width), np.int32)
         cursors = np.zeros((count,), np.int32)
         final = np.zeros((count,), bool)
@@ -1453,6 +1484,7 @@ class Server:
             for name, held in row.groups.items():
                 pieces[name][index, width - len(piece):] = held[row.prefilled:row.prefilled + len(piece)]
             slots[index], budgets[index], folds[index] = slot % size, row.budget, row.fold
+            continuations[index] = row.continuation
             if isinstance(row.seed, int):
                 seeds[index], seeded[index] = row.seed, True
             else:
@@ -1476,7 +1508,7 @@ class Server:
             valid,
             slots,
             budgets,
-            _row_keys(tuple(keys), seeds, seeded, folds, self.prng),
+            _row_keys(tuple(keys), seeds, seeded, folds, continuations, self.prng),
             tables,
             cursors,
             final,
@@ -1524,7 +1556,7 @@ class Server:
                 kept = np.flatnonzero(draws.drawn[step, slot])
                 if not len(kept):
                     continue
-                if not row.tokens:
+                if row.ticket.first is None:
                     row.ticket.first = now
                 row.tokens.extend(int(token) for token in draws.token[step, slot, kept])
                 row.behavior.extend(float(value) for value in draws.behavior[step, slot, kept])
@@ -1534,18 +1566,24 @@ class Server:
                     del self._rows[slot]
                     self.rows.release(row)
                     del drew[slot]
-                    row.ticket._drew(row.tokens)
+                    _streamed(row)
                     self._finish(row, terminated=bool(draws.ended[step, slot]))
         for row in drew.values():
-            row.ticket._drew(row.tokens)
+            _streamed(row)
 
     def fail(self, failure: BaseException) -> None:
         """Stop after `failure`: every waiting and running request settles with it, and a later
         submission or step is refused."""
         waiting = self._waiting.failed(failure, *self._rows.values())
         self._rows.clear()
-        for row in waiting:
-            settled(row.ticket, failure)
+        self._gathering.clear()
+        # A request cancelled while it waited whose first dropped continuation told its ticket so is done;
+        # one never seated is told now (`settled`), each ticket once, its continuations sharing it.
+        told = set(self._dropped)
+        self._dropped.clear()
+        for ticket in dict.fromkeys(row.ticket for row in waiting):
+            if ticket not in told:
+                settled(ticket, failure)
 
     def _finish(self, row: _Row, *, terminated: bool) -> None:
         budget = row.budget
@@ -1556,11 +1594,38 @@ class Server:
         drawn[0, :count] = row.tokens
         behavior[0, :count] = row.behavior
         raw[0, :count] = row.raw
-        decoder = None if self.processor is None else functools.partial(decoded_rows, self.processor)
+        generation = Generation(np.concatenate([row.prompt[None], drawn], axis=1),
+                                np.array([count], np.int32), np.array([terminated]), behavior, raw, rows=1,
+                                decoder=self._decoder)
+        held = self._gathering.setdefault(row.ticket, {})
+        held[row.continuation] = generation
+        if len(held) < self.n:
+            return
+        del self._gathering[row.ticket]
         row.ticket.finished = time.perf_counter()
-        settled(row.ticket, Generation(
-            np.concatenate([row.prompt[None], drawn], axis=1), np.array([count], np.int32),
-            np.array([terminated]), behavior, raw, rows=1, decoder=decoder))
+        # The continuations' rows in order, each declared leaf of theirs joined (`Generation`'s pytree).
+        settled(row.ticket, jax.tree.map(lambda *leaves: np.concatenate(leaves),
+                                         *(held[continuation] for continuation in range(self.n)))
+                .replace(rows=self.n))
+
+    @functools.cached_property
+    def _decoder(self) -> Callable[[ArrayLike, ArrayLike, int], tuple[str, ...]] | None:
+        """A generation's text decoder, one for the server, so its continuations' generations join."""
+        return None if self.processor is None else functools.partial(decoded_rows, self.processor)
+
+
+def _counted(n: int) -> int:
+    """`n`, a request's count of continuations, refused where it is no positive integer."""
+    if type(n) is not int or n < 1:
+        raise ValueError("n must be a positive integer number of continuations")
+    return n
+
+
+def _streamed(row: _Row) -> None:
+    """A row's tokens so far to its ticket's readers (`Ticket.tokens`): a request's first continuation's,
+    which alone it streams."""
+    if row.continuation == 0:
+        row.ticket._drew(row.tokens)
 
 
 def _local_groups(rows: NamedSharding | None, slots: int, groups: int) -> tuple[int, ...]:

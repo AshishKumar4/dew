@@ -18,18 +18,22 @@ def convert(directory):
     directory = Path(directory)
     from safetensors.numpy import load_file
 
-    from dew.interop.diffusion import write_flax_component
+    from dew.interop.diffusion import Declared, write_flax_component
     from dew.interop.safetensors_io import write_file
     index = json.loads((directory / "model_index.json").read_text())
-    for component in ("unet", "vae", "text_encoder", "text_encoder_2", "safety_checker"):
+    # Each Flax component the pipeline declares (its entries' others are its own fields, `_name_or_path`),
+    # its weight files named as the library its entry names writes them.
+    for component, entry in index.items():
         folder = directory / component
-        flax_file = folder / ("diffusion_flax_model.msgpack" if component in ("unet", "vae") else "flax_model.msgpack")
-        declared = index.get(component, [None, None])
-        if not declared[1] or not declared[1].startswith("Flax"):
+        if not (isinstance(entry, list) and folder.is_dir()):
             continue
-        filename = "diffusion_pytorch_model.safetensors" if component in ("unet", "vae") else "model.safetensors"
+        declared = Declared.of(entry, component)
+        if not declared.name.startswith("Flax"):
+            continue
+        flax_file = folder / declared.flax_file
+        filename = f"{declared.stem}.safetensors"
         if not flax_file.is_file():
-            write_flax_component(directory, component, load_file(folder / filename))
+            write_flax_component(directory, component, declared, load_file(folder / filename))
             continue
         tensors = {}
         for path, value in flatten_dict(serialization.msgpack_restore(flax_file.read_bytes())).items():
@@ -46,10 +50,10 @@ def convert(directory):
                 if part not in ("linear_1", "linear_2"):
                     part = re.sub(r"_(\d+)$", r".\1", part)
                 if component == "vae":
-                    part = {"query": "to_q", "key": "to_k", "value": "to_v", "proj_attn": "to_out.0"}.get(part, part)
+                    renamed = {"query": "to_q", "key": "to_k", "value": "to_v", "proj_attn": "to_out.0"}
+                    part = renamed.get(part, part)
                 names.append(part)
             tensors[".".join(names)] = np.ascontiguousarray(value)
-        filename = "diffusion_pytorch_model.safetensors" if component in ("unet", "vae") else "model.safetensors"
         write_file(tensors, folder / filename, {"format": "pt"})
     print(directory, "canonical safetensors ready")
 

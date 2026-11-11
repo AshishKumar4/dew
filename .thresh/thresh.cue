@@ -148,14 +148,14 @@ seams: "grouped-cells": {
 	paths:   ["src/dew/nn/kernels/grouped_matmul.py"]
 	entries: "DECLARED"
 	declared: {
-		"(mma.sync, dense forward)":          "XLA's dense forward on an A100 (DENSE1)"
-		"(mma.sync, dense input_gradient)":   "XLA's dense input gradient on an A100 (DENSE1)"
-		"(mma.sync, dense kernel_gradient)":  "XLA's dense kernel gradient on an A100 (DENSE1)"
-		"(wgmma, grouped forward)":           "CUTLASS's grouped forward on an H100 (PAIR1-h100)"
-		"(wgmma, grouped input_gradient)":    "CUTLASS's grouped input gradient on an H100 (PAIR1-h100)"
-		"(wgmma, dense forward)":             "XLA's dense forward on an H100 (DENSE1)"
-		"(wgmma, dense input_gradient)":      "XLA's dense input gradient on an H100 (DENSE1)"
-		"(wgmma, dense kernel_gradient)":     "XLA's dense kernel gradient on an H100 (DENSE1)"
+		"(mma.sync, Kind(dense=True, made=Made.FORWARD))":          "XLA's dense forward on an A100 (DENSE1)"
+		"(mma.sync, Kind(dense=True, made=Made.INPUT_GRADIENT))":   "XLA's dense input gradient on an A100 (DENSE1)"
+		"(mma.sync, Kind(dense=True, made=Made.KERNEL_GRADIENT))":  "XLA's dense kernel gradient on an A100 (DENSE1)"
+		"(wgmma, Kind(dense=False, made=Made.FORWARD))":           "CUTLASS's grouped forward on an H100 (PAIR1-h100)"
+		"(wgmma, Kind(dense=False, made=Made.INPUT_GRADIENT))":    "CUTLASS's grouped input gradient on an H100 (PAIR1-h100)"
+		"(wgmma, Kind(dense=True, made=Made.FORWARD))":             "XLA's dense forward on an H100 (DENSE1)"
+		"(wgmma, Kind(dense=True, made=Made.INPUT_GRADIENT))":      "XLA's dense input gradient on an H100 (DENSE1)"
+		"(wgmma, Kind(dense=True, made=Made.KERNEL_GRADIENT))":     "XLA's dense kernel gradient on an H100 (DENSE1)"
 	}
 }
 
@@ -177,7 +177,8 @@ seams: "nvfp4-cells": {
 	paths:   ["src/dew/nn/kernels/gemm.py"]
 	entries: "NVFP4_CELLS"
 	declared: {
-		"(sm80, decode)": "the packed kernel at 1-64 rows on an A100 (PACKED_FASTER, W13-a100-4-M-NS-8b-a100)"
+		"(sm80, PackedRows.DECODE)": "the packed kernel at 1-64 rows on an A100 (PACKED_FASTER, W13-a100-4-M-NS-8b-a100)"
+		"(sm90, PackedRows.DECODE)": "the packed kernel at 1-64 rows on a GH200 (PACKED_FASTER_SM90, W7-gh200-8-M-NS-8-h100)"
 	}
 }
 
@@ -187,10 +188,10 @@ seams: "norm-cells": {
 	paths:   ["src/dew/nn/kernels/norm_swiglu.py"]
 	entries: "NORM_CELLS"
 	declared: {
-		"(sm80, bfloat16)": "the fused norm in bf16 on an A100 (FUSED_FASTER, 14a0df682)"
-		"(sm90, bfloat16)": "the fused norm in bf16 on an H100 (FUSED_FASTER, 14a0df682)"
-		"(sm80, float16)":  "the fused norm in fp16 on an A100 (FP16_NORM_FASTER, FSNORM16)"
-		"(sm90, float16)":  "the fused norm in fp16 on an H100 (FP16_NORM_FASTER, FSNORM16)"
+		"(sm80, NormRows(jnp.dtype(jnp.bfloat16), narrow=True))": "the fused norm in bf16 on an A100 (FUSED_FASTER, 14a0df682)"
+		"(sm90, NormRows(jnp.dtype(jnp.bfloat16), narrow=True))": "the fused norm in bf16 on an H100 (FUSED_FASTER, 14a0df682)"
+		"(sm80, NormRows(jnp.dtype(jnp.float16), narrow=True))":  "the fused norm in fp16 on an A100 (FP16_NORM_FASTER, FSNORM16)"
+		"(sm90, NormRows(jnp.dtype(jnp.float16), narrow=True))":  "the fused norm in fp16 on an H100 (FP16_NORM_FASTER, FSNORM16)"
 	}
 }
 
@@ -200,8 +201,8 @@ seams: "swiglu-cells": {
 	paths:   ["src/dew/nn/kernels/norm_swiglu.py"]
 	entries: "SWIGLU_CELLS"
 	declared: {
-		"(sm80, bfloat16)": "the fused SiLU product in bf16 on an A100 (FUSED_FASTER, 14a0df682)"
-		"(sm90, bfloat16)": "the fused SiLU product in bf16 on an H100 (FUSED_FASTER, 14a0df682)"
+		"(sm80, jnp.dtype(jnp.bfloat16))": "the fused SiLU product in bf16 on an A100 (FUSED_FASTER, 14a0df682)"
+		"(sm90, jnp.dtype(jnp.bfloat16))": "the fused SiLU product in bf16 on an H100 (FUSED_FASTER, 14a0df682)"
 	}
 }
 

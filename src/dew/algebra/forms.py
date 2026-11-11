@@ -106,15 +106,6 @@ class Refused(ValueError):
     """A declaration the derivation cannot express as monoids along its walked axis, and why."""
 
 
-def read_by(jaxpr: jcore.Jaxpr, sinks: set) -> set:
-    """The values `sinks` read, themselves included."""
-    read = set(sinks)
-    for equation in reversed(jaxpr.eqns):
-        if any(var in read for var in equation.outvars):
-            read.update(var for var in equation.invars if isinstance(var, jcore.Var))
-    return read
-
-
 def evaluate(closed, env: dict, needed: set) -> None:
     """Each equation an output of which is `needed` and not yet in `env`, evaluated into it in order."""
     def read(atom):
@@ -195,7 +186,7 @@ def inlined(function: Callable) -> Callable:
     return run
 
 
-PLACEMENTS = frozenset({"reshard", "sharding_constraint", "mesh_cast"})
+PLACEMENTS = (jcore.primitives.reshard_p, jax.lax.sharding_constraint_p)
 """The equations that place a value on a mesh and leave it as it is (each output its operand), taken as
 the identity where a walk's tiles are traced (`evaluated_inline`)."""
 
@@ -211,14 +202,14 @@ def _platform_default(equation: jcore.JaxprEqn,
     (dew.nn.precision), the same bf16 bits through a CUDA cast, an S5 scan scanned or chunked (dew.nn.ssm),
     and a kernel or its portable fallback (dew.nn.kernels.gemm). A program's own choices may compute
     different functions, and stay as written."""
-    if equation.primitive.name != "cond" or not equation.invars:
+    if equation.primitive is not jax.lax.cond_p or not equation.invars:
         return None
     index = equation.invars[0]
     chooser = producers.get(index) if isinstance(index, jcore.Var) else None
-    if chooser is None or chooser.primitive.name != "platform_index":
+    if chooser is None or chooser.primitive is not jcore.primitives.platform_index_p:
         return None
     platforms = chooser.params["platforms"]
-    return equation.params["branches"][platforms.index(None)] if None in platforms else None
+    return programs.branches(equation)[platforms.index(None)] if None in platforms else None
 
 
 def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
@@ -239,7 +230,7 @@ def evaluated_inline(jaxpr: jcore.Jaxpr, consts, values) -> list:
         elif (called := programs.called(equation)) is not None:
             # A call's program (`dew.nn.programs.called`), its constants with it.
             outs = evaluated_inline(called.jaxpr, called.consts, [read(atom) for atom in equation.invars])
-        elif equation.primitive.name in PLACEMENTS:
+        elif equation.primitive in PLACEMENTS:
             # Its values its operands': a tile a walk reads is placed already.
             outs = [read(atom) for atom in equation.invars]
         else:

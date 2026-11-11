@@ -63,8 +63,11 @@ if TYPE_CHECKING:
 
 _DTYPES = {"int8": 0, "uint8": 1, "int32": 2, "uint32": 3, "int64": 4, "uint64": 5, "float16": 6,
            "float32": 7, "float64": 8, "bfloat16": 9, "float8_e4m3fn": 10}
-"""`ncclDataType_t` by numpy dtype name (nccl.h; `ncclFloat8e4m3` is the code vLLM's `pynccl_wrapper`
-receives its FP8 weights as, the E4M3 a requantized FP8 source exports)."""
+"""`ncclDataType_t` by numpy dtype name, an ABI no Python package states: read from the `ncclDataType_t` enum
+of `nvidia/nccl/include/nccl.h` in nvidia-nccl-cu12 and -cu13 2.32.3 (the CUDA locks' release), the same
+block from 2.27.5 on, the first with the FP8 codes. `ncclFloat8e4m3` is the code vLLM's `pynccl_wrapper`
+receives its FP8 weights as, the E4M3 a requantized FP8 source exports; the dtypes are those a publication
+exports that its receivers take."""
 
 _SUM = 0
 """`ncclSum` (nccl.h)."""

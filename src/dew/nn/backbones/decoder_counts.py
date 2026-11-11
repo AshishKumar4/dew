@@ -13,6 +13,7 @@ from ..attention_residuals import DepthAttention
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUpLayer
 from ..hyper_connections import stream_head
+from ..norms import NormSite
 from .decoder_block import gate_flops
 from .layer_names import group_layers, layer_index
 
@@ -51,10 +52,10 @@ def _root_flops(decoder: CausalTransformer, lengths, depth_counter) -> float:
     # The gated norms outside the layers (`NormSpec.gate_rank`): the embedding's once, at the lookup's
     # width where it norms the lookup, and the final one's each time a call runs it (`final_norm_runs`).
     lookup = decoder.embedding_features if decoder.embedding_norm_reads == 'lookup' else None
-    count += gate_flops(decoder.norms, ('embedding_layernorm',) if decoder.embedding_norm else (),
+    count += gate_flops(decoder.norms, (NormSite.EMBEDDING,) if decoder.embedding_norm else (),
                         lookup or decoder.emb_features, lengths, routed=None)
-    count += final_norm_runs(decoder) * gate_flops(decoder.norms, ('norm',), decoder.emb_features, lengths,
-                                                   routed=None)
+    count += final_norm_runs(decoder) * gate_flops(decoder.norms, (NormSite.FINAL,), decoder.emb_features,
+                                                   lengths, routed=None)
     return count
 
 
@@ -121,7 +122,8 @@ def logits_flops(decoder: CausalTransformer, lengths) -> float:
         if site in ('head_dense', 'project_out') or site.startswith('continuum_'):
             count += projection_flops(lengths, *projections[site])
     if decoder.head_transform is not None:
-        count += gate_flops(decoder.norms, ('head_norm',), projections['head_dense'][1], lengths, routed=None)
+        count += gate_flops(decoder.norms, (NormSite.HEAD,), projections['head_dense'][1], lengths,
+                            routed=None)
     return count
 
 

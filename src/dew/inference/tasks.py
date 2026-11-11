@@ -609,11 +609,11 @@ _DECODER = ("dew.nn.backbones.causal_transformer:CausalTransformer", "causal_tra
 def earlier_model(record: Mapping[str, object]) -> Mapping[str, object]:
     """A record's model with each component in today's fields (`earlier_shapes`), wherever the model
     nests it through another recorded wrapper: a Qwen or MiMo projector's earlier fields (ledger 1622),
-    and a decoder's and its layer kinds' YaRN field beside their rope scaling (`_one_scaling`, ledger
-    1898), whether the decoder names its class or a wrapper declares the field it fills
-    (`MultimodalTransformer.language_model`, `DiffusionGemma.text`), which records its fields alone
-    (ledger 2274). Carried until 1.0 (ledger 1552); current constructors and source codecs accept only
-    their current schema."""
+    a decoder's and its layer kinds' YaRN field beside their rope scaling (`_one_scaling`, ledger 1898)
+    and an earlier lightning layer's place (`_placed_lightning`, ledger 2564), whether the decoder names
+    its class or a wrapper declares the field it fills (`MultimodalTransformer.language_model`,
+    `DiffusionGemma.text`), which records its fields alone (ledger 2274). Carried until 1.0 (ledger
+    1552); current constructors and source codecs accept only their current schema."""
     def current(value):
         if isinstance(value, list | tuple):
             return [current(field) for field in value]
@@ -666,18 +666,53 @@ the layer's `Mixture` alone today (`dew.nn.value_experts.RoutedValues.mixture`, 
 
 def _decoder_fields(fields: Mapping[str, object]) -> Mapping[str, object]:
     """A decoder's fields and its layer kinds' with an earlier YaRN field read as their rope scaling
-    (`_one_scaling`), an earlier cross-attention, IDEFICS's block recorded by its fields alone
-    when the field declared that class, as its class record (`dew.nn.cross_attention.CrossBlocks`,
-    ledger 2320), and earlier value experts without the layer dispatch they recorded at its defaults
-    (`_LAYER_DISPATCH`)."""
+    (`_one_scaling`), an earlier lightning layer's place as its stack hands it (`_placed_lightning`), an
+    earlier cross-attention, IDEFICS's block recorded by its fields alone when the field declared that
+    class, as its class record (`dew.nn.cross_attention.CrossBlocks`, ledger 2320), and earlier value
+    experts without the layer dispatch they recorded at its defaults (`_LAYER_DISPATCH`)."""
     kinds, cross, values = fields.get("kinds"), fields.get("cross_attention"), fields.get("value_experts")
+    types = fields.get("layer_types")
     return {**_one_scaling(fields), **({"value_experts": _without_dispatch(values)}
                                        if isinstance(values, Mapping) else {}), **({"kinds": {
-        kind: ({**held, "fields": _one_scaling(held["fields"])} if "class" in held
-               else _one_scaling(held)) if isinstance(held, Mapping) else held
+        kind: _placed_lightning(kind, {**held, "fields": _one_scaling(held["fields"])} if "class" in held
+                                else _one_scaling(held), types) if isinstance(held, Mapping) else held
         for kind, held in kinds.items()}} if isinstance(kinds, Mapping) else {}),
         **({"cross_attention": {"class": "dew.nn.cross_attention:CrossAttention", "fields": dict(cross)}}
            if isinstance(cross, Mapping) and "class" not in cross else {})}
+
+
+_LIGHTNING = "dew.nn.mixers.lightning:LightningAttentionMixer"
+"""MiniMax's lightning attention mixer's import path, as a layer kind's mixer record names it (by it or by
+its alias, `dew.registry.mixers`)."""
+
+
+def _placed_lightning(name: str, kind: Mapping[str, object], types: object) -> Mapping[str, object]:
+    """A decoder's layer kind `name` (its fields, or its class record's) whose lightning mixer an earlier
+    record stated its place in (`layer_idx`, ledger 2564: a MiniMax run saved before the stack handed each
+    layer its place had a kind for each lightning layer, and every record since wrote it None) without
+    it: the stack hands each layer of the kind its place (`MixerCall.depth`), the one the kind stated.
+    A kind stating a place other than every one `types` (the decoder's `layer_types`) builds it at, or
+    stating one beside no layer types, set rates no stack hands its layers, and is refused."""
+    body = kind["fields"] if "class" in kind and isinstance(kind.get("fields"), Mapping) else kind
+    mixer = body.get("mixer") if isinstance(body, Mapping) else None
+    record = mixer.get("fields") if isinstance(mixer, Mapping) else None
+    named = mixer.get("class", mixer.get("name")) if isinstance(mixer, Mapping) else None
+    if not (isinstance(body, Mapping) and isinstance(mixer, Mapping) and isinstance(record, Mapping)
+            and isinstance(named, str) and "layer_idx" in record):
+        return kind
+    from dew.registry import mixers
+
+    if mixers.paths.get(named, named) != _LIGHTNING:
+        return kind
+    place = record["layer_idx"]
+    places = ([index for index, layer in enumerate(types) if layer == name]
+              if isinstance(types, list | tuple) else None)
+    if place is not None and (places is None or any(index != place for index in places)):
+        raise ValueError(f"an earlier record's layer kind {name!r} states a lightning layer's place {place} "
+                         f"and builds layers {places}: rates no stack hands its layers")
+    held = {**body, "mixer": {**mixer, "fields": {field: value for field, value in record.items()
+                                                  if field != "layer_idx"}}}
+    return {**kind, "fields": held} if body is not kind else held
 
 
 def _without_dispatch(values: Mapping[str, object]) -> Mapping[str, object]:

@@ -164,6 +164,26 @@ def pytest_runtest_makereport(item, call):
         gate.SWITCHED.clear()
         outcome.get_result().user_properties.append(switched)
         item.user_properties.append(switched)
+    # What the FP8 sites this test judged below a named arm measured (`reference_error.BELOW`), the JUnit
+    # property `fp8_below`: each form's ratio to that arm and to the dequantized reference, of a pass too.
+    if call.when == "call" and gate is not None and gate.BELOW:
+        below = ("fp8_below", json.dumps(gate.BELOW))
+        gate.BELOW.clear()
+        outcome.get_result().user_properties.append(below)
+        item.user_properties.append(below)
+    # A test of a process that computes as a user's does (`lane_environment.USERS_ARITHMETIC`, set for
+    # tests/test_users_process.py's children) reports the arithmetic it ran in, the JUnit property
+    # `users_arithmetic`: whether its programs trace wide, its default matmul precision and its devices.
+    precision = sys.modules.get("dew.nn.precision")
+    users = os.environ.get(lane_environment.USERS_ARITHMETIC) == "1"
+    if call.when == "call" and users and precision is not None:
+        import jax
+
+        computed = ("users_arithmetic", json.dumps({
+            "wide_cpu_arithmetic": precision.wide_cpu_arithmetic(),
+            "matmul_precision": jax.config.jax_default_matmul_precision, "devices": jax.device_count()}))
+        outcome.get_result().user_properties.append(computed)
+        item.user_properties.append(computed)
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -307,10 +327,11 @@ def released_past_budget():
 @pytest.fixture
 def without_deterministic_ops(monkeypatch):
     """The cuda lane runs the whole suite under --xla_gpu_deterministic_ops,
-    which Dew refuses cudnn attention under (openxla/xla#46500). XLA read the
+    under which Dew's fused kernels take their ordered schedules (a
+    FlashAttention backward's atomic sum is refused there). XLA read the
     variable at the compile above, so taking the flag back out of the
     environment leaves this executable's reductions as they are and lets a
-    test reach the cudnn path it is about."""
+    test run the default schedules a user's process runs."""
     flags = os.environ.get("XLA_FLAGS", "")
     monkeypatch.setenv("XLA_FLAGS", lane_environment.without_deterministic_ops(flags))
 

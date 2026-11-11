@@ -62,11 +62,11 @@ from types import MappingProxyType
 import numpy as np
 
 from dew import _records
-from dew.interop.config_records import native_fields
+from dew.interop.codecs import CODEC_FIELDS
+from dew.interop.config_records import hf_metadata, native_fields
 from dew.interop.decoder_config import read_only
 from dew.interop.decoder_parts import (
     ACTIVATIONS,
-    CODEC_FIELDS,
     DEFAULT_MAX_SEQ_LEN,
     IGNORED_FIELDS,
     KDA_LEAVES,
@@ -313,7 +313,7 @@ def _kimi_k3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     if not isinstance(text, Mapping):
         refuse('text_config', f"the wrapper carries its decoder under text_config, got {text!r}")
     unknown = sorted(key for key in set(text) - _LINEAR_FIELDS - _K3_FIELDS - SERIALIZED_TEXT_FIELDS
-                     - set(SERIALIZED_ENCODER_FIELDS) - IGNORED_FIELDS - CODEC_FIELDS
+                     - set(SERIALIZED_ENCODER_FIELDS) - hf_metadata() - IGNORED_FIELDS - CODEC_FIELDS
                      if not str(key).startswith('_'))
     if unknown:
         refuse(f"text_config fields {unknown}", "KimiLinearConfig has no such field to compute")

@@ -272,7 +272,7 @@ def parts(update: Program, readout: Program) -> Parts:
                  correction[0] if correction else None, *found, values_read=values_read)
 
 
-_KEEPING = frozenset({"copy", "copy_p"})
+_KEEPING = (jax.lax.copy_p,)
 """Equations that keep a value's elements, dtype and shape."""
 
 
@@ -313,13 +313,13 @@ def _translated(traced: Program, atoms: list) -> Token:
 
 def _algebra(equation: jcore.JaxprEqn, operands: list[Token]) -> Token | None:
     """One equation's output as its constructor states it over its operands' terms, None where none does."""
-    name = equation.primitive.name
+    primitive = equation.primitive
     shapes = [np.shape(atom.val) if isinstance(atom, jcore.Literal) else aval(atom).shape
               for atom in equation.invars]
     after = aval(equation.outvars[0]).shape
-    if name in _KEEPING:
+    if primitive in _KEEPING:
         return operands[0]
-    if name == "convert_element_type":
+    if primitive is jax.lax.convert_element_type_p:
         # A float widened keeps every value, so its term is its operand's; any other conversion rounds (an
         # integer's truncation), so its output is no term here: a leaf where it reads no state, refused where
         # it does.
@@ -327,17 +327,17 @@ def _algebra(equation: jcore.JaxprEqn, operands: list[Token]) -> Token | None:
         widened = (jnp.issubdtype(before, jnp.floating) and jnp.issubdtype(after, jnp.floating)
                    and jnp.promote_types(before, after) == after)
         return operands[0] if widened else None
-    if name in ("mul", "add"):
-        return operands[0].times(operands[1]) if name == "mul" else operands[0].plus(operands[1])
-    if name == "sub":
+    if primitive in (jax.lax.mul_p, jax.lax.add_p):
+        return operands[0].times(operands[1]) if primitive is jax.lax.mul_p else operands[0].plus(operands[1])
+    if primitive is jax.lax.sub_p:
         return operands[0].plus(_MINUS_ONE.times(operands[1]))
-    if name == "neg":
+    if primitive is jax.lax.neg_p:
         return _MINUS_ONE.times(operands[0])
-    if name in ("exp", "exp2"):
-        return (Token.exp if name == "exp" else Token.exp2)(operands[0])
-    if name in ("broadcast_in_dim", "reshape"):
+    if primitive in (jax.lax.exp_p, jax.lax.exp2_p):
+        return (Token.exp if primitive is jax.lax.exp_p else Token.exp2)(operands[0])
+    if primitive in (jax.lax.broadcast_in_dim_p, jax.lax.reshape_p):
         return _laid(operands[0], shapes[0], after, equation.params.get("broadcast_dimensions"))
-    if name == "dot_general":
+    if primitive is jax.lax.dot_general_p:
         (contracted, batch) = equation.params["dimension_numbers"]
         contracted, ranks = tuple(map(tuple, contracted)), [len(shape) for shape in shapes]
         if tuple(map(tuple, batch)) != ((), ()):

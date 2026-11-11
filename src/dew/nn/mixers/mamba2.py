@@ -78,8 +78,9 @@ from dew.nn.linear import (
     sequence_conv,
 )
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.mixers.mamba import inverse_softplus_step
+from dew.nn.mixers.mamba import inverse_softplus_step, log_index
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum, rms_statistics, rms_weighted
+from dew.nn.residuals import Residual
 from dew.nn.sharding import sequence_shards
 
 CHUNK_SIZE = 256
@@ -319,7 +320,7 @@ class Mamba2(nn.Module):
         # The reference's init: A_log = log(1..H), dt_bias the inverse
         # softplus of a step drawn between its default time_step_min and
         # max, D ones (init_mamba2_weights, modeling_mamba2.py:428-442).
-        self.A_log = self.param('A_log', _log_head_index, (self.num_heads,))
+        self.A_log = self.param('A_log', log_index, (self.num_heads,))
         self.dt_bias = self.param('dt_bias', inverse_softplus_step, (self.num_heads,))
         self.D = self.param('D', nn.initializers.ones, (self.num_heads,), jnp.float32)
         if self.section_multipliers is not None and len(self.section_multipliers) != 5:
@@ -482,13 +483,7 @@ def _sequence_mix(mixed, dt, segments, starts, valid, weights, *, scan, dtype):
     out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, valid=valid, axis=SEQUENCE_AXIS)
     # The scan's output as `held_scan` names it, a mixer's 'context' and a recurrence's 'scan'
     # (a remat policy's `RESIDUALS`).
-    return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
-
-
-def _log_head_index(key, shape):
-    """`A_log = log(1..H)`, the S4D-real init (modeling_mamba2.py:430-431)."""
-    del key
-    return jnp.log(jnp.arange(1, shape[0] + 1, dtype=jnp.float32))
+    return checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -499,7 +494,7 @@ class Mamba2Mixer(MixerBase):
     `head_dim` are the checkpoint's own.
     """
 
-    residuals = ('context', 'scan', 'conv')
+    residuals = (Residual.CONTEXT, Residual.SCAN, Residual.CONV)
     # Each document from the state and conv history its parent leaves (`dew.nn.linear.forked_scan`).
     reads_forks = True
     # Its cached prefill resets its state at each packed document's start (`dew.nn.linear`).

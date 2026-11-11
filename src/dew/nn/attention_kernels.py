@@ -289,7 +289,7 @@ width its backward takes, a causal or windowed call square or over another seque
 aligns as FlashAttention aligns them), no arbitrary mask, block groups, key lengths, bias, softcap or sinks,
 no deterministic ops, and a wheel holding code for the target."""
 
-CUDNN_FORWARD_SUPPORTS = (
+CUDNN_SUPPORTS = (
     _ON_GPU,
     _Need('capability', lambda case: bf16_dot_runs(), "cuDNN takes bf16 and fp16 from sm80",
                 row=INHERENT),
@@ -325,21 +325,12 @@ CUDNN_FORWARD_SUPPORTS = (
           row='roadmap: attention dropout in cuDNN'),
     _ARITHMETIC,
 )
-"""cuDNN's fused attention's forward requirements (`cudnn_attention`): a GPU of sm80 or later (cuDNN
+"""cuDNN's fused attention's requirements (`cudnn_attention`): a GPU of sm80 or later (cuDNN
 refuses bf16 and fp16 below it: "SDPA FP16/BF16 requires SM80"), one of its two dtypes, heads it tiles, no
 softcap or sinks, a window only behind the query, no documents but another sequence's aligned ones (which
-it takes as their mask, `_attention_kernel`), and no block groups or key starts: a decode step's, which
-takes no gradient (`DECODE`). Every fused kernel runs at the query's head width, values included
-(`widen_value_heads`)."""
-
-CUDNN_SUPPORTS = (
-    *CUDNN_FORWARD_SUPPORTS,
-    _Need('deterministic', lambda case: not deterministic_ops_requested(),
-                "--xla_gpu_deterministic_ops is set, under which XLA's cuDNN attention backward crashes "
-                "(openxla/xla#46500)", row=INHERENT),
-)
-"""cuDNN's fused attention's requirements where a call may take its gradient (`ATTENTION`): its forward's
-(`CUDNN_FORWARD_SUPPORTS`) and no deterministic ops, under which its backward crashes."""
+it takes as their mask, `_attention_kernel`), and no block groups or key starts. They are its backward's
+too, under deterministic ops as without: XLA runs cuDNN's deterministic algorithm there. Every fused kernel
+runs at the query's head width, values included (`widen_value_heads`)."""
 
 TRITON_SUPPORTS = (
     _FAST,
@@ -545,26 +536,34 @@ attention at Qwen3-8B's widths, 1 x 1024 (CELLS-h100, CELLS-a100); a longer fp32
 (`AttentionCase.cell`)."""
 
 
-DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
+FLASH = Kernel[AttentionCase]('flash', FLASH_SUPPORTS)
+XLA = Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True)
+INFERENCE = Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS, _Need(
+    'spans_only', lambda case: not case.spans_only,
+    "the call's visibility is spans alone, which a differentiated call's xla attention would build "
+    "densely: the template takes it", row=INHERENT), _FITS))
+"""The template for a call no derivative is taken of and xla's attention for one differentiated."""
+
+DECLARED: dict[tuple[str | None, str], tuple[Kernel[AttentionCase], str]] = {
     ('wgmma', 'attention'): (
-        'flash', "FlashAttention-3 measured faster than the Mosaic template on an H100 (llama-d128 bf16, "
+        FLASH, "FlashAttention-3 measured faster than the Mosaic template on an H100 (llama-d128 bf16, "
                  "2 x 4096, 32 query heads over 8 key heads, CUPTI on an exclusive node): forward 0.588 "
                  "against 0.761 ms causal and 1.094 against 1.296 full, training forward and backward 2.53 "
                  "against 11.45 causal and 4.49 against 16.48 full (receipts DERIVED-benchx-h100, "
                  "BWDSTAGES-h100); a training step's attention at Qwen3-8B's widths, 2 x 4096 bf16, 2.44 "
                  "against 11.38 ms causal and 4.26 against 15.61 full (CELLS-h100)"),
     ('wgmma', 'float32 attention'): (
-        'inference', "jax.nn's xla attention measured faster than the template's fp32 route on an H100 for a "
+        INFERENCE, "jax.nn's xla attention measured faster than the template's fp32 route on an H100 for a "
                      "training step's attention at Qwen3-8B's widths, 1 x 1024 fp32, 2.08 against 26.36 ms "
                      "causal and 2.19 against 46.21 full (CELLS-h100); the template's fp32 forward as bf16 "
                      "parts faster than xla's for a call no derivative is taken of where `template_infers` "
                      "(M-ET-16, W18-gh200-1)"),
     ('mma.sync', 'attention'): (
-        'flash', "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
+        FLASH, "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
                  "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
                  "full (CELLS-a100, CUPTI, 11 interleaved rounds)"),
     ('mma.sync', 'float32 attention'): (
-        'xla', "jax.nn's xla attention measured faster than the template's fp32 route on an A100 at "
+        XLA, "jax.nn's xla attention measured faster than the template's fp32 route on an A100 at "
                "Qwen3-8B's widths (32/8 heads x 128, CUPTI medians, one warm process, W76-a100, M-ET-28): a "
                "training step's attention 5.94 against 226.4 ms at 1 x 1024 causal and 6.00 against 373.0 "
                "full, 102.3 against 3002.7 at 1 x 4096 causal and 101.6 against 5832.6 full; its forward "
@@ -678,17 +677,14 @@ def _cudnn_loads() -> bool:
 
 
 ATTENTION = Op[AttentionCase](Choice.ATTENTION, (
-    Kernel[AttentionCase]('flash', FLASH_SUPPORTS),
+    FLASH,
     Kernel[AttentionCase]('triton', TRITON_SUPPORTS),
     Kernel[AttentionCase]('cudnn', (_FAST, *CUDNN_SUPPORTS)),
     Kernel[AttentionCase]('tpu', TPU_SUPPORTS),
-    Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True),
+    XLA,
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
-    Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS, _Need(
-        'spans_only', lambda case: not case.spans_only,
-        "the call's visibility is spans alone, which a differentiated call's xla attention would build "
-        "densely: the template takes it", row=INHERENT), _FITS)),
+    INFERENCE,
 ), _attention_preferred, _unlowered, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
 kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,
@@ -713,12 +709,15 @@ _FP32_DECODE = ("jax.nn's xla attention measured faster than the decode kernel a
                 "decode at every fp32 decode shape timed, its products IEEE fp32 as theirs (`highest`; wall "
                 "a step over 50 steps in one loop, interleaved rounds, 1 to 128 rows over 4096 and 32768 "
                 "keys, 32 or 16 query heads over 8, 128 or 64 wide): {}")
-DECODE_DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('sm80', 'float32 decode'): ('xla', _FP32_DECODE.format(
+DECODE_XLA = Kernel[AttentionCase]('xla', XLA_SUPPORTS, generic=True)
+"""A decode step's xla attention (the folded attention, `folded_attention`)."""
+
+DECODE_DECLARED: dict[tuple[str | None, str], tuple[Kernel[AttentionCase], str]] = {
+    ('sm80', 'float32 decode'): (DECODE_XLA, _FP32_DECODE.format(
         "on an A100 2.63 to 3.64 times the decode kernel's speed, 51.2 against 140.5 us at one row over "
         "4096 keys (ET-DFP32B-a100), and 25 to 161 times the template's, 52.5 against 5215.5 us there "
         "(ET-4312-a100)")),
-    ('sm90', 'float32 decode'): ('xla', _FP32_DECODE.format(
+    ('sm90', 'float32 decode'): (DECODE_XLA, _FP32_DECODE.format(
         "on an H100 2.75 to 3.60 times the decode kernel's speed, 23.8 against 72.4 us at one row over "
         "4096 keys (ET-DFP32B-h100), and 31 to 250 times the template's, 23.6 against 3669.2 us there "
         "(ET-4312-h100)")),
@@ -732,9 +731,8 @@ to 65 against 35.6, ET-DFP32-h100-pcie)."""
 
 DECODE = Op[AttentionCase](Choice.DECODE, (
     Kernel[AttentionCase]('decode', decode_attention.SUPPORTS),
-    # A decode step takes no gradient, so its cuDNN forward runs under deterministic ops too.
-    Kernel[AttentionCase]('cudnn', (*CUDNN_FORWARD_SUPPORTS, decode_attention.PRODUCTS)),
-    Kernel[AttentionCase]('xla', XLA_SUPPORTS, generic=True),
+    Kernel[AttentionCase]('cudnn', (*CUDNN_SUPPORTS, decode_attention.PRODUCTS)),
+    DECODE_XLA,
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', (*TEMPLATE_SUPPORTS, decode_attention.PRODUCTS)),
 ), _decode_preferred, _unlowered, DECODE_DECLARED)

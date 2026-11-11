@@ -726,41 +726,53 @@ class Arm:
                      witnessed(_gathered(record), f"draw {seed}"))
 
 
-RANDOM_PRIMITIVES = frozenset({"random_bits", "threefry2x32"})
-"""The equations that turn a key into random numbers: past a draw (`Step.sample`), where an arm's
-loss reads them, they are a draw no witness holds (dropout, a posterior's noise, a draw from
-`Step.key`)."""
+@functools.cache
+def _random() -> tuple:
+    """The equations that turn a key into random numbers: past a draw (`Step.sample`), where an arm's
+    loss reads them, they are a draw no witness holds (dropout, a posterior's noise, a draw from
+    `Step.key`)."""
+    from jax.extend.core import primitives
+
+    return primitives.random_bits_p, primitives.threefry2x32_p
 
 
-UNROUNDED = frozenset({
-    "reshape", "squeeze", "expand_dims", "broadcast_in_dim", "transpose", "concatenate", "slice",
-    "dynamic_slice", "dynamic_update_slice", "gather", "select_n", "copy", "copy_p", "rev", "pad",
-    "optimization_barrier", "stop_gradient", "max", "min", "neg", "abs", "sign", "reduce_max", "reduce_min",
-    "argmax", "argmin", "sort", "cond", "while", "scan", "shard_map",
-})
-"""Equations that move, select or order values without rounding them, or run programs whose own
-equations the audits read (`reached`, through the gate's `equations`), as every call does
-(`dew.nn.programs.CALLS`, read beside these): a float32 boundary value they carry past the boundaries stays
-the witnessed value, and only an equation that rounds past them must be float64."""
+@functools.cache
+def _unrounded() -> frozenset:
+    """Equations that select or order values without rounding them, or run programs whose own equations the
+    audits read (`reached`, through the gate's `equations`), as every call does (`Primitive.inlined_call`)
+    and every operation that only moves entries (`dew.nn.programs.rearranges`), both read beside these: a
+    float32 boundary value they carry past the boundaries stays the witnessed value, and only an equation
+    that rounds past them must be float64."""
+    import jax
+    from jax.extend.core import primitives
+
+    return frozenset({jax.lax.select_n_p, jax.lax.copy_p, jax.lax.optimization_barrier_p,
+                      jax.lax.stop_gradient_p, jax.lax.max_p, jax.lax.min_p, jax.lax.neg_p, jax.lax.abs_p,
+                      jax.lax.sign_p, jax.lax.reduce_max_p, jax.lax.reduce_min_p, jax.lax.argmax_p,
+                      jax.lax.argmin_p, jax.lax.sort_p, jax.lax.cond_p, jax.lax.while_p, jax.lax.scan_p,
+                      primitives.shard_map_p})
 
 
 def _rounds(eqn) -> bool:
-    """Whether an equation can round a floating value: not one of UNROUNDED nor a call, nor an identity
-    barrier (a primitive whose name says so), nor a conversion between equal dtypes or of a boolean, nor a
-    product with or quotient by the literal one, nor a sum with the literal zero."""
+    """Whether an equation can round a floating value: not one of `_unrounded`, nor a move of entries, nor a
+    call, nor Dew's identity barrier (`dew.nn.conv`'s), nor a conversion between equal dtypes or of a
+    boolean, nor a product with or quotient by the literal one, nor a sum with the literal zero. An
+    operation it does not know rounds."""
+    import jax
     import numpy as np
     from jax.extend import core
 
-    from dew.nn.programs import CALLS
+    from dew.nn.conv import _barrier_p
 
-    name = eqn.primitive.name
-    if name in UNROUNDED or name in CALLS or name.endswith("barrier"):
+    primitive = eqn.primitive
+    if (primitive in _unrounded() or primitive.rearranges or primitive.inlined_call
+            or primitive is _barrier_p):
         return False
-    if name == "convert_element_type":
+    if primitive is jax.lax.convert_element_type_p:
         source = eqn.invars[0].aval.dtype
         return source != eqn.outvars[0].aval.dtype and source != np.bool_
-    identity = {"mul": 1, "div": 1, "add": 0, "sub": 0}.get(name)
-    operands = eqn.invars if name in ("mul", "add") else eqn.invars[1:]
+    identity = {jax.lax.mul_p: 1, jax.lax.div_p: 1, jax.lax.add_p: 0, jax.lax.sub_p: 0}.get(primitive)
+    operands = eqn.invars if primitive in (jax.lax.mul_p, jax.lax.add_p) else eqn.invars[1:]
     return identity is None or not any(
         isinstance(var, core.Literal) and np.all(np.asarray(var.val) == identity) for var in operands)
 
@@ -829,7 +841,7 @@ def recording_loss(objective, variables, step):
 
 def audited(loss, kinds: Mapping[str, str], params, batch, label: str, *, wide: bool) -> set[str]:
     """Refuse (`CouplingRefused`) a loss whose value reads randomness outside its draws: an equation of
-    RANDOM_PRIMITIVES the loss reaches past every recorded value. `wide`, the float64 anchor's, also
+    `_random` the loss reaches past every recorded value. `wide`, the float64 anchor's, also
     holds its partition: every equation the loss reaches past its boundaries that rounds a floating
     value (`_rounds`) outputs float64, and the prefix (what feeds only boundaries) runs native,
     witnessed by the boundary records. Returns
@@ -844,7 +856,7 @@ def audited(loss, kinds: Mapping[str, str], params, batch, label: str, *, wide: 
     recorded = {name: var for name, var in zip(sorted(kinds), jaxpr.outvars[1:], strict=True)
                 if isinstance(var, core.Var)}
     drawn = reached(jaxpr, set(recorded.values()))
-    loose = [eqn for eqn in drawn if eqn.primitive.name in RANDOM_PRIMITIVES]
+    loose = [eqn for eqn in drawn if eqn.primitive in _random()]
     if loose:
         raise CouplingRefused(f"{label}: randomness reaches the loss outside its draws: {_named(loose[0])}")
     paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_flatten_with_path(batch)[0]]

@@ -19,7 +19,7 @@ from flax import linen as nn
 from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
-from dew.batch import Coordinates, prefix_sum
+from dew.batch import Coordinates
 from dew.nn.attention import (
     AttentionImpl,
     attention_case,
@@ -65,16 +65,19 @@ from dew.nn.kv_cache import (
     KVStore,
     cached_validity,
     filled_slots,
+    mixed_counts,
+    mixed_positions,
     open_kv_cache,
     rotated,
 )
 from dew.nn.local_attention import local_attention
-from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
+from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
+from dew.nn.precision import at_least_fp32, divided, float32_dot_general, l2norm, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.qsa import QSA, QSAIndexer, qsa_selection
+from dew.nn.residuals import QKV_RESIDUALS, Residual
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, LogicalAxes, constrain, declared
 from dew.nn.value_experts import RoutedValues
@@ -329,7 +332,7 @@ GATE_ACTIVATIONS = {
     'sigmoid': jax.nn.sigmoid,
     'silu': jax.nn.silu,
     # torch's softplus at beta log 2, log(1 + exp(x log 2)) / log 2.
-    'softplus2': lambda gate: jax.nn.softplus(gate * math.log(2)) / math.log(2),
+    'softplus2': lambda gate: divided(jax.nn.softplus(gate * math.log(2)), math.log(2)),
     # torch's softplus in at least float32, Laguna's `F.softplus(g_proj(x).float())`, which the branch's
     # product casts back (modeling_laguna.py:410).
     'softplus': lambda gate: jax.nn.softplus(gate.astype(at_least_fp32(gate.dtype))),
@@ -749,9 +752,9 @@ class CausalSelfAttention(nn.Module):
         if self.ctx.key_multiplier is not None:
             # Before its norm and rotation, as Falcon-H1's keys (`k_proj(x) * key_multiplier`).
             key = scaled(key, self.ctx.key_multiplier)
-        key = checkpoint_name(key, 'k_proj')
+        key = checkpoint_name(key, Residual.K_PROJ)
         if not self.ctx.k_eq_v:
-            value = checkpoint_name(value, 'v_proj')
+            value = checkpoint_name(value, Residual.V_PROJ)
         value = value.reshape(batch, length, self.ctx.num_kv_heads, self.value_dim)
         if self.ctx.value_scale is not None:
             value = scaled(value, self.ctx.value_scale)
@@ -963,7 +966,7 @@ class CausalSelfAttention(nn.Module):
                 dtype=self.ctx.dtype, precision=self.ctx.precision,
                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
                 implementation=self.ctx.attention_impl, sinks=sinks,
-                softcap=self.ctx.attn_logit_softcap), 'context')
+                softcap=self.ctx.attn_logit_softcap), Residual.CONTEXT)
             return self._output(attention, gate, B, S, own_value, progress)
         refused = self._unhonoured(attention_metadata, "general")
         if refused:
@@ -993,7 +996,7 @@ class CausalSelfAttention(nn.Module):
         them and column-parallel under a tensor axis (each shard a run of whole heads); the output gate
         where it gates, else None; and the keys and values `qkv_proj` packs beside the query, else
         None. The projections carry the names a remat policy saves or offloads
-        (mixer_base.RESIDUALS)."""
+        (residuals.RESIDUALS)."""
         B, S, _ = x.shape
         projected_kv = None
         group = self._group()
@@ -1002,7 +1005,7 @@ class CausalSelfAttention(nn.Module):
             projected_kv = (key, value)
         else:
             projected = self.q_proj(x)
-        projected = checkpoint_name(projected, 'q_proj')
+        projected = checkpoint_name(projected, Residual.Q_PROJ)
         if self._whole_norm:
             projected = self.q_norm(projected)
         gate = None
@@ -1015,7 +1018,7 @@ class CausalSelfAttention(nn.Module):
         else:
             query = projected.reshape(B, S, self.ctx.num_heads, self.ctx.head_dim)
         if self.ctx.output_gate and self.gate_projection != 'query':
-            gate = checkpoint_name(self.gate_proj(x), 'output_gate')
+            gate = checkpoint_name(self.gate_proj(x), Residual.OUTPUT_GATE)
             gate = gate.reshape(B, S, self.ctx.num_heads, -1)
         if self.ctx.qk_norm and not self._whole_norm and not self.qk_norm_after_rotary:
             query = self.q_norm(query, axes=HEADS)
@@ -1082,7 +1085,8 @@ class CausalSelfAttention(nn.Module):
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax, implementation=self.ctx.attention_impl,
             wide_logits=self.ctx.wide_logits,
             key_value_seq_lengths=jnp.maximum(lengths, 1), segment_ids=queries, key_segment_ids=segments,
-            max_segments=max_segments, sinks=self.sinks, softcap=self.ctx.attn_logit_softcap), 'context')
+            max_segments=max_segments, sinks=self.sinks, softcap=self.ctx.attn_logit_softcap),
+            Residual.CONTEXT)
         B, S = query.shape[:2]
         return self._output(attention, gate, B, S, None, progress)
 
@@ -1465,7 +1469,7 @@ class CausalSelfAttention(nn.Module):
                 segment_ids=documents,
                 block_groups=blocks, image_groups=images, key_valid=valid, key_runs=runs, places=held,
                 dropout_rate=self.ctx.attention_dropout_rate, dropout_rng=self.make_rng("dropout"),
-                deterministic=False), 'context')
+                deterministic=False), Residual.CONTEXT)
         # A chunk or metadata mask replaces `cursor` and keeps the gather; a window the kernels read
         # as each row's first key (`starts`).
         plain_step = append is not None and mask is cursor and S == 1 and bias is None and not sowing
@@ -1489,7 +1493,7 @@ class CausalSelfAttention(nn.Module):
                 sliding_window=window, mask=mask, bias=bias, sinks=sinks,
                 softcap=self.ctx.attn_logit_softcap, segment_ids=documents, max_segments=max_segments,
                 block_groups=blocks, image_groups=images, key_valid=valid, key_runs=runs, places=held),
-                'context')
+                Residual.CONTEXT)
         return attention
 
     @staticmethod
@@ -1508,14 +1512,7 @@ class CausalSelfAttention(nn.Module):
         refusal = mixed_attention_refusal(self.ctx, alibi=self.alibi)
         if refusal is not None:
             raise ValueError(f"a mixed serving step needs plain attention; {self.name}: {refusal}")
-        index = self.get_variable("cache", "cache_index")
-        rows, pieces = index.shape[0], admitted.slots.shape[0]
-        valid = jnp.asarray(valid, bool)[0]
-        prompt = valid[rows:].reshape(pieces, -1)
-        filled = admitted.cursors[:, None] + prefix_sum(prompt, dtype=jnp.int32) - 1
-        positions = jnp.concatenate([jnp.where(valid[:rows], index, -1),
-                                     jnp.where(prompt, filled, -1).reshape(-1)])
-        return positions[None]
+        return mixed_positions(self.get_variable("cache", "cache_index"), admitted, valid)
 
     def _mixed_attended(self, query, key, value, positions, metadata: AttentionMetadata):
         """A mixed call's attention: every valid token's keys and values go
@@ -1546,8 +1543,7 @@ class CausalSelfAttention(nn.Module):
                   if getattr(metadata, name) is not None}
         store.write_tokens(key[0], value[0], token_rows, positions, groups)
         prompt = positions[rows:].reshape(pieces, width)
-        index.value = (index.value + (positions[:rows] >= 0)).at[admitted.slots].set(
-            admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
+        index.value = mixed_counts(index.value, admitted, positions[None])
         # A cache keeping its keys rotated (an int8 one's) is read by queries in the same rotation.
         rotation = self.ctx.kv_cache.key_rotation(self.ctx.head_dim)
         if rotation is not None:
@@ -1567,7 +1563,7 @@ class CausalSelfAttention(nn.Module):
         reads = held_reads(index.value, positions[:rows])
         if self._pages(store, query[0, :rows], windowed=starts is not None, sunk=self.sinks is not None):
             decoded = store.decode(query[0, :rows], reads, self.ctx.attn_logit_softcap, starts, self.sinks)
-            decoded = checkpoint_name(decoded[:, None], 'context')
+            decoded = checkpoint_name(decoded[:, None], Residual.CONTEXT)
         else:
             decoded = self._decode_attention(query[0, :rows, None], *store.read(), positions[:rows], starts,
                                              self.sinks)
@@ -1664,7 +1660,7 @@ class CausalSelfAttention(nn.Module):
             implementation=self.ctx.attention_impl, causal=False,
             softcap=self.ctx.attn_logit_softcap, sinks=sinks,
             key_value_seq_lengths=reads.astype(jnp.int32), key_value_seq_starts=starts)
-        return checkpoint_name(attention, 'context')
+        return checkpoint_name(attention, Residual.CONTEXT)
 
     def _pages(self, store, query, windowed: bool, sunk: bool = False) -> bool:
         """Whether a decode step's query `[rows, heads, head_dim]` reads the paged pool `store` through
@@ -1753,7 +1749,7 @@ class CausalSelfAttention(nn.Module):
         padding (`positions` -1) reads one key (`held_reads`)."""
         reads = held_reads(self.get_variable("cache", "cache_index"), positions)
         out = append.store.decode(query[:, 0], reads, self.ctx.attn_logit_softcap, starts, sinks)
-        return checkpoint_name(out[:, None], 'context')
+        return checkpoint_name(out[:, None], Residual.CONTEXT)
 
     def _runs_local(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
         """Whether this call runs `local_attention`, which never builds the
@@ -1810,7 +1806,7 @@ class CausalSelfAttention(nn.Module):
         joined = attention.reshape(batch, length, self.ctx.num_heads * self.value_dim)
         if self.ctx.ngpt is not None:
             joined = l2norm(joined)
-        return checkpoint_name(self.o_proj(joined), 'o_proj')
+        return checkpoint_name(self.o_proj(joined), Residual.O_PROJ)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1823,7 +1819,7 @@ class AttentionMixer(MixerBase):
     kind (`{"name": "attention", "fields": {"nope": true}}`).
     """
 
-    residuals = (*QKV_RESIDUALS, 'output_gate', 'o_proj', 'context')
+    residuals = (*QKV_RESIDUALS, Residual.OUTPUT_GATE, Residual.O_PROJ, Residual.CONTEXT)
     # Each token reads its ancestors' keys and its own (`call_visibility`).
     reads_forks = True
     draws_init_std = True

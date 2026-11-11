@@ -48,9 +48,10 @@ from jax.extend import core as jcore
 
 from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, terms
-from dew.algebra.forms import Derived, Refused, aval, environment, evaluate, read_by
+from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
 from dew.nn.derivatives import Protected, contracted
 from dew.nn.precision import at_least_fp32, compensated_add, float32_einsum, float32_matmul, vanishing
+from dew.nn.programs import read_by
 
 Axes = tuple[str, ...]
 

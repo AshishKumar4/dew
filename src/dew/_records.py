@@ -33,15 +33,6 @@ type JSON = None | bool | int | float | str | list['JSON'] | dict[str, 'JSON']
 
 
 
-HF_METADATA = frozenset({
-    "architectures", "transformers_version", "torch_dtype", "dtype", "output_hidden_states",
-    "output_attentions", "return_dict", "is_encoder_decoder", "id2label", "label2id", "problem_type",
-    "chunk_size_feed_forward",
-})
-"""The fields every Hugging Face config serializes that describe no computation: its classes and
-release, its output and return flags, its label maps and task. A translator that refuses fields it
-does not read leaves these out, beside its own."""
-
 def duration(value: str) -> datetime.timedelta:
     """A positive recorded duration, in seconds, minutes or hours."""
     match = re.fullmatch(r'(\d+(?:\.\d+)?)(s|m|h)', value)
@@ -219,6 +210,25 @@ ADDED = "added"
 `dataclasses.field(default=..., repr=False, metadata={ADDED: True})`, so a run that leaves it at its
 default records the configuration it always did (a data step's identity, `dew.data.plan.StepIdentity`)
 and resumes under this Dew, and one that sets it records it (`set_added`)."""
+
+
+RUNS = "runs"
+"""The metadata key of a decoder field that says how the model runs or trains, not what it computes:
+precision and kernels, dropout, the initialization a loaded model's weights replace. `layer_scalar` is
+whether Gemma 4's scalars train, the forward multiplying by them either way; `scale_after_cast` orders a
+norm's scale and its cast to the compute dtype, the same product in fp32. An export's config need not
+carry such a field (`dew.interop.hf_decoders.refuse_rebuilt`). The decoder declares them
+(`dew.nn.backbones.causal_transformer.CausalTransformer`)."""
+
+NUMBERS = "numbers"
+"""The metadata key of a field that says in what numbers a module computes, not what (`RUNS`): its
+`dtype` and `precision`, which a decoder's and every part of a wrapper's (its towers, projections) spell
+alike and no export's config reads back as fields (`dew.interop.hf_decoders.NUMERICS_FIELDS`)."""
+
+ROUNDS = "rounds"
+"""The metadata key of a field that orders a model's rounding (`RUNS`): a norm's scale against its cast to the
+compute dtype, a softmax's width, which no family's config states and which change what it computes below
+float32 alone, so a release states them (`dew.interop.release.ROUNDING`)."""
 
 
 def set_added(value: DataclassInstance | Sequence[DataclassInstance] | Mapping[str, DataclassInstance] | JSON

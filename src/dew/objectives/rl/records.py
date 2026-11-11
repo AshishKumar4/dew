@@ -7,14 +7,19 @@ from dataclasses import asdict
 
 import numpy as np
 
-from dew._records import finite, integer, integers, listed, record as section, text
-from dew.inference.rollouts import Draw, routing_record
+from dew._records import finite, listed, record as section
+from dew.inference.rollouts import Draw
+from dew.registry import from_record
 from dew.sampling.text import Sampling
 
-from .episodes import Episode, EpisodeId, EpisodeStatus, Observation, Transition
+from .episodes import Episode
+from .sessions import json_object
 
 reals = functools.partial(listed, read=finite, what="a list of finite numbers")
-"""One list of finite numbers: a row's likelihoods (`listed`)."""
+"""One list of finite numbers: a row's likelihoods (`listed`), as an interchange record states them."""
+
+messages = functools.partial(listed, read=json_object, what="a list of chat messages")
+"""A list of chat messages, each a JSON object (`listed`, `json_object`)."""
 
 
 def record_json(value: Episode | Draw) -> str:
@@ -29,59 +34,16 @@ def _json_leaf(value: np.ndarray | Mapping[str, np.ndarray]) -> list | dict[str,
     return dict(value) if isinstance(value, Mapping) else value.tolist()
 
 
-def observation_record(value: Mapping[str, object]) -> Observation:
-    record = section(value, "observation")
-    reward = record["reward"]
-    return Observation(integers(record["context"], "context"),
-                       EpisodeStatus(integer(record["status"], "status")), text(record["detail"], "detail"),
-                       None if reward is None else finite(reward, "reward"),
-                       messages(record["messages"], "messages"), bool(record.get("compacted", False)),
-                       None if record.get("request") is None else section(record["request"], "request"))
-
-
-messages = functools.partial(listed, read=section, what="a list of chat messages")
-"""A list of chat messages, each a JSON object, kept as written (`listed`)."""
-
-
 def draw_record(value: Mapping[str, object], sampling: Sampling) -> Draw:
-    """Read a draw `asdict` wrote, checked to end as `sampling`, its episode's policy, ends one,
-    with the engine records it carries (routing as nested lists of expert ids, an object of them by
-    site where it is keyed, `routing_record`; kept ids per sampled id)."""
-    record = section(value, "draw")
-    raw, routed, support = record["raw_log_probs"], record["routed_experts"], record["support"]
-    return Draw(integers(record["prompt"], "prompt"), integers(record["tokens"], "tokens"),
-                reals(record["behavior_log_probs"], "behavior_log_probs"),
-                text(record["finish_reason"], "finish_reason"), integer(record["version"], "version"),
-                None if raw is None else reals(raw, "raw_log_probs"),
-                None if routed is None else routing_record(routed),
-                None if support is None else listed(support, "support", read=integers,
-                                                    what="a list of token-id lists")).checked(sampling)
-
-
-def sampling_record(value: Mapping[str, object]) -> Sampling:
-    """Read the sampling policy `asdict` wrote, every control included."""
-    from dew.registry import from_record
-
-    return from_record(Sampling, value, dtypes=False)
+    """Read a draw `asdict` wrote, through its declaration (`from_record`), checked to end as `sampling`,
+    its episode's policy, ends one."""
+    return from_record(Draw, section(value, "draw"), dtypes=False).checked(sampling)
 
 
 def episode_from_record(value: Mapping[str, object]) -> Episode:
-    """Read an episode `asdict` wrote, without reconstructing actions from rendered text."""
-    record = section(value, "episode")
-    identity = section(record["identity"], "identity")
-    initial, reward = record["initial"], record["reward"]
-    sampling = sampling_record(section(record["sampling"], "sampling"))
-    transitions = tuple(
-        Transition(draw_record(section(turn["action"], "action"), sampling),
-                   observation_record(section(turn["observation"], "observation")))
-        for turn in listed(record["transitions"], "transitions", read=section, what="a list of transitions"))
-    branch = identity.get("branch")
-    return Episode(EpisodeId(integer(identity["task"], "task"), integer(identity["attempt"], "attempt"),
-                             integer(identity["sample"], "sample"), integers(identity["seed"], "seed"),
-                             None if branch is None else text(branch, "branch")),
-                   integer(record["policy_step"], "policy_step"), sampling,
-                   None if initial is None else observation_record(section(initial, "initial")),
-                   transitions, EpisodeStatus(integer(record["status"], "status")),
-                   text(record["detail"], "detail"),
-                   None if reward is None else finite(reward, "reward"),
-                   _binding_id=text(record["_binding_id"], "_binding_id"))
+    """Read an episode `asdict` wrote, through its declaration (`from_record`), without reconstructing
+    actions from rendered text: each action checked to end as the episode's sampling ends one."""
+    episode = from_record(Episode, section(value, "episode"), dtypes=False)
+    for transition in episode.transitions:
+        transition.action.checked(episode.sampling)
+    return episode

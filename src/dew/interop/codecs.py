@@ -1181,32 +1181,52 @@ def _gridded(
     return tuple(np.asarray(grid[part]) for part in parts)
 
 
+@overload
+def _awq_columns(words: np.ndarray, bits: int) -> np.ndarray: ...
+@overload
+def _awq_columns(words: Stored, bits: int) -> Stored: ...
+def _awq_columns(words: Stored, bits: int) -> Stored:
+    """AWQ gemm words [..., m] to their codes [..., m * 32 / bits] in column order (`AWQ_ORDER`), the
+    inverse of `_awq_words`."""
+    codes = _codes(words, bits)
+    return codes.reshape(*codes.shape[:-1], -1, 32 // bits)[..., np.argsort(AWQ_ORDER)].reshape(codes.shape)
+
+
+def _awq_words(codes: np.ndarray, bits: int) -> np.ndarray:
+    """Codes [..., n] in column order packed into AWQ gemm words, each word's codes in `AWQ_ORDER`."""
+    ordered = codes.reshape(*codes.shape[:-1], -1, 32 // bits)[..., list(AWQ_ORDER)]
+    return _words(ordered.reshape(codes.shape), bits)
+
+
+@overload
+def _awq_grid(zeros: np.ndarray, scales: np.ndarray, inputs: int, *, bits: int,
+              group: int) -> tuple[np.ndarray, np.ndarray]: ...
+@overload
+def _awq_grid(zeros: Stored, scales: Stored, inputs: int, *, bits: int,
+              group: int) -> tuple[Stored, Stored]: ...
+def _awq_grid(zeros: Stored, scales: Stored, inputs: int, *, bits: int, group: int) -> tuple[Stored, Stored]:
+    """The zero codes and scales of each of `inputs` rows from the stored packed zeros and scales, a row
+    taking its `group`'s."""
+    rows = np.arange(inputs) // group
+    return _awq_columns(zeros, bits)[rows], scales[rows]
+
+
 def _awq_decode(tensors: Mapping[str, Stored], name: str, *, bits: int, group: int) -> Stored:
     stem = name.removesuffix('.weight')
-    order = np.argsort(AWQ_ORDER)
-
-    def columns(words: Stored) -> Stored:
-        codes = _codes(words, bits)
-        return codes.reshape(*codes.shape[:-1], -1, 32 // bits)[..., order].reshape(codes.shape)
-
-    codes, zeros = columns(tensors[stem + '.qweight']), columns(tensors[stem + '.qzeros'])
-    scales = unread.held(tensors[stem + '.scales'])
-    rows = np.arange(codes.shape[0]) // group
-    return _scaled_product(codes, zeros[rows], scales[rows]).T
+    codes = _awq_columns(tensors[stem + '.qweight'], bits)
+    zeros, scales = _awq_grid(tensors[stem + '.qzeros'], unread.held(tensors[stem + '.scales']),
+                              codes.shape[0], bits=bits, group=group)
+    return _scaled_product(codes, zeros, scales).T
 
 
 def _awq_encode(name: str, weight: np.ndarray, *, bits: int, group: int,
                 grid: Mapping[str, Stored] | None) -> dict[str, np.ndarray]:
     stem = name.removesuffix('.weight')
-    parts = (stem + '.qzeros', stem + '.scales')
-    packed_zeros, scales = _gridded(grid, name, parts)
-    order = np.argsort(AWQ_ORDER)
-    zeros = _codes(packed_zeros, bits)
-    zeros = zeros.reshape(*zeros.shape[:-1], -1, 32 // bits)[..., order].reshape(zeros.shape)
-    rows = np.arange(weight.shape[1]) // group
-    codes = _encoded_codes(name, weight.T, zeros[rows], scales[rows], bits)
-    packed = codes.reshape(codes.shape[0], -1, 32 // bits)[..., list(AWQ_ORDER)].reshape(codes.shape)
-    return {stem + '.qweight': _words(packed, bits), stem + '.qzeros': packed_zeros, stem + '.scales': scales}
+    packed_zeros, scales = _gridded(grid, name, (stem + '.qzeros', stem + '.scales'))
+    zeros, row_scales = _awq_grid(packed_zeros, scales, weight.shape[1], bits=bits, group=group)
+    codes = _encoded_codes(name, weight.T, zeros, row_scales, bits)
+    return {stem + '.qweight': _awq_words(codes, bits), stem + '.qzeros': packed_zeros,
+            stem + '.scales': scales}
 
 
 def _packed_format(suffixes: tuple[str, ...], decode, encode, grid: Mapping[str, Stored] | None,
@@ -1662,15 +1682,24 @@ _MODELOPT_FP8_WEIGHTS = {
 """ModelOpt's tensor-scaled FP8 weights use the existing compressed-tensors FP8 codec."""
 
 
-def _modelopt_algo(name: str, method: str, layers: Mapping[str, str]) -> str:
-    stem = name.removesuffix('.weight')
-    if method != 'MIXED_PRECISION':
-        return method
+def governing_layer(module: str, layers: Collection[str]) -> str | None:
+    """The key of ModelOpt's `quantized_layers` table (`layers`) that governs `module`'s weights: the
+    nearest dotted ancestor of it naming one, itself included; None where none does."""
+    stem = module
     while stem:
         if stem in layers:
-            return layers[stem]
+            return stem
         stem = stem.rsplit('.', 1)[0] if '.' in stem else ''
-    raise ValueError(f"{name} has no algorithm in ModelOpt quantized_layers")
+    return None
+
+
+def _modelopt_algo(name: str, method: str, layers: Mapping[str, str]) -> str:
+    if method != 'MIXED_PRECISION':
+        return method
+    key = governing_layer(name.removesuffix('.weight'), layers)
+    if key is None:
+        raise ValueError(f"{name} has no algorithm in ModelOpt quantized_layers")
+    return layers[key]
 
 
 def _modelopt_input_kind(name: str, method: str,
@@ -1708,6 +1737,17 @@ def _modelopt_names(tensors: Mapping[str, Stored], *, method: str = 'NVFP4',
     return tuple(stem + '.weight' for stem in stems)
 
 
+@overload
+def _modelopt_scales(scale: np.ndarray, overall: np.ndarray) -> np.ndarray: ...
+@overload
+def _modelopt_scales(scale: Stored, overall: Stored) -> Stored: ...
+def _modelopt_scales(scale: Stored, overall: Stored) -> Stored:
+    """ModelOpt NVFP4's scale of each block of 16 inputs, `scale`'s shape: its E4M3 block scale times the
+    float32 global scale, one for the tensor or one per leading expert."""
+    leading = () if overall.size == 1 else (scale.shape[0], *(1 for _ in scale.shape[1:]))
+    return scale.astype(np.float32) * overall.reshape(leading)
+
+
 def _modelopt_decode(tensors: Mapping[str, Stored], name: str, *, method: str = 'NVFP4',
                      layers: Mapping[str, str] = _MODELOPT_EMPTY_LAYERS) -> Stored:
     """ModelOpt 0.47.0's NVFP4QTensor.dequantize: block scale times global, then codes, then bf16."""
@@ -1736,10 +1776,9 @@ def _modelopt_decode(tensors: Mapping[str, Stored], name: str, *, method: str = 
     # The author's Python reader maps code 8 to +0; packed bytes remain in
     # the export grid so an untrained save can still keep that source code.
     values = np.where(np.equal(values, 0), np.float32(0), values)
-    global_shape = () if overall.size == 1 else (packed.shape[0], *(1 for _ in scale.shape[1:]))
-    effective = scale.astype(np.float32) * overall.reshape(global_shape)
-    return (values * effective[..., None]).reshape(*packed.shape[:-1], packed.shape[-1] * 2).astype(
-        ml_dtypes.bfloat16).astype(np.float32)
+    product = values * _modelopt_scales(scale, overall)[..., None]
+    return product.reshape(*packed.shape[:-1], packed.shape[-1] * 2).astype(ml_dtypes.bfloat16).astype(
+        np.float32)
 
 
 def _modelopt_encode(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored] | None,
@@ -1752,8 +1791,7 @@ def _modelopt_encode(name: str, weight: np.ndarray, *, grid: Mapping[str, Stored
         codec = compressed_tensors(_MODELOPT_FP8_WEIGHTS, grid={parts[0]: held[0]})
         return {**codec.encode(name, weight), parts[1]: held[1]}
     scale, overall, original = held[0], held[1], held[-1]
-    global_shape = () if overall.size == 1 else (weight.shape[0], *(1 for _ in scale.shape[1:]))
-    effective = np.repeat(scale.astype(np.float32) * overall.reshape(global_shape), 16, axis=-1)
+    effective = np.repeat(_modelopt_scales(scale, overall), 16, axis=-1)
     if np.any((effective == 0) & (weight != 0)):
         raise ValueError(f"{name} has a zero ModelOpt weight scale and trained values outside its grid")
     quotients = np.divide(weight.astype(np.float32), effective, out=np.zeros_like(effective),
@@ -1843,14 +1881,24 @@ def _refuse_mlx(config: Mapping[str, object]) -> None:
                 "safetensors repo it was converted from (the model card's base_model)")
 
 
+QUANTIZATION_CONFIG = "quantization_config"
+"""The config field a source's quantization is declared in (`quantization_record`)."""
+EXPERT_DTYPE = "expert_dtype"
+"""The config field DeepSeek-V4 names its routed experts' storage in, in its quantization_config or beside
+it (`source_quantization`)."""
+CODEC_FIELDS = frozenset({QUANTIZATION_CONFIG, EXPERT_DTYPE})
+"""The root config fields this codec reads (`source_quantization`), rather than any family: it decodes the
+weights they name and refuses a format it cannot, before a family translator sees the config."""
+
+
 def quantization_record(config: Mapping[str, object]) -> Mapping[str, object] | None:
     """A config's `quantization_config`, or its text_config's where it declares it there alone (KimiK3Config
     lifts `text_config.quantization_config` onto itself, configuration_kimi_k3.py:282-283); None for
     neither, and ValueError for one that is no object."""
-    quantization = config.get("quantization_config")
+    quantization = config.get(QUANTIZATION_CONFIG)
     text = config.get("text_config")
     if quantization is None and isinstance(text, Mapping):
-        quantization = text.get("quantization_config")
+        quantization = text.get(QUANTIZATION_CONFIG)
     if quantization is not None and not isinstance(quantization, Mapping):
         raise ValueError(f"quantization_config must be an object, got {quantization!r}")
     return quantization
@@ -1872,14 +1920,14 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
     if quantization is None:
         return None
     method = quantization.get("quant_method")
-    if method == "fp8" and ("expert_dtype" in quantization or "expert_dtype" in config):
+    if method == "fp8" and (EXPERT_DTYPE in quantization or EXPERT_DTYPE in config):
         # `fp8_format`'s blocks under ue8m0 scales, the only kind an E8M0
         # `.scale` holds. expert_dtype 'fp4' ships routed experts as E2M1
         # pairs (inference/model.py `Linear` under float4_e2m1fn_x2), 'fp8' or
         # null as FP8 blocks like every other Linear (the Base releases).
         block, ue8m0 = fp8_format(quantization)
         side = _square(block, "DeepSeek-V4's")
-        experts = quantization.get("expert_dtype", config.get("expert_dtype"))
+        experts = quantization.get(EXPERT_DTYPE, config.get(EXPERT_DTYPE))
         if not ue8m0:
             raise ValueError(
                 f"quantization_config declares expert_dtype, DeepSeek-V4's `.scale` storage, with scale_fmt "

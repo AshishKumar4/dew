@@ -34,7 +34,17 @@ import numpy as np
 from dew.algebra import derive, rewritten
 from dew.algebra.forms import Accumulated, Added, Merged, Operand
 from dew.nn.kernels.templates import layout, product
-from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Capped, Draw, Dropout, Initial, coded, within
+from dew.nn.kernels.templates.attention import (
+    LN2,
+    LOG2E,
+    NATURAL,
+    Capped,
+    Draw,
+    Dropout,
+    Initial,
+    coded,
+    within,
+)
 from dew.nn.precision import float32_einsum, two_product, two_sum
 
 
@@ -179,7 +189,7 @@ class Forward:
         raw."""
         if self.raw:
             return m * self.scale
-        return m / LOG2E if self.base2 else m
+        return m * LN2 if self.base2 else m
 
 
 class Recompute(NamedTuple):

@@ -221,13 +221,6 @@ def translate_weights(
     return translate_parameters(hf_tensors, _text_path, param_dtype)
 
 
-def translate_clip_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> ParamTree:
-    """Full CLIP parameters, with FP32 storage unless explicitly requested otherwise."""
-    return translate_parameters(hf_tensors, _clip_path, param_dtype)
-
-
 def bind_text_tower[Tower: nn.Module](
     name: str, translate: Callable[[Mapping[str, object]], NativeFields[Tower]],
     path_of: Callable[[str], tuple[str, ...] | None], name_or_dir: str, revision: str | None,

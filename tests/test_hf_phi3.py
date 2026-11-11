@@ -230,7 +230,8 @@ def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
     task = TextGeneration(loaded.model, loaded.variables,
                           sampling=Sampling(temperature=0, eos_token_ids=None))
     ids = np.load(DIRECTORY / 'input_ids.npy').astype(np.int32)
-    prompts = (ids[0, :4], ids[1, :2])
+    # Two prompts that cross LongRoPE's switch (at 8) as they decode, and one past it as it is admitted.
+    prompts = (ids[0, :4], ids[1, :2], ids[0, :10])
     server = Server.from_task(task, slots=2, capacity=64, admission=2)
     # The model's own refusal, its LongRoPE crossing's, not one of the placement's or another reader's.
     assert loaded.model.cache_rebuild_position is not None

@@ -751,12 +751,17 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
     # The two tasks compile their own programs, placed as each one's weights are: their options' logits
     # are held by check 1, over drawn states, against the live task in float64.
     words = sorted({word for example in EXAMPLES for word in example.state.split()})
+    # Every drawn state's row padded to one width, the row of a state of every word, which no state of three
+    # of them exceeds: each arm compiles once, not once a state's length (row 5390: 128 draws' programs of
+    # each of three arms held at once passed the process's mappings).
+    width = max(len(row.tokens) for row in live.rows([(' '.join(words), {'team': INTENT})])[0])
     wide = {}
 
     def scored(task, seed):
         """The options' logits of a state of three words drawn from the examples', as a call lays it out."""
         state = ' '.join(np.random.default_rng([0xD07, int(seed)]).choice(words, 3))
-        inputs = DecisionInputs.collate(task.rows([(state, {'team': INTENT})])[0], task.specials.pad)
+        inputs = DecisionInputs.collate(task.rows([(state, {'team': INTENT})])[0], task.specials.pad,
+                                        width=width)
         logits = wide.setdefault(id(task), jax.jit(task.model.logits))(task.variables, inputs)
         return np.asarray(logits)[np.asarray(inputs.options)]
 

@@ -129,15 +129,14 @@ class AudioTokenizerEncoder(nn.Module):
     def __call__(self, mels, lengths, batch_lengths=None):
         cfg = self.config
         batch_lengths = jnp.max(lengths) if batch_lengths is None else batch_lengths
-        conv = functools.partial(Conv, cfg.d_model, dtype=self.dtype, precision=self.precision)
+        first, second = encoder_convolutions(cfg, dtype=self.dtype, precision=self.precision)
         place = jnp.arange(mels.shape[1])[None, :]
         x = jnp.where((place < lengths[:, None])[..., None], mels, 0)
-        x = gelu_exact(conv((cfg.kernel_size,), padding=((1, 1),), name="conv1")(x))
+        x = gelu_exact(first(x))
         # The reference's first convolution ends where its batch does; the second reads zeros past it.
-        ends = jnp.broadcast_to(batch_lengths + 3 - cfg.kernel_size, lengths.shape)
+        ends = jnp.broadcast_to(convolved(first, batch_lengths), lengths.shape)
         x = jnp.where((jnp.arange(x.shape[1])[None, :] < ends[:, None])[..., None], x, 0)
-        x = gelu_exact(conv((cfg.kernel_size,), strides=(cfg.stride_size,), padding=((1, 1),),
-                            name="conv2")(x))
+        x = gelu_exact(second(x))
 
         (counts, codes), widest = (tower_counts(lengths, cfg),
                                    tower_counts(jnp.broadcast_to(batch_lengths, lengths.shape), cfg)[0])
@@ -177,8 +176,8 @@ class AudioTokenizerEncoder(nn.Module):
             spot = jnp.arange(x.shape[1])[None, :, None]
             x = jnp.where(spot < counts[:, None, None], x, jnp.where(spot < widest[:, None, None], last, 0))
             x = jnp.pad(x, ((0, 0), (0, -x.shape[1] % pool), (0, 0)))
-            x = gelu_exact(conv((pool,), strides=(pool,), padding="VALID", use_bias=False,
-                                name="down_sample_layer")(x))
+            x = gelu_exact(Conv(cfg.d_model, (pool,), strides=(pool,), padding="VALID", use_bias=False,
+                                dtype=self.dtype, precision=self.precision, name="down_sample_layer")(x))
             x = LayerNorm(epsilon=1e-5, dtype=self.dtype, name="down_sample_norm")(x)
         return x, jnp.arange(x.shape[1])[None, :] < codes[:, None]
 
@@ -291,9 +290,23 @@ def tower_counts(frames, tokenizer: MiMoAudioTokenizer):
     the tower's masks and the host's placement read (`MiMoAudio.encoded`). An empty segment, a clip's
     padding, holds none at any stage, as the release tokenizes none (`batch_longest`), whatever count the
     convolutions' arithmetic gives zero frames."""
-    kernel, stride = tokenizer.kernel_size, tokenizer.stride_size
-    convolved = (frames > 0) * ((frames + 3 - kernel + 2 - kernel) // stride + 1)
-    return convolved, -(-convolved // tokenizer.avg_pooler)
+    first, second = encoder_convolutions(tokenizer, parent=None)
+    counted = (frames > 0) * convolved(second, convolved(first, frames))
+    return counted, -(-counted // tokenizer.avg_pooler)
+
+
+def encoder_convolutions(tokenizer: MiMoAudioTokenizer, **options) -> tuple[Conv, Conv]:
+    """The audio tokenizer encoder's two convolutions over its mel frames, `conv1` and the strided `conv2`
+    (`AudioTokenizerEncoder`), declared once: the encoder runs them, and `tower_counts` reads their
+    frame counts (`convolved`)."""
+    conv = functools.partial(Conv, tokenizer.d_model, (tokenizer.kernel_size,), padding=((1, 1),), **options)
+    return conv(name="conv1"), conv(strides=(tokenizer.stride_size,), name="conv2")
+
+
+def convolved(conv: Conv, frames):
+    """The frames `conv` gives of `frames` (an integer or an integer array), its own output geometry
+    (`Conv.spatial_shape`)."""
+    return conv.spatial_shape((frames, conv.features))[0]
 
 
 def grouped(codes, group_size: int):

@@ -125,16 +125,12 @@ def _carried():
                          *rules.dominated(with_y[1], "y"), *rules.dominated(with_z[1], "z")).then(
             union(t).with_(x.dot(y, m).binary(combined, x.dot(z, m), q)),
             *rules.made(x.dot(y, m), with_y[1]), *rules.made(x.dot(z, m), with_z[1])))
-        # x @ z +- y @ z as (x +- y) @ z: x +- y new, and its product with z, each under the reach.
-        facts, power = rules.summed_magnitude(rules.magnitude(x, "x"), rules.magnitude(y, "y"))
-        added = x.binary(combined, y, q)
-        # The new product contracting x's columns, as x @ z does (`contracted`).
-        product = rules.product_magnitude(([], power), rules.magnitude(z, "z2"), length)
-        sets.append(rule(eq(t).to(x.dot(z, m).binary(combined, y.dot(z, m), q)), *plain,
-                         eq(shape(x)).to(shape(y)), eq(reads(z)).to(one), *facts,
-                         *rules.dominated(power, "new"), *contracted, *product[0],
-                         *rules.dominated(product[1], "summed")).then(
-            union(t).with_(added.dot(z, m)), *rules.made(added, power)))
+        # x @ z +- y @ z as (x +- y) @ z (`rules.shared_factored`, the linear set's declaration), over
+        # matrices and a z that reads the state; the new product contracts x's columns, as x @ z does
+        # (`contracted`).
+        conditions, actions = rules.shared_factored(t, x, y, z, m, q, combined=combined, side="right",
+                                                    length=(list(contracted), length))
+        sets.append(rule(*conditions, *plain, eq(reads(z)).to(one)).then(*actions))
     return ruleset(*sets, name="carried")
 
 
@@ -296,21 +292,11 @@ def _products(graph: EGraph, region: terms.Region) -> None:
             continue
         if not graph.check_bool(rules.plain(i64(index))):
             continue
-        made = _parameters(region, primitive, {**params, "dimension_numbers": plain})
         # The plain product multiplies the transposed one's operands (`terms.Region.products`).
-        region.products.setdefault(made, region.products.get(index, ()))
-        swapped = _parameters(region, jax.lax.transpose_p, {"permutation": (1, 0)})
+        made = region.interned(primitive, {**params, "dimension_numbers": plain}, region.products.get(index))
+        swapped = region.interned(jax.lax.transpose_p, {"permutation": (1, 0)})
         graph.register(rules.plain(i64(made)), rules.matrix_product(i64(made)),
                        set_(plain_of(i64(index))).to(i64(made)), set_(swap_of(i64(index))).to(i64(swapped)))
-
-
-def _parameters(region: terms.Region, primitive, params) -> int:
-    """The index of `primitive` at `params` in the region's table, added where it holds none."""
-    for index, (held, given) in enumerate(region.params):
-        if held is primitive and jax.tree.map(str, dict(given)) == jax.tree.map(str, dict(params)):
-            return index
-    region.params.append((primitive, dict(params)))
-    return len(region.params) - 1
 
 
 def _reads(term: Term, reading: set[int]) -> bool:

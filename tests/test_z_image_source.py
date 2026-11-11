@@ -33,7 +33,6 @@ from interop_support import (
     source_transformer,
 )
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
-from whole_suite import timed
 
 from dew.interop.diffusion import z_image_fields, z_image_path
 from dew.nn.backbones.z_image import ZImageTransformer
@@ -44,11 +43,6 @@ CASES = ("padded", "exact", "deep")
 CASE_SEEDS = {"padded": 128, "exact": 256, "deep": 512}
 """Check 1's declared seeds for each case, sized by `seeds_for` on armada: the padded case's paired with the
 source (`dew_fn`, the count check 1's paired verdict needs; 512 alone, 2026-11-01)."""
-PAST_TARGET = {"test_the_flow_and_its_gradients_match_the_source": {"deep": 117.8}}
-"""The cases past a group's 120 s target, which the whole suite alone runs (`whole_suite.timed`), each
-timed alone on an armada 25/17 worker (IG2504M, 2026-10-30), about 1.35 times that on the fleet's 26/17
-workers. The exact case, 75.0 s, checks every parameter's gradient in every train's run (ledger 2504),
-and the padded case at its paired count, 33 s (IGRESIZE, 2026-11-01), runs in every group."""
 ROWS = 4
 HEIGHT = 3
 BUDGET = 64
@@ -104,8 +98,11 @@ def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
     assert_transformer_exports(source, name, layouts, params)
 
 
-@pytest.mark.parametrize("name", timed(PAST_TARGET, "test_the_flow_and_its_gradients_match_the_source",
-                                       list(CASES)))
+@pytest.mark.parametrize("name", [
+    "padded", "exact",
+    # The deep case's 512 draws in map tasks of 128 (117.8 s whole, alone on a 25/17 worker; IG2504M), every
+    # train's run as the others'.
+    pytest.param("deep", id="deep", marks=pytest.mark.check1_shards(seeds=512, per_task=128))])
 def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, name):
     """The native flow is the negated source output, its gradients the negated source gradients,
     every parameter's among them, whatever the rows' prompt lengths, each as near float64 as

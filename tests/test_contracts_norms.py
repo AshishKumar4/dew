@@ -35,9 +35,9 @@ def test_an_exact_gelu_holds_every_order(edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_the_precision_seams_hold_every_order(edge):
-    """`precision`'s correctly rounded division, compensated sum and rounded operand (each a custom
-    derivative): every order finite wherever float64 is a normal float32 and the plain formula, the
-    division, the sum and the identity as JAX writes them, is."""
+    """`precision`'s correctly rounded division (a primitive of its own), compensated sum and rounded operand
+    (each a custom derivative): every order finite wherever float64 is a normal float32 and the plain
+    formula, the division, the sum and the identity as JAX writes them, is."""
     numerator, denominator = normal_draw(2648, (5, 4), (5, 4), scale=EDGES[edge])
     numerator_direction, denominator_direction = normal_draw(2649, (5, 4), (5, 4), scale=EDGES[edge])
     (cotangent,) = normal_draw(2650, (5, 4))

@@ -1198,6 +1198,7 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
     a bf16 fp8 run on a TPU turns NaN the way the served fp8 model did is not
     measured."""
     qwix = _qwix()
+    qarray = _qwix("qwix._src.core.qarray")
 
     def quantized(arg) -> bool:
         return isinstance(arg, qwix.QArray)
@@ -1206,11 +1207,8 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
         operands = [arg for arg in jax.tree.leaves(args, is_leaf=quantized) if quantized(arg)]
         if len(operands) < 2:
             return op(*args, **kwargs)
-        # The product's dtype as Qwix's rule gives it (qarray.get_accumulator_and_result_type): its
-        # operands' scales', an 8-bit or narrower one read as bfloat16, an integer one as int32.
-        dtype = jnp.result_type(*(
-            (jnp.int32 if "int" in operand.scale.dtype.name else jnp.bfloat16)
-            if operand.scale.dtype.itemsize <= 1 else operand.scale.dtype for operand in operands))
+        # The product's dtype as Qwix's own rule gives it: its operands' scales'.
+        dtype = qarray.get_accumulator_and_result_type(*operands, preferred_element_type=None)[1]
         rescaled = jax.tree.map(
             lambda arg: arg.astype(jnp.float32) if quantized(arg) else arg,
             args,

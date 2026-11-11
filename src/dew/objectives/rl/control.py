@@ -366,6 +366,15 @@ class ControlRollout:
             return functools.partial(self._simulated, env)
         return self.objective.program("collection", functools.partial(self._unrolled, env), holds=(env,))
 
+    def _started(self, key: jax.Array) -> Carry:
+        """Fresh episodes of the rollout's environment (`rollout_start`): over a JAX environment one
+        program, compiled whole as its collection is (`_collector`), rather than its reset's every
+        operation dispatched alone."""
+        env = self.env
+        if isinstance(env, Simulator):
+            return rollout_start(env, key)
+        return self.objective.program("start", functools.partial(rollout_start, env), holds=(env,))(key)
+
     def _unrolled(self, env: Env, params: Variables, carry: Carry) -> tuple[Carry, Transition]:
         """The carry after `unrolls` rollouts of the live policy in `env` and their steps
         `[unrolls, T, envs, ...]`, one scan, jitted whole."""
@@ -390,7 +399,7 @@ class ControlRollout:
         served = (int(state.updates) % passes or passes) if self._served is None else self._served
         carry, returns = self._carry, self._returns
         if carry is None or returns is None:
-            carry = rollout_start(self.env, key)
+            carry = self._started(key)
             returns = jnp.zeros(len(jax.tree.leaves(carry.observation)[0]), jnp.float32)
         collected, order = self._collected, self._order
         if served >= passes or collected is None or order is None:

@@ -42,6 +42,7 @@ from dew.nn.linear import fork_start, forked_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
+from dew.nn.residuals import Residual
 from dew.nn.sharding import sequence_shards
 
 LIGHTNING = recurrence.Hooks(decay='scalar', delta=False)
@@ -86,9 +87,6 @@ class LightningAttention(nn.Module):
     head_dim: int
     slopes: tuple[float, ...]
     layers: int
-    layer: int | None = None
-    """The layer's place, where its kind states it (`LightningAttentionMixer.layer_idx`), else the
-    stack's (`MixerCall.depth`)."""
     activation: str = 'silu'
     chunk_size: int = CHUNK_SIZE
     norm_eps: float = 1e-6
@@ -141,10 +139,10 @@ class LightningAttention(nn.Module):
         heads = qkv.reshape(batch, length, self.num_heads, 3 * self.head_dim)
         query, key, value = jnp.split(heads, 3, axis=-1)
         wide = at_least_fp32(qkv.dtype)
-        if self.layer is None and call.depth is None:
+        if call.depth is None:
             raise ValueError("a lightning layer's rates follow its place in the stack, which a decoder's "
                              "stack hands it (MixerCall.depth)")
-        place = self.layer if self.layer is not None else jnp.asarray(call.depth)[0, 0]
+        place = jnp.asarray(call.depth)[0, 0]
         # The release's fp32 slopes times its fp32 factor for the layer (:1348), in the state's dtype.
         factors = 1 - np.arange(self.layers) / (self.layers - 1) + 1e-5
         rates = jnp.asarray(self.slopes, wide) * jnp.asarray(factors, wide)[place]
@@ -189,7 +187,7 @@ class LightningAttention(nn.Module):
         if held is not None:
             held.value = final.astype(held.value.dtype)
         # The recurrence's output under both names a remat policy reads it by (`RESIDUALS`).
-        out = checkpoint_name(checkpoint_name(out, 'scan'), 'context')
+        out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
         out = self.norm(out.reshape(batch, length, self.features))
         return self.out_proj(nn.sigmoid(self.output_gate(x)) * out)
 
@@ -202,16 +200,12 @@ class LightningAttentionMixer(MixerBase):
     recurrence runs in, which changes no value but its rounding. The heads and their width are the
     context's: the layer's attention geometry, without its key/value heads, rotary or window."""
 
-    residuals = ('context', 'scan')
+    residuals = (Residual.CONTEXT, Residual.SCAN)
     reads_depth = True
     # Each document from the memory its parent leaves (`dew.nn.linear.forked_scan`).
     reads_forks = True
 
     num_hidden_layers: int = 2
-    layer_idx: int | None = None
-    """The layer's place, as a record saved before the stack handed each layer its own (ledger 2564)
-    states it, each lightning layer a kind of its own; such a record computes as it did. None reads the
-    stack's."""
     hidden_act: str = 'silu'
     block_size: int = CHUNK_SIZE
 
@@ -226,7 +220,6 @@ class LightningAttentionMixer(MixerBase):
             head_dim=ctx.head_dim,
             slopes=lightning_slopes(ctx.num_heads),
             layers=self.num_hidden_layers,
-            layer=self.layer_idx,
             activation=self.hidden_act,
             chunk_size=self.block_size,
             dtype=ctx.dtype,

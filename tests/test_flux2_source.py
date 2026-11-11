@@ -499,6 +499,27 @@ def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source):
         assert (tensor.dtype, tensor.tobytes()) == (stored.dtype, stored.tobytes()), name
 
 
+def test_a_mistral3_encoder_whose_config_states_no_tie_ties_as_its_config_class_does(source, tmp_path):
+    """A Mistral-3 text encoder whose config states no `tie_word_embeddings` ties its head as
+    Mistral3Config's own default does, as transformers reads the file: its language model read by the rule
+    a wrapper's is (`hf_decoders.language_model_config`), not a default of the pipeline's own."""
+    import shutil
+
+    from transformers import AutoConfig
+
+    from dew.interop.pipeline_assembly import _hidden_states_conditioning
+
+    directory = Path(shutil.copytree(source / "mistral3", tmp_path / "mistral3"))
+    stored = directory / "text_encoder" / "config.json"
+    stated = json.loads(stored.read_text())
+    stated.pop("tie_word_embeddings")
+    stored.write_text(json.dumps(stated))
+    encoder = _hidden_states_conditioning(directory, {}, jnp.float32, pipeline="flux2", tokens=512,
+                                          guidance=4.0, param_dtype="float32", attention_impl="xla")[0]
+    reference = AutoConfig.from_pretrained(directory / "text_encoder")
+    assert encoder.tower.tie_embeddings is reference.tie_word_embeddings is True
+
+
 def test_a_mistral3_encoder_storing_a_tensor_twice_reads_once_and_writes_both(source, record, tmp_path):
     """A checkpoint that stores its embedding under both of Mistral-3's
     spellings (transformers 4.50's `language_model.model.` and 4.52's

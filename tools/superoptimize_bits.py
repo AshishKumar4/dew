@@ -30,13 +30,19 @@ import z3
 
 from dew.algebra import bits
 from dew.algebra.bits import BitForm, BitOp, BitStep, Unit
+from dew.nn.programs import purely_called
 
 MASK = bits.MASK
 
 # --- the reference traced into a form ---------------------------------------------------------------------
 
-_PREDICATES = {name: code for code, name in enumerate(bits.COMPARISONS)}
-_FLIPPED = {"lt": "gt", "le": "ge", "gt": "lt", "ge": "le", "eq": "eq", "ne": "ne"}
+_FLIPS = {jax.lax.lt_p: jax.lax.gt_p, jax.lax.le_p: jax.lax.ge_p, jax.lax.gt_p: jax.lax.lt_p,
+          jax.lax.ge_p: jax.lax.le_p, jax.lax.eq_p: jax.lax.eq_p, jax.lax.ne_p: jax.lax.ne_p}
+"""JAX's comparisons, each with the one that holds of its operands exchanged."""
+
+_PREDICATES = {primitive: bits.COMPARISONS.index(primitive.name) for primitive in _FLIPS}
+"""Each comparison's code in the bit vocabulary, whose predicates carry JAX's own names
+(`bits.COMPARISONS`): a comparison the vocabulary lacks fails here, where the tool is loaded."""
 
 
 class _Seeded:
@@ -85,63 +91,65 @@ def seed(reference, *, signed_inputs: bool = False) -> BitForm:
                     for var, const in zip(jaxpr.constvars, consts, strict=True)})
         for equation in jaxpr.eqns:
             args = [read(var) for var in equation.invars]
-            name = equation.primitive.name
             signed = any(getattr(var.aval, "dtype", None) == jnp.int32 for var in equation.invars)
-            if name in ("pjit", "jit", "closed_call"):
-                env.update(zip(equation.outvars, run(equation.params["jaxpr"], args), strict=True))
+            if (body := purely_called(equation)) is not None:
+                env.update(zip(equation.outvars, run(body, args), strict=True))
                 continue
-            env[equation.outvars[0]] = _seeded(form, name, args, signed, equation)
+            env[equation.outvars[0]] = _seeded(form, equation.primitive, args, signed, equation)
         return [read(var) for var in jaxpr.outvars]
 
     [result] = run(closed, [_Place(0)])
     return BitForm(tuple(form.steps), (form.held(result),), tuple(1 << bit for bit in range(bits.WORD)))
 
 
-def _seeded(form: _Seeded, name: str, args, signed: bool, equation):
-    if name in ("convert_element_type", "broadcast_in_dim", "copy"):
+def _seeded(form: _Seeded, primitive, args, signed: bool, equation):
+    if primitive in (jax.lax.convert_element_type_p, jax.lax.broadcast_in_dim_p, jax.lax.copy_p):
         return args[0]
     constant = [not isinstance(arg, _Place) for arg in args]
     if all(constant):
-        raise ValueError(f"{name}: a step of constants alone (fold it in the reference)")
-    if name in ("shift_right_logical", "shift_left", "shift_right_arithmetic"):
+        raise ValueError(f"{primitive.name}: a step of constants alone (fold it in the reference)")
+    if primitive in (jax.lax.shift_right_logical_p, jax.lax.shift_left_p, jax.lax.shift_right_arithmetic_p):
         value, places = form.held(args[0]), args[1]
         if not isinstance(places, _Place):
-            op = {"shift_right_logical": BitOp.SHR, "shift_left": BitOp.SHL,
-                  "shift_right_arithmetic": BitOp.SAR}[name]
+            op = {jax.lax.shift_right_logical_p: BitOp.SHR, jax.lax.shift_left_p: BitOp.SHL,
+                  jax.lax.shift_right_arithmetic_p: BitOp.SAR}[primitive]
             return _Place(form.step(op, (value,), places)) if places else value
-        return _Place(form.step(BitOp.SHRV if name == "shift_right_logical" else BitOp.SHLV, (value, places)))
-    if name in ("and", "or", "xor"):
-        table = {"and": 0xF0 & 0xCC, "or": 0xF0 | 0xCC, "xor": 0xF0 ^ 0xCC}[name]
+        variable = BitOp.SHRV if primitive is jax.lax.shift_right_logical_p else BitOp.SHLV
+        return _Place(form.step(variable, (value, places)))
+    if primitive in (jax.lax.and_p, jax.lax.or_p, jax.lax.xor_p):
+        tables = {jax.lax.and_p: 0xF0 & 0xCC, jax.lax.or_p: 0xF0 | 0xCC, jax.lax.xor_p: 0xF0 ^ 0xCC}
+        table = tables[primitive]
         places = [arg for arg in args if isinstance(arg, _Place)]
         constants = [arg for arg in args if not isinstance(arg, _Place)]
         return _Place(form.step(BitOp.LOGIC, places, constants[0] if constants else 0, table))
-    if name == "not":
+    if primitive is jax.lax.not_p:
         return _Place(form.step(BitOp.LOGIC, (args[0],), 0, 0x0F))
-    if name == "add":
+    if primitive is jax.lax.add_p:
         places = [arg for arg in args if isinstance(arg, _Place)]
         return _Place(form.step(BitOp.IADD3, places, sum(arg for arg in args if not isinstance(arg, _Place))))
-    if name == "sub":
+    if primitive is jax.lax.sub_p:
         left, right = args
         if constant[0]:
             return _Place(form.step(BitOp.IADD3, (right,), left, 0b1))
         if constant[1]:
             return _Place(form.step(BitOp.IADD3, (left,), -right))
         return _Place(form.step(BitOp.IADD3, (left, right), 0, 0b10))
-    if name in ("min", "max"):
+    if primitive in (jax.lax.min_p, jax.lax.max_p):
         places = [arg for arg in args if isinstance(arg, _Place)]
         constants = [arg for arg in args if not isinstance(arg, _Place)]
         return _Place(form.step(BitOp.MINMAX, places, constants[0] if constants else 0,
-                                int(signed) | (2 if name == "max" else 0)))
-    if name in _PREDICATES:
-        predicate = name if not constant[0] else _FLIPPED[name]
+                                int(signed) | (2 if primitive is jax.lax.max_p else 0)))
+    if primitive in _PREDICATES:
+        # A constant on the left is the comparison with its operands exchanged.
+        predicate = _PREDICATES[_FLIPS[primitive] if constant[0] else primitive]
         places = [arg for arg in args if isinstance(arg, _Place)]
         constants = [arg for arg in args if not isinstance(arg, _Place)]
         return _Place(form.step(BitOp.CMP, places, constants[0] if constants else 0,
-                                _PREDICATES[predicate] | (8 if signed else 0)))
-    if name == "select_n":
+                                predicate | (8 if signed else 0)))
+    if primitive is jax.lax.select_n_p:
         predicate, false, true = args
         return _Place(form.step(BitOp.SEL, (form.held(predicate), form.held(true), form.held(false))))
-    raise ValueError(f"{name}: no step of the vocabulary")
+    raise ValueError(f"{primitive.name}: no step of the vocabulary")
 
 
 # --- each step's meaning over Z3's bit-vectors --------------------------------------------------------------

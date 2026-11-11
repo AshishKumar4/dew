@@ -99,6 +99,27 @@ def test_a_division_by_a_broadcast_divisor_is_held_at_its_own_forms_reach():
     assert np.all(contract({}, [dividend, np.broadcast_to(divisor, dividend.shape)], same, oc.FLOAT32))
 
 
+def test_a_correctly_rounded_division_is_held_at_its_exact_quotient():
+    """Dew's correctly rounded division (`dew.nn.precision.correctly_rounded_divide`) is held at its exact
+    quotient rounded to nearest, whatever the lane's own division reaches: its result holds, one step off at
+    an element breaks it there and nowhere else, and its gradient over a constant divisor, the cotangent over
+    that divisor (row 5277), is certified through."""
+    from dew.nn import precision
+
+    rng = np.random.default_rng(5277)
+    dividend, weights = (np.float32(rng.uniform(-4, 4, 256)) for _ in range(2))
+    divisor = np.float32(rng.uniform(0.01, 4, 256))
+    result = np.asarray(jax.jit(precision.correctly_rounded_divide)(dividend, divisor))
+    contract = ct.CONTRACTS["correctly_rounded_divide"]
+    assert np.all(contract({}, [dividend, divisor], result, oc.FLOAT32))
+    stepped = result.copy()
+    stepped[7] = np.nextafter(stepped[7], np.float32(np.inf))
+    held = contract({}, [dividend, divisor], stepped, oc.FLOAT32)
+    assert not held[7] and np.all(np.delete(held, 7))
+    ct.assert_certified(jax.grad(lambda x: jnp.sum(precision.divided(x, 6.0) * weights)),
+                        lambda seed: (dividend,), "a correctly rounded division's gradient", seeds=1)
+
+
 def test_a_sum_holds_in_any_order_and_a_lost_term_breaks_it():
     """A float32 sum taken left to right, pairwise or the lane's own way holds the sum's bound; a sum
     missing one term of a cancelling row breaks it."""

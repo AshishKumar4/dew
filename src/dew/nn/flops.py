@@ -13,12 +13,24 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Self
 
+import jax
 import numpy as np
 from flax import linen as nn
 from jax.core import ShapedArray
 from jax.extend import core as jaxpr_core
 
-from .programs import platform_branch
+from .programs import (
+    branches,
+    called,
+    cumulative,
+    opaque,
+    platform_branch,
+    positionwise,
+    rearranges,
+    reduction,
+    scan_body,
+    scatter,
+)
 from .protocols import Counted, CountedParameters
 
 
@@ -245,10 +257,13 @@ def traced_flops[**Arguments, Result](function: Callable[Arguments, Result], *ar
     here counts (a world model's loss with its imagination). The program is traced as for a CPU, where every
     product is one the jaxpr shows (a GPU's kernels are custom calls, whose products it does not), and of a
     platform's choice (`jax.lax.platform_dependent`) the accelerator's branch counts, the model's own
-    products (a CPU's sums them wide, `dew.nn.precision`). Refused, as a trace does not tell what runs: a
-    while loop's trips, and an operation holding several programs (a linear solve's)."""
-    import jax
-
+    products (a CPU's sums them wide, `dew.nn.precision`). A grouped product (`ragged_dot_general`, a
+    mixture's experts on a CPU) counts its rows' products, each against its own group's matrix. An
+    operation that does no product (an entrywise or positionwise one, one that moves entries, a reduction,
+    a cumulative one, a scatter, one that reads no operand: `dew.nn.programs`' facts, as JAX states them)
+    costs nothing here. Any other is refused by name, never counted as nothing: a while loop's trips, a
+    kernel launch's work (`opaque`), and an operation no fact states does no product (a linear solve, a
+    factorization, a primitive of another library's)."""
     from dew.nn.kernels.generation import assumed
 
     with assumed("cpu"):
@@ -260,33 +275,58 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
     """`traced_flops` of a program."""
     total = 0.0
     for equation in program.eqns:
-        name = equation.primitive.name
-        if name == "dot_general":
+        primitive = equation.primitive
+        if primitive is jax.lax.dot_general_p:
             (contracted, _), _ = equation.params["dimension_numbers"]
             left = _shape(equation.invars[0])
             products = math.prod(left[axis] for axis in contracted)
             total += 2 * math.prod(_shape(equation.outvars[0])) * products
-        elif name == "conv_general_dilated":
+        elif primitive is jax.lax.conv_general_dilated_p:
             kernel = _shape(equation.invars[1])
             outputs = kernel[equation.params["dimension_numbers"].rhs_spec[0]]
             total += 2 * math.prod(_shape(equation.outvars[0])) * math.prod(kernel) / outputs
-        elif name == "scan":
-            total += equation.params["length"] * _program_flops(equation.params["jaxpr"])
-        elif name == "cond":
-            branches = equation.params["branches"]
+        elif primitive is jax.lax.scan_p:
+            total += equation.params["length"] * _program_flops(scan_body(equation))
+        elif primitive is jax.lax.cond_p:
+            chosen = branches(equation)
             platforms = equation.params.get("branches_platforms")
             if platforms is not None:
-                branches = [branches[platform_branch(platforms, "cuda")]]
-            total += max(_program_flops(branch) for branch in branches)
-        elif name == "while":
+                chosen = (chosen[platform_branch(platforms, "cuda")],)
+            total += max(_program_flops(branch) for branch in chosen)
+        elif primitive is jaxpr_core.primitives.ragged_dot_general_p:
+            total += _grouped_flops(equation)
+        elif primitive is jax.lax.while_p:
             raise MissingFlopsCount("a while loop's trips are unknown to a traced count")
-        else:
-            nested = list(jaxpr_core.jaxprs_in_params(equation.params))
-            if len(nested) > 1:
-                raise MissingFlopsCount(f"{name} holds {len(nested)} programs, which of them run a trace "
-                                        "does not tell")
-            total += sum(_program_flops(program) for program in nested)
+        elif (body := called(equation)) is not None:
+            total += _program_flops(body)
+        elif opaque(equation):
+            raise MissingFlopsCount(f"{primitive.name} launches a kernel whose work its trace does not show")
+        elif not _productless(equation):
+            raise MissingFlopsCount(f"{primitive.name} does work no traced count states: it is no product "
+                                    "counted here, and no fact states it does none")
     return total
+
+
+def _productless(equation: jaxpr_core.JaxprEqn) -> bool:
+    """Whether `equation` does no product, by what JAX states of its primitive (`dew.nn.programs`): an
+    entrywise or positionwise operation, one that moves entries, a reduction, a cumulative one or a
+    scatter, whose work is pointwise in the entries it reads, or one that reads no operand (an `iota`)."""
+    primitive = equation.primitive
+    return (positionwise(primitive) or rearranges(primitive) or reduction(primitive)
+            or cumulative(primitive) or scatter(primitive) or not equation.invars)
+
+
+def _grouped_flops(equation: jaxpr_core.JaxprEqn) -> float:
+    """A grouped product's work (`ragged_dot_general`): every entry of its left operand meets one group's
+    matrix alone, which the group sizes choose, so each multiplies the right operand's free entries once,
+    two FLOPs a multiply-add: `2 x left entries x width` (a mixture's `2 x rows x depth x width`), its
+    groups partitioning the rows or, a transpose's, the depth."""
+    numbers = equation.params["ragged_dot_dimension_numbers"]
+    (_, right_contracted), (_, right_batch) = numbers.dot_dimension_numbers
+    right = _shape(equation.invars[1])
+    bound = {*right_contracted, *right_batch, *numbers.rhs_group_dimensions}
+    free = math.prod(size for axis, size in enumerate(right) if axis not in bound)
+    return 2.0 * math.prod(_shape(equation.invars[0])) * free
 
 
 def _shape(variable: jaxpr_core.Var | jaxpr_core.Literal) -> tuple[int, ...]:

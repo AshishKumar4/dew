@@ -810,6 +810,27 @@ def test_a_one_stage_scan_reads_a_frozen_base_where_it_lies():
 
 
 @pytest.mark.mesh(devices=8)
+def test_a_frozen_base_read_where_it_lies_holds_no_more_than_the_layers_unscanned():
+    """A LoRA run whose decoder computes in bf16 over float32 parameters and names no rung, its layers
+    scanned on one stage and its frozen base read where it lies (`decoder_stack.LAYER_ROWS`), holds no
+    more temporaries for its step than the same run over the layers unscanned: the backward reads each
+    layer's rows again from the iteration's index, so no value made of them alone (a row cast to bf16)
+    stacks among the scan's residuals (row 4751)."""
+    held = {}
+    for scan in (True, False):
+        model = decoder(scan_layers=scan, dtype="bfloat16")
+        base = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
+        adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, base, key=1)
+        run = trainer(adapter.model, LORA_OPTIMIZER, MeshSpec(fsdp=2), 8, variables=adapter.variables)
+        run.validate(steps=1)
+        state, _, _ = run.place()
+        batch = shard_batch(MeshSpec(fsdp=2).build(jax.devices()), token_rows(VOCAB, BATCH, SEQ + 1))
+        run.compile(state, batch)
+        held[scan] = run.executable.memory_analysis().temp_size_in_bytes
+    assert held[True] <= held[False], held
+
+
+@pytest.mark.mesh(devices=8)
 def test_a_stage_local_runs_rollout_samples_from_the_state_it_holds():
     """A rollout samples from the state a stage-local run holds, each layer on its own stage's devices,
     with no copy of every layer on every stage (ledger 3477): its policy reads the store off the mesh as

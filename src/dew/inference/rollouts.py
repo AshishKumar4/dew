@@ -239,6 +239,18 @@ class Draw:
         cut at its budget or aborted."""
         return self.finish_reason in ("stop", "tool_calls")
 
+    @classmethod
+    def generated(cls, prompt: Sequence[int], generation: Generation[np.ndarray], row: int,
+                  version: int) -> Draw:
+        """The draw a host generation's `row` holds after `prompt`, the ids it read: the first `lengths[row]`
+        ids past the row's padded prompt (`Generation.prompt_width`), each one's behavior and raw
+        likelihood, and `stop` where a criterion ended it, else `length`, under policy `version`."""
+        count, width = int(generation.lengths[row]), generation.prompt_width
+        return cls(tuple(prompt), tuple(int(token) for token in generation.tokens[row, width:width + count]),
+                   tuple(float(value) for value in generation.behavior_log_probs[row, :count]),
+                   "stop" if bool(generation.terminated[row]) else "length", version,
+                   tuple(float(value) for value in generation.raw_log_probs[row, :count]))
+
     def checked(self, sampling: Sampling) -> Draw:
         """Admit a nonempty sampled action ending as `sampling` ends one (`check_ending`).
         Imported call records may be empty, but an action presented by a sampling server may not."""
@@ -326,15 +338,6 @@ def _budget(max_new_tokens: int) -> int:
     if type(max_new_tokens) is not int or max_new_tokens < 1:
         raise ValueError("a rollout draws at least one token")
     return max_new_tokens
-
-
-def _native_draw(prompt: tuple[int, ...], generation: Generation[np.ndarray], version: int) -> Draw:
-    count = int(generation.lengths[0])
-    width = len(prompt)
-    return Draw(prompt, tuple(int(token) for token in generation.tokens[0, width:width + count]),
-                tuple(float(value) for value in generation.behavior_log_probs[0, :count]),
-                "stop" if bool(generation.terminated[0]) else "length", version,
-                tuple(float(value) for value in generation.raw_log_probs[0, :count]))
 
 
 class NativeRolloutServer:
@@ -466,7 +469,7 @@ class NativeRolloutServer:
             if not self._claimed(future):  # settled by `close`
                 return
             try:
-                draw = _native_draw(ids, done.result(), version).checked(self.sampling)
+                draw = Draw.generated(ids, done.result(), 0, version).checked(self.sampling)
             except BaseException as failure:
                 # The generation's own failure, or a draw that fails its checks, such as non-finite
                 # likelihoods: the claimed future takes it, since a done-callback's error reaches no one.

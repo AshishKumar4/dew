@@ -14,6 +14,7 @@ from dew.nn.inputs import PLAIN_CALL, TOKENWISE, MixerCall, routing_blocks
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import projection_role
 from dew.nn.protocols import ProjectionGroup, Routes, RoutesExperts, declared_groups
+from dew.nn.residuals import MLP_RESIDUALS
 
 if TYPE_CHECKING:
     from dew.nn.backbones.decoder_block import Mixture
@@ -69,7 +70,7 @@ class MLPMixer(MixerBase):
     second feed-forward uses.
     """
 
-    residuals = ('gate_proj', 'up_proj', 'down_proj')
+    residuals = MLP_RESIDUALS
 
     # Tokenwise, with no cache for a mixed call to misread or a loop's pass to rewrite.
     keeps_cache = False

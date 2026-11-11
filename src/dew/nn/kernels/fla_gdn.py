@@ -53,6 +53,7 @@ from dew.nn.kernels.chunked_launch import (
     spanned,
     write_rows,
 )
+from dew.nn.residuals import Residual
 
 RCP_LN2 = 1 / math.log(2)
 """1 / ln 2, fla's RCP_LN2 (whose 1.4426950216 rounds to the same fp32): its kernels take the cumulated
@@ -1153,7 +1154,7 @@ def prefixed_fwd(cumulated, q, k, v, g, beta, h0, cu_seqlens, scale: float, chun
     spans = sequences(rows, q.shape[1], cu_seqlens, chunk=chunk, documents=documents)
     g = checkpoint_name(recurrence.cumulated(g, scale=RCP_LN2, chunk=chunk, spans=spans, compensated=True,
                                              interpret=interpret),
-                        'delta_decay')
+                        Residual.DELTA_DECAY)
     return cumulated(q, k, v, algebra.separated(*g), beta, h0, spans, scale, chunk, interpret, keep, wide)
 
 
@@ -1168,11 +1169,11 @@ def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: i
     accuracy gate's source-aware check, `assert_graph_as_exact`), and this the port's arithmetic on it."""
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
     prefix, (g, g_lo) = g, g
-    a = checkpoint_name(kkt_solve(k, g, beta, g_lo=g_lo, **kernels), 'delta_inverse')
+    a = checkpoint_name(kkt_solve(k, g, beta, g_lo=g_lo, **kernels), Residual.DELTA_INVERSE)
     w, u = recompute_w_u(k, v, beta, a, g, g_lo=g_lo, **kernels)
     h, corrected, final = chunk_fwd_h(k, w, u, g, h0, g_lo=g_lo, **kernels)
     o = chunk_fwd_o(q, k, corrected, h, g, scale=scale, g_lo=g_lo, wide=wide, **kernels)
-    memory = checkpoint_name((w, h, corrected), 'delta_memory') if keep else None
+    memory = checkpoint_name((w, h, corrected), Residual.DELTA_MEMORY) if keep else None
     return (o, final), (q, k, v, prefix, beta, a, h0, memory, spans)
 
 

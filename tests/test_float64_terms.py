@@ -8,7 +8,7 @@ import mpmath
 import numpy as np
 import pytest
 from attention_oracle import anchored_softmax
-from float64_terms import float64_terms
+from float64_terms import float64_magnitudes, float64_terms
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import Mesh, PartitionSpec as P
 
@@ -65,6 +65,50 @@ def test_a_sum_of_one_sign_has_its_own_size_and_an_update_its_steps_terms():
     np.testing.assert_allclose(trace_terms, np.sqrt((0.81 + 1) * energy), rtol=1e-12)
     # The weight moved by 0.1 of each step's momentum; the value it started at carries none.
     np.testing.assert_allclose(moved_terms, np.sqrt(0.01 * (1 + 0.81 + 1) * energy), rtol=1e-12)
+
+
+def test_a_sums_magnitudes_are_its_terms_sizes_summed_beside_their_root_sum_of_squares():
+    """One program read both ways, each reading its own: a product of rows that cancel, scaled after its sum
+    and a bias added, has for magnitudes the sizes of its products summed and scaled, and the bias's own
+    (the most any partial sum reaches, far above the value where they cancel), and for terms the products'
+    root sum of squares, to which a bias no sum made adds none, read before the magnitudes and again after
+    them."""
+    rng = np.random.default_rng(5426)
+    rows, weights, bias = rng.normal(size=(4, 16)), rng.normal(size=(16, 3)), 8 * rng.normal(size=3)
+
+    def scaled(rows, weights):
+        return (rows @ weights) * 0.25 + bias
+
+    with jax.enable_x64(new_val=True):
+        value, terms = float64_terms(scaled, rows, weights)
+        _, magnitudes = float64_magnitudes(scaled, rows, weights)
+        _, again = float64_terms(scaled, rows, weights)
+    products = rows[:, :, None] * weights[None, :, :]
+    np.testing.assert_allclose(magnitudes, 0.25 * np.abs(products).sum(axis=1) + np.abs(bias), rtol=1e-12)
+    np.testing.assert_allclose(terms, 0.25 * np.sqrt((products**2).sum(axis=1)), rtol=1e-12)
+    np.testing.assert_array_equal(again, terms)
+    assert np.all(np.abs(np.asarray(value)) <= magnitudes) and np.all(terms <= magnitudes)
+
+
+def test_a_sum_behind_a_sum_carries_its_magnitudes_and_not_its_squares():
+    """A product selected by a mask, each row's product with its own group's matrix written as a sum over
+    the groups of a one-hot weight times each group's product: its magnitudes are those of the row's own
+    products, summed, the contraction behind the mask measured as written apart; its terms are the final
+    sum's alone, the selected product's own size, as before."""
+    rng = np.random.default_rng(5426)
+    rows, matrices = rng.normal(size=(6, 16)), rng.normal(size=(3, 16, 4))
+    groups = np.asarray([0, 0, 2, 1, 2, 2])
+
+    def masked(rows, matrices):
+        return jnp.einsum("rg,rgn->rn", jax.nn.one_hot(groups, 3, dtype=rows.dtype),
+                          jnp.einsum("rk,gkn->rgn", rows, matrices))
+
+    with jax.enable_x64(new_val=True):
+        value, magnitudes = float64_magnitudes(masked, rows, matrices)
+        _, terms = float64_terms(masked, rows, matrices)
+    products = rows[:, :, None] * matrices[groups]
+    np.testing.assert_allclose(magnitudes, np.abs(products).sum(axis=1), rtol=1e-12)
+    np.testing.assert_allclose(terms, np.abs(np.asarray(value)), rtol=1e-12)
 
 
 def test_a_recomputed_body_sums_its_own_terms():

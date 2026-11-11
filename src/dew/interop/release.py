@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, NamedTuple
 
@@ -18,44 +19,86 @@ from flax import linen as nn
 from jax.typing import DTypeLike
 
 from dew import _records
+from dew._records import JSON
 from dew.batch import Variables, unboxed
+from dew.inference.tasks import TaskSettings
 from dew.interop.weights import AUTO
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.precision import Numerics
 from dew.nn.protocols import Bounded, ComputesIn
-from dew.registry import DtypeName, dtype_name, from_record, to_record
+from dew.registry import DtypeName, dtype_name, from_record, record_fields
 
 if TYPE_CHECKING:
     from dew.config.release import Release
-    from dew.inference.tasks import TaskSettings
+
+
+@dataclass(frozen=True)
+class ReleaseDtypes:
+    """The dtype a released model computes in, by name (`computed_in`)."""
+
+    compute: DtypeName
+
+
+@dataclass(frozen=True)
+class ReleaseTask:
+    """A release's task declaration (`dew.config.Release.task`), one record written (`record`) and read
+    (`read`) through the registry: the run's task settings, the numerics its tasks trace under, the dtype its
+    model computes in, how it rounds (`rounding`) and the tokens its cache holds (`capacity`), each None
+    where the release states none (a decision release states its numerics and dtype alone,
+    `dew.decision.release.decision_envelope`); a release with no task states none of them."""
+
+    settings: TaskSettings | None = None
+    numerics: Numerics | None = None
+    dtypes: ReleaseDtypes | None = None
+    rounds: Mapping[str, bool] | None = None
+    max_seq_len: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.rounds is not None:
+            object.__setattr__(self, "rounds", {name: _records.boolean(value, name)
+                                                for name, value in self.rounds.items()})
+        if self.max_seq_len is not None:
+            _records.integer(self.max_seq_len, "max_seq_len")
+
+    def record(self) -> dict[str, JSON]:
+        """The task's record (`to_record`), the fields it states none of left out."""
+        return {name: value for name, value in record_fields(self, ReleaseTask).items() if value is not None}
+
+    @classmethod
+    def read(cls, record: Mapping[str, object]) -> ReleaseTask:
+        """The task a release's record states (`record`'s inverse)."""
+        return from_record(cls, _records.record(record, "task"), dtypes=False)
+
+    @property
+    def compute(self) -> DtypeName | None:
+        """The dtype its model computes in, None where the release states none."""
+        return None if self.dtypes is None else self.dtypes.compute
 
 
 def release_record(settings: TaskSettings, numerics: Numerics | None, model: nn.Module,
                    variables: Variables) -> Release:
-    """The release of a run's export: its task settings' record, its numerics, the dtype its model computes
-    in (`computed_in`), how it rounds (`rounding`) and the cache it holds (`capacity`); the parameters'
-    own dtypes are the export's."""
+    """The release of a run's export: its task settings, its numerics, the dtype its model computes in
+    (`computed_in`), how it rounds (`rounding`) and the cache it holds (`capacity`); the parameters' own
+    dtypes are the export's."""
     from dew.config.release import Release
-    from dew.inference.tasks import TaskSettings
 
-    return Release(task={"settings": to_record(settings, TaskSettings),
-                         "numerics": None if numerics is None else to_record(numerics, Numerics),
-                         "dtypes": {"compute": computed_in(numerics, model, variables)},
-                         "rounds": rounding(model), **capacity(model)})
+    dtypes = ReleaseDtypes(computed_in(numerics, model, variables))
+    return Release(task=ReleaseTask(settings, numerics, dtypes, rounding(model), capacity(model)).record())
 
 
-def capacity(model: nn.Module) -> dict[str, int]:
+def capacity(model: nn.Module) -> int | None:
     """The tokens `model`'s cache holds (`Bounded.max_seq_len`), where it states a count: a load-time
     capacity no family's config states beside its context (`max_position_embeddings`), which a request no
     shape bucket holds pads its cache to, so a release states it for its load (`released`) to build the
     model holding it, as `Pretrained.load(max_seq_len=...)` does."""
-    held = model.max_seq_len if isinstance(model, Bounded) else None
-    return {} if held is None else {"max_seq_len": held}
+    return model.max_seq_len if isinstance(model, Bounded) else None
 
 
-ROUNDING = ("scale_after_cast", "force_fp32_for_softmax")
+ROUNDING = tuple(field.name for field in dataclasses.fields(CausalTransformer)
+                 if field.metadata.get(_records.ROUNDS))
 """A model's fields that order its rounding (a norm's scale against its cast to the compute dtype, a softmax's
-width), which no family's config states and which change what it computes below float32 alone
-(`dew.interop.hf_decoders._RUNTIME_FIELDS`)."""
+width), which no family's config states and which change what it computes below float32 alone: the
+decoder's that say so (`dew._records.ROUNDS`), by name in any model that declares them."""
 
 
 def rounding(model: nn.Module) -> dict[str, bool]:
@@ -90,41 +133,14 @@ def computed_in(numerics: Numerics | None, model: nn.Module, variables: Variable
                                         if jnp.issubdtype(leaf.dtype, jnp.floating))))
 
 
-class Released(NamedTuple):
-    """What a release states of the run it was written of (`release_record`), each None (no rounding) where
-    it states none."""
-
-    settings: TaskSettings | None
-    numerics: Numerics | None
-    compute: DtypeName | None
-    rounds: Mapping[str, bool]
-    max_seq_len: int | None
-
-
-def released(directory: Path) -> Released:
+def released(directory: Path) -> ReleaseTask:
     """The run's own task settings, numerics, compute dtype, rounding and cache capacity an export of it
-    wrote (`release_record`), or None for each (no rounding) where the directory holds none: a source with
-    no run behind it builds its tasks from its own files, in the load's dtypes."""
+    wrote (`release_record`), or none of them where the directory holds none: a source with no run behind
+    it builds its tasks from its own files, in the load's dtypes."""
     from dew.config.release import Release
-    from dew.inference.tasks import TaskSettings
 
     release = Release.load(directory)
-    if release is None or release.task is None:
-        return Released(None, None, None, {}, None)
-    task = release.task
-    # A decision release states its task's numerics alone (`dew.decision.release.decision_envelope`): its
-    # own files declare its task.
-    settings, numerics, held = task.get("settings"), task.get("numerics"), task.get("max_seq_len")
-    dtypes = _records.record(task["dtypes"], "dtypes")
-    return Released(
-        None if settings is None else from_record(TaskSettings, _records.record(settings, "settings"),
-                                                  dtypes=False),
-        None if numerics is None else from_record(Numerics, _records.record(numerics, "numerics"),
-                                                  dtypes=False),
-        dtype_name(_records.text(dtypes["compute"], "compute")),
-        {name: _records.boolean(value, name)
-         for name, value in _records.record(task.get("rounds", {}), "rounds").items()},
-        None if held is None else _records.integer(held, "max_seq_len"))
+    return ReleaseTask() if release is None or release.task is None else ReleaseTask.read(release.task)
 
 
 class LoadSettings(NamedTuple):
@@ -151,11 +167,12 @@ def load_settings(directory: Path, numerics: Numerics | None, dtype: DTypeLike |
     master weights; and its cache's capacity, the load's `max_seq_len`, else the run's."""
     run = released(directory)
     held = run.max_seq_len if max_seq_len is None else max_seq_len
+    rounds = run.rounds or {}
     if numerics is not None:
         return LoadSettings(run.settings, numerics, dtype_name(numerics.dtypes.compute),
-                            dtype_name(numerics.dtypes.params), run.rounds, held)
+                            dtype_name(numerics.dtypes.params), rounds, held)
     compute = dtype_name(dtype) if dtype is not None else run.compute or "bfloat16"
     params: DtypeName | Literal["auto"] = (
         AUTO if param_dtype == AUTO or (param_dtype is None and run.compute is not None)
         else "float32" if param_dtype is None else dtype_name(param_dtype))
-    return LoadSettings(run.settings, run.numerics, compute, params, run.rounds, held)
+    return LoadSettings(run.settings, run.numerics, compute, params, rounds, held)

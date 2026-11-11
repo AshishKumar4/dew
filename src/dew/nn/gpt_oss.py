@@ -31,6 +31,7 @@ from dew.nn.moe import (
     weighs_one,
 )
 from dew.nn.precision import float32_dot_general, projection_role
+from dew.nn.residuals import Residual
 from dew.nn.sharding import declared
 
 if TYPE_CHECKING:
@@ -112,13 +113,13 @@ class GptOssExperts(nn.Module):
         projected = jnp.asarray(expert_projection(
             tokens, gate_up, sizes, dtype, self.implementation, self.precision, bias=gate_bias))
         # The dense MLP's residual names, the interleaved gate and up one product as a packed MLP's
-        # (mlp.py), so one remat policy covers every MLP (mixer_base.RESIDUALS).
-        projected = checkpoint_name(checkpoint_name(projected, 'gate_proj'), 'up_proj')
+        # (mlp.py), so one remat policy covers every MLP (residuals.RESIDUALS).
+        projected = checkpoint_name(checkpoint_name(projected, Residual.GATE_PROJ), Residual.UP_PROJ)
         gate, up = swiglu_clamped(projected[..., ::2], projected[..., 1::2], 7.0)
         activated = (up + 1) * quick_gelu(gate)
         output = jnp.asarray(expert_projection(
             activated, down, sizes, dtype, self.implementation, self.precision, bias=down_bias))
-        return checkpoint_name(output, 'down_proj')
+        return checkpoint_name(output, Residual.DOWN_PROJ)
 
 
 class GptOssMLP(nn.Module):

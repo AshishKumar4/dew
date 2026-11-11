@@ -34,7 +34,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew._records import JSON
+from dew._records import JSON, NUMBERS, ROUNDS, RUNS
 from dew.batch import (
     COORDINATES_FIELD,
     Coordinates,
@@ -79,12 +79,11 @@ from ..gemma3n import AltUp, clamped_predictions, rescale_to
 from ..hyper_connections import Carried, HyperConnections, enter_streams, leave_streams, stream_head
 from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase, coordinates_of
 from ..kv_cache import DecodeCursor, KVCache
-from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..ngpt import NGPT, gain
-from ..norms import RMSNorm
+from ..norms import NormSite, RMSNorm
 from ..precision import (
     at_least_fp32,
     capped_logits,
@@ -106,6 +105,7 @@ from ..protocols import (
     QuantizesInputs,
     declared_groups,
 )
+from ..residuals import MLP_RESIDUALS, RESIDUALS
 from ..rope import LongRopeScaling, Scaling
 from ..sharding import RESIDUAL, LogicalAxes, constrain, declared, pipeline_stages
 from ..value_experts import ValueExperts
@@ -226,7 +226,7 @@ class CausalTransformer(LinearProducts):
     """The dense feed-forward's gate and output multipliers (Falcon-H1's `mlp_multipliers`,
     `GatedMLP.gate_multiplier` and `down_multiplier`); None for neither. The shared and routed experts
     take none."""
-    max_seq_len: int = 2048
+    max_seq_len: int = dataclasses.field(default=2048, metadata={RUNS: True})
     context_length: int | None = None
     """The context a checkpoint states (max_position_embeddings), which an export writes back;
     None for `max_seq_len`. The model computes nothing from it: `max_seq_len` is its decode cache's
@@ -258,7 +258,7 @@ class CausalTransformer(LinearProducts):
     norm_bias: bool = False
     norms: Mapping[str, NormSpec] | None = None
     """The norms that differ from the model's others, by module name
-    (`decoder_block.NORM_SITES`): K2 Horizon's grouped statistics, an
+    (`decoder_block.NormSite`): K2 Horizon's grouped statistics, an
     epsilon or a weight of a norm's own."""
     embedding_norm: bool = False
     """Normalize token embeddings before the first block, as BLOOM and ModernBERT do."""
@@ -272,7 +272,8 @@ class CausalTransformer(LinearProducts):
     block reads the embedding norm's output as it is (modeling_modernbert.py,
     ModernBertEncoderLayer: attn_norm is Identity at layer 0)."""
     scale_offset: bool = False       # a norm's weight is (1 + w): Gemma's RMSNorm, GPT-3's LayerNorm
-    scale_after_cast: bool = False   # apply the weight after casting, as Llama and Qwen3 do
+    # Apply the weight after casting, as Llama and Qwen3 do.
+    scale_after_cast: bool = dataclasses.field(default=False, metadata={RUNS: True, ROUNDS: True})
     sandwich_norms: bool = False     # add a norm after each sublayer, as Gemma does
     pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
     post_residual_norms: bool = False  # norm the stream after each sublayer joins it: post-LN, OPT-350m's
@@ -288,7 +289,8 @@ class CausalTransformer(LinearProducts):
     qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
     attention_k_eq_v: bool = False           # Gemma 4's global layers read their values off the keys
-    layer_scalar: Literal["frozen", "trainable"] | None = None
+    layer_scalar: Literal["frozen", "trainable"] | None = dataclasses.field(default=None,
+                                                                            metadata={RUNS: True})
     attention_bias: bool = False
     """q/k/v biases, and o_proj's unless `o_proj_bias` says: none by default, as Llama's published
     `attention_bias: false`, where Flax's Dense adds one."""
@@ -326,7 +328,7 @@ class CausalTransformer(LinearProducts):
     applied to the final states, in fp32, so every head that contracts them
     (`output_table`) gets the same logits that `__call__` returns."""
     # lm-engine's init_utils.py at 45b6b57b.
-    initializer_range: float | None = None
+    initializer_range: float | None = dataclasses.field(default=None, metadata={RUNS: True})
     """The std of lm-engine's initialisation; None keeps each module's own
     initializer.
 
@@ -337,7 +339,7 @@ class CausalTransformer(LinearProducts):
     and norms at one. With `logits_scaling` set to m_width this is lm-engine's
     `init_method="mup"`, and with `logits_scaling` at 1 it is lm-engine's
     `"normal"`."""
-    depth_scaled_init: bool = False
+    depth_scaled_init: bool = dataclasses.field(default=False, metadata={RUNS: True})
     """Whether, with `initializer_range` set, the projections back into the
     residual stream (o_proj, out_proj, down_proj) divide their std by
     sqrt(2 * num_layers). This is lm-engine's `use_depth_scaled_init`."""
@@ -368,14 +370,14 @@ class CausalTransformer(LinearProducts):
     but never trains, as a source's `nn.Embedding(padding_idx=...)` leaves them (Gemma 3n's and Phi's
     pad_token_id, `TokenEmbedding.padding_idx`); a tied head still trains the row. None trains every
     row."""
-    dropout_rate: float = 0.0
-    embedding_dropout_rate: float = 0.0
-    attention_dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    attention_impl: AttentionImpl = "auto"
-    kv_cache: KVCache = KVCache()
+    dropout_rate: float = dataclasses.field(default=0.0, metadata={RUNS: True})
+    embedding_dropout_rate: float = dataclasses.field(default=0.0, metadata={RUNS: True})
+    attention_dropout_rate: float = dataclasses.field(default=0.0, metadata={RUNS: True})
+    dtype: Dtype | None = dataclasses.field(default=None, metadata={RUNS: True, NUMBERS: True})
+    precision: PrecisionLike = dataclasses.field(default=None, metadata={RUNS: True, NUMBERS: True})
+    force_fp32_for_softmax: bool = dataclasses.field(default=True, metadata={RUNS: True, ROUNDS: True})
+    attention_impl: AttentionImpl = dataclasses.field(default="auto", metadata={RUNS: True})
+    kv_cache: KVCache = dataclasses.field(default=KVCache(), metadata={RUNS: True})
     """How attention layers store the decode cache: dense or paged, full or
     quantized (`dew.nn.kv_cache`). The parameters do not depend on it."""
     mixture: Mixture | None = None        # some layers' feed-forward as `moe.SparseMLP`; None: dense
@@ -436,7 +438,7 @@ class CausalTransformer(LinearProducts):
     swiglu_limit: float | None = None  # GLM-5.3-Flash's clamp before every gated MLP's activation
     activation_sparsity_pattern: tuple[float, ...] | None = None
     """Gemma 3n's gaussian top-k activation sparsity, one fraction per layer."""
-    mask_token_id: int | None = None
+    mask_token_id: int | None = dataclasses.field(default=None, metadata={RUNS: True})
     """The vocabulary id that a masked-diffusion objective corrupts tokens to.
     None means plain training."""
     shifted_logits: bool = False
@@ -445,11 +447,11 @@ class CausalTransformer(LinearProducts):
     (Dream-v0); False reads each position's own (LLaDA). The forward ignores it: it says how
     the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
     masked loss and the sampler alike."""
-    scan_layers: bool = False
+    scan_layers: bool = dataclasses.field(default=False, metadata={RUNS: True})
     """Runs of like layers under flax's scan, and a step over resident weights, training's or a decode
     step's, a period's repeats as one body too (`scan_groups(periodic=True)`), so its program grows with
     the period, not the depth; a stage-local state on one stage holds each run as the scan reads it."""
-    bank_layers: int | None = None
+    bank_layers: int | None = dataclasses.field(default=None, metadata={RUNS: True})
     """The most layers one scanned run holds, which is also how many layers its
     parameter bank stacks. A longer run of like layers is split into
     consecutive runs of at most this many, each with its own bank under its own
@@ -461,7 +463,7 @@ class CausalTransformer(LinearProducts):
     loop: Loop | None = None
     """The layer stack run several times over its own output, its parameters
     shared (`Loop`), as Ouro's looped decoder runs it. None runs it once."""
-    remat: RematPolicy | None = None
+    remat: RematPolicy | None = dataclasses.field(default=None, metadata={RUNS: True})
     """The rematerialization policy. Each block is recomputed in the backward
     pass, keeping its inputs, any K/V passed to later layers, and the residuals
     the policy names. A config gives a name from `REMAT_POLICIES` or a record of
@@ -912,7 +914,7 @@ class CausalTransformer(LinearProducts):
             self.head_norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, precision=self.precision, specs=self.norms)(name='head_norm')
+                dtype=self.dtype, precision=self.precision, specs=self.norms)(name=NormSite.HEAD)
         if self.head_bias:
             self.head_bias_value = self.param(
                 'head_bias', declared(nn.initializers.zeros_init(), DECODER_AXES['head_bias']),
@@ -1675,8 +1677,10 @@ class CausalTransformer(LinearProducts):
             tokens_at = coordinates_of(attention_metadata, *tokens.shape)
             valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
             # Every cached call counts its real tokens, those at given places too, so a later call
-            # without places continues after them.
-            counted = self.decode_cursor(valid) if decode else prefix_sum(valid, dtype=jnp.int32) - 1
+            # without places continues after them; a serving step's mixed call counts each row's own.
+            admitted = None if attention_metadata is None else attention_metadata.admitted
+            counted = (self.decode_cursor(valid, admitted) if decode
+                       else prefix_sum(valid, dtype=jnp.int32) - 1)
             places = counted if tokens_at.positions is None else tokens_at.positions
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
         if self.embedding_norm and self.embedding_norm_reads == 'inputs':
@@ -2188,7 +2192,7 @@ class CausalTransformer(LinearProducts):
             self.embedding_layernorm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, precision=self.precision, specs=self.norms)(name='embedding_layernorm')
+                dtype=self.dtype, precision=self.precision, specs=self.norms)(name=NormSite.EMBEDDING)
         if self.position_embedding == 'learned':
             self.embed_positions = TokenEmbedding(
                 num_embeddings=self.position_rows,
@@ -2209,7 +2213,7 @@ class CausalTransformer(LinearProducts):
             self.norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
-                dtype=self.dtype, precision=self.precision, specs=self.norms)(name='norm')
+                dtype=self.dtype, precision=self.precision, specs=self.norms)(name=NormSite.FINAL)
 
     @nn.nowrap
     def with_kv_cache(self, layout: KVCache) -> Self:

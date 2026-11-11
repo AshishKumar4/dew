@@ -10,7 +10,6 @@ from dew.registry import Record
 
 from .common import (
     ProjectorLayout,
-    TowerBase,
     TowerLayout,
     _vision_section,
     activation_name,
@@ -18,7 +17,7 @@ from .common import (
     merger_projector,
     unplaced,
 )
-from .vit import PATCH_CONVOLUTION, translate_vit_weights
+from .vit import PATCH_CONVOLUTION, patch_convolution, translate_vit_weights
 
 _BLOCK_MAPS = {("attn", "qkv"): ("self_attn", "qkv_proj"), ("attn", "proj"): ("self_attn", "o_proj"),
                ("mlp", "gate_proj"): ("mlp", "gate_proj"), ("mlp", "up_proj"): ("mlp", "up_proj"),
@@ -29,13 +28,6 @@ _MIMO_ROUTES = Table(
     unplaced(r"merger\..+"), Route(PATCH_CONVOLUTION, "params/patch_embed/kernel"),
     Route("blocks.{index}.attn.sinks", "params/sinks_{index}"), block_routes(_BLOCK_MAPS, norm_bias=False))
 """A MiMo ViT's tensor names past `visual.`, both ways; the merger maps with the projector."""
-
-
-def _patch_convolution(tower: TowerBase) -> Mapping[str, tuple[int, ...]]:
-    """The patch map as the release stores it, a `[width, channels, time, patch, patch]` convolution."""
-    assert isinstance(tower, MiMoVision)
-    return {PATCH_CONVOLUTION: (tower.hidden_size, tower.in_channels, tower.temporal_patch_size,
-                                tower.patch_size, tower.patch_size)}
 
 
 def translate_mimo_vision_config(hf_config: Mapping[str, object]) -> Record:
@@ -73,7 +65,7 @@ def translate_mimo_projector_config(hf_config: Mapping[str, object], text_width:
 
 
 MIMO_VISION = TowerLayout("visual.", _MIMO_ROUTES, read=translate_vit_weights,
-                                    shapes=_patch_convolution)
+                                    shapes=patch_convolution)
 
 
 # MiMo's merger stores no biases (MiMoVisionPatchMerger's released tensors).

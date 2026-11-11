@@ -33,13 +33,14 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TypedDict
 
-from dew._records import JSON, finite, integer, integers, listed, record as section, text
+from dew._records import JSON, finite, integer, integers, record as section
 from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import routing_head, routing_json, routing_record, routing_rows
+from dew.registry import from_record, record_fields, recorded_names
 
-from .records import messages, reals
+from .records import reals
 from .rollout import Reward
-from .sessions import Call, Session, Status, Transcript, chains
+from .sessions import Call, Session, Status, chains
 
 MEDIA = ("multi_modal_data", "mm_processor_kwargs", "mm_processor_output")
 """The fields that put media into a row's context, which Dew's text trainer
@@ -48,19 +49,28 @@ does not read."""
 EXTRAS = (*MEDIA, "metrics")
 """Native fields Dew has no record for; they ride in `VerlTrajectory.extras`."""
 
-class _DewCall(TypedDict):
-    """One call of a chain: where its sampled ids start in the row's ids and
-    how many it sampled, which may be none (a call aborted before its first
-    token)."""
+_CALL_IN_ROW = ("prompt", "tokens", "behavior_log_probs", "routed_experts")
+"""The `Call` fields a row's own verl columns carry (its ids, mask, likelihoods and routing), which Dew's
+record of each call leaves out."""
 
-    start: int
-    count: int
-    finish_reason: str
-    version: int
-    raw_log_probs: list[float] | None
-    support: list[list[int]] | None
-    reward: float | None
-    transcript: dict[str, object] | None
+_SESSION_IN_ROWS = ("calls", "reward")
+"""The `Session` fields its rows carry (its calls, its `reward_score`), which Dew's record of the session
+leaves out."""
+
+
+@dataclass(frozen=True)
+class DewRow:
+    """Dew's own record of a row (`extra_fields.dew`): its session's record beside its calls and reward,
+    which chain of the session's it is and how many it has, each call's record beside its ids (where its
+    sampled ids `start` in the row's ids and how many, `count`, it sampled: none for a call aborted before
+    its first token), and whether Dew `stamped` the row's global steps. The session's and the calls' records
+    are theirs (`registry.record_fields`), read back by `from_record`."""
+
+    session: Mapping[str, JSON]
+    chain: int
+    chains: int
+    calls: tuple[Mapping[str, JSON], ...]
+    stamped: bool = False
 
 
 class VerlRow(TypedDict):
@@ -113,24 +123,9 @@ def to_verl(trajectories: Sequence[Session | VerlTrajectory]) -> list[VerlRow]:
             sampled = [index >= 0 for index in chain.calls]
             # A chain starts with its first call's whole prompt.
             start = chain.members[0][1]
-            calls: list[_DewCall] = []
-            for index, first, count in chain.members:
-                call = session.calls[index]
-                calls.append(
-                    {
-                        "start": first,
-                        "count": count,
-                        "finish_reason": call.finish_reason,
-                        "version": call.version,
-                        "raw_log_probs": None if call.raw_log_probs is None else list(call.raw_log_probs),
-                        "support": None if call.support is None else [list(kept) for kept in call.support],
-                        "reward": call.reward,
-                        "transcript": None if call.transcript is None else {
-                            "messages": [dict(message) for message in call.transcript.messages],
-                            "response": None if call.transcript.response is None
-                            else dict(call.transcript.response)},
-                    }
-                )
+            calls = tuple({"start": first, "count": count,
+                           **record_fields(session.calls[index], Call, without=_CALL_IN_ROW)}
+                          for index, first, count in chain.members)
             versions = [session.calls[index].version for index, _, _ in chain.members]
             gaps = sum(1 for position in range(start + 1, len(chain.tokens))
                        if not sampled[position] and sampled[position - 1])
@@ -142,22 +137,8 @@ def to_verl(trajectories: Sequence[Session | VerlTrajectory]) -> list[VerlRow]:
             stamped = "min_global_steps" not in extra
             if stamped:
                 extra.update(min_global_steps=min(versions), max_global_steps=max(versions))
-            extra["dew"] = {
-                "session": {
-                    "task": session.task,
-                    "group": session.group,
-                    "sample": session.sample,
-                    "attempt": session.attempt,
-                    "status": session.status.value,
-                    "components": dict(session.components),
-                    "detail": session.detail,
-                    "source": session.source,
-                },
-                "chain": number,
-                "chains": len(built),
-                "calls": calls,
-                "stamped": stamped,
-            }
+            extra["dew"] = record_fields(DewRow(record_fields(session, Session, without=_SESSION_IN_ROWS),
+                                                number, len(built), calls, stamped), DewRow)
             routing = chain.routing
             rows.append({
                 "prompt_ids": chain.tokens[:start],
@@ -195,20 +176,11 @@ def _runs(mask: Sequence[int], offset: int) -> list[tuple[int, int]]:
     return runs
 
 
-def _transcript(value: object) -> Transcript:
-    """A call's transcript as `to_verl` wrote it into `extra_fields.dew.calls`."""
-    if not isinstance(value, Mapping):
-        raise ValueError(f"transcript={value!r}: a call's transcript records its messages and response")
-    written = section(value, "transcript")
-    response = written["response"]
-    return Transcript(messages(written["messages"], "messages"),
-                      None if response is None else section(response, "response"))
-
-
 def _calls(row: Mapping[str, object], version: int | None,
-           described: Sequence[Mapping[str, object]] | None) -> tuple[Call, ...]:
+           described: Sequence[Mapping[str, JSON]] | None) -> tuple[Call, ...]:
     """Rebuild a row's model calls: each run of mask-1 ids is one call's
-    sampled ids, and the row's ids before it are the call's prompt."""
+    sampled ids, and the row's ids before it are the call's prompt; each
+    call's own record where Dew wrote the row (`DewRow.calls`)."""
     prompt, response, mask = _ids(row, "prompt_ids"), _ids(row, "response_ids"), _ids(row, "response_mask")
     if len(mask) != len(response) or set(mask) - {0, 1}:
         raise ValueError("verl response_mask holds one 0 or 1 per response id")
@@ -224,11 +196,6 @@ def _calls(row: Mapping[str, object], version: int | None,
     record = None if routed is None else routing_record(routed)
     calls = []
     for number, (begin, length) in enumerate(runs):
-        meta = described[number] if described is not None else {}
-        stated = meta.get("version", version)
-        if stated is None:
-            raise ValueError("a native verl row names its policy version in extra_fields.min_global_steps; "
-                             "this one has none, so pass version=")
         forwarded = begin + length - 1
         if not begin or begin + length > len(full):
             raise ValueError(f"verl call {number} samples ids {begin}..{begin + length} of a "
@@ -237,32 +204,34 @@ def _calls(row: Mapping[str, object], version: int | None,
             raise ValueError(
                 f"verl routed_experts covers {routing_rows(record)} ids; call {number} forwarded {forwarded}"
             )
-        support = meta.get("support")
         offset = begin - len(prompt)
-        calls.append(
-            Call(
-                prompt=tuple(full[:begin]),
-                tokens=tuple(full[begin : begin + length]),
-                behavior_log_probs=tuple(logprobs[offset : offset + length]),
-                finish_reason=text(
-                    meta.get("finish_reason", "stop" if number == len(runs) - 1 else "tool_calls"),
-                    "finish_reason",
-                ),
-                version=integer(stated, "version"),
-                raw_log_probs=None if meta.get("raw_log_probs") is None
-                else reals(meta["raw_log_probs"], "raw_log_probs"),
-                routed_experts=None if record is None else routing_head(record, forwarded),
-                support=None if support is None else listed(
-                    support, "support", read=integers, what="a list of token-id lists"),
-                reward=None if meta.get("reward") is None else finite(meta["reward"], "reward"),
-                transcript=None if meta.get("transcript") is None else _transcript(meta["transcript"]),
-            )
-        )
+        carried = {"prompt": tuple(full[:begin]), "tokens": tuple(full[begin:begin + length]),
+                   "behavior_log_probs": tuple(logprobs[offset:offset + length]),
+                   "routed_experts": None if record is None else routing_head(record, forwarded)}
+        # A call that states no finish (a native row's, an earlier Dew row's): the chain's last stopped it and
+        # every other ended on a tool call.
+        finished = "stop" if number == len(runs) - 1 else "tool_calls"
+        if described is not None:
+            own = {name: value for name, value in described[number].items() if name not in ("start", "count")}
+            calls.append(from_record(Call, {"finish_reason": finished, **own, **carried}, dtypes=False))
+        elif version is None:
+            raise ValueError("a native verl row names its policy version in extra_fields.min_global_steps; "
+                             "this one has none, so pass version=")
+        else:
+            calls.append(Call(**carried, finish_reason=finished, version=version))
     return tuple(calls)
 
 
-def _dew(row: Mapping[str, object]) -> Mapping[str, object]:
-    return section(section(row["extra_fields"], "extra_fields")["dew"], "dew")
+def _dew(row: Mapping[str, object]) -> DewRow:
+    """Dew's record of a row it wrote (`DewRow`), its session's and each call's record whole, as Dew writes
+    them (`_whole`)."""
+    dew = from_record(DewRow, section(section(row["extra_fields"], "extra_fields")["dew"], "dew"),
+                      dtypes=False)
+    missing = sorted(set(recorded_names(Session)) - set(_SESSION_IN_ROWS) - set(dew.session))
+    if missing:
+        # A session's identity a default would read as another session's (its source, its group).
+        raise ValueError(f"a session's record Dew wrote states each of its fields; this one lacks {missing}")
+    return dew
 
 
 def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
@@ -314,30 +283,22 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
             used = 1
         else:
             dew = _dew(row)
-            count = integer(dew["chains"], "chains")
+            count = integer(dew.chains, "chains")
             if not 1 <= count <= len(rows) - cursor:
                 raise ValueError(f"verl row {cursor} says its session spans {count} rows; "
                                  f"a session spans at least one, and {len(rows) - cursor} remain")
-            group = rows[cursor:cursor + count]
+            group = [_dew(member) for member in rows[cursor:cursor + count]]
             if (
                 len(group) != count
-                or [integer(_dew(member)["chain"], "chain") for member in group] != list(range(count))
-                or any(_dew(member)["session"] != dew["session"] for member in group)
+                or [member.chain for member in group] != list(range(count))
+                or any(member.session != dew.session for member in group)
             ):
                 raise ValueError(f"verl rows from {cursor} do not hold the {count} chains of one session")
-            calls = tuple(call for member in group
-                          for call in _calls(member, None, listed(
-                              _dew(member)["calls"], "calls", read=section, what="a list of calls")))
-            record = section(dew["session"], "session")
-            components = {key: finite(value, key)
-                          for key, value in section(record["components"], "components").items()}
-            session = Session(text(record["task"], "task"), text(record["group"], "group"),
-                              integer(record["sample"], "sample"), integer(record["attempt"], "attempt"),
-                              calls, Status(text(record["status"], "status")),
-                              None if reward is None else finite(reward, "reward_score"),
-                              MappingProxyType(components), text(record["detail"], "detail"),
-                              text(record["source"], "source"))
-            if dew.get("stamped", False):
+            calls = tuple(call for member, written in zip(rows[cursor:cursor + count], group, strict=True)
+                          for call in _calls(member, None, written.calls))
+            scored = None if reward is None else finite(reward, "reward_score")
+            session = from_record(Session, {**dew.session, "calls": calls, "reward": scored}, dtypes=False)
+            if dew.stamped:
                 for key in ("min_global_steps", "max_global_steps"):
                     extra.pop(key, None)
             used = count

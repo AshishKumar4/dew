@@ -69,6 +69,7 @@ from dew.nn.attention import AttentionImpl
 from dew.nn.inputs import document_reach
 from dew.nn.kv_cache import cache_positions, filled_slots
 from dew.nn.precision import at_least_fp32, broadcast_summed, configured_precision, exact_float32, scaled
+from dew.nn.programs import purely_called
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import parameter_path
 from dew.registry import resolve_dtype
@@ -1116,16 +1117,25 @@ def _Draws():
     return Draws()
 
 
-_OPMATH: Mapping[str, tuple[int, str] | None] = {
-    "gelu": None, "silu": None, "native_layer_norm": None, "native_group_norm": None,
-    "_softmax": (2, "half_to_float"), "_log_softmax": (2, "half_to_float")}
+_OPMATH = ("gelu", "silu", "native_layer_norm", "native_group_norm", "_softmax", "_log_softmax")
 """The aten ops torchax lowers into several roundings of a narrow float (jax.nn's gelu, silu,
 softmax and log_softmax, and its layer and group norms' mean, variance and normalization),
-where torch's kernels compute a bf16 or fp16 operand in fp32 and round each output once; by
-the position and name of the argument that keeps the output fp32 (`half_to_float`), where the
-op has one. Left to torchax, a GPT-NeoX's LayerNorm took the variance of its bf16-rounded deviations,
-which scaled its logits by 1 - 8.9e-4 and put its bf16 loss 7.7 times torch's distance from
-float64."""
+where torch's kernels compute a bf16 or fp16 operand in fp32 and round each output once. Which ops
+torch computes at its opmath is a fact of ATen's compiled kernels (`at::opmath_type`), which no
+schema or Python registry of the installed torch carries; the argument that keeps an op's output
+fp32 (`half_to_float`) its schema states (`_keeps_fp32`). Left to torchax, a GPT-NeoX's LayerNorm
+took the variance of its bf16-rounded deviations, which scaled its logits by 1 - 8.9e-4 and put its
+bf16 loss 7.7 times torch's distance from float64."""
+
+_KEEPS_FP32 = "half_to_float"
+"""The aten argument that keeps a softmax's output fp32 for a narrow input."""
+
+
+def _keeps_fp32(op) -> tuple[int, str] | None:
+    """The position and name of `op`'s argument that keeps its output fp32 (`_KEEPS_FP32`), as its schema
+    states them, or None where it has none."""
+    names = [argument.name for argument in op._schema.arguments]
+    return (names.index(_KEEPS_FP32), _KEEPS_FP32) if _KEEPS_FP32 in names else None
 
 
 @functools.cache
@@ -1138,8 +1148,9 @@ def _environment():
     from torchax.tensor import Environment
 
     env = Environment()
-    for name, keeps_fp32 in _OPMATH.items():
+    for name in _OPMATH:
         packet = getattr(torch.ops.aten, name)
+        keeps_fp32 = _keeps_fp32(packet.default)
         # Every key torchax registers the op under: its packet, or one of the packet's overloads.
         registered = ops_registry.all_aten_ops
         for op in (packet, *(getattr(packet, overload) for overload in packet.overloads())):
@@ -1198,8 +1209,7 @@ def _accumulating(closed: Jaxpr, *arguments: jax.Array) -> list[jax.Array]:
             for var in equation.invars:
                 if not isinstance(var, Literal) and last[var] == index and var not in kept:
                     held.pop(var, None)
-            if equation.primitive is primitives.jit_p:
-                inner = equation.params["jaxpr"]
+            if (inner := purely_called(equation)) is not None:
                 outputs = evaluate(inner.jaxpr, inner.consts, inputs)
             elif equation.primitive is primitives.broadcast_in_dim_p and _narrow_float(inputs[0]):
                 outputs = [broadcast_summed(inputs[0], tuple(equation.params["shape"]),

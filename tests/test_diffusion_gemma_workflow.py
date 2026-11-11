@@ -228,6 +228,45 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
         saved.process, saved.max_new_tokens, saved.pad_token_id) and task.pad_token_id == 5
 
 
+@pytest.mark.parametrize("fixture", ["diffusion-gemma-workflow", "diffusion-gemma-sft"])
+def test_a_runs_export_is_its_bundles_published_layout_where_transformers_builds_it(tmp_path, fixture):
+    """`dew export` of a block-diffusion run (`export_run`, which asks the model's layout first,
+    `source_layout`) writes the published layout its bundle writes (`Pretrained.from_run(...).save`),
+    config and tensors alike, where transformers' DiffusionGemmaForBlockDiffusion builds the model (the
+    image-reading fixture); Google's dense text-only model, which that class cannot build, exports as the
+    run's native release, stating why (row 4784)."""
+    from etils import epath
+    from safetensors.numpy import load_file
+    from test_inference import make_block_run
+
+    from dew.config.release import Release
+    from dew.inference.loading import released_model
+    from dew.inference.tasks import SavedRun
+    from dew.interop.saved_sources import export_run
+
+    run = tmp_path / "run"
+    run.mkdir()
+    # The published layout writes its tokenizer's files, a byte vocabulary having none.
+    published = fixture == FIXTURE.name
+    make_block_run(run, fixture=fixture, scale=0.02, tokenizer=str(FIXTURE) if published else "byte",
+                   pad_token_id=5)
+    exported = tmp_path / "exported"
+    export_run(SavedRun.pinned(str(run)), exported)
+    if not published:
+        assert released_model(epath.Path(exported))
+        task = Release.load(str(exported)).task
+        assert task is not None and "unstated" in task
+        return
+    saved = tmp_path / "saved"
+    Pretrained.from_run(str(run)).save(saved)
+    configs = [json.loads((path / "config.json").read_text()) for path in (exported, saved)]
+    assert configs[0] == configs[1] and configs[0]["model_type"] == "diffusion_gemma"
+    written, expected = (load_file(str(path / "model.safetensors")) for path in (exported, saved))
+    assert sorted(written) == sorted(expected)
+    for name, tensor in expected.items():
+        np.testing.assert_array_equal(written[name], tensor, err_msg=name)
+
+
 def test_a_block_process_round_trips_through_transformers_generation_config():
     """A process with integer thresholds and its own temperatures and step
     budget writes a generation config transformers' class accepts, and reads

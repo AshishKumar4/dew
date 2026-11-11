@@ -12,6 +12,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
+from float64_terms import scanned_steps
 from jax._src.pallas import mpmd, pallas_call as pallas_call_module
 from jax.extend import core
 
@@ -102,24 +103,15 @@ def _while(equation, values: list, found: list) -> list:
 
 
 def _scan(equation, values: list, found: list) -> list:
-    """A `scan` run step by step, each step's launches run alone (`_evaluated`), its stacked outputs
-    stacked as the scan stacks them; its operands and results split as JAX's own scan splits them
-    (`ft_in`, `ft_out`)."""
-    params = equation.params
-    body, closed = _closed(params["jaxpr"])
-    fixed, carry, xs = (list(part) for part in params["ft_in"].update(values).unpack())
-    steps = range(params["length"] - 1, -1, -1) if params["reverse"] else range(params["length"])
-    ys = []
-    for step in steps:
-        outs = _evaluated(body, closed, [*fixed, *carry, *(x[step] for x in xs)], found)
-        carry, y = (list(part) for part in params["ft_out"].update(outs).unpack())
-        ys.append(y)
-    if params["reverse"]:
-        ys.reverse()
-    stacked = [jax.numpy.stack(column) for column in zip(*ys, strict=True)] if ys else [
-        jax.numpy.zeros((0, *variable.aval.shape[1:]), variable.aval.dtype)
-        for variable in equation.outvars[len(carry):]]
-    return [*carry, *stacked]
+    """A `scan` run step by step as the gate's one program walker steps it (`float64_terms.scanned_steps`:
+    its operands split, its carries threaded and its outputs stacked there), each step's launches run alone
+    (`_evaluated`)."""
+    body, closed = _closed(equation.params["jaxpr"])
+
+    def step(_, operands):
+        return [(out,) for out in _evaluated(body, closed, [value for (value,) in operands], found)]
+
+    return [value for (value,) in scanned_steps(equation, [(value,) for value in values], step, lanes=1)]
 
 
 def _cond(equation, values: list, found: list) -> list:

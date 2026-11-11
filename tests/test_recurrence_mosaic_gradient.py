@@ -48,7 +48,7 @@ from dew.nn.kernels.recurrence_chunk import Chunk, recomputing
 from dew.nn.kernels.templates import bundles, mosaic_sm90, mosaic_sm100
 from dew.nn.kernels.templates.recurrence import chunk_forward, mainloop, mainloop_backward, template
 from dew.nn.kernels.templates.recurrence.template import mosaic_rule
-from dew.nn.mixer_base import DELTA_RULE_RESIDUALS
+from dew.nn.residuals import DELTA_RULE_RESIDUALS
 
 pytestmark = pytest.mark.kernel
 

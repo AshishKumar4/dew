@@ -16,19 +16,22 @@ from dew._coordination import read_home
 from dew.batch import Variables, merge, thaw
 from dew.nn.protocols import BankedStacks, StagedStacks
 
+LAYERS = "layers_"
+"""The prefix of every stack module's name: a layer's `layers_3`, a scanned run's `layers_3_7`."""
+
 
 def group_name(first: int, count: int) -> str:
     """The module name of a scanned run: `layers_3_7` runs layers 3 through 7."""
-    return f'layers_{first}_{first + count - 1}'
+    return f'{LAYERS}{first}_{first + count - 1}'
 
 
 def group_layers(name: str) -> range | None:
     """The layers a stack module name runs: `layers_3_7` as range(3, 8),
     `layers_3` as range(3, 4), anything else as None. The inverse of
     `group_name`, for a reader keyed by single layers that meets the run."""
-    if not name.startswith("layers_"):
+    if not name.startswith(LAYERS):
         return None
-    parts = name[len("layers_"):].split("_")
+    parts = name[len(LAYERS):].split("_")
     if not all(part.isdigit() for part in parts) or len(parts) > 2:
         return None
     first, last = int(parts[0]), int(parts[-1])
@@ -39,10 +42,27 @@ def layer_index(name: str) -> int | None:
     """Return the layer index a single layer's `layers_N` module name holds (`group_layers`), or
     None, a run's `layers_3_7` (or one-layer run's `layers_3_3`) among the rest."""
     layers = group_layers(name)
-    return layers.start if layers is not None and name == f"layers_{layers.start}" else None
+    return layers.start if layers is not None and name == f"{LAYERS}{layers.start}" else None
 
 
-__all__ = ["group_layers", "group_name", "layer_index"]
+def any_layer(path: str, *, pattern: bool = False) -> str:
+    """`path`, a module path (`stages/layers_1/attn`, `layers_3_7/mlp`), with each stack module of it any
+    layer (`layers_*`), a pipeline stage's `stages/` before it dropped: the path every layer of the stack
+    shares. With `pattern`, `path` is a glob (`layers_3/*`), each component naming a stack module
+    (`layers_` and anything) widened alike, its other components as they are."""
+    parts: list[str] = []
+    for part in path.split("/"):
+        named = part.startswith(LAYERS) if pattern else group_layers(part) is not None
+        if not named:
+            parts.append(part)
+            continue
+        if not pattern and parts[-1:] == ["stages"]:
+            parts.pop()
+        parts.append(f"{LAYERS}*")
+    return "/".join(parts)
+
+
+__all__ = ["LAYERS", "any_layer", "group_layers", "group_name", "layer_index"]
 
 
 def array_rows(path, leaf, shape: tuple[int, ...]) -> list:

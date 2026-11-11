@@ -49,6 +49,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import struct
 
+from dew.nn.precision import divided
+
 ARM = 0.17 * 0.5 ** 0.5
 """A rotor's offset along x and y from the centre, metres: Flightmare's 0.17 m arm in an X."""
 POSITIONS = ((ARM, -ARM), (-ARM, -ARM), (-ARM, ARM), (ARM, ARM))
@@ -286,7 +288,7 @@ def flown(quadrotor: Quadrotor, body: Body, flight: Flight, collective: jax.Arra
         rates_now = flight.angular_velocity + angular * dt
         power = jnp.sum(body.drag_coefficient * speed ** 3) / q.efficiency
         current = power / (q.cells * flight.voltage)
-        drawn = flight.drawn + current * dt / 3600
+        drawn = flight.drawn + divided(current * dt, 3600)
         open_circuit = body.charged - q.discharge * drawn / q.capacity
         voltage = jnp.maximum(open_circuit - body.resistance * current, 0.1)
         flight = dataclasses.replace(flight, position=flight.position + velocity * dt, velocity=velocity,

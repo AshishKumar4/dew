@@ -35,7 +35,6 @@ import struct
 import sys
 import types
 from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
 import requests
@@ -50,9 +49,9 @@ import triton
 import triton.language as tl
 from modelopt.torch.export import export_hf_checkpoint
 from modelopt.torch.kernels.quantization.gemm.fp4_kernel_hopper import fp4_fake_quant_kernel as sm89_kernel
-from modelopt.torch.quantization.qtensor import FP8QTensor, NVFP4QTensor
 from modelopt.torch.quantization.tensor_quant import fp8_eager
-from safetensors.torch import load_file, save_file
+from modelopt_worker import author_models, author_weight
+from safetensors.torch import save_file
 from transformers import Qwen3Config, Qwen3ForCausalLM
 from triton.language.extra.cuda import libdevice
 
@@ -124,78 +123,6 @@ def author_qdq(x: torch.Tensor, global_scale: torch.Tensor, *, corrected: bool =
     return out.reshape(shape)
 
 
-def author_weight(stored: dict[str, torch.Tensor], stem: str) -> torch.Tensor:
-    packed = stored[stem + ".weight"]
-    if packed.dtype == torch.float8_e4m3fn:
-        quantized = FP8QTensor(packed.shape, torch.bfloat16, packed)
-        return quantized.dequantize(scale=stored[stem + '.weight_scale'])
-    shape = torch.Size((packed.shape[0], 2 * packed.shape[1]))
-    quantized = NVFP4QTensor(shape, torch.bfloat16, packed)
-    return quantized.dequantize(scale=stored[stem + ".weight_scale"],
-                               double_scale=stored[stem + ".weight_scale_2"], block_sizes={-1: 16})
-
-
-def author_models(directory: Path, arrays: dict | None = None):
-    """The author's forward of the checkpoint at `directory` on the GPU: its weights decoded as the author
-    decodes them (`author_weight`), the float32 reference and its float64 twin (`float64_twin`, built inside
-    `float64` so its rotary tables are float64's), each input quantizer registered on its layer in both, the
-    discrete kernel run in fp32 in the widened model; with `arrays`, each quantized layer's forward inputs
-    and QDQ outputs recorded into it. Returns the two models, the stored tensors, the quantized stems and the
-    hooks."""
-    from _dew_torch.precision import float64_twin
-
-    stored = load_file(directory / "model.safetensors", device="cuda")
-    config = Qwen3Config.from_pretrained(directory)
-    del config.quantization_config
-    config._attn_implementation = "eager"
-    reference = Qwen3ForCausalLM(config).to("cuda").eval()
-    quantized = [name.removesuffix('.weight_scale') for name in stored if name.endswith('.weight_scale')]
-    suffixes = (".weight_scale", ".weight_scale_2", ".input_scale")
-    parts = {stem + suffix for stem in quantized for suffix in suffixes}
-    state = {name: value.float() for name, value in stored.items() if name not in parts}
-    for stem in quantized:
-        state[stem + ".weight"] = author_weight(stored, stem).float()
-        if arrays is not None:
-            arrays[stem + "/weight"] = state[stem + ".weight"].cpu().numpy()
-    missing, unexpected = reference.load_state_dict(state, strict=False)
-    assert missing == ["lm_head.weight"] and not unexpected, (missing, unexpected)
-    reference.tie_weights()
-    # The float64 truth is the reference's twin (`float64_twin`), built inside `float64` so its rotary
-    # tables are float64's, each input quantizer registered on its layer in both.
-    wide = float64_twin(reference)
-    direct_float = torch.Tensor.float
-    original_to = torch.Tensor.to
-    hooks = []
-    for stem in quantized:
-        if stem + '.input_scale' not in stored:
-            continue
-        overall = stored[stem + ".input_scale"]
-        is_fp8 = stored[stem + '.weight'].dtype == torch.float8_e4m3fn
-
-        def input_hook(_, args, overall=overall, stem=stem, is_fp8=is_fp8):
-            value = args[0]
-            def quantize(x):
-                if is_fp8:
-                    with patch.object(torch.Tensor, 'to', original_to):
-                        return fp8_eager(x, overall * 448)
-                return author_qdq(x, overall)
-            # The same discrete kernel runs in fp32 in the widened model.
-            if value.dtype == torch.float64:
-                return (quantize(direct_float(value)).double(),)
-            output = quantize(value)
-            if arrays is not None:
-                arrays[stem + "/forward_inputs"] = value.detach().cpu().numpy()
-                arrays[stem + "/forward_qdq"] = output.detach().cpu().numpy()
-                if not is_fp8:
-                    arrays[stem + "/forward_sm89_qdq"] = author_qdq(value, overall,
-                                                                    corrected=False).cpu().numpy()
-            return (output,)
-
-        hooks += [model.get_submodule(stem).register_forward_pre_hook(input_hook)
-                  for model in (reference, wide)]
-    return reference, wide, stored, quantized, hooks
-
-
 def tiny(*, mixed: bool = False) -> None:
     from _dew_torch.precision import float64
 
@@ -221,13 +148,18 @@ def tiny(*, mixed: bool = False) -> None:
     directory = ROOT / ('mixed' if mixed else 'tiny')
     export_hf_checkpoint(model, dtype=torch.bfloat16, export_dir=directory)
     arrays = {"ids": ids.cpu().numpy()}
-    reference, wide, stored, quantized, hooks = author_models(directory, arrays)
+    reference, wide, stored, quantized, hooks = author_models(directory, author_qdq, "cuda", arrays)
     with torch.no_grad():
         arrays["logits"] = reference(ids, use_cache=False).logits.cpu().numpy()
     with float64(), torch.no_grad():
         arrays["logits_f64"] = wide(ids, use_cache=False).logits.cpu().numpy()
     for hook in hooks:
         hook.remove()
+    for stem in quantized:
+        if stem + "/forward_inputs" in arrays and stored[stem + ".weight"].dtype != torch.float8_e4m3fn:
+            inputs = torch.from_numpy(arrays[stem + "/forward_inputs"]).cuda()
+            arrays[stem + "/forward_sm89_qdq"] = author_qdq(inputs, stored[stem + ".input_scale"],
+                                                            corrected=False).cpu().numpy()
     generator = torch.Generator(device="cuda").manual_seed(2050)
     probe = torch.randn(16, 64, generator=generator, device="cuda")
     probe[0] = 0

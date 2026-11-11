@@ -2,15 +2,10 @@
 (`tools/meanflow_reference.py`), and the objective and interval sampling
 built around it."""
 
-import os
-import subprocess
-import sys
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from lane_environment import without_deterministic_ops
 from arm_arithmetic import float64_held
 from reference_error import as_given, assert_as_exact, widened
 
@@ -168,17 +163,8 @@ def agrees_with_xla(kernel: str) -> None:
 
 def meanflow_trains_through_a_fused_attention_kernel():
     """A fused attention kernel defines only its reverse-mode derivative, so MeanFlow's target JVP
-    traces for forward mode (`forward_mode_attention`): a step through Triton's kernel, which runs
-    under the cuda lane's --xla_gpu_deterministic_ops, agrees with the xla kernel's
-    (`agrees_with_xla`), and so does one through cuDNN's, which XLA cannot run under that flag
-    (openxla/xla#46500), in a process of its own whose XLA starts without it."""
+    traces for forward mode (`forward_mode_attention`): a step through Triton's kernel and one through
+    cuDNN's each agree with the xla kernel's (`agrees_with_xla`), under the cuda lane's
+    --xla_gpu_deterministic_ops as the lane runs."""
     agrees_with_xla("triton")
-    flags = without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
-    script = "import test_mean_flow; test_mean_flow.agrees_with_xla('cudnn')"
-    # This checkout's Dew, ahead of any the environment installs.
-    source = str(Path(__file__).resolve().parents[1] / "src")
-    path = os.pathsep.join(filter(None, (source, os.environ.get("PYTHONPATH"))))
-    done = subprocess.run([sys.executable, "-c", script], cwd=Path(__file__).resolve().parent,
-                          capture_output=True, text=True, timeout=900,
-                          env={**os.environ, "XLA_FLAGS": flags, "PYTHONPATH": path})
-    assert done.returncode == 0, done.stderr[-4000:]
+    agrees_with_xla("cudnn")

@@ -832,7 +832,6 @@ PACKED_SEEDS = 256
 on armada."""
 
 
-@pytest.mark.whole_suite
 def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_model():
     """`dew.pipeline` packs a decoder's projections before quantizing them; served packed, its logits
     and its draws' log-likelihoods, a task's and a server's, are on par (check 1) with the canonical
@@ -1598,15 +1597,13 @@ def placed(tree, dtype):
 
 def with_triton_gemms(flow) -> None:
     """Run `flow`, a function of this module, in a fresh process under the lane's flags without the
-    two that keep XLA's Triton GEMM fusion out of a program: deterministic ops and
-    `--xla_gpu_enable_triton_gemm=false` (tests/lane_environment.py's `REPEATABLE_GPU_FLAGS`). Its pinned
-    autotuning then gives every GEMM a program leaves to Triton the fusion, as XLA's own autotuner
-    does at small contractions, where it computed int8 dots as two or four times their product
-    (openxla/xla#51016). XLA reads its flags once a process."""
+    one that keeps XLA's Triton GEMM fusion out of a program, deterministic ops (tests/lane_environment.py's
+    `REPEATABLE_GPU_FLAGS`). Its pinned autotuning then gives every GEMM a program leaves to Triton the
+    fusion, as XLA's own autotuner does at small contractions, where it computed int8 dots as two or four
+    times their product (openxla/xla#51016). XLA reads its flags once a process."""
     pytest.importorskip("qwix")
     here = Path(__file__).resolve().parent
-    flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_deterministic_ops",
-                          "--xla_gpu_enable_triton_gemm")
+    flags = without_flags(os.environ.get("XLA_FLAGS", ""), "--xla_gpu_deterministic_ops")
     script = f"import {Path(__file__).stem} as tests; tests.{flow.__name__}()"
     # pytest's own path (pyproject's `pythonpath`: the sources and the repository root) and this directory.
     path = os.pathsep.join([str(here.parent / "src"), str(here.parent), str(here)])

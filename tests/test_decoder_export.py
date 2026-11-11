@@ -698,11 +698,28 @@ PREPARED = {"gpt2": ("gpt2-tiny", "transformer.h.0.attn.c_attn.weight", ""),
             "gpt2-bare": ("gpt2-tiny", "h.0.attn.c_attn.weight", "transformer."),
             "gptj": ("gptj-tiny", "transformer.h.0.attn.q_proj.weight", ""),
             "gpt-neox": ("gpt-neox-tiny", "gpt_neox.layers.0.attention.query_key_value.weight", ""),
-            "modernbert": ("modernbert-tiny", "model.layers.0.attn.Wqkv.weight", "")}
-"""Families whose `prepare` rewrites a tensor before it binds, the one each
-checkpoint ships in FP8 here, and the prefix its names leave out: GPT-2's
-Conv1D qkv, also as the bare GPT2Model stores it without `transformer.`,
-GPT-J's query rows in rotary order, GPT-NeoX's and ModernBERT's fused qkv."""
+            "modernbert": ("modernbert-tiny", "model.layers.0.attn.Wqkv.weight", ""),
+            "modernbert-bare": ("modernbert-tiny", "layers.0.attn.Wqkv.weight", "model.")}
+"""Families whose tensors bind other than as stored, the one each checkpoint
+ships in FP8 here, and the prefix its names leave out: GPT-2's Conv1D qkv,
+also as the bare GPT2Model stores it without `transformer.`, GPT-J's query
+rows in rotary order, GPT-NeoX's and ModernBERT's fused qkv, ModernBERT's
+also as the bare ModernBertModel stores it without `model.`."""
+
+
+@pytest.mark.parametrize(("fixture", "prefix"),
+                         [("gpt2-tiny", "transformer."), ("modernbert-tiny", "model.")])
+def test_a_bare_models_checkpoint_loads_as_its_language_models(fixture, prefix, tmp_path):
+    """A bare model's checkpoint, its language model's names without their prefix (GPT2Model's
+    `transformer.`, ModernBertModel's `model.`), loads the leaves its language model's does: its family's
+    routes read both (`layouts.Spelled`)."""
+    tensors = {stored.removeprefix(prefix): tensor
+               for stored, tensor in load_shards(FIXTURES / fixture).items()}
+    save_hf_layout(tensors, json.loads((FIXTURES / fixture / "config.json").read_text()), tmp_path)
+    bare = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    headed = Pretrained.load(FIXTURES / fixture, dtype="float32", attention_impl="reference")
+    assert jax.tree.structure(bare.variables) == jax.tree.structure(headed.variables)
+    jax.tree.map(np.testing.assert_array_equal, bare.variables, headed.variables)
 
 
 @pytest.mark.parametrize("case", list(PREPARED), ids=list(PREPARED))

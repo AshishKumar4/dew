@@ -294,7 +294,7 @@ def test_a_deep_release_verifies_at_its_probes_cut_depth_as_at_its_own():
     (`verify.logits_mapped`), which a computation of the same function meets at any depth and width,
     where a fixed rounding per layer measured on narrow fixtures refused it at two layers. The load's
     route reads it so (`source_route`), before any weight downloads."""
-    from dew.interop.pretrained import VerifiedRoute, source_route
+    from dew.interop.routes import VerifiedRoute, source_route
 
     route = source_route(SEED_OSS)
     assert isinstance(route, VerifiedRoute) and route.verified.family == "qwen2"
@@ -484,7 +484,8 @@ def test_a_change_to_the_twins_package_verifies_a_mapping_again(tmp_path):
 
 def test_a_first_verification_says_it_runs_and_a_recorded_one_does_not(tmp_path, monkeypatch, caplog):
     """Verifying a type no registered family reads runs the source and Dew over the probe's draws: the
-    load says so before it starts, once a type, its record read silently by the next load."""
+    load says so before it starts, once a type, its record read silently by the next load, the verdict its
+    record holds as `VerifiedMapping` declares it."""
     import logging
 
     from dew.interop.verify import verify_mapping
@@ -505,5 +506,13 @@ def test_a_first_verification_says_it_runs_and_a_recorded_one_does_not(tmp_path,
     assert announced() == ["cwm"]
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="dew.interop.verify"):
-        verify_mapping(config)
+        verdict = verify_mapping(config)
     assert announced() == []
+    # The record holds the verdict `VerifiedMapping` declares, in the bytes the hand-written record had.
+    from dew.interop.verify import VerifiedMapping
+
+    assert isinstance(verdict, VerifiedMapping)
+    (written,) = (tmp_path / "cache").glob("**/mapping.json")
+    assert written.read_text() == json.dumps({
+        "model_type": verdict.model_type, "family": verdict.family, "reference": verdict.reference,
+        "draws": verdict.draws, "inert": list(verdict.inert)})

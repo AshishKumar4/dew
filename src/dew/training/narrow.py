@@ -40,34 +40,32 @@ from jax.core import ShapedArray
 from jax.extend import core
 
 from dew.batch import FROZEN, Variables, merge, select
-from dew.nn.programs import called, named
-
-_DERIVED = frozenset({"custom_jvp_call", "custom_vjp_call"})
-"""The calls whose program a narrowed operand does not reach as it is (`_inner`): a custom derivative's,
-whose derivative rule, not its primal's program, makes its operand's cotangent, so a cast folded into its
-primal leaves its cotangent the rule's."""
+from dew.nn.programs import called, own_derivative, scan_body
 
 
 def _inner(eqn, index: int):
-    """The callee jaxpr of `eqn` and the variable it binds the `index`th operand to, where the callee sees
-    each iteration's own slice or the operand itself; else None. A call's program is the one it runs on its
-    operands one for one (`called`); a scan's, its body, which slices its stacked operands."""
-    name = named(eqn.primitive)
-    if name == "scan":
-        # A scan's constants and carries are read by every iteration, whose cotangents it sums in the
-        # operand's dtype; only its stacked operands are sliced, one slice an iteration, the leading axis
-        # gone.
-        inner = eqn.params["jaxpr"].jaxpr
+    """The callee jaxpr of `eqn` and the variable it binds the `index`th
+    operand to, where the callee sees each iteration's own slice or the
+    operand itself; else None. A narrowed operand reaches a call's program as it is (`called`) through every
+    call but a custom derivative's (`own_derivative`), whose derivative rule, not its primal's program, makes
+    its operand's cotangent, so a cast folded into its primal leaves its cotangent the rule's."""
+    scanned = scan_body(eqn) if eqn.primitive is jax.lax.scan_p else None
+    inner = scanned if scanned is not None or own_derivative(eqn.primitive) else called(eqn)
+    if inner is None or index >= len(inner.invars):
+        return None
+    # A scan's constants and carries are read by every iteration, whose
+    # cotangents it sums in the operand's dtype; only its stacked operands
+    # are sliced, one slice an iteration, the leading axis gone.
+    if scanned is not None:
         outer, bound = eqn.invars[index].aval, inner.invars[index].aval
         if not (isinstance(outer, ShapedArray) and isinstance(bound, ShapedArray)
                 and outer.shape == (eqn.params["length"], *bound.shape)):
             return None
-        return inner, inner.invars[index]
-    inner = None if name in _DERIVED else called(eqn)
-    return None if inner is None else (inner, inner.invars[index])
+    return inner, inner.invars[index]
 
 
-_STACKING = ("stack", "reshape", "expand_dims", "squeeze", "broadcast_in_dim", "concatenate")
+_STACKING = (jax.lax.stack_p, jax.lax.reshape_p, jax.lax.squeeze_p, jax.lax.broadcast_in_dim_p,
+             jax.lax.concatenate_p)
 """The ops a stack of layers builds its operand with, each element of the result one of its
 operands': a cast of the result is the stack of its operands' casts, and its cotangent's slices are
 theirs."""
@@ -92,11 +90,11 @@ def _cast_once(var, jaxpr, weights: frozenset) -> jnp.dtype | None:
     if not _read_once(var, jaxpr):
         return None
     eqn, index = _uses(var, jaxpr)[0]
-    if named(eqn.primitive) == "convert_element_type":
+    if eqn.primitive is jax.lax.convert_element_type_p:
         dtype = jnp.dtype(eqn.params["new_dtype"])
         narrower = jnp.issubdtype(dtype, jnp.floating) and dtype.itemsize < var.aval.dtype.itemsize
         return dtype if narrower else None
-    if named(eqn.primitive) in _STACKING and len(eqn.outvars) == 1:
+    if eqn.primitive in _STACKING and len(eqn.outvars) == 1:
         stacked = eqn.outvars[0]
         operands = [operand for operand in eqn.invars if isinstance(operand, core.Var)]
         sized = [operand.aval for operand in operands if isinstance(operand.aval, ShapedArray)]

@@ -42,6 +42,18 @@ def test_the_releases_ngram_lookups_hash_its_ids_as_transformers_does():
     np.testing.assert_array_equal(np.ravel(spec.primes[0]), recorded['vocab_sizes'])
 
 
+def test_the_releases_ngram_config_writes_back_as_it_states_it():
+    """Qwen3.8-Flash-Next's n-gram lookup keys read into its `Engram` and write back as its config states
+    them, in its order: one declaration both ways (`qwen4_exp.ENGRAM_CONFIG`); a key it leaves at its
+    class's default (its `seed`) is written at that default."""
+    from dew.interop.families.qwen4_exp import _engram_written
+
+    stated = json.loads((RELEASE / 'config.json').read_text())['text_config']
+    written = _engram_written(translate_config(stated).value)
+    kept = [(key, value) for key, value in written.items() if key in stated]
+    assert kept == [(key, stated[key]) for key, _ in kept] and len(kept) >= len(written) - 1
+
+
 EXPORT_SEEDS = 16
 """The export's declared draws of ids against transformers' read of it (check 1), sized by `seeds_for`
 paired with Dew's logits on armada."""

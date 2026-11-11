@@ -27,6 +27,7 @@ import jax
 import jax.extend.core as jcore
 import numpy as np
 from jax.core import ShapedArray
+from jax.extend.core import primitives
 
 from dew import algebra
 from dew._records import JSON
@@ -35,7 +36,7 @@ from dew.data.dataset import rows_of
 from dew.distributed.placement import placed_bytes
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
 from dew.nn.kernels.generation import _compute_capability, gpu_target
-from dew.nn.programs import bodies, computed, named
+from dew.nn.programs import bodies, computed, loop_programs, reduction, scan_body, scatter
 from dew.objectives.base import Objective
 from dew.state import TrainState
 from dew.training.compiled_program import (
@@ -115,25 +116,31 @@ def device_bytes(tree) -> int:
                          if jax.typeof(leaf).memory_space == jax.memory.Space.Device])
 
 
-CHEAP = frozenset({
-    "add", "add_any", "and", "bitcast_convert_type", "broadcast_in_dim", "ceil", "clamp", "clz", "eq", "ne",
-    "lt", "le", "gt", "ge", "complex", "concatenate", "convert_element_type", "copy", "copy_p",
-    "dynamic_slice", "dynamic_update_slice", "floor", "imag", "iota", "is_finite", "max", "min", "mul", "neg",
-    "not", "or", "xor", "pad", "population_count", "real", "reduce_precision", "reshape", "squeeze",
-    "expand_dims", "rev", "round", "select_n", "shift_left", "shift_right_arithmetic", "shift_right_logical",
-    "slice", "sub", "transpose", "integer_pow", "square", "name"})
+CHEAP = frozenset({jax.lax.add_p, primitives.add_jaxvals_p, jax.lax.and_p, jax.lax.bitcast_convert_type_p,
+    jax.lax.broadcast_in_dim_p, jax.lax.ceil_p, jax.lax.clamp_p, jax.lax.clz_p, jax.lax.eq_p, jax.lax.ne_p,
+    jax.lax.lt_p, jax.lax.le_p, jax.lax.gt_p, jax.lax.ge_p, jax.lax.complex_p, jax.lax.concatenate_p,
+    jax.lax.convert_element_type_p, jax.lax.copy_p, jax.lax.dynamic_slice_p, jax.lax.dynamic_update_slice_p,
+    jax.lax.floor_p, jax.lax.imag_p, jax.lax.iota_p, jax.lax.is_finite_p, jax.lax.max_p, jax.lax.min_p,
+    jax.lax.mul_p, jax.lax.neg_p, jax.lax.not_p, jax.lax.or_p, jax.lax.xor_p, jax.lax.pad_p,
+    jax.lax.population_count_p, jax.lax.real_p, jax.lax.reduce_precision_p, jax.lax.reshape_p,
+    jax.lax.squeeze_p, jax.lax.rev_p, jax.lax.round_p, jax.lax.select_n_p, jax.lax.shift_left_p,
+    jax.lax.shift_right_arithmetic_p, jax.lax.shift_right_logical_p, jax.lax.slice_p, jax.lax.sub_p,
+    jax.lax.transpose_p, jax.lax.integer_pow_p, jax.lax.square_p, primitives.name_p})
 """The primitives XLA's CPU fusion takes for cheap, which it duplicates into each consumer rather than
 keep a buffer of (`InstructionFusion::IsExpensive`, xla/service/instruction_fusion.cc: every elementwise
 op but division, the transcendentals and their kin, and the layout ops), an integer power and a square
 lowering to its multiplies, a cotangent sum, which JAX lowers to one `add` (`add_jaxvals_lowering`,
 jax/_src/interpreters/mlir.py), and a checkpoint's name, which computes nothing."""
 
-REAL_CHEAP = frozenset({"abs", "sign", "sin", "cos", "tan", "sinh"})
+REAL_CHEAP = frozenset({jax.lax.abs_p, jax.lax.sign_p, jax.lax.sin_p, jax.lax.cos_p, jax.lax.tan_p,
+    jax.lax.sinh_p})
 """The primitives XLA's CPU fusion takes for cheap over real elements alone (`IsExpensive`)."""
 
-ELEMENTWISE = CHEAP | REAL_CHEAP | frozenset({
-    "div", "rem", "exp", "exp2", "log", "log1p", "expm1", "tanh", "logistic", "erf", "erfc", "erf_inv",
-    "pow", "sqrt", "rsqrt", "cbrt", "atan2", "asin", "acos", "atan", "cosh", "asinh", "acosh", "atanh"})
+ELEMENTWISE = CHEAP | REAL_CHEAP | frozenset({jax.lax.div_p, jax.lax.rem_p, jax.lax.exp_p, jax.lax.exp2_p,
+    jax.lax.log_p, jax.lax.log1p_p, jax.lax.expm1_p, jax.lax.tanh_p, jax.lax.logistic_p, jax.lax.erf_p,
+    jax.lax.erfc_p, jax.lax.erf_inv_p, jax.lax.pow_p, jax.lax.sqrt_p, jax.lax.rsqrt_p, jax.lax.cbrt_p,
+    jax.lax.atan2_p, jax.lax.asin_p, jax.lax.acos_p, jax.lax.atan_p, jax.lax.cosh_p, jax.lax.asinh_p,
+    jax.lax.acosh_p, jax.lax.atanh_p})
 """The elementwise and layout primitives, every one of which XLA's GPU fusion recomputes in each consumer
 rather than keep a buffer of: its priority fusion fuses a producer into all its consumers where its cost
 model finds the memory traffic saved worth the recompute (xla/backends/gpu/transforms/priority_fusion.cc),
@@ -141,20 +148,31 @@ an elementwise one's always on a memory-bound GPU, a transcendental's too (an at
 probabilities, on an H100's compile, recomputed from its scores in the backward)."""
 
 
-TRANSPOSES = frozenset({"transpose"})
+TRANSPOSES = (jax.lax.transpose_p,)
 """The layout primitive XLA's layout assignment folds into the storage of a value the program computes,
 laying it out as its reader needs (a returned gradient's), not into an input's, whose layout is fixed."""
 
 
-LOOPS = frozenset({"scan", "while"})
+LOOPS = (jax.lax.scan_p, jax.lax.while_p)
+"""The primitives that run their body turn after turn, their results held across the turns."""
 
 POINTER_BYTES = 8
 """The bytes of a pointer, which XLA's tuple of a program's results holds one of for each result."""
 
-PRODUCTS = frozenset({"dot_general", "conv_general_dilated", "ragged_dot_general"})
+PRODUCTS = (jax.lax.dot_general_p, jax.lax.conv_general_dilated_p, primitives.ragged_dot_general_p)
 """The products a weight's gradient is made by, past which a value is a cotangent the backward reads on
 (`sunk`)."""
-"""The primitives that run their body turn after turn, their results held across the turns."""
+
+def _folds(primitive: jcore.Primitive) -> bool:
+    """Whether `primitive` folds entries into one value over axes or windows: a reduction that is not the
+    place of an extremum, or one over windows."""
+    return primitive in WINDOWS or (reduction(primitive)
+                                    and primitive not in (jax.lax.argmax_p, jax.lax.argmin_p))
+
+
+WINDOWS = (jax.lax.reduce_window_p, jax.lax.reduce_window_sum_p, jax.lax.reduce_window_max_p,
+           jax.lax.reduce_window_min_p)
+"""The reductions over windows, which fuse as the reductions over axes do."""
 
 
 def traced_gradient(loss: Callable, params, arguments: Sequence) -> tuple[jcore.Jaxpr, int, list]:
@@ -291,7 +309,7 @@ def sunk(program: jcore.Jaxpr) -> jcore.Jaxpr:
         made = [out for out in program.eqns[index].outvars if computed(out)]
         # Every result read by late equations alone, none a product, and one at least read or returned.
         if any(readers[out] or out in outputs for out in made) and all(
-                reader in late and named(program.eqns[reader].primitive) not in PRODUCTS
+                reader in late and program.eqns[reader].primitive not in PRODUCTS
                 for out in made for reader in readers[out]):
             late.add(index)
     ordered = sorted(range(len(program.eqns)), key=lambda index: index in late)
@@ -326,7 +344,7 @@ def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
     priority_fusion.cc) keep buffers by their cost models' judgment, no rule the derivation can source.
     Such a step's compile decides its fit, and a miss is logged with the need it compiled to."""
     return platform == "gpu" and any(
-        named(equation.primitive) == "ragged_dot_general"
+        equation.primitive is primitives.ragged_dot_general_p
         or any(bounded_below(body, platform) for body in bodies(equation))
         for equation in program.eqns)
 
@@ -401,14 +419,14 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
                 starting = {value for value in spanned.get(index, set()) if begun[value] == index}
                 # A reduction's fusion runs on YNNPACK's kernels as a product's does; an elementwise
                 # one is XLA's own loop, which reads its broadcasts and transposes in place.
-                reduced = [out for out in made if named(equation.primitive).startswith("reduce_")]
+                reduced = made if _folds(equation.primitive) else []
                 operands += sum(map(device_share, laid_inputs(frontier, [*reduced, *made_for, *starting])))
             products = 0 if not cublas_product(equation) else (
                 workspace.sliced if sliced.fused(equation) else workspace.each)
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
             # results are what its body returns.
             running = (looped(frontier, last, index, equation, made, carried) + inner
-                       if named(equation.primitive) in LOOPS else max(inner, made_bytes) - taken)
+                       if equation.primitive in LOOPS else max(inner, made_bytes) - taken)
             # The fusions that make its operands run before it, each buffer they alone read freed with them
             # (`freed`): the most is theirs, or its own past them.
             freed = sum(map(device_share, dying(frontier, equation, made_for, held, last, index)))
@@ -462,7 +480,7 @@ def laid_copies(frontier: Frontier, program: jcore.Jaxpr) -> list[tuple[int, int
     an attention's keys read by its scores' product and its queries' gradient, an H100's compile)."""
     spans: dict[tuple, list[int]] = {}
     for index, equation in enumerate(program.eqns):
-        if named(equation.primitive) != "dot_general":
+        if equation.primitive is not jax.lax.dot_general_p:
             continue
         (contracted, batched) = equation.params["dimension_numbers"]
         for operand, contracting, batch in zip(equation.invars[:2], contracted, batched, strict=True):
@@ -488,7 +506,7 @@ def cpu_layouts(frontier: Frontier, program: jcore.Jaxpr) -> tuple[
     otherwise). Row 5290: 64 x 128 tokens, 8 heads over 2, compiled 1.375 times the derivation without.
     Last, each shared value's first reader, where it is made."""
     products = [(index, equation) for index, equation in enumerate(program.eqns)
-                if named(equation.primitive) == "dot_general"]
+                if equation.primitive is jax.lax.dot_general_p]
     reads: dict = {}
     for index, equation in products:
         for value in unfused(frontier, equation):
@@ -533,12 +551,12 @@ def laid_inputs(frontier: Frontier, values: Sequence[jcore.Var]) -> set[jcore.Va
             # A product or a loop reads its operands from memory: no fusion of the chain runs past it.
             continue
         reads = [read for read in equation.invars if computed(read)]
-        name = named(equation.primitive)
+        primitive = equation.primitive
         # Every broadcast that widens a value, of constants too (a mask's iota, a cotangent of ones): XLA
         # may fold it into the fusion or make it apart, and a bound counts it apart.
-        widened = (name == "broadcast_in_dim"
+        widened = (primitive is jax.lax.broadcast_in_dim_p
                    and math.prod(dimensions(value)) > math.prod(dimensions(equation.invars[0])))
-        relaid = name in ("transpose", "convert_element_type") and any(
+        relaid = primitive in (jax.lax.transpose_p, jax.lax.convert_element_type_p) and any(
             read in frontier.inputs or frontier.buffered(read) for read in reads)
         if widened or relaid:
             found.add(value)
@@ -633,10 +651,10 @@ def unfused(frontier: Frontier, equation: jcore.JaxprEqn) -> set[jcore.Var]:
     scatter fuses its indices and updates but those reading its base, which XLA computes apart, as it
     computes the base apart into the buffer the scatter writes (`CanEmitInputFusedScatter`,
     xla/service/gpu/gpu_fusible.cc): its updates computed from its base hold a buffer of their own."""
-    name = named(equation.primitive)
-    if name == "optimization_barrier" or not equation.invars:
+    primitive = equation.primitive
+    if primitive is jax.lax.optimization_barrier_p or not equation.invars:
         return set()
-    if name.startswith("scatter"):
+    if scatter(primitive):
         base = frontier.roots(equation.invars[:1])
         return {value for value in equation.invars[1:] if computed(value) and value is not equation.invars[0]
                 and frontier.made_for(value) and frontier.roots([value]) & base}
@@ -670,10 +688,10 @@ def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapp
     (`HloDataflowAnalysis::CanShareOperandBufferWithUser`, xla/hlo/analysis/hlo_dataflow_analysis.cc) and
     a GEMM's bias's that nothing else reads, before it or after (`FuseMatrixBiasAdd`'s `can_overwrite_bias`,
     xla/backends/gpu/transforms/gemm_rewriter.cc); none for any other equation."""
-    name = named(equation.primitive)
-    if name.startswith("scatter") and equation.invars:
+    primitive = equation.primitive
+    if scatter(primitive) and equation.invars:
         at = 0
-    elif name == "dot_general" and len(equation.invars) == 3:
+    elif primitive is jax.lax.dot_general_p and len(equation.invars) == 3:
         at = 2
     else:
         return 0
@@ -704,14 +722,14 @@ def carry(equation: jcore.JaxprEqn) -> list[tuple]:
     (`ComputeAliasedValues`, xla/hlo/analysis/hlo_alias_analysis.cc), copying the initial value into a
     buffer of the loop's where it is an input or still read (copy insertion,
     xla/service/copy_insertion.cc)."""
-    if named(equation.primitive) == "while":
+    if equation.primitive is jax.lax.while_p:
         start = equation.params["cond_nconsts"] + equation.params["body_nconsts"]
-        body = equation.params["body_jaxpr"].jaxpr
+        body = loop_programs(equation)[1].jaxpr
         taken = body.invars[equation.params["body_nconsts"]:]
         changed = [returned is not took for returned, took in zip(body.outvars, taken, strict=True)]
         return list(zip(equation.invars[start:], equation.outvars, changed, strict=True))
-    if named(equation.primitive) == "scan":
-        body = equation.params["jaxpr"].jaxpr
+    if equation.primitive is jax.lax.scan_p:
+        body = scan_body(equation).jaxpr
         _, started, _ = equation.params["ft_in"].update(equation.invars).unpack()
         _, taken, _ = equation.params["ft_in"].update(body.invars).unpack()
         ended, _ = equation.params["ft_out"].update(equation.outvars).unpack()
@@ -739,9 +757,9 @@ def looped(frontier: Frontier, last: Mapping, index: int, equation: jcore.JaxprE
 def returned_carry(equation: jcore.JaxprEqn, body: jcore.Jaxpr) -> frozenset:
     """The values `body` returns into the buffers the loop `equation` carries, where it is the loop's
     body (`carry`); none of any other program."""
-    if named(equation.primitive) == "while" and body is equation.params["body_jaxpr"].jaxpr:
+    if equation.primitive is jax.lax.while_p and body is loop_programs(equation)[1].jaxpr:
         return frozenset(value for value in body.outvars if computed(value))
-    if named(equation.primitive) == "scan" and body is equation.params["jaxpr"].jaxpr:
+    if equation.primitive is jax.lax.scan_p and body is scan_body(equation).jaxpr:
         returned, _ = equation.params["ft_out"].update(body.outvars).unpack()
         return frozenset(value for value in returned if computed(value))
     return frozenset()
@@ -785,7 +803,7 @@ class Frontier:
         # (`HloDataflowAnalysis::UpdateOptimizationBarrierValueSet`,
         # xla/hlo/analysis/hlo_dataflow_analysis.cc).
         self.forwards = {out: operand for equation in program.eqns
-                         if named(equation.primitive) == "optimization_barrier"
+                         if equation.primitive is jax.lax.optimization_barrier_p
                          for out, operand in zip(equation.outvars, equation.invars, strict=True)}
         self.barred = {operand for operand in self.forwards.values() if computed(operand)}
 
@@ -807,7 +825,7 @@ class Frontier:
         if bitcast(equation):
             return operand in self.inputs or not self.fused(operand) or self.view(operand)
         # XLA lays a value out once, so a transpose is its storage only where it is its one reader.
-        return (named(equation.primitive) in TRANSPOSES and operand not in self.inputs
+        return (equation.primitive in TRANSPOSES and operand not in self.inputs
                 and self.readers[operand] == 1 and (not self.fused(operand) or self.view(operand)))
 
     def fused(self, value) -> bool:
@@ -845,9 +863,9 @@ class Frontier:
         result and its updates read from its base apart (`unfused`):
         Qwen3.5-4B's tied embedding's gradient, a scatter-add into zeros, was derived holding the zeros
         beside it, 2.37 GiB over XLA's 4.76 at its step's peak under 'full' (row 4089)."""
-        name = named(equation.primitive)
-        return (recomputed(equation, self.platform) or name == "reduce"
-                or name.startswith(("reduce_", "arg", "scatter")))
+        primitive = equation.primitive
+        return (recomputed(equation, self.platform) or primitive is jax.lax.reduce_p or primitive in WINDOWS
+                or reduction(primitive) or scatter(primitive))
 
     def roots(self, values: Iterable) -> set[jcore.Var]:
         """The buffers reading `values` holds (`reading`) and the inputs they are computed from or view: what
@@ -895,16 +913,16 @@ def recomputed(equation: jcore.JaxprEqn, platform: str) -> bool:
     """Whether XLA's fusion on `platform` recomputes what `equation` computes in each consumer rather than
     keep it: on a GPU every elementwise primitive (`ELEMENTWISE`), elsewhere the cheap ones (`CHEAP`, and
     `REAL_CHEAP` over real values). A program it reads has its calls inlined (`compiled`)."""
-    name = named(equation.primitive)
+    primitive = equation.primitive
     if bitcast(equation):
         # A bitcast holds no buffer of its own, on any platform.
         return True
     if platform == "gpu":
-        return name in ELEMENTWISE
-    if name in REAL_CHEAP:
+        return primitive in ELEMENTWISE
+    if primitive in REAL_CHEAP:
         return not any(isinstance(out.aval, ShapedArray) and np.issubdtype(out.aval.dtype, np.complexfloating)
                        for out in equation.outvars)
-    return name in CHEAP
+    return primitive in CHEAP
 
 
 class Workspace(NamedTuple):

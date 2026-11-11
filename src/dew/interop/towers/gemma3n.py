@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from dew import _records
-from dew.interop.config_records import NativeFields
+from dew.interop.config_records import NativeFields, hf_metadata
 from dew.interop.layouts import Prefixed, Route, Table
 from dew.interop.unread import Stored
 from dew.interop.weights import placed
@@ -101,7 +101,7 @@ def _gemma3n_vision_record(
             "vocab_size", "vocab_offset", "rms_norm_eps"}
     # These are serialized HF metadata. Vocabulary and RMS fields above feed
     # the vision embedder; construction fields feed the MobileNet encoder.
-    metadata = _records.HF_METADATA | {"initializer_range", "label_names", "num_classes"}
+    metadata = hf_metadata() | {"initializer_range", "label_names", "num_classes"}
     unknown = (set(vision) - used - metadata
                - {key for key in vision if str(key).startswith("_")})
     if unknown:

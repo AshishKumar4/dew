@@ -16,13 +16,25 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.precision import accumulated, asks_default_precision, exact_products, float64_sum, products_dtype
 
-HALF = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
-"""The 16-bit dtypes the kernels multiply exactly."""
 
-EIGHT = (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float8_e5m2))
-"""The FP8 dtypes the kernels multiply (testing.md, FP8 products): each code exact in bfloat16, so its
-products exact as a 16-bit operand's, its running sum promoted into fp32 every depth step
-(`Product.promoted`), as Hopper's FP8 tensor cores sum within a step in a narrower accumulator."""
+def _floating_bits(dtype) -> int | None:
+    """`dtype`'s bits where it is a floating dtype (`jnp.finfo`'s), None where it is not."""
+    dtype = jnp.dtype(dtype)
+    return jnp.finfo(dtype).bits if jnp.issubdtype(dtype, jnp.floating) else None
+
+
+def half(dtype) -> bool:
+    """Whether `dtype` is a 16-bit float (bfloat16, float16), whose products the kernels multiply exactly
+    into fp32."""
+    return _floating_bits(dtype) == 16
+
+
+def eight(dtype) -> bool:
+    """Whether `dtype` is an 8-bit float, an FP8 operand (testing.md, FP8 products): each code exact in
+    bfloat16, so its products exact as a 16-bit operand's, its running sum promoted into fp32 every depth
+    step (`Product.promoted`), as Hopper's FP8 tensor cores sum within a step in a narrower accumulator.
+    Which formats a family's products read is its own fact (`mosaic.Issuer.fp8_formats`)."""
+    return _floating_bits(dtype) == 8
 
 
 @dataclasses.dataclass(frozen=True)
@@ -32,7 +44,7 @@ class Product:
     accumulator apart, the IEEE sums a precision above the default asks of an fp32 output, since the tensor
     cores truncate each add within a step; a 16-bit output's one rounding hides the difference.
     `refusal` says why the kernels do not compute the product, None where they do. An FP8 product
-    (`EIGHT`) is always promoted, each 128-deep step's partial added into the fp32 accumulator apart: the
+    (`eight`) is always promoted, each 128-deep step's partial added into the fp32 accumulator apart: the
     FP8 contract's budget is met so (testing.md, FP8 products)."""
     compute: jnp.dtype
     promoted: bool
@@ -84,7 +96,7 @@ def declared(compute: Dtype, precision: PrecisionLike, *, outputs: tuple = (),
     `compute` whole and sum in fp32, so a portable route computes it."""
     compute = jnp.dtype(compute)
     above = not asks_default_precision(precision, configured=True)
-    return Product(compute, compute in EIGHT or promoted(above=above, outputs=outputs),
+    return Product(compute, eight(compute) or promoted(above=above, outputs=outputs),
                    _refusal(compute, operands, above, precision))
 
 
@@ -106,14 +118,14 @@ def _refusal(compute: jnp.dtype, operands: tuple, above: bool, precision: Precis
              ) -> str | None:
     if jax.config.jax_enable_x64:
         return "x64 widens the kernels' int32 group offsets"
-    if compute not in EIGHT and not exact_products(precision, compute):
+    if not eight(compute) and not exact_products(precision, compute):
         return ("a declared dot algorithm narrows or widens the products, which the kernels multiply whole "
                 "with fp32 sums")
     # An operand fp32 holds is no complex one and none wider (8-bit floats promote implicitly to nothing).
     if any(jnp.issubdtype(dtype, jnp.complexfloating) or jnp.dtype(dtype).itemsize > 4
            for dtype in (compute, *operands)):
         return "an operand fp32 does not hold, and the kernels sum gradients in fp32"
-    if compute in HALF or compute in EIGHT:
+    if half(compute) or eight(compute):
         return None
     if compute != jnp.dtype(jnp.float32):
         return f"the kernels do not multiply in {compute.name}"
@@ -136,7 +148,7 @@ def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numb
     summed as every float32 contraction is (`precision.accumulated`: in float64 under Dew's wide test
     arithmetic, else as the CPU's vectorized dot sums it), so a mainloop's sums and the fp32 references they
     are held to sum alike."""
-    if product.compute in EIGHT:
+    if eight(product.compute):
         return jax.lax.dot_general(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), dimension_numbers,
                                    preferred_element_type=jnp.float32)
     contraction = functools.partial(jax.lax.dot_general, dimension_numbers=dimension_numbers)

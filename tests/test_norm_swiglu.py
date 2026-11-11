@@ -248,8 +248,8 @@ def test_an_activation_after_the_norm_is_the_kernels_where_it_maps_each_element_
     """Row 821: the fused norm applies an activation after it (`RMSNorm.activation`, a U-Net's output norm's
     swish) where `norm_swiglu.elementwise` holds: every equation maps each element alone and Pallas's Triton
     lowering takes it. Activations of one element each, exact gelu's erfc aside, take the kernel; one that
-    reads other elements or positions takes XLA's; one reading its operand's extents (`y / y.shape[-1]`)
-    takes the kernel, read at the call's shape."""
+    reads other elements or positions takes XLA's, a square tile's transpose among them; one reading its
+    operand's extents (`y / y.shape[-1]`) takes the kernel, read at the call's shape."""
     from dew.nn import activations
 
     for function in (jax.nn.silu, jax.nn.swish, activations.silu, jax.nn.relu, activations.gelu_tanh,
@@ -262,6 +262,10 @@ def test_an_activation_after_the_norm_is_the_kernels_where_it_maps_each_element_
                      lambda x: x + jnp.arange(3.0), lambda x: x.sum(-1), lambda x: x * positions,
                      lambda x: jitted(x)):
         assert not norm_swiglu.elementwise(function, (2, 3)), function
+    # A transpose or a reversal of a square tile keeps its shape and reads each element at another's place
+    # (an exclusion list of positional operations let the transpose through).
+    for function in (lambda x: x.T, lambda x: jnp.flip(x, -1), lambda x: jnp.swapaxes(x, 0, 1) * 2):
+        assert not norm_swiglu.elementwise(function, (3, 3)), function
     x = jnp.ones((4, 64), jnp.bfloat16)
     with generation.assumed("sm90"):
         assert norm_swiglu.rms_kernel("auto", x, jnp.ones((64,)), jnp.bfloat16, fp32_statistics=True,

@@ -17,9 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from float64_terms import float64_forward
 from interop_support import NVFP4_QDQ_CASES, assert_same_stored_tensors
-from one_draw import assert_as_exact_as_the_reference
 from reference_runs import assert_arms_as_recorded
 
 from dew.interop import Pretrained
@@ -29,10 +27,11 @@ from dew.registry import ModelConfig
 CODECS = Path(__file__).parent / "fixtures" / "codecs"
 CHECKPOINTS = ("modelopt/tiny", "modelopt/mixed", *(f"nvfp4_qdq/{kind}" for kind in NVFP4_QDQ_CASES),
                "storage/fp8", "storage/nvfp4")
-RECORDED = ("storage/fp8", "storage/nvfp4", *(f"nvfp4_qdq/{kind}" for kind in NVFP4_QDQ_CASES))
-"""The compressed-tensors checkpoints, recorded over drawn ids (tools/codec_worker.py). ModelOpt's stay on
-one draw (row 4741): its reference runs its author's CUDA kernels."""
-ONE_DRAW = ("modelopt/tiny", "modelopt/mixed")
+RECORDED = ("modelopt/tiny", "modelopt/mixed", "storage/fp8", "storage/nvfp4",
+            *(f"nvfp4_qdq/{kind}" for kind in NVFP4_QDQ_CASES))
+"""Every checkpoint, recorded over drawn ids by its author's own CPU forward, where Dew's arm runs:
+compressed-tensors' reader (tools/codec_worker.py) and ModelOpt's (tools/modelopt_worker.py, rows 4741 and
+5244)."""
 CODEC_SEEDS = dict.fromkeys(RECORDED, 8)
 """Each checkpoint's declared seeds, sized by `seeds_for` paired as its recording confirmed them."""
 
@@ -80,19 +79,6 @@ def test_a_quantized_checkpoint_computes_its_reference(name):
     (weight-only NVFP4 rounds them to bf16, FP8 to its stored scale's dtype), so the format's quantization is
     common to both forwards and the check measures only their rounding."""
     assert_arms_as_recorded(pipeline_arms(name), site(name), CODEC_SEEDS[name], f"{name} logits")
-
-
-@pytest.mark.parametrize("name", ONE_DRAW)
-def test_a_modelopt_checkpoint_computes_its_reference(name):
-    """ModelOpt's NVFP4 and its per-layer FP8 and NVFP4 table: the author's forward of the same files on its
-    recorded ids, held by the one-draw rule (row 4741)."""
-    directory = CODECS / name
-    with np.load(directory / "reference.npz") as reference:
-        ids, expected, truth = reference["ids"].astype(np.int32), reference["logits"], reference["logits_f64"]
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    actual = np.asarray(loaded.model.apply(loaded.variables, ids))
-    _, terms = float64_forward(loaded.model, loaded.variables, ids)
-    assert_as_exact_as_the_reference(actual, expected, truth, f"{name} logits", terms=terms)
 
 
 @pytest.mark.parametrize("name", CHECKPOINTS)

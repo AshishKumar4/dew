@@ -327,12 +327,15 @@ class Synchronous:
     (the module docstring's synchronous case); `Snapshot` is what the collector draws from."""
 
     lag = 0
-    rescore = None
-    """None: the collected calls' raw likelihoods are the proximal policy's, drawn from the variables
-    the step trains, so `old_log_probs` are those and no rescoring forward runs."""
 
-    def __init__(self, collector: Collector):
+    def __init__(self, collector: Collector, rescoring: GRPOObjective | None = None):
+        """`rescoring` is the objective whose proximal policy differs from the collected calls' raw
+        likelihoods (one reading its ratio at another `sampling_temperature`), which the packed rows are
+        rescored under at the step's weights (`rescore`); None where those likelihoods are the proximal
+        policy's, drawn from the variables the step trains, so `old_log_probs` are those and no rescoring
+        forward runs."""
         self.collector = collector
+        self.rescore = None if rescoring is None else functools.partial(scored_rows, rescoring)
         self._serial = 0
 
     @property
@@ -680,18 +683,15 @@ class RolloutScheduler:
         that runs out of `max_new_tokens` trains on its reward, as `truncation='score'` says. A reward-side
         reference penalty (`GRPOObjective.reward_kl`) is `objective`'s own (`reference`).
 
-        The calls' raw likelihoods are the proximal policy's (`Synchronous.rescore`), the policy at
-        temperature 1 over the whole vocabulary: a GRPO objective whose ratio reads its policy at another
-        `sampling_temperature` is refused, since its unchanged weights would not give a ratio of 1."""
-        if isinstance(objective, GRPOObjective) and objective.sampling_temperature != 1.0:
-            raise ValueError(
-                "a synchronous collection's proximal likelihoods are the policy's raw ones, at temperature "
-                f"1, and this objective reads its ratio at sampling_temperature="
-                f"{objective.sampling_temperature}; set it to 1.0, or collect asynchronously, where the "
-                "proximal policy is rescored")
+        The calls' raw likelihoods are the proximal policy's, the policy at temperature 1 over the whole
+        vocabulary; a GRPO objective whose ratio reads its policy at another `sampling_temperature` has
+        its packed rows rescored at the step's weights (`Synchronous`'s `rescoring`), as an asynchronous
+        collection's are, so its unchanged weights give a ratio of 1."""
         collector = PolicyCollector(objective, reward, decode, max_new_tokens,
                                     Sampling() if sampling is None else sampling)
-        return cls(Synchronous(collector), tasks=prompt_tasks, groups=groups, estimator=estimator,
+        rescoring = (objective if isinstance(objective, GRPOObjective)
+                     and objective.sampling_temperature != 1.0 else None)
+        return cls(Synchronous(collector, rescoring), tasks=prompt_tasks, groups=groups, estimator=estimator,
                    truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
                    reference=objective if isinstance(objective, GRPOObjective) and objective.reward_kl > 0
                    else None, generation_batches=generation_batches,

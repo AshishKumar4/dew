@@ -27,7 +27,7 @@ from interop_support import fetch
 from model_support import encoded_form
 
 from dew.interop import Pretrained, codecs
-from dew.interop.safetensors_io import _STORED_DTYPES, read_weights, save_hf_layout
+from dew.interop.safetensors_io import read_weights, save_hf_layout, stored_dtypes
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 
@@ -515,7 +515,7 @@ def released_tensor(repo: str, name: str, rows: tuple[int, int] | None) -> np.nd
         row = (end - start) // shape[0]
         start, end, shape[0] = start + rows[0] * row, start + rows[1] * row, rows[1] - rows[0]
     return np.frombuffer(fetch(url, 8 + length + start, 8 + length + end - 1),
-                         _STORED_DTYPES[meta["dtype"]]).reshape(shape)
+                         stored_dtypes()[meta["dtype"]]).reshape(shape)
 
 
 @pytest.mark.network

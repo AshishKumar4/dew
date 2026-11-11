@@ -9,7 +9,6 @@ program merely named like one is walked inside."""
 import jax
 import jax.numpy as jnp
 import pytest
-from process_support import assert_exits_cleanly
 
 from dew.interop.sequence_causality import CAUSAL_ATTENTION, TOKENWISE, attested, causality_refusal
 
@@ -136,30 +135,6 @@ REFUSED = {
 }
 
 
-def test_an_operation_is_known_by_its_object_whatever_the_processs_random_keys():
-    """JAX's own operations are read by their objects, those JAX exports by their modules and the random
-    ones it binds without exporting off a trace of its public random functions
-    (`dew.nn.programs.jax_name`): the linear algebra's and every random operation's, in a process whose
-    keys are another implementation's too (`jax_default_prng_impl`), where the trace's key is its own."""
-    assert_exits_cleanly("""
-import jax
-jax.config.update("jax_default_prng_impl", "rbg")
-from jax.extend.core import primitives
-from dew.nn.programs import jax_name
-assert jax_name(jax.lax.exp_p) == "exp"
-assert jax_name(primitives.cholesky_p) == "cholesky"
-assert jax_name(primitives.random_gamma_p) == "random_gamma"
-def names(function, argument):
-    return {jax_name(equation.primitive) for equation in jax.make_jaxpr(function)(argument).jaxpr.eqns}
-key = jax.random.key(0)
-for function, argument, name in ((lambda key: jax.random.fold_in(key, 1), key, "random_fold_in"),
-                                 (jax.random.key, 0, "random_seed"), (jax.random.clone, key, "random_clone"),
-                                 (jax.random.key_data, key, "random_unwrap")):
-    found = names(function, argument)
-    assert name in found, (name, found)
-""")
-
-
 def refusal(function, lengths=LENGTHS):
     """The walk's refusal of `function` at the first of `lengths` it refuses, None where it proves each."""
     for length in lengths:
@@ -178,6 +153,19 @@ def test_a_program_whose_positions_read_no_later_one_is_admitted(name):
 @pytest.mark.parametrize("name", sorted(REFUSED))
 def test_a_program_reading_a_later_position_or_unproven_is_refused(name):
     assert refusal(REFUSED[name]) is not None
+
+
+def test_another_librarys_operation_named_as_one_of_jaxs_reads_its_operands_whole():
+    """An operation is known by its object: a primitive of another library's under the name of JAX's
+    entrywise `exp`, which may read any position, gives every entry the latest its operands read and is
+    refused, where JAX's own `exp` over the same states is admitted. The walk may refuse a causal program,
+    never admit a later read on a name's word."""
+    from jax.extend import core as jcore
+
+    named_exp = jcore.Primitive("exp")
+    named_exp.def_abstract_eval(lambda value: value)
+    assert refusal(lambda tokens: named_exp.bind(embedded(tokens))) is not None
+    assert refusal(lambda tokens: jnp.exp(embedded(tokens))) is None
 
 
 def test_a_program_that_reads_later_positions_past_a_length_is_proven_below_it_and_refused_above():

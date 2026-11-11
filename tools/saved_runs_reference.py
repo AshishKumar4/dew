@@ -90,7 +90,7 @@ def evidence(run, state, directory: Path) -> dict:
             "finite_steps": None if state.scale is None else int(state.scale.fin_steps),
             "consumed": None if state.consumed is None else int(state.consumed), "remat": compiled["remat"],
             "plan": {name: value for name, value in plan.items()
-                     if name not in ("kernels", "probes", "derived", "rewrites")}}
+                     if name not in ("kernels", "probes", "derived", "rewrites", "passes")}}
 
 
 def main() -> None:

@@ -48,6 +48,7 @@ from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.mixers.mamba2 import MambaRMSNormGated
 from dew.nn.norms import RMSNorm
 from dew.nn.precision import at_least_fp32, float32_dot_general
+from dew.nn.residuals import Residual
 from dew.nn.scatter import gather_positions
 from dew.nn.sharding import sequence_shards
 
@@ -554,7 +555,7 @@ class Mamba3(nn.Module):
                 variable.value = value.astype(variable.value.dtype)
         # The scan's output under both names a remat policy reads it by (`RESIDUALS`), as `held_scan` marks
         # it.
-        out = checkpoint_name(checkpoint_name(out, 'scan'), 'context')
+        out = checkpoint_name(checkpoint_name(out, Residual.SCAN), Residual.CONTEXT)
         out = out + self.D[:, None] * values.astype(wide)
         ranks = (batch, length, self.mimo_rank, self.intermediate_size)
         if self.outproj_norm:
@@ -577,7 +578,7 @@ class Mamba3Mixer(MixerBase):
     `A_floor`, `chunk_size` (the chunked op's tokens, mamba_ssm's times its rank) and `outproj_norm`
     (`is_outproj_norm`), at its defaults (state-spaces/mamba3-siso-187m's)."""
 
-    residuals = ('context', 'scan')
+    residuals = (Residual.CONTEXT, Residual.SCAN)
     # Each document from the carry its parent leaves (`entered_mamba3`).
     reads_forks = True
     # Its cached prefill resets its state at each packed document's start (`chunk_mamba3`'s `starts`).

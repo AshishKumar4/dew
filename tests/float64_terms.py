@@ -14,21 +14,25 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from arm_arithmetic import unrewritten
+from jax.extend.core import primitives
 
 from dew.nn import programs
+from dew.nn.precision import correctly_rounded_divide_p
 
-SUMS = frozenset({"dot_general", "ragged_dot_general", "reduce_sum", "conv_general_dilated", "cumsum",
-                  "scatter-add"})
+SUMS = frozenset({jax.lax.dot_general_p, primitives.ragged_dot_general_p, jax.lax.reduce_sum_p,
+    jax.lax.conv_general_dilated_p, jax.lax.cumsum_p, jax.lax.scatter_add_p})
 """The operations that sum terms: a leaf's terms are those its own sums add,
 taken at their float64 values (`float64_terms`). A ragged dot, an expert
 layer's grouped matmul, sums as a dot does within each group, and its
 transpose, which the kernel's gradient runs, is one too."""
 
-CARRIES = frozenset({"add", "add_any", "sub", "neg", "convert_element_type", "reshape", "transpose",
-                     "broadcast_in_dim", "squeeze", "expand_dims", "copy", "copy_p", "reduce_precision",
-                     "slice", "dynamic_slice", "concatenate", "pad", "select_n", "optimization_barrier",
-                     "name", "psum", "psum_invariant", "reduce_scatter", "all_gather", "all_gather_invariant",
-                     "all_to_all", "ppermute", "pvary"})
+CARRIES = frozenset({jax.lax.add_p, primitives.add_jaxvals_p, jax.lax.sub_p, jax.lax.neg_p,
+    jax.lax.convert_element_type_p, jax.lax.reshape_p, jax.lax.transpose_p, jax.lax.broadcast_in_dim_p,
+    jax.lax.squeeze_p, jax.lax.copy_p, jax.lax.reduce_precision_p, jax.lax.slice_p, jax.lax.dynamic_slice_p,
+    jax.lax.concatenate_p, jax.lax.pad_p, jax.lax.select_n_p, jax.lax.optimization_barrier_p,
+    primitives.name_p, jax.lax.psum_p, primitives.psum_invariant_p, primitives.reduce_scatter_p,
+    jax.lax.all_gather_p, primitives.all_gather_invariant_p, jax.lax.all_to_all_p, jax.lax.ppermute_p,
+    primitives.pvary_p})
 """The operations that carry the terms of sums into a leaf without making
 new ones: sums combined (tied weights, accumulated microbatches, an update
 added to a parameter, devices' partials) and moved, by a remat name
@@ -36,6 +40,10 @@ added to a parameter, devices' partials) and moved, by a remat name
 A product or quotient of a sum by a value that is none carries them too,
 scaled element by element (`_applied`), as `s_i sum_k x_ik` sums the terms
 `s_i x_ik`; a product of two sums ends them."""
+
+SCALING = (jax.lax.mul_p, jax.lax.div_p, correctly_rounded_divide_p)
+"""A product, and a quotient by a value that is no sum (JAX's and Dew's correctly rounded one), which scale
+a sum's terms element by element (`_applied`)."""
 
 
 def float32_values(jaxpr) -> int:
@@ -93,15 +101,41 @@ def float64_terms(fn, *args):
     steps between its branches and loops is one (`_span`), the
     branches and loops walked as their values pick. The operations and their
     order are the walk's, compiled where the walk dispatched each alone."""
+    tree, values, squares = _termed(fn, args, power=2)
+    return tree.unflatten(values), tree.unflatten([np.sqrt(square) for square in squares])
+
+
+def float64_magnitudes(fn, *args):
+    """`fn(*args)` evaluated as `float64_terms` evaluates it, and the tree of each output leaf's terms'
+    magnitudes, summed: the terms its sums add, each by its size and not its square, carried as the terms
+    are, and through the sums behind a sum too: a sum's operand that sums made is taken at its own
+    magnitudes, and a product of two sums at the product of theirs, so a contraction selected by a mask
+    or nested in another is measured by what it multiplies and adds, however its formula is written. No
+    partial sum reaching the leaf through sums, products, scalings and moves is larger, in any order: a
+    leaf whose magnitudes lie inside a format's range overflows in no order of those sums, which the
+    derivative contracts hold a value finite by (tests/contract_support.py). A value any other operation
+    makes is its own size, and is added at it where a sum's terms meet it (a bias added to a sum, a
+    carry's start)."""
+    tree, values, sizes = _termed(fn, args, power=1)
+    return tree.unflatten(values), tree.unflatten(sizes)
+
+
+def _termed(fn, args, *, power: int):
+    """`fn(*args)`'s outputs' tree, their values and each one's terms summed at `power` (`POWER`: their
+    squares, or their magnitudes), the evaluation `float64_terms` describes."""
     closed, tree = _traced(fn, args)
     leaves = jax.tree.leaves(args)
-    with evaluated_on(leaves):
-        if _static(closed.jaxpr):
-            values, energies = _compiled(closed.jaxpr)(closed.consts, leaves)
-        else:
-            values, energies = _evaluated(closed.jaxpr, closed.consts, leaves, compiling=True)
-    return tree.unflatten(values), tree.unflatten([np.sqrt(np.asarray(_or_size(energy, value)))
-                                                   for energy, value in zip(energies, values, strict=True)])
+    token = POWER.set(power)
+    try:
+        with evaluated_on(leaves):
+            if _static(closed.jaxpr):
+                values, energies = _compiled(closed.jaxpr)(closed.consts, leaves)
+            else:
+                values, energies = _evaluated(closed.jaxpr, closed.consts, leaves, compiling=True)
+        return tree, values, [np.asarray(_or_size(energy, value))
+                              for energy, value in zip(energies, values, strict=True)]
+    finally:
+        POWER.reset(token)
 
 
 TRACES: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
@@ -131,12 +165,17 @@ def _static(jaxpr) -> bool:
 
 def _platform_picked(jaxpr) -> frozenset:
     """The variables of `jaxpr` its platform makes (`platform_index`), which a branch they pick reads."""
-    return frozenset(var for equation in jaxpr.eqns if equation.primitive.name == "platform_index"
+    return frozenset(var for equation in jaxpr.eqns if equation.primitive is primitives.platform_index_p
                      for var in equation.outvars)
 
 
 PLACED: contextvars.ContextVar = contextvars.ContextVar("float64_terms_placed", default=None)
 """The device the evaluation in progress runs on (`evaluated_on`), None outside one."""
+
+POWER: contextvars.ContextVar = contextvars.ContextVar("float64_terms_power", default=2)
+"""The power of a term's size the evaluation in progress sums into an energy (`_termed`): 2, the terms'
+squares (`float64_terms`), or 1, their magnitudes (`float64_magnitudes`). Every compiled evaluation's key
+holds it."""
 
 
 @contextlib.contextmanager
@@ -209,7 +248,7 @@ def released() -> None:
 def _compiled(jaxpr):
     """The compiled evaluation (`_evaluated`) of `jaxpr`, a static program, taking its constants and
     its inputs, compiled once a program (`_traced`)."""
-    key = (jaxpr, _target())
+    key = (jaxpr, _target(), POWER.get())
     if key not in COMPILED:
         COMPILED[key] = jax.jit(lambda consts, given: _evaluated(jaxpr, consts, given))
     return COMPILED[key]
@@ -218,8 +257,8 @@ def _compiled(jaxpr):
 class Rule(Protocol):
     """How a walk other than the terms' evaluates each primitive (`_evaluated`'s `rule`): its outputs from
     its inputs (`primitive`), and the rule of a walk's equation, step or iteration `index` within it, an
-    equation's primitive `name` given (`at`), so a rule that draws reads a draw of its own at every
-    equation it meets (tests/rounding_bound.py's taps) and check 2 names each equation by its path
+    equation's primitive's name given for a path's text (`at`), so a rule that draws reads a draw of its own
+    at every equation it meets (tests/rounding_bound.py's taps) and check 2 names each equation by its path
     (tests/certified.py), and the dtype its values hold each traced type in (`held`)."""
 
     def at(self, index: int, name: str | None = None) -> Rule: ...
@@ -249,11 +288,10 @@ def walked(jaxpr, consts, args, rule: Rule, *, compiling: bool = False) -> list:
 
 
 def _evaluated(jaxpr, consts, args, given=None, compiling: bool = False, rule=None, used=None):
-    """`jaxpr`'s outputs and their terms' energies, the sums of their squares
-    (`float64_terms`), from `args` and the energies `given` for them (none for
-    a computation's own inputs). A value no sum made has none. `compiling`
-    evaluates each run of static steps between a branch and a loop
-    (`_runs`) as one compiled program (`_span`).
+    """`jaxpr`'s outputs and their terms' energies, the sums of their squares (`float64_terms`; of their
+    magnitudes under `float64_magnitudes`, `POWER`), from `args` and the energies `given` for them (none
+    for a computation's own inputs). A value no sum made has none. `compiling` evaluates each run of
+    static steps between a branch and a loop (`_runs`) as one compiled program (`_span`).
 
     `rule`, where given, evaluates every primitive in place of the terms
     arithmetic (`Rule`): the walk, its calls' bodies, scans, loops, branches
@@ -344,33 +382,30 @@ every draw, its bodies' too."""
 
 
 def _layout(jaxpr):
-    """What the walk reads of `jaxpr`'s structure alone, once a jaxpr: the variables whose terms reach an
-    output (`_carrying`), the step that reads each variable last, after which it goes as an execution
-    frees it (a chunked scan's float64 intermediates would otherwise all stay), and its spans (`_runs`)."""
+    """What the walk reads of `jaxpr`'s structure alone, once a jaxpr and measure (`POWER`): the variables
+    whose terms reach an output (`_carrying`), the step that reads each variable last, after which it goes
+    as an execution frees it (a chunked scan's float64 intermediates would otherwise all stay), and its
+    spans (`_runs`)."""
     from jax.extend.core import Literal
 
-    if jaxpr not in LAYOUTS:
+    key = (jaxpr, POWER.get())
+    if key not in LAYOUTS:
         last = {var: index for index, equation in enumerate(jaxpr.eqns)
                 for var in equation.invars if not isinstance(var, Literal)}
         for var in jaxpr.outvars:
             if not isinstance(var, Literal):
                 last.pop(var, None)
-        LAYOUTS[jaxpr] = (_carrying(jaxpr), last, tuple(_runs(jaxpr)))
-    return LAYOUTS[jaxpr]
+        LAYOUTS[key] = (_carrying(jaxpr), last, tuple(_runs(jaxpr)))
+    return LAYOUTS[key]
 
 
 def _static_equation(equation, picked: frozenset = frozenset()) -> bool:
     """Whether `equation` takes no branch or loop its values pick, its bodies' included (`_static`): a
     branch whose index is among `picked`, its platform's (`_platform_picked`), is not one."""
-    name = equation.primitive.name
-    if name == "while" or (name == "cond" and equation.invars[0] not in picked):
+    primitive = equation.primitive
+    if primitive is jax.lax.while_p or (primitive is jax.lax.cond_p and equation.invars[0] not in picked):
         return False
-    for value in equation.params.values():
-        for body in value if isinstance(value, tuple | list) else (value,):
-            inner = getattr(body, "jaxpr", body)
-            if hasattr(inner, "eqns") and not _static(inner):
-                return False
-    return True
+    return all(_static(body) for body in programs.bodies(equation))
 
 
 def _runs(jaxpr) -> list[tuple[int, int]]:
@@ -401,14 +436,14 @@ def _span(jaxpr, start: int, stop: int):
     rule (`_evaluated`'s, None for none) to the kept ones'."""
     from jax.extend.core import Literal
 
-    key = (jaxpr, start, stop, _target())
+    key = (jaxpr, start, stop, _target(), POWER.get())
     if key not in RUNS:
         wanted, last, _ = _layout(jaxpr)
         run = jaxpr.eqns[start:stop]
         # A platform's index the run reads is read again inside it (`_platform`), never passed in: the
         # branch it picks is then one static step of the compiled run.
-        platforms = {var: equation for equation in jaxpr.eqns if equation.primitive.name == "platform_index"
-                     for var in equation.outvars}
+        platforms = {var: equation for equation in jaxpr.eqns
+                     if equation.primitive is primitives.platform_index_p for var in equation.outvars}
         written, reads = set(), []
         for equation in run:
             reads += [var for var in equation.invars
@@ -459,57 +494,70 @@ def _real(var) -> bool:
 
 def _carried(equation) -> list[int]:
     """The operands whose terms `equation` carries to its outputs: real floats
-    alone, as a complex value's terms have no order to sum in."""
-    name, operands = equation.primitive.name, equation.invars
+    alone, as a complex value's terms have no order to sum in. A sum carries
+    none of its operands' squares, and their magnitudes (`float64_magnitudes`)."""
+    primitive, operands = equation.primitive, equation.invars
     if not all(_real(var) or not jnp.issubdtype(var.aval.dtype, jnp.inexact) for var in equation.outvars):
         return []
     floats = [index for index, var in enumerate(operands) if _real(var)]
-    if name in CARRIES or _body(equation) is not None or name in ("scan", "while", "cond", "shard_map"):
+    if (primitive in CARRIES or _body(equation) is not None or programs.control_flow(primitive)
+            or primitive is primitives.shard_map_p):
         return floats
-    if name == "reduce_sum":
-        # A sum over unit axes adds nothing: it moves its operand, as a broadcast's transpose does.
-        return floats if all(operands[0].aval.shape[axis] == 1 for axis in equation.params["axes"]) else []
-    if name in ("mul", "div"):
+    if _moved(equation) or primitive in SCALING:
         return floats
-    return []
+    # A sum's operands that sums made carry their magnitudes into it; their squares end at it.
+    return floats if primitive in SUMS and POWER.get() == 1 else []
+
+
+def _moved(equation) -> bool:
+    """Whether `equation`, a sum, adds nothing: one over unit axes, which moves its operand as a broadcast's
+    transpose does and carries its terms as a move (`_carried`)."""
+    return equation.primitive is jax.lax.reduce_sum_p and all(
+        equation.invars[0].aval.shape[axis] == 1 for axis in equation.params["axes"])
 
 
 def _body(equation):
-    """The jaxpr and constants a call runs (`dew.nn.programs.CALLS`: a jit, a remat, a custom rule's primal, a
-    marked span, each evaluated op by op as the computation's own), or None. A shard_map's per-device program
-    is evaluated too, on each device's blocks (`_mapped`); a body that runs elsewhere, a Pallas kernel, is
-    one operation, its outputs their own size."""
+    """The jaxpr and constants a call runs (`dew.nn.programs.called`: a jit, a remat, a custom rule's primal,
+    a marked span, each evaluated op by op as the computation's own), or None. A shard_map's per-device
+    program is evaluated too, on each device's blocks (`_mapped`); a body that runs elsewhere, a Pallas
+    kernel, is one operation, its outputs their own size."""
     body = programs.called(equation)
     return None if body is None else (body, body.consts)
 
 
-def _squared(value):
-    return jnp.square(jnp.abs(value)) if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
+def _sized(value):
+    """`value`'s size at the evaluation's power (`POWER`): its square, or its magnitude."""
+    return jnp.square(jnp.abs(value)) if POWER.get() == 2 else jnp.abs(value)
+
+
+def _measured(value):
+    """A term's energy (`_sized`), none for a value that is no float."""
+    return _sized(value) if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
 
 
 def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rule=None, used=None):
     """`equation`'s outputs from `inputs`, and their energies where `wanted`, a body's runs of static
     steps compiled where `compiling` (`_evaluated`); a primitive's by `rule` where one is given; a body's
     `used` outputs alone (`_evaluated`'s)."""
-    name, params = equation.primitive.name, equation.params
-    if name == "platform_index":
+    primitive, params = equation.primitive, equation.params
+    if primitive is primitives.platform_index_p:
         return [_platform(equation)], [None]
     body = _body(equation)
     walked = wanted or rule is not None
     if walked and body is not None:
         return _evaluated(*body, inputs, given, compiling, rule, used)
-    if rule is not None and name in ("scan", "while", "cond") and _traced_values(inputs):
+    if rule is not None and programs.control_flow(primitive) and _traced_values(inputs):
         # Traced, its values pick no branch and bound no Python loop: the primitive itself over walked bodies.
-        outputs = _bound_walk(name, params, inputs, rule, used)
+        outputs = _bound_walk(equation, inputs, rule, used)
         return outputs, [None] * len(outputs)
-    if walked and name == "scan":
-        return _scanned(params, inputs, given, compiling, rule, used)
-    if walked and name == "while":
-        return _looped(params, inputs, given, compiling, rule)
-    if walked and name == "shard_map":
-        return _mapped(params, inputs, given, rule)
-    if walked and name == "cond":
-        branch = params["branches"][int(inputs[0])]
+    if walked and primitive is jax.lax.scan_p:
+        return _scanned(equation, inputs, given, compiling, rule, used)
+    if walked and primitive is jax.lax.while_p:
+        return _looped(equation, inputs, given, compiling, rule)
+    if walked and primitive is primitives.shard_map_p:
+        return _mapped(equation, inputs, given, rule)
+    if walked and primitive is jax.lax.cond_p:
+        branch = programs.branches(equation)[int(inputs[0])]
         return _evaluated(branch.jaxpr, branch.consts, inputs[1:], given[1:], compiling, rule, used)
     if rule is not None:
         outputs = rule.primitive(equation, inputs)
@@ -519,48 +567,57 @@ def _applied(equation, inputs, given, wanted: bool, compiling: bool = False, rul
     if not wanted:
         return outputs, [None] * len(outputs)
     carried = _carried(equation)
-    if name in SUMS and not carried and all(_real(var) for var in equation.outvars):
-        squares = [_squared(value) if _real(var) or jnp.issubdtype(var.aval.dtype, jnp.complexfloating)
-                   else value for var, value in zip(equation.invars, inputs, strict=True)]
-        return outputs, [equation.primitive.bind(*squares, **equation.primitive.get_bind_params(params))]
+    summing = primitive in SUMS and all(_real(var) for var in equation.outvars)
+    if summing and (not carried or POWER.get() == 1) and not _moved(equation):
+        # Each operand at its own size, or at the magnitudes the sums behind it carried (`_carried`).
+        nested = POWER.get() == 1
+        sizes = [energy if nested and energy is not None else _measured(value)
+                 if _real(var) or jnp.issubdtype(var.aval.dtype, jnp.complexfloating) else value
+                 for var, value, energy in zip(equation.invars, inputs, given, strict=True)]
+        return outputs, [equation.primitive.bind(*sizes, **equation.primitive.get_bind_params(params))]
     if not carried:
         return outputs, [None] * len(outputs)
-    if name in ("mul", "div"):
+    if primitive in SCALING:
         summed = [index for index in carried if given[index] is not None]
-        if len(summed) != 1 or (name == "div" and summed != [0]):
+        if len(summed) == 2 and primitive is jax.lax.mul_p and POWER.get() == 1:
+            # A product of two sums is within the product of their magnitudes; its squares end here.
+            return outputs, [given[0] * given[1]]
+        if len(summed) != 1 or (primitive is not jax.lax.mul_p and summed != [0]):
             return outputs, [None] * len(outputs)
         (index,) = summed
-        scale = jnp.square(jnp.abs(inputs[1 - index]))
-        return outputs, [given[index] * scale if name == "mul" else given[index] / scale]
+        scale = _sized(inputs[1 - index])
+        return outputs, [given[index] * scale if primitive is jax.lax.mul_p else given[index] / scale]
     if all(given[index] is None for index in carried):
         return outputs, [None] * len(outputs)
-    operands = [_or_zero(given[index], value) if index in carried else value
+    # An operand no sum made adds no terms to the squares; a partial sum reaches its size too (`POWER`).
+    untracked = _or_zero if POWER.get() == 2 else _or_own
+    operands = [untracked(given[index], value) if index in carried else value
                 for index, value in enumerate(inputs)]
-    primitive = jax.lax.add_p if name == "sub" else equation.primitive
-    made = (primitive.bind(*operands) if name == "sub" else
-            operands[0] if name == "neg" else
+    made = (jax.lax.add_p.bind(*operands) if primitive is jax.lax.sub_p else
+            operands[0] if primitive is jax.lax.neg_p else
             primitive.bind(*operands, **primitive.get_bind_params(params)))
     made = list(made) if primitive.multiple_results else [made]
     return outputs, [energy if jnp.issubdtype(jnp.result_type(value), jnp.inexact) else None
                      for energy, value in zip(made, outputs, strict=True)]
 
 
-def scan_groups(params, operands: int) -> tuple[int, int]:
-    """A scan equation's (`params`, of `operands` operands) constants and carries, its step's first
-    operands, as its operand tree declares them (`ft_in`)."""
-    constants, carries, _ = (len(group) for group in params["ft_in"].update(range(operands)).unpack())
+def scan_groups(equation) -> tuple[int, int]:
+    """A scan's `equation`'s constants and carries, its step's first operands, as its operand tree declares
+    them (`ft_in`)."""
+    groups = equation.params["ft_in"].update(range(len(equation.invars))).unpack()
+    constants, carries, _ = (len(group) for group in groups)
     return constants, carries
 
 
-def scanned_steps(params, inputs: list[tuple], body, lanes: int) -> list[tuple]:
-    """A scan (lax.scan's equation `params`) over `inputs` a step at a time, as the gate's evaluators
+def scanned_steps(equation, inputs: list[tuple], body, lanes: int) -> list[tuple]:
+    """A scan (lax.scan's `equation`) over `inputs` a step at a time, as the gate's evaluators
     walk one (`float64_terms`, check 2's `certified`): each input a tuple of lanes, a value and what an
     evaluator carries beside it, sliced at each step lane by lane (a lane of None stays None), and
     `body(step, step_inputs)` the body's outputs for one step, carries first, tuples alike. The carries
     thread from step to step and each further output stacks over the steps in scan order, a lane where
     every step has one (else None); an empty scan's from its outvars' avals, its `lanes` - 1 others None."""
-    jaxpr = params["jaxpr"].jaxpr
-    constants, carries = scan_groups(params, len(inputs))
+    jaxpr, params = programs.scan_body(equation).jaxpr, equation.params
+    constants, carries = scan_groups(equation)
     consts, carry, xs = (inputs[:constants], inputs[constants:constants + carries],
                          inputs[constants + carries:])
     ys = []
@@ -585,20 +642,20 @@ def _traced_values(values) -> bool:
     return any(isinstance(value, jax.core.Tracer) for value in values)
 
 
-def _bound_walk(name: str, params, inputs: list, rule, used=None) -> list:
+def _bound_walk(equation, inputs: list, rule, used=None) -> list:
     """A traced scan, while loop or branch of a rule's walk, bound as its own primitive (`jax.lax.scan`,
     `while_loop`, `switch`) whose bodies the walk evaluates, each step's or iteration's rule its own
     (`Rule.at`) as when it steps them concretely: a scan's at its step's index, a loop's at its iteration
     and its test at `-1 - iteration`, a branch's the walk's own. Of a branch's and a scan's outputs its
     `used` ones alone are walked, zeros of their types the rest, so each body keeps its signature."""
-    if name == "cond":
+    primitive, params = equation.primitive, equation.params
+    if primitive is jax.lax.cond_p:
         index, *operands = inputs
-        branches = [lambda *values, branch=branch: _filled(branch.jaxpr, branch.consts, list(values), rule,
-                                                           used)
-                    for branch in params["branches"]]
-        return list(jax.lax.switch(index, branches, *operands))
-    if name == "while":
-        condition, body = params["cond_jaxpr"], params["body_jaxpr"]
+        taken = [lambda *values, branch=branch: _filled(branch.jaxpr, branch.consts, list(values), rule, used)
+                 for branch in programs.branches(equation)]
+        return list(jax.lax.switch(index, taken, *operands))
+    if primitive is jax.lax.while_p:
+        condition, body = programs.loop_programs(equation)
         tested, run = params["cond_nconsts"], params["body_nconsts"]
         condition_consts, body_consts = inputs[:tested], inputs[tested:tested + run]
 
@@ -615,9 +672,9 @@ def _bound_walk(name: str, params, inputs: list, rule, used=None) -> list:
         carry = [_held(value, var, rule)
                  for value, var in zip(inputs[tested + run:], body.jaxpr.invars[run:], strict=True)]
         return list(jax.lax.while_loop(test, step, (0, carry))[1])
-    body, length, reverse = params["jaxpr"], params["length"], params["reverse"]
-    constants, carries = scan_groups(params, len(inputs))
-    consts, reading = inputs[:constants], _scan_reads(params, len(inputs), used)
+    body, length, reverse = programs.scan_body(equation), params["length"], params["reverse"]
+    constants, carries = scan_groups(equation)
+    consts, reading = inputs[:constants], _scan_reads(equation, used)
 
     def step(state, sliced):
         counter, carry = state
@@ -633,15 +690,15 @@ def _bound_walk(name: str, params, inputs: list, rule, used=None) -> list:
     return [*carry, *ys]
 
 
-def _scan_reads(params, operands: int, used, compiling: bool = False) -> tuple:
+def _scan_reads(equation, used, compiling: bool = False) -> tuple:
     """Which of a scan body's outputs its `used` outputs read (`_evaluated`'s `used`, every one where None):
     a used carry or output, and every carry a read output reads back in through the next step, until none
     is added, over the spans its steps run (`_evaluated`'s: each run of static steps whole where
     `compiling`, which reads every input of a run any of it reads, else each equation)."""
     from jax.extend.core import Var
 
-    body = params["jaxpr"].jaxpr
-    constants, carries = scan_groups(params, operands)
+    body = programs.scan_body(equation).jaxpr
+    constants, carries = scan_groups(equation)
     reading = tuple([True] * len(body.outvars) if used is None else used)
     spans = _layout(body)[2] if compiling else tuple((index, index + 1) for index in range(len(body.eqns)))
     while True:
@@ -671,11 +728,11 @@ def _held(value, var, rule):
     return jnp.zeros(var.aval.shape, dtype) if value is None else jnp.asarray(value).astype(dtype)
 
 
-def _scanned(params, inputs, given, compiling: bool = False, rule=None, used=None):
+def _scanned(equation, inputs, given, compiling: bool = False, rule=None, used=None):
     """A scan's outputs and energies (`float64_terms`), its body evaluated a step at a time, each step's
     rule its own (`Rule.at`), its `used` outputs alone (`_scan_reads`)."""
-    body = params["jaxpr"]
-    reading = _scan_reads(params, len(inputs), used, compiling)
+    body = programs.scan_body(equation)
+    reading = _scan_reads(equation, used, compiling)
 
     def step(index, pairs):
         outputs, made = _evaluated(body.jaxpr, body.consts, [value for value, _ in pairs],
@@ -683,14 +740,14 @@ def _scanned(params, inputs, given, compiling: bool = False, rule=None, used=Non
                                    None if rule is None else rule.at(index), reading)
         return list(zip(outputs, made, strict=True))
 
-    walked = scanned_steps(params, list(zip(inputs, given, strict=True)), step, lanes=2)
+    walked = scanned_steps(equation, list(zip(inputs, given, strict=True)), step, lanes=2)
     return [value for value, _ in walked], [energy for _, energy in walked]
 
 
-def _looped(params, inputs, given, compiling: bool = False, rule=None):
+def _looped(equation, inputs, given, compiling: bool = False, rule=None):
     """A while loop's carries and energies (`float64_terms`), its body evaluated a step at a time, each
     iteration's rule its own (`Rule.at`)."""
-    condition, body = params["cond_jaxpr"], params["body_jaxpr"]
+    (condition, body), params = programs.loop_programs(equation), equation.params
     tested, run = params["cond_nconsts"], params["body_nconsts"]
     condition_consts, body_consts, carry = inputs[:tested], inputs[tested:tested + run], inputs[tested + run:]
     body_terms, carry_terms = given[tested:tested + run], given[tested + run:]
@@ -704,11 +761,12 @@ def _looped(params, inputs, given, compiling: bool = False, rule=None):
     return carry, carry_terms
 
 
-def _mapped(params, inputs, given, rule=None):
+def _mapped(equation, inputs, given, rule=None):
     """A shard_map's outputs and energies (`float64_terms`), its program evaluated
     op by op on each device's blocks, as the map runs it: an expert layer's
     dispatch (`dew.nn.moe`), whose grouped matmul and its transpose sum."""
-    body, specs, out_specs = params["jaxpr"], tuple(params["in_specs"]), tuple(params["out_specs"])
+    (body,), params = programs.bodies(equation), equation.params
+    specs, out_specs = tuple(params["in_specs"]), tuple(params["out_specs"])
 
     def program(values, energies):
         return tuple(map(tuple, _evaluated(body.jaxpr, body.consts, values, energies, rule=rule)))
@@ -722,8 +780,13 @@ def _or_zero(energy, value):
     return jnp.zeros_like(value) if energy is None else energy
 
 
+def _or_own(energy, value):
+    """A carried operand's magnitudes, its own size where no sum made it."""
+    return _sized(value) if energy is None else energy
+
+
 def _or_size(energy, value):
-    """An output's energy: the one its sums carried, else its own size's square."""
+    """An output's energy: the one its sums carried, else its own size's (`_sized`)."""
     if not jnp.issubdtype(jnp.result_type(value), jnp.inexact):
         return np.zeros(np.shape(value))
-    return _squared(value) if energy is None else energy
+    return _measured(value) if energy is None else energy

@@ -22,8 +22,8 @@ import tokamax
 from flax.linen.dtypes import promote_dtype
 from jax.ad_checkpoint import checkpoint_name
 
-from dew._devices import deterministic_ops_requested
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
+from dew.nn.residuals import Residual
 
 from .attention_kernels import (
     ATTENTION,
@@ -611,7 +611,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     A mesh sequence axis above one runs `sequence_parallel_attention`. Active dropout draws each weight
     from `dropout_rng` on the route the selector takes for it (`reference`, or `template` where named),
     at its global place on a sequence axis above one, and refuses explicit fused kernels. The
-    result carries the checkpoint name 'attention_output', so a remat policy
+    result carries the checkpoint name `Residual.ATTENTION_OUTPUT`, so a remat policy
     can save it instead of replaying the kernel (`remat_block` in dit.py).
     """
     shards = sequence_shards()
@@ -664,7 +664,7 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                      key_value_seq_starts=key_value_seq_starts, block_groups=block_groups,
                      image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
                      dropout_rate=dropout_rate if dropping else 0.0, dropout_seed=words)
-    return checkpoint_name(out, 'attention_output')
+    return checkpoint_name(out, Residual.ATTENTION_OUTPUT)
 
 
 def _read_nothing(out: jax.Array, live: jax.Array | None) -> jax.Array:
@@ -766,21 +766,7 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
             return cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                                    key_value_seq_lengths)
 
-        if deterministic_ops_requested():
-            # The decode selector takes cuDNN's forward under deterministic ops (`attention_kernels.DECODE`),
-            # whose backward crashes there (`CUDNN_SUPPORTS`): a differentiated call takes the reference
-            # path's derivative of the attention it computes, the decode kernel's own glue.
-            visible = combined_attention_mask(
-                query.shape[-3], key.shape[-3], causal, sliding_window,
-                mask if key_value_seq_lengths is None
-                else with_key_lengths(mask, key_value_seq_lengths, key.shape[-3]))
-
-            def referenced(query, key, value):
-                return reference_attention(query, key, value, mask=visible, bias=bias)
-
-            out = forward_differentiable(fused, referenced, query, key, value)
-        else:
-            out = fused(query, key, value)
+        out = fused(query, key, value)
     elif implementation == 'triton':
         out = triton_attention(query, key, value, causal)
     elif implementation == 'flash':
