@@ -237,6 +237,10 @@ class Loop:
     `early_exit_threshold`, OuroForCausalLM.forward), the last pass's where
     none does. The probability a pass exits is its hazard `sigmoid(logit)`
     times the chance no pass before it did; the last pass takes the rest.
+    `exits` gives every pass its exit state without the gate: each pass's
+    coda and final norm as the last pass's, sown as its `states` where the
+    caller opens `exits`, as a loss that weighs every pass reads them
+    (`dew.objectives.passes.PassWeights`); a gate implies it (`exiting`).
 
     `remat` checkpoints each pass of the block, the first included, with one
     Flax lifted checkpoint. Backpropagation keeps each pass's input and
@@ -269,8 +273,8 @@ class Loop:
     A decode cache holds one entry per pass and layer. The first pass keeps
     its layers' own names; pass t > 0's layer i is `layers_{L + (t - 1) n + i - first}`,
     L the decoder's layers and n the block's (`PassView`). Over the whole
-    stack that is `layers_{t L + i}`, as Ouro's cache indexes them. Under
-    an exit gate, pass t < T - 1's coda layer j is
+    stack that is `layers_{t L + i}`, as Ouro's cache indexes them. Where
+    every pass exits (`exiting`), pass t < T - 1's coda layer j is
     `layers_{L + (T - 1) n + t c + j - end}` beside them, c the coda's
     layers, T the steps. With
     `shared_cache` every pass reads and writes its layers' one entry, each
@@ -288,11 +292,18 @@ class Loop:
     shared_cache: bool = False
     implicit: bool = False
     exit_threshold: float | None = None
+    exits: bool = False
+
+    @property
+    def exiting(self) -> bool:
+        """Whether every pass leaves through the coda and the final norm as the last does: under an exit
+        gate, which weighs each, or `exits`."""
+        return self.exit_gate or self.exits
 
     def __post_init__(self):
         if self.steps < 1:
             raise ValueError(f"a loop runs its stack at least once, got steps={self.steps}")
-        if self.reinject and (not self.step_norm or self.exit_gate):
+        if self.reinject and (not self.step_norm or self.exiting):
             raise ValueError("a reinjecting loop norms each pass's state (step_norm) and exits at "
                              "the last pass")
         if self.implicit and (self.step_norm or self.reinject):

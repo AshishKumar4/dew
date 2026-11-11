@@ -845,8 +845,10 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
     on = generation if stated is None else stated
     # A canonical target's devices stand for any GPU of the generation; a host's own topology's, for its own.
     portable = not on_tpus and not set(trainer.device_mesh.devices.flat) <= _HOSTS_GPUS
+    # The first step's pass count, the phase its batch was read in (`Trainer`'s `phase_passes`).
+    trainer.phase_passes.at(batch)
     try:
-        with assumed(on, portable=portable):
+        with assumed(on, portable=portable), trainer.phase_passes.scoped(trainer):
             target = gpu_target()
             planned = trainer._compiled_plan(start.abstract, step_batch(trainer, batch), None, capacity,
                                              frontier)

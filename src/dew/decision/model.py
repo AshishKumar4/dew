@@ -14,7 +14,7 @@ from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
 from dew.nn.inspection import QK
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
-from dew.nn.protocols import TokenModel, VocabularyRows
+from dew.nn.protocols import EXITS, Looped, TokenModel, VocabularyRows
 from dew.nn.visibility import block_ends, block_starts
 from dew.nn.wrapping import HeadedModel
 from dew.objectives.base import joined
@@ -183,6 +183,28 @@ class DecisionModel(HeadedModel):
                                            progress=progress, opened=opened)
         logits, head_sown = self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs,
                                              opened=opened)
+        if QK in opened:
+            sown = {**sown, QK: {"backbone": sown.get(QK, {}), "head": head_sown.get(QK, {})}}
+        return logits, sown
+
+    def pass_logits(self, variables: Variables, inputs: DecisionInputs, *,
+                    media: ModelInputs | None = None, train: bool = False,
+                    rngs: dict[str, jax.Array] | None = None, progress: Progress = END,
+                    opened: Sequence[str] = ()) -> tuple[tuple[jax.Array, ...], Variables]:
+        """Each pass's option logits of a looped backbone whose every pass exits (`Loop.exiting`), in
+        order, the last pass's `observed_logits`': each earlier pass's exit states as the backbone's forward
+        gathered them (`Looped.exit_passes`) read by the head as the last pass's states are; and what the
+        rows' pass sowed into the `opened` collections, as `observed_logits` gives it."""
+        states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
+                                           progress=progress, opened=[*opened, EXITS])
+        backbone = self.backbone
+        assert isinstance(backbone, Looped), "a looped backbone's exits"
+        earlier, _ = backbone.exit_passes(sown)
+        last, head_sown = self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs,
+                                           opened=opened)
+        logits = (*(self.head_logits(variables, state, inputs, spanned, train=train, rngs=rngs)[0]
+                    for state in earlier), last)
+        sown = {name: value for name, value in sown.items() if name != EXITS}
         if QK in opened:
             sown = {**sown, QK: {"backbone": sown.get(QK, {}), "head": head_sown.get(QK, {})}}
         return logits, sown
