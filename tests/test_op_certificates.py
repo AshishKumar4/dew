@@ -268,6 +268,26 @@ def test_ln2_is_what_the_oracle_takes_it_for():
     assert oc._LN2_LO.hex() == "-0x1.0ca86c3898d00p-49"
 
 
+@pytest.mark.parametrize("fmt", FORMATS, ids=lambda fmt: fmt.name)
+def test_below_and_above_are_the_formats_own_neighbours(fmt):
+    """`below` and `above` give the format's values on either side of a float64, as the format's own library
+    steps to them (a cast to nearest, then NumPy's next value where the cast went past): at values across
+    the range and both signs, in the subnormal range, on the grid, a float64 step off it, and past the
+    largest, where the far side is an infinity."""
+    dtype = oc.DTYPES[fmt.name]
+    rng = np.random.default_rng(7)
+    spread = rng.standard_normal(8192) * 2.0 ** rng.integers(fmt.emin - fmt.precision - 2, fmt.emax + 1, 8192)
+    on_grid = spread.astype(dtype).astype(np.float64)
+    values = np.concatenate([spread, on_grid, np.nextafter(on_grid, np.inf), np.nextafter(on_grid, -np.inf),
+                             [0.0, -0.0, fmt.largest, -fmt.largest, 2.0 * fmt.largest, -2.0 * fmt.largest]])
+    with np.errstate(over="ignore"):
+        cast = values.astype(dtype)
+        down = np.where(cast > values, np.nextafter(cast, dtype(-np.inf)), cast).astype(np.float64)
+        up = np.where(cast < values, np.nextafter(cast, dtype(np.inf)), cast).astype(np.float64)
+    np.testing.assert_array_equal(oc.below(values, fmt), down)
+    np.testing.assert_array_equal(oc.above(values, fmt), up)
+
+
 def test_an_intervals_ends_come_back_exact_and_signed():
     """`interval_ends` returns an interval's ends exactly, at the interval's precision, with their signs:
     a negative interval's ends are negative, and a 96-bit interval keeps its 96 bits."""

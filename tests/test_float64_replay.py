@@ -241,6 +241,22 @@ def test_a_division_dew_rounds_to_float32_replays_as_the_float64_quotient():
     np.testing.assert_array_equal(np.asarray(float64_replay(program)(x, y)), np.asarray(wide))
 
 
+def test_a_scans_gradient_replays_in_float64():
+    """The gradient of a scan stacks its steps' cotangents into an array made to be written over, which
+    states no arithmetic: the replay evaluates it with the rest, the gradient what the same scan gives on
+    float64 operands (a MeanFlow step's truth, whose replay refused it by name)."""
+    def summed(x):
+        def step(carry, row):
+            return carry * 0.5 + jnp.tanh(row), carry @ row
+
+        return jax.lax.scan(step, jnp.zeros(3), x)[1].sum()
+
+    x = np.random.default_rng(2).normal(size=(5, 3)).astype(np.float32)
+    with jax.enable_x64(new_val=True):
+        wide = jax.grad(summed)(jnp.asarray(x, jnp.float64))
+    np.testing.assert_array_equal(np.asarray(float64_replay(jax.grad(summed))(x)), np.asarray(wide))
+
+
 def test_a_padded_product_replays_in_float64():
     """A program that pads a float before it multiplies and sums, as Dew's blocked CPU product pads a depth
     to whole blocks in a library process's arithmetic, replays in float64: what the program computes on
