@@ -280,14 +280,16 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
             # never decrease along it, and their first and last key indices bound the span.
             numbers = jnp.take_along_axis(by_places[-1][0], order, axis=1)
             start, end = _narrowed(start, end, order, run_lo, run_hi, numbers, wanted, wanted)
-    if lengths is not None:
-        end = jnp.minimum(end, lengths.astype(jnp.int32)[:, None])
-    if starts is not None:
-        start = jnp.maximum(start, starts.astype(jnp.int32)[:, None])
     if runs is not None:
         sides = None if sliding_window is None or positions is None else window_sides(causal, sliding_window)
         start, end = _read_runs(jnp.asarray(runs, jnp.int32), start, end, keys,
                                 (by_places, sides, positions), (place, own, block_groups))
+    # The call's hard bounds last, once, on every path: a block widens a query's keys past its causal and
+    # window bounds alone (`_grouped`, `_whole_blocks`), never past its row's lengths or starts.
+    if lengths is not None:
+        end = jnp.minimum(end, lengths.astype(jnp.int32).reshape(-1, *(1,) * (end.ndim - 1)))
+    if starts is not None:
+        start = jnp.maximum(start, starts.astype(jnp.int32).reshape(-1, *(1,) * (start.ndim - 1)))
     blocks = True if causal and (block_groups is not None or image_groups is not None) else None
     narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks, valid, runs, slots)
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
