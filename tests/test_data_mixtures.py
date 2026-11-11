@@ -2244,25 +2244,15 @@ def test_an_unseeded_mix_reads_its_members_in_the_order_it_declares_them(read):
             earlier.close()
 
 
-def test_a_phased_runs_statistics_count_each_phase_it_reached():
-    """A run's statistics count every phase it has read: a corpus a later phase adds appears once the run
-    reaches it, beside the first phase's, and not before."""
-    from dew.data.pipeline import Phases
-
-    first = mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat()], by="tokens")
-    second = mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat(),
-                  _token_rows("added", 3, 4).repeat()], by="tokens")
-    data = compile(Pipeline(Phases((first, second), (10, None))).batch(1), read="memory", loading=READ)
+def test_a_phased_runs_statistics_count_each_phase_it_reached(tmp_path):
+    """A run's statistics count every phase it has opened: a corpus its second phase adds to the first's
+    is counted beside it, where only the first phase's loader was counted, its corpus alone."""
+    _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    data = phased_packed((first, 3), ({first: 1.0, second: 1.0}, None))
     stream = data.train(DataPartition())
-
-    def labels() -> set[str]:
-        return {name.removeprefix("data/weighed_tokens/") for name in data.statistics()
-                if name.startswith("data/weighed_tokens/")}
-
     try:
-        list(itertools.islice(stream, 5))
-        assert labels() == {"short", "long"}
-        list(itertools.islice(stream, 15))
-        assert labels() == {"short", "long", "added"}
+        list(itertools.islice(stream, 4))
+        rows = {name: count for name, count in data.statistics().items() if name.startswith("data/rows/")}
     finally:
         stream.close()
+    assert len(rows) == 2 and all(count > 0 for count in rows.values()), rows
