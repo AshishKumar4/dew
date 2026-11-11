@@ -992,9 +992,10 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     plan, 45-95 s each, paid twice where a cut parted their tests). A marked test the record does not name
     yet joins its setup's tests all the same (Main, 2026-11-02: a marked pair waited on the record to share
     its fixture), its setup's group keeping the place of its first recorded test, where the plan has it,
-    though the new test comes first. A test the record lacks, alone or a new setup's, weighs its file's mean,
-    so the task's cut may part from the plan's: each test still runs in one group, and its file's groups run,
-    never reused, until the record names it (`record`'s `unkeyed`). A mark written
+    though the new test comes first. A test the record lacks, alone or a new setup's, joins the plan's groups
+    without moving a recorded test from its planned group (`session.kept`), the new tests cut by the file's
+    mean across them: each test still runs in one group, and its file's groups run, never reused, until the
+    record names it (`record`'s `unkeyed`). A mark written
     elsewhere than a test's own decorator, or of a name not a literal string, refuses the file, naming its
     line, as the plan cannot read it."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
@@ -1032,8 +1033,8 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
         "3.12:tests/test_order.py#3/3": [order["3c"]]}
     assert [ci.members("tests/test_order.py", f"{group}/3") for group in (1, 2, 3)] == [
         [order["1b"]], [order["2a"]], [order["3c"]]]
-    # A new lone test, or a new setup's pair, before recorded a, b, c weighs their mean: the task cuts the
-    # file by it, the plan by the record, and the file's groups are not reused.
+    # A new lone test, or a new setup's pair, before recorded a, b, c joins the first group, a, b and c each
+    # staying in its planned group, and the file's groups are not reused.
     files = {"lone": ("0x", "1a", "2b", "3c"), "group": ("0y", "0z", "1a", "2b", "3c")}
     for name, tests in files.items():
         (tmp_path / f"tests/test_{name}.py").write_text(
@@ -1047,7 +1048,7 @@ def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cu
     commit(tmp_path, "files whose new tests come before their recorded ones")
     rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
     assert all(row["exitCode"] == 0 for row in rows)
-    cuts = {"lone": (("0x", "1a"), ("2b", "3c"), ()), "group": (("0y", "0z"), ("1a", "2b"), ("3c",))}
+    cuts = {"lone": (("0x", "1a"), ("2b",), ("3c",)), "group": (("0y", "0z", "1a"), ("2b",), ("3c",))}
     for name, cut in cuts.items():
         assert {row["name"]: sorted(row["tests"]) for row in rows if f"test_{name}" in row["name"]} == {
             f"3.12:tests/test_{name}.py#{group}/3": sorted(node[name, test] for test in tests)

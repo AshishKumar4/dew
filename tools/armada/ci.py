@@ -706,8 +706,7 @@ def parted_record() -> dict[str, dict[str, float]]:
 
 def own_tests(name: str, tests: dict[str, float]) -> dict[str, float]:
     """Of file `name`'s recorded `tests`, those but its check-1 sites', which run apart (`sites`)."""
-    held = sites(name)
-    return {node: seconds for node, seconds in tests.items() if session.site_name(node, held) not in held}
+    return session.own(tests, sites(name))
 
 
 def durations_record() -> dict[str, float]:

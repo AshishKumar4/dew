@@ -302,19 +302,44 @@ def unit_seconds(nodes: list[str], seconds: list[float]) -> list[float]:
     return [sum(seconds[index] for index in unit) for unit in units(nodes)]
 
 
-def cut(nodes: list[str], seconds: list[float], count: int,
-        recorded: Container[str] | None = None) -> list[list[str]]:
-    """`nodes` (node-id order, each weighing its `seconds`) as `count` groups (`groups`) of `units`: how
-    every task of a split file and the plan alike cut its tests (split.py, ci.py's `members`), a shared
-    setup's tests in one group, at its first test `recorded` names (the nodes the durations record names,
-    where given). A test the record lacks weighs what its caller gives it (split.py: its file's mean), so a
-    new parametrization spreads across the groups from its first run, never into one group past its
-    deadline (2026-11-03: test_attention_mosaic's ~190 new ids, weighed nothing, packed into one). The plan,
-    which reads the record alone, cuts as the task does where the record names every test the task collects;
-    a group of a file it does not is run, never reused (ci.py's `record`)."""
-    held = units(nodes, recorded)
+def cut(nodes: list[str], seconds: list[float], count: int) -> list[list[str]]:
+    """`nodes` (node-id order, each weighing its `seconds`) as `count` groups (`groups`) of `units`, a shared
+    setup's tests in one group: how the plan cuts a split file's recorded tests (ci.py's `members`), which
+    every task of it keeps whatever else it collects (`kept`)."""
+    held = units(nodes)
     runs = groups([sum(seconds[index] for index in unit) for unit in held], count)
     return [[nodes[index] for unit in held[run.start:run.stop] for index in unit] for run in runs]
+
+
+def own(recorded: Mapping[str, float], sites: Container[str]) -> dict[str, float]:
+    """Of a test file's `recorded` tests (node id to seconds, in node-id order), those but its `sites'`
+    (`declared_marks`, `site_name`), which run apart: what the plan cuts the file by (ci.py's `own_tests`)
+    and every task of it cuts alike (split.py)."""
+    return {node: seconds for node, seconds in recorded.items() if site_name(node, sites) not in sites}
+
+
+def kept(nodes: list[str], planned: list[list[str]], mean: float) -> list[list[str]]:
+    """`nodes`, a task's collected tests of one split file in node-id order, as the plan's groups
+    `planned` (the file's recorded tests cut, `cut`): each test the record names in its planned group, so no
+    group runs a recorded test its plan did not weigh (2026-11-11: two new parameters moved test_recurrence's
+    963 s test into a group planned at 77 s); a test the record lacks that shares a setup with a recorded
+    one (`units`) in that one's group; and the rest, `mean` seconds each, cut into as many runs of
+    consecutive tests as there are groups (`groups`), the kth run joining the kth group, so a new
+    parametrization spreads across the groups from its first run, never into one group past its deadline
+    (2026-11-03: test_attention_mosaic's ~190 new ids, weighed nothing, packed into one). A group of a file
+    whose record misses a test it collects is run, never reused (ci.py's `record`)."""
+    group_of = {node: index for index, members in enumerate(planned) for node in members}
+    held: list[list[str]] = [[] for _ in planned]
+    new: list[list[str]] = []
+    for unit in units(nodes, group_of):
+        placed = next((group_of[nodes[index]] for index in unit if nodes[index] in group_of), None)
+        if placed is None:
+            new.append([nodes[index] for index in unit])
+        else:
+            held[placed].extend(nodes[index] for index in unit)
+    for index, run in enumerate(groups([mean * len(unit) for unit in new], len(planned))):
+        held[index].extend(node for unit in new[run.start:run.stop] for node in unit)
+    return [sorted(members) for members in held]
 
 
 def starts(weights: list[int], capacity: int) -> list[int]:
