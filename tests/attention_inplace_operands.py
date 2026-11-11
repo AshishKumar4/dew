@@ -27,6 +27,7 @@ from test_attention_mosaic import ON_HOPPER
 from dew.nn.attention import AttentionImpl, scaled_dot_product_attention
 from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
+from dew.nn.precision import at_least_fp32
 
 TILES = attention_mosaic.BackwardTiles
 CALLS = {
@@ -41,12 +42,14 @@ LENGTH = 1024
 HEADS = 8
 SEEDS = 8
 def _route(causal: bool, implementation: AttentionImpl = "template"):
-    """The route's training step: the gradients of `sum(attention * dout)` through `implementation`."""
+    """The route's training step: the gradients of `sum(attention * dout)` through `implementation`, the sum
+    at least fp32 (`at_least_fp32`), so its float64 twin sums in float64."""
     def step(query, key, value, dout):
         def loss(query, key, value):
             out = scaled_dot_product_attention(query, key, value, implementation=implementation,
                                                causal=causal)
-            return (out.astype(jnp.float32) * dout.astype(jnp.float32)).sum()
+            summed = at_least_fp32(out.dtype)
+            return (out.astype(summed) * dout.astype(summed)).sum()
 
         return jax.grad(loss, argnums=(0, 1, 2))(query, key, value)
 
