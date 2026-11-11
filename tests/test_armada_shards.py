@@ -235,7 +235,7 @@ def test_a_sites_map_tasks_are_cut_by_what_their_records_say_they_paid_whatever_
     # Each task of 4 seeds took 300 s, 280 s of it before its first draw and 5 s a draw: its setup alone
     # passes the target, so the declared cut stands, its tasks weighed at their setup and draws.
     recorded = {"rows": {first: 300.0},
-                "files": {ci.costed(task, "setup"): 280.0, ci.costed(task, "unit"): 5.0}}
+                "files": {ci.costs.costed(task, "setup"): 280.0, ci.costs.costed(task, "unit"): 5.0}}
     assert [(entry["split"], entry["weight"]) for entry in ci.plan(256.0, recorded)
             if entry["python"] == "3.12" and ".draws-" in entry["split"]] == [
         ("test_site.draws-0-4", 300.0), ("test_site.draws-4-12", 320.0), ("test_site.draws-12-20", 320.0)]
@@ -467,7 +467,7 @@ def test_site():
         ("3.12:tests/test_site.py#test_site", 0, ["tests/test_site.py::test_site"])]
     task = ci.site_task("3.12", "tests/test_site.py", "test_site")
     costs = {key: seconds for key, seconds in row["timings"].items() if key != row["name"]}
-    assert sorted(costs) == [ci.costed(task, "setup"), ci.costed(task, "unit")]
+    assert sorted(costs) == [ci.costs.costed(task, "setup"), ci.costs.costed(task, "unit")]
     assert all(seconds > 0 for seconds in costs.values()), costs
     shutil.rmtree(inputs / "job/0")
     assert entry_task(ci, monkeypatch, judge, out, inputs=inputs) == 0
