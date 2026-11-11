@@ -1201,8 +1201,11 @@ class Trainer(Generic[Loss, Effects]):
         self._xla_defaults, self._narrow = planned.xla_defaults, planned.narrow
         if runs := pgle_runs():
             trials = Trials(state, batch, owned=False) if trials is None else trials
+            # A step lowered afresh past a spilled kernel derives no footprint, as the search's own do
+            # (`FitSearch.relowering`).
+            relower = functools.partial(lower, planned.split, planned.narrow, derived=False)
             planned = planned.guided(trials.profiled(self._runner(planned, mesh), planned, mesh, runs), runs,
-                                     mesh, functools.partial(lower, planned.split, planned.narrow))
+                                     mesh, relower)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         self.validation = self._validation(planned.candidate.prepared)
