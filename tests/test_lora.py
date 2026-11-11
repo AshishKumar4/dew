@@ -124,7 +124,7 @@ def _token_loss(objective, params, tokens):
 
 def test_a_fused_adapted_site_runs_as_the_branch_does(decoder, loaded, reference):
     """Named (`generation.chosen(low_rank='fused')`), each plain dense site adapted runs its base product and
-    its update as one template product (`gemm.low_rank`, row 1304), reported as the selector's route, and
+    its update as one template product (`low_rank.low_rank`, row 1304), reported as the selector's route, and
     the adapter's gradients reach every factor the unfused branch's reach, finite. The fused product's
     values and gradients against the branch's own program are check 1's (test_gemm_template's
     `test_an_adapted_products_fused_form_holds_check_1`)."""

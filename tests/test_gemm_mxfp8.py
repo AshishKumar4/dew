@@ -1,5 +1,5 @@
-"""The MXFP8 operand form (`gemm.MxFp8`: E4M3 codes, an E8M0 power-of-two scale every 32 depths, OCP MX) and
-its grouped product's portable arm (`gemm.mxfp8_product`, row 4519), on the CPU."""
+"""The MXFP8 operand form (`formats.MxFp8`: E4M3 codes, an E8M0 power-of-two scale every 32 depths, OCP MX)
+and its grouped product's portable arm (`gemm.mxfp8_product`, row 4519), on the CPU."""
 
 import jax
 import jax.numpy as jnp
@@ -10,7 +10,7 @@ from blockwise_matrix import step_operands
 from low_precision_support import spread
 from reference_error import assert_as_exact, with_gradients
 
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import formats, gemm, generation, projections
 from dew.nn.kernels.templates import product
 
 SEEDS = 8
@@ -20,13 +20,13 @@ def test_an_mxfp8_operand_holds_each_blocks_largest_code_in_its_scales_binade():
     """Each 32-depth block's scale puts its largest magnitude in [256, 512) (OCP MX's rule), so its code,
     rounded to E4M3 and saturating at 448, lies in [256, 448]; a block at float32's top binade decodes
     finite; and its values are an MXFP8 operand's already, quantizing them again giving them back."""
-    operand = gemm.MxFp8.quantized(spread(0, (64, 256), product.MXFP8.depth))
+    operand = formats.MxFp8.quantized(spread(0, (64, 256), product.MXFP8.depth))
     per = product.MXFP8.depth
     largest = jnp.max(jnp.abs(operand.codes.astype(jnp.float32)).reshape(64, -1, per), axis=-1)
     assert bool(jnp.all((largest >= 256) & (largest <= 448))), largest
     top = jnp.full((1, product.MXFP8.depth), jnp.finfo(jnp.float32).max * 0.99, jnp.float32)
-    assert bool(jnp.all(jnp.isfinite(gemm.MxFp8.quantized(top).decoded())))
-    again = gemm.MxFp8.quantized(operand.decoded())
+    assert bool(jnp.all(jnp.isfinite(formats.MxFp8.quantized(top).decoded())))
+    again = formats.MxFp8.quantized(operand.decoded())
     np.testing.assert_array_equal(np.asarray(again.decoded()), np.asarray(operand.decoded()))
 
 
@@ -37,11 +37,11 @@ def test_an_mxfp8_scale_reads_the_exponent_of_a_magnitude_just_under_a_power_of_
     same operand."""
     under = np.nextafter(np.float32(2.0 ** 100), np.float32(0))
     block = jnp.full((1, product.MXFP8.depth), under, jnp.float32)
-    operand = gemm.MxFp8.quantized(block)
+    operand = formats.MxFp8.quantized(block)
     assert float(operand.scales[0, 0].astype(jnp.float32)) == 2.0 ** 91
     assert float(operand.codes[0, 0].astype(jnp.float32)) == 448.0
     with jax.enable_x64(new_val=True):
-        wide = gemm.MxFp8.quantized(jnp.asarray(block, jnp.float64))
+        wide = formats.MxFp8.quantized(jnp.asarray(block, jnp.float64))
     for field in ("codes", "scales"):
         np.testing.assert_array_equal(np.asarray(getattr(wide, field)).view(np.uint8),
                                       np.asarray(getattr(operand, field)).view(np.uint8))
@@ -67,7 +67,7 @@ def test_an_mxfp8_grouped_product_is_its_decoded_values_product(kernel):
 
     def dew(x, w):
         with generation.chosen(mxfp8=kernel):
-            return gemm.mxfp8_product(gemm.MxFp8.quantized(x), gemm.MxFp8.quantized(w), blocks,
+            return gemm.mxfp8_product(formats.MxFp8.quantized(x), formats.MxFp8.quantized(w), blocks,
                                       out_dtype=jnp.float32, interpret_on_cpu=kernel == "mosaic")
 
     with generation.assumed("sm100"), generation.routes() as routes:
@@ -78,14 +78,14 @@ def test_an_mxfp8_grouped_product_is_its_decoded_values_product(kernel):
 
 
 def test_an_mxfp8_projections_training_step_is_on_par():
-    """One training step through the MXFP8 recipe (`gemm.mxfp8_projection`: its output and both gradients),
-    the decoded arms in XLA, on par with the recipe in float64 (tests/mx_matrix.py's `recipe_truth`) over the
-    draws (check 1), against the same step's float32 sums of the decoded operands."""
+    """One training step through the MXFP8 recipe (`projections.mxfp8_projection`: its output and both
+    gradients), the decoded arms in XLA, on par with the recipe in float64 (tests/mx_matrix.py's
+    `recipe_truth`) over the draws (check 1), against the same step's float32 sums of the decoded operands."""
     blocks = jnp.asarray([1, 0, 2], jnp.int32)
 
     def projection(x, w):
         with generation.chosen(mxfp8="xla"):
-            return gemm.mxfp8_projection(x, w, blocks, out_dtype=jnp.float32)
+            return projections.mxfp8_projection(x, w, blocks, out_dtype=jnp.float32)
 
     plain = mx_matrix.recipe_truth(blocks, jnp.float32)
     assert_as_exact(jax.jit(with_gradients(projection)), jax.jit(with_gradients(plain)), step_operands,

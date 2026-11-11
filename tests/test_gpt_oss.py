@@ -157,7 +157,7 @@ def test_gpt_oss_experts_served_from_packed_banks_are_on_par_with_their_values_d
 
     from dew.quantization import QUANTIZATION
 
-    # An NVFP4 matrix's depth is whole stages (`gemm.NVFP4_STAGE`, 256).
+    # An NVFP4 matrix's depth is whole stages (`formats.NVFP4_STAGE`, 256).
     hidden, intermediate, experts, tokens = 256, 256, 4, 16
     (gate_up, gate_up_values), (down, down_values) = (
         packed_banks(experts, *shape, seed) for seed, shape in enumerate(((hidden, 2 * intermediate),

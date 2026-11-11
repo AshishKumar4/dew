@@ -16,7 +16,7 @@ from reference_error import assert_as_exact
 from dew.nn import precision
 from dew.nn.blocks import table_rows
 from dew.nn.dense import Dense
-from dew.nn.kernels import gemm, generation
+from dew.nn.kernels import formats, gemm, generation, low_rank, projections
 
 
 @pytest.mark.parametrize("edge", EDGES)
@@ -189,10 +189,10 @@ def test_a_grouped_gemm_holds_every_order(edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_an_adapted_product_holds_every_reverse_order(edge):
-    """`gemm.low_rank` (LoRA's adapted product as one product over the depth its rank extends, its custom VJP
-    declared through `derivatives.declared_derivative`): every reverse order, under a nested jit and a scan,
-    in the rows, the kernel and both factors, finite wherever float64 is a normal float32 and wherever the
-    plain adapted product (`x·W + s·(x·A)·B`, its float64 run the truth) is, at values whose products near
+    """`low_rank.low_rank` (LoRA's adapted product as one product over the depth its rank extends, its custom
+    VJP declared through `derivatives.declared_derivative`): every reverse order, under a nested jit and a
+    scan, in the rows, the kernel and both factors, finite wherever float64 is a normal float32 and wherever
+    the plain adapted product (`x·W + s·(x·A)·B`, its float64 run the truth) is, at values whose products near
     float32's ends. It takes no forward order yet: a custom VJP has none (row 1304; the appended pair walked
     in place brings one)."""
     shapes = ((8, 16), (16, 12), (16, 4), (4, 12))
@@ -201,7 +201,7 @@ def test_an_adapted_product_holds_every_reverse_order(edge):
     (cotangent,) = normal_draw(1306, (8, 12))
 
     def adapted(rows, kernel, a, b):
-        return gemm.low_rank(rows, kernel, a, b, 0.5, out_dtype=rows.dtype)
+        return low_rank.low_rank(rows, kernel, a, b, 0.5, out_dtype=rows.dtype)
 
     def plain(rows, kernel, a, b):
         return rows @ kernel + 0.5 * ((rows @ a) @ b)
@@ -235,12 +235,12 @@ def test_a_once_rounded_biased_layer_holds_every_order(edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_an_mxfp8_projection_holds_every_reverse_order(edge):
-    """`gemm.mxfp8_projection` (the MXFP8 recipe, its custom VJP the recipe's own MX products, declared as a
-    surrogate): every reverse order, under a nested jit and a scan, in the rows and the matrices, finite
+    """`projections.mxfp8_projection` (the MXFP8 recipe, its custom VJP the recipe's own MX products, declared
+    as a surrogate): every reverse order, under a nested jit and a scan, in the rows and the matrices, finite
     wherever float64 is a normal float32 and wherever the recipe's own fp32 sums are (tests/mx_matrix.py's
-    `recipe_truth`, its float64 run the truth: a value quantized can round up past float32's largest where
-    the unquantized one does not), at values whose products near float32's ends (row 2513). It takes no
-    forward order: a custom VJP has none."""
+    `recipe_truth`, its float64 run the truth: a value quantized can round up past float32's largest where the
+    unquantized one does not), at values whose products near float32's ends (row 2513). It takes no forward
+    order: a custom VJP has none."""
     import mx_matrix
 
     group_blocks = jnp.asarray([1, 0, 1], jnp.int32)
@@ -249,7 +249,7 @@ def test_an_mxfp8_projection_holds_every_reverse_order(edge):
     (cotangent,) = normal_draw(2521, (256, 128))
 
     def recipe(rows, matrices):
-        return gemm.mxfp8_projection(rows, matrices, group_blocks, out_dtype=rows.dtype)
+        return projections.mxfp8_projection(rows, matrices, group_blocks, out_dtype=rows.dtype)
 
     assert_contract(recipe, primals, direction, cotangent, f"an mxfp8 projection {edge}",
                     truth_fn=mx_matrix.recipe_truth(group_blocks),
@@ -258,11 +258,11 @@ def test_an_mxfp8_projection_holds_every_reverse_order(edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_an_nvfp4_projection_holds_every_reverse_order(edge):
-    """`gemm.nvfp4_projection` (the NVFP4 recipe, its custom VJP the recipe's own NVFP4 products, declared as
-    a surrogate): every reverse order, under a nested jit and a scan, in the rows and the matrices, finite
-    wherever float64 is a normal float32 and wherever the recipe's own fp32 sums are (`mx_matrix.recipe_truth`
-    of `gemm.NvFp4Block`, its float64 run the truth), at values whose products near float32's ends (row
-    2513). It takes no forward order: a custom VJP has none."""
+    """`projections.nvfp4_projection` (the NVFP4 recipe, its custom VJP the recipe's own NVFP4 products,
+    declared as a surrogate): every reverse order, under a nested jit and a scan, in the rows and the
+    matrices, finite wherever float64 is a normal float32 and wherever the recipe's own fp32 sums are
+    (`mx_matrix.recipe_truth` of `formats.NvFp4Block`, its float64 run the truth), at values whose products
+    near float32's ends (row 2513). It takes no forward order: a custom VJP has none."""
     import mx_matrix
 
     group_blocks = jnp.asarray([1, 0, 1], jnp.int32)
@@ -271,7 +271,7 @@ def test_an_nvfp4_projection_holds_every_reverse_order(edge):
     (cotangent,) = normal_draw(2524, (256, 128))
 
     def recipe(rows, matrices):
-        return gemm.nvfp4_projection(rows, matrices, group_blocks, out_dtype=rows.dtype)
+        return projections.nvfp4_projection(rows, matrices, group_blocks, out_dtype=rows.dtype)
 
     truth = functools.partial(mx_matrix.recipe_truth, group_blocks, quantized=mx_matrix.nvfp4_values)
     assert_contract(recipe, primals, direction, cotangent, f"an nvfp4 projection {edge}", truth_fn=truth(),
@@ -280,8 +280,8 @@ def test_an_nvfp4_projection_holds_every_reverse_order(edge):
 
 @pytest.mark.parametrize("edge", EDGES)
 def test_a_blockwise_fp8_projection_holds_every_reverse_order(edge):
-    """`gemm.blockwise_fp8_projection` (DeepSeek-V3's blockwise FP8 recipe, its custom VJP the recipe's own
-    FP8 products, declared through `derivatives.declared_derivative` as a surrogate): every reverse order,
+    """`projections.blockwise_fp8_projection` (DeepSeek-V3's blockwise FP8 recipe, its custom VJP the recipe's
+    own FP8 products, declared through `derivatives.declared_derivative` as a surrogate): every reverse order,
     under a nested jit and a scan, in the rows and the matrices, finite wherever float64 is a normal float32
     and wherever the plain grouped product (its float64 run the truth) is, at values whose products near
     float32's ends (row 2513). It takes no forward order: a custom VJP has none."""
@@ -292,7 +292,7 @@ def test_a_blockwise_fp8_projection_holds_every_reverse_order(edge):
     (cotangent,) = normal_draw(2515, (256, 128))
 
     def recipe(rows, matrices):
-        return gemm.blockwise_fp8_projection(rows, matrices, group_blocks, out_dtype=rows.dtype)
+        return projections.blockwise_fp8_projection(rows, matrices, group_blocks, out_dtype=rows.dtype)
 
     def plain(rows, matrices):
         return jax.lax.ragged_dot(rows, matrices, sizes)
@@ -315,7 +315,7 @@ def test_an_nvfp4_products_kernels_hold_every_order(edge, kernel="xla"):
     magnitudes = np.where(codes >= 8, -1.0, 1.0) * e2m1[codes & 7]
     exponents = np.random.default_rng(3622).integers(-2, 3, size=(16, 64))
     block = jnp.asarray(np.exp2(exponents), jnp.float8_e4m3fn)
-    matrix = gemm.NvFp4.of(jnp.asarray(magnitudes, jnp.float32), block, 0.5)
+    matrix = formats.NvFp4.of(jnp.asarray(magnitudes, jnp.float32), block, 0.5)
     values = matrix.decoded().astype(jnp.float32) * matrix.factor
     primals = normal_draw(3623, (64, 256), scale=EDGES[edge])
     direction = normal_draw(3624, (64, 256), scale=EDGES[edge])
@@ -340,7 +340,7 @@ def test_an_nvfp4_products_cotangent_past_bf16s_largest_keeps_its_input_gradient
     three-part split rounded the first part to infinity and its remainder to NaN."""
     # A tensor scale of 2^-8, so the factor the decode defers (`NvFp4.factor`, its owed 2^8 times the scale)
     # is one and the cotangent reaches the packed kernel's reverse as it is.
-    matrix = gemm.NvFp4.of(jnp.full((256, 64), 0.5, jnp.float32), jnp.ones((16, 64), jnp.float8_e4m3fn),
+    matrix = formats.NvFp4.of(jnp.full((256, 64), 0.5, jnp.float32), jnp.ones((16, 64), jnp.float8_e4m3fn),
                            2.0 ** -8)
     rows = jnp.ones((8, 256), jnp.bfloat16)
     cotangent = jnp.zeros((8, 64), jnp.float32).at[0, 0].set(3.4e38)
