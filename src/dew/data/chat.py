@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import inspect
 import json
 from collections.abc import Mapping, Sequence
 from enum import Enum
@@ -216,10 +217,6 @@ class ToolCall:
         return call
 
 
-RESERVED = ("role", "content", "tool_calls", "tool_call_id", "name")
-"""The message keys the boundary types; every other key rides in `extra`."""
-
-
 @dataclasses.dataclass(frozen=True)
 class Message:
     """One turn of a conversation, in the shape the chat template reads.
@@ -291,6 +288,10 @@ class Message:
             row["name"] = self.name
         row.update(self.extra)
         return row
+
+
+RESERVED = tuple(field.name for field in dataclasses.fields(Message) if field.name != "extra")
+"""The message keys the boundary types (`Message`'s fields); every other key rides in `extra`."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -390,19 +391,28 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
     return ids
 
 
-RENDERER_KEYS = frozenset({"conversation", "tools", "documents", "tokenize", "return_dict", "return_tensors",
-                           "add_generation_prompt", "continue_final_message", "chat_template",
-                           "enable_thinking", "padding", "truncation", "max_length", "tokenizer_kwargs",
-                           "return_assistant_tokens_mask"})
-"""The keywords the template call itself owns (`apply_chat_template`'s and this module's own
-controls), which a template's variables (`options`) never set: each has its own field."""
+DEW_CONTROLS = frozenset({"enable_thinking"})
+"""The template call's controls Dew owns beside the renderer's own (`renderer_controls`): thinking, which
+`_rendered` switches."""
+
+
+@functools.cache
+def renderer_controls() -> frozenset[str]:
+    """The keywords the template call itself owns, which a template's variables (`options`) never set: the
+    renderer's own parameters, as `apply_chat_template` declares them, and Dew's (`DEW_CONTROLS`)."""
+    from transformers import PreTrainedTokenizerBase
+
+    named = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    parameters = inspect.signature(PreTrainedTokenizerBase.apply_chat_template).parameters
+    return frozenset(name for name, parameter in parameters.items()
+                     if parameter.kind in named and name != "self") | DEW_CONTROLS
 
 
 def template_options(options: Mapping[str, JSON], *, where: str) -> Mapping[str, JSON]:
     """`options` as a chat template's own variables, refused (ValueError) where one names a keyword
-    the template call owns (`RENDERER_KEYS`): thinking, the template and the rest have their own
+    the template call owns (`renderer_controls`): thinking, the template and the rest have their own
     fields, so an option never overrides one silently or collides with it."""
-    owned = sorted(set(options) & RENDERER_KEYS)
+    owned = sorted(set(options) & renderer_controls())
     if owned:
         raise ValueError(f"{where}: {owned} are the chat template call's own controls, not template "
                          "variables; set them through their own fields")

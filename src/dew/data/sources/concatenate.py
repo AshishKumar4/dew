@@ -118,19 +118,39 @@ class Concatenate(Dataset):
                                                                  for manifest in divisible))
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class JoinedShard(Shard):
+    """A shard of a concatenation's: its store's `own` shard, from the store at place `store` among them,
+    named by both (`id`, its store's place and its own name, which a cache keys its rows by) and spanning
+    what its own does, unless a read since narrowed it (`ShardManifest.sized`)."""
+
+    store: int
+    own: Shard
+
+    @classmethod
+    def of(cls, store: int, own: Shard) -> JoinedShard:
+        spans = {field.name: getattr(own, field.name) for field in dataclasses.fields(Shard)}
+        return cls(**{**spans, "id": f"{store}/{own.id}"}, store=store, own=own)
+
+    def own_spanned(self) -> Shard:
+        """Its own shard as its store reads it, spanning what this one now spans."""
+        spans = {field.name: getattr(self, field.name) for field in dataclasses.fields(Shard)}
+        return dataclasses.replace(self.own, **{**spans, "id": self.own.id})
+
+
 def _joined(shards: Iterable[Iterable[Shard]]) -> tuple[Shard, ...]:
-    """The shards of a concatenation's stores, one store's after another, each named by its store's
-    place among them and its own name in it, which `_read_joined` reads it by."""
-    return tuple(dataclasses.replace(shard, id=f"{index}/{shard.id}")
-                 for index, held in enumerate(shards) for shard in held)
+    """The shards of a concatenation's stores, one store's after another, each its store's own joined
+    (`JoinedShard`), which `_read_joined` reads it by."""
+    return tuple(JoinedShard.of(index, shard) for index, held in enumerate(shards) for shard in held)
 
 
 def _read_joined(manifests: Sequence[ShardManifest], shard: Shard,
                  options: grain.ReadOptions | None = None) -> grain.IterDataset:
     """Shard `shard` of a concatenation, its store's own or a part of one (`_subdivided`), read by its
     store's reader as the store names it."""
-    index, _, own = shard.id.partition("/")
-    return manifests[int(index)].reader(dataclasses.replace(shard, id=own), options)
+    if not isinstance(shard, JoinedShard):
+        raise TypeError(f"a concatenation reads its own shards, not a {type(shard).__name__}")
+    return manifests[shard.store].reader(shard.own_spanned(), options)
 
 
 def _subdivided(manifests: Sequence[ShardManifest], count: int) -> tuple[Shard, ...]:

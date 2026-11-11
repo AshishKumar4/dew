@@ -106,6 +106,15 @@ def object_info(payload: bytes | BinaryIO) -> ObjectInfo:
     return {"bytes": size, "sha256": digest.hexdigest()}
 
 
+def _chain_protocols(url: str) -> tuple[str, ...]:
+    """The protocols of `url`'s chain (`a::b://path`), outermost first, as fsspec names each link
+    (`fsspec.core._un_chain`): a link of a bare word its protocol, any other its URL's, a path's `file`."""
+    from fsspec.core import split_protocol
+
+    return tuple(link if "://" not in link and link.isidentifier() else split_protocol(link)[0] or "file"
+                 for link in url.split("::"))
+
+
 def matching(found: ObjectInfo, expected: Mapping[str, object], url: str) -> None:
     """Refuse an object at `url` whose size and digest, `found`, are not what was committed for it."""
     if found["bytes"] != expected["bytes"] or found["sha256"] != expected["sha256"]:
@@ -661,10 +670,15 @@ class Store:
             scheme = "file"
         options = dict(self.storage_options or {})
         transport = options.pop("dewcache", {})
-        backend = options.pop(scheme, {})
+        # Each protocol of the chain keeps its own options, as fsspec reads them (`fsspec.core._un_chain`:
+        # a protocol's options under its name, and the unscoped ones its first protocol's); the first stays
+        # the store's own once the mirror leads the chain.
+        scoped = {name: options.pop(name) for name in _chain_protocols(self.url) if name in options}
+        backend = scoped.pop(scheme, {})
         if not isinstance(backend, Mapping):
             raise ValueError(f"storage options for {scheme!r} must be a mapping")
-        return Store("dewcache::" + self.url, {scheme: {**backend, **options}, "dewcache": transport})
+        return Store("dewcache::" + self.url,
+                     {**scoped, scheme: {**backend, **options}, "dewcache": transport})
 
     def child(self, path: str) -> Store:
         path = path.rstrip("/")

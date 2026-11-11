@@ -11,7 +11,7 @@ import math
 import sys
 import threading
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from fractions import Fraction
 from typing import Protocol, TypeGuard, runtime_checkable
 
@@ -591,8 +591,10 @@ class Proportions:
 
     @classmethod
     def of(cls, weights: Sequence[float], seed: int | None = None) -> Proportions:
-        scale = 100 / min(weights)
-        return cls(tuple(int(weight * scale) for weight in weights), seed)
+        """`weights` as Grain's mixes take them (`_float_to_int_proportions`), with `seed`."""
+        from grain._src.python.dataset.transformations.mix import _float_to_int_proportions
+
+        return cls(tuple(_float_to_int_proportions(weights)), seed)
 
     def window(self, index: int) -> tuple[np.ndarray, np.ndarray]:
         """The `index`th window of the mix: the corpus each of its positions reads, and how many of that
@@ -608,12 +610,18 @@ class Proportions:
             read = np.bincount(self.window(windows)[0][:offset], minlength=len(self.proportions))
             return tuple(windows * proportion + int(count)
                          for proportion, count in zip(self.proportions, read, strict=True))
-        counts, remaining, left = [], sum(self.proportions), records
+        return tuple(self._split(records))
+
+    def _split[Left: (int, np.ndarray)](self, left: Left) -> Iterator[Left]:
+        """The unseeded mix's records of each corpus among its first `left` positions, a corpus at a time
+        in its order: of `left`, the corpus takes `left - rest` and leaves `rest = left (remaining -
+        proportion) // remaining` to the corpora after it. `left` a count, or an array of counts, each
+        split alike."""
+        remaining = sum(self.proportions)
         for proportion in self.proportions:
             rest = left * (remaining - proportion) // remaining
-            counts.append(left - rest)
+            yield left - rest
             left, remaining = rest, remaining - proportion
-        return tuple(counts)
 
     def covering(self, sizes: Sequence[int]) -> int:
         """The fewest positions of the mix in which every corpus reads `sizes` of its records, its
@@ -662,17 +670,14 @@ class Proportions:
                 record[held] = (int(index) * np.asarray(self.proportions, np.int64)[corpus[held]]
                                 + before[offsets[held]])
             return corpus, record
-        left = np.arange(start, start + positions + 1, dtype=np.int64)
         corpus = np.full(positions, -1, np.int64)
         record = np.zeros(positions, np.int64)
-        for index, proportion in enumerate(self.proportions):
-            rest = left * (remaining - proportion) // remaining
+        for index, taken in enumerate(self._split(np.arange(start, start + positions + 1, dtype=np.int64))):
             # The position's corpus is the first whose count grows from it to the next position.
-            grows = (corpus < 0) & (np.diff(left - rest) > 0)
-            corpus[grows], record[grows] = index, (left - rest)[:-1][grows]
+            grows = (corpus < 0) & (np.diff(taken) > 0)
+            corpus[grows], record[grows] = index, taken[:-1][grows]
             if (corpus >= 0).all():
                 break
-            left, remaining = rest, remaining - proportion
         return corpus, record
 
 
@@ -890,37 +895,31 @@ class _MixRead(pygrain.DatasetIterator[Batch]):
         self._group.close(self._index)
 
 
-class _ReadDataset(pygrain.IterDataset[Batch]):
-    def __init__(self, parent: pygrain.IterDataset[Batch], group: _MixReads, index: int):
-        super().__init__(parent)
-        self._group, self._index = group, index
-
-    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        return _MixRead(self._group, self._index)
-
-
 class KeyedMix(pygrain.IterDataset[Batch]):
     """Grain's weighted mix of corpora, each read as it is drawn (`_MixReads`), and
-    each keyed by its member's key (`keys`): Grain saves a keyed mix's positions by key and
-    restores those it finds, so a member that joins starts at its first row and one that left is
-    dropped while the others resume where they were. With a `seed`, the corpus each position reads is
-    `Proportions(seed=...)`'s, its windows' choices permuted (`_SeededMix`), its position saved alike."""
+    each keyed by its member's key (`keys`): its positions saved by key as Grain saves a keyed mix's,
+    restoring those it finds, so a member that joins starts at its first row and one that left is
+    dropped while the others resume where they were. The corpus each position reads is
+    `Proportions(seed=...)`'s (`_ProportionalMix`), its windows' choices permuted where a `seed` is
+    given, over the members in the order the mix declares them, the order a phase's prefix counts them in
+    (`dew.data.compile._delivered`). A read of a plan before `dew.data.plan.DECLARED_MIX` reads an unseeded
+    mix's members in their keys' sorted order (`declared` false), as Grain's mix of a mapping read them,
+    so a position it saved resumes as it read."""
 
     def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float],
-                 keys: Sequence[str], seed: int | None = None):
+                 keys: Sequence[str], seed: int | None = None, *, declared: bool = True):
         super().__init__(parents)
         self._corpora, self._weights, self._keys = tuple(parents), tuple(weights), tuple(keys)
         self._seed = seed
+        order = range(len(self._keys))
+        self._order = tuple(order if declared or seed is not None
+                            else sorted(order, key=self._keys.__getitem__))
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         group = _MixReads(self._corpora)
-        if self._seed is not None:
-            reads = {key: _MixRead(group, index) for index, key in enumerate(self._keys)}
-            return _SeededMix(reads, Proportions.of(self._weights, self._seed))
-        parents = {key: _ReadDataset(parent, group, index)
-                   for index, (key, parent) in enumerate(zip(self._keys, self._corpora, strict=True))}
-        weights = dict(zip(self._keys, self._weights, strict=True))
-        return iter(pygrain.IterDataset.mix(parents, weights))
+        reads = {self._keys[index]: _MixRead(group, index) for index in self._order}
+        weights = [self._weights[index] for index in self._order]
+        return _ProportionalMix(reads, Proportions.of(weights, self._seed))
 
 
 class _Captured:
@@ -951,8 +950,8 @@ class _Captured:
         return self._held
 
 
-class _SeededMix(pygrain.DatasetIterator[Batch]):
-    """A keyed mix's reads (`KeyedMix`) in the corpus order a seeded `Proportions` gives each position,
+class _ProportionalMix(pygrain.DatasetIterator[Batch]):
+    """A keyed mix's reads (`KeyedMix`) in the corpus order its `Proportions` gives each position,
     its position saved as Grain saves its own mix's: each corpus's under its key, the positions read
     and whether a corpus ended the mix, so a restore finds the corpora it holds and starts the rest."""
 

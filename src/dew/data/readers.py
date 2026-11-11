@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import os
 import uuid
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from types import MappingProxyType
 from typing import Literal
 
@@ -369,23 +370,44 @@ class _Statistics:
         self._mirrored.append(published)
         return published.publish
 
-    def __call__(self) -> Mapping[str, float]:
-        """The metrics of every corpus: the counts of the prefix a memory read ran, followed by
-        those the latest reader published of the rest (`CorpusCounts.followed`), which a reader
-        restored from another's position carries on from."""
+    def corpora(self) -> dict[str, CorpusCounts]:
+        """Every corpus's counts by name: the counts of the prefix a memory read ran, followed by those
+        the latest reader published of the rest (`CorpusCounts.followed`), which a reader restored from
+        another's position carries on from."""
         read = {name: counts for published in self._published for name, counts in published.counts.items()}
         merged = {name: counts.followed(read.pop(name)) if name in read else counts
                   for name, counts in self._counts.items()}
-        # What this process's mirrors did since the run began beside them (`Mirrored`, row 4299), and each
-        # loading worker's, which its readers' positions carried (`WorkerMirrors`, row 4339).
-        mirrored = [self._own.metrics(), *(counts for published in (*self._published, *self._mirrored)
-                                        for process, counts in published.mirrors.items()
-                                        if not process.startswith(f"{os.getpid()}:"))]
-        summed: dict[str, float] = {}
-        for counts in mirrored:
-            for name, value in counts.items():
-                summed[name] = summed.get(name, 0.0) + float(value)
-        return {**data_metrics([*merged.values(), *read.values()]), **summed}
+        return {**merged, **read}
+
+    def workers_mirrors(self) -> list[Mapping[str, float]]:
+        """Each loading worker's mirror counters, which its readers' positions carried (`WorkerMirrors`,
+        row 4339): another process's, never this one's, which `Mirrored` counts."""
+        return [counts for published in (*self._published, *self._mirrored)
+                for process, counts in published.mirrors.items() if not process.startswith(f"{os.getpid()}:")]
+
+    def __call__(self) -> Mapping[str, float]:
+        return statistics_of((self,))
+
+
+def statistics_of(sources: Sequence[_Statistics]) -> Mapping[str, float]:
+    """The metrics of a run read by the loaders `sources` count, in the order it read them (a phased run's
+    phases): each corpus's counts, summed over the loaders that read it (a later phase reads on past
+    what the one before it read, `CorpusCounts.add`); and what this process's mirrors did since the
+    first began (`Mirrored`, row 4299), once, beside every loading worker's."""
+    corpora: dict[str, CorpusCounts] = {}
+    for source in sources:
+        for name, counts in source.corpora().items():
+            if name in corpora:
+                summed_counts = copy.deepcopy(corpora[name])
+                summed_counts.add(counts)
+                counts = summed_counts
+            corpora[name] = counts
+    summed: dict[str, float] = {}
+    workers = [counts for source in sources for counts in source.workers_mirrors()]
+    for counts in (sources[0]._own.metrics(), *workers):
+        for name, value in counts.items():
+            summed[name] = summed.get(name, 0.0) + float(value)
+    return {**data_metrics(corpora.values()), **summed}
 
 
 @dataclasses.dataclass(frozen=True)

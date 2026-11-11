@@ -2218,3 +2218,43 @@ def test_a_token_mixture_logs_the_tokens_it_drew_of_each_member_through_a_resume
     for name, tag, targets, after in (("short", 1, 1, 0), ("long", 2, 9, refused)):
         drawn = sum(value // 1000 == tag for value in read_ids) + after
         assert statistics[f"data/weighed_tokens/{name}"] == targets * drawn
+
+
+def _named(name: str, tag: int) -> Pipeline:
+    """A corpus of 64 records named `name`, each saying it is the `tag`th corpus's."""
+    return Pipeline(Memory(Indexed(tag, 64)), name=name)
+
+
+@pytest.mark.parametrize("read", ["streamed", "indexed"])
+def test_an_unseeded_mix_reads_its_members_in_the_order_it_declares_them(read):
+    """A mix of no seed reads its members in the order it declares them, 'z' before 'a', streamed as it
+    is read by index and as every prefix of it is counted (`Proportions`); a plan of version 12 streamed
+    them in their keys' sorted order, as Grain's mix of a mapping does, and a run it saved reads so still."""
+    chain = mix([_named("z", 1).repeat(), _named("a", 2).repeat()]).batch(4)
+    first = compile(chain, read=read, loading=READ).train(DataPartition())
+    try:
+        assert ids(itertools.islice(first, 2)) == [[1000, 2000, 1001, 2001], [1002, 2002, 1003, 2003]]
+    finally:
+        first.close()
+    if read == "streamed":
+        earlier = compile(chain, read=read, loading=READ, plan_version=12).train(DataPartition())
+        try:
+            assert ids(itertools.islice(earlier, 1)) == [[2000, 1000, 2001, 1001]]
+        finally:
+            earlier.close()
+
+
+def test_a_phased_runs_statistics_count_each_phase_it_reached():
+    """A run's statistics count every phase it read, a later phase's corpus among them: its rows
+    once the run reached it, beside the first phase's."""
+    chain = phases((_named("first", 1).repeat(), 3), (_named("second", 2).repeat(), None)).batch(8)
+    data = compile(chain, read="indexed", loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        list(itertools.islice(stream, 5))
+        statistics = data.statistics()
+    finally:
+        stream.close()
+    rows = {name.removeprefix("data/rows/"): count for name, count in statistics.items()
+            if name.startswith("data/rows/")}
+    assert sorted(rows.values()) == [16, 24], rows

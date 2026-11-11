@@ -1380,6 +1380,27 @@ def test_published_generation_exposes_only_declared_order_metadata_and_plan():
     assert generation.plan_hash("offsets") == fingerprint(np.arange(5))
 
 
+@pytest.mark.parametrize("dtype", ["bfloat16", "float8_e4m3fn", "int32"])
+def test_a_published_plan_of_a_numeric_ml_dtype_reads_back_as_that_dtype(dtype):
+    """A packing plan of bfloat16 or a float8, whose NPY pages hold voids of their width, reads back as
+    the numbers it was published as, in its dtype, page by page and whole, as a plain one does."""
+    import ml_dtypes
+    import numpy as np
+
+    source = Memory([{"id": index} for index in range(4)])
+    cache, key = _cache(), _key()
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
+    for index in range(len(rows)):
+        rows[index]
+    rows.finish()
+    rows.close()
+    numbers = np.arange(5, dtype=np.float32).astype(np.dtype(getattr(ml_dtypes, dtype, dtype)))
+    generation = cache.publish(key, source, plan=lambda ready: {"scores": numbers})
+    assert generation.plan("scores").dtype == numbers.dtype
+    np.testing.assert_array_equal(generation.plan("scores"), numbers)
+    assert generation.plan_at("scores", 3).dtype == numbers.dtype and generation.plan_at("scores", 3) == 3
+
+
 def test_transient_failures_never_certify_cache_coverage_but_permanent_rejections_do():
     from dew.data.pipeline import Rejected
 

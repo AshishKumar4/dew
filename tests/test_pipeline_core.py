@@ -2271,6 +2271,27 @@ def test_a_worker_batch_shares_its_large_columns_and_pickles_the_small_ones():
                 column.unlink_on_del()
 
 
+@pytest.mark.parametrize("dtype", ["bfloat16", "float8_e4m3fn"])
+def test_a_batch_of_ml_dtype_numbers_stacks_as_any_number_does(dtype):
+    """A field of bfloat16 or float8 numbers, which NumPy kinds as voids, stacks along the batch as any
+    number does, its dtype kept, so the batch counts its rows by it."""
+    import ml_dtypes
+
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading, rows_of
+    from dew.data.sources import Memory
+
+    numbers = np.dtype(getattr(ml_dtypes, dtype))
+    rows = [{"score": np.asarray(index, numbers), "vector": np.full(3, index, numbers)} for index in range(8)]
+    stream = compile(Memory(rows).batch(4), loading=Loading(workers=0)).train(DataPartition())
+    try:
+        batch = next(stream)
+    finally:
+        stream.close()
+    assert isinstance(batch["score"], np.ndarray) and batch["score"].dtype == numbers
+    assert batch["vector"].shape == (4, 3) and rows_of(batch) == 4
+
+
 def test_a_step_drops_records_only_when_it_says_so():
     """A step keeps every record unless it declares `rejects`, whatever its annotations read: an
     unannotated indexed step and an annotated one compile to one global order with an epoch
