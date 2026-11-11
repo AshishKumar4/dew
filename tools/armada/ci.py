@@ -401,7 +401,9 @@ def cache_key(common: str, name: str, split: str, depends: list[str],
     if session.SITE.fullmatch(split):
         digest.update(split.encode())
     elif split and split != COLLECT:
-        digest.update(split.encode() + json.dumps(members(name, split, reading)).encode())
+        # A process variant's (`varied`) by its name beside its cut's tests; a whole file's variant, its name.
+        cut = cut_of(split)
+        digest.update(split.encode() + (json.dumps(members(name, cut, reading)).encode() if cut else b""))
     return digest.hexdigest()
 
 
@@ -475,8 +477,8 @@ def row_place(row_name: str, held: str) -> str:
     `whole` or a split's `<index>-of-<count>` (`key_parts`), a process variant's (`varied`) with
     `-as-<variant>` after it, in the Worker's key alphabet."""
     _, name, split = parsed_row(row_name)
-    group, _, variant = split.partition(VARIED)
-    return (f"{held}/{name}/" + ("-of-".join(group.split("/")) if group else "whole")
+    variant = split.partition(VARIED)[2]
+    return (f"{held}/{name}/" + ("-of-".join(cut.split("/")) if (cut := cut_of(split)) else "whole")
             + (f"-as-{variant}" if variant else ""))
 
 
@@ -770,6 +772,11 @@ def varied(group: str, variant: str) -> str:
     return f"{group}{VARIED}{variant}" if variant else group
 
 
+def cut_of(group: str) -> str:
+    """The cut a row's group names ("G/N"; none, a whole file's), whichever process ran it (`varied`)."""
+    return group.partition(VARIED)[0]
+
+
 def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> list[float]:
     """The weights of the groups a file that took `seconds` as `cut` groups runs as. Of those
     seconds, what its recorded `tests`' times leave is what each group paid besides its tests (its
@@ -814,7 +821,9 @@ def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | N
         if ":" not in row_name:
             continue
         python_, name_, split_ = parsed_row(row_name)
-        if (python_, name_) != (python, name) or split_ == COLLECT or session.SITE.fullmatch(split_):
+        # Nor is a GPU lane's process variant (`varied`): no armada plan cuts by one.
+        if ((python_, name_) != (python, name) or split_ == COLLECT or session.SITE.fullmatch(split_)
+                or VARIED in split_):
             continue
         if not split_:
             whole = seconds
@@ -1321,7 +1330,7 @@ def stale_cost(name: str, group: str, reading: Reading) -> float:
     cold row; a file the record does not name, that alone."""
     reading.cut(name, 1)
     own = own_tests(name, (reading.durations or {}).get(name, {}))
-    nodes = members(name, group, reading) if group else list(own)
+    nodes = members(name, cut, reading) if (cut := cut_of(group)) else list(own)
     return sum(own.get(node, 0.0) for node in nodes) + COLD_SECONDS
 
 
@@ -2255,7 +2264,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
             continue
         python, name, split_ = parsed_row(row_["name"])
         if (python == PYTHONS[0] and split_ != COLLECT and not session.SITE.fullmatch(split_)
-                and Path(name).is_file() and name not in changed):
+                and VARIED not in split_ and Path(name).is_file() and name not in changed):
             rows.setdefault(name, []).append(row_)
     kept = {node: seconds for node, seconds in record.items() if Path(node.split("::")[0]).is_file()}
     for name, held in rows.items():
