@@ -96,6 +96,66 @@ def test_a_gpu_lane_given_the_whole_gpu_hands_its_files_jaxs_default_share(ci, t
     assert float(share) == float(ci.WHOLE_GPU)
 
 
+def test_a_lanes_prepare_runs_on_the_cpu_what_its_run_will_hold_and_records_nothing(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A lane's prepare (`gpu-lane --prepare`) runs each of its files that holds a test marked `prepares`, on
+    the CPU under the prepare's word (DEW_TIER_PREPARE, which the suite's conftest reads to skip every other
+    test), with the store its environment names: a cut file's group prepares exactly the tests its run then
+    holds, as both select and cut the file alike (a prepare that selected the marked tests alone would cut
+    them into other groups, and a run would find a test its part never prepared); a file with nothing to
+    prepare starts no process; and a prepare records no row, so no lane or task reuses it as a test's run.
+    The fixtures are fetched first, as a run's are."""
+    url, stored, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    interpreter(tmp_path, "3.12")
+    fetched = fetcher(tmp_path)
+    monkeypatch.setenv("DEW_TIER_TRUTHS", str(tmp_path / "truths"))
+    # The harness's side, as the suite's own conftest has it: a prepare skips every test but those it
+    # prepares.
+    (tmp_path / "tests/conftest.py").write_text(
+        "import os, pytest\n"
+        "def pytest_configure(config):\n"
+        "    config.addinivalue_line('markers', 'prepares: prepared on the CPU before its GPU run')\n"
+        "def pytest_runtest_setup(item):\n"
+        "    if os.environ.get('DEW_TIER_PREPARE') == '1' and item.get_closest_marker('prepares') is None:\n"
+        "        pytest.skip('nothing to prepare')\n")
+    (tmp_path / "tests/test_flows.py").write_text(
+        "import os, pytest\n"
+        "def said(name):\n"
+        "    kind = 'prepared' if os.environ.get('DEW_TIER_PREPARE') == '1' else 'ran'\n"
+        "    with open(f'{kind}.log', 'a') as log:\n"
+        "        log.write(' '.join([name, os.environ.get('JAX_PLATFORMS', '-'),\n"
+        "                            os.environ.get('DEW_TIER_TRUTHS', '-')]) + chr(10))\n"
+        + "".join(f"{'@pytest.mark.prepares' + chr(10) if index % 2 else ''}"
+                  f"def test_{index}():\n    said('test_{index}')\n" for index in range(6)))
+    (tmp_path / "tests/test_plain.py").write_text(LANE_TEST)
+
+    def said(kind: str) -> list[list[str]]:
+        log = tmp_path / f"{kind}.log"
+        lines = [line.split() for line in log.read_text().splitlines()] if log.is_file() else []
+        log.unlink(missing_ok=True)
+        return lines
+
+    out, marked = tmp_path / "verdict.json", {"test_1", "test_3", "test_5"}
+    prepared = {}
+    for group in ("1/2", "2/2"):
+        name = f"tests/test_flows.py#{group}"
+        assert ci.gpu_prepared("3.12", [name, "tests/test_plain.py"], out, processes=2, deadline=600.0) == 0
+        assert [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]] == [
+            (f"3.12:{name}", 0)]
+        lines = said("prepared")
+        assert {tuple(line[1:]) for line in lines} == {("cpu", str(tmp_path / "truths"))}
+        prepared[group] = {line[0] for line in lines}
+    assert fetched.is_file() and not lane_runs(tmp_path, "test_plain"), "nothing to prepare starts no process"
+    assert not stored, "a prepare records no row"
+    assert prepared["1/2"] | prepared["2/2"] == marked and not prepared["1/2"] & prepared["2/2"]
+    for group in ("1/2", "2/2"):
+        assert ci.gpu_lane("3.12", [f"tests/test_flows.py#{group}"], out, cache="on", processes=1,
+                           deadline=600.0) == 0
+        assert {line[0] for line in said("ran")} & marked == prepared[group], group
+    assert stored, "its run's rows are recorded as any lane's"
+
+
 def test_a_gpu_lane_names_its_files_but_with_network(ci, monkeypatch):
     """`gpu-lane` without --tests is the network lane's alone, which runs every file holding a network-marked
     test: a CUDA lane names its files, and one that names none is refused, not run over the network files'
