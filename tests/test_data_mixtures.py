@@ -2365,6 +2365,11 @@ def test_phases_batched_outside_themselves_read_as_they_did():
     second = Pipeline(Memory(Indexed(2, 8)))
     repeated = _endless_ids(phases((finite.repeat(2), 10), (second, None)).batch(8), 11)
     assert len(repeated) == 11 and repeated[2][0] // 1000 == 1 and repeated[10][0] // 1000 == 2
+    # A chain that states its own repeat reads as it states it, its phases batched inside themselves too.
+    once = phases((Pipeline(Memory(Indexed(1, 16))).batch(8), 1),
+                  (Pipeline(Memory(Indexed(2, 16))).batch(8), None))
+    assert _endless_ids(once.repeat(1), 4) == [list(range(1000, 1008)), list(range(2000, 2008)),
+                                               list(range(2008, 2016))]
 
 
 def test_a_phase_batched_inside_itself_saved_under_plan_12_reads_as_12_did():

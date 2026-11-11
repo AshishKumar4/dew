@@ -1913,13 +1913,13 @@ def _endless(chain: Pipeline, version: int = PLAN_VERSIONS[-1]) -> Pipeline:
     into it; a mixture whose members all read on is read as it is. A phase that batches inside itself and
     states no repeat reads on with its repeat before its own batch (`_repeated_inside`), from plan version
     `DECLARED_MIX`."""
+    if any(isinstance(stage, Repeat) for stage in chain.stages) or _reads_on(chain):
+        return chain
     source = chain.source
     if isinstance(source, Phases) and version >= DECLARED_MIX:
         chain = dataclasses.replace(chain, source=dataclasses.replace(
             source, pipelines=tuple(map(_repeated_inside, source.pipelines))))
         source = chain.source
-    if any(isinstance(stage, Repeat) for stage in chain.stages) or _reads_on(chain):
-        return chain
     batching = [index for index, stage in enumerate(chain.stages)
                 if isinstance(stage, (BatchStage, TokenBudget))]
     at = batching[0] if batching else len(chain.stages)
