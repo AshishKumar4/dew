@@ -136,6 +136,30 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     assert all(entry["split"] != ci.COLLECT and entry["cache"] == "off" for entry in daily)
 
 
+def test_a_split_groups_weight_covers_its_recorded_nodes_when_collection_has_new_tests(ci, tmp_path):
+    """A new node before a slow recorded node must not move that slow node into a group weighed for
+    other tests. Recurrence's 963.595 s node ran in group 16/137, weighed at 76.919 s, after two new
+    parameters changed the task's cut from the plan's recorded-node cut."""
+    interpreter(tmp_path, "3.12")
+    name = "tests/test_heavy.py"
+    tests = ("a", "b", "bb_new", "c", "d", "e", "f", "g", "h")
+    (tmp_path / name).write_text("".join(f"def test_{test}(): pass\n" for test in tests))
+    recorded = {f"{name}::test_{test}": 963.595 if test == "c" else 50.0
+                for test in tests if test != "bb_new"}
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(recorded))
+    timings = {"files": {ci.row("3.12", name, ""): sum(recorded.values())},
+               "rows": {ci.row("3.12", name, ""): sum(recorded.values())}}
+    planned = [entry for entry in ci.plan(120.0, timings) if entry["python"] == "3.12"]
+    observed = []
+    for index, entry in enumerate(planned):
+        report = tmp_path / f"report-{index}.xml"
+        assert ci.targeted("3.12", [], report, [name], entry["split"]) == 0
+        nodes = [ci.node_of(case) for case in ET.parse(report).getroot().iter("testcase")]
+        assert entry["weight"] >= sum(recorded.get(node, 0.0) for node in nodes), (entry, nodes)
+        observed.extend(nodes)
+    assert sorted(observed) == sorted(f"{name}::test_{test}" for test in tests)
+
+
 def test_a_task_states_the_same_key_in_every_plan_that_cuts_it_whatever_its_name_and_weight(ci, tmp_path,
                                                                                            monkeypatch):
     """Armada keeps a task's recorded use under the key its entry states (its `keyOf`), so a task the next
