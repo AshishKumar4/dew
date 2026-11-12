@@ -52,6 +52,7 @@ from dew.training.memory import (
     derived_headroom,
     head_fused_of,
     head_tile_of,
+    headed_more,
     judged,
     local_devices,
     offloads,
@@ -671,9 +672,6 @@ class FitSearch[LossT, EffectsT]:
     derived: list[dict[str, JSON]] = dataclasses.field(default_factory=list)
     split_stated: bool = False
     """Whether the run states its split (`Trainer(split=...)`), which the search then reads alone."""
-    stated: bool = False
-    """Whether the run states its split (`split_stated`) and its remat (`remat_set`): nothing is left for
-    the derivation to choose, so it derives no footprint and the compile decides (`admitted`)."""
     """Each rung the derivation read before the first compile: its rung, terms, headroom and label."""
     judged_at: dict[tuple[str, int], int | None] = dataclasses.field(default_factory=dict)
     """The derived headroom of each candidate the derivation read, by its rung (`rung`) and split: what
@@ -721,15 +719,12 @@ class FitSearch[LossT, EffectsT]:
         """The first fitting plan found by the split-and-rung search, and every compile it made, its
         first rung the one the derivation picks (`derived_start`). Once admission succeeds, no optional
         alternate policy is compiled."""
-        # A run that states its split (one candidate) and its remat leaves the derivation nothing to
-        # choose: it reads no footprint, and the compile at that plan decides (a 4B decoder's derivation
-        # held its first step for 47 minutes at a split and remat the run had stated, row 5479).
-        self.stated = self.split_stated and self.remat_set
-        if self.stated and self.derive is not None:
-            self.derived.append({**self.current(), "narrow": self.narrow, "split": candidates[0],
-                                 "headroom": None, "label": "stated", "terms": None})
-            _log.info("the run states its split %d and remat %s, so no footprint is derived and the compile "
-                      "decides", candidates[0], self.remat_rung())
+        # A run that states its split (one candidate) and its remat leaves the derivation the rungs below
+        # its remat to choose (the narrow copies, its head's tile): the one it judges to fit is the one
+        # compile, lowered from the trace that judged it, where compiling each rung to find it compiled
+        # seven programs for a 4B decoder's step (row 5556: 240 of its plan's 574 s, four probes of which
+        # three missed: the narrow copies, then the whole logits, and XLA's options, by 55, 48 and 2 GB).
+        # Its derivation is its trace's (row 5479's 47 minutes were the derivation's own, 13 s since).
         # A rung fits where its most microbatches do; the derivation then finds its split there, which
         # alone is compiled where it is right (`derived_split`). A step that fits at its fewest fits at
         # every split, at the rung it stands on: one derivation says so, and no rung is walked.
@@ -817,9 +812,9 @@ class FitSearch[LossT, EffectsT]:
         rungs read are `derived`. A rung the derivation cannot judge ('unknown': residuals over several
         devices) or devices that state no memory to judge one against ('unstated') end the walk where it
         started, at the base rung, as does a ladder no rung of which fits. A run that sets its remat
-        compiles at it alone; its split is read there (`derived_split`). A 'fits' is the derivation's
-        judgment, which the one compile confirms."""
-        if not self.deriving() or self.resumed is not None or self.remat_set:
+        climbs its head's rungs alone (`headed_more`); its split is read there (`derived_split`). A
+        'fits' is the derivation's judgment, which the one compile confirms."""
+        if not self.deriving() or self.resumed is not None:
             return
         base = self.configuration()
         label, narrow = self.walked(split)
@@ -855,7 +850,9 @@ class FitSearch[LossT, EffectsT]:
                 narrow = False
                 continue
             narrow = False
-            if not self.onward(lambda: recompute_more(self.objective, self.base)):
+            # A run that states its remat climbs its head's rungs alone (`headed_more`).
+            if not self.onward(functools.partial(headed_more if self.remat_set else recompute_more,
+                                                 self.objective, self.base)):
                 break
         return label, narrow
 
@@ -892,7 +889,7 @@ class FitSearch[LossT, EffectsT]:
             program, kernels = derived.lowers()
             return dataclasses.replace(derived, program=program, kernels=kernels, lowers=None)
         return self.lower(split, self.narrow, self.footprints.get(key),
-                          derived=self.ahead is None and not self.stated)
+                          derived=self.ahead is None)
 
     def relowering(self, split: int) -> Candidate:
         """The step at `split` lowered afresh past a kernel that spilled (`Relowered`), with no footprint:
@@ -1010,9 +1007,8 @@ class FitSearch[LossT, EffectsT]:
         return derived is not None and derived < 0
 
     def deriving(self) -> bool:
-        """Whether the search derives footprints: it has the step to trace (`derive`), and the run left it
-        something to choose (`stated`)."""
-        return self.derive is not None and not self.stated
+        """Whether the search derives footprints: it has the step to trace (`derive`)."""
+        return self.derive is not None
 
     def judging(self) -> bool:
         """Whether every process's devices judge a derived footprint (`memory.judged`) at the search's
@@ -1091,8 +1087,7 @@ class FitSearch[LossT, EffectsT]:
                 # kept step's here, and none is lowered from its derivation's trace.
                 self.footprints.clear()
                 self.derivations.clear()
-                if not self.stated:
-                    candidate = self.footprinted(split, candidate)
+                candidate = self.footprinted(split, candidate)
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
         self.sampled = None
         if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
