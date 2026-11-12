@@ -979,12 +979,12 @@ class FitSearch[LossT, EffectsT]:
         that compile's (`over_at`), or whole where either is not derived."""
         return self._scaled(self.over, self.over_at, split)
 
-    def _scaled(self, most: dict[str, int], at: dict[str, int], split: int) -> int:
-        """The bytes `most` holds at the objective's remat rung, a compile's whose derived temporaries `at`
-        holds, in proportion to the step's at `split` (what the derivation misses grows with what it
-        derives), or whole where either is unknown."""
+    def _scaled(self, most: dict[str, int], measured_at: dict[str, int], split: int) -> int:
+        """The bytes `most` holds at the objective's remat rung, a compile's whose derived temporaries
+        `measured_at` holds, in proportion to the step's at `split` (what the derivation misses grows with
+        what it derives), or whole where either is unknown."""
         rung = self.remat_rung()
-        measured, at = most.get(rung, 0), at.get(rung)
+        measured, at = most.get(rung, 0), measured_at.get(rung)
         footprint = self.footprints.get(self.candidate_key(split, self.narrow))
         temporaries = None if footprint is None else footprint.temporaries
         if not measured or not at or temporaries is None:
