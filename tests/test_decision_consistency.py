@@ -121,8 +121,9 @@ def test_a_run_with_no_consistency_term_reads_no_groups_however_its_rows_state_t
         from dew.data.compile import compile
         from dew.decision import decisions
 
+        head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
         objective = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
-                                      consistency=consistency)
+                                      head=head, consistency=consistency)
         chain = Memory([row, row]).pipe(decisions).batch(tokens=LAYOUT.max_len)
         loader = compile(chain, read="memory", objective=objective.data())
         return next(iter(loader.train(DataPartition())))
