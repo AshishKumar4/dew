@@ -174,7 +174,8 @@ def test_a_sites_unmeasured_map_tasks_weigh_its_measured_ones_rate_not_a_record_
     assert [weighed[name] for name in names] == [40.0, 80.0, 80.0]
 
 
-def test_a_sites_map_tasks_keep_their_declared_cut_within_four_targets_and_are_cut_finer_past_them(ci, tmp_path):
+def test_a_sites_map_tasks_keep_their_declared_cut_within_four_targets_and_are_cut_finer_past_them(
+        ci, tmp_path):
     """A site's map tasks keep the cut its mark declares while a task of it takes at most four of the plan's
     targets by its measured rate (`costs.SITE_TARGETS`): every map task pays the site's setup again, so cut
     down to one target, sites declared at 8 to 64 draws a task ran as 640 tasks of one or two draws, and a
