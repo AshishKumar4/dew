@@ -1635,13 +1635,6 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return self.model_tree(variables)
 
-    def bind_plan(self, version: int) -> None:
-        """Take the data plan version the run's data reads its rows by (`Loader.plan`,
-        `dew.data.plan.PLAN_VERSIONS`), before it binds its widths and records its task: an objective whose
-        rows a plan before this Dew's lays out otherwise (`ObjectiveData.earlier`) reads everything else of
-        them as that plan does. One whose rows every plan lays out alike keeps nothing."""
-        del version
-
     def bind_widths(self, widths: Mapping[str, object]) -> None:
         """Take the run's static widths, the facts its data's run-scoped steps bound (`Loader.widths`,
         such as a decision's `slots`), before the run records its task (`task_settings`). An objective

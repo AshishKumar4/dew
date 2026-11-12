@@ -335,9 +335,6 @@ def counters() -> tuple[dataclasses.Field, ...]:
     return tuple(field for field in dataclasses.fields(CorpusCounts) if field.metadata in (COUNT, KINDS))
 
 
-CUT_COUNTS = tuple(field.name for field in counters() if field.metadata == KINDS and field.name != "rejected")
-"""A corpus's counts by kind but its rejections, which a position version 7 saved kept alone
-(`dew.data.plan.earlier_position`)."""
 """Where a counting iterator's position keeps its corpus's counts, beside its parent's position:
 a key of Dew's own, which `state_counts` and `rewound` find and no Grain position holds."""
 
@@ -902,24 +899,18 @@ class KeyedMix(pygrain.IterDataset[Batch]):
     dropped while the others resume where they were. The corpus each position reads is
     `Proportions(seed=...)`'s (`_ProportionalMix`), its windows' choices permuted where a `seed` is
     given, over the members in the order the mix declares them, the order a phase's prefix counts them in
-    (`dew.data.compile._delivered`). A read of a plan before `dew.data.plan.DECLARED_MIX` reads an unseeded
-    mix's members in their keys' sorted order (`declared` false), as Grain's mix of a mapping read them,
-    so a position it saved resumes as it read."""
+    (`dew.data.compile._delivered`)."""
 
     def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float],
-                 keys: Sequence[str], seed: int | None = None, *, declared: bool = True):
+                 keys: Sequence[str], seed: int | None = None):
         super().__init__(parents)
         self._corpora, self._weights, self._keys = tuple(parents), tuple(weights), tuple(keys)
         self._seed = seed
-        order = range(len(self._keys))
-        self._order = tuple(order if declared or seed is not None
-                            else sorted(order, key=self._keys.__getitem__))
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         group = _MixReads(self._corpora)
-        reads = {self._keys[index]: _MixRead(group, index) for index in self._order}
-        weights = [self._weights[index] for index in self._order]
-        return _ProportionalMix(reads, Proportions.of(weights, self._seed))
+        reads = {key: _MixRead(group, index) for index, key in enumerate(self._keys)}
+        return _ProportionalMix(reads, Proportions.of(self._weights, self._seed))
 
 
 class _Captured:

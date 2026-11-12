@@ -749,11 +749,9 @@ class Files(Dataset):
         if self.kind == "files":
             return self._projected(_Paths(self.paths))
         if read == "memory" and self.kind != "array_record":
-            from dew.data.plan import FILE_SHARDS
-
             # Each shard as its reader reads it: an Arrow file or a Parquet one's row groups as `where`
             # filters them, a file's lines; each file's footer read as its rows are.
-            shards = self.manifest(FILE_SHARDS).shards
+            shards = self.manifest().shards
             return tuple(row for shard in shards for row in self._read_shard(shard))
         if self.kind in ("parquet", "arrow"):
             rows = _ArrowRecords(self)
@@ -902,16 +900,14 @@ class Files(Dataset):
             return self._listed_files[number]
         return self._footers.fragment(self, number).subset(row_group_ids=[group])
 
-    def manifest(self, version: int) -> ShardManifest:
-        """The files' shards at data plan `version`, each named by its file's place (`_places`) and where in
-        it it starts, so a fill keyed by a shard's rows finds them wherever the files are mounted: a Parquet
-        store's its files from `dew.data.plan.FILE_SHARDS` (`_by_file`), its row groups before it."""
-        from dew.data.plan import FILE_SHARDS
-
-        if self.kind == "parquet" and version >= FILE_SHARDS:
+    def manifest(self) -> ShardManifest:
+        """The files' shards, each named by its file's place (`_places`) and where in it it starts, so a fill
+        keyed by a shard's rows finds them wherever the files are mounted: a Parquet store's its files
+        (`_by_file`), an Arrow store's its record batches."""
+        if self.kind == "parquet":
             return self._by_file()
         shards = []
-        if self.kind in ("parquet", "arrow"):
+        if self.kind == "arrow":
             pieces = self._pieces
             names = [self._shard_name(fragment.path) for fragment in self._listed_files]
             for number in range(len(pieces.rows)):
@@ -943,7 +939,7 @@ class Files(Dataset):
         return ShardManifest(tuple(shards), self._read_shard, self._subdivided if divisible else None)
 
     def _by_file(self) -> ShardManifest:
-        """A Parquet store's files as its shards (`dew.data.plan.FILE_SHARDS`), each read row group by row
+        """A Parquet store's files as its shards, each read row group by row
         group as its reader reaches them, its footer read as it opens (`_ParquetRows`): no footer read before
         the first record, where its row groups as shards read every file's first (FineWeb-Edu's default
         configuration's 2410, 196 s: row 4131), as Grain's and `datasets`' Parquet streams read file by file.

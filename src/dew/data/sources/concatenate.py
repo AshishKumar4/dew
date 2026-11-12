@@ -98,11 +98,11 @@ class Concatenate(Dataset):
         measured = [length for length in lengths if length is not None]
         return np.concatenate(measured) if len(measured) == len(lengths) else None
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         """Each store's shards at `version`, one store after another: their index order where each
         store's is, as `records` joins them; their rows counted (`ShardManifest.sized`) where every
         store's are stated or counted."""
-        manifests = tuple(source.manifest(version) for source in self.sources)
+        manifests = tuple(source.manifest() for source in self.sources)
         ordered = all(manifest.index_ordered for manifest in manifests)
         countable = any(manifest.counted is not None for manifest in manifests) and all(
             manifest.counted is not None or all(shard.rows is not None for shard in manifest.shards)

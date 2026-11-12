@@ -225,10 +225,6 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
                                                               jnp.zeros((1, self.seq_len), jnp.int32)))
         return joined({"policy": self.actor.init(key, variables), "critic": critic})
 
-    def bind_plan(self, version: int) -> None:
-        """Take the run's data plan version, as its actor's (`TokenScorer.bind_plan`)."""
-        self.actor.bind_plan(version)
-
     def shares_prefixes(self, train: bool = False) -> bool:
         """Whether its rows are packed over one copy of the prompt a group's chains begin with: where its
         actor shares (`TokenScorer.shares_prefixes`) and its critic reads a call over forks as each chain's

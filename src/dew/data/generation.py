@@ -20,7 +20,7 @@ from dew.batch import Batch
 from dew.data.dataset import Loading, Records
 from dew.data.declared import Declared, Replaced
 from dew.data.pipeline import Record, Rejected
-from dew.data.plan import array_digest, filled_version
+from dew.data.plan import array_digest
 from dew.data.retention import LocalRetention
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _indexed_manifest, _uncounted, url_label
 from dew.data.sources.codec import as_named, decode, dtype_name, encode, encoded_fingerprint
@@ -118,12 +118,12 @@ def _fact(value: Batch | bytes | Rejected | None, name: str) -> int | None:
     return int(stated)
 
 
-def _store_shards_named(source: Source, version: int, completions: Mapping[str, object]) -> bool:
-    """Whether a stream's fill keys its rows by its store's own shards at data plan `version`, or by the
+def _store_shards_named(source: Source, completions: Mapping[str, object]) -> bool:
+    """Whether a stream's fill keys its rows by its store's own shards, or by the
     store's finer ones (a Parquet store's row groups, `ShardManifest.parts`): a stream cut into more shards
     than these keys its rows by its own cuts, which no generation of the store holds, and publishes
     nothing."""
-    manifest = source.manifest(version)
+    manifest = source.manifest()
     named = {json.loads(row)[0] for row in completions}
     stored = {shard.id for shard in manifest.shards}
     return named <= stored or named <= {shard.id for shard in manifest.parts()}
@@ -144,11 +144,10 @@ def _publish(
     completions, shards = _sealed(root, pins)
     if current is not None:
         _retain_committed(root, current, completions, shards, pins)
-    # A stream's fill numbers its rows by the shards its key says it read (`filled_version`).
-    streamed, version = any(row.startswith("[") for row in completions), filled_version(key.fill)
-    if of_several and streamed and not _store_shards_named(source, version, completions):
+    streamed = any(row.startswith("[") for row in completions)
+    if of_several and streamed and not _store_shards_named(source, completions):
         return None
-    expected = tuple(_source_ids(source, version, streamed=streamed, completed=completions))
+    expected = tuple(_source_ids(source, streamed=streamed, completed=completions))
     expected_keys = {_row_key(row) for row in expected}
     missing, extra = expected_keys - completions.keys(), completions.keys() - expected_keys
     if of_several and missing and not extra:
@@ -395,18 +394,17 @@ def _completion(entry: Mapping[str, object], encoded: Batch | bytes | None) -> N
         raise ValueError(f"cache completion {differing} differ for {entry['id']}")
 
 
-def _source_ids(source: Source, version: int, *, streamed: bool = False,
+def _source_ids(source: Source, *, streamed: bool = False,
                 completed: Iterable[str] = ()) -> Iterator[RowId]:
     """The store's input IDs, refusing subdivided fills before reopening it: a
     fill keyed by place (`completed` holds its numbers) numbers the records
-    a memory or indexed read holds, and a stream's by its shards at data plan
-    `version` (`ShardManifest`)."""
+    a memory or indexed read holds, and a stream's by its shards (`ShardManifest`)."""
     completed = tuple(completed)
     if not streamed and (source.supports("indexed") or completed):
         yield from range(len(source.records("indexed" if source.supports("indexed") else "memory")))
         return
     # Counted off its store's footers, a default read's threads at once, where its shards state no rows.
-    manifest = source.manifest(version).sized(Loading().threads)
+    manifest = source.manifest().sized(Loading().threads)
     shards = manifest.shards
     if manifest.subdivide is not None:
         named = {row[0] for row in map(json.loads, completed) if isinstance(row, list)}
@@ -622,7 +620,7 @@ class _GenerationSource:
     def records(self, read: Read) -> Records:
         return self.generation
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         return _indexed_manifest(self, self.generation.url, 4096)
 
     def metadata(self) -> Mapping[str, object]:

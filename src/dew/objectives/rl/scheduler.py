@@ -623,10 +623,9 @@ class RolloutScheduler:
       reference, the state's frozen starting policy, and repacked with
       `sessions.reference_penalties`.
     - `scorer` is the objective that trains on the packed rows: where its model computes a shared prefix
-      as each chain's own, as each call packs them (`shares_prefixes(train=True)`, its run's plan bound
-      by then, `TokenScorer.bind_plan`), the prompt a group's chains begin with is packed once (`pack`'s
-      `share`); None packs each chain whole. `sampled`, `served` and `episodes` name their objective,
-      `PPORollout` its own.
+      as each chain's own, as each call packs them (`shares_prefixes(train=True)`), the prompt a group's
+      chains begin with is packed once (`pack`'s `share`); None packs each chain whole. `sampled`,
+      `served` and `episodes` name their objective, `PPORollout` its own.
 
     `metrics` holds the latest call's numbers, which the trainer logs as
     `rollout/<name>`.

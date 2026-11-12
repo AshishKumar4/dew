@@ -213,10 +213,8 @@ class Source(Protocol):
         """The records by index, for a memory or an indexed read."""
         ...
 
-    def manifest(self, version: int) -> ShardManifest:
-        """The shards and their reader, for a streamed read of data plan `version`
-        (`dew.data.plan.PLAN_VERSIONS`), which decides a store's shards where
-        versions shard it otherwise (a Parquet store's, `dew.data.plan.FILE_SHARDS`)."""
+    def manifest(self) -> ShardManifest:
+        """The shards and their reader, for a streamed read."""
         ...
 
     def metadata(self) -> Mapping[str, object]:
@@ -310,8 +308,8 @@ class View[S: Source]:
     def records(self, read: Read) -> Records:
         return self.source.records(read)
 
-    def manifest(self, version: int) -> ShardManifest:
-        return self.source.manifest(version)
+    def manifest(self) -> ShardManifest:
+        return self.source.manifest()
 
     def lengths(self) -> np.ndarray | None:
         return self.source.lengths()
