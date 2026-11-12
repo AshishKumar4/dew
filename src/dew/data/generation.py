@@ -656,10 +656,9 @@ class _GenerationSource:
         entry = self.generation.manifest["metadata"].get("lengths")
         if entry is None:
             return None
-        return self._length_index.values
-
-    @cached_property
-    def _length_index(self) -> ArrayIndex:
-        entry = self.generation.manifest["metadata"]["lengths"]
         lengths = Store(self.generation.url, self.generation.storage_options).child(entry["path"])
-        return ArrayIndex(lengths.url, self.generation.storage_options, Declared(lengths, entry))
+        index = ArrayIndex(lengths.url, self.generation.storage_options, Declared(lengths, entry))
+        try:
+            return np.array(index.values, copy=True)
+        finally:
+            index.close()

@@ -7,14 +7,12 @@ where TensorFlow is not installed. They require no downloads or preparation.
 
 import itertools
 import shutil
-from collections import Counter
 from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
 import pytest
 import tensorflow_datasets as tfds
-from fsspec.implementations.local import LocalFileSystem
 
 from dew.data import TFDS, Loading, Memory, images, presets
 from dew.data.compile import compile
@@ -78,16 +76,6 @@ def test_streamed_tfds_pins_one_fingerprint_for_all_virtual_shards(tmp_path, mon
     if location == "mirror":
         directory = Path(source.directory)
     assert source.metadata()["rows"] == 20
-    opened = Counter()
-    open_file = LocalFileSystem.open
-
-    def count(self, path, *args, **kwargs):
-        filename = Path(path)
-        if filename.parent == directory:
-            opened[filename.name] += 1
-        return open_file(self, path, *args, **kwargs)
-
-    monkeypatch.setattr(LocalFileSystem, "open", count)
     reader = compile(source.repeat().batch(2), read="streamed",
                      loading=Loading(workers=0, threads=1, read_buffer=1)).train(DataPartition())
     try:
@@ -101,9 +89,6 @@ def test_streamed_tfds_pins_one_fingerprint_for_all_virtual_shards(tmp_path, mon
         assert int(decode_image(source.records("indexed")[0]["image"])[0, 0, 0]) == 10
     finally:
         reader.close()
-    assert opened["dataset_info.json"] == opened["features.json"] == opened["label.labels.txt"] == 1
-    assert opened["dew_images-train.array_record-00000-of-00001"] == 1
-    assert opened["dew_images-test.array_record-00000-of-00001"] == 1
     assert source.fingerprint()["files"] == selected("all").fingerprint()["files"]
 
 

@@ -125,6 +125,16 @@ class TokenRecords:
         return {name: value for name, value in self.__dict__.items() if name not in ("shards", "spans")}
 
 
+    def close(self) -> None:
+        records = self.__dict__.pop("records", None)
+        if records is not None:
+            records.close()
+        self.__dict__.pop("shards", None)
+        self.__dict__.pop("spans", None)
+        self.__dict__.pop("documents", None)
+        for index in self.indexes:
+            index.close()
+
 def _earlier_ends(tokens: TokenRecords) -> np.ndarray:
     """Where a Dew before row 3028 ended a token store's documents, which it read by their EOS: just past
     each, or at the stream's end for an unterminated tail; an empty stream holds none. Read only to resume a
@@ -172,31 +182,36 @@ class TokenFiles(Dataset):
     @cached_property
     def tokens(self) -> TokenRecords:
         eos = self.meta.get("eos_id")
-        if eos is not None and not isinstance(eos, int):
+        if eos is not None and (isinstance(eos, bool) or not isinstance(eos, int)):
             raise ValueError("token metadata eos_id must be an integer or null")
         committed = self.committed
         if committed["format"] != "array_record":
             raise ValueError("token exports must use ArrayRecord")
         root = Store(self.url, self.storage_options)
-        indexes = []
+        indexes: list[ArrayIndex] = []
         paths = []
         declared = []
         entries = committed["files"]
         if not isinstance(entries, list):
             raise ValueError("token export files must be a list")
-        for entry in entries:
-            if entry["lengths"] is None:
-                raise FileNotFoundError(
-                    f"token export needs the producer's lengths; export with length_field="
-                    f"{self.field or 'text'!r}"
-                )
-            lengths = root.child(entry["lengths"]["path"])
-            index = ArrayIndex(lengths.url, self.storage_options, Declared(lengths, entry["lengths"]))
-            if index.values.ndim != 2 or index.values.shape[1] != LENGTH_INDEX_WIDTH:
-                raise ValueError("token export index needs length and cumulative end columns")
-            indexes.append(index)
-            paths.append(root.child(entry["path"]).url)
-            declared.append(Declared(root.child(entry["path"]), entry))
+        try:
+            for entry in entries:
+                if entry["lengths"] is None:
+                    raise FileNotFoundError(
+                        f"token export needs the producer's lengths; export with length_field="
+                        f"{self.field or 'text'!r}"
+                    )
+                lengths = root.child(entry["lengths"]["path"])
+                index = ArrayIndex(lengths.url, self.storage_options, Declared(lengths, entry["lengths"]))
+                indexes.append(index)
+                if index.values.ndim != 2 or index.values.shape[1] != LENGTH_INDEX_WIDTH:
+                    raise ValueError("token export index needs length and cumulative end columns")
+                paths.append(root.child(entry["path"]).url)
+                declared.append(Declared(root.child(entry["path"]), entry))
+        except BaseException:
+            for index in indexes:
+                index.close()
+            raise
         # The field of each record that holds its tokens, "text" where the export names none.
         return TokenRecords(tuple(paths), tuple(indexes), str(self.meta.get("dtype", "int32")),
                             self.field or "text", eos, self.storage_options, tuple(declared))
@@ -284,8 +299,13 @@ class TokenFiles(Dataset):
 
     def records(self, read: Read) -> Records:
         """Each document by index (`document_ends`), in every read."""
-        return _TokenDocuments(self.tokens, self.document_ends())
-
+        documents = _TokenDocuments(self.tokens, self.document_ends())
+        if read != "memory":
+            return documents
+        try:
+            return tuple(documents[index] for index in range(len(documents)))
+        finally:
+            documents.close()
     def document_ends(self) -> np.ndarray:
         """Where each document ends among the export's tokens: each record its producer wrote, by its
         length index (`TokenRecords.shards`), a shard's after the shard before it, an EOS its tokens spell
@@ -321,3 +341,6 @@ class _TokenDocuments:
     def __getitem__(self, index: int) -> Batch:
         start = int(self.ends[index - 1]) if index else 0
         return {"text": self.tokens[start : int(self.ends[index])].astype(np.int32)}
+
+    def close(self) -> None:
+        self.tokens.close()

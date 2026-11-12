@@ -1026,9 +1026,14 @@ class _CachedIterator(grain.DatasetIterator):
             self.parent.set_state(state)
             self.ordinal = None
             return
-        ordinal = state["ordinal"]
-        parent = state["parent"]
-        if not isinstance(ordinal, int) or not isinstance(parent, Mapping):
+        ordinal = state.get("ordinal")
+        parent = state.get("parent")
+        if (
+            isinstance(ordinal, bool)
+            or not isinstance(ordinal, int)
+            or ordinal < 0
+            or not isinstance(parent, Mapping)
+        ):
             raise ValueError("invalid cached shard iterator state")
         self.parent.set_state(parent)
         self.ordinal = ordinal
