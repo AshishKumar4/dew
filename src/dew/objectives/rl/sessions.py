@@ -41,7 +41,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from types import MappingProxyType
-from typing import Protocol, SupportsFloat
+from typing import TYPE_CHECKING, Any, Protocol, SupportsFloat
 
 import jax
 import jax.numpy as jnp
@@ -54,6 +54,9 @@ from dew.data.forked_rows import ForkedRows, token_keys, windows_needed
 from dew.inference.rollouts import Draw, Routing, routing_rows
 from dew.nn.inputs import local_rows
 from dew.rl import group_advantage, rloo_advantage
+
+if TYPE_CHECKING:
+    from dew.objectives.base import Objective
 
 IDS_KEY = "input_ids"
 RESPONSE_MASK_KEY = "response_mask"
@@ -310,16 +313,19 @@ class Session:
 @dataclass(frozen=True)
 class Snapshot:
     """The trainer's state at one rollout call, as an acquisition reads it: the `variables` the
-    step trains, its attempted `step` and committed `updates`, the call's `key`, and the `branch` it
+    step trains, its attempted `step` and committed `updates`, the call's `key`, the `branch` it
     is drawn on, a cooldown branch's name (`RolloutScheduler.branch`) or None for the run's own, which
     keeps what a collector records of a branch's calls apart from the run's at the same step and key
-    (an `EpisodeJournal`'s cohorts)."""
+    (an `EpisodeJournal`'s cohorts), and the `objective` the step trains, its phase's (a looped model's
+    pass count, `dew.training.phase_passes`), whose policy a collector draws from: None for a snapshot
+    no step took, whose collector draws from no policy (a scripted one's)."""
 
     variables: Variables
     step: int
     updates: int
     key: jax.Array
     branch: str | None = None
+    objective: Objective[Any, Any] | None = None
 
 
 class Collector(Protocol):

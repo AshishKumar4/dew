@@ -29,7 +29,7 @@ from flax import linen as nn
 from dew.batch import Batch, Variables, unboxed
 from dew.inference.models import ModelSettings, ReleasesModel
 from dew.nn.kernels.options import program
-from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, traced_update_flops
+from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, own_objective, traced_update_flops
 from dew.rl.distributions import normal_entropy, normal_log_density, tanh_log_jacobian
 from dew.rl.env import Carry, Env, Memory, Observation, Params, Transition, Tree, env_rollout, view
 from dew.rl.evaluation import episodes
@@ -91,10 +91,15 @@ def tanh_normal_log_prob(raw: jax.Array, location: jax.Array, scale: jax.Array) 
     return jnp.sum(normal_log_density(raw, location, scale) - tanh_log_jacobian(raw), axis=-1)
 
 
-def tanh_normal_entropy(location: jax.Array, scale: jax.Array, key: jax.Array) -> jax.Array:
+def tanh_normal_entropy(location: jax.Array, scale: jax.Array, key: jax.Array | None = None, *,
+                        noise: jax.Array | None = None) -> jax.Array:
     """The squashed normal's entropy as Brax estimates it: the normal's, plus the tanh's log-Jacobian
-    at one draw, summed over the action."""
-    raw = location + scale * jax.random.normal(key, location.shape, location.dtype)
+    at one draw (`noise` where given, else drawn from `key`), summed over the action."""
+    if noise is None:
+        if key is None:
+            raise ValueError("estimating squashed-normal entropy needs a key or normal noise")
+        noise = jax.random.normal(key, location.shape, location.dtype)
+    raw = location + scale * noise.astype(location.dtype)
     return jnp.sum(normal_entropy(scale) + tanh_log_jacobian(raw), axis=-1)
 
 
@@ -108,7 +113,7 @@ class ControlSettings(ModelSettings):
     reads: tuple[str, ...] = ()
 
 
-class ControlPPOObjective(ReleasesModel, Objective[Ratio]):
+class ControlPPOObjective(ReleasesModel, Objective[Ratio, Variables]):
     """PPO over an `ActorCritic` (the module docstring). A batch holds sequences `[B, T]`: each step's
     `observation`, the pre-squash `raw_action` taken and its `log_prob` under the policy that took
     it, the `reward`, whether the step `terminated` or was `truncated`, and the `following`
@@ -145,7 +150,11 @@ class ControlPPOObjective(ReleasesModel, Objective[Ratio]):
         """What the actor and critic read of an observation: its `reads` views joined, or it whole."""
         if not self.reads:
             return view(observation)
-        return jnp.concatenate([jnp.asarray(view(observation, name), jnp.float32) for name in self.reads], -1)
+        parts = [view(observation, name) for name in self.reads]
+        from dew.nn.precision import at_least_fp32
+
+        wide = at_least_fp32(jnp.result_type(*parts))
+        return jnp.concatenate([jnp.asarray(part, wide) for part in parts], -1)
 
     def held_variables(self) -> Variables | None:
         return self.variables
@@ -208,7 +217,29 @@ class ControlPPOObjective(ReleasesModel, Objective[Ratio]):
               "entropy_cost", "reads")
     """What it reads and its return and loss settings."""
 
-    def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
+    def batch_statistics(self, variables: Variables,
+                         part_at: Callable[[jax.Array], tuple[Batch, Step]],
+                         split: int) -> tuple[jax.Array, jax.Array]:
+        from dew.batch import VALID_ROWS
+
+        model = self.model.bind(variables)
+
+        def part(_, index: jax.Array):
+            micro, _ = part_at(index)
+            micro, row_real = self._clean_rows(micro, jnp.asarray(micro["reward"]).shape[0])
+            values = model.value(self.seen(micro["observation"]))
+            after = model.value(self.seen(micro["following"]))
+            advantages, _ = self.advantages(values, after, micro)
+            return None, (advantages, row_real)
+
+        _, (advantages, real) = jax.lax.scan(part, None, jnp.arange(split, dtype=jnp.int32))
+        ordered = jnp.swapaxes(advantages, 0, 1).reshape(-1, *advantages.shape[2:])
+        marked = {VALID_ROWS: jnp.swapaxes(real, 0, 1).reshape(-1)}
+        return jax.lax.stop_gradient(self.row_moments(ordered, marked, (0, 1)))
+
+    def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux[Variables]]:
+        rows = jnp.asarray(batch["reward"]).shape[0]
+        batch, row_real = self._clean_rows(batch, rows)
         observation, following = self.seen(batch["observation"]), self.seen(batch["following"])
         model = self.model.bind(variables)
         location, scale = model.policy(observation)
@@ -216,16 +247,27 @@ class ControlPPOObjective(ReleasesModel, Objective[Ratio]):
         after = jax.lax.stop_gradient(model.value(following))
         advantages, targets = jax.lax.stop_gradient(
             self.advantages(jax.lax.stop_gradient(values), after, batch))
-        whitened = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        log_ratio = tanh_normal_log_prob(batch["raw_action"], location, scale) - batch["log_prob"]
-        mask = jnp.ones(log_ratio.shape, log_ratio.dtype)
-        policy, metrics = clipped_surrogate_terms(log_ratio, whitened, mask, self.clip, self.clip,
+        # A sequence that repeats a real one to fill a batch (`VALID_ROWS`) weighs nothing: not in the
+        # whitening's moments, the surrogate's metrics, the loss or its mass, so a batch of repeats
+        # alone has no mass and updates nothing (`Objective.row_mean`).
+        real = jnp.broadcast_to(row_real[:, None], values.shape)
+        advantages = jnp.where(real, advantages, 0)
+        mean, variance = (self.row_moments(advantages, batch, (0, 1))
+                          if step.batch_statistics is None else step.batch_statistics)
+        whitened = (advantages - mean) / (jnp.sqrt(variance) + 1e-8)
+        raw_action = jnp.asarray(batch["raw_action"], location.dtype)
+        old_log_prob = jnp.asarray(batch["log_prob"], location.dtype)
+        log_ratio = jnp.where(real, tanh_normal_log_prob(raw_action, location, scale) - old_log_prob, 0)
+        policy, metrics = clipped_surrogate_terms(log_ratio, whitened, real, self.clip, self.clip,
                                                   dual_clip=None)
         value = self.value_cost * 0.5 * jnp.square(targets - values)
-        entropy = tanh_normal_entropy(location, scale, step.key)
+        noise = step.sample("entropy noise", jax.random.normal, location.shape[1:], dtype=jnp.float32,
+                            rows=rows)
+        entropy = tanh_normal_entropy(location, scale, noise=noise)
         per_step = policy + value - self.entropy_cost * entropy
-        metrics = {**metrics, "policy": policy.mean(), "value": value.mean(), "entropy": entropy.mean()}
-        return Ratio(per_step.sum(), jnp.asarray(per_step.size, per_step.dtype)), Aux(metrics)
+        terms = {"policy": policy, "value": value, "entropy": entropy}
+        metrics = {**metrics, **{name: self.row_mean(term, batch).mean()[0] for name, term in terms.items()}}
+        return self.row_mean(per_step, batch), Aux(metrics)
 
 
 def _summary(steps: Transition, returns: jax.Array):
@@ -393,7 +435,9 @@ class ControlRollout:
             unrolled.append(steps)
         return carry, jax.tree.map(lambda *leaves: jnp.stack(leaves), *unrolled)
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
+    def __call__[LossT, EffectsT](self, state: TrainState, batch: Batch, key: jax.Array, *,
+                                  objective: Objective[LossT, EffectsT]) -> Batch:
+        own_objective(type(self).__name__, self.objective, objective)
         passes = self.epochs * self.minibatches
         # The rollout's own count of the minibatches served (row 3932); none yet, the updates' as before.
         served = (int(state.updates) % passes or passes) if self._served is None else self._served

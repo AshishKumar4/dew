@@ -758,7 +758,7 @@ def test_rollouts_share_their_prompts_where_their_scorer_does():
     def packed(scorer, objective):
         state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(3)).initial_state()
         scheduler = RolloutScheduler(Synchronous(Scripted(sessions)), groups=2, scorer=scorer)
-        return lambda: FORK_PARENTS_KEY in scheduler(state, batch, jax.random.key(0))
+        return lambda: FORK_PARENTS_KEY in scheduler(state, batch, jax.random.key(0), objective=objective)
 
     class Plain(nn.Module):
         """A backbone that states no reading of a call over forks."""

@@ -3,7 +3,7 @@
 import functools
 from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING, overload
+from typing import TYPE_CHECKING, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
@@ -49,23 +49,34 @@ def _table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
     return rows_taken(table, ids).astype(dtype)
 
 
-def token_table(model: "nn.Module | HeadedModel") -> tuple[int, frozenset[int]] | None:
+class TokenTable(NamedTuple):
+    """The embedding table a token field indexes (`token_table`): its `rows`, the ids its model replaces
+    wherever they occur (`replaced`), and whether it replaces the id at each slot a call's media fill
+    (`media`, `dew.nn.inputs.media_slots`)."""
+
+    rows: int
+    replaced: frozenset[int]
+    media: bool
+
+
+def token_table(model: "nn.Module | HeadedModel") -> TokenTable | None:
     """The embedding table a model reads its tokens through, which a token field indexes
     (`dew.inputs.spec.Field.indexing`): the rows its declared vocabulary
     (`dew.nn.protocols.Bounded`) builds, found on the model, the backbone a head reads
-    (`dew.nn.wrapping.HeadedModel`) or the decoder a wrapper holds (`WrapsDecoder`), and the
-    placeholder ids a multimodal model replaces before its table reads them (`ReplacesTokens`), which
-    hold no row of their own; None for a model of no stated vocabulary."""
+    (`dew.nn.wrapping.HeadedModel`) or the decoder a wrapper holds (`WrapsDecoder`), and what a
+    multimodal model replaces before its table reads it, as it states (`ReplacesTokens`): ids wherever
+    they occur, and the id at a slot media fill; None for a model of no stated vocabulary."""
     from dew.nn.protocols import Bounded, ReplacesTokens, WrapsDecoder
     from dew.nn.wrapping import HeadedModel
 
     replaced: set[int] = set()
+    media = False
     while True:
         if isinstance(model, ReplacesTokens):
-            replaced |= {*model.extra_placeholder_ids,
-                         *(() if model.image_token_id is None else (model.image_token_id,))}
+            replaced |= model.replaced_ids
+            media = True
         if isinstance(model, Bounded) and isinstance(model.vocab_size, int):
-            return model.vocab_size, frozenset(replaced)
+            return TokenTable(model.vocab_size, frozenset(replaced), media)
         if isinstance(model, WrapsDecoder):
             model = getattr(model, model.wraps)
         elif isinstance(model, HeadedModel):

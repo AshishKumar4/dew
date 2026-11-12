@@ -128,8 +128,7 @@ def assert_contract(fn, primals, direction, cotangent, label: str, *, truth_fn=N
     operations stay in range fails (row 1768, a contraction Dew summed before the division that brought it
     back), as does one that overflows over terms that cancel inside the range in every order (2^126 twice
     and its negative twice); and a sum whose terms float32 can overflow in one order and not another is
-    held to neither order (row 5426: Dew's blocked sum and XLA's chain each overflow partials the other
-    does not). The
+    held to neither order (row 5426: two orders each overflow partials the other does not). The
     float64 run is `fn`'s own, or `truth_fn`'s, the plain float64 formula, where `fn` computes in a fixed
     precision whatever its inputs' (a declared dot algorithm). `without` names orders the contract does not
     take yet, each joining with its row's fix (a row's head brings its own test)."""

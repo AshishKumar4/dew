@@ -1025,8 +1025,8 @@ def test_a_rollout_run_bounded_in_examples_steps_as_the_run_without_it_and_ends_
     alone = Trainer(Thin(), optim, key=0, accumulation=2, tracker=plain).fit(
         clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
     handed = Trainer(Thin(), optim, key=0, accumulation=2, tracker=rolled,
-                     rollout=lambda state, batch, key: batch).fit(clocked_chain(x), examples=CLOCKED_RECORDS,
-                                                                  log_every=1)
+                     rollout=lambda state, batch, key, *, objective: batch).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
     assert int(handed.consumed) == int(alone.consumed) == CLOCKED_RECORDS
     np.testing.assert_array_equal(np.asarray(handed.variables["params"]["w"]),
                                   np.asarray(alone.variables["params"]["w"]))
@@ -1039,7 +1039,7 @@ class DrawingFurther:
 
     draws_further = True
 
-    def __call__(self, state, batch, key, further):
+    def __call__(self, state, batch, key, further, *, objective):
         from dew.nn.inputs import local_rows
 
         drawn = further()

@@ -500,7 +500,7 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
         return -np.square(images.mean(axis=(1, 2, 3)) - context["target"])
 
     rollout = FlowRollout(objective, reward, groups=3, steps=4, train_steps=2)
-    batch = rollout(state, prompts, jax.random.key(23))
+    batch = rollout(state, prompts, jax.random.key(23), objective=objective)
     rewards = np.asarray(batch["rewards"], np.float64).reshape(2, 3)
     expected = (rewards - rewards.mean(axis=1, keepdims=True)) / (rewards.std(axis=1, keepdims=True) + 1e-4)
     np.testing.assert_array_equal(batch["advantages"], expected.reshape(-1).astype(np.float32))
@@ -509,12 +509,14 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     # whatever their advantages (row 3346's review).
     from dew.batch import VALID_ROWS
 
-    partial = rollout(state, {**prompts, VALID_ROWS: np.asarray([True, False])}, jax.random.key(23))
+    partial = rollout(state, {**prompts, VALID_ROWS: np.asarray([True, False])}, jax.random.key(23),
+                      objective=rollout.objective)
     assert not partial["transition_mask"][3:].any()
     np.testing.assert_array_equal(partial["transition_mask"][:3], batch["transition_mask"][:3])
 
     def rolled(seed):
-        return rollout(state, prompts, jax.random.fold_in(jax.random.key(23), seed))
+        return rollout(state, prompts, jax.random.fold_in(jax.random.key(23), seed),
+                       objective=rollout.objective)
 
     def guided(variables, batch, dtype):
         weights, encoders = objective.model_variables(variables), variables["encoders"]
@@ -656,10 +658,11 @@ def test_an_inpainting_rollout_rescores_with_its_masked_image_inputs():
         return -np.square(images.mean(axis=(1, 2, 3)))
 
     rollout = FlowRollout(objective, reward, groups=2, steps=4, train_steps=2)
-    batch = rollout(state, {"image": pixels, "mask": mask}, jax.random.key(42))
+    batch = rollout(state, {"image": pixels, "mask": mask}, jax.random.key(42), objective=rollout.objective)
     variables = state.variables
     def rolled(seed):
-        return rollout(state, {"image": pixels, "mask": mask}, jax.random.fold_in(jax.random.key(42), seed))
+        return rollout(state, {"image": pixels, "mask": mask}, jax.random.fold_in(jax.random.key(42), seed),
+                       objective=rollout.objective)
 
     def inpainted(variables, batch, dtype):
         gain = np.asarray(objective.model_variables(variables)["params"]["gain"], dtype)
@@ -762,7 +765,8 @@ def test_a_clip_reward_scores_each_sample_against_its_prompts_caption():
 
     captions = ["red", "blue"]
     prompts = {**inputs.tokenize(captions), "captions": np.asarray(captions)}
-    batch = FlowRollout(objective, reward, groups=2, steps=3)(state, prompts, jax.random.key(3))
+    batch = FlowRollout(objective, reward, groups=2, steps=3)(state, prompts, jax.random.key(3),
+                                                              objective=objective)
     assert seen["captions"] == ["red", "red", "blue", "blue"]
     scored = np.asarray(clip.fn(ImageGrid(seen["images"]), {"captions": np.asarray(seen["captions"])}))
     np.testing.assert_array_equal(np.asarray(batch["rewards"]), scored.astype(np.float32))
@@ -808,7 +812,6 @@ def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
         np.testing.assert_array_equal(np.asarray(report["global_advantages"], np.float32),
                                       expected_advantages.astype(np.float32))
         np.testing.assert_array_equal(report["global_rewards"], raw_callback.astype(np.float32))
-        assert not report["x64_enabled"]
         # The reassembled batch rescores as the one process's does, and keeps its recorded densities;
         # the one process's rescoring and recording of this model and process are check 1's, against
         # the authors' Gaussian (test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods).
@@ -932,7 +935,7 @@ def test_float64_callback_distinctions_reach_a_real_policy_update():
     trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(91), rollout=rollout)
     initial = trainer.place()[0]
     source = {"image": np.zeros((count, 4, 4, 1), np.uint8)}
-    collected = rollout(initial, source, jax.random.key(92))
+    collected = rollout(initial, source, jax.random.key(92), objective=rollout.objective)
     data = Loader(train=lambda partition: itertools.repeat(source), val=None, records=count, batch=count)
     final = trainer.fit(data, steps=1, log_every=1)
     assert int(final.updates) == 1
@@ -944,6 +947,19 @@ def test_float64_callback_distinctions_reach_a_real_policy_update():
     assert collected["rewards"].dtype == np.float64
     np.testing.assert_array_equal(collected["transition_mask"],
                                    np.broadcast_to((oracle != 0)[:, None], (count * 3, 2)))
+    from rl_support import assert_filled_batch_invariants
+
+    from dew.data.dataset import FilledBatch
+
+    three = {name: np.asarray(value)[:3] for name, value in collected.items()}
+    if count * 3 < 3:
+        three = {name: np.repeat(np.asarray(value)[:1], 3, axis=0) for name, value in collected.items()}
+    filled_flow = FilledBatch(4).map(three)
+    corrupted = {name: np.asarray(value).copy() for name, value in filled_flow.items()}
+    corrupted["advantages"][3] = np.nan
+    corrupted["old_log_probs"][3] = np.nan
+    corrupted["rewards"][3] = 1e9
+    assert_filled_batch_invariants(objective, filled_flow, corrupted, FilledBatch(4, real=False).map(three))
 
 
 

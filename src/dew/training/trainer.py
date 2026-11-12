@@ -158,6 +158,7 @@ from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
     Transaction,
+    batch_statistics_shapes,
     compact_qk,
     loss_scale,
     pooled_by_mean,
@@ -743,7 +744,7 @@ class Trainer(Generic[Loss, Effects]):
         return jax.make_jaxpr(loss, return_shape=True)(variables, self._model_shapes(batch), *rest)
 
     def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, window: int,
-                                 shape_only=False):
+                                 split: int = 1, shape_only=False):
         """The state with the accumulation a `window` of microbatches of `batch`'s shapes pools in, empty;
         unchanged under a window of one, a custom step or a held one that replays such batches
         (`Accumulation.replays`): a ramp's stage begins with a window (`Ramp.stages`)."""
@@ -760,6 +761,7 @@ class Trainer(Generic[Loss, Effects]):
         records = jax.tree.map(shape, self._model_shapes(batch))
         mutable = (None if shared or aux.variables is None else
                    jax.tree.map(shape, {name: state.variables[name] for name in aux.variables}))
+        batch_stats = batch_statistics_shapes(self.objective, state, records, window, split)
 
         def zeros(leaf):
             wide = at_least_fp32(leaf.dtype)
@@ -782,7 +784,11 @@ class Trainer(Generic[Loss, Effects]):
                 batches=None if shared else buffer(records),
                 variables=None if mutable is None else buffer(mutable),
                 attempts=None if shared else jnp.zeros((slots,), jnp.int32),
-                tokens=jnp.zeros((2,), jnp.uint32) if TOKENS in batch else None)
+                tokens=jnp.zeros((2,), jnp.uint32) if TOKENS in batch else None,
+                batch_statistics=None if batch_stats is None else tuple(zeros(x) for x in batch_stats),
+                replayed_statistics=(None if shared or batch_stats is None
+                                     else tuple(buffer(zeros(x)) for x in batch_stats)),
+                statistics_stamp=None if batch_stats is None else jnp.full((2,), -1, jnp.int32))
 
         pending = jax.eval_shape(allocate)
         # The microbatches the state's window holds are read only where it is replaced (`kept_window`).
@@ -807,8 +813,8 @@ class Trainer(Generic[Loss, Effects]):
         (`windowed`): what a run's first step of a window builds, and a run compiled ahead compiles
         (`dew.training.ahead.started`)."""
         return windowed(lambda state, rows, *, shape_only: self._initialize_accumulation(
-            state, rows, candidate.shapes, window=window, shape_only=shape_only), state, candidate.micro,
-            self.shardings)
+            state, rows, candidate.shapes, window=window, split=window // self.accumulation,
+            shape_only=shape_only), state, candidate.micro, self.shardings)
 
     @contextlib.contextmanager
     def _traced_on(self, mesh: Mesh | AbstractMesh,
@@ -838,7 +844,7 @@ class Trainer(Generic[Loss, Effects]):
         refuse_unpassed_progress(self.objective, passes=isinstance(self.step, PassesProgress))
         custom = self.step(self.objective, self.optimizer)
 
-        def run(current, batch, part, tokens, closes=None):
+        def run(current, batch, part, tokens, closes=None, whole=None):
             advanced, loss, aux = custom(current, batch)
             return advanced, loss, aux, None
         return run
@@ -1121,7 +1127,8 @@ class Trainer(Generic[Loss, Effects]):
                 # worker, and a stream that may run out can on any read: a process whose read failed stops
                 # its peers before they compile or step without it.
                 read = read_batch(run, interval, state, self.rollout, self.device_mesh, run.marked,
-                                  self._shape.examples, agree=run.agrees(first=not seen))
+                                  self._shape.examples, agree=run.agrees(first=not seen),
+                                  objective=self._step_objective)
                 if read is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
@@ -1592,7 +1599,7 @@ class Trainer(Generic[Loss, Effects]):
                     self._scheduled(plan, branched)
                     read = read_batch(branched, counted, cooled, self.rollout, self.device_mesh, run.marked,
                                       self._shape.examples, agree=branched.agrees(first=not done),
-                                      phase="cooldown read", branch=True)
+                                      phase="cooldown read", branch=True, objective=self._step_objective)
                     if read is None:
                         break
                     (batch, device, _), read = read, None
@@ -1803,6 +1810,12 @@ class Trainer(Generic[Loss, Effects]):
         if self.device_mesh.shape.get(STAGE_AXIS, 1) > 1 and self.rollout is None:
             check_batch(dataset.batch, self.device_mesh, self.microbatches)
 
+    def _step_objective(self, batch: Batch) -> Objective[Loss, Effects]:
+        """The objective the step reading `batch` trains: the run's own, or its copy at the pass count of the
+        phase `batch` was read in (`phase_passes`), which the step is compiled at, before a rollout draws
+        for it (`Rollout`)."""
+        return self.phase_passes.objective_for(self.phase_passes.count(batch))
+
     def _counted_batch(self, batch: Batch) -> Batch:
         """Prepare host counts before placement, never fetch a device batch to count it.
 
@@ -1818,7 +1831,7 @@ class Trainer(Generic[Loss, Effects]):
         if self._refusal is None:
             # The model the batch's step runs: its phase's pass count (`phase_passes`), read off the batch,
             # since this thread prepares it ahead of the step that takes the count.
-            objective = self.phase_passes.objective_for(self.phase_passes.count(batch))
+            objective = self._step_objective(batch)
             try:
                 return prepare_counts(objective, batch, count_model=True)
             except MissingFlopsCount as missing:

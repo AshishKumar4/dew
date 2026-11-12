@@ -27,7 +27,7 @@ class DrawingFurther:
 
     draws_further = True
 
-    def __call__(self, state, batch, key, further):
+    def __call__(self, state, batch, key, further, *, objective):
         from dew.nn.inputs import local_rows
 
         further()

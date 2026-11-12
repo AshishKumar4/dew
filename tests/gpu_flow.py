@@ -14,7 +14,7 @@ import functools
 import inspect
 import itertools
 import traceback
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping, Sequence
 
 import lane_environment
 import pytest
@@ -25,12 +25,56 @@ from generation_support import lowers_as, runnable
 class Cell:
     """One native route's property: `run` asserts it, under `generation` where it names one, its kernels
     Mosaic GPU's where `mosaic` (run only where the device runs them as the generation lowers them,
-    `generation_support.lowers_as`)."""
+    `generation_support.lowers_as`); `native` its values of the axes a GPU runs natively, which a class's
+    covering reads (`covering`), and `fault` the GPU-only fault or red it is kept for by name, None where the
+    covering decides."""
 
     label: str
     run: Callable[[], None]
     generation: str | None = None
     mosaic: bool = False
+    native: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    fault: str | None = None
+
+
+def held(combination: Mapping[str, str], *, values: bool = True) -> set:
+    """What `combination` (axes to values) holds of a covering: each pair of its axis values, and each value
+    alone where `values`."""
+    items = sorted(combination.items())
+    return {*itertools.combinations(items, 2), *((item,) for item in items if values)}
+
+
+def greedy(combinations: Sequence[Mapping[str, str]], left: set, *, values: bool = True) -> list[int]:
+    """The indices of the fewest of `combinations` holding everything `left` names (`held`), chosen greedily:
+    the one holding the most not yet held first, a tie to the first in their order."""
+    chosen = []
+    left = set(left)
+    while left:
+        best = max(range(len(combinations)),
+                   key=lambda index: len(left & held(combinations[index], values=values)))
+        if not left & held(combinations[best], values=values):
+            raise ValueError(f"no combination holds {sorted(left)[:5]}")
+        chosen.append(best)
+        left -= held(combinations[best], values=values)
+    return chosen
+
+
+def covering(cells: Iterable[Cell]) -> list[Cell]:
+    """The cells of a class a GPU runs (row 5461's covering set, docs/design/testing.md): each kept by
+    name for a GPU-only fault or red (`Cell.fault`), and the fewest others in whose native axes
+    (`Cell.native`: launch kind or instruction family, dtype and precision form, forward or backward form)
+    every value and every pair of values the class's cells hold occurs, chosen as the kernel matrices'
+    covering chooses (`greedy`); every other cell of the class is the CPU's, interpreted and through the
+    compile gate. Cells of other generations are covered apart, as each GPU runs its own."""
+    cells = list(cells)
+    kept = [cell for cell in cells if cell.fault is not None]
+    chosen = []
+    for generation in dict.fromkeys(cell.generation for cell in cells):
+        mine = [cell for cell in cells if cell.generation == generation and cell.fault is None]
+        left = set().union(*(held(cell.native) for cell in mine)) - set().union(
+            *(held(cell.native) for cell in kept if cell.generation == generation))
+        chosen += [mine[index] for index in greedy([cell.native for cell in mine], left)]
+    return [cell for cell in cells if any(cell is pick for pick in (*kept, *chosen))]
 
 
 class CellsFailed(AssertionError):
@@ -148,22 +192,27 @@ def _parameter_sets(mark) -> list[tuple[str, dict, list]]:
     return sets
 
 
-def cells_of(check, generation: str | None = None, **fixtures) -> list[Cell]:
+def cells_of(check, generation: str | None = None, *, native: Callable[..., Mapping[str, str]] | None = None,
+             fault: Callable[..., str | None] | None = None, **fixtures) -> list[Cell]:
     """A cell for each parameter set `check`'s own `pytest.mark.parametrize` marks give (their product, as
     pytest collects them), each run with that set and those of `fixtures` it takes by name, under
     `generation`, or a matrix cell's under the generation its set covers (`cell`); a `skipif` mark of
     `check`'s own, or of a set's, whose condition holds skips its cell with its reason, as pytest would. So
-    a cell function keeps its test's grid where its test kept it, and a flow names the function alone."""
+    a cell function keeps its test's grid where its test kept it, and a flow names the function alone. A
+    class's covering reads each cell's native axes, `native(**its parameter set)`, and the GPU-only fault it
+    is kept for by name, `fault(**its parameter set)` (`Cell.native`, `Cell.fault`, `covering`)."""
     taken = inspect.signature(check).parameters
     name = check.__name__.replace("_", " ")
     cells = []
-    for label, arguments, marks in _parameter_grid(check):
-        arguments = {**{key: value for key, value in fixtures.items() if key in taken}, **arguments}
+    for label, given, marks in _parameter_grid(check):
+        arguments = {**{key: value for key, value in fixtures.items() if key in taken}, **given}
         run = _skipped(marks, name) or functools.partial(check, **arguments)
         under = generation
         if under is None and hasattr(check, "covers"):
             under = check.covers(**arguments).get("generation")
-        cells.append(Cell(f"{name}: {label}" if label else name, run, under))
+        cells.append(Cell(f"{name}: {label}" if label else name, run, under,
+                          native=dict(native(**given)) if native else {},
+                          fault=fault(**given) if fault else None))
     return cells
 
 

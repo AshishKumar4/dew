@@ -1472,16 +1472,21 @@ def heavy_masks(runs) -> list:
     truths draw by draw, as a mask, None for a leaf of none: those whose share of the reference's squared
     error summed over the draws exceeds their uniform share of their row (1/n, n its length along the leaf's
     last axis). The unweighted RMS, which defines on par, is theirs, so the weighed check judges them apart
-    from the light rest (`Weighed.classed`): an error moved onto them never hides behind the rest's."""
+    from the light rest (`Weighed.classed`): an error moved onto them never hides behind the rest's. A leaf
+    whose rows hold one value (a scalar, a last axis of one) has none, whatever its draws: where every leaf
+    is such, the first draw's shapes decide it and no further draw is read (a scalar loss's site read its
+    weighed check's every draw, reference and truth, in each of its map tasks, for no class)."""
     totals = None
     for ran, true in runs:
         structure = jax.tree.structure(true)
         squares = [np.square(np.asarray(arm, np.float64) - np.asarray(truth, np.float64))
-                   if float_leaf(truth) and np.ndim(truth) else None
+                   if float_leaf(truth) and np.ndim(truth) and np.shape(truth)[-1] > 1 else None
                    for arm, truth in zip(structure.flatten_up_to(ran), structure.flatten_up_to(true),
                                          strict=True)]
         totals = squares if totals is None else [None if total is None else total + square
                                                  for total, square in zip(totals, squares, strict=True)]
+        if all(square is None for square in squares):
+            break
     masks = []
     for total in totals or []:
         heavy = None if total is None else total * total.shape[-1] > np.sum(total, axis=-1, keepdims=True)
