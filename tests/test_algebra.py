@@ -445,3 +445,46 @@ def test_recognition_reads_a_program_inside_any_call_as_the_program(call):
     both = canonical(jax.make_jaxpr(lambda x, scale: (wrapped(scale)(x), program(x, scale)))(
         jnp.linspace(-1.0, 1.0, 8), jnp.float32(0.5)))
     assert both.outvars[0] is both.outvars[1]
+
+
+COMPLEX_EDGES = [complex(-0.0, -0.0), complex(1.5, -0.0), complex(-0.0, 2.0), complex(np.inf, 2.0),
+                 complex(-0.0, -np.inf)]
+"""Complex values whose parts a rewrite that is no identity changes: negative zeros and infinities."""
+
+
+def _computed_as_written(program, kept: bool) -> None:
+    """Recognition's normal form (`canonical`) of the complex `program(z)` computes the program's own
+    value at `COMPLEX_EDGES`, each part and its sign, and reads the program as `z` itself or, `kept`, as a
+    value of its own."""
+    from jax.core import eval_jaxpr
+
+    from dew.algebra.normal_form import canonical
+
+    z = jnp.asarray(COMPLEX_EDGES, jnp.complex64)
+    # The normal form's constants are literals of their values, so it holds none of its own.
+    form = canonical(jax.make_jaxpr(lambda z: (program(z), z))(z))
+    computed, written = np.asarray(eval_jaxpr(form, (), z)[0]), np.asarray(program(z))
+    for part in (np.real, np.imag):
+        np.testing.assert_array_equal(part(computed), part(written))
+        np.testing.assert_array_equal(np.signbit(part(computed)), np.signbit(part(written)))
+    assert (form.outvars[0] is not form.outvars[1]) == kept
+
+
+@pytest.mark.parametrize("zero", [0j, complex(-0.0, 0.0), complex(0.0, -0.0), complex(-0.0, -0.0)],
+                         ids=["positive", "negative real part", "negative imaginary part", "negative"])
+def test_a_complex_value_less_a_zero_is_read_as_the_program_computes_it(zero):
+    """A complex program `z - 0`: a zero positive in both parts is dropped and one negative in either is
+    kept, as a real one is, so the form computes the program's own value bit for bit at a `z` of negative
+    zeros, whose sign that part's subtraction decides; where the zero's sign was asked of the complex
+    constant whole, which NumPy has no answer for, and the normal form of a valid program raised."""
+    _computed_as_written(lambda z: z - jnp.asarray(zero, z.dtype),
+                         kept=bool(np.signbit(zero.real) or np.signbit(zero.imag)))
+
+
+@pytest.mark.parametrize("by_one", [jnp.multiply, jnp.divide], ids=["product", "quotient"])
+def test_a_complex_value_by_one_is_read_as_the_program_computes_it(by_one):
+    """A complex program `z * 1` or `z / 1` keeps its operation: a complex product and quotient mix
+    their operands' parts, so one changes a negative zero's sign and gives an infinity's other part a
+    NaN, where a real `x * 1` is `x`; the form that dropped it computed another value."""
+    _computed_as_written(lambda z: by_one(z, jnp.asarray(1, z.dtype)), kept=True)
+

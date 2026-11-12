@@ -397,18 +397,25 @@ def _scalar(value) -> np.ndarray:
 
 
 def _one(value) -> bool:
-    """Whether `value` is a constant (computed, `_evaluated`) of ones alone: `x / 1` and `x * 1` are `x` for
-    every `x`, its sign, infinities and NaNs among them."""
-    return not isinstance(value, jax_core.Tracer) and bool(np.all(np.asarray(value) == 1))
+    """Whether `value` is a real constant (computed, `_evaluated`) of ones alone: `x / 1` and `x * 1` are
+    `x` for every real `x`, its sign and infinities among them, and a NaN stays one. A complex one is none:
+    a complex product and quotient mix their operands' two parts, so `(-0 - 0j) * 1` is `0 - 0j` and
+    `(inf + 2j) * 1` has a NaN part."""
+    if isinstance(value, jax_core.Tracer):
+        return False
+    held = np.asarray(value)
+    return not np.iscomplexobj(held) and bool(np.all(held == 1))
 
 
 def _zero(value) -> bool:
     """Whether `value` is a constant (computed, `_evaluated`) of positive zeros alone: `x - 0` is `x` for
-    every `x`, where `x - (-0)` makes a negative zero positive."""
+    every `x` (a NaN stays one), where `x - (-0)` makes a negative zero positive; a complex zero in each of
+    its two parts, which a complex difference subtracts apart."""
     if isinstance(value, jax_core.Tracer):
         return False
     held = np.asarray(value)
-    return not np.any(held) and not np.any(np.signbit(held))
+    parts = (held.real, held.imag) if np.iscomplexobj(held) else (held,)
+    return not np.any(held) and not any(np.any(np.signbit(part)) for part in parts)
 
 
 def _laid(equation: jcore.JaxprEqn, value, laid: _Made):
