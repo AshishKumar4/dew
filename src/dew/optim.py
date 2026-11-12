@@ -295,6 +295,7 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
     devices (`orthogonalized`). Each parameter's matrix is its dimension numbers'
     (`muon_weight_dimension_numbers`), or each of its heads' where `per_head` names it (`head_widths`)."""
     coefficients = _coefficients(ns_coeffs, ns_steps)
+    static = np.asarray(coefficients)
     algorithm = dot_algorithm(ns_precision)
 
     def init_fn(params):
@@ -311,7 +312,9 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
                                   optax.tree.bias_correction(updates, beta, count))
         else:
             mu_hat = optax.tree.bias_correction(mu, beta, count)
-        orthogonal = orthogonalized(mu_hat, muon_weight_dimension_numbers(mu_hat), state.ns_coeffs, ns_steps,
+        # The coefficients the transform was built with, constants of its program (`newton_schulz`); its
+        # state holds them too, as optax's does.
+        orthogonal = orthogonalized(mu_hat, muon_weight_dimension_numbers(mu_hat), static, ns_steps,
                                     eps, preconditioning, algorithm, head_widths(mu_hat, per_head))
         if adaptive:
             # The orthogonal update scaled by the dual norm of the momentum's (arXiv 2409.20325), each

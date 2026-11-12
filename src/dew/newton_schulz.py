@@ -91,7 +91,7 @@ def as_matrices(x: jax.Array, numbers: optax.contrib.MuonDimensionNumbers
     return stack, lambda matrices: jnp.transpose(matrices.reshape(moved.shape), back)
 
 
-def orthogonalized(updates: optax.Updates, numbers, coeffs: jax.Array, steps: int, eps: float,
+def orthogonalized(updates: optax.Updates, numbers, coeffs, steps: int, eps: float,
                    preconditioning: Preconditioning = "frobenius",
                    algorithm: jax.lax.DotAlgorithmPreset | None = None, widths=None,
                    chunk_bytes: int | None = None) -> optax.Updates:
@@ -120,7 +120,7 @@ def orthogonalized(updates: optax.Updates, numbers, coeffs: jax.Array, steps: in
     return with_auto(spread)(updates)
 
 
-def _spread_orthogonalized(updates, *, numbers, coeffs: jax.Array, steps: int, eps: float,
+def _spread_orthogonalized(updates, *, numbers, coeffs, steps: int, eps: float,
                            algorithm: jax.lax.DotAlgorithmPreset | None, widths,
                            preconditioning: Preconditioning, chunk_bytes: int | None) -> optax.Updates:
     """`orthogonalized`'s iteration over a mesh of Auto axes: each stack laid out `[devices, share, rows,
@@ -205,7 +205,7 @@ def working_bytes(rows: int, columns: int, dtype: jnp.dtype) -> int:
     return (3 * rows * columns + 3 * side * side) * dtype.itemsize
 
 
-def newton_schulz(x: jax.Array, coeffs: jax.Array, steps: int, eps: float,
+def newton_schulz(x: jax.Array, coeffs, steps: int, eps: float,
                   preconditioning: Preconditioning = "frobenius") -> jax.Array:
     """optax's Newton-Schulz (`orthogonalize_via_newton_schulz`, optax 0.2.8) of each of `x`'s matrices, its
     last two axes, as they are stored: optax transposes a matrix taller than it is wide, iterates, and
@@ -213,7 +213,10 @@ def newton_schulz(x: jax.Array, coeffs: jax.Array, steps: int, eps: float,
     its Gram product taken on the shorter side, `X Xᴴ` or `Xᴴ X`, and the polynomial applied from that side,
     `B X` or `X B`: so the products contract the stored layout, and no matrix is transposed. Its
     preconditioning optax's: the Frobenius or spectral norm, or the AOL or Schatten-4 rescaling of the first
-    step; `coeffs` one triple, `steps` times, or a schedule of them."""
+    step; `coeffs` one triple, `steps` times, or a schedule of them, known when the step is traced: each
+    coefficient a constant of the program, rounded to the iteration's dtype as optax rounds it, which a
+    product's scaling and its added term fold into (`a X + B X` one product's epilogue; an array of them,
+    read at run time, left each scaling its own pass over the stack: row 5669's trace, 50 ms a step)."""
     rows, columns = x.shape[-2:]
     tall = rows > columns
     batch = tuple(range(x.ndim - 2))
@@ -231,20 +234,20 @@ def newton_schulz(x: jax.Array, coeffs: jax.Array, steps: int, eps: float,
         return product(matrices, polynomial, (last, last - 1)) if tall else product(
             polynomial, matrices, (last, last - 1))
 
-    def stepped(matrices: jax.Array, a: jax.Array, triple: jax.Array) -> jax.Array:
+    def stepped(matrices: jax.Array, a: jax.Array, triple: tuple[float, ...]) -> jax.Array:
         polynomial = triple[1] * a + triple[2] * product(a, a, (last, last - 1))
         return triple[0] * matrices + applied(polynomial, matrices)
 
-    def base(matrices: jax.Array, triple: jax.Array) -> jax.Array:
+    def base(matrices: jax.Array, triple: tuple[float, ...]) -> jax.Array:
         return stepped(matrices, gram(matrices), triple)
 
-    def aol(matrices: jax.Array, triple: jax.Array) -> jax.Array:
+    def aol(matrices: jax.Array, triple: tuple[float, ...]) -> jax.Array:
         a = gram(matrices)
         scale = jax.lax.rsqrt(jnp.clip(jnp.abs(a).sum(axis=-1), min=eps))
         side = scale[..., None, :] if tall else scale[..., :, None]
         return stepped(matrices * side, a * scale[..., :, None] * scale[..., None, :], triple)
 
-    def schatten(matrices: jax.Array, triple: jax.Array) -> jax.Array:
+    def schatten(matrices: jax.Array, triple: tuple[float, ...]) -> jax.Array:
         a = gram(matrices, conjugate=False)
         scale = jax.lax.rsqrt(jnp.clip(jnp.linalg.norm(a, axis=(-2, -1), keepdims=True), min=eps))
         return stepped(matrices * scale, a * scale ** 2, triple)
@@ -254,12 +257,13 @@ def newton_schulz(x: jax.Array, coeffs: jax.Array, steps: int, eps: float,
     elif preconditioning == "spectral":
         x = x / (jnp.linalg.norm(x, ord=2, axis=(-2, -1), keepdims=True) + eps)
     first = {"aol": aol, "schatten": schatten}.get(preconditioning, base)
-    triples = coeffs.astype(x.dtype)
-    if triples.ndim == 1:
-        triples = jnp.broadcast_to(triples, (steps, 3))
+    table = np.asarray(coeffs, np.float64)
+    rows = [table] * steps if table.ndim == 1 else list(table)
+    # Each as Python floats, weakly typed, so each rounds to the iteration's dtype as optax's cast does.
+    triples = [tuple(float(value) for value in row) for row in rows]
     x = first(x, triples[0])
-    for triple in range(1, triples.shape[0]):
-        x = base(x, triples[triple])
+    for triple in triples[1:]:
+        x = base(x, triple)
     return x
 
 
