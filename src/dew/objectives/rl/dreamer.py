@@ -42,7 +42,16 @@ from dew.inference.models import ReleasesModel
 from dew.nn.categorical import kl_divergence
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32, divided
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, traced_update_flops
+from dew.objectives.base import (
+    Aux,
+    EMASpec,
+    Objective,
+    Ratio,
+    Shown,
+    Step,
+    own_objective,
+    traced_update_flops,
+)
 from dew.objectives.rl.tssm import TSSM, Cache, Window
 from dew.rl.aggregation import LABEL, Teacher, labelled, paired
 from dew.rl.distributions import (
@@ -74,7 +83,6 @@ from dew.rl.env import (
 from dew.rl.evaluation import episodes
 from dew.rl.replay import ReplayBuffer, Steps
 from dew.rl.simulator import DrivenSimulator, Simulator, simulator_rollout, simulator_start
-from dew.training.rollout import own_objective
 
 if TYPE_CHECKING:
     from dew.state import TrainState
@@ -1066,7 +1074,7 @@ class DreamerRollout:
         return live
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array, *, objective: Objective) -> Batch:
-        own_objective(self, self.objective, objective)
+        own_objective(type(self).__name__, self.objective, objective)
         act_key, sample_key = jax.random.split(key)
         variables = state.variables
         updates = int(state.updates)

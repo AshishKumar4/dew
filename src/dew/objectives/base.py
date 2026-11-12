@@ -112,6 +112,17 @@ class Stepping(Protocol):
 """An objective's `init` with its held variables bound as `Partial` children,
 which a JIT takes as arguments (`Objective.initializer` says why)."""
 
+
+def own_objective(name: str, held: Hashable, objective: Hashable) -> None:
+    """Refuse a step's `objective` other than `held`, the one `name`'s rollout made its policy for: a
+    phase's pass count (`dew.training.phase_passes`) changes the policy, which a policy built or compiled
+    once does not follow. Compared by identity, so of any loss and effects."""
+    if objective is not held:
+        raise ValueError(f"{name} acts with the objective it was made for, and this step trains another (a "
+                         "phase's pass count, `phase_passes`); run it without phases that set the loop's "
+                         "passes")
+
+
 @struct.dataclass
 class Ratio:
     """A loss numerator and its denominator, kept apart until the loss is reduced.

@@ -83,16 +83,6 @@ class Rollout(Protocol):
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array, *, objective: Objective) -> Batch: ...
 
 
-def own_objective(rollout: object, held: object, objective: object) -> None:
-    """Refuse a step's `objective` (`Rollout`) other than `held`, the one `rollout` compiled its policy's
-    programs for: a phase's pass count changes the policy, which those programs do not. Compared by
-    identity, so of any loss and effects."""
-    if objective is not held:
-        raise ValueError(f"{type(rollout).__name__} acts with the objective it was made for, and this step "
-                         "trains another (a phase's pass count, `phase_passes`); run it without phases that "
-                         "set the loop's passes")
-
-
 def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
     """The rollout's report of its latest call. A rollout is any callable,
     and a plain function reports nothing, so the trainer reads `metrics` at this boundary."""

@@ -154,10 +154,9 @@ from dew.distributed.batches import first_reader_batch, shard_batch
 from dew.nn.inputs import local_rows, mesh_of
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import Progress
-from dew.objectives.base import Objective, Shown
+from dew.objectives.base import Objective, Shown, own_objective
 from dew.sampling.text import Sampling
 from dew.state import TrainState
-from dew.training.rollout import own_objective
 
 from ..lm import TokenScorer
 from .episodes import EnvironmentFactory, EpisodeCollector, EpisodeInference, EpisodeRecorder, Verifier
@@ -670,18 +669,17 @@ class RolloutScheduler:
         self._owned: tuple[Callable[[], None], ...] = ()
         """What it built itself and closes at its end (`served`'s source and server)."""
 
-    def drawn_from(self) -> object | None:
-        """The objective whose policy the acquisition draws from where that policy is its own, fixed when it
-        was built: an asynchronous source's server's (`Asynchronous.objective`), or the one an episode
-        collector's bound policy was made for (`scorer`, `EpisodeCollector.policy`). None where the
-        collection draws from each call's objective (a `PolicyCollector`) or from no policy at all (a
-        scripted collector). A call whose step trains another objective (a phase's pass count) is refused
-        (`own_objective`): its rows would train under a policy that did not draw them."""
+    def _own_policy[LossT, EffectsT](self, objective: Objective[LossT, EffectsT]) -> None:
+        """Refuse a step's `objective` other than the one the acquisition's policy was made for, where that
+        policy is its own, fixed when it was built: an asynchronous source's server's
+        (`Asynchronous.objective`), or an episode collector's bound one (`scorer`, which such a scheduler
+        names, `EpisodeCollector.policy`). A `PolicyCollector` draws from each call's objective, and a
+        scripted collector from none. Its rows would otherwise train under a policy that did not draw them
+        (`own_objective`)."""
         if isinstance(self.acquisition, Asynchronous):
-            return self.acquisition.objective
-        if isinstance(self.acquisition.collector, EpisodeCollector):
-            return self.scorer
-        return None
+            own_objective(type(self).__name__, self.acquisition.objective, objective)
+        elif isinstance(self.acquisition.collector, EpisodeCollector):
+            own_objective(type(self).__name__, self.scorer, objective)
 
     @property
     def draws_further(self) -> bool:
@@ -983,9 +981,7 @@ class RolloutScheduler:
         if self.draws_further and further is None:
             raise ValueError("generation_batches above 1 draws further batches through the trainer's read of "
                              "its stream (further=), and this call was handed none")
-        drawn = self.drawn_from()
-        if drawn is not None:
-            own_objective(self, drawn, objective)
+        self._own_policy(objective)
         grpo = objective if isinstance(objective, GRPOObjective) else None
         if (self.acquisition.rescores or self.penalized) and grpo is None:
             raise TypeError("the call rescores its rows or pays a reward-side penalty, a GRPO objective's, "
