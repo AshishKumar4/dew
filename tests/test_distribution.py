@@ -29,6 +29,8 @@ from process_support import raised
 from reference_error import as_given, assert_as_exact
 
 from dew.distributed.placement import parameter_axes
+from dew.parity import FEWEST_SEEDS
+from dew.parity_stages import staged_units
 from dew.training import MeshSpec
 
 # Needs the eight simulated CPU devices conftest configures, except the tests
@@ -41,6 +43,10 @@ WORKER = Path(__file__).with_name("distribution_worker.py")
 SCHEDULER = Path(__file__).with_name("scheduler_worker.py")
 # Three adam steps on another topology; observed 2.4e-7.
 TOLERANCE = 1e-5
+SEEDS = FEWEST_SEEDS
+"""The seeds check 1 judges a pool's values by (`launches_as_exact`)."""
+DRAWS = staged_units(SEEDS)
+"""The independent draws a launch computes for it (a worker's `--draws`): check 1's two stages'."""
 
 
 def launches_as_exact(label: str, dew, reference, truth, *, seeds: int) -> None:
