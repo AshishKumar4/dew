@@ -1069,6 +1069,12 @@ PROBES = "cotangent_probes"
 """The collection a step's cotangent probes ride in, laid out by the model calls that read them
 (`dew.nn.inspection.tapped`)."""
 
+PARTS = "__parts__"
+"""The key under which a step's observations and probes of a model applied in parts (a decision run's backbone
+and head, a PPO run's policy and critic) hold each part's tree by its name in the model's variables
+(`dew.nn.inspection.in_parts`): a key of those trees' own, as their summaries' (`dew.nn.inspection.SOWN`)
+and probes' (`PROBE`) are, which names no module."""
+
 
 def part(variables: Variables, name: str) -> Variables:
     """Cut the `name` subtree out of every collection that holds one: one
@@ -1084,14 +1090,17 @@ def part(variables: Variables, name: str) -> Variables:
 
 def probed(variables: Variables, name: str | None) -> Variables:
     """`variables` with a step's cotangent probes cut to those its objective nests under `name`, what one
-    of its model calls sows (`dew.nn.inspection.probes_of`), all of them where it nests none there; none
-    with `name` None, for a call whose cotangent the step does not summarize (a pass under no gradient)."""
+    of its model calls sows (`dew.nn.inspection.probes_of`), a part's of a model applied in parts
+    (`PARTS`), all of them where it nests none there; none with `name` None, for a call whose cotangent
+    the step does not summarize (a pass under no gradient)."""
     if PROBES not in variables:
         return variables
     rest = {collection: tree for collection, tree in variables.items() if collection != PROBES}
     if name is None:
         return rest
-    return {**rest, PROBES: variables[PROBES].get(name, variables[PROBES])}
+    # A model applied in parts holds each part's probes under its name (`PARTS`).
+    probes = variables[PROBES].get(PARTS, variables[PROBES])
+    return {**rest, PROBES: probes.get(name, probes)}
 
 
 def leaves_by_path(tree: Variables) -> dict[tuple[str, ...], jax.Array]:

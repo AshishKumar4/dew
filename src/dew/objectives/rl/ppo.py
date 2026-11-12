@@ -18,7 +18,7 @@ from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites, part_stage_sites
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
-from dew.nn.inspection import beside, component
+from dew.nn.inspection import component, in_parts
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import ForkedCalls, HiddenStates
@@ -308,7 +308,8 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
             if column not in batch or jnp.shape(batch[column]) != jnp.shape(batch[RESPONSE_MASK_KEY]):
                 raise ValueError(f"PPO requires response-aligned {column} from the rollout")
         policy_step = replace(step, ema=None if step.ema is None else part(step.ema, "policy"))
-        pg, aux = self.actor.loss(part(variables, "policy"), batch, policy_step)
+        with component("policy"):
+            pg, aux = self.actor.loss(part(variables, "policy"), batch, policy_step)
         raw_mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
         real = (self.row_weights(batch, raw_mask.shape[0]) > 0)[:, None]
         mask = jnp.where(real, raw_mask, 0)
@@ -323,10 +324,10 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         qk = None if aux.qk_stats is None else {"policy": aux.qk_stats}
         if critic_qk is not None:
             qk = {**(qk or {}), "critic": critic_qk}
-        # The critic's watched activations under its part of the variables (`critic`), beside the actor's
-        # own paths (`dew.nn.inspection.beside`).
-        inspected = aux.inspected if not critic_inspected else beside(aux.inspected or {}, "critic",
-                                                                       critic_inspected)
+        # The actor's and the critic's watched activations each under its part of the variables
+        # (`dew.nn.inspection.in_parts`), which the log names them by (`policy/...`, `critic/...`).
+        inspected = None if critic_inspected is None else in_parts({"policy": aux.inspected or {},
+                                                                    "critic": critic_inspected})
         return PPOStatistics(pg, critic), Aux(metrics, qk_stats=qk, effects=aux.effects, inspected=inspected)
 
     def reduce_loss(self, stats: PPOStatistics | Ratio) -> tuple[jax.Array, jax.Array]:

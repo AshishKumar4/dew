@@ -12,7 +12,7 @@ from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import HOWS
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
-from dew.nn.inspection import QK, beside, component, observed_maxima
+from dew.nn.inspection import INSPECTED, QK, component, in_parts, observed_maxima
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import EXITS, Looped, TokenModel, VocabularyRows
 from dew.nn.visibility import block_ends, block_starts
@@ -96,7 +96,8 @@ class DecisionModel(HeadedModel):
         stepped = progressed(self.backbone, progress)
 
         def applied(*args, **kwargs) -> tuple[jax.Array, Variables]:
-            out = self.backbone.apply(backbone, *args, mutable=list(opened) or False, **kwargs)
+            with component("backbone"):
+                out = self.backbone.apply(backbone, *args, mutable=list(opened) or False, **kwargs)
             return out if opened else (out, {})
         # The backbone's final states: its `hidden_states`, or a native encoder's own forward.
         states_method = self.states_method
@@ -262,14 +263,15 @@ def beside_head(sown: Variables, head: Variables, opened: Sequence[str]) -> Vari
     """What a row's backbone sowed (`sown`) with what its head sowed (`head`) beside it, in each collection
     the step `opened`: the attention logit maxima (`qk`) of each under its own parameters' name
     (`backbone`, `head`), so a QK-Clip finds every layer's maxima where it finds its weights (row 1608);
-    every other collection's, the watched activations (`inspected`) among them, the head's under `head`,
-    its part of the model's variables, beside the backbone's own paths (`dew.nn.inspection.beside`)."""
+    the watched activations (`inspected`) each under its part of the model's variables
+    (`dew.nn.inspection.in_parts`), which the log names them by (`backbone/...`, `head/...`); every other
+    collection the head sowed into, alike."""
     merged = dict(sown)
     for name in opened:
         if name == QK:
             merged[QK] = {"backbone": sown.get(QK, {}), "head": head.get(QK, {})}
-        elif head.get(name):
-            merged[name] = beside(sown.get(name, {}), "head", head[name])
+        elif name == INSPECTED or head.get(name):
+            merged[name] = in_parts({"backbone": sown.get(name, {}), "head": head.get(name, {})})
     return merged
 
 
