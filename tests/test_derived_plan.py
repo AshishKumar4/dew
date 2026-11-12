@@ -264,14 +264,14 @@ def test_a_miss_orders_the_compiles_and_rules_out_only_what_the_derivation_itsel
     assert not search.refused(1)
 
 
-def traced(trainer, batch=DEEP) -> tuple[int, int]:
-    """`trainer` compiled for `batch`, and how often its plan traced its step and made a candidate of it,
+def traced(trainer) -> tuple[int, int]:
+    """`trainer` compiled, and how often its plan traced its step and made a candidate of it,
     counted by the profiler: its step's traces (`_lowering.routed`, each one's dispatches' routes) and its
     candidates (`_candidates._candidate`), a derivation's and a lowering's alike."""
     from dew.training import _candidates, _lowering
 
     profiler = cProfile.Profile()
-    profiler.runcall(compiled, trainer, batch)
+    profiler.runcall(compiled, trainer)
     stats = pstats.Stats(profiler).stats.items()
     return (sum(calls for (file, _, name), (_, calls, *_) in stats
                 if name == "routed" and file == _lowering.__file__),
@@ -562,9 +562,10 @@ LOGITS = 32768 * 32768 * 4
 
 def test_a_step_whose_whole_logits_alone_leave_no_room_traces_its_tiled_step_alone(monkeypatch, tmp_path):
     """With room for the step at its head's tile and not for its whole fp32 logits beside what it holds, the
-    derivation refuses the whole logits untraced, read off the loss's forward (row 5556: on Qwen3.5-4B the
-    state and its logits are 100 GB of an 80 GB device), and the plan traces the tiled step once, the one
-    it compiles once."""
+    derivation refuses the whole logits by their floor, read off the loss's forward before any gradient is
+    traced (row 5556: on Qwen3.5-4B the state and its logits are 100 GB of an 80 GB device), its terms a
+    bound and no trace's, and judges the tiled step by its traced footprint, the one it compiles once, at
+    the rung a run that states the tiled head takes."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
     tiled = wide("tiled")
     room = needs(monkeypatch, tiled, lambda: compiled(tiled, WIDE))
@@ -573,9 +574,15 @@ def test_a_step_whose_whole_logits_alone_leave_no_room_traces_its_tiled_step_alo
     free(monkeypatch, room)
     trainer = wide()
     with Compiles("step") as compiles:
-        steps, _ = traced(trainer, WIDE)
-    assert [entry["label"] for entry in trainer.plan["derived"]] == ["refuses by its whole logits", "fits"]
-    assert (steps, compiles.count) == (1, 1) and trainer.plan["probes"][-1]["fits"]
+        compiled(trainer, WIDE)
+    floor, judged = trainer.plan["derived"]
+    assert (floor["label"], judged["label"]) == ("refuses by its whole logits", "fits")
+    assert not floor["terms"]["peak_exact"] and floor["terms"]["residuals"] is None
+    assert judged["terms"]["residuals"] is not None
+    assert compiles.count == 1 and trainer.plan["probes"][-1]["fits"]
+    head = ("head_tile", "head_fused")
+    assert [trainer.plan[name] for name in head] == [tiled.plan[name] for name in head]
+    assert trainer.plan["head_tile"] is not None
 
 
 def test_a_whole_logits_trace_bounds_its_tiled_steps_peak(monkeypatch, tmp_path):

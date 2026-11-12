@@ -221,25 +221,6 @@ def climb_to[LossT, EffectsT](objective: Objective[LossT, EffectsT], rung: Mappi
         objective.substitute(modules)
 
 
-def head_table_shape[LossT, EffectsT](objective: Objective[LossT, EffectsT], variables: Variables
-                                      ) -> tuple[int, int] | None:
-    """The rows and features of the vocabulary table a head that keeps its whole logits scores, as the
-    objective's model declares it (`dew.nn.protocols.head_table`, over `variables`' shapes): None for an
-    objective with no such head (`dew.objectives.lm.head.HeadedObjective`), one whose head is tiled already,
-    or a model whose head no matrix alone is."""
-    from dew.nn.protocols import AffineHead, head_table
-    from dew.objectives.lm.head import HeadedObjective
-
-    if (not isinstance(objective, HeadedObjective) or head_tile_of(objective) is not None
-            or not isinstance(objective.model, AffineHead)):
-        return None
-    table = jax.eval_shape(lambda tree: head_table(objective.model, tree), variables)
-    if table is None:
-        return None
-    rows, features = table.matrix.shape if table.vocab_major else table.matrix.shape[::-1]
-    return int(rows), int(features)
-
-
 def head_tile_of[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> tuple[int, int] | None:
     """The tile the vocabulary head the objective trains computes its
     backward in (`ProgramModule.head_tile`), or None for a head that keeps

@@ -35,7 +35,7 @@ from dew.training._lowering import KernelReport, Routed, kernel_report, routed
 from dew.training.diloco import group_of, windowed
 from dew.training.distributed import microbatch, microbatch_shapes
 from dew.training.footprint import Footprint, candidate_footprint, logits_floor
-from dew.training.memory import derived_headroom, local_devices
+from dew.training.memory import derived_headroom, local_devices, pooled_headroom
 from dew.training.model_flops import batch_consumed, batch_tokens
 from dew.training.narrow import narrow_copies, narrowed
 from dew.training.planning import Candidate, splits
@@ -313,11 +313,13 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
         if staging_measured and not lowering:
             traced()
     window = split * settings.accumulation
-    floor = (None if not floored or lowering or not derived or footprint is not None or loss is None
-             or mesh is not None else logits_floor(settings.objective, loss.jaxpr, prepared, held))
-    short = None if floor is None else derived_headroom(floor, local_devices(settings.device_mesh), capacity,
-                                                        built)
-    if short is not None and short < 0:
+    # Every process reads the floor, and the pool's judgment of it, so all trace alike (`pooled_headroom`).
+    flooring = (floored and not lowering and derived and footprint is None and loss is not None
+                and mesh is None)
+    floor = logits_floor(settings.objective, loss.jaxpr, prepared, held, micro) if flooring else None
+    short = pooled_headroom(None if floor is None else derived_headroom(
+        floor, local_devices(settings.device_mesh), capacity, built)) if flooring else None
+    if floor is not None and short is not None and short < 0:
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, None, launches or "[]",
                          KernelReport((), ()), floor, floored=True)
     if derived and footprint is None and shapes is not None and mesh is None:

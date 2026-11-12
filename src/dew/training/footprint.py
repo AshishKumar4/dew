@@ -48,7 +48,7 @@ from dew.training.compiled_program import (
     lowering_platform,
     simplified,
 )
-from dew.training.memory import head_fused_of, head_table_shape, head_tile_of, judged
+from dew.training.memory import head_fused_of, head_tile_of, judged
 from dew.training.narrow import forward_variables
 from dew.training.transaction import attempt_step
 
@@ -1065,22 +1065,34 @@ def resident_bytes(prepared: TrainState) -> dict[str, int]:
         "accumulation": prepared.accumulation, "compute": prepared.compute, "groups": prepared.inner}.items()}
 
 
+def row_shards(micro: Batch) -> int | None:
+    """How many devices of the abstract mesh split `micro`'s rows, where they split nothing else (data and
+    fully sharded data parallelism, `row_axes`; an expert axis splits the experts too): a device's share of
+    any value of the rows is that many times smaller. None where the layout splits more than the rows
+    (stages, tensor, sequence), whose shares the partitioner chooses."""
+    mesh = jax.sharding.get_abstract_mesh()
+    spread = set() if mesh.empty else {name for name, size in mesh.shape.items() if size > 1}
+    rows = set(row_axes(rows_of(micro), mesh=mesh)) & {DATA_AXIS, FSDP_AXIS} if spread else set()
+    return math.prod(mesh.shape[name] for name in rows) if spread <= rows else None
+
+
 def logits_floor[LossT, EffectsT](objective: Objective[LossT, EffectsT], forward: jcore.Jaxpr,
-                                  prepared: TrainState, held: int) -> Footprint | None:
+                                  prepared: TrainState, held: int, micro: Batch) -> Footprint | None:
     """The least a step whose head keeps its whole logits holds beside its state, read off its loss's
     `forward` program before its gradient is traced: those logits in fp32, as the head keeps them for
     the backward pass (`HeadedObjective.keeps_whole_logits`), a row of the head's table for each token of
-    the states it contracts the table with (`contracted_tokens`), with `held` beside them; a footprint
+    the states it contracts the table with (`contracted_tokens`), a device's share of them over the
+    devices that split `micro`'s rows (`row_shards`), with `held` beside them; a footprint
     whose headroom is an upper bound (`exact` False), so a step it leaves no room refuses on it untraced
-    (`Candidate.floored`). None for a head that keeps no whole logits, or a forward whose head reads no
-    states (row 5556: Qwen3.5-4B's 4 x 12288 tokens hold 48.8 GB of them, where its state holds 51.9 GB of
-    an 80 GB device)."""
-    table = head_table_shape(objective, prepared.variables)
-    tokens = None if table is None else contracted_tokens(forward, table)
-    if not tokens:
+    (`Candidate.floored`). None for a head that keeps no whole logits, a forward whose head reads no
+    states, or a layout that splits more than the rows (row 5556: Qwen3.5-4B's 4 x 12288 tokens hold
+    48.8 GB of them, where its state holds 51.9 GB of an 80 GB device)."""
+    table, shards = objective.whole_head_table(prepared.variables), row_shards(micro)
+    tokens = None if table is None or shards is None else contracted_tokens(forward, table)
+    if not tokens or shards is None:
         return None
     return Footprint(None, device_bytes(prepared.variables["params"]), held, resident_bytes(prepared),
-                     tokens * table[0] * np.dtype(np.float32).itemsize, exact=False)
+                     math.ceil(tokens / shards) * table[0] * np.dtype(np.float32).itemsize, exact=False)
 
 
 def contracted_tokens(program: jcore.Jaxpr, table: tuple[int, int]) -> int:
@@ -1141,10 +1153,7 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     device whose memory nothing judges at `capacity` (`judged`: a CPU, a compile-only GPU no capacity is
     given), whose walk reads no rung ('unstated', `FitSearch.walked`)."""
     mesh = jax.sharding.get_abstract_mesh()
-    spread = set() if mesh.empty else {name for name, size in mesh.shape.items() if size > 1}
-    # Data and fully sharded data parallelism split the rows alone; an expert axis splits the experts too.
-    rows = set(row_axes(rows_of(micro), mesh=mesh)) & {DATA_AXIS, FSDP_AXIS} if spread else set()
-    if not spread <= rows or not judged(target, capacity):
+    if row_shards(micro) is None or not judged(target, capacity):
         residuals = peak = reads = head = None
     else:
         loss, (variables, *rest) = traced_loss(objective, prepared, window, split)
@@ -1174,6 +1183,6 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
             residuals, peak, head = derived_terms(
                 trained, arguments[0]["params"], arguments, platform=target.platform,
                 workspace=gemm_workspace(target), lowering=lowering, consumed=reads, deferred=late,
-                table=head_table_shape(objective, variables))
+                table=objective.whole_head_table(variables))
     return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident_bytes(prepared),
                      None if peak is None else peak.bytes, peak is None or peak.exact, staged, reads, head)

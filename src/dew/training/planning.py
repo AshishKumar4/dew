@@ -41,6 +41,7 @@ from dew.nn.kernels.options import compiler_options, program, program_digest
 from dew.nn.kernels.templates import report
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
+from dew.telemetry.compiles import EVENTS, Compiles
 from dew.telemetry.instrumentation import compiled_memory
 from dew.telemetry.profile import Profiler, active_profile
 from dew.training.ahead import handed
@@ -153,6 +154,10 @@ class Candidate:
     """Where the candidate was traced alone (its derivation's), its step lowered from the trace it made,
     at most one trace of the step whoever asks (`FitSearch.lowering`); None for a lowered candidate or one
     whose lowering measures configs (`tune_kernels`), which lowers afresh for each."""
+    spent: Mapping[str, float] = dataclasses.field(default_factory=dict)
+    """The seconds JAX recorded of its step's work so far, by kind (`dew.telemetry.compiles.EVENTS`: traced,
+    lowered, compiled), its derivation's and its lowering's (`FitSearch.judged`, `lowering`), which its
+    probe adds its compile to (`Probe.spent`)."""
     floored: bool = False
     """Whether its footprint is its whole logits' floor alone (`dew.training._candidates.logits_floor`),
     which leaves no device room, so its gradient was never traced: the walk climbs past it untraced."""
@@ -329,6 +334,9 @@ class Probe:
     """Whether the executable is the step compiled ahead (`FitSearch.ahead`), not the search's own."""
     compile_seconds: float = 0.0
     """Time spent compiling or loading this program, apart from its shape trace and lowering."""
+    spent: Mapping[str, float] = dataclasses.field(default_factory=dict)
+    """The seconds JAX recorded of the candidate's work, its traces, lowerings and backend compile by kind
+    (`Candidate.spent` and its compile's), which the compiled-step record and the perf gate read."""
     derived_headroom: int | None = None
     """The headroom the derivation judged the candidate would leave (`derived_headroom`), None where it
     judged none: beside `headroom`, which the compile measured, its error."""
@@ -346,7 +354,8 @@ class Probe:
         return {"split": self.split, "rows": self.rows, **self.rung, "fits": self.fits,
                 "headroom": self.headroom, "temp": self.temp, "argument": self.argument,
                 "derived": None if self.derived is None else self.derived.record(), "ahead": self.ahead,
-                "compile_seconds": self.compile_seconds, "derived_headroom": self.derived_headroom}
+                "compile_seconds": self.compile_seconds, "derived_headroom": self.derived_headroom,
+                "spent": dict(self.spent)}
 
     def named(self) -> str:
         tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
@@ -616,6 +625,23 @@ class Lower(Protocol):
 
     def __call__(self, split: int, narrow: bool, footprint: Footprint | None = None, *, derived: bool = True,
                  lowering: bool = True) -> Candidate: ...
+
+
+class _Spent(Compiles):
+    """Every program JAX traces, lowers or compiles while it is open, each kind of its events held."""
+
+    COUNTED = frozenset(EVENTS.values())
+
+
+@contextlib.contextmanager
+def spending(candidate: Candidate | None = None) -> Iterator[dict[str, float]]:
+    """The seconds JAX records of the work within the block, by kind (`EVENTS`: traced, lowered, compiled),
+    added to `candidate`'s (`Candidate.spent`), in the dict it yields once the block ends."""
+    held = dict({} if candidate is None else candidate.spent)
+    with _Spent(None) as compiles:
+        yield held
+    for made in compiles.programs:
+        held[made.kind] = held.get(made.kind, 0.0) + made.seconds
 
 
 class _Traced(NamedTuple):
@@ -935,7 +961,9 @@ class FitSearch[LossT, EffectsT]:
         key = self.candidate_key(split, narrow)
         if key not in self.judged_at:
             assert self.derive is not None
-            candidate = self.derive(split, narrow)
+            with spending() as spent:
+                candidate = self.derive(split, narrow)
+            candidate = dataclasses.replace(candidate, spent=spent)
             self.derivations[key] = candidate
             footprint = candidate.footprint
             headroom = pooled_headroom(None if footprint is None else derived_headroom(
@@ -961,10 +989,12 @@ class FitSearch[LossT, EffectsT]:
         key = self.candidate_key(split, self.narrow)
         derived = self.derivations.pop(key, None)
         if derived is not None and derived.lowers is not None:
-            program, kernels = derived.lowers()
-            return dataclasses.replace(derived, program=program, kernels=kernels, lowers=None)
-        return self.lower(split, self.narrow, self.footprints.get(key),
-                          derived=self.ahead is None)
+            with spending(derived) as spent:
+                program, kernels = derived.lowers()
+            return dataclasses.replace(derived, program=program, kernels=kernels, lowers=None, spent=spent)
+        with spending() as spent:
+            lowered = self.lower(split, self.narrow, self.footprints.get(key), derived=self.ahead is None)
+        return dataclasses.replace(lowered, spent=spent)
 
     def relowering(self, split: int) -> Candidate:
         """The step at `split` lowered afresh past a kernel that spilled (`Relowered`), with no footprint:
@@ -1132,58 +1162,61 @@ class FitSearch[LossT, EffectsT]:
         measure."""
         options = self.compiled_options(candidate)
         taken, ahead = self.ahead is not None, self.ahead
-        began = time.perf_counter()
-        early, firsts, relowered = None, [], None
-        if ahead is not None:
-            executable, self.ahead = ahead.taken(candidate.lowered), None
-        else:
-            # A run that inspects compiles its sampled step beside the step, at once (`report.attempts`),
-            # its compile kept only where the step fits, as the step's own is kept first.
-            early = None if candidate.sampled is None else candidate.sampled()
-            firsts = report.attempts([(candidate.lowered, options)]
-                                     + ([] if early is None else [(early, options)]))
-            relowered = Relowered(lambda: self.relowering(split))
-            executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered,
-                                             first=firsts[0])
-            candidate = relowered.candidate(candidate)
-            if relowered.last is not None:
-                # A spill's refusal changes the configs every derivation traced: each is traced again, the
-                # kept step's here, and none is lowered from its derivation's trace.
-                self.footprints.clear()
-                self.derivations.clear()
-                candidate = self.footprinted(split, candidate)
-        fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
-        self.sampled = None
-        if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
-            # The sampled step compiled ahead with the step, lowered as its compile lowered it (`handed`),
-            # which its target compiles none of.
-            with handed(ahead):
-                sampled = candidate.sampled()
-            self.sampled = SampledStep(ahead.sampled.program, ahead.sampled.taken(sampled, jax.devices()))
-        elif fit and candidate.sampled is not None:
-            # The one compiled beside the step's, but where the step was lowered afresh past a spill, which
-            # its sampled step is then too, as one lowered after the step's compile would be.
-            beside = early if relowered is not None and relowered.last is None else None
-            lowered = [candidate.sampled() if beside is None else beside]
+        with spending(candidate) as spent:
+            began = time.perf_counter()
+            early, firsts, relowered = None, [], None
+            if ahead is not None:
+                executable, self.ahead = ahead.taken(candidate.lowered), None
+            else:
+                # A run that inspects compiles its sampled step beside the step, at once (`report.attempts`),
+                # its compile kept only where the step fits, as the step's own is kept first.
+                early = None if candidate.sampled is None else candidate.sampled()
+                firsts = report.attempts([(candidate.lowered, options)]
+                                         + ([] if early is None else [(early, options)]))
+                relowered = Relowered(lambda: self.relowering(split))
+                executable = compiled_if_it_fits(candidate.lowered, options, self.refusals, relower=relowered,
+                                                 first=firsts[0])
+                candidate = relowered.candidate(candidate)
+                if relowered.last is not None:
+                    # A spill's refusal changes the configs every derivation traced: each is traced again, the
+                    # kept step's here, and none is lowered from its derivation's trace.
+                    self.footprints.clear()
+                    self.derivations.clear()
+                    candidate = self.footprinted(split, candidate)
+            fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
+            self.sampled = None
+            if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
+                # The sampled step compiled ahead with the step, lowered as its compile lowered it (`handed`),
+                # which its target compiles none of.
+                with handed(ahead):
+                    sampled = candidate.sampled()
+                self.sampled = SampledStep(ahead.sampled.program, ahead.sampled.taken(sampled, jax.devices()))
+            elif fit and candidate.sampled is not None:
+                # The one compiled beside the step's, but where the step was lowered afresh past a spill,
+                # which its sampled step is then too, as one lowered after the step's compile would be.
+                beside = early if relowered is not None and relowered.last is None else None
+                lowered = [candidate.sampled() if beside is None else beside]
 
-            def resampled() -> jax.stages.Lowered:
-                """The sampled step lowered afresh, its launches derived past a spilled one's config."""
-                again = self.relowering(split).sampled
-                assert again is not None
-                lowered.append(again())
-                return lowered[-1]
-            compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled,
-                                           first=None if beside is None else firsts[1])
-            if len(lowered) > 1:
-                self.footprints.clear()
-                self.derivations.clear()
-            self.sampled = None if compiled is None else SampledStep(program_digest(lowered[-1]), compiled)
-            fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
+                def resampled() -> jax.stages.Lowered:
+                    """The sampled step lowered afresh, its launches derived past a spilled one's config."""
+                    again = self.relowering(split).sampled
+                    assert again is not None
+                    lowered.append(again())
+                    return lowered[-1]
+                compiled = compiled_if_it_fits(lowered[0], options, self.refusals, relower=resampled,
+                                               first=None if beside is None else firsts[1])
+                if len(lowered) > 1:
+                    self.footprints.clear()
+                    self.derivations.clear()
+                self.sampled = (None if compiled is None
+                                else SampledStep(program_digest(lowered[-1]), compiled))
+                fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
         foreseen = pooled_headroom(None if candidate.footprint is None else derived_headroom(
             candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built))
-        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen)
+        probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen,
+                                    spent=spent)
         self.learned(foreseen, pooled_headroom(headroom), fit=fit,
                      temporaries=None if candidate.footprint is None else candidate.footprint.temporaries)
         if foreseen is not None and (foreseen >= 0) != fit:
