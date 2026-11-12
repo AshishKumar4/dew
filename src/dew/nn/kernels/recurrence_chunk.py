@@ -34,11 +34,14 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import PartitionSpec as P
 
+from dew.algebra import derive
+from dew.algebra.derive import FORMS_HELD
 from dew.algebra.scan import RESET_DECAY
 from dew.batch import document_firsts
 from dew.nn.attention_masks import repeat_kv_heads
 from dew.nn.derivatives import KernelGlue, Protected, contracted
 from dew.nn.inputs import cu_seqlens
+from dew.nn.nested import nested
 from dew.nn.precision import asks_default_precision, at_least_fp32, exact_products, l2norm, rounds_products
 from dew.nn.residuals import Residual
 from dew.nn.sharding import grouped_heads, manual_map, rows_like, varying_like
@@ -502,8 +505,6 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
     it stores at documents' last chunks (`_walk`), the final memory the row's last. `bound`,
     the layer's write gate's largest where its keys are of unit norm (`recurrence.Hooks.inverse_bound`), is
     the declaration's range facts (`scan.Scan.ranges`)."""
-    from dew.algebra import SATURATION, scan
-
     dtype, work, query, key = _grouped(query, key, value, dtype)
     rows, length, heads, columns = value.shape
     aligned = None
@@ -512,30 +513,11 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
         query, key, value, g, beta = aligned.laid(query, key, value, g, beta)
         starts = None
     width = key.shape[-1]
-    per_key = g.ndim == 4
-
-    def update(h, q, k, v, g, beta):
-        del q
-        decayed = jnp.exp(g).reshape(-1, 1) * h
-        written = v - k @ decayed if delta else v
-        return decayed + beta * k[:, None] * written[None, :]
-
-    def readout(h, q, k, v, g, beta):
-        del k, v, g, beta
-        return scale * (q @ h)
-
-    axes = {"q": ("time", "key"), "k": ("time", "key"), "v": ("time", "value"),
-            "g": ("time", "key") if per_key else ("time",), "beta": ("time",)}
-    reset = None if starts is None else RESET
-    declared = axes if reset is None else {**axes, reset: ("time",)}
-    # A log decay at most 0 (its decay at most 1); with a bound, keys of unit norm and gates at most it, so
-    # two tokens' corrections overlap by at most it (Cauchy-Schwarz).
-    ranges = {"g": (-math.inf, 0.0), **({} if bound is None else {"k": 1.0, "beta": bound, "overlap": bound})}
-    forms = scan.derive_scan(scan.Scan(update, readout, declared, walked="time",
-                                       state=((width, columns), work), reset=reset, ranges=ranges),
-                             saturation=SATURATION)
+    declared = (_delta_forms, (("delta", delta), ("scale", scale), ("per_key", g.ndim == 4),
+                                ("width", width), ("columns", columns), ("work", jnp.dtype(work)),
+                                ("reset", starts is not None), ("bound", bound)))
     held = 0 if forked is None else forked.held
-    given = dict(zip(axes, (query, key, value, g, beta), strict=True))
+    given = dict(zip(("q", "k", "v", "g", "beta"), (query, key, value, g, beta), strict=True))
     operands = _chunked(given, starts, config.chunk, work)
     # The memory entering, and each carry below, typed as every operand varies (a checked `shard_map`'s
     # manual axes; an explicit axis's rows, as the portable math's): a step's outputs vary wherever its inputs
@@ -553,15 +535,70 @@ def xla_mainloop(config: Tiles, query, key, value, g, beta, state=None, starts=N
         walked = (varying_like(jnp.moveaxis(state.astype(work), 1, 2), *varying), headed(aligned.loads),
                   headed(aligned.stores),
                   *(() if entries is None else (varying_like(jnp.moveaxis(entries, 2, 1), *varying),)))
-        outputs, final = _walk(forms, width, recomputed_memory(), held)(operands, walked)
+        outputs, final = _walk_once(*declared, width=width, recomputed=recomputed_memory(), held=held,
+                                    context=derive.context())(operands, walked)
         out = jnp.moveaxis(outputs.reshape(*outputs.shape[:2], -1, columns), 1, 2)
         return aligned.unlaid(out).astype(dtype), final
     entering = varying_like(rows_like(jnp.zeros((rows, heads, width, columns), work), value) if state is None
                             else state.astype(work), *varying)
 
-    outputs, final = _walk(forms, width, recomputed_memory())(operands, entering)
+    outputs, final = _walk_once(*declared, width=width, recomputed=recomputed_memory(), held=0,
+                                context=derive.context())(operands, entering)
     out = outputs.reshape(*outputs.shape[:2], -1, columns)
     return jnp.moveaxis(out[:, :, :length], 1, 2).astype(dtype), final
+
+
+@functools.lru_cache(maxsize=FORMS_HELD)
+def _delta_forms(*, delta: bool, scale: float, per_key: bool, width: int, columns: int, work: jnp.dtype,
+                 reset: bool, bound: float | None):
+    """The delta rule's (or a plain linear recurrence's, without `delta`) chunk forms (`scan.derive_scan`) for
+    these facts, every one its declaration reads: the update `h = D h - beta k (k^T D h) + beta k v^T` (`D h
+    + beta k v^T` without the delta rule) of a `[width, columns]` state in `work`, `D = exp(g)` a head's or
+    each key's (`per_key`), read `scale q^T h`, packed documents' resets where `reset`, and the range facts
+    `bound` proves. Derived once for equal facts, the latest `FORMS_HELD` kept: built from a call's fresh
+    closures, every layer's call derived its own forms, their decomposition and carry splits (`derive_scan`'s
+    caches a declaration's) again, 0.25 s a split (a 4B decoder's plan, row 5556)."""
+    from dew.algebra import SATURATION, scan
+
+    def update(h, q, k, v, g, beta):
+        del q
+        decayed = jnp.exp(g).reshape(-1, 1) * h
+        written = v - k @ decayed if delta else v
+        return decayed + beta * k[:, None] * written[None, :]
+
+    def readout(h, q, k, v, g, beta):
+        del k, v, g, beta
+        return scale * (q @ h)
+
+    axes = {"q": ("time", "key"), "k": ("time", "key"), "v": ("time", "value"),
+            "g": ("time", "key") if per_key else ("time",), "beta": ("time",)}
+    declared = {**axes, RESET: ("time",)} if reset else axes
+    # A log decay at most 0 (its decay at most 1); with a bound, keys of unit norm and gates at most it, so
+    # two tokens' corrections overlap by at most it (Cauchy-Schwarz).
+    ranges = {"g": (-math.inf, 0.0), **({} if bound is None else {"k": 1.0, "beta": bound, "overlap": bound})}
+    declaration = scan.Scan(update, readout, declared, walked="time", state=((width, columns), work),
+                            reset=RESET if reset else None, ranges=ranges)
+    return scan.derive_scan(declaration, saturation=SATURATION)
+
+
+@functools.lru_cache(maxsize=FORMS_HELD)
+def _walk_once(declare: Callable, facts: tuple, *, width: int, recomputed: bool, held: int, context: tuple):
+    """The walk (`_walk`) by the forms `declare(**dict(facts))` derives (`_delta_forms`, `_oja_forms`) as one
+    nested program (`dew.nn.nested`), traced once for equal shapes within a trace (`jax.jit`'s cache, keyed
+    on the function and its operands' types) and compiled by the enclosing program, the latest `FORMS_HELD`
+    kept. Keyed on every fact the walk reads:
+    its declaration's, `width`, `recomputed` and `held` (`_walk`'s), and `context`, what the forms'
+    derivation reads (`derive.context`: the mesh, target, numerics, precision and checks a split is priced
+    and traced under), which the walk reads no other way: JAX's trace cache keys on none of Dew's, and the
+    split one context derives is no other's. Traced at every call, each layer's walk took 0.65 s of a trace
+    again (jsf-gdn-layers: 8 equal layers' training step 5.2 s, 1 layer's 0.63 s)."""
+    del context
+    walked = _walk(declare(**dict(facts)), width, recomputed, held)
+
+    def recurrence_walk(operands, h):
+        return walked(operands, h)
+
+    return nested(recurrence_walk)
 
 
 def table_read(given, table, slot):
@@ -596,12 +633,30 @@ def chunk_gated_oja_rule(query, key, value, gv, beta, state=None, starts=None, *
     dimension `gv`, read along its values (`scan.Scan`'s readout `h^T (scale q)`): the chunk forms the token
     update derives (`dew.algebra.scan`, `linear_scan.Parts.values_read`), walked as the delta rule's portable
     math walks them (`_walk`), their derivative the token update replayed a chunk at a time."""
-    from dew.algebra import SATURATION, scan
-
     dtype, work, query, key = _grouped(query, key, value, dtype)
     rows, length, heads, columns = value.shape
     width = key.shape[-1]
     scale = width ** -0.5 if scale is None else scale
+
+    declared = (_oja_forms, (("scale", scale), ("width", width), ("columns", columns),
+                              ("work", jnp.dtype(work)), ("reset", starts is not None)))
+    given = dict(zip(("q", "k", "v", "g", "beta"), (query, key, value, gv, beta), strict=True))
+    operands = _chunked(given, starts, chunk_size, work)
+    varying = (query, key, value, gv, beta, starts)
+    entering = varying_like(rows_like(jnp.zeros((rows, heads, columns, width), work), value) if state is None
+                            else jnp.swapaxes(state.astype(work), -1, -2), *varying)
+    outputs, final = _walk_once(*declared, width=columns, recomputed=recomputed_memory(), held=0,
+                                context=derive.context())(operands, entering)
+    out = outputs.reshape(*outputs.shape[:2], -1, columns)
+    return jnp.moveaxis(out[:, :, :length], 1, 2).astype(dtype), jnp.swapaxes(final, -1, -2)
+
+
+@functools.lru_cache(maxsize=FORMS_HELD)
+def _oja_forms(*, scale: float, width: int, columns: int, work: jnp.dtype, reset: bool):
+    """Oja's rule's chunk forms (`chunk_gated_oja_rule`'s, on the transposed memory `[columns, width]` in
+    `work`, read `h^T (scale q)`, packed documents' resets where `reset`) for these facts, every one its
+    declaration reads, derived once (`_delta_forms`')."""
+    from dew.algebra import SATURATION, scan
 
     def update(h, q, k, v, g, beta):
         del q
@@ -614,19 +669,10 @@ def chunk_gated_oja_rule(query, key, value, gv, beta, state=None, starts=None, *
 
     axes = {"q": ("time", "value"), "k": ("time", "value"), "v": ("time", "key"), "g": ("time", "key"),
             "beta": ("time",)}
-    reset = None if starts is None else RESET
-    declared = axes if reset is None else {**axes, reset: ("time",)}
+    declared = {**axes, RESET: ("time",)} if reset else axes
     declaration = scan.Scan(update, readout, declared, walked="time", state=((columns, width), work),
-                            reset=reset, ranges={"g": (-math.inf, 0.0)})
-    forms = scan.derive_scan(declaration, saturation=SATURATION)
-    given = dict(zip(axes, (query, key, value, gv, beta), strict=True))
-    operands = _chunked(given, starts, chunk_size, work)
-    varying = (query, key, value, gv, beta, starts)
-    entering = varying_like(rows_like(jnp.zeros((rows, heads, columns, width), work), value) if state is None
-                            else jnp.swapaxes(state.astype(work), -1, -2), *varying)
-    outputs, final = _walk(forms, columns, recomputed_memory())(operands, entering)
-    out = outputs.reshape(*outputs.shape[:2], -1, columns)
-    return jnp.moveaxis(out[:, :, :length], 1, 2).astype(dtype), jnp.swapaxes(final, -1, -2)
+                            reset=RESET if reset else None, ranges={"g": (-math.inf, 0.0)})
+    return scan.derive_scan(declaration, saturation=SATURATION)
 
 
 def recurrent_gated_oja_rule(query, key, value, gv, beta, state=None, *, starts=None,

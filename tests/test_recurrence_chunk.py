@@ -3,6 +3,7 @@ every hook combination it takes, a sequence over several chunks and a ragged las
 too, held to the same recurrence run a token at a time (the decode step's reference,
 `recurrence.step_reference`) under the accuracy gate (tests/reference_error.py), both from float64."""
 
+import collections
 import contextlib
 import dataclasses
 import functools
@@ -13,6 +14,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import tiny_models
+from flax import linen as nn
 from jax.sharding import Mesh, PartitionSpec as P
 from port_support import row_names_port
 from reference_error import (
@@ -22,6 +25,7 @@ from reference_error import (
     assert_rounds_where_the_reference_does,
     chain_roundings,
     dot_precisions,
+    equations,
     widened,
     with_gradients,
 )
@@ -393,6 +397,26 @@ def test_the_portable_maths_products_state_ieee_float32_as_a_gpu_runs_them(hooks
     narrowed = {(str(stated), shapes) for stated, dtype, shapes in precisions
                 if dtype == jnp.float32 and stated != highest}
     assert precisions and not narrowed, narrowed
+
+
+def test_a_decoder_of_equal_gated_delta_net_layers_traces_the_portable_walk_once():
+    """A Qwen3.5 toy decoder (tests/architecture_cases.py's, three equal gated delta net layers) traced for
+    its training step on the portable math: each layer's walk the one trace (`_walk_once`: the forms its
+    facts derive once, the walk one jitted function), where every layer derived its forms and traced its walk
+    again, 0.65 s a layer (a 4B decoder's plan spent 70 s of its trace there, row 5556)."""
+    model = tiny_models.build_model("causal_transformer+qwen35", dtype="float32")
+    tokens = jnp.arange(2 * 16, dtype=jnp.int32).reshape(2, 16) % 16
+    params = nn.unbox(model.init(jax.random.key(0), tokens))["params"]
+
+    def loss(params):
+        return jnp.sum(model.apply({"params": params}, tokens).astype(jnp.float32))
+
+    with generation.chosen(gated_delta_rule='xla'):
+        graph = jax.make_jaxpr(jax.grad(loss))(params)
+    # Each of the walk's traces (the step's forward, and the one its linearization takes) the three layers'.
+    layers = collections.Counter(id(equation.params["jaxpr"]) for equation in equations(graph)
+                                 if equation.params.get("name") == "recurrence_walk")
+    assert layers and set(layers.values()) == {3}, layers
 
 
 def test_fla_refuses_a_forked_call_named_or_handed_to_it():
