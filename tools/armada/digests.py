@@ -220,8 +220,10 @@ def looked_up(looked: Path) -> bytes:
     directory = looked.parent
     if not directory.is_dir():
         return b"missing"
-    found = sorted(entry.name for entry in directory.iterdir() if not built(entry) and (
-        entry.name == looked.name or entry.name.startswith(f"{looked.name}.")))
+    # The name first: whether an entry is a build's output walks into a directory, and a search's directory
+    # holds hundreds of other names (2026-11-12: 47 million entries examined for a task's 156,000 lookups).
+    found = sorted(entry.name for entry in directory.iterdir() if (
+        entry.name == looked.name or entry.name.startswith(f"{looked.name}.")) and not built(entry))
     if looked.is_dir() and not looked.is_symlink():
         found += sorted(f"{looked.name}/{entry.name}" for entry in looked.iterdir()
                         if entry.name.partition(".")[0] == "__init__" and not built(entry))
