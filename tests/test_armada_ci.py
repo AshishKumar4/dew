@@ -2058,7 +2058,7 @@ def run_options(tmp_path: Path, ref: str, policy: str, option: str, whole: bool 
     return [word for word in run if word.startswith(option)]
 
 
-def test_a_base_push_is_graded_at_a_targeted_runs_priority_and_the_background_suite_below_every_lanes(tmp_path):
+def test_a_base_push_runs_at_a_targeted_runs_priority_and_the_background_suite_below_every_lanes(tmp_path):
     """A push to base/kernels runs its suite at a targeted run's priority, 0, with the suite's ordinary
     deadline, so it is graded: at a lane's whole-suite priority (-10) with the background deadline it waited
     behind every train, precheck and lane run and ran out its 6,000 s ungraded, every one of the eleven runs
@@ -2070,7 +2070,6 @@ def test_a_base_push_is_graded_at_a_targeted_runs_priority_and_the_background_su
         return run_options(tmp_path, ref, "off", "--priority")
 
     assert priority("base/kernels") == ["--priority=0"]
-    assert run_options(tmp_path / "graded", "base/kernels", "on", "--deadline") == ["--deadline=2700"]
     assert priority("fix/lane") == []
     # Main's whole run (the schedule's, the queue's whole dispatch) is background work, below every lane's run
     # at a head (verdict.sh's -10), so no head waits behind it (Main, 2026-11-06); a push to main stays its
@@ -2082,8 +2081,8 @@ def test_a_base_push_is_graded_at_a_targeted_runs_priority_and_the_background_su
     calls = suite_step(tmp_path / "whole-deadlines", "main", "", "off", 2, whole=True)
     assert {word for call in calls for word in call if word.startswith(("--deadline", "--pool=48"))} == {
         "--deadline=6000", "--pool=48"}
-    # A base push, below lanes too and on the pool armada gives it, keeps the background deadline.
-    assert run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline") == ["--deadline=6000"]
+    # A base push, no background run now, on the pool armada gives it, has the suite's ordinary deadline.
+    assert run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline") == ["--deadline=2700"]
     assert run_options(tmp_path / "base-pool", "base/kernels", "on", "--pool") == []
 
 
