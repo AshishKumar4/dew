@@ -226,22 +226,27 @@ Each seam requires one standing end-to-end test that runs every implementation r
 ### LoRA fine-tuning a chat model, exported for vLLM
 
 ```python
-bundle = Pretrained.load("Qwen/Qwen3.5-0.8B")
-adapted, adapter = bundle.adapt(LoRA(rank=16), key=0)
-chats = Hub("HuggingFaceH4/ultrachat_200k", split="train_sft").map(chat.template(bundle.processor)).pack(seq_len=4096)
-trainer = Trainer(LMObjective(adapted, seq_len=4096, loss_role=Role.ASSISTANT), optax.adamw(1e-4), key=0)
-trainer.fit(chats.shuffle(seed=0).batch(64), epochs=2)
-adapter.save("out/lora")
+model_id = "Qwen/Qwen2.5-0.5B-Instruct"
+bundle = Pretrained.load(model_id).adapt(LoRA(rank=16, modules=("q_proj", "v_proj")), key=0)
+chats = Hub("HuggingFaceH4/ultrachat_200k", split="train_sft").shuffle(seed=0).repeat().pipe(
+    presets.sft, model_id, seq_len=1024, batch=4)
+objective = LMObjective(bundle, seq_len=1024, loss_role=Role.ASSISTANT)
+state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(chats, steps=100)
+bundle.adapter.save(state.variables, "out/lora")   # PEFT's directory, which vLLM's LoRA loads
 ```
 
 ### A diffusion model, then samples
 
 ```python
-model = DiT.preset("dit-b/2")
-data = Files("gs://data/laion/*.array_record").filter_map(images.DecodeImage()).map(images.Resize(256)).batch(256)
-trainer = Trainer(DiffusionObjective(model, process=FlowMatching(), vae="stabilityai/sd-vae-ft-ema"), optax.adamw(1e-4), key=0)
-state = trainer.fit(data, steps=400_000)
-images = dew.pipeline(trainer)("a red fox in snow", steps=50, guidance=4.0, key=0)
+vae = load_autoencoder("pcuenq/sd-vae-ft-mse-flax")
+model = SimpleDiT(patch_size=2, emb_features=128, num_layers=4, num_heads=4, output_channels=4)
+inputs = InputSpec(Field("image", (64, 64, 3)),
+                   conditions={"textcontext": Condition(CLIPText.from_pretrained("openai/clip-vit-large-patch14"))})
+data = TFDS("oxford_flowers102", split="train").shuffle(seed=0).repeat().pipe(
+    presets.images, 64, batch=16, caption=images.caption("a photo of a {label}"))
+objective = DiffusionObjective(model, Flow(), inputs, autoencoder=vae, solver=Euler())
+state = Trainer(objective, OptimConfig(learning_rate=2e-4), key=0).fit(data, steps=1000)
+pictures = objective.pipeline(state)("a red rose", steps=50, guidance=3.0, key=1).host().images
 ```
 
 ### The same LM script on 64 GPUs

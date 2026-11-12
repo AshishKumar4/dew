@@ -117,10 +117,15 @@ def test_a_run_with_no_consistency_term_reads_no_groups_however_its_rows_state_t
            "groups": {"billing": {"billing": {"true": "yes", "false": "no"}, "asked": {"true": "no"}}}}
 
     def batch(consistency: float):
+        from dew.data import Memory
+        from dew.data.compile import compile
+        from dew.decision import decisions
+
         objective = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                       consistency=consistency)
-        reader = decision_rows([row, row], None, objective=objective.data(), tokens=LAYOUT.max_len)
-        return next(iter(reader.train(DataPartition())))
+        chain = Memory([row, row]).pipe(decisions).batch(tokens=LAYOUT.max_len)
+        loader = compile(chain, read="memory", objective=objective.data())
+        return next(iter(loader.train(DataPartition())))
 
     assert batch(0.0)
     with pytest.raises(ValueError):

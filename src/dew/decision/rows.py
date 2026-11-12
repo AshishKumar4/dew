@@ -17,7 +17,7 @@ from dew.batch import Batch, coordinates, document_spans
 from dew.data.forked_rows import window_forks
 from dew.data.pipeline import Pack, Rejected, composed, cut_counts
 from dew.data.text import Tokenizer
-from dew.decision.data import Example, GroupedExamples
+from dew.decision.data import Example, GroupedExamples, grouped_by
 from dew.decision.head import Head
 from dew.decision.inputs import compacted, labelled_rows, question_owners
 from dew.decision.layout import (
@@ -375,6 +375,9 @@ class Fit(pygrain.MapTransform):
 
     def _fitted(self, element: Batch) -> Batch | Rejected:
         held = element.get("example", element)
+        if self.grouped and isinstance(held, (Example, GroupedExamples)):
+            # A parsed row's groups as its row stated them, read only where consistency weighs them.
+            held = grouped_by(element, held)
         if isinstance(held, GroupedExamples) or (isinstance(held, Mapping) and "examples" in held):
             grouped = GroupedExamples.of(held, groups=self.grouped)
             # Without a consistency term the examples are rows of their own, which no window ties.

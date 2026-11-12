@@ -442,7 +442,8 @@ def test_a_gauss_newton_window_the_stream_ends_inside_commits_a_solve_of_the_row
         rows = Memory([{"x": row, "y": target} for row, target in zip(x[:count], y[:count], strict=True)])
         trainer = Trainer(LeastSquares(features), gauss_newton(damping=1e-6), key=0, layout=LAYOUT,
                           accumulation=4)
-        state = trainer.fit(rows.batch(8), epochs=1)
+        # A run longer than the stream, which ends it inside the second window where it holds a fifth.
+        state = trainer.fit(rows.batch(8), steps=8)
         assert int(state.updates) == -(-count // 32)
         return np.asarray(state.variables["params"]["Dense_0"]["kernel"])[:, 0]
 
