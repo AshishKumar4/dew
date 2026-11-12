@@ -737,7 +737,8 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
 
     def rolled(objective):
         state = started(objective)
-        drawn = rollout.build(objective)(state, batch_for(objective, 16), jax.random.PRNGKey(2))
+        drawn = rollout.build(objective)(state, batch_for(objective, 16), jax.random.PRNGKey(2),
+                                         objective=objective)
         fields = {name: np.asarray(drawn[name]) for name in (
             "latents", "next_latents", "timesteps", "next_timesteps", OLD_LOG_PROBS_KEY, REWARDS_KEY)}
         assert all(np.all(np.isfinite(field)) for field in fields.values())

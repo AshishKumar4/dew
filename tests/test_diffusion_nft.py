@@ -135,8 +135,9 @@ def test_a_rollout_samples_the_old_policy_and_normalizes_by_the_batchs_spread():
     assert not np.array_equal(*(np.asarray(jax.tree.leaves(state.variables["params"])[0])
                                 for state in (initial, final)))
     old_weights = final.replace(variables=final.averaged)
-    np.testing.assert_array_equal(rollout(final, prompts, jax.random.key(23))["latents"],
-                                  rollout(old_weights, prompts, jax.random.key(23))["latents"])
+    own = rollout.objective
+    np.testing.assert_array_equal(rollout(final, prompts, jax.random.key(23), objective=own)["latents"],
+                                  rollout(old_weights, prompts, jax.random.key(23), objective=own)["latents"])
 
 
 def test_a_rollout_over_a_partly_read_share_trains_only_its_real_rows():
@@ -150,7 +151,7 @@ def test_a_rollout_over_a_partly_read_share_trains_only_its_real_rows():
     prompts = nft.inputs.tokenize(PROMPTS)
     real = np.arange(len(PROMPTS)) < len(PROMPTS) - 3
     rollout, initial, _ = fitted(nft, reward, prompts, groups=3, steps=5, train_steps=3)
-    batch = rollout(initial, {**prompts, VALID_ROWS: real}, jax.random.key(23))
+    batch = rollout(initial, {**prompts, VALID_ROWS: real}, jax.random.key(23), objective=rollout.objective)
     held = np.repeat(real, 3)
     np.testing.assert_array_equal(batch[VALID_ROWS], held)
     rewards = np.asarray(batch["rewards"], np.float64)
@@ -275,7 +276,7 @@ def test_an_inpainting_rollout_samples_and_trains_with_its_masked_image_inputs()
     assert int(final.updates) == 1
     gain = [float(nft.model_variables(state.variables)["params"]["gain"]) for state in (initial, final)]
     assert np.isfinite(gain).all() and gain[0] != gain[1]
-    batch = rollout(initial, source, jax.random.key(23))
+    batch = rollout(initial, source, jax.random.key(23), objective=rollout.objective)
     assert set(batch["spatial"]) == {"mask", "masked_image"}
     assert len(batch["spatial"]["mask"]) == len(batch["latents"])
     step = Step(jnp.asarray(0), jax.random.key(32), {"params": initial.variables["params"]})

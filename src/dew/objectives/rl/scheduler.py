@@ -666,17 +666,16 @@ class RolloutScheduler:
 
     def drawn_from(self) -> object | None:
         """The objective whose policy the acquisition draws from where that policy is its own, fixed when it
-        was built: an asynchronous source's server's (`Asynchronous.objective`), or the objective a
-        synchronous collector other than a `PolicyCollector` was built for (`scorer`: an episode
-        collector's bound policy). None where the collection draws from each call's objective, a
-        `PolicyCollector`'s, or from no policy at all (a scripted collector's). A call whose step trains
-        another objective (a phase's pass count) is refused (`own_objective`): its rows would train under a
-        policy that did not draw them."""
+        was built: an asynchronous source's server's (`Asynchronous.objective`), or the one an episode
+        collector's bound policy was made for (`scorer`, `EpisodeCollector.policy`). None where the
+        collection draws from each call's objective (a `PolicyCollector`) or from no policy at all (a
+        scripted collector). A call whose step trains another objective (a phase's pass count) is refused
+        (`own_objective`): its rows would train under a policy that did not draw them."""
         if isinstance(self.acquisition, Asynchronous):
             return self.acquisition.objective
-        if isinstance(self.acquisition.collector, PolicyCollector):
-            return None
-        return self.scorer if isinstance(self.scorer, Objective) else None
+        if isinstance(self.acquisition.collector, EpisodeCollector):
+            return self.scorer
+        return None
 
     @property
     def draws_further(self) -> bool:

@@ -247,7 +247,8 @@ def test_a_rollout_writes_its_replay_in_place(agent):
     begun = rollout.held_replay
     assert begun is not None
     # The next update owes steps the prefill did not take.
-    rollout(dataclasses.replace(state, updates=state.updates + 1), {}, jax.random.key(2))
+    rollout(dataclasses.replace(state, updates=state.updates + 1), {}, jax.random.key(2),
+            objective=rollout.objective)
     assert all(leaf.is_deleted() for leaf in jax.tree.leaves(begun.held))
 
 
