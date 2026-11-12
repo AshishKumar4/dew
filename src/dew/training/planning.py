@@ -148,6 +148,10 @@ class Candidate:
     sampled: Callable[[], jax.stages.Lowered] | None = None
     """The same step summarizing what the run inspects at its commit, lowered on call
     (`dew.training.inspection`); None in a run that inspects nothing."""
+    lowers: Callable[[], tuple[jax.stages.Lowered, KernelReport]] | None = None
+    """Where the candidate was traced alone (its derivation's), its step lowered from the trace it made,
+    at most one trace of the step whoever asks (`FitSearch.lowering`); None for a lowered candidate or one
+    whose lowering measures configs (`tune_kernels`), which lowers afresh for each."""
 
     @property
     def lowered(self) -> jax.stages.Lowered:
@@ -680,6 +684,9 @@ class FitSearch[LossT, EffectsT]:
     """The footprint of each candidate the derivation read, which its lowering keeps (`lowering`): traced
     again there, it was 22 of a Qwen3.5-4B step's 185 seconds of `compile_ahead` (row 4261). A spill's
     refusal, which changes the configs its kernels take, clears it (`measured`)."""
+    derivations: dict[tuple[str, int], Candidate] = dataclasses.field(default_factory=dict)
+    """Each candidate the derivation traced (`judged`), until the search compiles it, lowered from it
+    (`lowering`)."""
     under: dict[str, int] = dataclasses.field(default_factory=dict)
     """By remat rung (`remat_rung`), the most bytes a compile there needed past its derived headroom: a
     candidate there is judged to fit only where its derived headroom holds that much more, in proportion
@@ -856,11 +863,13 @@ class FitSearch[LossT, EffectsT]:
         """The derived headroom of the step at `split` and `narrow` at the objective's rung, traced once a
         candidate (`judged_at`), and recorded beside the rungs `walked` reads; None where the derivation
         cannot judge it or no device states memory to judge it against. Every process reads it alike
-        (`memory.pooled_headroom`), so each compiles the plan the others do."""
+        (`memory.pooled_headroom`), so each compiles the plan the others do. The candidate is kept, so the
+        one the search compiles is lowered from it (`lowering`)."""
         key = self.candidate_key(split, narrow)
         if key not in self.judged_at:
             assert self.derive is not None
             candidate = self.derive(split, narrow)
+            self.derivations[key] = candidate
             footprint = candidate.footprint
             headroom = pooled_headroom(None if footprint is None else derived_headroom(
                 footprint, local_devices(self.mesh), self.capacity, candidate.built))
@@ -872,10 +881,17 @@ class FitSearch[LossT, EffectsT]:
         return self.judged_at[key]
 
     def lowering(self, split: int) -> Candidate:
-        """The step at `split` at the objective's rung and the search's `narrow`, lowered, with the
-        footprint the derivation traced of it where it read it (`footprints`); one the step compiled ahead
-        serves (`ahead`) derives none, its compile having judged the derivation where it was compiled."""
-        return self.lower(split, self.narrow, self.footprints.get(self.candidate_key(split, self.narrow)),
+        """The step at `split` at the objective's rung and the search's `narrow`, lowered: from the
+        candidate its derivation made (`derivations`, `Candidate.lowers`), so the step it judged is traced
+        once and lowered from that trace, its footprint with it; else lowered afresh, with the footprint the
+        derivation traced of it where it read it (`footprints`). One the step compiled ahead serves
+        (`ahead`) derives none, its compile having judged the derivation where it was compiled."""
+        key = self.candidate_key(split, self.narrow)
+        derived = self.derivations.pop(key, None)
+        if derived is not None and derived.lowers is not None:
+            program, kernels = derived.lowers()
+            return dataclasses.replace(derived, program=program, kernels=kernels, lowers=None)
+        return self.lower(split, self.narrow, self.footprints.get(key),
                           derived=self.ahead is None and not self.stated)
 
     def relowering(self, split: int) -> Candidate:
@@ -918,14 +934,17 @@ class FitSearch[LossT, EffectsT]:
                              "against (a CPU, or a compile-only GPU given no capacity), so the derivation "
                              "picks no plan and the compiles decide it", self.remat_rung())
             return first
-        # The fewest, where the search judged it at this rung (`fits_at_fewest`), is read as it was.
-        fewest = self.judged_at.get(self.candidate_key(candidates[0], self.narrow), -1)
-        if fewest is not None and fewest >= 0:
+        # From the fewest up: a step whose fewest microbatches fit traces that one candidate alone, the
+        # one the search compiles (`lowering`). Past it, the most, then halving between, as memory falls
+        # with the split (`planned`'s assumption, which a footprint that grows with the split would break:
+        # none here, its terms all of one microbatch or of the whole window).
+        fewest = self.judged(candidates[0], self.narrow)
+        if fewest is None or fewest >= 0 or len(candidates) == 1:
             return first
         headroom = self.judged(candidates[-1], self.narrow)
         if headroom is None or headroom < 0:
             return first
-        low, high = -1, len(candidates) - 1
+        low, high = 0, len(candidates) - 1
         while high - low > 1:
             middle = (low + high) // 2
             judged = self.judged(candidates[middle], self.narrow)
@@ -1069,8 +1088,9 @@ class FitSearch[LossT, EffectsT]:
             candidate = relowered.candidate(candidate)
             if relowered.last is not None:
                 # A spill's refusal changes the configs every derivation traced: each is traced again, the
-                # kept step's here.
+                # kept step's here, and none is lowered from its derivation's trace.
                 self.footprints.clear()
+                self.derivations.clear()
                 if not self.stated:
                     candidate = self.footprinted(split, candidate)
         fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
@@ -1097,6 +1117,7 @@ class FitSearch[LossT, EffectsT]:
                                            first=None if beside is None else firsts[1])
             if len(lowered) > 1:
                 self.footprints.clear()
+                self.derivations.clear()
             self.sampled = None if compiled is None else SampledStep(program_digest(lowered[-1]), compiled)
             fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began

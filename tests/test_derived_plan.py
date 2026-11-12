@@ -263,6 +263,53 @@ def test_a_miss_orders_the_compiles_and_rules_out_only_what_the_derivation_itsel
     assert not search.refused(1)
 
 
+def traced(trainer) -> tuple[int, int]:
+    """`trainer` compiled, and how often its plan traced its step and made a candidate of it, counted by the
+    profiler: its step's traces (`_lowering.routed`, each one's dispatches' routes) and its candidates
+    (`_candidates._candidate`), a derivation's and a lowering's alike."""
+    from dew.training import _candidates, _lowering
+
+    profiler = cProfile.Profile()
+    profiler.runcall(compiled, trainer)
+    stats = pstats.Stats(profiler).stats.items()
+    return (sum(calls for (file, _, name), (_, calls, *_) in stats
+                if name == "routed" and file == _lowering.__file__),
+            sum(calls for (file, _, name), (_, calls, *_) in stats
+                if name == "_candidate" and file == _candidates.__file__))
+
+
+def test_a_stated_remat_whose_whole_batch_fits_traces_its_step_once(monkeypatch, tmp_path):
+    """A run that states its remat and leaves its split to the plan, with room for its whole batch at once:
+    the derivation judges the fewest microbatches first, which fit, so the plan makes one candidate and
+    traces its step once, the compile lowering that trace, where the search judged the most first and
+    halved down, a candidate each, and traced the one it compiled again (row 5556)."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    free(monkeypatch, LIMIT)
+    trainer = deep(REMAT_POLICIES["full"], split=None)
+    with Compiles("step") as compiles:
+        steps, candidates = traced(trainer)
+    assert trainer.plan["split"] == 1 and [entry["split"] for entry in trainer.plan["derived"]] == [1]
+    assert (steps, candidates, compiles.count) == (1, 1, 1)
+
+
+def test_a_stated_remat_whose_whole_batch_does_not_fit_traces_only_the_splits_it_tries(monkeypatch, tmp_path):
+    """The run of the test above with room for its step at two microbatches and not one: the derivation
+    judges one, then the most, then halves between them, each split once, and the plan traces the step of
+    each split it compiles once, the first from the trace its derivation made."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    sizing = deep(REMAT_POLICIES["full"], split=2)
+    room = needs(monkeypatch, sizing, lambda: compiled(sizing))
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, room)
+    trainer = deep(REMAT_POLICIES["full"], split=None)
+    steps, candidates = traced(trainer)
+    judged = [entry["split"] for entry in trainer.plan["derived"]]
+    compiled_splits = [probe["split"] for probe in trainer.plan["probes"]]
+    assert judged[0] == 1 and len(judged) == len(set(judged)) and trainer.plan["probes"][-1]["fits"]
+    assert steps == len(compiled_splits)
+    assert candidates == len(judged) + len(set(compiled_splits) - set(judged))
+
+
 def test_the_search_takes_the_fewest_microbatches_that_fit_however_a_miss_elsewhere_corrects_them(
         monkeypatch, tmp_path):
     """In the program a user's process runs (its CPU's products as XLA sums them), with room for the step at
