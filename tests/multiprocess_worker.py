@@ -32,7 +32,7 @@ from pool_records import (
     online_pipeline,
     replicated_loader,
 )
-from process_support import serve_mode, worker_parser
+from process_support import refusal, serve_mode, worker_parser
 from rl_support import pooled_rollout, rollout_prompts
 
 from dew.data import Loading
@@ -677,9 +677,9 @@ def mode_pool_refusals(args) -> dict:
     runs out after one batch there, and a batch without a field. A resume
     from a newest checkpoint the processes list differently is refused as
     well, and streams that run out after one batch on both end the fit
-    there. Each outcome is what the fit ended in: the error's type it was refused with and the steps it
-    took first, or None and its steps for a fit that trained; then every process passes one more
-    agreement, which a rank left behind would block."""
+    there. Each outcome is what the fit ended in: the refusal it was refused with (its type, the agreement
+    and the process it names: `refusal`) and the steps it took first, or None and its steps for a fit that
+    trained; then every process passes one more agreement, which a rank left behind would block."""
     import jax
     import optax
     from affine_run import FEATURES, Regression
@@ -738,7 +738,7 @@ def mode_pool_refusals(args) -> dict:
             trainer.fit(data, steps=2, log_every=1, **flags)
             refused = None
         except (ValueError, RuntimeError) as error:
-            refused = type(error).__name__
+            refused = refusal(error)
         steps = [step for step, scalars in heard.scalars if "train/loss" in scalars]
         return {"refused": refused, "steps": steps}
 
@@ -767,7 +767,7 @@ def mode_pool_refusals(args) -> dict:
     try:
         outcomes["stale"] = {"refused": None, "restored": int(resumed.place()[0].step)}
     except (ValueError, RuntimeError) as error:
-        outcomes["stale"] = {"refused": type(error).__name__, "restored": None}
+        outcomes["stale"] = {"refused": refusal(error), "restored": None}
     _coordination.agreed("the pool after its refusals", lambda: True)
     return outcomes
 
