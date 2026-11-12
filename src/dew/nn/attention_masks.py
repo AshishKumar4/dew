@@ -165,7 +165,7 @@ def visibility_mask(query_length: int, key_length: int, causal: bool, sliding_wi
 def visible_rows(query_length: int, key_length: int, causal: bool, sliding_window: int | None,
                  mask=None, segment_ids=None, key_value_seq_lengths=None,
                  key_value_seq_starts=None, *, block_groups=None, image_groups=None, key_valid=None,
-                 key_runs=None, places=None) -> jax.Array | None:
+                 key_runs=None, places=None, query_slots=None) -> jax.Array | None:
     """Whether each query row sees a key, `[B or 1, Q, H or 1, 1]` over the
     output, or None where every row does.
 
@@ -180,7 +180,8 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
     which the program knows as it traces, unless it is a packed row's padding.
     """
     if (mask is None and key_value_seq_lengths is None and key_value_seq_starts is None and key_valid is None
-            and key_runs is None and places is None and not isinstance(segment_ids, CrossDocuments)):
+            and key_runs is None and places is None and query_slots is None
+            and not isinstance(segment_ids, CrossDocuments)):
         # The keys row i may see run from 0 to the last one; causality keeps 0 in reach, and a
         # window ends w - 1 keys before the row (`windowed`). A call's own documents keep each row's
         # own key, and block and image groups only add keys beside it.
@@ -193,12 +194,13 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
     if mask is None:
         spans = key_spans(query_length, key_length, causal, sliding_window, segment_ids,
                           key_value_seq_lengths, key_value_seq_starts, block_groups=block_groups,
-                          image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places)
+                          image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
+                          query_slots=query_slots)
         return template.reads(spans)[:, :, None, None]
     seen = jnp.any(visibility_mask(query_length, key_length, causal, sliding_window, mask, segment_ids,
                                    key_value_seq_lengths, key_value_seq_starts, block_groups=block_groups,
                                    image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
-                                   places=places), -1)
+                                   places=places, query_slots=query_slots), -1)
     return jnp.swapaxes(seen, -1, -2)[..., None]
 
 

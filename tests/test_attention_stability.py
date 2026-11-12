@@ -355,17 +355,19 @@ def _small_and_large(seed: int, rows: int, dtype: str) -> np.ndarray:
     return value
 
 
-def _masked_outlier(seed: int, rows: int = 64, *, dtype: str = "float32"):
+def _masked_outlier(seed: int, rows: int = 64, *, dtype: str = "float32", every_column: bool = False):
     """One query a row over eight keys of equal logits, the first four seen and the last four past its
     length: the seen keys' values a drawn 2^-125 to 2^-120 in their first column and a draw in [-1, 1) times
     2^-120 past it, the unseen ones' first column near fp32's largest, each at `dtype`'s own extremes
     (`_small_and_large`). A key the row does not see weighs nothing, so no value it holds scales the row's
-    sums or flushes the small ones it reads. The cotangent reads none of the first column: a backward forms
-    every key's `dO · vᵀ`, an unseen one's too, which a cotangent on that column carries past fp32's largest
-    (the reference's fp32 and FlashAttention's alike)."""
+    sums or flushes the small ones it reads. The cotangent reads none of the first column but `every_column`:
+    jax's attention, the reference arm, forms every key's `dO · vᵀ`, an unseen one's too, which a cotangent
+    on that column carries past fp32's largest and its zero weight to NaN (FlashAttention's backward alike);
+    Dew's are finite there (`test_an_unseen_keys_value_past_fp32s_largest_takes_no_part_in_a_gradient`)."""
     value = _small_and_large(seed, rows, dtype)
     (dout,) = _normal(seed + 3, (rows, 1, 1, 16))
-    dout[..., 0] = 0.0
+    if not every_column:
+        dout[..., 0] = 0.0
     return (np.zeros((rows, 1, 1, 16), np.float32), np.zeros((rows, 8, 1, 16), np.float32), value, None,
             dout)
 
@@ -1079,6 +1081,22 @@ def test_the_default_form_is_finite_where_the_truth_is_at_fp32s_edges(family):
     (`algebra.SCALED_WALK`) and under the fold's guard (`algebra.walked`), finite in the default form over
     every family (`default_is_finite`)."""
     default_is_finite(family, "portable")
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_an_unseen_keys_value_past_fp32s_largest_takes_no_part_in_a_gradient(dtype):
+    """A row's unseen keys whose values pass fp32's largest in their first column under a cotangent on every
+    column (`_masked_outlier`'s `every_column`): each template mainloop's gradients in both forms finite
+    wherever the float64 truth's are (`gradient.where_seen`), where jax's attention, FlashAttention's
+    backward and Dew's reference path, its formula as jax's, form `0 · inf` (row 5278)."""
+    name = f"small values beside unseen ones near fp32's largest, {dtype}"
+    family = dataclasses.replace(FAMILIES[name], draw=functools.partial(_masked_outlier, dtype=dtype,
+                                                                        every_column=True))
+    draw, truth = _cast(family, family.draw), with_gradients(_reference(family, anchored=True))
+    arms = {f"{mainloop} {form}": fn for form, options in (("default", {}), ("accurate", ACCURATE))
+            for mainloop, fn in _mainloops(family, options).items()}
+    for label, fn in arms.items():
+        assert_finite(jax.jit(with_gradients(fn)), truth, draw, f"{label} {dtype}", seeds=SEEDS[name])
 
 
 BAND_FAMILIES = ("a share in bf16's subnormal band on a value near its largest",
