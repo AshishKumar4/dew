@@ -466,6 +466,20 @@ def test_a_query_of_one_key_takes_an_exactly_zero_query_gradient(structure):
         assert zero[:, 0].all()
 
 
+def test_a_row_weighs_its_own_keys_however_far_below_every_finite_logit():
+    """A causal call whose first query's one key has a logit of about -3e38, below any finite stand-in for a
+    hidden key's: Splash weighs that key whole and the hidden keys nothing, so the row reads the key's own
+    value, 0, beside hidden values of 1; every gradient finite."""
+    width, tokens = 128, 128
+    query = np.zeros((1, tokens, 1, width), np.float32)
+    key = np.zeros((1, tokens, 1, width), np.float32)
+    value = np.ones((1, tokens, 1, width), np.float32)
+    query[0, 0, 0, 0], key[0, 0, 0, 0], value[0, 0] = -5.8e19, 5.8e19, 0.0
+    out, *grads = value_and_grads('tpu', *(jnp.asarray(x) for x in (query, key, value)), causal=True)
+    np.testing.assert_array_equal(out[0, 0], 0.0)
+    assert all(np.isfinite(grad).all() for grad in grads)
+
+
 @on_tpu
 @pytest.mark.parametrize("dtype, width, softcap", [
     (jnp.bfloat16, 128, True), (jnp.float32, 128, True), (jnp.float32, 256, False),
