@@ -212,7 +212,9 @@ is pairwise, so no single most accurate candidate is ranked, and none may be adm
 Each form is priced in time from the device facts Dew already owns, never from facts of its own:
 
 - the program model reads `dew.nn.kernels.generation.gpu_target()` (memory bandwidth, dense peaks by precision,
-  the part's measured latencies: a kernel's fixed seconds, a loop's and an in-kernel step's), so every process of a pool prices with the same numbers. No price reads
+  the part's measured latencies: a kernel's fixed seconds, a loop's and an in-kernel step's), so every process of a pool prices with the same numbers (each given the
+  same target: one the pass is told, one a process assumes, or the interpreted templates' on a host of no
+  accelerator, `cost.target`). No price reads
   links: every registered rule either keeps a reduction's axes and count or joins two reductions into one
   (`joined`; `linear`'s shared operand out of two products), which the device price already prefers, so a
   collective's bytes over `dew.training.distributed.link_figure` would only agree with it. A rule that moves a
@@ -223,7 +225,8 @@ Each form is priced in time from the device facts Dew already owns, never from f
 
 A region's seconds are computed once, from its composed terms over the chosen DAG (§6.5): bytes over bandwidth,
 FLOPs over the dtype's rate, each kernel XLA's fusion makes of it (a reduction's
-and a product's, each a fusion's root) at the part's measured fixed latency (its launch and first byte), so a
+and a product's, each a fusion's root) at the part's measured fixed latency (its launch and first byte; a part no measurement holds pays none, and
+its kernels are counted as work no rate prices, §6.5), so a
 chain of dependent reductions pays a kernel's latency a link, and the span of a loop XLA lowers at its
 iteration's latency (§6.5), combined as `templates.cost` combines a launch's. Row
 4072's validation priced 1,580 profiled kernels: without a kernel's fixed latency an H100's XLA fusions came
@@ -638,13 +641,15 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   rate prices is the compile-time splice's). No module calls `choose` yet (the generator is parked, §6.11).
 - One choice of this kind is live: a product's dot algorithm for the accuracy its site asks
   (`dew.algebra.error.product_precision`, row 5473). Its candidates are the algorithms JAX itself states for
-  the operands' dtype (`DotAlgorithmPreset.supported_lhs_types`), priced by `cost.product_work` in the mode
+  the operands' dtype (`dew.nn.programs.dot_algorithms`, by JAX's own conversion of each preset), priced by `cost.product_work` in the mode
   and passes JAX lowers each to, and it takes the cheapest the site's gate admits on its own family (a
   three-pass TF32 product where one pass misses the accuracy and IEEE fp32 costs more); none admitted is
   refused. A site reads it in place of a hand-picked preset; the recurrence ports, the template's accurate
   parts and the GEMM's low-precision forms are to (their lanes' rows).
 - Extraction is egglog's `greedy-dag` (`dew.algebra.extract.cheapest`), each shared node priced once; its
-  exact counterpart (`extract.extracted`) is the oracle. The exact extraction finds the roots' forms whose nodes
+  exact counterpart (`extract.extracted`) is the oracle (exact as a mixed integer program is: solved to a
+  relative gap of zero within the solver's feasibility tolerance, each price level held at its least within
+  that tolerance before the next is read). The exact extraction finds the roots' forms whose nodes
   together cost least as a mixed integer program, solved by HiGHS through SciPy: one binary choice per node; a
   used class takes one node, a used node's child classes are used, and an order over each cyclic class keeps the
   choice a DAG. The nodes and their prices are the model's own, read through one `greedy-dag` pass that records
@@ -677,7 +682,7 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   unit's rate from them (`templates.cost.rates`); a unit a target states no rate of (a TPU's vector and
   transcendental units, which no primary source states) is priced by none, and a form is cheaper only where it
   takes fewer seconds and no more of that work (`cost.cheaper`), so it is cheaper whatever the rate. A process
-  of no accelerator prices as the interpreted templates' H100, a GPU no row names by its family's and its
+  of no accelerator prices as the interpreted templates' H100 (or the device an interpreted check assumes), a GPU no row names by its family's and its
   runtime's facts (`cost.target`):
   - XLA's fusion (`cost.fused`), for the compile-time pass over a program, error-aware extraction and the
     derived scan's carry split (`carry.split`, whose carry runs as a loop XLA lowers, a chunk an iteration, its
@@ -698,7 +703,9 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   6000's 137.7 ns). The algebra's terms state no span of their own, extraction composing a span as its largest
   node's (`extract.Level`), so a derived tile form's span is the derivation's to state. A whole launch's step,
   its tile's load and products where its ring does not hide them, is the launch model's (row 4123).
-- Every rule is the pass's own, applied wherever its cost model prices the rewrite cheaper, with no
+- Every rule is the pass's own, applied wherever its cost model prices the rewrite cheaper (today: wherever a
+  window opens at one of its heads, within the window's saturation limits and its greedy extraction, §6.6,
+  §6.7), with no
   condition on XLA: where XLA would make the same rewrite the result is the same, and where XLA's factoring
   and reassociation are held to integers, powers of two or fast math, the pass's fire on floats wherever the
   range facts admit them. A study of the pinned pipeline (an H100's and the CPU's optimized programs with the
@@ -849,7 +856,8 @@ maxima. The derivation's readings (`Term.stepped`, `merged`, `finished`, `held`)
 under its rules (`decoupled`). At a walked reduction a monoid's identity holds, a sum that scales with a maximum
 rescaled by `exp(k_carried - k_new)` first. A carried state is `Term.state(index, side)`. The engine's sets the
 numerics admit saturate in the same e-graph, so a form is extracted from the language and the engine's rewrites
-together, under the program's cost. The readings cost without bound: a value no rule rewrites leaves its form
+together, under the tile walk's cost (`cost.walk`: a kernel's mainloop, not an XLA program's fusions; a scan's
+chunk and carry are priced as the program, `cost.fused`). The readings cost without bound: a value no rule rewrites leaves its form
 unpriced, and the declaration is refused. Each tile shape's rewrite joins the kernel report (§6.8).
 
 A scan's chunk forms are split by extraction (`carry.py`). The chunk function, traced at one chunk, enters
@@ -857,12 +865,15 @@ the e-graph with the values that read the state marked. The products' linear alg
 transposed operand's product as a plain product of its transpose, a product distributed over a sum that reads
 the state, two products associated so the state is last, two products of one operand factored. The carried
 outputs are extracted under a two-part price, the work that reads the state first and the rest second, so the
-carry reads the state through the fewest products; the emitted outputs take the program's cost. The forms'
+carry reads the state through the fewest products (what is minimized is the modeled seconds of the work that
+reads the state, which is the fewest products where its products are of one size); the emitted outputs take the program's cost. The forms'
 largest terms that read no state are the walk's prepared values (`Derived.prepare`), computed for every chunk
 at once; the carry alone runs in sequence. The delta rule's carry is one product of the state by a matrix the
 chunk prepared, its solve against the state off the carry.
 
-The chunk function's algorithm is derived by rules (`linear_scan.py`); nothing of its form is written. The
+The chunk function's algorithm is derived by rules (`linear_scan.py`); nothing of its form is written (its
+algebraic form: how its decays' pairs and its compensated prefixes are evaluated is written arithmetic, the
+representations the template keeps, below). The
 token's update and readout, traced at one token, enter an e-graph as their algebra over the state
 (`Token`): scalars, vectors along the keys or the values laid as columns or rows, products, sums,
 exponentials, and a vector's contraction with a matrix over the keys. A value free of the state whose
@@ -888,7 +899,10 @@ check at finite shapes (three tokens, the test's shape inventory), and the doubl
 solved inverse it must equal, not derived from `scan`'s own implementation of it: a proof at every chunk
 size is an open gap.
 
-A derived algebra's laws are proven before its forms ship, in the suite (tests/algebra_laws.py): identity, associativity, consistency
+A derived algebra's laws are proven before its forms ship, in the suite (tests/algebra_laws.py; today at the
+extents it walks, two and three keys a tile over every kernel tile shape, for the attention forward's and
+backward's declarations at each dtype and the recurrence's tiles, their fast forms; that the laws at those
+extents carry to every chunking is the induction the laws state, which the suite does not itself prove): identity, associativity, consistency
 (a tile folded into a state is a walk of it merged), and the declared function (a walk of two tiles finishes
 as the function of them joined, an output along the walk each tile's own joined). Together they make a
 walk's result independent of its chunking and its merge tree. The proof is over the reals: the forms traced
@@ -993,7 +1007,9 @@ class Scan:                          # a recurrence
     operands: Mapping[str, Axes]
     walked: str                      # "time"
     state: tuple[tuple[int, ...], jnp.dtype]   # the state's shape (keys by values) and dtype
-    reset: str | None = None         # an operand whose tokens start a document
+    reset: str | None = None         # an operand whose tokens start a document: each takes the finite
+                                     # exponent `scan.RESET_DECAY` for its own (the state entering it
+                                     # decays to exactly 0 in fp32), the replaced exponent given no gradient
     ranges: Mapping[str, float | tuple[float, float]] = {}   # bounds, "state" and "overlap" among them
 
 class Derived(NamedTuple):           # dew.algebra.forms
