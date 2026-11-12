@@ -982,19 +982,22 @@ def data_resumed(loader: Loader, partition: DataPartition, position: Callable[[]
         return held[0], ()
     stream = loader.train(partition)
     try:
+        def refused(why: str) -> PlanChanged:
+            return PlanChanged(tuple(differs), f"the saved data position's plan differs from this run's in "
+                               f"{', '.join(differs)}, and the run's stream {why}, so its data cannot start "
+                               "again: resume it exactly with the data that wrote it, or start a new run "
+                               "from its weights")
+
         if isinstance(stream, StepPhases):
             start = stream.restarted(step)
-        elif isinstance(stream, PhasedStream | RampedStream) and held[0] is not None:
+        elif isinstance(stream, (PhasedStream, RampedStream)):
+            if held[0] is None:
+                raise refused("reads in stages its saved position places, which this share cannot read")
             start = stream.restarted(held[0])
-        elif isinstance(stream, Checkpointable) and not isinstance(stream, PhasedStream | RampedStream):
+        elif isinstance(stream, Checkpointable):
             start = stream.get_state()
         else:
-            why = ("keeps no position to start from" if not isinstance(stream, Checkpointable) else
-                   "reads in stages its saved position places, which this share cannot read")
-            raise PlanChanged(tuple(differs), f"the saved data position's plan differs from this run's in "
-                              f"{', '.join(differs)}, and the run's stream {why}, so its data cannot start "
-                              "again: resume it exactly with the data that wrote it, or start a new run "
-                              "from its weights")
+            raise refused("keeps no position to start from")
     finally:
         if isinstance(stream, Closeable):
             stream.close()

@@ -115,7 +115,7 @@ def _phased(seed: int):
         return Pipeline(Memory({"x": x, "id": np.arange(tag * 100, tag * 100 + 32, dtype=np.int32)}),
                         name=str(tag))
 
-    later = mix([corpus(2).repeat(), corpus(3).repeat()], seed=seed).repeat()
+    later = mix([corpus(2).repeat(), corpus(3).repeat()], seed=seed)
     return phases((corpus(1).repeat().batch(4), 3), (later.batch(4), None))
 
 
@@ -160,21 +160,15 @@ def test_a_phased_run_resumed_relaxed_after_a_changed_mix_opens_its_phase_at_its
 
 
 def test_a_run_bounded_in_examples_resumed_relaxed_after_its_data_changed_ends_at_its_bound(tmp_path):
-    """A run bounded in examples, paused halfway and resumed relaxed over data shuffled otherwise, starts
-    its data again and ends where its own count of consumed examples reaches its bound."""
+    """A run bounded in examples that counts no steps ahead (`clocked_fit`), paused halfway and resumed
+    relaxed over other records, starts its data again and ends where its own count of consumed examples
+    reaches its bound."""
+    from test_run_budgets import CLOCKED_RECORDS, clocked_fit, clocked_records
+
     from dew.training import Pause
 
-    (x,) = records(0)
-
-    def fit(seed: int, **flags):
-        chain = Pipeline(Memory({"x": x})).shuffle(seed=seed).batch(BATCH)
-        tracker = RecordingTracker()
-        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
-                          checkpoints=Checkpoints(str(tmp_path)), tracker=tracker)
-        return trainer.fit(chain, examples=40, log_every=1, **flags), tracker
-
-    paused, _ = fit(1, stop=Pause(0.5))
-    assert 0 < int(paused.consumed) < 40
-    ended, tracker = fit(2)
+    paused, _ = clocked_fit(clocked_records(0)[0], 1, directory=tmp_path, stop=Pause(0.5))
+    assert 0 < int(paused.consumed) < CLOCKED_RECORDS
+    ended, tracker = clocked_fit(clocked_records(1)[0], 1, directory=tmp_path)
     assert _reported(tracker, DataRestarted)
-    assert int(ended.consumed) == 40
+    assert int(ended.consumed) == CLOCKED_RECORDS
