@@ -335,6 +335,69 @@ def members_held(row: Batch, member: str | None) -> dict[str, int]:
     return {} if member is None else joined({member: consumed - refused})
 
 
+@dataclasses.dataclass(frozen=True)
+class BatchedGroups:
+    """A `map_batches` step over one group: its records, as Grain's flat map takes them, the run's counts of
+    them carried out of the step's sight as `consumed_by` carries a record's (`dew.data.lowering`)."""
+
+    stage: Batched
+    max_fan_out: int = 1 << 20
+
+    def flat_map(self, group: list[Record]) -> Sequence[Record]:
+        rows = [record(value, "batched input") for value in group]
+        # The source examples the group's rows consume are the run's accounting, out of the step's sight:
+        # a step that keeps its rows keeps each row's, and one that makes others gives their sum to its
+        # last row, as a record step's expansion does (`consumed_by`).
+        counted = [row for row in rows if CONSUMED in row]
+        held = [accounts(row) for row in counted]
+        consumed, refused = [count for count, _ in held], [part for _, part in held]
+        # The draws of a phase's shared corpora (`DRAWN`), which go where the counts go.
+        drawn = [drawn_of(row) for row in counted]
+        drawing = any(DRAWN in row for row in counted)
+        # Each row's mixture member and its counts by member (`MEMBERS`), and the member every output is
+        # of where the group's rows are all one member's.
+        tags = [member_of(row) for row in rows]
+        members = [members_held(row, tag) for row, tag in zip(rows, tags, strict=True) if CONSUMED in row]
+        alike = bool(tags) and tags[0] is not None and len(set(tags)) == 1
+        common = tags[0] if alike else None
+        counted_by = any(MEMBERS in row or MEMBER in row for row in rows if CONSUMED in row)
+        rows = [{name: value for name, value in row.items() if name not in COUNTING} for row in rows]
+        columns = {name: [row[name] for row in rows] for name in rows[0]}
+        made = dict(self.stage.step(columns))
+        counts = {len(values) for values in made.values()}
+        if len(counts) > 1:
+            raise ValueError(f"a batched step returned columns of different lengths, {sorted(counts)}")
+        count = counts.pop() if counts else 0
+        if self.stage.same_rows:
+            if count != len(rows):
+                raise ValueError(f"map(batched=True) keeps the {len(rows)} rows it reads, and its step "
+                                 f"returned {count}; flat_map(batched=True) changes the count")
+            kept = [{**row, **{name: values[index] for name, values in made.items()},
+                     **({} if tag is None else {MEMBER: tag})}
+                    for index, (row, tag) in enumerate(zip(rows, tags, strict=True))]
+            return kept if not consumed else [
+                {**row, CONSUMED: held, REFUSED: carried, **({MEMBERS: split} if counted_by else {}),
+                 **({DRAWN: draws} if drawing else {})}
+                for row, held, carried, split, draws in zip(kept, consumed, refused, members, drawn,
+                                                            strict=True)]
+        outputs = [{name: values[index] for name, values in made.items()} for index in range(count)]
+        if common is not None:
+            outputs = [{**row, MEMBER: common} for row in outputs]
+        if not consumed:
+            return outputs
+        if not outputs:
+            # A group it makes no rows of leaves its examples on a marker, which the next row carries on
+            # (`Carried`), completing no member's.
+            held = sum(consumed)
+            return [Rejected("empty_expansion", consumed=held, member=common,
+                             drawn=tuple(itertools.chain.from_iterable(drawn)))] if held else []
+        none, last = ({MEMBERS: {}}, {MEMBERS: joined(*members)}) if counted_by else ({}, {})
+        if drawing:
+            none, last = {**none, DRAWN: ()}, {**last, DRAWN: tuple(itertools.chain.from_iterable(drawn))}
+        return [*({**row, CONSUMED: 0, REFUSED: 0, **none} for row in outputs[:-1]),
+                {**outputs[-1], CONSUMED: sum(consumed), REFUSED: sum(refused), **last}]
+
+
 def consumed_forward(elements: Sequence[Record]) -> list[Record]:
     """`elements` in their order, each rejected row's consumed examples (`Rejected.consumed`) carried on
     to the next row kept after it, as the corpus's reading carries them (`Accepted`), so a group that

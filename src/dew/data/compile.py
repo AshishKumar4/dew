@@ -1373,16 +1373,11 @@ def _compile_phases(
     def staged_at(index: int, consumed: Mapping[str, int], members: Mapping[str, str] | None = None
                   ) -> _Staged:
         """Phase `index`, each corpus it reads continued past what the phases before it read of it: on its
-        own stream (`members`, those it shares with other phases), each draw of its shared members stamped
-        (`_Build.stamped`)."""
+        own stream, those it shares with other phases stamped (`members`, `_stamped`)."""
         phase = _drawn(_continued(source.pipelines[index], consumed), members or {})
-        staged = _staged(phase._then(*train.stages), validation if index == 0 else None, objective=objective,
-                         read=read, provision=provision, loading=loading, seed=seed, rejections=rejections,
-                         version=plan_version)
-        if not members:
-            return staged
-        stamped = dataclasses.replace(staged.build, stamped=frozenset(members))
-        return dataclasses.replace(staged, build=stamped)
+        return _stamped(_staged(phase._then(*train.stages), validation if index == 0 else None,
+                                objective=objective, read=read, provision=provision, loading=loading,
+                                seed=seed, rejections=rejections, version=plan_version), members or {})
 
     tokens = source.clock == "tokens"
     first = staged_at(0, {})
@@ -1520,6 +1515,14 @@ def _shared(phases: Phases) -> tuple[dict[str, str], ...]:
             place = next(at for at, child in enumerate(mix.pipelines) if child is held)
             members[index][_member_keys(_members(mix.pipelines))[place]] = key
     return tuple(members)
+
+
+def _stamped(staged: _Staged, members: Mapping[str, str]) -> _Staged:
+    """`staged`, a phase on its own stream, its mix stamping each draw of the members it shares with other
+    phases (`members`, `_Build.stamped`)."""
+    if not members:
+        return staged
+    return dataclasses.replace(staged, build=dataclasses.replace(staged.build, stamped=frozenset(members)))
 
 
 def _drawn(pipeline: Pipeline, members: Mapping[str, str]) -> Pipeline:

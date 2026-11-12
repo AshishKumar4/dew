@@ -39,7 +39,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import _position
-from dew._records import JSON, boolean, integer, integers, json_value, listed, record, strings, text
+from dew._records import boolean, integer, integers, json_value, listed, record, strings, text
 from dew.batch import DRAWS, EXAMPLES_CONSUMED, PHASE, VALID_ROWS, Batch, Draws, Phase, padded_rows
 from dew.data import cgroups
 from dew.mesh import LayoutRefused, batch_axes
@@ -47,7 +47,7 @@ from dew.mesh import LayoutRefused, batch_axes
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from dew.data.mixing import CorpusCounts
+    from dew.data.mixing import CorpusCounts, Left
     from dew.data.pipeline import DeviceStep
     from dew.data.plan import Plan
 
@@ -1783,7 +1783,7 @@ class StepPhases(Forwarding):
         self._shared = [dict(members) for members in shared] or [{} for _ in readers]
         # By corpus, each mix read's position of it as the phase before left it, its low pull and the pulls
         # past it the run trained; and the draws trained by mix read and member in the phase it stands in.
-        self._carried: dict[str, list[dict[str, JSON]]] = {}
+        self._carried: dict[str, list[Left]] = {}
         self._trained: dict[tuple[str, str], _Frontier] = {}
 
     def __iter__(self) -> Iterator[Batch]:
@@ -1825,10 +1825,9 @@ class StepPhases(Forwarding):
         return {**batch, PHASE: Phase(phase)}
 
     def _carry_from(self, phase: int, reader: Iterator[Batch]) -> None:
-        """Each corpus phase `phase` shares with a later phase, as it leaves it (`carried`): by mix read, the
-        member's position at its earliest in the phase's position, its low pull there, and the pulls past it
-        the run trained."""
-        from dew.data.mixing import STAMPING, stamped_mixes
+        """Each corpus phase `phase` shares with a later phase, as it leaves it (`dew.data.mixing.left_by`),
+        carried to the phase that reads it next (`carried`)."""
+        from dew.data.mixing import left_by
 
         members = self._shared[phase]
         if not members:
@@ -1837,61 +1836,28 @@ class StepPhases(Forwarding):
             raise TypeError(f"phase {phase}'s stream keeps no position, which its shared corpora "
                             "continue from")
         own = reader.get_state()
-        earliest: dict[str, dict] = {}
-        for mix in stamped_mixes(json.loads(own) if isinstance(own, bytes) else own):
-            stamping = record(mix[STAMPING], "a mix's draws")
-            node = text(stamping["node"], "a mix's node")
-            pulled = record(stamping["pulled"], "a mix's pulls")
-            held = earliest.get(node)
-            if held is None or sum(map(int, pulled.values())) < sum(
-                    map(int, record(held[STAMPING], "a mix's draws")["pulled"].values())):
-                earliest[node] = mix
-        carried: dict[str, list[dict[str, JSON]]] = {}
-        for node, mix in earliest.items():
-            pulled = record(record(mix[STAMPING], "a mix's draws")["pulled"], "a mix's pulls")
-            parents = record(mix["parents"], "a mix's corpora")
-            for member, corpus in members.items():
-                low = integer(pulled[member], f"member {member}'s pulls")
-                trained = self._trained.get((node, member), _Frontier())
-                carried.setdefault(corpus, []).append(
-                    {"position": json_value(parents[member], f"member {member}'s position"), "low": low,
-                     "past": trained.past(low)})
-        self._carried.update(carried)
+        state = json_value(json.loads(own) if isinstance(own, bytes) else own, "a phase's position")
+
+        def trained(node: str, member: str, low: int) -> tuple[int, ...]:
+            return self._trained.get((node, member), _Frontier()).past(low)
+
+        self._carried.update(left_by(state, members, trained))
         self._trained.clear()
 
     def _carry_into(self, phase: int, reader: Iterator[Batch]) -> None:
-        """Phase `phase`'s reader with each corpus it shares with an earlier phase where that phase left
-        it (`_carry_from`): each mix read's member at the earlier's position, its pulls counted from the low
-        pull and drawn past those the run trained, its counts its own from here (`uncounted`)."""
-        from dew.data.mixing import STAMPING, stamped_mixes, uncounted
+        """Phase `phase`'s reader with each corpus it shares with an earlier phase where that phase left it
+        (`dew.data.mixing.continued`)."""
+        from dew.data.mixing import continued
 
-        members = {member: corpus for member, corpus in self._shared[phase].items()
-                   if corpus in self._carried}
-        if not members:
+        members = self._shared[phase]
+        if not any(corpus in self._carried for corpus in members.values()):
             return
         if not isinstance(reader, Checkpointable):
             raise TypeError(f"phase {phase}'s stream keeps no position, which its shared corpora "
                             "continue into")
         own = reader.get_state()
-        state = json.loads(own) if isinstance(own, bytes) else own
-        mixes = stamped_mixes(state)
-        nodes = list(dict.fromkeys(text(record(mix[STAMPING], "a mix's draws")["node"], "a mix's node")
-                                   for mix in mixes))
-        for corpus in set(members.values()):
-            if len(self._carried[corpus]) != len(nodes):
-                raise ValueError(f"phase {phase} reads its shared corpora in {len(nodes)} mix reads and "
-                                 f"the phase that left corpus {corpus} read it in "
-                                 f"{len(self._carried[corpus])}: read the phases that share a corpus in the "
-                                 "same loading workers")
-        for mix in mixes:
-            stamping = record(mix[STAMPING], "a mix's draws")
-            at = nodes.index(text(stamping["node"], "a mix's node"))
-            parents = record(mix["parents"], "a mix's corpora")
-            for member, corpus in members.items():
-                carried = self._carried[corpus][at]
-                parents[member] = uncounted(carried["position"])
-                stamping["pulled"][member] = carried["low"]
-                stamping["skips"][member] = carried["past"]
+        held = json_value(json.loads(own) if isinstance(own, bytes) else own, "a phase's position")
+        state = continued(held, members, self._carried)
         reader.set_state(json.dumps(state).encode() if isinstance(own, bytes) else state)
 
     def get_state(self) -> bytes:
@@ -1901,7 +1867,8 @@ class StepPhases(Forwarding):
         if not isinstance(stream, Checkpointable):
             raise TypeError(f"phase {phase}'s stream keeps no position")
         own = stream.get_state()
-        shared = {"carried": self._carried, "trained": [
+        carried = {corpus: [left.record() for left in held] for corpus, held in self._carried.items()}
+        shared = {"carried": carried, "trained": [
             [node, member, frontier.count, sorted(frontier.ahead)]
             for (node, member), frontier in self._trained.items()]} if any(self._shared) else {}
         return json.dumps({_position.STEP_PHASES: {
@@ -1929,7 +1896,9 @@ class StepPhases(Forwarding):
                              f"at {end}")
         own = base64.b64decode(text(saved["position"], "the saved phase's position"))
         # What a position saved before phases shared corpora holds of them: none.
-        self._carried = {corpus: [record(entry, "a carried corpus") for entry in listed(
+        from dew.data.mixing import Left
+
+        self._carried = {corpus: [Left.of(entry) for entry in listed(
             entries, f"carried corpus {corpus}", read=json_value, what="a list of mix reads")]
             for corpus, entries in record(saved.get("carried", {}), "carried corpora").items()}
         self._trained = {}

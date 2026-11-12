@@ -177,13 +177,8 @@ def test_elastic_phases_that_share_a_corpus_resume_inside_the_second_on_another_
     for share in again:
         share.set_state(state)
     for step in (5, 6):
-        held = sorted(itertools.chain.from_iterable(_kept_ids(next(share)) for share in again))
+        held = sorted(itertools.chain.from_iterable(_ids(next(share)) for share in again))
         assert held == sorted(whole[step])
-
-
-def _kept_ids(batch) -> list[int]:
-    keep = batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool))
-    return np.asarray(batch["id"])[keep].tolist()
 
 
 def test_phases_that_share_a_corpus_otherwise_than_as_one_member_each_are_refused():
@@ -344,12 +339,6 @@ wrote run there: phases on their own streams inside the first, and a bounded mix
 or its held shuffle holds counts."""
 
 
-def _rest(stream) -> list[list[int]]:
-    held = [np.asarray(batch["id"]).tolist() for batch in stream]
-    stream.close()
-    return held
-
-
 @pytest.mark.parametrize("saved", ["step_phases", "bounded_mixture_strided", "bounded_mixture_held"])
 def test_a_position_saved_before_phases_shared_corpora_resumes_as_it_was_read(saved):
     """A position main saved before draws were stamped and carried (no corpus carried or trained in a
@@ -367,9 +356,11 @@ def test_a_position_saved_before_phases_shared_corpora_resumes_as_it_was_read(sa
                    .named(name) for name, offset in (("left", 0), ("right", 100_000))]
         loader = compile(laid(mix(corpora)).read(read_as).batch(2), read=read_as, examples=2 * len(_LENGTHS))
         steps = 2 if saved.endswith("strided") else 3
-    stream = loader.train(DataPartition())
-    list(itertools.islice(stream, steps))
-    after = _rest(stream)
-    restored = loader.train(DataPartition())
-    restored.set_state((SAVED_BY_MAIN / f"{saved}.position").read_bytes())
-    assert _rest(restored) == after
+    streams = [loader.train(DataPartition()) for _ in range(2)]
+    list(itertools.islice(streams[0], steps))
+    streams[1].set_state((SAVED_BY_MAIN / f"{saved}.position").read_bytes())
+    # The rest of each read, the stopped one's and the restored one's, batch by batch.
+    after = [[_ids(batch) for batch in stream] for stream in streams]
+    for stream in streams:
+        stream.close()
+    assert after[1] == after[0] and after[0]

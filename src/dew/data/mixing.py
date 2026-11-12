@@ -19,7 +19,7 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import boolean, integer, integers, json_value, record, text
+from dew._records import JSON, boolean, integer, integers, json_value, record, text
 from dew.batch import Batch
 from dew.data.dataset import LONG_RUN, logged_run
 from dew.data.pipeline import DRAWN, Owed, Record, Rejected, accounts, drawn_of, member_of, members_of
@@ -420,7 +420,7 @@ class _AcceptedIterator(_CountedIterator[Batch]):
 class Carried(pygrain.IterDataset[Batch]):
     """`parent`'s rows, each marker's source examples (`Rejected.consumed`) carried on to the next row and
     the markers dropped, counting nothing: the carrier after a step whose markers no corpus's count
-    follows, a batched map's group it makes no rows of (`dew.data.lowering._Groups`). The examples it
+    follows, a batched map's group it makes no rows of (`dew.data.pipeline.BatchedGroups`). The examples it
     owes are checkpointed with its parent's position; those the stream ends owing are its end's
     (`dew.training._fit.drained`)."""
 
@@ -911,7 +911,7 @@ class Stamping:
         self.pulled[key] += 1
         return {**row, DRAWN: (draw,)}
 
-    def state(self) -> dict[str, object]:
+    def state(self) -> Mapping[str, object]:
         return {"node": self.node, "pulled": dict(self.pulled), "skips": self._held}
 
     def restore(self, state: Mapping[str, object]) -> None:
@@ -945,38 +945,116 @@ def restamped(stamping: Stamping | None, state: Mapping[str, object]) -> None:
         stamping.restore(record(state[STAMPING], "a mix's draws"))
 
 
-def stamped_mixes(state: object) -> list[dict]:
-    """Every saved position of a mix that stamps its draws in `state`, a reader's position as JSON: each mix
-    read's own (`Stamping.node`, a loading worker's own), and the copies of it a stage downstream keeps to
-    replay from (a packer's open group's start, a shuffle's window's), in the order a walk meets them."""
-    found: list[dict] = []
-    stack = [state]
+@dataclasses.dataclass(frozen=True)
+class Left:
+    """Where a phase left a member of its mix, one mix read's (`node`): the member's position at its earliest
+    in the phase's saved position, the low pull there (the first the run has not trained), and the pulls
+    past it the run trained (`past`), which a phase that continues the member draws past
+    (`dew.data.dataset.StepPhases`)."""
+
+    position: JSON
+    low: int
+    past: tuple[int, ...]
+
+    def record(self) -> dict[str, JSON]:
+        return {"position": self.position, "low": self.low, "past": list(self.past)}
+
+    @classmethod
+    def of(cls, saved: JSON) -> Left:
+        held = record(saved, "a corpus left by a phase")
+        return cls(json_value(held["position"], "its position"), integer(held["low"], "its low pull"),
+                   tuple(integers(held["past"], "its trained pulls")))
+
+
+def _stamped_mixes(state: JSON) -> list[dict[str, JSON]]:
+    """Every saved position of a mix that stamps its draws in `state`, a reader's position: each mix read's
+    own (a loading worker's slice's, `node_of`), and the copies of it a stage downstream keeps to replay from
+    (a packer's open group's start, a shuffle's window's), in the order a walk meets them."""
+    found: list[dict[str, JSON]] = []
+    stack: list[JSON] = [state]
     while stack:
-        node = stack.pop()
-        if isinstance(node, dict):
-            if STAMPING in node and "parents" in node:
-                found.append(node)
-            stack.extend(reversed(list(node.values())))
-        elif isinstance(node, list):
-            stack.extend(reversed(node))
+        match stack.pop():
+            case dict() as node:
+                if STAMPING in node and "parents" in node:
+                    found.append(node)
+                stack.extend(reversed(list(node.values())))
+            case list() as nodes:
+                stack.extend(reversed(nodes))
     return found
 
 
-def uncounted(position: object) -> object:
+def _drawing(mix: Mapping[str, JSON]) -> tuple[str, dict[str, JSON], dict[str, JSON]]:
+    """A mix position's node, its pulls by member and its skips by member (`Stamping.state`)."""
+    stamping = record(mix[STAMPING], "a mix's draws")
+    return (text(stamping["node"], "a mix's node"), dict(record(stamping["pulled"], "a mix's pulls")),
+            dict(record(stamping["skips"], "a mix's skipped pulls")))
+
+
+def left_by(state: JSON, members: Mapping[str, str],
+            trained: Callable[[str, str, int], tuple[int, ...]]) -> dict[str, list[Left]]:
+    """Where a phase whose saved position is `state` left each of `members` (mix member key: corpus), by
+    corpus, a `Left` for each mix read in the order its position names them: the member's position in
+    the mix read's earliest copy, which every stage after the mix replays from, its low pull there, and
+    the pulls past it `trained(node, member, low)` says the run trained."""
+    earliest: dict[str, tuple[int, dict[str, JSON]]] = {}
+    for mix in _stamped_mixes(state):
+        node, pulled, _ = _drawing(mix)
+        drawn = sum(integer(count, "a mix's pulls") for count in pulled.values())
+        if node not in earliest or drawn < earliest[node][0]:
+            earliest[node] = (drawn, mix)
+    left: dict[str, list[Left]] = {}
+    for node, (_, mix) in earliest.items():
+        _, pulled, _ = _drawing(mix)
+        parents = record(mix["parents"], "a mix's corpora")
+        for member, corpus in members.items():
+            low = integer(pulled[member], f"member {member}'s pulls")
+            position = json_value(parents[member], f"member {member}'s position")
+            left.setdefault(corpus, []).append(Left(position, low, trained(node, member, low)))
+    return left
+
+
+def continued(state: JSON, members: Mapping[str, str], left: Mapping[str, Sequence[Left]]) -> JSON:
+    """`state`, a fresh phase's saved position, with each of its `members` (mix member key: corpus) that
+    `left` holds at where the phase before left it (`left_by`), in every copy of each mix read, the i-th mix
+    read taking the corpus's i-th: its position, its pulls counted from the low pull and drawn past the
+    trained ones, its counts its own from here (`uncounted`). Refused where the phase reads the corpus in
+    another count of mix reads than the phase that left it."""
+    mixes = _stamped_mixes(state)
+    nodes = list(dict.fromkeys(_drawing(mix)[0] for mix in mixes))
+    for corpus, held in left.items():
+        if corpus in members.values() and len(held) != len(nodes):
+            raise ValueError(f"this phase reads its shared corpora in {len(nodes)} mix reads and the phase "
+                             f"that left corpus {corpus} read it in {len(held)}: read the phases that "
+                             "share a corpus in the same loading workers")
+    for mix in mixes:
+        node, pulled, skips = _drawing(mix)
+        at = nodes.index(node)
+        parents = dict(record(mix["parents"], "a mix's corpora"))
+        for member, corpus in members.items():
+            if corpus in left:
+                where = left[corpus][at]
+                parents[member] = uncounted(where.position)
+                pulled[member], skips[member] = where.low, list(where.past)
+        mix["parents"] = parents
+        mix[STAMPING] = {**record(mix[STAMPING], "a mix's draws"), "pulled": pulled, "skips": skips}
+    return state
+
+
+def uncounted(position: JSON) -> JSON:
     """`position`, a corpus's, with every counter it keeps (`COUNTER`) at no counts: a corpus a later phase
     reads on from an earlier phase's position counts what that phase reads of it, the earlier's counts
     being the earlier phase's own."""
-    if isinstance(position, list):
-        return [uncounted(part) for part in position]
-    if not isinstance(position, dict):
-        return position
-    held = {key: uncounted(part) for key, part in position.items()}
-    counter = held.get(COUNTER)
-    if isinstance(counter, dict) and "counts" in counter:
-        none = CorpusCounts(text(counter["corpus"], "a counter's corpus"),
-                            text(counter["label"], "a counter's label"))
-        held[COUNTER] = {**counter, "counts": none.state()}
-    return held
+    match position:
+        case list():
+            return [uncounted(part) for part in position]
+        case dict():
+            held: dict[str, JSON] = {key: uncounted(part) for key, part in position.items()}
+            match held.get(COUNTER):
+                case {"corpus": str(corpus), "label": str(label), "counts": _} as counter:
+                    held[COUNTER] = {**counter, "counts": json_value(CorpusCounts(corpus, label).state(),
+                                                                     "no counts")}
+            return held
+    return position
 
 
 class _MixRead(pygrain.DatasetIterator[Batch]):
