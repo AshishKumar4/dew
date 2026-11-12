@@ -7,6 +7,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A schedule's step horizons (its warmup's and decay's lengths in steps) are operands of its solver's state
+  (`RateState.horizons`) where a run builds it stated (`OptimConfig.build(stated=True)`), so a rehearsed run
+  and the run itself step one program over the persistent compile cache whatever their lengths. A schedule
+  states them through the new `ScheduleBase.horizons(steps)` hook, and `ScheduleBase.values` takes them
+  as `values(horizons, rates)` where it took `values(steps, rates)`: a subclass that read the run's length
+  in `values` overrides `horizons` to state the lengths it reads, or reads `{}`.
+
 - A run's fit plan judges a head that keeps its whole logits by their fp32 bytes before it traces the step's
   gradient (`Objective.whole_head_table` names the head's table), and bounds the rung after a traced one
   from that trace, so a step whose whole logits leave no room is planned from one gradient trace and
