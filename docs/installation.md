@@ -99,7 +99,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post81,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post83,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves Dew's JAX build, dewml's releases and the forks Dew carries, Qwix's build among them (the `quantization` extra). The CUDA plugins the `cuda12` and `cuda13` extras install (`jax-cuda12-plugin`, `jax-cuda13-plugin`) and their PJRT plugins (`jax-cuda12-pjrt`, `jax-cuda13-pjrt`, where Mosaic GPU compiles a kernel's PTX) are Dew's builds of its native code, carrying the Mosaic GPU fixes below that live in them, and the index serves them too. They are post81's on x86_64 and aarch64 (a GH200's Grace) alike, which add XLA's cuDNN fixes below (a cached graph's backend configuration, the deviceless description's memory bus width, a default convolution's engine) and its GEMM fusion under deterministic ops to post73's, and the `kernel-compile` extra's (x86_64 only) are post81's too. They pair with the stock `jaxlib==0.12.0.1`, and each GPU lock (`locks/cuda12.txt`, `locks/cuda13.txt`) carries each machine's pins under its markers, so a GH200 installs the same file. Every other package, jaxlib included, comes from PyPI. The fixes:
@@ -110,6 +110,8 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - A `custom_vjp` call (and Mosaic GPU's `custom_jvp` call) in a Pallas Triton or Mosaic GPU kernel lowers as its primal function, which a template's score hook through a `jax.custom_vjp` needs.
 - Mosaic GPU relays an MMA's accumulator out to a 16-bit MMA's left operand in registers, and an abstract device states its compute capability, which Mosaic GPU lowers for: the templates' Mosaic kernels need both on sm80.
 - The persistent compilation cache keys a CPU program by the host's CPU, which XLA:CPU compiles for, and every program by JAX's own build as well as jaxlib's, so neither another CPU nor another build over one jaxlib reads a program it cannot run.
+- A Mosaic GPU kernel whose operands sit on a concrete mesh lowers a reshard of a literal (`zeros_like` of a value carrying the mesh's sharding binds one), and `emit_pipeline`'s zeros bind none, so a template decode on sm80, sm86 and sm89 lowers with its operands on a `NamedSharding`.
+- A Pallas interpreter's thread map runs its threads' programs on a CPU client of its own, so an interpreted kernel inside a host callback never waits on in-flight units the calling computation's client holds, which hung interpreted kernels on a CPU whose device queue was full.
 - Mosaic GPU and Pallas Mosaic GPU lower `ceil` and `floor`, which a template's Mosaic kernel that rounds a value needs on an H100.
 - Pallas Mosaic GPU lowers `add_any` and `integer_pow` of every integer exponent, which the Mosaic attention backward under a score hook needs: a hook's transposed pullback sums its cotangents, and a temperature's backward raises it to the power -2.
 - Mosaic GPU's layout inference solves groups of unknowns that no constraint relates separately, so sm80's `mma.sync` GEMM tiles find their layouts.
