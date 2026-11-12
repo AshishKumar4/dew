@@ -26,6 +26,7 @@ import numpy as np
 import pytest
 from lane_environment import outside_any_cluster
 from process_support import raised
+from reference_error import as_given, assert_as_exact
 
 from dew.distributed.placement import parameter_axes
 from dew.training import MeshSpec
@@ -40,6 +41,23 @@ WORKER = Path(__file__).with_name("distribution_worker.py")
 SCHEDULER = Path(__file__).with_name("scheduler_worker.py")
 # Three adam steps on another topology; observed 2.4e-7.
 TOLERANCE = 1e-5
+
+
+def launches_as_exact(label: str, dew, reference, truth, *, seeds: int) -> None:
+    """Check 1 (`reference_error.assert_as_exact`) over three launches of one worker: `dew`'s values (a
+    pool of processes) are as exact as `reference`'s (one process of every device) from `truth`, the same
+    runs in float64 in one process. Each is its launch's values by draw, `staged_units(seeds)` of them (the
+    worker's `--draws`), a tree of named arrays a draw, `truth`'s float64: draw `d` of every launch starts
+    from the one initial state and the one batch that `d` names, so the three differ by their arithmetic
+    and their topology alone. The launches are whole runs in processes of their own, so each arm reads its
+    launch's values by the draw's index and the gate runs it as given; a second stage reads the further
+    draws the launches already hold."""
+    def read(launch):
+        return as_given(lambda index: launch[int(index)])
+
+    assert_as_exact(read(dew), read(reference), lambda seed: (np.asarray(seed),), label, seeds=seeds,
+                    truth_fn=read(truth))
+
 
 
 def start(*arguments: str, devices: int) -> subprocess.Popen:
