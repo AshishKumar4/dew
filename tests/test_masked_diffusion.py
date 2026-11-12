@@ -18,9 +18,10 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from arm_arithmetic import float64_held
 from flax import linen as nn
-from model_support import flat_tree
-from reference_error import as_given, assert_as_exact, widened
+from model_support import flat_tree, float64_twin
+from reference_error import assert_as_exact, widened
 
 from dew.batch import coordinates
 from dew.checkpoints import Checkpoints
@@ -346,6 +347,11 @@ def test_the_trainer_builds_its_state_from_the_held_checkpoint():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]))
 
 
+CONVERTED_SEEDS = 8
+"""The converted masked decoder's logits site's declared check-1 seeds against its float64 twin: `seeds_for`
+paired, on armada's CPU, every family's (mc-sizing2 at a0bc1bbfe, 11-12)."""
+
+
 @pytest.fixture(scope="module", params=["llada-tiny", "dream-tiny", "llada-moe-tiny",
                                       "llada-moe-v2-tiny", "llada2-tiny", "llada22-tiny"])
 def masked_source(request):
@@ -508,10 +514,18 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
         lambda leaf: leaf.dtype, reference.variables)
     expected_logits = jax.jit(lambda tokens: reference.model.apply(reference.variables, tokens))
     actual_logits = jax.jit(lambda tokens: converted.model.apply(converted.variables, tokens))
-    assert_as_exact(actual_logits, expected_logits,
-                    lambda seed: (np.asarray([(np.arange(8) + seed) % model.vocab_size], np.int32),),
-                    'converted masked decoder logits', seeds=8,
-                    truth_fn=as_given(lambda tokens: np.asarray(expected_logits(tokens), np.float64)))
+    # The truth is the reference's model in float64 over its bfloat16 weights' values (row 5145): the
+    # reference's own float32 logits widened would make it exact by construction.
+    wide_model, wide_variables = float64_twin(reference.model), float64_held(reference.variables)
+
+    def truth(tokens):
+        return wide_model.apply(wide_variables, tokens)
+
+    def drawn(seed):
+        return (np.asarray([(np.arange(8) + seed) % model.vocab_size], np.int32),)
+
+    label = 'converted masked decoder logits'
+    assert_as_exact(actual_logits, expected_logits, drawn, label, truth_fn=truth, seeds=CONVERTED_SEEDS)
 
     source.save(tmp_path / "published", variables=resumed.variables)
     reloaded = Pretrained.load(tmp_path / "published", dtype="bfloat16", attention_impl="xla")

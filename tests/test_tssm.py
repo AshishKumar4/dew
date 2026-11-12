@@ -7,11 +7,16 @@ to itself and nothing after, bit for bit."""
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings, seeds_for
+from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings
 
 from dew.objectives.rl.tssm import TSSM
 
 ROWS, LENGTH, WIDTH, HEADS = 3, 7, 16, 2
+
+
+STATE_SEEDS = 8
+"""The bfloat16 states site's declared check-1 seeds: `seeds_for` paired, on armada's CPU (mc-sizing at
+dde08fb8d, 11-12)."""
 
 
 def tiny(dtype=jnp.float32) -> TSSM:
@@ -118,7 +123,7 @@ def test_a_windows_states_in_bfloat16_are_on_par_with_the_written_transformers()
         return written_states(held, x, first)
 
     label = "a TSSM's states in bfloat16"
-    assert_as_exact(dew, written, draw, label, seeds=seeds_for(written, draw, label, dew_fn=dew))
+    assert_as_exact(dew, written, draw, label, seeds=STATE_SEEDS)
 
 
 def test_a_state_reads_its_episode_up_to_itself_and_nothing_after():

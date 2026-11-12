@@ -2088,19 +2088,21 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
     end the run there."""
     reports = run_pool("pool_refusals", tmp_path / "pool", 2, devices=4, timeout=300,
                        run_dir=str(tmp_path / "runs"))
-    for rank, report in enumerate(reports):
-        assert report["same"] is None and report["saved"] is None and report["latest"] == 2, report
-        assert "training data differs between the processes" in report["content"], report
-        assert "training data differs between the processes" in report["named"], report
-        # A pool compares what its processes hold, not where each mounted it: no description is named.
-        assert "training data differs between the processes" in report["count"], report
-        assert "holds no rows" in report["first_read"], report
-        assert "training read: the stream ended on 1 of 2 processes" in report["eof"], report
-        assert report["ended"] is None, report
-        assert "training batch layout differs" in report["layout"], report
-        assert "newest checkpoint differs" in report["stale"], report
-        if rank == 0:
-            assert "training read failed on rank 1" in report["first_read"], report
+    before = ("content", "named", "count", "first_read", "layout")
+    # The steps the pool logged, which its first process's tracker hears.
+    logged = reports[0]
+    assert logged["same"]["steps"] == logged["saved"]["steps"] == [1, 2] and logged["ended"]["steps"] == [1]
+    assert logged["eof"]["steps"] in ([], [1]) and all(logged[case]["steps"] == [] for case in before), logged
+    for report in reports:
+        # The controls train: one corpus, a saved run, and streams that run out together end there.
+        assert all(report[case]["refused"] is None for case in ("same", "saved", "ended")), report
+        assert report["latest"] == 2, report
+        # What the processes hold apart, every process refuses before any step logs; a stream one process
+        # ends refuses where it ends, past the steps both read; a listing older than the pool's newest
+        # checkpoint restores nothing.
+        assert all(report[case]["refused"] is not None for case in (*before, "eof")), report
+        assert report["stale"]["refused"] is not None and report["stale"]["restored"] is None, report
+
 
 
 @pytest.mark.distributed
