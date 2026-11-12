@@ -608,6 +608,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     EXACT_SUMS: ClassVar[bool] = False
     """Whether the kernel adds each depth step's product apart (`exact_sums`); one that does not is not
     eligible where the call asks for it."""
+    PRODUCER_GATHERS: ClassVar[bool] = False
+    """Whether its producer gathers the rows its table names (`gmm`'s `gather`); a kernel gradient's tables
+    are its consumers' copies (`mosaic_gpu.tgmm`'s `gather`)."""
     STAGED_ROWS: ClassVar[bool] = False
     """Whether a consumer prepares its share of each step's rows stage itself (the kernel gradient's
     prologue and group zeroing, `registers`)."""
@@ -949,7 +952,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # A family rewriting the staged rows in a role of its own runs it beside the consumers
         # (`mosaic_gpu.tgmm`'s `roles`).
         roles = config.warpgroups + self.rewritten(ba, family)
-        return resources.Launch(scope, roles, self.registers(ba, config), most=most, tile=launched)
+        # A producer whose issue loop holds more than its family's least states its own (a tcgen05 load warp
+        # gathering rows, `mosaic_gpu.gmm_producer`), as its kernel lowers it.
+        gathers = self.PRODUCER_GATHERS and ba.arguments.get('gather') is not None
+        producer = mosaic_gpu.gmm_producer(family, gathers)
+        return resources.Launch(scope, roles, self.registers(ba, config), most=most, tile=launched,
+                                producer=producer)
 
     def rewritten(self, ba, family: mosaic.Family) -> bool:
         """Whether the launch's staged rows are rewritten by `family`'s own role (`rewrites_in_persist`): its
@@ -1126,6 +1134,7 @@ class MosaicGmm(_Mosaic):
     """`Gmm` through the template's mainloop (`mosaic_gpu.gmm`) on a GPU family's bundle or a TPU core's,
     exact sums too: an FP8 product's running sum promoted into fp32 every step (`product.eight`)."""
 
+    PRODUCER_GATHERS: ClassVar[bool] = True
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
     EXACT_SUMS: ClassVar[bool] = True
     FP8: ClassVar[bool] = True
@@ -1147,7 +1156,8 @@ class MosaicGmm(_Mosaic):
             epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
             dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],),
             paired=ba.arguments.get('paired') is not None, step_scaled=self.STEP_SCALED,
-            block_scaled=self.BLOCK_SCALED)
+            block_scaled=self.BLOCK_SCALED, gathered=ba.arguments.get('gather') is not None,
+            interpret=bool(ba.arguments['interpret']))
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         # A group's rows on average over the call's groups, which a stack read from its `first` matrix

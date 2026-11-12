@@ -593,8 +593,10 @@ def _model(launch, ba, config) -> resources.RegisterModel:
     sized it by (`resources.shared_bytes` of `launch_of`'s allocations, including barriers), against the
     kernel's own."""
     family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-    shared = resources.shared_bytes(family, launch.launch_of(ba, config).scope(config.stages))
-    return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared)
+    planned = launch.launch_of(ba, config)
+    shared = resources.shared_bytes(family, planned.scope(config.stages))
+    return resources.register_model(family, config.warpgroups, launch.registers(ba, config), shared=shared,
+                                    producer=planned.producer)
 
 
 def _derived_and_refused(launch, ba, target) -> tuple:
@@ -706,6 +708,31 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     assert not failed, "\n".join(failed)
     assert all(record["kernels"] and all(not kernel["unread"] for kernel in record["kernels"])
                for record in found)
+
+
+def test_a_b200s_gathered_input_gradient_fits_its_derived_resources():
+    """The expert down projection's input gradient from the hybrid compile-ahead step (row 5358), its
+    rows gathered by the load warp's TMA gathers, compiles at its derived tile without spilling and in the
+    shared memory its plan sized: its producer lowered to the registers its gathers hold
+    (`mosaic_gpu.GATHERING_PRODUCER`; at the floor's 24 it spilled 56 bytes), its gathered stream's barriers
+    as its family allocates them (`Allocations.gathered`; planned as plain ones, 976 bytes short)."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    launch = grouped_matmul.MosaicGmm()
+    shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    arguments = launch.bind(
+        shaped((4096, 1024)), shaped((4, 8192, 1024)), jax.ShapeDtypeStruct((4,), jnp.int32),
+        gather=jax.ShapeDtypeStruct((4096,), jnp.int32),
+        out_dtype="bfloat16", trans_rhs=True, interpret=False)
+    with report.refusals(), generation.assumed("sm100"):
+        tile = launch.derived(arguments, generation.gpu_target())
+        assert tile is not None
+        cases = [support.KernelCase("gathered input gradient",
+                                    lambda: launch.lowering(arguments, tile),
+                                    {"dew_gmm": _model(launch, arguments, tile)})]
+        found = compile_mosaic_kernels(cases, "sm100")
+    failed = failures(found) + mosaic_failures(found)
+    assert not failed, "\n".join(failed)
 
 
 @functools.cache

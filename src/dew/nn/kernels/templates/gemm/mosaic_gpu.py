@@ -456,6 +456,10 @@ class Allocations:
     blocks: dict
     staged: tuple
     outputs: tuple
+    gathered: tuple = ()
+    """The streams a producer gathers (`GATHERED_STREAMS`, `mosaic.Family.streams`' `gathered`): their load
+    barriers its family's own (`gathered.ring`'s 8-byte words at a 1024-byte alignment, which the planner
+    counted as plain barriers: 976 bytes short of a B200's gathered input gradient's, row 5358)."""
 
     def scope(self, family: mosaic.Family, tiles: "Tiles", steps: int | None = None,
               rewritten: bool = False) -> resources.Scope:
@@ -470,7 +474,8 @@ class Allocations:
         rewrites = tuple(tiles.stages for _ in self.blocks) if rewritten else ()
         persisted, addresses = family.persist_scratch(consumers, rewrites)
         multicast = ('matrix',) if tiles.cluster > 1 and 'matrix' in self.blocks else ()
-        streams = family.streams(self.blocks, tiles.stages, consumers, multicast=multicast)
+        streams = family.streams(self.blocks, tiles.stages, consumers, multicast=multicast,
+                                 gathered=self.gathered)
         held, walks = family.lifetimes(streams, steps)
         # A core holding its values in scratch memory holds them beside (`mosaic.Issuer.value_scratch`).
         values = family.value_scratch(self.blocks, self.outputs)
@@ -490,7 +495,8 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
                     prologue_axes: tuple, prologue_dtypes: tuple, epilogue_axes: tuple,
                     epilogue_dtypes: tuple, dtypes: tuple, paired: bool = False,
                     transpose_lhs: bool = False, packed: bool = False, step_scaled: bool = False,
-                    block_scaled: bool = False, interpret: bool = False) -> Allocations:
+                    block_scaled: bool = False, interpret: bool = False, gathered: bool = False
+                    ) -> Allocations:
     """Dew: `gmm`'s allocations at `tiles` (`Allocations`), for rows of `dtype` and a matrix of `rhs_dtype`
     (two with `paired`), its side operands' axes and dtypes and its outputs' dtypes: a stream for the rows,
     each matrix and each prologue side operand that follows the steps (`_stepped`), each epilogue side
@@ -502,7 +508,8 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
     consumers splitting whole 64-column shares, one set the consumers share, each decoding its share of the
     columns (`_shared_decode`), two more than its family keeps product groups in flight
     (`mosaic.Family.in_flight`), as a consumer may decode a stage ahead of another's products; else each
-    consumer's own, one more, so no decode overwrites a stage a product still reads."""
+    consumer's own, one more, so no decode overwrites a stage a product still reads. With `gathered`
+    (compiled), its rows a producer's gather (`Allocations.gathered`)."""
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     # A consumer's accumulators: its share of the rows by the tile's columns, a pair's both where its products
     # span it (`tile_columns`); each stream's slot a multiprocessor's block.
@@ -533,7 +540,8 @@ def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, 
                                           jnp.bfloat16)])
     return Allocations(blocks, (sides['side_smems'], sides['side_barriers'], held['fixed_smems'],
                                 held['fixed_barriers'], decoded),
-                       tuple((part, jnp.dtype(out)) for out in dtypes))
+                       tuple((part, jnp.dtype(out)) for out in dtypes),
+                       GATHERED_STREAMS if gathered and not interpret else ())
 
 
 def _scale_tiles(block_m: int, block_n: int, block_k: int, dtype) -> dict:
@@ -815,7 +823,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     stepped, read, fixed = _stepped(family, prologue_axes, 'depth')
     allocations = _gmm_allocated(tiles, family, (lhs, rhs, paired, scales, step_scales, mx_scales), hooks,
                                  sides, dtypes, transpose_rhs=transpose_rhs, transpose_lhs=transpose_lhs,
-                                 interpret=bool(interpret))
+                                 interpret=bool(interpret), gathered=gather is not None)
     matrices = ('matrix',) if paired is None else ('matrix', 'paired')
     # The streams that follow the matrix's group and column tile: its own, and a packed one's scales.
     streamed = matrices + (() if scales is None else ('scales',))
@@ -878,7 +886,8 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
             family.persist(streams, walks, schedule, issue, finish, consumers=consumers,
                            axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=family.in_flight, unrolled=_unrolled(prologue, exact_sums),
-                           accumulators=(part,) * len(matrices), **_summed(family, tiles, exact_sums))
+                           accumulators=(part,) * len(matrices), **_summed(family, tiles, exact_sums),
+                           producer=gmm_producer(family, gather is not None))
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
@@ -888,9 +897,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                              else None, **_gathered(gather, tiles, lhs.dtype, interpret)))
 
     out_type = _declared(m if stored is None else stored, n, tiles.splits, dtypes)
-    operands = (lhs, rhs, *(() if paired is None else (paired,)), *(() if scales is None else (scales,)),
-                *(step_scales or ()), *(mx_scales or ()), *(() if gather is None else (gather,)),
-                *(() if scatter is None else (scatter,)))
+    operands = _gmm_operands(lhs, rhs, paired, scales, step_scales, mx_scales, gather, scatter)
     kernel = family.kernel(body, out_type=out_type,
                            grid=(multiprocessors // pair,), grid_names=("programs",), consumers=consumers,
                            interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
@@ -901,6 +908,16 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                          dense=dense, parts=(tail, scales, mx_scales, gather)))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
                   *_workspace(tail, (multiprocessors, 2, consumers, *part), interpret))
+
+
+def _gmm_operands(lhs, rhs, paired, scales, step_scales, mx_scales, gather, scatter) -> tuple:
+    """Dew: `gmm`'s kernel operands in the order its body reads them: the rows, each streamed matrix (its
+    own, a paired one, a packed one's scales), the step-wise and block scales, the gather and scatter
+    tables, each where the call has it."""
+    present = (*(() if paired is None else (paired,)), *(() if scales is None else (scales,)),
+               *(step_scales or ()), *(mx_scales or ()), *(() if gather is None else (gather,)),
+               *(() if scatter is None else (scatter,)))
+    return lhs, rhs, *present
 
 
 def _prefetched(tiles: Tiles, grid: tuple, steps: int, transpose_rhs: bool, interpret, *, dense: bool,
@@ -1076,7 +1093,7 @@ def _gmm_split_refused(tiles: Tiles, k: int, n: int, step_scales, *, exact_sums:
 
 def _gmm_allocated(tiles: Tiles, family: mosaic.Family, operands: tuple, hooks: tuple, sides: tuple,
                    dtypes: tuple, *, transpose_rhs: bool, transpose_lhs: bool,
-                   interpret: bool = False) -> Allocations:
+                   interpret: bool = False, gathered: bool = False) -> Allocations:
     """Dew: `gmm_allocations` for `_gmm_mainloop`'s call: its `operands` (rows, matrix, paired matrix, packed
     scales, step scales), its hooks' axes and side operands' dtypes, and its outputs' `dtypes`."""
     lhs, rhs, paired, scales, step_scales, mx_scales = operands
@@ -1089,7 +1106,7 @@ def _gmm_allocated(tiles: Tiles, family: mosaic.Family, operands: tuple, hooks: 
                            epilogue_dtypes=tuple(side.dtype for side in epilogue_operands), dtypes=dtypes,
                            paired=paired is not None, transpose_lhs=transpose_lhs, packed=scales is not None,
                            step_scaled=step_scales is not None, block_scaled=mx_scales is not None,
-                           interpret=interpret)
+                           interpret=interpret, gathered=gathered)
 
 
 def _mx_refused(mx_scales, tiles: Tiles, family: mosaic.Family, *, transpose_rhs: bool, plain: bool) -> None:
@@ -1148,7 +1165,24 @@ def _gathered(gather, tiles: Tiles, dtype, interpret) -> dict:
     if interpret:
         copies = rings.piece_copies((tiles.block_m, tiles.block_k), dtype, None, 1)
         return {'copies': {'rows': tiles.block_m * copies}}
-    return {'gathered': ('rows',)}
+    return {'gathered': GATHERED_STREAMS}
+
+
+GATHERED_STREAMS = ('rows',)
+"""The streams a gathered product's producer gathers (`gmm`'s `gather`): its rows'."""
+
+GATHERING_PRODUCER = 40
+"""The registers a tcgen05 load warp's threads hold issuing a gathered product's four-row TMA gathers
+(`gathered.tma_rows`: every thread holds the step's row indices), past `resources.producer_floor`'s 24: the
+expert down projection's gathered input gradient spilled 56 and 64 bytes at 24 on a B200 (128 x 128 at six
+stages, 128 x 64 at eight; the hybrid compile-ahead step, row 5358) and nothing at 40."""
+
+
+def gmm_producer(family: mosaic.Family, gathered: bool) -> int | None:
+    """Dew: the registers a GEMM launch's producer is lowered to where its issue loop holds more than its
+    family's least (`resources.Launch.producer`, `Family.persist`'s `producer`): a tcgen05 producer's
+    gathering rows (`GATHERING_PRODUCER`); None elsewhere (`resources.producer_floor`)."""
+    return GATHERING_PRODUCER if gathered and isinstance(family, mosaic_sm100.Tcgen05Rings) else None
 
 
 def _grouped_table(group_sizes: jax.Array, m: int, row_tile: int, first: jax.Array | None,
