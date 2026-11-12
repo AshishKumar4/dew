@@ -1386,6 +1386,44 @@ def test_a_recording_keeps_the_larger_count_sized_on_another_backend(planned):
                     seeds=seeds, truth_fn=truth)
 
 
+def test_a_recording_judged_is_held_to_dews_own_run_of_the_same_weights(tmp_path):
+    """A recording of another library running what Dew exports (`record_case`'s and
+    `assert_as_exact_as_recorded`'s `judged`) is the arm check 1 judges, Dew's own run its reference, its
+    seeds sized with the two in those places: a library that sums nearer float64 than Dew's run is on par,
+    where Dew's run judged against it is not, and an export read one part in ten thousand off is over."""
+    from reference_runs import assert_as_exact_as_recorded
+    from tool_support import load
+
+    def draw(seed):
+        x, w = _draw(seed)
+        return {"x": x, "w": w}
+
+    def read(inputs):
+        # The other library's run of the export: the product summed in float64 and rounded once.
+        truth = np.asarray(inputs["x"], np.float64) @ np.asarray(inputs["w"], np.float64)
+        return {"y": truth.astype(np.float32)}, {"y": truth}
+
+    def dew(dtype, inputs):
+        return {"y": np.asarray(inputs["x"], dtype) @ np.asarray(inputs["w"], dtype)}
+
+    def held(name, label, arrays, **roles):
+        np.savez(tmp_path / name, **arrays)
+        assert_as_exact_as_recorded(tmp_path / name, "site", int(arrays["site.seeds"]), draw, dew, label,
+                                    host=True, **roles)
+
+    def recorded(**roles):
+        return load("recorded_references").record_case(
+            "site", draw, read, store_inputs=False, dew=lambda inputs: dew(np.float32, inputs), **roles)
+
+    judged = recorded(judged=True)
+    held("read.npz", "the export read", judged, judged=True)
+    with pytest.raises(GateFailure):
+        held("reference.npz", "Dew's run judged", recorded())
+    with pytest.raises(GateFailure):
+        held("off.npz", "an export read off", {**judged, "site.reference.y": judged[
+            "site.reference.y"] * np.float32(1 + 1e-4)}, judged=True)
+
+
 def test_a_recording_asked_ahead_is_the_recording_asked_in_turn():
     """A reference asked several seeds at a time on threads of their own (`record_case`'s `ahead`, an
     `evaluate` that holds its own arithmetic) records what it records asked one seed at a time: the same

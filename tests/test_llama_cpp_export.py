@@ -6,8 +6,9 @@ vocabulary the GGUF carries; tools/llama_cpp_worker.py records libllama's
 float32 logits over drawn ids beside transformers' float64 logits on the same
 export. Here the export is written again and has to be the one llama.cpp
 read, config, generation config and weights; its tokenizer has to be the
-GGUF's vocabulary, piece for piece and special id for special id; and Dew's
-logits are on par with llama.cpp's by check 1.
+GGUF's vocabulary, piece for piece and special id for special id; and
+llama.cpp's logits of the export are on par with Dew's own of the same weights
+by check 1.
 """
 
 import functools
@@ -27,7 +28,8 @@ carries."""
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "llama_cpp" / "recording.npz"
 """tools/venv_reference.py's `llama-cpp` recording (tools/llama_cpp_worker.py), its outputs whole."""
 LLAMA_SEEDS = 8
-"""The site's declared seeds, sized by `seeds_for` paired as its recording confirmed them."""
+"""The site's declared seeds, sized by `seeds_for` paired as its recording confirmed them: libllama's
+logits the arm judged, Dew's the reference (tools/venv_reference.py's `judged`)."""
 OUTPUTS = ("logits",)
 
 
@@ -54,10 +56,13 @@ def dew(_, inputs) -> dict:
 
 
 def test_llama_cpp_reads_the_decoder_dew_exports_at_dews_logits():
-    """Dew's float32 logits on par with libllama's over drawn ids, both measured from transformers' float64
-    run of the same export (check 1), Dew's dense products XLA's own sums on the CPU (row 5448)."""
+    """libllama's float32 logits of Dew's export on par with Dew's own float32 logits of the same weights
+    over drawn ids, both measured from transformers' float64 run of the export (check 1): the export is
+    the product under test, so the arm judged is what llama.cpp computes from it and the reference what
+    Dew computes before exporting. A dropped or misnamed tensor, a wrong norm epsilon or a rope base
+    llama.cpp reads otherwise moves libllama's logits far past Dew's distance from float64."""
     assert_arms_as_recorded((FIXTURE, draw, dew, OUTPUTS), "llama-cpp", LLAMA_SEEDS, "llama.cpp logits",
-                            host=True)
+                            host=True, judged=True)
 
 
 def test_llama_cpp_reads_the_export_dew_writes(tmp_path):
