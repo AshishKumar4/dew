@@ -87,6 +87,18 @@ def refused_by_its_plan(run: Path, train: Callable[[], object], *, exact: bool) 
     return True
 
 
+def resumes_one_step(run: Path, last: int, built, kind: str) -> None:
+    """`built`, `run`'s run built again, prepared and trained relaxed, the default: refused before a step where
+    this Dew reads none of its checkpoint's format (`resumed_by_its_format`), else its fit started at `last`,
+    from that step's checkpoint, whatever data plan it was saved under."""
+    prepared = built.prepare()
+    if not resumed_by_its_format(run, prepared.objective, lambda: prepared.train(kind)):
+        return
+    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
+    started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
+    assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
+
+
 def archived(recorded: str, kind: str) -> tarfile.TarFile:
     """The archive of `kind`'s run the main `recorded` saved (`tools/saved_runs_reference.py`)."""
     stored = recording(f"tests/fixtures/saved_runs/{recorded}/{kind}.npz")["run"]
@@ -344,12 +356,7 @@ def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_pat
     (`resumed_by_its_format`); one whose data plan version this Dew reads none of resumes relaxed, the
     default, its data started again."""
     run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
-    prepared = built.prepare()
-    if not resumed_by_its_format(run, prepared.objective, lambda: prepared.train(kind)):
-        return
-    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
-    started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
-    assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
+    resumes_one_step(run, last, built, kind)
 
 
 @pytest.mark.parametrize("given", ["chain", "loader"])
@@ -404,12 +411,7 @@ def test_a_run_saved_while_its_version_was_data_plan_loads_and_resumes_by_it(tmp
     fields = {name: value for name, value in record["fields"].items() if name != "data_plan_version"}
     (run / "run.json").write_text(json.dumps({**record, "fields": {**fields, "data_plan": landed}}))
     assert RunConfig.load(str(run)).data_plan_version == version
-    prepared = built.prepare()
-    if not resumed_by_its_format(run, prepared.objective, lambda: prepared.train(kind)):
-        return
-    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
-    started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
-    assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
+    resumes_one_step(run, last, built, kind)
 
 
 def test_reading_a_saved_run_opens_no_device_before_its_process_is_prepared(tmp_path):
