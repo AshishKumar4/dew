@@ -526,9 +526,12 @@ data's alone.
   (a source or step with no identity is taken as unchanged). Where the plan differs (a rule, a fact, the
   order, the sources or steps, the topology, or a version this Dew does not read), the stream starts again
   from the beginning of its order, and the run says so: a warning names each part that differs, and the
-  run's records hold it (`DataRestarted`). It guarantees the model's state, not which rows come next. A
-  run bounded in examples counts them from its saved position, so its data cannot start again, and a
-  difference refuses it as an exact resume does.
+  run's records hold it (`DataRestarted`). It guarantees the model's state, not which rows come next. Data
+  read in stages starts again at the stage the run's progress stands in, opened at that stage's own start,
+  every boundary still where the run's progress places it: phases on the step clock at the run's step,
+  phases of one global order and a batch ramp at the records the run read, a token schedule's at the
+  committed tokens (a global position's `origin` holds how far into its phase the stage's reader opened).
+  A run bounded in examples ends where its own count reaches the bound.
 - `exact`: any difference refuses the resume, naming it, and a source or step with no identity is refused
   too, since nothing checks it. It guarantees the rows that come next are the ones the saved run would have
   read.

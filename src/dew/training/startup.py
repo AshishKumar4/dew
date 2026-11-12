@@ -119,4 +119,4 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
     with nn.logical_axis_rules(trainer.layout.axis_rules):
         data_resumed(loader, trainer._stream_partition(),
                      functools.partial(checkpoints.position, step, DataPartition.of(trainer.device_mesh)),
-                     resume=trainer.data_resume, examples=loader.examples)
+                     resume=trainer.data_resume, step=step)

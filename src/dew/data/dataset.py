@@ -1563,10 +1563,17 @@ class PhasedStream:
             self._stream(index)
         self._records = 0
         self._current: int | None = None
+        # The phase whose order a restart opened partway through it, at its own start, and the records of
+        # it the run had read then (`_position.Global.origin`); none for orders opened where they start.
+        self._origin: tuple[int, int] | None = None
         self.stop_seconds = stop_seconds
 
     def __iter__(self) -> Iterator[Batch]:
         return self
+
+    def _shift(self, phase: int) -> int:
+        """The records of `phase` its order's own reader was opened past (`_origin`), 0 for most."""
+        return self._origin[1] if self._origin is not None and self._origin[0] == phase else 0
 
     def _stream(self, phase: int) -> GlobalReader:
         """Phase `phase`'s reader, opened with the ends of the phases before it."""
@@ -1605,7 +1612,8 @@ class PhasedStream:
             stream = self._stream(phase)
             stream.set_state(
                 _position.encode(
-                    _position.Global(records=self._records - self._start(phase), order=stream.order)
+                    _position.Global(records=self._records - self._start(phase) - self._shift(phase),
+                                     order=stream.order)
                 )
             )
             self._current = phase
@@ -1647,6 +1655,7 @@ class PhasedStream:
                 plan={"phases": plans} if any(plan is not None for plan in plans) else None,
                 tokens=() if self._tokens is None else tuple(int(end) for end in self._tokens[:phase]
                                                              if end is not None),
+                origin=self._shift(phase),
             )
         )
 
@@ -1677,10 +1686,12 @@ class PhasedStream:
                 if index >= len(self._open) or (plan is not None and not isinstance(plan, Mapping)):
                     raise ValueError("saved phase plan is not part of this run")
                 end = saved.completed[index][1] if index < len(saved.completed) else saved.records
+                shift = saved.origin if index == len(saved.completed) else 0
                 stream = self._stream(index)
                 stream.set_state(
                     _position.encode(
-                        _position.Global(records=end - self._start(index), order=stream.order, plan=plan)
+                        _position.Global(records=end - self._start(index) - shift, order=stream.order,
+                                         plan=plan)
                     )
                 )
 
@@ -1709,6 +1720,31 @@ class PhasedStream:
             )
         self.close()
         self._records = saved.records
+        self._origin = (phase, saved.origin) if saved.origin else None
+
+    def restarted(self, saved: bytes) -> bytes:
+        """This run's position where a resume starts its data again, from `saved`, a position of the run
+        under another data plan: the run's records and the phases it completed as `saved` states them (the
+        run's progress), the phase it stands in opened at its own start, its order's reader shifted by the
+        records the run had read of it (`_position.Global.origin`), so every boundary falls where the
+        run's progress places it."""
+        held = _position.read(saved)
+        if self._tokens is None:
+            phase = phase_at(self._ends, held.records - 1) if held.records else 0
+            completed = tuple((self._stream(index).order, self._start(index + 1)) for index in range(phase))
+            tokens: tuple[int, ...] = ()
+        else:
+            # On the token clock the run's commits ended the phases it completed at the records it saved;
+            # its committed tokens move it on from there (`dew.training._fit.stage_reached`).
+            phase = min(len(held.completed), len(self._ends))
+            for index in range(len(self._ends)):
+                self._resolve(index, held.completed[index][1] if index < phase else None)
+            completed = tuple((self._stream(index).order, held.completed[index][1])
+                              for index in range(phase))
+            tokens = tuple(int(end) for end in self._tokens[:phase] if end is not None)
+        return _position.encode(_position.Global(
+            records=held.records, order=self._stream(phase).order, completed=completed, tokens=tokens,
+            origin=held.records - self._start(phase)))
 
     def ending(self, state: bytes) -> bytes:
         """`state`, a position of this run on the committed-token clock, with the phase it stands in
@@ -1896,6 +1932,13 @@ class StepPhases(Forwarding):
             "position": base64.b64encode(own if isinstance(own, bytes)
                                          else json.dumps(own).encode()).decode(),
             "encoded": isinstance(own, bytes)}}).encode()
+
+    def restarted(self, steps: int) -> bytes:
+        """This run's position where a resume starts its data again at step `steps`, the run's: the phase
+        that step stands in, its own stream opened at its start, and the run's steps, so each later phase
+        ends at the step it was written to."""
+        self._steps = steps
+        return self.get_state()
 
     def set_state(self, state: bytes) -> None:
         saved = record(record(json.loads(state), "saved phases' position").get(_position.STEP_PHASES),
@@ -2194,7 +2237,9 @@ class RampedStream(Forwarding):
             return _position.encode_ramped(_position.Ramped(self._mark, self._records - self._marked,
                                                             self._records))
         place = _position.read(_global_position(self._source.get_state()))
-        return _position.encode(dataclasses.replace(place, records=self._records))
+        # The source's own count lags the ramp's where a restart opened it at its start (`origin`).
+        return _position.encode(dataclasses.replace(place, records=self._records,
+                                                    origin=self._records - place.records))
 
     def set_state(self, state: bytes) -> None:
         self._held, self._mark = None, None
@@ -2209,8 +2254,10 @@ class RampedStream(Forwarding):
             self._source.set_state(place.source)
             self._records, self._skip = place.records, place.skip
         else:
-            self._source.set_state(state)
-            self._records = _position.read(state).records
+            place = _position.read(state)
+            self._source.set_state(_position.encode(dataclasses.replace(
+                place, records=place.records - place.origin, origin=0)))
+            self._records = place.records
         stage = self._stage()
         if (self._records - stage.records) % stage.batch:
             raise ValueError(
@@ -2219,6 +2266,18 @@ class RampedStream(Forwarding):
                 f"{stage.records} on, so no step of it ends there: the checkpoint "
                 f"was written by a run that ramped differently"
             )
+
+    def restarted(self, saved: bytes) -> bytes:
+        """This ramp's position where a resume starts its data again, from `saved`, a position of the run
+        under another data plan: the records the run's steps handed over as `saved` states them, which place
+        its stage, its source opened at its start (`_position.Global.origin`; an elastic read's own
+        position beside the ramp's count)."""
+        held = _position.ramped(saved)
+        records = held.records if held is not None else _position.read(saved).records
+        if self._elastic:
+            return _position.encode_ramped(_position.Ramped(self._elastic_state(), 0, records))
+        place = _position.read(_global_position(self._source.get_state()))
+        return _position.encode(dataclasses.replace(place, records=records, origin=records - place.records))
 
     def close(self) -> None:
         self._held = None

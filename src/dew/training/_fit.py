@@ -158,10 +158,14 @@ class FitPlan:
     def validation(self) -> bool:
         return bool(self.suites)
 
-    def finished(self, step: int, real: int) -> bool:
-        """Whether either run-length cap has been reached, after `real` tokens."""
+    def finished(self, step: int, real: int, consumed: int = 0) -> bool:
+        """Whether a run-length cap has been reached, after `real` tokens and `consumed` examples: its
+        steps, its tokens, or its bound in examples, which the run's own count reaches (`Loader.examples`;
+        where its data started again, before its stream runs out: `data_resumed`)."""
+        bound = self.dataset.examples
         return ((self.steps is not None and step >= self.steps)
-                or (self.tokens is not None and real >= self.tokens))
+                or (self.tokens is not None and real >= self.tokens)
+                or (bound is not None and consumed >= bound))
 
     def paused(self, step: int, real: int, consumed: int = 0) -> bool:
         """Whether the run has reached where its `Pause` ends it, after `real` tokens and `consumed`
@@ -172,7 +176,7 @@ class FitPlan:
 
     def ended(self, step: int, real: int, consumed: int = 0) -> bool:
         """Whether this fit has nothing left to train: its budget reached, or its pause."""
-        return self.finished(step, real) or self.paused(step, real, consumed)
+        return self.finished(step, real, consumed) or self.paused(step, real, consumed)
 
     def horizon(self, real: int) -> int | None:
         """The least count of committed tokens past `real` at which something this plan reads of the
@@ -494,7 +498,9 @@ class FitRun:
         if examples is None:
             return batch, None
         position = None if self.train is None else self.train.source_state
-        last = self.ends_here(interval)
+        # Its last where its stream runs out, or where the run's count reaches its bound (a stream started
+        # again holds the bound's examples whole: `data_resumed`).
+        last = self.ends_here(interval) or interval.consumed + counted(batch).examples >= examples
         if self.ran_out:
             batch = drained(batch, interval.consumed, examples)
         return closes_window(batch, examples, last=last), position
@@ -943,18 +949,20 @@ def _opened_at(loader: Loader, partition: DataPartition, position: bytes | None)
 
 
 def data_resumed(loader: Loader, partition: DataPartition, position: Callable[[], bytes | None],
-                 *, resume: DataResume, examples: int | None) -> tuple[bytes | None, tuple[str, ...]]:
+                 *, resume: DataResume, step: int) -> tuple[bytes | None, tuple[str, ...]]:
     """Where a resume's data reads on from, as the run's mode `resume` says (`Trainer.data_resume`, which a
-    loader compiled already resumes by too: `dew.data.compile.fitted`), and what differs
-    between its saved plan and the run's: the saved `position` (read here, its share's), and none, where
-    its plan makes the same rows; else, resumed relaxed, the position its stream starts at afresh, the
-    beginning of its order, and the names of what differs (`PlanChanged.differs`), every process alike
-    (`agreed_same`). Refused, naming what differs, where it resumes exactly, where the run is bounded in
-    `examples`, which it counts from its saved position, or where its stream reads in stages (a ramp, phases,
-    a schedule), whose boundaries the run's step and committed tokens place; a position no plan check refuses
-    (a damaged one) refuses either way. The one decision a run makes of its data's resume, before anything
-    is written over the run it resumes (`dew.training.startup.resume_admitted`) and where it opens its data
-    (`Trainer._starting`)."""
+    loader compiled already resumes by too: `dew.data.compile.fitted`), and what differs between its saved
+    plan and the run's: the saved `position` (read here, its share's), and none, where its plan makes the
+    same rows; else, resumed relaxed, the position its stream starts at afresh, and the names of what
+    differs (`PlanChanged.differs`), every process alike (`agreed_same`): the beginning of its order, or,
+    for a stream read in stages, the stage the run's progress stands in (`step`, the run's, or the records
+    and phases its saved position states) opened at its own start, every boundary kept where the run's
+    progress places it (`StepPhases.restarted`, `PhasedStream.restarted`, `RampedStream.restarted`). A run
+    bounded in examples keeps its bound on its own count (`FitPlan.finished`). Refused, naming what
+    differs, where it resumes exactly, or where the stream keeps no position; a position no plan check
+    refuses (a damaged one) refuses either way. The one decision a run makes of its data's resume, before
+    anything is written over the run it resumes (`dew.training.startup.resume_admitted`) and where it
+    opens its data (`Trainer._starting`)."""
     held: list[bytes | None] = [None]
 
     def found() -> list[str]:
@@ -974,16 +982,19 @@ def data_resumed(loader: Loader, partition: DataPartition, position: Callable[[]
         return held[0], ()
     stream = loader.train(partition)
     try:
-        staged = isinstance(stream, RampedStream | PhasedStream | StepPhases)
-        if examples is not None or staged or not isinstance(stream, Checkpointable):
-            why = ("is bounded in examples, which it counts from the examples its saved position consumed"
-                   if examples is not None else "reads in stages its step and committed tokens place"
-                   if staged else "keeps no position to start from")
+        if isinstance(stream, StepPhases):
+            start = stream.restarted(step)
+        elif isinstance(stream, PhasedStream | RampedStream) and held[0] is not None:
+            start = stream.restarted(held[0])
+        elif isinstance(stream, Checkpointable) and not isinstance(stream, PhasedStream | RampedStream):
+            start = stream.get_state()
+        else:
+            why = ("keeps no position to start from" if not isinstance(stream, Checkpointable) else
+                   "reads in stages its saved position places, which this share cannot read")
             raise PlanChanged(tuple(differs), f"the saved data position's plan differs from this run's in "
-                              f"{', '.join(differs)}, and the run {why}, so its data cannot start again: "
-                              "resume it exactly with the data that wrote it, or start a new run from its "
-                              "weights")
-        start = stream.get_state()
+                              f"{', '.join(differs)}, and the run's stream {why}, so its data cannot start "
+                              "again: resume it exactly with the data that wrote it, or start a new run "
+                              "from its weights")
     finally:
         if isinstance(stream, Closeable):
             stream.close()

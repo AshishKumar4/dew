@@ -1279,7 +1279,7 @@ class Trainer(Generic[Loss, Effects]):
         position, differs = data_resumed(
             dataset, self._stream_partition(),
             functools.partial(checkpoints.position, start.resume, DataPartition.of(self.device_mesh)),
-            resume=self.data_resume, examples=self._shape.examples)
+            resume=self.data_resume, step=start.resume)
         if differs:
             run.restarted = differs
             _log.warning("the saved data position's plan differs from this run's in %s, so its data starts "
@@ -1513,7 +1513,7 @@ class Trainer(Generic[Loss, Effects]):
         # once, by `_wind_down`, with every suite: never here before a rarer suite has. Only a step that
         # evaluates or pauses could save first (a ranked save scores every suite), so only there is the stream
         # read ahead (`FitRun.ends_here`): no other step's save waits on a batch a stream has yet to make.
-        ending = plan.finished(current, real) or (
+        ending = plan.finished(current, real, interval.consumed) or (
             (evaluation_due or plan.paused(current, real, interval.consumed)) and run.ends_here(interval))
         paused = not ending and plan.paused(current, real, interval.consumed)
         ranked = bool((plan.validation or plan.best or plan.stop) and run.checkpoint_due)
