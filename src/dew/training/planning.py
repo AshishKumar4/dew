@@ -748,7 +748,9 @@ class FitSearch[LossT, EffectsT]:
             # The split the derivation picked fit with headroom past what it derived: below it, a split it
             # judged short is compiled where that excess covers its shortfall (`refused`, `excess`), so a
             # derivation that over-states the step still takes the fewest that fit (row 5448: eight
-            # microbatches measured 1.28 MB past, and four, judged a few bytes short, fit to the byte).
+            # microbatches measured 1.28 MB past, and four, judged a few bytes short, fit to the byte). It
+            # trades a compile a halving step for the fewest microbatches, only where a compile measured such
+            # an excess.
             split = candidates[fewest_between(candidates, -1, derived, pruned)]
         spills: list[JSON] = [spill_record(miss) for miss in report.misses()[seen:]]
         refused: list[JSON] = [refusal_record(*refusal) for refusal in report.refused_launches()
