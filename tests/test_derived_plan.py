@@ -263,14 +263,14 @@ def test_a_miss_orders_the_compiles_and_rules_out_only_what_the_derivation_itsel
     assert not search.refused(1)
 
 
-def traced(trainer) -> tuple[int, int]:
-    """`trainer` compiled, and how often its plan traced its step and made a candidate of it, counted by the
-    profiler: its step's traces (`_lowering.routed`, each one's dispatches' routes) and its candidates
-    (`_candidates._candidate`), a derivation's and a lowering's alike."""
+def traced(trainer, batch=DEEP) -> tuple[int, int]:
+    """`trainer` compiled for `batch`, and how often its plan traced its step and made a candidate of it,
+    counted by the profiler: its step's traces (`_lowering.routed`, each one's dispatches' routes) and its
+    candidates (`_candidates._candidate`), a derivation's and a lowering's alike."""
     from dew.training import _candidates, _lowering
 
     profiler = cProfile.Profile()
-    profiler.runcall(compiled, trainer)
+    profiler.runcall(compiled, trainer, batch)
     stats = pstats.Stats(profiler).stats.items()
     return (sum(calls for (file, _, name), (_, calls, *_) in stats
                 if name == "routed" and file == _lowering.__file__),
@@ -542,3 +542,53 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
             Measurement({"temp": roomy["temp"]}, need <= budget, "xla", jax.__version__))
         assert evidence.compiled.admits == admits, evidence.describe()
         assert evidence.agrees, evidence.describe()
+
+
+def wide(head_tile=None):
+    """`deep`'s decoder over a vocabulary of 4096, its remat stated and its batch read whole, so its whole
+    fp32 logits (2048 tokens by 4096 rows, 32 MiB) are most of what its step holds; its head tiled where
+    `head_tile` says so."""
+    model = CausalTransformer(vocab_size=4096, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
+                              max_seq_len=256, remat=REMAT_POLICIES["full"])
+    return one_device(Trainer(LMObjective(model, seq_len=256, head_tile=head_tile), optax.sgd(1e-2),
+                              key=jax.random.key(0), split=1))
+
+
+WIDE = {"text": jnp.asarray((np.arange(8 * 257).reshape(8, 257) * 7) % 4096, jnp.int32)}
+
+
+def test_a_step_whose_whole_logits_alone_leave_no_room_traces_its_tiled_step_alone(monkeypatch, tmp_path):
+    """With room for the step at its head's tile and not for its whole fp32 logits beside what it holds, the
+    derivation refuses the whole logits untraced, read off the loss's forward (row 5556: on Qwen3.5-4B the
+    state and its logits are 100 GB of an 80 GB device), and the plan traces the tiled step once, the one
+    it compiles once."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    tiled = wide("tiled")
+    room = needs(monkeypatch, tiled, lambda: compiled(tiled, WIDE))
+    assert room < (2048 * 4096 * 4)
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, room)
+    trainer = wide()
+    with Compiles("step") as compiles:
+        steps, _ = traced(trainer, WIDE)
+    assert [entry["label"] for entry in trainer.plan["derived"]] == ["refuses by its whole logits", "fits"]
+    assert (steps, compiles.count) == (1, 1) and trainer.plan["probes"][-1]["fits"]
+
+
+def test_a_whole_logits_trace_bounds_its_tiled_steps_peak(monkeypatch, tmp_path):
+    """With room for the whole logits' floor and not for the whole-logits step, the derivation traces that
+    step, refused, and bounds the tiled step from it (`HeadTerms`): the tiled step's traced peak holds at
+    least the whole-logits peak without its logits, and at most their share beside it."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    whole = wide("whole")
+    need = needs(monkeypatch, whole, lambda: compiled(whole, WIDE))
+    floor = 2048 * 4096 * 4
+    assert floor < need
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, (floor + need) // 2)
+    trainer = wide()
+    compiled(trainer, WIDE)
+    refused, tiled = trainer.plan["derived"][:2]
+    head = refused["terms"]["head"]
+    assert refused["label"] == "refuses" and tiled["label"] == "fits"
+    assert head["headless"] <= tiled["terms"]["peak"] <= head["headless"] + head["held"]
