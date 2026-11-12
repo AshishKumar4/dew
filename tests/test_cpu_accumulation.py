@@ -105,6 +105,28 @@ def test_a_float32_product_returns_the_dtype_asked():
     assert result.dtype == jnp.float32 and float(result[0, 0]) == 1.0
 
 
+def test_a_float64_product_where_x64_is_off_is_its_plain_product():
+    """Float64 operands formed under x64 keep their dtype where x64 is off, as JAX keeps them, and Dew's
+    product of them is their plain float64 product, called or traced, with nothing warned: the policy
+    asked JAX what dtype objects multiply in, which with x64 off is a request for float64 that JAX refuses
+    with a warning, the suite's error, where a carry's prepared product reached it inside a float64 walk
+    (Kimi Linear's truth, an SGD step's)."""
+    import warnings
+
+    rng = np.random.default_rng(0)
+    with jax.enable_x64(new_val=True):
+        lhs, rhs = jnp.asarray(rng.standard_normal((4, 8))), jnp.asarray(rng.standard_normal((8, 3)))
+    dims = (((1,), (0,)), ((), ()))
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        called = float32_dot_general(lhs, rhs, dims)
+        traced = jax.jit(lambda lhs, rhs: float32_dot_general(lhs, rhs, dims))(lhs, rhs)
+        plain = jax.lax.dot_general(lhs, rhs, dims)
+    assert called.dtype == traced.dtype == plain.dtype == jnp.float64
+    np.testing.assert_array_equal(called, plain)
+    np.testing.assert_array_equal(traced, plain)
+
+
 @pytest.mark.parametrize("assumed_first", [True, False])
 def test_the_policy_is_the_executing_platforms_whatever_target_a_trace_assumed(assumed_first):
     """One jitted product, run on a CPU inside and outside `generation.assumed` in either order,

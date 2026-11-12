@@ -425,12 +425,18 @@ def exact_products(precision: jax.lax.PrecisionLike, dtype: DTypeLike) -> bool:
 
 
 def products_dtype(*operands) -> jnp.dtype | None:
-    """The dtype `operands` multiply in, by jax's implicit promotion; None where an 8-bit float
-    takes part, which jax promotes with nothing and whose product has no precision to resolve."""
-    dtypes = [jnp.dtype(operand.dtype) for operand in operands]
+    """The dtype `operands` multiply in, by jax's implicit promotion of the dtypes they hold: a JAX value's
+    own (a float64 formed under x64 keeps it where x64 is off, as JAX keeps it) and a host array's as JAX
+    reads an array (`jax.dtypes.canonicalize_dtype`: its float64 is float32 there). Operands of one dtype
+    multiply in it, and JAX is asked to promote differing ones alone: asked of float64 dtype objects where
+    x64 is off, it reads a request for a dtype it does not grant there and warns, though the operands hold
+    it. None where an 8-bit float takes part, which jax promotes with nothing and whose product has no
+    precision to resolve."""
+    dtypes = [jnp.dtype(operand.dtype) if isinstance(operand, jax.Array)
+              else jax.dtypes.canonicalize_dtype(operand.dtype) for operand in operands]
     if any(jnp.issubdtype(dtype, jnp.floating) and jnp.finfo(dtype).bits < 16 for dtype in dtypes):
         return None
-    return jnp.result_type(*dtypes)
+    return dtypes[0] if len(set(dtypes)) == 1 else jnp.result_type(*dtypes)
 
 
 def _intercepted() -> bool:
