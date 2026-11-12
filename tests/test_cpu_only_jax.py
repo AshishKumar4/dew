@@ -270,23 +270,28 @@ def test_an_application_that_routes_dews_records_receives_them_through_its_handl
 
 
 class _Device:
-    """A device as JAX lists one: its platform and kind."""
+    """A device as JAX lists one: its platform, kind and, a CUDA device's, compute capability."""
 
-    def __init__(self, platform: str, device_kind: str):
-        self.platform, self.device_kind = platform, device_kind
+    def __init__(self, platform: str, device_kind: str, compute_capability: str | None = None):
+        self.platform, self.device_kind, self.compute_capability = platform, device_kind, compute_capability
+        self.local_hardware_id = 0
 
 
-@pytest.mark.parametrize(("kinds", "cublas", "refused"), [
-    (["NVIDIA B200"], 120902, True), (["NVIDIA B200"], 130100, True), (["NVIDIA B200"], 130200, False),
-    (["NVIDIA B200"], 130801, False), (["NVIDIA RTX PRO 6000 Blackwell Server Edition"], 120902, False),
-    (["NVIDIA H100 80GB HBM3"], 120902, False), (["NVIDIA H100 80GB HBM3", "NVIDIA B200"], 120902, True),
-    (["NVIDIA B200"], None, False)])
-def test_a_run_refuses_gpus_holding_tensor_memory_under_a_cublas_that_frees_it_twice(kinds, cublas, refused):
-    """A run's start (`dew._devices.unsafe_cublas`, over the devices JAX opened) refuses any GPU whose own
-    architecture holds tensor memory (a B200's) under a cuBLAS below 13.2, and passes it under 13.2 or newer;
-    GPUs without tensor memory (an RTX PRO 6000, an H100) pass under either, and a host with a B200 among
-    them is refused (ledger 5671); a process with no CUDA plugin selected no cuBLAS."""
+@pytest.mark.parametrize(("gpus", "cublas", "refused"), [
+    ([("NVIDIA B200", "10.0")], 120902, True), ([("NVIDIA B200", "10.0")], 130100, True),
+    ([("NVIDIA B200", "10.0")], 130200, False), ([("NVIDIA B300", "10.3")], 130801, False),
+    ([("NVIDIA B300", "10.3")], 120902, True), ([("A part no table names", "10.0")], 120902, True),
+    ([("NVIDIA RTX PRO 6000 Blackwell Server Edition", "12.0")], 120902, False),
+    ([("NVIDIA H100 80GB HBM3", "9.0")], 120902, False),
+    ([("NVIDIA H100 80GB HBM3", "9.0"), ("NVIDIA B200", "10.0")], 120902, True),
+    ([("NVIDIA B200", "10.0")], None, False)])
+def test_a_run_refuses_gpus_holding_tensor_memory_under_a_cublas_that_frees_it_twice(gpus, cublas, refused):
+    """A run's start (`dew._devices.unsafe_cublas`, over the devices JAX opened) refuses any GPU whose
+    architecture holds tensor memory, by its compute capability (a B200's or B300's, and an SM 10.0 part no
+    table names), under a cuBLAS below 13.2, and passes it under 13.2 or newer; GPUs without tensor memory (an
+    RTX PRO 6000, an H100) pass under either, and a host with a B200 among them is refused (ledger 5671); a
+    process with no CUDA plugin selected no cuBLAS."""
     from dew._devices import unsafe_cublas
 
-    devices = [_Device("gpu", kind) for kind in kinds] + [_Device("cpu", "cpu")]
+    devices = [_Device("gpu", kind, capability) for kind, capability in gpus] + [_Device("cpu", "cpu")]
     assert (unsafe_cublas(devices, cublas, "570.124.06") is not None) == refused

@@ -416,8 +416,9 @@ def cublas_version() -> int | None:
 
 def unsafe_cublas(devices: Sequence, cublas: int | None, driver: str | None) -> str | None:
     """Why a process may not run its GPUs (`devices`, JAX's) under the cuBLAS it selected (`cublas`), with
-    what runs there; None where it may: any whose architecture holds tensor memory (its own target's
-    `tmem_columns`, `dew.nn.kernels.generation`) is refused under a cuBLAS below 13.2
+    what runs there; None where it may: any whose architecture holds tensor memory (`tmem_columns` of the
+    target its own generation gives, `dew.nn.kernels.generation.device_target`) is refused under a cuBLAS
+    below 13.2
     (`dew._builds.LEAST_CUBLAS_BESIDE_TENSOR_MEMORY`)."""
     major, minor = LEAST_CUBLAS_BESIDE_TENSOR_MEMORY
     if cublas is None or cublas >= major * 10000 + minor * 100:
@@ -425,7 +426,7 @@ def unsafe_cublas(devices: Sequence, cublas: int | None, driver: str | None) -> 
     from dew.nn.kernels import generation
 
     holding = sorted({device.device_kind for device in devices if device.platform == "gpu"
-                      and generation.gpu_target(device.device_kind).architecture.tmem_columns})
+                      and generation.device_target(device).architecture.tmem_columns})
     if not holding:
         return None
     driver_least = next(least for name, least, _, _ in CUDA_BUILDS if name == "cuda13")
@@ -448,8 +449,11 @@ def refuse_unsafe_cublas() -> None:
     It reads the devices JAX opened, as `refuse_cpu_only_jax` does, and asks with it."""
     import jax
 
+    devices = jax.devices()
+    if not any(device.platform == "gpu" for device in devices):
+        return
     listed = nvidia_gpus()
-    refusal = unsafe_cublas(jax.devices(), cublas_version(), listed[0] if listed else None)
+    refusal = unsafe_cublas(devices, cublas_version(), listed[0] if listed else None)
     if refusal:
         raise UnsafeCublas(refusal)
 
