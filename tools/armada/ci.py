@@ -748,8 +748,15 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
     how much slower armada ran the files measured both ways; else None, for a
     file nothing has timed."""
     recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
-    measured = {name: timings.get("files", {})[row(python, name, "")] for name in files
-                if row(python, name, "") in timings.get("files", {})}
+    # A file armada holds no timing of weighs its rows' sum at the cut they name (`measured_cut`), which is
+    # what its timing would say: armada keeps a plan's rows from run to run, and drops the file timings a run
+    # did not itself measure (ledger 5579).
+    measured = {}
+    for name in files:
+        held = timings.get("files", {}).get(row(python, name, ""))
+        cut = measured_cut(timings, python, name) if held is None else None
+        if held is not None or cut is not None:
+            measured[name] = held if cut is None else cut[0]
     ratios = sorted(measured[name] / recorded[name] for name in files
                     if name in measured and recorded.get(name, 0) > 1)
     slower = ratios[len(ratios) // 2] if ratios else 1.0
@@ -759,11 +766,25 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
 
 def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | None:
     """What `name` took under `python` at the cut its rows in `timings` name, and that cut's count
-    (`cuts.measured_cut`, over its rows by their groups); a map task's seconds are kept under its task's name,
-    no row's."""
-    return cuts.measured_cut({group: seconds for row_name, seconds in timings.get("rows", {}).items()
-                              if ":" in row_name for python_, name_, group in [parsed_row(row_name)]
-                              if (python_, name_) == (python, name)})
+    (`cuts.measured_cut`, over its rows by their groups, `grouped_rows`)."""
+    return cuts.measured_cut(grouped_rows(timings.get("rows", {})).get((python, name), {}))
+
+
+GROUPED: list = [None, {}]
+"""The rows `grouped_rows` last grouped, and their groups: a plan asks of one run's timings for every file."""
+
+
+def grouped_rows(measured: Mapping[str, float]) -> dict[tuple[str, str], dict[str, float]]:
+    """Armada's row timings `measured` by their Python and file, each row's seconds under its group; a map
+    task's seconds are kept under its task's name, no row's. Grouped once for the rows it was last asked of."""
+    if GROUPED[0] is not measured:
+        found: dict[tuple[str, str], dict[str, float]] = {}
+        for row_name, seconds in measured.items():
+            if ":" in row_name:
+                python, name, group = parsed_row(row_name)
+                found.setdefault((python, name), {})[group] = seconds
+        GROUPED[:] = [measured, found]
+    return GROUPED[1]
 
 
 APART = re.compile(r"\bpytest\.mark\.torchax\b")

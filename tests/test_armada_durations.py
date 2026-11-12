@@ -84,10 +84,10 @@ def test_a_file_no_run_measured_at_a_cut_weighs_its_estimate_and_no_setup_paid_a
 
 
 def test_a_file_armada_holds_only_rows_of_weighs_what_its_rows_took(ci, tmp_path):
-    """A file armada holds no file timing of, but whose rows it holds at a cut, weighs those rows' sum, as its
-    file timing would say, not its record scaled by the other files' ratio: armada keeps a plan's rows from run
-    to run and drops the file timings a run did not itself measure (ledger 5579: after one run that reused most
-    rows it held 1 file timing of 1,067, and 688 of 689 files were weighed by a guess)."""
+    """A file armada holds no file timing of, but whose rows it holds at a cut, weighs those rows' sum, as
+    its file timing would say, not its record scaled by the other files' ratio: armada keeps a plan's rows
+    from run to run and drops the file timings a run did not itself measure (ledger 5579: after one run that
+    reused most rows it held 1 file timing of 1,067, and 688 of 689 files were weighed by a guess)."""
     for name in ("test_measured", "test_rows", "test_neither"):
         (tmp_path / "tests" / f"{name}.py").write_text("")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
