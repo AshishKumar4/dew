@@ -22,6 +22,7 @@ import functools
 import json
 import math
 import re
+import typing
 from collections.abc import Callable, Collection, Mapping, Sequence
 from numbers import Real
 from typing import TYPE_CHECKING, overload
@@ -334,3 +335,14 @@ def _unremoved(config: JSON) -> JSON:
             removed = _REMOVED_BY_NAME[named]
             node.keywords = [keyword for keyword in node.keywords if keyword.arg not in removed]
     return ast.unparse(tree)
+
+
+def annotations_of(owner: type, **options) -> Mapping[str, object]:
+    """`owner`'s annotations resolved (`typing.get_type_hints`, `options` its own), its own type
+    parameters among the names they are read against: a class with type parameters (PEP 695:
+    `dew.objectives.base.TrainingScalar[Statistics, Additions]`) names them in its string annotations,
+    which Python 3.12.0 to 3.12.3 resolve without them (CPython gh-114053), and Dew declares 3.12.0. Every
+    reader that walks a config's classes reads their hints so (the option witness, the API report)."""
+    # Every class states its type parameters from 3.12, none where it declares none.
+    held = {parameter.__name__: parameter for parameter in owner.__type_params__}
+    return typing.get_type_hints(owner, localns=held, **options)
