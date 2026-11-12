@@ -3,6 +3,7 @@ cache with its read token, keeps the files whose rows ran green on exactly these
 lookups over tasks of the target's, and a task reuses each kept row it finds fresh and runs the rest; the
 inputs a row is keyed by, which a planner's clean checkout and a task's carried one read alike."""
 
+import io
 import json
 import os
 import re
@@ -577,17 +578,21 @@ def test_a_red_that_read_the_rows_state_before_another_red_still_revokes_the_gre
     again and let the green stand (review, 2026-11-12)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     flaky_row(tmp_path)
-    answered = ci.r2.Store.get
+    sender = ci.SEND
 
     def red(stale: bool = False) -> None:
-        def get(store, key: str, *args: object, **kwargs: object) -> bytes | None:
-            # As read before the other red's write: the row had no red then.
-            if stale and ("-reds/" in key or "-epochs/" in key):
-                return None
-            return answered(store, key, *args, **kwargs)
+        read = []
+
+        def send(method: str, url: str, headers, body, timeout: float):
+            # Its first read of the row's state as before the other red's write: the row had none then.
+            if stale and method == "GET" and ("-reds/" in url or "-epochs/" in url) and "test_a" in url \
+                    and not read:
+                read.append(url)
+                return 404, {}, io.BytesIO(b"")
+            return sender(method, url, headers, body, timeout)
 
         with monkeypatch.context() as patched:
-            patched.setattr(ci.r2.Store, "get", get)
+            patched.setattr(ci, "SEND", send)
             patched.setenv("FAIL", "1")
             rows = armada_task(ci, monkeypatch, verdict, policy="off")
         assert [row["exitCode"] for row in rows] == [1, 0, 0]
@@ -608,15 +613,15 @@ def test_a_lookup_whose_epoch_is_unread_or_gone_reuses_nothing(ci, tmp_path, mon
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
 
     # The Worker unavailable for the rows' epochs alone.
-    answered = ci.r2.Store.get
+    sender = ci.SEND
 
-    def get(store, key: str, *args: object, **kwargs: object) -> bytes | None:
-        if "-epochs/" in key:
-            raise ci.r2.Unavailable("the R2 Worker answered 503")
-        return answered(store, key, *args, **kwargs)
+    def send(method: str, url: str, headers, body, timeout: float):
+        if "-epochs/" in url:
+            raise ConnectionResetError("the connection to the Worker was reset")
+        return sender(method, url, headers, body, timeout)
 
     with monkeypatch.context() as patched:
-        patched.setattr(ci.r2.Store, "get", get)
+        patched.setattr(ci, "SEND", send)
         assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
     # Its epochs gone (the bucket's expiry), every green run recorded in them stands no more: a green written
     # after a red it read nothing of, kept past that red's epoch, is never reused (review, 2026-11-12).
