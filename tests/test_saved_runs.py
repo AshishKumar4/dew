@@ -61,14 +61,14 @@ def evidence(recorded: str, kind: str) -> dict | None:
     return json.loads((CORPUS / recorded / f"{kind}.evidence.json").read_text())
 
 
-def resumed_by_its_format(run: Path, resume: Callable[[], object]) -> bool:
+def resumed_by_its_format(run: Path, resume: Callable[[], object], *, exact: bool = False) -> bool:
     """Whether `run`'s last checkpoint is of a format this Dew resumes, the current one or the one before it,
     `resume` run on it then; else, a step that holds its whole state as one item (`dew.checkpoints.ONE_ITEM`)
-    as an older Dew wrote it, or a data position of a plan version this Dew reads none of
-    (`dew.data.plan.PLAN_VERSIONS`), `resume` refused, naming it."""
+    as an older Dew wrote it, or, resumed `exact`ly, a data position of a plan version this Dew reads none
+    of (`dew.data.plan.PLAN_VERSIONS`; a relaxed resume starts that data again), `resume` refused."""
     with Checkpoints(str(run)) as checkpoints:
         whole = (Path(checkpoints.path(checkpoints.latest)) / ONE_ITEM).is_dir()
-    if whole or RunConfig.load(str(run)).data_plan_version not in PLAN_VERSIONS:
+    if whole or (exact and RunConfig.load(str(run)).data_plan_version not in PLAN_VERSIONS):
         with pytest.raises(ValueError):
             resume()
         return False
@@ -239,11 +239,15 @@ def test_a_run_an_earlier_main_saved_exports_and_loads_back_answering_as_its_run
     assert main(["export", str(run), str(release)]) == 0
     assert answered_alike(answers(pipeline(str(release))), answers(task.from_run(str(run))))
 
+
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
-def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monkeypatch, recorded, kind):
-    """A kind's run saved at an earlier main resumes from its last checkpoint where this Dew reads its formats
-    (its checkpoint's and its data plan's, `resumed_by_its_format`), fitting the one step past it, and is
-    refused before it trains a step where it reads none of one of them."""
+@pytest.mark.parametrize("data_resume", ["exact", "relaxed"])
+def test_an_earlier_mains_run_resumes_its_state_and_its_data_by_its_mode(
+        tmp_path, monkeypatch, recorded, kind, data_resume):
+    """A kind's run saved at an earlier main resumes from its last checkpoint where this Dew reads its
+    checkpoint's format (`resumed_by_its_format`): relaxed (the default) whatever data plan wrote its
+    position, its data started again where this Dew reads none of it, and exactly only where it reads its
+    plan, refused before it trains a step otherwise."""
     run = extracted(tmp_path, recorded, kind)
     recorded_run = RunConfig.load(str(run))
     with Checkpoints(str(run)) as checkpoints:
@@ -255,10 +259,11 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     # A run counted in examples reads on to its bound; one counted in steps, one step more.
     steps = {} if recorded_run.trainer.examples is not None else {"steps": last + 1}
     trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), stop=None,
-                                  resume="require", compilation_cache_dir=None, multi_host=False, **steps)
+                                  resume="require", compilation_cache_dir=None, multi_host=False,
+                                  data_resume=data_resume, **steps)
     sources = {"data": here.data, "validation": here.validation}
     if not resumed_by_its_format(run, lambda: dataclasses.replace(
-            recorded_run, trainer=trainer, **sources).prepare().train(kind)):
+            recorded_run, trainer=trainer, **sources).prepare().train(kind), exact=data_resume == "exact"):
         stepped = [step for step, _ in LocalTracker(run / "tracking").scalars()]
         assert max(stepped) <= last
         return
@@ -328,17 +333,16 @@ def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, 
         python.train(prepared.objective, data, name=kind, metrics=prepared.metrics, rollout=prepared.rollout,
                      summary=prepared.summary, validation=validation, after=prepared.after)
 
-    if stated not in PLAN_VERSIONS:
-        # Its data, read at the version it states, which this Dew reads none of, is refused before a step.
-        with pytest.raises(ValueError):
-            train()
-        return
+    # Relaxed, the default, it resumes whatever plan wrote its data, started again where this Dew reads
+    # none of that plan.
     if not resumed_by_its_format(run, train):
         return
     records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
     started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
-    assert RunConfig.load(str(run)).data_plan_version == stated
+    # A plan version this Dew reads none of is read by its own where the run resumes relaxed (`resumed`).
+    readable = stated if stated in PLAN_VERSIONS else PLAN_VERSIONS[-1]
+    assert RunConfig.load(str(run)).data_plan_version == readable
 
 
 @pytest.mark.parametrize(("landed", "version"), [(9, 9), (None, 9)])
