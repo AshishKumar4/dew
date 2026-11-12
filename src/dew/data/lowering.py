@@ -1290,8 +1290,9 @@ class _Build:
         pool = (None if self.pool is None
                 else Workers(_shared_pool(self.pool.count, len(members), index), self.pool.buffer))
         loading = self.loading if pool is None else dataclasses.replace(self.loading, workers=pool.count)
+        # A member's own mixes stamp nothing: only the phase's mix draws what other phases read on.
         return dataclasses.replace(self, lowering=self.lowering.children[index], loading=loading, pool=pool,
-                                   corpus=(*self.corpus, _member_key(members, index)))
+                                   corpus=(*self.corpus, _member_key(members, index)), stamped=frozenset())
 
     def pooled(self, pipeline: Pipeline) -> _Build:
         """This build with its loading workers moved before the first step that can't carry what it

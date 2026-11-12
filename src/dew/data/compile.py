@@ -59,6 +59,7 @@ from dew.data.analysis import (
     _volatile,
     _written,
     reach,
+    same_stage,
     written,
 )
 from dew.data.compilation import compiling, within
@@ -1498,6 +1499,7 @@ def _shared(phases: Phases) -> tuple[dict[str, str], ...]:
             reads.setdefault(_corpus_key(corpus), []).append((index, chain))
     shared = {key: read for key, read in reads.items() if len({index for index, _ in read}) > 1}
     members: list[dict[str, str]] = [{} for _ in phases.pipelines]
+    keyed: dict[str, str] = {}
     for key, read in shared.items():
         (first, chain), *_ = read
         for index, held in read:
@@ -1507,13 +1509,20 @@ def _shared(phases: Phases) -> tuple[dict[str, str], ...]:
                                  "reads it other than as a member of its own mix, where a phase continues a "
                                  "corpus it shares by the member's key: read it as one "
                                  f"(`mix([({_name(held)}, 1.0)])` where the phase reads it alone)")
-            if [_identity(stage) for stage in held.stages] != [_identity(stage) for stage in chain.stages]:
+            if len(held.stages) != len(chain.stages) or not all(
+                    same_stage(made, kept) for made, kept in zip(held.stages, chain.stages, strict=True)):
                 raise ValueError(f"phases {first} and {index} read {_name(held)} through other steps "
                                  "before their mixes, so where the one left it is no place in the other's "
                                  "read: give it the same steps in each, and the steps that differ after the "
                                  "mix")
             place = next(at for at, child in enumerate(mix.pipelines) if child is held)
-            members[index][_member_keys(_members(mix.pipelines))[place]] = key
+            member = _member_keys(_members(mix.pipelines))[place]
+            # A member's draws and its steps' randomness are keyed by its key in its mix (`_member_key`).
+            if keyed.setdefault(key, member) != member:
+                raise ValueError(f"phases {first} and {index} read {_name(held)} under other keys in their "
+                                 f"mixes ({keyed[key]}, {member}), which key its shuffles and draws: name it "
+                                 "(`.named(...)`) alike in each, or keep its place among the unnamed")
+            members[index][member] = key
     return tuple(members)
 
 

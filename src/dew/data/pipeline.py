@@ -195,12 +195,14 @@ class MarkConsumed:
 
 
 class MarkDrawn:
-    """The step that marks each row a phase's mix draws, where later phases read on members of the mix, as
-    one consumed source example (`CONSUMED`), its draw (`DRAWN`, which the mix stamps on a shared member's)
-    going where that count goes, set right after the mix (`dew.data.compile`)."""
+    """The step right after a phase's mix whose members other phases read on (`dew.data.compile`), which
+    says its rows carry counts (`drawn_marked`): the mix itself marks each row it draws one consumed source
+    example (`CONSUMED`) with its draw (`DRAWN`, `dew.data.mixing.Stamping`), so every carrier after it moves
+    them. A record step, as every step after the mix is, sees no counts (`consumed_by`); it hands each row
+    on as it is."""
 
     def __call__(self, element: Batch) -> Batch:
-        return {**element, CONSUMED: 1, REFUSED: 0, DRAWN: element.get(DRAWN, ())}
+        return element
 
 
 def drawn_marked(stages: Sequence[object]) -> bool:

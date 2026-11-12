@@ -147,6 +147,34 @@ def test_phases_that_share_a_corpus_train_each_of_its_records_once_across_their_
         assert head + rest == whole, stop
 
 
+def test_three_phases_sharing_a_corpus_through_a_short_shuffled_middle_train_each_record_once():
+    """Three phases sharing a corpus, the first two shuffling their draws after their mixes and the middle one
+    a single step, which ends before it draws past every pull the first trained ahead: the third continues
+    from those too, so each record is trained once, none lost; one of the first's members is itself a mix,
+    which draws nothing the run carries; and a read stopped in the middle or the last phase, resumed, reads
+    what the read never stopped reads."""
+    nested = mix([member(4, endless=True), member(5, endless=True)])
+    first = mix([SHARED, nested], weights=(0.5, 0.5)).shuffle(1, streamed=6).batch(tokens=128)
+    middle = mix([SHARED, member(2, endless=True)], weights=(0.5, 0.5)).shuffle(2, streamed=4)
+    middle = middle.batch(tokens=64)
+    last = mix([SHARED, member(3, endless=True)], weights=(0.25, 0.75)).batch(tokens=64)
+    loader = compile(phases((first, 3), (middle, 4), (last, None)), read="indexed", loading=READ)
+    whole, stream = read(loader, 1000)
+    stream.close()
+    trained = [row for ids, _ in whole for row in ids if row // 1000 == 1]
+    assert len(trained) == len(set(trained)) and sorted(trained) == KEPT[:len(trained)]
+    assert len(trained) >= len(KEPT) - 4
+    for stop in (3, 4, 5):
+        head, stopped = read(loader, stop)
+        saved = stopped.get_state()
+        stopped.close()
+        resumed = loader.train(DataPartition())
+        resumed.set_state(saved)
+        rest, resumed = read(loader, 1000, resumed)
+        resumed.close()
+        assert head + rest == whole, stop
+
+
 def test_phases_that_share_a_corpus_continue_it_on_every_share_of_their_reads():
     """Two shares of phases sharing a corpus each continue their own cut of it: on each, every record of
     the corpus the share reads is trained once across the boundary, and no share trains another's."""
@@ -183,13 +211,19 @@ def test_elastic_phases_that_share_a_corpus_resume_inside_the_second_on_another_
 
 def test_phases_that_share_a_corpus_otherwise_than_as_one_member_each_are_refused():
     """A phase that reads a corpus another reads other than as a member of its own mix, whose position no key
-    names, and phases that read it through other steps before their mixes, where the one's draws are no
-    draws of the other's, are refused, as the run could not continue the corpus where it left it."""
+    names, phases that read it through other steps before their mixes, where the one's draws are no draws of
+    the other's, and phases that read it under other keys, which draw and shuffle it otherwise, are refused,
+    as the run could not continue the corpus where it left it."""
     with pytest.raises(ValueError):
         compile(phases((source(1), 3), (source(1), None)), read="indexed", loading=READ)
     other = mix([SHARED.map(lambda row: row), member(3, endless=True)]).batch(tokens=64)
     with pytest.raises(ValueError):
         compile(phases((mix([SHARED, member(2, endless=True)]).batch(tokens=128), 3), (other, None)),
+                read="indexed", loading=READ)
+    # Moved to another place among the unnamed, it is drawn and shuffled under another key.
+    moved = mix([member(3, endless=True), SHARED]).batch(tokens=64)
+    with pytest.raises(ValueError):
+        compile(phases((mix([SHARED, member(2, endless=True)]).batch(tokens=128), 3), (moved, None)),
                 read="indexed", loading=READ)
 
 

@@ -22,7 +22,18 @@ import numpy as np
 from dew._records import JSON, boolean, integer, integers, json_value, record, text
 from dew.batch import Batch
 from dew.data.dataset import LONG_RUN, logged_run
-from dew.data.pipeline import DRAWN, Owed, Record, Rejected, accounts, drawn_of, member_of, members_of
+from dew.data.pipeline import (
+    CONSUMED,
+    DRAWN,
+    REFUSED,
+    Owed,
+    Record,
+    Rejected,
+    accounts,
+    drawn_of,
+    member_of,
+    members_of,
+)
 from dew.data.shared import SharedMapping
 
 _log = logging.getLogger(__name__)
@@ -893,23 +904,22 @@ class Stamping:
         self._held: dict[str, list[int]] = {key: [] for key in self.keys}
 
     def read(self, key: str, pull: Callable[[], Batch]) -> Batch:
-        """Member `key`'s next draw by `pull`, stamped where it is a member later phases read on."""
+        """Member `key`'s next draw by `pull`, one consumed source example (`CONSUMED`), stamped where it is
+        a member other phases read on (`DRAWN`): every row of the mix holds the same counting fields."""
         if key not in self.keys:
-            return pull()
+            return _marked(key, pull(), ())
         skips = self.skips[key]
         while self.pulled[key] in skips:
-            # A pull an earlier phase's step trained: drawn past, never handed on again.
+            # A pull an earlier phase's step trained: drawn past, never handed on again. The skips a position
+            # holds are its own: a new mapping each time one is passed.
             pull()
             skips.discard(self.pulled[key])
-            self._held[key] = sorted(skips)
+            self._held = {**self._held, key: sorted(skips)}
             self.pulled[key] += 1
-        row = pull()
-        if not isinstance(row, Mapping):
-            raise TypeError(f"mixture member {key!r} gives {type(row).__name__} records, which carry no "
-                            "draw; a member later phases read on gives records")
         draw = (self.node, key, self.pulled[key])
+        row = _marked(key, pull(), (draw,))
         self.pulled[key] += 1
-        return {**row, DRAWN: (draw,)}
+        return row
 
     def state(self) -> Mapping[str, object]:
         return {"node": self.node, "pulled": dict(self.pulled), "skips": self._held}
@@ -932,6 +942,14 @@ def node_of(selection: slice | None) -> str:
     if selection is None:
         return "0:1"
     return f"{selection.start or 0}:{selection.step or 1}"
+
+
+def _marked(key: str, row: Batch, drawn: tuple[tuple[str, str, int], ...]) -> Batch:
+    """A mix's draw of member `key` as one consumed source example, its draws `drawn`."""
+    if not isinstance(row, Mapping):
+        raise TypeError(f"mixture member {key!r} gives {type(row).__name__} records, which carry no draw; "
+                        "a member of a mix other phases read on gives records")
+    return {**row, CONSUMED: 1, REFUSED: 0, DRAWN: drawn}
 
 
 STAMPING = "stamping"
@@ -1007,12 +1025,16 @@ def left_by(state: JSON, members: Mapping[str, str],
             earliest[node] = (drawn, mix)
     left: dict[str, list[Left]] = {}
     for node, (_, mix) in earliest.items():
-        _, pulled, _ = _drawing(mix)
+        _, pulled, skips = _drawing(mix)
         parents = record(mix["parents"], "a mix's corpora")
         for member, corpus in members.items():
             low = integer(pulled[member], f"member {member}'s pulls")
             position = json_value(parents[member], f"member {member}'s position")
-            left.setdefault(corpus, []).append(Left(position, low, trained(node, member, low)))
+            # Past the low pull, those this phase trained and those an earlier one did that this phase had
+            # yet to draw past (its position's skips).
+            inherited = integers(skips.get(member, []), f"member {member}'s skipped pulls")
+            past = sorted({*trained(node, member, low), *(pull for pull in inherited if pull >= low)})
+            left.setdefault(corpus, []).append(Left(position, low, tuple(past)))
     return left
 
 
