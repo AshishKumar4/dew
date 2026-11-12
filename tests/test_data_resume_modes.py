@@ -59,3 +59,47 @@ def test_a_resume_whose_data_is_unchanged_reads_on_and_records_no_restart(tmp_pa
     whole, _ = _fit(tmp_path / "whole", seed=1, steps=4)
     assert not _reported(tracker, DataRestarted)
     np.testing.assert_array_equal(resumed.variables["params"]["w"], whole.variables["params"]["w"])
+
+
+def test_a_run_refuses_a_loader_compiled_to_resume_otherwise():
+    """A loader compiled already resumes as it was compiled to (`compile(..., resume=)`), so a run that
+    resumes its data otherwise is refused before it trains, and one of the same mode trains."""
+    from dew.data.compile import compile
+
+    (x,) = records(0)
+    chain = Pipeline(Memory({"x": x})).shuffle(seed=1).repeat().batch(BATCH)
+    for data_resume, compiled in (("relaxed", "exact"), ("exact", "relaxed")):
+        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0, data_resume=data_resume)
+        with pytest.raises(ValueError):
+            trainer.fit(compile(chain, resume=compiled), steps=1)
+    trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0, data_resume="exact")
+    assert int(trainer.fit(compile(chain, resume="exact"), steps=1).step) == 1
+
+
+def test_a_position_read_by_other_rules_names_every_one():
+    """A position whose plan read by two rules this Dew reads otherwise is refused naming both
+    (`PlanChanged.differs`), which a relaxed run's restart records."""
+    import json
+
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import mix
+    from dew.data.plan import PlanChanged
+
+    def corpus(name, tag):
+        return Pipeline(Memory({"x": np.full((16, 1), tag, np.float32)}, shard_rows=4), name=name).repeat()
+
+    chain = mix([corpus("a", 1), corpus("b", 2)], seed=4).shuffle(seed=3, window=4).batch(2)
+    loader = compile(chain, read="streamed", loading=Loading(workers=0))
+    stream = loader.train(DataPartition())
+    next(stream)
+    decoded = json.loads(stream.get_state())
+    stream.close()
+    decoded["dew_data_plan"]["rules"].update(mix="another-schedule", shuffle="another-key")
+    resumed = loader.train(DataPartition())
+    try:
+        with pytest.raises(PlanChanged) as refused:
+            resumed.set_state(json.dumps(decoded).encode())
+    finally:
+        resumed.close()
+    assert {"rules.mix", "rules.shuffle"} <= set(refused.value.differs)

@@ -6,6 +6,7 @@ the evaluations' warming."""
 
 import contextlib
 import dataclasses
+import functools
 import logging
 import time
 from collections.abc import Iterator, Mapping
@@ -16,9 +17,9 @@ import flax.linen as nn
 from dew.data.compile import Handed, fitted
 from dew.data.dataset import DataPartition, Loader
 from dew.data.pipeline import Dataset, ObjectiveData
-from dew.data.plan import DataResume, PlanChanged
+from dew.data.plan import DataResume
 from dew.telemetry.instrumentation import count_compilation_cache
-from dew.training._fit import admitted
+from dew.training._fit import data_resumed
 from dew.training.budget import run_length, run_steps, run_tokens
 from dew.training.evaluation import EvalSuite, Split
 from dew.training.runtime import ready_process
@@ -107,19 +108,15 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
     (`RunConfig.train`): the data fit reads, compiled once as the run reads it (`RunConfig.readied`), the
     position of this process's share at the step it continues (`Checkpoints.resumed`,
     `Checkpoints.position`), and the stream of that share fit opens (`Trainer._stream_partition`), under
-    the layout's rules, restored and closed (`_fit.admitted`). Nothing where it continues no step or
-    saved no position, and a relaxed resume (`Trainer.data_resume`) refuses no position its plan differs
-    from, whose data starts again (`Trainer._data_resumed`)."""
+    the layout's rules, restored and closed (`_fit.data_resumed`). Nothing where it continues no step or
+    saved no position; a relaxed resume (`Loader.resume`) refuses no position whose data can start again,
+    the one decision fit makes too (`_fit.data_resumed`)."""
     checkpoints = trainer.checkpoints
     step = None if checkpoints is None else checkpoints.resumed(resume)
     if checkpoints is None or step is None:
         return
     # The shares fit reads by, its layout placing the rows, the saved one's among them.
     with nn.logical_axis_rules(trainer.layout.axis_rules):
-        saved = checkpoints.position(step, DataPartition.of(trainer.device_mesh))
-        if saved is not None:
-            try:
-                admitted(loader, trainer._stream_partition(), saved)
-            except PlanChanged:
-                if trainer.data_resume == "exact":
-                    raise
+        data_resumed(loader, trainer._stream_partition(),
+                     functools.partial(checkpoints.position, step, DataPartition.of(trainer.device_mesh)),
+                     examples=loader.examples)

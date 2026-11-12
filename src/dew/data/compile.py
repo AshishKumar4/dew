@@ -777,7 +777,7 @@ def compile(
     loading: Loading | None = None,
     seed: int = 0,
     rejections: Literal["drop", "mask"] = "drop",
-    resume: DataResume = "exact",
+    resume: DataResume = "relaxed",
     examples: int | None = None,
     widths: Mapping[str, object] | None = None,
     measured: _TrainingMeasured | None = None,
@@ -806,7 +806,7 @@ def compile(
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _TRAINING_LOADING
     if isinstance(train.source, Phases) and examples is None:
-        return _compile_phases(
+        phased = _compile_phases(
             train,
             validation=validation,
             host=host,
@@ -821,11 +821,13 @@ def compile(
             steps=steps,
             budget=tokens,
         )
+        return dataclasses.replace(phased, resume=resume)
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
                      seed=seed, rejections=rejections, examples=examples, widths=widths, measured=measured,
                      epochs=epochs, version=plan_version)
     batches = _run_batches(staged, steps=steps, examples=examples, epochs=epochs, tokens=tokens)
-    loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume, batches=batches)
+    compiled = _compiled(staged, _coordinated(staged.train), host=host, resume=resume, batches=batches)
+    loader = dataclasses.replace(compiled, resume=resume)
     if staged.passes is not None and epochs is not None:
         return dataclasses.replace(loader, examples=epochs * staged.passes, epochs=epochs,
                                    pass_examples=staged.passes, bound_ends=_bound_ends(staged.original))
@@ -2063,6 +2065,12 @@ def fitted[Entry](
     else:
         widths = run_widths(list(scored.values()), objective) if scored else {}
         loader = dataset
+        # A loader compiled already resumes as it was compiled to (`Loader.resume`): the run's own mode,
+        # one statement of how its resume treats its data.
+        if loader.resume is not None and loader.resume != resume:
+            raise ValueError(f"the run resumes its data {resume}, and the loader it is given was compiled to "
+                             f"resume {loader.resume}; compile it with resume={resume!r}, or hand the run "
+                             "its chain")
     if named is None:
         return loader, None
     # Validation reads by the version training does: a loader handed compiled already reads by its own,

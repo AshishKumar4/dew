@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import json
 import logging
 import math
 import os
@@ -25,7 +26,7 @@ from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
 from dew import _position
-from dew._coordination import agreed, agreed_next, agreed_reads, pool_size
+from dew._coordination import agreed, agreed_next, agreed_reads, agreed_same, pool_size
 from dew._records import JSON, integers
 from dew.batch import CLOSES_WINDOW, CONSUMED_COUNT, EXAMPLES_CONSUMED, VALID_ROWS, Batch, ConsumedCount
 from dew.checkpoints import Checkpoints
@@ -37,11 +38,14 @@ from dew.data.dataset import (
     Ends,
     Loader,
     PhasedStream,
+    RampedStream,
+    StepPhases,
     row_field,
     rows_of,
     stream_ends,
 )
 from dew.data.pipeline import Dataset
+from dew.data.plan import PlanChanged
 from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_position, split_fields
 from dew.distributed.placement import MeshSpec, Placement
 from dew.held_updates import waiting
@@ -936,6 +940,53 @@ def _opened_at(loader: Loader, partition: DataPartition, position: bytes | None)
     finally:
         if isinstance(stream, Closeable):
             stream.close()
+
+
+def data_resumed(loader: Loader, partition: DataPartition, position: Callable[[], bytes | None],
+                 *, examples: int | None) -> tuple[bytes | None, tuple[str, ...]]:
+    """Where a resume's data reads on from, as its loader's mode says (`Loader.resume`), and what differs
+    between its saved plan and the run's: the saved `position` (read here, its share's), and none, where
+    its plan makes the same rows; else, resumed relaxed, the position its stream starts at afresh, the
+    beginning of its order, and the names of what differs (`PlanChanged.differs`), every process alike
+    (`agreed_same`). Refused, naming what differs, where it resumes exactly, where the run is bounded in
+    `examples`, which it counts from its saved position, or where its stream reads in stages (a ramp, phases,
+    a schedule), whose boundaries the run's step and committed tokens place; a position no plan check refuses
+    (a damaged one) refuses either way. The one decision a run makes of its data's resume, before anything
+    is written over the run it resumes (`dew.training.startup.resume_admitted`) and where it opens its data
+    (`Trainer._starting`)."""
+    held: list[bytes | None] = [None]
+
+    def found() -> list[str]:
+        # A failure here (an exact refusal, a damaged position) is the pool's (`agreed_same`).
+        try:
+            held[0] = position()
+            if held[0] is not None:
+                admitted(loader, partition, held[0])
+            return []
+        except PlanChanged as changed:
+            if loader.resume == "exact":
+                raise
+            return list(changed.differs)
+
+    differs = agreed_same("data resume", found)
+    if not differs:
+        return held[0], ()
+    stream = loader.train(partition)
+    try:
+        staged = isinstance(stream, RampedStream | PhasedStream | StepPhases)
+        if examples is not None or staged or not isinstance(stream, Checkpointable):
+            why = ("is bounded in examples, which it counts from the examples its saved position consumed"
+                   if examples is not None else "reads in stages its step and committed tokens place"
+                   if staged else "keeps no position to start from")
+            raise PlanChanged(tuple(differs), f"the saved data position's plan differs from this run's in "
+                              f"{', '.join(differs)}, and the run {why}, so its data cannot start again: "
+                              "resume it exactly with the data that wrote it, or start a new run from its "
+                              "weights")
+        start = stream.get_state()
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    return start if isinstance(start, bytes) else json.dumps(start).encode(), tuple(differs)
 
 
 def admitted(loader: Loader, partition: DataPartition, position: bytes) -> None:

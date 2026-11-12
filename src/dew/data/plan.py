@@ -827,8 +827,26 @@ class Plan:
                 f"the saved data position was written under data plan version {written!r}, and this read is "
                 f"of version {current['version']!r}, which makes other rows or draws from the same plan; "
                 f"{route}{_RESUMED}")
+        # Its rules first, and what else differs beside them, named together (`PlanChanged.differs`).
+        rules = None
         if self.version >= STRUCTURED:
-            self._rules_alike(record(saved.get("rules", {}), "saved data plan rules"))
+            try:
+                self._rules_alike(record(saved.get("rules", {}), "saved data plan rules"))
+            except PlanChanged as differ:
+                rules = differ
+        try:
+            changes = self._compared(saved, current, resume)
+        except PlanChanged as other:
+            if rules is None:
+                raise
+            raise PlanChanged(rules.differs + other.differs, f"{rules}; {other}") from other
+        if rules is not None:
+            raise rules
+        return changes
+
+    def _compared(self, saved: Mapping[str, object], current: Mapping[str, JSON], resume: DataResume
+                  ) -> tuple[str, ...]:
+        """`check` of all but the version and the rules, the changed environment and members returned."""
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "relaxed":
             raise PlanChanged(
                 ("exact",),
@@ -922,13 +940,15 @@ class Plan:
         """Refuse a saved plan that read by a rule (`rules`) whose value is not this Dew's, naming the rule:
         its rows come next by another rule than this read's. Grain's, whose iterator state a reader
         compares itself (`dew.data.readers._PerShare.set_state`), is not compared here."""
-        for name in sorted((set(saved) | set(self.rules)) - {"grain"}):
-            if saved.get(name) != self.rules.get(name):
-                raise PlanChanged(
-                    (f"rules.{name}",),
-                    f"the saved data position read by the {name} rule {saved.get(name)!r}, and this Dew "
-                    f"reads by {self.rules.get(name)!r}, which decides other rows next (docs/design/data.md, "
-                    f"the rules): {_RESUMED}")
+        differ = [name for name in sorted((set(saved) | set(self.rules)) - {"grain"})
+                  if saved.get(name) != self.rules.get(name)]
+        if differ:
+            # Every rule that differs, named at once (the restart's record names each).
+            read = "; ".join(f"{name} {saved.get(name)!r} where this Dew reads by {self.rules.get(name)!r}"
+                             for name in differ)
+            raise PlanChanged(tuple(f"rules.{name}" for name in differ),
+                              f"the saved data position read by other rules ({read}), which decide other "
+                              f"rows next (docs/design/data.md, the rules): {_RESUMED}")
 
     def _edited_members(self, saved: Mapping[str, object]) -> tuple[str, ...] | None:
         """How a streamed mix's members changed from `saved`'s, which a resume takes: members that

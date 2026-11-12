@@ -101,15 +101,26 @@ def decode(position: bytes) -> Global | None:
     envelope = _enveloped(position, ENVELOPE)
     if envelope is None:
         return None
-    if "tokens" not in envelope:
-        raise PlanChanged(("version",), "the saved global data position holds no committed tokens its phases "
-                                        "ended at, which a Dew before data plan version 13 wrote: resume it "
-                                        "with the Dew that wrote it, or relaxed (`data_resume='relaxed'`)")
     fields = {"records", "order", "completed"}
     if fields - set(envelope):
         raise ValueError(
             f"a saved global data position is missing {sorted(fields - set(envelope))}; "
             f"the checkpoint's position was written by dew and is damaged")
+    if "tokens" not in envelope:
+        from dew.data.plan import PLAN_VERSIONS
+
+        # Every position of a plan this Dew reads holds them; one whose plan is of another version, or
+        # names none (before plans were saved in positions), an earlier Dew wrote.
+        plan = envelope.get("plan")
+        version = plan.get("version") if isinstance(plan, dict) else None
+        if version in PLAN_VERSIONS:
+            raise ValueError("a saved global data position of this Dew's data plan holds no committed "
+                             "tokens its phases ended at; the checkpoint's position was written by dew "
+                             "and is damaged")
+        raise PlanChanged(("version",), f"the saved global data position was written under data plan "
+                                        f"version {version}, by an earlier Dew: resume it with the Dew that "
+                                        "wrote it, or relaxed (`data_resume='relaxed'`), its data started "
+                                        "again")
     completed = tuple((str(order), int(end)) for order, end in envelope["completed"])
     plan = envelope.get("plan")
     # A position of plan 13, which knew no restart, holds no origin: its streams opened where their phases

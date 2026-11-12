@@ -803,6 +803,9 @@ class Loader:
     counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
     validation_counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
     plan: Plan | None = None
+    resume: DataResume | None = None
+    """How its readers treat a resumed position (`dew.data.plan.DataResume`), the one a run that reads it
+    resumes by (`dew.training.Trainer.data_resume`); None for data handed as it is read."""
     statistics: Callable[[], Mapping[str, float]] = dataclasses.field(default=_data_statistics, repr=False)
     batch_tokens: int | None = None
     device: tuple[DeviceStep, ...] = ()
@@ -1657,11 +1660,9 @@ class PhasedStream:
                                  f"{len(self._ends) + 1}")
             finished = self._tokens[:len(saved.completed)]
             if saved.tokens != finished:
-                from dew.data.plan import PlanChanged
-
                 # Its records end where the saved run's commits reached the phases' tokens, which a phase
                 # ending at other tokens would read on from as though the run had reached them.
-                raise PlanChanged(("phases.tokens",),
+                raise _position.PlanChanged(("phases.tokens",),
                                   f"the saved run finished its phases at {list(saved.tokens)} committed "
                                   f"tokens, and this run's end at {list(finished)}; a phase the run has read "
                                   "cannot change under it")
@@ -1686,14 +1687,16 @@ class PhasedStream:
         for index, (order, end) in enumerate(saved.completed):
             if (index >= len(self._ends) or not same_order(order, self._stream(index).order)
                     or self._ends[index] != end):
-                raise ValueError(
+                raise _position.PlanChanged(
+                    (f"phases.{index}",),
                     f"the saved run finished phase {index} reading {order} to record "
                     f"{end}, and this run's phase {index} is not that; a phase the "
                     f"run has read cannot change under it"
                 )
         phase = len(saved.completed)
         if phase >= len(self._open) or not same_order(saved.order, self._stream(phase).order):
-            raise ValueError(
+            raise _position.PlanChanged(
+                (f"phases.{phase}",),
                 f"the saved position is {saved.records} records into phase {phase}, "
                 f"reading {saved.order}, and this run's phase {phase} reads something "
                 f"else; resume with the order the checkpoint was written in"
@@ -1902,19 +1905,19 @@ class StepPhases(Forwarding):
         identities = list(strings(saved["identities"], "saved phase identities"))
         if phase >= len(self._make) or ends != self._ends[:phase] or identities[:phase] != [
                 self._identity(index) for index in range(phase)]:
-            raise ValueError(f"the saved run finished phases ending at steps {ends}, and this run's phases "
-                             f"end at {self._ends[:phase]}, or read them otherwise; a phase the run has read "
-                             "cannot change under it")
+            raise _position.PlanChanged(
+                ("phases",), f"the saved run finished phases ending at steps {ends}, and this run's phases "
+                f"end at {self._ends[:phase]}, or read them otherwise; a phase the run has read cannot "
+                "change under it")
         steps = integer(saved["steps"], "the saved steps")
         end = self._ends[phase] if phase < len(self._ends) else None
         if end is not None and steps > end:
-            raise ValueError(f"the saved run has read {steps} steps, past this run's end of phase {phase} "
-                             f"at {end}")
+            raise _position.PlanChanged(
+                (f"phases.{phase}",), f"the saved run has read {steps} steps, past this run's end of phase "
+                f"{phase} at {end}")
         rule = saved.get("phases")
         if (rule == self.CONTINUES) != any(self._shared):
-            from dew.data.plan import PlanChanged
-
-            raise PlanChanged(("rules.phases",),
+            raise _position.PlanChanged(("rules.phases",),
                               f"the saved run's phases continue a corpus they share by the phases rule "
                               f"{rule!r}, and this run's by "
                               f"{self.CONTINUES if any(self._shared) else None!r} "
