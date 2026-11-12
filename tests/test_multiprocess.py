@@ -166,7 +166,8 @@ def test_a_pool_whose_held_out_share_holds_a_token_past_its_table_refuses_on_eve
     train = write_token_corpus(tmp_path / "tokens", tokens, tokens, vocab_size=101)
     corpus = write_token_corpus(tmp_path / "held", held, held, vocab_size=101)
     reports = run_pool("bounded_validation", tmp_path / "pool", 2, devices=1, tokens=train.train,
-                       held_tokens=corpus.train, seq_len=4, timeout=300)
+                       held_tokens=corpus.train, seq_len=4, timeout=300,
+                       script=Path(__file__).with_name("bounded_validation_worker.py"))
     assert sorted(report["refused"] for report in reports) == ["OutsideTable", "PeerFailure"]
 
 
