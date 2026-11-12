@@ -158,8 +158,9 @@ def reads_backend(code: types.CodeType) -> bool:
     short file's task (py-spy, tests/test_config.py, 2026-11-12)."""
     if code not in decided:
         tables = (code.co_names, code.co_varnames, code.co_cellvars, code.co_freevars)
+        # A constant is compared as an instruction's argument is, whatever its type.
         named = "platform" in code.co_names or any("default_backend" in table for table in tables) or any(
-            isinstance(constant, str) and constant == "default_backend" for constant in code.co_consts)
+            constant == "default_backend" for constant in code.co_consts)
         steps = list(dis.get_instructions(code)) if named else []
         decided[code] = any(
             step.argval == "default_backend"
@@ -371,33 +372,39 @@ def _this_python(program) -> bool:
         os.path.realpath(sys.executable)
 
 
+@functools.lru_cache(maxsize=1 << 14)
+def absolute(path: str, root: str) -> str | None:
+    """Absolute path `path` placed in the checkout at `root` (`placed`): a function of its text alone, kept
+    for the paths probed most lately, however many a run probes."""
+    return placed(os.path.abspath(path), root)
+
+
 def probed(probe: Callable[..., object], recorded: Callable[[str], None], root: str) -> Callable[..., object]:
     """`probe` (`PROBES`), which passes the path it is asked about to `recorded`, as `PROBED` and that path,
     before it answers: but a listing tool's (`listing_tool`), whose probes, as its listings, look for what
     it then records as it runs, and one a probe makes in answering (pathlib's `is_dir` asks `stat`), whose
     caller's probe is already recorded. An absolute path's place is the same whoever asks and wherever
-    from, so it is worked out once (`places`), and the asker's frame is read only for a path of the
-    checkout's: most probes are of the environment's packages, and placing each was 1.3-1.9% of a task
-    (py-spy, 2026-11-12)."""
-    places: dict[str, str | None] = {}
+    from, so it is kept (`absolute`), and its asker's frame is read only where it is the checkout's: most
+    probes are of the environment's packages, and placing each was 1.3-1.9% of a task (py-spy,
+    2026-11-12)."""
 
     @functools.wraps(probe)
     def asked(path, *arguments, **keywords):
         if getattr(placing, "probing", False):
             return probe(path, *arguments, **keywords)
         if type(path) is str and path.startswith(os.sep):
-            if path not in places:
-                places[path] = placed(os.path.abspath(path), root)
-            name = places[path]
-        elif isinstance(path, int):
-            name = None
+            name = absolute(path, root)
+            if name is not None and listing_tool(sys._getframe(1).f_code.co_filename):
+                name = None
         else:
             # A path relative to a directory descriptor (os.stat's dir_fd) is placed in the directory it
             # names.
             at = keywords.get("dir_fd")
             base = os.readlink(f"/proc/self/fd/{at}") if at is not None else ""
-            name = placed(os.path.abspath(os.path.join(base, os.fsdecode(os.fspath(path)))), root)
-        if name is not None and not listing_tool(sys._getframe(1).f_code.co_filename):
+            listed = isinstance(path, int) or listing_tool(sys._getframe(1).f_code.co_filename)
+            name = None if listed else placed(
+                os.path.abspath(os.path.join(base, os.fsdecode(os.fspath(path)))), root)
+        if name is not None:
             recorded(PROBED + name)
         placing.probing = True
         try:

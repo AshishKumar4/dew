@@ -3,6 +3,7 @@ cache with its read token, keeps the files whose rows ran green on exactly these
 lookups over tasks of the target's, and a task reuses each kept row it finds fresh and runs the rest; the
 inputs a row is keyed by, which a planner's clean checkout and a task's carried one read alike."""
 
+import hashlib
 import json
 import os
 import re
@@ -311,7 +312,9 @@ def test_a_lookup_examines_the_entries_of_its_name_alone(ci, tmp_path, monkeypat
     examined: list[str] = []
     built = digests.built
     monkeypatch.setattr(digests, "built", lambda path: examined.append(path.name) or built(path))
-    assert digests.looked_up(package / "searched") == digests.looked_up(alone / "searched")
+    found = hashlib.sha256(b"searched\nsearched.py\nsearched/__init__.py").digest()
+    assert digests.looked_up(package / "searched") == digests.looked_up(alone / "searched") == found
+    assert {"searched.py", "searched"} <= set(examined), sorted(set(examined))
     assert set(examined) <= {"searched.py", "searched", "__init__.py", "inner.py"}, sorted(set(examined))
 
 
