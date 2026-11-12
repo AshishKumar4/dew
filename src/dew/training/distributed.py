@@ -305,7 +305,8 @@ class Produced:
         if loader.batch_tokens is not None or any(tokens is not None for tokens in loader.token_batches):
             return cls(None)
         ramp = loader.ramp
-        ramped = () if ramp is None else tuple(stage.batch for stage in ramp.stages(loader.batch))
+        ramped = () if ramp is None else tuple(
+            stage.batch for stage in ramp.stages(loader.batch, partition.window))
         batches = {loader.batch, *loader.batches, *ramped}
         return cls(frozenset(partition.rows(batch) for batch in batches))
 

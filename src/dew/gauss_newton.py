@@ -46,11 +46,17 @@ class NormalEquations:
     update: int = struct.field(pytree_node=False)
 
     def solved(self, damping: float) -> jax.Array:
-        """The normal equations' damped solve against J^T r, flat: of an update that holds fewer rows than it
-        has (a run's last, whose stream ended inside its window), the least-squares solve of the rows it
-        holds, the least change that fits them where they are fewer than the weights (row 5722)."""
+        """The normal equations' damped solve against J^T r, flat. Undamped, an update that holds fewer rows
+        than it has (a run's last, whose stream ended inside its window) solves the rows it holds in the least
+        squares, the least change that fits them where they are fewer than the weights (row 5722); damped, its
+        system is positive definite whatever rows it holds."""
         system = self.normal + damping * jnp.eye(self.normal.shape[0], dtype=self.normal.dtype)
-        return jax.lax.cond(self.rows >= self.update, lambda: cho_solve(cho_factor(system), self.pulled),
+
+        def factored() -> jax.Array:
+            return cho_solve(cho_factor(system), self.pulled)
+        if damping > 0:
+            return factored()
+        return jax.lax.cond(self.rows >= self.update, factored,
                             lambda: jnp.linalg.lstsq(system, self.pulled)[0])
 
 

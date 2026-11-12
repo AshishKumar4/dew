@@ -289,7 +289,7 @@ class ParseExample(pygrain.MapTransform):
     def map(self, element: Batch) -> Batch:
         held = element.get("example")
         if isinstance(held, (Example, GroupedExamples)):
-            return {"example": held}
+            return {"example": held, **({GROUPS: element[GROUPS]} if GROUPS in element else {})}
         grouped = "examples" in element
         parsed = GroupedExamples.of(element, groups=False) if grouped else Example.of(element, groups=False)
         stated = element.get("groups") or (grouped and any(
