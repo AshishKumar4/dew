@@ -55,11 +55,10 @@ from dew.nn.inputs import (
     intersected_runs,
 )
 from dew.nn.inspection import QK
-from dew.nn.kernels.selection import select, selected
+from dew.nn.kernels.selection import select
 from dew.nn.kernels.templates import attention as template
 from dew.nn.kv_cache import (
     DOCUMENTS,
-    PAGED,
     TABLE,
     Append,
     KVCache,
@@ -1508,11 +1507,12 @@ class CausalSelfAttention(nn.Module):
     @staticmethod
     def _plain_step(append, query, key, value, positions, module, starts, *, sinks):
         """A plain decode step of `module` (the layer): through the paged kernel where its device's takes
-        the step (`_pages`), else through the layer's attention (`_decode_attention`), from each row's
-        first key `starts` where given."""
-        if append is not None and module._pages(append.store, query[:, 0], starts is not None,
-                                                sinks is not None):
-            return module._paged(append, query, positions, starts, sinks)
+        the step (`_paged_kernel`), else through the layer's attention (`_decode_attention`), from each
+        row's first key `starts` where given."""
+        kernel = (None if append is None else
+                  module._paged_kernel(append.store, query[:, 0], starts is not None, sinks is not None))
+        if kernel is not None:
+            return module._paged(append, kernel, query, positions, starts, sinks)
         return module._decode_attention(query, key, value, positions, starts, sinks)
 
     def _mixed_positions(self, admitted: Admitted, valid) -> jax.Array:
@@ -1570,8 +1570,11 @@ class CausalSelfAttention(nn.Module):
             return self._worked(store, query, index.value, positions[:rows], prompt, admitted.slots, starts,
                                 window)
         reads = held_reads(index.value, positions[:rows])
-        if self._pages(store, query[0, :rows], windowed=starts is not None, sunk=self.sinks is not None):
-            decoded = store.decode(query[0, :rows], reads, self.ctx.attn_logit_softcap, starts, self.sinks)
+        kernel = self._paged_kernel(store, query[0, :rows], windowed=starts is not None,
+                                    sunk=self.sinks is not None)
+        if kernel is not None:
+            decoded = store.decode(query[0, :rows], reads, kernel, self.ctx.attn_logit_softcap, starts,
+                                   self.sinks)
             decoded = checkpoint_name(decoded[:, None], Residual.CONTEXT)
         else:
             decoded = self._decode_attention(query[0, :rows, None], *store.read(), positions[:rows], starts,
@@ -1671,21 +1674,21 @@ class CausalSelfAttention(nn.Module):
             key_value_seq_lengths=reads.astype(jnp.int32), key_value_seq_starts=starts)
         return checkpoint_name(attention, Residual.CONTEXT)
 
-    def _pages(self, store, query, windowed: bool, sunk: bool = False) -> bool:
-        """Whether a decode step's query `[rows, heads, head_dim]` reads the paged pool `store` through
-        its device's paged kernel (`KVStore.decode`), as the paged selector chooses it (`PAGED`), rather
-        than the gathered rows through the layer's attention; a compact cache keeps no pages. A
+    def _paged_kernel(self, store, query, windowed: bool, sunk: bool = False) -> str | None:
+        """The paged kernel a decode step's query `[rows, heads, head_dim]` reads the pool `store` through
+        (`KVStore.decode`), as the paged selector chooses it (`PAGED`) for the step's one case
+        (`KVStore.case`: the pool's widths, the layer's arithmetic and implementation), reported as the
+        step's route; None where it reads the gathered rows through the layer's attention, as a compact
+        cache keeps no pages. A
         `windowed` step reads each row from its window's first key; a `sunk` one has sinks. A compact
         quantized cache's codes read as they lie where the template's decode takes them
         (`template_quantized`), no dequantized copy of the cache a step."""
         if store.layout.page_size is None and store.layout.quantized is None:
-            return False
-        case = store.case(query, value_dim=self.value_dim, softcap=self.ctx.attn_logit_softcap,
-                          arithmetic=reference_only(query, self.ctx.dtype, self.ctx.precision,
-                                                    self.ctx.force_fp32_for_softmax),
-                          named=self.ctx.attention_impl, windowed=windowed, sinks=sunk)
-        # A read ahead of the store's dispatch (`KVStore.decode`), which reports the route it runs.
-        return selected(PAGED, case).name != 'gathered'
+            return None
+        return store.paged_kernel(query, softcap=self.ctx.attn_logit_softcap,
+                                  arithmetic=reference_only(query, self.ctx.dtype, self.ctx.precision,
+                                                            self.ctx.force_fp32_for_softmax),
+                                  named=self.ctx.attention_impl, windowed=windowed, sinks=sunk)
 
     def _decode_masks(self, positions, rows: int, key_length: int, valid, history: dict[str, jax.Array]
                       ) -> tuple[jax.Array, jax.Array | None]:
@@ -1750,14 +1753,14 @@ class CausalSelfAttention(nn.Module):
                                        jnp.asarray(held & (kept == last), jnp.int32))
         return documents, True, None if window is None or window >= held.shape[-1] else window
 
-    def _paged(self, append: Append, query: jax.Array, positions: jax.Array, starts=None,
+    def _paged(self, append: Append, kernel: str, query: jax.Array, positions: jax.Array, starts=None,
                sinks=None) -> jax.Array:
-        """One decode step through the device's paged kernel, which reads the pool
-        through the page table from each row's `starts` under a window; the
-        gathered keys go unread and XLA drops the gather. A row whose query is
-        padding (`positions` -1) reads one key (`held_reads`)."""
+        """One decode step through the paged `kernel` the step's selection gave it (`_paged_kernel`), which
+        reads the pool through the page table from each row's `starts` under a window; the gathered keys
+        go unread and XLA drops the gather. A row whose query is padding (`positions` -1) reads one key
+        (`held_reads`)."""
         reads = held_reads(self.get_variable("cache", "cache_index"), positions)
-        out = append.store.decode(query[:, 0], reads, self.ctx.attn_logit_softcap, starts, sinks)
+        out = append.store.decode(query[:, 0], reads, kernel, self.ctx.attn_logit_softcap, starts, sinks)
         return checkpoint_name(out[:, None], Residual.CONTEXT)
 
     def _runs_local(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
