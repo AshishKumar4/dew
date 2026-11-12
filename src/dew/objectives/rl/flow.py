@@ -36,13 +36,14 @@ from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inspection import INSPECTED
 from dew.nn.precision import at_least_fp32, weighted_total
-from dew.objectives.base import OMITTED, Aux, Omitted, Ratio, Shown, Step
+from dew.objectives.base import OMITTED, Aux, Objective, Omitted, Ratio, Shown, Step
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG, Guidance, Pair, Prediction, Walk, pair_of
 from dew.sampling.solvers import Euler, Solver
+from dew.training.rollout import own_objective
 
 from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
 
@@ -375,7 +376,7 @@ class GroupedRollout:
 
         return jax.tree.map(repeat, batch), owned, count
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
+    def __call__(self, state: TrainState, batch: Batch, key: jax.Array, *, objective: Objective) -> Batch:
         """Collect one batch of samples and return this process's training rows.
 
         It expands each prompt into its group, generates on every process,
@@ -383,6 +384,7 @@ class GroupedRollout:
         generation into training rows (`_training_rows`). The processes agree
         that each phase succeeded before the next collective runs.
         """
+        own_objective(self, self.objective, objective)
         # The text a reward reads stays on each host (`split_fields`); the rest is placed. Every process
         # agrees which host fields there are before any of them gathers them.
         batch, host = split_fields(batch)

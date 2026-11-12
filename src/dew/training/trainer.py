@@ -1118,7 +1118,8 @@ class Trainer(Generic[Loss, Effects]):
                 # worker, and a stream that may run out can on any read: a process whose read failed stops
                 # its peers before they compile or step without it.
                 read = read_batch(run, interval, state, self.rollout, self.device_mesh, run.marked,
-                                  self._shape.examples, agree=run.agrees(first=not seen))
+                                  self._shape.examples, agree=run.agrees(first=not seen),
+                                  objective=self._step_objective)
                 if read is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
@@ -1589,7 +1590,7 @@ class Trainer(Generic[Loss, Effects]):
                     self._scheduled(plan, branched)
                     read = read_batch(branched, counted, cooled, self.rollout, self.device_mesh, run.marked,
                                       self._shape.examples, agree=branched.agrees(first=not done),
-                                      phase="cooldown read", branch=True)
+                                      phase="cooldown read", branch=True, objective=self._step_objective)
                     if read is None:
                         break
                     (batch, device, _), read = read, None
@@ -1800,6 +1801,12 @@ class Trainer(Generic[Loss, Effects]):
         if self.device_mesh.shape.get(STAGE_AXIS, 1) > 1 and self.rollout is None:
             check_batch(dataset.batch, self.device_mesh, self.microbatches)
 
+    def _step_objective(self, batch: Batch) -> Objective[Loss, Effects]:
+        """The objective the step reading `batch` trains: the run's own, or its copy at the pass count of the
+        phase `batch` was read in (`phase_passes`), which the step is compiled at, before a rollout draws
+        for it (`Rollout`)."""
+        return self.phase_passes.objective_for(self.phase_passes.count(batch))
+
     def _counted_batch(self, batch: Batch) -> Batch:
         """Prepare host counts before placement, never fetch a device batch to count it.
 
@@ -1815,7 +1822,7 @@ class Trainer(Generic[Loss, Effects]):
         if self._refusal is None:
             # The model the batch's step runs: its phase's pass count (`phase_passes`), read off the batch,
             # since this thread prepares it ahead of the step that takes the count.
-            objective = self.phase_passes.objective_for(self.phase_passes.count(batch))
+            objective = self._step_objective(batch)
             try:
                 return prepare_counts(objective, batch, count_model=True)
             except MissingFlopsCount as missing:

@@ -36,7 +36,7 @@ class Recorder:
         self.keys = []
         self.steps = []
 
-    def __call__(self, state, batch, key):
+    def __call__(self, state, batch, key, *, objective):
         self.keys.append(np.asarray(jax.random.key_data(key)).tobytes())
         self.steps.append(int(state.step))
         return batch
@@ -54,7 +54,7 @@ def test_an_identity_rollout_leaves_the_loop_byte_identical():
     assert frozen_trainer().rollout is None
     plain, ident = RecordingTracker(), RecordingTracker()
     alone = frozen_trainer(tracker=plain).fit(dataset(), steps=2, log_every=1)
-    rolled = frozen_trainer(rollout=lambda state, batch, key: batch,
+    rolled = frozen_trainer(rollout=lambda state, batch, key, *, objective: batch,
                             tracker=ident).fit(dataset(), steps=2, log_every=1)
 
     for left, right in zip(jax.tree.leaves(alone), jax.tree.leaves(rolled), strict=True):
@@ -106,7 +106,7 @@ def test_a_rollouts_metrics_log_as_of_its_latest_call():
     class Counting(Recorder):
         metrics: dict[str, float]
 
-        def __call__(self, state, batch, key):
+        def __call__(self, state, batch, key, *, objective):
             self.metrics = {"reward/mean": float(state.step) + 0.5}
             return super().__call__(state, batch, key)
 

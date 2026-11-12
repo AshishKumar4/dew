@@ -302,8 +302,8 @@ def test_a_synchronous_collection_rescores_a_ratio_read_at_another_temperature()
     scheduler = collected(tempered)
     seen = []
 
-    def rollout(state, batch, key):
-        packed = scheduler(state, batch, key, objective=tempered)
+    def rollout(state, batch, key, *, objective):
+        packed = scheduler(state, batch, key, objective=objective)
         seen.append((np.asarray(packed[OLD_LOG_PROBS_KEY]),
                      scored_rows(tempered, state.variables, packed, Progress(state.updates))))
         return packed
@@ -356,7 +356,7 @@ def asynchronously(objective: GRPOObjective, seen, steps: int = 6, *, rewarded: 
                                  estimator=estimator,
                                  penalized=objective.reward_kl > 0)
 
-    def rollout(state, batch, key):
+    def rollout(state, batch, key, *, objective):
         packed = scheduler(state, batch, key, objective=objective)
         seen(state, packed)
         return packed

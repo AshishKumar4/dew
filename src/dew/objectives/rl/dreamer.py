@@ -74,6 +74,7 @@ from dew.rl.env import (
 from dew.rl.evaluation import episodes
 from dew.rl.replay import ReplayBuffer, Steps
 from dew.rl.simulator import DrivenSimulator, Simulator, simulator_rollout, simulator_start
+from dew.training.rollout import own_objective
 
 if TYPE_CHECKING:
     from dew.state import TrainState
@@ -1064,7 +1065,8 @@ class DreamerRollout:
             live = self._advanced(variables, live, min(self.length, self.prefill - flown), random=True)
         return live
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
+    def __call__(self, state: TrainState, batch: Batch, key: jax.Array, *, objective: Objective) -> Batch:
+        own_objective(self, self.objective, objective)
         act_key, sample_key = jax.random.split(key)
         variables = state.variables
         updates = int(state.updates)

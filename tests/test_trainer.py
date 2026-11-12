@@ -1505,7 +1505,7 @@ class NoisedTargets:
     def __init__(self):
         self.steps: list[int] = []
 
-    def __call__(self, state, batch, key):
+    def __call__(self, state, batch, key, *, objective):
         self.steps.append(int(state.step))
         noise = np.asarray(jax.random.normal(key, np.shape(batch["y"])), np.float32)
         return {**batch, "y": np.asarray(batch["y"]) + np.float32(0.01) * (1 + int(state.step)) * noise}

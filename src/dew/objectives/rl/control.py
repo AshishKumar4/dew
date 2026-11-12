@@ -35,6 +35,7 @@ from dew.rl.env import Carry, Env, Memory, Observation, Params, Transition, Tree
 from dew.rl.evaluation import episodes
 from dew.rl.simulator import Simulator, branched, rollout_start, simulator_rollout
 from dew.rl.surrogate import clipped_surrogate_terms
+from dew.training.rollout import own_objective
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -393,7 +394,8 @@ class ControlRollout:
             unrolled.append(steps)
         return carry, jax.tree.map(lambda *leaves: jnp.stack(leaves), *unrolled)
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
+    def __call__(self, state: TrainState, batch: Batch, key: jax.Array, *, objective: Objective) -> Batch:
+        own_objective(self, self.objective, objective)
         passes = self.epochs * self.minibatches
         # The rollout's own count of the minibatches served (row 3932); none yet, the updates' as before.
         served = (int(state.updates) % passes or passes) if self._served is None else self._served
