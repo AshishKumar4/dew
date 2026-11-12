@@ -521,6 +521,19 @@ def test_two_trees_alternating_each_reuse_their_rows_and_a_changed_unit_of_a_set
     assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
 
 
+def flaky_row(root: Path) -> tuple[Path, str]:
+    """tests/test_a.py made flaky: red where FAIL is set, its red run executing a unit its green runs never do
+    (src/flaky.py's `failing`), so the red's executed set, and key, are its own: the file and its text."""
+    (root / "src").mkdir(exist_ok=True)
+    (root / "src/flaky.py").write_text("def failing():\n    raise AssertionError('flaky')\n")
+    flaky = ("import os, sys\nfrom pathlib import Path\nsys.path.insert(0, 'src')\nimport flaky\n"
+             "def test_a():\n"
+             "    with Path('runs-a').open('a') as runs: runs.write('x')\n"
+             "    if os.environ.get('FAIL'):\n        flaky.failing()\n")
+    (root / "tests/test_a.py").write_text(flaky)
+    return root / "tests/test_a.py", flaky
+
+
 def test_a_red_run_of_a_row_revokes_its_earlier_green_runs_by_any_set_token_or_tree(
         ci, tmp_path, monkeypatch, cache_worker):
     """A red run of a row (a flaky one on the very inputs a green run recorded) revokes every green run of it
@@ -529,15 +542,7 @@ def test_a_red_run_of_a_row_revokes_its_earlier_green_runs_by_any_set_token_or_t
     brings back none of this tree's earlier green runs (review, 2026-11-12: a red that executed another set
     revoked nothing by its own key)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
-    test_a = tmp_path / "tests/test_a.py"
-    # Its red run executes a unit its green runs never do, so the red's executed set, and key, are its own.
-    (tmp_path / "src").mkdir(exist_ok=True)
-    (tmp_path / "src/flaky.py").write_text("def failing():\n    raise AssertionError('flaky')\n")
-    flaky = ("import os, sys\nfrom pathlib import Path\nsys.path.insert(0, 'src')\nimport flaky\n"
-             "def test_a():\n"
-             "    with Path('runs-a').open('a') as runs: runs.write('x')\n"
-             "    if os.environ.get('FAIL'):\n        flaky.failing()\n")
-    test_a.write_text(flaky)
+    test_a, flaky = flaky_row(tmp_path)
     armada_task(ci, monkeypatch, verdict)
     entries = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"] and len(entries) == 1
@@ -562,3 +567,43 @@ def test_a_red_run_of_a_row_revokes_its_earlier_green_runs_by_any_set_token_or_t
     assert ci.main() == 0
     assert len((tmp_path / "runs-a").read_text()) == before + 1
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+
+
+def test_each_red_names_itself_so_a_green_between_two_reds_stands_after_neither(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Each red run of a row names itself the row's last red afresh, never a count another red may repeat at
+    once (two reds that read one count would both write the next): a green run recorded between two reds
+    follows the first, and after the second it stands no more (review, 2026-11-12)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    flaky_row(tmp_path)
+
+    def red() -> None:
+        monkeypatch.setenv("FAIL", "1")
+        assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict, policy="off")] == [1, 0, 0]
+        monkeypatch.delenv("FAIL")
+
+    armada_task(ci, monkeypatch, verdict)
+    red()
+    armada_task(ci, monkeypatch, verdict)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    red()
+    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
+
+
+def test_a_lookup_whose_last_red_is_unread_reuses_nothing(ci, tmp_path, monkeypatch, cache_worker):
+    """Where the Worker gives no answer for a row's last red, no green run of the row stands: the plan keeps
+    none, as an unread red may revoke any of them (review, 2026-11-12: an unread record read as none)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    armada_task(ci, monkeypatch, verdict)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+
+    # The Worker unavailable for the rows' last reds alone.
+    answered = ci.r2.Store.get
+
+    def get(store, key: str, *args: object, **kwargs: object) -> bytes | None:
+        if "-reds/" in key:
+            raise ci.r2.Unavailable("the R2 Worker answered 503")
+        return answered(store, key, *args, **kwargs)
+
+    monkeypatch.setattr(ci.r2.Store, "get", get)
+    assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
