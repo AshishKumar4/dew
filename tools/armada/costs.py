@@ -22,6 +22,16 @@ def costed(task: str, word: str) -> str:
     return f"{task}.{word}"
 
 
+SITE_TARGETS = 4
+"""How many of the plan's targets (a row's seconds, .armada.json's) a site's map task of its declared cut may
+take before the plan cuts it finer (ci.py's `cut_draws`). Every map task pays its site's setup again, so cut
+down to one target, sites declared at 8 to 64 draws a task ran as 640 tasks of one or two draws: of the
+suite's 167 check-1 task-hours 56 were their setups (2026-11-12, the run at ac69e5e9ede; by the 115 sites'
+recorded costs, 11,436 map tasks and 483 h cut to one target, 4,647 and 327 h to four). A task of four
+targets, 480 s, stays under the run's longest (packed rows of 900 to 1,400 s), as row 4376's 966 s shard,
+eight targets, did not."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Cost:
     """What a site's map task takes: its setup, once a task (its environment, imports and compiles before its
@@ -35,12 +45,12 @@ class Cost:
         """A task's seconds drawing `units`."""
         return self.setup + self.unit * units
 
-    def fitting(self, declared: int, target: float) -> int:
-        """The most units a task draws within `target` past its setup, at most `declared`, at least one; where
-        its setup alone fills the target, the declared cut, as every finer task pays the setup again."""
-        if not self.unit or self.setup >= target:
+    def fitting(self, declared: int, most: float) -> int:
+        """The most units a task draws within `most` seconds past its setup, at most `declared`, at least one;
+        where its setup alone fills them, the declared cut, as every finer task pays the setup again."""
+        if not self.unit or self.setup >= most:
             return declared
-        return max(1, min(declared, int((target - self.setup) // self.unit)))
+        return max(1, min(declared, int((most - self.setup) // self.unit)))
 
 
 def recorded(task: str, costs: Mapping[str, float], *, weighed: bool) -> Cost | None:

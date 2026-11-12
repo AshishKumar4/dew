@@ -538,7 +538,10 @@ def ahead_battery(args: argparse.Namespace) -> int:
     compile-only GPU of the kind, `COMPILE_TARGETS`), in each tree's environment of `--lock`, into
     `--out`/<the tree's directory name>: what `run --ahead` hands each arm's step rows, so the GPU compiles
     none of a step that is the program compiled ahead (dew-ops' perf jobs, in their GPU-free prepare). A
-    tree that compiles none ahead (one older than the handoff) runs as before, its GPU compiling."""
+    tree whose own benchmark_step has no `--compile-ahead` (one older than the handoff), asked of the tool
+    itself, is named and runs as before, its GPU compiling. A tree that has it and fails to compile ahead,
+    or whose tool cannot say what it takes, fails the battery (exit 1), and so the prepare that ran it: a
+    failure printed and passed over left the run to compile on the GPU unremarked (2026-11-12)."""
     generation, gib, device = COMPILE_TARGETS[args.kind]
     trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
     head_path = Path(trees[args.head.split("=", 1)[0]])
@@ -547,15 +550,23 @@ def ahead_battery(args: argparse.Namespace) -> int:
     cases = [case for name, case in STEP_CASES.items()
              if (not args.only or any(word in name for word in args.only))
              and device in STEP_HARDWARE.get(name, (device,))]
+    failed = []
     for name, path in trees.items():
         if name in unbuilt or not cases:
             continue
-        done = _run(Path(path), pythons[name], "benchmark_step.py",
-                    ["--cases", json.dumps(cases), "--compile-ahead", str(Path(args.out) / Path(path).name),
-                     "--generation", generation, "--capacity-gib", str(gib)], head_path / "tools", 3600)
+        taken = _run(Path(path), pythons[name], "benchmark_step.py", ["--help"], head_path / "tools", 600)
+        if taken.returncode == 0 and "--compile-ahead" not in taken.stdout:
+            print(f"{name}: its benchmark_step has no --compile-ahead (a tree before the handoff): none of "
+                  "its steps is compiled ahead", flush=True)
+            continue
+        done = taken if taken.returncode else _run(
+            Path(path), pythons[name], "benchmark_step.py",
+            ["--cases", json.dumps(cases), "--compile-ahead", str(Path(args.out) / Path(path).name),
+             "--generation", generation, "--capacity-gib", str(gib)], head_path / "tools", 3600)
         said = f"into {args.out}" if done.returncode == 0 else f"not: {done.stderr[-400:]}"
         print(f"{name}: steps compiled ahead {said}", flush=True)
-    return 0
+        failed += [name] if done.returncode else []
+    return 1 if failed else 0
 
 
 def compile_battery(args: argparse.Namespace) -> int:
