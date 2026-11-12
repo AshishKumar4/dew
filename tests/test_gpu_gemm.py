@@ -32,12 +32,10 @@ one process (`gpu_flow`), each cell its own file's property:
   path's, dense and grouped, each matrix layout, hook and dtype its served pairs name (gemm_matrix).
 - The fused GEMM's check-1 matrix (tests/kernel_matrix.py): a region's training step through the fuser's
   prologue and epilogue on par with the same region's stages in XLA (fused_gemm_matrix).
-- The joined projections' check-1 matrix (tests/kernel_matrix.py): a gated MLP's gate and up projections, or a
-  gated delta net's b and a, run as one GEMM, the layer's training step on par with the projections apart
-  (join_matrix).
-- The NVFP4, MX, blockwise FP8 and adapted products' check-1 matrices (tests/kernel_matrix.py). Each matrix
-  runs here over the combinations of the axes a GPU runs natively, its kernel or form and precision, and the
-  cases a red found on a GPU (`kernel_matrix.seeded_cells`); its other pairs are the CPU's.
+- The NVFP4, blockwise FP8 and adapted products' check-1 matrices (tests/kernel_matrix.py), each at the cases
+  a red found on a GPU (`kernel_matrix.seeded_cells`), and the MX products' over a covering of their block
+  formats and output dtypes on a Blackwell, whose block-scaled MMA no interpreter runs; every other pair is
+  the CPU's, interpreted, as the joined projections' matrix is.
 """
 
 import functools
