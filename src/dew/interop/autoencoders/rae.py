@@ -171,6 +171,7 @@ def load_rae(
     lazy: bool = False,
     shapes: Mapping[str, tuple[int, ...]] | None = None,
     tensors: Mapping[str, Stored] | None = None,
+    read: Mapping[str, object] | None = None,
 ) -> tuple[RAEAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published RAE, its parameters and their source layouts from
     `subfolder` of a directory or Hub repo, such as
@@ -181,7 +182,7 @@ def load_rae(
     source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
     placement to read (`dew.interop.weights.record_layouts`)."""
     directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED,
-                                         weights=params is None and tensors is None)
+                                         weights=params is None and tensors is None, read=read)
     model = rae_fields(config).value.clone(dtype=compute)
     image = jax.ShapeDtypeStruct((1, model.input_size, model.input_size, 3), jnp.float32)
     return bind_component(

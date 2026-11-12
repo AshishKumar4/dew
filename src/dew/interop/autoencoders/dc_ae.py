@@ -132,7 +132,8 @@ def dc_ae_path(name: str, ndim: int) -> tuple[str, ...] | None:
 def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                subfolder: str = "", param_dtype: str = "float32", params: Variables | None = None,
                lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None,
-               tensors: Mapping[str, Stored] | None = None
+               tensors: Mapping[str, Stored] | None = None,
+               read: Mapping[str, object] | None = None
                ) -> tuple[DCAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published DC-AE, its parameters and their source layouts from
     `subfolder` of a directory or Hub repo holding its config.json and
@@ -144,7 +145,7 @@ def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | 
     source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
     placement to read (`dew.interop.weights.record_layouts`)."""
     directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED,
-                                         weights=params is None and tensors is None)
+                                         weights=params is None and tensors is None, read=read)
     model = dc_ae_fields(config).value.clone(dtype=compute)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)

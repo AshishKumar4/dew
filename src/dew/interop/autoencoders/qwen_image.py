@@ -131,7 +131,8 @@ def qwen_image_vae_path(name: str, ndim: int) -> tuple[str, ...]:
 def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                         subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
                         lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None,
-                        tensors: Mapping[str, Stored] | None = None
+                        tensors: Mapping[str, Stored] | None = None,
+                        read: Mapping[str, object] | None = None
                         ) -> tuple[QwenImageAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published Qwen-Image 2.1 VAE, its parameters and their source
     layouts from `subfolder` of a pipeline directory or Hub repo; only that
@@ -140,7 +141,7 @@ def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revisio
     `lazy` leaves read ones `SourceLeaf`s for a placement to read
     (`dew.interop.weights.record_layouts`)."""
     directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED,
-                                         weights=params is None and tensors is None)
+                                         weights=params is None and tensors is None, read=read)
     model = qwen_image_vae_fields(config).value.clone(dtype=compute)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
