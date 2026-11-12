@@ -162,7 +162,8 @@ def test_a_pool_whose_held_out_share_holds_a_token_past_its_table_refuses_on_eve
     tokens = np.arange(65, dtype=np.uint16) % 64
     held = tokens.copy()
     held[61] = 100
-    train = write_token_corpus(tmp_path / "tokens", tokens, tokens, vocab_size=64)
+    # Both stores of one tokenizer, of 101 ids, which a table of 64 rows does not hold.
+    train = write_token_corpus(tmp_path / "tokens", tokens, tokens, vocab_size=101)
     corpus = write_token_corpus(tmp_path / "held", held, held, vocab_size=101)
     reports = run_pool("bounded_validation", tmp_path / "pool", 2, devices=1, tokens=train.train,
                        held_tokens=corpus.train, seq_len=4, timeout=300)
