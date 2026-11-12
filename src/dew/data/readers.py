@@ -120,11 +120,14 @@ class _CanonicalPass:
         from dew.data.sources.codec import decode, encode
 
         root = jax.process_index() == 0
-        held = agreed(
-            "canonical validation read",
-            lambda: next(self._source, None) if self._source is not None else None,
-        )
-        payload = b"" if held is None else encode(held)
+
+        def read_payload() -> bytes:
+            if self._source is None:
+                return b""
+            held = next(self._source, None)
+            return b"" if held is None else encode(held)
+
+        payload = agreed("canonical validation read", read_payload)
         size = broadcast_from_process_zero(len(payload))
         if not size:
             raise StopIteration
