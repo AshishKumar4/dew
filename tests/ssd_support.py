@@ -66,8 +66,10 @@ def ssd_orbit(arrays, seed):
 def mamba2_draw(seed, shape=(2, 70, 4, 6, 2, 5)):
     """The transformers scan fixture's distribution and geometry, with a fresh input and orbit seed.
 
-    `dt` is raw, before softplus and its per-head bias, as the upstream reference takes it.
-    """
+    `dt` is raw, before softplus and its per-head bias, as the upstream reference takes it. `A`'s exp is
+    taken in float64 and rounded once, the same bits on every host: NumPy's float32 exp is its own on each
+    (x86's vector routine and an aarch64 host's libm drew other `A` at 2,243 of the 2,560 recorded seeds, so a
+    GH200's Grace host failed every scan site's input digest, ledger 5046)."""
     batch, length, heads, width, groups, state = shape
     rng = np.random.default_rng(seed)
 
@@ -76,7 +78,8 @@ def mamba2_draw(seed, shape=(2, 70, 4, 6, 2, 5)):
 
     return ssd_orbit({
         "x": normal((batch, length, heads, width)), "dt": normal((batch, length, heads)),
-        "A": -np.exp(normal((heads,))), "B": normal((batch, length, groups, state)),
+        "A": -np.exp(normal((heads,)).astype(np.float64)).astype(np.float32),
+        "B": normal((batch, length, groups, state)),
         "C": normal((batch, length, groups, state)), "D": normal((heads,)),
         "dt_bias": normal((heads,)), "h0": normal((batch, heads, width, state)),
     }, seed)
