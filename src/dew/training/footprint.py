@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import contextvars
 import dataclasses
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -47,7 +48,7 @@ from dew.training.compiled_program import (
     lowering_platform,
     simplified,
 )
-from dew.training.memory import head_fused_of, head_tile_of, judged
+from dew.training.memory import head_fused_of, head_table_shape, head_tile_of, judged
 from dew.training.narrow import forward_variables
 from dew.training.transaction import attempt_step
 
@@ -83,6 +84,10 @@ class Footprint:
     """Whether `peak` holds each gradient only while it is made, the step reading it there into the
     buffers its state donates (`transaction.consumed_where_made`, asked where the peak is derived), else
     every gradient to the end; None where no peak is derived."""
+    head: HeadTerms | None = None
+    """What `peak` holds of a head that keeps its whole logits (`HeadTerms`), from which the step's peak at
+    its head's tile is bounded without a trace of it (`dew.training.planning.FitSearch.walked`); None for a
+    step whose head keeps no whole logits, or where no peak is derived."""
 
     @property
     def temporaries(self) -> int | None:
@@ -97,7 +102,26 @@ class Footprint:
         """The terms traced, not an admission decision: XLA's fit check remains authoritative."""
         return {"residuals": self.residuals, "gradients": self.gradients, "held": self.held,
                 "resident": dict(self.resident), "peak": self.peak, "peak_exact": self.exact,
-                "staged": self.staged, "consumed": self.consumed}
+                "staged": self.staged, "consumed": self.consumed,
+                "head": None if self.head is None else self.head._asdict()}
+
+
+class HeadTerms(NamedTuple):
+    """What a gradient program's peak (`peak_bytes`) holds of its head's whole logits, the values shaped by
+    the head's rows and the step's tokens (`logits_shaped`): its peak with none of them held
+    (`headless`), the most bytes of them held at once (`held`), and the elements of the largest
+    (`elements`). A step whose head takes the backward a tile at a time holds the rest as the whole-logits
+    step does, and of them a tile's share at most: its peak is at most `headless + tile * held /
+    elements`, read off the whole-logits step's one trace (row 5556: on Qwen3.5-4B's step, 4 x 12288
+    tokens, the headless peak of its whole-logits trace is its tiled trace's peak to the byte)."""
+
+    headless: int
+    held: int
+    elements: int
+
+    def tiled(self, tile: tuple[int, int]) -> int:
+        """The most the step's gradient program holds at its head's `tile`: its peak bounded above."""
+        return self.headless + math.ceil(tile[0] * tile[1] * self.held / self.elements)
 
 
 class Peak(NamedTuple):
@@ -191,16 +215,55 @@ def traced_gradient(loss: Callable, params, arguments: Sequence) -> tuple[jcore.
 
 
 def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str, workspace: Workspace,
-                  lowering: str | None = None, consumed: bool = False,
-                  deferred: bool = False) -> tuple[int, Peak]:
+                  lowering: str | None = None, consumed: bool = False, deferred: bool = False,
+                  table: tuple[int, int] | None = None) -> tuple[int, Peak, HeadTerms | None]:
     """`residual_bytes` and `gradient_peak` of `loss(params, *arguments)` from one trace of its forward and
     backward (`traced_gradient`), lowered once (`compiled`, its outputs the gradient and the residuals
     alike: an equation's lowering reads no output), as each derives it from its own (row 4261: lowered
-    for each, the two lowerings were 16 of a Qwen3.5-4B candidate's 28 seconds)."""
+    for each, the two lowerings were 16 of a Qwen3.5-4B candidate's 28 seconds); and, for a head that keeps
+    its whole logits from a table of `table`'s rows and features, what its peak holds of them
+    (`head_terms`)."""
     program, count, shapes = traced_gradient(loss, params, arguments)
     lowered = simplified(program, platform, lowering)
-    return (_kept(lowered, count, shapes, platform),
-            _peak(lowered, count, platform, workspace, consumed, deferred))
+    peak = _peak(lowered, count, platform, workspace, consumed, deferred)
+    head = (None if table is None
+            else head_terms(lowered, count, platform, workspace, table, consumed, deferred))
+    return _kept(lowered, count, shapes, platform), peak, head
+
+
+_COUNTED: contextvars.ContextVar[Callable[[jcore.Var], bool] | None] = contextvars.ContextVar(
+    "counted", default=None)
+"""Which values `device_share` counts the bytes of, every one where None: `head_terms`'s peaks."""
+
+
+def logits_shaped(value: jcore.Var, table: tuple[int, int]) -> bool:
+    """Whether `value` is a head's logits, or a value of their shape, of a table of `table`'s rows and
+    features: one that holds the rows and more elements than the table, each token's row of them, where the
+    table's own shape and its gradient's hold no more."""
+    shape = getattr(value.aval, "shape", ())
+    return table[0] in shape and math.prod(shape) > table[0] * table[1]
+
+
+def head_terms(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Workspace, table: tuple[int, int],
+               consumed: bool = False, deferred: bool = False) -> HeadTerms | None:
+    """What `_peak` of `lowered` holds of the head's whole logits (`HeadTerms`), its values shaped by
+    `table` (`logits_shaped`): its peak with none of them counted and with them alone; None where it holds
+    none."""
+    def shaped(value) -> bool:
+        return logits_shaped(value, table)
+
+    found = [math.prod(value.aval.shape) for equation in lowered.eqns for value in equation.outvars
+             if shaped(value)]
+    if not found:
+        return None
+    terms = []
+    for counted in (lambda value: not shaped(value), shaped):
+        token = _COUNTED.set(counted)
+        try:
+            terms.append(_peak(lowered, count, platform, workspace, consumed, deferred).bytes)
+        finally:
+            _COUNTED.reset(token)
+    return HeadTerms(*terms, max(found))
 
 
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str,
@@ -930,6 +993,9 @@ def device_share(value: jcore.Var) -> int:
     aval = value.aval
     if not isinstance(aval, ShapedArray) or aval.memory_space != jax.memory.Space.Device:
         return 0
+    counted = _COUNTED.get()
+    if counted is not None and not counted(value):
+        return 0
     return math.prod(aval.shape) * aval.dtype.itemsize
 
 
@@ -1032,7 +1098,7 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     # Data and fully sharded data parallelism split the rows alone; an expert axis splits the experts too.
     rows = set(row_axes(rows_of(micro), mesh=mesh)) & {DATA_AXIS, FSDP_AXIS} if spread else set()
     if not spread <= rows or not judged(target, capacity):
-        residuals = peak = reads = None
+        residuals = peak = reads = head = None
     else:
         loss, (variables, *rest) = traced_loss(objective, prepared, window, split)
         variables = forward_variables(variables, prepared.compute)
@@ -1058,11 +1124,12 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
             # weight gradients after the backward on some GPUs (`late_weight_gradients`).
             late = (head_tile_of(objective) is not None and not head_fused_of(objective)
                     and late_weight_gradients(target))
-            residuals, peak = derived_terms(trained, arguments[0]["params"], arguments,
-                                            platform=target.platform, workspace=gemm_workspace(target),
-                                            lowering=lowering, consumed=reads, deferred=late)
+            residuals, peak, head = derived_terms(
+                trained, arguments[0]["params"], arguments, platform=target.platform,
+                workspace=gemm_workspace(target), lowering=lowering, consumed=reads, deferred=late,
+                table=head_table_shape(objective, variables))
     resident = {name: device_bytes(value) for name, value in {
         "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
         "accumulation": prepared.accumulation, "compute": prepared.compute, "groups": prepared.inner}.items()}
     return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident,
-                     None if peak is None else peak.bytes, peak is None or peak.exact, staged, reads)
+                     None if peak is None else peak.bytes, peak is None or peak.exact, staged, reads, head)
