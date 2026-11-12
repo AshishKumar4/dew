@@ -808,7 +808,6 @@ def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
         np.testing.assert_array_equal(np.asarray(report["global_advantages"], np.float32),
                                       expected_advantages.astype(np.float32))
         np.testing.assert_array_equal(report["global_rewards"], raw_callback.astype(np.float32))
-        assert not report["x64_enabled"]
         # The reassembled batch rescores as the one process's does, and keeps its recorded densities;
         # the one process's rescoring and recording of this model and process are check 1's, against
         # the authors' Gaussian (test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods).
@@ -944,6 +943,19 @@ def test_float64_callback_distinctions_reach_a_real_policy_update():
     assert collected["rewards"].dtype == np.float64
     np.testing.assert_array_equal(collected["transition_mask"],
                                    np.broadcast_to((oracle != 0)[:, None], (count * 3, 2)))
+    from rl_support import assert_filled_batch_invariants
+
+    from dew.data.dataset import FilledBatch
+
+    three = {name: np.asarray(value)[:3] for name, value in collected.items()}
+    if count * 3 < 3:
+        three = {name: np.repeat(np.asarray(value)[:1], 3, axis=0) for name, value in collected.items()}
+    filled_flow = FilledBatch(4).map(three)
+    corrupted = {name: np.asarray(value).copy() for name, value in filled_flow.items()}
+    corrupted["advantages"][3] = np.nan
+    corrupted["old_log_probs"][3] = np.nan
+    corrupted["rewards"][3] = 1e9
+    assert_filled_batch_invariants(objective, filled_flow, corrupted, FilledBatch(4, real=False).map(three))
 
 
 

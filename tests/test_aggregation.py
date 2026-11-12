@@ -46,27 +46,6 @@ def test_a_labelled_student_acts_as_itself_and_each_step_holds_the_teachers_acti
     np.testing.assert_array_equal(np.asarray(together.extras[LABEL]), expected.astype(np.float32))
 
 
-@pytest.mark.parametrize("simulated", [False, True])
-def test_a_dreamer_rollout_with_a_teacher_writes_each_steps_label_beside_the_action_it_took(simulated):
-    """A Dreamer rollout given a pilot as its teacher, over targets in JAX or simulated on the host, writes
-    every step it takes, its random prefill's and its agent's, with the pilot's action at the step's
-    observation, which the agent's own actions are not."""
-    objective = DreamerV3Objective(tiny())
-    env = HostTarget() if simulated else Batched(TimeLimit(Target(), episode_length=20), 8)
-    rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=8.0, prefill=24,
-                             teacher=Teacher(pilot, {"gain": jnp.asarray(0.75)}))
-    dreamer_fit(None, objective, rollout, 4)
-    replay = rollout.held_replay
-    assert replay is not None
-    filled = int(replay.filled)
-    assert filled > 24
-    held = jax.device_get(replay.held)
-    observation = np.asarray(held["observation"][:filled])
-    expected = np.clip(0.75 * 2 * (1 - observation), -1, 1).astype(np.float32)
-    np.testing.assert_array_equal(np.asarray(held[LABEL][:filled]), expected)
-    assert not np.array_equal(np.asarray(held["action"][:filled]), expected)
-
-
 def test_a_replay_given_to_a_rollout_holds_a_label_exactly_where_it_has_a_teacher():
     """A rollout with a teacher is refused a replay of unlabelled steps, and one without a teacher a replay
     of labelled steps: each writes the steps it takes on the replay it is given."""
@@ -169,17 +148,18 @@ def test_a_greedy_step_is_the_agents_step_without_its_draw():
 
 
 @pytest.mark.parametrize("simulated", [False, True])
-@pytest.mark.parametrize("taught", [False, True])
-def test_a_demonstrated_prefill_writes_the_demonstrators_actions_and_a_teachers_labels(simulated, taught):
-    """A Dreamer rollout whose prefill a pilot demonstrates, over targets in JAX or simulated on the host,
-    writes each prefill step with the pilot's action at its observation, and, given a second pilot as its
-    teacher, that one's action as its label; the agent then acts on from the memory it started with, its
-    own steps the pilot's actions no more."""
+@pytest.mark.parametrize(("demonstrated", "taught"), [(False, True), (True, False), (True, True)])
+def test_a_demonstrated_prefill_writes_the_demonstrators_actions_and_a_teachers_labels(
+        simulated, demonstrated, taught):
+    """A Dreamer rollout over targets in JAX or simulated on the host writes each prefill step with its
+    demonstrator's action when given (and random prefill actions otherwise), and, given a pilot as its
+    teacher, writes that teacher's action as `LABEL` on every step while the agent's own actions differ."""
     objective = DreamerV3Objective(tiny())
     env = HostTarget() if simulated else Batched(TimeLimit(Target(), episode_length=20), 8)
+    demonstrator = Teacher(pilot, {"gain": jnp.asarray(0.75)}) if demonstrated else None
     teacher = Teacher(pilot, {"gain": jnp.asarray(0.5)}) if taught else None
     rollout = DreamerRollout(objective, env, capacity=400, batch=8, length=16, train_ratio=8.0, prefill=24,
-                             demonstrator=Teacher(pilot, {"gain": jnp.asarray(0.75)}), teacher=teacher)
+                             demonstrator=demonstrator, teacher=teacher)
     dreamer_fit(None, objective, rollout, 2)
     written = jax.device_get(rollout.held_replay)
     filled, held = int(written.filled), written.held
@@ -189,11 +169,13 @@ def test_a_demonstrated_prefill_writes_the_demonstrators_actions_and_a_teachers_
     def piloted(gain):
         return np.clip(gain * 2 * (1 - observation), -1, 1).astype(np.float32)
 
-    np.testing.assert_array_equal(action[:24], piloted(0.75)[:24])
-    assert not np.array_equal(action[24:], piloted(0.75)[24:])
+    if demonstrated:
+        np.testing.assert_array_equal(action[:24], piloted(0.75)[:24])
+        assert not np.array_equal(action[24:], piloted(0.75)[24:])
     assert (LABEL in held) == taught
     if taught:
         np.testing.assert_array_equal(np.asarray(held[LABEL][:filled]), piloted(0.5))
+        assert not np.array_equal(action, piloted(0.5))
 
 
 @pytest.mark.parametrize("demonstrated", [False, True])

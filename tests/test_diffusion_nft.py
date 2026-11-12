@@ -120,8 +120,15 @@ def test_a_rollout_samples_the_old_policy_and_normalizes_by_the_batchs_spread():
     bit. Each sample's advantage is its reward less its group's mean over the standard deviation of
     every reward in the batch plus 1e-4 (stat_tracking.py:14-30 under global_std), and its times are
     the sampler grid's first `train_steps`."""
+    from rl_support import assert_filled_batch_invariants
+
+    from dew.averaging import ema_update
+    from dew.batch import VALID_ROWS
+    from dew.data.dataset import FilledBatch
+
     start = objective().init(jax.random.key(20))
-    nft = objective(variables=nudged(start, jax.random.key(22)), old_decay=optax.constant_schedule(0.9))
+    nft = objective(variables=nudged(start, jax.random.key(22)), old_decay=optax.constant_schedule(0.5),
+                    kl=0.1)
     prompts = nft.inputs.tokenize(PROMPTS)
     rollout, initial, final = fitted(nft, reward, prompts, groups=3, steps=5, train_steps=3)
     batch = rollout(initial, prompts, jax.random.key(23))
@@ -134,53 +141,28 @@ def test_a_rollout_samples_the_old_policy_and_normalizes_by_the_batchs_spread():
     assert int(final.updates) == 1
     assert not np.array_equal(*(np.asarray(jax.tree.leaves(state.variables["params"])[0])
                                 for state in (initial, final)))
+    jax.tree.map(np.testing.assert_array_equal, final.ema, ema_update(initial.ema, final.variables, 0.5))
     old_weights = final.replace(variables=final.averaged)
     np.testing.assert_array_equal(rollout(final, prompts, jax.random.key(23))["latents"],
                                   rollout(old_weights, prompts, jax.random.key(23))["latents"])
 
-
-def test_a_rollout_over_a_partly_read_share_trains_only_its_real_rows():
-    """A batch whose last three source rows repeat others (`VALID_ROWS`, a pool's share whose read ran out
-    partway): the rollout's samples of them are marked so (`real_samples`), train nothing, and leave the
-    rewards' spread its real samples' alone (row 3346's review)."""
-    from dew.batch import VALID_ROWS
-
-    start = objective().init(jax.random.key(20))
-    nft = objective(variables=nudged(start, jax.random.key(22)), old_decay=optax.constant_schedule(0.9))
-    prompts = nft.inputs.tokenize(PROMPTS)
     real = np.arange(len(PROMPTS)) < len(PROMPTS) - 3
-    rollout, initial, _ = fitted(nft, reward, prompts, groups=3, steps=5, train_steps=3)
-    batch = rollout(initial, {**prompts, VALID_ROWS: real}, jax.random.key(23))
+    partial = rollout(initial, {**prompts, VALID_ROWS: real}, jax.random.key(23))
     held = np.repeat(real, 3)
-    np.testing.assert_array_equal(batch[VALID_ROWS], held)
-    rewards = np.asarray(batch["rewards"], np.float64)
-    grouped = rewards.reshape(len(PROMPTS), 3)
-    expected = (grouped - grouped.mean(axis=1, keepdims=True)) / (rewards[held].std() + 1e-4)
-    np.testing.assert_array_equal(batch["advantages"], expected.reshape(-1).astype(np.float32))
+    np.testing.assert_array_equal(partial[VALID_ROWS], held)
+    part_rewards = np.asarray(partial["rewards"], np.float64)
+    part_grouped = part_rewards.reshape(len(PROMPTS), 3)
+    part_expected = ((part_grouped - part_grouped.mean(axis=1, keepdims=True))
+                     / (part_rewards[held].std() + 1e-4))
+    np.testing.assert_array_equal(partial["advantages"], part_expected.reshape(-1).astype(np.float32))
 
-
-def test_a_loss_weighs_nothing_of_a_repeated_source_rows_samples():
-    """DiffusionNFT's loss over 8 samples, the last 3 of repeated source rows (`VALID_ROWS`): it is the loss
-    of the first 5 alone, its mean over the real samples, however large the repeats' advantages (row 3346's
-    review)."""
-    from dew.batch import VALID_ROWS
-    from dew.objectives.base import Step
-
-    nft = objective()
-    variables = nudged(nft.init(jax.random.key(30)), jax.random.key(33))
-    rng = np.random.default_rng(31)
-    samples = rng.normal(size=(8, 4, 4, 1)).astype(np.float32)
-    times = np.broadcast_to(np.asarray([1.0, 0.75, 0.5], np.float32), (8, 3))
-    advantages = rng.normal(size=8).astype(np.float32)
-    batch = {"latents": samples, "timesteps": times, "advantages": advantages,
-             **nft.inputs.tokenize(["red"] * 8)}
-    step = Step(jnp.asarray(0), jax.random.key(32), {"params": variables["params"]})
-    real = np.arange(8) < 5
-    loud = {**batch, "advantages": np.where(real, advantages, 1e6).astype(np.float32), VALID_ROWS: real}
-    masked, _ = nft.loss(variables, loud, step)
-    assert float(masked.mass) == 5
-    quiet, _ = nft.loss(variables, {**batch, VALID_ROWS: real}, step)
-    np.testing.assert_array_equal(np.asarray(masked.total), np.asarray(quiet.total))
+    three = jax.tree.map(lambda leaf: np.asarray(leaf)[:3],
+                         {name: value for name, value in batch.items() if name != VALID_ROWS})
+    filled_nft = FilledBatch(4).map(three)
+    corrupted = jax.tree.map(lambda leaf: np.asarray(leaf).copy(), filled_nft)
+    corrupted["advantages"][3] = 1e6
+    corrupted["rewards"][3] = 1e9
+    assert_filled_batch_invariants(nft, filled_nft, corrupted, FilledBatch(4, real=False).map(three))
 
 
 def test_the_released_decay_is_its_trainers_schedule():
@@ -192,19 +174,6 @@ def test_the_released_decay_is_its_trainers_schedule():
         found = np.asarray(released_old_decay(updates))
     expected = np.minimum(0.001 * (updates + 1), 0.5)
     assert_computes_the_oracle(found, expected, "the old policy's decay", roundings=3)
-
-
-def test_the_old_policy_follows_the_trained_one_at_its_decay():
-    """At an update the old policy, the EMA slot, keeps its decay's share of itself and takes the rest
-    from the trained weights, bit for bit at a decay of one half, whose arithmetic rounds once however
-    it fuses."""
-    from dew.averaging import ema_update
-
-    nft = objective(variables=nudged(objective().init(jax.random.key(20)), jax.random.key(22)),
-                    old_decay=optax.constant_schedule(0.5))
-    _, initial, final = fitted(nft, lambda images, context: images.mean(axis=(1, 2, 3)),
-                               nft.inputs.tokenize(PROMPTS), groups=2, steps=5, train_steps=2)
-    jax.tree.map(np.testing.assert_array_equal, final.ema, ema_update(initial.ema, final.variables, 0.5))
 
 
 @pytest.mark.parametrize("asked", [{"beta": 0.0}, {"adv_clip_max": 0.0}, {"kl": -1.0}, {"kl": 1e-4}],
