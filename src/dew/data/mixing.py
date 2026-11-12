@@ -258,6 +258,13 @@ class _KeepAccepted:
         self._touched.add(member)
         return self.members[member]
 
+    def _refusing(self, member: str | None, members: Mapping[str, int]) -> list[CorpusCounts]:
+        """The counts a refused row is counted under: its member's (`MEMBER`), or, a row of several members'
+        examples (`MEMBERS`), each of theirs (row 5716), else the counter's own."""
+        if member is not None or not members or not self.members:
+            return [self._of(member)]
+        return [self._of(key) for key in sorted(members)]
+
     def member_states(self) -> SharedMapping[Mapping[str, object]]:
         """Each member's counts as they stand, by member key (`MEMBERS`): the states captured before, the
         members' that moved since made again, the rest shared with them (`SharedMapping`), so a capture before
@@ -278,10 +285,12 @@ class _KeepAccepted:
     def __call__(self, element: Batch | Rejected) -> TypeGuard[Batch]:
         self.counts.attempted += 1
         if isinstance(element, Rejected):
-            self.rejections += 1
             reason = element.reason
             self.owed.owe(element.consumed, element.drawn)
-            self._of(element.member).dropped(element)
+            refusing = self._refusing(element.member, element.members)
+            self.rejections += len(refusing)
+            for counts in refusing:
+                counts.dropped(element)
         else:
             count = None if self.tokens is None else self.tokens(element)
             if count is not None and count < 0:
@@ -291,9 +300,11 @@ class _KeepAccepted:
                 self.consecutive = 0
                 return True
             reason = "zero_targets"
-            self.rejections += 1
             self.owed.owe(accounts(element)[0], drawn_of(element))
-            self._of(member_of(element)).rejected[reason] += 1
+            refusing = self._refusing(member_of(element), members_of(element))
+            self.rejections += len(refusing)
+            for counts in refusing:
+                counts.rejected[reason] += 1
         self.consecutive += 1
         if not self.warned and self.rejections / self.counts.attempted > _WARN_OVER:
             _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
@@ -425,46 +436,6 @@ class _AcceptedIterator(_CountedIterator[Batch]):
             if key in members:
                 counts.restore(record(record(members[key], "member counter")["counts"], "member counts"))
         self._predicate.restored()
-
-
-class Carried(pygrain.IterDataset[Batch]):
-    """`parent`'s rows, each marker's source examples (`Rejected.consumed`) carried on to the next row and
-    the markers dropped, counting nothing: the carrier after a step whose markers no corpus's count
-    follows, a batched map's group it makes no rows of (`dew.data.pipeline.BatchedGroups`). The examples it
-    owes are checkpointed with its parent's position; those the stream ends owing are its end's
-    (`dew.training._fit.drained`)."""
-
-    def __init__(self, parent: pygrain.IterDataset[Batch | Rejected]):
-        super().__init__(parent)
-        self._records = parent
-
-    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        return _CarriedIterator(iter(self._records))
-
-
-class _CarriedIterator(pygrain.DatasetIterator[Batch]):
-    def __init__(self, parent: pygrain.DatasetIterator):
-        super().__init__(parent)
-        self._read, self._owed = parent, Owed()
-
-    def __next__(self) -> Batch:
-        while True:
-            element = next(self._read)
-            if isinstance(element, Rejected):
-                self._owed.owe(element.consumed, element.drawn)
-                continue
-            return self._owed.paid(element)
-
-    def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._read.get_state(), "owed": self._owed.examples, **self._owed.saved_draws()}
-
-    def set_state(self, state: Mapping[str, object]) -> None:
-        self._read.set_state(record(state["parent"], "carried parent"))
-        self._owed = Owed.restored(integer(state["owed"], "examples owed"),
-                                   json_value(state.get("drawn"), "draws owed"))
-
-    def close(self) -> None:
-        self._read.close()
 
 
 class Accepted(pygrain.IterDataset[Batch]):

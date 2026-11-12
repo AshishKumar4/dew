@@ -87,7 +87,6 @@ from dew.data.handoff import (
 )
 from dew.data.mixing import (
     Accepted,
-    Carried,
     Chunked,
     CorpusCounts,
     KeyedMix,
@@ -98,7 +97,7 @@ from dew.data.mixing import (
     token_weights,
 )
 from dew.data.ordering import Skipping, place_of
-from dew.data.packing import FirstFitPacked, _Concatenated, _OverlappedCuts, window_fields
+from dew.data.packing import FirstFitPacked, LastPieces, _Concatenated, _OverlappedCuts, window_fields
 from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
@@ -878,11 +877,13 @@ class _Inputs(pygrain.MapDataset):
         return outputs[0] if self._single and isinstance(outputs, tuple) else outputs
 
 
-def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
+def _packed(documents: pygrain.IterDataset, stage: Pack, *, consumed: bool = False
+            ) -> pygrain.IterDataset:
     """`documents` packed for the stage's policy: first-fit as an indexed read's plan places them
-    (`FirstFitPacked`), the rest by Grain's own packers."""
+    (`FirstFitPacked`), each example's counts where its last piece is emitted where the documents carry them
+    (`consumed`, `LastPieces`), the rest by Grain's own packers."""
     if stage.policy == "first-fit":
-        return FirstFitPacked(documents, stage)
+        return FirstFitPacked(documents, stage, LastPieces(stage.fields[0]) if consumed else None)
     sizes, _ = window_fields(stage)
     if stage.policy == "concat":
         cut = _OverlappedCuts(documents, stage) if stage.overlap else documents
@@ -920,7 +921,7 @@ class _Ruled(pygrain.IterDataset):
             documents = documents.map(_ConsumedAt(stage.fields[0], held))
             laid = (*ACCOUNTS, *(() if held is None else (DOCUMENT,)))
             stage = dataclasses.replace(stage, fields=(*stage.fields, *laid))
-        windows = (_packed(documents.map(stage.document), stage)
+        windows = (_packed(documents.map(stage.document), stage, consumed=self._consumed)
                    if isinstance(stage, Pack) else CausalWindows(documents, stage, held))
         return _RuledIterator(iter(windows), seen, stage.fields[0], consumed=self._consumed, documents=held,
                               drawn=self._drawn)
@@ -1271,8 +1272,10 @@ class _Build:
         """The rules deciding which rows come next that a read of `pipeline` by this build reads by, each
         its owner's one statement (docs/design/data.md, the rules): how its steps are named
         (`dew.data.plan.IDENTITY`), a shuffle's key (`SHUFFLE`), a mix's schedule (`dew.data.mixing.MIX`),
-        and, where its loading workers read its inputs in their order, how they are dealt
-        (`dew.data.elastic_order.DEALING`); only those the read uses. A plan records them
+        where its loading workers read its inputs in their order, how they are dealt
+        (`dew.data.elastic_order.DEALING`), how a phase continues a corpus an earlier phase read out of
+        order (`DRAWN`) and how a batched step's empty groups are refused
+        (`dew.data.pipeline.BatchedGroups.REFUSALS`); only those the read uses. A plan records them
         (`dew.data.plan.Plan.rules`) and a resume compares them."""
         from dew.data.elastic_order import DEALING
         from dew.data.mixing import MIX
@@ -1280,9 +1283,11 @@ class _Build:
 
         mixed = any(isinstance(chain.source, Mixture) for chain in chains(pipeline))
         shuffled = any(isinstance(stage, Shuffle) for stage in _steps(pipeline))
+        batched = any(isinstance(stage, Batched) for stage in _steps(pipeline))
         return {"identity": IDENTITY, **({"shuffle": self.SHUFFLE} if shuffled else {}),
                 **({"mix": MIX} if mixed else {}), **({"dealing": DEALING} if self.in_order else {}),
-                **({"phases": self.DRAWN} if self.skipped else {})}
+                **({"phases": self.DRAWN} if self.skipped else {}),
+                **({"batched": BatchedGroups.REFUSALS} if batched else {})}
 
     def counting(self, pipeline: Pipeline) -> bool:
         """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
@@ -1911,8 +1916,9 @@ class _Build:
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage))
-            if self.counting(pipeline):
-                rows = Carried(rows)
+            # A group it makes no rows of is refused and counted here, its examples carried to the next row.
+            rows = Accepted(rows, _name(pipeline), _label(pipeline), rows=False,
+                            members=self.counted_members(pipeline))
         else:
             return self.layout_stage(rows, stage, pipeline, at)
         return rows

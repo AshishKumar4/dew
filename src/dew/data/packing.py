@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import ClassVar
 
 import grain.python as pygrain
@@ -22,7 +22,7 @@ from dew._records import integer, integers, record
 from dew.batch import Batch
 from dew.data.dataset import Records, restore_parent
 from dew.data.generation import Generation
-from dew.data.pipeline import ExpandStep, Pack
+from dew.data.pipeline import ACCOUNTS, DOCUMENT, ExpandStep, Pack
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _consumed, _indexed_manifest
 from dew.data.tokens import (
@@ -112,12 +112,21 @@ class FirstFitPacked(pygrain.IterDataset[Batch]):
     packer's: where the documents of the windows it emits now began, how many of those windows it
     emitted and how many in all, so a position either saved resumes on the other."""
 
-    def __init__(self, documents: pygrain.IterDataset[Batch], pack: Pack):
+    def __init__(self, documents: pygrain.IterDataset[Batch], pack: Pack, settled: Settled | None = None):
         super().__init__(documents)
-        self._documents, self._pack = documents, pack
+        self._documents, self._pack, self._settled = documents, pack, settled
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        return _FirstFitPacking(self._documents.__iter__(), self._pack)
+        return _FirstFitPacking(self._documents.__iter__(), self._pack, self._settled)
+
+
+type Laid = list[tuple[Batch, tuple[int, ...]]]
+"""Windows a first-fit laying emits together, in order, each with the places of the documents it holds among
+those laid (`_FirstFitLaying.emitted`)."""
+
+type Settled = Callable[[Laid], Laid]
+"""What a reader makes of each set of windows a first-fit laying emits together before it hands them on: the
+counts a set's windows carry moved to where its documents' examples complete (`dew.data.lowering`)."""
 
 
 def window_fields(pack: Pack) -> tuple[dict[str, int], tuple[str, ...]]:
@@ -128,6 +137,48 @@ def window_fields(pack: Pack) -> tuple[dict[str, int], tuple[str, ...]]:
             (pack.fields[0], *(name for name, _ in pack.along)))
 
 
+@dataclasses.dataclass(frozen=True)
+class LastPieces:
+    """The windows a first-fit laying emits together (`Settled`), each source example's
+    counts (`ACCOUNTS`) and, of a mixture's, its document's end (`DOCUMENT`) moved to the window emitted last
+    of those holding a piece of it, so it completes where its every piece is delivered (row 5713). An
+    expansion's pieces before its last carry no counts (`dew.data.pipeline.consumed_by`), and first-fit can
+    lay the last piece in an earlier window than another: width 5 in two windows, pieces of 2, 5 and 3
+    tokens lay the first and last in the first window, the 5 in the second. A piece laid in a set emitted
+    before is delivered already. The documents' tokens say which each is by `field`'s segment ids."""
+
+    field: str
+
+    def __call__(self, laid: Laid) -> Laid:
+        segments = f"{self.field}_segment_ids"
+        # Each document of the set by its place among those laid: its window and its last token's place there.
+        ends: dict[int, tuple[int, int]] = {}
+        for at, (window, held) in enumerate(laid):
+            ids = np.asarray(window[segments])
+            for segment, document in enumerate(held, start=1):
+                ends[document] = (at, int(np.flatnonzero(ids == segment)[-1]))
+        pieces: list[int] = []
+        for document in sorted(ends):
+            at, token = ends[document]
+            window = laid[at][0]
+            if not any(int(window[name][token]) for name in ACCOUNTS):
+                pieces.append(document)
+                continue
+            last = max((*pieces, document), key=lambda piece: (ends[piece][0], piece))
+            pieces = []
+            into, end = ends[last]
+            if into == at:
+                continue
+            target = laid[into][0]
+            for name in ACCOUNTS:
+                target[name][end], window[name][token] = window[name][token], 0
+            if DOCUMENT in window:
+                # Its document ends where its last piece does, and the piece's where the document did.
+                ended, held = window[DOCUMENT], target[DOCUMENT]
+                held[end], ended[token] = ended[token], held[end]
+        return laid
+
+
 class _FirstFitLaying:
     """Documents, each as `pack` reads one (`Pack.document`), laid first-fit into windows as they come:
     `pack.bins` windows open at a time, a document that fits none emitting every one that holds a
@@ -135,8 +186,8 @@ class _FirstFitLaying:
     on, with the places of the documents it holds among those laid, in the order it laid them, which
     its segment ids number from 1."""
 
-    def __init__(self, pack: Pack):
-        self._pack = pack
+    def __init__(self, pack: Pack, settled: Settled | None = None):
+        self._pack, self._settled = pack, settled
         self._lengths, self._paired = window_fields(pack)
         self._placement = FirstFit([self._lengths[name] for name in self._paired], pack.bins, pack.segments)
         self._count = 0
@@ -172,11 +223,10 @@ class _FirstFitLaying:
     def emitted(self) -> list[tuple[Batch, tuple[int, ...]]]:
         """Every window that holds a document, in order, none open after."""
         assert self._laid is not None
-        windows: list[tuple[Batch, tuple[int, ...]]] = [
-            (dict(sorted(window.items())), tuple(self._held[index]))
-            for index, window in enumerate(self._laid.windows())]
+        windows: Laid = [(dict(sorted(window.items())), tuple(self._held[index]))
+                         for index, window in enumerate(self._laid.windows())]
         self.restart()
-        return windows
+        return windows if self._settled is None else self._settled(windows)
 
 
 def first_fit_windows(documents: Sequence[Batch], pack: Pack) -> list[tuple[Batch, tuple[int, ...]]]:
@@ -190,10 +240,10 @@ def first_fit_windows(documents: Sequence[Batch], pack: Pack) -> list[tuple[Batc
 
 
 class _FirstFitPacking(pygrain.DatasetIterator[Batch]):
-    def __init__(self, documents: pygrain.DatasetIterator[Batch], pack: Pack):
+    def __init__(self, documents: pygrain.DatasetIterator[Batch], pack: Pack, settled: Settled | None):
         super().__init__(documents)
         self._documents = documents
-        self._laying = _FirstFitLaying(pack)
+        self._laying = _FirstFitLaying(pack, settled)
         self._restart(documents.get_state())
         self._counter = 0
 

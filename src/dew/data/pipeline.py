@@ -9,7 +9,16 @@ import math
 import time
 import types
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, overload, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    ClassVar,
+    Concatenate,
+    Literal,
+    Protocol,
+    TypeGuard,
+    overload,
+    runtime_checkable,
+)
 
 import grain.python as pygrain
 import numpy as np
@@ -40,6 +49,9 @@ class Rejected:
     the refusal (`dew.data.mixing.CorpusCounts.dropped`)."""
     member: str | None = None
     """The mixture member the rejected row was drawn from (`MEMBER`), which its refusal is counted under."""
+    members: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    """The source examples by mixture member a rejected row holding several members' was the last of
+    (`MEMBERS`, a window of several members' documents), each member counting the refusal (row 5716)."""
     drawn: Drawn = ()
     """The draws of a phase's shared corpora the rejected row was the last of (`DRAWN`), carried on with
     `consumed`."""
@@ -201,7 +213,7 @@ class MarkConsumed:
 class Owed:
     """The source examples rows a step dropped or made none of were the last of (`Rejected.consumed`),
     owed to the next row kept: the one carrier the reading process's (`dew.data.mixing.Accepted`), a
-    batched step's (`dew.data.mixing.Carried`) and a loading worker's group (`dew.data.lowering`) use."""
+    batched step's (`BatchedGroups`, its counter's) and a loading worker's group (`dew.data.lowering`) use."""
 
     examples: int = 0
     drawn: Drawn = ()
@@ -258,7 +270,9 @@ def consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) -> 
     rest = [{CONSUMED: 0, REFUSED: 0, **split, **none, **row} if isinstance(row, Mapping) else row
             for row in rest]
     if isinstance(last, Rejected):
-        carried: Record = dataclasses.replace(last, consumed=last.consumed + consumed,
+        # A row of several members' (no `MEMBER`) leaves its refusal to each member it completes examples of.
+        held = {} if last.member is not None else joined(last.members, members)
+        carried: Record = dataclasses.replace(last, consumed=last.consumed + consumed, members=held,
                                               drawn=(*last.drawn, *drawn))
     elif isinstance(last, Mapping):
         own, owned = accounts(last)
@@ -327,7 +341,13 @@ def members_held(row: Batch, member: str | None) -> dict[str, int]:
 @dataclasses.dataclass(frozen=True)
 class BatchedGroups:
     """A `map_batches` step over one group: its records, as Grain's flat map takes them, the run's counts of
-    them carried out of the step's sight as `consumed_by` carries a record's (`dew.data.lowering`)."""
+    them carried out of the step's sight as `consumed_by` carries a record's (`dew.data.lowering`), and a
+    group it makes no rows of refused (`REFUSALS`)."""
+
+    REFUSALS: ClassVar[str] = "counted"
+    """The `batched` rule a plan of a read through a batched step records (docs/design/data.md, the rules):
+    a group the step makes no rows of is refused as an empty expansion and counted where the step stands
+    (row 5717), which a reader's position holds; a position of a read before it holds no such count."""
 
     stage: Batched
     max_fan_out: int = 1 << 20
@@ -372,14 +392,14 @@ class BatchedGroups:
         outputs = [{name: values[index] for name, values in made.items()} for index in range(count)]
         if common is not None:
             outputs = [{**row, MEMBER: common} for row in outputs]
+        if not outputs:
+            # A group it makes no rows of is refused as an empty expansion, as a record step's is, counted
+            # where the step stands, its examples on the marker for the next row kept to carry on
+            # (`dew.data.mixing.Accepted`), completing no member's.
+            return [Rejected("empty_expansion", consumed=sum(consumed), member=common,
+                             drawn=tuple(itertools.chain.from_iterable(drawn)))]
         if not consumed:
             return outputs
-        if not outputs:
-            # A group it makes no rows of leaves its examples on a marker, which the next row carries on
-            # (`Carried`), completing no member's.
-            held = sum(consumed)
-            return [Rejected("empty_expansion", consumed=held, member=common,
-                             drawn=tuple(itertools.chain.from_iterable(drawn)))] if held else []
         none, last = ({MEMBERS: {}}, {MEMBERS: joined(*members)}) if counted_by else ({}, {})
         if drawing:
             none, last = {**none, DRAWN: ()}, {**last, DRAWN: tuple(itertools.chain.from_iterable(drawn))}
