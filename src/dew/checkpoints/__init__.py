@@ -518,18 +518,22 @@ def _paths(tree) -> set[str]:
             for path, _ in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
 
-def _refuse_lacking(lacking: set[str], where: str) -> None:
-    """Refuse a template whose leaves `lacking` the checkpoint at `where` does not hold."""
+def _refuse_lacking(lacking: set[str], where: str, unread: set[str] = frozenset()) -> None:
+    """Refuse a template whose leaves `lacking` the checkpoint at `where` does not hold, naming what it
+    holds in their place: its `unread` leaves, those the template does not ask, beside a lacking one (a
+    layout another model or an earlier Dew wrote, a projection group's members stored packed among them).
+    Paths are `_paths`'."""
     if lacking:
         names = sorted(lacking)
+        beside = {name.rsplit("/", 2)[0] for name in names}
+        instead = sorted(name for name in unread if name.rsplit("/", 2)[0] in beside)
+        more = " and more" if len(instead) > 4 else ""
+        held = f" It holds {', '.join(instead[:4])}{more} in their place." if instead else ""
         raise ValueError(
             f"The checkpoint at {where} holds no {', '.join(names[:6])}"
-            f"{f' or {len(names) - 6} more leaves' if len(names) > 6 else ''}, "
-            f"which this run's state has: the checkpoint was written by a model "
-            f"or objective without them, or by an earlier Dew that stored them "
-            f"otherwise (a decision run's projections packed as its served task "
-            f"packs them, before ledger 2299's fix). Restore it with the model and "
-            f"the Dew it was written with, or start a fresh run from its weights.")
+            f"{f' or {len(names) - 6} more leaves' if len(names) > 6 else ''}, which this run's state has: "
+            f"another model or objective wrote it, or an earlier Dew that laid them out otherwise.{held} "
+            f"Restore it with the model and the Dew that wrote it, or start a fresh run from its weights.")
 
 
 RETIRED_RATE = ("learning_rate_scale", "learning_rate_shape")
@@ -2005,9 +2009,10 @@ class Checkpoints:
                     f"and the gradient accumulation it was written with. Resume it "
                     f"with those, or start a fresh run in a directory of its own."
                 ) from mismatch
-            _refuse_lacking({jax.tree_util.keystr(path) for path, leaf
+            _refuse_lacking({jax.tree_util.keystr(path, simple=True, separator="/") for path, leaf
                              in jax.tree_util.tree_flatten_with_path(dict(restored))[0]
-                             if isinstance(leaf, jax.ShapeDtypeStruct)}, where)
+                             if isinstance(leaf, jax.ShapeDtypeStruct)}, where,
+                            _paths(dict(metadata)) - _paths(state_tree))
             keys = _keys(snapshot)
             restored = {name: value if name == 'position' else _placed(value, state_tree[name], keys)
                         for name, value in restored.items()}

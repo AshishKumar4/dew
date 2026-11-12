@@ -212,8 +212,8 @@ def _calls(row: Mapping[str, object], version: int | None,
             own = {name: value for name, value in described[number].items() if name not in ("start", "count")}
             if "finish_reason" not in own:
                 raise ValueError(f"Dew's record of verl call {number} states no finish_reason, as only "
-                                 "an earlier Dew wrote it; export the sessions again with the Dew that "
-                                 "collected them")
+                                 "an earlier Dew wrote it: read the rows with the Dew that wrote them, or "
+                                 "collect the sessions again")
             calls.append(from_record(Call, {**own, **carried}, dtypes=False))
         elif version is None:
             raise ValueError("a native verl row names its policy version in extra_fields.min_global_steps; "
