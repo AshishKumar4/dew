@@ -462,3 +462,60 @@ def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
     rows = armada_task(ci, monkeypatch, verdict)
     assert len(rows) == 3 and all(row["exitCode"] == 0 for row in rows)
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 2]
+
+
+def test_a_row_green_on_a_tree_is_reused_there_after_another_tree_ran_it_executing_another_set(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A row run green on a tree is reused when that tree is planned again, though a run of another tree came
+    after it and executed another set of inputs (a helper its test called there): the row's list keeps each
+    green run's executed set, and the plan keys this tree's inputs with its own set (2026-11-12: keyed with
+    the last run's set alone, train 781's CI kept 2 of 4,180 tasks, and a reach of a comment's change planned
+    7,161 rows)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    armada_task(ci, monkeypatch, verdict)
+    test_a = tmp_path / "tests/test_a.py"
+    main = test_a.read_text()
+    # Another tree: test_a calls a helper of its own, so its run executes a set this tree's never did.
+    helper = tmp_path / "tests/helper_other.py"
+    helper.write_text("def value():\n    return 1\n")
+    test_a.write_text("from helper_other import value\n"
+                      + main.replace("def test_a():\n", "def test_a():\n    assert value() == 1\n"))
+    armada_task(ci, monkeypatch, verdict)
+    helper.unlink()
+    test_a.write_text(main)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    rows = armada_task(ci, monkeypatch, verdict)
+    assert sorted((row["name"], row["exitCode"]) for row in rows) == [
+        (f"3.12:tests/test_{name}.py", 0) for name in "abc"]
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [2, 1, 1]
+
+
+def test_two_trees_alternating_each_reuse_their_rows_and_a_changed_unit_of_a_set_runs_its_row(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Two trees whose runs of a row execute different sets, planned in turn, each reuse their own green rows
+    (main's and base's, a train's and a lane's); a unit of a recorded set changed in the tree runs the row
+    again: a set is a hit only where every input it names holds what it held."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    test_a = tmp_path / "tests/test_a.py"
+    plain = test_a.read_text()
+    helper = tmp_path / "tests/helper_other.py"
+    calling = "from helper_other import value\n" + plain.replace("def test_a():\n",
+                                                                 "def test_a():\n    assert value() == 1\n")
+
+    def tree(*, other: bool, body: str = "def value():\n    return 1\n") -> None:
+        if other:
+            helper.write_text(body)
+            test_a.write_text(calling)
+        else:
+            helper.unlink(missing_ok=True)
+            test_a.write_text(plain)
+
+    for other in (False, True):
+        tree(other=other)
+        armada_task(ci, monkeypatch, verdict)
+    for other in (False, True, False, True):
+        tree(other=other)
+        assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"], other
+    # The other tree's helper changed in the unit test_a ran: its row runs, the rest reused.
+    tree(other=True, body="def value():\n    return 2 - 1\n")
+    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
