@@ -312,7 +312,8 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         # The natural form's rewalk at its own tiles (`Tiles.relaunch`), its spans' block map of them.
         at, at_spans = _form_tiles(spec, call, form, tiles, spans_of)
         # A rewalk's flags: those the plain launch stated of its rows (`flagged`), else its live rows'.
-        flags = None if live is None else live if isinstance(live, _Flags) else _Flags.of(live, at.block_q)
+        flags = (None if live is None else live if isinstance(live, _Flags)
+                 else _Flags.of(live.reshape(*live.shape[:2], -1), at.block_q))
         # A rewalk into the plain launch's outputs (`algebra.walked_launches`' `in_place`): masked, its rows
         # the live ones, the rest of its outputs left as the plain launch wrote them (`_Read.into`).
         # An in-place rewalk is of live rows (`algebra.walked_launches`).
@@ -395,7 +396,10 @@ def _plain_launches(walk: _InferenceWalk, q: jax.Array, form: algebra.Forward, a
     if stated and len(blocks) == 1:
         # Its rows' rewalk flags as its programs stated them (`algebra.walked_launches`' contract).
         return (out, *finished), None, _Flags.stated(status, at.block_q)
-    return (out, *finished), status[0], None
+    # Its rows' maxima a slice at a time, `[B, H, S, Qp]`, as `algebra.walked_launches` reads a launch's
+    # (its last axis a slice's queries, which the guard's own rows and padding are positions along).
+    maxima = status[0]
+    return (out, *finished), maxima.reshape(*maxima.shape[:2], splits, -1) if splits > 1 else maxima, None
 
 
 def _walked_outputs(walked: tuple, *, queries: int, width: int, rows: bool, splits: int):
@@ -916,18 +920,22 @@ def _value_tile(program: _Program, shape: tuple, dtype, turn, slots, converted=N
 
 
 def _status_stored(family: mosaic.Family, spec: algebra.Forward, state: algebra.Partial,
-                   status_views: tuple | None, row_smem) -> None:
+                   status_views: tuple | None, row_smem, first) -> None:
     """A consumer's rows' status into `status_views` (`_launch`'s): each row's maximum in the walk's units, a
     row that saw no key -inf (`algebra.reached`'s convention), every other its maximum, `LEAST` included,
     which the fold's guard reads; or, where the launch flags its rows (three views, `_Flags`), beside it each
     one's rewalk and its block's, which the masked rewalk reads as they are (`algebra.rewalks`); nothing where
-    the launch gives no status (None, `_Block.status`)."""
+    the launch gives no status (None, `_Block.status`). `first` is its first row's query."""
     if status_views is None:
         return
     maximum = jnp.where(algebra.no_keys(state.total), -jnp.inf, state.m)
     status = (maximum,)
     if len(status_views) == 3:
-        live = jnp.where(algebra.rewalks(spec, maximum)[0], 1.0, 0.0)
+        # Its rows' queries where it walks padding (`algebra.padded_queries`), a tile's places reduced along
+        # its columns, as `algebra.Coords.query_places` forms them (a row's iota takes no row layout).
+        queries = (jnp.max(first + family.iota(state.acc.shape, 0), axis=-1)
+                   if algebra.padded_queries(spec) is not None else None)
+        live = jnp.where(algebra.rewalks(spec, maximum, queries)[0], 1.0, 0.0)
         status = (maximum, live, jnp.broadcast_to(jnp.max(live), live.shape))
     family.stored(tuple(map(family.as_row, status)), status_views, smem=row_smem)
 
@@ -1059,7 +1067,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
         out_stage(split_sums)
     pl.when(consumer == 0)(turn)
-    _status_stored(family, spec, state, stored().status, row_smem)
+    _status_stored(family, spec, state, stored().status, row_smem, first)
     _stored_walk(program, spec, state, trained, hooked, (row, head, first), hooks=hooks, training=training,
                  out=(out_view, out_stage), rows=(stored, row_smem), keep=keep)
 
