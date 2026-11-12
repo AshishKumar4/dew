@@ -676,6 +676,11 @@ def test_a_reader_tokenizes_each_text_of_its_rows_once(arm):
     assert tokenizer.texts and set(tokenizer.texts.values()) == {1}
 
 
+PACKED_SEEDS = 256
+"""Check 1's declared seeds for the packed charges against each example's alone, a draw a model's
+variables, sized paired by `seeds_for` on armada."""
+
+
 def test_a_packed_loss_counts_only_real_scored_questions():
     """Different joint-row lengths and label counts contribute question charges, not token,
     window, unanswered or padding counts; a repeated held window contributes neither part."""
@@ -705,30 +710,39 @@ def test_a_packed_loss_counts_only_real_scored_questions():
     (repeated,) = np.flatnonzero(~real)
     assert any(np.array_equal(batch["tokens"][repeated], tokens) for tokens in batch["tokens"][real])
     variables = objective.init(jax.random.key(0))
-    charges, lengths = [], []
+    # Each example alone, its own row: the inputs of its row and, for each labelled question, its slot,
+    # options and gold over them as the row orders them.
+    alone = []
     for example in examples:
         (encoded,) = layout.rows(TOKENIZER, SPECIALS, example.state, example.questions)
-        lengths.append(len(encoded.tokens))
-        inputs = DecisionInputs.collate([encoded], SPECIALS.pad)
-        logits = np.asarray(objective.model.logits(variables, inputs), np.float64)[0]
-        for slot, laid in enumerate(encoded.questions):
-            if laid.name not in example.labels():
-                continue
-            shown = logits[slot, :len(laid.options)]
-            shifted = shown - shown.max()
-            log_probabilities = shifted - np.log(np.exp(shifted).sum())
-            gold = example.distribution(laid.name)[list(laid.order)]
-            charges.append(-float(np.dot(gold, log_probabilities)))
-    assert len(set(lengths)) == len(examples)
+        alone.append((DecisionInputs.collate([encoded], SPECIALS.pad), [
+            (slot, len(laid.options), example.distribution(laid.name)[list(laid.order)])
+            for slot, laid in enumerate(encoded.questions) if laid.name in example.labels()]))
+    assert len({inputs.tokens.shape[-1] for inputs, _ in alone}) == len(examples)
     count = sum(len(example.labels()) for example in examples)
-    assert len(charges) == count == 4
+    assert sum(len(labelled) for _, labelled in alone) == count == 4
     step = Step(jnp.asarray(0), jax.random.key(0), None)
     loss, _ = objective.loss(variables, batch, step)
     assert float(loss.mass) == count
-    assert float(loss.total) == pytest.approx(sum(charges), rel=1e-5)
-    reduced, active = objective.reduce_loss(loss)
-    assert bool(active)
-    assert float(reduced) == pytest.approx(sum(charges) / count, rel=1e-5)
+    assert bool(objective.reduce_loss(loss)[1])
+
+    def packed(variables):
+        loss, _ = objective.loss(variables, batch, step)
+        return {"total": loss.total, "mean": objective.reduce_loss(loss)[0]}
+
+    def each_alone(variables):
+        charges = []
+        for inputs, labelled in alone:
+            logits = objective.model.logits(variables, inputs)[0]
+            for slot, options, gold in labelled:
+                log_probabilities = jax.nn.log_softmax(logits[slot, :options])
+                charges.append(-jnp.dot(jnp.asarray(gold, logits.dtype), log_probabilities))
+        total = jnp.sum(jnp.stack(charges))
+        return {"total": total, "mean": total / count}
+
+    init = jax.jit(objective.init)
+    assert_as_exact(packed, each_alone, lambda seed: (nn.unbox(init(jax.random.key(seed))),),
+                    "a packed batch's question charges against each example's alone", seeds=PACKED_SEEDS)
     unmarked = {name: value for name, value in batch.items() if name != VALID_ROWS}
     counted_repeats, _ = objective.loss(variables, unmarked, step)
     assert float(counted_repeats.mass) == int(batch["scored"].sum()) > count

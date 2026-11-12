@@ -302,18 +302,20 @@ def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(
 
 
 def test_arrayrecords_wait_for_a_busy_reader_before_opening_a_missing_shard(arrayrecord_paths, monkeypatch):
+    import time
+
     import grain.python as grain
 
     from dew.data.sources.records import ArrayRecords
 
+    real = {os.path.realpath(path) for path in arrayrecord_paths}
     source = ArrayRecords(arrayrecord_paths, counts=(8,) * len(arrayrecord_paths))
     width = Loading().threads
     entered = threading.Barrier(width + 1)
-    released, queued = threading.Event(), threading.Event()
+    released = threading.Event()
     lock = threading.Lock()
     admitted = 0
     underlying_read = grain.ArrayRecordDataSource.__getitem__
-    condition_wait = threading.Condition.wait
 
     def held(reader, index):
         nonlocal admitted
@@ -325,20 +327,17 @@ def test_arrayrecords_wait_for_a_busy_reader_before_opening_a_missing_shard(arra
             assert released.wait(timeout=5)
         return underlying_read(reader, index)
 
-    def waiting(condition, timeout=None):
-        if condition is source._shards._lock:
-            queued.set()
-        return condition_wait(condition, timeout)
-
     monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", held)
-    monkeypatch.setattr(threading.Condition, "wait", waiting)
     try:
         with ThreadPoolExecutor(width + 1) as pool:
             pending = [pool.submit(source.__getitem__, 8 * shard) for shard in range(width)]
             try:
                 entered.wait(timeout=5)
                 overflow = pool.submit(source.__getitem__, 8 * width)
-                assert queued.wait(timeout=5)
+                deadline = time.monotonic() + 0.05
+                while time.monotonic() < deadline:
+                    assert sum(opened.path in real for opened in psutil.Process().open_files()) <= width
+                    time.sleep(0.005)
                 assert not overflow.done()
             finally:
                 released.set()
@@ -348,7 +347,6 @@ def test_arrayrecords_wait_for_a_busy_reader_before_opening_a_missing_shard(arra
             assert overflow.result(timeout=5) == f"{width}:0".encode()
     finally:
         source.close()
-
 
 def test_a_read_past_the_bound_never_waits_on_another_source_opening_a_shard(arrayrecord_paths):
     """A source opening a shard holds its own lock while it opens (a remote shard downloads). A read
