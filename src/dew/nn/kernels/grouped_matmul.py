@@ -95,6 +95,9 @@ class Hooks:
     """The accumulator tiles the epilogue takes before its side tiles: a launch's binding states them from
     its bound operands (two where a second matrix is bound, `gmm_call`'s `paired`; `_GroupedLaunch.bind`),
     never a caller."""
+    depth_masked: bool = False
+    """Whether the prologue's result is zeroed past the call's depth by its last side vector
+    (`mosaic_gpu.depth_masked`), which a launch's alignment binds once (`MosaicGmm._aligned`)."""
 
     def before(self):
         """The prologue as a kernel traces it: on the squeezed side tiles."""
@@ -843,9 +846,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def _derived(self, ba, target, admits=None) -> mosaic_gpu.Tiles | None:
         """The derivation's tile of `ba` on `target` (`mosaic_gpu.derived`), each candidate also one `admits`
-        takes where given (a swapped call's own rule, `MosaicGmm._left_fits`), on the call as the launch runs
-        it (`_aligned`)."""
-        ba = self._aligned(ba)
+        takes where given (a swapped call's own rule, `MosaicGmm._left_fits`), on the call padded to whole
+        tiles (`_aligned`'s `whole_tiles`): the tile a launch runs whether its depth and width are padded or
+        run partial (`_partial_axes`)."""
+        ba = self._aligned(ba, whole_tiles=True)
         layouts = self._families(ba, target)
         if not layouts:
             return None
@@ -1004,30 +1008,46 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         call as it runs it (`_aligned`) by default."""
         return self._aligned(ba), config
 
-    def _aligned(self, ba):
+    def _aligned(self, ba, *, whole_tiles: bool = False):
         """The call as the launch runs it (`_fwd`'s `_padded`): its depth and width each padded with zeros to
         whole units of its family's tiles where they are not (its depth to the least step,
         `Family.depths`, or a tile's rows where the depth is a tile's; its width to whole column units,
         `Family.column_unit`), the output sliced back; the call itself where they are. A width of 100
         columns, which no tile divides, so runs on 128, the template's where Triton's masked tiles ran it.
-        The padding stands where the loads cannot bound a partial tile: Mosaic GPU's TMA view of a partial
-        dimension is refused ("dimension 1 must have size smaller or a multiple of its tiling 64, but got
-        100", a022d3abb83), which the fork's row 5299 takes; its cost is the padded operands' copy."""
+        An axis the launch runs with its last step or column tile partial (`_partial_axes`: TMA's bounded
+        loads, row 5299) is not padded, so no copy is made of its operands; `whole_tiles`, every axis padded,
+        the call the tile is derived on (`_derived`)."""
         layouts = self._families(ba, generation.gpu_target())
         if not layouts:
             return ba
-        family, dtype = layouts[0], ba.arguments['tokens'].dtype
-        # The width in whole column units and whole units of the call's column vectors (`_vector_units`: an
-        # mma.sync bias's 64, where its column unit is 32; a 200-wide input gradient padded to 224 took no
-        # tile, EM-unal2).
-        width_unit = math.lcm(family.column_unit(dtype), self._vector_units(ba, family)[1])
-        units = {'depth': self._depth_unit(ba, family, dtype), 'width': width_unit}
-        extents = self._padded_extents(ba)
-        grown = {axis: -(-extent // units[axis]) * units[axis] for axis, extent in extents.items()}
+        family = layouts[0]
+        extents, whole = self._whole_extents(ba, family)
+        if whole == extents:
+            return ba
+        depth_partial, width_partial = (False, False) if whole_tiles else self._partial_axes(ba, family)
+        partial = {'depth': depth_partial, 'width': width_partial}
+        grown = {axis: extent if partial.get(axis) else whole[axis] for axis, extent in extents.items()}
         if grown == extents:
             return ba
         padded = {name: _grown(value, dims, grown) for name, value, dims in self._padded_dims(ba)}
         return type(ba)(ba.op, {**ba.arguments, **padded})
+
+    def _whole_extents(self, ba, family: mosaic.Family) -> tuple[dict[str, int], dict[str, int]]:
+        """The call's depth and width (`_padded_extents`) and each in whole units of `family`'s tiles, as
+        `_aligned` pads them: its depth to the least step (`_depth_unit`), its width to whole column units
+        and whole units of the call's column vectors (`_vector_units`: an mma.sync bias's 64, where its
+        column unit is 32; a 200-wide input gradient padded to 224 took no tile, EM-unal2)."""
+        dtype = ba.arguments['tokens'].dtype
+        width_unit = math.lcm(family.column_unit(dtype), self._vector_units(ba, family)[1])
+        units = {'depth': self._depth_unit(ba, family, dtype), 'width': width_unit}
+        extents = self._padded_extents(ba)
+        return extents, {axis: -(-extent // units[axis]) * units[axis] for axis, extent in extents.items()}
+
+    def _partial_axes(self, ba, family: mosaic.Family) -> tuple[bool, bool]:
+        """Whether the call's depth, and its width, run their last step and column tile partial on `family`
+        rather than padded (`_aligned`): a product's alone (`MosaicGmm._partial_axes`)."""
+        del ba, family
+        return False, False
 
     @abc.abstractmethod
     def _depth_unit(self, ba, family: mosaic.Family, dtype) -> int:
@@ -1137,10 +1157,90 @@ class MosaicGmm(_Mosaic):
         return -(-tokens.shape[0] // max(ba.arguments['sizes'].shape[0], 1)), depth, width
 
     def _divides(self, ba, config: mosaic_gpu.Tiles) -> bool:
-        kernel = ba.arguments['kernel']
+        # A depth or width the tile does not divide where its last step or column tile runs partial
+        # (`_partial_axes`, at the tile `mosaic_gpu.partial_runs`), no deeper or wider than the call.
+        kernel, dtype = ba.arguments['kernel'], ba.arguments['tokens'].dtype
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
-        columns = mosaic_gpu.tile_columns(config, mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype))
-        return depth % config.block_k == 0 and width % columns == 0
+        family = mosaic_gpu.family_of(config, dtype)
+        columns = mosaic_gpu.tile_columns(config, family)
+        runs = mosaic_gpu.partial_runs(config, dtype, ba.arguments['interpret'],
+                                       transpose_rhs=ba.arguments['trans_rhs'],
+                                       gathered=ba.arguments.get('gather') is not None,
+                                       scattered=ba.arguments.get('scatter') is not None)
+        depth_partial, width_partial = (each and run for each, run in
+                                        zip(self._partial_axes(ba, family), runs, strict=True))
+        return ((depth % config.block_k == 0 or (depth_partial and config.block_k <= depth))
+                and (width % columns == 0 or (width_partial and columns <= width)))
+
+    def _partial_axes(self, ba, family: mosaic.Family) -> tuple[bool, bool]:
+        """`_Mosaic._partial_axes`: each axis the call does not fill with whole tiles that the launch may run
+        partial (`_partial_admitted`) where the tile it derives on the padded call (`_derived`, read once
+        through `derived`) runs it partial as it is (`mosaic_gpu.partial_runs`): the same tile, its operands
+        and output uncopied, so it runs no slower than padded. A partial axis that would take a narrower tile
+        is padded instead: a GH200's grouped 4096 x 200 x 136 product ran its partial tiles one swizzled tile
+        deep and wide 1.07x and its input gradient 1.20x their padded time, where 8192 x 1000 x 1400's ran
+        0.86x and 0.93x (M-EM-22b)."""
+        extents, whole = self._whole_extents(ba, family)
+        short = (extents.get('depth') != whole.get('depth'), extents.get('width') != whole.get('width'))
+        admitted = tuple(each and grows for each, grows in zip(self._partial_admitted(ba, family), short,
+                                                                strict=True))
+        if not any(admitted):
+            return False, False
+        tile = self.derived(self._aligned(ba, whole_tiles=True), generation.gpu_target())
+        if tile is None:
+            return False, False
+        dtype = ba.arguments['tokens'].dtype
+        runs = mosaic_gpu.partial_runs(tile, dtype, ba.arguments['interpret'],
+                                       transpose_rhs=ba.arguments['trans_rhs'],
+                                       gathered=ba.arguments.get('gather') is not None,
+                                       scattered=ba.arguments.get('scatter') is not None)
+        # The tile no deeper and no wider than the call (`mosaic_gpu.gmm`'s refusal): a last tile partial,
+        # never a first.
+        within = (tile.block_k <= extents['depth'],
+                  mosaic_gpu.tile_columns(tile, mosaic_gpu.family_of(tile, dtype)) <= extents['width'])
+        depth_partial, width_partial = (each and run and fits for each, run, fits
+                                        in zip(admitted, runs, within, strict=True))
+        return depth_partial, width_partial
+
+    def _partial_admitted(self, ba, family: mosaic.Family) -> tuple[bool, bool]:
+        """Whether the launch may run the call's depth, and its width, partial: a plain matrix's product (no
+        packed, step- or block-scaled one) on a
+        family whose loads past an operand are bounded (`Family.bounded_loads`, TMA's) and whose products
+        read its blocks by descriptor (`mosaic_gpu.partial_runs`), compiled, not swapped
+        (`_swapped`), each axis at least a swizzled tile long where every operand and output along it lies in
+        rows of whole 16 bytes, as a TMA descriptor's strides must (a 100-wide bf16 matrix's 200-byte rows are
+        padded: "Async copies require all GMEM strides except the last one to be a multiple of 16 bytes"), and
+        no side tile runs along it (a side's copy spans its own dtype's tiles, which the fork's untiled view
+        of a partial extent takes one of: a float32 side's 64 columns are two); the depth's where the rows are
+        not gathered and the width's where they are not scattered (a gather's and a scatter's piecewise copies
+        are unbounded)."""
+        if (self.STEPS is not None or self.STEP_SCALED or self.BLOCK_SCALED or not family.bounded_loads
+                or family.operands_in_registers or ba.arguments['interpret']
+                or self._swapped(ba, generation.gpu_target()) is not None):
+            return False, False
+        tokens, kernel, hooks = ba.arguments['tokens'], ba.arguments['kernel'], ba.arguments['hooks']
+        trans_rhs = ba.arguments['trans_rhs']
+        depth, width = (kernel.shape[2], kernel.shape[1]) if trans_rhs else kernel.shape[1:]
+
+        def rows_of(extent: int, *dtypes) -> bool:
+            # A call no narrower than a swizzled tile (`mosaic_gpu.partial_step`), which its last tile
+            # spans partial; a narrower one is padded to its tile, as a whole tile's rows are.
+            return (extent >= mosaic_gpu.partial_step(tokens.dtype)
+                    and all(extent * jnp.dtype(dtype).itemsize % 16 == 0 for dtype in dtypes))
+
+        def tiled(operands: tuple, axes_of: tuple, axis: str) -> bool:
+            # A side tile along the axis (a vector's copy is one tile of its own, its load past it zeros).
+            return any(len(axes) > 1 and axis in axes for axes in axes_of[:len(operands)])
+
+        outputs = hooks.out_dtypes or (ba.arguments['out_dtype'],)
+        depth_partial = (rows_of(depth, tokens.dtype, *((kernel.dtype,) if trans_rhs else ()))
+                         and not tiled(ba.arguments['prologue_operands'], hooks.prologue_axes, 'depth')
+                         and ba.arguments.get('gather') is None)
+        width_partial = (rows_of(width, *outputs, *(() if trans_rhs else (kernel.dtype,)))
+                         and not tiled(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes,
+                                       'columns')
+                         and ba.arguments.get('scatter') is None)
+        return depth_partial, width_partial
 
     def _depth_unit(self, ba, family: mosaic.Family, dtype) -> int:
         # The least step its stage takes, in whole units of a prologue's depth vectors (`candidate`'s, the
@@ -1151,21 +1251,27 @@ class MosaicGmm(_Mosaic):
             return step
         return math.lcm(step, family.vector_unit(jnp.float32), self._vector_units(ba, family)[2])
 
-    def _aligned(self, ba):
+    def _aligned(self, ba, *, whole_tiles: bool = False):
         # A prologue never sees the depth's padding: its result zeroed past the call's depth by a side vector
         # over the depth (`mosaic_gpu.depth_masked`), bound with the padded call so its planner, its register
         # model and its kernel stage the vector alike.
-        aligned = super()._aligned(ba)
+        aligned = super()._aligned(ba, whole_tiles=whole_tiles)
         hooks = aligned.arguments['hooks']
         depth = self._padded_extents(ba).get('depth')
         padded = self._padded_extents(aligned).get('depth')
-        if hooks.prologue is None or depth is None or depth == padded:
+        # A depth run with its last step partial (`_partial_axes`) is masked too, its mask a vector of the
+        # depth whose last step's load past it reads zeros.
+        layouts = self._families(ba, generation.gpu_target())
+        steps = self.STEPS or (layouts[0].depths(ba.arguments['tokens'].dtype) if layouts else ())
+        whole = depth is not None and any(depth % step == 0 for step in steps)
+        # A binding aligned once keeps its mask (planning aligns the bound call again: `_ran`, `registers`).
+        if hooks.prologue is None or depth is None or (depth == padded and whole) or hooks.depth_masked:
             return aligned
         abstract = isinstance(ba.arguments['tokens'], jax.ShapeDtypeStruct)
         valid = (jax.ShapeDtypeStruct((padded,), jnp.float32) if abstract
                  else (jnp.arange(padded) < depth).astype(jnp.float32))
         masked = dataclasses.replace(
-            hooks, prologue=functools.partial(mosaic_gpu.depth_masked, hooks.prologue),
+            hooks, prologue=functools.partial(mosaic_gpu.depth_masked, hooks.prologue), depth_masked=True,
             prologue_axes=(*hooks.prologue_axes, ('depth',)),
             prologue_dtypes=(*hooks.prologue_dtypes, 'float32') if hooks.prologue_dtypes else (),
             prologue_broadcast=(*hooks.prologue_broadcast, ()) if hooks.prologue_broadcast else ())
@@ -1309,7 +1415,7 @@ class MosaicGmm(_Mosaic):
         # (the GEMM compile gate, EM-G1), its runs' traced steps beside the running sum.
         depth = ba.arguments['tokens'].shape[1]
         if config.splits > 1 and ((ba.arguments['dense'] and not config.swapped) or ba.arguments['exact_sums']
-                                  or not mosaic_gpu.split_runs(depth // config.block_k, config.splits)):
+                                  or not mosaic_gpu.split_runs(-(-depth // config.block_k), config.splits)):
             return False
         return super().legal(ba, config, target)
 

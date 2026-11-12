@@ -396,14 +396,16 @@ GEMM_SHAPES = {"qwen3 gate": (4096, 2048, 768, 128), "mixtral up": (4096, 4096, 
                "llama up": (4096, 4096, 14336, 1), "qwen3.5-4b up": (24576, 2560, 9216, 1),
                "qwen3.5-4b down": (24576, 9216, 2560, 1), "qwen3.5-4b key": (24576, 2560, 1024, 1),
                "qwen3.5-4b gates": (24576, 2560, 64, 1), "narrow kernel gradient": (4096, 64, 256, 1),
-               "unaligned": (4096, 200, 100, 4)}
+               "unaligned": (4096, 200, 100, 4), "unaligned in whole 16 bytes": (4096, 200, 136, 4)}
 """Real projections' extents `(rows, depth, width, groups)` for the GEMM mainloops' compile gate, over which
 the derived tiles move: MoE expert products (Qwen3-30B-A3B's, Mixtral's and DeepSeek-V3's: rows a few tiles a
 group, or less than one, a wide and a deep product, and a decode step's, 8 tokens' top-8 rows over 256
 experts), dense ones (Llama 3 8B's up, and Qwen3.5-4B's training step at its 24,576 rows a device: its widest,
 deepest, narrow key and narrowest gate products, its HLO 10-28), and a kernel gradient of 64 output rows,
-which one consumer computes, and a grouped product of a depth and width no tile divides, run padded to
-whole tiles (`grouped_matmul._Mosaic._aligned`)."""
+which one consumer computes, and grouped products of a depth and width no tile divides: on a TMA family a
+product's last step and column tile run partial where its rows along them are whole 16 bytes (200 x 136;
+`mosaic_gpu.partial_runs`, row 5299), its width padded where they are not (100: 200-byte bf16 rows,
+`grouped_matmul._Mosaic._aligned`)."""
 
 PLAIN_FORMS = ("forward", "forward bf16", "forward fp16", "input gradient", "input gradient fp16",
                "kernel gradient", "kernel gradient fp32", "kernel gradient fp16", "dense kernel gradient")
