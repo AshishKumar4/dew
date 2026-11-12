@@ -250,7 +250,7 @@ per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
 
 SEEDS = {"attention": 64, "deepseek_v4": 256, "deepseek_v4 csa": 256, "deepseek_v4 csa2": 256,
          "deepseek_v4 hca": 256, "gated_delta_net": 512, "kimi_delta_attention": 64,
-         "kpool_sparse_attention": 16, "kpool_sparse_attention notail": 64, "lightning_attention": 64,
+         "kpool_sparse_attention": 16, "kpool_sparse_attention notail": 16, "lightning_attention": 64,
          "llama4": 128, "mamba": 32, "mamba2": 256, "mamba3": 512, "memory": 256,
          "mla": 64,
          "mlp": 64, "parallel": 64, "qsa_attention": 128, "short_conv": 64}
