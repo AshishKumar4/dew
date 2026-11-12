@@ -114,6 +114,20 @@ every batch it delivers (`dew.data.dataset.PhasedStream`), so a step knows its p
 read the batch ahead of it; a batch of a run in no phases holds none, its phase the first."""
 
 
+DRAWS = "data_draws"
+"""A training batch's host field of the draws of corpora phases share that it trains (`Draws`), which a
+phase on its own stream reads off each batch and drops before the run sees it
+(`dew.data.dataset.StepPhases`), so the next phase continues each shared corpus from them."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Draws:
+    """The draws of a phase's shared corpora a batch trains (`DRAWS`), each `(node, member, pull)`
+    (`dew.data.pipeline.DRAWN`): an object no device holds."""
+
+    draws: tuple[tuple[str, str, int], ...]
+
+
 @dataclasses.dataclass(frozen=True)
 class Phase:
     """The data phase a training batch was read in, by its place among the run's phases (`PHASE`): an

@@ -40,6 +40,9 @@ class Rejected:
     the refusal (`dew.data.mixing.CorpusCounts.dropped`)."""
     member: str | None = None
     """The mixture member the rejected row was drawn from (`MEMBER`), which its refusal is counted under."""
+    drawn: Drawn = ()
+    """The draws of a phase's shared corpora the rejected row was the last of (`DRAWN`), carried on with
+    `consumed`."""
 
 
 CONSUMED = "_dew_consumed"
@@ -53,6 +56,18 @@ REFUSED = "_dew_refused"
 """The part of a row's `CONSUMED` that are source examples a step rejected or made no row of, which the row
 carries on (`Owed`): consumed, and none of them trained. It travels with `CONSUMED` through every step, so a
 count of the examples delivered rows complete takes their difference (`dew.data.mixing.CorpusCounts`)."""
+
+DRAWN = "_dew_drawn"
+"""The draws of a mix's corpora that phases share a row is the last of, each `(node, member, pull)`: the mix
+read it was drawn by (its node, `dew.data.mixing.Stamping`), the member's key and its pull's number there.
+Set with its `CONSUMED` where the mix draws it, and carried wherever that count goes, so the batch says the
+draws its step trains (`dew.batch.DRAWS`): a phase on its own stream continues each shared corpus from them
+(`dew.data.dataset.StepPhases`)."""
+
+type Draw = tuple[str, str, int]
+"""A draw of a phase's shared corpus (`DRAWN`): its mix read's node, the member's key and its pull."""
+
+type Drawn = tuple[Draw, ...]
 
 ACCOUNTS = (CONSUMED, REFUSED)
 """A row's two counts of source examples, which every step carries together, as integers no batch stacks."""
@@ -70,7 +85,7 @@ and carried wherever its counts go, so a mixture counts each member's examples w
 (`dew.data.mixing.CorpusCounts`). Examples a step refused are carried on as refused (`Owed`) and complete
 no member's: what is refused of a member is counted where it is refused (`Rejected.member`)."""
 
-COUNTING = (*ACCOUNTS, MEMBER, MEMBERS)
+COUNTING = (*ACCOUNTS, MEMBER, MEMBERS, DRAWN)
 """A row's fields the run counts it by, which every step carries out of its sight."""
 
 type Members = Mapping[str, int]
@@ -108,22 +123,29 @@ id negated at the document's last token, so a window says which documents it hol
 @dataclasses.dataclass
 class Documents:
     """The documents a layout lays out of a mixture's rows, each under the id its tokens carry (`DOCUMENT`):
-    the member it was drawn from (`MEMBER`, none for one of several members' rows) and the examples it
-    completes by member (`MEMBERS`), until the window that holds its last token takes them."""
+    the member it was drawn from (`MEMBER`, none for one of several members' rows), the examples it
+    completes by member (`MEMBERS`) and the draws of shared corpora it is the last of (`DRAWN`), until the
+    window that holds its last token takes them."""
 
     next: int = 1
-    held: dict[int, tuple[str | None, dict[str, int]]] = dataclasses.field(default_factory=dict)
+    held: dict[int, tuple[str | None, dict[str, int], Drawn]] = dataclasses.field(default_factory=dict)
 
-    def laid(self, member: str | None, members: Members) -> int:
-        """The id of a document of `member` that completes `members`."""
+    def laid(self, member: str | None, members: Members, drawn: Drawn = ()) -> int:
+        """The id of a document of `member` that completes `members` and is the last of `drawn`."""
         document, self.next = self.next, self.next + 1
-        self.held[document] = (member, dict(members))
+        self.held[document] = (member, dict(members), drawn)
         return document
 
     def saved(self, documents: Iterable[int]) -> dict[str, JSON]:
-        """`documents`' members and examples as a saved position holds them, by id."""
-        return {str(document): [self.held[document][0], dict(self.held[document][1])]
-                for document in sorted(set(documents)) if document in self.held}
+        """`documents`' members, examples and draws as a saved position holds them, by id: the draws only
+        where it holds any, so a position of a run that draws none reads as before."""
+        saved: dict[str, JSON] = {}
+        for document in sorted(set(documents)):
+            if document in self.held:
+                member, members, drawn = self.held[document]
+                saved[str(document)] = [member, dict(members), *([[list(draw) for draw in drawn]] if drawn
+                                                                 else [])]
+        return saved
 
     def restore(self, saved: JSON) -> None:
         """Hold the documents a saved position held (`saved`) again."""
@@ -131,12 +153,27 @@ class Documents:
             if not document.isdecimal():
                 raise ValueError(f"a held document's id is a whole number, got {document!r}")
             match entry:
-                case [member, {**members}] if member is None or isinstance(member, str):
+                # A position saved before documents held draws holds none.
+                case [member, {**members}, *drawn] if (member is None or isinstance(member, str)) and len(
+                        drawn) <= 1:
                     examples = {str(key): integer(count, "a held document's examples")
                                 for key, count in members.items()}
-                    self.held[int(document)] = (member, examples)
+                    draws = drawn_of({DRAWN: drawn[0]}) if drawn else ()
+                    self.held[int(document)] = (member, examples, draws)
                 case _:
-                    raise ValueError(f"a held document is its member and examples by member, got {entry!r}")
+                    raise ValueError(f"a held document is its member, examples by member and draws, got "
+                                     f"{entry!r}")
+
+
+def drawn_of(row: Batch | Rejected) -> Drawn:
+    """The draws `row` is the last of (`DRAWN`), none where it holds none."""
+    if isinstance(row, Rejected):
+        return row.drawn
+    held = row.get(DRAWN, ())
+    if not isinstance(held, (list, tuple)):
+        raise ValueError(f"a row's draws are a list of (node, member, pull), got {type(held).__name__}")
+    return tuple((text(node, "a draw's node"), text(member, "a draw's member"),
+                  integer(pull, "a draw's pull")) for node, member, pull in held)
 
 
 def accounts(row: Batch | Rejected) -> tuple[int, int]:
@@ -157,6 +194,20 @@ class MarkConsumed:
         return {**element, CONSUMED: 1, REFUSED: 0}
 
 
+class MarkDrawn:
+    """The step that marks each row a phase's mix draws, where later phases read on members of the mix, as
+    one consumed source example (`CONSUMED`), its draw (`DRAWN`, which the mix stamps on a shared member's)
+    going where that count goes, set right after the mix (`dew.data.compile`)."""
+
+    def __call__(self, element: Batch) -> Batch:
+        return {**element, CONSUMED: 1, REFUSED: 0, DRAWN: element.get(DRAWN, ())}
+
+
+def drawn_marked(stages: Sequence[object]) -> bool:
+    """Whether `stages` mark a phase's draws (`MarkDrawn`)."""
+    return any(isinstance(stage, Map) and isinstance(stage.step, MarkDrawn) for stage in stages)
+
+
 @dataclasses.dataclass
 class Owed:
     """The source examples rows a step dropped or made none of were the last of (`Rejected.consumed`),
@@ -164,19 +215,33 @@ class Owed:
     batched step's (`dew.data.mixing.Carried`) and a loading worker's group (`dew.data.lowering`) use."""
 
     examples: int = 0
+    drawn: Drawn = ()
+    """The draws the dropped rows were the last of (`DRAWN`), owed with their examples."""
 
-    def owe(self, consumed: int) -> None:
-        """Owe `consumed` more examples to the next row kept."""
+    @classmethod
+    def restored(cls, examples: int, saved: JSON | None) -> Owed:
+        """Examples owed and the draws a position saved beside them (`saved_draws`), none where it saved
+        none, as a position saved before draws were owed does."""
+        return cls(examples, drawn_of({DRAWN: saved}) if saved is not None else ())
+
+    def saved_draws(self) -> dict[str, JSON]:
+        """The draws owed as a position saves them, under `drawn`, nothing where it owes none."""
+        return {"drawn": [list(draw) for draw in self.drawn]} if self.drawn else {}
+
+    def owe(self, consumed: int, drawn: Drawn = ()) -> None:
+        """Owe `consumed` more examples, and the draws `drawn`, to the next row kept."""
         self.examples += consumed
+        self.drawn = (*self.drawn, *drawn)
 
     def paid(self, row: Batch) -> Batch:
-        """`row`, kept, taking the examples owed (`CONSUMED`), every one refused (`REFUSED`), none owed
-        after it."""
-        owed, self.examples = self.examples, 0
-        if not owed:
+        """`row`, kept, taking the examples owed (`CONSUMED`), every one refused (`REFUSED`), and the draws
+        owed (`DRAWN`), none owed after it."""
+        owed, drawn, self.examples, self.drawn = self.examples, self.drawn, 0, ()
+        if not owed and not drawn:
             return row
         consumed, refused = accounts(row)
-        return {**row, CONSUMED: owed + consumed, REFUSED: owed + refused}
+        paid = {**row, CONSUMED: owed + consumed, REFUSED: owed + refused}
+        return {**paid, DRAWN: (*drawn, *drawn_of(row))} if drawn else paid
 
 
 def consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) -> tuple[Record, ...]:
@@ -198,15 +263,21 @@ def consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) -> 
     consumed, refused = accounts(given)
     members = members_held(given, member)
     split = {MEMBERS: {}} if MEMBERS in given else {}
+    drawn = drawn_of(given)
+    none = {DRAWN: ()} if DRAWN in given else {}
     *rest, last = outputs
-    rest = [{CONSUMED: 0, REFUSED: 0, **split, **row} if isinstance(row, Mapping) else row for row in rest]
+    rest = [{CONSUMED: 0, REFUSED: 0, **split, **none, **row} if isinstance(row, Mapping) else row
+            for row in rest]
     if isinstance(last, Rejected):
-        carried: Record = dataclasses.replace(last, consumed=last.consumed + consumed)
+        carried: Record = dataclasses.replace(last, consumed=last.consumed + consumed,
+                                              drawn=(*last.drawn, *drawn))
     elif isinstance(last, Mapping):
         own, owned = accounts(last)
         carried = {**last, CONSUMED: consumed + own, REFUSED: refused + owned}
         if split or MEMBERS in last:
             carried[MEMBERS] = joined(members_of(last), members)
+        if none or DRAWN in last:
+            carried[DRAWN] = (*drawn_of(last), *drawn)
     else:
         raise ValueError(f"a row of a run bounded in examples became {type(last).__name__}, which carries no "
                          "count of the examples it consumes; a step after the bound returns records")
@@ -274,15 +345,15 @@ def consumed_forward(elements: Sequence[Record]) -> list[Record]:
     markers: list[int] = []
     owed = Owed()
     for element in elements:
-        if isinstance(element, Rejected) and element.consumed:
+        if isinstance(element, Rejected) and (element.consumed or element.drawn):
             markers.append(len(carried))
-            owed.owe(element.consumed)
+            owed.owe(element.consumed, element.drawn)
         elif markers and isinstance(element, Mapping) and CONSUMED in element:
             # The markers' counts move to this row; none follows them in the group otherwise.
             for at in markers:
                 marker = carried[at]
                 assert isinstance(marker, Rejected)
-                carried[at] = dataclasses.replace(marker, consumed=0)
+                carried[at] = dataclasses.replace(marker, consumed=0, drawn=())
             element, markers = owed.paid(element), []
         carried.append(element)
     return carried

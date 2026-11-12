@@ -114,6 +114,7 @@ from dew.data.pipeline import (
     MapBatch,
     MapWithIndex,
     MarkConsumed,
+    MarkDrawn,
     Mixture,
     Native,
     ObjectiveData,
@@ -1369,25 +1370,32 @@ def _compile_phases(
 
     _tokenizer_contract((train,) if validation is None else (train, validation))
 
-    def staged_at(index: int, consumed: Mapping[str, int]) -> _Staged:
-        """Phase `index`, each corpus it reads continued past what the phases before it read of it."""
-        return _staged(_continued(source.pipelines[index], consumed)._then(*train.stages),
-                       validation if index == 0 else None, objective=objective, read=read,
-                       provision=provision, loading=loading, seed=seed, rejections=rejections,
-                       version=plan_version)
+    def staged_at(index: int, consumed: Mapping[str, int], members: Mapping[str, str] | None = None
+                  ) -> _Staged:
+        """Phase `index`, each corpus it reads continued past what the phases before it read of it: on its
+        own stream (`members`, those it shares with other phases), each draw of its shared members stamped
+        (`_Build.stamped`)."""
+        phase = _drawn(_continued(source.pipelines[index], consumed), members or {})
+        staged = _staged(phase._then(*train.stages), validation if index == 0 else None, objective=objective,
+                         read=read, provision=provision, loading=loading, seed=seed, rejections=rejections,
+                         version=plan_version)
+        if not members:
+            return staged
+        stamped = dataclasses.replace(staged.build, stamped=frozenset(members))
+        return dataclasses.replace(staged, build=stamped)
 
     tokens = source.clock == "tokens"
     first = staged_at(0, {})
     # Phases on the step clock whose first reads per share (its order cut where each share reads it: a
     # stream batched by its tokens after steps that drop rows) read each its own stream (`StepPhases`).
     per_share = not tokens and not first.build.global_order
-    if per_share:
-        _apart(source)
+    shared = _shared(source) if per_share else tuple({} for _ in source.pipelines)
     staged: list[tuple[_Staged, int | None]] = []
     for index, until in enumerate(source.ends):
         if per_share:
             # Its end is its step's, the steps its own stream reads.
-            staged.append((first if not index else staged_at(index, {}), until))
+            staged.append((first if not index and not shared[0] else staged_at(index, {}, shared[index]),
+                           until))
             continue
         # A phase on the token clock ends where the run reaches it, so it is staged as it reads first,
         # and again with the ends of the phases before it once the run reaches them (`opened`).
@@ -1441,7 +1449,7 @@ def _compile_phases(
         if per_share:
             readers = [functools.partial(loaded.train, partition) for loaded, _ in built]
             return StepPhases(readers, source.ends, batches=batches,
-                              opened=lambda index: counted(built[index][0]) and None)
+                              opened=lambda index: counted(built[index][0]) and None, shared=shared)
 
         def global_reader(index: int, ends: tuple[int, ...]) -> GlobalReader:
             opened_reader = opened(index, ends).train(partition)
@@ -1478,21 +1486,48 @@ def _ordered(index: int, phase: _Staged) -> _Staged:
     return phase
 
 
-def _apart(phases: Phases) -> None:
-    """Refuse phases read each on its own stream (`StepPhases`) where two read one corpus: the later
-    opens it at its first record, where phases in one global order continue it from where the one before
-    left it, so it would read the records the earlier phase read again."""
-    seen: dict[str, tuple[int, str]] = {}
+def _corpus_key(corpus: Source) -> str:
+    """A corpus as phases share it: its store's content (`Source.fingerprint`), whatever a chain names it."""
+    return fingerprint(json.loads(json.dumps(corpus.fingerprint(), sort_keys=True, default=str)))
+
+
+def _shared(phases: Phases) -> tuple[dict[str, str], ...]:
+    """Each phase's mix members a phase on its own stream (`StepPhases`) reads on from another phase, by
+    member key, and the corpus each is (`_corpus_key`): the next phase that reads a corpus continues it from
+    the draws the run trained of it (`dew.data.mixing.Stamping`). Refuses a shared corpus a phase reads other
+    than as a member of its own mix, whose position no key names, and one two phases read through other
+    steps before their mixes, where the earlier's draws are no draws of the later's."""
+    reads: dict[str, list[tuple[int, Pipeline]]] = {}
     for index, pipeline in enumerate(phases.pipelines):
         for chain, corpus in _leaves(pipeline):
-            # A corpus is its store's content (`Source.fingerprint`), whatever a chain names it.
-            key = json.dumps(corpus.fingerprint(), sort_keys=True, default=str)
-            earlier, named = seen.setdefault(key, (index, _name(chain)))
-            if earlier != index:
-                raise ValueError(f"phases {earlier} and {index} both read one corpus ({named}, "
-                                 f"{_name(chain)}), each phase on its own stream as a read per share is, "
-                                 "which opens the corpus at its first record again; read each corpus in one "
-                                 "phase, or make the phases one global order")
+            reads.setdefault(_corpus_key(corpus), []).append((index, chain))
+    shared = {key: read for key, read in reads.items() if len({index for index, _ in read}) > 1}
+    members: list[dict[str, str]] = [{} for _ in phases.pipelines]
+    for key, read in shared.items():
+        (first, chain), *_ = read
+        for index, held in read:
+            mix = phases.pipelines[index].source
+            if not isinstance(mix, Mixture) or not any(held is child for child in mix.pipelines):
+                raise ValueError(f"phases {first} and {index} both read {_name(held)}, and phase {index} "
+                                 "reads it other than as a member of its own mix, where a phase continues a "
+                                 "corpus it shares by the member's key: read it as one "
+                                 f"(`mix([({_name(held)}, 1.0)])` where the phase reads it alone)")
+            if [_identity(stage) for stage in held.stages] != [_identity(stage) for stage in chain.stages]:
+                raise ValueError(f"phases {first} and {index} read {_name(held)} through other steps "
+                                 "before their mixes, so where the one left it is no place in the other's "
+                                 "read: give it the same steps in each, and the steps that differ after the "
+                                 "mix")
+            place = next(at for at, child in enumerate(mix.pipelines) if child is held)
+            members[index][_member_keys(_members(mix.pipelines))[place]] = key
+    return tuple(members)
+
+
+def _drawn(pipeline: Pipeline, members: Mapping[str, str]) -> Pipeline:
+    """`pipeline`, a phase whose mix members later or earlier phases read on (`members`), marking each draw
+    of its mix (`MarkDrawn`) right after it."""
+    if not members:
+        return pipeline
+    return dataclasses.replace(pipeline, stages=(Map(MarkDrawn()), *pipeline.stages))
 
 
 def _updates_aligned(ends: Sequence[int | None], batches: Sequence[int], window: int = 1) -> None:

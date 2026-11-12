@@ -29,6 +29,7 @@ from dew._records import integer, integers, json_value, listed, record
 from dew.batch import Batch
 from dew.data.pipeline import (
     CONSUMED,
+    DRAWN,
     MEMBERS,
     REFUSED,
     Members,
@@ -36,6 +37,7 @@ from dew.data.pipeline import (
     Stage,
     Windows,
     accounts,
+    drawn_of,
     joined,
     members_of,
 )
@@ -129,6 +131,9 @@ class _Held:
     consumed: int
     refused: int
     members: dict[str, int] = dataclasses.field(default_factory=dict)
+    drawn: tuple[tuple[str, str, int], ...] = ()
+    """The draws of a phase's shared corpora the unit is the last of (`DRAWN`); none in a position saved
+    before units held draws."""
     missing: int = dataclasses.field(default=0, init=False)
 
     def __post_init__(self) -> None:
@@ -137,6 +142,7 @@ class _Held:
             integer(getattr(self, name), f"a held count's {name}")
         for count in record(self.members, "a held count's members").values():
             integer(count, "a held count's member examples")
+        self.drawn = drawn_of({DRAWN: self.drawn})
 
 
 class _CompletedIterator(pygrain.DatasetIterator):
@@ -170,7 +176,7 @@ class _CompletedIterator(pygrain.DatasetIterator):
                 self._release(waiting, released)
         consumed, refused = accounts(window)
         if consumed or refused:
-            self._held[unit] = _Held(since, consumed, refused, dict(members_of(window)))
+            self._held[unit] = _Held(since, consumed, refused, dict(members_of(window)), drawn_of(window))
             if self._wait(unit):
                 self._release(unit, released)
         return released.on(window)
@@ -191,7 +197,7 @@ class _CompletedIterator(pygrain.DatasetIterator):
 
     def _release(self, unit: int, released: _Released) -> None:
         held = self._held.pop(unit)
-        released.add(held.consumed, held.refused, held.members)
+        released.add(held.consumed, held.refused, held.members, held.drawn)
 
     def get_state(self) -> Mapping[str, object]:
         held = [[unit, to_record(counts, _Held)] for unit, counts in self._held.items()]
@@ -232,7 +238,7 @@ def released(units: Numbered, window: int | None, seed: int) -> pygrain.IterData
     than the shuffle's own."""
     rows = (record(row, "a numbered window") for row in units)
     held = [(integer(row[UNIT], "a window's unit"), integer(row[SINCE], "a window's first unit"),
-             *accounts(row), members_of(row), MEMBERS in row) for row in rows]
+             *accounts(row), members_of(row), drawn_of(row), MEMBERS in row, DRAWN in row) for row in rows]
     units_count = len(held)
     size = window or max(units_count, 1)
     drawn = np.fromiter(gx.WindowShuffleIterDataset(pygrain.MapDataset.range(units_count).to_iter_dataset(),
@@ -240,12 +246,14 @@ def released(units: Numbered, window: int | None, seed: int) -> pygrain.IterData
     place_of = np.empty(units_count, np.int64)
     place_of[drawn] = np.arange(units_count)
     table = np.zeros((units_count, 2), np.int64)
-    # A mixture's examples by member, sparse: of the units whose draws release any.
+    # A mixture's examples by member, sparse: of the units whose draws release any; and the draws of a
+    # phase's shared corpora they release.
     split: dict[int, dict[str, int]] = {}
+    draws: dict[int, tuple[tuple[str, str, int], ...]] = {}
     # The latest place among each span's units, the spans' first units never falling back (`Numbered`):
     # the units still in the latest span, by falling place.
     latest: collections.deque[int] = collections.deque()
-    for unit, since, consumed, refused, members, _ in held:
+    for unit, since, consumed, refused, members, drawn, *_ in held:
         while latest and place_of[latest[-1]] <= place_of[unit]:
             latest.pop()
         latest.append(unit)
@@ -256,8 +264,11 @@ def released(units: Numbered, window: int | None, seed: int) -> pygrain.IterData
             table[at] += (consumed, refused)
             if members:
                 split[at] = joined(split.get(at, {}), members)
+            if drawn:
+                draws[at] = (*draws.get(at, ()), *drawn)
     shuffled = gx.WindowShuffleIterDataset(units, window_size=size, seed=seed)
-    return shuffled.map(_Release(table, split, any(counted for *_, counted in held)))
+    return shuffled.map(_Release(table, split, any(counted for *_, counted, _ in held), draws,
+                                 any(drawing for *_, drawing in held)))
 
 
 @dataclasses.dataclass
@@ -267,17 +278,22 @@ class _Released:
     consumed: int = 0
     refused: int = 0
     members: dict[str, int] = dataclasses.field(default_factory=dict)
+    drawn: tuple[tuple[str, str, int], ...] = ()
 
-    def add(self, consumed: int, refused: int, members: Members) -> None:
+    def add(self, consumed: int, refused: int, members: Members, drawn: tuple[tuple[str, str, int], ...]
+            ) -> None:
         self.consumed, self.refused = self.consumed + consumed, self.refused + refused
         self.members = joined(self.members, members)
+        self.drawn = (*self.drawn, *drawn)
 
     def on(self, window: Batch) -> Batch:
         """`window` with these counts in place of its own, a mixture's by member where it counts them or
-        any are released on it."""
+        any are released on it, and the draws released on it where the read draws any."""
         counted = {**window, CONSUMED: self.consumed, REFUSED: self.refused}
         if MEMBERS in window or self.members:
             counted[MEMBERS] = dict(self.members)
+        if DRAWN in window or self.drawn:
+            counted[DRAWN] = self.drawn
         return counted
 
 
@@ -290,6 +306,8 @@ class _Release:
     table: np.ndarray
     members: Mapping[int, Mapping[str, int]]
     counted: bool
+    draws: Mapping[int, tuple[tuple[str, str, int], ...]] = dataclasses.field(default_factory=dict)
+    drawing: bool = False
 
     def __call__(self, row: Batch) -> Batch:
         window = dict(row)
@@ -299,4 +317,6 @@ class _Release:
         released = {**window, CONSUMED: int(consumed), REFUSED: int(refused)}
         if self.counted or MEMBERS in window:
             released[MEMBERS] = dict(self.members.get(unit, {}))
+        if self.drawing or DRAWN in window:
+            released[DRAWN] = self.draws.get(unit, ())
         return released
