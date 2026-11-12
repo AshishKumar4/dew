@@ -243,7 +243,7 @@ def test_a_rollout_writes_its_replay_in_place(agent):
     rollout = DreamerRollout(objective, environments(), capacity=400, batch=8, length=16, train_ratio=8.0,
                              prefill=24)
     state = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout).place()[0]
-    rollout(state, {}, jax.random.key(1))
+    rollout(state, {}, jax.random.key(1), objective=objective)
     begun = rollout.held_replay
     assert begun is not None
     # The next update owes steps the prefill did not take.

@@ -500,7 +500,7 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
         return -np.square(images.mean(axis=(1, 2, 3)) - context["target"])
 
     rollout = FlowRollout(objective, reward, groups=3, steps=4, train_steps=2)
-    batch = rollout(state, prompts, jax.random.key(23))
+    batch = rollout(state, prompts, jax.random.key(23), objective=objective)
     rewards = np.asarray(batch["rewards"], np.float64).reshape(2, 3)
     expected = (rewards - rewards.mean(axis=1, keepdims=True)) / (rewards.std(axis=1, keepdims=True) + 1e-4)
     np.testing.assert_array_equal(batch["advantages"], expected.reshape(-1).astype(np.float32))

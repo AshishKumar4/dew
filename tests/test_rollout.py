@@ -108,7 +108,7 @@ def test_a_rollouts_metrics_log_as_of_its_latest_call():
 
         def __call__(self, state, batch, key, *, objective):
             self.metrics = {"reward/mean": float(state.step) + 0.5}
-            return super().__call__(state, batch, key)
+            return super().__call__(state, batch, key, objective=objective)
 
     tracking = RecordingTracker()
     frozen_trainer(rollout=Counting(), tracker=tracking).fit(dataset(), steps=4, log_every=2)

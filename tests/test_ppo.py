@@ -85,7 +85,8 @@ def test_episode_gae_crosses_turns_without_discounting_observations_or_padding()
     """verl episode GAE: advantage 2.39e-7, return 5.97e-8 maximum differences."""
     trainer, rollout = build_ppo()
     state = trainer.initial_state()
-    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23),
+                    objective=trainer.objective)
     episodes = collect(rollout.episodes, state)
     with np.load(FIXTURE) as reference:
         # The fixture holds verl's GAE in the old one-row-per-call layout,
@@ -403,7 +404,8 @@ def test_composite_objective_and_parameter_gradients_match_verl():
     """verl combined loss differs by 3.26e-8; parameter gradients by at most 1.50e-8."""
     trainer, rollout = build_ppo()
     state = trainer.initial_state()
-    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23),
+                    objective=trainer.objective)
     with np.load(FIXTURE) as reference:
         params = {"policy": {"table": jnp.asarray(reference["objective_policy"])},
                   "critic": {"backbone": {"scale": jnp.asarray(reference["objective_scale"])},

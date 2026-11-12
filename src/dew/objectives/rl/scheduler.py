@@ -140,7 +140,7 @@ from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass, field
-from typing import ClassVar, Protocol
+from typing import Any, ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -157,6 +157,7 @@ from dew.nn.progress import Progress
 from dew.objectives.base import Objective, Shown
 from dew.sampling.text import Sampling
 from dew.state import TrainState
+from dew.training.rollout import own_objective
 
 from ..lm import TokenScorer
 from .episodes import EnvironmentFactory, EpisodeCollector, EpisodeInference, EpisodeRecorder, Verifier
@@ -610,11 +611,10 @@ class RolloutScheduler:
       (`sessions.overlong_penalty`). `generation_batches` is the most data
       batches a call admits groups from, its step's and those it draws
       further (`further`, the trainer's read of its stream).
-    - `reference` is the objective whose reward-side reference penalty
-      (`GRPOObjective.reward_kl`) each call's reward pays before the
-      estimator compares returns: the packed rows are scored under its
-      reference, the state's frozen starting policy, and repacked with
-      `sessions.reference_penalties`.
+    - `penalized` says each call's reward pays the step's objective's reward-side
+      reference penalty (`GRPOObjective.reward_kl`) before the estimator compares
+      returns: the packed rows are scored under its reference, the state's frozen
+      starting policy, and repacked with `sessions.reference_penalties`.
     - `scorer` is the objective that trains on the packed rows: where its model computes a shared prefix
       as each chain's own, as each call packs them (`shares_prefixes(train=True)`, its run's plan bound
       by then, `TokenScorer.bind_plan`), the prompt a group's chains begin with is packed once (`pack`'s
@@ -664,6 +664,20 @@ class RolloutScheduler:
         self._owned: tuple[Callable[[], None], ...] = ()
         """What it built itself and closes at its end (`served`'s source and server)."""
 
+    def drawn_from(self) -> Objective[Any, Any] | None:
+        """The objective whose policy the acquisition draws from where that policy is its own, fixed when it
+        was built: an asynchronous source's server's (`Asynchronous.objective`), or the objective a
+        synchronous collector other than a `PolicyCollector` was built for (`scorer`: an episode
+        collector's bound policy). None where the collection draws from each call's objective, a
+        `PolicyCollector`'s, or from no policy at all (a scripted collector's). A call whose step trains
+        another objective (a phase's pass count) is refused (`own_objective`): its rows would train under a
+        policy that did not draw them."""
+        if isinstance(self.acquisition, Asynchronous):
+            return self.acquisition.objective
+        if isinstance(self.acquisition.collector, PolicyCollector):
+            return None
+        return self.scorer if isinstance(self.scorer, Objective) else None
+
     @property
     def draws_further(self) -> bool:
         """Whether a call may draw data batches past its step's (`generation_batches`), which the trainer
@@ -685,7 +699,7 @@ class RolloutScheduler:
 
         The calls' raw likelihoods are the proximal policy's, the policy at temperature 1 over the whole
         vocabulary; a GRPO objective whose ratio reads its policy at another `sampling_temperature` has
-        its packed rows rescored at the step's weights (`Synchronous`'s `rescoring`), as an asynchronous
+        its packed rows rescored at the step's weights (`Synchronous`'s `rescores`), as an asynchronous
         collection's are, so its unchanged weights give a ratio of 1."""
         collector = PolicyCollector(objective, reward, decode, max_new_tokens,
                                     Sampling() if sampling is None else sampling)
@@ -964,6 +978,9 @@ class RolloutScheduler:
         if self.draws_further and further is None:
             raise ValueError("generation_batches above 1 draws further batches through the trainer's read of "
                              "its stream (further=), and this call was handed none")
+        drawn = self.drawn_from()
+        if drawn is not None:
+            own_objective(self, drawn, objective)
         grpo = objective if isinstance(objective, GRPOObjective) else None
         if (self.acquisition.rescores or self.penalized) and grpo is None:
             raise TypeError("the call rescores its rows or pays a reward-side penalty, a GRPO objective's, "

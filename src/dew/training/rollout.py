@@ -6,7 +6,7 @@ from __future__ import annotations
 import contextlib
 import time
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import jax
 import numpy as np
@@ -83,7 +83,7 @@ class Rollout(Protocol):
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array, *, objective: Objective) -> Batch: ...
 
 
-def own_objective(rollout: object, held: Objective, objective: Objective) -> None:
+def own_objective(rollout: object, held: Objective[Any, Any], objective: Objective[Any, Any]) -> None:
     """Refuse a step's `objective` (`Rollout`) other than `held`, the one `rollout` compiled its policy's
     programs for: a phase's pass count changes the policy, which those programs do not."""
     if objective is not held:

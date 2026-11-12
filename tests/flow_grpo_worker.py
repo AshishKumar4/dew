@@ -104,7 +104,7 @@ def main() -> None:
     refusal = None
     if processes > 1:
         try:
-            rollout(initial, local, jax.random.key(71))
+            rollout(initial, local, jax.random.key(71), objective=objective)
         except ValueError as error:
             refusal = type(error).__name__
     device, host = split_fields(local)

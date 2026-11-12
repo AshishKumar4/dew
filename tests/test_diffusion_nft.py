@@ -124,7 +124,7 @@ def test_a_rollout_samples_the_old_policy_and_normalizes_by_the_batchs_spread():
     nft = objective(variables=nudged(start, jax.random.key(22)), old_decay=optax.constant_schedule(0.9))
     prompts = nft.inputs.tokenize(PROMPTS)
     rollout, initial, final = fitted(nft, reward, prompts, groups=3, steps=5, train_steps=3)
-    batch = rollout(initial, prompts, jax.random.key(23))
+    batch = rollout(initial, prompts, jax.random.key(23), objective=nft)
     rewards = np.asarray(batch["rewards"], np.float64)
     grouped = rewards.reshape(8, 3)
     expected = (grouped - grouped.mean(axis=1, keepdims=True)) / (rewards.std() + 1e-4)

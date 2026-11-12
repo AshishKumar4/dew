@@ -839,7 +839,8 @@ def test_a_stage_local_runs_rollout_samples_from_the_state_it_holds():
     run = trainer(model, ADAM_FAST, STAGED, 8)
     read = []
 
-    def rollout(state, batch, key):
+    def rollout(state, batch, key, *, objective):
+        del objective
         stored = run.stored(state)
         greedy = [np.argmax(np.asarray(model.apply(dict(variables), batch["text"])), axis=-1)
                   for variables in (state.variables, stored.variables)]

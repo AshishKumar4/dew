@@ -592,7 +592,7 @@ class Counted(ControlRollout):
 
     def __call__(self, state, batch, key, *, objective):
         before = self._collected
-        out = super().__call__(state, batch, key)
+        out = super().__call__(state, batch, key, objective=objective)
         if self._collected is not before:
             self.made.append(self._collected)
         self.served.append(out)
