@@ -161,29 +161,32 @@ def test_a_position_another_grain_wrote_resumes_where_its_state_is_laid_out_alik
         stream.close()
 
 
-def test_a_stream_whose_store_holds_other_shards_is_refused(tmp_path):
-    """A streamed position of a store of files resumes where the store holds the shards the read that saved
-    it read in turn, and is refused where it holds others (its `shards` fact)."""
+def test_a_stream_its_store_cuts_into_other_shards_is_refused(tmp_path):
+    """A streamed position of a store of lines resumes where the store cuts its content into the shards the
+    read that saved it read in turn, and is refused where they differ (its `shards` fact): a Dew that cuts
+    the same files, of the same read options, otherwise reads them in another order."""
     root = tmp_path / "rows"
     root.mkdir()
     for part in range(2):
         rows = "".join(f'{{"id": {part * 10 + row}}}\n' for row in range(8))
         (root / f"part-{part}.jsonl").write_text(rows)
-    chain = Pipeline(Files(str(root), format="jsonl")).repeat().batch(2)
+    chain = Pipeline(Files(str(root), format="jsonl", shard_bytes=64)).repeat().batch(2)
     saved, after = _saved(chain)
-    stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
-    try:
-        stream.set_state(saved)
-        assert _ids(stream, 2) == after
-    finally:
-        stream.close()
-    (root / "part-2.jsonl").write_text('{"id": 99}\n')
-    stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
-    try:
-        with pytest.raises(ValueError):
-            stream.set_state(saved)
-    finally:
-        stream.close()
+
+    def cut_otherwise(decoded):
+        decoded["dew_data_plan"]["derived"]["0/shards"] = "another cut"
+
+    for state, refused in ((saved, False), (_edited(saved, cut_otherwise), True)):
+        stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+        try:
+            if refused:
+                with pytest.raises(ValueError):
+                    stream.set_state(state)
+            else:
+                stream.set_state(state)
+                assert _ids(stream, 2) == after
+        finally:
+            stream.close()
 
 
 def _named(name: str, tag: int) -> Pipeline:
