@@ -113,15 +113,16 @@ def test_what_every_layer_of_a_run_updating_in_its_backward_reads_takes_its_laye
     the run's rule gave it none, so whatever computed it never trained (audit3 nn-core P1)."""
     from dew.nn import in_backward
 
-    def update(path, index, gradient, weights, moments):
-        return jax.tree.map(lambda w, g: w - 0.5 * g, weights, gradient), {}
+    def kept(path, index, gradient, weights, moments):
+        # The update is no part of what this holds: the weights stay as they are.
+        return weights, {}
 
     def layer(weights, x, key, context):
         return jnp.tanh(x @ weights["kernel"] + context)
 
     def through_run(kernel, x, context):
         norms = {"sumsq": jnp.zeros((3,), kernel.dtype), "nonfinite": jnp.zeros((3,), kernel.dtype)}
-        with in_backward.planned(in_backward.InBackward(update=update, moments=())):
+        with in_backward.planned(in_backward.InBackward(update=kept, moments=())):
             y = in_backward.scanned_run(("layers_0_2",), layer, {"kernel": kernel}, None, {}, norms, x, None,
                                         (context,))
         return jnp.sum(y ** 2)

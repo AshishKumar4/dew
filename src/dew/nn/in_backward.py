@@ -140,7 +140,7 @@ def _written(tree, layer, index):
 
 
 def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: Tree | None,
-                moments: Mapping[str, Tree], norms: Tree, x: jax.Array, per_layer: object,
+                moments: Mapping[str, Tree], norms: Tree, x: jax.Array, per_layer: tuple | jax.Array | None,
                 shared: Sequence[object]) -> jax.Array:
     """`layer(weights_i, x, per_layer_i, *shared)` over the run's layers in order, as a scan computes it,
     whose backward updates the run in place (`InBackward`): its new weights, masters and moments, and each
