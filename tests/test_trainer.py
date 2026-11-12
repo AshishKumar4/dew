@@ -1226,7 +1226,7 @@ def test_a_global_position_is_read_by_any_process_count(tmp_path):
     count that wrote it."""
     trainer = make_trainer(tmp_path)
     trainer.fit(dataset(), steps=1, log_every=1)
-    global_position = _position.encode(_position.Global(records=16, order="Counting"))
+    global_position = _position.encode(_position.Global(records=16, order=json.dumps({"read": "counting"})))
     _rewrite_position(trainer, 2, [global_position, global_position], shares=[[0, 2], [1, 2]])
 
     assert Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())[1] == global_position

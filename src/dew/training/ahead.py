@@ -57,6 +57,7 @@ from typing import TYPE_CHECKING
 import jax
 import jax.experimental.topologies as topologies
 import numpy as np
+from jax._src import cache_key
 from jax.experimental import serialize_executable
 from jaxlib import xla_client
 
@@ -644,17 +645,16 @@ def _current(path: str | Path, what: str, held: Sequence[object]) -> None:
 
 
 def host_cpu() -> str | None:
-    """This host's processor as a CPU target states it (`BuildTarget.cpu`): its model and the instruction
-    sets it reports (Linux's `/proc/cpuinfo`), which XLA's CPU compile reads to choose a program's code.
-    None on a system that states them nowhere Python reads: no CPU program is kept for such a host or
-    handed on one (`cpu_stated`)."""
-    cpuinfo = Path("/proc/cpuinfo")
-    if not cpuinfo.exists():
+    """This host's processor as a CPU target states it (`BuildTarget.cpu`): as XLA's CPU compile, which
+    chooses a program's code by it, reads it to key its own persistent programs
+    (`jax._src.cache_key.host_cpu`), the first processor's vendor, family, model and instruction sets
+    (an Arm part's), from Linux's `/proc/cpuinfo`. None where that reading names the platform alone (no
+    readable `/proc/cpuinfo`, or one stating neither), which hosts of other instruction sets share: no
+    CPU program is kept for such a host or handed on one (`cpu_stated`)."""
+    described = cache_key.host_cpu()
+    if described == " ".join((platform.system(), platform.machine(), platform.processor())):
         return None
-    first = cpuinfo.read_text().split("\n\n", 1)[0]
-    named = sorted(line for line in first.splitlines()
-                   if line.split(":", 1)[0].strip() in ("model name", "flags", "Features", "CPU part"))
-    return hashlib.sha256("\n".join(named).encode()).hexdigest()[:16]
+    return hashlib.sha256(described.encode()).hexdigest()[:16]
 
 
 def cpu_stated(target: BuildTarget, devices: Sequence) -> None:

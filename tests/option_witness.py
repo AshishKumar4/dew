@@ -13,6 +13,7 @@ from pathlib import Path
 import jax
 import numpy as np
 from model_support import moved
+from recording import finite
 from run_kinds import (
     BESIDE,
     blocked,
@@ -410,11 +411,15 @@ def answers(task) -> list[object]:
 
 def answered_alike(first: list[object], second: list[object]) -> bool:
     """Whether two requests' answers (`answers`) are one: each leaf equal, an array's in shape and in
-    every entry."""
+    every entry, each number of either finite first (`recording.finite`); no request a test makes
+    (`requested`) answers a number that is not."""
+    for leaf in (*first, *second):
+        assert finite(leaf), f"a request answers a number that is not finite: {leaf}"
+
     def alike(a, b) -> bool:
         if isinstance(a, np.ndarray) or isinstance(b, np.ndarray):
             return (isinstance(a, np.ndarray) and isinstance(b, np.ndarray) and a.shape == b.shape
-                    and np.array_equal(a, b, equal_nan=True))
+                    and np.array_equal(a, b))
         return bool(a == b)
     return len(first) == len(second) and all(alike(a, b) for a, b in zip(first, second, strict=True))
 

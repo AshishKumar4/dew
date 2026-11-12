@@ -304,7 +304,7 @@ class _PerShare(Forwarding):
             self._publish(state)
         # The position alone: the loading workers' mirror counters it carried are this read's metrics, not
         # its place (`PositionText` empties them), so every reader of an elastic read saves one position.
-        saved = {"dew_data_plan": self._plan_record, "counters": COUNTERS, "iterator": state}
+        saved = {_position.PLAN: self._plan_record, "counters": COUNTERS, "iterator": state}
         return self._position_text({_position.REPLICATED: saved} if self._replicated else saved)
 
     def set_state(self, state: bytes) -> None:
@@ -317,7 +317,7 @@ class _PerShare(Forwarding):
                 ".elastic() on the chain")
         decoded = record(json.loads(state), "saved per-share position") if held is None else held
         self.resumed_at(decoded)
-        written = record(decoded.get("dew_data_plan"), "saved data plan")
+        written = record(decoded.get(_position.PLAN), "saved data plan")
         self._plan.check(written, resume=self._resume)
         saved = record(decoded.get("iterator"), "saved Grain iterator")
         self.close()
@@ -347,11 +347,11 @@ class _PerShare(Forwarding):
         this Dew reads (`dew.data.plan.PLAN_VERSIONS`), in the workers it names: this share's build at that
         version (`saved_as`), which the run goes on under; a position of this read's own version, or of one
         this Dew reads none of, which its check refuses, as it is."""
-        written = record(decoded.get("dew_data_plan"), "saved data plan").get("version")
+        written = record(decoded.get(_position.PLAN), "saved data plan").get("version")
         if (self._saved_as is None or written == self._plan.version or not isinstance(written, int)
                 or written not in PLAN_VERSIONS):
             return
-        topology = record(record(decoded.get("dew_data_plan"), "saved data plan").get("topology", {}),
+        topology = record(record(decoded.get(_position.PLAN), "saved data plan").get("topology", {}),
                           "saved data plan topology")
         workers = integer(topology.get("workers", 0), "saved per-share workers")
         self._open, self._plan = self._saved_as(written, workers)

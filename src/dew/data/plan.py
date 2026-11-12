@@ -21,7 +21,7 @@ import numpy as np
 
 from dew import _checkout
 from dew._hashing import array_header
-from dew._position import PER_SHARE
+from dew._position import PER_SHARE, unplaced
 from dew._records import ADDED, JSON, json_value, listed, record, set_added
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
@@ -159,6 +159,22 @@ def callable_name(step: Callable[..., Batch]) -> str:
     own name there."""
     kind = step if inspect.isfunction(step) or inspect.ismethod(step) else type(step)
     return f"{kind.__module__}.{kind.__qualname__}"
+
+
+def reader_name(reader: Callable[..., Batch], declared: str | None, step: str) -> str:
+    """What the reader a batch encoder runs computes, as the encoder's identity states it: `declared`
+    where the encoder is given it, else a module function's qualified name (`callable_name`), or a
+    configured object's method's, whose object's dependencies the encoder's identity records
+    (`_dependencies`). Any other reader, a partial, a lambda, a function defined in another, another
+    object's method or callable, computes what its binding says, which no name holds: refused, for
+    the encoder `step` to be given what it computes."""
+    if declared is not None:
+        return declared
+    named = inspect.isfunction(reader) and "<" not in reader.__qualname__
+    if named or (inspect.ismethod(reader) and isinstance(reader.__self__, _Dependencies)):
+        return callable_name(reader)
+    raise ValueError(f"{step}'s reader {reader!r} computes what its binding says, which no name of it "
+                     f"holds; declare what it computes: {step}(reader, declared='name@version')")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -551,16 +567,6 @@ def same_order(saved: str, current: str) -> bool:
     compared without their sources' descriptions, which name where a host mounted them, as a
     pool compares its processes' orders (`Plan.identity`)."""
     return unplaced(json.loads(saved)) == unplaced(json.loads(current))
-
-
-def unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
-    """`order` without its sources' descriptions, which name where a host
-    mounted them, its corpora's and phases' included."""
-    if isinstance(order, dict):
-        return {name: unplaced(value) for name, value in order.items() if name != "source"}
-    if isinstance(order, list):
-        return [unplaced(value) for value in order]
-    return order
 
 
 def spelled(order, version: int) -> JSON:

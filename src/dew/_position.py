@@ -23,7 +23,7 @@ import dataclasses
 import json
 from collections.abc import Mapping
 
-from dew._records import integer, record, text
+from dew._records import JSON, integer, json_value, listed, record, text
 
 ENVELOPE = "dew_global_position"
 """The key a global position is written under.
@@ -49,7 +49,8 @@ the provisioned lowering)."""
 class Global:
     """`records` records of `order` have been read, by every process together.
 
-    `order` describes the record order that count indexes into. The same
+    `order` describes the record order that count indexes into, as JSON, its
+    sources among it (`unplaced`). The same
     offset into another corpus, another record count or another shuffle seed
     is another place, and nothing in the offset itself says which order it
     came from: grain's DataLoader compared the repr of its sampler and its
@@ -115,6 +116,10 @@ one reader reads stopped, which every reader reads whole and keeps its share of,
 writes the same one and any process count reads it back."""
 
 
+PLAN = "dew_data_plan"
+"""The key an elastic read's position holds its data plan's record under (`dew.data.plan.Plan.record`)."""
+
+
 def replicated(position: bytes) -> Mapping[str, object] | None:
     """The elastic read's position `position` holds (`REPLICATED`), or None for any other kind."""
     return _enveloped(position, REPLICATED)
@@ -166,6 +171,57 @@ def phase_position(position: bytes) -> bytes | None:
     if held is None:
         return None
     return base64.b64decode(text(held["position"], "the saved phase's position"))
+
+
+def unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
+    """`order` without its sources' descriptions, which name where a host
+    mounted them, its corpora's and phases' included."""
+    if isinstance(order, dict):
+        return {name: unplaced(value) for name, value in order.items() if name != "source"}
+    if isinstance(order, list):
+        return [unplaced(value) for value in order]
+    return order
+
+
+def place(position: bytes) -> Mapping[str, object]:
+    """The place a position any process count reads (`translates`) names, as every process that wrote it
+    holds it: the position with each order in it, a global position's, its finished phases' and its
+    data plan's, an elastic read's plan's, without its sources' descriptions (`unplaced`). Processes
+    that mount one dataset at different paths read one order (`dew.data.plan.Plan.identity`) to one
+    place, and save positions whose bytes differ only there; a ramp's read and a read of phases' own
+    reader's position are read the same way."""
+    if (phased := phase_position(position)) is not None:
+        return {STEP_PHASES: {**_held(position, STEP_PHASES), "position": place(phased)}}
+    if (globally := decode(position)) is not None:
+        completed = [[unplaced(json.loads(order)), end] for order, end in globally.completed]
+        return {ENVELOPE: {**dataclasses.asdict(globally), "order": unplaced(json.loads(globally.order)),
+                           "completed": completed,
+                           "plan": None if globally.plan is None else _unplaced_plan(globally.plan)}}
+    if (read := ramped(position)) is not None:
+        return {RAMPED: {"source": place(read.source), "skip": read.skip, "records": read.records}}
+    return {REPLICATED: {name: _unplaced_plan(value) if name == PLAN else value
+                         for name, value in _held(position, REPLICATED).items()}}
+
+
+def _unplaced_plan(plan: Mapping[str, object]) -> Mapping[str, object]:
+    """A data plan's record (`dew.data.plan.Plan.record`) with its order unplaced (`unplaced`), or a
+    read of phases' plans (`dew.data.dataset.PhasedStream`: each phase's, None where it states none),
+    each so."""
+    held = record(plan, "saved data plan")
+    if "phases" in held:
+        def phased(phase: JSON, key: str) -> Mapping[str, object] | None:
+            return None if phase is None else _unplaced_plan(record(phase, key))
+
+        return {"phases": listed(held["phases"], "saved phase plans", read=phased, what="phases' data plans")}
+    return {**held, "order": unplaced(json_value(held["order"], "saved plan order"))}
+
+
+def _held(position: bytes, key: str) -> dict:
+    """The object `position` holds under dew's `key`, which its kind was read by."""
+    held = _enveloped(position, key)
+    if held is None:
+        raise ValueError(f"a saved data position holds no {key}; it was written by dew and is damaged")
+    return held
 
 
 def _enveloped(position: bytes, key: str) -> dict | None:
