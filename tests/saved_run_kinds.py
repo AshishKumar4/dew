@@ -17,7 +17,6 @@ import json
 from pathlib import Path
 
 import numpy as np
-import process_support
 import run_kinds
 from run_kinds import KINDS, MostlyKept, decision, lm, masked, read, requested
 from test_lm_recipe import SEQ, write_token_files
@@ -32,7 +31,7 @@ from dew.decision.task import Decide
 from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.lora import LoRA
-from dew.nn.precision import WIDE_CPU_ARITHMETIC, numerics_of
+from dew.nn.precision import numerics_of
 from dew.registry import ModelConfig
 from dew.training.budget import Pause
 
@@ -195,26 +194,6 @@ def trained_finite(run: Path) -> dict[int, dict[str, float]]:
             found.setdefault(step, {}).update(kept)
     if not found or not all(np.isfinite(value) for held in found.values() for value in held.values()):
         raise ValueError(f"{run.name}: its run logged {found or 'no loss'}, not finite losses")
-    return found
-
-
-def computed(directory: Path | str, step: int | None = None, *, wide: bool = False
-             ) -> dict[str, dict[str, list[str]]]:
-    """Each module's dtypes, by its variable scope's path, that one request of the task a saved run at
-    `directory` loads, at `step` or else its default, multiplies in (`products`, a packed projection's at
-    each of its members), beside the projections its model packs (`packs`): its products' operands'
-    (`saved_run_products`), read in a fresh interpreter, where every program the request runs lowers, as
-    the corpus's writer reads them. A model whose outer module states bfloat16 while one projection of
-    its decoder computes in float32 states float32 at that projection's scope. The products are a CPU's in
-    a user's process, or where `wide` in the suite's wide arithmetic, which multiplies a product of
-    float32 operands in float64 (`dew.nn.precision.WIDE_CPU_ARITHMETIC`), as the corpus's generations
-    before evidence version 3 recorded them; an accelerator lowers its own (bible §7 runs these files on
-    the CPU)."""
-    # A record names the repo's sources by their path in it, read from the checkout's root.
-    found = process_support.fresh(Path(__file__).with_name("saved_run_products.py"), str(directory),
-                                  *([] if step is None else [str(step)]), cwd=process_support.REPO_ROOT,
-                                  variables={WIDE_CPU_ARITHMETIC: "1" if wide else "0"})
-    assert found["products"], "the request lowered no matrix product"
     return found
 
 

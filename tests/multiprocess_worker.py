@@ -21,6 +21,17 @@ from pathlib import Path
 import numpy as np
 from flax import linen as nn
 from matrix_support import MATRIX_RECORDS, matrix_prefix, published_matrix
+from pool_records import (
+    BATCH,
+    RES,
+    batch_records,
+    elastic_loader,
+    indexed_loader,
+    mounted_loader,
+    online_loader,
+    online_pipeline,
+    replicated_loader,
+)
 from process_support import serve_mode, worker_parser
 from rl_support import pooled_rollout, rollout_prompts
 
@@ -29,8 +40,6 @@ from dew.data.dataset import Loader
 from dew.telemetry.records import RECORD_TYPES
 from dew.training.evaluation import Evaluation
 
-RES = 8
-BATCH = 8
 # The test model's parameters are far below the production shard threshold, so
 # the threshold is lowered; at the production value fsdp > 1 would replicate
 # every parameter.
@@ -162,127 +171,6 @@ def as_numpy(tree):
         return jax.tree.map(np.asarray, tree)
     from jax.experimental import multihost_utils
     return multihost_utils.process_allgather(tree, tiled=True)
-
-
-def indexed_loader(records: int, batch: int = BATCH):
-    """A checkpointable source whose batches say which records they hold.
-
-    Sharded by process, as grain's own loader shards, so a process's position
-    names its own shard and a resume has to hand it back to that process and
-    no other. On the plain data-parallel meshes it runs on, a process's share
-    of the partition is its own shard.
-    """
-    import grain.python as pygrain
-
-    class ToImage(pygrain.MapTransform):
-        def map(self, index):
-            return {"image": np.full((RES, RES, 3), index, np.uint8)}
-
-    return pygrain.DataLoader(
-        data_source=pygrain.RangeDataSource(0, records, 1),
-        sampler=pygrain.IndexSampler(num_records=records, shuffle=False, seed=0,
-                                     num_epochs=1,
-                                     shard_options=pygrain.ShardByJaxProcess()),
-        operations=[ToImage(), pygrain.Batch(batch, drop_remainder=True)],
-        worker_count=0,
-    )
-
-
-@dataclasses.dataclass(frozen=True)
-class Indexed:
-    """`records` records that say which they are, in the field the objective reads."""
-
-    records: int
-
-    def __len__(self):
-        return self.records
-
-    def __getitem__(self, index):
-        return {"image": np.full((RES, RES, 3), index, np.uint8)}
-
-
-def elastic_loader(records: int, workers: int):
-    """The same records compiled to a global order, whose position is a global count.
-
-    The loader above is grain's own `DataLoader`, whose position is one
-    process's offset into its shard. This one is the path every dataset spec
-    takes, so what a pool reading it exercises is a position every process
-    reports alike and a pool of another size reads back.
-    """
-    from dew.data import Memory
-    from dew.data.compile import compile
-    from dew.data.pipeline import Pipeline
-
-    return compile(Pipeline(Memory(Indexed(records))).shuffle(0).repeat().batch(BATCH), seed=0,
-                   loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
-
-
-def served_image(index: int) -> bytes:
-    """The bytes a pool's server answers record `index`'s url with: its image, as `elastic_loader`'s
-    records hold it."""
-    return np.full((RES, RES, 3), index, np.uint8).tobytes()
-
-
-@dataclasses.dataclass(frozen=True)
-class Pixels:
-    """A fetched record's bytes read back as its image."""
-
-    identity = "pixels@1"
-
-    def __call__(self, row):
-        return {"image": np.frombuffer(row["bytes"], np.uint8).reshape(RES, RES, 3)}
-
-
-def online_pipeline(records: int, address: str, *, shared: bool, epochs: int | None = None):
-    """`elastic_loader`'s records fetched over HTTP from the pool's server at `address`, a url each, in
-    either order a fetch is read in: the catalog shuffled and each process fetching its own share of it
-    (`shared`), or every process fetching the catalog as a memory read does and shuffling what it kept,
-    one global order; `epochs` passes of it, or passes without end."""
-    from dew.data import Memory
-    from dew.data.pipeline import Pipeline
-    from dew.data.sources.urls import Fetch
-
-    catalog = Pipeline(Memory([{"url": f"http://{address}/{index}"} for index in range(records)]))
-    fetched = (Fetch(output="bytes"), Pixels())
-    if shared:
-        return catalog.shuffle(0).repeat(epochs).filter_map(*fetched)
-    return catalog.filter_map(*fetched).shuffle(0).repeat(epochs)
-
-
-def online_loader(records: int, workers: int, address: str, *, shared: bool):
-    """`elastic_loader` over records fetched from the pool's server (`online_pipeline`)."""
-    from dew.data.compile import compile
-
-    return compile(online_pipeline(records, address, shared=shared).batch(BATCH), seed=0,
-                   loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
-
-
-@dataclasses.dataclass(frozen=True)
-class Unthirded:
-    """Whether a record's image is not every third one's, so a stream filtered by it drops records."""
-
-    identity = "unthirded@1"
-
-    def __call__(self, row) -> bool:
-        return int(row["image"][0, 0, 0]) % 3 != 0
-
-
-def replicated_loader(records: int, workers: int):
-    """`elastic_loader`'s records filtered, so which rows there are only the whole order states, read
-    elastically (`Pipeline.elastic`): every process reads that order and keeps its share of each
-    batch. A fetch would read it differently on each, which an elastic read over several refuses."""
-    from dew.data import Memory
-    from dew.data.compile import compile
-    from dew.data.pipeline import Pipeline
-
-    chain = Pipeline(Memory(Indexed(records))).shuffle(0).repeat().filter(Unthirded()).batch(BATCH).elastic()
-    return compile(chain, seed=0, loading=Loading(workers=workers, threads=2, read_buffer=8,
-                                                  worker_buffer=2)).train
-
-
-def batch_records(batch) -> list[int]:
-    """The record ids a batch out of `indexed_loader` holds."""
-    return [int(value) for value in np.asarray(batch["image"])[:, 0, 0, 0]]
 
 
 class BlockUntilKilled:
@@ -722,6 +610,8 @@ def mode_fit(args) -> dict:
         open_train = online_loader(args.records, args.workers, args.online, shared=args.shared)
     elif args.elastic:
         open_train = elastic_loader(args.records, args.workers)
+    elif args.mounts:
+        open_train = mounted_loader(args.workers, args.mounts, args.process_id)
     else:
         loader = indexed_loader(args.records, rows)
         if args.block_after:
@@ -2467,6 +2357,8 @@ def parse_args(argv=None):
     parser.add_argument("--elastic", action="store_true",
                         help="read the training records through a compiled global order, whose "
                              "saved position is a global record count")
+    parser.add_argument("--mounts", help="the directory under which each process mounts the records' file at "
+                                         "its own path (`mounted_loader`)")
     parser.add_argument("--release", help="the decision release decision_publish places and publishes")
     parser.add_argument("--online", help="host:port of the server whose urls the records are fetched from "
                                          "(`online_loader`)")

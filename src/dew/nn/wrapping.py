@@ -17,6 +17,7 @@ from flax.typing import Dtype
 from dew.batch import Variables, part, thaw
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites, part_stage_sites
 from dew.nn.protocols import (
+    ComputesIn,
     CrossAttending,
     OutputTable,
     VocabularyRows,
@@ -193,6 +194,12 @@ class HeadedModel:
 
     def __post_init__(self):
         _states_method(self.backbone)
+
+    @property
+    def dtype(self) -> Dtype | None:
+        """The dtype it computes in (`ComputesIn`): its backbone's, whose final states its head reads; None
+        where the backbone states none."""
+        return self.backbone.dtype if isinstance(self.backbone, ComputesIn) else None
 
     @property
     def states_method(self) -> str:

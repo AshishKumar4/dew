@@ -143,5 +143,6 @@ def test_a_validation_batch_scores_its_captions_by_clips_tokenizer_whatever_its_
             metric(ImageGrid(generated), {"captions": unread})
     # Captions kept under a field a condition encodes would overwrite one or the other.
     from dew.data.images import EncodeCaptions
+    encode = EncodeCaptions(lambda captions: {"text": captions}, keep="text", declared="text@1")
     with pytest.raises(ValueError):
-        EncodeCaptions(lambda captions: {"text": captions}, keep="text")({"caption": list(prompts)})
+        encode({"caption": list(prompts)})
