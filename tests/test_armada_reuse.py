@@ -292,6 +292,29 @@ def test_a_plan_keeps_each_green_group_of_a_heavy_file_and_a_task_runs_a_group_w
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "cd"] == [1, 2]
 
 
+def test_a_lookup_examines_the_entries_of_its_name_alone(ci, tmp_path, monkeypatch):
+    """What an import's search of a directory finds is read from the entries of the searched name alone: no
+    other entry is examined for being a build's output, which walks into a directory (2026-11-12: a task's
+    keys examined every entry of tests/ once a lookup, 47 million of them for 156,000 lookups, and that was
+    11 of the 12 minutes of this file's longest test). The answer is the one a directory holding the name's
+    entries alone gives."""
+    digests = ci.digests
+    package = tmp_path / "package"
+    for name in ("searched.py", "searched/__init__.py", "searched/inner.py", "searchedmore.py",
+                 *(f"sibling{index}/module.py" for index in range(20))):
+        (package / name).parent.mkdir(parents=True, exist_ok=True)
+        (package / name).write_text("")
+    alone = tmp_path / "alone"
+    for name in ("searched.py", "searched/__init__.py"):
+        (alone / name).parent.mkdir(parents=True, exist_ok=True)
+        (alone / name).write_text("")
+    examined: list[str] = []
+    built = digests.built
+    monkeypatch.setattr(digests, "built", lambda path: examined.append(path.name) or built(path))
+    assert digests.looked_up(package / "searched") == digests.looked_up(alone / "searched")
+    assert set(examined) <= {"searched.py", "searched", "__init__.py", "inner.py"}, sorted(set(examined))
+
+
 def test_a_plan_spreads_its_kept_rows_over_tasks_of_the_targets_lookups(ci, tmp_path, monkeypatch,
                                                                         cache_worker):
     """The plan's kept rows fill tasks of at most the target's lookups, a lookup a row in seconds, each of
