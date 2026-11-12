@@ -633,6 +633,18 @@ def mode_token_budget(args) -> dict:
     return {"step": int(state.step), "updates": int(state.updates), "logged": len(tracker.losses)}
 
 
+def mode_bounded_validation(args) -> dict:
+    """A fit whose held-out split holds a token past the model's table on one rank's share, scored every
+    step: the refusal each rank meets, by its type, where every rank refuses together."""
+    trainer = token_trainer(args.name, args.out.parent, fsdp=1, seq_len=args.seq_len, checkpoints=None)
+    data = token_data(args, packed=False, loading=Loading(workers=0, threads=1, read_buffer=1))
+    try:
+        trainer.fit(data, steps=2, eval_every=1, log_every=1)
+    except Exception as error:  # the refusal itself is the report
+        return {"refused": type(error).__name__}
+    return {"refused": None}
+
+
 def mode_schedule_fit(args) -> dict:
     """`--steps` of `token_trainer` on a schedule of `--tokens` read in two orders, the first stage for
     60 committed tokens (`dew.data.schedule`): the step the run reached, the record its first stage
@@ -2413,7 +2425,8 @@ def mode_matrix(args) -> dict:
             "batches": batches}
 
 
-MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit": mode_schedule_fit,
+MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
+         "bounded_validation": mode_bounded_validation, "schedule_fit": mode_schedule_fit,
          "decision_publish": mode_decision_publish,
          "host_training": mode_host_training, "step_fits": mode_step_fits,
          "whole_validation": mode_whole_validation, "host_fields": mode_host_fields,

@@ -154,6 +154,21 @@ def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
         assert report["sum"] == 3 * MESH_DEVICES
 
 
+def test_a_pool_whose_held_out_share_holds_a_token_past_its_table_refuses_on_every_rank(tmp_path):
+    """A two-process fit whose held-out split holds a token past its model's 64-row table in one rank's
+    share (multiprocess_worker.VOCAB) refuses on every rank, the rank holding it naming the token
+    (`OutsideTable`) and its peer its failure, inside the agreement each batch's cover is: no rank waits on
+    a peer that left."""
+    tokens = np.arange(65, dtype=np.uint16) % 64
+    held = tokens.copy()
+    held[61] = 100
+    train = write_token_corpus(tmp_path / "tokens", tokens, tokens, vocab_size=64)
+    corpus = write_token_corpus(tmp_path / "held", held, held, vocab_size=101)
+    reports = run_pool("bounded_validation", tmp_path / "pool", 2, devices=1, tokens=train.train,
+                       held_tokens=corpus.train, seq_len=4, timeout=300)
+    assert sorted(report["refused"] for report in reports) == ["OutsideTable", "PeerFailure"]
+
+
 def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_path):
     # The worker's model reads 64 rows (multiprocess_worker.VOCAB); the ramp's last target is the 65th id.
     corpus = token_corpus(tmp_path / "tokens", records=16, seq_len=4, rows=64)
