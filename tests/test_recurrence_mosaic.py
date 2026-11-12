@@ -310,12 +310,12 @@ def test_the_packed_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_i
     key dimension."""
 
 
-@pytest.mark.check1_shards(seeds=32, per_task=8)
+@pytest.mark.check1_shards(seeds=128, per_task=8)
 @drawn_forward('a decay a key dimension', 'fp32')
 def test_the_mosaic_forward_over_an_fp32_decay_a_key_dimension_is_as_exact_as_its_reference():
     """`the_mosaic_forward_is_as_exact_as_its_reference` at an fp32 call under a decay a key dimension:
     refused at exact products (the accurate forms, `mainloop.per_key_refusal`), its arm the portable math's
-    (test_recurrence_chunk's); under the fast forms held to recorded fla-core's fp32 at its 32 seeds."""
+    (test_recurrence_chunk's); under the fast forms held to recorded fla-core's fp32 at its 128 seeds."""
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=8)

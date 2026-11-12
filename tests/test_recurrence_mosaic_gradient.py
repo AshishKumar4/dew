@@ -117,7 +117,7 @@ def test_a_bf16_gradient_under_a_decay_a_key_dimension_is_as_exact_as_its_refere
     forward's memories kept."""
 
 
-@pytest.mark.check1_shards(seeds=32, per_task=8)
+@pytest.mark.check1_shards(seeds=128, per_task=12)
 @interpreted_gradient('a decay a key dimension', 'fp32', 'kept')
 def test_an_fp32_gradient_under_a_decay_a_key_dimension_is_as_exact_as_its_reference():
     """`the_mosaic_gradient_is_as_exact_as_its_reference` under a decay a key dimension in fp32 under the

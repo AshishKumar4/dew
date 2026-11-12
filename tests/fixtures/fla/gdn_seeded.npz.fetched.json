@@ -1,9 +1,9 @@
 {
- "bytes": 40038574,
+ "bytes": 41315917,
  "license": "MIT",
- "path": "recordings/6afff3dedcc80e843218d54b1ac7c2b9e23d4d5f287f4da6262e8c23a983847c.npz",
- "reference": "fla-core-0.5.2+tilelang-0.1.15",
+ "path": "recordings/132df436d26ab8ed025fb85cf5f292daa0c6e294533db377d9b12769f020f744.npz",
+ "reference": "fla-core-0.5.2+torch-2.14.1+triton-3.8.0",
  "repo": "dewml/fixtures",
- "revision": "e757134faff2717ff733d79bb8a5278b8491de41",
- "sha256": "6afff3dedcc80e843218d54b1ac7c2b9e23d4d5f287f4da6262e8c23a983847c"
+ "revision": "faedf65e12d0e6ffa86805af7bcba8b2b609652b",
+ "sha256": "132df436d26ab8ed025fb85cf5f292daa0c6e294533db377d9b12769f020f744"
 }
