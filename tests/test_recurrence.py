@@ -434,3 +434,40 @@ def test_a_decode_tokens_launch_runs_per_shard_moving_nothing(local):
     cases = [KernelCase("decode token", call, expected=expected)]
     failed = route_failures(cases, compile_mosaic_kernels(cases, "sm90"))
     assert (failed == []) == local, failed
+
+
+@pytest.mark.parametrize('rows', [1, 128], ids=['one row', '128 rows'])
+@pytest.mark.parametrize('target', ['sm80', 'sm90', 'sm100'])
+def test_a_decode_step_holds_its_registers_at_the_residency_it_plans(target, rows):
+    """Mamba-2's decode step (its rated decay and skip, the most registers a step's hooks hold) over 128 keys
+    a head, compiled for a compile-only `target` (`kernel_compile`) at one row, whose grid the plan may split
+    between two warpgroups a program, and at 128, past a wave (`step._plan`): its launch spills nothing at
+    the registers its planned residency leaves a thread (`mosaic.compiler_params`' `resident`), and ptxas's
+    least spill-free cap is within the step's model (`step.step_registers`), so a step whose need grows past
+    its share fails here rather than spilling or leaving programs out on the GPU (row 4864; uncapped, an
+    A100's step took all 255 registers, two programs a multiprocessor)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates import bundles
+    from dew.nn.kernels.templates.recurrence import step as template
+
+    hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+    heads, key_width, value_width = 64, 128, 64
+
+    def call():
+        def token(state, query, key, value, beta, rate, skip):
+            given = recurrence.Step(state, query=query, key=key, value=value, beta=beta, rate=rate, skip=skip)
+            return template.step(hooks, given, dtype=None, family=bundles.of(target, jnp.float32))
+
+        shaped = jax.ShapeDtypeStruct
+        return token, (shaped((rows, heads, key_width, value_width), jnp.float32),
+                       *(shaped((rows, 1, key_width), jnp.bfloat16),) * 2,
+                       shaped((rows, heads, value_width), jnp.bfloat16), shaped((rows, heads), jnp.float32),
+                       *(shaped((heads,), jnp.float32),) * 2)
+
+    (record,) = compile_mosaic_kernels([KernelCase('decode step', call)], target, least=True)
+    assert not mosaic_failures([record]), mosaic_failures([record])
+    (kernel,) = [kernel for kernel in record['kernels'] if 'recurrence_step' in kernel['kernel']]
+    assert kernel['spilled'] == 0 and kernel['least'] is not None, kernel
+    assert kernel['least'] <= template.step_registers(), kernel
