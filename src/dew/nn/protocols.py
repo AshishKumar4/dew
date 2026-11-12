@@ -580,12 +580,16 @@ class MediaWrapper(Protocol):
 @runtime_checkable
 class ReplacesTokens(Protocol):
     """A model that replaces some of its token ids before its embedding table reads them, as it states
-    (`dew.nn.multimodal.MultimodalTransformer`): the ids it replaces wherever they occur (`replaced_ids`),
-    and the id at each slot a call's media fill (`dew.nn.inputs.media_slots`), whose embedding its towers
-    give; every other id reads its table."""
+    (`dew.nn.multimodal.MultimodalTransformer`, `dew.nn.diffusion_gemma.DiffusionGemma`): the ids it
+    replaces wherever they occur (`replaced_ids`), and whether it replaces the id at each slot a call's
+    media fill (`replaces_media`, `dew.nn.inputs.media_slots`), whose embedding its towers give; every
+    other id reads its table."""
 
     @property
     def replaced_ids(self) -> frozenset[int]: ...
+
+    @property
+    def replaces_media(self) -> bool: ...
 
 
 @runtime_checkable

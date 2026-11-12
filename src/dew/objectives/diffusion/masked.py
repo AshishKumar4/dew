@@ -151,8 +151,8 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         self.decode = decode
         text = Field.indexing(TEXT_KEY, (seq_len,), model)
         # The mask id is placed inside the compiled step, where no host check of a batch sees it.
-        if text.rows is not None and not text.admits(process.mask_id):
-            raise OutsideTable("the masking process's mask_id", process.mask_id, text.rows)
+        if text.table is not None and not text.admits(process.mask_id):
+            raise OutsideTable("the masking process's mask_id", process.mask_id, text.table.rows)
         self.inputs = InputSpec(sample=text)
         self.ema = EMASpec.constant(ema_decay)
 

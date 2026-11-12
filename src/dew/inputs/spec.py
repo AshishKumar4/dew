@@ -37,6 +37,7 @@ from dew.registry import DtypeName
 if TYPE_CHECKING:
     from flax import linen as nn
 
+    from dew.nn.blocks import TokenTable
     from dew.nn.wrapping import HeadedModel
 
 
@@ -74,21 +75,15 @@ class Field:
     key: str
     shape: tuple[int, ...]
     variable_axes: tuple[int, ...] = ()
-    rows: int | None = dataclasses.field(default=None, metadata={"record": False})
-    """The rows of the table the field's integers index, a token field's its model's embedding table
-    (`dew.nn.blocks.token_table`), read off the model where an objective declares the field: every value
-    in `[0, rows)` but the ids its model replaces before the table reads them (`replaced`), as `bounded`
-    holds it; None for a field that indexes nothing. Not recorded: the model a run rebuilds states it."""
-    replaced: frozenset[int] = dataclasses.field(default=frozenset(), metadata={"record": False})
-    """Ids the model replaces wherever they occur before its table reads them (Gemma 4's media
-    placeholders), which hold no row."""
-    media: bool = dataclasses.field(default=False, metadata={"record": False})
-    """Whether the model replaces the id at each slot a call's media fill (`dew.nn.inputs.media_slots`), its
-    towers' embedding in its table's place, so that id holds no row."""
+    table: TokenTable | None = dataclasses.field(default=None, metadata={"record": False})
+    """The table the field's integers index, a token field's its model's embedding table
+    (`dew.nn.blocks.token_table`), read off the model where an objective declares the field: its rows,
+    the ids its model replaces wherever they occur and whether it replaces the id at each slot a call's
+    media fill, as `bounded` holds them; None for a field that indexes nothing. Not recorded: the model a
+    run rebuilds states it."""
 
     def __post_init__(self):
         object.__setattr__(self, "shape", tuple(int(size) for size in self.shape))
-        object.__setattr__(self, "replaced", frozenset(int(token) for token in self.replaced))
         if any(axis < 0 or axis >= len(self.shape) for axis in self.variable_axes):
             raise ValueError("variable field axes must index its per-sample shape")
 
@@ -96,59 +91,60 @@ class Field:
     def indexing(cls, key: str, shape: tuple[int, ...], model: nn.Module | HeadedModel, *,
                  variable_axes: tuple[int, ...] = ()) -> Field:
         """The field `key` of `shape` whose integers index `model`'s embedding table
-        (`dew.nn.blocks.token_table`): its rows and the ids it replaces, none where it states no table."""
+        (`dew.nn.blocks.token_table`), none where it states no table."""
         from dew.nn.blocks import token_table
 
-        table = token_table(model)
-        if table is None:
-            return cls(key, shape, variable_axes)
-        return cls(key, shape, variable_axes, rows=table.rows, replaced=table.replaced, media=table.media)
+        return cls(key, shape, variable_axes, token_table(model))
 
-    def bounded(self, value: object, spelling: Callable[[int], str] | None = None,
-                slots: jax.typing.ArrayLike | None = None) -> None:
-        """Refuse `value`, this field's rows (a `ModelInputs`'s token rows), where it holds an id outside
-        `[0, rows)` its model reads from its table: not `replaced`, nor at a slot the rows' media fill where
-        its model replaces those (`media`; a `ModelInputs`'s own, or `slots`, a request's, as
-        `dew.nn.inputs.media_slots` reads them). Such an id reads no row of the table, whose gather fills it
-        with NaN (`jnp.take`'s out-of-bounds fill), a run's loss and a served token NaN with finite logits
-        beside it. Names the id, its token where `spelling` knows it, and the table's rows. Rows a caller
-        gave already placed (a batch of device arrays) are bounded where they lie, their least and greatest
-        id read back alone (two scalars, outside any step), and read back whole only to name a refused id."""
-        if self.rows is None:
+    def bounded(self, value: object, spelling: Callable[[int], str] | None = None) -> None:
+        """Refuse `value`, this field's rows (a `ModelInputs`, or bare token rows), where it holds an id
+        outside its table's rows its model reads from the table: not one it replaces wherever it occurs,
+        nor at a slot a `ModelInputs`'s media fill where its model replaces those (`TokenTable.media`,
+        `dew.nn.inputs.media_slots`). Such an id reads no row of the table, whose gather fills it with NaN
+        (`jnp.take`'s out-of-bounds fill), a run's loss and a served token NaN with finite logits beside
+        it. Names the id, its token where `spelling` knows it, and the table's rows. Rows a caller gave
+        already placed (a batch of device arrays) are bounded where they lie, their least and greatest id
+        read back alone (two scalars, outside any step), and read back whole only to name a refused id;
+        host rows are bounded on the host."""
+        table = self.table
+        if table is None:
             return
         held = value.tokens if isinstance(value, ModelInputs) else value
-        if isinstance(value, ModelInputs):
-            slots = media_slots(value.token_fields, value.tokens.shape)
-        if isinstance(held, jax.Array):
+        placed = isinstance(held, jax.Array)
+        xp = jnp if placed else np
+        slots = (media_slots(value.token_fields, value.tokens.shape, xp=xp)
+                 if table.media and isinstance(value, ModelInputs) else None)
+        if placed:
             if held.size == 0 or not jnp.issubdtype(held.dtype, jnp.integer):
                 return
             # The ids its model replaces counted as a row's, so a valid batch reads back two scalars alone.
-            kept = (held if not self.replaced
-                    else jnp.where(jnp.isin(held, jnp.asarray(sorted(self.replaced), held.dtype)), 0, held))
-            kept = jnp.where(jnp.asarray(slots), 0, kept) if self.media and slots is not None else kept
+            kept = (held if not table.replaced
+                    else jnp.where(jnp.isin(held, jnp.asarray(sorted(table.replaced), held.dtype)), 0, held))
+            kept = kept if slots is None else jnp.where(slots, 0, kept)
             low, high = (int(bound) for bound in jax.device_get((jnp.min(kept), jnp.max(kept))))
-            if low >= 0 and high < self.rows:
+            if low >= 0 and high < table.rows:
                 return
         ids = np.asarray(held)
         if ids.size == 0 or ids.dtype.kind not in "iu":
             return
-        if self.media and slots is not None:
+        if slots is not None:
             ids = np.where(np.asarray(slots), 0, ids)
         low, high = int(ids.min()), int(ids.max())
-        if low >= 0 and high < self.rows:
+        if low >= 0 and high < table.rows:
             return
-        outside = np.unique(ids[(ids < 0) | (ids >= self.rows)])
-        outside = outside[~np.isin(outside, list(self.replaced))] if self.replaced else outside
+        outside = np.unique(ids[(ids < 0) | (ids >= table.rows)])
+        outside = outside[~np.isin(outside, list(table.replaced))] if table.replaced else outside
         if outside.size == 0:
             return
         token = int(outside[0] if outside[0] < 0 else outside[-1])
-        raise OutsideTable(f"field {self.key!r}", token, self.rows,
+        raise OutsideTable(f"field {self.key!r}", token, table.rows,
                            None if spelling is None or token < 0 else spelling(token))
 
     def admits(self, token: int) -> bool:
         """Whether `token` reads a row of the table this field indexes, or is an id its model replaces
         before the table reads it; any id where the field indexes no table."""
-        return self.rows is None or 0 <= token < self.rows or token in self.replaced
+        table = self.table
+        return table is None or 0 <= token < table.rows or token in table.replaced
 
     @classmethod
     def of(cls, key: str, batch: Batch) -> Field:
