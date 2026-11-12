@@ -140,6 +140,10 @@ from dew.training.compiled_program import lowering_platform
 PRECISION = "precision"
 """The entry of a reference's array file that records the precision its generator's matmuls took."""
 
+UPSTREAM_DEFAULT = "upstream default"
+"""What a port's upstream recording's `PRECISION` begins with: its generator ran the upstream at its own
+default precision, no switch set (testing.md: a port is held to its upstream), its arithmetic after it."""
+
 
 def ieee_fixture(path) -> dict[str, np.ndarray]:
     """The arrays of a reference's array file, refused unless its generator
@@ -149,14 +153,30 @@ def ieee_fixture(path) -> dict[str, np.ndarray]:
     regenerated with TF32 matmuls, ten mantissa bits, sits farther from
     float64 and so widens the budget to fit a coarser Dew, and the float32
     arrays it stores look the same; only the generator's record tells."""
-    with np.load(path) as stored:
-        arrays = {name: stored[name] for name in stored.files}
-    recorded = str(arrays.pop(PRECISION)) if PRECISION in arrays else "no precision"
+    arrays, recorded = _stored_precision(path)
     if recorded != "ieee":
         raise ValueError(f"{path} records {recorded!r} for its matmuls, not 'ieee'; regenerate it "
                          f"with IEEE matmuls")
     return arrays
 
+
+def upstream_fixture(path) -> dict[str, np.ndarray]:
+    """The arrays of a port's upstream recording, refused unless its generator recorded the upstream at its
+    own default precision (`UPSTREAM_DEFAULT`): a port multiplies as its upstream does at the default
+    precision (fla's Triton dots an fp32 product as one TF32), so its reference is the upstream's own
+    arithmetic, like with like, never one a switch made IEEE (`ieee_fixture`'s, every other reference's)."""
+    arrays, recorded = _stored_precision(path)
+    if not recorded.startswith(UPSTREAM_DEFAULT):
+        raise ValueError(f"{path} records {recorded!r} for its matmuls, not its upstream at its own default "
+                         "precision; regenerate it with no precision switch set")
+    return arrays
+
+
+def _stored_precision(path) -> tuple[dict[str, np.ndarray], str]:
+    """A reference's array file's arrays and what its generator recorded of its matmuls (`PRECISION`)."""
+    with np.load(path) as stored:
+        arrays = {name: stored[name] for name in stored.files}
+    return arrays, str(arrays.pop(PRECISION)) if PRECISION in arrays else "no precision"
 
 
 WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
@@ -169,6 +189,7 @@ of different instruction sets, though the bits still part with the host (docs/pe
 SSD kernel's host check 1 without YNNPACK"); and XLA:CPU's fusion choices are not Dew's (rows 4520, 4522).
 The empty list, not the documented `-individual_dot`, because compiler options take no such spelling and
 that one leaves a scan's reductions fused. The census (`CENSUS`) compiles without it (`switched_off`)."""
+
 
 
 def switched_off() -> dict:

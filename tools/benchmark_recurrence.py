@@ -26,9 +26,12 @@ operands included, each arm a shape in a process of its own, so no other arm's o
 The JAX arms run in Dew's environment (`jax` mode, a process an arm and shape, which `jax` mode spawns) and
 the torch arms in their own (`torch` mode, which imports neither JAX nor Dew), one after another on the same
 GPU; `row` mode reads their JSON lines and prints the markdown rows. Each time is the median of
-`--repeats` synchronized calls after `--warmup`, in milliseconds; forward plus backward is one call
-returning the outputs and their VJP under the cotangents `do` and `dfinal`, as torch's backward runs after
-its forward.
+`--repeats` calls after `--warmup`, in milliseconds, each call its kernels' device time summed on either
+side (JAX's by CUPTI, `dew.telemetry.benchmark.device_time`; torch's by its profiler's CUDA events), so
+no host dispatch enters either: a JAX arm timed by the host's clock around one call carried its dispatch,
+which put the short conv's template at 1.19 times fla's forward where its kernels took 165 us against fla's
+200 to 209 (ncu, A100, LF-PROF-a100). Forward plus backward is one call returning the outputs and their VJP
+under the cotangents `do` and `dfinal`, as torch's backward runs after its forward.
 
 MFU is the shape's model FLOPs (`flops`: `dew.nn.flops`' recurrent function, the same count for every
 arm, chunk work excluded) over the time and the GPU's dense bf16 peak (`dew.nn.kernels.generation`'s
@@ -225,7 +228,7 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int, only: str) -> l
     import jax
 
     from dew.nn.kernels.options import program
-    from dew.telemetry.benchmark import samples
+    from dew.telemetry.benchmark import device_time
 
     arms, refusals, inputs, cotangents = jax_parts(shape)
     rows = []
@@ -235,14 +238,15 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int, only: str) -> l
         row = {'shape': name, 'arm': arm}
         rows.append(row)
         if refusals.get(arm):
-            row.update(fwd_ms=None, fwd_bwd_ms=None, error=f"refuses: {refusals[arm]}")
+            row.update(fwd_ms=None, fwd_bwd_ms=None, refused=refusals[arm])
             continue
         parts = (('fwd_ms', program(fn), inputs),
                  ('fwd_bwd_ms', program(forward_backward(fn)), (cotangents, *inputs)))
         for part, compiled, given_args in parts:
             try:
-                measured = samples(compiled, *given_args, warmup=warmup, repeats=repeats)
-                row[part] = 1e3 * statistics.median(measured)
+                with device_time() as device:
+                    measured = [device.seconds(compiled, *given_args) for _ in range(warmup + repeats)]
+                row[part] = 1e3 * statistics.median(measured[warmup:])
             except jax.errors.JaxRuntimeError as error:
                 row[part], row['error'] = None, _failure(error)
             row[part.replace('_ms', '_peak_mb')] = _jax_peak()
@@ -290,7 +294,7 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
             from flash_qla import chunk_gated_delta_rule as rule
         except ValueError as error:  # FlashQLA refuses an architecture it has no kernels for at import
             return {'shape': name, 'arm': arm, 'length': shape.length, 'device': torch.cuda.get_device_name(),
-                    'fwd_ms': None, 'fwd_bwd_ms': None, 'error': f"refuses sm{major}{minor}: {error}"}
+                    'fwd_ms': None, 'fwd_bwd_ms': None, 'refused': f"sm{major}{minor}: {error}"}
 
         leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'],
                   given['beta'].to(bf16)]
@@ -343,20 +347,24 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
             for _ in range(warmup):
                 fn()
             torch.cuda.synchronize()
-            measured = []
-            for _ in range(repeats):
-                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-                start.record()
-                fn()
-                end.record()
-                torch.cuda.synchronize()
-                measured.append(start.elapsed_time(end))
-            row[part] = statistics.median(measured)
+            row[part] = statistics.median(_kernel_milliseconds(torch, fn) for _ in range(repeats))
         except torch.OutOfMemoryError as error:
             row[part], row['error'] = None, _failure(error)
             torch.cuda.empty_cache()
         row[part.replace('_ms', '_peak_mb')] = torch.cuda.max_memory_allocated() / 2 ** 20
     return row
+
+
+def _kernel_milliseconds(torch, fn) -> float:
+    """One call of `fn`'s device milliseconds, its CUDA kernels' summed as torch's profiler reads them
+    (CUPTI's, as the JAX arms' are), no host dispatch among them."""
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CUDA]) as profiled:
+        fn()
+        torch.cuda.synchronize()
+    return sum(event.device_time for event in profiled.events()
+               if event.device_type == torch.autograd.DeviceType.CUDA) / 1e3
 
 
 def markdown(rows: list[dict], sha: str) -> list[str]:
@@ -377,7 +385,9 @@ def markdown(rows: list[dict], sha: str) -> list[str]:
         for arm in ARMS[shape.kind]:
             row = found.get(arm)
             if row is None or row.get('fwd_ms') is None:
-                cells.append(f"{arm} {row.get('error', 'failed') if row else 'not run'}")
+                said = ('not run' if row is None else f"refuses: {row['refused']}" if 'refused' in row
+                        else row.get('error', 'failed'))
+                cells.append(f"{arm} {said}")
                 continue
             parts, peaks = [], []
             for key, factor in (('fwd_ms', 1), ('fwd_bwd_ms', 3)):
@@ -414,14 +424,19 @@ def main(argv: list[str] | None = None) -> None:
         print('\n'.join(markdown(rows, args.sha)))
         return
     names = sorted(SHAPES) if args.shape == 'all' else [args.shape]
+    failed = []
     for name in names:
         shape = SHAPES[name] if args.length is None else dataclasses.replace(SHAPES[name], length=args.length)
         if args.mode == 'jax' and args.arm is None:
+            # Every arm runs in its process however another ended; one ending without its row fails the run.
             for arm in (arm for arm in ARMS[shape.kind] if arm in JAX_ARMS):
-                subprocess.run([sys.executable, __file__, 'jax', '--shape', name, '--arm', arm, '--warmup',
-                                str(args.warmup), '--repeats', str(args.repeats), '--sha', args.sha,
-                                *(['--out', args.out] if args.out else []),
-                                *(['--length', str(args.length)] if args.length else [])], check=False)
+                command = [sys.executable, __file__, 'jax', '--shape', name, '--arm', arm, '--warmup',
+                           str(args.warmup), '--repeats', str(args.repeats), '--sha', args.sha,
+                           *(['--out', args.out] if args.out else []),
+                           *(['--length', str(args.length)] if args.length else [])]
+                ended = subprocess.run(command, check=False)
+                if ended.returncode:
+                    failed.append(f"{name} {arm} (exit {ended.returncode})")
             continue
         if args.mode == 'jax':
             import jax
@@ -439,6 +454,11 @@ def main(argv: list[str] | None = None) -> None:
             if args.out:
                 with open(args.out, 'a') as handle:
                     handle.write(line + '\n')
+        # Every row written, an arm that failed (an `error`, not a refusal) fails the run: a receipt never
+        # reads as a scoreboard of an arm that did not run.
+        failed += [f"{name} {row['arm']}: {row['error'][:200]}" for row in found if 'error' in row]
+    if failed:
+        sys.exit("benchmark_recurrence: arms failed:\n" + "\n".join(failed))
 
 
 if __name__ == '__main__':

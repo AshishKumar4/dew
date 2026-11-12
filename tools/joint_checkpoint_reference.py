@@ -30,16 +30,14 @@ runs each request through the same release with HF's Qwen 3.5 Gated DeltaNet
 on fla's own chunked rule, and writes each question's fp32 logits to
 logits_fla.npz under `<case>/<id>`, with `precision` its matmuls': the
 reference Dew's model is held to where its delta rule runs on its port, fla's
-algorithm (tests/test_decision_joint_checkpoint.py). Every product is IEEE
-fp32, as tests/reference_error.py's `ieee_fixture` requires: run it with
-TRITON_F32_DEFAULT=ieee for the dots that leave their precision unset, and it
-sets the one constant that fixes fla-core 0.5.2's intra-chunk solve at TF32 on
-a GPU that has it (fla/ops/gated_delta_rule/chunk_fwd.py:20-23) to 'ieee',
-the value fla takes on a GPU without TF32. Triton keys its disk cache on a
-kernel's source and not on the globals it reads, so these kernels compile into
-a cache directory of their own. Its environment is pinned: torch 2.8.0 for
-CUDA 12.8, transformers 5.16.1 and fla-core 0.5.2, which `on_fla` checks
-before it runs.
+algorithm (tests/test_decision_joint_checkpoint.py). The upstream runs at its
+own default precision, no switch set (testing.md: a port is held to its
+upstream), fla's Triton dots and its intra-chunk solve taking an fp32 product
+as one TF32 as Dew's port does at the default precision, and the recording
+states that arithmetic (`upstream_precision`; tests/reference_error.py's
+`upstream_fixture` reads it). Its environment is pinned: torch 2.8.0 for CUDA
+12.8, transformers 5.16.1 and fla-core 0.5.2, which `on_fla` checks before it
+runs.
 
 With `--parity`, it reads that head back and records the release over check 1's seeds
 (`recorded_references.record_case`), each seed's requests drawn (`drawn_requests`: states plain or
@@ -169,15 +167,10 @@ def on_fla() -> None:
     from transformers.models.qwen3_5 import modeling_qwen3_5
 
     require("fla")
-    if os.environ.get("TRITON_F32_DEFAULT") != "ieee":
-        raise SystemExit("run with TRITON_F32_DEFAULT=ieee so fla's kernels keep fp32")
-    if os.environ.get("FLA_TRIL_PRECISION", "ieee") != "ieee":
-        raise SystemExit("leave FLA_TRIL_PRECISION at its 'ieee' default")
-    os.environ["TRITON_CACHE_DIR"] = str(Path.home() / ".cache" / "dew" / "triton-ieee")
-    from fla.ops.gated_delta_rule import chunk_fwd, chunk_gated_delta_rule
-    from triton.language import constexpr
-
-    chunk_fwd.SOLVE_TRIL_DOT_PRECISION = constexpr("ieee")
+    switched = [name for name in ("TRITON_F32_DEFAULT", "FLA_TRIL_PRECISION") if name in os.environ]
+    if switched:
+        raise SystemExit(f"unset {', '.join(switched)}: the upstream runs at its own default precision")
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 
     # HF's Qwen 3.5 takes fla's rule only where its kernel lookup resolves it, which it did not in this
     # environment; its Gated DeltaNet calls the rule by this module name, so it is fla's here, on the
@@ -190,8 +183,6 @@ def on_fla() -> None:
         return chunk_gated_delta_rule(*args, **taken)
 
     modeling_qwen3_5.torch_chunk_gated_delta_rule = on_fla_rule
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
     device = torch.device("cuda")
     upstream, _ = upstream_module()
     tokenizer = AutoTokenizer.from_pretrained(BACKBONE)
@@ -212,19 +203,23 @@ def on_fla() -> None:
         for question, fp32 in zip(encoded.questions, found, strict=True):
             logits[f"{case}/{question.question_id}"] = fp32.cpu().numpy()
     assert calls, "no layer ran fla's rule"
-    np.savez(OUT / "logits_fla.npz", **logits, precision=fla_precision())
+    np.savez(OUT / "logits_fla.npz", **logits, precision=upstream_precision())
 
 
-def fla_precision() -> str:
+def upstream_precision() -> str:
     """What logits_fla.npz records of its run's matmuls (`recorded_matmuls`), fla's two triangular
-    solves among them."""
+    solves among them, under `UPSTREAM_DEFAULT`, the mark of an upstream at its own default precision."""
     from fla.ops.gated_delta_rule import chunk_fwd
 
     from _dew_torch.precision import recorded_matmuls
 
+    sys.path.insert(0, str(ROOT / "tests"))
+    from reference_error import UPSTREAM_DEFAULT
+
     solve = chunk_fwd.SOLVE_TRIL_DOT_PRECISION
-    return recorded_matmuls(FLA_TRIL_PRECISION=os.environ.get("FLA_TRIL_PRECISION", "ieee"),
-                            **{"the intra-chunk solve": str(getattr(solve, "value", solve))})
+    modes = recorded_matmuls(FLA_TRIL_PRECISION="ieee",
+                             **{"the intra-chunk solve": str(getattr(solve, "value", solve))})
+    return f"{UPSTREAM_DEFAULT}: {modes}"
 
 
 def released():
