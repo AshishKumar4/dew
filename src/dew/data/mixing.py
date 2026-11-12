@@ -36,6 +36,7 @@ from dew.data.pipeline import (
     members_of,
 )
 from dew.data.shared import SharedMapping
+from dew.data.storage import without_mirrors
 
 _log = logging.getLogger(__name__)
 
@@ -1062,6 +1063,19 @@ def continued(state: JSON, members: Mapping[str, str], left: Mapping[str, Sequen
     return state
 
 
+def unmirrored(position: JSON) -> JSON:
+    """`position`, a corpus's, without the mirror counters its loading workers' positions carry by process
+    (`dew.data.storage.without_mirrors`): a draw's position names where the corpus stands, alike on
+    every share of an elastic read, and a phase continuing it counts its own mirrors."""
+    match position:
+        case list():
+            return [unmirrored(part) for part in position]
+        case dict():
+            return json_value({key: unmirrored(part) for key, part in without_mirrors(position).items()},
+                              "a corpus's position")
+    return position
+
+
 def uncounted(position: JSON) -> JSON:
     """`position`, a corpus's, with every counter it keeps (`COUNTER`) at no counts: a corpus a later phase
     reads on from an earlier phase's position counts what that phase reads of it, the earlier's counts
@@ -1093,7 +1107,8 @@ class _MixRead(pygrain.DatasetIterator[Batch]):
         if self._stamping is None:
             return self._group.read(self._index)
         return self._stamping.read(self._key, lambda: self._group.read(self._index),
-                                   lambda: json_value(copy.deepcopy(self.get_state()), "a corpus's position"))
+                                   lambda: unmirrored(json_value(copy.deepcopy(self.get_state()),
+                                                                 "a corpus's position")))
 
     def get_state(self) -> Mapping[str, object]:
         state = self._group.state(self._index)
