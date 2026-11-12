@@ -294,12 +294,11 @@ class Produced:
     """What a training stream declares it hands each step, checked on each batch before its transfer
     (docs/design/training.md, the producer's contract; row 5724): its share's rows of a step, one of the
     global batches its loader states (`Loader.batch`, a schedule's phases' `Loader.batches`, a ramp's
-    stages'), and each field's dtype as its first batch holds it. A batch of other rows, or a field of
-    another dtype, is refused naming both, where it would compile as another step's signature. A batch
-    measured in tokens (`Loader.batch_tokens`) holds rows as its tokens fit, and states none."""
+    stages'). A batch of other rows is refused naming both, where it would compile as another step; its
+    fields' dtypes may change, each its own step's (a mixed-precision stream's). A batch measured in tokens
+    (`Loader.batch_tokens`) holds rows as its tokens fit, and states none."""
 
     rows: frozenset[int] | None
-    dtypes: dict[str, str] = dataclasses.field(default_factory=dict)
 
     @classmethod
     def of(cls, loader: Loader, partition: DataPartition) -> Produced:
@@ -316,15 +315,6 @@ class Produced:
             raise ValueError(f"the training stream handed a step {rows} rows on this share, where its loader "
                              f"states {sorted(self.rows)}: a step after the batch changed its rows, which "
                              "would compile another step; batch where the rows are made")
-        for name, value in batch.items():
-            dtype = getattr(value, "dtype", None)
-            if dtype is None:
-                continue
-            held = self.dtypes.setdefault(name, str(dtype))
-            if held != str(dtype):
-                raise ValueError(f"the training stream's field {name!r} is {dtype} in this batch and was "
-                                 f"{held} in the first: a step changed its dtype, which would compile "
-                                 "another step")
         return batch
 
 

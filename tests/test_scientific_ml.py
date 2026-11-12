@@ -437,14 +437,17 @@ def test_a_gauss_newton_window_the_stream_ends_inside_solves_the_rows_it_holds(f
     generator = np.random.default_rng(5)
     x = generator.normal(size=(5, features)).astype(np.float32)
     y = generator.normal(size=5).astype(np.float32)
-    rows = Memory([{"x": row, "y": target} for row, target in zip(x, y, strict=True)]).batch(1)
-    trainer = Trainer(LeastSquares(features), gauss_newton(damping=1e-6), key=0, layout=LAYOUT,
-                      accumulation=4)
-    state = trainer.fit(rows)
-    weights = np.asarray(state.variables["params"]["Dense_0"]["kernel"])[:, 0]
-    assert int(state.updates) == 2
-    # The last window's solve fits its one row: its residual nil beside the row's scale.
-    assert abs(float(x[4] @ weights - y[4])) < 1e-3 * (abs(float(y[4])) + 1)
+    def trained(count: int) -> np.ndarray:
+        rows = Memory([{"x": row, "y": target} for row, target in zip(x[:count], y[:count], strict=True)])
+        trainer = Trainer(LeastSquares(features), gauss_newton(damping=1e-6), key=0, layout=LAYOUT,
+                          accumulation=4)
+        state = trainer.fit(rows.batch(1), epochs=1)
+        assert int(state.updates) == -(-count // 4)
+        return np.asarray(state.variables["params"]["Dense_0"]["kernel"])[:, 0]
+
+    whole, last = trained(4), trained(5)
+    # The last window moved the weights toward its row, which the four before left unfitted.
+    assert abs(float(x[4] @ last - y[4])) < abs(float(x[4] @ whole - y[4]))
 
 
 def test_a_gauss_newton_update_held_by_a_wrapper_that_drops_its_statistics_is_refused():

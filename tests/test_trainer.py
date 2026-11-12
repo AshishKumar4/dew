@@ -189,9 +189,12 @@ def test_a_runs_start_reports_each_phase_it_took_once():
     assert sorted(started) == ["startup/compile_seconds", "startup/data_seconds", "startup/warm_seconds"]
 
 
-def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
-    state = make_trainer(objective=TokenRegression()).fit(dataset(), steps=2, tokens=30)
-    assert int(state.step) == 2
+def test_a_run_given_steps_and_tokens_is_refused_as_a_budget_named_twice():
+    """One budget (row 5725): a fit given both `steps` and `tokens` is refused before it reads, as one given
+    steps and epochs is; tokens alone bound it."""
+    with pytest.raises(ValueError):
+        make_trainer(objective=TokenRegression()).fit(dataset(), steps=2, tokens=30)
+    assert int(make_trainer(objective=TokenRegression()).fit(dataset(), tokens=24).step) == 2
 
 
 @pytest.mark.parametrize("schedule", [None, Power(peak_value=.1, warmup_steps=2, a=.1, b=0),
@@ -204,7 +207,7 @@ def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
 
 def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):
     first = make_trainer(tmp_path, objective=TokenRegression())
-    assert int(first.fit(dataset(), steps=2, tokens=30, log_every=1).step) == 2
+    assert int(first.fit(dataset(), tokens=24, log_every=1).step) == 2
     assert first.checkpoints.control(2)["committed_tokens"] == 24
     resumed = make_trainer(tmp_path, objective=TokenRegression())
     assert int(resumed.fit(dataset(), tokens=30, log_every=1).step) == 3
@@ -296,7 +299,7 @@ def test_a_run_no_record_describes_checkpoints_its_reason_and_a_records_own_erro
 
 
 def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
-    make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), steps=2, tokens=30)
+    make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=24)
     trainer = make_trainer(tmp_path, objective=TokenRegression())
     state = trainer.initial_state()
     assert int(trainer.fit(dataset(), tokens=30, state=state).step) == 3
@@ -371,14 +374,6 @@ def test_a_batch_of_other_rows_than_its_loader_states_is_refused_before_it_is_pl
     with pytest.raises(ValueError):
         make_trainer().fit(dataset(stream), steps=4)
     assert int(make_trainer().fit(dataset(), steps=4).step) == 4
-
-
-def test_a_run_given_steps_and_tokens_is_refused_as_a_budget_named_twice():
-    """One budget (row 5725): a fit given both `steps` and `tokens` is refused before it reads, as one given
-    steps and epochs is; tokens alone bound it."""
-    with pytest.raises(ValueError):
-        budget_lm_trainer().fit(lm_data(), steps=2, tokens=96)
-    assert int(budget_lm_trainer().fit(lm_data(), tokens=96).step) == 2
 
 
 def test_a_direct_resume_into_another_models_computation_is_refused_and_its_own_resumes(tmp_path):
