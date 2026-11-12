@@ -6,8 +6,8 @@ pool, extends each of its layers' attention with DEX (`dew.nn.dex`), whose expor
 projection as it is written, and exports it as a saved run's release, the run's restore
 (`Pretrained.from_saved`) standing in for the placed decoder and the release cut into small shards,
 process 0 publishing and the other reading every tensor as it does (`publishes`). Each records the
-files it wrote and, exporting a deeper decoder (`DEEP`), how far its resident memory rises during the
-export and while it holds that decoder's whole tree home (`resident_growth`), and the decoder's size;
+files it wrote and, exporting a deeper decoder (`DEEP`), how far its allocated bytes rise during the
+export and while it holds that decoder's whole tree home (`allocated_growth`), and the decoder's size;
 outside the export's scope the write is refused. It also writes the same weights unplaced, as one
 process does. Every mode records what it saw into --out and asserts nothing.
 
@@ -22,9 +22,11 @@ import ctypes
 import functools
 import gc
 import hashlib
+import threading
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
+from typing import ClassVar
 
 from flax import linen as nn
 from process_support import serve_mode, worker_parser
@@ -35,8 +37,7 @@ FIELDS = {"vocab_size": 512, "emb_features": 64, "num_layers": 8, "num_heads": 4
 
 DEEP = {**FIELDS, "num_layers": 32, "emb_features": 128, "mlp_features": 512}
 """A decoder of about 31 MB in float32 whose largest tensors (the embedding, a feed-forward kernel) are
-256 KiB each, so a host holding one tensor home at a time holds a hundredth of it, and its resident
-memory's own movement during an export (2 to 6 MB on armada) stays far below half of it."""
+256 KiB each, so a host holding one tensor home at a time holds a hundredth of it."""
 
 TINY_SHARD = 4
 """Far below the production threshold, so the pool's mesh shards every kernel."""
@@ -47,7 +48,7 @@ SHARD = "64KB"
 RELEASE_SHARD = "1MB"
 """A saved run's release's shard size (`released`), so its 17 MB are written in shards each a fraction of
 it: the writer holds one shard at a time, and at the 5 GB default the release is one shard, which held
-the whole release on each host (19 to 22 MB of resident growth on armada) while tracemalloc read 0.25 MB."""
+the whole release on each host while tracemalloc read 0.25 MB."""
 
 
 def digests(directory: Path) -> dict[str, str]:
@@ -64,27 +65,51 @@ def tensors(directory: Path) -> dict[str, tuple[str, list[int], str]]:
 
 
 SAMPLED = 0.005
-"""Seconds between the resident counts `resident_growth` takes inside its block."""
+"""Seconds between the counts `allocated_growth` takes inside its block."""
+
+
+class _Mallinfo2(ctypes.Structure):
+    """glibc's `struct mallinfo2` (malloc.h), its fields in bytes."""
+    _fields_: ClassVar[list[tuple[str, type]]] = [(name, ctypes.c_size_t) for name in (
+        "arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks", "fsmblks", "uordblks", "fordblks",
+        "keepcost")]
+
+
+def allocated() -> int:
+    """The bytes glibc's allocator holds allocated, in every arena and every mapped chunk (`mallinfo2`'s
+    `uordblks` and `hblkhd`): NumPy's arrays and XLA CPU's buffers, a tensor read home among them, live
+    however their pages were come by."""
+    mallinfo2 = ctypes.CDLL(None).mallinfo2
+    mallinfo2.restype = _Mallinfo2
+    info = mallinfo2()
+    return info.uordblks + info.hblkhd
 
 
 @contextlib.contextmanager
-def resident_growth(into: list[int]) -> Iterator[None]:
-    """How far this process's resident pages rise above where they start within the block, appended to
-    `into`: the most of its exact counts (`dew.telemetry.benchmark.resident_peak`, every `SAMPLED`
-    seconds and as it ends), after a collection and glibc's return of its free pages (`malloc_trim`), so
-    pages a freed allocation left resident do not hide one that reuses them. The pages XLA's buffers newly
-    take are among them, the buffers a tensor is read home into, which tracemalloc, counting Python's and
-    NumPy's allocations alone, never sees (ledger 3794); storage another allocator keeps from before the
-    block and reuses is not, which each test checks against by the same measure over the whole tree held
-    home. What a block holds home past a sample's interval is counted: a whole tree read home before it is
-    written, which the export's bound is about."""
-    from dew.telemetry.benchmark import resident_peak
-
+def allocated_growth(into: list[int]) -> Iterator[None]:
+    """How far the bytes this process holds allocated (`allocated`) rise above where they start within the
+    block, appended to `into`: the most of its counts every `SAMPLED` seconds on a thread of its own and as
+    it ends, after a collection. What a block holds home past a sample's interval is counted: a whole tree
+    read home before it is written, which the export's bound is about. Resident pages, the measure before
+    it, did not count what the allocator served from pages freed earlier in the process: a tree held home
+    after an identical one was freed rose by under a fiftieth of itself, and after the exports before it
+    by under half (rows 5266, 5562)."""
     gc.collect()
-    ctypes.CDLL(None).malloc_trim(0)
-    with resident_peak(SAMPLED) as peak:
+    began = allocated()
+    most, stop = [began], threading.Event()
+
+    def sampled() -> None:
+        while not stop.wait(SAMPLED):
+            most[0] = max(most[0], allocated())
+
+    sampler = threading.Thread(target=sampled, daemon=True)
+    sampler.start()
+    try:
         yield
-    into.append(peak.rise())
+    finally:
+        stop.set()
+        sampler.join()
+        into.append(max(most[0], allocated()) - began)
 
 
 def exported(args) -> dict:
@@ -148,11 +173,11 @@ def exported(args) -> dict:
     _, _, deep, _, deep_bundle = built(DEEP)
     restoring(deep_bundle)
     growth: list[int] = []
-    with resident_growth(growth):
+    with allocated_growth(growth):
         export(f"deep{rank}")
     # The same measure over the deeper decoder's whole tree held home, every process taking part as the
     # export's reads do: it sees what a host holding the model holds.
-    with resident_growth(growth):
+    with allocated_growth(growth):
         held = [np.array(leaf) if leaf.is_fully_addressable
                 else np.asarray(multihost_utils.process_allgather(leaf, tiled=True))
                 for leaf in jax.tree.leaves(deep)]
@@ -173,7 +198,7 @@ def exported(args) -> dict:
 
 def scoped_growth(modules) -> list[dict]:
     """Each `reading_home` scope the export opens (`dew.interop.saved_sources`), as it closes: how far the
-    host's resident pages rose inside it (`resident_growth`) and whether its writer wrote weights."""
+    host's allocated bytes rose inside it (`allocated_growth`) and whether its writer wrote weights."""
     from dew import _coordination
 
     scopes: list[dict] = []
@@ -183,7 +208,7 @@ def scoped_growth(modules) -> list[dict]:
     def measured(phase, **options):
         growth: list[int] = []
         try:
-            with resident_growth(growth), opened(phase, **options):
+            with allocated_growth(growth), opened(phase, **options):
                 writes = _coordination.writes_weights()
                 yield
         finally:
@@ -220,7 +245,7 @@ def released(args) -> dict:
     read = list(scopes)
     scopes.clear()
     held: list[int] = []
-    with resident_growth(held):
+    with allocated_growth(held):
         tensors = [load_file(path) for path in sorted(Path(release).glob("*.safetensors"))]
     del tensors
     destination = Path(args.run_dir).parent / "exported"
