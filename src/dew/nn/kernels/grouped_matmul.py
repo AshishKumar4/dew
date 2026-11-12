@@ -2244,6 +2244,10 @@ DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str
     ('mma.sync', Kind(dense=True, made=Made.KERNEL_GRADIENT)):
         (XLA, "DENSE1 (A100, one program a multiprocessor): Mosaic 1.964x, Triton 1.735x XLA's dot; "
              "M-FS-9 (RTX PRO 6000): Mosaic 1.72x, Triton 1.28x"),
+    ('mma.sync', Kind(dense=False, made=Made.FORWARD)):
+        (CUTLASS, "M-EM-2 (A100-SXM4-40GB at 1095 MHz, base/kernels 59b96a9b4c2, 400 role-swapped pairs, A/A "
+                 "within 0.993-1.008): the template 1.07x CUTLASS's time, geomean of 5 grouped MoE rows "
+                 "(Qwen3-30B-A3B up 1.193, down 1.090; Mixtral up 0.795, down 1.090; GPT-OSS-20B up 1.244)"),
     ('wgmma', Kind(dense=False, made=Made.FORWARD)):
         (CUTLASS, "PAIR1-h100 (c771912a6, H100 SXM, a pair of multiprocessors a cluster multicasting each "
                  "group's matrix): the template 1.019x CUTLASS's time, geomean of 7 grouped MoE rows "
