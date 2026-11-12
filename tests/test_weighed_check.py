@@ -170,6 +170,30 @@ def judged_on_its_own(dew, label: str) -> None:
     parity.judge(drawn, CONDITIONED_SEEDS, label, conditioning=conditioning)
 
 
+def test_leaves_whose_rows_hold_one_value_are_classed_from_the_first_draw_alone():
+    """A leaf whose rows hold one value (a scalar loss, a last axis of one) has no heavy element, whatever
+    its draws: the classes of a site of such leaves are decided by its first draw's shapes, and its later
+    draws, each a run of its reference and its float64 truth, are not read. A leaf of wider rows beside
+    them is classed over every draw: its heavy elements are those of the errors pooled, which here are
+    not the first draw's."""
+    def runs(*errors):
+        # Each draw's reference off its truth (zeros) by `errors`' leaves at that draw.
+        for draw in zip(*errors, strict=True):
+            ran = [np.asarray(error, np.float64) for error in draw]
+            yield ran, [np.zeros_like(leaf) for leaf in ran]
+
+    narrow = runs([1.0, 2.0, 3.0, 4.0], [[[1.0], [5.0]]] * 4)
+    assert parity.heavy_masks(narrow) == [None, None]
+    assert len(list(narrow)) == 3
+    # The wide leaf's first draw errs at its first element alone; pooled, each of the other three holds 12
+    # of the row's 45 squared, past its uniform share, and the first 9, under it.
+    rows = [[[3.0, 0.0, 0.0, 0.0]]] + [[[0.0, 2.0, 2.0, 2.0]]] * 3
+    wide = runs([1.0, 2.0, 3.0, 4.0], [[[1.0], [5.0]]] * 4, rows)
+    scalar, single, classed = parity.heavy_masks(wide)
+    assert scalar is None and single is None and not list(wide)
+    np.testing.assert_array_equal(classed, [[False, True, True, True]])
+
+
 def test_the_librarys_judge_weighs_its_arms_as_the_suite_does():
     """dew.parity's `judge` with a conditioning decides alike: the reformulated arm passes, and the biased
     product, which the unweighted check leaves undecided, fails decided on its light elements."""
