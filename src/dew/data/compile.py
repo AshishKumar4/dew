@@ -1386,11 +1386,15 @@ def _compile_phases(
     per_share = not tokens and not first.build.global_order
     shared = _shared(source) if per_share else tuple({} for _ in source.pipelines)
     staged: list[tuple[_Staged, int | None]] = []
+    # Phases that share corpora hand their members' rows on in groups of the first one's batch alike.
+    grouped = first.build.batch if any(shared) else None
     for index, until in enumerate(source.ends):
         if per_share:
             # Its end is its step's, the steps its own stream reads.
-            staged.append((first if not index and not shared[0] else staged_at(index, {}, shared[index]),
-                           until))
+            phase = first if not index and not shared[0] else staged_at(index, {}, shared[index])
+            if shared[index]:
+                phase = dataclasses.replace(phase, build=dataclasses.replace(phase.build, grouped=grouped))
+            staged.append((phase, until))
             continue
         # A phase on the token clock ends where the run reaches it, so it is staged as it reads first,
         # and again with the ends of the phases before it once the run reaches them (`opened`).

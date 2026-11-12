@@ -1248,6 +1248,10 @@ class _Build:
     """The key of the chain this builds, read outside any mixture, where it was given a name: the key a
     mixture keys it by as its first member of that name (`dew.data.compile._own_key`), which its shuffles
     draw by (`ordered`)."""
+    grouped: int | None = None
+    """The rows its loading workers hand on a group at a time (`handed`) where phases share its corpora:
+    every such phase's alike (the first's batch), so a member's position one phase leaves is a position in
+    the next phase's read of it; None for its own batch."""
     stamped: frozenset[str] = frozenset()
     """The keys of its mix's members that later phases read on, read on their own streams (`StepPhases`):
     each draw of them says which it is (`DRAWN`, `dew.data.mixing.Stamping`), so the phase that reads one
@@ -1960,7 +1964,8 @@ class _Build:
         # A worker hands on its rows and markers a share's batch count at a time, the fields that
         # stack stacked as a batch's are, as many groups in flight as it had batches; an elastic read's
         # a whole batch's count, the same on every topology.
-        size = self.batch if self.elastic else partition.rows(self.batch)
+        batch = self.batch if self.grouped is None else self.grouped
+        size = batch if self.elastic else partition.rows(batch)
         read = functools.partial(self.read_in, pipeline=pipeline, partition=partition, pool=pool)
         if self.in_order and not isinstance(rows, pygrain.MapDataset):
             # Its rows come as a stream (a streamed read, a cache of each input's outputs), which every
