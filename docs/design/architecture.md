@@ -117,26 +117,13 @@ When one of Dew's layers calls an operation, a selector decides which kernel run
 
 The device's family comes from its compute capability: sm80, sm86, sm89 and sm120 are `mma.sync`; sm90 is `wgmma`; sm100 and sm103 are `tcgen05`. An old route keeps a cell only where a measured receipt shows it faster, declared on the operation (`Op.declared`). The end state in the spec is no selector at all: one template per operation, and plain XLA by a fixed capability rule on a GPU outside every family a template claims.
 
-| Operation | Default today | Template's place |
-|---|---|---|
-| Attention, bf16 or fp16, on H100 or A100 | FlashAttention, version 3 on sm90 and 2 on sm80, where it takes the call (declared cells, built into Dew's `dew-flash-attn` wheel) | Runs what FlashAttention refuses and the template supports: span masks, block groups, sinks, softcap, key validity. The template reads masks as spans, so an arbitrary dense mask goes to XLA or the reference implementation. The Mosaic mainloop is qualified on wgmma only, so on sm80 the template runs its Pallas-Triton mainloop. |
-| Attention, fp32, on wgmma and mma.sync GPUs | XLA (declared) |  |
-| Attention, sm100 and sm103 | Template, Pallas-Triton mainloop, or plain JAX | The tcgen05 mainloop is built but not routed. |
-| Attention, decode-shaped | The Pallas-Triton decode kernel |  |
-| Dense GEMM, sm80 and sm90 | XLA's dot, which calls cuBLAS (declared from measurements) | Dense calls reach the template through `projections.dot_general`; every dense cell on these GPUs is declared to XLA by receipt. |
-| Grouped GEMM (MoE) | Template: Mosaic GPU, then Mosaic TPU, then Triton | CUTLASS keeps the wgmma forward and input-gradient cells where installed; Triton keeps one mma.sync cell. |
-| Linear recurrence: gated delta, SSD, selective scan | Template first | The ported kernels (fla, mamba_ssm's SSD) keep their declared wgmma and mma.sync cells. |
-| RMSNorm and SwiGLU | XLA | Pallas-Triton on declared sm80 and sm90 cells: RMSNorm in bf16 and fp16, SwiGLU in bf16. |
-| TPU | Splash attention; the Mosaic TPU grouped GEMM |  |
-| CPU, and GPUs older than sm80 | XLA, or the template's plain-JAX mainloop |  |
-
-So on today's H100 and A100, a plain causal bf16 attention runs FlashAttention and a dense projection runs cuBLAS. The templates run the calls those kernels cannot take, the grouped and recurrent operations, and every cell where they measured faster. The spec counts each declared old route as a defect in the template: the profile finds why it loses, the template is fixed, and the old route is deleted once the template matches it.
+Which kernel takes which call today is not listed here, where a second list would drift from the first: it is each operation's `Op` in the code, its kernels in order with their requirements and its declared cells. The contract those routes are held to is [kernel-templates.md](kernel-templates.md), whose coverage tables (Appendices A to C) say what is supported, measured and missing, cell by cell. The spec counts each declared old route as a defect in the template: the profile finds why it loses, the template is fixed, and the old route is deleted once the template matches it.
 
 *Where it lives: `dew.nn.kernels.selection` (`Op`, `Kernel`, `select`), `dew.nn.kernels.generation` (`architecture`, `route`, `chosen`), `dew.nn.attention_kernels` (`ATTENTION`, `DECLARED`), `templates/attention_route.py`, `grouped_matmul.GROUPED`, `recurrence_chunk` (`GATED_DELTA`, `SCAN`, `SELECTIVE`), `norm_swiglu`.*
 
 ## The template engine
 
-*Routing the tcgen05 bundle and a TPU bundle are planned.*
+*A template's program admits an instruction family by its capabilities, which is admission and not a measured qualification: what is qualified on a device is its receipts'. tcgen05's overlap walk is a mainloop of its own.*
 
 A template is one algorithm, written once, that generates the kernel for the device it runs on. Dew has three: attention, linear recurrence and GEMM. The spec's long-term goal is a whole forward and backward pass as one persistent kernel generated from the device's facts. That fixes two things about the templates: each derives its one kernel from facts, with no lookup tables and no sweeps, and each keeps its operands, outputs and resources explicit, so a later scheduler can place them.
 
@@ -152,7 +139,7 @@ The math of a template lives once, as named pure functions on tile values. For a
 
 Everything that differs by GPU architecture lives once, in the shared Mosaic toolkit, as one `Family` per instruction family. A family is an `Issuer` composed with a `Transport`. The issuer owns the matrix instructions, their waits, where accumulators live and the register facts. The transport owns loading and the pipeline: the roles and their register budgets, the walk that streams each operand's blocks through rings, persistent loops, loads, stores and the fix-up of split tiles. A mainloop holds only the order of its bundle's steps around the algebra. A template has one mainloop for every family whose overlap structure is the same, and a separate thin one only where it differs.
 
-Seven GPU bundles exist. `WGMMA` serves sm90: a producer warpgroup and two consumers, with 227 KiB of shared memory. `FED` is wgmma with no producer, each consumer feeding its own ring, for tiles whose consumers need more registers than a producer leaves them (attention's backward takes it). `Mma` serves sm80 to sm89 with `mma.sync` and a single consumer, with 163 KiB of shared memory on sm80 and 99 KiB on sm86 and sm89. `MmaFed` is the same instructions with TMA loads, for sm120. `RINGS` serves sm100's and sm103's tensor-memory accumulators for a launch that states them (the GEMM's), `PAIR` its two-CTA products where a launch's config names it, and `CHUNKS` the recurrence's products read back into registers.
+The bundles are `templates/bundles.py`'s, each naming the roles, the loads and the accumulator home it composes for one family and overlap structure. Which families a template's program runs on is read from their capabilities (attention's Mosaic program takes every family that issues its products in its consumers, `Family.issues_in_consumers`, mma.sync and the TPU's among them), never from a list kept here; the one-template, thin-mainloop rule they serve is [kernel-templates.md](kernel-templates.md)'s.
 
 ### Configs from device facts
 
@@ -166,9 +153,9 @@ The compile report checks each derived config against ptxas. It reads every Mosa
 
 ## Derived forms
 
-*Behind a switch that is off by default. The dev-time generator and error-aware extraction are parked, and the `error_free` rule set is not built.*
+*Attention's step, merge and output compute by their derived forms; a dropping call's forward step is hand-written. The dev-time generator and error-aware extraction are parked, and the `error_free` rule set is not built.*
 
-The template's algebra is hand-written today. The aim is to derive it from a declaration of what the operation computes, using the same e-graph engine, and to swap the derived forms in behind one switch once they meet both bars: as fast on every scoreboard row the route serves, and on par by check 1 against float64.
+A template's algebra is derived from a declaration of what the operation computes, using the same e-graph engine, and a derived form takes a hand-written one's place once it meets both bars: as fast on every scoreboard row the route serves, and on par by check 1 against float64. There is no switch between the two: attention's forms are bound as **Binding** below says, and what is still hand-written is named there.
 
 ![The derivation path of a Reduction, attention's. A Scan takes a shorter one: its token update read as an affine map and its chunk form derived by identities in the e-graph (`linear_scan`), then the carry's extraction. Derivation runs at trace time today; the spec's dev-time generator, which would check the derived modules into the repository as reviewed code, is parked.](https://raw.githubusercontent.com/AshishKumar4/dew/main/docs/assets/architecture-derived.svg)
 
