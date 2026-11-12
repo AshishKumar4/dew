@@ -4,6 +4,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from recording import bits
 
 from dew.checkpoints import Checkpoints
 from dew.distributed.placement import MeshSpec
@@ -13,13 +14,12 @@ from dew.training import Trainer
 
 
 def sequence_learned_bits(state) -> list[np.ndarray]:
-    """Host byte views of `state`'s learned and optimizer-held trees (`variables`, `opt_state`, `ema`,
+    """Host arrays of `state`'s learned and optimizer-held trees (`variables`, `opt_state`, `ema`,
     `updates`), apart from attempt counters (`step`, `microstep`) and transient window buffers."""
-    from recording import bits
-
     checked = bits((state.variables, state.opt_state, state.ema, state.updates))
-    assert all(not jnp.issubdtype(leaf.dtype, jnp.inexact) or bool(jnp.all(jnp.isfinite(leaf)))
-               for leaf in checked)
+    for leaf in checked:
+        if jnp.issubdtype(leaf.dtype, jnp.inexact):
+            assert bool(jnp.all(jnp.isfinite(leaf)))
     return checked
 
 
@@ -31,6 +31,11 @@ def nudged_tree(tree, seed: int, scale: float = 0.4):
              if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
              for leaf, key in zip(leaves, keys, strict=True)]
     return jax.tree.unflatten(structure, moved)
+
+
+def _step_case(compiled, initial, data):
+    out_state, out_loss, out_metrics, *_ = compiled(jax.tree.map(jnp.copy, initial), data)
+    return out_state, sequence_learned_bits(out_state), np.asarray(out_loss), jax.device_get(out_metrics)
 
 
 def assert_sequence_filled_invariants(objective, filled, corrupted, repeats, *, splits=(1, 2),
@@ -47,21 +52,15 @@ def assert_sequence_filled_invariants(objective, filled, corrupted, repeats, *, 
         if nudge:
             initial = initial.replace(variables={**initial.variables,
                                                  "params": nudged_tree(initial.variables["params"], 17)})
-        step = trainer.compile(initial, filled)
-        first_state, first_loss, first_metrics, *_ = step(jax.tree.map(jnp.copy, initial), filled)
-        other_state, other_loss, other_metrics, *_ = step(jax.tree.map(jnp.copy, initial), corrupted)
-        for left, right in zip(sequence_learned_bits(first_state), sequence_learned_bits(other_state),
-                               strict=True):
-            np.testing.assert_array_equal(left, right)
-        np.testing.assert_array_equal(np.asarray(first_loss), np.asarray(other_loss))
-        jax.tree.map(np.testing.assert_array_equal, jax.device_get(first_metrics),
-                     jax.device_get(other_metrics))
-        idle_state, idle_loss, *_ = step(jax.tree.map(jnp.copy, initial), repeats)
-        assert int(idle_state.updates) == 0 and float(idle_loss) == 0.0
-        assert int(idle_state.step) == 1 and int(idle_state.microstep) == split
-        for left, right in zip(sequence_learned_bits(idle_state), sequence_learned_bits(initial),
-                               strict=True):
-            np.testing.assert_array_equal(left, right)
+        compiled = trainer.compile(initial, filled)
+        _, first_bits, first_loss, first_metrics = _step_case(compiled, initial, filled)
+        _, other_bits, other_loss, other_metrics = _step_case(compiled, initial, corrupted)
+        jax.tree.map(np.testing.assert_array_equal, (first_bits, first_loss, first_metrics),
+                     (other_bits, other_loss, other_metrics))
+        idle_state, idle_bits, idle_loss, _ = _step_case(compiled, initial, repeats)
+        assert (int(idle_state.updates), int(idle_state.step), int(idle_state.microstep)) == (0, 1, split)
+        assert float(idle_loss) == 0.0
+        jax.tree.map(np.testing.assert_array_equal, idle_bits, sequence_learned_bits(initial))
 
 
 def recorded_step_tapes(objective, batch, *, key: int = 7, split: int,
