@@ -183,10 +183,12 @@ def spread_matrices(stacks: Sequence[jax.Array | jax.ShapeDtypeStruct], devices:
                     ) -> list[tuple[int, int, int]]:
     """Each stack `orthogonalized` iterates of `stacks` (`spread_stacks`), as its matrices, padding among
     them, and their rows and columns."""
-    sets = spread_stacks(stacks, group)
-    matrices = [sum(stacks[index].shape[0] for index in members) for members in sets]
-    return [(count + -count % devices, *stacks[members[0]].shape[1:])
-            for members, count in zip(sets, matrices, strict=True)]
+    joined = []
+    for members in spread_stacks(stacks, group):
+        count = sum(stacks[index].shape[0] for index in members)
+        _, rows, columns = stacks[members[0]].shape
+        joined.append((count + -count % devices, rows, columns))
+    return joined
 
 
 def newton_schulz_flops(matrices: int, rows: int, columns: int, steps: int) -> float:
