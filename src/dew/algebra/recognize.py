@@ -80,8 +80,14 @@ def recognized(jaxpr: jcore.Jaxpr, index: fusion.Index, families: Sequence[Famil
     `NORMS`), an anchor's candidates in the order its family
     names them, the first equal one taken, no two regions sharing an equation nor one `held` (a product's
     epilogue's). Each region's choice is held by its structure and its constants' values (`_HELD_REGIONS`),
-    the body's whole recognition by its structure and constants (`_HELD_BODIES`)."""
-    key = (_body_key(jaxpr, index), held, tuple(family.anchor for family in families), derive.context(),
+    the body's whole recognition by its structure and constants (`_HELD_BODIES`). A body binding none of the
+    families' anchors, at any depth of the programs it nests (`_bound`), has no region to find and is
+    answered at once, before any key of it is built: most bodies of a model built of Dew's own layers, whose
+    kernels its selectors already call (a Qwen3.5-4B training step's plan keyed and searched 7,034 bodies,
+    half of one equation, for no region, 37 of its seconds, row 5556)."""
+    if _bound(jaxpr).isdisjoint(family.anchor for family in families):
+        return []
+    key = (_keyed(jaxpr, index), held, tuple(family.anchor for family in families), derive.context(),
            _cache.KERNEL_CHOICES.value)
     if key not in _HELD_BODIES:
         _HELD_BODIES[key] = [_positioned(jaxpr, written)
@@ -96,6 +102,18 @@ _HELD_BODIES: collections.OrderedDict[Hashable, list] = collections.OrderedDict(
 """Each body's recognition by its structure, its constants and the context it was weighed in
 (`recognized`), positioned (`_positioned`): every retrace of a step, and every layer body of one structure,
 recognized once, the latest `fusion.DECISIONS_HELD` held."""
+
+
+def _keyed(jaxpr: jcore.Jaxpr, index: fusion.Index) -> Hashable:
+    """`jaxpr`'s key (`_body_key`), built once a body however many family sets are asked of it (the
+    compile point asks attention's, then the norms')."""
+    if index not in _HELD_KEYS:
+        _HELD_KEYS[index] = _body_key(jaxpr, index)
+    return _HELD_KEYS[index]
+
+
+_HELD_KEYS: weakref.WeakKeyDictionary[fusion.Index, Hashable] = weakref.WeakKeyDictionary()
+"""Each body's key (`_keyed`), held while its index lives."""
 
 
 def _body_key(jaxpr: jcore.Jaxpr, index: fusion.Index) -> Hashable:
@@ -223,9 +241,35 @@ def _holds(equation: jcore.JaxprEqn, primitive: jcore.Primitive) -> bool:
 
 
 def _binds(equation: jcore.JaxprEqn, primitives: Sequence[jcore.Primitive]) -> bool:
-    """Whether `equation` binds one of `primitives`, at any depth of the programs it nests."""
+    """Whether `equation` binds one of `primitives`, at any depth of the programs it nests (`_bound`)."""
     return equation.primitive in primitives or any(
-        _binds(nested, primitives) for body in bodies(equation) for nested in body.eqns)
+        not _bound(body).isdisjoint(primitives) for body in bodies(equation))
+
+
+def _bound(jaxpr: jcore.Jaxpr) -> frozenset[jcore.Primitive]:
+    """The primitives `jaxpr` binds, at any depth of the programs it nests, found once a program
+    (`_HELD_BOUND`): a step's bodies nest (a checkpoint's layer, its calls, their derivatives), and each
+    level is asked of every program beneath it, which walked anew for each equation above grew with the
+    nesting's depth times the program's size. The programs beneath it are read innermost first from a
+    stack of this function's own, so their nesting's depth takes none of the interpreter's."""
+    pending = [jaxpr]
+    while pending:
+        program_ = pending[-1]
+        if program_ in _HELD_BOUND:
+            pending.pop()
+            continue
+        nested = [body for equation in program_.eqns for body in bodies(equation)]
+        unread = [body for body in nested if body not in _HELD_BOUND]
+        if unread:
+            pending.extend(unread)
+            continue
+        _HELD_BOUND[program_] = frozenset({equation.primitive for equation in program_.eqns}).union(
+            *(_HELD_BOUND[body] for body in nested))
+    return _HELD_BOUND[jaxpr]
+
+
+_HELD_BOUND: weakref.WeakKeyDictionary[jcore.Jaxpr, frozenset[jcore.Primitive]] = weakref.WeakKeyDictionary()
+"""Each program's primitives (`_bound`), held while the program lives."""
 
 
 def _between(index: fusion.Index, operands: Sequence[jcore.Var],
