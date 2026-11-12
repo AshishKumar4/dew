@@ -13,7 +13,7 @@ import optax
 import pytest
 from flax import struct
 from recording import bits
-from reference_error import assert_computes_the_oracle, chain_roundings
+from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings
 from test_env_rollout import kept_as_left
 
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, LatentEnv, WorldModel, lambda_return
@@ -787,3 +787,148 @@ def test_an_equal_objective_built_anew_counts_its_update_from_the_first_ones_tra
     with Compiles(None) as other:
         DreamerV3Objective(tiny(), imagination=4).training_flops(None, windows)
     assert any(program.kind == "traced" for program in other.programs)
+
+
+DREAMER_SPLIT_SEEDS = 32
+"""Check 1's seeds for Dreamer filled-and-split updates across GRU and TSSM dynamics."""
+
+
+def dreamer_windows(rows: int, seed: int, length: int = 6, obs_size: int = 2, action_size: int = 2,
+                    reward_scale: float = 25.0) -> dict[str, np.ndarray]:
+    """`rows` replay windows of `length` steps with rewards scaled by `reward_scale` so imagined return
+    percentiles span well past unit scale."""
+    rng = np.random.default_rng([seed, 31])
+    shape = (rows, length)
+    first = rng.uniform(size=shape) < 0.2
+    first[:, 0] = True
+    terminal = (rng.uniform(size=shape) < 0.15) & ~first
+    last = terminal | ((rng.uniform(size=shape) < 0.15) & ~first)
+    return {"observation": rng.normal(size=(*shape, obs_size)).astype(np.float32),
+            "action": rng.uniform(-1.0, 1.0, size=(*shape, action_size)).astype(np.float32),
+            "reward": (reward_scale * rng.normal(size=shape)).astype(np.float32),
+            "first": first, "last": last, "terminal": terminal}
+
+
+@pytest.mark.parametrize("mode", ["world_only", "gru", "transformer"])
+def test_dreamer_filled_batches_train_real_windows_alone(mode):
+    """A batch of Dreamer replay windows filled out with repeats (`FilledBatch`, `VALID_ROWS`) trains on
+    its real windows alone at `split=1` and `split=2` (world-model-only, block-GRU and TSSM dynamics):
+    whatever sits in the repeat windows (including NaN observations and rewards), the stepped parameters,
+    `returns` percentiles, slow critic EMA, loss and metrics match bit for bit; and an all-invalid batch
+    commits no update."""
+    from rl_split_support import assert_sequence_filled_invariants
+
+    from dew.batch import VALID_ROWS
+    from dew.data.dataset import FilledBatch
+
+    dynamics = TSSM(action_size=2, stoch=4, classes=4, width=16, layers=1, heads=2, context=6)
+    model = tiny(2, 2, dynamics=dynamics if mode == "transformer" else None)
+    scales = {"policy": 0.0, "value": 0.0, "replay_value": 0.0} if mode == "world_only" else None
+    objective = DreamerV3Objective(model, imagination=4, return_rate=0.5, slow_decay=0.9, scales=scales)
+    filled = FilledBatch(4).map(dreamer_windows(3, 0))
+    assert filled[VALID_ROWS].tolist() == [True, True, True, False]
+    corrupted = {name: np.asarray(value).copy() for name, value in filled.items()}
+    drawn = dreamer_windows(4, 2, reward_scale=500.0)
+    for name, value in drawn.items():
+        corrupted[name][3] = value[3]
+    corrupted["observation"][3] = np.nan
+    corrupted["reward"][3] = np.nan
+    assert_sequence_filled_invariants(objective, filled, corrupted,
+                                      FilledBatch(4, real=False).map(dreamer_windows(3, 0)), nudge=True)
+
+
+def test_dreamer_split_step_preserves_draws_percentiles_and_mid_window_resume(tmp_path):
+    """Splitting a Dreamer step into microbatches on a model with nonconstant imagined returns draws
+    identical per-example posterior latents and imagined rollouts, updates `returns` percentiles once
+    over the logical minibatch rather than once a part, and resumes mid-window from its stored
+    `batch_statistics`."""
+    from rl_split_support import assert_mid_window_resume, nudged_tree, recorded_step_tapes
+
+    objective = DreamerV3Objective(tiny(2, 2), imagination=4, return_rate=0.5, slow_decay=0.9)
+    warmed_vars = {"params": nudged_tree(objective.init(jax.random.key(0))["params"], 13, scale=0.8),
+                   "returns": {"low": jnp.zeros((), jnp.float32), "high": jnp.zeros((), jnp.float32)}}
+    batch_a, batch_b = dreamer_windows(4, 5), dreamer_windows(4, 6)
+    split_state, split_tapes = recorded_step_tapes(objective, batch_a, key=9, split=2, variables=warmed_vars)
+    _, whole_tapes = recorded_step_tapes(objective, batch_a, key=9, split=1, variables=warmed_vars)
+    assert set(split_tapes) == {"posterior draw", "imagined latent", "imagined action"}
+    for name in split_tapes:
+        np.testing.assert_array_equal(split_tapes[name], whole_tapes[name], err_msg=name)
+    split_returns = jax.device_get(split_state.variables["returns"])
+    assert float(split_returns["low"]) < float(split_returns["high"])
+    with jax.enable_x64(new_val=True):
+        wide_obj = DreamerV3Objective(tiny(2, 2, dtype=jnp.float64), imagination=4, return_rate=0.5,
+                                      slow_decay=0.9)
+        wide_vars = {"params": nudged_tree(wide_obj.init(jax.random.key(0))["params"], 13, scale=0.8),
+                     "returns": {"low": jnp.zeros((), jnp.float64), "high": jnp.zeros((), jnp.float64)}}
+        wide_batch = {k: v.astype(np.float64) if v.dtype == np.float32 else v for k, v in batch_a.items()}
+        wide_split, _ = recorded_step_tapes(wide_obj, wide_batch, key=9, split=2, variables=wide_vars)
+        wide_whole, _ = recorded_step_tapes(wide_obj, wide_batch, key=9, split=1, variables=wide_vars)
+        s_ret = jax.device_get(wide_split.variables["returns"])
+        w_ret = jax.device_get(wide_whole.variables["returns"])
+        assert_computes_the_oracle(np.asarray([s_ret["low"], s_ret["high"]]),
+                                   np.asarray([w_ret["low"], w_ret["high"]]),
+                                   "Dreamer split return percentiles", roundings=64)
+    assert_mid_window_resume(objective, batch_a, batch_b, str(tmp_path / "mid"), nudge=True)
+
+
+@pytest.mark.parametrize("dynamics_kind", ["gru", "transformer"])
+def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamics_kind):
+    """A DreamerV3 update on 6 real windows padded to 8 with `FilledBatch` and stepped in `split=2`
+    microbatches through `Trainer` (with perturbed reward and value heads so imagined returns span well
+    past unit scale) updates parameters and slow critic EMA as `split=1` on the 6 real windows does,
+    held to the float64 update by check 1."""
+    from float64_replay import float64_replay
+    from rl_split_support import nudged_tree, prepare_split_whole_steps
+
+    from dew.averaging import ema_update
+    from dew.batch import merge
+    from dew.data.dataset import FilledBatch
+    from dew.objectives.base import Step
+
+    rate, slow_decay, obs_size, action_size = 0.05, 0.9, 16, 16
+    dyn = (None if dynamics_kind == "gru"
+           else TSSM(action_size=action_size, stoch=4, classes=4, width=32, layers=1, heads=2, context=6))
+    model = WorldModel(obs_size, action_size, dynamics=dyn, deter=32, hidden=32, stoch=4, classes=4,
+                       blocks=2, units=32)
+    objective = DreamerV3Objective(model, imagination=4, return_rate=0.5, slow_decay=slow_decay,
+                                   entropy=1e-2, imitation=0.5, smoothness=0.01, slow_targets=True)
+    template = dreamer_windows(6, 0, obs_size=obs_size, action_size=action_size)
+    split_start, whole_start, split_step, whole_step, update_key = prepare_split_whole_steps(
+        objective, rate, jax.random.key(33), template, FilledBatch(8).map(template))
+    init_fn = jax.jit(objective.init)
+    seeded_returns = {"low": jnp.asarray(-5.0, jnp.float32), "high": jnp.asarray(15.0, jnp.float32)}
+
+    def draw(seed: int):
+        base_params = init_fn(jax.random.key(seed))["params"]
+        variables = {"params": nudged_tree(base_params, seed + 1000, scale=0.6), "returns": seeded_returns}
+        ema = {"params": {"value": jax.tree.map(lambda x: x * 0.8, variables["params"]["value"])}}
+        real_batch = dreamer_windows(6, seed, obs_size=obs_size, action_size=action_size)
+        filled_batch = FilledBatch(8).map(real_batch)
+        s_state = jax.tree.map(jnp.copy, split_start.replace(variables=variables, ema=ema))
+        w_state = jax.tree.map(jnp.copy, whole_start.replace(variables=variables, ema=ema))
+        s_next = split_step(s_state, filled_batch)[0]
+        w_next = whole_step(w_state, real_batch)[0]
+        split_out = (s_next.variables["params"], s_next.ema)
+        whole_out = (w_next.variables["params"], w_next.ema)
+        return variables, ema, real_batch, split_out, whole_out
+
+    def whole_update(variables, ema, real_batch, _so, _wo):
+        step_info = Step(jnp.zeros((), jnp.int32), jax.random.fold_in(whole_start.key, 0),
+                         merge(variables, ema),
+                         committed=jnp.zeros((), jnp.int32), example_key=update_key,
+                         example_index=jnp.arange(6, dtype=jnp.int32), example_count=6)
+        grads = jax.grad(
+            lambda p: objective.scalar_loss({**variables, "params": p}, real_batch, step_info)[0]
+        )(variables["params"])
+        params_next = jax.tree.map(lambda leaf, grad: leaf - rate * grad, variables["params"], grads)
+        ema_next = ema_update(ema, {"params": params_next}, slow_decay)
+        return params_next, ema_next
+
+    def split_arm(_v, _e, _b, split_out, _wo):
+        return split_out
+
+    def whole_arm(_v, _e, _b, _so, whole_out):
+        return whole_out
+
+    assert_as_exact(split_arm, whole_arm, draw, f"DreamerV3 filled and split update ({dynamics_kind})",
+                    seeds=DREAMER_SPLIT_SEEDS, truth_fn=float64_replay(whole_update, compiled=True))

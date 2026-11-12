@@ -13,9 +13,9 @@ import optax
 import pytest
 from flax import struct
 from recording import bits
-from reference_error import assert_computes_the_oracle, chain_roundings
+from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings
 
-from dew.objectives.base import Shown
+from dew.objectives.base import Ratio, Shown
 from dew.objectives.rl.control import (
     ActorCritic,
     ControlPPOObjective,
@@ -198,6 +198,246 @@ def test_advantages_are_brax_two_passes_over_each_sequence():
             expected[row, t] = 2 * rewards[row, t] + 0.97 * (not terminated[row, t]) * after - values[row, t]
     assert_computes_the_oracle(targets, expected_targets, "value targets", roundings=roundings)
     assert_computes_the_oracle(advantages, expected, "advantages", roundings=roundings)
+
+
+def control_sequences(rows: int, seed: int, length: int = 8, obs_size: int = 2) -> dict[str, np.ndarray]:
+    """`rows` control sequences of `length` steps as a collection holds them, drawn from `seed`."""
+    rng = np.random.default_rng([seed, 7])
+    shape = (rows, length)
+    terminated = rng.uniform(size=shape) < 0.15
+    truncated = (rng.uniform(size=shape) < 0.15) & ~terminated
+    return {"observation": rng.normal(size=(*shape, obs_size)).astype(np.float32),
+            "following": rng.normal(size=(*shape, obs_size)).astype(np.float32),
+            "raw_action": rng.normal(size=(*shape, 1)).astype(np.float32),
+            "log_prob": (rng.normal(size=shape) - 1.0).astype(np.float32),
+            "reward": rng.normal(size=shape).astype(np.float32),
+            "terminated": terminated, "truncated": truncated}
+
+
+def test_ppo_trains_on_a_filled_batchs_real_sequences_alone():
+    """A batch of control sequences filled out with repeats (`FilledBatch`, `VALID_ROWS`) trains on its
+    real sequences alone through the trainer at `split=1` and `split=2`: whatever sits in the repeat
+    rows (including NaN observations, rewards and actions), the stepped state, loss and metrics match
+    bit for bit; and an all-invalid batch has no mass and commits no update."""
+    from rl_split_support import assert_sequence_filled_invariants
+
+    from dew.batch import VALID_ROWS
+    from dew.data.dataset import FilledBatch
+
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (16, 16)), 2, discount=0.9, entropy_cost=1e-2)
+    filled = FilledBatch(4).map(control_sequences(3, 0))
+    assert filled[VALID_ROWS].tolist() == [True, True, True, False]
+    corrupted = {name: np.asarray(value).copy() for name, value in filled.items()}
+    drawn = control_sequences(4, 1)
+    for name, value in drawn.items():
+        corrupted[name][3] = value[3]
+    corrupted["observation"][3] = np.nan
+    corrupted["reward"][3] = np.nan
+    corrupted["raw_action"][3] = np.nan
+    corrupted["log_prob"][3] = np.nan
+    assert_sequence_filled_invariants(objective, filled, corrupted,
+                                      FilledBatch(4, real=False).map(control_sequences(3, 0)))
+
+
+def test_ppo_split_step_preserves_whitening_draws_and_mid_window_resume(tmp_path):
+    """Splitting a PPO step into microbatches whitens advantages over the logical minibatch (so two
+    one-step sequences of advantages [1, 3] do not collapse to [0, 0] in singleton microbatches), draws
+    identical per-example entropy noise, adds no forward-to-backward residuals to the microbatch
+    footprint, and resumes mid-window from its stored `batch_statistics`."""
+    from rl_split_support import assert_mid_window_resume, recorded_step_tapes
+
+    from dew.distributed.placement import MeshSpec
+    from dew.training import Trainer
+
+    actor_only = ControlPPOObjective(ActorCritic(1, (8,), (8,)), 2, discount=0.9, value_cost=0.0,
+                                     entropy_cost=0.0)
+    two_rows = {"observation": np.asarray([[[-1.0, 0.5]], [[1.0, -0.5]]], np.float32),
+                "following": np.zeros((2, 1, 2), np.float32),
+                "raw_action": np.asarray([[[0.2]], [[-0.3]]], np.float32),
+                "log_prob": np.zeros((2, 1), np.float32),
+                "reward": np.asarray([[1.0], [3.0]], np.float32),
+                "terminated": np.ones((2, 1), bool), "truncated": np.zeros((2, 1), bool)}
+
+    def run_two(split: int):
+        trainer = Trainer(actor_only, optax.sgd(0.2), key=jax.random.key(4), split=split,
+                          checkpoints=None, tracker=None)
+        trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+        state = trainer.initial_state()
+        step = trainer.compile(state, two_rows)
+        moved, loss, *_ = step(jax.tree.map(jnp.copy, state), two_rows)
+        return state, moved, float(loss)
+
+    base_state, _, whole_loss = run_two(1)
+    _, split_two, split_loss = run_two(2)
+    assert not all(np.array_equal(np.asarray(a), np.asarray(b))
+                   for a, b in zip(jax.tree.leaves(split_two.variables["params"]["policy_net"]),
+                                   jax.tree.leaves(base_state.variables["params"]["policy_net"]),
+                                   strict=True))
+    np.testing.assert_array_equal(np.float32(split_loss), np.float32(whole_loss))
+    assert np.isfinite(split_loss) and split_loss != 0.0
+
+    objective = ControlPPOObjective(ActorCritic(1, (16, 16), (16, 16)), 2, discount=0.9, entropy_cost=0.1)
+    batch_a, batch_b = control_sequences(4, 10), control_sequences(4, 11)
+    _, split_tapes = recorded_step_tapes(objective, batch_a, split=2)
+    _, whole_tapes = recorded_step_tapes(objective, batch_a, split=1)
+    np.testing.assert_array_equal(split_tapes["entropy noise"], whole_tapes["entropy noise"])
+
+    planned, mesh = assert_mid_window_resume(objective, batch_a, batch_b, str(tmp_path / "mid"))
+    half_trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(8), split=1,
+                           checkpoints=None, tracker=None)
+    half_trainer.device_mesh = mesh
+    half_planned = half_trainer._compiled_plan(half_trainer.initial_state(), control_sequences(2, 10),
+                                               None, None)
+    assert (planned.candidate.footprint is not None and half_planned.candidate.footprint is not None
+            and planned.candidate.footprint.residuals == half_planned.candidate.footprint.residuals)
+
+
+@struct.dataclass
+class _CompositeLoss:
+    first: Ratio
+    second: Ratio
+
+
+def test_split_batch_statistics_refresh_on_rejection_and_replay_composite_terms():
+    """A split step's `batch_statistics` replays into earlier slots for composite loss statistics, and
+    refreshes on the new rejection stream when dynamic loss scaling rejects part 0."""
+    from dew.distributed.placement import MeshSpec
+    from dew.objectives.base import EXAMPLE_STREAM, Aux, Objective, Step
+    from dew.state import apart, together
+    from dew.training import Trainer
+
+    def int_draw(key):
+        return jax.random.randint(key, (), 1, 97).astype(jnp.float32)
+
+    class CompositeObjective(Objective[_CompositeLoss]):
+        def __init__(self, *, streamed: bool):
+            self.streamed = streamed
+
+        def fresh_variables(self, key, held):
+            del key, held
+            return {"params": {"w": jnp.asarray([1.0, 1.0], jnp.float32)}}
+
+        def batch_statistics(self, variables, part_at, split):
+            del variables
+
+            def each(_, index):
+                micro, step = part_at(index)
+                rows = micro["x"].shape[0]
+                vals = step.sample("stat int", int_draw, rows=rows) if self.streamed else micro["x"]
+                return None, jnp.mean(vals)
+
+            _, means = jax.lax.scan(each, None, jnp.arange(split, dtype=jnp.int32))
+            return (jnp.mean(means),)
+
+        def loss(self, variables, batch, step: Step):
+            rows = batch["x"].shape[0]
+            drawn = step.sample("stat int", int_draw, rows=rows) if self.streamed else batch["x"]
+            stat = jnp.mean(drawn) if step.batch_statistics is None else step.batch_statistics[0]
+            w = variables["params"]["w"]
+            mass = jnp.asarray(rows, jnp.float32)
+            bad = jnp.any(batch["reject"])
+            first_total = jnp.where(bad, jnp.nan, jnp.sum(w[0] * jnp.square(drawn - stat)))
+            second_total = jnp.sum(w[1] * stat * batch["x"])
+            return _CompositeLoss(Ratio(first_total, mass), Ratio(second_total, mass)), Aux({})
+
+        def reduce_loss(self, stats: _CompositeLoss):
+            a, a_ok = stats.first.mean()
+            b, b_ok = stats.second.mean()
+            return a + b, a_ok | b_ok
+
+    mesh = MeshSpec().build(jax.devices()[:1])
+    plain_batch = {"x": np.asarray([2.0, 4.0, 6.0, 8.0], np.float32), "reject": np.zeros(4, bool)}
+    outputs = []
+    for split in (1, 2):
+        trainer = Trainer(CompositeObjective(streamed=False), optax.sgd(0.5), key=jax.random.key(5),
+                          split=split, checkpoints=None, tracker=None)
+        trainer.device_mesh = mesh
+        state = trainer.initial_state()
+        step_fn = trainer.compile(state, plain_batch)
+        moved, *_ = step_fn(state, plain_batch)
+        outputs.append(np.asarray(moved.variables["params"]["w"]))
+    np.testing.assert_array_equal(outputs[1], outputs[0])
+
+    scaled_obj = CompositeObjective(streamed=True)
+    root_key = jax.random.key(12)
+    scaled_trainer = Trainer(scaled_obj, optax.sgd(0.5), key=root_key, split=2,
+                             dynamic_scale=True, checkpoints=None, tracker=None)
+    scaled_trainer.device_mesh = mesh
+    state = scaled_trainer.initial_state()
+    step_fn = scaled_trainer.compile(state, plain_batch)
+    reject_part0 = {"x": np.asarray([2.0, 4.0, 6.0, 8.0], np.float32),
+                    "reject": np.asarray([True, False, True, False])}
+    after_first, *_ = step_fn(jax.tree.map(jnp.copy, state), reject_part0)
+    assert int(after_first.updates) == 0 and int(after_first.microstep) == 1
+    planned = scaled_trainer._compiled_plan(state, plain_batch, None, None)
+    parts = planned.parts(mesh)
+    moving, frozen = apart(after_first)
+    moving, *_ = planned.executable(moving, frozen, jax.device_put(plain_batch, jax.devices()[0]), parts[0])
+    closed = together(moving, frozen)
+    assert int(closed.updates) == 1
+
+    rej1_key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM), 0), 1)
+    step_slot0 = Step(jnp.int32(0), jax.random.key(0), None, example_key=rej1_key,
+                      example_index=jnp.asarray([1, 3], jnp.int32), example_count=4)
+    step_slot0_p0 = Step(jnp.int32(0), jax.random.key(0), None, example_key=rej1_key,
+                         example_index=jnp.asarray([0, 2], jnp.int32), example_count=4)
+    d_p0 = step_slot0_p0.sample("stat int", int_draw, rows=2)
+    d_p1 = step_slot0.sample("stat int", int_draw, rows=2)
+    stat_batch1 = 0.5 * (jnp.mean(d_p0) + jnp.mean(d_p1))
+    grad_slot0 = jnp.asarray([jnp.mean(jnp.square(d_p1 - stat_batch1)),
+                              jnp.mean(stat_batch1 * jnp.asarray([4.0, 8.0], jnp.float32))], jnp.float32)
+    grad_slot1 = jnp.asarray([jnp.mean(jnp.square(d_p0 - stat_batch1)),
+                              jnp.mean(stat_batch1 * jnp.asarray([2.0, 6.0], jnp.float32))], jnp.float32)
+    expected_w = np.asarray(jnp.asarray([1.0, 1.0], jnp.float32) - 0.5 * 0.5 * (grad_slot0 + grad_slot1))
+    np.testing.assert_array_equal(np.asarray(closed.variables["params"]["w"]), expected_w)
+
+
+def test_ppo_filled_and_split_step_updates_as_the_real_minibatch_whole():
+    """A PPO update on 6 real sequences padded to 8 with `FilledBatch` and stepped in `split=2`
+    microbatches through `Trainer` updates every parameter as `split=1` on the 6 real sequences does,
+    held to the float64 update by check 1."""
+    from float64_replay import float64_replay
+    from rl_split_support import prepare_split_whole_steps
+
+    from dew.data.dataset import FilledBatch
+    from dew.objectives.base import Step
+
+    rate = 0.1
+    objective = ControlPPOObjective(ActorCritic(2, (16, 16), (16, 16)), 3, discount=0.95, lam=0.9,
+                                    entropy_cost=0.05)
+    template = control_sequences(6, 0, length=6, obs_size=3)
+    template["raw_action"] = np.random.default_rng(1).normal(size=(6, 6, 2)).astype(np.float32)
+    split_start, whole_start, split_step, whole_step, update_key = prepare_split_whole_steps(
+        objective, rate, jax.random.key(21), template, FilledBatch(8).map(template))
+    init_fn = jax.jit(objective.init)
+
+    def batch_for(seed: int) -> dict[str, np.ndarray]:
+        rng = np.random.default_rng([seed, 99])
+        seq = control_sequences(6, seed, length=6, obs_size=3)
+        seq["raw_action"] = rng.normal(size=(6, 6, 2)).astype(np.float32)
+        return seq
+
+    def draw(seed: int):
+        params = init_fn(jax.random.key(seed))["params"]
+        real_batch = batch_for(seed)
+        filled_batch = FilledBatch(8).map(real_batch)
+        s_state = jax.tree.map(jnp.copy, split_start.replace(variables={"params": params}))
+        w_state = jax.tree.map(jnp.copy, whole_start.replace(variables={"params": params}))
+        moved_split = split_step(s_state, filled_batch)[0].variables["params"]
+        moved_whole = whole_step(w_state, real_batch)[0].variables["params"]
+        return params, real_batch, moved_split, moved_whole
+
+    def whole_update(params, real_batch, _ms, _mw):
+        step_info = Step(jnp.zeros((), jnp.int32), jax.random.fold_in(whole_start.key, 0), None,
+                         committed=jnp.zeros((), jnp.int32), example_key=update_key,
+                         example_index=jnp.arange(6, dtype=jnp.int32), example_count=6)
+        grads = jax.grad(lambda p: objective.scalar_loss({"params": p}, real_batch, step_info)[0])(params)
+        return jax.tree.map(lambda leaf, grad: leaf - rate * grad, params, grads)
+
+    assert_as_exact(lambda _p, _b, moved_split, _mw: moved_split,
+                    lambda _p, _b, _ms, moved_whole: moved_whole, draw,
+                    "control PPO filled and split update", seeds=8,
+                    truth_fn=float64_replay(whole_update, compiled=True))
 
 
 @pytest.mark.parametrize("simulated", [False, True], ids=["env", "simulator"])
