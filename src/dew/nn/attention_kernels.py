@@ -203,9 +203,6 @@ class AttentionCase:
     template does not take it."""
     rows: int = 1
     """The call's rows, every leading axis of the query's `[B, T, N, D]` (a batch, its chunks)."""
-    drop_placed: bool = False
-    """Whether its dropout draws at a sequence slice's global queries or keys (`template.DropPlaces`), which
-    the Mosaic dropping walk does not read (`attention_route.drops`)."""
 
     @property
     def cell(self) -> tuple[str | None, "CallKind"]:
@@ -563,7 +560,7 @@ TEMPLATE_SUPPORTS = (
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),
     _Need('dropout',
-          lambda case: not case.dropout or attention_route.drops(case.dtype, placed=case.drop_placed),
+          lambda case: not case.dropout or attention_route.drops(case.dtype),
           attention_route.DROPS_NOT, row='1521'),
     _ARITHMETIC,
 )
@@ -608,7 +605,7 @@ falls toward 1.02. An fp32 call's: a training step's attention at Qwen3-8B's wid
 CELLS-a100)."""
 
 
-FLASH = Kernel[AttentionCase]('flash', FLASH_SUPPORTS)
+FLASH = Kernel[AttentionCase]('flash', FLASH_SUPPORTS, reverse_only=True)
 XLA = Kernel[AttentionCase]('xla', (_FAST_HANDOFF, *XLA_SUPPORTS), generic=True)
 INFERENCE = Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS, _Need(
     'spans_only', lambda case: not case.spans_only,
@@ -750,12 +747,12 @@ def _cudnn_loads() -> bool:
 
 ATTENTION = Op[AttentionCase](Choice.ATTENTION, (
     FLASH,
-    Kernel[AttentionCase]('triton', TRITON_SUPPORTS),
-    Kernel[AttentionCase]('cudnn', (_FAST, *CUDNN_SUPPORTS)),
-    Kernel[AttentionCase]('tpu', TPU_SUPPORTS),
+    Kernel[AttentionCase]('triton', TRITON_SUPPORTS, reverse_only=True),
+    Kernel[AttentionCase]('cudnn', (_FAST, *CUDNN_SUPPORTS), reverse_only=True),
+    Kernel[AttentionCase]('tpu', TPU_SUPPORTS, reverse_only=True),
     XLA,
     Kernel[AttentionCase]('reference', (), generic=True),
-    Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
+    Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS, reverse_only=True),
     INFERENCE,
 ), _attention_preferred, _unlowered, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
@@ -803,10 +800,10 @@ to 65 against 35.6, ET-DFP32-h100-pcie)."""
 
 DECODE = Op[AttentionCase](Choice.DECODE, (
     Kernel[AttentionCase]('decode', decode_attention.SUPPORTS),
-    Kernel[AttentionCase]('cudnn', (*CUDNN_SUPPORTS, decode_attention.PRODUCTS)),
+    Kernel[AttentionCase]('cudnn', (*CUDNN_SUPPORTS, decode_attention.PRODUCTS), reverse_only=True),
     DECODE_XLA,
     Kernel[AttentionCase]('reference', (), generic=True),
-    Kernel[AttentionCase]('template', (*TEMPLATE_SUPPORTS, decode_attention.PRODUCTS)),
+    Kernel[AttentionCase]('template', (*TEMPLATE_SUPPORTS, decode_attention.PRODUCTS), reverse_only=True),
 ), _decode_preferred, _unlowered, DECODE_DECLARED)
 """The selector of a call of few query positions over key lengths (`decodes`): the decode kernel
 (`decode_attention.attend`), cuDNN and the folded xla attention (`folded_attention`), a declared cell's
@@ -815,6 +812,11 @@ kernel first (`DECODE_DECLARED`), each fused kernel only where it computes the r
 `attention_route.attend`) where a call or a run's context names it (`generation.chosen(decode='template')`),
 until it measures faster than the decode kernel (rows 4042 to 4045, 4075)."""
 
+
+def reverse_only(kernel: str) -> bool:
+    """Whether the attention kernel named `kernel`, either selector's (`ATTENTION`, `DECODE`), defines its
+    reverse-mode derivative alone (`Kernel.reverse_only`)."""
+    return any(each.reverse_only for op in (ATTENTION, DECODE) for each in op.kernels if each.name == kernel)
 
 
 def decodes(case: AttentionCase) -> bool:

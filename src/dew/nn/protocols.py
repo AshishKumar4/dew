@@ -906,9 +906,8 @@ class ProjectionGroup:
         `projections()`, `{name: (inputs, outputs)}`, the geometry its setup builds."""
         return cls(path, packed, members, tuple(projections[name][1] for name in members))
 
-    def split[ArrayT: (jax.Array, np.ndarray)](self, out: ArrayT) -> tuple[ArrayT, ...]:
-        """The members' outputs from the packed projection's `out`, in member order: a traced array's or a
-        host array's (a served checkpoint's stored projection, `dew.checkpoints.served`), each its slice."""
+    def split(self, out: jax.Array) -> tuple[jax.Array, ...]:
+        """The members' outputs from the packed projection's `out`, in member order, each its slice."""
         ends = np.cumsum(self.widths)
         return tuple(out[..., int(end - width):int(end)]
                      for end, width in zip(ends, self.widths, strict=True))

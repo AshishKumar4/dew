@@ -52,6 +52,7 @@ from dew.nn.inputs import (
     counted_places,
     document_reach,
     fork_runs,
+    fork_slots,
     intersected_runs,
 )
 from dew.nn.inspection import QK
@@ -247,12 +248,10 @@ def fork_key_places(metadata: AttentionMetadata, rotary_positions, first: jax.Ar
     rotary position, and the row's cached tokens before them counted back from the place of the call's
     roots, the least of its tokens' (the cache's last document continuing into them, one token a place)."""
     positions = jnp.broadcast_to(jnp.asarray(rotary_positions, jnp.int32), (batch, queries))
-    valid = coordinates_of(metadata, batch, queries).valid
-    # A call that states no validity holds real tokens alone (`fork_runs`).
-    real = jnp.ones((batch, queries), bool) if valid is None else jnp.asarray(valid, bool)
+    written = fork_slots(metadata, batch, queries, first)
+    real = written >= 0
     slots = jnp.arange(keys, dtype=jnp.int32)[None, :]
     root = jnp.min(jnp.where(real, positions, jnp.iinfo(jnp.int32).max), axis=-1, keepdims=True)
-    written = first[:, None] + jnp.cumsum(real, axis=-1, dtype=jnp.int32) - 1
     rows = jnp.arange(batch)[:, None]
     cached = root - first[:, None] + slots
     held = cached.at[rows, jnp.where(real, written, keys)].set(positions, mode="drop")
@@ -279,7 +278,7 @@ def fork_anchor(written: jax.Array, documents: jax.Array) -> tuple[jax.Array, ja
 
 def dense_visibility(mask, documents, causal: bool, window: int | None, valid, runs, places, key_places,
                      queries: int, keys: int, chunk: int | None, *, block_groups=None,
-                     image_groups=None) -> jax.Array:
+                     image_groups=None, query_slots=None) -> jax.Array:
     """The `[B, 1, queries, keys]` mask of a call's visibility as a kernel reads it: `mask` with its
     documents, causality, window, block and image groups, key validity `valid` and key runs folded in
     (`visibility_mask`, the window counting real tokens where validity is given, or a runs call's from its
@@ -288,8 +287,19 @@ def dense_visibility(mask, documents, causal: bool, window: int | None, valid, r
     (`places`, `key_places`), never its cache slot."""
     counted = (places, key_places) if runs is not None else None if valid is None else places
     seen = visibility_mask(queries, keys, causal, window, mask, documents, block_groups=block_groups,
-                           image_groups=image_groups, key_valid=valid, key_runs=runs, places=counted)
+                           image_groups=image_groups, key_valid=valid, key_runs=runs, places=counted,
+                           query_slots=query_slots)
     return seen if chunk is None else seen & chunk_mask(places, key_places, chunk)
+
+
+def _own_groups(groups: _Groups, metadata: AttentionMetadata | None, anchor, batch: int, length: int,
+                decode: bool) -> tuple[_Groups, jax.Array | None]:
+    """The groups a call of its own visibility reads past its window, and its queries' slots: its blocks read
+    whole within its runs (the spans' `_whole_blocks`); a cached call's over the cache's keys, from the slots
+    its queries are stored at (`fork_slots`), known for a call over forks alone, else none."""
+    slots = None if anchor is None else fork_slots(metadata, batch, length, anchor[0])
+    kept = _Groups(block_groups=groups.block_groups) if not decode or slots is not None else _Groups()
+    return kept, slots
 
 
 class _Masking(NamedTuple):
@@ -328,6 +338,9 @@ class _Masking(NamedTuple):
     query_places: jax.Array | None
     """A cached call's queries' places its runs' window counts from (`CallVisibility.query_places`), or
     None where its queries are its keys."""
+    query_slots: jax.Array | None = None
+    """A cached call over forks's queries' own keys, the slots the cache stores them at (`fork_slots`),
+    whose blocks they read whole past their window, or None where its queries are its last keys."""
 
 
 
@@ -1293,19 +1306,15 @@ class CausalSelfAttention(nn.Module):
         runs = query_places = None
         # A cached call's forks follow its row's cache, from the document it continues (`fork_anchor`).
         anchor = None
-        if decode and attention_metadata is not None and attention_metadata.forks is not None:
-            if DOCUMENTS not in history:
-                raise ValueError(f"{self.name}: a cached call over forks continues its row's cache, which "
-                                 "this call reads none of")
-            anchor = fork_anchor(jnp.asarray(positions).reshape(B, S), history[DOCUMENTS])
+        anchor = self._fork_anchor(attention_metadata, positions, history, B, S, decode)
         own, implementation = self._overridden(attention_metadata, rotary_positions, B, S, key.shape[-3],
                                                key_places, implementation, masked, decode, anchor)
+        query_slots = None
         if own is not None:
             mask, runs, window, key_places, query_places, valid = own
-            # The call's runs are its visibility, each token's own group reached (`fork_runs`); an uncached
-            # call's blocks read whole past its window within them (the spans' `_whole_blocks`).
+            # The call's runs are its visibility, each token's own group reached (`fork_runs`).
             causal, documents, places = False, None, key_places if query_places is None else query_places
-            groups = _Groups() if decode else _Groups(block_groups=groups.block_groups)
+            groups, query_slots = _own_groups(groups, attention_metadata, anchor, B, S, decode)
         elif attention_metadata is not None and attention_metadata.key_valid is not None:
             # The call's keys' validity alone hides the keys it marks out from every query of the layer's own
             # visibility (row 4771): a mask's keys taken from it (a decode step's or a prefix's, read by the
@@ -1314,7 +1323,7 @@ class CausalSelfAttention(nn.Module):
                 self._keys_valid(attention_metadata, B, key.shape[-3]), mask, valid, implementation, masked)
         if self.ctx.attention_chunk is not None:
             mask = self._chunked(mask, documents, causal, window, valid, runs, groups, places, key_places, S,
-                                 key.shape[-3])
+                                 key.shape[-3], query_slots=query_slots)
             causal, window, documents, groups, valid, runs = False, None, None, _Groups(), None, None
             implementation = masked()
         # A cache call's one document a row bounds its documents; one naming them, its cache's numbering,
@@ -1324,7 +1333,18 @@ class CausalSelfAttention(nn.Module):
                         else 1 if isinstance(documents, CrossDocuments)
                         else coordinates_of(attention_metadata, B, S).max_segments)
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
-                        cursor, starts, key_places, groups, valid, runs, query_places)
+                        cursor, starts, key_places, groups, valid, runs, query_places, query_slots)
+
+    def _fork_anchor(self, metadata: AttentionMetadata | None, positions, history: dict, batch: int,
+                     length: int, decode: bool) -> tuple[jax.Array, jax.Array] | None:
+        """Where a cached call's forks follow its row's cache, from the document it continues (`fork_anchor`),
+        or None for a call of no forks or no cache."""
+        if not decode or metadata is None or metadata.forks is None:
+            return None
+        if DOCUMENTS not in history:
+            raise ValueError(f"{self.name}: a cached call over forks continues its row's cache, which this "
+                             "call reads none of")
+        return fork_anchor(jnp.asarray(positions).reshape(batch, length), history[DOCUMENTS])
 
     def _appended(self, query, key, value, positions, places, append, kv_store, segment_ids,
                   attention_metadata: AttentionMetadata | None, visibility: tuple):
@@ -1376,12 +1396,12 @@ class CausalSelfAttention(nn.Module):
         return None, key_valid if valid is None else jnp.asarray(valid, bool) & key_valid, implementation
 
     def _chunked(self, mask, documents, causal, window, valid, runs, groups: _Groups, places, key_places,
-                 queries: int, keys: int):
+                 queries: int, keys: int, query_slots=None):
         """A chunked layer's visibility as one mask (`dense_visibility`): the call's, each of its `queries`
         and `keys` in the chunk of its place, the queries' `places` and the keys' `key_places`."""
         return dense_visibility(mask, documents, causal, window, valid, runs, places, key_places, queries,
                                 keys, self.ctx.attention_chunk, block_groups=groups.block_groups,
-                                image_groups=groups.image_groups)
+                                image_groups=groups.image_groups, query_slots=query_slots)
 
     def _selected(self, masking: _Masking, x, rotary_positions, places, append, decode: bool) -> _Masking:
         """`masking` reading each query's keys QSA picks among those it sees (`dew.nn.qsa`), as one mask.
@@ -1408,7 +1428,8 @@ class CausalSelfAttention(nn.Module):
         groups = masking.groups
         visible = dense_visibility(masking.mask, masking.documents, masking.causal, masking.window,
                                    masking.valid, masking.runs, places, masking.key_places, S, keys.shape[1],
-                                   None, block_groups=groups.block_groups, image_groups=groups.image_groups)
+                                   None, block_groups=groups.block_groups, image_groups=groups.image_groups,
+                                   query_slots=masking.query_slots)
         visible = jnp.broadcast_to(visible, (B, 1, S, keys.shape[1]))[:, 0]
 
         def turn(blocks, first):
@@ -1447,7 +1468,7 @@ class CausalSelfAttention(nn.Module):
         general kernel otherwise, with the per-head logit maxima sown for
         QK-Clip when a caller opened that collection."""
         (query, key, value, causal, window, mask, documents, max_segments, implementation, cursor, starts,
-         key_places, groups, valid, runs, query_places) = masking
+         key_places, groups, valid, runs, query_places, query_slots) = masking
         B, S = query.shape[:2]
         # The call's spans past its causal flag, window, mask and documents, as the kernel reads them: its
         # groups, and its real keys with the places its window counts.
@@ -1463,7 +1484,8 @@ class CausalSelfAttention(nn.Module):
         if sowing:
             # Over the keys the call sees, as its spans say them (`visibility_mask`).
             seen = visibility_mask(S, key.shape[-3], causal, window, mask, documents, block_groups=blocks,
-                                   image_groups=images, key_valid=valid, key_runs=runs, places=held)
+                                   image_groups=images, key_valid=valid, key_runs=runs, places=held,
+                                   query_slots=query_slots)
             # Beside a context this call read through the same projections first (`attend_context`).
             found = with_context_logits(self, max_attention_logits(query, key, mask=seen, bias=bias))
             self.sow(QK, "max_logits", found)
@@ -1477,7 +1499,8 @@ class CausalSelfAttention(nn.Module):
                 sliding_window=window, mask=mask, bias=bias, sinks=sinks, softcap=self.ctx.attn_logit_softcap,
                 segment_ids=documents,
                 block_groups=blocks, image_groups=images, key_valid=valid, key_runs=runs, places=held,
-                dropout_rate=self.ctx.attention_dropout_rate, dropout_rng=self.make_rng("dropout"),
+                query_slots=query_slots, dropout_rate=self.ctx.attention_dropout_rate,
+                dropout_rng=self.make_rng("dropout"),
                 deterministic=False), Residual.CONTEXT)
         # A chunk or metadata mask replaces `cursor` and keeps the gather; a window the kernels read
         # as each row's first key (`starts`).
@@ -1501,8 +1524,8 @@ class CausalSelfAttention(nn.Module):
                 implementation=implementation, wide_logits=self.ctx.wide_logits, causal=causal,
                 sliding_window=window, mask=mask, bias=bias, sinks=sinks,
                 softcap=self.ctx.attn_logit_softcap, segment_ids=documents, max_segments=max_segments,
-                block_groups=blocks, image_groups=images, key_valid=valid, key_runs=runs, places=held),
-                Residual.CONTEXT)
+                block_groups=blocks, image_groups=images, key_valid=valid, key_runs=runs, places=held,
+                query_slots=query_slots), Residual.CONTEXT)
         return attention
 
     @staticmethod

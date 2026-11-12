@@ -111,7 +111,7 @@ class Torch(Dataset):
         indexed = TorchRecords(self.dataset, self.fields)
         return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         """The map-style records as a stream of consecutive index ranges (`_indexed_manifest`), as a
         memory source streams."""
         return _indexed_manifest(self, self.describe(), 1024)
@@ -127,5 +127,5 @@ def from_torch(dataset: TorchDataset, fields: tuple[str, ...] | None = None, *,
                identity: str | None = None) -> Torch:
     """A map-style `torch.utils.data.Dataset` as a Dew dataset, its samples
     named by `fields` where they are tuples. Plans and artifacts require a
-    versioned content `identity`, including non-exact resumes (`Torch`)."""
+    versioned content `identity`, including relaxed resumes (`Torch`)."""
     return Torch(dataset, fields, identity=identity)

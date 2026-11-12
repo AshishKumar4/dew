@@ -20,7 +20,6 @@ import contextlib
 import dataclasses
 import itertools
 import json
-import operator
 from pathlib import Path
 
 import grain.python as pygrain
@@ -140,15 +139,13 @@ def test_a_mixture_is_the_same_order_from_the_same_seed_and_another_from_another
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_a_mixtures_corpora_shuffled_by_one_seed_read_in_orders_of_their_own(read):
-    """Corpora of one length, each shuffled by one seed, read in orders of their own in a mix from data
-    plan version 9, each by its seed and its key in the mixture, so a corpus keeps its order whichever
-    others the mix holds; version 8, which a run saved under it reads by (`compile`'s `plan_version`),
-    read them in one permutation (row 3840)."""
-    def orders(names: tuple[str, ...], version: int | None = None) -> list[list[int]]:
+    """Corpora of one length, each shuffled by one seed, read in orders of their own in a mix, each by its
+    seed and its key in the mixture, so a corpus keeps its order whichever others the mix holds (row
+    3840)."""
+    def orders(names: tuple[str, ...]) -> list[list[int]]:
         corpora = [Pipeline(Memory(Indexed(tag, 16)), name=name).shuffle(5, **(
             {"window": 16} if read == "streamed" else {})).repeat() for tag, name in enumerate(names, 1)]
-        stated = {} if version is None else {"plan_version": version}
-        stream = compile(mix(corpora).batch(4), read=read, loading=READ, **stated).train(DataPartition())
+        stream = compile(mix(corpora).batch(4), read=read, loading=READ).train(DataPartition())
         try:
             seen = [value for step in taken(stream, 8) for value in step]
         finally:
@@ -160,73 +157,11 @@ def test_a_mixtures_corpora_shuffled_by_one_seed_read_in_orders_of_their_own(rea
     wiki, code = orders(("wiki", "code"))
     assert wiki != code
     assert orders(("wiki", "news"))[0] == wiki
-    assert operator.eq(*orders(("wiki", "code"), 8))
-
-
-def test_a_position_saved_under_plan_version_8_resumes_by_8_or_by_9_where_9_reads_it_alike():
-    """A position a version 8 read saved of a mix whose corpora shuffle, which version 9 reads in other
-    orders, resumes where 8 compiles the chain (`plan_version=8`) and is refused where 9 does, naming the
-    version to compile it by; one of a read whose order 9 reads alike, a mix of corpora that keep their
-    order, resumes under 9 (`dew.data.plan.read_otherwise_at_9`, row 3840)."""
-    def chain(shuffled: bool) -> Pipeline:
-        corpora = [Pipeline(Memory(Indexed(tag, 16)), name=name) for tag, name in ((1, "wiki"), (2, "code"))]
-        return mix([corpus.shuffle(5).repeat() if shuffled else corpus.repeat()
-                    for corpus in corpora]).batch(4)
-
-    for shuffled in (True, False):
-        saving = compile(chain(shuffled), read="indexed", loading=READ,
-                         plan_version=8).train(DataPartition())
-        try:
-            taken(saving, 2)
-            saved = saving.get_state()
-            expected = taken(saving, 2)
-        finally:
-            saving.close()
-        for version in (8, 9):
-            resumed = compile(chain(shuffled), read="indexed", loading=READ,
-                              plan_version=version).train(DataPartition())
-            try:
-                if shuffled and version == 9:
-                    with pytest.raises(ValueError):
-                        resumed.set_state(saved)
-                    continue
-                resumed.set_state(saved)
-                assert taken(resumed, 2) == expected
-            finally:
-                resumed.close()
-
-
-def test_an_unnamed_chains_shuffled_position_of_plan_version_8_resumes_under_9():
-    """A chain given no name shuffles by its seed alone under data plan version 9, as 8 shuffled it, so a
-    position 8 saved of it resumes under 9; a named chain's, which 9 shuffles by its name too, is refused
-    there, naming the version to read it by (rows 3840, 4063)."""
-    def opened(version: int, name: str | None = None):
-        chain = Pipeline(Memory(Indexed(1, 16)), name=name).shuffle(5).repeat().batch(4)
-        return compile(chain, read="indexed", loading=READ, plan_version=version).train(DataPartition())
-
-    for name in (None, "wiki"):
-        saving = opened(8, name)
-        try:
-            taken(saving, 1)
-            saved = saving.get_state()
-            expected = taken(saving, 1)
-        finally:
-            saving.close()
-        resumed = opened(9, name)
-        try:
-            if name is not None:
-                with pytest.raises(ValueError):
-                    resumed.set_state(saved)
-                continue
-            resumed.set_state(saved)
-            assert taken(resumed, 1) == expected
-        finally:
-            resumed.close()
 
 
 def test_a_named_chains_order_is_its_names_and_a_position_of_another_name_is_refused():
-    """A named chain read alone shuffles by its name from data plan version 9, as a mixture reads it as its
-    member, so its plan records the name: a position it saved is refused by the chain under another name,
+    """A named chain read alone shuffles by its name, as a mixture reads it as its member, so its plan
+    records the name: a position it saved is refused by the chain under another name,
     which reads another permutation of the same records, and resumes under its own (row 3840)."""
     def opened(name: str):
         chain = Pipeline(Memory(Indexed(1, 16)), name=name).shuffle(5).repeat().batch(4)
@@ -406,19 +341,6 @@ def test_a_mixed_validation_pass_ends_before_any_source_repeats(two_splits):
     scored = [value for batch in actual for value in batch]
     assert len(scored) == len(set(scored)) == 32
     assert all(sum(value >= 2000 for value in batch) == 1 for batch in actual)
-
-
-def test_a_mixture_written_in_either_order_is_the_same_run(two_splits):
-    big, small = two_splits
-    first, other = row_mix({big: 0.75, small: 0.25}), row_mix({small: 0.25, big: 0.75})
-    left, right = first.train(DataPartition()), other.train(DataPartition())
-    try:
-        assert taken(left, 4) == taken(right, 4)
-        assert left.get_state() == right.get_state()
-        assert taken(left, 3) == taken(right, 3)
-    finally:
-        left.close()
-        right.close()
 
 
 def test_sources_from_different_stores_mix_before_the_share_cut(two_splits):
@@ -919,32 +841,6 @@ def test_a_schedules_position_holds_the_tokens_its_finished_stages_ended_at(tmp_
     assert read[0] == read[1]
     with pytest.raises(ValueError):
         scheduled_packed((first, 5000), (both, None)).train(DataPartition()).set_state(ended)
-
-
-def test_a_schedules_position_saved_before_it_held_stage_tokens_resumes_only_in_its_first_stage(tmp_path):
-    """A schedule's position written before positions held the tokens its finished stages ended at (no
-    `tokens` in its envelope) records none: one standing in its first stage, which finished none, resumes;
-    one past it is refused, as nothing says where its finished stage ended in tokens (row 2862)."""
-    _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
-    both = {first: 1.0, second: 1.0}
-
-    def unrecorded(state: bytes) -> bytes:
-        held = json.loads(state)
-        held["dew_global_position"].pop("tokens")
-        return json.dumps(held).encode()
-
-    stream = scheduled_packed((first, 1000), (both, None)).train(DataPartition())
-    packed_rows(stream, 3)
-    early = unrecorded(stream.get_state())
-    opened = scheduled_packed((first, 1000), (both, None)).train(DataPartition())
-    assert isinstance(opened, PhasedStream)
-    past = unrecorded(opened.ending(stream.get_state()))
-    assert _position.read(early).tokens is None and _position.read(past).tokens is None
-    # Saved again as it was read, it still records none.
-    assert _position.read(_position.encode(_position.read(past))).tokens is None
-    scheduled_packed((first, 1000), (both, None)).train(DataPartition()).set_state(early)
-    with pytest.raises(ValueError):
-        scheduled_packed((first, 1000), (both, None)).train(DataPartition()).set_state(past)
 
 
 def test_a_schedule_counts_the_tokens_of_every_stage_but_its_last(tmp_path):
@@ -2053,26 +1949,53 @@ def test_phases_that_end_in_other_device_steps_are_refused():
                 read="memory", loading=READ)
 
 
-def test_a_token_mixture_of_published_generations_weighs_the_rows_and_targets_each_states(tmp_path):
-    """Published generations mix by tokens from the rows and valid targets each states, where
-    the weighting once looked for a windows count no generation states."""
+def test_a_token_mixture_of_published_generations_weighs_the_targets_each_states(tmp_path):
+    """Published generations of unequal valid targets a row mix by tokens from the targets each states
+    (`CountTargets`, read off the generation where the weighting once looked for a windows count none
+    states): no member is drawn while it leads the other by more of the targets drawn than one of the
+    other's rows, each row weighing its own targets (its tokens less one), through a saved position and
+    its resume, which reads on as an uninterrupted read does."""
     from dew.data.cache import Cache
     from dew.data.steps.text import CountTargets
     from dew.data.text import Tokenize
 
-    def published(name: str, documents: int) -> Pipeline:
-        texts = Memory([{"text": f"{name} {index:03d}"[-8:]} for index in range(documents)], identity=name)
-        generation = publish(Pipeline(texts).map(Tokenize()).filter_map(CountTargets()),
+    texts = {"short": " ".join(["short"] * 3), "long": " ".join(["long"] * 10)}
+
+    def published(name: str, tag: int) -> Pipeline:
+        rows = Memory([{"text": texts[name], "id": tag * 1000 + index} for index in range(16)], identity=name)
+        generation = publish(Pipeline(rows).map(Tokenize()).filter_map(CountTargets()),
                              Cache(str(tmp_path / name)), read="indexed", loading=READ)
         return Pipeline(generation.source(), name=name)
 
-    data = compile(mix([published("short", 4), published("long", 8)], by="tokens").repeat().batch(2),
+    data = compile(mix([published("short", 1), published("long", 2)], by="tokens").repeat().batch(1),
                    read="indexed", loading=READ)
-    stream = data.train(DataPartition())
-    try:
-        assert len(list(itertools.islice(stream, 4))) == 4
-    finally:
-        stream.close()
+
+    def read(count: int, state=None):
+        reader = data.train(DataPartition())
+        try:
+            if state is not None:
+                reader.set_state(state)
+            return [int(identity) for batch in itertools.islice(reader, count) for identity in batch["id"]], \
+                reader.get_state()
+        finally:
+            reader.close()
+
+    # Stopped within a cycle of the two members' shares, and resumed.
+    ids, state = read(23)
+    ids += read(21, state)[0]
+    assert ids == read(44)[0] and len(ids) == 44
+    # Each member's targets a row, its tokens less the one no target follows.
+    each = {name: len(Tokenize().map({"text": text})["text"]) - 1 for name, text in texts.items()}
+    assert each["short"] < each["long"]
+    # A member is drawn only while it leads the other by no more of their targets than one of the other's
+    # rows: its targets held to its half however its rows' lengths differ, where a mix by rows would
+    # draw short and long rows alike and fall a long row behind at once.
+    drawn = {"short": 0, "long": 0}
+    for identity in ids:
+        name, other = ("short", "long") if identity // 1000 == 1 else ("long", "short")
+        assert drawn[name] <= drawn[other] + each[other], (identity, drawn)
+        drawn[name] += each[name]
+    assert drawn["short"] > 0 and drawn["long"] > 0
 
 
 def _short_and_long() -> Pipeline:
@@ -2238,20 +2161,13 @@ def _named(name: str, tag: int) -> Pipeline:
 @pytest.mark.parametrize("read", ["streamed", "indexed"])
 def test_an_unseeded_mix_reads_its_members_in_the_order_it_declares_them(read):
     """A mix of no seed reads its members in the order it declares them, 'z' before 'a', streamed as it
-    is read by index and as every prefix of it is counted (`Proportions`); a plan of version 12 streamed
-    them in their keys' sorted order, as Grain's mix of a mapping does, and a run it saved reads so still."""
+    is read by index and as every prefix of it is counted (`Proportions`)."""
     chain = mix([_named("z", 1).repeat(), _named("a", 2).repeat()]).batch(4)
     first = compile(chain, read=read, loading=READ).train(DataPartition())
     try:
         assert ids(itertools.islice(first, 2)) == [[1000, 2000, 1001, 2001], [1002, 2002, 1003, 2003]]
     finally:
         first.close()
-    if read == "streamed":
-        earlier = compile(chain, read=read, loading=READ, plan_version=12).train(DataPartition())
-        try:
-            assert ids(itertools.islice(earlier, 1)) == [[2000, 1000, 2001, 1001]]
-        finally:
-            earlier.close()
 
 
 def test_a_phased_runs_statistics_count_each_phase_it_reached(tmp_path):
@@ -2272,39 +2188,6 @@ def test_a_phased_runs_statistics_count_each_phase_it_reached(tmp_path):
     assert len(rows) == 2 and counted in rows.values() and all(count > 0 for count in rows.values()), rows
 
 
-@pytest.mark.parametrize(("read", "version"), [("indexed", 13), ("streamed", 12)])
-def test_a_mix_saved_under_plan_version_12_resumes_as_12_read_it(read, version):
-    """A mix of no seed whose members are named out of their sorted order, saved under plan version 12,
-    resumes under this Dew's on the batches 12's read goes on to: read by index, its order the same at
-    both, its position goes on as 13's; streamed, which 12 mixed in its keys' sorted order, as 12's."""
-    chain = mix([_named("z", 1).repeat(), _named("a", 2).repeat()]).batch(4)
-    earlier = compile(chain, read=read, loading=READ, plan_version=12)
-    now = compile(chain, read=read, loading=READ)
-
-    def listed(stream, count):
-        return ids(itertools.islice(stream, count))
-
-    reader = earlier.train(DataPartition())
-    try:
-        whole = listed(reader, 6)
-    finally:
-        reader.close()
-    reader = earlier.train(DataPartition())
-    try:
-        head, saved = listed(reader, 3), reader.get_state()
-    finally:
-        reader.close()
-    resumed = now.train(DataPartition())
-    try:
-        resumed.set_state(saved)
-        assert head + listed(resumed, 3) == whole
-        state = resumed.get_state()
-        plan = _position.read(state).plan if read == "indexed" else json.loads(state)["dew_data_plan"]
-        assert plan["version"] == version
-    finally:
-        resumed.close()
-
-
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
 def test_a_phase_on_the_token_clock_of_a_mix_weighed_by_tokens_streamed_is_refused_as_one(read):
     """Phases on the token clock continue each corpus past what the phases before read of it, by their
@@ -2318,13 +2201,12 @@ def test_a_phase_on_the_token_clock_of_a_mix_weighed_by_tokens_streamed_is_refus
         compile(chain, read=read, loading=READ)
 
 
-def _endless_ids(chain, count: int, plan_version: int | None = None) -> list[list[int]]:
+def _endless_ids(chain, count: int) -> list[list[int]]:
     """The ids of the first `count` batches a run reads of `chain`, read on past its end (`fitted`)."""
     from dew.data.compile import fitted
     from dew.data.pipeline import ObjectiveData
 
-    versions = {} if plan_version is None else {"plan_version": plan_version}
-    loader, _ = fitted(chain, None, objective=ObjectiveData(), **versions)
+    loader, _ = fitted(chain, None, objective=ObjectiveData())
     stream = loader.train(DataPartition())
     try:
         return ids(itertools.islice(stream, count))
@@ -2379,11 +2261,3 @@ def test_phases_batched_outside_themselves_read_as_they_did():
                   (Pipeline(Memory(Indexed(2, 16))).batch(8), None))
     assert _endless_ids(once.repeat(1), 4) == [list(range(1000, 1008)), list(range(2000, 2008)),
                                                list(range(2008, 2016))]
-
-
-def test_a_phase_batched_inside_itself_saved_under_plan_12_reads_as_12_did():
-    """A run whose data plan is version 12, as a run saved under it resumes, reads a phase batched inside
-    itself with its repeat after its batch, as 12 did."""
-    first, second = Memory(Indexed(1, 12)), Memory(Indexed(2, 12))
-    phased = phases((Pipeline(first).batch(8), 2), (Pipeline(second).batch(8), None))
-    assert _endless_ids(phased, 2, plan_version=12)[1] == list(range(1000, 1008))

@@ -113,7 +113,8 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
     mine = [row for row, written_share in zip(rows, held, strict=True)
             if written_share == (share.index, share.count)]
     if not mine:
-        raise ValueError(
+        raise _position.PlanChanged(
+            ("topology",),
             f"The checkpoint at {where} holds data positions for the shares "
             f"{sorted(set(held))} (index, count), and this reader reads share "
             f"{share.index} of {share.count}. A position is where one share of "

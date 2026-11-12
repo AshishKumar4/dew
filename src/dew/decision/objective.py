@@ -15,7 +15,6 @@ from dew._records import record
 from dew.artifacts import Decisions
 from dew.batch import FROZEN, Batch, Variables, dicts, part, thaw, unboxed
 from dew.data.pipeline import Configured, ObjectiveData
-from dew.data.plan import PLAN_VERSIONS, SHARED_STATE
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
 from dew.decision.head import DecisionHead, Head
@@ -36,7 +35,6 @@ from dew.decision.rows import (
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.shared_state import asked_over, fork_depth, joint, shared_for
 from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out, trained_tree, whole_blocks_of
-from dew.inference.projections import declared_groups
 from dew.inference.tasks import Processor as TaskProcessor, RunProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
@@ -55,7 +53,6 @@ from dew.nn.protocols import (
     CrossAttending,
     Lacks,
     Looped,
-    ProjectionGroup,
     TokenModel,
 )
 from dew.objectives.base import (
@@ -413,8 +410,6 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         self.stated = layout
         self._shared = (shared_for(layout, module, head, train=True) if isinstance(layout, QuestionLayout)
                         else layout)
-        # The data plan version its rows are read by: this Dew's until its data binds its own (`bind_plan`).
-        self._plan = PLAN_VERSIONS[-1]
         self.tokenizer = tokenizer
         self.specials = specials or Specials.of(tokenizer)
         self.loss_rule = LogLoss() if loss is None else loss
@@ -493,31 +488,12 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         a question row's question."""
         return self.layout.spans_in_context
 
-    @functools.cached_property
-    def _written(self) -> Layout:
-        """The stated layout as a data plan before 12 laid it out (`dew.data.plan.SHARED_STATE`): one that
-        states its `shared_state`, its rows in streams (`QuestionLayout.streamed`), which neither its
-        record nor a step that holds it states, so a run saved under such a plan rebuilds the steps it
-        saved and reads on as it trained; any other, as it stands."""
-        stated = self.stated
-        if isinstance(stated, QuestionLayout) and stated.shared_state is not None:
-            return dataclasses.replace(stated, streamed=True)
-        return stated
-
     @property
     def layout(self) -> Layout:
         """The layout its rows are laid out by: a request's questions over one copy of its state where the
-        backbone and head read each question as its own row (`shared_for`), and the layout as it was
-        stated, read as such a plan read it (`_written`), under a data plan from before rows shared a
-        state (`bind_plan`, `dew.data.plan.SHARED_STATE`), so everything the objective reads of its rows,
-        their bounds, the widths it records and the task its steps declare, is the rows' its run trains
-        on."""
-        return self._written if self._plan < SHARED_STATE else self._shared
-
-    def bind_plan(self, version: int) -> None:
-        """Read its rows as data plan `version` lays them out (`layout`): the version the run's data was
-        compiled at (`ObjectiveData.at`), which a run saved under an earlier one resumes by."""
-        self._plan = version
+        backbone and head read each question as its own row (`shared_for`), the layout as it was stated
+        otherwise."""
+        return self._shared
 
     def _bounds(self, layout: Layout) -> Bounds:
         """The most rows, questions and options a window of `layout`'s rows packs (`Layout.bounds`)."""
@@ -528,17 +504,13 @@ class DecisionObjective(Objective[Ratio | Weighted]):
     def _shared_bounds(self) -> Bounds:
         return self._bounds(self._shared)
 
-    @functools.cached_property
-    def _stated_bounds(self) -> Bounds:
-        return self._shared_bounds if self._written is self._shared else self._bounds(self._written)
-
     @property
     def bounds(self) -> Bounds:
         """The most rows, questions and options a window packs (`Layout.bounds`), of the layout its rows
         are laid out by (`layout`),
         at most `segments` rows; rows that carry a context, an example's or their schema, pack as any
         do, each reading its own (`DecisionInputs.context_segments`)."""
-        return self._stated_bounds if self._plan < SHARED_STATE else self._shared_bounds
+        return self._shared_bounds
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.spans_in_context,
@@ -833,31 +805,24 @@ class DecisionObjective(Objective[Ratio | Weighted]):
 
     @property
     def _fork_depth(self) -> int:
-        """The longest chain of documents its batches hold, laid out as it states its layout or as it
-        derives it (`data`, by the plan's version): the longer of the two (`fork_depth`), a chain past
-        which a document reads nothing more."""
-        return max(fork_depth(self._shared), fork_depth(self._written))
+        """The longest chain of documents its batches hold (`fork_depth`), a chain past which a document
+        reads nothing more."""
+        return fork_depth(self._shared)
 
     @property
     def _joint_forks(self) -> bool:
-        """Whether its batches' rows read their documents together, as siblings do (`joint`), laid out as
-        it states its layout or as it derives it (`_fork_depth`)."""
-        return joint(self._shared) or joint(self._written)
+        """Whether its batches' rows read their documents together, as siblings do (`joint`)."""
+        return joint(self._shared)
 
     def data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData:
         """Fit rows before mixing, augment training layouts, and pack training
         and evaluation rows alike, by the objective's own tokenizer, which its
         `bounds` count in: a request's questions over one copy of its state where its layout shares
-        (`shared_for`), and as its layout is stated where a run's data plan predates that
-        (`ObjectiveData.earlier`, `dew.data.plan.SHARED_STATE`), so a run saved before resumes reading as
-        it was written."""
+        (`shared_for`)."""
         if tokenizer not in (None, self.tokenizer):
             raise ValueError("a decision objective lays its rows out with its own tokenizer; "
                              "pass tokenizer= when building it")
-        shared = self._data(self._shared, self._shared_bounds)
-        if self._written is self._shared or not isinstance(self._written, QuestionLayout):
-            return shared
-        return dataclasses.replace(shared, earlier=self._data(self._written, self._stated_bounds))
+        return self._data(self._shared, self._shared_bounds)
 
     def _data(self, layout: Layout, bounds: Bounds) -> ObjectiveData:
         """`data` as `layout` lays rows out within `bounds`."""
@@ -911,15 +876,6 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             self.model.context_encoder,
             self.options)
 
-    def served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]:
-        """The backbone's projection groups a served task packs (`Decide._served`), their paths from
-        the `params` root: what a checkpoint holds packed where its run trained a loaded task's packed
-        tree (mains 947ac9262 up to ledger 2299's fix), which a resume splits back
-        (`dew.checkpoints`). Carried to 1.0, when it is deleted (ledger 1552)."""
-        backbone = part(thaw(variables), "backbone")
-        return tuple(dataclasses.replace(group, path=("backbone", *group.path))
-                     for group in declared_groups(self.model.backbone, backbone))
-
     def recorded_model(self) -> nn.Module:
         """The backbone; the head is a task setting of its own."""
         return self.model.backbone
@@ -936,9 +892,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         A `Decide` encodes with the objective's own tokenizer and layout, so it
         takes no processor; it reads images with the backbone's own processor,
         which a task the objective fine-tunes brings. Its passes pad to the
-        run's widths (`bind_widths`), as the task loaded from its run does, and
-        under a data plan from before rows shared a state (`bind_plan`) it lays
-        its rows out as the run stated them, as that task does (`Decide._recorded`).
+        run's widths (`bind_widths`), as the task loaded from its run does.
         """
         if processor is not OMITTED:
             raise TypeError("a Decide task encodes with the objective's tokenizer and takes no processor")
@@ -952,5 +906,4 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             weights=Weights(int(state.step), averaged),
             processor=self.image_processor,
             budget=Budget(options=self.options),
-            derives_sharing=self._plan >= SHARED_STATE,
         )

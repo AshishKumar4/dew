@@ -1002,7 +1002,7 @@ def test_a_pool_whose_processes_fetched_other_records_is_refused_before_it_train
     # The same pool over a server that answers every url trains (`online_checkpoint`); this one
     # observed no step and saved none.
     assert [(report["refused"], report["observed"], report["written_steps"]) for report in reports] == [
-        ("ValueError", [], [])] * 2
+        ("PoolDiffers", [], [])] * 2
 
 
 @pytest.fixture(scope="module")
@@ -1894,7 +1894,7 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
                        else (("RuntimeError", False), ("PeerFailure", False)))
             assert (failed["error"], failed["own"]) in allowed, (failure, report)
             assert failure in report["closed"]
-        assert report["results"]["mismatched_plan"]["error"] == "ValueError", report
+        assert report["results"]["mismatched_plan"]["error"] == "PoolDiffers", report
 
 
 @pytest.mark.distributed
@@ -2088,19 +2088,31 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
     end the run there."""
     reports = run_pool("pool_refusals", tmp_path / "pool", 2, devices=4, timeout=300,
                        run_dir=str(tmp_path / "runs"))
+    before = ("content", "named", "count", "first_read", "layout")
+    # The steps the pool logged, which its first process's tracker hears.
+    logged = reports[0]
+    assert logged["same"]["steps"] == logged["saved"]["steps"] == [1, 2] and logged["ended"]["steps"] == [1]
+    assert logged["eof"]["steps"] in ([], [1]) and all(logged[case]["steps"] == [] for case in before), logged
+    differs = {"type": "PoolDiffers", "phase": "training data", "named": 1}
     for rank, report in enumerate(reports):
-        assert report["same"] is None and report["saved"] is None and report["latest"] == 2, report
-        assert "training data differs between the processes" in report["content"], report
-        assert "training data differs between the processes" in report["named"], report
-        # A pool compares what its processes hold, not where each mounted it: no description is named.
-        assert "training data differs between the processes" in report["count"], report
-        assert "holds no rows" in report["first_read"], report
-        assert "training read: the stream ended on 1 of 2 processes" in report["eof"], report
-        assert report["ended"] is None, report
-        assert "training batch layout differs" in report["layout"], report
-        assert "newest checkpoint differs" in report["stale"], report
-        if rank == 0:
-            assert "training read failed on rank 1" in report["first_read"], report
+        # The controls train: one corpus, a saved run, and streams that run out together end there.
+        assert all(report[case]["refused"] is None for case in ("same", "saved", "ended")), report
+        assert report["latest"] == 2, report
+        # What the processes hold apart, every process refuses before any step logs, by the agreement it
+        # failed and the process that held otherwise: process 1 differs however its copy is described or
+        # named; its read failed, which it refuses with its own error and process 0 with the rank that failed.
+        assert all(report[case]["refused"] == differs for case in ("content", "named", "count")), report
+        failed = {"type": "PeerFailure", "phase": "training read", "named": 1}
+        own = {"type": "ValueError", "phase": None, "named": None}
+        assert report["first_read"]["refused"] == (failed if rank == 0 else own), report
+        assert report["layout"]["refused"] == {"type": "PoolDiffers", "phase": "training batch layout",
+                                               "named": 1}
+        # A stream one process ends refuses where it ends, past the steps both read; a listing older than
+        # the pool's newest checkpoint restores nothing.
+        assert report["eof"]["refused"] == {"type": "StreamsEnded", "phase": "training read", "named": 1}
+        newest = {"type": "PoolDiffers", "phase": "newest checkpoint", "named": 1}
+        assert report["stale"] == {"refused": newest, "restored": None}, report
+
 
 
 @pytest.mark.distributed

@@ -48,6 +48,7 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.data.pipeline import Dataset
+from dew.data.plan import DataResume
 from dew.distributed.batches import (
     PREFETCH_DEPTH,
     DevicePrefetchIterator,
@@ -79,11 +80,14 @@ from dew.objectives.base import (
 )
 from dew.optim import (
     STACKED_OPTIMIZERS,
+    ScheduleBase,
     declaring,
     held_rates,
     scaled_rates,
+    schedule_states,
     settable_rates,
     with_bounds,
+    with_horizons,
     with_rates,
 )
 from dew.registry import Unrecordable
@@ -91,7 +95,15 @@ from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, ke
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
-from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitStarted, Record, StepCompiled
+from dew.telemetry.records import (
+    AxisLink,
+    CheckpointRequested,
+    DataRestarted,
+    FitEnded,
+    FitStarted,
+    Record,
+    StepCompiled,
+)
 from dew.training._candidates import RunShape, Stepping, StepSettings, prepared_for
 from dew.training._fit import (
     Emptied,
@@ -108,6 +120,7 @@ from dew.training._fit import (
     clocked,
     consumption_counted,
     counted_step,
+    data_resumed,
     declarations,
     first_batch,
     fit_policies,
@@ -215,6 +228,7 @@ class Trainer(Generic[Loss, Effects]):
         param_dtype: str | None = None,
         diloco: DiLoCo | None = None,
         phase_passes: Sequence[int] | None = None,
+        data_resume: DataResume = "relaxed",
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -260,6 +274,8 @@ class Trainer(Generic[Loss, Effects]):
         self.layout = layout
         self.accumulation = accumulation
         self.split = split
+        # How a resume treats its data (`DataResume`): relaxed starts it again where its plan differs.
+        self.data_resume: DataResume = data_resume
         self._microbatches, self._loss_scale = microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         # A loss scale stated by a flag alone is a value a step's trace can be kept by (`_step_key`).
@@ -640,7 +656,24 @@ class Trainer(Generic[Loss, Effects]):
         places the state (`Checkpoints.position`), and restores the state alone. A run handed a step
         compiled ahead builds it with the programs compiled with the step (`_taking`)."""
         with self._taking():
-            return self._placing(start, positioned=positioned)
+            state, shardings, position = self._placing(start, positioned=positioned)
+        return self._stated(state), shardings, position
+
+    def _stated(self, state: TrainState) -> TrainState:
+        """`state` with its scheduled solvers' step horizons this run's (`OptimConfig.horizons`), which a
+        configured run's optimizer holds as operands it sets on every state it steps (`stated`,
+        `dew.optim.with_horizons`): its step and its start are one program at any length of run, a
+        rehearsal's or a restart's served from the persistent cache. A restore's template (`_placing`)
+        holds them made, so a checkpoint saved without them restores. A trainer given an Optax
+        transformation keeps its own."""
+        config = self._config
+        if config is None:
+            return state
+        steps = self._shape.updates
+        horizons = config.horizons(steps, clocked=self._shape.examples is not None)
+        schedules = {group: rate for group, rate in config.grouped_rates().items()
+                     if isinstance(rate, ScheduleBase)}
+        return rates_set(state, lambda held: with_horizons(held, horizons, schedules, steps))
 
     def _placing(self, start: Start, *, positioned: bool
                  ) -> tuple[TrainState, Placement[TrainState], bytes | None]:
@@ -660,10 +693,8 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, abstract.variables,
                 lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype)))
         share = DataPartition.of(self.device_mesh) if positioned else None
-        # The groups a checkpoint may hold packed, named on the stored layers it holds (`row_shapes`).
-        served = self.objective.served_groups(self._staging.row_shapes(abstract.variables))
-        state, position = self._staging.restore(checkpoints, placed_shapes(abstract, shardings), resume,
-                                               share, served=served)
+        state, position = self._staging.restore(checkpoints, self._stated(placed_shapes(abstract, shardings)),
+                                               resume, share)
         state = restored(state, resume, self._shape.examples)
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         if (config := self._config) is not None:
@@ -1057,7 +1088,7 @@ class Trainer(Generic[Loss, Effects]):
         startup = Startup()
         loader, held, tokens, steps, examples = run_data(
             self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
-            examples=examples, accumulation=self.accumulation, startup=startup)
+            examples=examples, accumulation=self.accumulation, startup=startup, resume=self.data_resume)
         self.reading(loader, device_prefetch, examples=examples, steps=steps)
         self.scheduled(None if steps is None else steps // self.accumulation)
         # Its cadences resolved against the run's length, its scores declared, its best and stop policies,
@@ -1089,7 +1120,7 @@ class Trainer(Generic[Loss, Effects]):
         transformation keeps it."""
         if self._config is None:
             return
-        built = self._config.build(updates, clocked=self._shape.examples is not None)
+        built = self._config.build(updates, clocked=self._shape.examples is not None, stated=True)
         self._shape = dataclasses.replace(self._shape, updates=updates)
         self._optimizer = declaring(self.objective.optimizer(built), self._boxed_axes)
 
@@ -1268,8 +1299,9 @@ class Trainer(Generic[Loss, Effects]):
             initial = owned_dicts(self._staging.received(self.objective, dataclasses.replace(
                 initial, variables=dict(initial.variables))))
             with self._staging.held(boxed(self._boxed_axes())):
-                initial = afresh(initial, jax.eval_shape(self.optimizer.init, initial.variables["params"]),
-                                 self._shape.examples)
+                initial = self._stated(afresh(initial, schedule_states(self.optimizer,
+                                                                       initial.variables["params"]),
+                                              self._shape.examples))
             supplied, shardings = self._staging.supplied(initial, lambda staged: self._validated(staged)[0])
             return int(supplied.step), None, lambda: (supplied, shardings), None
         start = self._started(resume)
@@ -1277,8 +1309,16 @@ class Trainer(Generic[Loss, Effects]):
             run.stop_control = checkpoints.control(checkpoints.latest)
         if checkpoints is None or start.resume is None:
             return 0, None, lambda: self._placed(start, positioned=False)[:2], start.abstract
-        return (start.resume, checkpoints.position(start.resume, DataPartition.of(self.device_mesh)),
-                lambda: self._placed(start, positioned=False)[:2], start.abstract)
+        position, differs = data_resumed(
+            dataset, self._stream_partition(),
+            functools.partial(checkpoints.position, start.resume, DataPartition.of(self.device_mesh)),
+            resume=self.data_resume, step=start.resume)
+        if differs:
+            run.restarted = differs
+            _log.warning("the saved data position's plan differs from this run's in %s, so its data starts "
+                         "again from the beginning of its order while its state resumes "
+                         "(data_resume='relaxed'; 'exact' refuses it)", ", ".join(differs))
+        return start.resume, position, lambda: self._placed(start, positioned=False)[:2], start.abstract
 
     def _stream_partition(self) -> DataPartition:
         """The share of the run's data this process's training stream reads: the mesh's, its ramp's stages
@@ -1313,6 +1353,9 @@ class Trainer(Generic[Loss, Effects]):
         mesh, checkpoints, steps = self.device_mesh, self.checkpoints, plan.steps
         if steps is not None and current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
+        bound = self._shape.examples
+        if bound is not None and interval.consumed > bound:
+            raise ValueError(f"the run consumed {interval.consumed} examples, past the {bound} asked for")
         if plan.checkpoint_every and checkpoints is None:
             raise ValueError(
                 "checkpoint_every asks for checkpoints and this trainer has no "
@@ -1372,6 +1415,10 @@ class Trainer(Generic[Loss, Effects]):
             cadences=plan.recorded(self._config, self.accumulation, clocked=self._shape.examples is not None),
             groups=self._groups(state))
         self._report(started, current)
+        if run.restarted is not None:
+            self._report(DataRestarted(current, run.restarted), current)
+            self._display.note(f"Data starts again at step {current}: its saved plan differs in "
+                               f"{', '.join(run.restarted)}")
         if plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
         if plan.observe:
@@ -1504,7 +1551,7 @@ class Trainer(Generic[Loss, Effects]):
         # once, by `_wind_down`, with every suite: never here before a rarer suite has. Only a step that
         # evaluates or pauses could save first (a ranked save scores every suite), so only there is the stream
         # read ahead (`FitRun.ends_here`): no other step's save waits on a batch a stream has yet to make.
-        ending = plan.finished(current, real) or (
+        ending = plan.finished(current, real, interval.consumed) or (
             (evaluation_due or plan.paused(current, real, interval.consumed)) and run.ends_here(interval))
         paused = not ending and plan.paused(current, real, interval.consumed)
         ranked = bool((plan.validation or plan.best or plan.stop) and run.checkpoint_due)

@@ -351,26 +351,6 @@ def test_a_shuffle_of_windows_cutting_documents_counts_each_once_its_every_windo
         assert all(sum(held == {share} for held in owners.values()) >= 3 for share in range(shares))
 
 
-def test_a_counted_read_of_overlapping_windows_resumes_a_position_that_credited_each_token_to_its_first():
-    """A streamed read of twelve documents in windows of 4 tokens 2 apart, bounded to all twelve, its
-    position saved by main 91527d9fe, which credited each token to the first window holding it, where it
-    had credited a document's last token the next window holds too (tests/fixtures/
-    overlapping_windows_position.json): restored where each token goes to the last window holding it, it
-    credits none twice, the read consuming the 11 examples whose last tokens a window holds, as the saving
-    read did (review of row 1902)."""
-    fixture = Path(__file__).with_name("fixtures") / "overlapping_windows_position.json"
-    recorded = json.loads(fixture.read_text())
-    chain = Pipeline(Memory(_pieces(), shard_rows=3)).windows(4, stride=2, fields=("id",))
-    chain = chain.read("streamed").batch(1)
-    stream = compile(chain, read="streamed", examples=len(_LENGTHS)).train(DataPartition())
-    try:
-        stream.set_state(recorded["state"].encode())
-        after = [int(np.sum(batch[EXAMPLES_CONSUMED])) for batch in stream]
-    finally:
-        stream.close()
-    assert sum(recorded["before"]) + sum(after) == sum(recorded["before"]) + sum(recorded["after"]) == 11
-
-
 _MAPPED = {
     "concat mapped": (lambda chain: chain.pack(8, fields=("id",), policy="concat").map(_kept)
                       .shuffle(seed=1, window=4), "streamed"),
@@ -1333,15 +1313,16 @@ def test_a_clocked_run_resumed_with_a_larger_bound_trains_on_to_it(tmp_path):
 
 
 def test_a_resume_refuses_a_limit_grown_before_a_repeat(tmp_path):
-    """A limit a repeat reads after (`take(5).repeat()`), grown on resume, reads other records past the
-    saved position (its second pass the larger limit's next records, not the first five again), so the
-    resume is refused: only a bound with nothing but a batch after it reads on (row 2649)."""
+    """A limit a repeat reads after (`take(5).repeat()`), grown on resume, reads other records past the saved
+    position (its second pass the larger limit's next records, not the first five again), so an exact
+    resume is refused (a relaxed one starts its data again): only a bound with nothing but a batch after
+    it reads on (row 2649)."""
     (x,) = clocked_records(0)
 
     def fit(count: int, steps: int):
         chain = Pipeline(Memory({"x": x})).read("streamed").take(count).repeat().batch(BATCH)
         trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
-                          checkpoints=Checkpoints(str(tmp_path)))
+                          checkpoints=Checkpoints(str(tmp_path)), data_resume="exact")
         return trainer.fit(chain, steps=steps, log_every=1)
 
     fit(5, 2)
@@ -1350,9 +1331,9 @@ def test_a_resume_refuses_a_limit_grown_before_a_repeat(tmp_path):
 
 
 def test_a_resume_refuses_a_mixed_corpus_limit_grown_beneath_the_mixtures_repeat(tmp_path):
-    """A mixed corpus's limit, grown on resume, holds records its mixture's own shuffle and repeat read
-    after it (`mix([member.take(5)]).shuffle(window=2).take(100).repeat()`), so the resume is refused: only
-    the run's own chain's bound grows (row 2649)."""
+    """A mixed corpus's limit, grown on resume, holds records its mixture's own shuffle and repeat read after
+    it (`mix([member.take(5)]).shuffle(window=2).take(100).repeat()`), so an exact resume is refused (a
+    relaxed one starts its data again): only the run's own chain's bound grows (row 2649)."""
     from dew.data.pipeline import mix
 
     (x,) = clocked_records(0)
@@ -1361,7 +1342,7 @@ def test_a_resume_refuses_a_mixed_corpus_limit_grown_beneath_the_mixtures_repeat
         member = Pipeline(Memory({"x": x})).take(count)
         chain = mix([member]).read("streamed").shuffle(window=2).take(100).repeat().batch(BATCH)
         trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
-                          checkpoints=Checkpoints(str(tmp_path)))
+                          checkpoints=Checkpoints(str(tmp_path)), data_resume="exact")
         return trainer.fit(chain, steps=steps, log_every=1)
 
     fit(5, 2)

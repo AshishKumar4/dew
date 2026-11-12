@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import importlib.metadata
 import json
 import os
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from types import MappingProxyType
-from typing import Literal
 
 import grain.python as pygrain
 import numpy as np
 
 from dew import _position
-from dew._records import integer, record
+from dew._records import JSON, integer, json_value, record
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch
 from dew.data.dataset import (
     Closeable,
@@ -32,19 +32,15 @@ from dew.data.dataset import (
 )
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
-from dew.data.plan import (
-    COUNTERS,
-    DECLARED_MIX,
-    FILE_SHARDS,
-    IN_ORDER,
-    SHARED_STATE,
-    Plan,
-    earlier_position,
-    read_otherwise_at_11,
-    read_otherwise_at_13,
-)
+from dew.data.plan import COUNTERS, PLAN_VERSIONS, STRUCTURED, DataResume, Plan, PlanChanged
 from dew.data.shared import SharedMapping
 from dew.data.storage import MIRRORED, Mirrored, PositionText, carried_mirrors
+
+GRAIN = importlib.metadata.version("grain")
+"""The `grain` rule a per-share read's plan records (`dew.data.plan.Plan.rules`): the Grain whose iterators'
+states its position holds, which a resume under another restores through its iterators at once
+(`_PerShare._grain_restores`)."""
+
 
 READER_FIELDS = (EXAMPLES_CONSUMED, VALID_ROWS)
 """A batch's fields its reader owns, which a host step after the batch neither reads nor writes
@@ -239,7 +235,7 @@ class _PerShare(Forwarding):
         self,
         open_reader: Callable[[], pygrain.DatasetIterator[Batch]],
         plan: Plan,
-        resume: Literal["exact", "non-exact"],
+        resume: DataResume,
         *,
         stop_seconds: float,
         endless: bool = True,
@@ -250,7 +246,7 @@ class _PerShare(Forwarding):
         # The reader and plan of a position saved under another version this lowering reads by
         # (`resumed_at`), in the workers it names.
         self._saved_as = saved_as
-        self._resume: Literal["exact", "non-exact"] = resume
+        self._resume: DataResume = resume
         self._stop_seconds = stop_seconds
         self._endless = endless
         # An elastic read's position (`position.REPLICATED`), the same on every reader.
@@ -313,41 +309,54 @@ class _PerShare(Forwarding):
     def set_state(self, state: bytes) -> None:
         held = _position.replicated(state)
         if self._replicated != (held is not None):
-            raise ValueError(
+            raise PlanChanged(
+                ("topology",),
                 "this read is elastic, and the saved position is one share's own offset; resume it with the "
                 "chain that saved it (without .elastic())" if self._replicated else
                 "the saved position is an elastic read's, and this read is per share; resume it with "
                 ".elastic() on the chain")
         decoded = record(json.loads(state), "saved per-share position") if held is None else held
         self.resumed_at(decoded)
-        # The saved position's one translation (`earlier_position`), then its check.
-        written, iterator = earlier_position(decoded, self._plan)
+        written = record(decoded.get(_position.PLAN), "saved data plan")
         self._plan.check(written, resume=self._resume)
-        saved = record(iterator, "saved Grain iterator")
+        saved = record(decoded.get("iterator"), "saved Grain iterator")
         self.close()
         self._saved = saved
         self._statistics.publish(None)
+        if self._plan.version >= STRUCTURED:
+            rules = record(written.get("rules", {}), "saved data plan rules")
+            self._grain_restores(json_value(rules.get("grain"), "saved grain rule"))
+
+    def _grain_restores(self, written: JSON) -> None:
+        """Restore the saved iterator state now, through the iterators that own it, where a Grain of another
+        version wrote it (`written`, its `grain` rule): a state that Grain's iterators read otherwise
+        than this Grain's is refused, naming both, where its restore fails; one they read alike resumes."""
+        if written == GRAIN:
+            return
+        try:
+            self._reader()
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
+            self.close()
+            raise PlanChanged(("rules.grain",),
+                              f"the saved data position's iterator state was written by grain {written}, "
+                              f"which this grain {GRAIN} does not read (docs/design/data.md, the rules): "
+                              f"resume with grain=={written}, or go on from the run's weights as a new run "
+                              "that reads its data afresh") from error
 
     def resumed_at(self, decoded: Mapping[str, object]) -> None:
-        """Read on as the saved position `decoded` was read where a later Dew reads it otherwise: one a Dew
-        of version `FILE_SHARDS` saved that `IN_ORDER` reads otherwise (`read_otherwise_at_11`), its share
-        in the workers it names; and one of `SHARED_STATE` that `DECLARED_MIX` reads otherwise
-        (`read_otherwise_at_13`), its mixes in their keys' order. A run so saved resumes as its version
-        read it, and goes on under it; any other position is translated and checked as it was."""
-        if self._saved_as is None:
+        """Read on as the saved position `decoded` was read where it was saved under another plan version
+        this Dew reads (`dew.data.plan.PLAN_VERSIONS`), in the workers it names: this share's build at that
+        version (`saved_as`), which the run goes on under; a position of this read's own version, or of one
+        this Dew reads none of, which its check refuses, as it is."""
+        written = record(decoded.get(_position.PLAN), "saved data plan").get("version")
+        if (self._saved_as is None or written == self._plan.version or not isinstance(written, int)
+                or written not in PLAN_VERSIONS):
             return
-        for saved, later, otherwise in ((FILE_SHARDS, IN_ORDER, read_otherwise_at_11),
-                                        (SHARED_STATE, DECLARED_MIX, read_otherwise_at_13)):
-            if self._plan.version < later:
-                continue
-            written, _ = earlier_position(decoded, dataclasses.replace(self._plan, version=saved))
-            if written.get("version") != saved or otherwise(written) is None:
-                continue
-            topology = record(written.get("topology", {}), "saved data plan topology")
-            workers = integer(topology.get("workers", 0), "saved per-share workers")
-            self._open, self._plan = self._saved_as(saved, workers)
-            self._plan_record = SharedMapping.of(self._plan.record())
-            return
+        topology = record(record(decoded.get(_position.PLAN), "saved data plan").get("topology", {}),
+                          "saved data plan topology")
+        workers = integer(topology.get("workers", 0), "saved per-share workers")
+        self._open, self._plan = self._saved_as(written, workers)
+        self._plan_record = SharedMapping.of(self._plan.record())
 
     def identity(self) -> str:
         """What every share of the pool reads, which the pool agrees before it
