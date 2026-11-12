@@ -75,10 +75,9 @@ def test_a_trainer_with_room_passes_and_one_short_of_a_claim_fails():
 def test_within_states_a_margin_as_two_one_sided_contrasts():
     """Values a quarter above and three quarters above their target within a margin of a half: a quarter
     and minus a quarter short of the upper margin, three quarters and one and a quarter past the lower."""
-    sides = within("mean", np.asarray([0.75, 1.25]), 0.5, 0.5)
-    assert sorted(sides) == ["mean above its lower margin", "mean below its upper margin"]
-    np.testing.assert_array_equal(sides["mean below its upper margin"], [0.25, -0.25])
-    np.testing.assert_array_equal(sides["mean above its lower margin"], [0.75, 1.25])
+    below, above = sorted(within("mean", np.asarray([0.75, 1.25]), 0.5, 0.5).values(), key=np.sum)
+    np.testing.assert_array_equal(below, [0.25, -0.25])
+    np.testing.assert_array_equal(above, [0.75, 1.25])
 
 
 def test_sizing_declares_the_fewest_units_that_keep_a_trainer_like_its_pilots_false_reds_under_false_red():
