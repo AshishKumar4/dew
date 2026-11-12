@@ -122,6 +122,27 @@ def test_joined_projections_keep_the_dtype_their_promotion_gives_a_wider_bias():
                     truth_fn=lambda x: Pair(wide=True).apply(widened(params), x))
 
 
+def test_joined_projections_round_a_16bit_product_and_its_fp32_bias_once_as_each_does_apart():
+    """Joined, two bf16 projections whose biases are stored at fp32 round each product and its bias once,
+    as each projection apart does (`dense._biased`): an input of ones and a kernel column of 1 and 1/256 sum
+    to 1 + 1/256, which with a bias of 1/256 is 1 + 1/128 rounded once, but 1 where the product is rounded
+    to bf16 first (a tie to the even 1, a bf16 step past 1 being 1/128) and the bias added after."""
+    class Pair(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            projections = [Dense(1, dtype=jnp.bfloat16, name=name) for name in ("gate", "up")]
+            return jnp.stack([projection(x) for projection in projections], axis=-2), joined_dense(
+                x, projections, axis=-2)
+
+    x = jnp.ones((1, 2), jnp.bfloat16)
+    column = {"kernel": jnp.asarray([[1.0], [1 / 256]], jnp.float32),
+              "bias": jnp.asarray([1 / 256], jnp.float32)}
+    params = {"params": {"gate": column, "up": column}}
+    apart, joined = Pair().apply(params, x)
+    assert float(apart[0, 0, 0]) == 1 + 1 / 128
+    np.testing.assert_array_equal(np.asarray(joined, np.float32), np.asarray(apart, np.float32))
+
+
 @pytest.mark.parametrize("wrapped", ["direct", "nested", "dew", "input", "input_lora"])
 def test_quantized_projection_calls_keep_their_own_paths_under_a_joined_row(wrapped):
     from flax.errors import ScopeParamShapeError
