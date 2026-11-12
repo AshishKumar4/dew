@@ -123,7 +123,6 @@ def test_json_grain_and_hf_sources_validate_records_materialize_memory_and_shard
     `from_grain(MapDataset)` and `from_hf(Dataset)` materialize `memory` reads once and shard
     multi-thousand-row `streamed` reads across multiple shares."""
     import datasets
-    from data_support import LATEST
 
     bad_jsonl = tmp_path / "bad.jsonl"
     bad_jsonl.write_text("[1, 2]\n")
@@ -132,7 +131,7 @@ def test_json_grain_and_hf_sources_validate_records_materialize_memory_and_shard
 
     json_array = tmp_path / "array.json"
     json_array.write_text(json.dumps([{"id": 0}, {"id": 1}]))
-    manifest = Files(str(json_array)).manifest(LATEST)
+    manifest = Files(str(json_array)).manifest()
     iterator = iter(manifest.reader(manifest.shards[0]))
     try:
         for invalid in (-1, 3, True):
@@ -182,7 +181,7 @@ def test_json_grain_and_hf_sources_validate_records_materialize_memory_and_shard
     )
     for source in (grain_large, hf_arrow):
         # Single-reader streams keep one whole-store shard, so checkpoints past 1,024 rows resume.
-        single_manifest = source.manifest(LATEST)
+        single_manifest = source.manifest()
         assert len(single_manifest.shards) == 1 and single_manifest.shards[0].rows == 1500
         single_loader = compile(
             Pipeline(source).batch(1),
@@ -220,11 +219,10 @@ def test_json_grain_and_hf_sources_validate_records_materialize_memory_and_shard
 def test_source_iterators_and_token_exports_reject_boolean_positions_and_eos_ids(tmp_path):
     """`bool` is a subclass of `int` in Python, so checkpointed positions and `eos_id` metadata
     explicitly refuse `True` and `False` rather than reading them as `1` and `0`."""
-    from data_support import LATEST
 
     parquet_path = tmp_path / "rows.parquet"
     pq.write_table(pa.Table.from_pylist([{"id": 0}, {"id": 1}]), parquet_path)
-    pq_manifest = Files(str(parquet_path)).manifest(LATEST)
+    pq_manifest = Files(str(parquet_path)).manifest()
     pq_iter = iter(pq_manifest.reader(pq_manifest.shards[0]))
     try:
         with pytest.raises(ValueError):
@@ -234,7 +232,7 @@ def test_source_iterators_and_token_exports_reject_boolean_positions_and_eos_ids
 
     jsonl_path = tmp_path / "rows.jsonl"
     jsonl_path.write_text('{"id": 0}\n{"id": 1}\n')
-    line_manifest = Files(str(jsonl_path)).manifest(LATEST)
+    line_manifest = Files(str(jsonl_path)).manifest()
     line_iter = iter(line_manifest.reader(line_manifest.shards[0]))
     try:
         with pytest.raises(ValueError):
@@ -247,7 +245,7 @@ def test_source_iterators_and_token_exports_reject_boolean_positions_and_eos_ids
         info = tarfile.TarInfo("0.txt")
         info.size = 2
         archive.addfile(info, io.BytesIO(b"hi"))
-    tar_manifest = Files(str(tar_path)).manifest(LATEST)
+    tar_manifest = Files(str(tar_path)).manifest()
     tar_iter = iter(tar_manifest.reader(tar_manifest.shards[0]))
     try:
         with pytest.raises(ValueError):
@@ -261,7 +259,7 @@ def test_source_iterators_and_token_exports_reject_boolean_positions_and_eos_ids
         state=lambda _: 0,
         load_state=lambda _, saved: None,
     )
-    iter_manifest = iter_source.manifest(LATEST)
+    iter_manifest = iter_source.manifest()
     stream_iter = iter(iter_manifest.reader(iter_manifest.shards[0]))
     try:
         saved = dict(stream_iter.get_state())

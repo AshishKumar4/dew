@@ -1546,15 +1546,19 @@ def test_a_batch_encoders_reader_is_part_of_the_plan_a_resume_checks():
 
 
 def test_a_batch_encoders_reader_that_binds_what_it_reads_states_what_it_computes():
-    """A reader one function makes bound to its words (a partial) computes what its binding says,
-    which its function's name, the one a plan held of it, does not: the same function over other words
-    would resume as it, so an encoder of one is refused until it declares what it computes, and then
-    encodes by it."""
+    """A reader one function makes bound to its words (a partial) computes what its binding says, which
+    its function's name, the one a plan held of it, does not: the same function over other words would
+    resume as it. An encoder of one encodes by it and trains as any step does, a step of no stable
+    identity, which an exact resume or a cache refuses; declared, it is exact, and two declared apart are
+    two steps."""
+    from dew.data.plan import StepIdentity
+
     reader = functools.partial(_words_of, words=("a", "b"))
     for encoder in (EncodeCaptions, EncodeFields):
-        with pytest.raises(ValueError):
-            encoder(reader)
-    encoded = EncodeCaptions(reader, declared="words@ab")({"caption": ["x", "y", "z"]})
+        assert not StepIdentity.of(encoder(reader)).exact
+        ab, cd = encoder(reader, declared="words@ab"), encoder(reader, declared="words@cd")
+        assert StepIdentity.of(ab).exact and StepIdentity.of(ab).semantic() != StepIdentity.of(cd).semantic()
+    encoded = EncodeCaptions(reader)({"caption": ["x", "y", "z"]})
     np.testing.assert_array_equal(encoded["words"], ["a", "b", "a"])
 
 

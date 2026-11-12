@@ -122,15 +122,11 @@
    "lane": "Training"
   },
   "tests/test_decision_objective.py": {
-   "comparisons": 10,
+   "comparisons": 8,
    "lane": "Training"
   },
   "tests/test_decision_option_slots.py": {
    "comparisons": 1,
-   "lane": "Training"
-  },
-  "tests/test_decision_packing.py": {
-   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_decision_questions.py": {

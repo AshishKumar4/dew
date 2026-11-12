@@ -37,7 +37,7 @@ from dew.training.distributed import microbatch, microbatch_shapes
 from dew.training.footprint import Footprint, candidate_footprint
 from dew.training.memory import local_devices
 from dew.training.model_flops import batch_consumed, batch_tokens
-from dew.training.narrow import narrow_copies, narrowed
+from dew.training.narrow import holds_copies, narrow_copies, narrowed
 from dew.training.planning import Candidate, splits
 from dew.training.stages import StageLocal
 from dew.training.transaction import COMMIT_FIELDS, consumed_where_made, outcome, pooled_by_mean
@@ -267,9 +267,10 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
     last = state.window
     rebuilt = last is not None and not last.replays(prepared.window)
     # A step lowered for other devices is checked against none of this process's.
-    built = 0 if mesh is not None else placed_bytes([field for field, kept in (
-        (prepared.compute, state.compute), (prepared.window, None if rebuilt else last))
-        if kept is None and field is not None])
+    # The copies the runner makes where the state holds another program's, or none (`holds_copies`).
+    made = [] if prepared.compute is None or holds_copies(state.compute, copies) else [prepared.compute]
+    built = 0 if mesh is not None else placed_bytes(
+        [*made, *([prepared.window] if prepared.window is not None and (last is None or rebuilt) else [])])
     held = 0 if mesh is not None else prefetched_bytes(batch, placement, stepping.shape.prefetch) + built
     jitted = step_program(stepping, shapes, copies, shardings, placement, replicated, split)
     part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
