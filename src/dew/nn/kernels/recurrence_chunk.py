@@ -338,14 +338,28 @@ itself; and keys wider than the port takes in their dtype. Packed documents take
 stores the memories by where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
 (`chunked_launch.Sequences`)."""
 
-PORT_CELLS: dict[tuple[str | None, str], tuple[Kernel[PortCase], str]] = {}
+FLA_PORT = Kernel[PortCase]('fla', PORT_SUPPORTS, upstream='fla')
+"""Dew's port of fla's kernels (`fla_rule`)."""
+
+TCGEN05_FORWARD = ("on a B200, by device time, the port's forward 0.394 ms against the template's 0.724 on "
+                   "Qwen3.5-27B's gated delta net, 0.276 against 0.399 on Qwen3-Next's and 1.118 against "
+                   "2.507 on Kimi Linear's delta attention (M-JS-106 at 690a7e87d85)")
+"""The receipt behind tcgen05's forward cells."""
+
+PORT_CELLS: dict[tuple[str | None, str], tuple[Kernel[PortCase], str]] = {
+    ('tcgen05', 'forward'): (FLA_PORT, TCGEN05_FORWARD),
+    ('tcgen05', 'forward, a decay a key dimension'): (FLA_PORT, TCGEN05_FORWARD),
+}
 """The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows Dew's port
 of fla's kernels (`fla_rule`; "the port" below) faster than the recurrence template, each its old route's
 kernel and that receipt; every time below sets the template against that port, not against upstream fla's
 own kernels or FlashQLA's (tools/benchmark_recurrence.py's `fla` and `flashqla` arms): the delta rule's
 selector runs the port on them where it takes the call (`Op.declared`, owner, bible da64ae5); the list
-shrinks as the template wins its cells, and no cell is picked or ranked at run time. None is left: every
-cell is the template's. Warpgroup MMA's forward of Kimi delta attention, the last, is the template's, 1.154 ms
+shrinks as the template wins its cells, and no cell is picked or ranked at run time. A Blackwell's forward
+is the port's, the gated delta net's and Kimi delta attention's (`TCGEN05_FORWARD`); its training the
+template's, its forward and gradient 1.886 ms against the port's 1.744 on Qwen3.5-27B's gated delta net,
+1.196 against 1.422 on Qwen3-Next's and 4.312 against 4.313 on Kimi Linear's (M-JS-106). Every other cell
+is the template's. Warpgroup MMA's forward of Kimi delta attention, the last, is the template's, 1.154 ms
 against the port's 1.571 on a GH200 480GB and 1.647 against 2.412 on an H100 PCIe (M-JS-43b-gh200 and
 -h100pcie at e52d05f558f: exclusive, two rounds alternating the arms; the cell's receipt had the port's
 1.406 against the template's 1.624 on an H100 80GB HBM3 at c70aaa8, window-h100-c70aaa8-b8109ee). A gated
@@ -435,8 +449,7 @@ MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
 
 GATED_DELTA: Op[PortCase] = Op(Choice.GATED_DELTA_RULE,
-                               (MOSAIC, Kernel('fla', PORT_SUPPORTS, upstream='fla'),
-                                Kernel('xla', (), generic=True)),
+                               (MOSAIC, FLA_PORT, Kernel('xla', (), generic=True)),
                                declared=PORT_CELLS)
 """The delta rule's selector: on a declared port cell (`PORT_CELLS`) the port where it takes the call;
 otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the
@@ -1489,7 +1502,9 @@ arms' order). The template trains the rated scan under
 the fast forms (`mainloop_backward.fast_backward_form`); under the accurate ones it does not, by its refusal,
 not a cell: at the default precision the port then trains an fp32 call, its products one TF32 as
 mamba_ssm's, and at a precision above it (the accurate numerics', `dew.nn.precision.ACCURATE`) the port
-declines too (`_port_precision`) and the portable math trains it at that precision."""
+declines too (`_port_precision`) and the portable math trains it at that precision. An fp16 call's
+gradient the template refuses alike (no recording holds mamba_ssm's fp16 backward against it), so the port,
+the next kernel that takes it, trains it on a GPU: a refusal's route, not a cell (row 5739)."""
 
 SCAN: Op[ScanCase] = Op(Choice.SSD, (Kernel('mosaic_gpu', (*SSD_SUPPORTS[:3], *TEMPLATE_SUPPORTS)),
                                SSD_PORT, Kernel('tpu', TPU_SCAN_SUPPORTS),

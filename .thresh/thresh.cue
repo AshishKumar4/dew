@@ -128,7 +128,10 @@ seams: "port-cells": {
 	purpose: "each cell routes the delta rule to the fla port on a receipt that shows the port faster"
 	paths:   ["src/dew/nn/kernels/recurrence_chunk.py"]
 	entries: "PORT_CELLS"
-	declared: "(wgmma, forward, a decay a key dimension)": "Kimi delta attention's forward on an H100 80GB HBM3, the port's 1.406 ms against the template's 1.624"
+	declared: {
+		"(tcgen05, forward)":                          "the gated delta net's forward on a B200, the port's 0.394 ms against the template's 0.724 (M-JS-106)"
+		"(tcgen05, forward, a decay a key dimension)": "Kimi delta attention's forward on a B200, the port's 1.118 ms against the template's 2.507 (M-JS-106)"
+	}
 }
 
 seams: "scan-cells": {

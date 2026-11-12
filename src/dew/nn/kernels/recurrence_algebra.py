@@ -113,13 +113,22 @@ def prefix(g):
     lo)`, each token's `g log2(e)` an exact pair (its product with log2(e)'s fp32 rounding error-free,
     `precision.two_product`, plus its product with the rounding's remainder) summed compensated
     (`precision.compensated_add`), so a difference of two positions is as precise as its own range. One
-    program JAX traces once for `g`'s type: its exact sums traced afresh, each layer's forward, its kept
-    forward in the backward and its gradient's preparation each paid them, 226 s of Qwen3.5-4B's 1208 s
-    ahead-of-time compile (row 3142, FS2440-4B-STACKS)."""
+    variadic reduce-window over each position's chunk so far, which XLA fuses into the launches' layout of the
+    pair: as an associative scan its log-depth levels were XLA launches of their own, fourteen of the gated
+    delta net's 364 us forward on a GH200, 45 us of it (LF-GDN-NCU-gh200; four fusions in all compiled for an
+    sm90 with the window, jsf-prefix-rw), the pair as precise either way (1.2e-14 to 1.5e-14 relative from
+    float64 over decays of 1e-3 to 30 a token). One program JAX traces once for `g`'s type: its exact sums
+    traced afresh, each layer's forward, its kept forward in the backward and its gradient's preparation each
+    paid them, 226 s of Qwen3.5-4B's 1208 s ahead-of-time compile (row 3142, FS2440-4B-STACKS)."""
     scale = np.float32(LOG2_E)
     scaled, error = two_product(g, jnp.full_like(g, scale), bit_split=True)
     error = error + g * float(np.float32(LOG2_E - float(scale)))
-    return jax.lax.associative_scan(compensated_add, (scaled, error), axis=g.ndim - 2)
+    axis, size = g.ndim - 2, g.shape[g.ndim - 2]
+    window = tuple(size if dim == axis else 1 for dim in range(g.ndim))
+    padding = tuple((size - 1, 0) if dim == axis else (0, 0) for dim in range(g.ndim))
+    zero = jnp.zeros((), g.dtype)
+    return jax.lax.reduce_window((scaled, error), (zero, zero), compensated_add, window, (1,) * g.ndim,
+                                 padding)
 
 
 def scanned_prefix(g, stage: Callable[[tuple], Callable[[int], tuple]], *, chunk: int) -> tuple:

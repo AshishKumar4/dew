@@ -774,7 +774,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
     once, its streams' rings running on across them (`_planned_launch`): the family's `persist` takes each
-    tile's walk from its program at the tile's indices (`_tile_at`). A program that `reduces` none takes no
+    tile's walk from its program at the tile's indices (`_tile_at`), its producer at `PERSISTENT_PRODUCER`
+    where no floor is given. A program that `reduces` none takes no
     reduction scratch (`_scope`; the compile gate holds its plan's shared memory to at least the compiled
     kernel's).
     `after` are the `(shape, dtype)` tiles its program scopes after its walks (`final_memory_landing`), which
@@ -782,6 +783,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     `Tiles.walkers`) holds each staging and landing tile once a role, along a leading axis a role indexes
     (`role_tiles`): one role's products' tiles are no other's to write while its products read them."""
     family = call.family
+    if persistent and producer is None:
+        producer = stated_producer(call, PERSISTENT_PRODUCER)
     registers = held.registers(family, addressed(staging, landing or {}))
     allocations, scope, staging, landing = shared_allocation(call, blocks, staging, landing or {}, once=once,
                                                              consumers=consumers, swizzles=swizzles,
@@ -1043,9 +1046,8 @@ def _solved(k, v, hi, lo, beta, taken, call: Call, *, keeps: bool = True, applie
         out_type = (held.shape(call.heads * chunk), *out_type)
     work, hardware, held_tiles, staging, landing = _solved_resources(call, keeps=keeps, applies=applies,
                                                                      narrow=narrow)
-    # Its producer at 32 on a tcgen05 bundle: GDN's bf16 solve spilled 164 bytes at 24, none from 32.
     solved = launch_kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                           grid_names=("chunks", "heads"), producer=stated_producer(call, 32),
+                           grid_names=("chunks", "heads"),
                            blocks=stream_blocks(keys=((chunk, width), call.given),
                                                 **({"values": ((chunk, value_width),
                                                                call.given)} if applies else {}))
@@ -2190,6 +2192,20 @@ def _states_launched(program, call: Call, tiles: Tiles, delta: bool, keys: Opera
                          once=initials, landing=landing, after=after,
                          # Its last write's column sums an fp32 call's alone (`column_sums`).
                          reduces=held.parts > 1, producer=producer)
+
+
+PERSISTENT_PRODUCER = 32
+"""The floor a persistent launch's producer lowers to on a family whose producers load past the floor
+(`stated_producer`): its walk over the program's tiles carries their indices and addresses, which at the 24
+registers of `resources.producer_floor` ptxas spilled (32 bytes, an `STL.64` of an address pair after the
+producer's `setmaxnreg` decrease) once a program walked three tiles or more, and allocated the consumers
+past their live set around it: on a compile-only sm100 the gated delta net's scores' gradient held at 240
+registers a consumer from 512 tokens against 168 with its producer at 32, Nemotron-H 4B's SSD scores'
+gradient spilled 16 bytes at its 248 from 2048 tokens against holding at 200, and its local products'
+gradient held at 240 against 104, their consumers' live peaks the same at either floor (161 for the delta
+net's); 40, 48 and 64 gave 32's (row 5693, armada at 816a3c6d3f1). The gated delta net's 16-bit solve, one
+tile a program, spilled 164 bytes at 24 and none from 32. A consumer's raise at one program a multiprocessor
+stays 248; at two it is 224, 232 at 24."""
 
 
 def stated_producer(call: Call, registers: int) -> int | None:

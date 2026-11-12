@@ -1381,6 +1381,44 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     assert not failed, "\n".join(failed)
 
 
+@lowers('sm100')
+@pytest.mark.parametrize('name', ['qwen3.5-27b-gdn', 'nemotron-h-4b-ssd'])
+def test_a_persistent_launch_walking_many_tiles_holds_within_its_model_on_a_blackwell(name):
+    """A geometry's 16-bit training at its derived tiles, compiled for a compile-only B200 over one row of
+    2048 tokens, so each persistent launch's programs walk several tiles (the gate's 256 tokens walk one): no
+    launch spills, and ptxas's least spill-free cap is within each launch's register model. Its producer at
+    24 registers, the walk's indices and addresses spilled once a program walked three tiles or more and
+    ptxas allocated the consumers past their live set around them (`mainloop.PERSISTENT_PRODUCER`, row 5693:
+    the 4B SSD's scores' gradient spilled 16 bytes at its 248 registers, its model 223)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    dtype, rows, length = jnp.bfloat16, 1, 2048
+    facts = generation.gpu_target('sm100')
+    family = template.bundle(facts)
+    args = resource_operands(name, dtype, rows, length)
+    bound = template.MOSAIC.bind(*args, None, max_segments=None, bound=None if name in RATED else 1.0,
+                                 **_form(name, dtype), **_skipped(name, dtype))
+    with generation.assumed(facts):
+        tiles = template.MOSAIC.derived(bound, facts)
+        models = _models(template.MOSAIC.launches(bound, tiles, facts, backward=True), family, facts)
+    # The output's and the final memory's cotangents.
+    cotangents = [jax.ShapeDtypeStruct(args[2].shape, dtype),
+                  jax.ShapeDtypeStruct(args[5].shape, jnp.float32)]
+    call = functools.partial(_gate_call, name, dtype, [*args, *cotangents], None, tiles, family,
+                             training=True)
+    (record,) = compile_mosaic_kernels([KernelCase(name, call, models)], 'sm100', least=True)
+    assert not mosaic_failures([record]), mosaic_failures([record])
+
+    def modelled(kernel) -> int:
+        # The model's registers in the allocator's steps of 8, as ptxas's least cap is stated.
+        return -(-models[kernel['kernel'].split('__')[0]].registers // 8) * 8
+
+    over = [(kernel['kernel'], kernel['least'], modelled(kernel)) for kernel in record['kernels']
+            if kernel['spilled'] or kernel['least'] is None or kernel['least'] > modelled(kernel)]
+    assert not over, over
+
+
 def stepped_down(target: str, group: tuple, plans: dict, refused: list, apart: dict) -> tuple[list, list]:
     """The gate's cases of `group` on `target` (`compiled_cases`) and their records, compiled, then, for as
     long as a required launch spills at a config not refused before, its launch refused
