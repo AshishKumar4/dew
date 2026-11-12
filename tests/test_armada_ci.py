@@ -98,7 +98,8 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     daily run (DEW_WHOLE_SUITE) runs every file on both, with nothing only
     collected. Every row is named once, test_gen_api never."""
     for name in ("test_heavy", "test_light", "test_new", "test_measured", "test_gen_api", "test_config"):
-        (tmp_path / "tests" / f"{name}.py").write_text("")
+        (tmp_path / "tests" / f"{name}.py").write_text(
+            "".join(f"def test_{each}(): pass\n" for each in "abcde"))
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0,
          "tests/test_light.py::test_c": 30.0, "tests/test_measured.py::test_d": 25.0,
