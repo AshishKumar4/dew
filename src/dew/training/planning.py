@@ -836,9 +836,14 @@ class FitSearch[LossT, EffectsT]:
         narrow, label = self.narrow, "refuses"
         if not self.judging():
             # A device that states no memory leaves every rung unjudged (`admitted`), so no footprint is
-            # traced for it.
+            # traced for it. A run that sets its remat hears what it asked for and is not told: nothing
+            # is judged, and the compiles decide; one that leaves its remat to the walk asked nothing.
             self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": None,
                                  "label": "unstated", "terms": None})
+            if self.remat_set:
+                _log.warning("the run sets remat %s, and its devices state no memory to judge its footprint "
+                             "against (a CPU, or a compile-only GPU given no capacity), so the derivation "
+                             "picks no plan and the compiles decide it", self.remat_rung())
             return "unstated", narrow
         while True:
             headroom = self.judged(split, narrow)
@@ -918,18 +923,7 @@ class FitSearch[LossT, EffectsT]:
         derivation trusted where it refuses one, so the one compile at the most performant plan it admits
         decides (row 3341). `first` where the run starts from a plan (a recorded one, or a checkpoint's
         rung), where the derivation cannot judge the step, or where no candidate it reads fits."""
-        if not self.deriving() or self.resumed is not None or first != 0:
-            return first
-        if not self.judging():
-            if not self.derived:
-                # A run that sets its remat reads no rung's walk (`derived_start`), so its record says here
-                # what a walk would, and its log what it asked for and is not told: nothing is judged, and
-                # the compiles decide. A run that leaves its remat to the walk asked nothing of it.
-                self.derived.append({**self.current(), "narrow": self.narrow, "split": candidates[-1],
-                                     "headroom": None, "label": "unstated", "terms": None})
-                _log.warning("the run sets remat %s, and its devices state no memory to judge its footprint "
-                             "against (a CPU, or a compile-only GPU given no capacity), so the derivation "
-                             "picks no plan and the compiles decide it", self.remat_rung())
+        if not self.deriving() or self.resumed is not None or first != 0 or not self.judging():
             return first
         # From the fewest up: a step whose fewest microbatches fit traces that one candidate alone, the
         # one the search compiles (`lowering`). Past it, the most, then halving between, as memory falls
