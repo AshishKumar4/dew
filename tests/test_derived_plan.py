@@ -265,9 +265,9 @@ def test_a_miss_orders_the_compiles_and_rules_out_only_what_the_derivation_itsel
 
 
 def traced(trainer) -> tuple[int, int]:
-    """`trainer` compiled, and how often its plan traced its step and made a candidate of it,
-    counted by the profiler: its step's traces (`_lowering.routed`, each one's dispatches' routes) and its
-    candidates (`_candidates._candidate`), a derivation's and a lowering's alike."""
+    """`trainer` compiled, and how often its plan traced its step and prepared a candidate of it, counted by
+    the profiler: its step's traces (`_lowering.routed`, each one's dispatches' routes) and its loss's
+    forward traces (`_candidates.prepared_for`), a derivation's and a lowering's alike."""
     from dew.training import _candidates, _lowering
 
     profiler = cProfile.Profile()
@@ -276,7 +276,7 @@ def traced(trainer) -> tuple[int, int]:
     return (sum(calls for (file, _, name), (_, calls, *_) in stats
                 if name == "routed" and file == _lowering.__file__),
             sum(calls for (file, _, name), (_, calls, *_) in stats
-                if name == "_candidate" and file == _candidates.__file__))
+                if name == "prepared_for" and file == _candidates.__file__))
 
 
 def test_a_stated_remat_whose_whole_batch_fits_traces_its_step_once(monkeypatch, tmp_path):
