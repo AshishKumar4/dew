@@ -1382,7 +1382,7 @@ def _consumed_by(phases: Sequence[_Staged], ends: Sequence[int], version: int) -
             order = _drawn_order(phase.build, phase.train)
             places: dict[str, list[int]] = {}
             for index in range(end - start):
-                match order[index]:
+                match order(index):
                     case (str() as name, int() as place):
                         places.setdefault(name, []).append(place)
                     case drawn:
@@ -1394,9 +1394,9 @@ def _consumed_by(phases: Sequence[_Staged], ends: Sequence[int], version: int) -
     return consumed
 
 
-def _drawn_order(build: _Build, pipeline: Pipeline) -> pygrain.MapDataset:
+def _drawn_order(build: _Build, pipeline: Pipeline) -> Callable[[int], tuple[str, int]]:
     """The twin of draws of the global order a training read of `pipeline` by `build` counts its records in
-    (`_Build.batch_order`): its `index`th row the corpus and the place its `index`th record was drawn at,
+    (`_Build.batch_order`), by index: the corpus and the place its `index`th record was drawn at,
     where the corpus's chain first repeats (`place_of`); batched and through the stages after its batch
     that hold a place in it as its batches are (`_Build.placed`), each record its batch's."""
     places = _drawn_records(build, pipeline)
@@ -1412,7 +1412,7 @@ def _drawn_order(build: _Build, pipeline: Pipeline) -> pygrain.MapDataset:
         if held is None:
             raise IndexError(f"record {index} lies past the order's last batch")
         return held[index % stage.size]
-    return pygrain.MapDataset.range(len(batches) * stage.size).map(record)
+    return record
 
 
 def _drawn_records(build: _Build, pipeline: Pipeline) -> pygrain.MapDataset:
