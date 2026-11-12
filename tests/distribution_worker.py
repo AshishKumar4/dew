@@ -7,10 +7,15 @@ trains a few steps through `Trainer.fit` on one packed global batch, each
 process reading the share of it the mesh gives it (`DataPartition.of`), and
 process 0 writes the losses, the partition and, for every fsdp group of the
 mesh, the processes its devices sit on. The same script on one process is
-the reference the pool is compared with.
+the reference the pool is compared with, and with `--float64` the float64
+truth both are held to (check 1, `test_distribution.launches_as_exact`):
+`--draws` trains that many further runs, each from the run's one initial
+state on a packed batch of its own (the draw's seed, from `--first-draw`),
+and writes each one's losses.
 """
 
 import argparse
+import functools
 import hashlib
 import json
 import time
@@ -41,6 +46,53 @@ def fsdp_group_processes(mesh) -> list[list[int]]:
             for group in devices.reshape(-1, devices.shape[-1])]
 
 
+def rows_of(partition, batch):
+    """The rows of `batch` this partition's readers read, whole in every other dimension."""
+    import jax
+
+    rows = partition.rows(BATCH)
+    return jax.tree.map(lambda leaf: leaf[partition.index * rows:(partition.index + 1) * rows], batch)
+
+
+class Stream:
+    """A partition's share of a new packed batch at every step, drawn from
+    the step's index, each after `step_seconds`, and where it stands, so a
+    resumed run reads on."""
+
+    def __init__(self, partition, step_seconds: float = 0.0):
+        self.partition, self.step_seconds, self.read = partition, step_seconds, 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        time.sleep(self.step_seconds)
+        batch = packed_batch(self.read)
+        self.read += 1
+        return rows_of(self.partition, batch)
+
+    def get_state(self) -> bytes:
+        return str(self.read).encode()
+
+    def set_state(self, state: bytes) -> None:
+        self.read = int(state)
+
+
+def state_digest(state) -> str:
+    """One hash of every leaf of the trained state whole, in a fixed order, so
+    two runs' states compare by it."""
+    import jax
+    from jax.experimental import multihost_utils
+
+    digest = hashlib.sha256()
+    for path, leaf in jax.tree_util.tree_leaves_with_path(state):
+        whole = np.asarray(multihost_utils.process_allgather(
+            jax.random.key_data(leaf) if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf,
+            tiled=True))
+        digest.update(jax.tree_util.keystr(path).encode() + whole.tobytes())
+    return digest.hexdigest()
+
+
 class Losses:
     """The tracker the fit reports to: the loss of every step, in order, and
     the step each was logged at."""
@@ -48,11 +100,14 @@ class Losses:
     def __init__(self):
         self.losses: list[float] = []
         self.steps: list[int] = []
+        self.dtype: str | None = None
 
     def log(self, scalars, step):
         if "train/loss" in scalars:
             self.losses.append(float(scalars["train/loss"]))
             self.steps.append(int(step))
+            # The dtype the run computed its loss in, which a float written to JSON no longer says.
+            self.dtype = np.asarray(scalars["train/loss"]).dtype.name
 
     def artifact(self, value, step):
         pass
@@ -72,6 +127,11 @@ def main() -> None:
                         help="how long the loader takes over each batch, to slow the run down")
     parser.add_argument("--vary", action="store_true",
                         help="a new packed batch every step, from a stream a checkpoint can put back")
+    parser.add_argument("--draws", type=int, default=0,
+                        help="further runs, each on a packed batch of its own from the one initial state")
+    parser.add_argument("--first-draw", type=int, default=0, help="the first of those draws' seeds")
+    parser.add_argument("--float64", action="store_true",
+                        help="the float64 model under x64, each draw from the float32 initial state widened")
     args = parser.parse_args()
 
     from dew.training.runtime import prepare_process
@@ -80,8 +140,12 @@ def main() -> None:
 
     import jax
     import optax
+    from arm_arithmetic import float64_held
     from jax.experimental import multihost_utils
     from sharded import split_axes
+
+    if args.float64:
+        jax.config.update("jax_enable_x64", val=True)
 
     from dew.checkpoints import Checkpoints
     from dew.data.dataset import DataPartition, Loader
@@ -92,11 +156,9 @@ def main() -> None:
 
     def share(partition):
         """A loader's share: the rows of one packed batch this partition's
-        readers read, whole in every other dimension, for ever; or on
-        process 1 with --fail-at, until that batch."""
-        rows = partition.rows(BATCH)
-        mine = jax.tree.map(lambda leaf: leaf[partition.index * rows:(partition.index + 1) * rows],
-                            packed_batch())
+        readers read, for ever; or on process 1 with --fail-at, until that
+        batch."""
+        mine = rows_of(partition, packed_batch())
         read = 0
         while True:
             if read == args.fail_at and jax.process_index() == 1:
@@ -105,48 +167,45 @@ def main() -> None:
             time.sleep(args.step_seconds)
             yield mine
 
-    class Stream:
-        """A partition's share of a new packed batch at every step, drawn from
-        the step's index, and where it stands, so a resumed run reads on."""
+    def trainer_of(dtype, **options):
+        """The run's trainer over the model computing in `dtype` (None: the model's own, float32)."""
+        model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=2,
+                             num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN, dtype=dtype)
+        return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-2), key=jax.random.key(0),
+                       mesh=MeshSpec(**json.loads(args.mesh)), layout=Layout(min_shard=TINY_SHARD), **options)
 
-        def __init__(self, partition):
-            self.partition, self.read = partition, 0
-
-        def __iter__(self):
-            return self
-
-        def __next__(self):
-            time.sleep(args.step_seconds)
-            rows = self.partition.rows(BATCH)
-            batch = packed_batch(self.read)
-            self.read += 1
-            return jax.tree.map(
-                lambda leaf: leaf[self.partition.index * rows:(self.partition.index + 1) * rows], batch)
-
-        def get_state(self) -> bytes:
-            return str(self.read).encode()
-
-        def set_state(self, state: bytes) -> None:
-            self.read = int(state)
-
-    model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=32, num_layers=2,
-                         num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN)
     losses = Losses()
-    trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-2), key=jax.random.key(0),
-                      mesh=MeshSpec(**json.loads(args.mesh)), layout=Layout(min_shard=TINY_SHARD),
-                      checkpoints=None if args.checkpoints is None else Checkpoints(str(args.checkpoints)),
-                      tracker=losses)
-    state = trainer.fit(Loader(train=Stream if args.vary else share, val=None, records=None, batch=BATCH),
+    trainer = trainer_of("float64" if args.float64 else None, tracker=losses,
+                         checkpoints=None if args.checkpoints is None else Checkpoints(str(args.checkpoints)))
+    stream = functools.partial(Stream, step_seconds=args.step_seconds)
+    state = trainer.fit(Loader(train=stream if args.vary else share, val=None, records=None, batch=BATCH),
                         steps=args.steps, log_every=1)
-    # Every leaf of the trained state whole, in a fixed order, so two runs'
-    # states compare by one hash.
-    digest = hashlib.sha256()
-    for path, leaf in jax.tree_util.tree_leaves_with_path(state):
-        whole = np.asarray(multihost_utils.process_allgather(
-            jax.random.key_data(leaf) if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf,
-            tiled=True))
-        digest.update(jax.tree_util.keystr(path).encode() + whole.tobytes())
+    first = {"losses": list(losses.losses), "loss_steps": list(losses.steps)}
 
+    def started() -> dict:
+        """What a draw's fit starts from: the run's own initial state, which the float64 run takes as the
+        float32 run draws it, widened exactly, so every launch's draws start from the same values."""
+        if not args.float64:
+            return {}
+        with jax.enable_x64(new_val=False):
+            narrow = trainer_of(None).initial_state()
+        return {"state": narrow.replace(variables=float64_held(narrow.variables),
+                                        opt_state=float64_held(narrow.opt_state),
+                                        ema=float64_held(narrow.ema))}
+
+    def drawn(seed: int) -> list[float]:
+        """The losses of a run of the trainer on the packed batch `seed` draws."""
+        def batches(partition):
+            mine = rows_of(partition, packed_batch(seed))
+            while True:
+                yield mine
+
+        before = len(losses.losses)
+        trainer.fit(Loader(train=batches, val=None, records=None, batch=BATCH), steps=args.steps,
+                    log_every=1, **started())
+        return losses.losses[before:]
+
+    draws = [drawn(seed) for seed in range(args.first_draw, args.first_draw + args.draws)]
     # A leaf whose second dimension the sequence axis splits, placed from the
     # share and gathered back whole.
     mesh = trainer.device_mesh
@@ -164,9 +223,10 @@ def main() -> None:
             "split_axes": sorted(split_axes(state.variables["params"])),
             "partition": {"count": partition.count, "readers": partition.readers},
             "placed_whole": bool(np.array_equal(np.asarray(gathered), wide)),
-            "losses": losses.losses,
-            "loss_steps": losses.steps,
-            "state_digest": digest.hexdigest(),
+            **first,
+            "state_digest": state_digest(state),
+            "draws": draws,
+            "loss_dtype": losses.dtype,
         }))
 
 

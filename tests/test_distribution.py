@@ -43,8 +43,6 @@ pytestmark = pytest.mark.mesh
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("distribution_worker.py")
 SCHEDULER = Path(__file__).with_name("scheduler_worker.py")
-# Three adam steps on another topology; observed 2.4e-7.
-TOLERANCE = 1e-5
 SEEDS = FEWEST_SEEDS
 """The seeds check 1 judges a pool's values by (`launches_as_exact`)."""
 DRAWS = staged_units(SEEDS)
@@ -104,14 +102,18 @@ def launch(*arguments: str, devices: int, timeout: float = 600) -> subprocess.Co
     return finished(start(*arguments, devices=devices), timeout)
 
 
-def train(tmp_path: Path, mesh: dict, processes: int, devices: int = 8) -> dict:
+def train(tmp_path: Path, mesh: dict, processes: int, devices: int = 8, *, draws: range = range(0),
+          float64: bool = False) -> dict:
     """The worker's record of a pool of `processes` over `devices` CPU devices,
     whose trained parameters are split over every parameter axis the mesh
-    has (`sharded.assert_sharded`)."""
+    has (`sharded.assert_sharded`); with `draws`, of those further runs'
+    losses too (`Draws`), `float64` the float64 truth's."""
     out = tmp_path / f"{len(list(tmp_path.iterdir()))}.json"
     done = launch("--processes-per-host", str(processes), "--",
                   sys.executable, str(WORKER), "--out", str(out), "--mesh", json.dumps(mesh),
-                  devices=devices // processes)
+                  "--draws", str(len(draws)), "--first-draw", str(draws.start),
+                  *(["--float64"] if float64 else []),
+                  devices=devices // processes, timeout=600 + DRAW_SECONDS * len(draws))
     assert done.returncode == 0, done.stdout + done.stderr
     record = json.loads(out.read_text())
     wanted = {axis for axis in parameter_axes(record["mesh"]) if record["mesh"][axis] > 1}
@@ -119,9 +121,49 @@ def train(tmp_path: Path, mesh: dict, processes: int, devices: int = 8) -> dict:
     return record
 
 
+class Staged[Launched]:
+    """A pool's draws as check 1's two stages read them, by what a launch of a range of draws returns
+    (`launched`): the first SEEDS draws run with the first launch (`first`), and the further ones, which
+    only the second stage reads, in one more launch of the same pool when one is first asked for. A site
+    that passes its first stage then costs a fifth of the draws."""
+
+    def __init__(self, launched: Callable[[range], Launched]):
+        self.first = launched(range(SEEDS))
+        self._further, self._second = functools.partial(launched, range(SEEDS, DRAWS)), None
+
+    def at(self, draw: int) -> tuple[Launched, int]:
+        """The launch that holds `draw`, and the draw's place in it."""
+        if draw < SEEDS:
+            return self.first, draw
+        if self._second is None:
+            self._second = self._further()
+        return self._second, draw - SEEDS
+
+
+class Draws:
+    """A launch's losses by draw (`launches_as_exact`), in the dtype the run computed them in, and its
+    first launch's record, the draws launched as check 1's stages read them (`Staged`)."""
+
+    def __init__(self, tmp_path: Path, mesh: dict, processes: int, devices: int = 8, *,
+                 float64: bool = False):
+        self._staged = Staged(lambda draws: train(tmp_path, mesh, processes, devices, draws=draws,
+                                                  float64=float64))
+        self.record = self._staged.first
+
+    def __getitem__(self, draw: int) -> dict[str, np.ndarray]:
+        record, at = self._staged.at(draw)
+        return {"losses": np.asarray(record["draws"][at], record["loss_dtype"])}
+
+
 @pytest.fixture(scope="module")
-def reference(tmp_path_factory) -> dict:
-    return train(tmp_path_factory.mktemp("reference"), {"fsdp": 8}, processes=1)
+def reference(tmp_path_factory) -> Draws:
+    return Draws(tmp_path_factory.mktemp("reference"), {"fsdp": 8}, processes=1)
+
+
+@pytest.fixture(scope="module")
+def truth(tmp_path_factory) -> Draws:
+    """The reference's runs in float64, one process: the truth a pool and the reference are held to."""
+    return Draws(tmp_path_factory.mktemp("truth"), {"fsdp": 8}, processes=1, float64=True)
 
 
 @pytest.mark.parametrize("shared", [True, False], ids=["shared", "apart"])
@@ -160,23 +202,24 @@ def test_a_pool_caches_by_default_only_where_its_processes_share_the_directory(t
     assert held.parent == tmp_path / "home" / "dew" / "xla" and held.name.startswith(minor)
 
 
-def test_hybrid_sharding_groups_hosts_into_replicas_and_trains_like_fsdp(tmp_path, reference):
+def test_hybrid_sharding_groups_hosts_into_replicas_and_trains_like_fsdp(tmp_path, reference, truth):
     """Four processes of two devices, fsdp=2 over replicas=2: each replica is
     two processes and fsdp crosses the pair, where `jax.make_mesh` would put
-    every fsdp group on one process. The losses are plain fsdp's over all
-    eight devices."""
-    pool = train(tmp_path, {"fsdp": 2, "replicas": 2}, processes=4)
-    assert pool["processes"] == 4 and pool["mesh"]["data"] == 4
-    assert pool["fsdp_groups"] == [[0, 1], [0, 1], [2, 3], [2, 3]]
-    assert max(abs(a - b) for a, b in zip(pool["losses"], reference["losses"], strict=True)) < TOLERANCE
+    every fsdp group on one process. The losses are as exact as plain fsdp's
+    over all eight devices (check 1, from the same runs in float64)."""
+    pool = Draws(tmp_path, {"fsdp": 2, "replicas": 2}, processes=4)
+    assert pool.record["processes"] == 4 and pool.record["mesh"]["data"] == 4
+    assert pool.record["fsdp_groups"] == [[0, 1], [0, 1], [2, 3], [2, 3]]
+    launches_as_exact("hybrid sharding across four processes", pool, reference, truth, seeds=SEEDS)
 
 
-def test_context_parallelism_trains_like_whole_sequences_across_hosts(tmp_path, reference):
+def test_context_parallelism_trains_like_whole_sequences_across_hosts(tmp_path, reference, truth):
     """A packed batch with its sequence split two ways inside each host and
-    the replicas across the hosts trains to the reference's losses."""
-    pool = train(tmp_path, {"fsdp": 2, "sequence": 2, "replicas": 2}, processes=2)
-    assert pool["fsdp_groups"] == [[0], [0], [1], [1]]
-    assert max(abs(a - b) for a, b in zip(pool["losses"], reference["losses"], strict=True)) < TOLERANCE
+    the replicas across the hosts trains losses as exact as the reference's
+    (check 1, from the same runs in float64)."""
+    pool = Draws(tmp_path, {"fsdp": 2, "sequence": 2, "replicas": 2}, processes=2)
+    assert pool.record["fsdp_groups"] == [[0], [0], [1], [1]]
+    launches_as_exact("context parallelism across two hosts", pool, reference, truth, seeds=SEEDS)
 
 
 @pytest.mark.parametrize("mesh", [{"fsdp": 2, "stage": 2}, {"fsdp": 2, "sequence": 2}],
@@ -184,18 +227,20 @@ def test_context_parallelism_trains_like_whole_sequences_across_hosts(tmp_path, 
 def test_processes_that_hold_the_same_rows_read_the_same_share(tmp_path, mesh):
     """Four processes of one device, with the pipeline's stage axis or a split
     sequence between them: each pair holds one row shard, so the pair reads
-    one share of the batch and the pool trains the losses one process of
-    four devices trains. Every process reading its own quarter of the rows,
-    as the loaders once did, trained this stage mesh to 4.42, 4.03, 3.91
-    against 4.60, 3.47, 2.87, and fed the sequence mesh a batch of half its
-    rows. A leaf the sequence axis splits is placed from the share whole."""
-    alone = train(tmp_path, mesh, processes=1, devices=4)
-    pool = train(tmp_path, mesh, processes=4, devices=4)
+    one share of the batch and the pool trains losses as exact as one
+    process of four devices trains (check 1, from the same runs in float64).
+    Every process reading its own quarter of the rows, as the loaders once
+    did, trained this stage mesh to 4.42, 4.03, 3.91 against 4.60, 3.47,
+    2.87, and fed the sequence mesh a batch of half its rows. A leaf the
+    sequence axis splits is placed from the share whole."""
+    alone = Draws(tmp_path, mesh, processes=1, devices=4)
+    pool = Draws(tmp_path, mesh, processes=4, devices=4)
+    wide = Draws(tmp_path, mesh, processes=1, devices=4, float64=True)
 
-    assert pool["partition"] == {"count": 2, "readers": 2}
-    assert alone["partition"] == {"count": 1, "readers": 1}
-    assert pool["placed_whole"] and alone["placed_whole"]
-    assert max(abs(a - b) for a, b in zip(pool["losses"], alone["losses"], strict=True)) < TOLERANCE
+    assert pool.record["partition"] == {"count": 2, "readers": 2}
+    assert alone.record["partition"] == {"count": 1, "readers": 1}
+    assert pool.record["placed_whole"] and alone.record["placed_whole"]
+    launches_as_exact(f"four processes that share rows over {sorted(mesh)}", pool, alone, wide, seeds=SEEDS)
 
 
 def test_more_replicas_than_hosts_are_refused(tmp_path):
@@ -902,23 +947,16 @@ def handed(draw: dict, process: int) -> dict[str, np.ndarray]:
 class Updated:
     """A RolloutScheduler launch's values by draw (`launches_as_exact`): its final parameters, and where
     `rows` reads a draw's rows (`every_row`, a process's `handed`) their proximal rescoring
-    (`old_log_probs`), each in the dtype the run computed it in; and its first launch's record. The first
-    SEEDS draws run with the launch, and the further ones, which only check 1's second stage reads, in one
-    more launch of the same pool when first asked for."""
+    (`old_log_probs`), each in the dtype the run computed it in; and its first launch's record, the draws
+    launched as check 1's stages read them (`Staged`)."""
 
     def __init__(self, tmp_path: Path, mesh: dict, processes: int, *flags: str,
                  rows: Callable[[dict], dict[str, np.ndarray]] | None = None):
-        def launched(draws: range) -> tuple[dict, list[dict[str, np.ndarray]]]:
-            return scheduled(tmp_path, mesh, processes, *flags, draws=draws)
-
-        self.record, self._first = launched(range(SEEDS))
-        self._further, self._second, self._rows = functools.partial(launched, range(SEEDS, DRAWS)), None, rows
+        self._staged = Staged(lambda draws: scheduled(tmp_path, mesh, processes, *flags, draws=draws))
+        self.record, self._rows = self._staged.first[0], rows
 
     def __getitem__(self, draw: int) -> dict[str, object]:
-        record, finals, at = self.record, self._first, draw
-        if draw >= SEEDS:
-            self._second = self._second or self._further()
-            (record, finals), at = self._second, draw - SEEDS
+        (record, finals), at = self._staged.at(draw)
         values: dict[str, object] = {"params": finals[at]}
         if self._rows is not None:
             drawn = record["draws"][at]

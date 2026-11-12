@@ -189,10 +189,6 @@
    "comparisons": 4,
    "lane": "Training"
   },
-  "tests/test_distribution.py": {
-   "comparisons": 4,
-   "lane": "Training"
-  },
   "tests/test_dpo.py": {
    "comparisons": 7,
    "lane": "Models, Serving & RL"
