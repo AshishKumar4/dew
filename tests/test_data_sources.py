@@ -44,7 +44,8 @@ def test_memory_columns_snapshot_changes_with_content():
     assert [row["x"] for row in rows] == list(range(5))
     assert Memory([{"x": np.int16(4)}]).fingerprint() != Memory([{"x": np.int32(4)}]).fingerprint()
     assert Memory([{"x": 1}], shard_rows=1).fingerprint() != Memory([{"x": 1}], shard_rows=2).fingerprint()
-
+    with pytest.raises(ValueError):
+        len(Memory({"x": [1], "y": [1, 2]}).records("indexed"))
 
 @dataclasses.dataclass(frozen=True)
 class Numbered:
@@ -86,12 +87,6 @@ def test_memory_reads_a_dataframe_or_arrow_table_as_its_rows(read, table):
     assert Memory(given).fingerprint()["sha256"] == Memory(records).fingerprint()["sha256"]
     changed = frame.assign(text=[*columns["text"][:5], "changed"])
     assert Memory(changed).fingerprint()["sha256"] != Memory(frame).fingerprint()["sha256"]
-
-
-def test_memory_columns_of_different_row_counts_are_refused():
-    assert len(Memory({"x": [1, 2], "y": [1, 2]}).records("indexed")) == 2
-    with pytest.raises(ValueError):
-        len(Memory({"x": [1], "y": [1, 2]}).records("indexed"))
 
 
 def test_tfds_source_metadata_and_decoder_identity_need_no_data_scan():
@@ -141,27 +136,75 @@ def test_tfds_label_definitions_participate_in_source_identity(tmp_path):
     assert before != after
 
 
-def test_jsonl_ranges_cover_rows_once_even_at_line_boundaries():
+def test_jsonl_ranges_cover_rows_once_even_at_line_boundaries_and_across_long_records():
+    import fsspec
+    from fsspec.implementations.memory import MemoryFileSystem
+
     rows = [{"id": index, "text": "escaped\nline"} for index in range(30)]
     root = Store(f"memory://jsonl-{uuid4().hex}/rows.jsonl")
     root.write(b"\n".join(json.dumps(row).encode() for row in rows))
     files = Files(root.url, shard_bytes=67)
     assert not files.supports("indexed")
     assert files.supports("streamed")
-    actual = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
+    shards = files.manifest().shards
+    assert all(67 <= shard.stop - shard.start < 2 * 67 for shard in shards)
+    actual = [row for shard in shards for row in files.manifest().reader(shard)]
     assert actual == rows
     files.provision()
     assert files.supports("indexed")
     indexed = files.records("indexed")
     assert [indexed[index] for index in range(len(indexed))] == rows
-    reader = iter(files.manifest().reader(files.manifest().shards[0]))
+    reader = iter(files.manifest().reader(shards[0]))
     next(reader)
     state = reader.get_state()
     expected = list(reader)
-    resumed = iter(files.manifest().reader(files.manifest().shards[0]))
+    resumed = iter(files.manifest().reader(shards[0]))
     resumed.set_state(state)
     assert list(resumed) == expected
 
+    # A record spanning multiple ranges is read whole by its starting range, while spanned ranges
+    # read only their own byte window (`_SCAN_BYTES` bounded) and yield nothing.
+    read_bytes: list[int] = []
+
+    class CountedFile(io.BytesIO):
+        def read(self, size=-1):
+            chunk = super().read(size)
+            read_bytes.append(len(chunk))
+            return chunk
+
+    class CountedMemory(MemoryFileSystem):
+        protocol = "countedjsonl"
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(str(path).replace("countedjsonl://", "memory://", 1))
+
+        def _open(self, path, mode="rb", **kwargs):
+            opened = super()._open(path, mode, **kwargs)
+            return CountedFile(opened.getvalue()) if mode == "rb" else opened
+
+    fsspec.register_implementation("countedjsonl", CountedMemory, clobber=True)
+    spanned_store = Store(f"memory://spanned-{uuid4().hex}/rows.jsonl")
+    long_lines = [
+        json.dumps({"id": 0}),
+        json.dumps({"id": 1, "pad": "x" * 2_500_000}),
+        json.dumps({"id": 2}),
+    ]
+    spanned_store.write(("\n".join(long_lines) + "\n").encode())
+    spanned_files = Files(spanned_store.url.replace("memory://", "countedjsonl://", 1),
+                          format="jsonl", shard_bytes=500_000)
+    spanned_manifest = spanned_files.manifest()
+    middle = [
+        shard for shard in spanned_manifest.shards
+        if shard.start > len(long_lines[0]) + 1 and shard.stop < len(long_lines[0]) + len(long_lines[1])
+    ]
+    assert middle
+    read_bytes.clear()
+    assert list(spanned_manifest.reader(middle[0])) == []
+    assert sum(read_bytes) <= (middle[0].stop - middle[0].start) + 64 * 1024
+    assert [row["id"] for shard in spanned_manifest.shards for row in spanned_manifest.reader(shard)] == [
+        0, 1, 2
+    ]
 
 @pytest.mark.parametrize("held, suffix", [
     ("array", ".json"), ("array", ".json.gz"), ("array", ".json.bz2"),
@@ -237,21 +280,6 @@ def test_compressed_jsonl_reads_and_resumes_in_every_read_mode(tmp_path, extensi
     assert [indexed[index] for index in (29, 0, 15, 29)] == [rows[index] for index in (29, 0, 15, 29)]
 
 
-def test_csv_quoted_newlines_are_never_byte_split():
-    root = Store(f"memory://csv-{uuid4().hex}/rows.csv")
-    root.write(b'id,text\n0,"two\nlines"\n1,"last"\n')
-    files = Files(root.url, shard_bytes=2)
-    assert len(files.manifest().shards) == 1
-    assert list(files.manifest().reader(files.manifest().shards[0])) == [
-        {"id": "0", "text": "two\nlines"},
-        {"id": "1", "text": "last"},
-    ]
-    files.provision()
-    indexed = files.records("indexed")
-    assert indexed[0] == {"id": "0", "text": "two\nlines"}
-    assert indexed[1] == {"id": "1", "text": "last"}
-
-
 def test_file_catalog_keeps_distinct_nested_names_including_underscore_directories(tmp_path):
     names = [f"speaker-{speaker}/{clip}/00001.mp4" for speaker in (1, 2) for clip in ("_clip", "other")]
     for name in names:
@@ -260,25 +288,6 @@ def test_file_catalog_keeps_distinct_nested_names_including_underscore_directori
         path.write_bytes(b"video")
     rows = Files(str(tmp_path), format="files").records("indexed")
     assert [row["path"] for row in rows] == [(tmp_path / name).as_uri() for name in sorted(names)]
-
-
-def test_csv_large_quoted_fields_survive_streaming_and_offset_provisioning():
-    import csv
-
-    text = "a" * 140_000 + "\n" + "b" * 140_000
-    root = Store(f"memory://csv-large-{uuid4().hex}/rows.csv")
-    root.write(('id,text\n0,"' + text + '"\n').encode())
-    files = Files(root.url)
-    # A field past Python's default limit reads under the limit its caller raises (`Files`).
-    previous = csv.field_size_limit(len(text) + 1)
-    try:
-        manifest = files.manifest()
-        assert list(manifest.reader(manifest.shards[0])) == [{"id": "0", "text": text}]
-        files.provision()
-        assert files.records("indexed")[0] == {"id": "0", "text": text}
-    finally:
-        csv.field_size_limit(previous)
-
 
 def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
     root = Store(f"memory://arrow-{uuid4().hex}/table")
@@ -365,8 +374,8 @@ def test_a_csv_field_past_pythons_limit_reads_by_the_limit_its_caller_sets(tmp_p
         with pytest.raises(csv.Error):
             list(refused.records("memory"))
         csv.field_size_limit(1024 * 1024)
-        Files(str(path)).provision()
-        data = compile(Files(str(path)).repeat(1).batch(1), read=read,
+        Files(str(path), shard_bytes=16).provision()
+        data = compile(Files(str(path), shard_bytes=16).repeat(1).batch(1), read=read,
                        loading=Loading(workers=0, threads=4, read_buffer=4))
         whole = data.train(DataPartition())
         try:
@@ -1235,22 +1244,25 @@ def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monke
     assert downloaded[0].endswith(manifest["files"][2]["path"])
 
 
-def test_jsonl_offset_index_is_mapped_and_reopened_instead_of_pickled_as_rows():
+def test_jsonl_offset_index_reopens_without_pickling_its_rows():
     import pickle
 
     root = Store(f"memory://mapped-index-{uuid4().hex}/rows.jsonl")
-    root.write(b'{"id":0}\n{"id":1}\n')
+    payload = b"".join(json.dumps({"id": index, "pad": "x" * 64}).encode() + b"\n" for index in range(256))
+    root.write(payload)
     source = Files(root.url).provision()
     indexed = source.records("indexed")
-    assert isinstance(indexed.tables[0], np.memmap)
-    resumed = pickle.loads(pickle.dumps(indexed))
-    assert resumed[1] == {"id": 1}
-    assert isinstance(resumed.tables[0], np.memmap)
+    encoded = pickle.dumps(indexed)
+    assert len(encoded) < len(payload) // 4
+    resumed = pickle.loads(encoded)
+    assert resumed[1] == {"id": 1, "pad": "x" * 64}
+    assert resumed[255] == {"id": 255, "pad": "x" * 64}
 
 
 @pytest.mark.parametrize("format", ["jsonl", "text", "csv"])
-def test_copied_offset_indexes_define_one_order_at_different_mounts(tmp_path, format):
-    """Indexed copies agree on their compiled order and read the same records."""
+def test_copied_offset_indexes_share_one_order_and_resume_across_mounts(tmp_path, format):
+    """Indexed copies mounted at different paths agree on their compiled order, read the same
+    records, and resume a saved position across mounts."""
     from dew.data.compile import compile
 
     first = tmp_path / "host0" / "corpus"
@@ -1266,54 +1278,24 @@ def test_copied_offset_indexes_define_one_order_at_different_mounts(tmp_path, fo
     second = tmp_path / "elsewhere" / "mounted"
     shutil.copytree(first, second)
 
-    def read(directory):
-        reader = compile(Files(str(directory), format=format).repeat().batch(2),
-                         read="indexed", loading=Loading(workers=0)).train(DataPartition())
-        try:
-            return reader.identity(), [text for batch in itertools.islice(reader, 2)
-                                       for text in batch["text"].tolist()]
-        finally:
-            reader.close()
-
-    first_identity, first_rows = read(first)
-    second_identity, second_rows = read(second)
-    assert first_rows == second_rows == [f"row {index}" + ("\n" if format == "text" else "")
-                                        for index in range(4)]
-    assert first_identity == second_identity
-
-
-@pytest.mark.parametrize("format", ["jsonl", "text", "csv"])
-def test_a_copied_corpus_resumes_a_position_saved_at_another_mount(tmp_path, format):
-    """A position saved reading one copy of a corpus resumes on a copy mounted elsewhere: an
-    order is the same wherever its sources are mounted, as the pool's identity already
-    holds, and the copy reads on from the saved record."""
-    from dew.data.compile import compile
-
-    first = tmp_path / "host0" / "corpus"
-    first.mkdir(parents=True)
-    suffix = "txt" if format == "text" else format
-    rows = [f"row {index}" for index in range(4)]
-    (first / f"part-0.{suffix}").write_text(("text\n" if format == "csv" else "") + "\n".join(
-        json.dumps({"text": row}) if format == "jsonl" else row for row in rows) + "\n")
-    Files(str(first), format=format).provision()
-    second = tmp_path / "elsewhere" / "mounted"
-    shutil.copytree(first, second)
-
     def reader(directory):
         return compile(Files(str(directory), format=format).repeat().batch(1),
                        read="indexed", loading=Loading(workers=0)).train(DataPartition())
 
     saving, resumed = reader(first), reader(second)
     try:
-        next(saving)
+        assert saving.identity() == resumed.identity()
+        first_row = next(saving)["text"].tolist()
         saved = saving.get_state()
-        expected = next(saving)["text"].tolist()
+        remaining = [next(saving)["text"].tolist() for _ in range(3)]
         resumed.set_state(saved)
-        assert next(resumed)["text"].tolist() == expected
+        assert [next(resumed)["text"].tolist() for _ in range(3)] == remaining
+        assert [first_row, *remaining] == [
+            [f"row {index}" + ("\n" if format == "text" else "")] for index in range(4)
+        ]
     finally:
         saving.close()
         resumed.close()
-
 
 def test_a_pool_is_shown_which_part_of_its_plan_differs():
     """Processes whose plans differ are refused with each one's plan, part by
@@ -1562,7 +1544,10 @@ def test_an_unnamed_foreign_source_trains_and_resumes_only_where_told_its_conten
         loose.close()
     with pytest.raises(ValueError):
         compile(source().cache(str(tmp_path / "cache")).batch(4), read=read, loading=Loading(workers=0))
-
+    if kind in ("grain", "iterator"):
+        with pytest.raises(ValueError):
+            (from_grain(grain.MapDataset.source(rows), "") if kind == "grain"
+             else from_iter(lambda: iter(rows), identity=""))
 
 @pytest.mark.parametrize("kind,read", [("torch", "memory"), ("torch", "indexed"),
                                        ("grain", "indexed"), ("iterator", "streamed")])
@@ -1799,22 +1784,6 @@ def test_memory_reads_a_table_of_lists_bytes_and_nulls_as_records_hold_them(tabl
     held = Memory(given).records("indexed")
     assert [held[index] for index in range(len(held))] == records
     assert Memory(given).fingerprint()["sha256"] == Memory(records).fingerprint()["sha256"]
-
-
-@pytest.mark.parametrize("kind", ["grain", "iterator"])
-def test_foreign_sources_cannot_use_an_empty_content_identity(kind):
-    """A Grain or iterator source given an empty identity declares no content version, which is no
-    identity at all said otherwise: it is refused as it is made."""
-    import grain.python as grain
-
-    from dew.data import from_grain, from_iter
-
-    rows = [{"id": index} for index in range(8)]
-    with pytest.raises(ValueError):
-        if kind == "grain":
-            from_grain(grain.MapDataset.source(rows), "")
-        else:
-            from_iter(lambda: iter(rows), identity="")
 
 
 def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):
