@@ -309,10 +309,6 @@
    "comparisons": 10,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_inference_tasks.py": {
-   "comparisons": 5,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_instrumentation.py": {
    "comparisons": 8,
    "lane": "Training"
@@ -552,10 +548,6 @@
   "tests/test_sequence_parallel.py": {
    "comparisons": 6,
    "lane": "Kernels"
-  },
-  "tests/test_serving.py": {
-   "comparisons": 3,
-   "lane": "Models, Serving & RL"
   },
   "tests/test_source_schedulers.py": {
    "comparisons": 5,

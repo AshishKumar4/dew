@@ -142,7 +142,10 @@ def dew_run(server, prompts: np.ndarray, output: int):
 
 
 def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directory: Path):
-    """Untraced Python costs and a warmed decode-only Dew/XProf capture."""
+    """Untraced Python costs and a warmed decode-only Dew/XProf capture. The host's wall over the steps and
+    its profile are where a step's Python cost shows: one that built its program's dispatch key over the
+    weights and cache again each step (`dew.inference.serving_kernel.dispatched` runs an executable it
+    asked for once a size of admission) costs about 1 ms a step here (train 329's review)."""
     import jax
     from trace_window import DECODE_CATEGORIES, decode_category, kernel_totals
 
