@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import errno
 import fnmatch
+import functools
 import hashlib
 import importlib.util
 import json
@@ -43,6 +44,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
+import jax
 import numpy as np
 
 from dew._builds import dew_cache_dir
@@ -50,7 +52,7 @@ from dew._files import staged, stat_identity
 from dew._records import JSON
 from dew.interop import sources
 from dew.interop.pickles import host_view
-from dew.interop.safetensors_io import WEIGHT_STEMS, folder_weights, read_file, write_file
+from dew.interop.safetensors_io import WEIGHT_STEMS, folder_weights, read_file, stored_spec, write_file
 from dew.registry import to_record
 
 if TYPE_CHECKING:
@@ -60,6 +62,20 @@ INSTALL = "pip install 'dewml[diffusers]'"
 
 _CLIP_ENCODERS = ("CLIPTextModel", "CLIPTextModelWithProjection")
 
+_TORCH_STORAGE_TAGS: Mapping[str, str] = {
+    "float32": "F32",
+    "float16": "F16",
+    "bfloat16": "BF16",
+    "float64": "F64",
+    "int64": "I64",
+    "int32": "I32",
+    "int16": "I16",
+    "int8": "I8",
+    "uint8": "U8",
+    "bool": "BOOL",
+    "float8_e4m3fn": "F8_E4M3",
+    "float8_e5m2": "F8_E5M2",
+}
 
 def _torch_view(array: np.ndarray) -> torch.Tensor:
     """A torch tensor sharing `array`'s bytes, bfloat16 and float8 included."""
@@ -311,3 +327,154 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
                     f"put their diffusers-format weights under {configs}/<component>/ or load the file from "
                     "a repo that ships them")
         yield staging, target
+
+
+def _borrowed_specs(
+    absent: list[str],
+    configs: Path,
+    hub: sources.SourceReference | None,
+    index: Mapping[str, object],
+    entries: dict[str, Mapping[str, jax.ShapeDtypeStruct]],
+    filename: str,
+    origin: JSON,
+) -> tuple[sources.StoredWeights, dict[str, str]]:
+    backing = sources.StoredWeights(
+        str(configs) if hub is None else hub.name,
+        configs,
+        "" if hub is None else (hub.subfolder or ""),
+    )
+    backing_files: dict[str, str] = {}
+    empty = []
+    for name in absent:
+        component_specs = backing.specs(name)
+        if not component_specs:
+            empty.append(name)
+            continue
+        declared_entry = index.get(name)
+        library = (
+            str(declared_entry[0])
+            if isinstance(declared_entry, list) and declared_entry
+            else "diffusers"
+        )
+        weights_name = (
+            "diffusion_pytorch_model.safetensors" if library == "diffusers" else "model.safetensors"
+        )
+        virtual_file = f"{name}/{weights_name}"
+        entries[virtual_file] = {tname: spec for tname, (_, spec) in component_specs.items()}
+        for tname, (real_file, _) in component_specs.items():
+            backing_files[f"{virtual_file}\0{tname}"] = real_file
+    if empty:
+        raise ValueError(
+            f"{Path(filename).name} carries no weights for {empty}, and {origin} has none for them "
+            f"either; put their diffusers-format weights under {configs}/<component>/ or load the "
+            "file from a repo that ships them"
+        )
+    return backing, backing_files
+
+
+def metadata(
+    source: sources.SourceReference,
+    root: Path,
+    filename: str,
+    configs: Path | None = None,
+    hub: sources.SourceReference | None = None,
+) -> tuple[Path, sources.StoredWeights]:
+    """Build the metadata directory and translated component specs of a single-file checkpoint from
+    its safetensors header alone, without downloading or reading weight payloads."""
+    missing_pkgs = [
+        name for name in ("diffusers", "huggingface_hub", "torch") if importlib.util.find_spec(name) is None
+    ]
+    if missing_pkgs:
+        raise ImportError(
+            f"a single-file checkpoint converts through diffusers' key maps, which run in torch, "
+            f"and {missing_pkgs} are not installed; {INSTALL}"
+        )
+    import diffusers
+    import torch
+
+    raw_specs = source.stored_file(root, filename)
+    assert raw_specs is not None
+    checkpoint = {
+        name: torch.empty(tensor.shape, dtype=getattr(torch, np.dtype(tensor.dtype).name), device="meta")
+        for name, tensor in raw_specs.items()
+    }
+    if configs is None:
+        repo = config_repo(checkpoint)
+        configs = _configs(repo)
+        hub = sources.SourceReference(repo, configs.name)
+    meta_files = _metadata(configs)
+    if hub is not None:
+        origin: JSON = to_record(hub, sources.SourceReference)
+    else:
+        digest = hashlib.sha256()
+        for file in meta_files:
+            digest.update(f"{file.relative_to(configs).as_posix()}\0".encode() + file.read_bytes())
+        for file in sorted(configs.glob("*/*.safetensors*")):
+            _, size, modified = stat_identity(file)
+            digest.update(f"{file.relative_to(configs).as_posix()}\0{size}\0{modified}\0".encode())
+        origin = f"{configs.resolve()}#{digest.hexdigest()}"
+    selected = (Path(source.subfolder or "") / filename).as_posix()
+    source_id: JSON = (
+        [*stat_identity(source.file(root, filename))]
+        if os.path.isdir(source.name)
+        else [source.name, root.name, selected]
+    )
+    identity = json.dumps([source_id, origin, diffusers.__version__], sort_keys=True)
+    key = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    target = Path(dew_cache_dir()) / "single_file" / f"{key}-metadata"
+    index = pipeline_index(configs)
+    if not (target / "model_index.json").is_file():
+        with staged(target) as staging:
+            for file in meta_files:
+                copied = staging / file.relative_to(configs)
+                copied.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(file, copied)
+            (staging / "model_index.json").write_text(json.dumps(index, indent=2))
+    entries: dict[str, Mapping[str, jax.ShapeDtypeStruct]] = {}
+    absent: list[str] = []
+    for name, library, tensors in converted(checkpoint, configs, index):
+        if tensors is None:
+            absent.append(name)
+            continue
+        weights_name = (
+            "diffusion_pytorch_model.safetensors" if library == "diffusers" else "model.safetensors"
+        )
+        entries[f"{name}/{weights_name}"] = {
+            key_name: stored_spec(
+                key_name,
+                [int(dim) for dim in tensor.shape],
+                _TORCH_STORAGE_TAGS[str(tensor.dtype).removeprefix("torch.")],
+                weights_name,
+            )
+            for key_name, tensor in tensors.items()
+        }
+    backing: sources.StoredWeights | None = None
+    backing_files: dict[str, str] = {}
+    if absent:
+        backing, backing_files = _borrowed_specs(absent, configs, hub, index, entries, filename, origin)
+
+    @functools.cache
+    def real_converted() -> dict[str, dict[str, np.ndarray]]:
+        assert configs is not None
+        stored, _ = read_file(source.file(root, filename), copy_on_write=True)
+        loaded_ckpt = {name: _torch_view(np.asarray(tensor)) for name, tensor in stored.items()}
+        out: dict[str, dict[str, np.ndarray]] = {}
+        for comp_name, comp_lib, comp_tensors in converted(loaded_ckpt, configs, index):
+            if comp_tensors is None:
+                continue
+            wname = (
+                "diffusion_pytorch_model.safetensors" if comp_lib == "diffusers" else "model.safetensors"
+            )
+            out[f"{comp_name}/{wname}"] = {k: host_view(t, k) for k, t in comp_tensors.items()}
+        return out
+
+    def read_tensor(file: str, tensor_name: str) -> np.ndarray:
+        lookup = f"{file}\0{tensor_name}"
+        if lookup in backing_files:
+            assert backing is not None
+            return backing.sidecar(backing_files[lookup], tensor_name)
+        return real_converted()[file][tensor_name]
+
+    return target, sources.StoredWeights(
+        source.name, target, entries=entries, tensor_reader=read_tensor
+    )

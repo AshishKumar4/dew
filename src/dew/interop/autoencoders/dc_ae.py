@@ -14,6 +14,7 @@ import jax.numpy as jnp
 from dew import _records
 from dew.batch import Variables
 from dew.interop.components import bind_component
+from dew.interop.unread import Stored
 from dew.interop.weights import indexed_path
 from dew.nn.autoencoders.dc_ae import ACTIVATIONS, DCAE, DCAutoencoder
 
@@ -130,7 +131,8 @@ def dc_ae_path(name: str, ndim: int) -> tuple[str, ...] | None:
 
 def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                subfolder: str = "", param_dtype: str = "float32", params: Variables | None = None,
-               lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
+               lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None,
+               tensors: Mapping[str, Stored] | None = None
                ) -> tuple[DCAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published DC-AE, its parameters and their source layouts from
     `subfolder` of a directory or Hub repo holding its config.json and
@@ -141,7 +143,8 @@ def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | 
     Supplied `params` are bound unchanged: only the config is read, and no
     source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
     placement to read (`dew.interop.weights.record_layouts`)."""
-    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=params is None)
+    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED,
+                                         weights=params is None and tensors is None)
     model = DCAE(**dc_ae_fields(config), dtype=compute)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
@@ -150,5 +153,4 @@ def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | 
         lambda bound: DCAutoencoder(model=model, params=bound,
                                     latent_scale=config.get("scaling_factor", 1.0)),
         prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(frame,),
-        shapes=shapes)
-
+        shapes=shapes, tensors=tensors)

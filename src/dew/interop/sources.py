@@ -16,10 +16,10 @@ import functools
 import json
 import logging
 import os
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
 
 import jax
 import numpy as np
@@ -36,7 +36,7 @@ from dew.interop.safetensors_io import (
     stored_spec,
     weight_files,
 )
-from dew.interop.unread import Unread, unread
+from dew.interop.unread import Stored, Unread, unread
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
@@ -147,6 +147,41 @@ class SourceReference:
 
         return self.file(root, filename) if file_exists(self.name, selected, revision=root.name) else None
 
+    def stored_file(
+        self, root: Path, filename: str, *, optional: bool = False
+    ) -> Mapping[str, Stored] | None:
+        """One tensor file's shapes and dtypes alone (`Unread`), without downloading or mapping its
+        payload, or converted where it is a PyTorch pickle."""
+        selected = (Path(self.subfolder or "") / filename).as_posix()
+        if Path(selected).suffix == ".safetensors":
+            local_path = root / selected
+            if os.path.lexists(local_path) or os.path.isdir(self.name):
+                if not os.path.lexists(local_path):
+                    if optional:
+                        return None
+                    return tensor_file(self.file(root, filename))
+                return unread(header_specs(local_path))
+            from huggingface_hub import constants, file_exists
+
+            question = ("safetensors header", self.name, root.name, selected)
+            if (
+                optional
+                and not (constants.HF_HUB_OFFLINE and recorded_hub_answer(question) is not None)
+                and not file_exists(self.name, selected, revision=root.name)
+            ):
+                return None
+            if constants.HF_HUB_OFFLINE and recorded_hub_answer(question) is None:
+                raise FileNotFoundError(
+                    f"{self.name} at {root.name}: {selected}'s header was never read online"
+                )
+            header = hub_answer(
+                question, functools.partial(_hub_header, self.name, root.name, selected)
+            ).value
+            return unread({
+                name: stored_spec(name, shape, tag, selected) for name, (shape, tag) in header.items()
+            })
+        path = self.optional_file(root, filename) if optional else self.file(root, filename)
+        return None if path is None else tensor_file(path)
     def weights(self, root: Path, components: tuple[str, ...] = ("",)) -> Path:
         """The pinned root with exactly the requested component weights present."""
         requested = tuple((Path(self.subfolder or "") / part).as_posix() for part in components)
@@ -386,24 +421,60 @@ def _hub_header(name: str, revision: str, file: str) -> dict[str, tuple[list[int
     header = HfApi().parse_safetensors_file_metadata(name, file, revision=revision)
     return {tensor_name: (list(tensor.shape), tensor.dtype) for tensor_name, tensor in header.tensors.items()}
 
+def _hub_sidecar(name: str, revision: str, file: str, tensor_name: str) -> tuple[list[int], str, str]:
+    """Read one tiny metadata sidecar tensor's shape, dtype tag and hex bytes over an HTTP byte range."""
+    from huggingface_hub import HfFileSystem
 
-def stored_tensors(source: SourceReference, root: Path) -> LazyTensors[Unread] | None:
+    fs = HfFileSystem()
+    ref = f"{name}@{revision}/{file}"
+    header_len = int.from_bytes(fs.cat_file(ref, start=0, end=8), "little")
+    header = json.loads(fs.cat_file(ref, start=8, end=8 + header_len))
+    entry = _records.record(header[tensor_name], tensor_name)
+    offsets = _records.integers(entry["data_offsets"], "data_offsets")
+    raw = fs.cat_file(ref, start=8 + header_len + offsets[0], end=8 + header_len + offsets[1])
+    return list(_records.integers(entry["shape"], "shape")), _records.text(entry["dtype"], "dtype"), raw.hex()
+
+
+
+def read_safetensors_slice(
+    stream: IO[bytes], tensor_name: str, filename: str, *, offset: int = 0
+) -> np.ndarray:
+    """Read one small metadata tensor by byte slice from a seekable safetensors `stream` at `offset`."""
+    stream.seek(offset)
+    header_len = int.from_bytes(stream.read(8), "little")
+    header = json.loads(stream.read(header_len))
+    entry = _records.record(header[tensor_name], tensor_name)
+    bounds = _records.integers(entry["data_offsets"], "data_offsets")
+    stream.seek(offset + 8 + header_len + bounds[0])
+    raw = stream.read(bounds[1] - bounds[0])
+    spec = stored_spec(
+        tensor_name, _records.integers(entry["shape"], "shape"), _records.text(entry["dtype"], "dtype"),
+        filename,
+    )
+    return np.frombuffer(raw, dtype=spec.dtype).reshape(spec.shape).copy()
+
+def stored_tensors(source: SourceReference, root: Path, *, folder: str = "") -> LazyTensors[Stored] | None:
     """`source`'s weight tensors at the snapshot `root` (`snapshot(weights=False)`) as their shapes and
     dtypes alone, read from their safetensors headers (`StoredWeights.specs`, a Hub source's over HTTP
     and cached), what a load without its weights translates: each tensor an `Unread` array, its shape
-    and dtype, no value fetched or read. None for a checkpoint of PyTorch pickles alone, whose shapes
-    no header states, which a load reads whole. Raises FileNotFoundError where a header cannot be read
-    (offline, never read online)."""
+    and dtype, no value fetched or read, save a 2-element `.weight_shape` metadata sidecar read by byte
+    slice alone (`StoredWeights.sidecar`). None for a checkpoint of PyTorch pickles alone."""
     stored = StoredWeights(source.name, root, source.subfolder or "")
-    if not stored.files(""):
+    if not stored.files(folder):
         return None
-    held = stored.specs("")
+    held = stored.specs(folder)
     if held is None:
         raise FileNotFoundError(f"{source.name} at {root.name}: its weights' headers were never read "
                                 "online, and offline they are read from the files alone; load it online "
                                 "once, or with its weights")
-    return unread({name: spec for name, (_, spec) in held.items()})
-
+    return LazyTensors(
+        {name: spec for name, (_, spec) in held.items()},
+        lambda name: (
+            stored.sidecar(held[name][0], name)
+            if name.endswith(".weight_shape") and held[name][1].shape == (2,)
+            else Unread(held[name][1].shape, held[name][1].dtype)
+        ),
+    )
 
 @dataclass(frozen=True)
 class StoredWeights:
@@ -415,12 +486,20 @@ class StoredWeights:
     name_or_dir: str
     directory: Path
     subfolder: str = ""
+    entries: Mapping[str, Mapping[str, jax.ShapeDtypeStruct]] | None = None
+    tensor_reader: Callable[[str, str], np.ndarray] | None = None
 
     def files(self, folder: str) -> tuple[str, ...]:
         """The repo-relative files that hold `folder`'s weights (`weight_files`): a directory's
-        own, or the commit's, as the Hub lists them (`_hub_files`), recorded so an offline run
-        reads the same listing (`repo_files`)."""
-        if os.path.isdir(self.name_or_dir):
+        own, an archive's (`entries`), or the commit's, as the Hub lists them (`_hub_files`),
+        recorded so an offline run reads the same listing (`repo_files`)."""
+        if self.entries is not None:
+            listing = set(self.entries) | {
+                path.relative_to(self.directory).as_posix()
+                for path in self.directory.rglob("*")
+                if path.is_file()
+            }
+        elif os.path.isdir(self.name_or_dir):
             listing = {path.relative_to(self.directory).as_posix() for path in self.directory.rglob("*")
                        if path.is_file()}
         else:
@@ -445,7 +524,9 @@ class StoredWeights:
         owner: dict[str, str] = {}
         for file in self.files(folder):
             question = ("safetensors header", self.name_or_dir, self.directory.name, file)
-            if (self.directory / file).is_file():
+            if self.entries is not None and file in self.entries:
+                specs = dict(self.entries[file])
+            elif (self.directory / file).is_file():
                 specs = header_specs(self.directory / file)
             elif os.path.isdir(self.name_or_dir) or (constants.HF_HUB_OFFLINE
                                                      and recorded_hub_answer(question) is None):
@@ -466,9 +547,28 @@ class StoredWeights:
         def read(file: str) -> dict[str, np.ndarray]:
             return read_file(repo_file(self.name_or_dir, self.directory, file))[0]
 
-        return LazyTensors({name: spec for name, (_, spec) in held.items()},
-                           lambda name: read(held[name][0])[name])
+        def load_tensor(name: str) -> np.ndarray:
+            file = held[name][0]
+            if self.tensor_reader is not None and self.entries is not None and file in self.entries:
+                return self.tensor_reader(file, name)
+            return read(file)[name]
 
+        return LazyTensors({name: spec for name, (_, spec) in held.items()}, load_tensor)
+
+    def sidecar(self, file: str, name: str) -> np.ndarray:
+        """Read one small metadata tensor by byte slice without mapping or downloading the shard's weights."""
+        if self.tensor_reader is not None and self.entries is not None and file in self.entries:
+            return self.tensor_reader(file, name)
+        local_path = self.directory / file
+        if local_path.is_file():
+            with open(local_path, "rb") as stream:
+                return read_safetensors_slice(stream, name, os.fspath(local_path))
+        shape, tag, hex_bytes = hub_answer(
+            ("safetensors sidecar", self.name_or_dir, self.directory.name, file, name),
+            functools.partial(_hub_sidecar, self.name_or_dir, self.directory.name, file, name),
+        ).value
+        spec = stored_spec(name, shape, tag, file)
+        return np.frombuffer(bytes.fromhex(hex_bytes), dtype=spec.dtype).reshape(spec.shape).copy()
 
 @dataclass(frozen=True)
 class LoadName:

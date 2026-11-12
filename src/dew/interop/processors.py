@@ -114,6 +114,29 @@ def _chat_image(image: object) -> Media | str | bytes:
                      f"{type(image).__name__}")
 
 
+type MediaInput = Media | str | bytes | bytearray | Path | Sequence[MediaInput]
+
+
+def _is_image_collection(value: MediaInput) -> TypeGuard[Sequence[MediaInput]]:
+    """Whether `value` is a sequence of media items rather than one atomic path, byte buffer or array."""
+    return isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray))
+
+
+def _as_host_media(value: MediaInput) -> Media:
+    """Narrow `MediaInput` to `Media` when handing images to a `HostProcessor`."""
+    import io
+
+    from PIL import Image
+
+    if isinstance(value, np.ndarray | Image.Image):
+        return value
+    if isinstance(value, str | Path):
+        return Image.open(value)
+    if isinstance(value, bytes | bytearray):
+        return Image.open(io.BytesIO(value))
+    return [_as_host_media(entry) for entry in value]
+
+
 def takes_medias(reference: HostProcessor | MediasProcessor) -> TypeGuard[MediasProcessor]:
     """Whether a processor's public call takes `medias` (`MediasProcessor`), read from its signature."""
     return "medias" in inspect.signature(type(reference).__call__).parameters
@@ -334,7 +357,7 @@ class Processor:
         return AutoProcessor.from_pretrained(str(self.directory), local_files_only=True,
                                              trust_remote_code=trusted, **options)
 
-    def host_media(self, text: str | Sequence[str], *, images: Media) -> dict[str, np.ndarray]:
+    def host_media(self, text: str | Sequence[str], *, images: MediaInput) -> dict[str, np.ndarray]:
         """The source's fields for `text` and `images` as host arrays in their own dtypes, before Dew
         aligns them to model rows: asked of the processor in the tensor type it computes in
         (`_media_tensors`), and read as `_from_arrays` reads them, a bfloat16 field widened to
@@ -342,7 +365,7 @@ class Processor:
         return self._host_arrays(self.media(text=text if isinstance(text, str) else list(text), images=images,
                                             return_tensors=self._media_tensors))
 
-    def media(self, *, images: Media | None = None,
+    def media(self, *, images: MediaInput | None = None,
               **kwargs: Unpack[ProcessorCall]) -> Mapping[str, object]:
         """Return the source's media fields before Dew aligns them to model rows: its processor's own,
         or, for a processor whose public call takes its media as `medias` (Kimi K2.5's release's), the
@@ -352,9 +375,9 @@ class Processor:
         # An audio-only processor takes no images keyword at all.
         if images is None:
             return self._media_reference(**kwargs)
-        return self._media_reference(images=images, **kwargs)
+        return self._media_reference(images=_as_host_media(images), **kwargs)
 
-    def _medias_fields(self, images: Media | Sequence[object] | None,
+    def _medias_fields(self, images: MediaInput | None,
                        **kwargs: Unpack[ProcessorCall]) -> dict[str, np.ndarray]:
         """The fields of a processor whose public call takes `medias` and `text` (Kimi K2.5's release's
         KimiK25Processor at 4d01dfe, kimi_k25_processor.py:72-119), as Dew reads every other's: each row
@@ -377,23 +400,38 @@ class Processor:
         if text is None:
             raise ValueError(f"{type(self._media_reference).__name__} takes its media with their text")
         rows = [text] if isinstance(text, str) else list(text)
-        # One image (an array, a PIL image) or a sequence of them.
-        given: list[object] = ([] if images is None else list(images) if isinstance(images, Sequence)
-                               else [images])
+        # One image (an array, a PIL image, a path or bytes) or a sequence of them.
+        given: list[MediaInput] = (
+            [] if images is None else list(images) if _is_image_collection(images) else [images]
+        )
         per_row = len(rows) > 1 and len(given) == len(rows) and all(
-            isinstance(entry, Sequence) for entry in given)
+            _is_image_collection(entry) for entry in given
+        )
         image_id, _ = _media_token_ids(self.record)
         blocks = self._merge_size() ** 2
         tokens, pixels, grids = [], [], []
         for index, row in enumerate(rows):
             if per_row:
                 entry = given[index]
-                taken = list(entry) if isinstance(entry, Sequence) else [entry]
+                taken = list(entry) if _is_image_collection(entry) else [entry]
             else:
                 count = int(np.count_nonzero(np.asarray(self.reference(text=row)["input_ids"]) == image_id))
                 taken, given = given[:count], given[count:]
-            medias = [{"type": "image", "image": PILImage.fromarray(np.asarray(image))
-                       if isinstance(image, np.ndarray) else image} for image in taken]
+            medias = [
+                {
+                    "type": "image",
+                    "image": (
+                        PILImage.fromarray(np.asarray(image))
+                        if isinstance(image, np.ndarray)
+                        else str(image)
+                        if isinstance(image, Path)
+                        else bytes(image)
+                        if isinstance(image, bytearray)
+                        else image
+                    ),
+                }
+                for image in taken
+            ]
             values = reference(medias=medias, text=row, return_tensors="np")
             ids = np.asarray(values["input_ids"]).reshape(-1)
             grid = np.asarray(values["grid_thws"]).reshape(-1, 3) if taken else np.zeros((0, 3), np.int64)
@@ -423,7 +461,7 @@ class Processor:
 
         return image_text(self._media_reference, where=str(self.directory))
 
-    def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
+    def __call__(self, text: str | Sequence[str], *, images: MediaInput | None = None,
                  audio: Media | None = None, videos: Media | None = None,
                  video_metadata: Sequence[Mapping[str, object]] | None = None) -> ModelInputs:
         if video_metadata is not None and videos is None:

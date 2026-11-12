@@ -17,6 +17,7 @@ from jax.typing import DTypeLike
 
 from dew.batch import Variables
 from dew.interop.components import bind_component
+from dew.interop.unread import Stored
 from dew.nn.autoencoders.api import AutoEncoder, LatentNormalization
 from dew.nn.autoencoders.dc_ae import DCAutoencoder
 from dew.nn.autoencoders.flux2 import Flux2Autoencoder
@@ -63,13 +64,15 @@ class Loader(Protocol):
 
     def __call__(self, name_or_dir: str | Path, compute=..., *, revision: str | None = None,
                  subfolder: str = ..., param_dtype: str = "float32", params: Variables | None = None,
-                 lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
+                 lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None,
+                 tensors: Mapping[str, Stored] | None = None
                  ) -> tuple[AutoEncoder, Variables, tuple[WeightLayout, ...], dict]: ...
 
 
 def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                 subfolder: str | None = "vae", param_dtype: str = "float32", params: Variables | None = None,
-                lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
+                lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None,
+                tensors: Mapping[str, Stored] | None = None
                 ) -> tuple[StableDiffusionVAE, Variables, tuple[WeightLayout, ...], dict]:
     """Build an AutoencoderKL, its parameters and their source layouts, as `Loader` does: a pipeline's
     from the torch safetensors in `subfolder`, a standalone one's (`subfolder` None) where its repo or
@@ -81,9 +84,9 @@ def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
         directory, config, weights = located_vae(str(name_or_dir), revision or "bf16", params=params)
     else:
         directory, config = published_source(name_or_dir, revision, subfolder, KL_PUBLISHED,
-                                             weights=params is None, nameless=True)
+                                             weights=params is None and tensors is None, nameless=True)
         weights = TORCH_WEIGHTS
-    if weights == FLAX_WEIGHTS and params is None:
+    if weights == FLAX_WEIGHTS and params is None and tensors is None:
         params, shapes = flax_vae(directory / FLAX_WEIGHTS)
     model, shift, scale = published_kl(config, compute)
     image = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
@@ -92,7 +95,7 @@ def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
         directory, "vae", config, model, _vae_path,
         lambda bound: StableDiffusionVAE(model, bound, dtype=compute, latent_shift=shift, latent_scale=scale),
         prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(image,),
-        shapes=shapes)
+        shapes=shapes, tensors=tensors)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,6 +110,7 @@ class Registration:
     load: Loader
     nameless: bool = False
     finds: bool = False
+    metadata_tensors: tuple[str, ...] = ()
 
 
 REGISTRATIONS: tuple[Registration, ...] = (
@@ -114,7 +118,9 @@ REGISTRATIONS: tuple[Registration, ...] = (
     Registration(DCAutoencoder, dc_ae.PUBLISHED, load_dc_ae),
     Registration(WanAutoencoder, wan.PUBLISHED, load_wan_vae),
     Registration(RAEAutoencoder, rae.PUBLISHED, load_rae),
-    Registration(Flux2Autoencoder, flux2.PUBLISHED, load_flux2_vae),
+    Registration(
+        Flux2Autoencoder, flux2.PUBLISHED, load_flux2_vae, metadata_tensors=flux2.LATENT_STATISTICS
+    ),
     Registration(QwenImageAutoencoder, qwen_image.PUBLISHED, load_qwen_image_vae),
 )
 """Every built-in autoencoder a source loads: one registration each."""

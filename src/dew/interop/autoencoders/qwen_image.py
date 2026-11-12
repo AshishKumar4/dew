@@ -14,6 +14,7 @@ import jax.numpy as jnp
 from dew import _records
 from dew.batch import Variables
 from dew.interop.components import bind_component
+from dew.interop.unread import Stored
 from dew.interop.weights import indexed_path
 from dew.nn.autoencoders.qwen_image import QwenImageAutoencoder, QwenImageVAE
 
@@ -134,7 +135,8 @@ def qwen_image_vae_path(name: str, ndim: int) -> tuple[str, ...]:
 
 def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
                         subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
-                        lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
+                        lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None,
+                        tensors: Mapping[str, Stored] | None = None
                         ) -> tuple[QwenImageAutoencoder, Variables, tuple[WeightLayout, ...], dict]:
     """Build a published Qwen-Image 2.1 VAE, its parameters and their source
     layouts from `subfolder` of a pipeline directory or Hub repo; only that
@@ -142,7 +144,8 @@ def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revisio
     in the shape it declares. Supplied `params` are bound without a weight read;
     `lazy` leaves read ones `SourceLeaf`s for a placement to read
     (`dew.interop.weights.record_layouts`)."""
-    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=params is None)
+    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED,
+                                         weights=params is None and tensors is None)
     model = QwenImageVAE(**qwen_image_vae_fields(config), dtype=compute)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
@@ -151,5 +154,4 @@ def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revisio
         lambda bound: QwenImageAutoencoder(model=model, params=bound, latents_mean=config["latents_mean"],
                                            latents_std=config["latents_std"]),
         prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(frame,),
-        shapes=shapes)
-
+        shapes=shapes, tensors=tensors)
