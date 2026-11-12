@@ -24,6 +24,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   upstream's is. A run whose configured precision is above the default (`dew.nn.precision.ACCURATE`'s
   'highest') is declined by the ports and trains on the portable math in IEEE float32, as before.
 
+- `ControlPPOObjective` and `DreamerV3Objective` ignore repeated filler rows (`VALID_ROWS`), draw entropy,
+  posterior and imagination noise from `Step`'s per-example update streams, and compute minibatch-wide
+  advantage moments and return percentiles once across a split step's microbatches
+  (`Objective.batch_statistics`, `Step.batch_statistics`, `Objective.real_rows`).
+
 - A paged `Server` keeps a prefix cache by default (`prefix_cache=None` derives it on wherever the layout pages,
   the rows sample a token a step on the server's own mesh and the model computes a split prompt as a whole
   one); a request draws what it draws without it. Pass `prefix_cache=False` to keep pages private. A

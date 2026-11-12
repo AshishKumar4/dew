@@ -63,6 +63,7 @@ from dew.objectives.routing import refuse_fixed_routers
 from dew.optim import clips_qk, stepped
 from dew.state import Accumulation, TrainState, apart, together
 from dew.training.compiled_program import gradients_read
+from dew.training.distributed import microbatch
 from dew.training.inspection import Inspection, Summaries, stacked, summaries
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
@@ -124,10 +125,13 @@ def _chosen(take, taken, kept):
 
 
 def cleared(acc: Accumulation) -> Accumulation:
-    """`acc` emptied for its next window: its sums zero, its QK maxima at their identity."""
-    return dataclasses.replace(jax.tree.map(jnp.zeros_like, acc), qk_stats=jax.tree.map(
-        lambda x: jnp.full_like(x, -jnp.inf) if jnp.issubdtype(x.dtype, jnp.inexact) else jnp.zeros_like(x),
-        acc.qk_stats))
+    """`acc` emptied for its next window: its sums zero, its QK maxima and statistics stamp at their
+    identities."""
+    return dataclasses.replace(
+        jax.tree.map(jnp.zeros_like, acc),
+        qk_stats=jax.tree.map(lambda x: (jnp.full_like(x, -jnp.inf) if jnp.issubdtype(x.dtype, jnp.inexact)
+                                         else jnp.zeros_like(x)), acc.qk_stats),
+        statistics_stamp=None if acc.statistics_stamp is None else jnp.full_like(acc.statistics_stamp, -1))
 
 
 def dropped_window(state, size: int):
@@ -148,7 +152,8 @@ def window_dropped(microstep: jax.Array, acc: Accumulation, size: int) -> tuple[
     for its gradient sum. A state's other fields go round it, as a compiled program over them alone
     leaves a host-master state's resident frozen weights where they are."""
     return microstep - microstep % size, dataclasses.replace(
-        cleared(dataclasses.replace(acc, gradient=None)), gradient=acc.gradient)
+        cleared(dataclasses.replace(acc, gradient=None, batch_statistics=None)),
+        gradient=acc.gradient, batch_statistics=acc.batch_statistics)
 
 
 def _only_when(due, taken, kept, operand):
@@ -645,7 +650,8 @@ def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, re
 
 
 def attempt_step(state, variables, ema, batch, *, split: int, slots: int, attempt, part, slot,
-                 microstep=None, record: bool = False, watched: Watched | None = None) -> Step:
+                 microstep=None, record: bool = False, watched: Watched | None = None,
+                 batch_statistics: tuple[jax.Array, ...] | None = None) -> Step:
     """The `Step` the loss of attempt `attempt` of the update `state` commits next reads: the step it
     counts, its microbatches accepted (`microstep`, the state's where none is given) over the `split`
     each step is read in; the attempt's own key; the averaged weights `ema` beside `variables`; the
@@ -658,7 +664,35 @@ def attempt_step(state, variables, ema, batch, *, split: int, slots: int, attemp
     return Step(accepted // split, jax.random.fold_in(state.key, attempt), with_ema(variables, ema),
                 committed=state.updates, record=record, qk_stats=clips_qk(state.opt_state),
                 equations=solves_equations(state.opt_state), watched=watched,
+                batch_statistics=batch_statistics,
                 **example_fields(state, slot, split, batch, slots, part, attempt - accepted, microstep))
+
+
+def batch_statistics_shapes[LossT, EffectsT](
+        objective: Objective[LossT, EffectsT], state: TrainState, micro: Batch, window: int,
+        split: int) -> tuple[jax.ShapeDtypeStruct, ...] | None:
+    """The shapes of `objective.batch_statistics` for a step read in `split` microbatches; None where
+    `split` is 1 or the objective states none."""
+    if split <= 1:
+        return None
+    variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
+
+    def traced(variables, compute, ema, micro_batch, step_count, microstep, key, updates):
+        current = dataclasses.replace(state, step=step_count, microstep=microstep, key=key,
+                                      updates=updates)
+        read = with_projected(forward_variables(variables, compute),
+                              functools.partial(objective.projected, updated=False))
+
+        def part_at(index: jax.Array) -> tuple[Batch, Step]:
+            step = attempt_step(current, variables, ema, micro_batch, split=split, slots=window,
+                                attempt=step_count * split + index, part=index, slot=index,
+                                microstep=microstep + index)
+            return micro_batch, step
+
+        return objective.batch_statistics(read, part_at, split)
+
+    return jax.eval_shape(traced, variables, state.compute, state.ema, micro, state.step, state.microstep,
+                          state.key, state.updates)
 
 
 def placed_as_rows(index: jax.Array, batch) -> jax.Array:
@@ -877,15 +911,20 @@ class Transaction:
             **state.variables, **jax.tree.map(lambda x: x[index], previous.variables)}
         accepted, attempt = state.microstep - fill + index, previous.attempts[index]
         # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
+        replayed_stats = (previous.batch_statistics if previous.replayed_statistics is None
+                          else tuple(x[index] for x in previous.replayed_statistics))
         step_info = self.attempt(state, variables, batch, attempt, attempt % self.split, index,
-                                 microstep=accepted)
+                                 microstep=accepted, batch_statistics=replayed_stats)
         return self.read(variables, state.compute), batch, step_info
 
-    def attempt(self, state, variables, batch, attempt, part, slot, microstep=None) -> Step:
+    def attempt(self, state, variables, batch, attempt, part, slot, microstep=None, *,
+                batch_statistics: tuple[jax.Array, ...] | None = None,
+                recorded: bool | None = None, watch: bool = True) -> Step:
         """`attempt_step` of this transaction's split, window, recording and watch."""
         return attempt_step(state, variables, self.fetched(state).ema, batch, split=self.split,
                             slots=self.size, attempt=attempt, part=part, slot=slot, microstep=microstep,
-                            record=self.record, watched=self.watched)
+                            record=self.record if recorded is None else recorded,
+                            watched=self.watched if watch else None, batch_statistics=batch_statistics)
 
     def _places(self, slot, evaluated: Evaluated, part) -> jax.Array:
         """The places the window's slot `slot` and the column its loss saw give an evaluation's rows
@@ -1012,6 +1051,46 @@ class Transaction:
         logged = kept(aux.inspected, self.watched.modules)
         return {**found, **cotangent_summaries(probed, self.watched.histogram, logged)}
 
+    def _retained_window(self, state: TrainState, batch: Batch, pending: PendingAttempt, attempt,
+                         read: jax.Array) -> Accumulation:
+        """`pending.candidate` cleared when due, else retaining this microbatch's slot, with `gradient`
+        and `batch_statistics` bypassing the conditional."""
+        candidate = pending.candidate
+        assert candidate is not None
+        held_stats = candidate.batch_statistics
+        held_stamp = candidate.statistics_stamp
+
+        def retain(acc):
+            if acc.tokens is not None:
+                acc = dataclasses.replace(acc, tokens=_TokenCount.add(acc.tokens, read))
+            if not self.shared:
+                acc = dataclasses.replace(
+                    acc,
+                    batches=jax.tree.map(
+                        lambda held, x: held.at[pending.fill].set(x), acc.batches, batch
+                    ),
+                    attempts=acc.attempts.at[pending.fill].set(attempt),
+                )
+                if acc.variables is not None:
+                    reads = {name: state.variables[name] for name in acc.variables}
+                    acc = dataclasses.replace(acc, variables=jax.tree.map(
+                        lambda held, x: held.at[pending.fill].set(x), acc.variables, reads))
+                if acc.replayed_statistics is not None and held_stats is not None:
+                    acc = dataclasses.replace(acc, replayed_statistics=tuple(
+                        held.at[pending.fill].set(x)
+                        for held, x in zip(acc.replayed_statistics, held_stats, strict=True)))
+            return acc
+
+        # A pooled window's gradient sum (a replayed window keeps none) and split batch statistics go
+        # round the reset too, the next first microbatch replacing them (`prepare_attempt`).
+        window = jax.lax.cond(
+            pending.due, cleared, retain,
+            dataclasses.replace(candidate, gradient=None, batch_statistics=None))
+        stamp = (None if held_stamp is None
+                 else jnp.where(pending.due, window.statistics_stamp, held_stamp))
+        return dataclasses.replace(window, gradient=candidate.gradient, batch_statistics=held_stats,
+                                   statistics_stamp=stamp)
+
     def finish_attempt(self, state, batch, aux, pending, gradient, attempt, tokens, probed=None):
         """Commit the window when it is due, then advance the state's clocks.
 
@@ -1080,34 +1159,8 @@ class Transaction:
         if scale is not None:
             accepted = finite & _all_finite((numerical.variables, numerical.opt_state, numerical.ema))
         if previous is not None:
-            candidate = pending.candidate
-            assert candidate is not None
-
-            def retain(acc):
-                if acc.tokens is not None:
-                    acc = dataclasses.replace(acc, tokens=_TokenCount.add(acc.tokens, read))
-                if not self.shared:
-                    acc = dataclasses.replace(
-                        acc,
-                        batches=jax.tree.map(
-                            lambda held, x: held.at[pending.fill].set(x), acc.batches, batch
-                        ),
-                        attempts=acc.attempts.at[pending.fill].set(attempt),
-                    )
-                    if acc.variables is not None:
-                        reads = {name: state.variables[name] for name in acc.variables}
-                        acc = dataclasses.replace(acc, variables=jax.tree.map(
-                            lambda held, x: held.at[pending.fill].set(x), acc.variables, reads))
-                return acc
-
-            # A pooled window's gradient sum (a replayed window keeps none)
-            # goes round the reset too, its next first microbatch restarting
-            # it (`prepare_attempt`): passed through on every microbatch the
-            # window does not commit, it was copied each time (Qwen3.5-0.8B's 1 GB
-            # embedding sum, twice a step on an A100).
-            window = jax.lax.cond(pending.due, cleared, retain, dataclasses.replace(candidate, gradient=None))
             numerical = dataclasses.replace(
-                numerical, accumulation=dataclasses.replace(window, gradient=candidate.gradient))
+                numerical, accumulation=self._retained_window(state, batch, pending, attempt, read))
         # A rejected attempt drops its window (`dropped_window`): the update it would have closed is
         # skipped whole, its accepted microbatches with it.
         advanced = _chosen(accepted, numerical, dropped_window(state, self.size))
@@ -1281,6 +1334,41 @@ class Transaction:
         return dataclasses.replace(realized, aux=dataclasses.replace(realized.aux,
                                                                     record=recorded(evaluations, ran)))
 
+    def _step_attempt(self, state, read: Variables, batch: Batch, attempt, part, slot,
+                      whole: Batch | None):
+        """`state` and the `Step` for `part`, computing `batch_statistics` at `part` 0 or whenever the
+        update/rejection stamp moved and holding them on `state.accumulation` across parts."""
+        held_stats = None if state.accumulation is None else state.accumulation.batch_statistics
+        held_stamp = None if state.accumulation is None else state.accumulation.statistics_stamp
+        batch_stats = held_stats
+        if held_stats is not None and held_stamp is not None and whole is not None:
+            rejected = attempt - state.microstep
+            stamp = jnp.stack([state.updates, rejected]).astype(jnp.int32)
+            base_slot = slot - slot % self.split
+            base_microstep = state.microstep - state.microstep % self.split
+
+            def compute_batch_stats(_):
+                def part_at(index: jax.Array) -> tuple[Batch, Step]:
+                    micro = microbatch(whole, index, self.split)
+                    step_i = self.attempt(state, state.variables, micro,
+                                          base_microstep + index + rejected, index, base_slot + index,
+                                          microstep=base_microstep + index, recorded=False, watch=False)
+                    return micro, step_i
+
+                found = self.objective.batch_statistics(jax.lax.stop_gradient(read), part_at, self.split)
+                assert found is not None
+                return tuple(jax.lax.stop_gradient(x).astype(held.dtype)
+                             for x, held in zip(found, held_stats, strict=True))
+
+            stale = (part == 0) | jnp.any(held_stamp != stamp)
+            batch_stats = jax.lax.cond(stale, compute_batch_stats, lambda _: held_stats, None)
+            assert state.accumulation is not None
+            state = dataclasses.replace(
+                state, accumulation=dataclasses.replace(state.accumulation, batch_statistics=batch_stats,
+                                                        statistics_stamp=stamp))
+        return state, self.attempt(state, state.variables, batch, attempt, part, slot,
+                                   batch_statistics=batch_stats)
+
     def step(self, *, realize=None, host=False, frozen: Sequence[tuple[str, ...]] = ((FROZEN,),)):
         """Build the function that runs one attempt over the shared phases.
 
@@ -1304,7 +1392,7 @@ class Transaction:
         unscale = compile_phase(self.unscaled)
         add = compile_phase(self.add_contribution)
 
-        def run(state, batch, part, tokens, closes=None):
+        def run(state, batch, part, tokens, closes=None, whole=None):
             # The `part`th microbatch of the step's batch is attempt step *
             # split + part, with a draw of its own; the objective's schedules
             # count steps, however many microbatches each is read in. `tokens`
@@ -1313,10 +1401,10 @@ class Transaction:
             attempt = state.step * self.split + part
             # Every attempt the run made and did not accept draws afresh (`attempt_step`'s rejections).
             slot = state.microstep % self.size
-            step_info = self.attempt(state, state.variables, batch, attempt, part, slot)
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             # A watched cotangent is read unscaled by the factor its backward is seeded with.
             read = self.read(state.variables, state.compute)
+            state, step_info = self._step_attempt(state, read, batch, attempt, part, slot, whole)
             # The runs a one-stage scanned state holds update in their backward where the step's update
             # reads each gradient alone (`planned`); a host step, or one realized otherwise, as before.
             realized, planned = self._realized_in(state, realize, read, batch, step_info, factor, host=host)
@@ -1356,6 +1444,7 @@ class Transaction:
                     realized = realize(replayed, records, step_info)
                     replayed_record = evaluation_of(realized.aux)
                     if kept is not None and replayed_record is not None:
+                        assert state.accumulation is not None and state.accumulation.attempts is not None
                         attempt = state.accumulation.attempts[index]
                         places = self._places(index, replayed_record, attempt % self.split)
                         evaluated = (replayed_record, places)

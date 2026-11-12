@@ -158,6 +158,7 @@ from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
     Transaction,
+    batch_statistics_shapes,
     compact_qk,
     loss_scale,
     pooled_by_mean,
@@ -740,7 +741,7 @@ class Trainer(Generic[Loss, Effects]):
         return jax.make_jaxpr(loss, return_shape=True)(variables, self._model_shapes(batch), *rest)
 
     def _initialize_accumulation(self, state: TrainState, batch: Batch, shapes, *, window: int,
-                                 shape_only=False):
+                                 split: int = 1, shape_only=False):
         """The state with the accumulation a `window` of microbatches of `batch`'s shapes pools in, empty;
         unchanged under a window of one, a custom step or a held one that replays such batches
         (`Accumulation.replays`): a ramp's stage begins with a window (`Ramp.stages`)."""
@@ -757,6 +758,7 @@ class Trainer(Generic[Loss, Effects]):
         records = jax.tree.map(shape, self._model_shapes(batch))
         mutable = (None if shared or aux.variables is None else
                    jax.tree.map(shape, {name: state.variables[name] for name in aux.variables}))
+        batch_stats = batch_statistics_shapes(self.objective, state, records, window, split)
 
         def zeros(leaf):
             wide = at_least_fp32(leaf.dtype)
@@ -779,7 +781,11 @@ class Trainer(Generic[Loss, Effects]):
                 batches=None if shared else buffer(records),
                 variables=None if mutable is None else buffer(mutable),
                 attempts=None if shared else jnp.zeros((slots,), jnp.int32),
-                tokens=jnp.zeros((2,), jnp.uint32) if TOKENS in batch else None)
+                tokens=jnp.zeros((2,), jnp.uint32) if TOKENS in batch else None,
+                batch_statistics=None if batch_stats is None else tuple(zeros(x) for x in batch_stats),
+                replayed_statistics=(None if shared or batch_stats is None
+                                     else tuple(buffer(zeros(x)) for x in batch_stats)),
+                statistics_stamp=None if batch_stats is None else jnp.full((2,), -1, jnp.int32))
 
         pending = jax.eval_shape(allocate)
         # The microbatches the state's window holds are read only where it is replaced (`kept_window`).
@@ -804,8 +810,8 @@ class Trainer(Generic[Loss, Effects]):
         (`windowed`): what a run's first step of a window builds, and a run compiled ahead compiles
         (`dew.training.ahead.started`)."""
         return windowed(lambda state, rows, *, shape_only: self._initialize_accumulation(
-            state, rows, candidate.shapes, window=window, shape_only=shape_only), state, candidate.micro,
-            self.shardings)
+            state, rows, candidate.shapes, window=window, split=window // self.accumulation,
+            shape_only=shape_only), state, candidate.micro, self.shardings)
 
     @contextlib.contextmanager
     def _traced_on(self, mesh: Mesh | AbstractMesh,
@@ -835,7 +841,7 @@ class Trainer(Generic[Loss, Effects]):
         refuse_unpassed_progress(self.objective, passes=isinstance(self.step, PassesProgress))
         custom = self.step(self.objective, self.optimizer)
 
-        def run(current, batch, part, tokens, closes=None):
+        def run(current, batch, part, tokens, closes=None, whole=None):
             advanced, loss, aux = custom(current, batch)
             return advanced, loss, aux, None
         return run

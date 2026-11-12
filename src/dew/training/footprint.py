@@ -25,6 +25,7 @@ from typing import NamedTuple
 
 import jax
 import jax.extend.core as jcore
+import jax.numpy as jnp
 import numpy as np
 from jax.core import ShapedArray
 from jax.extend.core import primitives
@@ -50,7 +51,7 @@ from dew.training.compiled_program import (
 )
 from dew.training.memory import head_fused_of, head_tile_of, judged
 from dew.training.narrow import forward_variables
-from dew.training.transaction import attempt_step
+from dew.training.transaction import attempt_step, batch_statistics_shapes
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1134,9 +1135,11 @@ def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: T
     def loss(variables, batch, microstep, key, step, ema, updates):
         # The step's first attempt of its first part, as the transaction reads it (`attempt_step`).
         current = dataclasses.replace(state, microstep=microstep, key=key, step=step, updates=updates)
+        shared = batch_statistics_shapes(objective, current, batch, window, split)
+        stats = None if shared is None else tuple(jnp.zeros(x.shape, x.dtype) for x in shared)
         return objective._loss(variables, batch, attempt_step(
             current, variables, ema, batch, split=split, slots=window, attempt=step * split, part=0,
-            slot=microstep % window))
+            slot=microstep % window, batch_statistics=stats))
 
     return loss, (variables, state.microstep, state.key, state.step, state.ema, state.updates)
 
