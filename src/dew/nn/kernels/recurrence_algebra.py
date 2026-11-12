@@ -17,6 +17,7 @@ the portable math's issuer is XLA's (`portable`), a kernel's its own dot."""
 
 import functools
 import math
+import os
 from collections.abc import Callable, Iterator, Sequence
 from typing import NamedTuple, Protocol
 
@@ -1304,5 +1305,8 @@ def summed_pairs(pairs, issue: Issue = portable, columns: Callable[[jax.Array], 
     and each token's sum its column's (`columns`, a mainloop's own reduction across its rows' warps, where
     given)."""
     lag = _lags(pairs.shape)
-    terms = jnp.where(lag >= 0, issue("summed", pairs, Exact(jnp.where(lag < 0, 1.0, 0.0))), 0.0)
+    triangle = jnp.where(lag < 0, 1.0, 0.0)
+    if os.environ.get("DBG_TRIANGLE_ONES"):
+        triangle = jnp.ones_like(triangle)
+    terms = jnp.where(lag >= 0, issue("summed", pairs, Exact(triangle)), 0.0)
     return jnp.sum(terms, axis=0) if columns is None else columns(terms)
