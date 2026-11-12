@@ -443,17 +443,8 @@ PAIRED_FORMS = ("paired swiglu forward", "paired forward")
 def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
     """Each GEMM Mosaic launch form (`PLAIN_FORMS`, `PAIRED_FORMS`, `HOOKED_FORMS`) at a projection's
     extents: its name, launch, abstract operands and options."""
-    from test_gemm_template import (
-        biased,
-        casted,
-        doubled,
-        gated,
-        normed,
-        scaled,
-        scaled_rows,
-        silu_residual,
-        swiglu,
-    )
+    from test_gemm_paired import swiglu
+    from test_gemm_template import biased, casted, doubled, gated, normed, scaled, scaled_rows, silu_residual
 
     shaped = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     vector = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
