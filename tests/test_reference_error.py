@@ -605,11 +605,11 @@ def summed_wide(x, w):
 def test_check_1_runs_each_arm_as_its_users_sum_their_products():
     """On the CPU lane check 1 runs each arm with fp32 products summed in fp32 (`summed_as_run`), the
     truth outside that: Dew's product, which sums in float64 only under the suite's wide arithmetic and
-    pairwise in float32 as its users run it (`accumulated`, row 4863), is judged as they run it, so it is
+    as XLA's own float32 dot as its users run it (`accumulated`, row 5448), is judged as they run it, so it is
     on par with XLA's plain fp32 dot but not with the same product kept to its float64 sums; and against
     that product the plain dot fails too, so the truth is still float64's."""
     assert_as_exact(dews_product, jnp.matmul, long_dot_draw, "as its users sum", seeds=16)
-    for arm, label in ((dews_product, "pairwise against summed wide"), (jnp.matmul, "summed wide")):
+    for arm, label in ((dews_product, "as run against summed wide"), (jnp.matmul, "summed wide")):
         with pytest.raises(GateFailure):
             assert_as_exact(arm, summed_wide, long_dot_draw, label, seeds=16)
 

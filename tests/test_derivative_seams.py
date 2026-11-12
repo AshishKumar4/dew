@@ -39,7 +39,7 @@ def test_the_contract_holds_a_sum_only_where_no_order_of_it_can_overflow():
     each term first, does not, and is refused (row 1768's class). Where float32 overflows the terms in one
     order and not another (terms near the largest that cancel), no order is held: a form that sums the
     alternate terms first, which overflows where the plain formula's pairs cancel, holds the contract (row
-    5426, a blocked sum beside a chain)."""
+    5426, two summation orders)."""
     direction, cotangent = (jnp.ones((8,), jnp.float32),), jnp.ones((), jnp.float32)
 
     def scaled_first(x):

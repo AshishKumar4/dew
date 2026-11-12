@@ -198,7 +198,7 @@ def _platform_default(equation: jcore.JaxprEqn,
     for, its default; None for any other equation, or a choice without one. Read so in Dew's own programs
     alone (a form's walk, a declaration recognition traces), where each choice computes one function on every
     branch, which differ in rounding, order or implementation alone: a depthwise convolution's Triton or lax
-    form (dew.nn.conv), a TPU's barrier or none, a CPU's float64 sums, blocked sums and exact bf16 products
+    form (dew.nn.conv), a TPU's barrier or none, a CPU's float64 sums and exact bf16 products
     (dew.nn.precision), the same bf16 bits through a CUDA cast, an S5 scan scanned or chunked (dew.nn.ssm),
     and a kernel or its portable fallback (dew.nn.kernels.gemm). A program's own choices may compute
     different functions, and stay as written."""

@@ -55,9 +55,7 @@ def dew(_, inputs) -> dict:
 
 def test_llama_cpp_reads_the_decoder_dew_exports_at_dews_logits():
     """Dew's float32 logits on par with libllama's over drawn ids, both measured from transformers' float64
-    run of the same export (check 1): Dew's dense products summed blocked and pairwise on the CPU
-    (`precision.accumulated`, row 4863), where XLA's one sequential chain carried them to 1.77 times
-    libllama's distance (row 4735)."""
+    run of the same export (check 1), Dew's dense products XLA's own sums on the CPU (row 5448)."""
     assert_arms_as_recorded((FIXTURE, draw, dew, OUTPUTS), "llama-cpp", LLAMA_SEEDS, "llama.cpp logits",
                             host=True)
 

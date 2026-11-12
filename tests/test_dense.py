@@ -75,8 +75,8 @@ def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dt
     """Flax's parameters bit for bit, but for a batched kernel, which draws each batch member alone
     (`test_a_batched_kernel_draws_each_member_at_its_own_fan_in`), and with flax's parameters, its
     biases zero, flax's output where both sum their fp32 products alike (`FP32_SUMS`): a layer naming no
-    product of its own sums a CPU's fp32 products blocked and pairwise (`dew.nn.pairwise`, row 4863), so
-    flax's is given Dew's plain product; each pair drawn or computed in one program (ledger 3178)."""
+    product of its own takes the GEMM template's dispatch (`projections.dot_general`), so flax's is given
+    that product; each pair drawn or computed in one program (ledger 3178)."""
     x = jnp.asarray(np.random.default_rng(0).standard_normal(shape), dtype)
     mine, theirs = build(ours), build(flaxs)
     if isinstance(theirs, nn.Dense | nn.DenseGeneral) and theirs.dot_general is None:
