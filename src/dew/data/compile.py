@@ -139,7 +139,16 @@ from dew.data.pipeline import (
     with_children,
     with_stores,
 )
-from dew.data.plan import DECLARED_MIX, PLAN_VERSIONS, Plan, StepIdentity, fingerprint, read_by, unplaced
+from dew.data.plan import (
+    DECLARED_MIX,
+    PLAN_VERSIONS,
+    Plan,
+    StepIdentity,
+    fingerprint,
+    read_by,
+    spelled,
+    unplaced,
+)
 from dew.data.readers import Opener, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
     Read,
@@ -536,7 +545,7 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]
         return read
 
     def steps(identities: Sequence[StepIdentity]) -> JSON:
-        return [{**step.semantic(), "modules": list(step.modules)} for step in identities]
+        return [{**step.semantic(build.version), "modules": list(step.modules)} for step in identities]
 
     corpora = build.lowering.order["corpora"]
     if not isinstance(corpora, list):
@@ -551,7 +560,7 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]
                       *(_identity(stage) for stage in written(tuple(_steps(child)))
                         if not isinstance(stage, (Workers, Prefetch)))]
         members[key] = (json_value({
-            "order": unplaced(json_value(corpora[index], "member order")),
+            "order": unplaced(spelled(corpora[index], build.version)),
             "sources": [read_of(read).fingerprint() for read in sources],
             "steps": steps(identities),
             "derived": dict(_derived(child, build.child(index))),
@@ -674,6 +683,7 @@ def _measure(
     automatic: str | None = None,
     examples: int | None = None,
     epochs: int | None = None,
+    version: int = PLAN_VERSIONS[-1],
 ) -> _Measured:
     """`_prepared`'s first part: each branch checked, its generations promoted and checked again, its
     sources provisioned and pinned, the objective's steps placed, a training read's bound taken, and with
@@ -713,7 +723,8 @@ def _measure(
         metadata = _metadata(branches, read)
         if read == "memory" and counts is not None:
             branches = tuple(
-                _materialize(_configured(branch, metadata, read, "source"), count, training=not scored)
+                _materialize(_configured(branch, metadata, read, "source"), count, training=not scored,
+                             version=version)
                 for branch, count, scored in zip(branches, counts, held, strict=True)
             )
             if training and not stored(branches[0]):
@@ -724,13 +735,13 @@ def _measure(
 
 
 def _made(prepared: Sequence[Pipeline], read: Read, counts: Sequence[dict[str, CorpusCounts]], *,
-          training: bool) -> tuple[Pipeline, ...]:
+          training: bool, version: int = PLAN_VERSIONS[-1]) -> tuple[Pipeline, ...]:
     """Prepared branches as a memory read makes them, the first training where `training`: their
     first stages run and their rows held (`_materialize`), counted into `counts`, then the memory
     reads pinning took let go (`_released`); another read's as they are."""
     if read != "memory":
         return tuple(prepared)
-    made = tuple(_materialize(branch, count, training=training and not index)
+    made = tuple(_materialize(branch, count, training=training and not index, version=version)
                  for index, (branch, count) in enumerate(zip(prepared, counts, strict=True)))
     _released(prepared)
     return made
@@ -844,7 +855,7 @@ def _bound_ends(pipeline: Pipeline) -> bool:
 
 def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective: ObjectiveData | None,
                       read: Read, provision: bool, loading: Loading, examples: int | None,
-                      epochs: int | None = None) -> _TrainingMeasured:
+                      epochs: int | None = None, version: int = PLAN_VERSIONS[-1]) -> _TrainingMeasured:
     """A compile's training branch, and its `validation`, prepared through their source's own steps as
     the compile reads them (`_measure`): bounded to `examples`, a chain's own layout as written, before
     preparation could plan it into its source, and the objective's with its preparation; each corpus's
@@ -868,6 +879,7 @@ def _training_measure(train: Pipeline, validation: Pipeline | None, *, objective
         automatic=automatic_root(loading),
         examples=examples if written is None else None,
         epochs=epochs,
+        version=version,
     )
     return _TrainingMeasured(**{field.name: getattr(measured, field.name)
                                 for field in dataclasses.fields(measured)}, mirrored=since)
@@ -917,14 +929,15 @@ def _staged(
     batch_tokens = None if stated is None else stated.tokens
     if measured is None:
         measured = _training_measure(train, validation, objective=objective, read=read, provision=provision,
-                                     loading=loading, examples=examples, epochs=epochs)
+                                     loading=loading, examples=examples, epochs=epochs, version=version)
     counts, validation_counts = (*measured.counts, {})[:2]
     branches = _prepared(measured.branches, read, provision=provision, training=True, objective=objective,
                          widths=widths, measured=measured)
     if not any(isinstance(stage, BatchStage) for stage in branches[0].stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
     original = branches[0]
-    train, *scored = _made(branches, read, (counts, validation_counts)[: len(branches)], training=True)
+    train, *scored = _made(branches, read, (counts, validation_counts)[: len(branches)], training=True,
+                           version=version)
     validation = scored[0] if scored else None
     # A memory read that kept none of the scored records scores none.
     if validation_counts and not any(count.accepted for count in validation_counts.values()):
@@ -1139,6 +1152,7 @@ def _compiled(
               if not isinstance(stage, (Workers, Prefetch))),
             *(StepIdentity.of(step) for step in host),
         ),
+        version=build.version,
     )
     members = _member_manifests(train, build, host)
     plan = Plan(
@@ -1984,7 +1998,7 @@ def fitted[Entry](
         measured = (None if not scored or (isinstance(trained.source, Phases) and examples is None) else
                     _training_measure(trained, None, objective=objective, read=read, provision=True,
                                       loading=trained._loading or _DEFAULT_LOADING, examples=examples,
-                                      epochs=epochs if examples is None else None))
+                                      epochs=epochs if examples is None else None, version=plan_version))
         widths = (run_widths([*([measured] if measured else []), *scored.values()], objective)
                   if scored else {})
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,

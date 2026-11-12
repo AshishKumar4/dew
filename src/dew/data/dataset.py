@@ -1349,7 +1349,7 @@ class GlobalStream:
         self._published = published
         self.ends: Ends = "never" if endless else "together"
         self._batch = batch
-        self._order = json.dumps(plan.order, sort_keys=True)
+        self._order = json.dumps(plan.spelled_order(), sort_keys=True)
         self._records = 0
         self._reads: pygrain.DatasetIterator[Batch] | None = None
         self._loading = loading

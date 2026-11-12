@@ -12,6 +12,7 @@ import logging
 import platform
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
@@ -176,11 +177,15 @@ class StepIdentity:
     declared: str | None = None
     dependencies: Mapping[str, object] = dataclasses.field(default_factory=dict)
     code: tuple[int, ...] = ()
+    printed: str | None = dataclasses.field(default=None, compare=False)
+    """The configuration as plans before `STRUCTURED` spelled it (`_printed_config`), which a plan of an
+    earlier version records instead (`record`), None where it is `config`'s spelling."""
 
     @classmethod
     def of(cls, step: object, identity: str | None = None, *, cache: bool = False) -> StepIdentity:
         """`step`'s identity, refused where a cache keys it (`cache`) and
-        cannot (`keyable`)."""
+        cannot (`keyable`): its configuration described once, field by field (`structured`), and spelled
+        as earlier plans spelled it beside it (`printed`)."""
         kind = step if inspect.isfunction(step) else type(step)
         module = kind.__module__
         name = f"{module}.{kind.__qualname__}"
@@ -206,25 +211,32 @@ class StepIdentity:
             if dataclasses.is_dataclass(step) and not isinstance(step, type)
             else {}
         )
-        if dataclasses.is_dataclass(step) and not isinstance(step, type) and (
-                dependencies or _holds_arrays(step) or set_added(step)):
-            config = json.dumps(_configuration(step), sort_keys=True)
+        printed = None
+        if frozen:
+            printed = _printed_config(step, config, bool(dependencies))
+            config = json.dumps(structured(step), sort_keys=True)
         code = (0,) if inspect.isfunction(step) and declared is None and modules else ()
-        named = cls(name, config, exact, modules, declared, dependencies, code)
+        named = cls(name, config, exact, modules, declared, dependencies, code, printed)
         if cache and not named.keyable(function=inspect.isfunction(step), external=external):
             raise ValueError(f"cache prefix step {name} needs identity='name@version'")
         return named
 
-    def record(self) -> dict[str, JSON]:
-        """The identity as a manifest records it: every field but `code`, which its modules' places say."""
-        return {field.name: json_value(getattr(self, field.name), field.name)
-                for field in dataclasses.fields(self) if field.name != "code"}
+    def record(self, version: int | None = None) -> dict[str, JSON]:
+        """The identity as a manifest of plan `version` (the latest by default) records it: every field but
+        `code`, which its modules' places say, and `printed`, which is its configuration in a plan before
+        `STRUCTURED`."""
+        recorded = {field.name: json_value(getattr(self, field.name), field.name)
+                    for field in dataclasses.fields(self) if field.name not in ("code", "printed")}
+        if version is not None and version < STRUCTURED and self.printed is not None:
+            recorded["config"] = self.printed
+        return recorded
 
-    def composed(self, factory: StepIdentity, config: str) -> StepIdentity:
-        """This step's identity as the `Configured` stage `factory` resolved it, under `config`: the
-        factory's modules after its own, and their places of code (`code`) with them."""
+    def composed(self, factory: StepIdentity, config: str, printed: str | None = None) -> StepIdentity:
+        """This step's identity as the `Configured` stage `factory` resolved it, under `config` (and
+        `printed`, its earlier spelling): the factory's modules after its own, and their places of code
+        (`code`) with them."""
         return dataclasses.replace(
-            self, config=config, modules=(*self.modules, *factory.modules),
+            self, config=config, printed=printed, modules=(*self.modules, *factory.modules),
             code=(*self.code, *(len(self.modules) + place for place in factory.code)))
 
     def keyable(self, *, function: bool, external: bool) -> bool:
@@ -233,10 +245,10 @@ class StepIdentity:
         which Dew's revision does not name."""
         return self.exact and not ((external or function) and self.declared is None)
 
-    def semantic(self) -> dict[str, JSON]:
+    def semantic(self, version: int | None = None) -> dict[str, JSON]:
         """What the step computes, on any host: its identity without its
-        modules' bytes, which only a manifest's environment records."""
-        return {name: value for name, value in self.record().items() if name != "modules"}
+        modules' bytes, which only a manifest's environment records, as plan `version` records it."""
+        return {name: value for name, value in self.record(version).items() if name != "modules"}
 
 
 @runtime_checkable
@@ -264,6 +276,61 @@ def _dependencies(step: DataclassInstance) -> Mapping[str, object]:
             if nested:
                 dependencies[field.name] = nested
     return dependencies
+
+
+def structured(value: object) -> JSON:
+    """`value`, a step or any part of one, described by its structure, the one description a plan of version
+    `STRUCTURED` or later records: a dataclass by its class and each field it records (`repr=True`, and an
+    added one where set, `dew._records.ADDED`), a configured object by what it computes (`dependencies`),
+    a container entry by entry, an array by its fingerprint, a callable by its own identity
+    (`StepIdentity`), a scalar as JSON holds it, and anything else by its text, without addresses."""
+    if isinstance(value, _Dependencies):
+        return json_value(value.dependencies(), type(value).__qualname__)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        kind = type(value)
+        described: dict[str, JSON] = {"class": f"{kind.__module__}.{kind.__qualname__}"}
+        for field in dataclasses.fields(value):
+            held = getattr(value, field.name)
+            if field.repr or (field.metadata.get(ADDED) and held != field.default):
+                described[field.name] = structured(held)
+        return described
+    match value:
+        case None | bool() | int() | str():
+            return value
+        case float():
+            return value if np.isfinite(value) else {"float": value.hex()}
+        case Enum():
+            return {"enum": f"{type(value).__module__}.{type(value).__qualname__}", "name": value.name}
+        case list() | tuple():
+            return [structured(entry) for entry in value]
+        case Mapping():
+            return {name if isinstance(name, str) else repr(name): structured(entry)
+                    for name, entry in value.items()}
+        case np.ndarray() | jax.Array():
+            return {"array": content_fingerprint(np.asarray(value)).hex()}
+        case np.generic():
+            return structured(value.item())
+        case np.dtype():
+            return {"dtype": str(value)}
+    if isinstance(value, type):
+        return {"class": f"{value.__module__}.{value.__qualname__}"}
+    if inspect.ismethod(value):
+        # A bound method computes what its object's configuration says.
+        return {"method": callable_name(value), "of": structured(value.__self__)}
+    if inspect.isfunction(value):
+        return {"function": StepIdentity.of(value).semantic()}
+    if inspect.isbuiltin(value):
+        return {"function": f"{getattr(value, '__module__', None)}.{value.__qualname__}"}
+    return {"text": re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))}
+
+
+def _printed_config(step: DataclassInstance, config: str, dependent: bool) -> str:
+    """A dataclass step's configuration as plans before `STRUCTURED` spelled it (`StepIdentity.printed`):
+    its repr, or, where it calls a configured object, holds an array or sets an added field, the JSON of its
+    fields (`_configuration`). Read only where a plan of an earlier version is compared."""
+    if dependent or _holds_arrays(step) or set_added(step):
+        return json.dumps(_configuration(step), sort_keys=True)
+    return config
 
 
 def _configuration(step: DataclassInstance) -> dict[str, JSON]:
@@ -396,6 +463,9 @@ class Manifest:
     codec: int = 1
     schema: int = 1
     clean: bool = True
+    version: int | None = dataclasses.field(default=None, compare=False)
+    """The plan version whose spelling its steps are recorded in (`StepIdentity.record`): a cache's key's,
+    the version that fills it; None for the latest."""
 
     @classmethod
     def of(
@@ -405,6 +475,7 @@ class Manifest:
         *,
         ran: Sequence[StepIdentity] = (),
         fill: Mapping[str, object] | None = None,
+        version: int | None = None,
     ) -> Manifest:
         (revision, clean), lock = checkout_now(), _locked()
         return cls(
@@ -420,20 +491,24 @@ class Manifest:
                 if step.dependencies
             },
             clean=clean,
+            version=version,
         )
 
-    def record(self) -> dict[str, JSON]:
+    def record(self, version: int | None = None) -> dict[str, JSON]:
+        """The manifest as a plan of `version` (its own, `version`, by default) records it: each step's
+        identity as that version spells it (`StepIdentity.record`)."""
+        version = self.version if version is None else version
         recorded: dict[str, JSON] = {
             field.name: json_value(getattr(self, field.name), field.name)
             for field in dataclasses.fields(self)
-            if field.name not in ("steps", "ran")
+            if field.name not in ("steps", "ran", "version")
         }
-        recorded["steps"] = [step.record() for step in self.steps]
-        recorded["ran"] = [step.record() for step in self.ran]
+        recorded["steps"] = [step.record(version) for step in self.steps]
+        recorded["ran"] = [step.record(version) for step in self.ran]
         return recorded
 
-    def semantic(self) -> dict[str, JSON]:
-        return _semantic(self.record())
+    def semantic(self, version: int | None = None) -> dict[str, JSON]:
+        return _semantic(self.record(version))
 
     def environment(self) -> dict[str, JSON]:
         return _environment(self.record())
@@ -481,8 +556,29 @@ def unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | No
     return order
 
 
+def spelled(order: object, version: int) -> JSON:
+    """`order`, an analysis's (`dew.data.analysis._analyzed`), as a plan of `version` records it: each of
+    its stages, the stage the analysis read, described by its structure (`structured`) from `STRUCTURED`,
+    printed (its repr) before it, every other entry as JSON holds it."""
+    match order:
+        case Mapping():
+            return {name: [_spelled_stage(stage, version) for stage in part]
+                    if name == "stages" and isinstance(part, list | tuple) else spelled(part, version)
+                    for name, part in order.items()}
+        case list() | tuple():
+            return [spelled(part, version) for part in order]
+    return json_value(order, "order")
+
+
+def _spelled_stage(stage: object, version: int) -> JSON:
+    """An order's stage as plan `version` records it (`spelled`)."""
+    if isinstance(stage, str):
+        return stage
+    return structured(stage) if version >= STRUCTURED else repr(stage)
+
+
 _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
-"""A limit's record in an order's stages (`Limit`'s repr)."""
+"""A printed limit in an order's stages before `STRUCTURED` (`Limit`'s repr)."""
 
 
 def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[str, object], JSON]:
@@ -809,6 +905,9 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     if (saved.get("version") == SHARED_STATE and plan.version >= DECLARED_MIX
             and read_otherwise_at_13(saved) is None):
         saved = {**saved, "version": DECLARED_MIX}
+    # A plan of 13 is one of 14 spelled as 13 spelled it (`STRUCTURED`): the rest of it is read as 14 reads
+    # it, in that spelling (`Plan.as_spelled`).
+    plan = plan.as_spelled(saved.get("version"))
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:
         return saved
@@ -816,7 +915,7 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     named = _named_as_today(json_value(manifest.get("source", {}), "saved data source"), plan.stores)
     saved = {**saved, "manifest": {**manifest, "source": named}, **_members_as_today(saved, plan)}
     saved_sources = record(named, "saved data source").get("sources")
-    sources = record(plan.manifest.semantic().get("source", {}), "data source").get("sources")
+    sources = record(plan.manifest.semantic(plan.version).get("source", {}), "data source").get("sources")
     if not isinstance(saved_sources, list) or not isinstance(sources, list):
         return saved
     held = dict(record(saved.get("derived", {}), "saved derived order"))
@@ -949,19 +1048,46 @@ def grown_limits(saved: dict[str, JSON] | list[JSON] | str | int | float | bool 
 def _grown_stages(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
                   current: dict[str, JSON] | list[JSON] | str | int | float | bool | None
                   ) -> frozenset[tuple[str, str]] | None:
-    """`grown_limits` of the run's chain's stages (their records, in order)."""
+    """`grown_limits` of the run's chain's stages (their records, in order): each limit the current order
+    grew past the saved one's, every stage after it a batch, by the spelling its manifest's step records
+    (`_canonical`)."""
     if not (isinstance(saved, list) and isinstance(current, list)) or len(saved) != len(current):
         return frozenset() if saved == current else None
     found = set()
     for at, (before, after) in enumerate(zip(saved, current, strict=True)):
         if before == after:
             continue
-        held, now = _LIMIT.fullmatch(str(before)), _LIMIT.fullmatch(str(after))
-        if (held is None or now is None or int(now.group(1)) < int(held.group(1))
-                or not all(str(stage).startswith("BatchStage(") for stage in saved[at + 1:])):
+        held, now = _limit_count(before), _limit_count(after)
+        if (held is None or now is None or now < held
+                or not all(_is_stage(stage, "BatchStage") for stage in saved[at + 1:])):
             return None
-        found.add((str(before), str(after)))
+        found.add((_canonical(before), _canonical(after)))
     return frozenset(found)
+
+
+def _limit_count(stage: JSON) -> int | None:
+    """The count of an order's limit, as a plan of any version records it (`spelled`): structurally from
+    `STRUCTURED`, printed before it (`_LIMIT`); None for any other stage."""
+    match stage:
+        case {"class": "dew.data.pipeline.Limit", "count": int(count), "passes": None}:
+            return count
+        case str():
+            printed = _LIMIT.fullmatch(stage)
+            return None if printed is None else int(printed.group(1))
+    return None
+
+
+def _is_stage(stage: JSON, kind: str) -> bool:
+    """Whether an order's stage, as a plan of any version records it, is of the stage class `kind`."""
+    if isinstance(stage, dict):
+        return stage.get("class") == f"dew.data.pipeline.{kind}"
+    return str(stage).startswith(f"{kind}(")
+
+
+def _canonical(stage: JSON) -> str:
+    """An order's stage as its manifest's step records its configuration: a structured one's canonical
+    JSON, a printed one as printed."""
+    return stage if isinstance(stage, str) else json.dumps(stage, sort_keys=True)
 
 
 def _steps_grown(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
@@ -1017,7 +1143,14 @@ endlessly repeats each phase before its own batch, as a single stream's repeat i
 (`dew.data.compile._endless`), where 12 repeated it after the batch: a pass holding less than a batch
 never yielded one."""
 
-PLAN_VERSIONS = (8, 9, FILE_SHARDS, IN_ORDER, SHARED_STATE, DECLARED_MIX)
+STRUCTURED = 14
+"""The plan version from which a plan describes each stage and each step's configuration once, by its
+structure (`structured`): its class and fields, a callable by its own identity, an array by its fingerprint.
+13's printed them (their reprs) and read the printing back to compare a grown limit and fields a
+configuration lost; a plan of 13 or before is still recorded and compared in that spelling
+(`StepIdentity.printed`, `spelled`), which reads the rows 14 reads."""
+
+PLAN_VERSIONS = (8, 9, FILE_SHARDS, IN_ORDER, SHARED_STATE, DECLARED_MIX, STRUCTURED)
 """The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a corpus's key, its name
 in the mixture that reads it or a named chain's own, into each shuffle of its own, so corpora of one length
 shuffled by one seed read in orders of their own and a named corpus reads one order mixed or alone (row
@@ -1092,9 +1225,9 @@ class Plan:
         return {
             "version": self.version,
             "lowering": self.lowering,
-            "manifest": self.manifest.semantic(),
+            "manifest": self.manifest.semantic(self.version),
             "environment": self.manifest.environment(),
-            "order": json_value(self.order, "order"),
+            "order": self.spelled_order(),
             "derived": json_value(self.derived, "derived"),
             "topology": json_value(self.topology, "topology"),
             "rejections": self.rejections,
@@ -1111,8 +1244,21 @@ class Plan:
         which part differs. The order's sources are named by the manifest's
         content, not by their descriptions: hosts that mount one dataset at
         different paths read the same records."""
-        order = unplaced(json_value(self.order, "order"))
+        order = unplaced(self.spelled_order())
         return f"{json.dumps(order, sort_keys=True)} under plan {json.dumps(self.parts(), sort_keys=True)}"
+
+    def as_spelled(self, version: object) -> Plan:
+        """This plan as a saved plan of `version` spells it, where it makes the rows that one did: a plan of
+        `STRUCTURED` as `DECLARED_MIX` printed its stages and configurations, which read the same rows, else
+        itself."""
+        if version == DECLARED_MIX and self.version == STRUCTURED:
+            return dataclasses.replace(self, version=DECLARED_MIX)
+        return self
+
+    def spelled_order(self) -> JSON:
+        """The order as this plan's version records it (`spelled`): its stages, each the stage object the
+        analysis read, described structurally (`structured`), or printed as before `STRUCTURED`."""
+        return spelled(self.order, self.version)
 
     def parts(self) -> dict[str, JSON]:
         """A digest of each part of the plan but its order, its environment and
@@ -1126,7 +1272,8 @@ class Plan:
             {name: value for name, value in self.topology.items() if name != "share"}, "topology"
         )
         return {**{name: _digests(value) for name, value in recorded.items()},
-                **{f"manifest {name}": _digests(value) for name, value in self.manifest.semantic().items()}}
+                **{f"manifest {name}": _digests(value)
+                   for name, value in self.manifest.semantic(self.version).items()}}
 
     def check(
         self, saved: Mapping[str, object], *, resume: Literal["exact", "non-exact"] = "exact"
@@ -1137,6 +1284,9 @@ class Plan:
         whose code changed and that declares no identity. A changed environment
         (`Manifest.environment`) is returned and warned of, and refused for a
         per-share plan."""
+        spelled = self.as_spelled(saved.get("version"))
+        if spelled is not self:
+            return spelled.check(saved, resume=resume)
         current = self.record()
         if current["version"] != saved.get("version"):
             otherwise = (read_otherwise_at_8(saved) if saved.get("version") == 7 else
@@ -1188,7 +1338,7 @@ class Plan:
         # Each identity without the fields its configurations lost since runs were saved (`without_removed`).
         manifest, semantic = (record(without_removed(found), "data manifest") for found in (
             json_value(record(saved.get("manifest"), "saved data manifest"), "saved data manifest"),
-            json_value(self.manifest.semantic(), "data manifest")))
+            json_value(self.manifest.semantic(self.version), "data manifest")))
         # A bound the order grew is its steps' limit too.
         changed = tuple(name for name in _changed(manifest, semantic)
                         if not (name == "steps" and _steps_grown(json_value(manifest[name], "saved steps"),
@@ -1252,7 +1402,8 @@ class Plan:
             if before[key] != self.members[key]:
                 raise ValueError(f"saved data plan member {key} changed what it reads or runs")
         mixture = ("corpora", "members", "weights")
-        current = {name: json_value(value, name) for name, value in self.order.items() if name not in mixture}
+        spelled_order = record(self.spelled_order(), "order")
+        current = {name: value for name, value in spelled_order.items() if name not in mixture}
         before_order = {name: value for name, value in order.items() if name not in mixture}
         if unplaced(before_order) != unplaced(current):
             raise PlanOrderChanged.between(before_order, current)

@@ -274,6 +274,10 @@ def earlier_fields(value: JSON) -> JSON:
 _REMOVED_BY_NAME = {path.rsplit(":", 1)[-1]: names for path, names in REMOVED_FIELDS.items()}
 """`REMOVED_FIELDS` by class name, as a configuration's repr names it."""
 
+_REMOVED_BY_PATH = {path.replace(":", "."): names for path, names in REMOVED_FIELDS.items()}
+"""`REMOVED_FIELDS` by dotted class path, as a structured configuration names it
+(`dew.data.plan.structured`)."""
+
 
 @overload
 def without_fields(value: dict[str, JSON], names: Collection[str]) -> dict[str, JSON]: ...
@@ -315,8 +319,11 @@ def _unremoved(config: JSON) -> JSON:
     if isinstance(config, list):
         return [_unremoved(part) for part in config]
     if isinstance(config, dict):
-        return {key: _unremoved(part) for key, part in config.items()}
-    if not isinstance(config, str) or not any(f"{name}(" in config for name in _REMOVED_BY_NAME):
+        # A structured configuration names its class and holds its fields beside it.
+        removed = _REMOVED_BY_PATH.get(config["class"]) if isinstance(config.get("class"), str) else None
+        return {key: _unremoved(part) for key, part in config.items() if not removed or key not in removed}
+    if not isinstance(config, str) or not (any(f"{name}(" in config for name in _REMOVED_BY_NAME)
+                                           or any(f'"{path}"' in config for path in _REMOVED_BY_PATH)):
         return config
     try:
         parsed = json.loads(config)

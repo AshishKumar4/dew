@@ -84,6 +84,9 @@ class _Memory(View[Source]):
     inputs: int = 0
     ran: tuple[Stage, ...] = ()
     segments: int | None = None
+    version: int = PLAN_VERSIONS[-1]
+    """The plan version the read is recorded under, which spells the identities of the steps it ran
+    (`dew.data.plan.StepIdentity.record`)."""
     """The most documents a window holds where `ran` packs them, which its
     batches declare (`Coordinates.max_segments`)."""
 
@@ -94,7 +97,7 @@ class _Memory(View[Source]):
         return {
             "materialized": self.source.fingerprint(),
             "derived": self.derived,
-            "steps": [_identity(stage).semantic() for stage in self.ran],
+            "steps": [_identity(stage).semantic(self.version) for stage in self.ran],
         }
 
     def supports(self, read: Read) -> bool:
@@ -133,11 +136,12 @@ def _materialize(
     counts: dict[str, CorpusCounts],
     *,
     training: bool = True,
+    version: int = PLAN_VERSIONS[-1],
 ) -> Pipeline:
     if isinstance(pipeline.source, Phases):
         raise ValueError("materialize each phase before constructing its global order")
     if isinstance(pipeline.source, (Mixture, Phases)):
-        return _memory_mixture(pipeline, pipeline.source, counts, training=training)
+        return _memory_mixture(pipeline, pipeline.source, counts, training=training, version=version)
     source = pipeline.source
     stored = source.records("memory")
     counter = counts.setdefault(_name(pipeline), CorpusCounts(_name(pipeline), _label(pipeline)))
@@ -149,7 +153,7 @@ def _materialize(
     eager = lowering.cache if lowering.cache is not None and lowering.eager > lowering.cache else None
     rows, consumed = _memory_inputs(pipeline, source, stored, counter, eager)
     return _memory_stages(
-        pipeline, source, stored, rows, consumed, lowering.eager, counter, training=training
+        pipeline, source, stored, rows, consumed, lowering.eager, counter, training=training, version=version
     )
 
 
@@ -220,6 +224,7 @@ def _memory_stages(
     counter: CorpusCounts,
     *,
     training: bool,
+    version: int = PLAN_VERSIONS[-1],
 ) -> Pipeline:
     derived: dict[str, str] = {}
     targets: Mapping[str, int] | None = None
@@ -296,7 +301,7 @@ def _memory_stages(
     # stands (`_counts_rows`).
     counted = (rows if examples is None else examples) if _counts_rows(pipeline, 0) else None
     return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, documents,
-                         counted=counted)
+                         counted=counted, version=version)
 
 
 def _memory_pack(stage: Pack, rows: list[tuple[tuple[int, ...], Record]], source: Source,
@@ -461,8 +466,10 @@ def _memory_mixture(
     counts: dict[str, CorpusCounts],
     *,
     training: bool,
+    version: int = PLAN_VERSIONS[-1],
 ) -> Pipeline:
-    children = tuple(_measured_targets(_materialize(child, counts, training=training), mixture)
+    children = tuple(_measured_targets(_materialize(child, counts, training=training, version=version),
+                                       mixture)
                      for child in mixture.pipelines)
     kept = tuple(
         (child, weight)
@@ -496,6 +503,7 @@ def _memory_order(
     documents: int | None,
     *,
     counted: Sequence[tuple[tuple[int, ...], Record]] | None,
+    version: int = PLAN_VERSIONS[-1],
 ) -> Pipeline:
     rows = [
         (identifier, value if isinstance(value, bytes) else record(value, "materialized record"))
@@ -533,6 +541,7 @@ def _memory_order(
             inputs,
             written(pipeline.stages[:consumed]),
             documents,
+            version,
         ),
         stages=remaining,
     )

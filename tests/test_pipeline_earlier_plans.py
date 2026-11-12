@@ -1,6 +1,8 @@
 """Earlier data plans read by this one: a version 7 plan and position of a streamed read of two shares,
-which version 8 reads as 7 did where it reads the order alike, refusing it otherwise."""
+which version 8 reads as 7 did where it reads the order alike, refusing it otherwise; and a plan of 13,
+which printed what 14 describes by its structure."""
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -58,3 +60,48 @@ def test_a_version_7_position_of_a_two_share_streamed_read_resumes_where_8_reads
         assert [np.asarray(next(stream)["id"]).tolist() for _ in range(2)] == saved["after"]
     finally:
         stream.close()
+
+
+@dataclasses.dataclass(frozen=True)
+class Scaled:
+    """A configured record step: each id times `factor`."""
+
+    factor: int
+
+    def __call__(self, row):
+        return {**row, "id": row["id"] * self.factor}
+
+
+def _taken(count: int, factor: int = 2):
+    """A shuffled chain of 40 ids through a configured step, taken to `count` records, in batches of two."""
+    rows = Memory({"id": np.arange(1, 41, dtype=np.int32)}, shard_rows=4)
+    return Pipeline(rows).shuffle(seed=3, window=8).map(Scaled(factor)).repeat().take(count).batch(2)
+
+
+def _ids(stream, batches: int) -> list[list[int]]:
+    return [np.asarray(next(stream)["id"]).tolist() for _ in range(batches)]
+
+
+@pytest.mark.parametrize("read", ["streamed", "indexed"])
+def test_a_position_a_plan_of_13_saved_resumes_under_14_which_spells_its_plan_otherwise(read):
+    """A position saved under data plan 13, which printed its order's stages and its steps' configurations,
+    resumes under 14, which describes them by their structure (`STRUCTURED`) and reads the same rows: onto
+    the rows 13 reads next, through a take grown since, which reads on past the old bound; a configured step
+    whose configuration changed is refused, its rows not the saved run's. A position 14 saved resumes under
+    14 alike."""
+    for saved_at in (13, 14):
+        before = compile(_taken(20), read=read, loading=Loading(workers=0), plan_version=saved_at)
+        stream = before.train(DataPartition())
+        _ids(stream, 3)
+        saved = stream.get_state()
+        after = _ids(stream, 4)
+        stream.close()
+        for count in (20, 30):
+            resumed = compile(_taken(count), read=read, loading=Loading(workers=0)).train(DataPartition())
+            resumed.set_state(saved)
+            assert _ids(resumed, 4) == after, (saved_at, count)
+            resumed.close()
+        changed = compile(_taken(20, factor=3), read=read, loading=Loading(workers=0)).train(DataPartition())
+        with pytest.raises(ValueError):
+            changed.set_state(saved)
+        changed.close()
