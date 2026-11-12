@@ -2,7 +2,9 @@
 derivation walks the ladder from the base rung before anything compiles, and the compile confirms it or
 climbs on as a correction. A run that starts from a plan, recorded or resumed, tries that plan first."""
 
+import cProfile
 import logging
+import pstats
 
 import jax
 import jax.numpy as jnp
@@ -329,18 +331,17 @@ def test_a_run_that_states_its_split_and_remat_derives_nothing_and_compiles_once
     derived, before the search or for its compile, and the one compile decides (row 5479: a 4B decoder's
     derivation held its first step 47 minutes at a split and remat the run had stated). Its record says so
     ("stated"), and a run that leaves either to the plan derives as it did."""
-    from dew.training import _candidates
+    from dew.training import footprint
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
     free(monkeypatch, LIMIT)
-    derived = []
-    real = _candidates.candidate_footprint
-    # Where a candidate step's footprint is derived (`_candidates._candidate`).
-    monkeypatch.setattr(_candidates, "candidate_footprint",
-                        lambda *args, **kwargs: derived.append(1) or real(*args, **kwargs))
     stated = deep(REMAT_POLICIES["full"], split=1)
+    # Each candidate step's footprint derived (`footprint.candidate_footprint`), counted by the profiler.
+    profiler = cProfile.Profile()
     with Compiles("step") as compiles:
-        compiled(stated)
+        profiler.runcall(compiled, stated)
+    derived = sum(calls for (file, _, name), (_, calls, *_) in pstats.Stats(profiler).stats.items()
+                  if name == "candidate_footprint" and file == footprint.__file__)
     assert compiles.count == 1 and not derived
     assert [entry["label"] for entry in stated.plan["derived"]] == ["stated"]
     assert stated.plan["probes"][0]["derived_headroom"] is None and stated.plan["probes"][0]["fits"]

@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import typing
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -62,15 +61,19 @@ class Release:
         """The release `record` states, each field it declares read as declared, a mapping kept as the
         record it is (a model's fields among them, which only their own reader builds) and a field it leaves
         out None: one that states a field a release does not hold, or one of another shape, is refused."""
-        hints = typing.get_type_hints(cls)
         declared = [field.name for field in dataclasses.fields(cls)]
         unknown = sorted(set(record) - set(declared))
         if unknown:
             raise ValueError(f"a release states {', '.join(declared)}, not {unknown}")
-        readers = {name: _records.integer if int in typing.get_args(hints[name]) else _records.record
-                   for name in declared}
-        return cls(**{name: None if value is None else readers[name](value, name)
-                      for name, value in record.items()})
+
+        def mapping(name: str) -> Mapping[str, object] | None:
+            value = record.get(name)
+            return None if value is None else _records.record(value, name)
+
+        length = record.get("max_length")
+        return cls(task=mapping("task"), layout=mapping("layout"),
+                   max_length=None if length is None else _records.integer(length, "max_length"),
+                   calibration=mapping("calibration"))
 
     @classmethod
     def load(cls, directory: str | Path) -> Release | None:

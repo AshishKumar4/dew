@@ -72,7 +72,6 @@ from dew.data.dataset import (
 )
 from dew.data.elastic_order import _InputOrder, _StreamOrder
 from dew.data.handoff import (
-    _RECORD,
     RecordStage,
     _Barren,
     _carried,
@@ -85,6 +84,7 @@ from dew.data.handoff import (
     _threads,
     _Ungrouped,
     _Unspread,
+    record_stage_of,
 )
 from dew.data.mixing import (
     Accepted,
@@ -511,7 +511,7 @@ def _run(
     run: list[RecordStage] = []
     drawn = counted = False
     for stage in stages[start:stop]:
-        if not isinstance(stage, _RECORD):
+        if not record_stage_of(stage):
             break
         if _threads((stage,)) is not None:
             return tuple(run) or (stage,)
@@ -1729,7 +1729,7 @@ class _Build:
                 examples, counting = True, _consumes(pipeline)
                 rows = rows if counting else Accepted(_as_iter(rows, self.loading), _name(pipeline),
                                                       _label(pipeline), rows=_counts_rows(pipeline, index))
-            if isinstance(stage, _RECORD):
+            if record_stage_of(stage):
                 # The record steps from here run as one operator (`_run`), up to where the workers
                 # hand their rows on.
                 run = _run(pipeline.stages, index, carried if index < carried else len(pipeline.stages),
@@ -1790,7 +1790,7 @@ class _Build:
         counted = isinstance(stage, FlatMap) and stage.examples and counting
         examples, counting = (True, _consumes(pipeline)) if counted else (examples, counting)
         # The hand-off ends a spread at its first stage that is no record step (`_handoff`).
-        run = tuple(stage for stage in pipeline.stages[at:carried] if isinstance(stage, _RECORD))
+        run = tuple(stage for stage in pipeline.stages[at:carried] if record_stage_of(stage))
         assert len(run) == carried - at, "a spread runs record steps alone"
         seeds = tuple(self.stage_seed(pipeline, index, partition) if isinstance(step, RandomMap) else None
                       for index, step in enumerate(run, start=at))
@@ -1857,7 +1857,7 @@ class _Build:
         stage = _for_rows(stage, rows)
         if isinstance(stage, Shuffle):
             stage = self.ordered(stage)
-        if isinstance(stage, _RECORD):
+        if record_stage_of(stage):
             return self.record_stage(rows, (stage,), pipeline, partition, at)
         if isinstance(stage, Shuffle) and stage.block_shards is not None:
             return self.block_shuffle(rows, stage, pipeline, partition)

@@ -87,7 +87,8 @@ if TYPE_CHECKING:
 
     from dew.checkpoints import Resume
     from dew.data.compile import Handed
-    from dew.data.dataset import DataPartition, Dataset, Loader
+    from dew.data.dataset import DataPartition, Loader
+    from dew.data.pipeline import Dataset
     from dew.training._fit import FitArguments, FitPlan, Start
     from dew.training.planning import Planned
     from dew.training.trainer import Trainer

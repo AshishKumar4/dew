@@ -365,7 +365,7 @@ class SignalWake:
             with contextlib.suppress(BlockingIOError):
                 os.write(self._write, b"\0")
 
-    def wait(self, condition: threading.Condition, ready: Callable[[], object]) -> None:
+    def wait(self, condition: threading.Condition, ready: Callable[[], bool]) -> None:
         """Wait, holding `condition`, until `ready()` holds, woken by a notice (`notify`) or a signal, whose
         handler then runs here and may raise."""
         while not ready():
@@ -381,11 +381,9 @@ class SignalWake:
     def _drained(self) -> None:
         """Empty the pipe, each signal's byte forwarded to the wakeup fd set before this one, as CPython's
         own handler writes it: a byte a full fd cannot take is dropped, as CPython drops it."""
-        while True:
-            try:
-                read = os.read(self._read, 512)
-            except BlockingIOError:
-                return
+        # Read while the pipe holds bytes (`poll` at no wait), so its end is no failure to read.
+        while self._poll.poll(0):
+            read = os.read(self._read, 512)
             signals = read.replace(b"\0", b"")
             if signals and self._previous != -1:
                 with contextlib.suppress(BlockingIOError):

@@ -66,9 +66,9 @@ def _decoder_record(value: object) -> Mapping[str, object] | None:
 def metadata_files() -> tuple[str, str]:
     """What a prepared version directory holds beside its shards: its info and its features, as TFDS names
     them (`tensorflow_datasets.core.constants`), read where a directory is there to look in."""
-    from tensorflow_datasets.core import constants
+    from tensorflow_datasets.core.constants import DATASET_INFO_FILENAME, FEATURES_FILENAME
 
-    return constants.DATASET_INFO_FILENAME, constants.FEATURES_FILENAME
+    return DATASET_INFO_FILENAME, FEATURES_FILENAME
 
 PREPARE = (
     "Prepare it in a separate environment with "

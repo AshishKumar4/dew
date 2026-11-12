@@ -40,6 +40,7 @@ from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, Union
 import jax
 import tyro
 from etils import epath
+from tyro.conf._confstruct import _SubcommandConfig
 
 import dew.io
 from dew import _records, registry, training
@@ -375,8 +376,9 @@ class Prepared[LossT, EffectsT]:
                                validation=self.validation)
 
 
-_SUBCOMMAND = type(tyro.conf.subcommand("dew"))
-"""The marker a field's annotation declares a subcommand with (`tyro.conf.subcommand`)."""
+_SUBCOMMAND = _SubcommandConfig
+"""The marker a field's annotation declares a subcommand with (`tyro.conf.subcommand`, which states it as
+an object of this class)."""
 
 
 def flag_subcommands(config: type, prefix: str = "") -> dict[str, str]:
@@ -392,7 +394,8 @@ def flag_subcommands(config: type, prefix: str = "") -> dict[str, str]:
         given = [option for option in options if option is not type(None)]
         marked = [(typing.get_args(option)[0], marker.name) for option in given
                   if typing.get_origin(option) is Annotated
-                  for marker in typing.get_args(option)[1:] if isinstance(marker, _SUBCOMMAND)]
+                  for marker in typing.get_args(option)[1:]
+                  if isinstance(marker, _SUBCOMMAND) and marker.name is not None]
         if marked and len(marked) == len(given) < len(options):
             found[path] = marked[0][1]
             nested = [kind for kind, _ in marked]

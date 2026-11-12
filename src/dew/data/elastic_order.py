@@ -38,7 +38,7 @@ class _Gathered(pygrain.MapDataset):
     order, which Grain's repeat states as `sys.maxsize` inputs, holds as many groups as that counts."""
 
     def __init__(self, rows: pygrain.MapDataset, start: int, size: int,
-                 grouping: Callable[[Sequence], Batch]):
+                 grouping: Callable[[Sequence], Packet]):
         super().__init__(rows)
         self._rows, self._start, self._size, self._grouping = rows, start, size, grouping
         self._groups = -(-max(len(rows) - start, 0) // size)
@@ -50,7 +50,7 @@ class _Gathered(pygrain.MapDataset):
     def __getitem__(self, index: slice) -> pygrain.MapDataset: ...
 
     @overload
-    def __getitem__(self, index: int) -> Batch: ...
+    def __getitem__(self, index: int) -> Packet: ...
 
     def __getitem__(self, index):
         if isinstance(index, slice):
@@ -240,7 +240,7 @@ class _KeptIterator(pygrain.DatasetIterator):
         if kept.position is not None:
             self._rows.set_state(kept.position)
 
-    def __next__(self) -> Batch:
+    def __next__(self) -> Positioned:
         kept = self._kept
         while True:
             group = list(itertools.islice(self._rows, kept.opening if self._number == 0 else kept.size))

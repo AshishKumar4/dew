@@ -96,7 +96,7 @@ class WindowShuffle(grain.IterDataset[Batch]):
         return _WindowShuffled(self._rows.__iter__(), window=self._window, seed=self._seed)
 
 
-class _WindowShuffled(_WindowShuffleDatasetIterator):
+class _WindowShuffled(_WindowShuffleDatasetIterator[Batch]):
     """Grain's window shuffle (`_WindowShuffleDatasetIterator`: its permutation, `_reshuffle_window`, and
     the position it saves), each window after the first read as the one before is given, a record of it
     for each record given (`_read_ahead`); Grain's own reads a window whole as its first record is asked."""
@@ -136,5 +136,5 @@ class _WindowShuffled(_WindowShuffleDatasetIterator):
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self._ended, self._ahead, self._next = False, [], None
-        super().set_state(state)
+        super().set_state(dict(state))
 

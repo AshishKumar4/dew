@@ -1319,6 +1319,34 @@ def _phase_batches(source: Phases, index: int, phase: _Staged, *, steps: int | N
                         tokens=span(budget) if tokens else budget)
 
 
+def _consumed_by(phases: Sequence[_Staged], ends: Sequence[int]) -> dict[str, int]:
+    """What `phases` read of each corpus, each ending at its record end of `ends`: its members a memory read
+    kept, at the shares the lowering mixes."""
+    consumed: dict[str, int] = {}
+    for phase, (start, end) in zip(phases, itertools.pairwise((0, *ends)), strict=True):
+        _delivered(phase.train, end - start, consumed)
+    return consumed
+
+
+def _built_phases(source: Phases, staged: Sequence[tuple[_Staged, int | None]],
+                  packed: tuple[Coordinated, ...], *,
+                  host: tuple[HostStep, ...], resume: Literal["exact", "non-exact"], steps: int | None,
+                  budget: int | None, tokens: bool) -> list[tuple[Loader, int | None]]:
+    """Each staged phase compiled (`_compiled`) at the batches it reads (`_phase_batches`), beside its end:
+    every phase of a run runs the first's device steps, so a phase whose own differ is refused."""
+    built: list[tuple[Loader, int | None]] = []
+    for index, (phase, end) in enumerate(staged):
+        batches = _phase_batches(source, index, phase, steps=steps, budget=budget, tokens=tokens)
+        loaded = _compiled(phase, packed, host=host, resume=resume, batches=batches)
+        if built and loaded.device != built[0][0].device:
+            # The run applies one set of device steps to every batch (`Loader.device`), so a phase
+            # whose own differ would run the first phase's.
+            raise ValueError(f"phase {index} ends in other device steps than phase 0; every phase of "
+                             f"a run runs the same ones, written after the phases")
+        built.append((loaded, end))
+    return built
+
+
 def _compile_phases(
     train: Pipeline,
     *,
@@ -1348,14 +1376,6 @@ def _compile_phases(
                        provision=provision, loading=loading, seed=seed, rejections=rejections,
                        version=plan_version)
 
-    def consumed_by(phases: Sequence[_Staged], ends: Sequence[int]) -> dict[str, int]:
-        """What `phases` read of each corpus, each ending at its record end of `ends`: its members a
-        memory read kept, at the shares the lowering mixes."""
-        consumed: dict[str, int] = {}
-        for phase, (start, end) in zip(phases, itertools.pairwise((0, *ends)), strict=True):
-            _delivered(phase.train, end - start, consumed)
-        return consumed
-
     tokens = source.clock == "tokens"
     first = staged_at(0, {})
     # Phases on the step clock whose first reads per share (its order cut where each share reads it: a
@@ -1373,7 +1393,7 @@ def _compile_phases(
         # and again with the ends of the phases before it once the run reaches them (`opened`).
         ends = [end for _, end in staged if end is not None]
         phase = _ordered(index, first if not index else staged_at(
-            index, {} if tokens else consumed_by([phase for phase, _ in staged], ends)))
+            index, {} if tokens else _consumed_by([phase for phase, _ in staged], ends)))
         # A phase on the step clock ends at its step's record: the records of the phases before it, and its
         # own steps in its own rows (row 4812).
         before, started = (ends[-1] if ends else 0), (source.ends[index - 1] or 0) if index else 0
@@ -1381,16 +1401,8 @@ def _compile_phases(
                        else before + (until - started) * phase.build.batch))
     # Every phase declares the most documents a window of any phase holds, so the run steps one program.
     packed = _coordinated(*(phase.train for phase, _ in staged))
-    built: list[tuple[Loader, int | None]] = []
-    for index, (phase, end) in enumerate(staged):
-        batches = _phase_batches(source, index, phase, steps=steps, budget=budget, tokens=tokens)
-        loaded = _compiled(phase, packed, host=host, resume=resume, batches=batches)
-        if built and loaded.device != built[0][0].device:
-            # The run applies one set of device steps to every batch (`Loader.device`), so a phase
-            # whose own differ would run the first phase's.
-            raise ValueError(f"phase {index} ends in other device steps than phase 0; every phase of "
-                             f"a run runs the same ones, written after the phases")
-        built.append((loaded, end))
+    built = _built_phases(source, staged, packed, host=host, resume=resume, steps=steps, budget=budget,
+                          tokens=tokens)
 
     # The loaders the run's reads opened, in the order they opened them, whose counts its statistics are
     # (`statistics_of`): the first phase's from the start, each later one's as the run reaches it.
@@ -1411,7 +1423,7 @@ def _compile_phases(
         unless a corpus it reads continues from theirs."""
         loader = built[index][0]
         if tokens and index:
-            consumed = consumed_by([phase for phase, _ in staged[:index]], ends)
+            consumed = _consumed_by([phase for phase, _ in staged[:index]], ends)
             if any(consumed.get(_name(chain), 0) for chain, _ in _leaves(source.pipelines[index])):
                 phase = staged_at(index, consumed)
                 batches = _phase_batches(source, index, phase, steps=steps, budget=budget, tokens=tokens)

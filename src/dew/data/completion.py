@@ -209,7 +209,10 @@ class _CompletedIterator(pygrain.DatasetIterator):
                     held = from_record(_Held, saved)
                 case [unit, since, consumed, refused, dict(members)]:
                     # A position saved before its counts were saved as their record: its fields in order.
-                    held = _Held(since, consumed, refused, members)
+                    held = _Held(integer(since, "a held count's unit"), integer(consumed, "a held count"),
+                                 integer(refused, "a held refusal count"),
+                                 {name: integer(count, f"held member {name}")
+                                  for name, count in members.items()})
                 case _:
                     raise ValueError(f"a held count is its unit and its counts: {entry!r}")
             at = integer(unit, "a held count's unit")

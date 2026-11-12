@@ -760,8 +760,8 @@ def read_otherwise_at_13(saved: Mapping[str, object]) -> str | None:
     if saved.get("lowering") == "global" and order.get("read") in ("indexed", "memory"):
         return None
 
-    def mixes(node: object) -> Iterator[Mapping[str, object]]:
-        if isinstance(node, Mapping):
+    def mixes(node: JSON) -> Iterator[dict[str, JSON]]:
+        if isinstance(node, dict):
             if "corpora" in node and "members" in node:
                 yield node
             for value in node.values():
@@ -770,7 +770,7 @@ def read_otherwise_at_13(saved: Mapping[str, object]) -> str | None:
             for value in node:
                 yield from mixes(value)
 
-    for mix in mixes(order):
+    for mix in mixes(json_value(order, "saved order")):
         keys = _member_keys(strings(mix["members"], "a saved mix's members"))
         if mix.get("shares") == "accepted rows" and "selection_seed" not in mix and keys != sorted(keys):
             return ("version 12 read this streamed mix's members in their keys' sorted order, and version 13 "

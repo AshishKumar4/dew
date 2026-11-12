@@ -17,7 +17,7 @@ import tomllib
 import urllib.parse
 import weakref
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import BinaryIO, NamedTuple, Protocol, TypedDict, runtime_checkable
 
@@ -608,6 +608,9 @@ class Store:
     url: str
     storage_options: Mapping[str, object] | None = field(default=None, repr=False)
     retention: LocalRetention | None = field(default=None, repr=False)
+    idle_seconds: float = field(default=IDLE_SECONDS, repr=False)
+    """How long a GCS transfer may go without a byte before it fails (`IDLE_SECONDS`), where its options
+    bound it otherwise."""
 
     def resolve(self) -> tuple[AbstractFileSystem, str]:
         _registered()
@@ -618,13 +621,13 @@ class Store:
                 options.pop(cache, None)
         scheme = layers[-1].split("://", 1)[0] if "://" in layers[-1] else "file"
         if scheme in ("gs", "gcs"):
-            # A GCS request idle past `IDLE_SECONDS` fails, as every S3 request does, unless its options
+            # A GCS request idle past `idle_seconds` fails, as every S3 request does, unless its options
             # bound it otherwise.
-            idle = aiohttp.ClientTimeout(sock_connect=IDLE_SECONDS, sock_read=IDLE_SECONDS)
+            idle = aiohttp.ClientTimeout(sock_connect=self.idle_seconds, sock_read=self.idle_seconds)
             if len(layers) == 1:
                 options.setdefault("requests_timeout", idle)
             else:
-                options[scheme] = {"requests_timeout": idle, **options.get(scheme, {})}
+                options[scheme] = {"requests_timeout": idle, **record(options.get(scheme, {}), scheme)}
         return fsspec.core.url_to_fs(self.url, **options)
 
     def readable(self) -> Readable:
@@ -664,7 +667,8 @@ class Store:
         from fsspec.core import _un_chain
 
         links = {protocol: kwargs for _, protocol, kwargs in _un_chain(self.url, options)}
-        return Store("dewcache::" + self.url, {**links, "dewcache": transport})
+        return Store("dewcache::" + self.url, {**links, "dewcache": transport},
+                     idle_seconds=self.idle_seconds)
 
     def child(self, path: str) -> Store:
         path = path.rstrip("/")
@@ -675,7 +679,7 @@ class Store:
             or any(part in ("", ".", "..") for part in path.split("/"))
         ):
             raise ValueError(f"storage child must stay inside its root: {path!r}")
-        return Store(self.url.rstrip("/") + "/" + path, self.storage_options, self.retention)
+        return replace(self, url=self.url.rstrip("/") + "/" + path)
 
     def describe(self) -> Mapping[str, object]:
         fs = backing(self.resolve()[0])

@@ -35,7 +35,7 @@ import dataclasses
 import functools
 import inspect
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from enum import Enum
 from typing import TYPE_CHECKING, Literal
 
@@ -396,22 +396,22 @@ DEW_CONTROLS = frozenset({"enable_thinking"})
 `_rendered` switches."""
 
 
-def renderer_controls(render: Callable[..., object]) -> frozenset[str]:
-    """The keywords the template call `render` itself owns, which a template's variables (`options`)
-    never set: its own named parameters, as the bound renderer declares them, and Dew's
+def renderer_controls(renderer: inspect.Signature) -> frozenset[str]:
+    """The keywords the template call whose signature is `renderer` owns, which a template's variables
+    (`options`) never set: its own named parameters, as the bound renderer declares them, and Dew's
     (`DEW_CONTROLS`)."""
     named = (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
-    return frozenset(name for name, parameter in inspect.signature(render).parameters.items()
+    return frozenset(name for name, parameter in renderer.parameters.items()
                      if parameter.kind in named) | DEW_CONTROLS
 
 
 def template_options(options: Mapping[str, JSON], *, where: str,
-                     render: Callable[..., object] | None = None) -> Mapping[str, JSON]:
+                     renderer: inspect.Signature | None = None) -> Mapping[str, JSON]:
     """`options` as a chat template's own variables, refused (ValueError) where one names a keyword
-    the template call owns: Dew's (`DEW_CONTROLS`), checked as a run is configured, and with the renderer
-    `render` its own (`renderer_controls`), checked where it renders, so an option never overrides one
-    silently or collides with it."""
-    owned = sorted(set(options) & (DEW_CONTROLS if render is None else renderer_controls(render)))
+    the template call owns: Dew's (`DEW_CONTROLS`), checked as a run is configured, and with the
+    renderer's signature (`renderer`) its own (`renderer_controls`), checked where it renders, so an
+    option never overrides one silently or collides with it."""
+    owned = sorted(set(options) & (DEW_CONTROLS if renderer is None else renderer_controls(renderer)))
     if owned:
         raise ValueError(f"{where}: {owned} are the chat template call's own controls, not template "
                          "variables; set them through their own fields")
@@ -430,7 +430,8 @@ def _rendered(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping[
             tokenizer.apply_chat_template, rows, tools=[dict(tool) for tool in tools] or None,
             tokenize=tokenize, return_dict=False, add_generation_prompt=generation_prompt,
             **({} if chat_template is None else {"chat_template": chat_template}),
-            **template_options(options or {}, where=where, render=tokenizer.apply_chat_template))
+            **template_options(options or {}, where=where,
+                               renderer=inspect.signature(tokenizer.apply_chat_template)))
         return render() if thinking is None else render(enable_thinking=thinking)
     except (TemplateError, TypeError) as exc:
         raise ValueError(f"{where}: the chat template refused the conversation: {exc}") from exc

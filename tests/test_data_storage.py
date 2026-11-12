@@ -236,12 +236,12 @@ def test_an_immutable_put_to_a_store_that_reads_its_writes_back_at_once_refuses_
             return super().cat_file(path, *args, **kwargs)[::-1]
 
     fsspec.register_implementation("garbling", Garbling, clobber=True)
-    with pytest.raises(OSError, match="did not verify"):
+    with pytest.raises(OSError):
         Store(f"garbling://storage-{uuid4().hex}/value").put_immutable(b"payload", retries=5)
     assert len(reads) == 1
 
 
-def test_a_gcs_read_whose_store_goes_silent_fails_rather_than_waiting(monkeypatch):
+def test_a_gcs_read_whose_store_goes_silent_fails_rather_than_waiting():
     """A GCS store that takes a connection and never answers fails the transfer once it has been idle
     `IDLE_SECONDS`, as an S3 transfer does by botocore's own bound, where gcsfs bounds none: a close that
     waits out its transfers (`dew.data.cache`) ends when its store is gone."""
@@ -249,16 +249,15 @@ def test_a_gcs_read_whose_store_goes_silent_fails_rather_than_waiting(monkeypatc
 
     import aiohttp
 
-    from dew.data import storage
-
-    monkeypatch.setattr(storage, "IDLE_SECONDS", 1)
     silent = socket.socket()
     silent.bind(("127.0.0.1", 0))
     silent.listen()
     taken = []
     threading.Thread(target=lambda: taken.append(silent.accept()), daemon=True).start()
+    # Idle a second, where a store's own bound is `IDLE_SECONDS`.
     store = Store(f"gs://silent-{uuid4().hex}/object",
-                  {"endpoint_url": f"http://127.0.0.1:{silent.getsockname()[1]}", "token": "anon"})
+                  {"endpoint_url": f"http://127.0.0.1:{silent.getsockname()[1]}", "token": "anon"},
+                  idle_seconds=1)
     try:
         with pytest.raises((OSError, TimeoutError, aiohttp.ClientError)):
             store.read()

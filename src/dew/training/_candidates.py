@@ -334,8 +334,8 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
     # DiLoCo's groups read their own parameters, which no narrow copy shadows.
     # A step the trainer composes narrows, from the loss it traced; a custom step's traces none (`traced`
     # None), and a scaled loss's copies none.
-    narrows = narrow and traced is not None and not settings.dynamic_scale and settings.diloco is None
-    copies = narrow_copies(state, traced) if narrows else {}
+    narrows = narrow and not settings.dynamic_scale and settings.diloco is None
+    copies = narrow_copies(state, traced) if narrows and traced is not None else {}
     prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
         lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
     return shapes, copies, prepared

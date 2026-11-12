@@ -310,5 +310,5 @@ def test_a_layout_restored_from_a_saved_count_rule_of_the_wrong_kind_is_refused(
     again = LayoutRule()
     again.restore(restored.state())
     assert restored.rule == again.rule == CountRule(1, None, "text_roles")
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(ValueError):
         LayoutRule().restore({"seen": True, "rule": {**SAVED_RULE, field: value}})

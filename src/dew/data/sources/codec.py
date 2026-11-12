@@ -11,7 +11,7 @@ import json
 import math
 import re
 import struct
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from decimal import Decimal
 from typing import TYPE_CHECKING
 
@@ -19,7 +19,7 @@ import jax
 import numpy as np
 import numpy.lib.format as npy_format
 
-from dew._records import JSON
+from dew._records import JSON, integer, text
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -187,27 +187,85 @@ class _Hashed:
         return str(len(self.hashes) - 1)
 
 
-@dataclasses.dataclass(frozen=True)
-class _Tag:
-    """One value type of the artifact schema: its tag, whether a value is of it (`holds`), its payload
-    as `_tree` writes it under the tag (`encoded`) and the value `_restore` reads back from that payload
-    (`decoded`, None for a form only a hash reads). The schema is these, in the order `_tree` tries them."""
-
-    tag: str
-    holds: Callable[[object], bool]
-    encoded: Callable[[object, _Stored | _Hashed, bool], JSON]
-    decoded: Callable[[object, Mapping[str, bytes]], Value] | None
-
-
 def _stored_array(value: np.ndarray, leaves: _Stored | _Hashed) -> JSON:
     """An array's leaf, a dtype NumPy's plain form misnames viewed as its storage."""
     dtype = _dtype(value)
     return leaves.add(value.view(np.dtype(value.dtype.str)) if dtype else value)
 
 
-def _dataclass_decoded(payload: object, leaves: Mapping[str, bytes]) -> Value:
-    identity, fields = payload
-    module, name = identity
+_TIMES = (datetime.datetime, datetime.date, datetime.time)
+"""The datetime types a record holds by their ISO text, the most specific first (a datetime is a date)."""
+
+
+def _tagged(value: Value, leaves: _Stored | _Hashed, canonical: bool) -> dict[str, JSON] | None:
+    """The node of a value of the artifact schema's tagged types beyond JSON's own, tried in this order: a
+    non-finite float by its hex, a complex by its two parts exactly (as a record holds a Python complex
+    beside its other fields), a time by its ISO text, a timedelta by its parts, a decimal by its text,
+    bytes as a leaf, an object array by its shape and values, an array as a leaf beside its dtype's name, a
+    tuple and a list by their entries; None for any other value (`_restore` reads each back)."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"float": value.hex()}
+    if isinstance(value, complex):
+        return {"complex": [float(value.real).hex(), float(value.imag).hex()]}
+    for kind in _TIMES:
+        if isinstance(value, kind):
+            return {kind.__name__: value.isoformat()}
+    if isinstance(value, datetime.timedelta):
+        return {"timedelta": [value.days, value.seconds, value.microseconds]}
+    if isinstance(value, Decimal):
+        return {"decimal": str(value)}
+    if isinstance(value, bytes):
+        return {"bytes": leaves.add(value)}
+    if isinstance(value, np.ndarray):
+        if value.dtype.hasobject:
+            return {"object_array": {"shape": list(value.shape),
+                                     "values": _tree(value.tolist(), leaves, canonical)}}
+        return {"array": _stored_array(value, leaves), **_dtype(value)}
+    if isinstance(value, tuple | list):
+        return {"tuple" if isinstance(value, tuple) else "list": [_tree(entry, leaves, canonical)
+                                                                  for entry in value]}
+    return None
+
+
+def _untagged(node: Mapping[str, JSON], leaves: Mapping[str, bytes]) -> tuple[Value] | None:
+    """The value a tagged node holds (`_tagged`), as a one-tuple, so a value of None reads as itself; None
+    where the node holds none of the tags read back (an array is read by `_restore` itself)."""
+    if "float" in node:
+        return (float.fromhex(text(node["float"], "artifact float")),)
+    if "complex" in node:
+        real, imaginary = _pair(node["complex"], "artifact complex")
+        return (complex(float.fromhex(text(real, "artifact complex")),
+                        float.fromhex(text(imaginary, "artifact complex"))),)
+    for kind in _TIMES:
+        if kind.__name__ in node:
+            return (kind.fromisoformat(text(node[kind.__name__], f"artifact {kind.__name__}")),)
+    if "timedelta" in node:
+        parts = node["timedelta"]
+        if not isinstance(parts, list):
+            raise ValueError("artifact timedelta is not its parts")
+        return (datetime.timedelta(*(integer(part, "artifact timedelta") for part in parts)),)
+    if "decimal" in node:
+        return (Decimal(text(node["decimal"], "artifact decimal")),)
+    if "bytes" in node:
+        return (leaves[str(node["bytes"])],)
+    if "object_array" in node:
+        return (_object_array_decoded(node["object_array"], leaves),)
+    for name, kind in (("tuple", tuple), ("list", list)):
+        if isinstance(entries := node.get(name), list):
+            return (kind(_restore(value, leaves) for value in entries),)
+    return None
+
+
+def _pair(value: JSON, key: str) -> tuple[JSON, JSON]:
+    """`value`, a node's list of two parts, refused otherwise, naming `key`."""
+    if not isinstance(value, list) or len(value) != 2:
+        raise ValueError(f"{key} is not two parts")
+    return value[0], value[1]
+
+
+def _dataclass_decoded(identity: list[JSON], fields: Mapping[str, JSON],
+                       leaves: Mapping[str, bytes]) -> Value:
+    module, name = _pair(identity, "artifact dataclass")
     if not isinstance(module, str) or not module.startswith("dew.") or not isinstance(name, str):
         raise ValueError("artifact dataclass is outside the Dew schema")
     cls = getattr(importlib.import_module(module), name)
@@ -216,47 +274,12 @@ def _dataclass_decoded(payload: object, leaves: Mapping[str, bytes]) -> Value:
     return cls(**{key: _restore(value, leaves) for key, value in fields.items()})
 
 
-def _object_array_decoded(payload: object, leaves: Mapping[str, bytes]) -> Value:
-    if not isinstance(payload, dict) or not isinstance(payload.get("shape"), list):
+def _object_array_decoded(payload: JSON, leaves: Mapping[str, bytes]) -> Value:
+    shape = payload.get("shape") if isinstance(payload, dict) else None
+    if not isinstance(payload, dict) or not isinstance(shape, list):
         raise ValueError("artifact object array has no shape")
-    return np.asarray(_restore(payload["values"], leaves), dtype=object).reshape(payload["shape"])
-
-
-_TIMES = (datetime.datetime, datetime.date, datetime.time)
-"""The datetime types a record holds by their ISO text, the most specific first (a datetime is a date)."""
-
-_TAGS: tuple[_Tag, ...] = (
-    _Tag("float", lambda value: isinstance(value, float) and not math.isfinite(value),
-         lambda value, leaves, canonical: value.hex(), lambda payload, leaves: float.fromhex(payload)),
-    # Its two parts exactly, as a record holds a Python complex beside its other fields.
-    _Tag("complex", lambda value: isinstance(value, complex),
-         lambda value, leaves, canonical: [float(value.real).hex(), float(value.imag).hex()],
-         lambda payload, leaves: complex(float.fromhex(payload[0]), float.fromhex(payload[1]))),
-    *(_Tag(kind.__name__, lambda value, kind=kind: isinstance(value, kind),
-           lambda value, leaves, canonical: value.isoformat(),
-           lambda payload, leaves, kind=kind: kind.fromisoformat(payload)) for kind in _TIMES),
-    _Tag("timedelta", lambda value: isinstance(value, datetime.timedelta),
-         lambda value, leaves, canonical: [value.days, value.seconds, value.microseconds],
-         lambda payload, leaves: datetime.timedelta(*payload)),
-    _Tag("decimal", lambda value: isinstance(value, Decimal),
-         lambda value, leaves, canonical: str(value), lambda payload, leaves: Decimal(payload)),
-    _Tag("bytes", lambda value: isinstance(value, bytes),
-         lambda value, leaves, canonical: leaves.add(value), lambda payload, leaves: leaves[str(payload)]),
-    _Tag("object_array", lambda value: isinstance(value, np.ndarray) and value.dtype.hasobject,
-         lambda value, leaves, canonical: {"shape": list(value.shape),
-                                           "values": _tree(value.tolist(), leaves, canonical)},
-         _object_array_decoded),
-    _Tag("array", lambda value: isinstance(value, np.ndarray),
-         lambda value, leaves, canonical: _stored_array(value, leaves), None),
-    _Tag("tuple", lambda value: isinstance(value, tuple),
-         lambda value, leaves, canonical: [_tree(entry, leaves, canonical) for entry in value],
-         lambda payload, leaves: tuple(_restore(value, leaves) for value in payload)),
-    _Tag("list", lambda value: isinstance(value, list),
-         lambda value, leaves, canonical: [_tree(entry, leaves, canonical) for entry in value],
-         lambda payload, leaves: [_restore(value, leaves) for value in payload]),
-)
-"""The artifact schema's tagged value types beyond JSON's own, in the order `_tree` tries them; an array,
-a scalar, a mapping and a dataclass read their extra fields (`_tree`, `_restore`)."""
+    return np.asarray(_restore(payload["values"], leaves), dtype=object).reshape(
+        [integer(size, "artifact object array shape") for size in shape])
 
 
 def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> JSON:
@@ -268,10 +291,8 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
     if isinstance(value, np.generic):
         array = np.asarray(value)
         return {"scalar": _stored_array(array, leaves), **_dtype(array)}
-    tag = next((tag for tag in _TAGS if tag.holds(value)), None)
-    if tag is not None and tag.tag not in ("tuple", "list"):
-        extra = _dtype(value) if tag.tag == "array" else {}
-        return {tag.tag: tag.encoded(value, leaves, canonical), **extra}
+    if (tagged := _tagged(value, leaves, canonical)) is not None:
+        return tagged
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     if isinstance(value, Mapping):
@@ -284,8 +305,6 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
             raise Unencodable("artifact mappings need string keys")
         keys = sorted(value) if canonical else value
         return {"mapping": {key: _tree(value[key], leaves, canonical) for key in keys}}
-    if tag is not None:
-        return {tag.tag: tag.encoded(value, leaves, canonical)}
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         cls = type(value)
         if not cls.__module__.startswith("dew.") and not leaves.opaque:
@@ -308,7 +327,7 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
     raise Unencodable(f"artifact codec cannot encode {type(value).__name__}")
 
 
-def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:
+def _restore(node: JSON, leaves: Mapping[str, bytes]) -> Value:
     if node is None or isinstance(node, (bool, int, float, str)):
         return node
     if not isinstance(node, dict):
@@ -317,18 +336,14 @@ def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:
         return _array(node, leaves, "scalar")[()]
     if "array" in node:
         return _array(node, leaves, "array")
-    for tag in _TAGS:
-        if tag.decoded is not None and tag.tag in node:
-            payload = node[tag.tag]
-            if tag.tag in ("list", "tuple") and not isinstance(payload, list):
-                continue
-            return tag.decoded(payload, leaves)
+    if (untagged := _untagged(node, leaves)) is not None:
+        return untagged[0]
     values = node.get("mapping")
     if isinstance(values, dict):
         return {key: _restore(value, leaves) for key, value in values.items()}
     identity, fields = node.get("dataclass"), node.get("fields")
     if isinstance(identity, list) and len(identity) == 2 and isinstance(fields, dict):
-        return _dataclass_decoded((identity, fields), leaves)
+        return _dataclass_decoded(identity, fields, leaves)
     raise ValueError("unknown artifact record schema")
 
 

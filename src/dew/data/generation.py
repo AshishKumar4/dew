@@ -11,11 +11,11 @@ from contextlib import ExitStack, closing
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
-from dew._records import JSON
+from dew._records import JSON, integer, text
 from dew.batch import Batch
 from dew.data.dataset import Loading, Records
 from dew.data.declared import Declared, Replaced
@@ -247,7 +247,8 @@ def _publish(
 def _facts(verified: Mapping[str, JSON]) -> ObjectInfo:
     """The size and digest of an object `Store.verified` published, as a reference to it states them
     (`ObjectInfo`): the version a remote store holds it at is the reader's, not the reference's."""
-    return cast(ObjectInfo, {name: verified[name] for name in ObjectInfo.__annotations__})
+    return {"bytes": integer(verified["bytes"], "a published object's size"),
+            "sha256": text(verified["sha256"], "a published object's digest")}
 
 
 def _write_plan(root: Store, name: str, array: np.ndarray) -> Mapping[str, object]:

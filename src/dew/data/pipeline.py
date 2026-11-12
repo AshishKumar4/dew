@@ -1513,7 +1513,7 @@ class Pipeline(Dataset):
                     and all(now is was for now, was in zip(each.stages, before.stages, strict=False)))
 
         as_stated, as_read = (before.pipe(entry.function, *entry.args, **settings)
-                              for settings in (stated, stated | read))
+                              for settings in (stated, {**stated, **read}))
         # What the call sets beside its stages (its mode, its loading) is the chain's as it stands, so a
         # setting that changed any of it has no place to be put back in.
         if entry.input is not None or not extends(as_stated) or not extends(as_read):

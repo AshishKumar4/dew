@@ -165,6 +165,22 @@ def test_a_step_placed_by_the_layout_trains_on_par_with_one_device(name):
                     truth_fn=truth)
 
 
+def pipeline_placed(name: str, source):
+    """The placement on an eight-device mesh of `LAYOUT` of the training state of the pipeline at `source`
+    (`diffusion_support.source_objective`), held to the layout's invariants (`assert_placed`)."""
+    from diffusion_support import source_objective
+
+    _, objective = source_objective(source)
+    mesh = LAYOUT.build(jax.devices()[:8])
+    trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), mesh=LAYOUT,
+                      layout=Layout(min_shard=MIN_SHARD), tracker=None)
+    trainer.device_mesh = mesh
+    state = jax.eval_shape(trainer.initial_state)
+    placed = trainer.shardings(state)
+    assert_placed(name, state.variables, placed.variables, mesh, objective.parameter_axes)
+    return placed
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_pipelines_state_and_load_are_placed_by_their_declared_axes_and_load_alike(tmp_path):
     """The tiny Flux pipeline's training state, its frozen CLIP and T5 encoders by their own tables beside
@@ -173,20 +189,12 @@ def test_a_pipelines_state_and_load_are_placed_by_their_declared_axes_and_load_a
     placed as the training state places it (ledger 3453)."""
     from pathlib import Path
 
-    from diffusion_support import source_objective
     from interop_support import extract_fixture
 
     from dew.interop.pretrained import Pretrained
 
     source = extract_fixture(Path(__file__).with_name("fixtures") / "flux_source.tar.xz", tmp_path)
-    _, objective = source_objective(source)
-    mesh = LAYOUT.build(jax.devices()[:8])
-    trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), mesh=LAYOUT,
-                      layout=Layout(min_shard=MIN_SHARD), tracker=None)
-    trainer.device_mesh = mesh
-    state = jax.eval_shape(trainer.initial_state)
-    placed = trainer.shardings(state)
-    assert_placed("flux", state.variables, placed.variables, mesh, objective.parameter_axes)
+    placed = pipeline_placed("flux", source)
     on_mesh = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla", mesh=LAYOUT,
                               layout=Layout(min_shard=MIN_SHARD))
     alone = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
@@ -208,20 +216,12 @@ def test_a_pipelines_frozen_language_tower_is_split_as_its_draw_declares(tmp_pat
     parameters by paths its held tree lays out otherwise, so none of them was found)."""
     from pathlib import Path
 
-    from diffusion_support import source_objective
     from interop_support import extract_fixture
 
     from dew.mesh import TENSOR_AXIS
 
     source = extract_fixture(Path(__file__).with_name("fixtures") / "qwen_image_source.tar.xz", tmp_path)
-    _, objective = source_objective(source)
-    mesh = LAYOUT.build(jax.devices()[:8])
-    trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0), mesh=LAYOUT,
-                      layout=Layout(min_shard=MIN_SHARD), tracker=None)
-    trainer.device_mesh = mesh
-    state = jax.eval_shape(trainer.initial_state)
-    placed = trainer.shardings(state)
-    assert_placed("qwen-image", state.variables, placed.variables, mesh, objective.parameter_axes)
+    placed = pipeline_placed("qwen-image", source)
     tower = [sharding for path, sharding in jax.tree_util.tree_leaves_with_path(placed.variables)
              if "text_encoder" in jax.tree_util.keystr(path)]
     assert tower and any(TENSOR_AXIS in mesh_axes(entry) for sharding in tower for entry in sharding.spec)

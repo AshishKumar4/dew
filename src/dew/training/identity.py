@@ -59,6 +59,7 @@ from pathlib import Path
 import jax
 import numpy as np
 from jax._src import config as jax_config
+from jax.core import ShapedArray
 from jax.experimental.layout import Format, Layout
 
 from dew import _cache
@@ -91,7 +92,12 @@ def _coded(module: str | None, at: str) -> str:
 def _main(module: str) -> list:
     """What states `__main__`'s code where a class or function of it is part of an identity: its file's
     digest, as no process record holds it (a process that saves and one that serves run other scripts)."""
-    return [_source(Path(sys.modules[module].__file__))] if module == "__main__" else []
+    if module != "__main__":
+        return []
+    file = sys.modules[module].__file__
+    if file is None:
+        raise Unestablished("`__main__` is no file (an interactive session), so no record states its code")
+    return [_source(Path(file))]
 
 
 def _named(value, at: str) -> list | None:
@@ -206,7 +212,7 @@ def _stated(value, at: str, known: Mapping[int, JSON], walking: frozenset[int]) 
                 [[field.name, again(getattr(value, field.name, None), at=f"{at}.{field.name}")]
                  for field in dataclasses.fields(value)]]
     key = terms.parameter_key(value)
-    if key[0] != "object":
+    if isinstance(key, tuple) and key[0] != "object":
         return ["native", _plain(key, at)]
     if (parts := _parts(value, at, again)) is not None:
         return parts
@@ -241,7 +247,7 @@ def _parts(value, at: str, again: Callable[..., JSON]) -> JSON | None:
     one device's sharding, a device, and any other of JAX's by its attributes where it holds them plainly
     (an axis environment's sizes and names), the layout XLA chooses (`Layout.AUTO`). None for a value that
     is none of them."""
-    if isinstance(value, jax.core.ShapedArray):
+    if isinstance(value, ShapedArray):
         return ["abstract", list(value.shape), str(value.dtype), bool(value.weak_type)]
     if isinstance(value, type(jax.tree.structure(()))):
         return _tree(value, at, again)

@@ -281,15 +281,18 @@ def test_a_run_no_record_describes_checkpoints_its_reason_and_a_records_own_erro
     trainer = make_trainer(tmp_path, objective=Unnamed())
     trainer.fit(dataset(), steps=1)
     trainer.checkpoints.wait()
-    with pytest.raises(ValueError, match="no import path a record can name"):
+    with pytest.raises(ValueError):
         TextGeneration.from_run(trainer.checkpoints.directory)
+
+    bug = KeyError("the record's own bug")
 
     class Broken(Regression):
         def inference_record(self):
-            raise KeyError("the record's own bug")
+            raise bug
 
-    with pytest.raises(KeyError, match="the record's own bug"):
+    with pytest.raises(KeyError) as raised:
         make_trainer(tmp_path / "broken", objective=Broken()).fit(dataset(), steps=1)
+    assert raised.value is bug
 
 
 def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):

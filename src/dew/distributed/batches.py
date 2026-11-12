@@ -630,7 +630,7 @@ class DevicePrefetchIterator:
         again."""
         self._start()
         with self._ready:
-            self._waited(lambda: self._first is not None or self._placing or self._queued
+            self._waited(lambda: self._first is not None or bool(self._placing) or bool(self._queued)
                          or self._done.is_set() or self._stop.is_set())
             if self._first is not None:
                 return self._first
@@ -647,7 +647,7 @@ class DevicePrefetchIterator:
             self._notify()
         self._start()
         with self._ready:
-            self._waited(lambda: self._queued or self._done.is_set() or self._stop.is_set())
+            self._waited(lambda: bool(self._queued) or self._done.is_set() or self._stop.is_set())
             if self._stop.is_set():
                 raise StopIteration
             if self._queued:
@@ -658,7 +658,7 @@ class DevicePrefetchIterator:
         self._raise_ended()
         raise StopIteration
 
-    def _waited(self, ready: Callable[[], object]) -> None:
+    def _waited(self, ready: Callable[[], bool]) -> None:
         """Wait, holding `_ready`, until `ready()` holds: a consumer's wait on the worker. On the main
         thread under a fit's `SignalWake` it waits there, so a signal ends the wait and its handler runs
         (rows 5215, 5229); elsewhere on the condition."""

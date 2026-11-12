@@ -925,18 +925,20 @@ def test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_r
 
 
 @pytest.mark.parametrize("kernel", ["cudnn", "flash"])
-def test_a_program_holding_a_kernel_this_host_cannot_lower_is_refused_ahead_naming_it(monkeypatch, kernel):
+def test_a_program_holding_a_kernel_this_host_cannot_lower_is_refused_ahead_naming_it(kernel):
     """A program whose attention names a CUDA library kernel this host cannot lower for the target, compiled
-    ahead for a canonical sm90: refused, the kernel, why and the program named, never compiled with another
+    ahead for a canonical GPU: refused, the kernel, why and the program named, never compiled with another
     kernel in its place (row 4616). cuDNN's plan holds to its GPU's model, so no canonical target takes it
-    (`generation.Assumption.portable`); FlashAttention without its wheel's code for the target (here its
-    wheel read as holding none, `attention_kernels.flash_lowered`)."""
-    from dew.nn import attention_kernels
+    (`generation.Assumption.portable`), here an sm90; FlashAttention for a generation its installed wheel
+    holds no code for (`attention_kernels.flash_built_for`), any where no wheel is installed."""
     from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.attention_kernels import flash_architectures, flash_built_for
     from dew.nn.kernels.selection import Unlowerable
     from dew.training.ahead import compile_programs
 
-    monkeypatch.setattr(attention_kernels, "flash_lowered", lambda: False)
+    built = flash_architectures() or ()
+    target = "sm90" if kernel == "cudnn" else next(
+        name for name in gate_generations() if not flash_built_for(name, built))
 
     def attended(query, key, value):
         return scaled_dot_product_attention(query, key, value, causal=True, implementation=kernel)
@@ -944,7 +946,7 @@ def test_a_program_holding_a_kernel_this_host_cannot_lower_is_refused_ahead_nami
     shapes = [jax.ShapeDtypeStruct(shape, jnp.bfloat16)
               for shape in ((2, 256, 4, 64), (2, 256, 2, 64), (2, 256, 2, 64))]
     with pytest.raises(Unlowerable) as refused:
-        compile_programs({"attention": (attended, shapes)}, "sm90")
+        compile_programs({"attention": (attended, shapes)}, target)
     assert (refused.value.choice, refused.value.kernel, refused.value.program) == ("attention", kernel,
                                                                                   "attention")
 

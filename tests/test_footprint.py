@@ -1,6 +1,8 @@
 """The residual storage a pullback names before compiling, not a claim about XLA's scheduled peak."""
 
+import cProfile
 import math
+import pstats
 
 import jax
 import jax.numpy as jnp
@@ -866,7 +868,7 @@ def test_a_derived_peak_is_of_the_program_the_algebra_pass_makes_of_the_step():
     assert rewritten[1:] == plain[1:], (rewritten, plain)
 
 
-def test_a_steps_derivation_reads_its_program_in_proportion_to_its_layers(monkeypatch):
+def test_a_steps_derivation_reads_its_program_in_proportion_to_its_layers():
     """A decoder's derived peak on a GPU reads each value of its step's program a bounded number of times
     however deep it is: its products' operands are paired by the storage each reads, never each with every
     other, so twice the layers is about twice the reading (row 5479: a 4B decoder's derivation held its
@@ -874,17 +876,8 @@ def test_a_steps_derivation_reads_its_program_in_proportion_to_its_layers(monkey
     whether the program computes."""
     import optax
 
+    from dew.nn import programs
     from dew.registry import models
-    from dew.training import footprint
-
-    real = footprint.computed
-    asked = [0]
-
-    def computed(value):
-        asked[0] += 1
-        return real(value)
-
-    monkeypatch.setattr(footprint, "computed", computed)
 
     def reads(layers: int) -> int:
         model = models.build("causal_transformer", vocab_size=128, emb_features=64, num_layers=layers,
@@ -896,9 +889,12 @@ def test_a_steps_derivation_reads_its_program_in_proportion_to_its_layers(monkey
             logits = model.apply({"params": params}, tokens[:, :-1])
             return optax.softmax_cross_entropy_with_integer_labels(logits, tokens[:, 1:]).mean(), ()
 
-        asked[0] = 0
-        gradient_peak(loss, params, (tokens,), platform="gpu", workspace=Workspace(0, 0))
-        return asked[0]
+        # Each value the derivation asks whether the program computes (`dew.nn.programs.computed`), counted
+        # by the profiler, which reads every call without standing in for one.
+        profiler = cProfile.Profile()
+        profiler.runcall(gradient_peak, loss, params, (tokens,), platform="gpu", workspace=Workspace(0, 0))
+        return sum(calls for (file, _, name), (_, calls, *_) in pstats.Stats(profiler).stats.items()
+                   if name == "computed" and file == programs.__file__)
 
     shallow, deep = reads(4), reads(8)
     assert deep < 2.5 * shallow, (shallow, deep)

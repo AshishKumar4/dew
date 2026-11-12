@@ -13,6 +13,7 @@ from typing import NamedTuple
 
 import grain.python as pygrain
 import numpy as np
+from typing_extensions import TypeIs
 
 from dew._records import boolean, record
 from dew.batch import Batch
@@ -45,6 +46,11 @@ type RecordStage = Map | RandomMap | MapWithIndex | Filter | FlatMap
 
 _RECORD = typing.get_args(RecordStage.__value__)
 """`RecordStage`'s kinds, for a stage's isinstance."""
+
+
+def record_stage_of(stage: Stage) -> TypeIs[RecordStage]:
+    """Whether `stage` reads a record and gives what it makes of it (`RecordStage`)."""
+    return isinstance(stage, _RECORD)
 
 
 def _threads(stages: Sequence[Stage]) -> int | None:
@@ -167,13 +173,12 @@ class _Unspread:
 
 class Packet(NamedTuple):
     """A loading worker's group of inputs as it crosses to the reading process (`_Grouped` makes it,
-    `_Ungrouped` reads it): `held`, the records by field where they hold the same fields (`alike`), a
-    column a field, else the records as they are; `rows`, how many; `markers`, those of the records its
-    steps dropped. A named tuple, which Grain's worker queue walks as it walks a batch, its stacked
+    `_Ungrouped` reads it): `held`, the records by field where they hold the same fields, a column a
+    field, else the list of the records as they are; `rows`, how many; `markers`, those of the records
+    its steps dropped. A named tuple, which Grain's worker queue walks as it walks a batch, its stacked
     columns crossing in shared memory."""
 
-    held: Mapping[str, np.ndarray | list] | list
-    alike: bool
+    held: Mapping[str, np.ndarray | list] | list[Record]
     rows: int
     markers: list[Rejected]
 
@@ -204,7 +209,7 @@ class _Grouped:
         # the integers they are, which the reading process counts (`_Ungrouped`, `Accepted`).
         held = ({name: [row[name] for row in records] if name in ACCOUNTS else
                  self.column([row[name] for row in records]) for name in records[0]} if alike else rows)
-        return Packet(held, alike, len(rows), markers)
+        return Packet(held, len(rows), markers)
 
     def column(self, values: list[Field]) -> np.ndarray | list[Field]:
         """One field's values across the group: stacked where they are arrays of one shape and type,
@@ -232,7 +237,7 @@ class _Ungrouped:
         markers = [marker for marker in group.markers if not marker.consumed]
         # A marker of the examples the group's last rows were the last of follows its rows.
         trailing = [marker for marker in group.markers if marker.consumed]
-        if not group.alike:
+        if isinstance(group.held, list):
             return [*markers, *group.held, *trailing]
         columns: dict[str, np.ndarray | list] = {}
         for name, column in record(group.held, "grouped records").items():

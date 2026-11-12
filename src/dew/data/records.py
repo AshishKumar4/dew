@@ -353,14 +353,24 @@ def _entries(value: object, where: str) -> list[JSON]:
 _OMITTED = "omitted at its default"
 
 
-def _reads(read: Callable[[object, str], object], *, omitted: bool = False) -> dict[str, object]:
+type _Field = JSON | Sequence[JSON] | Mapping[str, JSON] | Sequence[float]
+"""What a layout field holds as it reads back (`_reads`)."""
+
+
+def _reads(read: Callable[[JSON, str], _Field], *, omitted: bool = False) -> Mapping[str, object]:
     """A layout field's metadata: how it reads back (`read`, given the value and what it is), and whether
     a record leaves it out at its default."""
     return {"read": read, _OMITTED: omitted}
 
 
-def _kept(value: object, what: str) -> object:
+def _kept(value: JSON, what: str) -> JSON:
+    """A field held as its record holds it, whatever JSON it is."""
     return value
+
+
+def _mapping(value: JSON, what: str) -> Mapping[str, JSON]:
+    """A field that is a record of its own, each entry the JSON it holds."""
+    return {key: json_value(entry, f"{what} {key}") for key, entry in record(value, what).items()}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -369,7 +379,7 @@ class _ChainRecord:
     call of `pipe` with its input, a mix or phases), the chain's name, how it reads, its loading, whether it
     is elastic (written only where it is) and its stages, in that order."""
 
-    source: Mapping[str, JSON] = dataclasses.field(metadata=_reads(lambda value, what: record(value, what)))
+    source: Mapping[str, JSON] = dataclasses.field(metadata=_reads(_mapping))
     name: str | None = dataclasses.field(default=None, metadata=_reads(
         lambda value, what: None if value is None else str(value)))
     read: JSON = dataclasses.field(default=None, metadata=_reads(_kept))
@@ -403,7 +413,8 @@ class _PhasesRecord:
 def _laid_out(laid: _ChainRecord | _MixRecord | _PhasesRecord) -> dict[str, JSON]:
     """`laid` as its record holds it: each of its fields in their declared order, one its layout omits
     at its default left out there."""
-    return {field.name: typing.cast(JSON, getattr(laid, field.name)) for field in dataclasses.fields(laid)
+    return {field.name: json_value(getattr(laid, field.name), field.name)
+            for field in dataclasses.fields(laid)
             if not (field.metadata[_OMITTED] and getattr(laid, field.name) == field.default)}
 
 
@@ -509,7 +520,7 @@ def _source(source: Source | Mixture | Phases) -> dict[str, JSON]:
         return _laid_out(_MixRecord([_chain(child) for child in source.pipelines], list(source.weights),
                                     tokens, source.seed))
     if isinstance(source, Phases):
-        ends = list(source.ends)
+        ends: list[JSON] = list(source.ends)
         return _laid_out(_PhasesRecord([_chain(child) for child in source.pipelines],
                                        until_steps=ends if source.clock == "steps" else None,
                                        until_tokens=ends if source.clock == "tokens" else None))
@@ -658,8 +669,8 @@ def _read_source(written: Mapping[str, object]) -> Source | Mixture | Phases:
         counted = None if mix.tokens is None else from_record(counting, json_value(mix.tokens, "tokens"))
         if counted is not None and not _counts(counted):
             raise ValueError("a mixture's token count reads back as no function")
-        return Mixture(tuple(_read_chain(record(child, "corpus")) for child in mix.mix), mix.weights, counted,
-                       mix.seed)
+        return Mixture(tuple(_read_chain(record(child, "corpus")) for child in mix.mix), tuple(mix.weights),
+                       counted, mix.seed)
     if "phases" in written:
         phases = _read_laid(_PhasesRecord, written, "phases")
         # The one clock the record names: its tokens' where it names them, its steps' otherwise.

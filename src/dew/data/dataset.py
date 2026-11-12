@@ -1498,6 +1498,12 @@ def phase_ends(ends: Sequence[int | None], unit: Literal["step", "token", "recor
     return bounded
 
 
+def phase_at(ends: Sequence[int | None], at: int) -> int:
+    """The phase that reads `at`, a record or a step on the phases' clock: the first whose end, known, is
+    past it; the last phase's, whose end none states, where none is."""
+    return next((index for index, end in enumerate(ends) if end is None or at < end), len(ends))
+
+
 class PhasedStream:
     """Reads one global order per phase, switching at step boundaries.
 
@@ -1572,11 +1578,6 @@ class PhasedStream:
             self._streams[phase] = self._open[phase](tuple(end for end in before if end is not None))
         return self._streams[phase]
 
-    def _phase(self, records: int) -> int:
-        """The phase that reads the record at `records`: the first whose end, known, is past it."""
-        return next((index for index, end in enumerate(self._ends) if end is None or records < end),
-                    len(self._ends))
-
     def _start(self, phase: int) -> int:
         start = self._ends[phase - 1] if phase else 0
         if start is None:
@@ -1597,7 +1598,7 @@ class PhasedStream:
             self._streams.pop(later).close()
 
     def __next__(self) -> Batch:
-        phase = self._phase(self._records)
+        phase = phase_at(self._ends, self._records)
         if phase != self._current:
             if self._current is not None:
                 self._streams[self._current].close()
@@ -1630,9 +1631,9 @@ class PhasedStream:
         # clock ended is completed where it ended, as no list of phases
         # says where that is.
         if self._tokens is not None:
-            phase = self._phase(self._records)
+            phase = phase_at(self._ends, self._records)
         else:
-            phase = self._phase(self._records - 1) if self._records else 0
+            phase = phase_at(self._ends, self._records - 1) if self._records else 0
         plans = [
             _position.read(_global_position(self._stream(index).get_state())).plan
             for index in range(phase + 1)
@@ -1718,7 +1719,7 @@ class PhasedStream:
         if self._tokens is None:
             raise ValueError("phases on the step clock end at the steps they were written with")
         self.set_state(state)
-        phase = self._phase(self._records)
+        phase = phase_at(self._ends, self._records)
         if phase >= len(self._ends):
             raise ValueError("the last phase runs on; it has no end to reach")
         self._resolve(phase, self._records)
@@ -1773,11 +1774,6 @@ class StepPhases(Forwarding):
     def __iter__(self) -> Iterator[Batch]:
         return self
 
-    def _phase(self, steps: int) -> int:
-        """The phase that reads step `steps`: the first whose end is past it."""
-        return next((index for index, end in enumerate(self._ends) if end is None or steps < end),
-                    len(self._ends))
-
     def _reader(self, phase: int) -> Iterator[Batch]:
         if phase not in self._readers:
             self._readers[phase] = self._make[phase]()
@@ -1796,14 +1792,14 @@ class StepPhases(Forwarding):
         return self._source
 
     def __next__(self) -> Batch:
-        phase = self._phase(self._steps)
+        phase = phase_at(self._ends, self._steps)
         batch = next(self._stream(phase))
         self._steps += 1
         return {**batch, PHASE: Phase(phase)}
 
     def get_state(self) -> bytes:
         # The phase of the last step read: at a boundary nothing of the next phase is read yet.
-        phase = self._phase(self._steps - 1) if self._steps else 0
+        phase = phase_at(self._ends, self._steps - 1) if self._steps else 0
         stream = self._stream(phase)
         if not isinstance(stream, Checkpointable):
             raise TypeError(f"phase {phase}'s stream keeps no position")

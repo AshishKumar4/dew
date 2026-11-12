@@ -160,7 +160,7 @@ def forward_variables(variables: Variables, compute: Variables | None) -> Variab
     return variables if compute is None else merge(variables, compute)
 
 
-def narrow_copies(state, traced: core.ClosedJaxpr) -> dict:
+def narrow_copies(state, traced: core.Jaxpr) -> dict:
     """The parameters a step the trainer composes reads through narrow copies, by path under `params`
     (`cast_paths`): on every GPU but one whose row measured them off, for a state that holds no frozen
     collection. `traced` is the loss its first attempt reads as the trainer traced it for its shapes
