@@ -393,11 +393,11 @@ class StepCompiler[L, E]:
         candidates = splits(stepping.shape.rows, batch, mesh, settings.microbatches, stepping.shape.split)
 
         def lower(split: int, narrow: bool, footprint: Footprint | None = None, *, derived: bool = True,
-                  lowering: bool = True) -> Candidate:
+                  lowering: bool = True, floored: bool = False) -> Candidate:
             rung = {**self.rung(), 'narrow': narrow, 'split': split}
             return candidate_for(stepping, state, batch, schedule, placement, replicated, split,
                                  narrow, recorded_launches(recorded, rung), lowering=lowering,
-                                 capacity=capacity, footprint=footprint, derived=derived)
+                                 capacity=capacity, footprint=footprint, derived=derived, floored=floored)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -415,7 +415,7 @@ class StepCompiler[L, E]:
                 self.objective, candidate.micro, candidate.prepared.variables, mesh),
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self.ahead, capacity=capacity,
-            derive=None if recorded is not None else functools.partial(lower, lowering=False),
+            derive=None if recorded is not None else functools.partial(lower, lowering=False, floored=True),
             split_stated=stepping.shape.split is not None)
         planned, probes = search.admitted(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0)

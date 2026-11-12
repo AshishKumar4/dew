@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from typing import ClassVar, Literal
 
+import jax
 from flax import linen as nn
 
 from dew.nn.protocols import AffineHead, OutputTable, head_table
@@ -92,6 +93,18 @@ class HeadedObjective(Objective[Loss, Effects]):
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         return (self.head_program(self.model),)
+
+    def whole_head_table(self, variables) -> tuple[int, int] | None:
+        """The table its model's head scores where it keeps its whole logits (`Objective.whole_head_table`):
+        none where the head is tiled, or no matrix alone is (`head_program`'s)."""
+        if (self.head_tile is not None or not reads_states(self.model)
+                or not isinstance(self.model, AffineHead)):
+            return None
+        table = jax.eval_shape(lambda tree: head_table(self.model, tree), variables)
+        if table is None:
+            return None
+        rows, features = table.matrix.shape if table.vocab_major else table.matrix.shape[::-1]
+        return int(rows), int(features)
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that keeps its whole logits to `tile`, and report what it moved to.
