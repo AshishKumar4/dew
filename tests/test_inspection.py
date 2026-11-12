@@ -409,6 +409,7 @@ def test_a_watched_prediction_depth_summarizes_its_rows_real_positions_alone():
     positions both of whose tokens are real (`CausalTransformer.mtp_hidden_states`, each depth's rows one
     shorter): two batches that differ only in the ids at their rows' padded tail log the same summary, bit
     for bit, where a depth's summary over every position read the padding's states (audit3 O2)."""
+    from dew.batch import TEXT_KEY, coordinates
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
 
@@ -419,10 +420,9 @@ def test_a_watched_prediction_depth_summarizes_its_rows_real_positions_alone():
     rows = jax.device_count()
 
     def batch(pad):
-        real = np.r_[np.ones(8), np.zeros(4)].astype(np.int32)
-        return {"input_ids": np.tile(np.r_[np.arange(1, 9), [pad] * 4], (rows, 1)).astype(np.int32),
-                "text_segment_ids": np.tile(real, (rows, 1)),
-                "text_positions": np.tile(np.r_[np.arange(8), np.zeros(4)], (rows, 1)).astype(np.int32)}
+        ids = np.tile(np.r_[np.arange(1, 9), [pad] * 4], (rows, 1)).astype(np.int32)
+        valid = np.tile(np.r_[np.ones(8, bool), np.zeros(4, bool)], (rows, 1))
+        return {TEXT_KEY: ids, "text_coordinates": coordinates(valid=valid, xp=np)}
 
     first, second = (inspected(trainer, batch(pad)) for pad in (3, 7))
     watched = sorted(name for name in first if name.startswith("inspect/activations/mtp_1/"))
