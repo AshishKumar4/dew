@@ -55,22 +55,25 @@ def room(tmp_path_factory) -> int:
         return (full + min(whole, LIMIT - base.plan["derived"][0]["headroom"])) // 2
 
 
-def test_the_first_compile_is_at_the_least_recompute_rung_the_derivation_says_fits(
+def test_the_first_compile_is_at_the_least_recompute_rung_the_derivation_does_not_refuse(
         monkeypatch, tmp_path, room):
     """With room for the step under full recomputation and not under none, the search's first compile
-    is at the least-recompute rung whose derived footprint fits, which the compile confirms: the step
-    compiles once, where the climb from the base rung compiled every rung below. The plan records each
-    rung the derivation read, refused below and fitting at its rung."""
+    is at the least-recompute rung the derivation admits. A fitting upper bound is confirmed once; an
+    interval spanning the room leaves its candidate to the compile, which can miss and climb."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
     free(monkeypatch, room)
     trainer = deep()
     with Compiles("step") as compiles:
         compiled(trainer)
-    labels = [entry["label"] for entry in trainer.plan["derived"]]
-    assert labels[0] == "refuses" and labels[-1] == "fits"
-    assert set(labels[1:-1]) <= {"refuses", "refuses by the last trace"}
-    assert trainer.plan["remat"] is not None and trainer.plan["derived"][-1]["remat"] == trainer.plan["remat"]
-    assert compiles.count == 1 and trainer.plan["probes"][0]["fits"]
+    entries, probes = trainer.plan["derived"], trainer.plan["probes"]
+    admitted = next(index for index, entry in enumerate(entries) if entry["label"] in ("fits", "unknown"))
+    assert all(entry["label"].startswith("refuses") for entry in entries[:admitted])
+    assert all(probes[0][key] == entries[admitted][key]
+               for key in ("remat", "head_tile", "head_fused", "narrow", "split"))
+    assert compiles.count == len(probes) and probes[-1]["fits"]
+    assert not any(probe["fits"] for probe in probes[:-1])
+    if entries[admitted]["label"] == "fits":
+        assert compiles.count == 1 and trainer.plan["remat"] == entries[admitted]["remat"]
 
 
 def test_a_derivation_that_fits_the_base_rung_or_cannot_judge_starts_the_search_there(monkeypatch, tmp_path):
@@ -124,11 +127,11 @@ def test_an_objective_that_trains_two_modules_unset_reads_the_derivation(monkeyp
     assert trainer.plan["derived"]
 
 
-def test_the_first_compile_is_at_the_fewest_microbatches_the_derivation_says_fit(monkeypatch, tmp_path):
-    """With room for the step at four microbatches and not at two, as both its compile and its derivation
-    say, the search's first compile is at four, the fewest the derivation says fit, which the compile
-    confirms: the step compiles once, where the search compiled the whole batch first and halved the
-    range by compiles (row 3341). The plan records the splits the derivation read."""
+def test_the_first_compile_is_at_the_fewest_microbatches_the_derivation_does_not_refuse(
+        monkeypatch, tmp_path):
+    """With room for four microbatches and not two, the first compile is at the fewest split whose
+    bounds leave it possible. A CPU interval can leave two undecided; its miss then takes four, with
+    no compile below a fitting split."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
     need = {}
     for split in (2, 4):
@@ -143,15 +146,19 @@ def test_the_first_compile_is_at_the_fewest_microbatches_the_derivation_says_fit
     trainer = deep(split=None)
     with Compiles("step") as compiles:
         compiled(trainer)
-    assert compiles.count == 1 and trainer.plan["split"] == 4 and trainer.plan["remat"] is None
-    assert {entry["split"]: entry["label"] for entry in trainer.plan["derived"]}[2] == "refuses"
+    judgments = {entry["split"]: entry for entry in trainer.plan["derived"]}
+    possible = min(split for split, entry in judgments.items() if entry["label"] in ("fits", "unknown"))
+    probes = trainer.plan["probes"]
+    assert probes[0]["split"] == possible and trainer.plan["split"] == 4 and trainer.plan["remat"] is None
+    assert compiles.count == len(probes) and not any(probe["fits"] for probe in probes[:-1])
+    assert probes[-1]["fits"] and judgments[2]["label"] in ("refuses", "unknown")
+    if judgments[possible]["label"] == "fits":
+        assert compiles.count == 1
 
 
 def test_a_split_the_derivation_leaves_no_byte_to_spare_is_one_it_fits(monkeypatch, tmp_path):
-    """A split whose derived headroom is exactly nothing fits as the derivation judges a fit (a headroom of
-    at least nothing), so with room for four microbatches to the byte the search's first compile is at
-    four, the fewest the derivation says fit, not the eight past it (row 3341's review: a headroom of
-    nothing read as a refusal)."""
+    """A split whose upper bound leaves exactly zero headroom fits. A smaller CPU split can remain
+    undecided, but neither that interval nor a zero upper-bound headroom skips the fitting split."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
     sizing = deep(split=4)
     needs(monkeypatch, sizing, lambda: compiled(sizing))
@@ -160,8 +167,10 @@ def test_a_split_the_derivation_leaves_no_byte_to_spare_is_one_it_fits(monkeypat
     free(monkeypatch, LIMIT - judged["headroom"])
     trainer = deep(split=None)
     compiled(trainer)
-    headroom = {entry["split"]: entry["headroom"] for entry in trainer.plan["derived"]}
-    assert headroom[4] == 0 and headroom[2] < 0 and asked(trainer)[0][0] == 4
+    judgments = {entry["split"]: entry for entry in trainer.plan["derived"]}
+    assert judgments[4]["headroom"] == 0 and judgments[4]["label"] == "fits"
+    assert judgments[2]["headroom"] is None or judgments[2]["headroom"] < 0
+    assert trainer.plan["split"] == 4 and asked(trainer)[-1][0] == 4
 
 
 def test_past_a_miss_the_derivation_orders_the_next_compile_where_it_judges():
@@ -328,9 +337,122 @@ def test_the_search_takes_the_fewest_microbatches_that_fit_however_a_miss_elsewh
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
     free(monkeypatch, room)
     trainer = deep(split=None)
-    compiled(trainer)
+    with Compiles("step") as compiles:
+        compiled(trainer)
     assert trainer.plan["split"] == fewest, need
     assert trainer.plan["probes"][-1]["fits"] and trainer.plan["probes"][-1]["headroom"] >= 0
+    if jax.devices()[0].platform == "cpu":
+        assert compiles.count == 1 and [probe["split"] for probe in trainer.plan["probes"]] == [fewest]
+        judgments = {entry["split"]: entry for entry in trainer.plan["derived"]}
+        assert judgments[2]["label"] == "refuses" and judgments[2]["headroom_bounds"][1] < 0
+        assert judgments[4]["label"] == "unknown"
+        assert judgments[4]["headroom_bounds"][0] < 0 <= judgments[4]["headroom_bounds"][1]
+
+
+@pytest.mark.parametrize("kind", [
+    "reduction-exp", "erf", "log-reduction", "vector-dot", "named-product-exp", "gather-reduction",
+])
+def test_a_fused_cpu_chain_is_admitted_at_its_compiled_need(monkeypatch, tmp_path, kind):
+    """A reduction's library fusion and an erf backward's ordinary loop can absorb their input chains.
+    Those intermediate arrays cannot refuse a whole step that has exactly its compiled need available."""
+    from flax import linen as nn
+    from jax.ad_checkpoint import checkpoint_name
+
+    from dew.objectives.base import Objective
+    from dew.training.footprint import Workspace, gradient_peak
+
+    parameter_shape, row_shape = {
+        "reduction-exp": ((4096, 1024), (4096, 1024)),
+        "erf": ((4096, 1024), (4096, 1024)),
+        "log-reduction": ((64,), (32, 64)),
+        "vector-dot": ((), (1024,)),
+        "named-product-exp": ((64, 64), (4096, 64)),
+        "gather-reduction": ((), (1024,)),
+    }[kind]
+
+    def transformed(weights, rows):
+        if kind == "erf":
+            return jax.lax.erf(weights)
+        if kind == "log-reduction":
+            return jnp.log(weights[None, :] + rows)
+        if kind == "vector-dot":
+            return weights * jnp.vdot(jnp.exp(rows[0]), rows[1])
+        if kind == "named-product-exp":
+            return jnp.exp(checkpoint_name(rows @ weights, "projection"))
+        if kind == "gather-reduction":
+            return weights * jnp.take(rows[0], rows[1], mode="clip")
+        return jnp.exp(jnp.sum(weights * rows, axis=1))
+
+    def scalar_loss(weights, rows):
+        return jnp.sum(transformed(weights, rows)), ()
+
+    class FusedRows(nn.Module):
+        @nn.compact
+        def __call__(self, rows):
+            weights = self.param("kernel", nn.initializers.zeros_init(), parameter_shape)
+            return transformed(weights, rows)
+
+    class RowLoss(Objective):
+        def __init__(self):
+            self.model = FusedRows()
+
+        def fresh_variables(self, key, held):
+            shape = row_shape if kind in ("vector-dot", "gather-reduction") else (1, row_shape[-1])
+            inputs = jnp.ones(shape, jnp.float32)
+            rows = inputs
+            if kind == "vector-dot":
+                rows = (inputs, inputs)
+            elif kind == "gather-reduction":
+                rows = (inputs, jnp.arange(row_shape[0], dtype=jnp.int32))
+            return nn.unbox(self.model.init(key, rows))
+
+        def loss(self, variables, batch, step):
+            rows = ((batch["rows"], batch["values"]) if kind == "vector-dot" else
+                    (batch["rows"], batch["indices"]) if kind == "gather-reduction" else batch["rows"])
+            return jnp.sum(self.model.apply(variables, rows))
+
+    cpu = jax.devices("cpu")[0]
+    with jax.default_device(cpu):
+        shape = jax.ShapeDtypeStruct(parameter_shape, jnp.float32)
+        inputs = jax.ShapeDtypeStruct(row_shape, jnp.float32)
+        if kind == "vector-dot":
+            inputs = (inputs, inputs)
+        elif kind == "gather-reduction":
+            inputs = (inputs, jax.ShapeDtypeStruct(row_shape, jnp.int32))
+        peak = gradient_peak(scalar_loss, shape, (inputs,), platform="cpu", workspace=Workspace(0, 0))
+        analysis = jax.jit(jax.grad(lambda weights, rows: scalar_loss(weights, rows)[0])).lower(
+            shape, inputs).compile().memory_analysis()
+        compiled_peak = (analysis.output_size_in_bytes + analysis.temp_size_in_bytes
+                         - analysis.alias_size_in_bytes)
+        assert peak.lower is not None and peak.lower <= compiled_peak <= peak.bytes
+        batch = {"rows": jnp.ones(row_shape, jnp.float32)}
+        if kind == "vector-dot":
+            batch["values"] = jnp.ones(row_shape, jnp.float32)
+        elif kind == "gather-reduction":
+            batch["indices"] = jnp.arange(row_shape[0], dtype=jnp.int32)
+
+        def built():
+            trainer = Trainer(RowLoss(), optax.sgd(1e-2), key=jax.random.key(0), split=1)
+            trainer.device_mesh = MeshSpec().build([cpu])
+            return trainer
+
+        def compile_step(trainer):
+            state, _, _ = trainer.place()
+            return trainer.compile(state, batch)
+
+        monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+        sizing = built()
+        room = needs(monkeypatch, sizing, lambda: compile_step(sizing))
+        monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+        free(monkeypatch, room)
+        trainer = built()
+        with Compiles("step") as compiles:
+            compile_step(trainer)
+    assert trainer.plan["split"] == 1 and compiles.count == 1
+    assert len(trainer.plan["probes"]) == 1 and trainer.plan["probes"][0]["headroom"] == 0
+    judgment = trainer.plan["derived"][0]
+    assert judgment["label"] in ("fits", "unknown")
+    assert judgment["headroom"] is None or judgment["headroom"] >= 0
 
 
 def test_a_miss_corrects_each_split_by_its_share_of_the_derived_temporaries():
@@ -443,14 +565,10 @@ def test_a_run_over_a_tensor_axis_whose_footprint_the_derivation_cannot_judge_co
 
 
 def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monkeypatch, tmp_path, caplog):
-    """Every compile's plan record holds the headroom the derivation judged beside the one the compile
-    measured, and each compile whose fit the derivation judged otherwise is told as a model miss, the
-    compile deciding: with room between what the derivation and the compile say a step at full
-    recomputation needs, the run hears a miss for its first compile and one for each it judged so. Whether
-    a head policy past that compile then fits the room, a plan, or none does, a refusal, is the
-    compiler's schedule's: under XLA:CPU's memory-optimized schedule the head tiled, its gradient taken
-    in the backward, fits it (7263045940), under its default none did; the misses are told either way,
-    each warning marked with the probe it names (`MODEL_MISS`), read whatever its wording (A40)."""
+    """A compile whose fit contradicts a definite judgment is marked MODEL_MISS. A single-bound case
+    uses room between the prediction and measurement. For a CPU interval, the external compiler's
+    reported extra workspace makes a definite fitting upper bound miss; an undecided interval alone
+    would carry no wrong judgment."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
     free(monkeypatch, LIMIT)
     # The split left to the plan, so the derivation judges what it compiles.
@@ -458,9 +576,30 @@ def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monke
     compiled(sizing)
     (measured,) = sizing.plan["probes"]
     derived, compiled_need = LIMIT - measured["derived_headroom"], LIMIT - measured["headroom"]
-    assert derived != compiled_need
+    interval = measured["derived"].get("peak_lower") is not None
+    if interval:
+        from types import SimpleNamespace
+
+        room = 2 * max(derived, compiled_need)
+        original = jax.stages.Compiled.memory_analysis
+
+        def extra_workspace(executable):
+            # A compiler can add workspace the shape derivation does not know about. Its memory
+            # analysis is the external measurement that must expose that miss, even with an interval.
+            stats = original(executable)
+            return SimpleNamespace(
+                argument_size_in_bytes=stats.argument_size_in_bytes,
+                output_size_in_bytes=stats.output_size_in_bytes,
+                alias_size_in_bytes=stats.alias_size_in_bytes,
+                temp_size_in_bytes=stats.temp_size_in_bytes + room,
+                generated_code_size_in_bytes=stats.generated_code_size_in_bytes)
+
+        monkeypatch.setattr(jax.stages.Compiled, "memory_analysis", extra_workspace)
+    else:
+        assert derived != compiled_need
+        room = (derived + compiled_need) // 2
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "between"))
-    free(monkeypatch, (derived + compiled_need) // 2)
+    free(monkeypatch, room)
     trainer = deep(REMAT_POLICIES["full"], split=None)
     refused: PlanRefused | None = None
     with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
@@ -472,7 +611,7 @@ def test_a_compile_the_derivation_judged_otherwise_is_told_as_a_model_miss(monke
     probes = [probe.record() for probe in refused.probes] if refused else trainer.plan["probes"]
     judged = [probe for probe in probes
               if probe["derived_headroom"] is not None and (probe["derived_headroom"] >= 0) != probe["fits"]]
-    assert compiles.count >= 1 and probes[0]["fits"] == (compiled_need < derived)
+    assert compiles.count >= 1 and probes[0]["fits"] == (not interval and compiled_need < derived)
     assert missed and len(missed) == len(judged) and all(missed)
 
 

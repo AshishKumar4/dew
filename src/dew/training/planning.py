@@ -259,6 +259,13 @@ def judged_likely(headroom: int | None, under: int, *, forecast: bool) -> bool:
     return headroom - under >= 0
 
 
+def _judged_headroom(bounds: tuple[int, int] | None) -> int | None:
+    """A definite judgment of the pooled headroom interval; an interval spanning zero is undecided."""
+    if bounds is None or bounds[0] < 0 <= bounds[1]:
+        return None
+    return bounds[0] if bounds[0] >= 0 else bounds[1]
+
+
 def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
             climb: Callable[[], bool], likely: Callable[[int], bool] = lambda split: False,
             halved: Callable[[int], bool] | None = None) -> int | None:
@@ -935,22 +942,21 @@ class FitSearch[LossT, EffectsT]:
         if footprint.peak is None or self.remat_rung() != last.remat or (narrow and not last.narrow):
             return None
         if (tile, fused) == (last.tile, last.fused):
-            least = most = footprint.peak
+            least = footprint.peak if footprint.peak_lower is None else footprint.peak_lower
+            most = footprint.peak
         elif last.tile is None and tile is not None and footprint.head is not None:
-            least, most = footprint.head.headless, footprint.head.tiled(tile, fused=fused)
+            least = (footprint.head.headless if footprint.peak_lower is None else
+                     0 if footprint.head.lower is None else footprint.head.lower)
+            most = footprint.head.tiled(tile, fused=fused)
         else:
             return None
         copies = footprint.resident.get("compute", 0) if last.narrow and not narrow else 0
         resident = {**footprint.resident, "compute": footprint.resident.get("compute", 0) - copies}
         devices = local_devices(self.mesh)
 
-        def headroom(peak: int) -> int | None:
-            bounded = dataclasses.replace(footprint, resident=resident, held=footprint.held - copies,
-                                          peak=peak)
-            return derived_headroom(bounded, devices, self.capacity, last.built - copies)
-
-        low, high = pooled_headroom(headroom(most + copies)), pooled_headroom(headroom(least))
-        return None if low is None or high is None else (low, high)
+        bounded = dataclasses.replace(footprint, resident=resident, held=footprint.held - copies,
+                                      peak=most + copies, peak_lower=least)
+        return derived_headroom(bounded, devices, self.capacity, last.built - copies)
 
     def judged(self, split: int, narrow: bool) -> int | None:
         """The derived headroom of the step at `split` and `narrow` at the objective's rung, traced once a
@@ -966,14 +972,16 @@ class FitSearch[LossT, EffectsT]:
             candidate = dataclasses.replace(candidate, spent=spent)
             self.derivations[key] = candidate
             footprint = candidate.footprint
-            headroom = pooled_headroom(None if footprint is None else derived_headroom(
-                footprint, local_devices(self.mesh), self.capacity, candidate.built))
+            bounds = derived_headroom(footprint, local_devices(self.mesh), self.capacity, candidate.built)
+            headroom = _judged_headroom(bounds)
             label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
             if candidate.floored:
                 # Its whole logits alone leave it short: no trace of its gradient was made.
                 label = "refuses by its whole logits"
             self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": headroom,
-                                 "label": label, "terms": None if footprint is None else footprint.record()})
+                                 "label": label, "terms": None if footprint is None else footprint.record(),
+                                 **({} if bounds is None or bounds[0] == bounds[1] else {
+                                     "headroom_bounds": list(bounds)})})
             self.judged_at[key], self.copies_at[key] = headroom, bool(candidate.copies)
             # A floor is no trace's footprint: its lowering, and the rungs after it, trace their own.
             self.footprints[key] = None if candidate.floored else footprint
@@ -1033,13 +1041,13 @@ class FitSearch[LossT, EffectsT]:
         if fewest is None or fewest >= 0 or len(candidates) == 1:
             return first
         headroom = self.judged(candidates[-1], self.narrow)
-        if headroom is None or headroom < 0:
+        if headroom is not None and headroom < 0:
             return first
         low, high = 0, len(candidates) - 1
         while high - low > 1:
             middle = (low + high) // 2
             judged = self.judged(candidates[middle], self.narrow)
-            fits = judged is not None and judged >= 0
+            fits = judged is None or judged >= 0
             low, high = (low, middle) if fits else (middle, high)
         return high
 
@@ -1213,7 +1221,7 @@ class FitSearch[LossT, EffectsT]:
                 fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
-        foreseen = pooled_headroom(None if candidate.footprint is None else derived_headroom(
+        foreseen = _judged_headroom(derived_headroom(
             candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built))
         probe = dataclasses.replace(probe, ahead=taken, compile_seconds=seconds, derived_headroom=foreseen,
                                     spent=spent)

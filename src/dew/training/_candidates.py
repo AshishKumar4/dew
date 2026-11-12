@@ -35,7 +35,7 @@ from dew.training._lowering import KernelReport, Routed, kernel_report, routed
 from dew.training.diloco import group_of, windowed
 from dew.training.distributed import microbatch, microbatch_shapes
 from dew.training.footprint import Footprint, candidate_footprint, logits_floor
-from dew.training.memory import derived_headroom, local_devices, pooled_headroom
+from dew.training.memory import derived_headroom, local_devices
 from dew.training.model_flops import batch_consumed, batch_tokens
 from dew.training.narrow import narrow_copies, narrowed
 from dew.training.planning import Candidate, splits
@@ -313,13 +313,14 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
         if staging_measured and not lowering:
             traced()
     window = split * settings.accumulation
-    # Every process reads the floor, and the pool's judgment of it, so all trace alike (`pooled_headroom`).
+    # Every process reads the floor and its pooled interval, so all trace alike (`derived_headroom`).
     forward = None if loss is None else loss.jaxpr
     flooring = floored and not lowering and derived and footprint is None and mesh is None
     floor = (logits_floor(settings.objective, forward, prepared, held, micro)
              if flooring and forward is not None else None)
-    short = pooled_headroom(None if floor is None else derived_headroom(
-        floor, local_devices(settings.device_mesh), capacity, built)) if flooring else None
+    bounds = (derived_headroom(floor, local_devices(settings.device_mesh), capacity, built)
+              if flooring else None)
+    short = None if bounds is None else bounds[1]
     if floor is not None and short is not None and short < 0:
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, None, launches or "[]",
                          KernelReport((), ()), floor, floored=True)

@@ -727,6 +727,42 @@ def test_a_cpu_attention_training_steps_derived_peak_bounds_its_compile(rows, to
     assert compiled(pulled, *operands, query) <= derived + cotangent
 
 
+@pytest.mark.parametrize("transform", [
+    lambda rows, scale: jnp.exp(rows),
+    lambda rows, scale: -rows,
+    lambda rows, scale: rows + scale,
+    lambda rows, scale: rows / scale,
+    lambda rows, scale: rows ** scale,
+    lambda rows, scale: rows.astype(jnp.bfloat16).astype(jnp.float32),
+], ids=["exp", "negate", "add", "divide", "power", "convert"])
+def test_a_cpu_library_reduction_followed_by_a_masked_product_bounds_its_compile(transform):
+    """A CPU library fusion can grow from a reduction through each family of YNNPACK operators,
+    including transcendentals and division, before a select stops it. Its full expanded result is an
+    array beside the select's result, even when LLVM would keep the row operation in a buffer."""
+    from dew.training.compiled_program import simplified
+    from dew.training.footprint import peak_bytes
+
+    rows = jax.ShapeDtypeStruct((4096, 1024), jnp.float32)
+    mask = jax.ShapeDtypeStruct((1024, 4096), jnp.bool_)
+    weights = jax.ShapeDtypeStruct((4096, 2), jnp.float32)
+    scale = jax.ShapeDtypeStruct((4096,), jnp.float32)
+    operands = (rows, rows, mask, weights, scale)
+
+    def selected_product(rows, other, mask, weights, scale):
+        totals = transform(jnp.sum(rows, axis=1), scale)
+        expanded = jnp.broadcast_to(totals[:, None], rows.shape) * other
+        return jnp.where(mask, expanded.T, 0) @ weights
+
+    program = simplified(jax.make_jaxpr(selected_product)(*operands).jaxpr, "cpu")
+    held = sum(math.prod(operand.shape) * jnp.dtype(operand.dtype).itemsize for operand in operands)
+    derived = peak_bytes(program, "cpu", Workspace(0, 0)) + held
+    with jax.default_device(jax.devices("cpu")[0]):
+        analysis = jax.jit(selected_product).lower(*operands).compile().memory_analysis()
+    compiled = (analysis.argument_size_in_bytes + analysis.output_size_in_bytes
+                + analysis.temp_size_in_bytes - analysis.alias_size_in_bytes)
+    assert compiled <= derived, (derived, compiled)
+
+
 def test_a_tpus_derived_peak_takes_none_of_a_cpus_terms():
     """The arrays a CPU's YNNPACK fusions read apart (`laid_inputs`, `cpu_layouts`) are a CPU's alone: a
     TPU's derived peak is the generic one a GPU's is where no product reads, and a CPU's holds the
