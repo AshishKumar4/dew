@@ -5,6 +5,7 @@ import collections
 import contextlib
 import itertools
 import json
+from pathlib import Path
 
 import flax.linen as nn
 import jax
@@ -355,6 +356,51 @@ def test_every_kinds_run_logs_the_activations_its_command_line_watches(kind, tmp
     cotangents = {name.rsplit("/", 1)[1] for name in logged[2] if name.startswith("inspect/cotangents/")}
     assert {"mean", "std", "rms", "non_finite"} <= cotangents
     assert not any(name.startswith("inspect/") for name in logged[1])
+
+
+def watching_alone(kind: str, root: Path):
+    """`kind`'s run over data under `root` with a trained component its model call's every forward
+    reaches beside the backbone's, and the globs naming that component alone: a decision run's head
+    (`*Head`, `*Readout`: `DecisionModel.head_logits`), and an LM run's second prediction depth
+    (`mtp_1/*`), of a model of two (`LMObjective.mtp_weight`)."""
+    import dataclasses
+
+    from dew.config import ObjectiveConfig
+    from dew.registry import ModelConfig
+
+    run = KINDS[kind](root, drawn=False)
+    if kind == "decision":
+        return run, ["*Head", "*Readout"]
+    model = ModelConfig("causal_transformer", {**run.model.fields, "num_nextn_predict_layers": 2})
+    depths = dataclasses.replace(run, model=model, objective=ObjectiveConfig("lm", {"mtp_weight": 0.3}))
+    return depths, ["mtp_1/*"]
+
+
+@pytest.mark.parametrize("kind", ["decision", "lm"])
+def test_a_run_watching_a_trained_component_alone_logs_its_activations_and_cotangents(kind, tmp_path):
+    """A run watching only a component its step trains beside the backbone, a decision run's head or an
+    LM run's prediction depth (`watching_alone`), logs that component's output summary and its loss's
+    cotangent there at its sampled step, named under the component's own path (`head/...`, `mtp_1/...`):
+    each model call the objective trains through opens the step's collections and returns what it sowed
+    (audit3 O2: the head opened its attention maxima alone and a depth's pass returned its routers,
+    maxima and indexer records alone, so a watch of either was refused as watching nothing)."""
+    record, runs = tmp_path / "record", tmp_path / "runs"
+    (tmp_path / "data").mkdir()
+    run, modules = watching_alone(kind, tmp_path / "data")
+    run.save(str(record))
+    inspection = {"class": "dew.training.inspection:Inspection",
+                  "fields": {"modules": modules, "every": 1, "targets": ["params"], "cotangents": True}}
+    settings = {"trainer.name": "watched", "trainer.checkpoint_dir": str(runs), "trainer.steps": "1",
+                "trainer.log_every": "1", "trainer.eval_every": "None", "trainer.checkpoint_every": "None",
+                "trainer.inspection": json.dumps(inspection), "trainer.multi_host": "False",
+                "trainer.compilation_cache_dir": "None"}
+    assert main(["train", str(record / "run.json"),
+                 *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
+    logged = scalars(runs / "watched")[1]
+    component = "head" if kind == "decision" else "mtp_1"
+    for log in ("activations", "cotangents"):
+        found = {name.rsplit("/", 1)[1] for name in logged if name.startswith(f"inspect/{log}/{component}/")}
+        assert {"mean", "std", "non_finite"} <= found, (log, sorted(logged))
 
 
 class Headed(nn.Module):

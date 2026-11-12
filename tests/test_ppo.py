@@ -591,6 +591,33 @@ def test_rejected_actor_tokens_leave_only_the_weighted_critic_support(coefficien
     assert changed == (coefficient > 0)
 
 
+def test_a_run_watching_its_critic_alone_logs_the_critics_activations_and_cotangents():
+    """A PPO run watching only its critic (`ValueHead`), a model its step trains beside the actor, logs the
+    critic's output summary and the loss's cotangent there at its sampled step, under the critic's part of
+    the variables (`critic/...`): the critic's forward opens the step's collections and the loss returns
+    what it sowed beside the actor's (audit3 O2: it opened its attention maxima alone, so a watch of the
+    critic was refused as watching nothing)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.training import Inspection, inspected
+
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, qk_norm=False)
+    objective = PPOObjective(model, 5, critic=ValueHead(model))
+    trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(0),
+                      inspection=Inspection(modules=("ValueHead",), targets=("params",), cotangents=True))
+    ids = jnp.tile(jnp.arange(6, dtype=jnp.int32), (jax.device_count(), 1))
+    mask = jnp.broadcast_to(jnp.arange(6) >= 3, ids.shape).astype(jnp.float32)
+    batch = {"input_ids": ids, "text_segment_ids": jnp.ones_like(ids),
+             "text_positions": jnp.broadcast_to(jnp.arange(6), ids.shape),
+             "response_mask": mask, "advantages": mask,
+             "behavior_log_probs": jnp.full(ids.shape, -3.),
+             "old_values": jnp.zeros_like(mask), "returns": mask}
+    logged = inspected(trainer, batch)
+    for log in ("activations", "cotangents"):
+        found = {name.rsplit("/", 1)[1] for name in logged if name.startswith(f"inspect/{log}/critic/")}
+        assert {"mean", "std", "non_finite"} <= found, (log, sorted(logged))
+
+
 def test_a_value_head_takes_packed_rows_as_flat_fields_or_coordinates():
     """`ValueHead`'s call is a public boundary (ledger 1122): packed rows' `segment_ids` and
     `positions` lay out as their coordinates do, the same values bit for bit, and both together are
