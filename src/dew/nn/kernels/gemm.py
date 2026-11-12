@@ -62,30 +62,29 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
          layer: jax.Array | None = None, paired: jax.Array | None = None, gather: jax.Array | None = None,
          scatter: jax.Array | None = None):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
-    `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default
-    (explicitly or through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in
-    the kernels: the product `precision` declares (`templates.product.declared`), which every launch of
-    the call and of its derivative keeps. `prologue_jvp(lhs, *side_arrays)`, where given, is the prologue's
-    derivative in place of the prologue's own: a function of `lhs`'s and each side array's tangent giving
-    the multiplied operand's (a fused producer's whole JVP, `fused`), which forward mode takes, reverse mode
-    transposes and every higher order differentiates (`_prologued`). `compute`, where given, is the
-    dtype the products take, `lhs` rounded to it as `rhs` is, where `lhs`'s own dtype is what its
-    cotangent takes, summed in fp32 and rounded once to it (an fp32 input's of a bf16 product); the
-    rounding passes tangents through unrounded, the MoE projection's law
-    (`xla_products.portable_projection`), and there is no prologue. `layer`, where given (a traced
-    index), picks one layer of a stacked `rhs` (`[layers, *matrices]`: a layer's groups, or its one
-    matrix for a dense product), read in place: the launches take the layer's groups and read their
-    matrices where they lie in the stack, from the layer's first (`_grouped`), so no slice of the stack
-    is made and they tile, split and sum as the call over the layer's matrices alone. Its gradient is
-    the stack's, every other layer's zero. `paired`, a second matrix
-    of `rhs`'s shape, the rows multiply into a second accumulator the epilogue takes before its side
-    operands (`epilogue(acc, paired_acc, *sides)`: a gate's and an up projection's SwiGLU), else an output.
-    `gather`, int32 `[rows]` of a grouped call with no prologue or stacked layer, makes the product's rows
-    `lhs[gather]`, read where they lie: a mixture of experts' tokens in their own order, the router's sort
-    fused into the rows' loads where Mosaic GPU's launch takes the call (its producer's gather, row 1376),
-    gathered by XLA elsewhere; the rows' cotangent is summed back into each token's (`lhs`'s, a token every
-    slot reads). `scatter`, int32 `[rows]` of a grouped call, a permutation, writes the product's row `i` at
-    each output's row `scatter[i]`: the slots in token order, the un-permute fused into Mosaic GPU's stores
+    `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default (explicitly or
+    through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in the kernels: the
+    product `precision` declares (`templates.product.declared`), which every launch of the call and of its
+    derivative keeps. `prologue_jvp(lhs, *side_arrays)`, where given, is the prologue's derivative in place of
+    the prologue's own: a function of `lhs`'s and each side array's tangent giving the multiplied operand's (a
+    fused producer's whole JVP, `fused`), which forward mode takes, reverse mode transposes and every higher
+    order differentiates (`_prologued`). `compute`, where given, is the dtype the products take, `lhs` rounded
+    to it as `rhs` is, where `lhs`'s own dtype is what its cotangent takes, summed in fp32 and rounded once to
+    it (an fp32 input's of a bf16 product); the rounding passes tangents through unrounded, the MoE
+    projection's law (`xla_products.portable_projection`), and there is no prologue. `layer`, where given (a
+    traced index), picks one layer of a stacked `rhs` (`[layers, *matrices]`: a layer's groups, or its one
+    matrix for a dense product), read in place: the launches take the layer's groups and read their matrices
+    where they lie in the stack, from the layer's first (`_grouped`), so no slice of the stack is made and
+    they tile, split and sum as the call over the layer's matrices alone. Its gradient is the stack's, every
+    other layer's zero. `paired`, a second matrix of `rhs`'s shape (a stack of them at the same `layer`), the
+    rows multiply into a second accumulator the epilogue takes before its side operands (`epilogue(acc,
+    paired_acc, *sides)`: a gate's and an up projection's SwiGLU), else an output. `gather`, int32 `[rows]` of
+    a grouped call with no prologue (a stack's layer's too), makes the product's rows `lhs[gather]`, read
+    where they lie: a mixture of experts' tokens in their own order, the router's sort fused into the rows'
+    loads where Mosaic GPU's launch takes the call (its producer's gather, row 1376), gathered by XLA
+    elsewhere; the rows' cotangent is summed back into each token's (`lhs`'s, a token every slot reads).
+    `scatter`, int32 `[rows]` of a grouped call, a permutation, writes the product's row `i` at each output's
+    row `scatter[i]`: the slots in token order, the un-permute fused into Mosaic GPU's stores
     (`mosaic.Scattered`), written by XLA elsewhere; the outputs' cotangents are read back through it, a
     gather. An NVFP4 `rhs` (`NvFp4`; a stack of banks at its `layer`, row 4861) is `_nvfp4_gemm`'s, frozen."""
     if isinstance(rhs, NvFp4):
@@ -94,7 +93,7 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
                            interpret_on_cpu=interpret_on_cpu,
                            refused=(transpose_rhs, prologue, prologue_operands, paired, prologue_jvp,
                                     out_dtypes))
-    _gemm_refused(group_sizes, prologue=prologue, layer=layer, paired=paired, gather=gather, scatter=scatter,
+    _gemm_refused(group_sizes, prologue=prologue, gather=gather, scatter=scatter,
                   compute=compute)
     straight = compute is not None
     compute = jnp.dtype(lhs.dtype if compute is None else compute)
@@ -180,20 +179,18 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
 def _scattered_cotangent(cotangent, scatter, *, epilogue, first) -> tuple:
     """A scattered product's cotangent (`gemm`'s `scatter`) and the table its gradients' launches read it
     through: read where its rows landed (row 1376), or gathered here for an epilogue's derivative, which
-    reads it row by row, or a stack's input gradient (no gathered product reads a stack), no table then."""
+    reads it row by row, or a stack's layer's input gradient, whose launch reads no slots, no table then."""
     if scatter is None or (epilogue is None and first is None):
         return cotangent, scatter
     return jax.tree.map(lambda d: d[scatter], cotangent), None
 
 
-def _gemm_refused(group_sizes, *, prologue, layer, paired, gather, scatter, compute) -> None:
-    """`gemm`'s refusal of a call it does not take: a pair beside a stacked layer, gathered rows but a
-    grouped call's with no prologue or stacked layer, scattered rows but a grouped call's, a prologue beside
-    a named `compute`."""
-    if paired is not None and layer is not None:
-        raise ValueError("a paired product takes no stacked layer")
-    if gather is not None and (group_sizes is None or prologue is not None or layer is not None):
-        raise ValueError("gathered rows are a grouped call's, with no prologue or stacked layer")
+def _gemm_refused(group_sizes, *, prologue, gather, scatter, compute) -> None:
+    """`gemm`'s refusal of a call it does not take: gathered rows but a grouped call's with no prologue (a
+    prologue's side operands are each row's, which a gather would read at its tokens' rows, undefined),
+    scattered rows but a grouped call's, a prologue beside a named `compute`."""
+    if gather is not None and (group_sizes is None or prologue is not None):
+        raise ValueError("gathered rows are a grouped call's, with no prologue")
     if scatter is not None and group_sizes is None:
         raise ValueError("scattered rows are a grouped call's")
     if compute is not None and prologue is not None:
@@ -417,12 +414,12 @@ def nvfp4_product(lhs: jax.Array, matrix: NvFp4, group_sizes: jax.Array | None =
     their sorted rows: each group's rows times its expert's matrix, each times its expert's factor, frozen
     (no gradient reaches the bank), each tile decoding its group's expert's stages in place on the packed
     kernel; with `gather` besides, its rows `lhs[gather]`, read where they lie (`gemm`'s `gather`). With
-    `layer` (a traced index) instead, `matrix` is a stack of banks (`NvFp4.layer`: a scanned load's, row
+    `layer` (a traced index) too, `matrix` is a stack of banks (`NvFp4.layer`: a scanned load's, row
     4861) read at that layer in place, as `gemm` reads a stacked matrix's (`gemm`'s `layer`): the packed
     kernel's groups read the layer's matrices from its first where they lie in the stack, no slice of it
     made, and elsewhere the layer's bank alone is decoded."""
-    if layer is not None and (group_sizes is None or gather is not None):
-        raise ValueError("a stack of banks' layer is a grouped call's, its rows gathered before it")
+    if layer is not None and group_sizes is None:
+        raise ValueError("a stack of banks' layer is a grouped call's")
     bank = matrix if layer is None else matrix.layer(layer)
     rows = lhs.astype(jnp.bfloat16)
     launch = grouped_matmul.MosaicPackedGmm()
@@ -808,7 +805,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
                                      prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
                                      epilogue_axes, dtypes, several=several, summed_as=summed_as or dtypes,
                                      transpose_rhs=transpose_rhs, interpret_on_cpu=interpret_on_cpu,
-                                     precision=precision, dense=dense), scatter)
+                                     precision=precision, dense=dense, first=first), scatter)
         if not callable(launch) and (gather is not None or scatter is not None):
             # No launch reads the rows where they lie or writes them at their slots (mma.sync's bundle
             # gathers none, row 5213): the rows gathered first and the outputs put at their slots after, the
@@ -1119,11 +1116,15 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
     with `config.compute`, the products of the operands rounded to it, its tangent the MoE projection's
     (`xla_products.portable_projection`, whose sum, at least fp32, it reads); with `paired`, both matrices'
     products, the epilogue's two accumulators; with `first`, the groups' matrices of a stacked `rhs` from
-    that one (`_grouped`), sliced out, as XLA's ragged dot reads a matrix a group."""
+    that one (`_grouped`), sliced out, as XLA's ragged dot reads a matrix a group, a pair's second stack's
+    alike."""
     transpose_rhs, precision, compute, dense = (config.transpose_rhs, config.precision, config.compute,
                                                 config.dense)
     if first is not None:
-        rhs = jax.lax.dynamic_slice_in_dim(rhs, first, group_sizes.shape[0], 0)
+        def layer_of(stack: jax.Array) -> jax.Array:
+            return jax.lax.dynamic_slice_in_dim(stack, first, group_sizes.shape[0])
+        rhs = layer_of(rhs)
+        paired = None if paired is None else layer_of(paired)
     matrices = tuple(jnp.swapaxes(each, 1, 2) if transpose_rhs else each
                      for each in (rhs, *(() if paired is None else (paired,))))
     prologue_arrays = _rows(prologue_arrays, prologue_axes, group_sizes, lhs.shape[0])

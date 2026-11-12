@@ -1321,15 +1321,16 @@ def _gmm_shape_refused(lhs, rhs, tiles: Tiles, extents: tuple, interpret, *, dty
 def _gmm_refused(rhs, tiles: Tiles, extents: tuple, *, columns: int, dense: bool, first, paired,
                  partial: tuple[bool, bool] = (False, False)) -> None:
     """Dew: `gmm`'s refusal of a call its launch does not take: a dense product of several matrices, a stack
-    read from its first matrix but a grouped product's of one, a paired matrix not its product's shape, or
-    extents (`rows`, `depth`, `matrices`, the matrix's depth, `width`) its tile's step and `columns`
-    (`tile_columns`) do not divide but where its last step and column tile run `partial` (`partial_runs`),
-    no deeper or wider than the call."""
+    read from its first matrix but a grouped product's (a pair's second stack read alike: each matrix stream
+    reads its tile's `TileGroup.matrix`, the stack's from `first`), a paired matrix not its product's shape,
+    or extents (`rows`, `depth`, `matrices`, the matrix's depth, `width`) its tile's step and `columns`
+    (`tile_columns`) do not divide but where its last step and column tile run `partial` (`partial_runs`), no
+    deeper or wider than the call."""
     rows, k, matrices, k2, n = extents
     if dense and matrices != 1:
         raise ValueError("a dense product takes one matrix")
-    if first is not None and (dense or paired is not None):
-        raise ValueError("a stack read from its first matrix is a grouped product's of one matrix")
+    if first is not None and dense:
+        raise ValueError("a stack read from its first matrix is a grouped product's")
     if paired is not None and paired.shape != rhs.shape:
         raise ValueError(f"a paired matrix {paired.shape} is not its product's {rhs.shape}")
     depth = k % tiles.block_k == 0 or (partial[0] and tiles.block_k <= k)

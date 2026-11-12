@@ -252,21 +252,24 @@ def test_an_nvfp4_banks_grouped_product_is_its_values_product(generation_name, k
     np.testing.assert_array_equal(np.asarray(got, np.float64), truth)
 
 
+@pytest.mark.parametrize("gathered", [False, True], ids=["rows", "gathered-rows"])
 @pytest.mark.parametrize("kernel", ["packed", "xla"])
-def test_a_stack_of_nvfp4_banks_is_read_at_its_layer_as_that_layers_bank(kernel):
+def test_a_stack_of_nvfp4_banks_is_read_at_its_layer_as_that_layers_bank(kernel, gathered):
     """`gemm.nvfp4_product` of a stack of three layers' banks (`[layers, groups, ...]` fields, a scanned
     packed load's, row 4861) at a traced layer (`layer`) through `kernel`: the packed kernel reading the
     layer's experts where they lie in the stack (`mosaic_gpu.gmm`'s `first`, interpreted as an H100's), or
     the layer's bank decoded; bit for bit that layer's bank's own product, its rows' gradient too, at each
-    layer, over a ragged group table."""
+    layer, over a ragged group table; `gathered`, its rows a routing's gather of the tokens read where they
+    lie (a scanned MoE layer's, row 5391), as that bank's product of the same gather."""
     banks = [nvfp4_bank(20 + 4 * layer, 4, 256, 128)[0] for layer in range(3)]
     stack = jax.tree.map(lambda *fields: jnp.stack(fields), *banks)
     sizes = jnp.asarray([40, 0, 56, 24], jnp.int32)
     rows = jnp.asarray(np.random.default_rng(21).integers(-3, 4, size=(128, 256)), jnp.float32)
     cotangent = jnp.asarray(np.random.default_rng(22).integers(-3, 4, size=(128, 128)), jnp.float32)
+    table = jnp.asarray(np.random.default_rng(23).integers(0, 100, 128), jnp.int32) if gathered else None
 
     def product(rows, matrix, layer=None):
-        return gemm.nvfp4_product(rows, matrix, sizes, layer=layer, out_dtype=jnp.float32,
+        return gemm.nvfp4_product(rows, matrix, sizes, table, layer=layer, out_dtype=jnp.float32,
                                   interpret_on_cpu=True)
 
     with generation.assumed("sm90"), generation.chosen(nvfp4=kernel), generation.routes() as routes:

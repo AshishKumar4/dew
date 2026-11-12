@@ -1032,54 +1032,62 @@ def test_a_ragged_products_portable_route_places_its_output_on_an_explicit_mesh(
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
+@pytest.mark.parametrize("layered", [False, True], ids=["matrices", "stack-layer"])
 @pytest.mark.parametrize("scattered", [False, True])
-def test_a_gathered_projection_is_its_gathered_rows_projection_in_every_order(scattered):
+def test_a_gathered_projection_is_its_gathered_rows_projection_in_every_order(scattered, layered):
     """`gemm.gemm`'s `gather` (row 1376) on a CPU (XLA's program): the projection of `tokens[gather]`, its
     value, its tangent and its reverse pass (each token's cotangent the sum of the slots reading it, a token
     no slot reads zero) bitwise the projection of the rows gathered first, plain and paired; `scattered`,
     each row written at its entry of a permutation (`scatter`), bitwise those rows put there after, its
-    cotangents read back through it; a gathered dense or stacked call, and a scattered dense one, refused."""
+    cotangents read back through it; `layered`, the matrices a stack's layer (a scanned MoE layer's gate and
+    up over its gathered tokens, row 5391), bitwise that layer's matrices'; a gathered dense call, and a
+    scattered dense one, refused."""
     rng = np.random.default_rng(3)
     tokens = jnp.asarray(rng.normal(size=(40, 64)), jnp.float32)
-    matrices = jnp.asarray(rng.normal(size=(2, 3, 64, 32)) / 8, jnp.float32)
-    a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, scattered=scattered)
+    matrices = jnp.asarray(rng.normal(size=(2, *((3,) if layered else ()), 3, 64, 32)) / 8, jnp.float32)
+    layer = jnp.asarray(1, jnp.int32) if layered else None
+    a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, scattered=scattered,
+                                                          layer=layer)
     table = jnp.asarray(rng.integers(0, 30, 72), jnp.int32)
-    sizes = jnp.asarray([20, 0, 44], jnp.int32)
-    for refused in ({"group_sizes": None}, {"layer": jnp.asarray(0, jnp.int32)}):
-        with pytest.raises(ValueError):
-            arguments = {"group_sizes": sizes, **refused}
-            stack = matrices if "layer" in refused else matrices[0]
-            gemm.gemm(tokens, stack, arguments.pop("group_sizes"), out_dtype=jnp.float32, gather=table,
-                      **arguments)
     with pytest.raises(ValueError):
-        gemm.gemm(tokens, matrices[0, 0], None, out_dtype=jnp.float32,
+        gemm.gemm(tokens, matrices.reshape(-1, 64, 32)[0], None, out_dtype=jnp.float32, gather=table)
+    with pytest.raises(ValueError):
+        gemm.gemm(tokens, matrices.reshape(-1, 64, 32)[0], None, out_dtype=jnp.float32,
                   scatter=jnp.arange(40, dtype=jnp.int32))
 
 
+@pytest.mark.parametrize(("name", "layered"), [("sm90", False), ("sm90", True), ("sm100", True)],
+                         ids=["h100", "h100-stack-layer", "b200-stack-layer"])
 @pytest.mark.parametrize("scattered", [False, True])
-def test_a_gathered_projections_reverse_pass_reads_its_rows_where_they_lie(scattered):
-    """`a_gathered_projection_is_its_gathered_rows_projection` through the template on an H100, interpreted
-    (row 1376's reverse pass): the kernel gradient reads the tokens through the gather table and a
-    scattered product's cotangent through its slots (`gemm_t`'s `gather`), and the input gradient reads
-    that cotangent through the slots (`gemm`'s `gather`), none of them gathered first. bf16 throughout, so
-    each gradient is the template's own product (an fp32 cotangent's would be XLA's); integer values, so
-    every sum is exact whatever tile each launch derives, and each side's one rounding the same."""
+def test_a_gathered_projections_reverse_pass_reads_its_rows_where_they_lie(scattered, name, layered):
+    """`a_gathered_projection_is_its_gathered_rows_projection` through the template, interpreted (row 1376's
+    reverse pass): on an H100 the kernel gradient reads the tokens through the gather table and a scattered
+    product's cotangent through its slots (`gemm_t`'s `gather`), and the input gradient reads that cotangent
+    through the slots (`gemm`'s `gather`), none of them gathered first; `layered`, the matrices a stack's
+    layer read in place (row 5391), the pair one launch on an H100 and its two products apart on a B200
+    (tcgen05's bundles take no pair, `Family.takes_pairs`: `gemm._apart`, each product at the layer). bf16
+    throughout, so each gradient is the template's own product (an fp32 cotangent's would be XLA's);
+    integer values, so every sum is exact whatever tile each launch derives, and each side's one rounding
+    the same."""
     rng = np.random.default_rng(5)
     tokens = jnp.asarray(rng.integers(-3, 4, size=(40, 128)), jnp.bfloat16)
-    matrices = jnp.asarray(rng.integers(-3, 4, size=(2, 3, 128, 128)), jnp.bfloat16)
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"):
+    stacked = (3,) if layered else ()
+    matrices = jnp.asarray(rng.integers(-3, 4, size=(2, *stacked, 3, 128, 128)), jnp.bfloat16)
+    layer = jnp.asarray(2, jnp.int32) if layered else None
+    with generation.assumed(name), generation.chosen(grouped_matmul="mosaic"):
         a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, scattered=scattered,
-                                                              interpret_on_cpu=True)
+                                                              interpret_on_cpu=True, layer=layer)
 
 
 def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng, *, scattered: bool,
-                                                          interpret_on_cpu: bool = False):
+                                                          interpret_on_cpu: bool = False, layer=None):
     """The projection of `tokens[gather]` (72 slots of 40 tokens, three groups, one empty, rows past them),
     its value, its tangent and its reverse pass (each token's cotangent the sum of the slots reading it, a
     token no slot reads zero), bitwise the projection of the rows gathered first, paired; `scattered`, each
     row written at its entry of a permutation, bitwise those rows put there after, its cotangents read
-    back through it. Its outputs, tangents and cotangents are in the tokens' dtype, the cotangents
-    integers."""
+    back through it; with `layer`, `matrices` two stacks read at that layer (`gemm`'s `layer`), bitwise the
+    layer's matrices' projection, each stack's gradient that layer's, every other zero. Its outputs,
+    tangents and cotangents are in the tokens' dtype, the cotangents integers."""
     table = jnp.asarray(rng.integers(0, 30, 72), jnp.int32)
     slots = jnp.asarray(rng.permutation(72), jnp.int32) if scattered else None
     sizes = jnp.asarray([20, 0, 44], jnp.int32)
@@ -1087,9 +1095,11 @@ def a_gathered_projection_is_its_gathered_rows_projection(tokens, matrices, rng,
                "interpret_on_cpu": interpret_on_cpu}
 
     def fused(tokens, first, second):
-        return gemm.gemm(tokens, first, sizes, paired=second, gather=table, scatter=slots, **options)
+        return gemm.gemm(tokens, first, sizes, paired=second, gather=table, scatter=slots, layer=layer,
+                         **options)
 
     def apart(tokens, first, second):
+        first, second = (first, second) if layer is None else (first[layer], second[layer])
         outs = gemm.gemm(tokens[table], first, sizes, paired=second, **options)
         return outs if slots is None else tuple(jnp.zeros_like(out).at[slots].set(out) for out in outs)
 
