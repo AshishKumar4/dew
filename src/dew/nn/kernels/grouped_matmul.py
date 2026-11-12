@@ -49,7 +49,7 @@ from . import generation, selection, tuning
 from .generation import INHERENT
 from .templates import across, base, bundles, mosaic, report, resources, swizzling
 from .templates.axes import held as held_axes
-from .templates.gemm import mosaic_gpu
+from .templates.gemm import mosaic_gpu, packed
 from .templates.product import SCALE_DEPTH, Product, eight
 
 
@@ -1506,10 +1506,26 @@ class MosaicPackedGmm(MosaicGmm):
     its `kernel`, the bank as Dew stores it (`formats.NvFp4`: its words and block scales, K-major, its shape
     and dtype the bfloat16 matrix it decodes to, `[groups, depth, width]`), streamed as its words and block
     scales and each stage decoded in place into the consumer's buffers (`mosaic_gpu.gmm`'s `scales`), so its
-    tile takes `mosaic_gpu.NVFP4_STEP`-deep steps, whole 64-column tiles, the decode's shared memory and
-    registers, and no cluster, split, swap or hook."""
+    tile takes `packed.NVFP4_STEP`-deep steps, whole 64-column tiles, the decode's shared memory and
+    registers, and no cluster, split or hook. A decode-sized dense call runs swapped (`_swapped`, row 5387):
+    the matrix the products' rows, each stage of it decoded in registers into their left operand, the call's
+    rows the columns."""
 
-    STEPS: ClassVar[tuple[int, ...] | None] = (mosaic_gpu.NVFP4_STEP,)
+    STEPS: ClassVar[tuple[int, ...] | None] = (packed.NVFP4_STEP,)
+
+    def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
+             prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
+             first: jax.Array | None = None, gather: jax.Array | None = None,
+             scatter: jax.Array | None = None, *, out_dtype: str, trans_rhs: bool, interpret: bool,
+             hooks: Hooks = NO_HOOKS, exact_sums: bool = False, dense: bool = False,
+             config: mosaic_gpu.Tiles, return_residuals: bool = False, packed_rows: bool = False):
+        # `packed_rows` states the swapped call's orientation (`_swapped`), which its derivation reads: the
+        # call itself runs as `config` says (`_launched_call`).
+        del packed_rows
+        return super()._fwd(tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
+                            gather, scatter, out_dtype=out_dtype, trans_rhs=trans_rhs, interpret=interpret,
+                            hooks=hooks, exact_sums=exact_sums, dense=dense, config=config,
+                            return_residuals=return_residuals)
 
     def _streamed_matrix(self, kernel: "_PackedMatrix", trans_rhs: bool) -> tuple:
         # Its words, K-major whatever orientation its decoded shape states, and its block scales, which each
@@ -1517,27 +1533,83 @@ class MosaicPackedGmm(MosaicGmm):
         del trans_rhs
         return kernel.words, True, {'scales': kernel.scales}
 
+    def _matrix_transposed(self, ba) -> bool:
+        # Its words K-major, or a swapped call's rows read transposed (`_swapped`): its matrix streams
+        # transposed either way, whatever the binding holds (an abstract matrix where a derivation binds it).
+        del ba
+        return True
+
     def _allocations(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
+        dtype = ba.arguments['tokens'].dtype
+        rows = ba.arguments['packed_rows']
         return mosaic_gpu.gmm_allocations(
-            config, family, dtype=ba.arguments['tokens'].dtype, rhs_dtype=jnp.uint32, transpose_rhs=True,
+            config, family, dtype=dtype, rhs_dtype=dtype if rows else jnp.uint32, transpose_rhs=True,
             prologue_axes=(), prologue_dtypes=(), epilogue_axes=(), epilogue_dtypes=(),
-            dtypes=(ba.arguments['out_dtype'],), packed=True)
+            dtypes=(ba.arguments['out_dtype'],), packed=True, packed_rows=rows)
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
-        return (config.cluster == 1 and config.splits == 1 and not config.swapped and config.block_n % 64 == 0
+        # A swapped call's consumers each decode 64 rows of the matrix, its fragment's; the matrix's columns
+        # take whole 64-column fragments otherwise (`packed.rows_taken`, `packed.taken`).
+        whole = (config.block_m // config.warpgroups == 64 if ba.arguments['packed_rows']
+                 else config.block_n % 64 == 0)
+        return (config.cluster == 1 and config.splits == 1 and not config.swapped and whole
                 and super().candidate(ba, config, target))
 
     def _swapped(self, ba, target):
-        # Its matrix is packed: no swapped orientation reads it.
-        del ba, target
+        """The dense product `ba` swapped (`MosaicGmm._swapped`'s orientation): its matrix the products'
+        rows, each stage of it decoded in registers into their left operand (`mosaic_gpu.gmm`'s
+        `packed_rows`, row 5387), so no decoded stage passes through shared memory, and its rows a matrix of
+        them, read transposed. None where it runs as it is: a grouped call, one with hooks or a pair, one
+        whose rows fill a role (`Family.role_rows`), or one on a family whose products take no left
+        operand from registers in the decode's layout (`packed.rows_taken`: the warpgroup MMA's fragment)."""
+        families = self._families(ba, target)
+        tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
+        if (not families or not all(family.layout == plgpu.Layout.WGMMA for family in families)
+                or not ba.arguments.get('dense') or ba.arguments['hooks'] != NO_HOOKS
+                or ba.arguments.get('paired') is not None
+                or tokens.shape[0] >= min(family.role_rows for family in families)):
+            return None
+        depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
+        unit = max(family.column_unit(tokens.dtype) for family in families)
+        abstract = functools.partial(jax.ShapeDtypeStruct, dtype=tokens.dtype)
+        options = {name: value for name, value in ba.arguments.items()
+                   if name not in ('tokens', 'kernel', 'sizes', 'trans_rhs', 'packed_rows')}
+        return self.bind(abstract((width, depth)), abstract((1, -(-tokens.shape[0] // unit) * unit, depth)),
+                         ba.arguments['sizes'], **options, trans_rhs=True, packed_rows=True)
+
+    def _launched_call(self, tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
+                       gather, scatter, *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks,
+                       exact_sums: bool, dense: bool, config: mosaic_gpu.Tiles, formats: dict):
+        if not config.swapped:
+            return super()._launched_call(tokens, kernel, sizes, prologue_operands, epilogue_operands,
+                                          paired, first, gather, scatter, out_dtype=out_dtype,
+                                          trans_rhs=trans_rhs, interpret=interpret, hooks=hooks,
+                                          exact_sums=exact_sums, dense=dense, config=config, formats=formats)
+        # The product transposed (`_swapped`): the matrix's words and scales the rows, decoded in registers,
+        # times the rows padded to whole column tiles and read transposed, the output transposed back.
+        rows = tokens.shape[0]
+        padded = jnp.pad(tokens, ((0, -rows % config.block_n), (0, 0)))
+        tile = dataclasses.replace(config, swapped=False)
+        out = mosaic_gpu.gmm(kernel.words[0], padded[None], sizes, tiles=tile, transpose_rhs=True,
+                             out_dtype=out_dtype, multiprocessors=self._launched(tile, interpret),
+                             interpret=INTERPRETED if interpret else False, dense=True,
+                             exact_sums=exact_sums, scales=kernel.scales[0], packed_rows=True)
+        assert isinstance(out, jax.Array), "one output (`out_dtypes` is not passed)"
+        return out[:, :rows].T, None
 
     def registers(self, ba, config: mosaic_gpu.Tiles) -> int | None:
         # Beside the plain product's live set, a step's decode holds a 128-depth group's words, the code
-        # being decoded and the stage's block scales, each a `[block_n, 16]` register tile over a role's
-        # threads (`mosaic_gpu._stage_decoded`), and a word's decode in flight, its form's live registers
-        # (`bits.BitForm.live`).
+        # being decoded and the stage's block scales, each a `[columns, 16]` register tile over a role's
+        # threads (`packed.lanes`, its columns the tile's, or a consumer's rows where the call runs swapped),
+        # and a word's decode in flight, its form's live registers (`bits.BitForm.live`); swapped, the
+        # decoded stage too, the products' left operand (`packed.rows_decoded`, bfloat16 a half register).
+        if ba.arguments['packed_rows']:
+            share = config.block_m // config.warpgroups
+            decoded = 3 * share * 16 + share * config.block_k // 2
+        else:
+            decoded = 3 * config.block_n * 16
         return _beside(super().registers(ba, config),
-                       3 * config.block_n * 16 // resources.THREADS + bits.NVFP4_BFLOAT16_FORM.live)
+                       decoded // resources.THREADS + bits.NVFP4_BFLOAT16_FORM.live)
 
 
 @dataclasses.dataclass(frozen=True)

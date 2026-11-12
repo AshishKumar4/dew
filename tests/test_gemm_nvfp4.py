@@ -16,7 +16,7 @@ from low_precision_support import nvfp4
 
 from dew.algebra import bits
 from dew.nn import fake_quant
-from dew.nn.kernels import formats, gemm, generation, grouped_matmul
+from dew.nn.kernels import formats, gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
@@ -98,6 +98,30 @@ def test_the_mainloop_decodes_an_nvfp4_stage_in_place(family):
             packed(dataclasses.replace(tiles, block_k=128))
 
 
+@INTERPRETS
+def test_the_mainloop_decodes_an_nvfp4_matrixs_rows_into_its_products_left_operand():
+    """`mosaic_gpu.gmm` of an NVFP4 matrix as its rows (`packed_rows`: a decode-sized product swapped, row
+    5387) decodes each 256-deep stage of the matrix in registers into the warpgroup MMA's left operand and
+    multiplies the call's rows read transposed: the decoded matrix's transpose times the rows', bitwise
+    (small integer rows, every product and sum exact), two consumers' row tiles and two steps, interpreted
+    on warpgroup MMA; mma.sync, whose register operand's fragment is not the decode's, is refused."""
+    matrix, _ = nvfp4(11, 512, 256, scale=0.25)
+    rows = jnp.asarray(np.random.default_rng(12).integers(-3, 4, size=(16, 512)), jnp.bfloat16)
+    expected = np.asarray(matrix.decoded(), np.float64).T @ np.asarray(rows, np.float64).T
+
+    def swapped(family):
+        return mosaic_gpu.gmm(matrix.words, rows[None], jnp.asarray([256], jnp.int32),
+                              tiles=mosaic_gpu.Tiles(128, 16, 256, 2, 1, warpgroups=2, family=family),
+                              transpose_rhs=True, out_dtype=jnp.float32, multiprocessors=4,
+                              interpret=grouped_matmul.INTERPRETED, dense=True, scales=matrix.scales,
+                              packed_rows=True)
+
+    with generation.assumed("sm90"):
+        np.testing.assert_array_equal(np.asarray(swapped("wgmma"), np.float64), expected)
+    with generation.assumed("sm80"), pytest.raises(ValueError):
+        swapped("mma.sync")
+
+
 @pytest.mark.parametrize("family", ["mma.sync", "wgmma"])
 def test_the_mainloops_nvfp4_stage_decode_lowers_for_cuda(family):
     """The packed matrix's kernel (`mosaic_gpu.gmm` with `scales`) lowers for CUDA on the CPU on each
@@ -116,6 +140,25 @@ def test_the_mainloops_nvfp4_stage_decode_lowers_for_cuda(family):
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), name)
     with generation.assumed(name), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(packed).trace(rows, words, scales).lower(lowering_platforms=("cuda",))
+
+
+def test_the_mainloops_nvfp4_rows_decode_lowers_for_hopper():
+    """The swapped packed kernel (`mosaic_gpu.gmm` with `packed_rows`) lowers for CUDA on the CPU on warpgroup
+    MMA: its rows' words and scales streamed at the row tile, each stage decoded in registers in the
+    warpgroup MMA's fragment layout and taken as the products' register operand."""
+    words = jax.ShapeDtypeStruct((256, 512 // 8), jnp.uint32)
+    scales = jax.ShapeDtypeStruct((256, 512 // 16), jnp.float8_e4m3fn)
+    rows = jax.ShapeDtypeStruct((1, 16, 512), jnp.bfloat16)
+    tiles = mosaic_gpu.Tiles(128, 16, 256, 2, 1, warpgroups=2, family="wgmma")
+
+    def swapped(words, rows, scales):
+        return mosaic_gpu.gmm(words, rows, jnp.asarray([256], jnp.int32), tiles=tiles, transpose_rhs=True,
+                              out_dtype=jnp.float32, multiprocessors=4, dense=True, scales=scales,
+                              packed_rows=True)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(swapped).trace(words, rows, scales).lower(lowering_platforms=("cuda",))
 
 
 @INTERPRETS
@@ -140,6 +183,36 @@ def test_an_nvfp4_products_packed_kernel_is_its_decoded_product(generation_name)
         want, pull_xla = jax.vjp(lambda x: product(x, "xla"), rows)
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
         np.testing.assert_array_equal(np.asarray(pull(cotangent)[0]), np.asarray(pull_xla(cotangent)[0]))
+    np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
+
+
+@INTERPRETS
+def test_a_decode_sized_nvfp4_product_swapped_is_its_decoded_product():
+    """`gemm.nvfp4_product` at a decode step's 13 rows on an H100, its packed kernel named, derives a tile
+    the launch holds legal, and at a swapped tile (pinned: the matrix decoded in registers into the
+    warpgroup MMA's left operand, the rows padded to the tile's 64 columns and read transposed, row 5387)
+    gives the decoded product's value bitwise over four stages: small integer rows, every product and sum
+    exact in fp32."""
+    matrix, values = nvfp4(13, 1024, 256, scale=0.25)
+    rows = jnp.asarray(np.random.default_rng(14).integers(-3, 4, size=(13, 1024)), jnp.float32)
+    swapped = mosaic_gpu.Tiles(128, 64, 256, 3, 1, warpgroups=2, family="wgmma.fed", swapped=True)
+    launch = grouped_matmul.MosaicPackedGmm()
+
+    def product(x, kernel):
+        with generation.chosen(nvfp4=kernel):
+            return gemm.nvfp4_product(x, matrix, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    with generation.assumed("sm90"):
+        with tuning.seen() as launches:
+            product(rows, "packed")
+        assert all(launch.legal(ba, config, generation.gpu_target())
+                   for (op, _), (config, ba) in zip(launches, launches.taken, strict=True)
+                   if isinstance(op, grouped_matmul.MosaicPackedGmm)), launches.taken
+        with tuning.pinned({grouped_matmul.MosaicPackedGmm: swapped}):
+            got = product(rows, "packed")
+        want = product(rows, "xla")
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
     np.testing.assert_array_equal(np.asarray(got, np.float64), np.asarray(rows, np.float64) @ values)
 
 

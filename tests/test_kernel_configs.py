@@ -1003,7 +1003,7 @@ def test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel(rows, name
     decoded once a call): its program launches the template's packed product (`kernel_compile.Expected`, its
     route evidence), which ptxas compiles, its E2M1 codes decoded by their form's PTX inline
     (`inline_forms.registers`, row 3733), its E4M3 block scales by integer arithmetic
-    (`mosaic_gpu._e4m3_values`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas
+    (`packed.e4m3_values`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas
     refused the kernel (W8-a100, M-NS-8; row 3621)."""
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures
 
@@ -1024,7 +1024,7 @@ def test_a_hoppers_nvfp4_decode_runs_its_packed_kernel():
 def test_a_hoppers_nvfp4_prefill_shares_its_stage_decode():
     """An NVFP4 projection at a prefill's 4096 rows on a compile-only H100, its packed kernel named: its
     consumers share each stage's decode, each its share of the columns, meeting at a named barrier
-    (`mosaic_gpu._shared_decode`, row 3621's prefill), which ptxas compiles (`kernel_compile.Expected`)."""
+    (`packed.shared_decode`, row 3621's prefill), which ptxas compiles (`kernel_compile.Expected`)."""
     _assert_launches("sm90", "nvfp4 4096 rows", functools.partial(_nvfp4_projected, 4096, "packed"), 1,
                      "dew_gmm")
 
