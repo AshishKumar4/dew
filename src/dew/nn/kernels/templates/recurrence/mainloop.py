@@ -59,7 +59,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation, recurrence_algebra as algebra, tables, tuning
-from dew.nn.kernels.templates import bundles, mosaic, operands, product, resources, swizzling
+from dew.nn.kernels.templates import bundles, mosaic, operands, product, resources, rings, swizzling
 from dew.nn.kernels.templates.cost import Work, estimate
 from dew.nn.kernels.templates.operands import Issuer, Parts
 from dew.nn.kernels.templates.recurrence.table import (
@@ -830,7 +830,12 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
             def given(at: dict) -> mosaic.Walk | None:
                 """The tile's walk as its program gives it at its grid indices `at`, or None where the program
                 runs its own roles (`sequence_walk`'s)."""
-                return program(at, *arrays, streams=streams, staging=tuple(staged), landing=lands)
+                staged_at, lands_at = tuple(staged), lands
+                if os.environ.get("DBG_STAGE_OPAQUE"):
+                    def here(ref):
+                        return ref.at[pl.ds(rings.opaque(0) * ref.shape[0], ref.shape[0])]
+                    staged_at, lands_at = jax.tree.map(here, (staged_at, lands_at))
+                return program(at, *arrays, streams=streams, staging=staged_at, landing=lands_at)
 
             if persistent:
                 _persisted(family, streams["walked"], given, live, arrays, grid, grid_names, call.interpret,
