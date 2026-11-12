@@ -1500,7 +1500,7 @@ def mode_replicated_rollout(args) -> dict:
                       layout=Layout(min_shard=TINY), rollout=rollout)
     state, _, _ = trainer.place()
     partition = DataPartition.of(trainer.device_mesh)
-    packed = rollout(state, rollout_prompts(), jax.random.key(9))
+    packed = rollout(state, rollout_prompts(), jax.random.key(9), objective=objective)
     handed = {name: np.asarray(multihost_utils.process_allgather(np.asarray(packed[name])))
               for name in ("input_ids", "response_mask", "advantages", "old_log_probs")}
     rewarded = multihost_utils.process_allgather(np.asarray(len(scored), np.int64))
@@ -1610,7 +1610,7 @@ def mode_rollout(args) -> dict:
     state, _, _ = trainer.place()
     facts = sharding_facts(state.variables)
     began = time.monotonic()
-    rolled = rollout(state, local, jax.random.key(9))
+    rolled = rollout(state, local, jax.random.key(9), objective=objective)
     sampled_seconds = time.monotonic() - began
     # Bounded rendezvous: a rank stranded in a collective never reaches it.
     arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int64))

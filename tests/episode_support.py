@@ -140,9 +140,11 @@ def cohort_snapshot(state, key=23) -> Snapshot:
     return Snapshot(state.variables, int(state.step), int(state.updates), jax.random.key(key))
 
 
-def trained_batch(collector, state, key=23, tasks=(31,)):
-    """The batch the trainer's scheduler (`episode_scheduler`) packs from one cohort of `tasks`' episodes."""
-    return episode_scheduler(collector)(state, {"task_id": np.asarray(tasks, np.int32)}, jax.random.key(key))
+def trained_batch(collector, state, objective, key=23, tasks=(31,)):
+    """The batch the trainer's scheduler (`episode_scheduler`) packs from one cohort of `tasks`' episodes
+    for a step of `objective`."""
+    return episode_scheduler(collector)(state, {"task_id": np.asarray(tasks, np.int32)}, jax.random.key(key),
+                                        objective=objective)
 
 
 def collect(collector, state, key=23, tasks=(31,)):

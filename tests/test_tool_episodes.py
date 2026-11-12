@@ -48,7 +48,7 @@ def test_multiturn_actions_keep_cached_likelihoods_and_observations_out_of_targe
     trainer, collector = build(harness, record=episodes.append)
     state = trainer.initial_state()
 
-    batch = trained_batch(collector, state)
+    batch = trained_batch(collector, state, trainer.objective)
 
     assert Counter(harness.opened) == Counter(harness.closed)
     assert len(harness.calls) == GROUPS
@@ -102,7 +102,8 @@ def test_grpo_gradient_matches_action_only_categorical_reference():
     episodes = []
     trainer, collector = build(record=episodes.append)
     state = trainer.initial_state()
-    batch = {name: jnp.asarray(value) for name, value in trained_batch(collector, state).items()}
+    trained = trained_batch(collector, state, trainer.objective)
+    batch = {name: jnp.asarray(value) for name, value in trained.items()}
     info = Step(state.microstep, jax.random.key(1), state.ema)
 
     def loss(table):

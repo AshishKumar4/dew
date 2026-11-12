@@ -460,10 +460,11 @@ class PPORollout:
                 RETURNS_KEY: placed_returns.reshape(shape)}
 
     def __call__(
-        self, state: TrainState, batch: Mapping[str, object], key: jax.Array
+        self, state: TrainState, batch: Mapping[str, object], key: jax.Array, *, objective: PPOObjective
     ) -> dict[str, np.ndarray]:
-        """Collect one cohort of episodes and return its packed rows with critic targets."""
-        projected = self.rollout(state, batch, key)
+        """Collect one cohort of episodes for a step of `objective`, the one the step trains (its phase's,
+        `dew.training.phase_passes`), and return its packed rows with its critic's targets."""
+        projected = self.rollout(state, batch, key, objective=objective)
         episodes = len(task_ids(batch)) * self.groups
         count = sum(from_every_process(min(2, int(np.count_nonzero(projected[RESPONSE_MASK_KEY])))))
         if int(count) == 0:
@@ -476,7 +477,7 @@ class PPORollout:
         device = agreed(
             "PPO critic inputs", lambda: projected if mesh is None else shard_batch(mesh, projected)
         )
-        critic = self.objective.program("values", self.objective.values)
+        critic = objective.program("values", objective.values)
         # The critic at the run's committed updates, the progress its loss trains it at (ledger 3008).
         values = agreed("PPO critic values",
                         lambda: local_rows(critic(state.variables, device, Progress(state.updates))))

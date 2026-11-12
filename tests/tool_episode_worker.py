@@ -50,7 +50,7 @@ def main() -> None:
 
     def rollout(state, batch, key):
         """The scheduler's call, keeping the batch it hands the step."""
-        trained.append(scheduler(state, batch, key))
+        trained.append(scheduler(state, batch, key, objective=trainer.objective))
         return trained[-1]
 
     trainer.rollout = rollout

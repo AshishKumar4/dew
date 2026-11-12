@@ -212,9 +212,10 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
                 INFO_KEY: np.stack([pad(""), pad("")])}
 
     keys = [jax.random.key(index) for index in range(3)]
-    rollout(state, batch(0), keys[0])
+    rollout(state, batch(0), keys[0], objective=objective)
     with steady_state(allow=("host_to_device",)):
-        rolled = [rollout(state, batch(offset), key) for offset, key in zip((1, 2), keys[1:], strict=True)]
+        rolled = [rollout(state, batch(offset), key, objective=objective)
+                  for offset, key in zip((1, 2), keys[1:], strict=True)]
     assert all(rows[IDS_KEY].shape == (4, PROMPT_WIDTH + RESPONSE_WIDTH) for rows in rolled)
 
 
@@ -239,12 +240,12 @@ def test_a_filled_prompt_batchs_repeats_are_neither_admitted_nor_trained_on():
              SOURCE_KEY: np.stack([_utf8("rule", info)] * 4), TRUTH_KEY: np.stack([_utf8("1", info)] * 4),
              INFO_KEY: np.stack([_utf8("", info)] * 4)}
     real = np.asarray([True, True, False, False])
-    rolled = rollout(state, {**batch, VALID_ROWS: real}, jax.random.key(1))
-    whole = rollout(state, batch, jax.random.key(1))
+    rolled = rollout(state, {**batch, VALID_ROWS: real}, jax.random.key(1), objective=objective)
+    whole = rollout(state, batch, jax.random.key(1), objective=objective)
     assert [record.groups for record in records] == [2, 4]
     responses = [int(np.asarray(rows[RESPONSE_MASK_KEY]).any(axis=1).sum()) for rows in (rolled, whole)]
     assert responses == [2 * 2, 4 * 2]
-    none = rollout(state, {**batch, VALID_ROWS: np.zeros(4, bool)}, jax.random.key(2))
+    none = rollout(state, {**batch, VALID_ROWS: np.zeros(4, bool)}, jax.random.key(2), objective=objective)
     assert records[-1].groups == 0 and not np.asarray(none[RESPONSE_MASK_KEY]).any()
 
 
@@ -296,13 +297,13 @@ def test_a_synchronous_collection_rescores_a_ratio_read_at_another_temperature()
         return RolloutScheduler.sampled(objective, lambda text, record: float(len(text)), groups=2,
                                         max_new_tokens=4, sampling=Sampling(temperature=1.3, top_k=5))
 
-    assert collected(GRPOObjective(TinyHead(vocab_size=vocab), 8 + 4 - 1)).acquisition.rescore is None
+    assert not collected(GRPOObjective(TinyHead(vocab_size=vocab), 8 + 4 - 1)).acquisition.rescores
     tempered = GRPOObjective(TinyHead(vocab_size=vocab), 8 + 4 - 1, sampling_temperature=0.7)
     scheduler = collected(tempered)
     seen = []
 
     def rollout(state, batch, key):
-        packed = scheduler(state, batch, key)
+        packed = scheduler(state, batch, key, objective=tempered)
         seen.append((np.asarray(packed[OLD_LOG_PROBS_KEY]),
                      scored_rows(tempered, state.variables, packed, Progress(state.updates))))
         return packed
@@ -353,10 +354,10 @@ def asynchronously(objective: GRPOObjective, seen, steps: int = 6, *, rewarded: 
     scheduler = RolloutScheduler(Asynchronous(ScriptedSource(drawn), Published(), objective, width=8,
                                               rows=len(tasks), max_lag=1, ahead=0), groups=2,
                                  estimator=estimator,
-                                 reference=objective if objective.reward_kl > 0 else None)
+                                 penalized=objective.reward_kl > 0)
 
     def rollout(state, batch, key):
-        packed = scheduler(state, batch, key)
+        packed = scheduler(state, batch, key, objective=objective)
         seen(state, packed)
         return packed
 
