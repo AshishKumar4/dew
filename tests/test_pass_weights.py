@@ -241,6 +241,37 @@ def test_a_phased_run_steps_each_phase_at_its_own_pass_count():
                                          jax.device_get(stepped.variables), jax.device_get(own.variables)))
 
 
+def test_a_phased_run_under_narrow_copies_steps_each_phase_on_its_own_copies():
+    """A run whose loop runs 1 pass in its first phase and 3 in its second (`phase_passes`), computing in
+    bf16 over fp32 weights with narrow copies on (`dew.training.narrow`): each phase's program plans its
+    own copies (the loop's block read once a step while it runs one pass, three times across three), and
+    the step of each reads the state with its own (row 5560: the second phase's step was handed the
+    first's and refused the tree). It trains through the boundary and lands where the same run with copies
+    off lands, the same cast bit for bit."""
+    from dew.data.dataset import Loader
+    from dew.nn.kernels.generation import chosen
+    from dew.training import Layout, Trainer
+
+    tokens = jnp.asarray(np.random.default_rng(4).integers(0, 256, (jax.device_count() * 2, 17)), jnp.int32)
+
+    def phased():
+        for step in itertools.count():
+            yield {"text": tokens, PHASE: Phase(0 if step < 2 else 1)}
+
+    def fit(copies: bool):
+        with chosen(narrow_copies="on" if copies else "off"):
+            trainer = Trainer(LMObjective(looped().clone(dtype=jnp.bfloat16), 16), optax.sgd(0.1),
+                              key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
+                              phase_passes=(1, STEPS))
+            state = trainer.fit(Loader(train=lambda partition: phased(), val=None, records=None,
+                                       batch=len(tokens)), steps=4, log_every=100)
+        return jax.device_get(state.variables)
+
+    copied, plain = fit(copies=True), fit(copies=False)
+    for left, right in zip(jax.tree.leaves(copied), jax.tree.leaves(plain), strict=True):
+        np.testing.assert_array_equal(left, right)
+
+
 def cut_loop_loss(model, weights, tokens):
     """The stated program of pass weights under a cut: the cut loop's every exit, one forward, each through
     the head as its last pass's output is, their cross entropies weighed before the mean; the loss and its
