@@ -20,8 +20,8 @@ tests in node-id order, each as light as that many runs let it be, a heavier
 test alone. Each group also pays the file's setup (its module's fixtures,
 imports and compiles), which is what armada measured the file at beyond its
 tests' times in tests/test_durations.json, at the cut its rows were last timed
-at and shared among that cut's groups (`measured_cut`), so the file takes the
-fewest groups whose heaviest, setup included, holds to `target` (`split`). A file weighs armada's
+at and shared among that cut's groups (`cuts.measured_cut`), so the file takes the
+fewest groups whose heaviest, setup included, holds to `target` (`cuts.split`). A file weighs armada's
 median of its last green runs, or its tests' sum in tests/test_durations.json where that is more
 (those runs may predate the file's current tests), else that sum scaled to armada, else the mean.
 Each entry names its rows, one a file (or a file's group), so armada grades a task that leaves
@@ -174,6 +174,7 @@ grading = _loaded(HERE / "grading.py")
 host = _loaded(HERE / "host.py")
 stalls = _loaded(HERE / "stalls.py")
 costs = _loaded(HERE / "costs.py")
+cuts = _loaded(HERE / "cuts.py")
 command_line = _loaded(HERE / "arguments.py")
 rows = _loaded(HERE / "rows.py")
 row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
@@ -756,65 +757,6 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
             else recorded[name] * slower if name in recorded else None for name in files}
 
 
-def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> list[float]:
-    """The weights of the groups a file that took `seconds` as `cut` groups runs as. Of those
-    seconds, what its recorded `tests`' times leave is what each group paid besides its tests (its
-    module's fixtures, imports and compiles, which a test's least recorded time does not hold), so
-    each group weighs its tests plus that setup. The file is cut (`session.groups`) into the fewest runs
-    whose tests fit what the setup leaves of `target`, at least half of it, so a file whose setup
-    is most of a group is not cut into slivers that each pay it again; a heavier test runs alone.
-    Counting the setup once a group, rather than scaling every test by the file's total, keeps a
-    file from being cut finer each run for the setup its last cut added. A file keeps the cut it
-    ran as while that cut's heaviest group, setup included, stays within `KEPT` of `target`:
-    a group's compiled programs are cached under its cut (tests/remote_cache.py), so a new cut
-    compiles every group from nothing, and the setup that measures moves the next cut again
-    (armada dew-20261020144644-dceff433: a new cut fetched no programs, and 14 of its 20 split
-    files would have been cut again). A file with no recorded time runs as equal counts of its
-    tests."""
-    if sum(tests) <= 0:
-        count = math.ceil(seconds / target)
-        return [seconds / count] * count
-    setup = max(seconds - sum(tests), 0.0) / cut
-    heaviest = max(sum(tests[run.start:run.stop]) for run in session.groups(tests, cut)) if cut > 1 else None
-    if heaviest is not None and heaviest + setup <= KEPT * target:
-        count = cut
-    else:
-        room = max(target - setup, target / 2)
-        count = len(session.starts(session.milliseconds(tests), round(room * 1000)))
-    return [sum(tests[run.start:run.stop]) + setup for run in session.groups(tests, count) if run]
-
-
-KEPT = 1.5
-"""How far past the target a split file's heaviest group may run before the file is cut again."""
-
-
-def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | None:
-    """What `name` took under `python` at the cut its rows in `timings` name, and that cut's count:
-    its groups' rows summed where every group of a count has its row (the most groups if several
-    counts do), else its whole row, else None. A row's median is measured at the cut its name
-    holds, unlike the file's median, which mixes the cuts of the runs it remembers."""
-    whole, counts = None, {}
-    for row_name, seconds in timings.get("rows", {}).items():
-        # A map task's seconds are kept under its task's name, no row's; a site's judge is no group of the cut
-        # (`sites`).
-        if ":" not in row_name:
-            continue
-        python_, name_, split_ = parsed_row(row_name)
-        # Nor is a GPU lane's process variant (`varied`): no armada plan cuts by one.
-        if ((python_, name_) != (python, name) or split_ == COLLECT or session.SITE.fullmatch(split_)
-                or VARIED in split_):
-            continue
-        if not split_:
-            whole = seconds
-            continue
-        index, count = (int(part) for part in split_.split("/"))
-        counts.setdefault(count, {})[index] = seconds
-    complete = [count for count, held in counts.items() if len(held) == count]
-    if complete:
-        return sum(counts[max(complete)].values()), max(complete)
-    return None if whole is None else (whole, 1)
-
-
 APART = re.compile(r"\bpytest\.mark\.torchax\b")
 """A file marked `torchax` imports torchax, which renames torch's privateuse1 backend to "jax" for
 the whole process, so a torch.compile in a later file of its task fails (test_reference_helpers'
@@ -1184,8 +1126,8 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
         groups: dict[str, list[tuple[str, float]]] = {}
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
-                at = costs.measured_as(recorded.get(name, []), seconds, measured_cut(timings, python, name))
-                cut = split(at[0], at[1], target, at[2])
+                cut = cuts.weighed(recorded.get(name, []), seconds, target,
+                                   cuts.measured_cut(timings, python, name))
                 groups[name] = [(f"{group}/{len(cut)}" if len(cut) > 1 else "", weight)
                                 for group, weight in enumerate(cut, start=1)]
         # Each check-1 site its file's marks shard is a row of its own, its judge's.
@@ -2282,9 +2224,8 @@ def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut
     """Whether a file's record `own` no longer cuts it as it runs: its tests differ from those its rows
     `observed` (one added, removed or renamed); a file within `target` (it took `seconds`), or one with no
     tests to cut, is recorded past it, so the plan would split what runs whole; or, for a file past it (as
-    `cut` groups), the groups the
-    plan cuts from the record (`split`) run a group past `KEPT` of the target as its tests ran, setup
-    included, and those it would cut from what they took run their heaviest shorter. A cut that fits is
+    `cut` groups), the groups the plan cuts from the record (`cuts.split`) run a group past `cuts.KEPT` of
+    the target as its tests ran, setup included, and those it would cut from what they took run their heaviest shorter. A cut that fits is
     kept whatever its tests' times drift, as the plan keeps it, and so is one whose heaviest group no cut
     shortens (a test heavier than the budget, which runs alone either way): a fold rewrites a file only
     where its plan changes for the better."""
@@ -2298,10 +2239,10 @@ def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut
     setup = max(seconds - sum(ran), 0.0) / cut
 
     def heaviest(weights: list[float]) -> float:
-        count = len(split(weights, seconds, target, cut))
+        count = len(cuts.split(weights, seconds, target, cut))
         return max(sum(ran[run.start:run.stop]) + setup for run in session.groups(weights, count) if run)
 
-    return heaviest(recorded) > KEPT * target and heaviest(ran) < heaviest(recorded)
+    return heaviest(recorded) > cuts.KEPT * target and heaviest(ran) < heaviest(recorded)
 
 
 ARTIFACTS = "/armada/task/artifacts"
