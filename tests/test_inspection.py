@@ -404,6 +404,60 @@ def test_a_run_watching_a_trained_component_alone_logs_its_activations_and_cotan
         assert {"mean", "std", "non_finite"} <= found, (log, sorted(logged))
 
 
+def test_a_model_applied_in_parts_names_each_module_by_its_path_in_the_variables():
+    """A model applied in parts (a PPO run's policy and critic) whose first part holds a module named as
+    the other part (an actor's `critic`) logs each module by its path in the model's variables, fixed
+    whatever a run watches, the two never alike: the critic's `value` as `critic/value` and the actor's
+    `critic/value` as `policy/critic/value`, by class, by a glob of their path within their part or by
+    one of their path in the variables; and each part's call reads its own probes (`dew.batch.part`),
+    where nesting the critic beside the actor's root paths shared them (rows 5697, audit3 O2)."""
+    from dew.batch import PROBES, part
+    from dew.nn.inspection import (
+        INSPECTED,
+        PROBE,
+        component,
+        discovering,
+        flattened,
+        in_parts,
+        probes_of,
+        watching,
+    )
+
+    class Value(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            return nn.Dense(2, name="value")(x)
+
+    class Actor(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            return Value(name="critic")(x)
+
+    x = jnp.ones((1, 3))
+    actor, critic = Actor(), Value()
+    variables = {"policy": actor.init(jax.random.key(0), x), "critic": critic.init(jax.random.key(1), x)}
+
+    def sown(globs):
+        with watching(globs, cotangents=True), discovering():
+            with component("policy"):
+                _, own = actor.apply(variables["policy"], x, mutable=[INSPECTED])
+            with component("critic"):
+                _, apart = critic.apply(variables["critic"], x, mutable=[INSPECTED])
+        return in_parts({"policy": own.get(INSPECTED, {}), "critic": apart.get(INSPECTED, {})})
+
+    def logged(globs):
+        return sorted({name.rsplit("/", 1)[0] for name in flattened(sown(globs), globs)})
+
+    both = ["activations/critic/value", "activations/policy/critic/value"]
+    assert logged(("Dense",)) == logged(("*value",)) == logged(("critic/value",)) == both
+    assert logged(("policy/*",)) == ["activations/policy/critic/value"]
+    assert logged(("critic/v*",)) == both
+    probes = {"params": {"policy": {}, "critic": {}}, PROBES: probes_of(sown(("Dense",)))}
+    own, apart = (part(probes, name)[PROBES] for name in ("policy", "critic"))
+    assert jax.tree.structure(own) == jax.tree.structure({"critic": {"value": {PROBE: 0}}})
+    assert jax.tree.structure(apart) == jax.tree.structure({"value": {PROBE: 0}})
+
+
 def test_a_watched_prediction_depth_summarizes_its_rows_real_positions_alone():
     """An LM run watching its second prediction depth (`mtp_1/*`) summarizes that depth's output over the
     positions whose every reached token is real and in its document (`CausalTransformer.mtp_hidden_states`,
