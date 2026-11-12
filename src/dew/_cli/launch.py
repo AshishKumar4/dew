@@ -277,8 +277,9 @@ class Launch:
         """Where every process reaches process 0: this machine's name when it
         is one of several hosts and named as itself. A name that is loopback
         in itself is refused, since every other host would reach itself at
-        it."""
-        host = self.coordinator or hosts[0]
+        it. A host given as an ssh destination with a login (`user@host`) is
+        reached over ssh at that, and joined at its network name alone."""
+        host = self.coordinator or hosts[0].rpartition("@")[2]
         if host in LOCAL_HOSTS and any(name not in LOCAL_HOSTS for name in hosts):
             host = socket.getfqdn()
             if names_loopback(host):
