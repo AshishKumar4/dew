@@ -15,11 +15,9 @@ JSON. The `JSON` alias both directions speak is declared here, once.
 
 from __future__ import annotations
 
-import ast
 import dataclasses
 import datetime
 import functools
-import json
 import math
 import re
 import typing
@@ -249,8 +247,7 @@ def set_added(value: DataclassInstance | Sequence[DataclassInstance] | Mapping[s
 REMOVED_FIELDS: Mapping[str, frozenset[str]] = {"dew.decision.layout:OptionLines": frozenset({"stream"})}
 """The fields a configuration lost after runs were saved with them, by its class's import path: each always
 another's (a question's option lines' stream, its instructions', rows 2008 to 2450), so a saved record of one
-means what today's, which has none, does. A saved run's records read without them (`earlier_fields`), and a
-saved data step's identity compares without them (`without_removed`). Carried to 1.0 (ledger 1552)."""
+means what today's, which has none, does. A saved run's records read without them (`earlier_fields`)."""
 
 
 def earlier_fields(value: JSON) -> JSON:
@@ -272,10 +269,6 @@ def earlier_fields(value: JSON) -> JSON:
     return held
 
 
-_REMOVED_BY_NAME = {path.rsplit(":", 1)[-1]: names for path, names in REMOVED_FIELDS.items()}
-"""`REMOVED_FIELDS` by class name, as a configuration's repr names it."""
-
-
 @overload
 def without_fields(value: dict[str, JSON], names: Collection[str]) -> dict[str, JSON]: ...
 @overload
@@ -288,53 +281,6 @@ def without_fields(value: JSON, names: Collection[str]) -> JSON:
     if isinstance(value, dict):
         return {key: without_fields(part, names) for key, part in value.items() if key not in names}
     return value
-
-
-def without_removed(value: JSON) -> JSON:
-    """`value`, a data step's identity or a manifest of them (`dew.data.plan.StepIdentity.semantic`), each
-    identity of a Dew step that declares none of its own with the fields configurations lost since runs were
-    saved (`REMOVED_FIELDS`) left out of its configuration's repr (`OptionLines(..., stream='context')`),
-    within its JSON record or alone (`_unremoved`). Another step's identity, a declared one and any other
-    text are as they were, so a saved identity and today's compare by what their steps compute
-    (`dew.data.plan.Plan.check`), and a changed step of a user's still differs."""
-    if isinstance(value, list):
-        return [without_removed(part) for part in value]
-    if not isinstance(value, dict):
-        return value
-    held = {key: without_removed(part) for key, part in value.items()}
-    name, config = held.get("name"), held.get("config")
-    if isinstance(name, str) and name.startswith("dew.") and held.get("declared") is None and isinstance(
-            config, str):
-        held["config"] = _unremoved(config)
-    return held
-
-
-def _unremoved(config: JSON) -> JSON:
-    """A Dew step's configuration (`without_removed`) without the fields its configurations lost: in a
-    configuration's repr (a call named as the class `REMOVED_FIELDS` names) and in each string of a JSON
-    record of one (a configured step's binding), wherever it nests."""
-    if isinstance(config, list):
-        return [_unremoved(part) for part in config]
-    if isinstance(config, dict):
-        return {key: _unremoved(part) for key, part in config.items()}
-    if not isinstance(config, str) or not any(f"{name}(" in config for name in _REMOVED_BY_NAME):
-        return config
-    try:
-        parsed = json.loads(config)
-    except ValueError:
-        parsed = None
-    if isinstance(parsed, dict | list):
-        return json.dumps(_unremoved(parsed), sort_keys=True)
-    try:
-        tree = ast.parse(config, mode="eval")
-    except SyntaxError:
-        return config
-    for node in ast.walk(tree):
-        named = node.func.id if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) else None
-        if isinstance(node, ast.Call) and named in _REMOVED_BY_NAME:
-            removed = _REMOVED_BY_NAME[named]
-            node.keywords = [keyword for keyword in node.keywords if keyword.arg not in removed]
-    return ast.unparse(tree)
 
 
 def annotations_of(owner: type, **options) -> Mapping[str, object]:

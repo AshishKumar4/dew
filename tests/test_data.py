@@ -312,7 +312,7 @@ def test_automatic_workers_read_each_run_length_as_a_read_in_none_does_within_th
 def test_a_read_cut_per_share_reads_one_order_in_any_count_of_workers():
     """A training read cut per share, its steps run in its loading workers before an expansion that makes
     its rows a stream, reads the batches it reads in no workers in one, two, four and the count automatic
-    loading resolves to (`IN_ORDER`, `_Build.in_order`): each worker reads whole groups of consecutive inputs
+    loading resolves to (`_Build.in_order`): each worker reads whole groups of consecutive inputs
     by index and they are handed on in turn. A position saved in any count resumes in any other on the
     batches the uninterrupted read goes on to (row 4862)."""
     chain = (Pipeline(Memory(_Indexed(40))).shuffle(5).repeat().random_map(_Jittered())
@@ -392,14 +392,12 @@ class _Tokens:
 
 
 @pytest.mark.parametrize("chain", ["chunked", "expanded twice"])
-def test_a_read_in_order_counts_its_rows_and_examples_as_the_earlier_read(chain):
-    """A read cut per share in its inputs' order (`IN_ORDER`), in no workers and in two, counts what a
-    version 10 read counts of the same batches: a cut into chunks its records' chunks
-    (`data/chunks_per_record`), which the reading process keeps, and an objective's expansion after
-    another the source examples it makes rows of (`FlatMap.examples`), each where it stands (review of
-    row 4862)."""
+def test_a_read_in_order_counts_its_rows_and_examples_alike_in_any_count_of_workers(chain):
+    """A read cut per share in its inputs' order (`_Build.in_order`), in no workers and in two, counts the
+    same of the same batches: a cut into chunks its records' chunks (`data/chunks_per_record`), which the
+    reading process keeps, and an objective's expansion after another the source examples it makes rows
+    of (`FlatMap.examples`), each where it stands (review of row 4862)."""
     from dew.data.pipeline import FlatMap
-    from dew.data.plan import FILE_SHARDS
     from dew.data.text import Chunks
 
     source = Pipeline(Memory(_Indexed(30)), name="docs").shuffle(5).repeat()
@@ -408,10 +406,9 @@ def test_a_read_in_order_counts_its_rows_and_examples_as_the_earlier_read(chain)
     else:
         built = source.flat_map(_Spread())._then(FlatMap(_Spread(), examples=True)).batch(4)
 
-    def counted(workers, version):
-        pinned = {} if version is None else {"plan_version": version}
+    def counted(workers):
         loading = Loading(workers=workers, host=TWO_CPUS)
-        loader = compile(built, seed=5, steps=10**6, loading=loading, **pinned)
+        loader = compile(built, seed=5, steps=10**6, loading=loading)
         reader = loader.train(DataPartition())
         try:
             listed(reader, 6)
@@ -420,42 +417,8 @@ def test_a_read_in_order_counts_its_rows_and_examples_as_the_earlier_read(chain)
         finally:
             reader.close()
 
-    earlier = counted(0, FILE_SHARDS)
-    assert earlier
-    for workers in (0, 2):
-        assert counted(workers, None) == earlier
-
-
-@pytest.mark.parametrize("workers", [0, 2])
-def test_a_position_saved_under_plan_version_10_resumes_as_10_read_it(workers):
-    """A per-share read saved under plan version 10, in no workers or in two, which each read every
-    second input, resumes under this Dew's version (`IN_ORDER`) as 10 read it, in the workers its position
-    names (`_PerShare.resumed_at`): on the batches 10's read goes on to, bit for bit, and its positions name
-    10 still."""
-    from dew.data.plan import FILE_SHARDS, IN_ORDER, PLAN_VERSIONS
-
-    chain = (Pipeline(Memory(_Indexed(40))).shuffle(5).repeat().random_map(_Jittered())
-             .flat_map(_Spread()).batch(4))
-    earlier = compile(chain, seed=5, loading=Loading(workers=workers), plan_version=FILE_SHARDS)
-    now = compile(chain, seed=5)
-    assert earlier.plan.version == FILE_SHARDS and now.plan.version == PLAN_VERSIONS[-1] >= IN_ORDER
-    reader = earlier.train(DataPartition())
-    try:
-        whole = listed(reader, 12)
-    finally:
-        reader.close()
-    reader = earlier.train(DataPartition())
-    try:
-        head, saved = listed(reader, 5), reader.get_state()
-    finally:
-        reader.close()
-    resumed = now.train(DataPartition())
-    try:
-        resumed.set_state(saved)
-        assert head + listed(resumed, 7) == whole
-        assert json.loads(resumed.get_state())["dew_data_plan"]["version"] == FILE_SHARDS
-    finally:
-        resumed.close()
+    alone = counted(0)
+    assert alone and counted(2) == alone
 
 
 @pytest.mark.parametrize("workers", [0, pytest.param(1, marks=pytest.mark.slow),
@@ -1088,7 +1051,7 @@ class _Lazy:
     def lengths(self):
         return None
 
-    def manifest(self, version):
+    def manifest(self):
         raise ValueError("a lazy source is indexed")
 
 

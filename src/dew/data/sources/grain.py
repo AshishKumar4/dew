@@ -48,7 +48,7 @@ class Grain(Dataset):
         rows = self.dataset.map(source_record)
         return tuple(rows[index] for index in range(len(rows))) if read == "memory" else rows
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         if isinstance(self.dataset, grain.MapDataset):
             return _single_indexed_manifest(self, self.describe())
         return ShardManifest((Shard(self.describe(), self.describe()),), self._read_shard)

@@ -14,6 +14,18 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   Mosaic GPU kernel over operands on a concrete mesh lowers a reshard of a literal, so a bf16 template
   decode on an Ampere or Ada GPU whose operands sit on a `NamedSharding` lowers, where it failed with
   "Shaped arrays must be represented by ir.Values, got: 0".
+- Data plan version 14, the last global one: a plan describes each step by its structure (its class and
+  fields, a callable by its own identity, an array by its fingerprint, a mapping in its order) and records,
+  by name, the rules its read takes its next rows by (`identity`, `shuffle`, `mix`, `dealing`, `grain`,
+  `phases`) and the shards a stream reads, each one value beside the code that implements it
+  (docs/design/data.md, the rules). A resume compares them and refuses a differing one by its name; a Grain
+  upgrade refuses only a position whose iterator state its iterators cannot restore. Phases that share a
+  corpus continue it from the draws the run trained. This Dew reads plans of 13 exactly (a run's resume
+  compiles its data at 13, and a per-share position of 13 resumes in a read compiled at 14 as 13 read it)
+  and refuses 8 to 12, naming both ways on: resume with the Dew that wrote it, or go on from its weights as
+  a new run that reads its data afresh. `Objective.bind_plan`, `dew.data.pipeline.earlier`, `Pipeline.at`
+  and `ObjectiveData.earlier` are gone, and `Source.manifest` takes no version.
+
 - A run's fit plan judges a head that keeps its whole logits by their fp32 bytes before it traces the step's
   gradient (`Objective.whole_head_table` names the head's table), and bounds the rung after a traced one
   from that trace, so a step whose whole logits leave no room is planned from one gradient trace and
