@@ -46,11 +46,11 @@ def main() -> None:
     trainer, collector = build(environment=environment, record=records.append)
     if mode == "mismatch" and rank == 1:
         collector = replace(collector, max_turns=collector.max_turns + 1)
-    scheduler, trained = episode_scheduler(collector), []
+    scheduler, trained = episode_scheduler(collector, trainer.objective), []
 
-    def rollout(state, batch, key):
+    def rollout(state, batch, key, *, objective):
         """The scheduler's call, keeping the batch it hands the step."""
-        trained.append(scheduler(state, batch, key))
+        trained.append(scheduler(state, batch, key, objective=objective))
         return trained[-1]
 
     trainer.rollout = rollout

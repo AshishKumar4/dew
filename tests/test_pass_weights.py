@@ -340,7 +340,7 @@ def corpus(tag: int):
     return Memory(rows).repeat().batch(8)
 
 
-def remade(state, batch, key):
+def remade(state, batch, key, *, objective):
     """A rollout that makes its batch afresh of the rows it reads, as a sampler's does: none of the read's
     own fields (its phase among them) on what it makes."""
     return {"text": np.asarray(batch["text"])}

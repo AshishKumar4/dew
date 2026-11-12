@@ -1,5 +1,6 @@
 """A tracker that keeps everything a run reports, for a test to read back, an observer that
-preempts the run it observes, and a run's state as arrays for a bit-for-bit comparison."""
+preempts the run it observes, and a run's state as arrays for a bit-for-bit comparison, whose numbers are
+finite first."""
 
 import dataclasses
 import os
@@ -49,6 +50,14 @@ class Preempting(Observe):
 def preempting(at: int, **observed) -> Preempting:
     """`Preempting` after step `at`."""
     return Preempting(at_step=at, **observed)
+
+
+def finite(value) -> bool:
+    """Whether every floating or complex entry of `value` is finite, as a bit-for-bit comparison needs first:
+    NaN equals NaN to an array comparison that matches NaNs, and an infinity equals itself, so two runs or
+    two requests gone to NaN or overflow would pass as one. Integers, booleans and text hold none."""
+    values = np.asarray(value)
+    return values.dtype.kind not in "fc" or bool(np.all(np.isfinite(values)))
 
 
 def bits(state) -> list[np.ndarray]:

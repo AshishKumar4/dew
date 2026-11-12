@@ -28,6 +28,7 @@ from dew.nn.kernels.templates import (
     attention_program as program,
     axes,
     report,
+    resources,
 )
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
@@ -553,13 +554,35 @@ def _derived[T: (Tiles, BackwardTiles)](launch: Template[T], ba: tokamax.BoundAr
     of the fastest on an A100 and an H100 (ATT-ZERO3-a100, ATT-ZERO4-h100), a training walk 64 by 64, the
     tile measured fastest of it where its anchor row puts 128 rows past a thread's registers
     (TRAINTILES3-a100), and a backward 64 by 64, the measured order's first (DPROF3-a100, DPROF3-h100).
-    None where no tile holds."""
-    for rows in (extent for extent in EXTENTS if held % extent == 0):
-        for walk in (extent for extent in EXTENTS if walked % extent == 0):
-            config = tiles(rows, walk)
-            if launch.legal(ba, config, target):
-                return config
-    return None
+    Where its products issue on the FMA pipes rather than the tensor cores (an fp32 call's IEEE products,
+    `kernel_dot`), the largest such tile a multiprocessor holds two programs of (`_resident`) first, eight
+    warps to hide each other's latency: one program a multiprocessor left its warps without an eligible one
+    92 to 94% of cycles (an H100's fp32 training step at 1 x 1024, 147,456 bytes a program at 64 by 64,
+    M-ET-55), and two took that step from 26.1 to 9.5 ms on an H100 and 28.7 to 22.8 on an A100, every
+    launch faster (M-ET-57). A tensor-core launch keeps its largest tile: a bf16 backward at 32 by 64, two
+    programs, took 2.34 ms a launch on an H100 where 64 by 64, one, took 1.30 to 1.58 (M-ET-57). None where
+    no tile holds."""
+    legal = [config for rows in (extent for extent in EXTENTS if held % extent == 0)
+             for config in (tiles(rows, walk) for walk in EXTENTS if walked % walk == 0)
+             if launch.legal(ba, config, target)]
+    if _Staged.of(target, ba.arguments["query"].dtype, held).fp32:
+        return next((config for config in legal if _resident(launch, ba, config, target) >= 2),
+                    next(iter(legal), None))
+    return next(iter(legal), None)
+
+
+def _resident[T: (Tiles, BackwardTiles)](launch: Template[T], ba: tokamax.BoundArguments, config: T,
+                                        target: generation.GpuTarget) -> int:
+    """The programs of a launch at `config` a multiprocessor holds at once: its threads' registers
+    (`registers`, at the allocator's step), `WARPS` warps of them, within its register file, as many as it
+    holds blocks, and its shared memory (`staged_bytes`) within the multiprocessor's, each program's
+    reservation its own (`resources.shared_programs`)."""
+    held = target.multiprocessor
+    step = held.register_step
+    allocated = -(-(launch.registers(ba, config) or step) // step) * step * WARPS * held.warp_threads
+    most = min(held.registers // allocated, held.resident_blocks)
+    return resources.shared_programs(most, launch.staged_bytes(ba, config, target),
+                                     generation.shared_budget(target))
 
 
 def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.BlockSpec:

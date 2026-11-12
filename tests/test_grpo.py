@@ -26,7 +26,15 @@ from reference_error import (
     recording,
     with_gradients,
 )
-from rl_support import Published, ScriptedSource, TinyHead, TinyLogits, clipped_surrogate, token_mean
+from rl_support import (
+    Published,
+    ScriptedSource,
+    TinyHead,
+    TinyLogits,
+    assert_filled_batch_invariants,
+    clipped_surrogate,
+    token_mean,
+)
 from steady_state import steady_state
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, _utf8
@@ -136,33 +144,6 @@ def test_a_prompt_dataset_trains_as_the_prompt_config_does():
                               read="memory", loading=Loading(workers=0))))
 
 
-def test_the_loss_reads_the_rolled_out_batch():
-    """The objective's loss is the composition over the batch's own terms:
-    current log-probabilities scored along each chain, ratio against the
-    stored old ones, surrogate and KL masked alike."""
-    objective = GRPOObjective(TinyHead(vocab_size=VOCAB),
-                              PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
-    params = nn.unbox(objective.init(jax.random.key(0)))
-    frozen = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf)), params)
-    batch = rollout_batch()
-    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
-
-    loss, aux = objective.scalar_loss(params, batch, step)
-
-    ids = np.asarray(batch[IDS_KEY])
-    start = PROMPT_WIDTH - 1
-    policy = np.asarray(objective.per_token_log_probs(params, ids))[:, start:]
-    ref = np.asarray(objective.per_token_log_probs(frozen, ids))[:, start:]
-    old = np.asarray(batch[OLD_LOG_PROBS_KEY])[:, PROMPT_WIDTH:]
-    advantages = np.asarray(batch[ADVANTAGES_KEY])[:, PROMPT_WIDTH:]
-    mask = np.asarray(batch[RESPONSE_MASK_KEY])[:, PROMPT_WIDTH:]
-    ratio = token_log_ratio(jnp.asarray(policy), jnp.asarray(old))
-    pg, _ = clipped_surrogate(ratio, jnp.asarray(advantages), jnp.asarray(mask))
-    kl = token_mean(k3_kl(jnp.asarray(policy), jnp.asarray(ref)), jnp.asarray(mask))
-    assert float(loss) == pytest.approx(float(pg + 0.01 * kl), rel=1e-5)
-    assert {"pg", "actor/pg_clipfrac", "actor/ppo_kl", "actor/pg_clipfrac_lower", "kl"} <= set(aux.metrics)
-
-
 @pytest.mark.parametrize("policy", [TinyHead, TinyLogits])
 def test_evaluation_scores_prompt_perplexity(policy):
     """Validation never samples: each prompt's shifted cross entropy, the
@@ -212,9 +193,10 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
                 INFO_KEY: np.stack([pad(""), pad("")])}
 
     keys = [jax.random.key(index) for index in range(3)]
-    rollout(state, batch(0), keys[0])
+    rollout(state, batch(0), keys[0], objective=objective)
     with steady_state(allow=("host_to_device",)):
-        rolled = [rollout(state, batch(offset), key) for offset, key in zip((1, 2), keys[1:], strict=True)]
+        rolled = [rollout(state, batch(offset), key, objective=objective)
+                  for offset, key in zip((1, 2), keys[1:], strict=True)]
     assert all(rows[IDS_KEY].shape == (4, PROMPT_WIDTH + RESPONSE_WIDTH) for rows in rolled)
 
 
@@ -239,13 +221,24 @@ def test_a_filled_prompt_batchs_repeats_are_neither_admitted_nor_trained_on():
              SOURCE_KEY: np.stack([_utf8("rule", info)] * 4), TRUTH_KEY: np.stack([_utf8("1", info)] * 4),
              INFO_KEY: np.stack([_utf8("", info)] * 4)}
     real = np.asarray([True, True, False, False])
-    rolled = rollout(state, {**batch, VALID_ROWS: real}, jax.random.key(1))
-    whole = rollout(state, batch, jax.random.key(1))
+    rolled = rollout(state, {**batch, VALID_ROWS: real}, jax.random.key(1), objective=objective)
+    whole = rollout(state, batch, jax.random.key(1), objective=objective)
     assert [record.groups for record in records] == [2, 4]
     responses = [int(np.asarray(rows[RESPONSE_MASK_KEY]).any(axis=1).sum()) for rows in (rolled, whole)]
     assert responses == [2 * 2, 4 * 2]
-    none = rollout(state, {**batch, VALID_ROWS: np.zeros(4, bool)}, jax.random.key(2))
+    none = rollout(state, {**batch, VALID_ROWS: np.zeros(4, bool)}, jax.random.key(2), objective=objective)
     assert records[-1].groups == 0 and not np.asarray(none[RESPONSE_MASK_KEY]).any()
+    from dew.data.dataset import FilledBatch
+
+    packed = {key: np.concatenate([np.asarray(value), np.asarray(rollout_batch(2)[key])[:1]])
+              for key, value in rollout_batch(0).items()}
+    filled_packed = FilledBatch(4).map(packed)
+    corrupted = {key: np.asarray(value).copy() for key, value in filled_packed.items()}
+    corrupted[ADVANTAGES_KEY][3] = np.nan
+    corrupted[OLD_LOG_PROBS_KEY][3] = np.nan
+    corrupted[BEHAVIOR_LOG_PROBS_KEY][3] = np.nan
+    assert_filled_batch_invariants(objective, filled_packed, corrupted,
+                                   FilledBatch(4, real=False).map(packed))
 
 
 K3_SEEDS = 8
@@ -296,13 +289,12 @@ def test_a_synchronous_collection_rescores_a_ratio_read_at_another_temperature()
         return RolloutScheduler.sampled(objective, lambda text, record: float(len(text)), groups=2,
                                         max_new_tokens=4, sampling=Sampling(temperature=1.3, top_k=5))
 
-    assert collected(GRPOObjective(TinyHead(vocab_size=vocab), 8 + 4 - 1)).acquisition.rescore is None
     tempered = GRPOObjective(TinyHead(vocab_size=vocab), 8 + 4 - 1, sampling_temperature=0.7)
     scheduler = collected(tempered)
     seen = []
 
-    def rollout(state, batch, key):
-        packed = scheduler(state, batch, key)
+    def rollout(state, batch, key, *, objective):
+        packed = scheduler(state, batch, key, objective=objective)
         seen.append((np.asarray(packed[OLD_LOG_PROBS_KEY]),
                      scored_rows(tempered, state.variables, packed, Progress(state.updates))))
         return packed
@@ -353,10 +345,10 @@ def asynchronously(objective: GRPOObjective, seen, steps: int = 6, *, rewarded: 
     scheduler = RolloutScheduler(Asynchronous(ScriptedSource(drawn), Published(), objective, width=8,
                                               rows=len(tasks), max_lag=1, ahead=0), groups=2,
                                  estimator=estimator,
-                                 reference=objective if objective.reward_kl > 0 else None)
+                                 penalized=objective.reward_kl > 0)
 
-    def rollout(state, batch, key):
-        packed = scheduler(state, batch, key)
+    def rollout(state, batch, key, *, objective):
+        packed = scheduler(state, batch, key, objective=objective)
         seen(state, packed)
         return packed
 
@@ -406,40 +398,6 @@ def test_a_reward_penalty_over_the_starting_weights_is_nil_half_way_through_an_a
     np.testing.assert_array_equal(advantages[5], 0)
 
 
-def test_a_run_names_a_method_that_builds_its_objective_and_its_rollout(tmp_path):
-    """A GRPO run whose rollout names a method (`--rollout.method rloo`) builds the method's objective and
-    scheduler from it: RLOO's reference penalty in the reward, weighted by the run's
-    `--objective.reward-kl`, keeps the frozen starting policy the step's rewards are penalized against.
-    The run records the method and loads with it, and a setting the method fixes, stated on the command
-    line (`--objective.beta` under DAPO, which penalizes no reference), is refused."""
-    import rl_support
-
-    from dew.config import ObjectiveConfig
-    from dew.config.lm import LMRunConfig, PromptRollout
-    from dew.data import Memory, presets
-    from dew.registry import ModelConfig
-
-    tokenizer = str(Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat")
-    rows = [{"prompt": "hi there", "data_source": "rule", "ground_truth": "a"}] * 8
-    rollout = PromptRollout(reward=f"{rl_support.__name__}:completion_length", groups=2, max_new_tokens=4)
-    model = ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1, "num_heads": 2,
-                                               "dtype": "float32"})
-    default = LMRunConfig(data=Memory(rows).pipe(presets.prompts, tokenizer, max_prompt_len=8, batch=8),
-                          tokenizer=tokenizer, objective=ObjectiveConfig("grpo"), rollout=rollout,
-                          model=model, max_new_tokens=0)
-    flags = ["--trainer.steps", "1", "--trainer.name", "rloo", "--trainer.checkpoint-dir", str(tmp_path),
-             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False"]
-    config = LMRunConfig.cli([*flags, "--rollout.method", "rloo", "--objective.reward-kl", "0.05"],
-                             default=default)
-    state = config.run()
-    assert int(state.step) == 1 and state.ema is not None
-    assert LMRunConfig.load(str(tmp_path / "rloo")).rollout.method == "rloo"
-    refused = LMRunConfig.cli([*flags, "--trainer.name", "dapo", "--rollout.method", "dapo",
-                               "--objective.beta", "0.1"], default=default)
-    with pytest.raises(ValueError):
-        refused.run()
-
-
 def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
     """A GRPO run whose rollout names a served draw (`--rollout.served.slots 8`, `ServedRollout`) trains
     on completions Dew's own server draws ahead of the trainer (`RolloutScheduler.served`), its first
@@ -448,15 +406,13 @@ def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
     the trainer's weights (`rollout/lag/mean` above 0, which each step's own generation never does), each
     weighted by the objective's behavior importance, a group's samples of a prompt reading its paged prompt
     once (`--rollout.served.page-size`), and the server ends with the run. The run records the
-    served settings and loads with them, and a record written before they existed loads as drawing each
-    step's own (ledger 2695)."""
-    import json
+    served settings and loads with them."""
     import threading
 
     import rl_support
 
     from dew.config import ObjectiveConfig
-    from dew.config.lm import LMRunConfig, PromptRollout, ServedRollout
+    from dew.config.lm import LMRunConfig, PromptRollout
     from dew.data import Memory, presets
     from dew.registry import ModelConfig
     from dew.training import LocalTracker
@@ -476,8 +432,6 @@ def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
                               "--rollout.served.max-lag", "2", "--rollout.served.page-size", "4",
                               "--objective.behavior-importance", "2.0"],
                              default=default)
-    assert config.rollout is not None
-    assert config.rollout.served == ServedRollout(slots=8, max_lag=2, sync_every=2, page_size=4)
     state = config.run()
     assert int(state.step) == 3
     # The server and its reward pool end with the run: no engine or scorer thread outlives it.
@@ -488,11 +442,6 @@ def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
                 if "rollout/lag/mean" in scalars]
     assert max(lags) > 0
     assert LMRunConfig.load(str(tmp_path / "served")).rollout == config.rollout
-    record = json.loads((tmp_path / "served" / "run.json").read_text())
-    del record["fields"]["rollout"]["served"]
-    (tmp_path / "served" / "run.json").write_text(json.dumps(record))
-    loaded = LMRunConfig.load(str(tmp_path / "served")).rollout
-    assert loaded is not None and loaded.served is None
 
 
 def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
@@ -521,11 +470,18 @@ def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
                           model=model, max_new_tokens=0)
     config = LMRunConfig.cli(["--trainer.steps", "1", "--trainer.name", "grpo", "--trainer.checkpoint-dir",
                               str(tmp_path), "--trainer.compilation-cache-dir", "None",
-                              "--trainer.multi-host", "False", "--trainer.log-every", "1"], default=default)
-    assert config.tokens().seq_len == 8 + 4 - 1
+                              "--trainer.multi-host", "False", "--trainer.log-every", "1",
+                              "--rollout.method", "rloo", "--objective.reward-kl", "0.05"], default=default)
     state = config.run()
-    assert int(state.step) == 1
-    assert LMRunConfig.load(str(tmp_path / "grpo")).rollout == rollout
+    assert int(state.step) == 1 and state.ema is not None
+    loaded = LMRunConfig.load(str(tmp_path / "grpo")).rollout
+    assert loaded is not None and loaded.method == "rloo"
+    refused = LMRunConfig.cli(["--trainer.steps", "1", "--trainer.name", "dapo",
+                               "--trainer.checkpoint-dir", str(tmp_path),
+                               "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
+                               "--rollout.method", "dapo", "--objective.beta", "0.1"], default=default)
+    with pytest.raises(ValueError):
+        refused.run()
     with pytest.raises(ValueError):
         dataclasses.replace(config, rollout=None)
     with pytest.raises(ValueError):

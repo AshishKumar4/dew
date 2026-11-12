@@ -146,7 +146,7 @@ def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numb
     reference arm, the dequantized product with fp32 sums (testing.md, FP8 products). Any other product is
     `jax.lax.dot_general`'s, accumulated in fp32: a 16-bit one's products are exact, and a float32 one's
     summed as every float32 contraction is (`precision.accumulated`: in float64 under Dew's wide test
-    arithmetic, else as the CPU's vectorized dot sums it), so a mainloop's sums and the fp32 references they
+    arithmetic, else as XLA sums it), so a mainloop's sums and the fp32 references they
     are held to sum alike."""
     if eight(product.compute):
         return jax.lax.dot_general(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), dimension_numbers,

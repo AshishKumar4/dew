@@ -61,32 +61,27 @@ def anonymous(run: Path, name: str, places: dict[str, str]) -> bytes:
     return packed.getvalue()
 
 
-EVIDENCE = 3
+EVIDENCE = 4
 """The version of what a recorded generation's runs record they serialized (`evidence`), which its
-`source.json` states; a generation that states one holds every kind's. Version 2 records the dtypes
-one request of each task multiplies in by module path (`products`), in the suite's wide CPU arithmetic;
-version 3 records them in a user's process, which the runs themselves are the same in (row 5442)."""
+`source.json` states; a generation that states one holds every kind's. Versions 2 and 3 also recorded
+the dtypes one request multiplied in by module path (`products`), which no main reads: a loaded task's
+compute is the one its model states (tests/test_saved_runs.py's `computes_in`)."""
 
 
 def evidence(run, state, directory: Path) -> dict:
     """What a saved run serialized, as a later main's load and resume read it back
-    (tests/test_saved_runs.py): its parameters' dtypes, its compute's as its run states it, the dtypes
-    one request of the task loaded from it multiplies in (`computed`), its dynamic loss scale and the
+    (tests/test_saved_runs.py): its parameters' dtypes, its compute's as its run states it, its dynamic
+    loss scale and the
     finite steps it counted, the examples it consumed, its last step, and the rung its step compiled at,
     the remat and the plan it was admitted under (`StepCompiled`) but what the plan measured: its probes,
     kernels and rewrites' reports, which time what they ran."""
     import jax
-    from saved_run_kinds import computed
-
-    from dew.registry import objectives
 
     lines = (directory / "tracking" / "records.jsonl").read_text().splitlines()
     records = [json.loads(line) for line in lines]
     compiled = [row["value"] for row in records if row["type"] == "StepCompiled"][-1]
     plan = compiled["plan"] or {}
-    tasked = objectives[run.objective.name].saved_task is not None
     return {"step": int(state.step), "compute": run.compute_dtype(),
-            "products": computed(directory, wide=False)["products"] if tasked else None,
             "params": sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])}),
             "scale": None if state.scale is None else float(state.scale.scale),
             "finite_steps": None if state.scale is None else int(state.scale.fin_steps),

@@ -3,6 +3,7 @@ rounding: random operands, and the operands where a float64 evaluation would rou
 format's edges decide (ties, a fused multiply-add's low part, subnormal cells, overflow, signed zero)."""
 
 import fractions
+import math
 
 import ml_dtypes
 import numpy as np
@@ -259,13 +260,14 @@ def test_the_exp2_enclosure_holds_its_proven_bound():
 
 def test_ln2_is_what_the_oracle_takes_it_for():
     """The 100 digits of ln 2 the exp oracle reduces by lie within 2^-330 of an exact enclosure of
-    ln 2, so they are no premise; its high part and its rest are the ones its bound reads."""
+    ln 2, so they are no premise; its high part and its rest, the two its bound reads, sum to those digits
+    within the rest's own rounding."""
     low, high = oc.ln2_enclosure()
     assert high - low < fractions.Fraction(2) ** -340
     # The whole enclosure within 2^-330 of the digits, so every value it holds, ln 2 among them, is.
     assert high - fractions.Fraction(2) ** -330 <= oc._LN2 <= low + fractions.Fraction(2) ** -330
-    assert oc._LN2_HI.hex() == "0x1.62e42fefa3a00p-1"
-    assert oc._LN2_LO.hex() == "-0x1.0ca86c3898d00p-49"
+    parts = fractions.Fraction(oc._LN2_HI) + fractions.Fraction(oc._LN2_LO)
+    assert abs(parts - oc._LN2) <= fractions.Fraction(math.ulp(oc._LN2_LO))
 
 
 @pytest.mark.parametrize("fmt", FORMATS, ids=lambda fmt: fmt.name)

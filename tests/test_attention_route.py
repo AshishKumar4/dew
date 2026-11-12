@@ -1102,6 +1102,26 @@ def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_l
     assert analysis.temp_size_in_bytes < min(heads * tokens * tokens, generation.host_memory_share())
 
 
+@pytest.mark.parametrize(("generation_name", "tokens", "width", "declared"), [
+    ("sm80", 4096, 128, True), ("sm90", 32768, 64, True), ("sm80", 256, 128, True), ("sm80", 4096, 256, True),
+    ("sm90", 65536, 128, False), ("sm80", 65536, 64, False)],
+    ids=["a100-measured", "h100-longest", "shorter", "wider", "longer", "longer-narrower"])
+def test_a_16_bit_calls_declared_cell_holds_only_within_its_receipts_shapes(generation_name, tokens, width,
+                                                                             declared):
+    """A bf16 causal call over 8 key heads on an A100 or an H100, whose declared cell names FlashAttention
+    (`attention_kernels.DECLARED`), its receipts holding up to 32768 tokens (`MEASURED`: their lead growing
+    as the calls shorten): a call within them, a shorter or a wider one among them, is in that cell; a
+    longer one is a cell none declares, which takes the template (row 5285)."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+
+    query = jax.ShapeDtypeStruct((1, tokens, 32, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, tokens, 8, width), jnp.bfloat16)
+    with generation.assumed(generation_name):
+        cell = attention_case(query, key, causal=True).cell
+    assert (cell in attention_kernels.DECLARED) == declared
+
+
 @pytest.mark.parametrize(("groups", "limits", "least"), [
     ("0::/outer/inner\n", {"sys/fs/cgroup/memory.max": "max", "sys/fs/cgroup/outer/memory.max": "2147483648",
                            "sys/fs/cgroup/outer/inner/memory.max": "4294967296"}, 2147483648),

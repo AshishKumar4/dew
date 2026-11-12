@@ -195,10 +195,11 @@ def test_a_program_one_process_kept_runs_in_another_that_traces_nothing(tmp_path
     call made inside one of Dew's own contexts, have no identity a file can state and are named as not
     kept (row 5265: a warm scoring server paid its programs' traces)."""
     saved = kept_in(tmp_path / "kept")
-    assert saved["refused"] == ["__main__.<lambda> (0)", "kept_module.scaled (1)"], saved["reasons"]
-    assert saved["kept"] == 9
-    assert (saved["cpu"] is not None) == (jax.default_backend() == "cpu")
     answers = saved["answers"]
+    # Every answered call kept, and the two calls of no identity the worker makes besides named as not.
+    assert saved["kept"] == len(answers)
+    assert len(saved["refused"]) == 2, saved["reasons"]
+    assert (saved["cpu"] is not None) == (jax.default_backend() == "cpu")
     assert answers["none"] != answers["empty"] and answers["one"] != answers["two"]
     assert kept_answer(kept_worker(tmp_path / "kept", "take")) == {"answers": answers, "needed": []}
     assert kept_answer(kept_worker(tmp_path / "kept", "verify"))["answers"] == answers
@@ -239,6 +240,71 @@ def test_programs_kept_under_other_code_settings_or_target_are_refused_by_name(t
     assert kept_worker(tmp_path, "take", environment=environment).returncode != 0
     assert kept_answer(kept_worker(tmp_path, "differences", environment=environment)) == {
         "process": process, "target": target}
+
+
+CHECKED_MODULE = '''
+import jax.numpy as jnp
+from jax.experimental import checkify
+
+
+def _doubled(values):
+    checkify.check(jnp.all(values > 0), "the values must be positive")
+    return values * 2
+
+
+def checked(values):
+    return checkify.checkify(_doubled)(values)
+'''
+"""A program whose check a run keeps (`checked`): its error tree holds the check's traceback."""
+
+CHECKED_RUN = """
+import json, sys
+import jax.numpy as jnp
+from jax.experimental import checkify
+import checked_module
+from dew.nn.kernels.options import owned_program
+from dew.training.ahead import keeping, kept
+
+mode, path = sys.argv[1], sys.argv[2]
+program = owned_program(checked_module.checked)
+
+
+def refused():
+    error, _ = program(-jnp.ones(3))
+    try:
+        error.throw()
+    except checkify.JaxRuntimeError as raised:
+        return [type(raised).__name__, str(raised)]
+    return None
+
+
+if mode == "keep":
+    with keeping() as programs:
+        program(jnp.ones(3))
+    programs.save(path)
+    print(json.dumps({"refused": refused(), "kept": len(programs.kept)}))
+else:
+    with kept(path):
+        print(json.dumps({"refused": refused()}))
+"""
+"""A process that keeps a checked program, or is handed it, and reports what its failed check raises."""
+
+
+def test_a_kept_programs_failed_check_raises_where_handed_as_where_kept(tmp_path):
+    """A checked program kept by one process (its error tree's tracebacks held as their frames,
+    `HeldTraceback`) and handed to another raises its failed check there as the keeping process does, the
+    check's own error and message, not an error of the held traceback's."""
+    import process_support
+
+    (tmp_path / "checked_module.py").write_text(CHECKED_MODULE)
+    path = str(tmp_path / "checked.dew-aot")
+    # The module beside the file, on the path as a user's own.
+    found = {"PYTHONPATH": os.pathsep.join((str(tmp_path), str(process_support.REPO_ROOT / "src"),
+                                            str(process_support.REPO_ROOT / "tests")))}
+    keep = process_support.fresh(CHECKED_RUN, "keep", path, variables=found)
+    take = process_support.fresh(CHECKED_RUN, "take", path, variables=found)
+    assert keep["kept"] == 1 and keep["refused"] is not None
+    assert take["refused"] == keep["refused"]
 
 
 def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):

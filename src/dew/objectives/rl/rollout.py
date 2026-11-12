@@ -107,9 +107,11 @@ class PolicyCollector:
     text (`sessions.Collector`; `RolloutScheduler.sampled` builds the usual scheduler over it).
 
     A call draws every task's `samples` continuations in one generation
-    (`TextGeneration`'s `n`, one prefill per prompt) from the snapshot's
-    variables under its key, and scores each by `reward` on its decoded
-    text. EOS counts as an action in the response mask, but the text passed
+    (`TextGeneration`'s `n`, one prefill per prompt) from the policy of the
+    objective the step trains (`Snapshot.objective`, its phase's) at the
+    snapshot's variables under its key, and scores each by `reward` on its
+    decoded text. `objective` states the rows' width and the sampling's stop
+    ids, which a phase's copy of it shares. EOS counts as an action in the response mask, but the text passed
     to `reward` leaves it out. A completion that ran out of
     `max_new_tokens` is TRUNCATED, and the scheduler's `truncation` decides
     whether it trains. Each call keeps the raw likelihoods the cached model
@@ -151,10 +153,14 @@ class PolicyCollector:
         mesh = mesh_of(snapshot.variables)
         prompts, inputs = (self._prepared(tasks) if mesh is None
                            else agreed("rollout input preparation", lambda: self._prepared(tasks)))
-        # The policy the step's loss reads, at the updates the run committed (`Objective.progress`), whose
-        # likelihoods are the proximal column's.
+        # The policy the step's loss reads: its objective's (its phase's), at the updates the run committed
+        # (`Objective.progress`), whose likelihoods are the proximal column's.
+        trained = snapshot.objective
+        if not isinstance(trained, TokenScorer):
+            raise ValueError("a policy collector draws from the token scorer the step trains, and this "
+                             f"snapshot holds {type(trained).__name__}")
         progress = Progress(jnp.asarray(snapshot.updates, jnp.int32))
-        generated = self.objective.policy(snapshot.variables, self.sampling, progress)(
+        generated = trained.policy(snapshot.variables, self.sampling, progress)(
             inputs, self.max_new_tokens, key=snapshot.key, n=samples).host()
         if mesh is not None and DataPartition.of(mesh).reader != 0:
             # A share's later reader drew its part of the program; the first reader scores the share.

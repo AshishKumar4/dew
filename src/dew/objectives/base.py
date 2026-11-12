@@ -112,6 +112,17 @@ class Stepping(Protocol):
 """An objective's `init` with its held variables bound as `Partial` children,
 which a JIT takes as arguments (`Objective.initializer` says why)."""
 
+
+def own_objective(name: str, held: Hashable, objective: Hashable) -> None:
+    """Refuse a step's `objective` other than `held`, the one `name`'s rollout made its policy for: a
+    phase's pass count (`dew.training.phase_passes`) changes the policy, which a policy built or compiled
+    once does not follow. Compared by identity, so of any loss and effects."""
+    if objective is not held:
+        raise ValueError(f"{name} acts with the objective it was made for, and this step trains another (a "
+                         "phase's pass count, `phase_passes`); run it without phases that set the loop's "
+                         "passes")
+
+
 @struct.dataclass
 class Ratio:
     """A loss numerator and its denominator, kept apart until the loss is reduced.
@@ -353,6 +364,10 @@ class Step:
     """The activations a sampled step watches (`dew.nn.inspection.watching`): the objective opens the
     `inspected` collection in the model call it trains through and returns what it sowed
     (`Aux.inspected`). None on every other step; static, as `qk_stats` is."""
+    batch_statistics: tuple[jax.Array, ...] | None = None
+    """Detached statistics over the step's logical minibatch (`Objective.batch_statistics`), computed
+    once at a split step's first microbatch and held across its parts; None where the step is read whole
+    or the objective states none."""
 
     def sown(self, *collections: str) -> list[str]:
         """The collections a model call the objective trains through opens: `collections`, the ones its
@@ -1274,6 +1289,23 @@ class Objective(ABC, Generic[Loss, Effects]):
         `reduce_loss` runs on the sum.
         """
 
+    def batch_statistics(self, variables: Variables,
+                         part_at: Callable[[jax.Array], tuple[Batch, Step]],
+                         split: int) -> tuple[jax.Array, ...] | None:
+        """Detached statistics over a split step's logical minibatch (`Step.batch_statistics`), or None.
+
+        Use this only where a minibatch-wide statistic needs the model's live forward (such as Brax PPO's
+        current-critic advantage moments or Dreamer's imagined return percentiles); statistics from
+        rollout outputs belong on the host before splitting. When `split > 1`, the step's first
+        microbatch (`part` 0) runs this once, scanning `part_at(index)` over `0 .. split - 1` at one
+        extra forward per part while holding one part's activations at a time, and keeps the stopped
+        tuple on `Accumulation` for the remaining parts (including after a mid-window checkpoint
+        restore). When `split == 1`, `loss` receives `Step.batch_statistics=None` and computes over its
+        whole batch directly.
+        """
+        del variables, part_at, split
+        return None
+
     def validation_loss(self, variables: Variables, batch: Batch,
                         step: Step) -> Loss | tuple[Loss, Aux[Effects]]:
         """Return `loss`'s statistics in evaluation mode, unless the objective scores held-out rows
@@ -1348,15 +1380,40 @@ class Objective(ABC, Generic[Loss, Effects]):
         return mean, var
 
     @staticmethod
+    def real_rows(batch: Batch, rows: int) -> jax.Array:
+        """Whether each of `batch`'s `rows` rows is a real record rather than a repeat filling an evaluation
+        or rollout batch (`VALID_ROWS`), bool `[rows]`."""
+        valid = batch.get(VALID_ROWS)
+        if valid is None:
+            return jnp.ones((rows,), bool)
+        return jnp.asarray(valid, bool).reshape(rows)
+
+    @staticmethod
     def row_weights(batch: Batch, rows: int) -> jax.Array:
         """Each of the batch's `rows` rows' weight, float32: 1 for a real row
         and 0 for a repeat that fills an evaluation batch (`VALID_ROWS`), and 1
-        for every row of a training batch. A rule an objective computes itself
-        weights its rows by this, as `row_mean` does."""
-        valid = batch.get(VALID_ROWS)
-        if valid is None:
-            return jnp.ones((rows,), jnp.float32)
-        return jnp.asarray(valid, jnp.float32).reshape(rows)
+        for every row of a training batch (`real_rows`). A rule an objective
+        computes itself weights its rows by this, as `row_mean` does."""
+        return Objective.real_rows(batch, rows).astype(jnp.float32)
+
+    @staticmethod
+    def _clean_rows(batch: Batch, rows: int) -> tuple[Batch, jax.Array]:
+        """`batch` with row-indexed entries on filler rows (`VALID_ROWS=False`) replaced by zeros so
+        non-finite filler values never enter forward or reverse-mode AD, beside `real_rows`."""
+        real = Objective.real_rows(batch, rows)
+        if VALID_ROWS not in batch:
+            return batch, real
+
+        def neutral(leaf):
+            entries = jnp.asarray(leaf)
+            if entries.ndim == 0 or entries.shape[0] != rows:
+                return leaf
+            expanded = real.reshape(rows, *(1,) * (entries.ndim - 1))
+            return jnp.where(expanded, entries, jnp.zeros((), entries.dtype))
+
+        cleaned = {key: value if key == VALID_ROWS else jax.tree.map(neutral, value)
+                   for key, value in batch.items()}
+        return cleaned, real
 
     @staticmethod
     def accuracy(correct: jax.Array, batch: Batch, weights: jax.Array | None = None, *,
@@ -1477,6 +1534,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         stats, aux = self._loss(variables, batch, step)
         value, _ = self.reduce_loss(stats)
         return value, aux
+
+    def whole_head_table(self, variables: Variables) -> tuple[int, int] | None:
+        """The rows and features of the vocabulary table a head that keeps its whole logits for the backward
+        pass scores, over `variables`' shapes, which a planner bounds the step's logits by
+        (`dew.training.footprint.logits_floor`); None for an objective with no such head, or one tiled
+        already."""
+        return None
 
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that keeps its whole logits for the backward pass to a bounded tile.

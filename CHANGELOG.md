@@ -7,12 +7,27 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A run's fit plan judges a head that keeps its whole logits by their fp32 bytes before it traces the step's
+  gradient (`Objective.whole_head_table` names the head's table), and bounds the rung after a traced one
+  from that trace, so a step whose whole logits leave no room is planned from one gradient trace and
+  compiled once (on Qwen3.5-4B, 4 x 12,288 tokens on one 80 GB GPU: one trace where three ran). Each probe
+  in a compiled step's plan records its candidate's traced, lowered and compiled seconds (`spent`).
+
+- `GRPOObjective`, `PPOObjective`, `FlowGRPOObjective` and `DiffusionNFTObjective` mask repeated filler rows
+  (`VALID_ROWS`) out of their losses, weights, critic terms and reported metrics, leaving an all-invalid
+  batch with zero mass.
+
 - An fp32 call that runs on the gated delta rule's, Kimi delta attention's or the SSD's port on a GPU (Dew's
   ports of fla's and mamba_ssm's kernels; the SSD's training takes its port on an A100 and an H100) under the
   default numerics multiplies its fp32 products in one TF32, as fla's and mamba_ssm's own kernels do, where it
   took an fp32 product's accuracy (BF16x6): its state is about 2^13 further from float64 than before, as its
   upstream's is. A run whose configured precision is above the default (`dew.nn.precision.ACCURATE`'s
   'highest') is declined by the ports and trains on the portable math in IEEE float32, as before.
+
+- `ControlPPOObjective` and `DreamerV3Objective` ignore repeated filler rows (`VALID_ROWS`), draw entropy,
+  posterior and imagination noise from `Step`'s per-example update streams, and compute minibatch-wide
+  advantage moments and return percentiles once across a split step's microbatches
+  (`Objective.batch_statistics`, `Step.batch_statistics`, `Objective.real_rows`).
 
 - A paged `Server` keeps a prefix cache by default (`prefix_cache=None` derives it on wherever the layout pages,
   the rows sample a token a step on the server's own mesh and the model computes a split prompt as a whole

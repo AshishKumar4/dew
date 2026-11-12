@@ -356,6 +356,16 @@ class MultimodalTransformer(DecoderWrapper):
     def num_nextn_predict_layers(self) -> int:
         return self.language_model.num_nextn_predict_layers
 
+    @property
+    def replaced_ids(self) -> frozenset[int]:
+        """The ids `_fused` replaces wherever they occur (`dew.nn.protocols.ReplacesTokens`): Gemma 4's
+        placeholders, which read as padding. Another family's read its table, but at the slots a call's
+        media fill (`dew.nn.inputs.media_slots`)."""
+        if not wrapper(self.family).gemma4:
+            return frozenset()
+        return frozenset({*self.extra_placeholder_ids,
+                          *(() if self.image_token_id is None else (self.image_token_id,))})
+
     def _fused(self, tokens, image_indices=None, audio_indices=None, conditioning=None,
                train: bool = False) -> Fusion:
         """Decoder token identities and their embeddings with media slots filled,
@@ -367,10 +377,8 @@ class MultimodalTransformer(DecoderWrapper):
         ranges, so it runs this path with no payloads too; any other call
         without payloads leaves the decoder its own lookup.
         """
-        if wrapper(self.family).gemma4:
-            placeholder = tokens == self.image_token_id
-            for token_id in self.extra_placeholder_ids:
-                placeholder = placeholder | (tokens == token_id)
+        if self.replaced_ids:
+            placeholder = jnp.isin(tokens, jnp.asarray(sorted(self.replaced_ids), tokens.dtype))
             tokens = jnp.where(placeholder, self.pad_token_id, tokens)
         if conditioning is None and (image_indices is not None or audio_indices is not None):
             raise ValueError("media indices require conditioning payloads")

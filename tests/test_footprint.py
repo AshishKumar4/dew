@@ -40,7 +40,7 @@ def test_a_marked_spans_peak_is_its_bodys_as_xla_inlines_it():
     x = jax.ShapeDtypeStruct((256, 64), jnp.float32)
 
     def derived(span):
-        residuals, peak = derived_terms(lambda weights, x: loss(weights, x, span=span), weights, (x,),
+        residuals, peak, _ = derived_terms(lambda weights, x: loss(weights, x, span=span), weights, (x,),
                                         platform="gpu", workspace=Workspace(0, 0))
         return residuals, peak.bytes
 
@@ -856,7 +856,7 @@ def test_a_derived_peak_is_of_the_program_the_algebra_pass_makes_of_the_step():
 
     def derived():
         program, _, _ = traced_gradient(loss, weights, (x,))
-        residuals, peak = derived_terms(loss, weights, (x,), platform="gpu", workspace=Workspace(0, 0))
+        residuals, peak, _ = derived_terms(loss, weights, (x,), platform="gpu", workspace=Workspace(0, 0))
         forward = [equation for equation in program.eqns if equation.primitive.name == "dot_general"
                    and equation.outvars[0].aval.shape == (256, 1024)]
         return len(forward), residuals, peak.bytes

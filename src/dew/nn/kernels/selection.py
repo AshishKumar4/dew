@@ -175,6 +175,17 @@ class Op[C]:
     """Another op's named choice that names this one's kernel, unless this call or op names its own.
     Entries are ordered, as the op's requirements and candidates are."""
 
+    def __post_init__(self) -> None:
+        # Each declared cell runs one of the op's kernels, in a scope a device generation or its instruction
+        # family states: one that names another, or no scope, matches no call.
+        from . import generation
+
+        scopes = {*generation.TARGETS, *map(generation.family, generation.TARGETS)}
+        for (scope, _), (kernel, _) in self.declared.items():
+            if kernel not in self.kernels or scope not in scopes:
+                raise ValueError(f"{self.choice} declares {kernel.name!r} in {scope!r}, which matches no "
+                                 f"call: its kernels are {', '.join(each.name for each in self.kernels)}")
+
     def kernel(self, name: str) -> Kernel[C]:
         for kernel in self.kernels:
             if kernel.name == name:

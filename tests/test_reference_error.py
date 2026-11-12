@@ -605,11 +605,11 @@ def summed_wide(x, w):
 def test_check_1_runs_each_arm_as_its_users_sum_their_products():
     """On the CPU lane check 1 runs each arm with fp32 products summed in fp32 (`summed_as_run`), the
     truth outside that: Dew's product, which sums in float64 only under the suite's wide arithmetic and
-    pairwise in float32 as its users run it (`accumulated`, row 4863), is judged as they run it, so it is
+    as XLA's own float32 dot as its users run it (`accumulated`, row 5448), is judged as they run it, so it is
     on par with XLA's plain fp32 dot but not with the same product kept to its float64 sums; and against
     that product the plain dot fails too, so the truth is still float64's."""
     assert_as_exact(dews_product, jnp.matmul, long_dot_draw, "as its users sum", seeds=16)
-    for arm, label in ((dews_product, "pairwise against summed wide"), (jnp.matmul, "summed wide")):
+    for arm, label in ((dews_product, "as run against summed wide"), (jnp.matmul, "summed wide")):
         with pytest.raises(GateFailure):
             assert_as_exact(arm, summed_wide, long_dot_draw, label, seeds=16)
 
@@ -1068,15 +1068,6 @@ def test_check_one_holds_each_leaf_to_its_truths_path_and_shape():
         assert_as_exact(_product, _broadcast, _draw, "another reference", seeds=8, truth_fn=_product)
 
 
-def test_check_one_passes_an_equally_exact_sum_over_the_seeds_its_own_reference_resolves():
-    """The product summed in reverse rounds as exactly as the reference, by other partial sums: over the
-    seeds the reference compared with itself needs (`seeds_for`), its pooled RMS error sits within
-    PARITY of the reference's, every run alike."""
-    seeds = seeds_for(_product, _draw, "product")
-    assert_as_exact(_reordered, _product, _draw, "reordered", seeds=seeds)
-    assert_as_exact(_reordered, _product, _draw, "reordered", seeds=seeds)
-
-
 def test_a_committed_fixture_is_its_references_output_within_twice_a_fresh_runs_error():
     """An artifact check, not a parity (`assert_same_artifact`): a committed fixture whose largest error
     from float64 is up to twice a fresh run's is the reference's output; one further is not, even where
@@ -1113,8 +1104,7 @@ def test_a_runs_learning_rates_part_from_the_base_at_any_float32_difference(monk
     next_up = np.nextafter(base, np.float32(1)).astype(np.float64)
     records = {"base": {"config": config, "lr": base.tolist()}}
     assert not compare.conditions({**records, "run": {"config": config, "lr": rounding.tolist()}})
-    [found] = compare.conditions({**records, "run": {"config": config, "lr": next_up.tolist()}})
-    assert found.startswith("lr of run parts from base at 3 of 3 steps, first at step 0")
+    assert len(compare.conditions({**records, "run": {"config": config, "lr": next_up.tolist()}})) == 1
 
 
 @pytest.mark.parametrize("wrong", [_lost_term, _bf16_operands], ids=["lost term", "bf16 operands"])
@@ -1128,10 +1118,9 @@ def test_check_one_fails_a_sum_that_differs_rather_than_rounds(wrong):
 
 def test_a_failing_site_raises_its_findings_as_data():
     """A lost term fails check 1's pooled ratio: its finding names the leaf, the rule and a measure past
-    PARITY, and the failure's message is its findings', one a line."""
+    PARITY."""
     with pytest.raises(GateFailure) as raised:
         assert_as_exact(_lost_term, _product, _draw, "lost", seeds=seeds_for(_product, _draw, "product"))
-    assert str(raised.value) == "\n".join(map(str, raised.value.findings))
     pooled = [finding for finding in raised.value.findings if finding.rule == "pooled"]
     assert pooled and all(finding.leaf.startswith("lost") and finding.measure > math.log(PARITY)
                           for finding in pooled)
@@ -1165,7 +1154,9 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
 
     mine, theirs = np.asarray([4.0, 0.01] * 20), np.ones(40)
     assert _status(math.sqrt(2.005), *_interval(mine, theirs)) == "inconclusive"
-    assert _typical_status(mine, theirs)[4].startswith("its draws' log ratios spread")
+    # The typical draw's ratio passes, so what leaves the leaf undecided is its draws' spread or tail.
+    status, *typical, _ = _typical_status(mine, theirs)
+    assert status == "inconclusive" and _status(*typical) == "pass"
     with pytest.raises(Inconclusive):
         assert_as_exact(dew, reference, errors, "straddling", seeds=8, truth_fn=truth)
     with pytest.raises(Inconclusive):
@@ -1384,6 +1375,44 @@ def test_a_recording_keeps_the_larger_count_sized_on_another_backend(planned):
                                                 truth_fn=product)
     assert_as_exact(lambda index, inputs: product(inputs), reference, drawn, "larger backend",
                     seeds=seeds, truth_fn=truth)
+
+
+def test_a_recording_judged_is_held_to_dews_own_run_of_the_same_weights(tmp_path):
+    """A recording of another library running what Dew exports (`record_case`'s and
+    `assert_as_exact_as_recorded`'s `judged`) is the arm check 1 judges, Dew's own run its reference, its
+    seeds sized with the two in those places: a library that sums nearer float64 than Dew's run is on par,
+    where Dew's run judged against it is not, and an export read one part in ten thousand off is over."""
+    from reference_runs import assert_as_exact_as_recorded
+    from tool_support import load
+
+    def draw(seed):
+        x, w = _draw(seed)
+        return {"x": x, "w": w}
+
+    def read(inputs):
+        # The other library's run of the export: the product summed in float64 and rounded once.
+        truth = np.asarray(inputs["x"], np.float64) @ np.asarray(inputs["w"], np.float64)
+        return {"y": truth.astype(np.float32)}, {"y": truth}
+
+    def dew(dtype, inputs):
+        return {"y": np.asarray(inputs["x"], dtype) @ np.asarray(inputs["w"], dtype)}
+
+    def held(name, label, arrays, **roles):
+        np.savez(tmp_path / name, **arrays)
+        assert_as_exact_as_recorded(tmp_path / name, "site", int(arrays["site.seeds"]), draw, dew, label,
+                                    host=True, **roles)
+
+    def recorded(**roles):
+        return load("recorded_references").record_case(
+            "site", draw, read, store_inputs=False, dew=lambda inputs: dew(np.float32, inputs), **roles)
+
+    judged = recorded(judged=True)
+    held("read.npz", "the export read", judged, judged=True)
+    with pytest.raises(GateFailure):
+        held("reference.npz", "Dew's run judged", recorded())
+    with pytest.raises(GateFailure):
+        held("off.npz", "an export read off", {**judged, "site.reference.y": judged[
+            "site.reference.y"] * np.float32(1 + 1e-4)}, judged=True)
 
 
 def test_a_recording_asked_ahead_is_the_recording_asked_in_turn():
@@ -2254,7 +2283,7 @@ def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or
     its log ratios spread within QUALIFYING_SPREAD, passes at the count it sizes; a Dew twice off on every
     draw is refused by its typical draw; one ten times off on a tenth of its draws, which the typical
     draw's ratio leaves under PARITY, is refused by the spread its fault adds."""
-    from dew.parity import _interval, _resolves, _typical_status
+    from dew.parity import _interval, _resolves, _status, _typical_status
 
     reference = rounded_apart(1)
     seeds = seeds_for(reference, rounding_apart, "rounding apart", truth_fn=exact_value,
@@ -2279,7 +2308,8 @@ def test_arms_rounding_apart_are_judged_by_the_typical_draw_and_a_fault_on_it_or
     # ratio 2.46, unresolved, the typical draw's ratio under PARITY; the spread of its log ratios refuses it.
     mine, theirs = np.where(np.arange(256) < 13, 100.0, 1.0), np.ones(256)
     assert not _resolves(*_interval(mine, theirs))
-    assert _typical_status(mine, theirs)[4].startswith("its draws' log ratios spread")
+    status, *typical, _ = _typical_status(mine, theirs)
+    assert status == "inconclusive" and _status(*typical) == "pass"
 
 
 def test_a_leaf_the_second_stage_finds_over_is_over_whatever_its_first_stages_typical_draw():

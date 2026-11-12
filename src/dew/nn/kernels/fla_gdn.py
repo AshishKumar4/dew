@@ -1147,8 +1147,8 @@ def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: i
     it: the inverse, `w` and `u`, the memory across chunks, then the output, and what the backward saves.
     Every decay takes both (`algebra.between`, `algebra.raised`): from the rounded prefix alone a steep
     token's rounding took every mild one after it, the output 1530 times the portable math's distance from
-    float64 (ledger 2098). The prefix is a value the port rounds and holds, a node of its graph (the
-    accuracy gate's source-aware check, `assert_graph_as_exact`), and this the port's arithmetic on it."""
+    float64 (ledger 2098). The prefix is a value the port rounds and holds, and this the port's arithmetic
+    on it."""
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
     prefix, (g, g_lo) = g, g
     a = checkpoint_name(kkt_solve(k, g, beta, g_lo=g_lo, **kernels), Residual.DELTA_INVERSE)

@@ -26,6 +26,7 @@ from dew.nn.inputs import local_rows
 from dew.objectives.base import Metric, Shown
 
 if TYPE_CHECKING:
+    from dew.objectives.base import Objective
     from dew.state import TrainState
     from dew.training._fit import FitRun
     from dew.training.interval import Interval
@@ -72,9 +73,15 @@ class Rollout(Protocol):
     processes with a checkpointer is refused one as its fit starts
     (`_rollout_admitted`). The
     contract is the post-training spec's (docs/design/post-training.md, §14).
+
+    `objective` is the one the step it feeds trains: the run's own, or, where its data's phases set the
+    loop's pass count (`Trainer(phase_passes=)`), the copy at the count of the phase the step's batch was
+    read in (`PhasePasses.objective_for`), which a policy drawn for the step samples as. A rollout that acts
+    with a policy of its own compiled once refuses one other than its own (`own_objective`).
     """
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
+    def __call__[LossT, EffectsT](self, state: TrainState, batch: Batch, key: jax.Array, *,
+                                  objective: Objective[LossT, EffectsT]) -> Batch: ...
 
 
 def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
@@ -83,15 +90,18 @@ def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
     return getattr(rollout, 'metrics', {})
 
 
-def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: Mesh,
-               marked: Callable[[Batch], Batch], interval: Interval, run: FitRun, *,
-               examples: int | None = None, closes: bool = False) -> tuple[Batch, bytes | None]:
+def rolled_out[LossT, EffectsT](rollout: Rollout | None, state: TrainState, batch: Batch, mesh: Mesh,
+                                marked: Callable[[Batch], Batch], interval: Interval, run: FitRun, *,
+                                objective: Objective[LossT, EffectsT] | None = None,
+                                examples: int | None = None, closes: bool = False
+                                ) -> tuple[Batch, bytes | None]:
     """`batch` sampled through `rollout` from `state`, as the run holds it, which its policy reads off
     the mesh (`decoder_stack.off_stages`), its host preparation `marked` and placed on `mesh`
     (`shard_batch`), its seconds counted in `interval`, `run`'s stream placing nothing meanwhile
     (`FitRun.held`); without a rollout, the batch as it is. The batch it makes carries the run's metadata of
     the read (`carried`): the data phase its step's batch was read in, and in a run on the examples clock the
-    examples of the batches it read, its step's and each it drew further. Where it `closes` a step of the run
+    examples of the batches it read, its step's and each it drew further. `objective` is the one the step
+    trains (`Rollout`), which a run with a rollout passes. Where it `closes` a step of the run
     bounded to `examples`, the batch is closed (`FitRun.closing`) after the rollout's last draw, so the
     look-ahead that finds the stream's end, and the position the step saves, come after every batch it read,
     in a pool each a pooled read (`FitRun.further`). With the batch, the position the step saves, or None.
@@ -105,12 +115,13 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
 
     if rollout is None:
         return run.closing(interval, batch, examples) if closes else (batch, None)
+    assert objective is not None, "a rollout draws for the objective its step trains"
     began = time.perf_counter()
     key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
     consumed = _Consumed(batch)
     further = {"further": consumed.reading(run.further(interval))} if _draws_further(rollout) else {}
     with run.held():
-        made = carried(rollout(state, _unread(batch), key, **further), batch, consumed)
+        made = carried(rollout(state, _unread(batch), key, **further, objective=objective), batch, consumed)
         prepared = marked(made)
         # The count the rollout's batch consumes is what it read, as `ConsumedCount`s count it.
         batch = shard_batch(mesh, prepared if CONSUMED_COUNT not in made else {

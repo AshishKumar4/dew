@@ -23,13 +23,13 @@ import jax
 import pytest
 from process_support import assert_exits_cleanly
 from reference_error import recording
-from saved_run_kinds import SAVED_KINDS, answered, computed, trained_finite
-from saved_run_products import unpacked
+from saved_run_kinds import SAVED_KINDS, answered, trained_finite
 
 from dew.checkpoints import Checkpoints
 from dew.config import RunConfig
 from dew.decision.task import Decide
 from dew.inference.tasks import SavedRun
+from dew.interop.release import computed_in
 from dew.registry import objectives
 from dew.training import LocalTracker
 
@@ -44,27 +44,20 @@ ABSOLUTE = re.compile(rb"/(?:home|Users|root|tmp|mnt|private|var)/")
 """An absolute place of the machine that wrote a file: a home, a scratch or a mounted directory."""
 
 
-PRODUCTS = 2
-"""The evidence version from which a generation records the dtypes one request of each run's task
-multiplies in, by module path (`saved_run_kinds.computed`); an earlier one's are not compared."""
-
-USERS_PRODUCTS = 3
-"""The evidence version from which a generation records its products in a user's process
-(`saved_runs_reference.EVIDENCE`); an earlier one recorded them in the suite's wide CPU arithmetic, and
-they are read again in it (`computed`'s `wide`): a product of float32 operands there multiplies in
-float64 (row 5442)."""
+def computes_in(task) -> str:
+    """The dtype a loaded task's model states it computes in (`dew.nn.protocols.ComputesIn`), by name, or
+    where it states none its parameters' (`dew.interop.release.computed_in`)."""
+    return computed_in(None, task.model, task.variables)
 
 
 def evidence(recorded: str, kind: str) -> dict | None:
-    """What `kind`'s run the main `recorded` saved serialized (`saved_runs_reference.evidence`), beside
-    the version its generation states (`version`), None where that main's generation records none: one
-    recorded before its version (`source.json`'s `evidence`). A generation that states one holds every
-    kind's."""
+    """What `kind`'s run the main `recorded` saved serialized (`saved_runs_reference.evidence`), None
+    where that main's generation records none: one recorded before it stated an evidence version
+    (`source.json`'s `evidence`). A generation that states one holds every kind's."""
     source = json.loads((CORPUS / recorded / "source.json").read_text())
     if "evidence" not in source:
         return None
-    seen = json.loads((CORPUS / recorded / f"{kind}.evidence.json").read_text())
-    return {**seen, "version": source["evidence"]}
+    return json.loads((CORPUS / recorded / f"{kind}.evidence.json").read_text())
 
 
 def archived(recorded: str, kind: str) -> tarfile.TarFile:
@@ -195,19 +188,13 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, monkeypatch, re
         declared = checkpoints.artifact(last) is not None
     if seen is not None:
         assert recorded_run.compute_dtype() == seen["compute"]
-        if seen["version"] >= PRODUCTS:
-            # A run that declared its task recorded what one request multiplied, and one that declared
-            # none recorded nothing.
-            assert (seen["products"] is not None) == declared
-        if declared and seen["version"] >= PRODUCTS:
-            # The task loaded multiplies as the one the run saved did: one request's products, module by
-            # module, in the dtypes they multiplied in then.
-            found = computed(run, wide=seen["version"] < USERS_PRODUCTS)
-            assert found["products"] == unpacked(seen["products"], found["packs"])
     if declared:
         saved = SavedRun.pinned(str(run))
         assert saved.step == last
-        answered(task.from_run(str(run)))
+        loaded = task.from_run(str(run))
+        # The task loaded computes in the dtype its run did, as its model and numerics state it.
+        assert computes_in(loaded) == recorded_run.compute_dtype()
+        answered(loaded)
     else:
         with pytest.raises(ValueError):
             SavedRun.pinned(str(run))
@@ -292,10 +279,8 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
         assert consumed is None or consumed > seen["consumed"]
         assert not clocked or consumed == recorded_run.trainer.examples
         # The model the resumed fit trained computes as the saved one did: the task its new step saves.
-        # Where its main recorded them: a run whose objective declared no task then recorded none.
-        if task is not None and seen["version"] >= PRODUCTS and seen["products"] is not None:
-            found = computed(run, int(state.step), wide=seen["version"] < USERS_PRODUCTS)
-            assert found["products"] == unpacked(seen["products"], found["packs"])
+        if task is not None:
+            assert computes_in(task.from_run(str(run), step=int(state.step))) == seen["compute"]
         # The step the resumed fit compiled, at the rung it was admitted at.
         compiled = [row["value"] for row in records[resumed:] if row["type"] == "StepCompiled"][-1]
         assert compiled["remat"] == seen["remat"]
@@ -458,145 +443,6 @@ def test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_fr
         trained(run, tmp_path, kind, trainer={"name": kind, "steps": steps, "checkpoint_final": True})
         assert str(steps) in {path.name for path in directory.iterdir()}
         assert json.loads((directory / "run.json").read_text())["fields"]["option_text"] == written
-
-
-def test_a_packed_projections_products_count_at_each_of_its_members():
-    """A task that serves a group of projections packed (`dew.nn.protocols.ProjectionGroup`: a decoder's
-    q, k and v as `qkv_proj`) multiplies them in one product, which the evidence counts at each member
-    (`unpacked`), so a run a main saved before the task packed them compares with one it packs: the same
-    dtypes at the same members. A member whose dtype moved still differs; a module of the same name that
-    no group declares (a linear attention's own `qkv_proj`) keeps its path; and two groups of one packed
-    name unpack each to its own members."""
-    from saved_run_products import unpacked
-
-    packs = {"layers_0/self_attn/qkv_proj": ["layers_0/self_attn/q_proj", "layers_0/self_attn/k_proj",
-                                             "layers_0/self_attn/v_proj"],
-             "layers_0/mlp/gate_up_proj": ["layers_0/mlp/gate_proj", "layers_0/mlp/up_proj"],
-             "layers_1/self_attn/qkv_proj": ["layers_1/self_attn/q_proj", "layers_1/self_attn/kv_proj"]}
-    then = {"layers_0/self_attn/q_proj": ["float64"], "layers_0/self_attn/k_proj": ["float64"],
-            "layers_0/self_attn/v_proj": ["float64"], "layers_0/mlp/gate_proj": ["float32"],
-            "layers_0/mlp/up_proj": ["float32"], "layers_1/self_attn/q_proj": ["float64"],
-            "layers_1/self_attn/kv_proj": ["float64"], "layers_2/lightning/qkv_proj": ["float64"]}
-    now = {"layers_0/self_attn/qkv_proj": ["float64"], "layers_0/mlp/gate_up_proj": ["float32"],
-           "layers_1/self_attn/qkv_proj": ["float64"], "layers_2/lightning/qkv_proj": ["float64"]}
-    assert unpacked(now, packs) == unpacked(then, packs) == then
-    moved = {**then, "layers_0/mlp/up_proj": ["bfloat16"]}
-    assert unpacked(moved, packs) != unpacked(now, packs)
-
-
-def test_a_called_product_is_read_at_the_scope_that_called_it(tmp_path, monkeypatch):
-    """A product in a called program is read at the scope of the call that runs it, as XLA inlines it: a wide
-    sum's (`precision.accumulated` on a CPU in the wide arithmetic the corpus's earlier generations recorded
-    in, one private function traced once for its types, its own location naming no scope) at its caller's,
-    and one under a scope of the called program's own at that (row 3193)."""
-    import jax.numpy as jnp
-    from saved_run_products import SCOPE, products
-
-    from dew.nn.precision import WIDE_CPU_ARITHMETIC, accumulated
-
-    monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
-
-    @jax.jit
-    def block(x, weight):
-        with jax.named_scope(SCOPE + "layer2|inner"):
-            return x @ weight
-
-    def program(x, first, second):
-        with jax.named_scope(SCOPE + "layer1"):
-            hidden = accumulated(jnp.dot, x, first)
-        with jax.named_scope(SCOPE + "layer2"):
-            return block(hidden.astype(jnp.bfloat16), second)
-
-    with jax.default_device(jax.devices("cpu")[0]):
-        x, w = jnp.ones((4, 8), jnp.float32), jnp.ones((8, 8), jnp.float32)
-        jax.config.update("jax_dump_ir_to", str(tmp_path))
-        try:
-            jax.jit(program)(x, w, w.astype(jnp.bfloat16)).block_until_ready()
-        finally:
-            jax.config.update("jax_dump_ir_to", "")
-    texts = [path.read_text() for path in sorted(tmp_path.glob("*.mlir"))]
-    assert products(texts) == {"layer1": ["float64"], "layer2/inner": ["bfloat16"]}
-
-
-def test_a_requests_products_are_named_by_their_variable_scopes():
-    """The products the saved-run evidence compares (`saved_run_products`) are named by the variable scope
-    of the module that runs them in the task's tree, whichever method or class runs them: a helper
-    method's product is its owner's, a shared scope's its sharer's, two siblings' apart, roots of one
-    class applied over branches of the tree apart, a dozen in one request, a renamed class's the same;
-    and a projection whose dtype moves moves alone, and a branch whose trunk is held frozen, read from two
-    collections, its own. Two branches alike in every leaf, which no root's reading tells apart, are
-    refused."""
-    import jax.numpy as jnp
-    from flax import linen as nn
-    from saved_run_products import products, scoping
-
-    from dew.batch import freeze, part, thaw
-
-    class Pair(nn.Module):
-        right: jnp.dtype
-        width: int = 4
-
-        def setup(self):
-            self.left = nn.Dense(self.width, dtype=jnp.float32, param_dtype=jnp.float32)
-            self.right_ = nn.Dense(self.width, dtype=self.right, param_dtype=jnp.float32, name="right")
-
-        def project(self, x):
-            return self.right_(x)
-
-        def __call__(self, x):
-            return self.left(x)[..., :4] + self.project(x)[..., :4]
-
-    class Shared(nn.Module):
-        """A `Pair` in this module's own scope (`nn.share_scope`), as a release's decoder shares its text
-        model's."""
-
-        right: jnp.dtype
-
-        def setup(self):
-            self.inner = Pair(self.right)
-            nn.share_scope(self, self.inner)
-
-        def __call__(self, x):
-            return self.inner(x)
-
-    class Renamed(Pair):
-        """`Pair` under another name, over the same variables."""
-
-    x = jnp.ones((2, 4), jnp.float32)
-
-    def read(roots: dict[str, nn.Module], frozen: bool = False) -> dict[str, list[str]]:
-        tree = {"params": {name: root.init(jax.random.key(0), x)["params"] for name, root in roots.items()}}
-        if frozen:
-            # Each root's right projection held frozen, as a run's frozen trunk is (`dew.batch.freeze`).
-            tree = freeze(tree, lambda path: "right" not in path)
-
-        def request(tree, x):
-            # Each root reads its trunk whole (`thaw`), as a run's model reads its frozen trunk.
-            return sum(root.apply(thaw(part(tree, name)), x) for name, root in roots.items())
-
-        with nn.intercept_methods(scoping(tree)):
-            lowered = jax.jit(request).lower(tree, x)
-        return products([lowered.as_text(debug_info=True)])
-
-    assert read({"pair": Pair(jnp.bfloat16)}) == {"pair/left": ["float32"], "pair/right": ["bfloat16"]}
-    assert read({"pair": Shared(jnp.bfloat16)}) == read({"pair": Pair(jnp.bfloat16)})
-    assert read({"pair": Renamed(jnp.bfloat16)}) == read({"pair": Pair(jnp.bfloat16)})
-    assert read({"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)}) == {
-        "first/left": ["float32"], "first/right": ["float32"], "second/left": ["float32"],
-        "second/right": ["bfloat16"]}
-    # A dozen roots of one class applied one after another in one request, each over its own branch, each
-    # freed before the next is made (which Python may make at a freed one's address): each named by its
-    # own branch, never an earlier root's (row 2867).
-    dtypes = [jnp.float32 if index % 2 else jnp.bfloat16 for index in range(12)]
-    assert read({f"r{index}": Pair(dtype, width=4 + index) for index, dtype in enumerate(dtypes)}) == {
-        f"r{index}/{side}": ["float32" if side == "left" else jnp.dtype(dtype).name]
-        for index, dtype in enumerate(dtypes) for side in ("left", "right")}
-    with pytest.raises(ValueError):
-        read({"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16)})
-    # A branch read from two collections, its trunk held frozen, is the branch its root reads.
-    assert read({"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)}, frozen=True) == read(
-        {"first": Pair(jnp.float32), "second": Pair(jnp.bfloat16, width=8)})
-
 
 
 @pytest.mark.parametrize(("recorded", "kind"),

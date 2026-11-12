@@ -2,6 +2,9 @@
 one process (`gpu_flow`), each cell its own file's property:
 
 - A dense product's exact sums survive one row tile through Triton's MMA accumulation (test_gemm_template).
+- A pair of multiprocessors' cooperative tile, a cluster multicasting its shared blocks, holds check 1 with
+  its hooks, and a dense kernel gradient's balanced tail, its partials fixed up across programs, holds
+  check 1, on an H100 (test_gemm_template).
 - CUTLASS runs the grouped projection as exactly as XLA wherever it is chosen, over every grouping that
   routes a row (test_grouped_gemm).
 - The blockwise FP8 kernel gradient (rows contiguous, step scales) holds check 1 on an H100
@@ -29,12 +32,10 @@ one process (`gpu_flow`), each cell its own file's property:
   path's, dense and grouped, each matrix layout, hook and dtype its served pairs name (gemm_matrix).
 - The fused GEMM's check-1 matrix (tests/kernel_matrix.py): a region's training step through the fuser's
   prologue and epilogue on par with the same region's stages in XLA (fused_gemm_matrix).
-- The joined projections' check-1 matrix (tests/kernel_matrix.py): a gated MLP's gate and up projections, or a
-  gated delta net's b and a, run as one GEMM, the layer's training step on par with the projections apart
-  (join_matrix).
-- The NVFP4, MX, blockwise FP8 and adapted products' check-1 matrices (tests/kernel_matrix.py). Each matrix
-  runs here over the combinations of the axes a GPU runs natively, its kernel or form and precision, and the
-  cases a red found on a GPU (`kernel_matrix.native_cells`); its other pairs are the CPU's.
+- The NVFP4, blockwise FP8 and adapted products' check-1 matrices (tests/kernel_matrix.py), each at the cases
+  a red found on a GPU (`kernel_matrix.seeded_cells`), and the MX products' over a covering of their block
+  formats and output dtypes on a Blackwell, whose block-scaled MMA no interpreter runs; every other pair is
+  the CPU's, interpreted, as the joined projections' matrix is.
 """
 
 import functools
@@ -53,7 +54,7 @@ import test_gemm_widths as gemm_widths
 import test_grouped_gemm as grouped_gemm
 import test_mosaic_toolkit as mosaic_toolkit
 import test_warpgroup_scan as warpgroup_scan
-from gpu_flow import Cell, run_cells, when
+from gpu_flow import Cell, cells_of, covering, run_cells, when
 from jax.experimental.pallas import fuser
 from reference_error import assert_as_exact
 
@@ -119,77 +120,116 @@ def a_fused_projection_trains_its_producer_and_epilogue():
                         "fused projection producer and epilogue update", seeds=8, truth_fn=reference)
 
 
+PARTIAL_TILE = "a TMA copy of a partial tile, which reads zeros and clips stores where the interpreter pads"
+"""Why a width no tile divides stays on the GPU (the GEMM lane, 11-11)."""
+
+RING = "a ring's asynchronous slots, which the interpreter walks in one order"
+"""Why the toolkit's rings stay on the GPU (the GEMM lane, 11-11)."""
+
+CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads whole in each program"
+"""Why a pair of multiprocessors' cooperative tile stays on the GPU (the GEMM lane, 11-12)."""
+
+BALANCED_TAIL = "a balanced tail's partials fixed up across programs, which the interpreter runs in one order"
+"""Why a dense kernel gradient's balanced tail stays on the GPU (the GEMM lane, 11-12)."""
+
+
 def test_the_gemm_kernels_run_on_this_gpu():
-    """Every GEMM and toolkit cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all
-    raised together; the toolkit's on an H100 alone."""
-    run_cells([
+    """The GEMM and toolkit cells above a GPU runs (`gpu_flow.covering`: each kept for a GPU-only fault by
+    name, the fewest others covering its native axes, every other the CPU's, interpreted and through the
+    compile gate), each one's failure kept and all raised together; the toolkit's on an H100 alone."""
+    run_cells(covering([
         Cell("a fused projection trains its producer and epilogue",
-             a_fused_projection_trains_its_producer_and_epilogue, "sm90"),
+             a_fused_projection_trains_its_producer_and_epilogue, "sm90",
+             native={"launch": "fused prologue and epilogue", "pass": "training"}),
         Cell("a dense product's exact sums survive one row tile",
              when(generation.triton_runs(), "needs a GPU the Pallas kernels compile for",
-                  gemm_template.a_dense_products_exact_sums_survive_one_row_tile)),
+                  gemm_template.a_dense_products_exact_sums_survive_one_row_tile),
+             native={"launch": "dense", "pass": "forward"}),
         *(Cell(f"CUTLASS runs the projection as exactly as XLA where chosen: {sizes}",
                functools.partial(grouped_gemm.cutlass_runs_the_projection_as_exactly_as_xla_where_chosen,
-                                 sizes))
+                                 sizes),
+               fault="CUTLASS's launches, which no CPU runs" if sizes == "ragged" else None,
+               native={"launch": "cutlass", "groups": sizes})
           for sizes in grouped_gemm.SIZES if any(grouped_gemm.SIZES[sizes])),
         *(Cell(f"the template sums 16-bit products into fp32 as exactly as XLA: depth {depth}",
                functools.partial(grouped_gemm.the_template_sums_16_bit_products_into_fp32_as_exactly_as_xla,
-                                 depth))
+                                 depth),
+               # Its depth native: the tensor cores' own fp32 sums over the contraction, the claim.
+               native={"launch": "grouped", "pass": "forward", "dtype": "16-bit", "depth": str(depth)})
           for depth in (128, 512)),
         Cell("the template takes a gpt-oss width as exactly as XLA",
-             grouped_gemm.the_template_takes_a_gpt_oss_width_as_exactly_as_xla),
+             grouped_gemm.the_template_takes_a_gpt_oss_width_as_exactly_as_xla, fault=PARTIAL_TILE),
         *(Cell(f"the template runs widths no tile divides: {depth}x{width}",
                functools.partial(gemm_widths.unaligned_widths_run_on_the_template, depth, width,
-                                 interpret=False))
+                                 interpret=False), fault=PARTIAL_TILE)
           for depth, width in gemm_widths.WIDTHS),
+        *(Cell(f"a pair's cooperative tile holds check 1 with its hooks: {case}",
+               functools.partial(gemm_template.a_cooperative_tile_holds_check_1_with_its_hooks, case,
+                                 gemm_template.PAIRED), "sm90", fault=CLUSTER)
+          for case in ("scaled", "row scaled")),
+        *(Cell(f"a dense kernel gradient's balanced tail holds check 1: {rows}x{depth}x{width} into "
+               f"{jnp.dtype(dtype).name}",
+               functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
+                                 depth, width, dtype), "sm90", fault=BALANCED_TAIL)
+          for rows, depth, width in gemm_template.BALANCED_TAILS for dtype in (jnp.bfloat16, jnp.float32)),
         Cell("the blockwise FP8 kernel gradient is on par",
-             gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90"),
+             gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90", fault="red at 475913063"),
         Cell("the blockwise FP8 kernel gradient's portable arm sums exactly",
-             gemm_blockwise.a_blockwise_kernel_gradients_portable_arm_sums_exactly),
+             gemm_blockwise.a_blockwise_kernel_gradients_portable_arm_sums_exactly,
+             native={"launch": "blockwise portable", "pass": "gradient"}),
         *(Cell(f"a gathered grouped product is on par{': paired and scattered' if paired else ''}",
                functools.partial(gemm_gather.a_gathered_product_is_on_par, paired=paired, scattered=paired),
-               "sm90")
+               "sm90", fault="red at 475913063")
           for paired in (False, True)),
         *(Cell(f"a gathered kernel gradient is its gathered rows' gradient: {splits} splits",
                functools.partial(gemm_gather.a_gathered_kernel_gradient_is_its_gathered_rows_gradient,
-                                 splits=splits), "sm90")
+                                 splits=splits), "sm90",
+               fault="a cross-CTA partial combine, whose order the interpreter fixes" if splits > 1 else None,
+               native={"launch": "gathered", "pass": "gradient"})
           for splits in (1, 2)),
         Cell("a Blackwell's gathered product is its gathered rows' product",
-             gemm_gather.a_blackwells_gathered_product_is_its_gathered_rows_product, "sm100"),
+             gemm_gather.a_blackwells_gathered_product_is_its_gathered_rows_product, "sm100",
+             native={"launch": "gathered", "pass": "forward"}),
         *(Cell(f"CUTLASS runs a mapped projection as exactly as XLA where chosen: "
                f"{'shared' if shared else 'mapped'} matrices",
                functools.partial(grouped_gemm.cutlass_runs_a_mapped_projection_as_exactly_as_xla_where_chosen,
-                                 shared))
+                                 shared), native={"launch": "cutlass", "groups": "mapped",
+                                                  "matrices": "shared" if shared else "mapped"})
           for shared in (False, True)),
         *(Cell(f"a ring streams tiles of their own trip counts: {consumers} consumers",
                functools.partial(mosaic_toolkit.a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100,
-                                 consumers), "sm90")
+                                 consumers), "sm90", fault=RING)
           for consumers in (1, 2)),
         *(Cell(f"every warpgroup read lands its products: {path}",
                functools.partial(mosaic_toolkit.every_warpgroup_read_lands_its_products_on_an_h100, path),
-               "sm90")
+               "sm90", fault="ptxas's fold of a read path's sign op (row 4346)")
           for path in mosaic_toolkit.READS),
         *(Cell(f"consumers feeding their own ring split a step: {consumers} consumers from {lo}",
                functools.partial(mosaic_toolkit.consumers_feeding_their_own_ring_split_a_step_on_an_h100,
-                                 consumers, lo), "sm90")
+                                 consumers, lo), "sm90", fault=RING)
           for consumers, lo in ((1, 0), (2, 0), (2, 3))),
         Cell("the shared GEMM mainloop runs on Blackwell's tcgen05",
-             gemm_tcgen05.the_shared_mainloop_runs_exactly_on_blackwell, "sm100"),
+             gemm_tcgen05.the_shared_mainloop_runs_exactly_on_blackwell, "sm100",
+             native={"launch": "tcgen05 mainloop"}),
         *(Cell(f"tcgen05's epilogues hold check 1: {case} at {tiles.family} {tiles.block_n}x{tiles.stages}",
                functools.partial(gemm_tcgen05.tcgen05s_epilogues_hold_check_1_on_blackwell, case, tiles),
-               "sm100")
+               "sm100", native={"launch": f"tcgen05 {tiles.family}", "epilogue": case})
           for tiles in (*gemm_tcgen05.TILES, gemm_tcgen05.PAIRED) for case in gemm_tcgen05.EPILOGUES),
         *(Cell(f"the NVFP4 product's packed kernel holds every order: {name} {edge}",
                functools.partial(contracts_gemm.test_an_nvfp4_products_kernels_hold_every_order, edge,
-                                 "packed"), name)
+                                 "packed"), name,
+               fault=("the NVFP4 packed decode's PTX form" if edge == next(iter(contracts_gemm.EDGES))
+                      else None),
+               native={"launch": "nvfp4 packed"})
           for name in ("sm90", "sm80") for edge in contracts_gemm.EDGES),
         *(Cell(f"the warpgroup scan walks the recurrence: {positions} positions"
                f"{' reversed' if reverse else ''}{' exclusive' if exclusive else ''}",
                functools.partial(warpgroup_scan.the_scan_walks_the_recurrence_on_this_gpu, positions, reverse,
-                                 exclusive))
+                                 exclusive),
+               native={"launch": "warpgroup scan", "reverse": str(reverse), "exclusive": str(exclusive)})
           for positions in warpgroup_scan.POSITIONS for reverse in (False, True)
           for exclusive in (False, True)),
-    ])
+    ]))
 
 
 @pytest.mark.users_process
@@ -212,49 +252,45 @@ def test_the_gemm_kernels_run_on_this_gpu_as_a_users_process_runs_them():
 
 def test_the_gemm_matrix_holds_on_this_gpu():
     """GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the
-    reference path's (XLA's ragged dot), at each combination of the axes a GPU runs natively
-    (`kernel_matrix.native_cells`), each cell on its own GPU."""
-    run_cells(kernel_matrix.native_cells("gemm"))
+    reference path's (XLA's ragged dot), at each case a GPU-only red seeded
+    (`kernel_matrix.seeded_cells`), each cell on its own GPU; its other pairs are the CPU's."""
+    run_cells(kernel_matrix.seeded_cells("gemm"))
 
 
 def test_the_fused_gemm_matrix_holds_on_this_gpu():
     """The fused GEMM's check-1 matrix (tests/kernel_matrix.py): a region's training step with its producer
-    and consumers fused into the template's stages on par with the same region's stages and product in XLA, at
-    each combination of the axes a GPU runs natively (`kernel_matrix.native_cells`), each cell on its own
-    GPU."""
-    run_cells(kernel_matrix.native_cells("fused_gemm"))
+    and consumers fused into the template's stages on par with the same region's stages and product in XLA,
+    at each case a GPU-only red seeded (`kernel_matrix.seeded_cells`), each cell on its own GPU; its other
+    pairs are the CPU's."""
+    run_cells(kernel_matrix.seeded_cells("fused_gemm"))
 
 
 def test_the_nvfp4_matrix_holds_on_this_gpu():
     """The NVFP4 product's check-1 matrix (tests/kernel_matrix.py): its training step with the matrix decoded
-    in the mainloop on par with it decoded once a call, at each combination of the axes a GPU runs natively
-    (`kernel_matrix.native_cells`), each cell on its own GPU."""
-    run_cells(kernel_matrix.native_cells("nvfp4"))
+    in the mainloop on par with it decoded once a call, at each case a GPU-only red seeded
+    (`kernel_matrix.seeded_cells`), each cell on its own GPU; its other pairs are the CPU's."""
+    run_cells(kernel_matrix.seeded_cells("nvfp4"))
 
 
 def test_the_mx_matrix_holds_on_this_gpu():
-    """The MX product's check-1 matrix (tests/kernel_matrix.py): its forward through the template's block-
-    scaled products on par with the decoded operands' product in XLA, at each combination of the axes a GPU
-    runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
-    run_cells(kernel_matrix.native_cells("mxfp8"))
+    """The block-scaled product's check-1 matrix (tests/kernel_matrix.py): its forward through the template's
+    block-scaled products, MXFP8's and NVFP4's, on par with the decoded operands' product in XLA, over a
+    covering of its cells by block format and output dtype (`gpu_flow.covering`), each on its own GPU: a
+    Blackwell's block-scaled MMA and its scale loads, which no interpreter runs, though no red seeded them."""
+    run_cells(covering(cells_of(
+        kernel_matrix.check("mxfp8"),
+        native=lambda case: dict(zip(("format", "out_dtype"), (case[1], case[4]), strict=True)))))
 
 
 def test_the_blockwise_matrix_holds_on_this_gpu():
     """The blockwise-scaled FP8 product's check-1 matrix (tests/kernel_matrix.py): its forward through the
-    template's step-scaled walk on par with the scaled blocks summed in XLA, at each combination of the axes a
-    GPU runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
-    run_cells(kernel_matrix.native_cells("blockwise_fp8"))
+    template's step-scaled walk on par with the scaled blocks summed in XLA, at each case a GPU-only red
+    seeded (`kernel_matrix.seeded_cells`), each cell on its own GPU; its other pairs are the CPU's."""
+    run_cells(kernel_matrix.seeded_cells("blockwise_fp8"))
 
 
 def test_the_low_rank_matrix_holds_on_this_gpu():
     """The adapted product's check-1 matrix (tests/kernel_matrix.py): a LoRA-adapted projection's training
-    step with its base product and update fused on par with them apart, at each combination of the axes a GPU
-    runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
-    run_cells(kernel_matrix.native_cells("low_rank"))
-
-
-def test_the_join_matrix_holds_on_this_gpu():
-    """The joined projections' check-1 matrix (tests/kernel_matrix.py): a layer's training step with two of
-    its projections run as one GEMM on par with the projections apart, at each combination of the axes a GPU
-    runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
-    run_cells(kernel_matrix.native_cells("join"))
+    step with its base product and update fused on par with them apart, at each case a GPU-only red seeded
+    (`kernel_matrix.seeded_cells`), each cell on its own GPU; its other pairs are the CPU's."""
+    run_cells(kernel_matrix.seeded_cells("low_rank"))

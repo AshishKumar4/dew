@@ -467,17 +467,25 @@ def narrowed_draw(hooks, seed: int):
                                             if getattr(operands, name) is not None}), seeded
 
 
-@pytest.mark.check1_shards(seeds=8, per_task=1)
-@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[8], FORMED[4]], ids=str)
-def test_the_templates_forked_documents_are_as_exact_as_each_alone_interpreted(hooks):
-    """The recurrence template interpreted over a forked call in 16 bits, the gated delta rule, Kimi delta
-    attention and Mamba2's SSD: its walks take each document's memory up from the call's table and keep
-    the finals its documents store (`table.Taking`, `table.Returning`; ledger 5376), as its call over
-    each document alone (`assert_forked_on_par`), the same launches' arithmetic. A draw a task: four
-    took 287 to 381 s a task (jsf-table-phase at 693aa1c1c)."""
+FORKED_TEMPLATE = [HOOKS[4], HOOKS[8], FORMED[4]]
+"""The forked call's forms on the template: the gated delta rule, Kimi delta attention and Mamba2's SSD."""
+
+
+def the_templates_forked_documents_are_as_exact_as_each_alone(hooks):
+    """The recurrence template over a forked call in 16 bits: its walks take each document's memory up from
+    the call's table and keep the finals its documents store (`table.Taking`, `table.Returning`; ledger
+    5376), as its call over each document alone (`assert_forked_on_par`), the same launches' arithmetic."""
     assert_forked_on_par('mosaic_gpu', hooks, functools.partial(narrowed_draw, hooks),
                          f'mosaic_gpu {hooks} a forked call\'s documents, against each alone',
                          seeds=8, alone=True)
+
+
+@pytest.mark.check1_shards(seeds=8, per_task=1)
+@pytest.mark.parametrize('hooks', FORKED_TEMPLATE, ids=str)
+def test_the_templates_forked_documents_are_as_exact_as_each_alone_interpreted(hooks):
+    """`the_templates_forked_documents_are_as_exact_as_each_alone` interpreted off a GPU. A draw a task: four
+    took 287 to 381 s a task (jsf-table-phase at 693aa1c1c)."""
+    the_templates_forked_documents_are_as_exact_as_each_alone(hooks)
 
 
 def edge_draw(hooks, seed: int):

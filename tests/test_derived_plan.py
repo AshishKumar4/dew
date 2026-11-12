@@ -67,7 +67,8 @@ def test_the_first_compile_is_at_the_least_recompute_rung_the_derivation_says_fi
     with Compiles("step") as compiles:
         compiled(trainer)
     labels = [entry["label"] for entry in trainer.plan["derived"]]
-    assert labels[0] == "refuses" and labels[-1] == "fits" and set(labels[1:-1]) <= {"refuses"}
+    assert labels[0] == "refuses" and labels[-1] == "fits"
+    assert set(labels[1:-1]) <= {"refuses", "refuses by the last trace"}
     assert trainer.plan["remat"] is not None and trainer.plan["derived"][-1]["remat"] == trainer.plan["remat"]
     assert compiles.count == 1 and trainer.plan["probes"][0]["fits"]
 
@@ -264,9 +265,9 @@ def test_a_miss_orders_the_compiles_and_rules_out_only_what_the_derivation_itsel
 
 
 def traced(trainer) -> tuple[int, int]:
-    """`trainer` compiled, and how often its plan traced its step and made a candidate of it, counted by the
-    profiler: its step's traces (`_lowering.routed`, each one's dispatches' routes) and its candidates
-    (`_candidates._candidate`), a derivation's and a lowering's alike."""
+    """`trainer` compiled, and how often its plan traced its step and made a candidate of it,
+    counted by the profiler: its step's traces (`_lowering.routed`, each one's dispatches' routes) and its
+    candidates (`_candidates._candidate`), a derivation's and a lowering's alike."""
     from dew.training import _candidates, _lowering
 
     profiler = cProfile.Profile()
@@ -350,6 +351,24 @@ def test_a_miss_corrects_each_split_by_its_share_of_the_derived_temporaries():
     search.learned(357 * kb, -606 * kb, fit=False, temporaries=1229 * kb)
     assert not search.refused(2) and search.likely(2)
     assert search.shortfall(2) == 963 * kb * 615 // 1229
+
+
+def test_a_compile_past_its_derived_headroom_lifts_the_refusals_its_excess_covers():
+    """A compile that measured more headroom than its derivation foresaw lifts a split's refusal only where
+    that excess, scaled by the split's derived temporaries against the compile's (`FitSearch.excess`),
+    covers the split's derived shortfall: 1 KB past at eight microbatches leaves four, judged 1 MB short,
+    refused, and 2 MB past lifts it (row 5448: eight measured 1.28 MB past; four, judged short, fit)."""
+    from dew.training.footprint import Footprint
+
+    kb = 1000
+    for past, refused in ((1 * kb, True), (2000 * kb, False)):
+        search = bare_search(deep(split=None).objective)
+        for split, headroom, temporaries in ((4, -1000 * kb, 600 * kb), (8, 500 * kb, 300 * kb)):
+            key = search.candidate_key(split, narrow=False)
+            search.judged_at[key] = headroom
+            search.footprints[key] = Footprint(residuals=0, gradients=0, held=0, peak=temporaries)
+        search.learned(500 * kb, 500 * kb + past, fit=True, temporaries=300 * kb)
+        assert search.refused(4) is refused
 
 
 def test_a_split_the_derivation_refuses_is_still_asked_at_its_half_rung():
@@ -542,3 +561,64 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
             Measurement({"temp": roomy["temp"]}, need <= budget, "xla", jax.__version__))
         assert evidence.compiled.admits == admits, evidence.describe()
         assert evidence.agrees, evidence.describe()
+
+
+def wide(head_tile=None):
+    """`deep`'s decoder over a vocabulary of 32768 and rows of 4096 tokens, its remat stated and its batch
+    read whole, so its whole fp32 logits (32768 tokens by 32768 rows, `LOGITS`) are most of what its step
+    holds, and more than its head's tile; its head tiled where `head_tile` says so."""
+    model = CausalTransformer(vocab_size=32768, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
+                              max_seq_len=4096, remat=REMAT_POLICIES["full"])
+    return one_device(Trainer(LMObjective(model, seq_len=4096, head_tile=head_tile), optax.sgd(1e-2),
+                              key=jax.random.key(0), split=1))
+
+
+WIDE = {"text": jnp.asarray((np.arange(8 * 4097).reshape(8, 4097) * 7) % 32768, jnp.int32)}
+LOGITS = 32768 * 32768 * 4
+"""The bytes of `wide`'s whole fp32 logits."""
+
+
+def test_a_step_whose_whole_logits_alone_leave_no_room_traces_its_tiled_step_alone(monkeypatch, tmp_path):
+    """With room for the step at its head's tile and not for its whole fp32 logits beside what it holds, the
+    derivation refuses the whole logits by their floor, read off the loss's forward before any gradient is
+    traced (row 5556: on Qwen3.5-4B the state and its logits are 100 GB of an 80 GB device), its terms a
+    bound and no trace's, and judges the tiled step by its traced footprint, the one it compiles once, at
+    the rung a run that states the tiled head takes."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    tiled = wide("tiled")
+    room = needs(monkeypatch, tiled, lambda: compiled(tiled, WIDE))
+    assert room < LOGITS
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, room)
+    trainer = wide()
+    with Compiles("step") as compiles:
+        compiled(trainer, WIDE)
+    floor, judged = trainer.plan["derived"]
+    assert (floor["label"], judged["label"]) == ("refuses by its whole logits", "fits")
+    assert not floor["terms"]["peak_exact"] and floor["terms"]["residuals"] is None
+    assert judged["terms"]["residuals"] is not None
+    assert compiles.count == 1 and trainer.plan["probes"][-1]["fits"]
+    # The probe records the seconds JAX spent on its candidate: its traces, its lowering and its compile.
+    assert {"traced", "lowered", "compiled"} <= set(trainer.plan["probes"][-1]["spent"])
+    head = ("head_tile", "head_fused")
+    assert [trainer.plan[name] for name in head] == [tiled.plan[name] for name in head]
+    assert trainer.plan["head_tile"] is not None
+
+
+def test_a_whole_logits_trace_bounds_its_tiled_steps_peak(monkeypatch, tmp_path):
+    """With room for the whole logits' floor and not for the whole-logits step, the derivation traces that
+    step, refused, and bounds the tiled step from it (`HeadTerms`): the tiled step's traced peak holds at
+    least the whole-logits peak without its logits, and at most their share beside it."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    whole = wide("whole")
+    need = needs(monkeypatch, whole, lambda: compiled(whole, WIDE))
+    floor = LOGITS
+    assert floor < need
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, (floor + need) // 2)
+    trainer = wide()
+    compiled(trainer, WIDE)
+    refused, tiled = trainer.plan["derived"][:2]
+    head = refused["terms"]["head"]
+    assert refused["label"] == "refuses" and tiled["label"] == "fits"
+    assert head["headless"] <= tiled["terms"]["peak"] <= head["headless"] + head["held"]

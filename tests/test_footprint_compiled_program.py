@@ -607,7 +607,7 @@ def test_a_derived_footprint_traces_its_loss_once():
         traced.append(None)
         return jnp.sum(jnp.tanh(rows @ weights) ** 2), {}
 
-    residuals, peak = derived_terms(loss, weights, (rows,), platform="gpu", workspace=Workspace(0, 0))
+    residuals, peak, _ = derived_terms(loss, weights, (rows,), platform="gpu", workspace=Workspace(0, 0))
     assert len(traced) == 1
 
     def pullback(weights, rows):

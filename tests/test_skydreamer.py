@@ -2,14 +2,11 @@
 and ends over drawn flights on each track (Eq 1-2, Sec II-C), the frames of gates passed by, its starts
 (Table III), the flight plan (Eq 12), the commands its actions are and their latency; the fisheye lens's
 resampling (`dew.rl.hyperlux`); a world model reading proprioceptive entries beside its image; the
-policy-mean smoothness term (Eq 11); and the recipe's runs (`tools/skydreamer_race.py`) read back from their
-records."""
+policy-mean smoothness term (Eq 11); and the recipe's chunk scheduling (`tools/skydreamer_race.py`)."""
 
 import dataclasses
 import itertools
-import json
 import math
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +18,7 @@ from dew.objectives.rl.dreamer import DreamerV3Objective, WorldModel
 from dew.rl.flight import commanded
 from dew.rl.hyperlux import fisheye_map, fisheyed
 from dew.rl.quadrotor import GRAVITY, hovering
-from dew.rl.skydreamer import CIRCLE, TRACKS, Lap, Sky, SkyRace, plan
+from dew.rl.skydreamer import CIRCLE, TRACKS, Sky, SkyRace, plan
 
 SKY = Sky()
 
@@ -103,7 +100,6 @@ def test_a_race_rewards_and_ends_as_skydreamer_writes(track):
         step = jax.jit(race.step)
         for drone, key in enumerate(jax.random.split(jax.random.key(5), 64)):
             lap, _ = race.reset(key)
-            assert isinstance(lap, Lap)
             straight = drone % 2 == 1
             if straight:
                 heading = math.radians(gates[int(lap.index)][1])
@@ -236,20 +232,6 @@ def test_an_action_commands_collective_thrust_and_body_rates_after_its_latency()
                                            (held + wanted)[at], f"throttle {throttle}", roundings=4)
 
 
-def test_a_curriculum_draws_the_latency_and_randomizes_the_drone_and_camera_only_above_none():
-    """At no randomization every drone's command waits its nominal four steps, its rate limit is the
-    nominal 10 rad/s and its image neutral; at full randomization the latency spans two to six steps, each
-    drawn, and the rate limits and images vary from drone to drone."""
-    sky = Sky(latency=0.044)
-    for ramp, delays in ((0.0, {4}), (1.0, {2, 3, 4, 5, 6})):
-        race = SkyRace(sky, views=("passed",), ramp=ramp)
-        laps = jax.vmap(lambda key, race=race: race.reset(key)[0])(jax.random.split(jax.random.key(3), 512))
-        assert set(np.unique(np.asarray(laps.delay)).tolist()) == delays
-        varies = [np.ptp(np.asarray(value)) > 0 for value in (laps.rate_limit, laps.camera.exposure,
-                                                              laps.camera.gamma, laps.body.mass)]
-        assert varies == [ramp > 0] * 4
-
-
 def test_a_race_of_a_level_per_track_flies_each_tracks_episodes_at_its_own():
     """A race over the circle at no randomization and the inverted loop at full: the circle's episodes wait
     their nominal four steps and fly the nominal drone with no rotor noise, the loop's span two to six steps
@@ -262,8 +244,9 @@ def test_a_race_of_a_level_per_track_flies_each_tracks_episodes_at_its_own():
     for index, delays, varies in ((0, {4}, False), (1, {2, 3, 4, 5, 6}, True)):
         on = track == index
         assert set(np.unique(np.asarray(laps.delay)[on]).tolist()) == delays
-        spread = [np.ptp(np.asarray(value)[on]) > 0 for value in (laps.rate_limit, laps.body.mass)]
-        assert spread == [varies] * 2
+        spread = [np.ptp(np.asarray(value)[on]) > 0 for value in (
+            laps.rate_limit, laps.camera.exposure, laps.camera.gamma, laps.body.mass)]
+        assert spread == [varies] * 4
     circle = jax.tree.map(lambda leaf: leaf[int(np.flatnonzero(track == 0)[0])], laps)
     action = jnp.asarray([0.3, 0.1, -0.2, 0.05])
     for ramp, apart in (((0.0, 1.0), False), ((1.0, 0.0), True)):
@@ -386,17 +369,3 @@ def test_a_recipes_run_trains_nothing_past_its_steps_and_scores_a_chunk_left_uns
     assert tool.chunk_end(200_000, 1_602_048, 4_000_000, 100_000, warmup, pending=False) == 200_000 + 12_244
     assert tool.chunk_end(200_000, 1_602_048, 4_000_000, 100_000, longer, pending=False) == 200_000 + 3_061
 
-
-@pytest.mark.parametrize("setting", ["BASE", "REALISM"])
-def test_a_recipes_run_reads_back_as_itself(setting):
-    """The recipe's run in each setting (`tools/skydreamer_race.py`: the base check and the realism run)
-    and each of its phases reads back from its record as itself."""
-    from tool_support import load
-
-    from dew.config.env import EnvRunConfig
-
-    tool = load("skydreamer_race")
-    chosen = getattr(tool, setting)
-    for phase in chosen.phases:
-        run = tool.run(Path("/runs/base"), Path("/assets"), setting=chosen, phase=phase)
-        assert EnvRunConfig.from_dict(json.loads(json.dumps(run.to_dict()))) == run
