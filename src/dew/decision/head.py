@@ -302,6 +302,17 @@ class _FieldLayer(nn.Module):
         return fields + mlp(_layer_norm(self.dtype, "norm3")(fields))
 
 
+def option_cosine(fields: jax.Array, options: jax.Array) -> jax.Array:
+    """Each option slot's cosine of its field and its option, `[B, P]` of `[B, P, F]` each, computed at
+    least fp32 wide (`at_least_fp32`) from the operands on, its norms and its sum both, as the alignment
+    loss's cosine is. Normalized in bfloat16, XLA's CPU compiler fused the two norms and the sum of
+    their product into one YNNPACK reduction, which came back different in each process, NaNs among
+    them; at fp32 the same fusion is right (row 5495)."""
+    wide = at_least_fp32(fields.dtype)
+    return jnp.sum(l2_normalized(fields.astype(wide), 1e-8) * l2_normalized(options.astype(wide), 1e-8),
+                   axis=-1)
+
+
 def _per_slot(values: jax.Array, owners: jax.Array, inputs: DecisionInputs) -> jax.Array:
     """Each question's `values` `[B, Q, F]` at its option slots, `[B, P, F]`: on the grid a question's
     `width` slots repeat it, a broadcast whose transpose sums them, and compacted slots gather by their
@@ -502,7 +513,7 @@ class JointSchemaHead(Head):
                                l2_normalized(lexical, 1e-12), anchor))
         options = self.option_norm(routed)
         repeated = _per_slot(fields, owners, inputs)
-        cosine = jnp.sum(l2_normalized(repeated, 1e-8) * l2_normalized(options, 1e-8), axis=-1)
+        cosine = option_cosine(repeated, options)
         features = jnp.concatenate([repeated, options, repeated * options, jnp.abs(repeated - options)], -1)
         residual = self.scorer_out(gelu_exact_torch(self.scorer_hidden(features)))[..., 0]
         joint = jnp.exp(jnp.minimum(self.joint_logit_scale, math.log(100.0))) * cosine + residual

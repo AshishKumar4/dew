@@ -13,7 +13,7 @@ import optax
 import pytest
 from decision_support import decision_rows
 from flax import linen as nn
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, assert_fp32_reduction_bound
 
 from dew.artifacts import Decisions
 from dew.batch import FROZEN, VALID_ROWS
@@ -779,3 +779,33 @@ def test_the_abstract_state_draws_a_missing_head_at_the_shapes_init_draws(joint)
     drawn = objective.complete_variables(jax.random.key(0), backbone)
     again = jax.eval_shape(objective.complete_variables, jax.random.key(0), backbone)
     assert jax.tree.map(np.shape, again) == jax.tree.map(np.shape, drawn)
+
+
+def test_the_joint_heads_bfloat16_cosine_is_an_fp32_cosine_in_every_process_on_a_cpu():
+    """The joint head's cosine of its fields and options (`option_cosine`) of bfloat16 operands on a CPU,
+    at the `[32, 128, 24]` whose 16-bit cosine XLA's CPU compiler fused into one YNNPACK reduction that
+    came back different in each process, NaNs among them (row 5495): two fresh processes give it alike,
+    and within two float32 evaluations' distance of the cosine of the same values given in float32
+    (`reduction_bound`). Each evaluation's product of a field's and an option's entry carries at most
+    3n + 4 roundings over the n = 24 entries: for each operand, n in its sum of squares, one in the
+    square root and one in the division; then one in the product and n - 1 in the cosine's sum."""
+    from process_support import fresh
+
+    script = """
+import json
+import jax, jax.numpy as jnp, numpy as np
+from dew.decision.head import option_cosine
+shape = (32, 128, 24)
+z = np.arange(np.prod(shape), dtype=np.float32).reshape(shape)
+fields, options = (jnp.asarray(np.sin(z) * 2, jnp.bfloat16), jnp.asarray(np.cos(z) * 2, jnp.bfloat16))
+cosines = (jax.jit(option_cosine)(fields, options),
+           jax.jit(option_cosine)(fields.astype(jnp.float32), options.astype(jnp.float32)))
+a, b = (np.asarray(v, np.float64) for v in (fields, options))
+magnitudes = np.abs(a * b).sum(-1) / (np.linalg.norm(a, axis=-1) * np.linalg.norm(b, axis=-1))
+print(json.dumps({"dtypes": [str(c.dtype) for c in cosines],
+                  "cosines": [np.asarray(c).tolist() for c in cosines], "magnitudes": magnitudes.tolist()}))
+"""
+    first, second = (fresh(script, platforms="cpu") for _ in range(2))
+    assert first == second and first["dtypes"] == ["float32", "float32"]
+    cosine, wide = first["cosines"]
+    assert_fp32_reduction_bound(cosine, wide, first["magnitudes"], terms=3 * 24 + 4)
