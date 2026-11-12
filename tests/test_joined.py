@@ -143,6 +143,24 @@ def test_joined_projections_round_a_16bit_product_and_its_fp32_bias_once_as_each
     np.testing.assert_array_equal(np.asarray(joined, np.float32), np.asarray(apart, np.float32))
 
 
+def test_projections_of_two_products_do_not_join():
+    """Two projections whose products differ (one lax's own, one `float32_dot_general`) do not join: the
+    join takes the first projection's product for all of them (`JoinCase.uniform`)."""
+    from dew.nn.joined import join_case
+    from dew.nn.precision import float32_dot_general
+
+    class Pair(nn.Module):
+        @nn.compact
+        def __call__(self, x):
+            gate, up = Dense(8, name="gate"), Dense(8, name="up", dot_general=float32_dot_general)
+            gate(x), up(x)
+            return join_case((gate, up)).uniform, join_case((gate, Dense(8, name="other"))).uniform
+
+    x = jnp.ones((2, 4), jnp.float32)
+    params = Pair().init(jax.random.key(0), x)
+    assert Pair().apply(params, x) == (False, True)
+
+
 @pytest.mark.parametrize("wrapped", ["direct", "nested", "dew", "input", "input_lora"])
 def test_quantized_projection_calls_keep_their_own_paths_under_a_joined_row(wrapped):
     from flax.errors import ScopeParamShapeError

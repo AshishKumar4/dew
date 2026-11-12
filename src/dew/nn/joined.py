@@ -25,10 +25,10 @@ from .kernels.selection import Kernel, Op, Requirement, select
 
 @dataclasses.dataclass(frozen=True)
 class JoinCase:
-    """The projections of one input as the join's selector reads them (`joins`): whether each is a plain
-    Dense (`dense`) on the join's dot_general (`dot_general`), whether they agree in width, bias, dtype,
-    precision and promotion (`uniform`), whether a wrapper intercepts their own calls (`intercepted`),
-    and whether each holds its own kernel (`held`)."""
+    """The projections of one input as the join's selector reads them (`joins`): whether each is a plain Dense
+    (`dense`) on the join's dot_general (`dot_general`), whether they agree in width, bias, dtype, precision,
+    promotion and product (`uniform`: the join takes the first's product for all), whether a wrapper
+    intercepts their own calls (`intercepted`), and whether each holds its own kernel (`held`)."""
 
     dense: bool
     dot_general: bool
@@ -73,7 +73,7 @@ def join_case(projections: Sequence[nn.Module]) -> JoinCase:
         dot_general=all(projection.dot_general in (None, float32_dot_general)
                         and projection.dot_general_cls is None for projection in projections),
         uniform=len({(projection.features, projection.use_bias, projection.dtype, projection.precision,
-                      projection.promote_dtype) for projection in projections}) == 1,
+                      projection.promote_dtype, projection.dot_general) for projection in projections}) == 1,
         intercepted=(any(projection.product_owned() for projection in projections) if dense
                      else intercepted()),
         held=all(projection.has_variable('params', 'kernel') for projection in projections))
