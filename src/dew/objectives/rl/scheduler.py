@@ -140,7 +140,7 @@ from collections import Counter, deque
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import FIRST_COMPLETED, Future, wait
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Protocol
+from typing import ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -664,7 +664,7 @@ class RolloutScheduler:
         self._owned: tuple[Callable[[], None], ...] = ()
         """What it built itself and closes at its end (`served`'s source and server)."""
 
-    def drawn_from(self) -> Objective[Any, Any] | None:
+    def drawn_from(self) -> object | None:
         """The objective whose policy the acquisition draws from where that policy is its own, fixed when it
         was built: an asynchronous source's server's (`Asynchronous.objective`), or the objective a
         synchronous collector other than a `PolicyCollector` was built for (`scorer`: an episode
