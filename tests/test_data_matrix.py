@@ -130,9 +130,11 @@ def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, tr
         restarted = run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
                              cell=cell, name="matrix", steps=2 * STEPS, **prepared(cell))
         fresh, _, _ = trained(cell, processes)
+        # The run's records, which process 0 writes, name what differed.
+        assert restarted[0]["restarted"] == ["topology"], restarted[0]["restarted"]
         for report, whole in zip(restarted, fresh, strict=True):
-            assert report["restarted"] == ["topology"] and report["step"] == 2 * STEPS, report
-            assert report["batches"] == whole["batches"][:len(report["batches"])], report
+            assert report["step"] == 2 * STEPS
+            assert report["batches"] == whole["batches"][:len(report["batches"])]
         return
     resumed = run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
                        cell=cell, name="matrix", steps=2 * STEPS, **prepared(cell))

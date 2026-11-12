@@ -2293,30 +2293,19 @@ def mode_matrix(args) -> dict:
     for `--steps`, from where the run directory's checkpoint left it. `batches`
     is a digest of each batch this process read, in the order it read them;
     `restarted` what its resume found differing in its saved data plan, where
-    its data started again (`DataRestarted`), else None."""
+    its data started again (`DataRestarted`, which process 0 reports), else None."""
+    from recording import RecordingTracker
+
     from dew.data.dataset import tapped
     from dew.telemetry.records import DataRestarted
-
-    class Restarts:
-        """The restarts a run reports, nothing else kept."""
-
-        def __init__(self):
-            self.differs = None
-
-        def log(self, scalars, step):
-            pass
-
-        def artifact(self, value, step):
-            if isinstance(value, DataRestarted):
-                self.differs = list(value.differs)
 
     read, cached, rejecting, packed = args.cell.split(",")
     # A published cell reads the generation its test published once (`--prepared`), as every run of a
     # prepared dataset does; a cache the pool fills lives beside its run.
     cache_dir = Path(args.prepared) if cached == "published" else Path(args.run_dir).parent / "cache"
     data = matrix_data(read, cached, rejecting == "rejecting", packed == "packed", cache_dir)
-    restarts = Restarts()
-    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, tracker=restarts)
+    recorded = RecordingTracker()
+    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, tracker=recorded)
     restored_step = None if trainer.checkpoints.latest is None else trainer.checkpoints.latest
     batches = []
     train = tapped(data.train, lambda batch: batches.append(hashlib.sha256(b"".join(
@@ -2337,7 +2326,8 @@ def mode_matrix(args) -> dict:
     _, position = restored_state(trainer)
     return {"step": int(as_numpy(state.step)), "restored_step": restored_step,
             "lowering": None if data.plan is None else data.plan.lowering, "dataset_state": position,
-            "batches": batches, "restarted": restarts.differs}
+            "batches": batches, "restarted": next((list(value.differs) for _, value in recorded.artifacts
+                                                   if isinstance(value, DataRestarted)), None)}
 
 
 MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit": mode_schedule_fit,
