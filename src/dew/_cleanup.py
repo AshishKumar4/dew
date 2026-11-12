@@ -5,8 +5,8 @@ group ends with it on every exit.
 A group `start`ed has a lifeline (`lifeline`) as well: this module run in a session of its own, which
 holds the read end of a pipe whose write end only the owner holds and kills the group once that pipe
 closes, as it does when the owner dies however it dies (a SIGKILL, a SIGTERM that unwinds no `with`)
-or stops the group (`stop`). A group that ends on its own ends its lifeline, which then kills nothing:
-its id is free for another process. The group stays in a session of its own, so a rank's cleanup
+or stops the group (`stop`). A group that ends on its own, its leader's or the last process its leader
+left, ends its lifeline, which then kills nothing: its id is free for another process. The group stays in a session of its own, so a rank's cleanup
 signals its own (the maintainer, 2026-10-28: a worker outlived its killed owner 43 hours at 195% CPU on
 the VM). The standard library alone: the CI harness loads this file by path (tools/armada/child_groups.py),
 as importing `dew` sets the process's XLA flags."""
@@ -396,28 +396,71 @@ def owned_group(command: Sequence[str], *, grace: float = 0.0, interrupt: int = 
     return _ending(lambda: start(command, **options), ended)
 
 
+RESCAN_SECONDS = 1.0
+"""How often a lifeline asks which processes its group holds where it can watch none of them itself (a Python
+without `os.pidfd_open`)."""
+
+
+def _watched(pid: int, group: int) -> int | None:
+    """A descriptor of process `pid`, readable when it ends, where it is a process of `group`: asked after the
+    descriptor is open, so the answer is of the process the descriptor holds. None where it is gone, is
+    another group's (its number taken again), or this Python opens no such descriptor."""
+    try:
+        found = os.pidfd_open(pid)
+    except (AttributeError, ProcessLookupError):
+        return None
+    try:
+        if os.getpgid(pid) == group:
+            return found
+    except ProcessLookupError:
+        pass
+    os.close(found)
+    return None
+
+
 def lifeline(owner: int) -> None:
     """A group's lifeline, reading its owner pipe `owner`: the group's leader, written as the group starts,
-    then the pipe's close, the owner gone or the group stopped, upon which it kills the group. A group whose
-    leader ends with no process of it left ends the lifeline with no kill, as the group's id may then name
-    another's; one whose descendants outlive its leader is still killed with its owner. An owner gone before
-    it named a group leaves none to kill."""
+    then the pipe's close, the owner gone or the group stopped, upon which it kills the group. It watches
+    every process of the group by a descriptor of that process (`_watched`), reading the group again as each
+    ends, so it knows the moment the group holds none: it then ends with no kill, as the group's id may name
+    another's from then on, however long its owner lives (it watched the leader alone, and after a leader
+    that left a process it watched nothing of the group: that process's end went unseen, and its owner's end
+    killed whatever group held the id by then). One whose processes outlive its leader is still killed with
+    its owner: by its id, while a process it watches is alive, which keeps the id the group's. An owner gone
+    before it named a group leaves none to kill."""
     named = os.read(owner, 32).strip()
     if not named:
         return
     group = int(named)
-    try:
-        watched = [owner, os.pidfd_open(group)]
-    except ProcessLookupError:
-        watched = [owner]
-        if not members(group):
+    held: dict[int, int] = {}
+
+    def read() -> list[int]:
+        """The group's processes now, each one new to `held` watched; those it could not watch."""
+        unwatched = []
+        for pid in members(group):
+            if pid not in held:
+                found = _watched(pid, group)
+                if found is None:
+                    unwatched.append(pid)
+                else:
+                    held[pid] = found
+        return unwatched
+
+    while True:
+        unwatched = read()
+        if not held and not unwatched:
             return
-    # Readable as the owner's pipe closes, or as the leader ends.
-    while owner not in select.select(watched, [], [])[0]:
-        if not members(group):
-            return
-        watched = [owner]
-    _killpg(group, signal.SIGKILL)
+        # Readable as the owner's pipe closes, or as a process of the group ends; where one cannot be watched
+        # (no `os.pidfd_open`), the group is read again each `RESCAN_SECONDS`.
+        ready = select.select([owner, *held.values()], [], [], RESCAN_SECONDS if unwatched else None)[0]
+        if owner in ready:
+            break
+        for pid in [pid for pid, found in held.items() if found in ready]:
+            os.close(held.pop(pid))
+    unwatched = read()
+    alive = [found for found in held.values() if not select.select([found], [], [], 0)[0]]
+    if alive or (unwatched and members(group)):
+        _killpg(group, signal.SIGKILL)
 
 
 if __name__ == "__main__":
