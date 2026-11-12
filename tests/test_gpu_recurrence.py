@@ -9,6 +9,10 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
   portable scan, on an H100 (test_selective_template).
 - A two-role walk's training on an H100, its two consumers a launch no flow's widths reach
   (test_recurrence_mosaic_gradient).
+- The template over a forked call, its walks taking each document's memory from the call's table and storing
+  the finals later documents take (test_recurrence_chunk), and, in a user's process, its fp32 forward at the
+  default precision on each GPU's instruction family, its training on an H100's (test_recurrence_mosaic, its
+  gradient's).
 - Each recurrence layer trained on its port's kernels, natively (`PORT_KERNELS`): a gated delta net on the
   FLA GDN kernels and a Kimi delta attention layer on FLA KDA's chunk_kda, packed rows, forward and every
   gradient on par from float64 with the portable rule's; their training step the same bit for bit each
@@ -40,13 +44,14 @@ import numpy as np
 import pytest
 import test_fla_gdn as fla_gdn
 import test_mamba_ssd as mamba_ssd
+import test_recurrence_chunk as chunked
 import test_recurrence_mosaic as forward
 import test_recurrence_mosaic_gradient as gradient
 import test_recurrence_stability as stability
 import test_recurrence_template_stability as template_stability
 import test_selective_template as selective_template
 from delta_rule_support import fused_step
-from gpu_flow import Cell, run_cells, when
+from gpu_flow import Cell, covering, run_cells, when
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import decode_through
 from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
@@ -193,12 +198,44 @@ def a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device(axis: str
                     truth_fn=module.clone(dtype=jnp.float64).apply)
 
 
+STRESS = "a stress regime a model's draws do not reach"
+"""Why a cell keeps its regime on the GPU (Main, 11-11): the template's and the SSD port's stress inputs,
+where the GPU's own rounding (TF32, `ex2.approx`) meets a regime a flow's ordinary draws never show, every
+one of them. The template's 120 took 1,851 s on an A100 and 1,578 s on a GH200 (the tier at 173b18381);
+interpreted, their gradients' declared draws would take about 22 CPU-hours a run, and a long sequence's and
+a fading memory's are past a task, so the CPU interprets each form's forward in its ordinary regimes alone
+(test_recurrence_template_stability's sharded twins)."""
+
+USERS_PRODUCTS = "the portable math's state products at a user's process's precision (M-JS-96)"
+"""Why the portable backward's cells stay on the GPU, every one: in a user's A100 process its state products,
+stating no precision, ran in TF32, 1823 times the fp32 recurrence's distance from float64, which the
+interpreter, exact, and the suite's process, at 'highest', never show."""
+
+RACES = "a race or an asynchronous order the interpreter's one schedule cannot show"
+"""Why a repeat-bitwise cell stays on the GPU: the interpreter runs one schedule (the recurrence lane, 11-11:
+07cf6603271's register reuse differed run to run on a GH200 while every CPU check passed)."""
+
+PACKED_PORT = "the FLA port's packed training, which no flow packs"
+"""Why a port's packed training stays on the GPU: no model flow packs documents."""
+
+FORKED = "a forked call's walk over its table, which no flow forks"
+"""Why a forked call stays on the GPU: its walks take each document's memory up from the call's table and
+store the finals later documents take, across launches whose order the interpreter's one schedule fixes
+(the recurrence lane, 11-11), and no model flow forks a call."""
+
+NATIVE_ROUNDING = "an fp32 call's products and exponentials at the GPU's own rounding"
+"""Why an fp32 call at the default precision stays on the GPU: its products round as each instruction family
+rounds an fp32 operand (mma.sync's TF32 'rna', a warpgroup MMA's TF32 read; the run's fast forms, the
+owner's "tf32 default") and its exponentials are ex2.approx's, which the interpreter computes exactly (the
+recurrence lane, 11-11): a cell each GPU kind runs, its family's own."""
+
+
 def template_stability_cells() -> list[Cell]:
     """The template finite and on par where chunked forms break, every form, regime and product."""
     finite = template_stability.the_template_stays_finite_and_on_par_where_chunked_forms_break
     return [Cell(f"the template stays finite and on par where chunked forms break: {name} {regime} {product}"
                  f"{'' if forms is None else f' ({forms} forms)'}",
-                 functools.partial(finite, name, regime, product, forms))
+                 functools.partial(finite, name, regime, product, forms), fault=STRESS)
             for name, regime, product, forms in template_stability.CASES]
 
 
@@ -207,7 +244,7 @@ def portable_cells() -> list[Cell]:
     precision a user's run gives them, JAX's default unless they state one."""
     exact = stability.test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences
     label = "the portable backward as a GPU compiles it is as exact as the recurrence's"
-    return [Cell(f"{label}: {name} {regime}", functools.partial(exact, name, regime))
+    return [Cell(f"{label}: {name} {regime}", functools.partial(exact, name, regime), fault=USERS_PRODUCTS)
             for name, regime in stability.ACCELERATED]
 
 
@@ -217,12 +254,13 @@ def ssd_port_cells() -> list[Cell]:
     return [
         *(Cell(f"the SSD port stays finite and exact where chunked forms break: {regime}",
                functools.partial(stability.the_ssd_port_stays_finite_and_exact_where_chunked_forms_break,
-                                 regime))
+                                 regime), fault=STRESS)
           for regime in stability.REGIMES),
         Cell("the SSD on the template under the fast forms is as exact as mamba_ssm",
-             mamba_ssd.the_template_is_as_exact_as_mamba_ssm),
+             mamba_ssd.the_template_is_as_exact_as_mamba_ssm, native={"launch": "ssd template"}),
         *(Cell(f"the SSD port's gradient is as exact as the recurrence's: {regime}",
-               functools.partial(stability.the_ssd_ports_gradient_is_as_exact_as_the_recurrences, regime))
+               functools.partial(stability.the_ssd_ports_gradient_is_as_exact_as_the_recurrences, regime),
+               fault=STRESS)
           for regime in stability.REGIMES),
     ]
 
@@ -233,7 +271,7 @@ def selective_cells() -> list[Cell]:
         *(Cell(f"a Mamba layer is as exact under the template: packed {packed}"
                f"{f', a held state {held}' if held else ''}",
                functools.partial(selective_template.the_layer_is_as_exact_under_the_template, packed, held),
-               "sm90")
+               "sm90", native={"documents": "packed" if packed else "one", "state": str(held)})
           for packed, held in ((False, None), (True, None), (False, "through the template"))),
     ]
 
@@ -243,18 +281,43 @@ def port_training_cells() -> list[Cell]:
     against fla's own."""
     return [
         Cell(f"a gated delta net trains on its port on par with the portable rule ({PORT_KERNELS['fla']})",
-             functools.partial(trains_on_its_port, gated_delta_net)),
+             functools.partial(trains_on_its_port, gated_delta_net), fault=PACKED_PORT),
         Cell(f"a Kimi delta attention layer trains on its port on par with the portable rule "
-             f"({PORT_KERNELS['kda']})", functools.partial(trains_on_its_port, kimi_delta_attention)),
+             f"({PORT_KERNELS['kda']})", functools.partial(trains_on_its_port, kimi_delta_attention),
+             fault=PACKED_PORT),
         # Kimi delta attention trains on its port alone: the template's fast backward takes no decay a key
         # dimension.
         *(Cell(f"a {make.__name__} training step on {kernel} repeats bit for bit",
-               functools.partial(repeats_bit_for_bit, make, kernel))
+               functools.partial(repeats_bit_for_bit, make, kernel), fault=RACES)
           for make, kernels in ((gated_delta_net, ("fla", "mosaic_gpu")), (kimi_delta_attention, ("fla",)))
           for kernel in kernels),
         *(Cell(f"the port is as exact as fla's own: {'kda' if per_key else 'gdn'} {dtypes}",
-               functools.partial(fla_gdn.the_port_is_as_exact_as_fla, per_key, dtypes))
+               functools.partial(fla_gdn.the_port_is_as_exact_as_fla, per_key, dtypes),
+               native={"kernel": "kda" if per_key else "gdn", "dtypes": dtypes})
           for per_key in (False, True) for dtypes in fla_gdn.FLA_DTYPES),
+    ]
+
+
+def forked_cells() -> list[Cell]:
+    """The template over a forked call."""
+    return [Cell(f"the template's forked documents are as exact as each alone: {hooks}",
+                 functools.partial(chunked.the_templates_forked_documents_are_as_exact_as_each_alone, hooks),
+                 fault=FORKED)
+            for hooks in chunked.FORKED_TEMPLATE]
+
+
+def fp32_template_cells() -> list[Cell]:
+    """The template's fp32 forward and training step at the default precision on each GPU's instruction
+    family, in a user's process (`USERS`), where the default precision is JAX's own."""
+    return [
+        # The fp32 forward each instruction family takes at a GPU's widths (an sm80's, an sm90's, an sm100's;
+        # jsf-fp32-taken), its training an sm90's alone.
+        Cell("the template's fp32 forward at the default precision is as exact as fla's: one sequence",
+             functools.partial(forward.the_mosaic_forward_is_as_exact_as_its_reference, "one sequence",
+                               jnp.float32), fault=NATIVE_ROUNDING),
+        Cell("the template's fp32 training step at the default precision is as exact as fla's: one sequence",
+             functools.partial(gradient.the_mosaic_gradient_is_as_exact_as_its_reference, "one sequence",
+                               jnp.float32, "kept"), "sm90", fault=NATIVE_ROUNDING),
     ]
 
 
@@ -263,25 +326,28 @@ def walk_cells() -> list[Cell]:
     which the derivation gives a call whose walks fill more than a wave, a launch no flow's widths reach."""
     walk = gradient.test_a_walk_of_two_roles_is_as_exact_as_its_reference
     return [Cell(f"a walk of two roles is as exact as its reference: {name}",
-                 functools.partial(walk, *values), "sm90")
+                 functools.partial(walk, *values), "sm90", fault="two consumer roles' synchronization")
             for name, values in forward.native(gradient.WALK_GRID, gradient.INTERPRETED_WALKS)]
 
 
 def decode_cells() -> list[Cell]:
     """The decode launches as a server runs them."""
     return [
-        Cell("the decode kernel leaves an idle row alone", the_decode_kernel_leaves_an_idle_row_alone),
+        Cell("the decode kernel leaves an idle row alone", the_decode_kernel_leaves_an_idle_row_alone,
+             native={"launch": "decode step"}),
         Cell("the fused decode step gives the same bits however its launches are timed",
-             the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed),
+             the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed, fault=RACES),
         *(Cell(f"a layer choosing the fused step decodes on a mesh as on one device: {axis}",
                when(jax.device_count() >= 2, "needs two GPUs", functools.partial(
-                   a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device, axis)))
+                   a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device, axis)),
+               fault="two GPUs")
           for axis in ("data", "tensor")),
     ]
 
 
 FAMILIES = {"two-role walk": walk_cells, "template stability": template_stability_cells,
             "portable": portable_cells, "SSD port": ssd_port_cells, "selective scan": selective_cells,
+            "forked template": forked_cells, "fp32 template": fp32_template_cells,
             "port training and decode": lambda: [*port_training_cells(), *decode_cells()]}
 """The recurrence cells by family, each family a test of its own: the planner times and packs each, and one
 family's failure hides no other's (a single flow of every family ran past a GPU job's 50 minutes). A
@@ -289,7 +355,7 @@ layer's port training and its decode run as one flow. The Mosaic mainloop's forw
 the model flows' (tests/test_gpu_flows.py: Kimi's delta attention, Qwen3-Next's gated delta net, MiniMax's
 lightning attention), its cases the CPU's, interpreted and through the compile gate (row 5461)."""
 
-USERS = {"portable"}
+USERS = {"portable", "fp32 template"}
 """The families whose claim is what a user's process computes, run in a process computing as a user's does
 (`users_process`, tests/conftest.py) and not in the suite's, whose JAX_DEFAULT_MATMUL_PRECISION=highest
 (tests/lane_environment.py) gives every product that states no precision IEEE float32: the portable math's
@@ -300,32 +366,20 @@ recurrence's distance from float64 (M-JS-96), which no cell saw (the recurrence 
 @pytest.mark.parametrize("family", [
     pytest.param(family, marks=pytest.mark.users_process if family in USERS else ()) for family in FAMILIES])
 def test_the_recurrences_run_on_this_gpu(family):
-    """A family's recurrence cells on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
-    together."""
-    run_cells(FAMILIES[family]())
+    """A family's recurrence cells on this GPU (`gpu_flow.run_cells`) a GPU runs (`gpu_flow.covering`: each
+    kept for a GPU-only fault by name, the fewest others covering its native axes, every other the CPU's,
+    interpreted and through the compile gate), each one's failure kept and all raised together."""
+    run_cells(covering(FAMILIES[family]()))
 
 
 def test_the_recurrence_matrix_holds_on_this_gpu():
     """The recurrence's check-1 matrix (tests/kernel_matrix.py): the chunked op's training step, its kernel
     named, on par with its form's port's, or the portable math's where no port takes it, at each combination
     of the axes a GPU runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
-    run_cells(kernel_matrix.native_cells("recurrence"))
+    run_cells(kernel_matrix.seeded_cells("recurrence"))
 
 
 def test_the_short_conv_matrix_holds_on_this_gpu():
     """The short conv's check-1 matrix: a delta net's conv at its training shapes on the kernels, on par with
     XLA's conv, in each precision on each GPU (`kernel_matrix.native_cells`)."""
-    run_cells(kernel_matrix.native_cells("short_conv"))
-
-
-def test_the_selective_scan_matrix_holds_on_this_gpu():
-    """The selective scan's check-1 matrix: each recorded case on the template, on par with recorded
-    mamba_ssm, each cell on its own GPU."""
-    run_cells(kernel_matrix.native_cells("selective_scan"))
-
-
-def test_the_recurrent_decode_matrix_holds_on_this_gpu():
-    """The recurrent decode's check-1 matrix: each layer's decode tokens on each decode kernel, its state in
-    each precision, on par with the portable step's, each cell on its own GPU
-    (`kernel_matrix.native_cells`)."""
-    run_cells(kernel_matrix.native_cells("delta_decode"))
+    run_cells(kernel_matrix.seeded_cells("short_conv"))
