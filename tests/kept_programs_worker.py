@@ -56,12 +56,18 @@ elif mode == "keep":
         answers = answered()
         # A function that reads an array outside its arguments has no identity a file can state, and
         # neither has a call inside one of Dew's own contexts.
-        owned_program(lambda: values * 2)()
+        def outside():
+            return values * 2
+
+        owned_program(outside)()
         with measured_links({}):
             scaled(kept_module.Scale(scale + 100), values)
     saved = programs.save(path)
+    # The functions of the calls that have no identity, by the names a refusal states them by.
+    unidentified = sorted(f"{function.__module__}.{function.__qualname__}"
+                          for function in (outside, kept_module.scaled))
     found = {"answers": answers, "kept": len(saved.kept), "refused": sorted(programs.refused),
-             "reasons": programs.refused, "cpu": saved.target.cpu}
+             "reasons": programs.refused, "cpu": saved.target.cpu, "unidentified": unidentified}
 else:
     try:
         with kept(path, verify=mode == "verify"), Compiles(None) as compiles:

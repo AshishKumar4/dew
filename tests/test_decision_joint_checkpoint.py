@@ -327,9 +327,11 @@ def test_a_decision_release_exports_every_tensor_it_saves(tmp_path, kind):
 def test_a_decision_releases_export_reads_its_readout_home_only_as_each_tensor_is_read(tmp_path, kind):
     """A release's export (`PretrainedDecision.export`) reads no array home as it is made, listed or
     planned (`tensor_specs`), as a weight push plans its chunks before it reads any (ledger 4370): all of
-    it passes the transfer guard (`steady_state.guarded`). Each of its readout's tensors reads its leaves
-    home as it is read, which the guard refuses. A release saved by a process that does not publish
-    (`reading_home`'s `writes` false, a pool's other processes) writes none of its readout."""
+    it passes the transfer guard (`steady_state.guarded`). Each of its readout's tensors reads its own
+    leaves home as it is read, which the guard refuses: a tensor read leaves every other's still unread.
+    A release saved by a process that does not publish (`reading_home`'s `writes` false, a pool's other
+    processes) reads its readout home as the publisher does, which a pool's gathers need, and writes none
+    of it."""
     from dew import _coordination
     from dew.interop.safetensors_io import tensor_specs
 
@@ -343,10 +345,15 @@ def test_a_decision_releases_export_reads_its_readout_home_only_as_each_tensor_i
         bundle.backbone().export())
     readout = [name for name in names if name not in backbone]
     assert bool(readout) == (kind != "slot_lm")
-    for name in readout:
-        with guarded(allow=moves), pytest.raises(RuntimeError):
-            exported[name]
+    for index, name in enumerate(readout):
+        for unread in readout[index:]:
+            with guarded(allow=moves), pytest.raises(RuntimeError):
+                exported[unread]
+        exported[name]
     if kind in ("joint", "slot"):
+        with (_coordination.reading_home("weight export", writes=False), guarded(allow=moves),
+              pytest.raises(RuntimeError)):
+            bundle.save(tmp_path / "guarded")
         with _coordination.reading_home("weight export", writes=False):
             bundle.save(tmp_path / "other")
         written = {path.name for path in (tmp_path / "other").iterdir()}

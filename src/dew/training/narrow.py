@@ -177,6 +177,22 @@ def narrow_copies(state, traced: core.Jaxpr) -> dict:
     return cast_paths(traced, variables, ("params",))
 
 
+def held_copies(compute: Variables | None) -> dict[tuple[str, ...], jnp.dtype]:
+    """The narrow copies a state's `compute` holds (`narrowed`'s tree), by path under `params`, each its
+    dtype: the plan of the program that made them, none for a state that holds none."""
+    if compute is None:
+        return {}
+    return {tuple(key.key for key in path)[1:]: jnp.dtype(leaf.dtype)
+            for path, leaf in jax.tree_util.tree_flatten_with_path(compute)[0]}
+
+
+def holds_copies(compute: Variables | None, copies: dict[tuple[str, ...], jnp.dtype]) -> bool:
+    """Whether a state's `compute` holds the narrow copies `copies` plans (`held_copies`): a step reads the
+    state with its own, made where it does not (`dew.training.compiler.StepCompiler.runner`), and a plan's
+    fit counts them built where it does not (`dew.training._candidates`)."""
+    return held_copies(compute) == {path: jnp.dtype(dtype) for path, dtype in copies.items()}
+
+
 def narrowing(copies: dict[tuple[str, ...], jnp.dtype], towers: tuple, out_shardings) -> OuterProgram:
     """The program a step's state runs to make its narrowed copies of its weights (`narrowed`), placed by
     `out_shardings`, compiled under the options of the objective's `towers`: the one program a run's first

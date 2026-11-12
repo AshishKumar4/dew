@@ -196,9 +196,11 @@ def test_a_program_one_process_kept_runs_in_another_that_traces_nothing(tmp_path
     kept (row 5265: a warm scoring server paid its programs' traces)."""
     saved = kept_in(tmp_path / "kept")
     answers = saved["answers"]
-    # Every answered call kept, and the two calls of no identity the worker makes besides named as not.
+    # Every answered call kept, and the calls of no identity the worker makes besides, those alone, named
+    # as not.
     assert saved["kept"] == len(answers)
-    assert len(saved["refused"]) == 2, saved["reasons"]
+    refused = sorted(name.rsplit(" (", 1)[0] for name in saved["refused"])
+    assert refused == saved["unidentified"], saved["reasons"]
     assert (saved["cpu"] is not None) == (jax.default_backend() == "cpu")
     assert answers["none"] != answers["empty"] and answers["one"] != answers["two"]
     assert kept_answer(kept_worker(tmp_path / "kept", "take")) == {"answers": answers, "needed": []}
