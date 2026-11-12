@@ -352,12 +352,18 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
 
     def maker(atom) -> jcore.JaxprEqn | None:
         equation = None if isinstance(atom, jcore.Literal) else made.get(atom)
-        return equation if equation is not None and terms.spoken(equation) else None
+        return equation if equation is not None and terms.spoken_as(equation) is not None else None
 
-    heads = [equation for equation in jaxpr.eqns if terms.spoken(equation) and rules.heads(
-        terms.symbol(equation.primitive),
-        [None if (operand := maker(atom)) is None else terms.symbol(operand.primitive)
-         for atom in equation.invars])]
+    def made_as(atom) -> str | None:
+        """The symbol of the language's equation that makes `atom`, None for a value from outside it."""
+        operand = maker(atom)
+        return None if operand is None else terms.spoken_as(operand)
+
+    def heads_window(equation: jcore.JaxprEqn) -> bool:
+        name = terms.spoken_as(equation)
+        return name is not None and rules.heads(name, [made_as(atom) for atom in equation.invars])
+
+    heads = [equation for equation in jaxpr.eqns if heads_window(equation)]
     if not heads:
         return []
     order = {id(equation): index for index, equation in enumerate(jaxpr.eqns)}
@@ -615,10 +621,10 @@ def _within(jaxpr: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels:
     equations = []
     for equation in jaxpr.eqns:
         if _holds_regions(equation) or _marked(equation, WITHIN) or (
-                _marked(equation, (Algebra,)) and not _opens(equation)):
+                _marked(equation, (Algebra,)) and _opening(equation) is None):
             params = with_bodies(equation.params,
                                  lambda body: _closed(body, accurate, saturation, kernels))
-        elif _opens(equation):
+        elif _opening(equation) is not None:
             # Its body's own bodies rewritten, its math left to the region it opens into (`_opened`).
             params = with_bodies(equation.params,
                                  lambda body: _within(body, accurate, saturation, kernels))
@@ -644,12 +650,14 @@ def _marked(equation: jcore.JaxprEqn, kinds: tuple[type, ...]) -> bool:
     return equation.primitive is marked_call_p and isinstance(equation.params["kind"], kinds)
 
 
-def _opens(equation: jcore.JaxprEqn) -> bool:
-    """Whether `equation` is an Algebra span the pass opens into the region around it (`_opened`): one of no
-    effects over arrays alone, whose renamed variables no effect names (a reference's would). Any other
-    Algebra span is rewritten within its call."""
-    return (_marked(equation, (Algebra,)) and not equation.effects
-            and all(isinstance(var.aval, ShapedArray) for var in (*equation.invars, *equation.outvars)))
+def _opening(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
+    """The body of an Algebra span the pass opens into the region around it (`_opened`), the program its
+    call runs on its operands one for one (`called`), None for any other equation: a span of no effects
+    over arrays alone, whose renamed variables no effect names (a reference's would). Any other Algebra
+    span is rewritten within its call."""
+    opens = (_marked(equation, (Algebra,)) and not equation.effects
+             and all(isinstance(var.aval, ShapedArray) for var in (*equation.invars, *equation.outvars)))
+    return called(equation) if opens else None
 
 
 def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kernels: bool) -> jcore.Jaxpr:
@@ -669,10 +677,10 @@ def _rewritten(closed: jcore.Jaxpr, accurate: bool, saturation: Saturation, kern
 
 
 def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
-    """`jaxpr` with each Algebra span's call it opens (`_opens`) replaced by its body's equations, nested
+    """`jaxpr` with each Algebra span's call it opens (`_opening`) replaced by its body's equations, nested
     spans opened too, over the call's operands, its body's constants the program's, and each reader of the
     call's results reading what its body computes them as; `jaxpr` itself where it holds none."""
-    if not any(_opens(equation) for equation in jaxpr.eqns):
+    if all(_opening(equation) is None for equation in jaxpr.eqns):
         return jaxpr
     constvars, consts = list(jaxpr.constvars), list(jaxpr.consts)
     computed: dict[jcore.Var, jcore.Var | jcore.Literal] = {}
@@ -683,10 +691,11 @@ def _opened(jaxpr: jcore.Jaxpr) -> jcore.Jaxpr:
 
     for equation in jaxpr.eqns:
         equation = equation.replace(invars=[outer(atom) for atom in equation.invars])
-        if not _opens(equation):
+        opening = _opening(equation)
+        if opening is None:
             equations.append(equation)
             continue
-        body = _opened(called(equation))
+        body = _opened(opening)
         # The body's constants the program's own, each a fresh variable of it (`inlined`).
         fresh = [jcore.Var(var.aval) for var in body.constvars]
         constvars += fresh
