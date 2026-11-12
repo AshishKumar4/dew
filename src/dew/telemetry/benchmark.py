@@ -30,7 +30,7 @@ import time
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from fractions import Fraction
 from pathlib import Path
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -111,11 +111,30 @@ def resident_memory() -> dict[str, int]:
     return fields
 
 
+class _Mallinfo2(ctypes.Structure):
+    """glibc's `struct mallinfo2` (malloc.h), its fields in bytes."""
+    _fields_: ClassVar = [(name, ctypes.c_size_t) for name in (
+        "arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks", "fsmblks", "uordblks", "fordblks",
+        "keepcost")]
+
+
+def allocated_memory() -> dict[str, int]:
+    """The bytes glibc's allocator holds allocated, in every arena and every mapped chunk (`mallinfo2`'s
+    `uordblks` and `hblkhd`), as `Allocated`: NumPy's arrays and XLA CPU's buffers, a tensor read home
+    among them, live however their pages were come by. Resident pages (`resident_memory`) do not count
+    what the allocator serves from pages freed earlier in the process: a tree held home after an
+    identical one was freed rose by under a fiftieth of itself (rows 5266, 5562)."""
+    mallinfo2 = ctypes.CDLL(None).mallinfo2
+    mallinfo2.restype = _Mallinfo2
+    info = mallinfo2()
+    return {"Allocated": info.uordblks + info.hblkhd}
+
+
 @dataclasses.dataclass
 class ResidentPeak:
-    """What `resident_peak` read of the process's resident memory (`resident_memory`'s fields): at the
-    block's start (`before`), and the most of each field it saw within it (`most`), whole once the
-    block ends."""
+    """What `resident_peak` read of the process's memory (its counter's fields, `resident_memory`'s by
+    default): at the block's start (`before`), and the most of each field it saw within it (`most`),
+    whole once the block ends."""
 
     before: dict[str, int]
     most: dict[str, int]
@@ -126,17 +145,19 @@ class ResidentPeak:
 
 
 @contextlib.contextmanager
-def resident_peak(interval: float = 0.002) -> Iterator[ResidentPeak]:
-    """The process's resident memory at the block's start and the most of each field within it
-    (`ResidentPeak`), read exactly (`resident_memory`) every `interval` seconds on a thread of its own and
-    once as the block ends, however it ends: a region's high-water, which the kernel's own (VmHWM) keeps
-    for the process's whole life alone. What the region holds for less than an interval may be missed."""
-    before = resident_memory()
+def resident_peak(interval: float = 0.002,
+                  counter: Callable[[], dict[str, int]] = resident_memory) -> Iterator[ResidentPeak]:
+    """The process's memory as `counter` counts it, its resident pages read exactly (`resident_memory`)
+    or its allocated bytes (`allocated_memory`), at the block's start and the most of each field within it
+    (`ResidentPeak`), read every `interval` seconds on a thread of its own and once as the block ends,
+    however it ends: a region's high-water, which the kernel's own (VmHWM) keeps for the process's whole
+    life alone. What the region holds for less than an interval may be missed."""
+    before = counter()
     peak = ResidentPeak(before, dict(before))
     finished = threading.Event()
 
     def held() -> None:
-        now = resident_memory()
+        now = counter()
         peak.most.update({name: max(peak.most.get(name, value), value) for name, value in now.items()})
 
     def sample() -> None:
