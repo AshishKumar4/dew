@@ -186,8 +186,7 @@ def test_a_pattern_that_matches_nothing_quantizes_nothing():
     """A narrowed pattern is selective: a regex no module path matches leaves every product the fp32 one,
     so the quantized model's logits are on par with the unquantized model's (check 1, against its float64
     forward), where a pattern that matched everything moves them by int8's rounding, far past it. The two
-    are two programs: Qwix owns the quantized model's products, which a CPU sums as XLA's dot does, where
-    the unquantized model's projections sum pairwise there (`precision.projection_product`)."""
+    are two programs: Qwix owns the quantized model's products, Dew the unquantized model's."""
     from float64_terms import float64_forward
 
     pytest.importorskip("qwix")

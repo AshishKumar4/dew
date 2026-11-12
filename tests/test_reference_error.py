@@ -605,11 +605,11 @@ def summed_wide(x, w):
 def test_check_1_runs_each_arm_as_its_users_sum_their_products():
     """On the CPU lane check 1 runs each arm with fp32 products summed in fp32 (`summed_as_run`), the
     truth outside that: Dew's product, which sums in float64 only under the suite's wide arithmetic and
-    pairwise in float32 as its users run it (`accumulated`, row 4863), is judged as they run it, so it is
+    as XLA's own float32 dot as its users run it (`accumulated`, row 5448), is judged as they run it, so it is
     on par with XLA's plain fp32 dot but not with the same product kept to its float64 sums; and against
     that product the plain dot fails too, so the truth is still float64's."""
     assert_as_exact(dews_product, jnp.matmul, long_dot_draw, "as its users sum", seeds=16)
-    for arm, label in ((dews_product, "pairwise against summed wide"), (jnp.matmul, "summed wide")):
+    for arm, label in ((dews_product, "as run against summed wide"), (jnp.matmul, "summed wide")):
         with pytest.raises(GateFailure):
             assert_as_exact(arm, summed_wide, long_dot_draw, label, seeds=16)
 
@@ -1375,6 +1375,44 @@ def test_a_recording_keeps_the_larger_count_sized_on_another_backend(planned):
                                                 truth_fn=product)
     assert_as_exact(lambda index, inputs: product(inputs), reference, drawn, "larger backend",
                     seeds=seeds, truth_fn=truth)
+
+
+def test_a_recording_judged_is_held_to_dews_own_run_of_the_same_weights(tmp_path):
+    """A recording of another library running what Dew exports (`record_case`'s and
+    `assert_as_exact_as_recorded`'s `judged`) is the arm check 1 judges, Dew's own run its reference, its
+    seeds sized with the two in those places: a library that sums nearer float64 than Dew's run is on par,
+    where Dew's run judged against it is not, and an export read one part in ten thousand off is over."""
+    from reference_runs import assert_as_exact_as_recorded
+    from tool_support import load
+
+    def draw(seed):
+        x, w = _draw(seed)
+        return {"x": x, "w": w}
+
+    def read(inputs):
+        # The other library's run of the export: the product summed in float64 and rounded once.
+        truth = np.asarray(inputs["x"], np.float64) @ np.asarray(inputs["w"], np.float64)
+        return {"y": truth.astype(np.float32)}, {"y": truth}
+
+    def dew(dtype, inputs):
+        return {"y": np.asarray(inputs["x"], dtype) @ np.asarray(inputs["w"], dtype)}
+
+    def held(name, label, arrays, **roles):
+        np.savez(tmp_path / name, **arrays)
+        assert_as_exact_as_recorded(tmp_path / name, "site", int(arrays["site.seeds"]), draw, dew, label,
+                                    host=True, **roles)
+
+    def recorded(**roles):
+        return load("recorded_references").record_case(
+            "site", draw, read, store_inputs=False, dew=lambda inputs: dew(np.float32, inputs), **roles)
+
+    judged = recorded(judged=True)
+    held("read.npz", "the export read", judged, judged=True)
+    with pytest.raises(GateFailure):
+        held("reference.npz", "Dew's run judged", recorded())
+    with pytest.raises(GateFailure):
+        held("off.npz", "an export read off", {**judged, "site.reference.y": judged[
+            "site.reference.y"] * np.float32(1 + 1e-4)}, judged=True)
 
 
 def test_a_recording_asked_ahead_is_the_recording_asked_in_turn():

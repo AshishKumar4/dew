@@ -1,6 +1,6 @@
 """llama.cpp reading the decoder Dew exports (tools/llama_cpp_reference.py's), over drawn ids, in float32,
-beside transformers' float64 run of the same export: the reference arm of tools/venv_reference.py's
-`llama-cpp` site (its protocol tools/reference_worker.py), on the CPU.
+beside transformers' float64 run of the same export: the recorded arm of tools/venv_reference.py's
+`llama-cpp` site, the one its test judges (`judged`; its protocol tools/reference_worker.py), on the CPU.
 
     python tools/llama_cpp_worker.py llama-cpp    `IN OUT` lines on stdin, each `done`
 

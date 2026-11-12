@@ -123,7 +123,7 @@ def ragged_layout(lhs_rank: int, rhs_rank: int, numbers) -> RaggedLayout | None:
     """Which grouped product a `ragged_dot_general` of operands of those ranks under `numbers` (its
     `RaggedDotDimensionNumbers`) is, its left operand's rows ragged and no batch axes; None for any other.
     The one reading of those dimensions: the algebra's fusion takes a product's form from it
-    (`dew.algebra.fusion`), and a CPU's pairwise sum what it blocks (`dew.nn.pairwise`)."""
+    (`dew.algebra.fusion`)."""
     (contracted, against), batch = (tuple(map(tuple, pair)) for pair in numbers.dot_dimension_numbers)
     grouped = tuple(numbers.rhs_group_dimensions)
     if batch != ((), ()) or lhs_rank != 2 or tuple(numbers.lhs_ragged_dimensions) != (0,):
@@ -213,7 +213,7 @@ def _program(primitive: jcore.Primitive, params: Mapping) -> jcore.Jaxpr | None:
 
 def purely_called(equation: jcore.JaxprEqn) -> jcore.Jaxpr | None:
     """The program `equation` runs (`called`) where its call does nothing else, else None: what a reader that
-    runs a call in its caller reads (staging's `flattened`, the pairwise sums' `dew.nn.precision._paired`).
+    runs a call in its caller reads (staging's `flattened`, a template layout's `_call`, torchax's evaluator).
     JAX states which calls are pure where it defines them (`Primitive.transparent_call`: a `jit`'s and an
     evaluated jaxpr's; an optax helper's `jit` over a whole tree, `jnp.einsum`'s). A checkpoint's, a custom
     derivative's and a custom batching rule's call do more than their program, a rule of their own, and a

@@ -2222,7 +2222,7 @@ def xla_dot(tokens: jax.Array, matrix: jax.Array, *, precision: PrecisionLike = 
     """A dense product, every row through one matrix (`[depth, width]`), as `xla_ragged_dot` multiplies a
     group's rows (`_as_multiplied`), as XLA's own dot: no group, so no row masked, and no ragged dot to
     trace or to expand (a dense call's portable branch, `gemm`'s), summed as `precision.accumulated` sums a
-    contraction (a CPU's float32 product as a vectorized dot sums it, row 4863)."""
+    contraction (XLA's own on a CPU, row 5448)."""
     tokens, matrix, precision = _as_multiplied(tokens, matrix, precision)
     return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (0,)), ((), ())),
                                          precision=precision),
@@ -2241,8 +2241,8 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     XLA's TPU kernel writes values into the rows past the groups, where
     other backends write zeros, and its lhs cotangent is the same kernel.
     Those rows are zeroed going in and coming out, so neither the output
-    nor a dropped row's gradient carries them. Its sums are `precision.accumulated`'s (a CPU's float32
-    product as a vectorized dot sums it, row 4863).
+    nor a dropped row's gradient carries them. Its sums are `precision.accumulated`'s (XLA's own on a CPU,
+    row 5448).
     """
     tokens, kernel, precision = _as_multiplied(tokens, kernel, precision)
     # bincount widens under x64; TPU ragged-dot only lowers int32 counts.
