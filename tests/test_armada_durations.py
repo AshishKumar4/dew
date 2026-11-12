@@ -61,6 +61,27 @@ def test_a_split_file_pays_its_setup_once_a_group_and_is_not_cut_finer_for_it(ci
     assert ci.measured_cut(timings, "3.12", "tests/test_unseen.py") is None
 
 
+def test_a_file_no_run_measured_at_a_cut_weighs_its_estimate_and_no_setup_paid_again_by_every_group(
+        ci, tmp_path):
+    """A file whose rows armada holds at no cut is estimated (its record times how much slower armada ran the
+    files measured both ways): the plan spreads that estimate over its groups, their weights its sum, and
+    takes none of it for a setup every group pays again (2026-11-12: one file's timing was left, 1.6 times
+    its record; the plan charged the 0.6 of each other file's record to every group it cut, 1,123 task-hours
+    for a suite of 100, armada sized the run by 6,500 s tasks that took a minute, and train 772's CI ran out
+    its deadline on 20 of 688 containers)."""
+    for name in ("test_measured", "test_unmeasured"):
+        (tmp_path / "tests" / f"{name}.py").write_text("")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {**{f"tests/test_measured.py::test_cell[{n}]": 10.0 for n in range(10)},
+         **{f"tests/test_unmeasured.py::test_cell[{n}]": 10.0 for n in range(100)}}))
+    # The one file measured took 1.6 times its record, as one whole row.
+    timings = {"files": {"3.12:tests/test_measured.py": 160.0}, "rows": {"3.12:tests/test_measured.py": 160.0}}
+    groups = [entry["weight"] for entry in ci.plan(100.0, timings)
+              if entry["python"] == "3.12" and entry["tests"] == "tests/test_unmeasured.py"]
+    assert sum(groups) == pytest.approx(1600.0) and max(groups) <= 100.0
+    assert len(groups) == 16
+
+
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
     """Each task of a split file runs its own group (split.py) of the same
     cut, so the groups together run every test, none twice, a test the
