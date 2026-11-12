@@ -463,6 +463,9 @@ class GpuTarget:
     contraction's) holds its re-read footprint against: the datasheet's, where NVIDIA's tuning guide states
     it, else unknown; a real device's own (`runtime_facts`)."""
     measured: Mapping[str, Measured] = dataclasses.field(default_factory=dict, hash=False)
+    all_gather_combine_bytes: Mapping[str, int] = dataclasses.field(default_factory=dict, hash=False)
+    """The all-gather combine threshold a training step over several of this part takes, where a step
+    measured one, by device-kind prefix (`all_gather_combine`); else `dew.training.memory.COLLECTIVES`'."""
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
@@ -540,6 +543,12 @@ class GpuTarget:
     @property
     def peaks(self) -> Mapping[str, float]:
         return self._part(self.dense_peaks) or {}
+
+    @property
+    def all_gather_combine(self) -> int | None:
+        """The all-gather combine threshold this part measured (`all_gather_combine_bytes`); None where no
+        step measured one."""
+        return self._part(self.all_gather_combine_bytes)
 
     @property
     def part(self) -> Measured | None:
@@ -705,7 +714,11 @@ TARGETS = {target.generation: target for target in (
               measured={'NVIDIA H100 80GB HBM3': Measured(1.87e-6, 3.190e12, launch=1.02e-6, handoff=0.78e-6),
                         'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12, handoff=0.695e-6),
                         'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6),
-                        'NVIDIA H200': Measured(2.81e-6, 4.617e12)}),
+                        'NVIDIA H200': Measured(2.81e-6, 4.617e12)},
+              # A Qwen3.5-4B decision step over two H100 SXM at fsdp 2 (IG-SCALING-2XH100, row 5568): every
+              # timed cell within 1% at 1 GiB, 128 MiB and 30 MiB, 128 MiB's peak 5 GiB below 1 GiB's at two
+              # rows a device a microbatch (39.4 against 44.6 GiB).
+              all_gather_combine_bytes={'NVIDIA H100 80GB HBM3': 128 * 2 ** 20}),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
