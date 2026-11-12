@@ -16,7 +16,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew import _position
-from dew._records import integer, record
+from dew._records import JSON, integer, json_value, record
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch
 from dew.data.dataset import (
     Closeable,
@@ -42,13 +42,14 @@ GRAIN = importlib.metadata.version("grain")
 states its position holds, which a resume under another compares by their layout (`layout`)."""
 
 
-def layout(state: object) -> object:
+def layout(state: JSON) -> JSON:
     """`state`, an iterator's saved state, as its keys and their nesting alone: a mapping's keys each with
     its value's layout, a sequence's entries', any other value's type's name."""
-    if isinstance(state, Mapping):
-        return {key: layout(value) for key, value in state.items()}
-    if isinstance(state, (list, tuple)):
-        return [layout(value) for value in state]
+    match state:
+        case dict():
+            return {key: layout(value) for key, value in state.items()}
+        case list():
+            return [layout(value) for value in state]
     return type(state).__name__
 
 
@@ -330,12 +331,13 @@ class _PerShare(Forwarding):
         self._plan.check(written, resume=self._resume)
         saved = record(decoded.get("iterator"), "saved Grain iterator")
         if self._plan.version >= STRUCTURED:
-            self._grain_alike(record(written.get("rules", {}), "saved data plan rules").get("grain"), saved)
+            rules = record(written.get("rules", {}), "saved data plan rules")
+            self._grain_alike(json_value(rules.get("grain"), "saved grain rule"), saved)
         self.close()
         self._saved = saved
         self._statistics.publish(None)
 
-    def _grain_alike(self, saved: object, iterator: Mapping[str, object]) -> None:
+    def _grain_alike(self, saved: JSON, iterator: Mapping[str, object]) -> None:
         """Refuse a position whose iterator state a Grain of another version wrote (`saved`, its `grain`
         rule, `GRAIN`) in another layout than this read's: its keys and their nesting (`layout`), which
         a Grain that changed its iterators' states writes otherwise. A state of the same layout resumes."""
@@ -347,7 +349,7 @@ class _PerShare(Forwarding):
         finally:
             if isinstance(reader, Closeable):
                 reader.close()
-        if layout(today) != layout(iterator):
+        if layout(json_value(today, "an iterator's state")) != layout(json_value(iterator, "a saved state")):
             raise ValueError(f"the saved data position's iterator state was written by grain {saved}, in "
                              f"another layout than this grain {GRAIN}'s reads (docs/design/data.md, the "
                              f"rules): resume with grain=={saved}, or go on from the run's weights as a new "

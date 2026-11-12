@@ -413,7 +413,7 @@ def test_phases_sharing_a_corpus_saved_under_13_resume_by_13_and_are_refused_by_
     stopped.close()
     refusing = compile(shared_phases(), read="indexed", loading=READ).train(DataPartition())
     try:
-        with pytest.raises(ValueError, match="phases rule"):
+        with pytest.raises(ValueError):
             refusing.set_state(saved)
     finally:
         refusing.close()

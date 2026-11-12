@@ -127,7 +127,7 @@ class _Memory(View[Source]):
                                minlength=len(sizes))
         return tuple(int(size) for size in selected), remote
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         raise ValueError("materialized records are read by index")
 
 

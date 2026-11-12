@@ -283,7 +283,7 @@ its structure. A plan of 13 printed it (`StepIdentity.printed`), which this Dew 
 it is a new value (docs/design/data.md, the rules)."""
 
 
-def structured(value: object) -> JSON:
+def structured(value) -> JSON:
     """`value`, a step or any part of one, described by its structure, the one description a plan of version
     `STRUCTURED` or later records: a dataclass by its class and each field it records (`repr=True`, and an
     added one where set, `dew._records.ADDED`), a configured object by what it computes (`dependencies`),
@@ -325,7 +325,7 @@ def structured(value: object) -> JSON:
     if inspect.isfunction(value):
         return {"function": StepIdentity.of(value).semantic()}
     if inspect.isbuiltin(value):
-        return {"function": f"{getattr(value, '__module__', None)}.{value.__qualname__}"}
+        return {"function": f"{value.__module__}.{value.__qualname__}"}
     return {"text": re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))}
 
 
@@ -561,7 +561,7 @@ def unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | No
     return order
 
 
-def spelled(order: object, version: int) -> JSON:
+def spelled(order, version: int) -> JSON:
     """`order`, an analysis's (`dew.data.analysis._analyzed`), as a plan of `version` records it: each of
     its stages, the stage the analysis read, described by its structure (`structured`) from `STRUCTURED`,
     printed (its repr) before it, every other entry as JSON holds it."""
@@ -575,7 +575,7 @@ def spelled(order: object, version: int) -> JSON:
     return json_value(order, "order")
 
 
-def _spelled_stage(stage: object, version: int) -> JSON:
+def _spelled_stage(stage, version: int) -> JSON:
     """An order's stage as plan `version` records it (`spelled`)."""
     if isinstance(stage, str):
         return stage
@@ -624,7 +624,7 @@ def _grown_stages(saved: dict[str, JSON] | list[JSON] | str | int | float | bool
         if (held is None or now is None or now < held
                 or not all(_is_stage(stage, "BatchStage") for stage in saved[at + 1:])):
             return None
-        found.add((_canonical(before), _canonical(after)))
+        found.add((_stage_text(before), _stage_text(after)))
     return frozenset(found)
 
 
@@ -634,23 +634,28 @@ def _limit_count(stage: JSON) -> int | None:
     match stage:
         case {"class": "dew.data.pipeline.Limit", "count": int(count), "passes": None}:
             return count
-        case str():
-            printed = _LIMIT.fullmatch(stage)
-            return None if printed is None else int(printed.group(1))
+        case str(printed) if (limit := _LIMIT.fullmatch(printed)) is not None:
+            return int(limit.group(1))
     return None
 
 
 def _is_stage(stage: JSON, kind: str) -> bool:
     """Whether an order's stage, as a plan of any version records it, is of the stage class `kind`."""
-    if isinstance(stage, dict):
-        return stage.get("class") == f"dew.data.pipeline.{kind}"
-    return str(stage).startswith(f"{kind}(")
+    match stage:
+        case {"class": str(named)}:
+            return named == f"dew.data.pipeline.{kind}"
+        case str(printed):
+            return printed.startswith(f"{kind}(")
+    return False
 
 
-def _canonical(stage: JSON) -> str:
+def _stage_text(stage: JSON) -> str:
     """An order's stage as its manifest's step records its configuration: a structured one's canonical
     JSON, a printed one as printed."""
-    return stage if isinstance(stage, str) else json.dumps(stage, sort_keys=True)
+    match stage:
+        case str(printed):
+            return printed
+    return json.dumps(stage, sort_keys=True)
 
 
 def _steps_grown(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
