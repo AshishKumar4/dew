@@ -128,9 +128,9 @@ def loss_dtype(trainer, state, batch) -> str:
 
     step = Step(state.microstep, jax.random.key(0), state.ema)
     with jax.set_mesh(trainer.device_mesh):
-        ratio, _ = jax.eval_shape(lambda variables: trainer.objective.loss(variables, batch, step),
-                                  state.variables)
-    return ratio.mean()[0].dtype.name
+        loss = jax.eval_shape(lambda variables: trainer.objective.loss(variables, batch, step)[0].mean()[0],
+                              state.variables)
+    return loss.dtype.name
 
 
 class Losses:
