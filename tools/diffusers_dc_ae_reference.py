@@ -32,11 +32,12 @@ bias, and every batch norm's running statistics, moved off their init,
 rounded to bfloat16-representable values so the fixture compresses; they are
 still float32 tensors.
 
-    python tools/diffusers_dc_ae_reference.py OUTPUT_DIR [VARIANT ...]
+    python tools/diffusers_dc_ae_reference.py OUTPUT_DIR conv shuffle    # with diffusers 0.34.0
+    python tools/diffusers_dc_ae_reference.py OUTPUT_DIR plain           # with the test extra's diffusers
     python tools/diffusers_dc_ae_reference.py bundle OUTPUT_DIR tests/fixtures/dc_ae.tar.xz
 
-Named variants are recorded into OUTPUT_DIR beside what it holds, its record keeping the others' releases;
-none records every variant.
+Named variants are recorded into OUTPUT_DIR beside what it holds, each by its cohort's release (`COHORTS`),
+the record keeping the others'; a run records one cohort's variants.
 """
 
 from __future__ import annotations
@@ -48,10 +49,12 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers_reference_helpers import on_bfloat16_grid
-from reference_releases import RELEASES, require
+from reference_releases import require
 from reference_vjp import recorded_vjp
 
-DIFFUSERS = RELEASES["diffusers"]["diffusers"]
+COHORTS = {"conv": "diffusers-0.34", "shuffle": "diffusers-0.34", "plain": "diffusers"}
+"""The reference release each variant is recorded by (`reference_releases.RELEASES`): a run records the
+variants of the release installed, one cohort at a time."""
 COMMON = {"in_channels": 3, "latent_channels": 8, "attention_head_dim": 8,
           "encoder_block_types": ["ResBlock", "ResBlock", "EfficientViTBlock"],
           "decoder_block_types": ["ResBlock", "ResBlock", "EfficientViTBlock"],
@@ -140,24 +143,28 @@ def bundle(directory: str, destination: str) -> None:
 
 
 def main(destination: str, variants: list[str]) -> None:
-    """Record `variants` (every one where none is named) into `destination`, beside the variants it holds,
+    """Record `variants`, one cohort's (`COHORTS`), into `destination`, beside the variants it holds,
     whose releases its record keeps."""
-    require("diffusers")
-    torch.set_num_threads(2)
-    root = Path(destination)
-    root.mkdir(parents=True, exist_ok=True)
     unknown = sorted(set(variants) - set(CONFIGS))
     if unknown:
         raise ValueError(f"{unknown} are no variants of {sorted(CONFIGS)}")
+    if not variants:
+        raise ValueError(f"name the variants to record, one cohort's at a time: {COHORTS}")
+    cohorts = {COHORTS[name] for name in variants}
+    if len(cohorts) != 1:
+        raise ValueError(f"the variants asked are recorded by {sorted(cohorts)}: record each cohort's apart, "
+                         "in its own environment")
+    (cohort,) = cohorts
+    release = require(cohort)["diffusers"]
+    torch.set_num_threads(2)
+    root = Path(destination)
+    root.mkdir(parents=True, exist_ok=True)
     held = root / "dc_ae.json"
     releases = json.loads(held.read_text()).get("releases", {}) if held.exists() else {}
-    for name in variants or list(CONFIGS):
+    for name in variants:
         arrays = build(CONFIGS[name], root / name)
         np.savez_compressed(root / name / "reference.npz", **arrays)
-        releases[name] = DIFFUSERS
-    missing = sorted(set(CONFIGS) - set(releases))
-    if missing:
-        raise ValueError(f"{root} holds no recording of {missing}: record them too")
+        releases[name] = release
     record = {"releases": releases, "configs": CONFIGS, "batch": BATCH, "height": HEIGHT, "width": WIDTH,
               "small": SMALL, "seed": SEED}
     held.write_text(json.dumps(record, indent=1) + "\n")

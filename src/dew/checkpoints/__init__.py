@@ -489,8 +489,11 @@ def _placed(tree, template, keys: Mapping[str, str]):
             return _keyed(leaf, want, keys)
         if leaf is want or (isinstance(leaf, jax.Array) and leaf.dtype == want.dtype):
             return leaf
-        value = jnp.asarray(leaf).astype(want.dtype)
         sharding = getattr(want, 'sharding', None)
+        if isinstance(leaf, np.ndarray) and sharding is not None:
+            # A host leaf cast on the host and put where it is wanted, no other device holding it on the way.
+            return jax.device_put(leaf.astype(want.dtype), sharding)
+        value = jnp.asarray(leaf).astype(want.dtype)
         return value if sharding is None else jax.device_put(value, sharding)
     return jax.tree.map(placed, tree, template)
 
@@ -1762,7 +1765,8 @@ class Checkpoints:
                   unread: tuple[tuple[str, ...], ...] = (), on_host: bool = False) -> Variables:
         """Read the selected step's live or averaged variables onto the requested layout, or with
         `on_host` into host arrays, restored onto this process's CPU device and fetched, no accelerator
-        holding them on the way (no `mesh` or `layout` beside it).
+        holding them on the way (no `mesh` or `layout` beside it); a local step, which knows the devices
+        it was written on alone, restores there and is fetched.
 
         Parameter storage conversion applies only to the owner's parameter
         roots; other collections retain their recorded dtypes and placement.
@@ -1792,8 +1796,10 @@ class Checkpoints:
             raise ValueError("on_host reads the variables into host arrays, and mesh and layout place "
                              "them; pass one")
         # On the host, restored onto this process's CPU device, every collection as a placed read restores
-        # it, then fetched as host arrays: no accelerator holds them on the way.
-        device_mesh = resolve_mesh(DefaultMesh().build(_host_devices()) if on_host
+        # it, then fetched as host arrays: no accelerator holds them on the way. A local step restores
+        # where it was written, the devices its shards name (`_check_placement`), and is fetched from there.
+        host = on_host and step != self._local_latest()
+        device_mesh = resolve_mesh(DefaultMesh().build(_host_devices()) if host
                                    else DefaultMesh() if mesh is None else mesh)
         chosen_layout = DefaultLayout() if layout is None else layout
         # A CPU-owned run stores its frozen collection banked; the layout places
