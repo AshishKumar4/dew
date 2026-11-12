@@ -1053,6 +1053,15 @@ def agreed_validity[TreeT: InputTree](tree: TreeT, processes: int, *, controls: 
     return filled_validity(tree, [bool(present) for present in gathered.max(axis=0)])
 
 
+def local_ids(inputs: ModelInputs) -> ModelInputs:
+    """This process's rows of `inputs`' token ids and the media index fields beside them
+    (`MEDIA_INDEX_FIELDS`), on the host (`local_rows`): what a check of its ids against a table reads
+    (`dew.inputs.spec.Field.bounded`), none of its media payloads or other fields fetched."""
+    fields = {name: local_rows(held) for name in MEDIA_INDEX_FIELDS
+              if isinstance(held := inputs.token_fields.get(name), jax.Array | np.ndarray)}
+    return ModelInputs(*jax.tree.map(np.asarray, (local_rows(inputs.tokens), fields)))
+
+
 @overload
 def local_rows(leaf: jax.typing.ArrayLike, *, host: Literal[True] = True) -> np.ndarray: ...
 
