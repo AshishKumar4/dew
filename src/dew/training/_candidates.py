@@ -346,7 +346,7 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
     if shapes is not None:
         stepping.staging.refuse_unpipelined(schedule, settings.objective)
     prepared = windowed(lambda state, rows, *, shape_only: stepping.initialize_accumulation(
-        state, rows, shapes, window=window, shape_only=shape_only), state, batch)
+        state, rows, shapes, window=window, split=split, shape_only=shape_only), state, batch)
     # DiLoCo's groups read their own parameters, which no narrow copy shadows.
     # A step the trainer composes narrows, from the loss it traced; a custom step's traces none (`traced`
     # None), and a scaled loss's copies none.
@@ -381,9 +381,12 @@ def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, c
         current = together(current, held)
         micro = microbatch(batch, part, split)
         early = [field for field in settings.layout.host if field not in late]
+        has_batch_stats = (split > 1 and current.window is not None
+                           and current.window.batch_statistics is not None)
+        whole = stepping.model_batch(batch) if has_batch_stats else None
         advanced, loss, aux, committed = body(stepping.fetched(current, shardings, early),
                                               stepping.model_batch(micro), part, batch_tokens(micro),
-                                              micro.get(CLOSES_WINDOW))
+                                              micro.get(CLOSES_WINDOW), whole)
         stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1,
                                  batch_consumed(micro))
         return (apart(stepped)[0], *rest)

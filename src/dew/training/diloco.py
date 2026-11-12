@@ -89,7 +89,7 @@ class DiLoCo:
         each group counts of the whole batch."""
         groups = mesh.shape[DILOCO_AXIS]
 
-        def replica(inner, shared, batch, part, tokens, closes):
+        def replica(inner, shared, batch, part, tokens, closes, whole):
             own = jax.tree.map(lambda leaf: leaf[0], inner)
             group = jax.lax.axis_index(DILOCO_AXIS)
             # Each group draws its own; one group draws as a run of one copy does.
@@ -97,20 +97,23 @@ class DiLoCo:
             view = dataclasses.replace(shared, **{field: getattr(own, field) for field in REPLICA_FIELDS},
                                        key=key)
             with example_groups(groups, group):
-                advanced, loss, aux, committed = body(view, batch, part, tokens, closes)
+                advanced, loss, aux, committed = body(view, batch, part, tokens, closes, whole)
             stacked = Replicas(**{field: jax.tree.map(lambda leaf: leaf[None], getattr(advanced, field))
                                   for field in REPLICA_FIELDS})
             agreed = jax.tree.map(_agreed, (loss, aux, committed))
             return stacked, *agreed
 
-        def run(current: TrainState, batch, part, tokens, closes=None):
+        def run(current: TrainState, batch, part, tokens, closes=None, whole=None):
             shared = dataclasses.replace(current, variables={}, opt_state=None, ema=None, inner=None)
             # A batch input of no rows, a scalar, every group reads whole.
             rows = jax.tree.map(lambda leaf: P(DILOCO_AXIS) if jnp.ndim(leaf) else P(), batch)
+            whole_rows = (None if whole is None else
+                          jax.tree.map(lambda leaf: P(DILOCO_AXIS) if jnp.ndim(leaf) else P(), whole))
             inner, loss, aux, committed = jax.shard_map(
                 replica, mesh=mesh, axis_names={DILOCO_AXIS}, check_vma=False,
-                in_specs=(P(DILOCO_AXIS), P(), rows, P(), P(), P()),
-                out_specs=(P(DILOCO_AXIS), P(), P(), P()))(current.inner, shared, batch, part, tokens, closes)
+                in_specs=(P(DILOCO_AXIS), P(), rows, P(), P(), P(), whole_rows),
+                out_specs=(P(DILOCO_AXIS), P(), P(), P()))(
+                    current.inner, shared, batch, part, tokens, closes, whole)
             first = jax.tree.map(lambda leaf: leaf[0], inner)
             advanced = dataclasses.replace(current, inner=inner, microstep=first.microstep,
                                            updates=first.updates, scale=first.scale)

@@ -369,12 +369,13 @@ def test_the_worlds_kl_losses_are_the_codes_and_the_representation_one_spares_th
         head = variables["params"]["prior_logits"]
         found, moved = np.asarray(kls(head)), jax.jacrev(kls)(head)
         roundings = chain_roundings(jax.make_jaxpr(kls)(head))
-        # The loss draws its posterior from the first of its step key's two halves.
-        world_key = jax.random.split(step.key)[0]
+        # The loss draws each window's posterior from its per-example stream (`Step.sample`).
+        gumbel = step.sample("posterior draw", jax.random.gumbel, (6, model.stoch, model.classes),
+                             dtype=jnp.float32, rows=3)
         previous = jnp.concatenate([jnp.zeros_like(windows["action"][:, :1]), windows["action"][:, :-1]], 1)
         deter, _, posterior, _ = objective.observed(variables, model.seen(windows["observation"]), previous,
-                                                    windows["first"], world_key)
-        prior = model.bind(variables, rngs={"latent": world_key}).prior(deter)
+                                                    windows["first"], gumbel=gumbel)
+        prior = model.bind(variables).prior(deter)
     post, prior = np.asarray(posterior, np.float64), np.asarray(prior, np.float64)
     divergence = np.sum(np.exp(post) * (post - prior), axis=(-1, -2))
     expected = np.mean(np.maximum(divergence, objective.free_nats))

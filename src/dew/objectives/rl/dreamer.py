@@ -26,7 +26,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import math
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NotRequired, TypedDict
 
@@ -307,8 +307,10 @@ class WorldModel(nn.Module):
     def initial(self, batch: tuple[int, ...]) -> tuple[jax.Array, jax.Array]:
         if self.dynamics is not None:
             held = self.dynamics
-            return jnp.zeros((*batch, held.width)), jnp.zeros((*batch, held.stoch, held.classes))
-        return jnp.zeros((*batch, self.deter)), jnp.zeros((*batch, self.stoch, self.classes))
+            wide = at_least_fp32(held.dtype)
+            return jnp.zeros((*batch, held.width), wide), jnp.zeros((*batch, held.stoch, held.classes), wide)
+        wide = at_least_fp32(self.dtype)
+        return jnp.zeros((*batch, self.deter), wide), jnp.zeros((*batch, self.stoch, self.classes), wide)
 
     def seen(self, observation: Observation) -> jax.Array | dict[str, jax.Array]:
         """What the encoder reads of an observation: its `reads` view, or the observation whole; beside an
@@ -316,13 +318,14 @@ class WorldModel(nn.Module):
         read = view(observation, self.reads)
         if not self.proprio:
             return read
-        widths = [jnp.asarray(view(observation, name), jnp.float32) for name, _ in self.proprio]
+        wide = at_least_fp32(self.dtype)
+        widths = [jnp.asarray(view(observation, name), wide) for name, _ in self.proprio]
         return {"image": read, "proprio": jnp.concatenate(widths, -1)}
 
     def predicted(self, name: str, feature: jax.Array) -> jax.Array:
         """The auxiliary head `name`'s prediction of its privileged entry."""
         hidden, out = self.auxiliary_heads[name]
-        return out(hidden(feature)).astype(jnp.float32)
+        return out(hidden(feature)).astype(at_least_fp32(self.dtype))
 
     def embed(self, observation: Observation) -> jax.Array:
         """The encoder's tokens of an observation (`seen`): a vector's symlogged first (rssm.py:218), an
@@ -367,8 +370,9 @@ class WorldModel(nn.Module):
         logits = self.prior_logits(self.prior_layers(deter))
         return unimix_log_probs(logits.reshape(*logits.shape[:-1], self.stoch, self.classes), self.unimix)
 
-    def categorical(self, log_probs: jax.Array) -> jax.Array:
-        return onehot_sample(self.make_rng("latent"), log_probs)
+    def categorical(self, log_probs: jax.Array, gumbel: jax.Array | None = None) -> jax.Array:
+        return onehot_sample(None if gumbel is not None else self.make_rng("latent"), log_probs,
+                             gumbel=gumbel)
 
     @staticmethod
     def feature(deter: jax.Array, stoch: jax.Array) -> jax.Array:
@@ -386,22 +390,23 @@ class WorldModel(nn.Module):
         image's pixels over 255 (rssm.py:345-355, outs.MSE summed over the image's axes); the
         proprioceptive entries are the auxiliary heads' to decode."""
         read = view(observation, "image" if self.proprio else None)
-        decoded = self.decode(deter, stoch).astype(jnp.float32)
+        decoded = self.decode(deter, stoch).astype(at_least_fp32(self.dtype))
         if self.image is None:
             return jnp.sum(jnp.square(decoded - symlog(read)), -1)
         return jnp.sum(jnp.square(decoded - divided(read.astype(decoded.dtype), 255)), (-3, -2, -1))
 
     def reward(self, feature: jax.Array) -> jax.Array:
-        return self.reward_logits(self.reward_layers(feature)).astype(jnp.float32)
+        return self.reward_logits(self.reward_layers(feature)).astype(at_least_fp32(self.dtype))
 
     def continue_(self, feature: jax.Array) -> jax.Array:
-        return self.continue_logit(self.continue_layers(feature))[..., 0].astype(jnp.float32)
+        return self.continue_logit(self.continue_layers(feature))[..., 0].astype(at_least_fp32(self.dtype))
 
     def policy(self, feature: jax.Array) -> tuple[jax.Array, jax.Array]:
         """The bounded normal's mean, tanh of its head, and its deviation between the floor and the
         ceiling (heads.py:146-155)."""
         x = self.policy_layers(feature)
-        mean, std = (head(x).astype(jnp.float32) for head in (self.policy_mean, self.policy_std))
+        wide = at_least_fp32(self.dtype)
+        mean, std = (head(x).astype(wide) for head in (self.policy_mean, self.policy_std))
         std = (self.max_std - self.min_std) * jax.nn.sigmoid(std + 2.0) + self.min_std
         return jnp.tanh(mean), std
 
@@ -417,7 +422,7 @@ class Critic(nn.Module):
     def __call__(self, feature: jax.Array) -> jax.Array:
         logits = nn.Dense(self.bins, kernel_init=_init(0.0), dtype=self.dtype,
                           param_dtype=at_least_fp32(self.dtype))(_Layers(self.units, 3, self.dtype)(feature))
-        return logits.astype(jnp.float32)
+        return logits.astype(at_least_fp32(self.dtype))
 
 
 def _shifted(stoch: jax.Array) -> jax.Array:
@@ -443,12 +448,31 @@ def lambda_return(last: jax.Array, term: jax.Array, reward: jax.Array, value: ja
     return returns.T
 
 
+def _percentile(values: jax.Array, kept: jax.Array, q: float) -> jax.Array:
+    """`values`' `q`th percentile over its `kept` entries alone, linear between ranks as `jnp.percentile`
+    takes it; NaN where a kept entry is NaN or where none is kept."""
+    flat_kept = jnp.asarray(kept, bool).reshape(-1)
+    flat_values = values.reshape(-1)
+    ordered = jnp.sort(jnp.where(flat_kept, flat_values, jnp.inf))
+    count = jnp.sum(flat_kept)
+    last = jnp.maximum(count - 1, 0)
+    rank = (q / 100.0) * last
+    lower = jnp.minimum(jnp.floor(rank).astype(jnp.int32), last)
+    upper = jnp.minimum(jnp.ceil(rank).astype(jnp.int32), last)
+    low_val, high_val = ordered[lower], ordered[upper]
+    interpolated = jnp.where(lower == upper, low_val, low_val + (rank - lower) * (high_val - low_val))
+    invalid = (count == 0) | jnp.any(flat_kept & jnp.isnan(flat_values))
+    return jnp.where(invalid, jnp.asarray(jnp.nan, interpolated.dtype), interpolated)
+
+
 @struct.dataclass
 class _Latent:
     deter: jax.Array
     stoch: jax.Array
-    key: jax.Array
+    key: jax.Array | None = None
     cache: Cache | None = None
+    gumbel: jax.Array | None = None
+    step_index: jax.Array | None = None
 
 
 @struct.dataclass
@@ -476,17 +500,28 @@ class LatentEnv:
     def action_size(self) -> int:
         return self.model.action_size
 
-    def at(self, deter: jax.Array, stoch: jax.Array, key: jax.Array,
-           cache: Cache | None = None) -> tuple[_Latent, jax.Array]:
-        """The latent imagination starts from, with the cache a TSSM's next step attends to."""
-        return _Latent(deter, stoch, key, cache), WorldModel.feature(deter, stoch)
+    def at(self, deter: jax.Array, stoch: jax.Array, key: jax.Array | None = None,
+           cache: Cache | None = None, *, gumbel: jax.Array | None = None) -> tuple[_Latent, jax.Array]:
+        """The latent imagination starts from, with the cache a TSSM's next step attends to, drawing from
+        `gumbel` `[steps, starts, stoch, classes]` where given, else from `key`."""
+        index = None if gumbel is None else jnp.zeros((), jnp.int32)
+        return _Latent(deter, stoch, key, cache, gumbel, index), WorldModel.feature(deter, stoch)
 
     def reset(self, key: jax.Array) -> tuple[_Latent, TimeStep]:
         raise TypeError("an imagination starts from replayed latents (LatentEnv.at), never a reset")
 
     def step(self, state: _Latent, action: jax.Array) -> tuple[_Latent, TimeStep]:
-        key, latent = jax.random.split(state.key)
-        model = self.model.bind(self.variables, rngs={"latent": latent})
+        key, gumbel, index = state.key, state.gumbel, state.step_index
+        if gumbel is None:
+            if key is None:
+                raise ValueError("a LatentEnv step needs a key or Gumbel noise")
+            key, latent = jax.random.split(key)
+            model = self.model.bind(self.variables, rngs={"latent": latent})
+            step_gumbel = None
+        else:
+            assert index is not None
+            model = self.model.bind(self.variables)
+            step_gumbel, index = gumbel[index], index + 1
         cache, dynamics = state.cache, model.dynamics
         if dynamics is None:
             deter = model.core(state.deter, state.stoch, action)
@@ -495,18 +530,18 @@ class LatentEnv:
                 raise ValueError("a TSSM imagines from a window's cache (LatentEnv.at)")
             never = jnp.zeros(action.shape[:-1], bool)
             deter, cache = dynamics.step(dynamics.inputs(state.stoch, action, never), never, cache)
-        stoch = model.categorical(model.prior(deter))
+        stoch = model.categorical(model.prior(deter), step_gumbel)
         feature = WorldModel.feature(deter, stoch)
         reward = twohot_mean(model.reward(feature), self.bins)
         never = jnp.zeros(reward.shape, bool)
-        return _Latent(deter, stoch, key, cache), TimeStep(feature, reward, never, never)
+        return _Latent(deter, stoch, key, cache, gumbel, index), TimeStep(feature, reward, never, never)
 
 
 AUXILIARY_SCALE = 0.5
 """An auxiliary head's loss weight, FlyDreamer's `aux_state` and `aux_goal` (configs.yaml `loss_scales`)."""
 
 
-class DreamerV3Objective(ReleasesModel, Objective[Ratio]):
+class DreamerV3Objective(ReleasesModel, Objective[Ratio, Variables]):
     """DreamerV3 over a `WorldModel` (the module docstring). A batch holds replayed windows `[B, T]`
     of DreamerV3's steps (`Driven`): `observation`, the `action` taken at it, the `reward` that came
     with it, and whether it was its episode's `first`, `last` or `terminal`. The scales weigh the
@@ -576,17 +611,28 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio]):
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         params_key, latent = jax.random.split(key)
-        inputs = self.model.example(1), jnp.zeros((1, self.model.action_size))
+        wide = at_least_fp32(self.model.dtype)
+        inputs = self.model.example(1), jnp.zeros((1, self.model.action_size), wide)
         tree = self.model.init({"params": params_key, "latent": latent}, *inputs)
         # The returns' 5th and 95th percentiles, an EMA from zero (utils.py:16-72, debias off).
-        return {**tree, "returns": {"low": jnp.zeros(()), "high": jnp.zeros(())}}
+        return {**tree, "returns": {"low": jnp.zeros((), wide), "high": jnp.zeros((), wide)}}
+
+    @property
+    def _imagines(self) -> bool:
+        return any(self.scales[name] for name in ("policy", "value", "replay_value"))
+
+    def _latent_shape(self) -> tuple[int, int]:
+        dynamics = self.model.dynamics
+        return (self.model.stoch, self.model.classes) if dynamics is None else (dynamics.stoch,
+                                                                                dynamics.classes)
 
     @property
     def validation_loss_refusal(self) -> str | None:
         return "DreamerV3 scores its agent by its episodes' returns, not a validation loss"
 
     def observe(self, model: WorldModel, deter: jax.Array, stoch: jax.Array, observation: Observation,
-                previous: jax.Array, first: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+                previous: jax.Array, first: jax.Array, *,
+                gumbel: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
         """One posterior step: the latent and action masked where an episode starts, the GRU, then
         the posterior's draw; the new latent, beside the posterior's log-probabilities."""
         keep = (~first)[..., None]
@@ -594,36 +640,51 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio]):
         stoch = stoch * keep[..., None]
         deter = model.core(deter, stoch, previous)
         posterior = model.posterior(deter, model.embed(observation))
-        return deter, model.categorical(posterior), posterior
+        return deter, model.categorical(posterior, gumbel), posterior
 
-    def observed(self, variables: Variables, observation: Observation, previous: jax.Array, first: jax.Array,
-                 key: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, Window | None]:
+    def observed(self, variables: Variables, observation: Observation, previous: jax.Array,
+                 first: jax.Array, key: jax.Array | None = None, *,
+                 gumbel: jax.Array | None = None
+                 ) -> tuple[jax.Array, jax.Array, jax.Array, Window | None]:
         """The posterior latents over windows `[B, T, ...]` from a zero latent: each step's
-        deterministic state, drawn categoricals and posterior log-probabilities, each step drawing from
-        its own of `T` keys split from `key`, as the code's scan seeds each step's sample
-        (rssm.py:63-90); and a transformer's window, whose keys and values imagination from each step
-        attends to (`TSSM.window`), None for the recurrent core."""
+        deterministic state, drawn categoricals and posterior log-probabilities, from `gumbel`
+        `[B, T, stoch, classes]` where given, else each step drawing from its own of `T` keys split from
+        `key`, as the code's scan seeds each step's sample (rssm.py:63-90); and a transformer's window,
+        whose keys and values imagination from each step attends to (`TSSM.window`), None for the
+        recurrent core."""
         rows, length = first.shape
-        model = self.model.bind(variables, rngs={"latent": key})
-        dynamics = model.dynamics
-        if dynamics is not None:
+        if self.model.dynamics is not None:
             # TransDreamer: the window's posteriors at once, then the transformer over the latents and
             # actions before each step.
+            if gumbel is not None:
+                model = self.model.bind(variables)
+            else:
+                if key is None:
+                    raise ValueError("observing windows needs a key or Gumbel noise")
+                model = self.model.bind(variables, rngs={"latent": key})
+            dynamics = model.dynamics
+            assert dynamics is not None
             posterior = model.posterior(None, model.embed(observation))
-            stoch = model.categorical(posterior)
+            stoch = model.categorical(posterior, gumbel)
             deter, window = dynamics.window(dynamics.inputs(_shifted(stoch), previous, first), first)
             return deter, stoch, posterior, window
+        if gumbel is None:
+            if key is None:
+                raise ValueError("observing windows needs a key or Gumbel noise")
+            bound, draws = None, jax.random.split(key, length)
+        else:
+            bound, draws = self.model.bind(variables), jnp.swapaxes(gumbel, 0, 1)
 
-        def step(latent, inputs):
+        def step_latent(latent, inputs):
             deter, stoch = latent
-            observation, previous, first, key = inputs
-            at = self.model.bind(variables, rngs={"latent": key})
-            deter, stoch, posterior = self.observe(at, deter, stoch, observation, previous, first)
+            obs_t, prev_t, first_t, draw_t = inputs
+            at = self.model.bind(variables, rngs={"latent": draw_t}) if bound is None else bound
+            deter, stoch, posterior = self.observe(at, deter, stoch, obs_t, prev_t, first_t,
+                                                   gumbel=None if bound is None else draw_t)
             return (deter, stoch), (deter, stoch, posterior)
 
-        steps = (*jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), (observation, previous, first)),
-                 jax.random.split(key, length))
-        _, found = jax.lax.scan(step, self.model.initial((rows,)), steps)
+        steps = (*jax.tree.map(lambda x: jnp.swapaxes(x, 0, 1), (observation, previous, first)), draws)
+        _, found = jax.lax.scan(step_latent, self.model.initial((rows,)), steps)
         deter, stoch, posterior = (jnp.swapaxes(x, 0, 1) for x in found)
         return deter, stoch, posterior, None
 
@@ -678,18 +739,149 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio]):
         """One update's work on `batch`, its loss's gradient's traced program's (`traced_update_flops`)."""
         return traced_update_flops(self, batch)[1]
 
-    def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
-        world_key, imagine_key = jax.random.split(step.key)
-        model = self.model.bind(variables, rngs={"latent": world_key})
+    def _posterior_pass(self, variables: Variables, batch: Batch, step: Step):
+        model = self.model.bind(variables)
         observation, action = model.seen(batch["observation"]), batch["action"]
-        reward = jnp.asarray(batch["reward"], jnp.float32)
         # A window starts its episode's latent afresh at its first step.
         first = jnp.asarray(batch["first"], bool).at[:, 0].set(True)
-        last, terminal = jnp.asarray(batch["last"], jnp.float32), jnp.asarray(batch["terminal"], jnp.float32)
         previous = jnp.concatenate([jnp.zeros_like(action[:, :1]), action[:, :-1]], 1)
-        rows, length = reward.shape
+        rows, length = first.shape
+        stoch_dim, classes_dim = self._latent_shape()
+        gumbel = step.sample("posterior draw", jax.random.gumbel, (length, stoch_dim, classes_dim),
+                             dtype=jnp.float32, rows=rows)
+        deter, stoch, posterior, window = self.observed(variables, observation, previous, first,
+                                                        gumbel=gumbel)
+        return observation, first, deter, stoch, posterior, window
 
-        deter, stoch, posterior, window = self.observed(variables, observation, previous, first, world_key)
+    def _imagined(self, variables: Variables, deter: jax.Array, stoch: jax.Array,
+                  window: Window | None, first: jax.Array, step: Step):
+        """Imagination from every replayed posterior state `[B*T, H + 1]`, its inputs held still
+        (agent.py:189-196), each window's prior latents and policy actions drawn from `step`'s
+        per-example streams."""
+        rows, length = first.shape
+        stoch_dim, classes_dim = self._latent_shape()
+        latent_gumbel = step.sample("imagined latent", jax.random.gumbel,
+                                    (length, self.imagination, stoch_dim, classes_dim), dtype=jnp.float32,
+                                    rows=rows)
+        latent_gumbel = jnp.swapaxes(
+            latent_gumbel.reshape(rows * length, self.imagination, stoch_dim, classes_dim), 0, 1)
+        action_noise = step.sample("imagined action", jax.random.normal,
+                                   (length, self.imagination + 1, self.model.action_size),
+                                   dtype=jnp.float32, rows=rows)
+        action_noise = jnp.swapaxes(
+            action_noise.reshape(rows * length, self.imagination + 1, self.model.action_size), 0, 1)
+
+        held = jax.lax.stop_gradient(variables)
+        env = LatentEnv(self.model, held, self.bins)
+        start_deter, start_stoch = (jax.lax.stop_gradient(x.reshape(rows * length, *x.shape[2:]))
+                                    for x in (deter, stoch))
+        cache, dynamics = None, self.model.dynamics
+        if dynamics is not None:
+            assert window is not None, "a transformer's posterior pass keeps its window"
+            # Each start's cache, the window's keys and values of its episode up to it.
+            cache = jax.lax.stop_gradient(dynamics.window_cache(window, first, self.imagination))
+        state, begin = env.at(start_deter, start_stoch, cache=cache, gumbel=latent_gumbel)
+
+        def policy(params: Params, feature: Observation, _key: jax.Array, at_step: Memory) -> tuple[
+                jax.Array, Tree, Memory]:
+            assert isinstance(at_step, jax.Array)
+            mean, std = self.model.bind(params).policy(view(feature))
+            return mean + std * action_noise[at_step].astype(mean.dtype), {}, at_step + 1
+
+        _, imagined = env_rollout(env, policy, held,
+                                  Carry(state, begin, step.key, jnp.zeros((), jnp.int32)),
+                                  self.imagination, reset=False)
+        # The start's feature then each imagined one, and the action taken at each [B*T, H + 1].
+        imagined_features = jnp.swapaxes(view(imagined.following.observation), 0, 1)
+        features = jnp.concatenate([begin[:, None], imagined_features], 1)
+        last_action, _, _ = policy(held, features[:, -1], step.key,
+                                   jnp.asarray(self.imagination, jnp.int32))
+        actions = jnp.concatenate([jnp.swapaxes(imagined.action, 0, 1), last_action[:, None]], 1)
+        still = self.model.bind(held)
+        rewards = twohot_mean(still.reward(features), self.bins)
+        cont = jax.nn.sigmoid(still.continue_(features))
+        model = self.model.bind(variables)
+        values = twohot_mean(model.value(features), self.bins)
+        slow = self.model.bind(merge(variables, jax.lax.stop_gradient(step.ema)) if step.ema is not None
+                               else held)
+        slow_values = twohot_mean(slow.value(features), self.bins)
+        weight = jax.lax.stop_gradient(jnp.cumprod(cont, 1))
+        boot = slow_values if self.slow_targets else values
+        returns = jax.lax.stop_gradient(lambda_return(jnp.zeros_like(cont), 1 - cont, rewards, boot, boot,
+                                                      1.0, self.lam))
+        return features, actions, weight, boot, slow_values, slow, returns
+
+    def _return_bounds(self, held: Mapping[str, jax.Array], returns: jax.Array,
+                       real: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """The return-percentile EMA (`low`, `high`) updated over `real` windows' `returns` `[N, T, H]`;
+        unchanged where no window is real."""
+        started = jnp.broadcast_to(real[:, None, None], returns.shape)
+        rate = self.return_rate
+
+        def moved(name: str, q: float) -> jax.Array:
+            prior = held[name]
+            ema = (1 - rate) * prior + rate * _percentile(returns, started, q)
+            return jnp.where(jnp.any(real), ema, prior).astype(prior.dtype)
+
+        return moved("low", 5), moved("high", 95)
+
+    def _weighed(self, losses: Mapping[str, jax.Array],
+                 batch: Batch) -> tuple[Ratio, dict[str, jax.Array]]:
+        """The weighted loss `Ratio` over `batch`'s real windows, each loss `[B, ...]` averaged over
+        its window first so every term shares the real windows' mass, and each term's mean metric."""
+        wide = at_least_fp32(self.model.dtype)
+        terms = {name: self.row_mean(jnp.mean(value, tuple(range(1, value.ndim))), batch)
+                 for name, value in losses.items()}
+        metrics = {f"loss_{name}": term.mean()[0] for name, term in terms.items()}
+        if not any(self.scales[name] for name in terms):
+            zero = jnp.zeros((), wide)
+            return Ratio(zero, zero), metrics
+        total = sum((self.scales[name] * term.total for name, term in terms.items()), jnp.zeros((), wide))
+        mass = next(iter(terms.values())).mass
+        return Ratio(total, mass), metrics
+
+    def batch_statistics(self, variables: Variables,
+                         part_at: Callable[[jax.Array], tuple[Batch, Step]],
+                         split: int) -> tuple[jax.Array, jax.Array] | None:
+        if not self._imagines:
+            return None
+
+        def part(_, index: jax.Array):
+            micro, step = part_at(index)
+            rows, length = jnp.asarray(micro["first"]).shape
+            micro, row_real = self._clean_rows(micro, rows)
+            _, first, deter, stoch, _, window = self._posterior_pass(variables, micro, step)
+            *_, returns = self._imagined(variables, deter, stoch, window, first, step)
+            return None, (returns.reshape(rows, length, self.imagination), row_real)
+
+        _, (returns, real) = jax.lax.scan(part, None, jnp.arange(split, dtype=jnp.int32))
+        ordered = jnp.swapaxes(returns, 0, 1).reshape(-1, *returns.shape[2:])
+        kept = jnp.swapaxes(real, 0, 1).reshape(-1)
+        return jax.lax.stop_gradient(self._return_bounds(variables["returns"], ordered, kept))
+
+    def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
+        if not effects:
+            return {}
+        held = variables["returns"]
+        low, active = effects["low"].mean()
+        high, _ = effects["high"].mean()
+        return {"returns": {
+            "low": jnp.where(active, low, held["low"]).astype(held["low"].dtype),
+            "high": jnp.where(active, high, held["high"]).astype(held["high"].dtype),
+        }}
+
+    def loss(self, variables: Variables, batch: Batch,
+             step: Step) -> tuple[Ratio, Aux[Variables]]:
+        rows, length = jnp.asarray(batch["reward"]).shape
+        batch, real = self._clean_rows(batch, rows)
+        wide = at_least_fp32(self.model.dtype)
+        model = self.model.bind(variables)
+        observation, first, deter, stoch, posterior, window = self._posterior_pass(variables, batch, step)
+        reward = jnp.asarray(batch["reward"], wide)
+        last, terminal = jnp.asarray(batch["last"], wide), jnp.asarray(batch["terminal"], wide)
+        # A window that repeats a real one to fill a batch (`VALID_ROWS`) weighs nothing: not in a loss,
+        # its mass or a metric (`Objective.row_mean`), nor, as imagination's starts, in the returns'
+        # percentiles; a batch of repeats alone has no mass and keeps the percentiles as they were.
         prior = model.prior(deter)
         feature = WorldModel.feature(deter, stoch)
         # `kl_divergence(logits, reference)` is KL(reference || logits): the code's dynamics loss
@@ -708,58 +900,22 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio]):
         logit = model.continue_(feature)
         losses["continue"] = optax.losses.sigmoid_binary_cross_entropy(logit, alive)
         for name, _, _ in self.model.auxiliary:
-            target = jnp.asarray(batch["observation"][name], jnp.float32)
+            target = jnp.asarray(batch["observation"][name], wide)
             losses[name] = jnp.sum(jnp.square(model.predicted(name, feature) - target), -1)
         if "imitation" in self.scales:
             # Each replayed step's imitated action at the state it was taken at; a last step's has no effect.
             mean, std = model.policy(jax.lax.stop_gradient(feature))
-            imitated = jnp.asarray(batch[self.imitates], jnp.float32)
+            imitated = jnp.asarray(batch[self.imitates], wide)
             losses["imitation"] = (1 - last) * -jnp.sum(normal_log_density(imitated, mean, std), -1)
-        if not any(self.scales[name] for name in ("policy", "value", "replay_value")):
-            total = sum((self.scales[name] * jnp.mean(value) for name, value in losses.items()),
-                        jnp.zeros(()))
-            metrics = {f"loss_{name}": jnp.mean(value) for name, value in losses.items()}
-            return Ratio(total, jnp.ones(())), Aux(metrics, variables={"returns": variables["returns"]})
+        if not self._imagines:
+            total, metrics = self._weighed(losses, batch)
+            return total, Aux(metrics)
 
-        # Imagination from every replayed posterior state, its inputs held still (agent.py:189-196).
-        env = LatentEnv(self.model, jax.lax.stop_gradient(variables), self.bins)
-        start_deter, start_stoch = (jax.lax.stop_gradient(x.reshape(rows * length, *x.shape[2:]))
-                                    for x in (deter, stoch))
-        latent_key, act_key, last_key = jax.random.split(imagine_key, 3)
-        cache, dynamics = None, model.dynamics
-        if dynamics is not None:
-            assert window is not None, "a transformer's posterior pass keeps its window"
-            # Each start's cache, the window's keys and values of its episode up to it.
-            cache = jax.lax.stop_gradient(dynamics.window_cache(window, first, self.imagination))
-        state, begin = env.at(start_deter, start_stoch, latent_key, cache)
-
-        def policy(params: Params, feature: Observation, key: jax.Array, memory: Memory) -> tuple[
-                jax.Array, Tree, Memory]:
-            mean, std = self.model.bind(params).policy(view(feature))
-            return mean + std * jax.random.normal(key, mean.shape), {}, None
-
-        held = jax.lax.stop_gradient(variables)
-        _, imagined = env_rollout(env, policy, held, Carry(state, begin, act_key), self.imagination,
-                                  reset=False)
-        # The start's feature then each imagined one, and the action taken at each [B*T, H + 1].
-        imagined_features = jnp.swapaxes(view(imagined.following.observation), 0, 1)
-        features = jnp.concatenate([begin[:, None], imagined_features], 1)
-        last_action, _, _ = policy(held, features[:, -1], last_key, None)
-        actions = jnp.concatenate([jnp.swapaxes(imagined.action, 0, 1), last_action[:, None]], 1)
-        still = self.model.bind(held)
-        rewards = twohot_mean(still.reward(features), self.bins)
-        cont = jax.nn.sigmoid(still.continue_(features))
-        values = twohot_mean(model.value(features), self.bins)
-        slow = self.model.bind(merge(variables, jax.lax.stop_gradient(step.ema)) if step.ema is not None
-                               else held)
-        slow_values = twohot_mean(slow.value(features), self.bins)
-        weight = jax.lax.stop_gradient(jnp.cumprod(cont, 1))
-        boot = slow_values if self.slow_targets else values
-        returns = jax.lax.stop_gradient(lambda_return(jnp.zeros_like(cont), 1 - cont, rewards, boot, boot,
-                                                      1.0, self.lam))
-        rate, held_returns = self.return_rate, variables["returns"]
-        low = (1 - rate) * held_returns["low"] + rate * jnp.percentile(returns, 5)
-        high = (1 - rate) * held_returns["high"] + rate * jnp.percentile(returns, 95)
+        features, actions, weight, boot, slow_values, slow, returns = self._imagined(
+            variables, deter, stoch, window, first, step)
+        row_returns = returns.reshape(rows, length, self.imagination)
+        low, high = (self._return_bounds(variables["returns"], row_returns, real)
+                     if step.batch_statistics is None else step.batch_statistics)
         scale = jnp.maximum(1.0, high - low)
         advantage = jax.lax.stop_gradient((returns - boot[:, :-1]) / scale)
         imagined_policy = self._imagined_policy(model.policy(features), actions, advantage, weight)
@@ -773,20 +929,24 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio]):
         # The critic toward the replay's own lambda-returns, bootstrapped by imagination's (agent.py:449-480).
         replay_logits = model.value(feature)
         replay_values = twohot_mean(replay_logits, self.bins)
-        boot = returns[:, 0].reshape(rows, length)
-        replay_returns = jax.lax.stop_gradient(lambda_return(last, terminal, reward, replay_values, boot,
-                                                             1 - 1 / self.horizon, self.lam))
+        replay_boot = returns[:, 0].reshape(rows, length)
+        replay_returns = jax.lax.stop_gradient(lambda_return(last, terminal, reward, replay_values,
+                                                             replay_boot, 1 - 1 / self.horizon, self.lam))
         replay_slow = twohot_mean(slow.value(feature), self.bins)
         replay_targets = jnp.concatenate([replay_returns, jnp.zeros_like(replay_returns[:, -1:])], 1)
         replay_value = (twohot_loss(replay_logits, replay_targets, self.bins)
                         + twohot_loss(replay_logits, replay_slow, self.bins))
         losses["replay_value"] = (1 - last)[:, :-1] * replay_value[:, :-1]
 
-        total = sum((self.scales[name] * jnp.mean(value) for name, value in losses.items()), jnp.zeros(()))
-        metrics = {f"loss_{name}": jnp.mean(value) for name, value in losses.items()}
-        metrics.update(return_scale=scale, imagined_return=jnp.mean(returns))
-        stats = {"returns": {"low": jax.lax.stop_gradient(low), "high": jax.lax.stop_gradient(high)}}
-        return Ratio(total, jnp.ones(())), Aux(metrics, variables=stats)
+        total, metrics = self._weighed(losses, batch)
+        metrics.update(return_scale=scale, imagined_return=self.row_mean(row_returns, batch).mean()[0])
+        real_mass = jnp.sum(real.astype(low.dtype))
+        stopped_low, stopped_high = jax.lax.stop_gradient(low), jax.lax.stop_gradient(high)
+        effects: Variables = {
+            "low": Ratio(jnp.where(real_mass > 0, real_mass * stopped_low, 0), real_mass),
+            "high": Ratio(jnp.where(real_mass > 0, real_mass * stopped_high, 0), real_mass),
+        }
+        return total, Aux(metrics, effects=effects)
 
     def _imagined_policy(self, policy: tuple[jax.Array, jax.Array], actions: jax.Array, advantage: jax.Array,
                          weight: jax.Array) -> jax.Array:

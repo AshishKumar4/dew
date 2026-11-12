@@ -19,6 +19,7 @@ import jax.extend.core as jcore
 import jax.numpy as jnp
 from jax._src import mesh as mesh_lib
 from jax._src.pallas.mpmd import mpmd_map_p
+from jax.core import ShapedArray
 from jax.experimental.pallas import pallas_call_p
 from jax.extend.backend import backends
 
@@ -287,6 +288,17 @@ def positionwise(primitive: jcore.Primitive) -> bool:
     keys are such (a key's data extends its shape, and `random_bits` takes the shape it fills past the
     keys'), which are entrywise over a key array's positions and not over a value's."""
     return primitive.elementwise or primitive.positionwise
+
+
+def prng_operation(equation: jcore.JaxprEqn) -> bool:
+    """Whether `equation` is a primitive operation on PRNG keys (`jax.dtypes.prng_key`), not a call,
+    kernel or control flow: wrapping or unwrapping key data, seeding, splitting, folding in or drawing
+    bits, none of which does a product."""
+    if opaque(equation) or bodies(equation):
+        return False
+    return any(isinstance(var.aval, ShapedArray)
+               and jnp.issubdtype(var.aval.dtype, jax.dtypes.prng_key)
+               for var in (*equation.invars, *equation.outvars))
 
 
 def rearranges(primitive: jcore.Primitive) -> bool:
