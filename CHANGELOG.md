@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Dew requires its JAX build 0.12.0.1.post83 (Python alone; the CUDA and PJRT plugins stay post81's): a
+  Pallas interpreter's thread map runs its threads on a CPU client of its own, so an interpreted kernel
+  inside a host callback no longer deadlocks when the calling computation's client has a full device queue.
 - Dew requires its JAX build 0.12.0.1.post82 (Python alone; the CUDA and PJRT plugins stay post81's): a
   Mosaic GPU kernel over operands on a concrete mesh lowers a reshard of a literal, so a bf16 template
   decode on an Ampere or Ada GPU whose operands sit on a `NamedSharding` lowers, where it failed with
