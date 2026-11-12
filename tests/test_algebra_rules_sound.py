@@ -571,7 +571,7 @@ def test_every_stated_magnitude_is_at_least_the_tables(name, index, rule):
     checked = 0
     for evaluated, _ in itertools.islice(_instantiations(matched, conditions, symbolic=False), 64):
         names = sorted(evaluated.arrays)
-        for powers in itertools.permutations(POWERS * 2, len(names)):
+        for powers in itertools.product(POWERS, repeat=len(names)):
             stated_powers = dict(zip(names, powers, strict=True))
             for kind, action in actions:
                 if kind != "set" or _set_name(action) != "log2_bound":
