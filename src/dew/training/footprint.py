@@ -17,8 +17,8 @@ from __future__ import annotations
 
 import collections
 import contextlib
-import contextvars
 import dataclasses
+import functools
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import NamedTuple
@@ -84,10 +84,11 @@ class Footprint:
     """Whether `peak` holds each gradient only while it is made, the step reading it there into the
     buffers its state donates (`transaction.consumed_where_made`, asked where the peak is derived), else
     every gradient to the end; None where no peak is derived."""
-    head: HeadTerms | None = None
-    """What `peak` holds of a head that keeps its whole logits (`HeadTerms`), from which the step's peak at
-    its head's tile is bounded without a trace of it (`dew.training.planning.FitSearch.walked`); None for a
-    step whose head keeps no whole logits, or where no peak is derived."""
+    head: Callable[[], HeadTerms | None] | None = dataclasses.field(default=None, compare=False)
+    """What `peak` holds of a head that keeps its whole logits (`HeadTerms`), read off its trace where it is
+    asked (`derived_terms`), from which the step's peak at its head's tile is bounded without a trace of it
+    (`dew.training.planning.FitSearch.walked`); None for a step whose head keeps no whole logits, or where
+    no peak is derived. No term the footprint records."""
 
     @property
     def temporaries(self) -> int | None:
@@ -102,8 +103,7 @@ class Footprint:
         """The terms traced, not an admission decision: XLA's fit check remains authoritative."""
         return {"residuals": self.residuals, "gradients": self.gradients, "held": self.held,
                 "resident": dict(self.resident), "peak": self.peak, "peak_exact": self.exact,
-                "staged": self.staged, "consumed": self.consumed,
-                "head": None if self.head is None else self.head._asdict()}
+                "staged": self.staged, "consumed": self.consumed}
 
 
 class HeadTerms(NamedTuple):
@@ -220,37 +220,28 @@ def traced_gradient(loss: Callable, params, arguments: Sequence) -> tuple[jcore.
 
 def derived_terms(loss: Callable, params, arguments: Sequence, *, platform: str, workspace: Workspace,
                   lowering: str | None = None, consumed: bool = False, deferred: bool = False,
-                  table: tuple[int, int] | None = None) -> tuple[int, Peak, HeadTerms | None]:
+                  table: tuple[int, int] | None = None
+                  ) -> tuple[int, Peak, Callable[[], HeadTerms | None] | None]:
     """`residual_bytes` and `gradient_peak` of `loss(params, *arguments)` from one trace of its forward and
     backward (`traced_gradient`), lowered once (`compiled`, its outputs the gradient and the residuals
     alike: an equation's lowering reads no output), as each derives it from its own (row 4261: lowered
     for each, the two lowerings were 16 of a Qwen3.5-4B candidate's 28 seconds); and, for a head that keeps
     its whole logits from a table of `table`'s rows and features, what its peak holds of them
-    (`head_terms`)."""
+    (`head_terms`), read where it is asked, once: two more walks of the program, which only a planner
+    bounding the next rung from a refused one reads (`dew.training.planning.FitSearch.derived_bounds`)."""
     program, count, shapes = traced_gradient(loss, params, arguments)
     lowered = simplified(program, platform, lowering)
     peak = _peak(lowered, count, platform, workspace, consumed, deferred)
-    head = (None if table is None
-            else head_terms(lowered, count, platform, workspace, table, consumed, deferred))
+    head = (None if table is None else functools.cache(functools.partial(
+        head_terms, lowered, count, platform, workspace, table, consumed, deferred)))
     return _kept(lowered, count, shapes, platform), peak, head
-
-
-_COUNTED: contextvars.ContextVar[Callable[[jcore.Var], bool] | None] = contextvars.ContextVar(
-    "counted", default=None)
-"""Which values `device_share` counts the bytes of, every one where None: `head_terms`'s peaks."""
-
-
-def shape_of(value: jcore.Var | jcore.Literal) -> tuple[int, ...]:
-    """`value`'s array shape, none for one that holds no array (a token)."""
-    aval = value.aval
-    return tuple(aval.shape) if isinstance(aval, ShapedArray) else ()
 
 
 def logits_shaped(value: jcore.Var, table: tuple[int, int]) -> bool:
     """Whether `value` is a head's logits, or a value of their shape, of a table of `table`'s rows and
     features: one that holds the rows and more elements than the table, each token's row of them, where the
     table's own shape and its gradient's hold no more."""
-    shape = shape_of(value)
+    shape = dimensions(value)
     return table[0] in shape and math.prod(shape) > table[0] * table[1]
 
 
@@ -262,18 +253,12 @@ def head_terms(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Works
     def shaped(value) -> bool:
         return logits_shaped(value, table)
 
-    found = [math.prod(shape_of(value)) for equation in lowered.eqns for value in equation.outvars
+    found = [math.prod(dimensions(value)) for equation in lowered.eqns for value in equation.outvars
              if shaped(value)]
     if not found:
         return None
-    terms = []
-    for counted in (lambda value: not shaped(value), shaped):
-        token = _COUNTED.set(counted)
-        try:
-            terms.append(_peak(lowered, count, platform, workspace, consumed, deferred).bytes)
-        finally:
-            _COUNTED.reset(token)
-    headless, held = terms
+    headless, held = (_peak(lowered, count, platform, workspace, consumed, deferred, counted).bytes
+                       for counted in (lambda value: not shaped(value), shaped))
     return HeadTerms(headless, held, max(found), table[0])
 
 
@@ -320,13 +305,13 @@ def _kept(lowered: jcore.Jaxpr, count: int, shapes: Sequence, platform: str) -> 
 
 
 def _peak(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Workspace, consumed: bool = False,
-          deferred: bool = False) -> Peak:
+          deferred: bool = False, counted: Callable[[jcore.Var], bool] | None = None) -> Peak:
     """`gradient_peak` of `traced_gradient`'s program as it is `lowered` (`compiled`), its first `count`
-    outputs the gradient."""
+    outputs the gradient, counting the values `counted` names alone (`peak_bytes`)."""
     gradient = lowered.replace(outvars=lowered.outvars[:count])
     # Hoisted last: a constant the gradient returns runs ahead of the work however its weight gradients run.
     ordered = hoisted(sunk(gradient) if deferred else gradient)
-    return Peak(peak_bytes(ordered, platform, workspace, consumed=consumed),
+    return Peak(peak_bytes(ordered, platform, workspace, consumed=consumed, counted=counted),
                 not bounded_below(gradient, platform))
 
 
@@ -424,7 +409,7 @@ def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
 
 def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
                slicing: Slicing | None = None, carried: frozenset = frozenset(), *,
-               consumed: bool = False) -> int:
+               consumed: bool = False, counted: Callable[[jcore.Var], bool] | None = None) -> int:
     """The most bytes `program` holds at once beside its inputs, its equations run in their traced
     order. A value XLA keeps a buffer of (`Frontier`) is held from the equation that computes it to the
     last that reads it, an output to the end. An equation that takes its operands from memory
@@ -443,7 +428,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     fuse or make apart, the arrays its fusions read apart (`laid_inputs`), what its products read made once
     or copied (`cpu_layouts`), and its input copies from its start. No schedule XLA picks is modelled: a
     compile confirms."""
-    frontier = Frontier(program, platform, returned=True)
+    frontier = Frontier(program, platform, returned=True, counted=counted)
     last = {kept: index for index, equation in enumerate(program.eqns)
             for kept in frontier.reading(equation.invars)}
     # The copies of the step's inputs its products read laid out for them (`laid_copies`), each held
@@ -477,15 +462,16 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
         live += sum(size for first, _, size in copies if first == index)
         made = [out for out in equation.outvars
                 if out in last and frontier.buffered(out) and out not in carried]
-        made_bytes = sum(map(device_share, made))
+        made_bytes = sum(map(frontier.share, made))
         # A scatter or a product with a bias writes its result in a buffer it reads last (`in_place`).
         taken = in_place(frontier, equation, held, last, index)
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body),
-                                    returned_carry(equation, body)) for body in bodies(equation)), default=0)
+                                    returned_carry(equation, body), counted=counted)
+                         for body in bodies(equation)), default=0)
             # An operand made beside an earlier product's is held from there (`siblings`), not made here.
             made_for = unfused(frontier, equation) - spanned.get(index, set())
-            operands = sum(map(device_share, made_for)) + beside.get(index, 0)
+            operands = sum(map(frontier.share, made_for)) + beside.get(index, 0)
             if platform == "cpu":
                 # The arrays the fusions making its operands read apart (`laid_inputs`), a shared one's
                 # where it is made, before its first reader.
@@ -493,7 +479,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
                 # A reduction's fusion runs on YNNPACK's kernels as a product's does; an elementwise
                 # one is XLA's own loop, which reads its broadcasts and transposes in place.
                 reduced = made if _folds(equation.primitive) else []
-                operands += sum(map(device_share, laid_inputs(frontier, [*reduced, *made_for, *starting])))
+                operands += sum(map(frontier.share, laid_inputs(frontier, [*reduced, *made_for, *starting])))
             products = 0 if not cublas_product(equation) else (
                 workspace.sliced if sliced.fused(equation) else workspace.each)
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
@@ -502,13 +488,13 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
                        if equation.primitive in LOOPS else max(inner, made_bytes) - taken)
             # The fusions that make its operands run before it, each buffer they alone read freed with them
             # (`freed`): the most is theirs, or its own past them.
-            freed = sum(map(device_share, dying(frontier, equation, made_for, held, last, index)))
+            freed = sum(map(frontier.share, dying(frontier, equation, made_for, held, last, index)))
             most = max(most, live + operands, live - freed + running + operands + products)
         held.update(made)
         live += made_bytes
         for done in [value for value in held if last[value] == index]:
             held.discard(done)
-            live -= device_share(done)
+            live -= frontier.share(done)
         live -= sum(size for _, ended, size in copies if ended == index)
     return most
 
@@ -563,7 +549,7 @@ def laid_copies(frontier: Frontier, program: jcore.Jaxpr) -> list[tuple[int, int
             taken = product_order(operand, contracting, batch)
             if taken is not None:
                 key = (source, dimensions(operand), taken)
-                spans.setdefault(key, [index, index, device_share(operand)])[1] = index
+                spans.setdefault(key, [index, index, frontier.share(operand)])[1] = index
     return [(first, ended, size) for first, ended, size in spans.values()]
 
 
@@ -601,8 +587,8 @@ def cpu_layouts(frontier: Frontier, program: jcore.Jaxpr) -> tuple[
                 continue
             kept = frontier.buffered(operand) or operand in shared
             if kept and product_order(operand, contracting, batch) is not None:
-                copied[index] = copied.get(index, 0) + device_share(operand)
-    return (copied, [(readers[0], readers[-1], device_share(value)) for value, readers in shared.items()],
+                copied[index] = copied.get(index, 0) + frontier.share(operand)
+    return (copied, [(readers[0], readers[-1], frontier.share(value)) for value, readers in shared.items()],
             spanned, {value: readers[value in constant] for value, readers in shared.items()})
 
 
@@ -715,8 +701,8 @@ def siblings(frontier: Frontier, program: jcore.Jaxpr) -> tuple[dict[int, int], 
     spanned = {index: kept for index, values in made.items()
                if (kept := {value for value in values & first.keys() if index >= first[value]})}
     last = {value: index for index, values in sorted(spanned.items()) for value in values}
-    return ({later: sum(map(device_share, others)) for later, others in beside.items()},
-            [(first[value], last[value], device_share(value)) for value in first], spanned)
+    return ({later: sum(map(frontier.share, others)) for later, others in beside.items()},
+            [(first[value], last[value], frontier.share(value)) for value in first], spanned)
 
 
 def unfused(frontier: Frontier, equation: jcore.JaxprEqn) -> set[jcore.Var]:
@@ -788,7 +774,7 @@ def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapp
         return 0
     if device_share(buffer) != device_share(equation.outvars[0]):
         return 0
-    return device_share(buffer)
+    return frontier.share(buffer)
 
 
 def carry(equation: jcore.JaxprEqn) -> list[tuple]:
@@ -826,8 +812,8 @@ def looped(frontier: Frontier, last: Mapping, index: int, equation: jcore.JaxprE
     slots = carry(equation)
     ends = {ended for _, ended, _ in slots}
     shared = sharing(frontier, last, index, equation) | reserved
-    return (sum(device_share(out) for out in made if out not in ends)
-            + sum(device_share(ended) for _, ended, changed in slots if changed and ended not in shared))
+    return (sum(frontier.share(out) for out in made if out not in ends)
+            + sum(frontier.share(ended) for _, ended, changed in slots if changed and ended not in shared))
 
 
 def returned_carry(equation: jcore.JaxprEqn, body: jcore.Jaxpr) -> frozenset:
@@ -864,10 +850,13 @@ class Frontier:
     it recomputes in its consumers computes (`recomputed`), which reads those it is computed from in
     its place, and one a layout primitive (`bitcast`) makes of another's buffer, which XLA's layout
     assignment lays that buffer out for; the program's outputs, where it returns them (`returned`),
-    always but as such a view; neither its inputs nor its literals."""
+    always but as such a view; neither its inputs nor its literals. It counts the bytes of the values
+    `counted` names alone (`share`), every value's where None."""
 
-    def __init__(self, program: jcore.Jaxpr, platform: str, *, returned: bool):
+    def __init__(self, program: jcore.Jaxpr, platform: str, *, returned: bool,
+                 counted: Callable[[jcore.Var], bool] | None = None):
         self.platform = platform
+        self.counted = counted
         self.producers = {out: equation for equation in program.eqns for out in equation.outvars}
         self.inputs = {*program.invars, *program.constvars}
         self.outputs = {out for out in program.outvars if computed(out)} if returned else set()
@@ -884,6 +873,10 @@ class Frontier:
                          if equation.primitive is jax.lax.optimization_barrier_p
                          for out, operand in zip(equation.outvars, equation.invars, strict=True)}
         self.barred = {operand for operand in self.forwards.values() if computed(operand)}
+
+    def share(self, value: jcore.Var) -> int:
+        """`device_share` of `value` where the frontier counts it (`counted`), else none."""
+        return device_share(value) if self.counted is None or self.counted(value) else 0
 
     def stored(self, operand) -> bool:
         """Whether `operand` is held in a buffer: an input, a value computed into one, or a view of one."""
@@ -1004,9 +997,6 @@ def device_share(value: jcore.Var) -> int:
     aval = value.aval
     if not isinstance(aval, ShapedArray) or aval.memory_space != jax.memory.Space.Device:
         return 0
-    counted = _COUNTED.get()
-    if counted is not None and not counted(value):
-        return 0
     return math.prod(aval.shape) * aval.dtype.itemsize
 
 
@@ -1112,7 +1102,7 @@ def contracted_tokens(program: jcore.Jaxpr, table: tuple[int, int]) -> int:
     shapes = {table, table[::-1]}
     most = 0
     for equation in program.eqns:
-        operands = [shape_of(value) for value in equation.invars]
+        operands = [dimensions(value) for value in equation.invars]
         if any(shape in shapes for shape in operands):
             most = max([most, *(math.prod(shape[:-1]) for shape in operands
                                 if shape not in shapes and len(shape) > 1 and shape[-1] == table[1])])

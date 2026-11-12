@@ -589,8 +589,8 @@ def test_a_step_whose_whole_logits_alone_leave_no_room_traces_its_tiled_step_alo
 
 def test_a_whole_logits_trace_bounds_its_tiled_steps_peak(monkeypatch, tmp_path):
     """With room for the whole logits' floor and not for the whole-logits step, the derivation traces that
-    step, refused, and bounds the tiled step from it (`HeadTerms`): the tiled step's traced peak holds at
-    least the whole-logits peak without its logits, and at most their share beside it."""
+    step, refused, and bounds the tiled step from it (`HeadTerms`): the headroom the tiled step's own trace
+    leaves lies within the bounds the whole-logits trace gave it."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
     whole = wide("whole")
     need = needs(monkeypatch, whole, lambda: compiled(whole, WIDE))
@@ -601,6 +601,6 @@ def test_a_whole_logits_trace_bounds_its_tiled_steps_peak(monkeypatch, tmp_path)
     trainer = wide()
     compiled(trainer, WIDE)
     refused, tiled = trainer.plan["derived"][:2]
-    head = refused["terms"]["head"]
     assert refused["label"] == "refuses" and tiled["label"] == "fits"
-    assert head["headless"] <= tiled["terms"]["peak"] <= head["headless"] + head["held"]
+    least, most = tiled["bounds"]
+    assert least <= tiled["headroom"] <= most

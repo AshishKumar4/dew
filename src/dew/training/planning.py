@@ -159,8 +159,18 @@ class Candidate:
     lowered, compiled), its derivation's and its lowering's (`FitSearch.judged`, `lowering`), which its
     probe adds its compile to (`Probe.spent`)."""
     floored: bool = False
-    """Whether its footprint is its whole logits' floor alone (`dew.training._candidates.logits_floor`),
-    which leaves no device room, so its gradient was never traced: the walk climbs past it untraced."""
+    """Whether its footprint is its whole logits' floor alone (`dew.training.footprint.logits_floor`), its
+    gradient untraced: a derivation's candidate, which the search judges by the floor first
+    (`FitSearch.judged`), and traces where the floor leaves room (`unfloored`)."""
+    traces: Callable[[], Candidate] | None = None
+    """For a candidate `floored`, the step at its rung with its gradient traced, from the forward its floor
+    read (`unfloored`); None where it was kept apart from the trace that made it
+    (`dew.training._candidates.candidate_for`)."""
+
+    def unfloored(self) -> Candidate:
+        """The candidate with its gradient traced and its footprint derived (`traces`)."""
+        assert self.traces is not None, "a candidate traced already, or kept apart from its trace"
+        return self.traces()
 
     @property
     def lowered(self) -> jax.stages.Lowered:
@@ -902,6 +912,9 @@ class FitSearch[LossT, EffectsT]:
             else:
                 headroom = self.judged(split, narrow)
                 label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
+                if bounds is not None:
+                    # The headroom its bounds said it would leave, beside the one its trace says.
+                    self.derived[-1] = {**self.derived[-1], "bounds": list(bounds)}
                 if bounds is not None and bounds[0] >= 0 and label == "refuses":
                     # The bounds said the rung fits and its trace says it does not: the derivation's miss.
                     self.derived[-1] = {**self.derived[-1], "miss": bounds[0]}
@@ -936,8 +949,8 @@ class FitSearch[LossT, EffectsT]:
             return None
         if (tile, fused) == (last.tile, last.fused):
             least = most = footprint.peak
-        elif last.tile is None and tile is not None and footprint.head is not None:
-            least, most = footprint.head.headless, footprint.head.tiled(tile, fused=fused)
+        elif last.tile is None and tile is not None and (head := footprint.head and footprint.head()):
+            least, most = head.headless, head.tiled(tile, fused=fused)
         else:
             return None
         copies = footprint.resident.get("compute", 0) if last.narrow and not narrow else 0
@@ -963,11 +976,16 @@ class FitSearch[LossT, EffectsT]:
             assert self.derive is not None
             with spending() as spent:
                 candidate = self.derive(split, narrow)
+                headroom = self.headroom(candidate)
+                if candidate.floored and (headroom is None or headroom >= 0):
+                    # Its whole logits' floor leaves room: its gradient is traced, which judges it, from
+                    # the forward the floor read, or afresh where the floor was kept apart from it.
+                    candidate = (candidate.unfloored() if candidate.traces is not None
+                                 else self.lower(split, narrow, lowering=False))
+                    headroom = self.headroom(candidate)
             candidate = dataclasses.replace(candidate, spent=spent)
             self.derivations[key] = candidate
             footprint = candidate.footprint
-            headroom = pooled_headroom(None if footprint is None else derived_headroom(
-                footprint, local_devices(self.mesh), self.capacity, candidate.built))
             label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
             if candidate.floored:
                 # Its whole logits alone leave it short: no trace of its gradient was made.
@@ -979,6 +997,13 @@ class FitSearch[LossT, EffectsT]:
             self.footprints[key] = None if candidate.floored else footprint
             self.built_at[key] = candidate.built
         return self.judged_at[key]
+
+    def headroom(self, candidate: Candidate) -> int | None:
+        """The headroom `candidate`'s derived footprint leaves the pool (`derived_headroom`, the same on every
+        process: `pooled_headroom`), None where it has none or no device states memory."""
+        footprint = candidate.footprint
+        return pooled_headroom(None if footprint is None else derived_headroom(
+            footprint, local_devices(self.mesh), self.capacity, candidate.built))
 
     def lowering(self, split: int) -> Candidate:
         """The step at `split` at the objective's rung and the search's `narrow`, lowered: from the
