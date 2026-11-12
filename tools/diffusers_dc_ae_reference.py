@@ -1,6 +1,7 @@
 """The actual DC-AE, saved and walked, for tests/fixtures.
 
-Three tiny `AutoencoderDC`s from diffusers 0.34.0 are constructed with the
+Three tiny `AutoencoderDC`s are constructed, each by the diffusers release its record names (`conv`
+and `shuffle` 0.34.0's, `plain` 0.39.0's), with the
 controls the published checkpoints use, at narrow widths:
 
 - `conv`, as `dc-ae-f32c32-sana-1.1`: strided-convolution downsampling,
@@ -31,8 +32,11 @@ bias, and every batch norm's running statistics, moved off their init,
 rounded to bfloat16-representable values so the fixture compresses; they are
 still float32 tensors.
 
-    python tools/diffusers_dc_ae_reference.py OUTPUT_DIR
+    python tools/diffusers_dc_ae_reference.py OUTPUT_DIR [VARIANT ...]
     python tools/diffusers_dc_ae_reference.py bundle OUTPUT_DIR tests/fixtures/dc_ae.tar.xz
+
+Named variants are recorded into OUTPUT_DIR beside what it holds, its record keeping the others' releases;
+none records every variant.
 """
 
 from __future__ import annotations
@@ -135,19 +139,28 @@ def bundle(directory: str, destination: str) -> None:
     print(f"{destination}: {Path(destination).stat().st_size / 1e6:.2f} MB")
 
 
-def main(destination: str) -> None:
-
+def main(destination: str, variants: list[str]) -> None:
+    """Record `variants` (every one where none is named) into `destination`, beside the variants it holds,
+    whose releases its record keeps."""
     require("diffusers")
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
-    for name, config in CONFIGS.items():
-        arrays = build(config, root / name)
+    unknown = sorted(set(variants) - set(CONFIGS))
+    if unknown:
+        raise ValueError(f"{unknown} are no variants of {sorted(CONFIGS)}")
+    held = root / "dc_ae.json"
+    releases = json.loads(held.read_text()).get("releases", {}) if held.exists() else {}
+    for name in variants or list(CONFIGS):
+        arrays = build(CONFIGS[name], root / name)
         np.savez_compressed(root / name / "reference.npz", **arrays)
-    # Each variant's release, which a fixture extended by one variant keeps for those it holds already.
-    record = {"diffusers": DIFFUSERS, "releases": dict.fromkeys(CONFIGS, DIFFUSERS), "configs": CONFIGS,
-              "batch": BATCH, "height": HEIGHT, "width": WIDTH, "small": SMALL, "seed": SEED}
-    (root / "dc_ae.json").write_text(json.dumps(record, indent=1) + "\n")
+        releases[name] = DIFFUSERS
+    missing = sorted(set(CONFIGS) - set(releases))
+    if missing:
+        raise ValueError(f"{root} holds no recording of {missing}: record them too")
+    record = {"releases": releases, "configs": CONFIGS, "batch": BATCH, "height": HEIGHT, "width": WIDTH,
+              "small": SMALL, "seed": SEED}
+    held.write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB")
 
@@ -156,4 +169,4 @@ if __name__ == "__main__":
     if len(sys.argv) > 3 and sys.argv[1] == "bundle":
         bundle(sys.argv[2], sys.argv[3])
     else:
-        main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-dc-ae-reference")
+        main(sys.argv[1] if len(sys.argv) > 1 else "/tmp/dew-dc-ae-reference", sys.argv[2:])
