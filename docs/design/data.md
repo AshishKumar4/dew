@@ -506,10 +506,18 @@ this Dew still reads that value (the version before, 13, below).
 | `dealing` | `input-order-groups` | `dew.data.elastic_order.DEALING` | How loading workers that read inputs in their order are dealt them: consecutive groups in turn. |
 | `grain` | Grain's version | `dew.data.readers.GRAIN` | The Grain whose iterator states a per-share position holds. Another Grain's position is restored at once through the iterators that own its state, and refused, naming both versions, where they cannot read it. |
 | `phases` | `stamped` | `dew.data.dataset.StepPhases.CONTINUES` | How a phase on its own stream continues a corpus an earlier phase shared: from the draws the run trained. Recorded in a read of phases' position. |
+| `phases` | `drawn` | `dew.data.lowering._Build.DRAWN` | How a phase of one global order continues a corpus an earlier phase read out of order: past the places its order's twin of draws says the run trained. Recorded in the plan of a phase that draws past any. |
 
 A streamed source's shards, the ids it reads in turn, are recorded as a fact of the plan (`{source}/shards`,
-`ShardManifest.digest`), compared as every derived fact is. A read in one global order needs no rule for how
-its phases continue a corpus: the offset each continues from is part of its recorded order.
+`ShardManifest.digest`), compared as every derived fact is. A phase of one global order continues each corpus
+from the first place the run did not train of it, a slice of its recorded order; where it reads on in order,
+that place is the count of records the earlier phases' mixes drew of it, and it needs no rule. Where an
+earlier phase moved its rows after its mix (a shuffle there, or a slice, take or repeat), its first records
+are no prefix of each corpus's draws: the earlier phase's order is traced once more over each corpus's places
+(the same mix, shuffles and slices, over the place each record is drawn at, where the corpus's chain first
+repeats), and the later phase starts past the first place it did not train and draws past those after it
+that it did. Each record is then trained once across the boundary, none lost. The trace costs one lookup a
+record the earlier phase read, once as the later phase is compiled or, on the token clock, opened.
 
 A plan of 13 records no rules, and reads by 13's: steps named by their printing, and phases that each read
 their corpora from their start. A run's resume compiles its data at the version it saved (its record's

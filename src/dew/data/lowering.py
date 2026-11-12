@@ -98,6 +98,7 @@ from dew.data.mixing import (
     rewound,
     token_weights,
 )
+from dew.data.ordering import Skipping, place_of
 from dew.data.packing import FirstFitPacked, _Concatenated, _OverlappedCuts, window_fields
 from dew.data.pipeline import (
     ACCOUNTS,
@@ -1257,6 +1258,16 @@ class _Build:
     """The keys of its mix's members that later phases read on, read on their own streams (`StepPhases`):
     each draw of them says which it is (`DRAWN`, `dew.data.mixing.Stamping`), so the phase that reads one
     next continues it from the draws the run trained. Empty for any other read."""
+    skipped: Mapping[str, tuple[int, ...]] = dataclasses.field(default_factory=dict)
+    """A phase of a global order's corpora, each by the name its chain goes by, it continues from where an
+    earlier phase read it out of order (a shuffle after its mix: `dew.data.compile`'s continuation): the
+    places past where it starts its corpus (the slice written after the chain's first repeat) the run trained
+    already, sorted, which it draws past (`dew.data.ordering.Skipping`). Empty for any other read."""
+    DRAWN: ClassVar[str] = "drawn"
+    """The `phases` rule a phase of a global order records where it continues a corpus past places the run
+    trained out of order (`skipped`): where an earlier phase read it, as the order's twin of draws traces
+    (docs/design/data.md, the rules). A phase that skips none records no rule, where it reads on from the
+    count of records its mix drew, as every phase did before (a plan of 13 still does)."""
 
     def rules(self, pipeline: Pipeline) -> dict[str, str]:
         """The rules deciding which rows come next that a read of `pipeline` by this build reads by, each
@@ -1272,7 +1283,8 @@ class _Build:
         mixed = any(isinstance(chain.source, Mixture) for chain in chains(pipeline))
         shuffled = any(isinstance(stage, Shuffle) for stage in _steps(pipeline))
         return {"identity": IDENTITY, **({"shuffle": self.SHUFFLE} if shuffled else {}),
-                **({"mix": MIX} if mixed else {}), **({"dealing": DEALING} if self.in_order else {})}
+                **({"mix": MIX} if mixed else {}), **({"dealing": DEALING} if self.in_order else {}),
+                **({"phases": self.DRAWN} if self.skipped else {})}
 
     def counting(self, pipeline: Pipeline) -> bool:
         """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
@@ -1402,9 +1414,7 @@ class _Build:
             mapped = [parent.map(functools.partial(member_record, member=key)) if tagged else parent
                       for key, parent in zip(keys, parents, strict=True)
                       if isinstance(parent, pygrain.MapDataset)]
-            selection = ProportionalSelection([len(parent) for parent in mapped], _weights(source),
-                                              source.seed)
-            return pygrain.MapDataset.select_from_datasets(mapped, selection)
+            return mixed_indexed(mapped, source)
         streams = [
             Accepted(_as_iter(parent, build.loading), _name(child), _label(child))
             for parent, build, child in zip(parents, builds, source.pipelines, strict=True)
@@ -1756,6 +1766,13 @@ class _Build:
                                   certain_after=_barren_bound(pipeline.stages, passes, carried))
         return self.delivered(rows, pipeline, counting=counting, examples=examples)
 
+    def skipping(self, rows: pygrain.MapDataset, pipeline: Pipeline, at: int) -> pygrain.MapDataset:
+        """`rows` at `pipeline`'s stage `at`, past the places of its corpus the run trained already where the
+        stage is the slice a phase continues it from (`skipped`, written after its first repeat)."""
+        skips = self.skipped.get(_name(pipeline), ())
+        repeat = place_of(pipeline) if skips else None
+        return Skipping(rows, skips) if repeat is not None and at == repeat + 1 else rows
+
     def hand_off(self, pipeline: Pipeline, consumed: int, carried: int, rows: Rows, *,
                  marked: bool) -> tuple[int, bool]:
         """Where a pooled read's workers hand its rows on, `carried` (`_carried`) at the latest, an in-order
@@ -1870,7 +1887,7 @@ class _Build:
                 drawn = WindowShuffle(units, window=stage.window, seed=stage.seed)
                 return Completed(drawn)
         if isinstance(stage, (Shuffle, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):
-            return _reordered(stage, rows)
+            return self.skipping(_reordered(stage, rows), pipeline, at)
         if isinstance(stage, Shuffle) and stage.window is not None:
             rows = WindowShuffle(_as_iter(rows, self.loading), window=stage.window, seed=stage.seed)
         elif isinstance(stage, (Shuffle, Slice)):
@@ -2372,6 +2389,13 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
             with _closing(rows) as read:
                 spans = _TokenSplit(read, split).spans
             yield spans
+
+
+def mixed_indexed(members: Sequence[pygrain.MapDataset], mixture: Mixture) -> pygrain.MapDataset:
+    """`members`, `mixture`'s indexed corpora, drawn from as its weights and seed say
+    (`ProportionalSelection`): its read's mix, and its twin of draws' (`dew.data.compile`)."""
+    selection = ProportionalSelection([len(member) for member in members], _weights(mixture), mixture.seed)
+    return pygrain.MapDataset.select_from_datasets(members, selection)
 
 
 def _weights(mixture: Mixture) -> Sequence[float]:
