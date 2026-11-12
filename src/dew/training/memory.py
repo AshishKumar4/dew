@@ -571,6 +571,16 @@ def recompute_more[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     return climbed(objective, base) is not None
 
 
+def headed_more[LossT, EffectsT](objective: Objective[LossT, EffectsT],
+                                  base: tuple[int, int] | None = None) -> bool:
+    """Move the objective one rung up its ladder where the rung is its head's (`climbed`'s first two:
+    the generation's tile for the whole logits, then that tile unfused), and return whether there was one:
+    a run that states its remat climbs no further."""
+    if head_tile_of(objective) == base and objective.tile_head() is not None:
+        return True
+    return objective.unfuse_head() is not None
+
+
 def climbed[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                              base: tuple[int, int] | None = None) -> str | None:
     """Move the objective one rung up its ladder as `recompute_more` does, and say what it moved to,
