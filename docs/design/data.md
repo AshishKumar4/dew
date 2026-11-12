@@ -531,7 +531,8 @@ data's alone.
   every boundary still where the run's progress places it: phases on the step clock at the run's step,
   phases of one global order and a batch ramp at the records the run read, a token schedule's at the
   committed tokens (a global position's `origin` holds how far into its phase the stage's reader opened).
-  A run bounded in examples ends where its own count reaches the bound.
+  A run bounded in examples ends at the step its own count reaches the bound, that step's rows trained whole,
+  so it may count past the bound by part of its last batch.
 - `exact`: any difference refuses the resume, naming it, and a source or step with no identity is refused
   too, since nothing checks it. It guarantees the rows that come next are the ones the saved run would have
   read.

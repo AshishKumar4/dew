@@ -105,8 +105,8 @@ def test_a_position_read_by_other_rules_names_every_one():
     assert {"rules.mix", "rules.shuffle"} <= set(refused.value.differs)
 
 
-def _phased(seed: int):
-    """Two phases of 8-row batches: corpus `a` for three steps, then a mix of `b` and `c` shuffled by
+def _phased(seed: int, batch: int = 8):
+    """Two phases of `batch`-row batches: corpus `a` for three steps, then a mix of `b` and `c` shuffled by
     `seed`, read on; each record's id names its corpus."""
     from dew.data.pipeline import mix, phases
 
@@ -116,14 +116,14 @@ def _phased(seed: int):
                         name=str(tag))
 
     later = mix([corpus(2).repeat(), corpus(3).repeat()], seed=seed)
-    return phases((corpus(1).repeat().batch(8), 3), (later.batch(8), None))
+    return phases((corpus(1).repeat().batch(batch), 3), (later.batch(batch), None))
 
 
-def _phased_fit(directory, seed: int, steps: int):
+def _phased_fit(directory, seed: int, steps: int, batch: int = 8):
     tracker = RecordingTracker()
     trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
                       checkpoints=Checkpoints(str(directory)), tracker=tracker)
-    return trainer.fit(_phased(seed), steps=steps, log_every=1, checkpoint_every=1), tracker
+    return trainer.fit(_phased(seed, batch), steps=steps, log_every=1, checkpoint_every=1), tracker
 
 
 def test_a_phased_run_resumed_relaxed_after_a_changed_mix_opens_its_phase_at_its_start(tmp_path):
@@ -161,8 +161,8 @@ def test_a_phased_run_resumed_relaxed_after_a_changed_mix_opens_its_phase_at_its
 
 def test_a_run_bounded_in_examples_resumed_relaxed_after_its_data_changed_ends_at_its_bound(tmp_path):
     """A run bounded in examples that counts no steps ahead (`clocked_fit`), paused halfway and resumed
-    relaxed over other records, starts its data again and ends where its own count of consumed examples
-    reaches its bound."""
+    relaxed over other records, starts its data again and ends at the step its own count of consumed
+    examples reaches its bound, that step's rows all trained."""
     from test_run_budgets import CLOCKED_RECORDS, clocked_fit, clocked_records
 
     from dew.training import Pause
@@ -171,4 +171,23 @@ def test_a_run_bounded_in_examples_resumed_relaxed_after_its_data_changed_ends_a
     assert 0 < int(paused.consumed) < CLOCKED_RECORDS
     ended, tracker = clocked_fit(clocked_records(1)[0], 1, directory=tmp_path)
     assert _reported(tracker, DataRestarted)
-    assert int(ended.consumed) == CLOCKED_RECORDS
+    # Its last batch trained whole: the count it ends at reaches the bound, past it by part of that batch.
+    assert CLOCKED_RECORDS <= int(ended.consumed) < CLOCKED_RECORDS + BATCH
+
+
+def test_a_phased_run_resumed_relaxed_with_other_batches_keeps_its_phases_at_their_steps(tmp_path):
+    """Phases on the step clock switch at the steps they name: a run saved at step 4, in its second phase,
+    resumed relaxed with batches of 16 rows where it read 8, places its progress by its step in the new
+    batches: its first phase completed at 3 steps of 16 rows, its second opened at its own start one step
+    in, and the position it saves a step later reads on there."""
+    import json
+
+    from dew.data.dataset import DataPartition
+
+    _phased_fit(tmp_path, seed=1, steps=4)
+    resumed, tracker = _phased_fit(tmp_path, seed=1, steps=5, batch=16)
+    assert _reported(tracker, DataRestarted) and int(resumed.step) == 5
+    with Checkpoints(str(tmp_path)) as checkpoints:
+        held = json.loads(checkpoints.position(5, DataPartition()))["dew_global_position"]
+    assert (held["records"], held["completed"][0][1], held["origin"]) == (80, 48, 16)
+

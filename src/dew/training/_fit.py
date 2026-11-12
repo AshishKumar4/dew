@@ -498,16 +498,11 @@ class FitRun:
         if examples is None:
             return batch, None
         position = None if self.train is None else self.train.source_state
-        # Its last where its stream runs out, or where the next batch would take the run's count past its
-        # bound (a stream started again holds the bound's examples whole: `data_resumed`), the last then
-        # consuming the bound's rest, so the run ends at its bound on its own count.
-        last = self.ends_here(interval)
-        ahead = None if self.ahead is None else self.ahead[0]
-        reached = ahead is not None and (interval.consumed + counted(batch).examples
-                                         + counted(ahead).examples > examples)
-        if self.ran_out or reached:
+        # Its last where its stream runs out, or where the run's count reaches its bound with it (a stream
+        # started again holds the bound's examples whole: `data_resumed`), its rows all trained.
+        last = self.ends_here(interval) or interval.consumed + counted(batch).examples >= examples
+        if self.ran_out:
             batch = drained(batch, interval.consumed, examples)
-        last = last or reached
         return closes_window(batch, examples, last=last), position
 
     def held(self) -> contextlib.AbstractContextManager[None]:
@@ -993,12 +988,10 @@ def data_resumed(loader: Loader, partition: DataPartition, position: Callable[[]
                                "again: resume it exactly with the data that wrote it, or start a new run "
                                "from its weights")
 
-        if isinstance(stream, StepPhases):
+        if isinstance(stream, StepPhases | RampedStream):
             start = stream.restarted(step)
-        elif isinstance(stream, (PhasedStream, RampedStream)):
-            if held[0] is None:
-                raise refused("reads in stages its saved position places, which this share cannot read")
-            start = stream.restarted(held[0])
+        elif isinstance(stream, PhasedStream):
+            start = stream.restarted(step, held[0])
         elif isinstance(stream, Checkpointable):
             start = stream.get_state()
         else:

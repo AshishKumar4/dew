@@ -1665,7 +1665,8 @@ class PhasedStream:
 
         if self._tokens is not None:
             if len(saved.completed) > len(self._ends):
-                raise ValueError(f"the saved run finished {len(saved.completed)} phases, and this run has "
+                raise _position.PlanChanged(("phases",), f"the saved run finished {len(saved.completed)} "
+                                            "phases, and this run has "
                                  f"{len(self._ends) + 1}")
             finished = self._tokens[:len(saved.completed)]
             if saved.tokens != finished:
@@ -1684,7 +1685,7 @@ class PhasedStream:
                 raise ValueError("saved phase plans do not cover the completed and current phases")
             for index, plan in enumerate(plans):
                 if index >= len(self._open) or (plan is not None and not isinstance(plan, Mapping)):
-                    raise ValueError("saved phase plan is not part of this run")
+                    raise _position.PlanChanged(("phases",), "a saved phase is not part of this run")
                 end = saved.completed[index][1] if index < len(saved.completed) else saved.records
                 shift = saved.origin if index == len(saved.completed) else 0
                 stream = self._stream(index)
@@ -1714,7 +1715,8 @@ class PhasedStream:
             )
         end = self._ends[phase] if phase < len(self._ends) else None
         if end is not None and saved.records > end:
-            raise ValueError(
+            raise _position.PlanChanged(
+                (f"phases.{phase}",),
                 f"the saved run has read {saved.records} records, past this run's end "
                 f"of phase {phase} at {end}"
             )
@@ -1722,29 +1724,41 @@ class PhasedStream:
         self._records = saved.records
         self._origin = (phase, saved.origin) if saved.origin else None
 
-    def restarted(self, saved: bytes) -> bytes:
-        """This run's position where a resume starts its data again, from `saved`, a position of the run
-        under another data plan: the run's records and the phases it completed as `saved` states them (the
-        run's progress), the phase it stands in opened at its own start, its order's reader shifted by the
-        records the run had read of it (`_position.Global.origin`), so every boundary falls where the
-        run's progress places it."""
-        held = _position.read(saved)
+    def restarted(self, steps: int, saved: bytes | None) -> bytes:
+        """This run's position where a resume starts its data again at step `steps`, the run's, from `saved`,
+        its position under another data plan where it is readable: the phase the run's progress
+        stands in opened at its own start, its order's reader shifted by the records the run had
+        read of it (`_position.Global.origin`), so every boundary falls where the run's progress
+        places it. On the step clock the progress is `steps`, the records this stream's own batches
+        make of them; on the token clock the phases the run's commits ended, at the records `saved`
+        states, or none where nothing of `saved` is readable, its committed tokens then ending them
+        from the start (`dew.training._fit.stage_reached`)."""
         if self._tokens is None:
-            phase = phase_at(self._ends, held.records - 1) if held.records else 0
+            records, phase = 0, 0
+            for phase, batch in enumerate(self.batches):
+                end = self._ends[phase] if phase < len(self._ends) else None
+                held = steps if end is None else min(steps, (end - self._start(phase)) // batch)
+                records, steps = records + held * batch, steps - held
+                if not steps:
+                    break
             completed = tuple((self._stream(index).order, self._start(index + 1)) for index in range(phase))
             tokens: tuple[int, ...] = ()
         else:
-            # On the token clock the run's commits ended the phases it completed at the records it saved;
-            # its committed tokens move it on from there (`dew.training._fit.stage_reached`).
-            phase = min(len(held.completed), len(self._ends))
+            try:
+                place = None if saved is None else _position.read(saved)
+            except ValueError:
+                place = None
+            if place is None:
+                return self.get_state()
+            phase, records = min(len(place.completed), len(self._ends)), place.records
             for index in range(len(self._ends)):
-                self._resolve(index, held.completed[index][1] if index < phase else None)
-            completed = tuple((self._stream(index).order, held.completed[index][1])
+                self._resolve(index, place.completed[index][1] if index < phase else None)
+            completed = tuple((self._stream(index).order, place.completed[index][1])
                               for index in range(phase))
             tokens = tuple(int(end) for end in self._tokens[:phase] if end is not None)
         return _position.encode(_position.Global(
-            records=held.records, order=self._stream(phase).order, completed=completed, tokens=tokens,
-            origin=held.records - self._start(phase)))
+            records=records, order=self._stream(phase).order, completed=completed, tokens=tokens,
+            origin=records - self._start(phase)))
 
     def ending(self, state: bytes) -> bytes:
         """`state`, a position of this run on the committed-token clock, with the phase it stands in
@@ -2269,13 +2283,13 @@ class RampedStream(Forwarding):
                 f"was written by a run that ramped differently"
             )
 
-    def restarted(self, saved: bytes) -> bytes:
-        """This ramp's position where a resume starts its data again, from `saved`, a position of the run
-        under another data plan: the records the run's steps handed over as `saved` states them, which place
-        its stage, its source opened at its start (`_position.Global.origin`; an elastic read's own
-        position beside the ramp's count)."""
-        held = _position.ramped(saved)
-        records = held.records if held is not None else _position.read(saved).records
+    def restarted(self, steps: int) -> bytes:
+        """This ramp's position where a resume starts its data again at step `steps`, the run's: the records
+        its own stages hand over in that many steps, which place its stage, its source opened at its start
+        (`_position.Global.origin`; an elastic read's own position beside the ramp's count)."""
+        records = 0
+        for _ in range(steps):
+            records += self._stages[self._ramp.holding(records)].batch
         if self._elastic:
             return _position.encode_ramped(_position.Ramped(self._elastic_state(), 0, records))
         place = _position.read(_global_position(self._source.get_state()))
