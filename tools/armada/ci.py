@@ -549,19 +549,30 @@ def matchable(depends: Sequence[str], reading: Reading) -> bool:
                    and reading.part(path) == digests.MISSING for path in depends)
 
 
-def remembered(python: str, row_name: str, held: str, depends: Sequence[str], token: str) -> None:
+SETS_WRITTEN: set[str] = set()
+"""The executed sets this process has written (`remembered`), each once however many rows name it."""
+
+
+def remembered(python: str, row_name: str, held: str, depends: Sequence[str], token: str,
+               ran: bool = False) -> None:
     """Row `row_name`'s executed set `depends` made the first of its list on class `held` (`sets_key`), the
-    least recently used leaving past `SETS_KEPT`: by every green run that records it, and by every task that
-    reuses a green run by it, so a burst of other trees' runs evicts no set a tree still reuses. A write lost
-    to another at once loses a set from the list, never adds a wrong one: a miss, a run, never a wrong reuse.
-    """
+    least recently used leaving past `SETS_KEPT`: by every green run that records it (`ran`), and by every
+    task that reuses a green run by it, so a burst of other trees' runs evicts no set a tree still reuses. A
+    write lost to another at once loses a set from the list, never adds a wrong one: a miss, a run, never a
+    wrong reuse. A green run writes its set's inputs again (once a process), so they outlive every green
+    record that names them under the bucket's expiry, which counts from each object's last write (review,
+    2026-11-12)."""
     digest = set_digest(depends)
+    # The set's inputs first, so a list never names a set the Worker lacks.
+    if ran and digest not in SETS_WRITTEN:
+        if not written(set_key(digest), token, json.dumps({"depends": sorted(depends)}).encode()):
+            return
+        SETS_WRITTEN.add(digest)
     held_sets = (recorded(sets_key(python, row_name, held), token) or {}).get("sets", [])
     if held_sets[:1] == [digest]:
         return
-    # The set's inputs first, so a list never names a set the Worker lacks; once a set is in the row's list.
-    if digest not in held_sets and not written(set_key(digest), token, json.dumps(
-            {"depends": sorted(depends)}).encode()):
+    if digest not in held_sets and digest not in SETS_WRITTEN and not written(
+            set_key(digest), token, json.dumps({"depends": sorted(depends)}).encode()):
         return
     kept = [digest, *(each for each in held_sets if each != digest)][:SETS_KEPT]
     written(sets_key(python, row_name, held), token, json.dumps({"sets": kept}).encode())
@@ -1917,7 +1928,7 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
             if ran_on is not None:
                 written(green_key(python, row_["name"], held, ran_on), token, body)
             if key is not None:
-                remembered(python, row_["name"], held, ran["depends"], token)
+                remembered(python, row_["name"], held, ran["depends"], token, ran=True)
 
 
 def written(key: str, token: str, body: bytes) -> bool:
