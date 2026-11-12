@@ -12,9 +12,10 @@ import dataclasses
 import functools
 import threading
 from collections.abc import Callable, Hashable, Mapping
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
+import jax.extend.core as jcore
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
@@ -35,9 +36,9 @@ from dew.training._lowering import KernelReport, Routed, kernel_report, routed
 from dew.training.diloco import group_of, windowed
 from dew.training.distributed import microbatch, microbatch_shapes
 from dew.training.footprint import Footprint, candidate_footprint, logits_floor
-from dew.training.memory import derived_headroom, local_devices, pooled_headroom
+from dew.training.memory import local_devices
 from dew.training.model_flops import batch_consumed, batch_tokens
-from dew.training.narrow import narrow_copies, narrowed
+from dew.training.narrow import holds_copies, narrow_copies, narrowed
 from dew.training.planning import Candidate, splits
 from dew.training.stages import StageLocal
 from dew.training.transaction import COMMIT_FIELDS, consumed_where_made, outcome, pooled_by_mean
@@ -178,7 +179,8 @@ def _footprinted(footprint: Footprint | None) -> Hashable:
     if footprint is None:
         return None
     return tuple((field.name, tuple(sorted(value.items())) if field.name == "resident" else value)
-                 for field in dataclasses.fields(footprint) for value in (getattr(footprint, field.name),))
+                 for field in dataclasses.fields(footprint) if field.compare
+                 for value in (getattr(footprint, field.name),))
 
 
 def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
@@ -216,9 +218,10 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
         # Kept detached from this trainer: its batch as shapes, its inspection's step none (`_sampled`
         # builds the reader's own).
         with _KEEPING:
-            # Its trace not kept (`lowers`): a kept derivation traces its step again where it is lowered.
+            # Its trace not kept (`lowers`, `traces`): a kept derivation traces its step again where it is
+            # lowered, and a kept floor its gradient where the search asks.
             _CANDIDATES[key] = dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None,
-                                                   lowers=None)
+                                                   lowers=None, traces=None)
             while len(_CANDIDATES) > KEPT_CANDIDATES:
                 _CANDIDATES.popitem(last=False)
     return candidate
@@ -245,7 +248,7 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
                                 mesh: Mesh | AbstractMesh | None = None,
                                 platforms: tuple[str, ...] | None = None, capacity: int | None = None,
                                 footprint: Footprint | None = None, derived: bool = True,
-                                floored: bool = False) -> Candidate:
+                                floored: bool = False, ready: Prepared | None = None) -> Candidate:
     """The step reading `batch` in `split` microbatches, lowered at the objective's current rung (traced
     alone where not `lowering`, for its derived footprint), with what the fit check holds beside it.
     `launches` are its kernel launches where a record holds them, which settle their configs before it
@@ -255,11 +258,13 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
     `footprint`, the one its derivation traced, which it keeps (`FitSearch.footprints`). One whose
     executable is a step compiled ahead derives none (not `derived`): its compile judged the
     derivation where it was compiled, and a run handed it does none of that work on its devices. A
-    derivation's candidate (`floored`, traced alone) whose whole logits alone leave a device no room
-    (`logits_floor`) is judged by them, its gradient never traced (`Candidate.floored`)."""
+    derivation's candidate (`floored`, traced alone) whose head keeps its whole logits is their floor
+    (`logits_floor`), its gradient traced where the search asks (`Candidate.unfloored`), from the loss it
+    traced (`ready`, `prepared_for`'s)."""
     settings = stepping.settings
     micro = microbatch_shapes(batch, split)
-    shapes, copies, prepared, loss = prepared_for(stepping, state, micro, schedule, split, narrow)
+    ready = ready or prepared_for(stepping, state, micro, schedule, split, narrow)
+    shapes, copies, prepared, loss = ready
     shardings = stepping.shardings(prepared)
     if mesh is not None:
         shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
@@ -271,9 +276,10 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
     last = state.window
     rebuilt = last is not None and not last.replays(prepared.window)
     # A step lowered for other devices is checked against none of this process's.
-    built = 0 if mesh is not None else placed_bytes([field for field, kept in (
-        (prepared.compute, state.compute), (prepared.window, None if rebuilt else last))
-        if kept is None and field is not None])
+    # The copies the runner makes where the state holds another program's, or none (`holds_copies`).
+    made = [] if prepared.compute is None or holds_copies(state.compute, copies) else [prepared.compute]
+    built = 0 if mesh is not None else placed_bytes(
+        [*made, *([prepared.window] if prepared.window is not None and (last is None or rebuilt) else [])])
     held = 0 if mesh is not None else prefetched_bytes(batch, placement, stepping.shape.prefetch) + built
     jitted = step_program(stepping, shapes, copies, shardings, placement, replicated, split)
     part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
@@ -313,16 +319,18 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
         if staging_measured and not lowering:
             traced()
     window = split * settings.accumulation
-    # Every process reads the floor, and the pool's judgment of it, so all trace alike (`pooled_headroom`).
+    # The floor of its whole logits, which the search judges first (`FitSearch.judged`): read from the
+    # shapes alone, alike on every process, it holds no judgment of memory a kept candidate could carry.
     forward = None if loss is None else loss.jaxpr
     flooring = floored and not lowering and derived and footprint is None and mesh is None
     floor = (logits_floor(settings.objective, forward, prepared, held, micro)
              if flooring and forward is not None else None)
-    short = pooled_headroom(None if floor is None else derived_headroom(
-        floor, local_devices(settings.device_mesh), capacity, built)) if flooring else None
-    if floor is not None and short is not None and short < 0:
+    if floor is not None:
+        traces = functools.partial(_candidate, stepping, state, batch, schedule, placement, replicated, split,
+                                   narrow, launches, lowering, mesh=mesh, platforms=platforms,
+                                   capacity=capacity, derived=derived, ready=ready)
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, None, launches or "[]",
-                         KernelReport((), ()), floor, floored=True)
+                         KernelReport((), ()), floor, floored=True, traces=traces)
     if derived and footprint is None and shapes is not None and mesh is None:
         footprint = candidate_footprint(
             settings.objective, stepping.model_shapes(micro), window, prepared, held,
@@ -346,8 +354,18 @@ def consumes_where_made[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], pr
                                    progressed=stepping.shape.examples is not None)
 
 
+class Prepared(NamedTuple):
+    """A step's state prepared over microbatches of a batch's shapes (`prepared_for`): the loss's shapes and
+    its forward program (`traced`; None under a custom step), the narrow copies, and the state."""
+
+    shapes: tuple | None
+    copies: dict
+    prepared: TrainState
+    traced: jcore.Jaxpr | None
+
+
 def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
-                                  schedule: Schedule, split: int, narrow: bool):
+                                  schedule: Schedule, split: int, narrow: bool) -> Prepared:
     """The loss's shapes (None under a custom step), the narrow copies and the state's shapes with the
     accumulation of an update's window, `split` microbatches a step (DiLoCo's groups' `windowed`), and
     the copies the step builds, as it traces them over microbatches of `batch`'s shapes, none where
@@ -368,7 +386,7 @@ def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Tr
     copies = narrow_copies(state, traced) if narrows and traced is not None else {}
     prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
         lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
-    return shapes, copies, prepared, traced
+    return Prepared(shapes, copies, prepared, traced)
 
 
 def step_program[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], shapes, copies: dict,

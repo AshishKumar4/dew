@@ -82,8 +82,8 @@ class _TarIterator(grain.DatasetIterator):
         return {"position": self.position}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        position = state["position"]
-        if not isinstance(position, int) or position < 0:
+        position = state.get("position")
+        if isinstance(position, bool) or not isinstance(position, int) or position < 0:
             raise ValueError("invalid WebDataset reader position")
         self.close()
         self.__init__(self.source)

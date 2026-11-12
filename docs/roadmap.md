@@ -8,23 +8,24 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666]
 - Cached and block visibility on the template's spans. [1495, 245, 5392, 5437]
 - Performance measurements. [569, 285, 295, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
-- One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427, 1701, 5305]
+- One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427, 1701]
 - The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293, 5368]
 - Inference through the templates. [3424, 3602]
-- The kernel challenge's lessons in the templates. [5213, 5271]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
-- CuTe parity and toolkit seams. [5388]
+- Cached cross-context document visibility. [5635]
+- Convolution repairs above their owner. [5665]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 822, 5391]
 - Further attention variants. [1461, 1462, 1463, 1465, 1317, 1466]
 - Native TPU GEMM dispatch. [1560]
-- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987, 5523]
+- Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987]
 - MoE transport, role-aware low precision and observability. [4515]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product. [4860]
+- The kernel challenge's lessons in the templates. [5271]
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5278, 5327]
 - Derived resources: tiles, registers, residency and issued work. [5567]
 - Exact on every path, every edge and every derivative order. [2656]
@@ -41,10 +42,12 @@ This page is generated from the maintainers' findings ledger as each change land
 - Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [1506, 1437]
 - Stacks, scans and looped models. [1568]
 - One token layout, and every layout and placement trains and serves. [1710, 1903]
+- Every nn and interop primitive, seam, contract and derivative has one owner. [3270, 5450, 5625]
+- Checkpoints.variables on a local. [5667]
 
 ## Training and parallelism
 
-- Time to first step: the compile path's re-derivations. [5556, 5558, 5560]
+- Time to first step: the compile path's re-derivations. [5556, 5558, 5669]
 - Distributed and memory training modes. [156, 873, 1306, 1307, 617]
 - Compile ahead within train CI time. [5324, 5361]
 - Training & Data's tests on check 1. [708]
@@ -60,12 +63,11 @@ This page is generated from the maintainers' findings ledger as each change land
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - Dory: the release qualified and its tests' oracles. [596]
 - Training and serving efficiency. [3330, 1880, 5292]
-- Every nn and interop primitive, seam, contract and derivative has one owner. [3270, 5450]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395, 5428]
 
 ## Algebra
 
-- One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 1570, 1551, 1571, 705, 1572, 4735, 5234, 5235, 5239, 5381, 5382]
+- One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 1570, 1551, 1571, 705, 1572, 4735, 5234, 5235, 5239, 5381]
 - Qwix's quantized convolution from its fork alone. [783]
 - Released checkpoints judged on GPUs. [1703, 1549]
 - Reference comparisons held by derived bounds. [1719, 1543, 2094]
@@ -79,6 +81,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## CI and tooling
 
 - Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5322, 5398, 5403]
-- Dew's CI, test cache and compile-ahead tests. [5377, 5491]
+- Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
 - 1364's ruling (docs/design/testing.md:78, :115). [3179]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]

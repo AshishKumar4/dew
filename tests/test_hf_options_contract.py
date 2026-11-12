@@ -12,24 +12,6 @@ from hub_support import native_builder
 from dew.data.sources.hub import Hub
 
 
-def test_hub_builder_uses_the_resolved_commit_and_named_configuration(tmp_path, monkeypatch):
-    import datasets
-    from huggingface_hub import HfApi
-
-    requested = []
-    # The real builder `datasets` makes of one split, which Hub reads as the Hub's would be read.
-    expected = native_builder({"validation": datasets.Dataset.from_dict({"id": [0, 1]})},
-                              tmp_path / "files", tmp_path / "arrow")
-    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="frozen"))
-    monkeypatch.setattr(datasets, "load_dataset_builder", lambda repo, **kwargs:
-                        requested.append((repo, kwargs)) or expected)
-    source = Hub("acme/records", split="validation", name="named", revision="release", cache_dir="arrow")
-    assert source.builder is expected
-    assert requested == [("acme/records", {"name": "named", "revision": "frozen", "cache_dir": "arrow"})]
-    assert source.fingerprint() == {"store": "hf", "repo": "acme/records", "revision": "frozen",
-                                 "config": "named", "split": "validation"}
-
-
 def test_a_split_prepared_in_two_caches_is_one_snapshot_and_one_plan(tmp_path, monkeypatch):
     """Two hosts prepare one pinned split, each in a cache directory of its
     own, and a third has not prepared it. Where a host keeps its Arrow files,
@@ -42,21 +24,35 @@ def test_a_split_prepared_in_two_caches_is_one_snapshot_and_one_plan(tmp_path, m
     from dew.data.compile import compile
     from dew.data.pipeline import Pipeline
 
-    rows = {"train": datasets.Dataset.from_dict({"id": list(range(8))})}
+    rows = {"validation": datasets.Dataset.from_dict({"id": list(range(8))})}
     builders = {str(cache): native_builder(rows, tmp_path, cache)
                 for cache in (tmp_path / "first", tmp_path / "second")}
     for builder in builders.values():
         builder.download_and_prepare()
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="frozen"))
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda repo, cache_dir, **_: builders[cache_dir])
-    sources = [Hub("acme/records", revision="frozen", cache_dir=cache) for cache in builders]
+    sources = [
+        Hub("acme/records", split="validation", name="named", revision="release", cache_dir=cache)
+        for cache in builders
+    ]
     plans = [compile(Pipeline(source).batch(2), loading=Loading(workers=0)).plan for source in sources]
-    unprepared = Hub("acme/records", revision="frozen", cache_dir=str(tmp_path / "third"))
-    assert sources[0].fingerprint() == sources[1].fingerprint()
+    unprepared = Hub(
+        "acme/records",
+        split="validation",
+        name="named",
+        revision="release",
+        cache_dir=str(tmp_path / "third"),
+    )
+    assert sources[0].fingerprint() == {
+        "store": "hf",
+        "repo": "acme/records",
+        "revision": "frozen",
+        "config": "named",
+        "split": "validation",
+    }
+    assert sources[0].fingerprint() == sources[1].fingerprint() == unprepared.fingerprint()
     assert plans[0] is not None and plans[1] is not None
     assert plans[0].record() == plans[1].record()
-    assert unprepared.fingerprint() == sources[0].fingerprint()
-
 
 def test_a_split_with_no_shards_and_no_conversion_reads_indexed_but_not_streamed(tmp_path, monkeypatch):
     """A default revision whose split has no native shards, in a repo with no

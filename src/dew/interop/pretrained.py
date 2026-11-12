@@ -1768,6 +1768,9 @@ class _Built(NamedTuple):
     layouts: tuple[WeightLayout, ...]
     retained: dict[str, unread.Stored]
     export_adapter: Callable[..., Mapping[str, np.ndarray]] | None = None
+    # The axes `model` draws each parameter in (`decoder_parts.decoder_axes`), read off the draw its tree
+    # was checked against where one was: the table its bundle is placed by.
+    axes: Mapping[tuple[str, ...], tuple[str | None, ...]] | None = None
 
 
 def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperFields,
@@ -1790,9 +1793,9 @@ def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperF
         parts["language_model"], record["text"], directory)})
     # Every component the record builds holds every leaf it computes with: a tower, projector or
     # prediction-depth tensor the checkpoint lacks is refused here, as a decoder's is.
-    decoder_parts.check_decoder_tree(variables, model)
+    axes = decoder_parts.check_decoder_tree(variables, model)
     layouts, retained = _wrapper_layouts(tensors, record, variables, language, media)
-    return _Built(model, variables, record, wrapper, layouts, retained)
+    return _Built(model, variables, record, wrapper, layouts, retained, axes=axes)
 
 
 def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransformer,
@@ -1841,7 +1844,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
     decoders.held_depths(record, variables["params"])
     built = {**record, "dtype": dtype, "attention_impl": attention_impl}
     model = from_record(CausalTransformer, built)
-    decoder_parts.check_decoder_tree(variables, model)
+    axes = decoder_parts.check_decoder_tree(variables, model)
     # The bindings are what an adapter loader resolves source names through
     # and what a quantized source is written back through, so a
     # derived-export family binds too; `save` picks its writer by
@@ -1871,7 +1874,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, unread.S
         elif not layouts:
             export_adapter = partial(_spelled_source_weights, {
                 entry.spelling(name): name for name in tensors if entry.spelling(name) != name})
-    return _Built(model, variables, record, built, layouts, retained, export_adapter)
+    return _Built(model, variables, record, built, layouts, retained, export_adapter, axes)
 
 
 def _extended[Loaded: Pretrained](loaded: Loaded, dex: DifferentialExtension | None,
@@ -2207,8 +2210,10 @@ def _translated(config: Mapping[str, object],
 
         variables = jax.tree.map(lambda leaf: leaf.read() if isinstance(leaf, SourceLeaf) else leaf,
                                  variables, is_leaf=lambda leaf: isinstance(leaf, NvFp4))
-    return _Translated(built._replace(model=model, variables=variables), quantized_tensors, scale_dtype, grid,
-                       stored)
+    # A model the source's input scales changed holds none of the checked draw's axes: a bundle draws them.
+    axes = built.axes if model is built.model else None
+    return _Translated(built._replace(model=model, variables=variables, axes=axes), quantized_tensors,
+                       scale_dtype, grid, stored)
 
 
 def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping[str, object], Variables]:
@@ -2366,7 +2371,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     translated = _translated(config, route, tensors, directory, dtype=dtype, param_dtype=param_dtype,
                              attention_impl=attention_impl, max_seq_len=max_seq_len, streaming=streaming,
                              packed_experts=packed_experts)
-    model, variables, record, built, layouts, retained, export_adapter = translated.built
+    model, variables, record, built, layouts, retained, export_adapter, drawn = translated.built
     quantized_tensors, scale_dtype, grid, stored = translated[1:]
     resolved_commit = commit
     if component is None and commit is not None:
@@ -2380,7 +2385,9 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     named = generation_config.get("tokenizer_name") if processor is None else None
 
     def bundle[K: Pretrained](kind: type[K]) -> K:
-        axes = quantized_loads.bank_axes(decoder_parts.decoder_axes(model), variables)
+        # The checked draw's axes, or, where no draw checked this model's tree, its own.
+        table = decoder_parts.decoder_axes(model) if drawn is None else drawn
+        axes = quantized_loads.bank_axes(table, variables)
         return kind(model, placed(variables, axes=axes),
                     processor, config,
                     directory, built, generation_config,

@@ -543,7 +543,8 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     fields, a decoder's or kind's YaRN field beside its rope scaling and a decoder's cross-attention
     by its fields alone (`earlier_model`, ledgers 1622, 1898 and 2320), and a row of segments'
     question budgets, which it ignored and an earlier record wrote at their defaults (row 2006), and a
-    step's attention form, which its numerics' forms hold now (row 2500). A record in today's shapes
+    step's attention form, which its numerics' forms hold now (row 2500), and a decision run's count of
+    questions a row, which no task reads. A record in today's shapes
     passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
     for key in ("head", "layout"):
@@ -594,6 +595,11 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
             migrated = earlier_fields(json_value(segments, "layout segments"))
             assert isinstance(migrated, list)
             current["layout"] = {**laid, "fields": {**fields, "segments": migrated}}
+    settings = declared_objective(current).settings if "questions" in current else None
+    if settings is not None and "questions" not in settings_fields(settings):
+        # A decision run's most questions a row, which no task reads (a pass's question slots are its
+        # windows'), recorded beside its options before the task setting went.
+        del current["questions"]
     if "attention_form" in current:
         # The form a step trained in, which its numerics' forms hold now (ledger 2500).
         current["precision"] = {"forms": current.pop("attention_form")}

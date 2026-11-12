@@ -241,35 +241,116 @@ def test_a_phased_run_steps_each_phase_at_its_own_pass_count():
                                          jax.device_get(stepped.variables), jax.device_get(own.variables)))
 
 
-def test_a_phased_run_under_narrow_copies_steps_each_phase_on_its_own_copies():
-    """A run whose loop runs 1 pass in its first phase and 3 in its second (`phase_passes`), computing in
-    bf16 over fp32 weights with narrow copies on (`dew.training.narrow`): each phase's program plans its
-    own copies (the loop's block read once a step while it runs one pass, three times across three), and
-    the step of each reads the state with its own (row 5560: the second phase's step was handed the
-    first's and refused the tree). It trains through the boundary and lands where the same run with copies
-    off lands, the same cast bit for bit."""
+PHASED_ROWS = 2
+"""The rows a device reads a step in the phased runs' checks."""
+
+
+def phased_draw(seed):
+    """A draw of the phased runs' checks: their batch's tokens and the key their model is drawn by."""
+    rows = jax.device_count() * PHASED_ROWS
+    return np.random.default_rng(seed).integers(0, 256, (rows, 17)).astype(np.int32), np.int32(seed)
+
+
+class PhasedTokens:
+    """`tokens` every step, its first two steps read in phase 0 and the rest in phase 1 (`dew.batch.PHASE`),
+    a stream that keeps its place (`dew.data.dataset.Checkpointable`): the steps it handed over."""
+
+    def __init__(self, tokens):
+        self.tokens, self.steps = jnp.asarray(tokens), 0
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.steps += 1
+        return {"text": self.tokens, PHASE: Phase(0 if self.steps <= 2 else 1)}
+
+    def get_state(self) -> bytes:
+        return str(self.steps).encode()
+
+    def set_state(self, state: bytes) -> None:
+        self.steps = int(state)
+
+
+def phased_loader(tokens):
+    """The phased runs' data (`PhasedTokens`)."""
     from dew.data.dataset import Loader
-    from dew.nn.kernels.generation import chosen
+
+    return Loader(train=lambda partition: PhasedTokens(tokens), val=None, records=None, batch=len(tokens))
+
+
+def phased_trainer(model, seed, phases: tuple[int, ...] | None = (1, STEPS), **options):
+    """A trainer of `model`'s LM over 16 tokens, its loop at 1 pass in phase 0 and STEPS in phase 1 (none
+    where `phases` is None)."""
     from dew.training import Layout, Trainer
 
-    tokens = jnp.asarray(np.random.default_rng(4).integers(0, 256, (jax.device_count() * 2, 17)), jnp.int32)
+    return Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(int(seed)),
+                   layout=Layout(min_shard=1, tolerance=1.0), phase_passes=phases, **options)
 
-    def phased():
-        for step in itertools.count():
-            yield {"text": tokens, PHASE: Phase(0 if step < 2 else 1)}
 
-    def fit(copies: bool):
-        with chosen(narrow_copies="on" if copies else "off"):
-            trainer = Trainer(LMObjective(looped().clone(dtype=jnp.bfloat16), 16), optax.sgd(0.1),
-                              key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
-                              phase_passes=(1, STEPS))
-            state = trainer.fit(Loader(train=lambda partition: phased(), val=None, records=None,
-                                       batch=len(tokens)), steps=4, log_every=100)
-        return jax.device_get(state.variables)
+def phased_params(trainer, tokens, steps: int = 4, **fitted) -> dict:
+    """The weights `trainer` lands at after `steps` steps of `phased_loader(tokens)`."""
+    state = trainer.fit(phased_loader(tokens), steps=steps, log_every=100, **fitted)
+    return {"params": state.variables["params"]}
 
-    copied, plain = fit(copies=True), fit(copies=False)
-    for left, right in zip(jax.tree.leaves(copied), jax.tree.leaves(plain), strict=True):
-        np.testing.assert_array_equal(left, right)
+
+def test_each_phase_of_a_phased_run_is_planned_at_its_own_split(monkeypatch, tmp_path):
+    """A run whose loop runs 1 pass in its first phase and 3 in its second (`phase_passes`), on devices with
+    room for the one-pass step whole and for the three-pass step only in two microbatches, plans each phase
+    when it begins, at an update's end: its first phase reads its batch whole, its second in two
+    microbatches (row 5558), where binding the first plan's split would have run the second out of
+    memory. It is, bit for bit, the run read whole through its first phase, stopped there and resumed in
+    two microbatches: each step the same program over the same state."""
+    from recording import bits
+    from test_plan import LIMIT, free
+
+    from dew.checkpoints import Checkpoints
+
+    tokens, _ = phased_draw(0)
+
+    def needed(model, split):
+        free(monkeypatch, LIMIT)
+        trainer = phased_trainer(model, 0, None, split=split)
+        state, _, _ = trainer.place()
+        trainer.compile(state, {"text": jnp.asarray(tokens)})
+        return LIMIT - trainer.plan["probes"][0]["headroom"]
+
+    once, whole, halves = needed(looped(steps=1), 1), needed(looped(), 1), needed(looped(), 2)
+    assert max(once, halves) < whole, (once, halves, whole)
+    free(monkeypatch, (max(once, halves) + whole) // 2)
+    planned = phased_trainer(looped(), 0)
+    landed = phased_params(planned, tokens)
+    assert planned.plan["split"] == 2
+    free(monkeypatch, LIMIT)
+    directory = str(tmp_path / "pinned")
+    phased_params(phased_trainer(looped(), 0, split=1, checkpoints=Checkpoints(directory)), tokens, steps=2,
+                  checkpoint_every=2)
+    pinned = phased_params(phased_trainer(looped(), 0, split=2, checkpoints=Checkpoints(directory)), tokens)
+    for mine, theirs in zip(bits(landed), bits(pinned), strict=True):
+        np.testing.assert_array_equal(mine, theirs)
+
+
+def test_a_phase_whose_program_plans_other_copies_counts_them_built_in_its_fit(monkeypatch):
+    """A run whose loop runs 3 passes in its first phase and 1 in its second, in bf16 over fp32 weights with
+    narrow copies on: the second phase's program plans other copies than the first's, which its step makes
+    as it is handed the state, the first's let go, so its plan's fit counts them built, as a fresh state's
+    step's does (train 769's review: the fit counted them only where the state held none, and a tight
+    phase could run out of memory the plan said it fit)."""
+    from test_plan import LIMIT, free
+
+    from dew.nn.kernels.generation import chosen
+
+    tokens, _ = phased_draw(0)
+    narrow = looped(steps=1).clone(dtype=jnp.bfloat16)
+    free(monkeypatch, LIMIT)
+    with chosen(narrow_copies="on"):
+        phased = phased_trainer(narrow, 0, (3, 1))
+        phased_params(phased, tokens)
+        fresh = phased_trainer(narrow, 0, None)
+        state, _, _ = fresh.place()
+        fresh.compile(state, {"text": jnp.asarray(tokens)})
+    # The fresh state's step counts the copies it makes; the phase's counts them too, with no more headroom.
+    assert phased.plan["probes"][0]["headroom"] <= fresh.plan["probes"][0]["headroom"]
 
 
 def cut_loop_loss(model, weights, tokens):
