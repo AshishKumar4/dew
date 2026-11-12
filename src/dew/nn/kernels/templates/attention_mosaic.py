@@ -80,6 +80,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     query_rows,
     reducing,
     refused,
+    score_places,
     split_queries,
     stagings,
     varying_slopes,
@@ -943,6 +944,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     """The tiles its score hook's pullback forms that vary in its dQ launch and its dK/dV launch
     (`varying_slopes`), as its builder reads them off the hook (`_backward_call`): a keyed launch's hook is
     its fingerprint, which keeps no trace of them."""
+    score_reads: tuple[bool, bool] = (False, False)
+    """Whether its score hook reads its queries' places and its keys' (`score_places`), as its builder reads
+    them off the hook (`_backward_call`): a keyed launch's hook is its fingerprint, which keeps no trace of
+    them, and its registers hold each it reads (`backward_registers`' `hooked`)."""
 
     def _fwd(self, query, key, value, dout, start, end, query_ids, key_ids, score_params, initial, residuals,
              drop=None, *, interpret: bool, config: BackwardTiles, return_residuals: bool = False):
@@ -1173,19 +1178,26 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # largest tile a multiprocessor holds two programs of first, one program's warps issuing under the
         # other's products (an A100's step at Qwen3-8B's heads, causal 2 x 8192: 32 x 32 at two programs
         # 56.65 ms against 64 x 32 at one 69.06, 2 x 2048 over 128 heads 17.43 against 20.33, M-ET-56).
-        residing = [] if family.products_overlap else [
+        # The two launches' dQ launch streams through a producer: on the call's bundle, else on the first of
+        # its layouts a producer fills (consumer Blackwell's, whose mma.sync bundle feeds its consumers'
+        # rings first, `bundles.MmaProduced`).
+        dq = next((layout for layout in (family, *self._layouts(target.generation, query.dtype))
+                   if not split_queries(layout)), None)
+        if dq is None:
+            return None
+        residing = [] if dq.products_overlap else [
             lambda config: fits(config) and self.resident(ba, config, target) >= 2]
         for wanted in (*residing, fits):
             for columns in (1, 2, 4):
-                for rows in (None, *(fewer_rows(family) if self.score_mod is None else ())):
+                for rows in (None, *(fewer_rows(dq) if self.score_mod is None else ())):
                     walks = extents if rows is None else functools.partial(_sides, rows)
                     for staged in (False, True):
                         def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
                                   ) -> BackwardTiles:
-                            return BackwardTiles(walked, rows, 2, consumers, family=family.name,
+                            return BackwardTiles(walked, rows, 2, consumers, family=dq.name,
                                                  columns=columns, staged_logits=staged, **dkv)
 
-                        if config := derive(family, query.dtype, key.shape[1], query.shape[1], tiles, wanted,
+                        if config := derive(dq, query.dtype, key.shape[1], query.shape[1], tiles, wanted,
                                               overlapped=False, walks=walks, rows=rows):
                             return config
         return None
@@ -1253,7 +1265,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         params = tuple(zip(self.score_kinds, (kept_dtype(param.dtype) for param in score_params),
                            strict=True))
         return BackwardRegisters(query.dtype, query.shape[-1], value.shape[-1], self.accurate, params,
-                                 self.score_slopes, drop is not None, config.queries_first)
+                                 self.score_slopes, drop is not None, config.queries_first, self.score_reads)
 
     def _held(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> bool:
         # Each launch's registers within its own layout's budget (`Family.registers`); every config where
@@ -1318,7 +1330,7 @@ def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                         score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
                         score_reduces=hook_reduces(hooks), form=spans.form, keys=spans.keys,
                         scale=logit_scale(query.shape[3], scale), natural=natural,
-                        accurate=accurate, rounded=rounded,
+                        accurate=accurate, rounded=rounded, score_reads=score_places(hooks),
                         score_slopes=(varying_slopes(hooks, DQ_GRADS), varying_slopes(hooks, DKV_GRADS)))
     return op, (query, key, value, dout, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params), hooks.initial, residuals, hooks.drop)

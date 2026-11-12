@@ -122,11 +122,12 @@ def fuses(accurate: bool, parametrized: bool) -> bool:
 
 def backward_layouts(generation_name: str | None, dtype) -> tuple[mosaic.Family, ...]:
     """The bundles the backward's launches take on a device of `generation_name` for operands of `dtype`, in
-    preference order (`bundles.layouts`, unscoped, `runs_backward`): a B200's and consumer Blackwell's the
-    mma.sync rings their consumers feed alone; none where the device has none."""
+    preference order (`bundles.layouts`, unscoped, `runs_backward`, its dQ launch streaming through a
+    producer, `produced`): a B200's and consumer Blackwell's the mma.sync rings their consumers feed, then
+    those a producer fills; none where the device has none."""
     if generation_name is None:
         return ()
-    return tuple(filter(runs_backward, bundles.layouts(generation_name, dtype, tpu=True)))
+    return tuple(filter(runs_backward, bundles.layouts(generation_name, dtype, tpu=True, produced=True)))
 
 
 def backward_bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
@@ -158,10 +159,11 @@ def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
     share, `block_q` x `block_k` (`Issuer.specialized`, as the GEMM's: mma.sync's warps by the share, whose
     default 64-row atom no 32-row consumer's operands cast to); a backward's as `backward_family` arranges
     it."""
-    # Every bundle the device issues (a launch of a row each ranks them all, `bundles.layouts`).
+    # Every bundle the device issues the mainloop's launches (a launch of a row each ranks them all,
+    # `bundles.layouts`), the backward's dQ launch's producer layout among them (`produced`).
     found = {family.name: family
              for family in bundles.layouts(generation.gpu_target().generation, dtype, 1, scoped=True,
-                                           tpu=True)}
+                                           tpu=True, produced=True)}
     family = found.get(tiles.family)
     if family is None:
         raise ValueError(f"{tiles}: this device's attention bundles are {sorted(found)}")
@@ -1747,7 +1749,8 @@ def _dq_registers(family: mosaic.Family, config: BackwardTiles, width: int, valu
 
 def backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
                         accurate: bool, dq: bool, split: bool = False, params: tuple = (),
-                        slopes: int = 0, dropped: bool = False) -> int:
+                        slopes: int = 0, dropped: bool = False,
+                        hooked: tuple[bool, bool] = (False, False)) -> int:
     """The registers a backward launch's consumer holds at `config` (`resources.live_registers`): a dQ
     consumer's dQ sums `[bq, D]` fp32 carried (and the accurate form's keyed sums) and its per-query rows,
     beside a step's logits and output cotangents' products fp32, then its score cotangents fp32 and one part
@@ -1761,7 +1764,8 @@ def backward_registers(family: mosaic.Family, config: BackwardTiles, width: int,
     int tiles, `_coords`, a byte an entry), from its logits' mask to its cotangents' (ptxas: the fused
     launch at 128 x 64 and width 64 spills 60 bytes, its model 252 without them; 64 x 64 at width 128 holds
     255 unspilled, 242); a keys-first step's places are vectors broadcast at each use. A score hook's
-    parameters and their gradients the launch forms are live beside its products (`_hook_live`), and its
+    parameters and their gradients the launch forms are live beside its products (`_hook_live`), the places
+    it reads as values (`hooked`, its queries' and its keys', `score_places`) in a keys-first launch, and its
     pullback's `slopes` tiles fp32 that vary (`varying_slopes`: its output and its slopes along its
     differentiated inputs) beside its output cotangents' product once the logits' is spent, a phase of their
     own (dQ under a temperature at 128 x 64, width 64, spilled 4316 bytes, its SASS's spills their float
@@ -1814,8 +1818,25 @@ def backward_registers(family: mosaic.Family, config: BackwardTiles, width: int,
         held = _fused_held(logits, dtype, dropped=dropped)
         return resources.live_registers(family, carried, products + held, pullback + held, dq_tile,
                                         *fragments) + statistics
-    queries = block_q // config.consumers if split else block_q
+    return _keys_first_registers(family, config, width, value_width, dtype, carried,
+                                 block_q // config.consumers if split else block_q, accurate=accurate,
+                                 params=params, slopes=slopes, hooked=hooked)
+
+
+def _keys_first_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype,
+                          carried: list, queries: int, *, accurate: bool, params: tuple, slopes: int,
+                          hooked: tuple[bool, bool]) -> int:
+    """`backward_registers`' keys-first dK/dV consumer at `config`, its `queries` a slot's or its share's:
+    its `carried` sums beside a step's two products and its hook's live values and places, its statistics in
+    its tiles' column layout, and its products' fragments."""
+    block_k = config.block_k
     held, vectors = _hook_live(family, queries, block_k, params, grads="keys", keys_first=True)
+    # The places a score hook reads (`score_places`), each a vector beside its products until the hook
+    # reads it: its mask folds them into its compares, a hook takes them as values (a B200's row-indexed
+    # dK/dV at 64 x 64, width 128, over two column shares: 24 bytes spilled at a model of 233, its query
+    # places' 16 words among ptxas's live registers, FINAL14).
+    vectors += (family.column_registers(queries, jnp.int32) if hooked[0] else 0)
+    vectors += (family.row_registers(block_k, jnp.int32) if hooked[1] else 0)
     # Its two products' accumulators, and where its family's products run past their step
     # (`Family.in_flight`: warpgroup MMA's) the next step's beside them in a launch of its own (an H100's
     # keys-first dK/dV at 64 x 64 over two consumers' query shares priced 108 to 124 registers where ptxas
@@ -1832,14 +1853,15 @@ def backward_registers(family: mosaic.Family, config: BackwardTiles, width: int,
     dq_width = width // config.consumers if config.shared_dq else width
     added = [[step[0], (queries, dq_width, jnp.float32)]] if config.fused else []
     # Its products' fragments where they read registers (`_products`), keys first: the logits' and the
-    # output cotangents' of the keys against the queries, then dV's and dK's of the weights and the score
-    # cotangents in registers.
+    # output cotangents' of the keys against the queries over the whole head, which every column share
+    # recomputes (`attention_mosaic_dkv`'s products read the slots whole), then dV's and dK's of the weights
+    # and the score cotangents in registers, its share of their columns.
     weights = (block_k, queries, dtype)
     columns = config.columns
     fragments = _products(
         family, dtype,
-        resources.Product(block_k, width // columns, queries, beside=step[:1], transposed=True),
-        resources.Product(block_k, value_width // columns, queries, beside=step, transposed=True),
+        resources.Product(block_k, width, queries, beside=step[:1], transposed=True),
+        resources.Product(block_k, value_width, queries, beside=step, transposed=True),
         resources.Product(block_k, queries, value_width // columns, beside=[weights], held=True),
         resources.Product(block_k, queries, width // columns, beside=[weights], held=True),
         narrow=config.narrow)
@@ -1869,7 +1891,8 @@ class BackwardRegisters:
     kernel's register model by as it lowers (`Family.kernel`'s `registers`): its operands' dtype, its query
     and value heads' widths, its form (`accurate`), its score hook's parameters' kinds and kept dtypes and
     the tiles its pullback varies in the dQ launch and the dK/dV launch (`slopes`), whether it drops
-    entries, and whether its config walks queries first (`BackwardTiles.queries_first`)."""
+    entries, whether its config walks queries first (`BackwardTiles.queries_first`), and the places its
+    score hook reads, its queries' and its keys' (`hooked`, `score_places`)."""
     dtype: Any
     width: int
     value_width: int
@@ -1878,6 +1901,7 @@ class BackwardRegisters:
     slopes: tuple[int, int]
     dropped: bool
     queries_first: bool
+    hooked: tuple[bool, bool]
 
     def at(self, tiles: BackwardTiles, *, dq: bool) -> int:
         """A consumer's registers in the dQ launch (`dq`) or the dK/dV launch at `tiles`, on the bundle they
@@ -1887,5 +1911,5 @@ class BackwardRegisters:
         return backward_registers(family, tiles, width, value_width, self.dtype, accurate=self.accurate,
                                   dq=dq, split=split_queries(family) and not self.queries_first,
                                   params=self.params, slopes=self.slopes[0 if dq else 1],
-                                  dropped=self.dropped)
+                                  dropped=self.dropped, hooked=self.hooked)
 
