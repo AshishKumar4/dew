@@ -67,7 +67,7 @@ import datetime
 import json
 import math
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence, Set
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, TypedDict, overload
 
@@ -518,7 +518,7 @@ def _paths(tree) -> set[str]:
             for path, _ in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
 
-def _refuse_lacking(lacking: set[str], where: str, unread: set[str] = frozenset()) -> None:
+def _refuse_lacking(lacking: set[str], where: str, unread: Set[str] = frozenset()) -> None:
     """Refuse a template whose leaves `lacking` the checkpoint at `where` does not hold, naming what it
     holds in their place: its `unread` leaves, those the template does not ask, beside a lacking one (a
     layout another model or an earlier Dew wrote, a projection group's members stored packed among them).
