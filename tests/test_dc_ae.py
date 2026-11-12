@@ -116,6 +116,27 @@ def test_the_autoencoder_scales_as_the_pipeline_does(variant):
     )
 
 
+def test_a_standalone_load_reads_its_config_once(source, monkeypatch):
+    """A published DC-AE loaded on its own (`load_autoencoder`) reads its config once: its dispatch's read,
+    which picks the loader, is the one the loader checks its class by and builds from, where the loader
+    resolved the release and parsed its config twice again (audit3 families F4). The reads are counted at
+    the file."""
+    from pathlib import Path as PathType
+
+    from dew.interop.autoencoders.pretrained import load_autoencoder
+
+    read_text, reads = PathType.read_text, []
+
+    def counted(path, *args, **kwargs):
+        if path.name == "config.json":
+            reads.append(path)
+        return read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(PathType, "read_text", counted)
+    loaded = load_autoencoder(str(source / "plain"), dtype=jnp.float32)
+    assert isinstance(loaded.model, DCAE) and len(reads) == 1
+
+
 def test_a_missing_tensor_is_refused(source, tmp_path):
     shutil.copytree(source / "conv", tmp_path / "vae")
     weights = tmp_path / "vae" / "diffusion_pytorch_model.safetensors"
