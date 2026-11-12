@@ -186,9 +186,12 @@ class KPoolIndexer(IndexerFront, nn.Module):
         rank = jnp.cumsum(visible, axis=-1, dtype=jnp.int32)
         visible_count = rank[..., -1:]
         held = visible & (rank > visible_count - visible_count % self.kpool)
-        # The held keys' indices in order, first among each query's (`top_k` of their negated indices).
-        first, _ = jax.lax.top_k(jnp.where(held, -jnp.arange(total), -total), self.kpool - 1)
-        return jnp.where(first > -total, -first, -1)
+        # The held keys' indices in order, first among each query's (`top_k` of their negated indices), as
+        # many as a row holds keys, then empty slots.
+        first, _ = jax.lax.top_k(jnp.where(held, -jnp.arange(total), -total), min(self.kpool - 1, total))
+        tail = jnp.where(first > -total, -first, -1)
+        return jnp.pad(tail, [(0, 0)] * (tail.ndim - 1) + [(0, self.kpool - 1 - tail.shape[-1])],
+                       constant_values=-1)
 
     def select_indices(self, x, q_resid, packed, visible, segments=None, documents: int = 1):
         """Complete selected token indices `[B, S, N]`, -1 for an empty slot.
