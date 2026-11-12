@@ -67,8 +67,8 @@ def pipeline(
     selects a run's averaged weights: None reads them when the run kept them
     and its live weights otherwise, and True always reads them. `step`
     selects a run's checkpoint and `revision` pins a Hub source; passing
-    `revision` for a run directory or `step` for a source raises
-    `ValueError`. `trust` names the packages outside Dew a run's record may
+    `revision` for a run directory, or `step` or `ema` for a source, raises
+    `ValueError`: they select nothing of it. `trust` names the packages outside Dew a run's record may
     import, and the sources whose own code a load may run (a media processor's,
     LFM3-VL's), as `trust_remote_code` does in transformers. `options` selects
     what a source builds, as a run's `--source` options do (`SourceOptions`:
@@ -117,11 +117,14 @@ def pipeline(
         return _from_run(root, mesh=mesh, layout=layout, dtype=dtype,
                          param_dtype=None if param_dtype == "auto" else param_dtype, ema=ema, step=step,
                          trust=trust)
-    if step is not None:
-        raise ValueError("step selects a run's checkpoint; a source checkpoint has one set of weights")
+    # A step or an EMA choice beside a source that is no saved run selects nothing of it, a release's
+    # recorded average included (`pinned_run`, every saved-run loader's rule).
+    from dew.interop.saved_sources import pinned_run
+
+    pinned_run(root, step=step, ema=ema)
     if root.is_dir() and released_model(root):
         if revision is not None or (options is not None and options != SourceOptions()) or (
-                precision is not None) or ema is not None:
+                precision is not None):
             raise ValueError("a native release records its own model, numerics and average: `dtype` and "
                              "`param_dtype` are what a load may set of them")
         from dew.inference.models import ReleasedRun

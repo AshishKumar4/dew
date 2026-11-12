@@ -115,8 +115,9 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
     if factor not in (None, 1, 1.0):
         refuse(f"rope_parameters.sliding_attention partial_rotary_factor {factor}",
                 "partial rotary applies to the full layers only")
-    read_rope_theta({**sliding, 'rope_type': sliding.get('rope_type', sliding.get('type', 'default'))},
-                "rope_parameters.sliding_attention")
+    # A whole-head factor (1) is read here, the plain entry without it by the shared parser.
+    rope_type = sliding.get('rope_type', sliding.get('type', 'default'))
+    read_rope_theta({**_whole_head(sliding), 'rope_type': rope_type}, "rope_parameters.sliding_attention")
     local = sliding.get('rope_theta', 10000.0)
     rope_type = full.get('rope_type', full.get('type', 'default'))
     factor = full.get('partial_rotary_factor')
@@ -138,13 +139,19 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
             refuse("rope_parameters.full_attention partial_rotary_factor",
                     "partial rotary comes spelled proportional")
         partial = None
-        theta = read_rope_theta(full, 'rope_parameters.full_attention') or 10000.0
+        theta = read_rope_theta(_whole_head(full), 'rope_parameters.full_attention') or 10000.0
     else:
         refuse(f"rope_parameters.full_attention (rope_type {rope_type!r})",
                 "the backbone applies plain rotary positions at rope_theta")
     local = _records.number(local, 'rope_parameters.sliding_attention rope_theta')
 
     return theta, (None if local == theta else local), partial
+
+
+def _whole_head(entry: Mapping[str, object]) -> dict[str, object]:
+    """A plain rope entry without its whole-head `partial_rotary_factor` (1), which the family's reader
+    has accepted, for the shared parser, which takes a plain entry's base frequency and type alone."""
+    return {key: value for key, value in entry.items() if key != 'partial_rotary_factor'}
 
 
 def _number(value: Configured, key: str) -> float | None:
