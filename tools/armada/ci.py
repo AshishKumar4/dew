@@ -1184,8 +1184,8 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
         groups: dict[str, list[tuple[str, float]]] = {}
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
-                at, count = measured_cut(timings, python, name) or (seconds, 1)
-                cut = split(recorded.get(name, []), at, target, count)
+                at = costs.measured_as(recorded.get(name, []), seconds, measured_cut(timings, python, name))
+                cut = split(at[0], at[1], target, at[2])
                 groups[name] = [(f"{group}/{len(cut)}" if len(cut) > 1 else "", weight)
                                 for group, weight in enumerate(cut, start=1)]
         # Each check-1 site its file's marks shard is a row of its own, its judge's.
