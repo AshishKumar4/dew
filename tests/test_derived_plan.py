@@ -546,17 +546,17 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
 
 
 def wide(head_tile=None):
-    """`deep`'s decoder over a vocabulary of 32768 and rows of 1024 tokens, its remat stated and its batch
-    read whole, so its whole fp32 logits (8192 tokens by 32768 rows, `LOGITS`) are most of what its step
+    """`deep`'s decoder over a vocabulary of 32768 and rows of 4096 tokens, its remat stated and its batch
+    read whole, so its whole fp32 logits (32768 tokens by 32768 rows, `LOGITS`) are most of what its step
     holds, and more than its head's tile; its head tiled where `head_tile` says so."""
     model = CausalTransformer(vocab_size=32768, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
-                              max_seq_len=1024, remat=REMAT_POLICIES["full"])
-    return one_device(Trainer(LMObjective(model, seq_len=1024, head_tile=head_tile), optax.sgd(1e-2),
+                              max_seq_len=4096, remat=REMAT_POLICIES["full"])
+    return one_device(Trainer(LMObjective(model, seq_len=4096, head_tile=head_tile), optax.sgd(1e-2),
                               key=jax.random.key(0), split=1))
 
 
-WIDE = {"text": jnp.asarray((np.arange(8 * 1025).reshape(8, 1025) * 7) % 32768, jnp.int32)}
-LOGITS = 8192 * 32768 * 4
+WIDE = {"text": jnp.asarray((np.arange(8 * 4097).reshape(8, 4097) * 7) % 32768, jnp.int32)}
+LOGITS = 32768 * 32768 * 4
 """The bytes of `wide`'s whole fp32 logits."""
 
 
