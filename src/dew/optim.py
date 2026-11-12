@@ -294,7 +294,9 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
     `ns_precision`'s dot algorithm (`ns_operands`), run whole on one device, the matrices spread across the
     devices (`orthogonalized`). Each parameter's matrix is its dimension numbers'
     (`muon_weight_dimension_numbers`), or each of its heads' where `per_head` names it (`head_widths`)."""
-    coefficients = _coefficients(ns_coeffs, ns_steps)
+    # Read now, whatever traces the transform's construction (a schedule's hyperparameters injected).
+    with jax.ensure_compile_time_eval():
+        coefficients = _coefficients(ns_coeffs, ns_steps)
     static = np.asarray(coefficients)
     algorithm = dot_algorithm(ns_precision)
 
@@ -797,7 +799,7 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
         numbers = jax.tree.unflatten(jax.tree.structure(moment), [
             _shifted(optax.contrib.MuonDimensionNumbers(), layers_of(path)[1]) if shape is None else shape
             for (path, _), shape in zip(held, given, strict=True)])
-        return orthogonalized(moment, numbers, jnp.asarray(NEWTON_SCHULZ), ns_steps, 1e-8,
+        return orthogonalized(moment, numbers, NEWTON_SCHULZ, ns_steps, 1e-8,
                               algorithm=dot_algorithm(ns_precision))
 
     kind = M3State if weight_dimension_numbers is None else M3GivenState

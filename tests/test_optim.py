@@ -370,7 +370,7 @@ def test_muons_bfloat16_newton_schulz_is_as_exact_as_jordans():
                "tall": optax.contrib.MuonDimensionNumbers((1,), (2,))}
 
     def dew(wide, tall):
-        done = orthogonalized({"wide": wide, "tall": tall}, numbers, jnp.asarray(NEWTON_SCHULZ), 5, 1e-8)
+        done = orthogonalized({"wide": wide, "tall": tall}, numbers, NEWTON_SCHULZ, 5, 1e-8)
         return [done["wide"], done["tall"]]
 
     def jordan(wide, tall):
@@ -702,11 +702,7 @@ def test_a_matrix_declared_with_no_axis_named_is_orthogonalized_as_one_matrix():
 
     params = {'params': {'layers_0': {'altup': {'prediction_coefs': {'kernel': jnp.zeros((16, 4))}}}}}
     path = ('params', 'layers_0', 'altup', 'prediction_coefs', 'kernel')
-    updates, grads = group_updates(params)
-    reference = optax.contrib.muon(LR)
-    one = {'kernel': node(grads, path)}
-    expected, _ = reference.update(one, reference.init(one), one)
-    np.testing.assert_array_equal(np.asarray(node(updates, path)), np.asarray(expected['kernel']))
+    assert_updates_as(muon_solver(), optax.contrib.muon(LR), params, [path], "an undeclared AltUp matrix")
 
 
 def test_the_router_gate_takes_the_adamw_update():

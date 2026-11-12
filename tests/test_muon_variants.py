@@ -143,7 +143,7 @@ def test_polar_express_orthogonalizes_as_its_paper_does(steps):
     def dew(wide, tall):
         # The stacks in the tree's own order, "tall" before "wide".
         return jax.tree.leaves(orthogonalized({"wide": wide, "tall": tall}, numbers,
-                                              jnp.asarray(polar_express(steps)), steps, 1e-7))
+                                              polar_express(steps), steps, 1e-7))
 
     def paper(dtype):
         @as_given
@@ -275,11 +275,11 @@ def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(precondi
     one = 1 if chunked else None
 
     def dew(*stacks):
-        return list(orthogonalized(stacks, numbers, jnp.asarray(NEWTON_SCHULZ), 5, 1e-8, preconditioning,
+        return list(orthogonalized(stacks, numbers, NEWTON_SCHULZ, 5, 1e-8, preconditioning,
                                    chunk_bytes=one))
 
     def optax_arm(*stacks):
-        return [orthogonalized_leaf(jnp.asarray(stack), 5, shape, coeffs=jnp.asarray(NEWTON_SCHULZ),
+        return [orthogonalized_leaf(jnp.asarray(stack), 5, shape, coeffs=NEWTON_SCHULZ,
                                     preconditioning=preconditioning)
                 for stack, shape in zip(stacks, numbers, strict=True)]
 
