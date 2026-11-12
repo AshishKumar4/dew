@@ -20,7 +20,7 @@ import json
 import os
 import threading
 import typing
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Literal, Protocol, runtime_checkable
 
@@ -1385,17 +1385,9 @@ def _compile_phases(
     # stream batched by its tokens after steps that drop rows) read each its own stream (`StepPhases`).
     per_share = not tokens and not first.build.global_order
     shared = _shared(source) if per_share else tuple({} for _ in source.pipelines)
-    staged: list[tuple[_Staged, int | None]] = []
-    # Phases that share corpora hand their members' rows on in groups of the first one's batch alike.
-    grouped = first.build.batch if any(shared) else None
-    for index, until in enumerate(source.ends):
-        if per_share:
-            # Its end is its step's, the steps its own stream reads.
-            phase = first if not index and not shared[0] else staged_at(index, {}, shared[index])
-            if shared[index]:
-                phase = dataclasses.replace(phase, build=dataclasses.replace(phase.build, grouped=grouped))
-            staged.append((phase, until))
-            continue
+    staged: list[tuple[_Staged, int | None]] = (
+        _own_streams(source, first, shared, staged_at) if per_share else [])
+    for index, until in () if per_share else enumerate(source.ends):
         # A phase on the token clock ends where the run reaches it, so it is staged as it reads first,
         # and again with the ends of the phases before it once the run reaches them (`opened`).
         ends = [end for _, end in staged if end is not None]
@@ -1527,6 +1519,23 @@ def _shared(phases: Phases) -> tuple[dict[str, str], ...]:
                                  "(`.named(...)`) alike in each, or keep its place among the unnamed")
             members[index][member] = key
     return tuple(members)
+
+
+def _own_streams(source: Phases, first: _Staged, shared: Sequence[Mapping[str, str]],
+                 staged_at: Callable[[int, Mapping[str, int], Mapping[str, str]], _Staged]
+                 ) -> list[tuple[_Staged, int | None]]:
+    """Each phase of `source` read on its own stream (`StepPhases`), staged beside its end, its step's:
+    `first` for phase 0 where it shares nothing, the rest by `staged_at` with the corpora each shares
+    (`shared`); phases that share corpora hand their members' rows on in groups of the first one's batch
+    alike (`_Build.grouped`)."""
+    grouped = first.build.batch if any(shared) else None
+    staged: list[tuple[_Staged, int | None]] = []
+    for index, until in enumerate(source.ends):
+        phase = first if not index and not shared[0] else staged_at(index, {}, shared[index])
+        if shared[index]:
+            phase = dataclasses.replace(phase, build=dataclasses.replace(phase.build, grouped=grouped))
+        staged.append((phase, until))
+    return staged
 
 
 def _stamped(staged: _Staged, members: Mapping[str, str]) -> _Staged:

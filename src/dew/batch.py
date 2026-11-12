@@ -13,12 +13,15 @@ import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from types import MappingProxyType
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct, traverse_util
+
+if TYPE_CHECKING:
+    from dew._records import JSON
 from flax.core import FrozenDict, meta
 
 type Variables = Mapping[str, Any]
@@ -122,10 +125,10 @@ phase on its own stream reads off each batch and drops before the run sees it
 
 @dataclasses.dataclass(frozen=True)
 class Draws:
-    """The draws of a phase's shared corpora a batch trains (`DRAWS`), each `(node, member, pull)`
-    (`dew.data.pipeline.DRAWN`): an object no device holds."""
+    """The draws of a phase's shared corpora a batch trains (`DRAWS`), each `(node, member, pull,
+    position)` (`dew.data.pipeline.Draw`): an object no device holds."""
 
-    draws: tuple[tuple[str, str, int], ...]
+    draws: tuple[tuple[str, str, int, JSON], ...]
 
 
 @dataclasses.dataclass(frozen=True)

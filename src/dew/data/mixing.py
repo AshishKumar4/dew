@@ -950,7 +950,7 @@ def node_of(selection: slice | None) -> str:
     return f"{selection.start or 0}:{selection.step or 1}"
 
 
-def _marked(key: str, row: Batch, drawn: Drawn) -> Batch:
+def _marked(key: str, row: object, drawn: Drawn) -> Batch:
     """A mix's draw of member `key` as one consumed source example, its draws `drawn`."""
     if not isinstance(row, Mapping):
         raise TypeError(f"mixture member {key!r} gives {type(row).__name__} records, which carry no draw; "
@@ -1071,8 +1071,7 @@ def unmirrored(position: JSON) -> JSON:
         case list():
             return [unmirrored(part) for part in position]
         case dict():
-            return json_value({key: unmirrored(part) for key, part in without_mirrors(position).items()},
-                              "a corpus's position")
+            return {key: unmirrored(json_value(part, key)) for key, part in without_mirrors(position).items()}
     return position
 
 

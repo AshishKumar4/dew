@@ -416,10 +416,10 @@ MIRRORS = "dew_mirrors"
 elastic read's order, `dew.data.elastic_order`) carries their mirror counters, by process."""
 
 
-def without_mirrors[V](held: Mapping[str, V]) -> dict[str, V | dict[str, object]]:
+def without_mirrors[V](held: Mapping[str, V]) -> Mapping[str, V | Mapping[str, JSON]]:
     """`held`, one level of a position, its loading workers' mirror counters emptied (`MIRRORED`,
     `MIRRORS`): what a position states of where its corpus stands, whichever processes mirrored it."""
-    emptied: dict[str, V | dict[str, object]] = dict(held)
+    emptied: dict[str, V | Mapping[str, JSON]] = dict(held)
     if isinstance(emptied.get(MIRRORED), Mapping):
         emptied[MIRRORED] = {"process": "saved", "counts": {}}
     if isinstance(emptied.get(MIRRORS), Mapping):
