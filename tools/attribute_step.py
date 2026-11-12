@@ -52,6 +52,7 @@ import tarfile
 import tempfile
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dew.nn.kernels.generation import gpu_target
@@ -222,37 +223,40 @@ def program_window(capture: Path, step: str) -> dict[str, float] | None:
     return {key: sum(each[key] for each in found) / len(found) for key in found[0]}
 
 
-def attribute_time(trace: Path, steps: int, model_flops: float | None,
-                   ops: dict[str, HloInstruction] | None = None, device: str | None = None) -> dict:
-    capture = capture_of(trace)
-    reports = capture / "reports"
-    rows = report_table(reports / "hlo_stats.json")[1]
-    if not rows:
-        return {"capture": str(capture), "error": "hlo_stats.json has no ops: profile with "
-                "XLA_FLAGS=--xla_gpu_enable_command_buffer= so XProf can attribute kernels"}
-    roofline = json.loads((reports / "roofline_model.json").read_text())
-    roofline = roofline[0] if isinstance(roofline, list) else roofline
-    # Dew's dense bf16 peak, the MFU denominator every run reports. XProf's roofline peak is a
-    # different kind of figure (on an RTX PRO 6000, 3,742 TFLOP/s, sparse low precision), kept for
-    # reference only: a device Dew's table does not name gets no peak-derived field at all.
+def _peaks(device: str | None) -> tuple[float | None, float | None, str]:
+    """The device's dense bf16 and FP8 peaks in GFLOP/s, from Dew's table (`gpu_target`), and where they
+    came from: None for a device the table does not name, which gets no peak-derived field at all."""
     target = gpu_target(device) if device else None
     known = None if target is None else target.bf16_peak
     peak = known / 1e9 if known else None
     fp8_peak = None if target is None or target.fp8_peak is None else target.fp8_peak / 1e9
-    peak_source = (f"dew.nn.kernels.generation.gpu_target for {device}" if known
-                   else f"unknown device: {device}" if device else "no device named")
-    xprof_peak = float(roofline.get("p", {}).get("peak_flop_rate", 0) or 0) or None
-    programs = program_times(rows)
-    step = max(programs, key=programs.__getitem__)
-    runs = program_runs(rows, step, steps, ops)
-    by_part: dict = defaultdict(lambda: defaultdict(float))
-    by_kind: dict = defaultdict(float)
-    by_part_kind: dict = defaultdict(lambda: defaultdict(float))
-    gemms, layouts, everything = [], [], []
-    fp8_gflop = 0.0
+    source = (f"dew.nn.kernels.generation.gpu_target for {device}" if known
+              else f"unknown device: {device}" if device else "no device named")
+    return peak, fp8_peak, source
+
+
+@dataclass
+class _Attributed:
+    """The step program's ops, each XProf row's time a step attributed to its part, direction and kind,
+    the GEMMs judged against their precision's peak (`_attributed`)."""
+
+    by_part: dict = field(default_factory=lambda: defaultdict(lambda: defaultdict(float)))
+    by_kind: dict = field(default_factory=lambda: defaultdict(float))
+    by_part_kind: dict = field(default_factory=lambda: defaultdict(lambda: defaultdict(float)))
+    gemms: list = field(default_factory=list)
+    layouts: list = field(default_factory=list)
+    everything: list = field(default_factory=list)
+    fp8_gflop: float = 0.0
     # The step's ops whose work the FLOP count leaves unsized (`HloInstruction.flops` None, or no op of the
     # module named), by kind, so a total that skips them (the GEMMs') says how many of its kind it skipped.
-    unsized: dict[str, int] = defaultdict(int)
+    unsized: dict = field(default_factory=lambda: defaultdict(int))
+
+
+def _attributed(rows: list, step: str, steps: int, ops: dict[str, HloInstruction] | None,
+                peak: float | None, fp8_peak: float | None) -> _Attributed:
+    """Each of the step program's rows (`step`), its time a step attributed (`_Attributed`)."""
+    runs = program_runs(rows, step, steps, ops)
+    found = _Attributed()
     for row in (row for row in rows if str(row.get("program_id")) == step):
         name = str(row.get("tf_op_name") or "")
         us = float(row["total_self_time"]) / steps
@@ -267,9 +271,9 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
             # An update is named by its root, the parameter it writes narrowed for the next step's
             # compute (training/narrow.py); the optimizer state it reads says what it is.
             part = "optimizer"
-        by_part[part][direction] += us
-        by_kind[kind] += us
-        by_part_kind[part][kind] += us
+        found.by_part[part][direction] += us
+        found.by_kind[kind] += us
+        found.by_part_kind[part][kind] += us
         # The compiled FLOPs over the measured time: the work done, counted from the op itself as the
         # step's FLOP count counts it, None where that count leaves it unsized. XProf's own rates are no
         # measure of it: its model rate put a cuBLAS weight-gradient GEMM of C6's Qwen3.5-0.8B at 550
@@ -277,7 +281,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         # Qwen3.5-0.8B step's GEMMs at 1.127 of the peak).
         flops, calls = (None, 0.0) if known is None else (known.flops, runs * known.runs)
         if flops is None:
-            unsized[kind] += 1
+            found.unsized[kind] += 1
         gflops = flops * calls / (us * 1e-6) / 1e9 if flops is not None and us else None
         # XProf's HBM bandwidth is GiB/s over the op's own time, so the op moves that much a step.
         hbm_mib = float(row.get("hbm_bw") or 0) * us * 1e-6 * 1024
@@ -286,21 +290,68 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
                   "gflops": None if gflops is None else round(gflops, 1), "hbm_mib": round(hbm_mib, 1),
                   "bound_by": row.get("bound_by"),
                   "source": source}
-        everything.append(record)
+        found.everything.append(record)
         if kind == "gemm":
             record["precision"] = gemm_precision(row, known)
             # Model FLOPs exclude remat's recompute, so an FP8 GEMM's recomputed copy is not charged.
             charged = record["precision"] == "fp8" and not (known is not None and known.recomputed)
             if gflops is not None and charged:
-                fp8_gflop += gflops * us * 1e-6
+                found.fp8_gflop += gflops * us * 1e-6
             # Each GEMM against its own precision's peak, as mfu_mixed counts it.
             limit = fp8_peak if record["precision"] == "fp8" else peak
             if limit and gflops is not None:
                 record["fraction_of_peak"] = round(gflops / limit, 3)
                 record["lost_us"] = round(us * max(0.0, 1 - gflops / limit), 1)
-                gemms.append(record)
+                found.gemms.append(record)
         if kind == "layout":
-            layouts.append(record)
+            found.layouts.append(record)
+    return found
+
+
+def _utilization(model_flops: float, timeline: dict[str, float] | None, steps: int, fp8_gflop: float,
+                 peak: float | None, fp8_peak: float | None) -> dict:
+    """Utilization of the step's busy device time, the union of its kernels (`program_window`), a
+    diagnostic beside the canonical MFU over wall time (docs/design/training.md), none without an
+    accelerator timeline. It names its precision: mfu_bf16, model FLOPs over the bf16 peak, which is
+    utilization only when every GEMM is bf16 and otherwise a bf16-equivalent throughput; mfu_mixed, each
+    GEMM's FLOPs over its own precision's peak, the true utilization, null where an FP8 GEMM runs on a
+    device with no FP8 peak in Dew's table."""
+    seconds = timeline["busy"] / steps / 1e9 if timeline else None
+    fp8 = fp8_gflop * 1e9
+    throughput = round(model_flops / seconds / 1e12, 2) if seconds else None
+    found = {"model_flops_per_step": model_flops, "fp8_gemm_flops_per_step": fp8,
+             "bf16_equiv_throughput_tflops": throughput,
+             "mfu_bf16_of_device_time": round(model_flops / seconds / (peak * 1e9), 4) if peak and seconds
+             else None}
+    if seconds and peak and not fp8:
+        found["mfu_mixed_of_device_time"] = found["mfu_bf16_of_device_time"]
+    elif seconds and peak and fp8_peak and fp8 <= model_flops:
+        share = ((model_flops - fp8) / (peak * 1e9) + fp8 / (fp8_peak * 1e9)) / seconds
+        found["mfu_mixed_of_device_time"] = round(share, 4)
+    else:
+        found["mfu_mixed_of_device_time"] = None
+    return found
+
+
+def attribute_time(trace: Path, steps: int, model_flops: float | None,
+                   ops: dict[str, HloInstruction] | None = None, device: str | None = None) -> dict:
+    capture = capture_of(trace)
+    reports = capture / "reports"
+    rows = report_table(reports / "hlo_stats.json")[1]
+    if not rows:
+        return {"capture": str(capture), "error": "hlo_stats.json has no ops: profile with "
+                "XLA_FLAGS=--xla_gpu_enable_command_buffer= so XProf can attribute kernels"}
+    roofline = json.loads((reports / "roofline_model.json").read_text())
+    roofline = roofline[0] if isinstance(roofline, list) else roofline
+    # Dew's dense bf16 peak, the MFU denominator every run reports. XProf's roofline peak is a
+    # different kind of figure (on an RTX PRO 6000, 3,742 TFLOP/s, sparse low precision), kept for
+    # reference only.
+    peak, fp8_peak, peak_source = _peaks(device)
+    xprof_peak = float(roofline.get("p", {}).get("peak_flop_rate", 0) or 0) or None
+    programs = program_times(rows)
+    step = max(programs, key=programs.__getitem__)
+    attributed = _attributed(rows, step, steps, ops, peak, fp8_peak)
+    gemms = attributed.gemms
     timeline = program_window(capture, step)
     figure = {} if timeline is None else {key: round(ns / steps / 1e6, 3) for key, ns in timeline.items()}
     judged_us = sum(record["us"] for record in gemms)
@@ -316,40 +367,21 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         # concurrent kernels each: attribution of where time went, not the device's busy time.
         **{f"device_{key}_ms_per_step": figure.get(key) for key in (
             "window", "busy", "compute", "exposed_communication", "other_programs", "idle")},
-        "op_self_time_ms_per_step": round(sum(by_kind.values()) / 1e3, 3),
+        "op_self_time_ms_per_step": round(sum(attributed.by_kind.values()) / 1e3, 3),
         "by_part_ms": {part: {direction: round(us / 1e3, 3) for direction, us in directions.items()}
-                       for part, directions in heaviest(by_part)},
-        "by_kind_ms": ms(by_kind),
-        "by_part_kind_ms": {part: ms(kinds) for part, kinds in heaviest(by_part_kind)},
-        "unsized_by_kind": dict(unsized),
+                       for part, directions in heaviest(attributed.by_part)},
+        "by_kind_ms": ms(attributed.by_kind),
+        "by_part_kind_ms": {part: ms(kinds) for part, kinds in heaviest(attributed.by_part_kind)},
+        "unsized_by_kind": dict(attributed.unsized),
         "gemm_fraction_of_peak": round(judged / judged_us, 3) if judged_us else None,
         "gemm_lost_ms": round(sum(record["lost_us"] for record in gemms) / 1e3, 3) if peak else None,
         "gemms_by_lost_time": sorted(gemms, key=lambda record: -record["lost_us"])[:25],
-        "layout_moves": sorted(layouts, key=lambda record: -record["us"])[:25],
-        "top_ops": sorted(everything, key=lambda record: -record["us"])[:40],
+        "layout_moves": sorted(attributed.layouts, key=lambda record: -record["us"])[:25],
+        "top_ops": sorted(attributed.everything, key=lambda record: -record["us"])[:40],
         "xprof_steps": report_table(reports / "input_pipeline_analyzer.json", 1)[1][:8],
     }
     if model_flops:
-        # Utilization of the step's busy device time, the union of its kernels (`program_window`), a
-        # diagnostic beside the canonical MFU over wall time (docs/design/training.md), none without an
-        # accelerator timeline. It names its precision: mfu_bf16, model FLOPs over the bf16 peak, which
-        # is utilization only when every GEMM is bf16 and otherwise a bf16-equivalent throughput;
-        # mfu_mixed, each GEMM's FLOPs over its own precision's peak, the true utilization, null where
-        # an FP8 GEMM runs on a device with no FP8 peak in Dew's table.
-        seconds = timeline["busy"] / steps / 1e9 if timeline else None
-        fp8 = fp8_gflop * 1e9
-        throughput = round(model_flops / seconds / 1e12, 2) if seconds else None
-        result.update(model_flops_per_step=model_flops, fp8_gemm_flops_per_step=fp8,
-                      bf16_equiv_throughput_tflops=throughput)
-        result["mfu_bf16_of_device_time"] = (
-            round(model_flops / seconds / (peak * 1e9), 4) if peak and seconds else None)
-        if seconds and peak and not fp8:
-            result["mfu_mixed_of_device_time"] = result["mfu_bf16_of_device_time"]
-        elif seconds and peak and fp8_peak and fp8 <= model_flops:
-            share = ((model_flops - fp8) / (peak * 1e9) + fp8 / (fp8_peak * 1e9)) / seconds
-            result["mfu_mixed_of_device_time"] = round(share, 4)
-        else:
-            result["mfu_mixed_of_device_time"] = None
+        result.update(_utilization(model_flops, timeline, steps, attributed.fp8_gflop, peak, fp8_peak))
     return result
 
 
