@@ -139,7 +139,6 @@ from dew.data.pipeline import (
     accounts,
     children,
     consumed_by,
-    drawn_marked,
     drawn_of,
     examples_bound,
     joined,
@@ -448,14 +447,14 @@ def _chained(
 def _consumes(pipeline: Pipeline) -> bool:
     """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
     examples marks each where its bound is (`examples_bound`), among its stages or those a memory read ran
-    as it held its rows (`_written`), and a phase whose mix later phases read on marks each draw
-    (`MarkDrawn`), so every row after it holds a count."""
+    as it held its rows (`_written`), so every row after it holds a count. A phase whose mix other phases
+    read on counts its draws too (`_Build.counting`)."""
     source = pipeline.source
     stages = pipeline.stages if isinstance(source, (Mixture, Phases)) else _written(source, pipeline.stages)
-    return examples_bound(stages) is not None or drawn_marked(stages)
+    return examples_bound(stages) is not None
 
 
-def _completes(pipeline: Pipeline, at: int) -> bool:
+def _completes(pipeline: Pipeline, at: int, counting: bool) -> bool:
     """Whether a shuffle at `at` in `pipeline` draws windows holding pieces of the examples a run bounded in
     examples counts (`_consumes`): a layout before it lays them across windows (`cuts`), among its
     stages or those a memory read ran as it held its rows (`_written`), so each count waits for its
@@ -463,7 +462,7 @@ def _completes(pipeline: Pipeline, at: int) -> bool:
     source = pipeline.source
     before = pipeline.stages[:at]
     laid = before if isinstance(source, (Mixture, Phases)) else _written(source, before)
-    return _consumes(pipeline) and cuts(laid)
+    return counting and cuts(laid)
 
 
 def _reach(pipeline: Pipeline, at: int) -> int | None:
@@ -1254,6 +1253,12 @@ class _Build:
     each draw of them says which it is (`DRAWN`, `dew.data.mixing.Stamping`), so the phase that reads one
     next continues it from the draws the run trained. Empty for any other read."""
 
+    def counting(self, pipeline: Pipeline) -> bool:
+        """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
+        examples marks them (`_consumes`), and a phase's mix whose members other phases read on marks each
+        of its draws (`stamped`, `dew.data.mixing.Stamping`)."""
+        return _consumes(pipeline) or bool(self.stamped)
+
     @property
     def global_order(self) -> bool:
         return not self.lowering.per_share
@@ -1409,7 +1414,7 @@ class _Build:
         per share counts each member's source examples where its rows are delivered (a run bounded in
         examples, `_consumes`); none elsewhere, a global order's counting nothing as it reads."""
         source = pipeline.source
-        if self.global_order or not isinstance(source, Mixture) or not _consumes(pipeline):
+        if self.global_order or not isinstance(source, Mixture) or not self.counting(pipeline):
             return ()
         keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         return tuple((key, _name(child), _label(child))
@@ -1695,7 +1700,7 @@ class _Build:
                 # those it carries for refused ones, `REFUSED`), in the reading process; any other counts
                 # each before the objective's step makes rows of it, and not again after, nor where a
                 # memory read made rows of them before (`_counts_rows`).
-                examples, counting = True, _consumes(pipeline)
+                examples, counting = True, self.counting(pipeline)
                 rows = rows if counting else Accepted(_as_iter(rows, self.loading), _name(pipeline),
                                                       _label(pipeline), rows=_counts_rows(pipeline, index))
             if record_stage_of(stage):
@@ -1757,7 +1762,7 @@ class _Build:
         stage the read goes on from."""
         stage = pipeline.stages[at]
         counted = isinstance(stage, FlatMap) and stage.examples and counting
-        examples, counting = (True, _consumes(pipeline)) if counted else (examples, counting)
+        examples, counting = (True, self.counting(pipeline)) if counted else (examples, counting)
         # The hand-off ends a spread at its first stage that is no record step (`_handoff`).
         run = tuple(stage for stage in pipeline.stages[at:carried] if record_stage_of(stage))
         assert len(run) == carried - at, "a spread runs record steps alone"
@@ -1835,7 +1840,7 @@ class _Build:
             return _repeated(rows, stage.epochs, _name(pipeline), self.loading, certain=certain)
         from dew.data.ordering import WindowShuffle
 
-        if isinstance(stage, Shuffle) and _completes(pipeline, at):
+        if isinstance(stage, Shuffle) and _completes(pipeline, at, self.counting(pipeline)):
             # Each example's count waits for every window holding a piece of it (`dew.data.completion`).
             units = Numbered(_as_iter(rows, self.loading), reach=_reach(pipeline, at))
             if self.read == "memory":
@@ -1873,7 +1878,7 @@ class _Build:
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage))
-            if _consumes(pipeline):
+            if self.counting(pipeline):
                 rows = Carried(rows)
         else:
             return self.layout_stage(rows, stage, pipeline, at)
@@ -1886,7 +1891,7 @@ class _Build:
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
             rows = _TokenSplit(rows, stage)
         elif isinstance(stage, (Pack, Windows)):
-            ruled = _Ruled(_as_iter(rows, self.loading), stage, consumed=_consumes(pipeline),
+            ruled = _Ruled(_as_iter(rows, self.loading), stage, consumed=self.counting(pipeline),
                            members=bool(self.counted_members(pipeline)), drawn=bool(self.stamped))
             rows = self.targeted(ruled, stage.fields[0], pipeline, at + 1)
         elif isinstance(stage, Artifact):

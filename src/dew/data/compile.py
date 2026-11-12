@@ -115,7 +115,6 @@ from dew.data.pipeline import (
     MapBatch,
     MapWithIndex,
     MarkConsumed,
-    MarkDrawn,
     Mixture,
     Native,
     ObjectiveData,
@@ -1375,7 +1374,7 @@ def _compile_phases(
                   ) -> _Staged:
         """Phase `index`, each corpus it reads continued past what the phases before it read of it: on its
         own stream, those it shares with other phases stamped (`members`, `_stamped`)."""
-        phase = _drawn(_continued(source.pipelines[index], consumed), members or {})
+        phase = _continued(source.pipelines[index], consumed)
         return _stamped(_staged(phase._then(*train.stages), validation if index == 0 else None,
                                 objective=objective, read=read, provision=provision, loading=loading,
                                 seed=seed, rejections=rejections, version=plan_version), members or {})
@@ -1532,14 +1531,6 @@ def _stamped(staged: _Staged, members: Mapping[str, str]) -> _Staged:
     if not members:
         return staged
     return dataclasses.replace(staged, build=dataclasses.replace(staged.build, stamped=frozenset(members)))
-
-
-def _drawn(pipeline: Pipeline, members: Mapping[str, str]) -> Pipeline:
-    """`pipeline`, a phase whose mix members later or earlier phases read on (`members`), marking each draw
-    of its mix (`MarkDrawn`) right after it."""
-    if not members:
-        return pipeline
-    return dataclasses.replace(pipeline, stages=(Map(MarkDrawn()), *pipeline.stages))
 
 
 def _updates_aligned(ends: Sequence[int | None], batches: Sequence[int], window: int = 1) -> None:

@@ -194,22 +194,6 @@ class MarkConsumed:
         return {**element, CONSUMED: 1, REFUSED: 0}
 
 
-class MarkDrawn:
-    """The step right after a phase's mix whose members other phases read on (`dew.data.compile`), which
-    says its rows carry counts (`drawn_marked`): the mix itself marks each row it draws one consumed source
-    example (`CONSUMED`) with its draw (`DRAWN`, `dew.data.mixing.Stamping`), so every carrier after it moves
-    them. A record step, as every step after the mix is, sees no counts (`consumed_by`); it hands each row
-    on as it is."""
-
-    def __call__(self, element: Batch) -> Batch:
-        return element
-
-
-def drawn_marked(stages: Sequence[object]) -> bool:
-    """Whether `stages` mark a phase's draws (`MarkDrawn`)."""
-    return any(isinstance(stage, Map) and isinstance(stage.step, MarkDrawn) for stage in stages)
-
-
 @dataclasses.dataclass
 class Owed:
     """The source examples rows a step dropped or made none of were the last of (`Rejected.consumed`),
