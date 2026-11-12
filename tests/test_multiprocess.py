@@ -1553,11 +1553,11 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
 
     assert [report["arrivals"] for report in reports] == [[0, 1], [0, 1]]
     # Every rank refuses each rank-local invalid input, both returning from it (the worker fails on one
-    # accepted), by its category whatever its words: rank 1, whose input it is, as invalid, and rank 0 as
-    # its peer's failure.
+    # accepted), by its category whatever its words: rank 1, whose input it is, as invalid (a token past
+    # the model's table as `OutsideTable`), and rank 0 as its peer's failure.
     faults = ("token", "length", "key", "component")
-    assert [report["invalid_errors"] for report in reports] == [dict.fromkeys(faults, "PeerFailure"),
-                                                              dict.fromkeys(faults, "ValueError")]
+    invalid = {**dict.fromkeys(faults, "ValueError"), "token": "OutsideTable"}
+    assert [report["invalid_errors"] for report in reports] == [dict.fromkeys(faults, "PeerFailure"), invalid]
     # Over weights on no mesh, rank 1's zero prompt length is its own refusal
     # and rank 0 samples its rows without hearing of it.
     assert reports[0]["meshless"] == {"rows": 2 * len(reports[0]["prompt_lengths"])}
