@@ -114,7 +114,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_decision_joint_checkpoint.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Training"
   },
   "tests/test_decision_laya.py": {
