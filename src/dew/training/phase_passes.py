@@ -13,7 +13,7 @@ from __future__ import annotations
 import contextlib
 from collections.abc import Hashable, Iterator, Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Protocol
 
 from flax import linen as nn
 
@@ -22,11 +22,11 @@ from dew.nn.protocols import Looped, Looping
 from dew.objectives.base import Objective
 
 
-class Holding(Protocol):
+class Holding[L, E](Protocol):
     """What holds the objective a step is built from: a `Trainer`, and the `StepCompiler` that compiles
     it."""
 
-    objective: Objective[Any, Any]
+    objective: Objective[L, E]
 
 
 def _looped(module: nn.Module) -> bool:
@@ -51,10 +51,11 @@ def _passed(module: nn.Module, passes: int) -> nn.Module:
 
 @dataclass
 class PhasePasses[L, E]:
-    """A pass count a phase of a run's data (`counts`, none where every step runs the objective's own),
-    the count the step being compiled runs (`current`, None for the objective's own), and the objective
-    at each count a step was built at (`objective_for`)."""
+    """The run's own objective (`base`), a pass count a phase of its data (`counts`, none where every step
+    runs the objective's own), the count the step being compiled runs (`current`, None for the
+    objective's own), and the objective at each count a step was built at (`objective_for`)."""
 
+    base: Objective[L, E]
     counts: tuple[int, ...] = ()
     current: int | None = None
     built: dict[int, Objective[L, E]] = field(default_factory=dict)
@@ -64,7 +65,7 @@ class PhasePasses[L, E]:
         """`stated` checked: each count at least one, the objective's modules looping, the last phase's count
         the one they hold, the model the run hands on. No counts where it states none."""
         if stated is None:
-            return cls()
+            return cls(objective)
         counts = tuple(int(count) for count in stated)
         if not counts or min(counts) < 1:
             raise ValueError(f"phase_passes runs each phase at least one pass, got {list(counts)}")
@@ -77,19 +78,23 @@ class PhasePasses[L, E]:
         if held != {counts[-1]}:
             raise ValueError(f"the objective's loop runs {sorted(held)} passes and the last phase "
                              f"{counts[-1]}: it holds the count the run hands on")
-        return cls(counts)
+        return cls(objective, counts)
 
-    def at(self, batch: Batch) -> int | None:
-        """The count of the phase `batch` was read in (its host `PHASE`, phase 0 where its data has none),
-        taken as the step being compiled's (`current`); None where the run states no counts. A phase past
-        the counts is refused, naming both."""
+    def count(self, batch: Batch) -> int | None:
+        """The count of the phase `batch` was read in (its host `PHASE`, phase 0 where its data has none);
+        None where the run states no counts. A phase past the counts is refused, naming both."""
         if not self.counts:
             return None
         phase = batch[PHASE].index if PHASE in batch else 0
         if phase >= len(self.counts):
             raise ValueError(f"a batch of the run's phase {phase} meets phase_passes of {len(self.counts)} "
                              "phase(s): one count a phase")
-        self.current = self.counts[phase]
+        return self.counts[phase]
+
+    def at(self, batch: Batch) -> int | None:
+        """The count of the phase `batch` was read in (`count`), taken as the step being compiled's
+        (`current`)."""
+        self.current = self.count(batch)
         return self.current
 
     def key(self, signature: Hashable) -> Hashable:
@@ -107,24 +112,26 @@ class PhasePasses[L, E]:
             self.run(objective, self.current)
 
     @contextlib.contextmanager
-    def scoped(self, *holders: Holding) -> Iterator[None]:
+    def scoped(self, *holders: Holding[L, E]) -> Iterator[None]:
         """Each of `holders`' objective at the step's count while a step is built (`objective_for`), the one
-        the step and its host runner hold; each's own again after."""
-        bases = [holder.objective for holder in holders]
-        for holder, base in zip(holders, bases, strict=True):
-            holder.objective = self.objective_for(base)
+        the step and its host runner hold; the run's own again after."""
+        for holder in holders:
+            holder.objective = self.objective_for(self.current)
         try:
             yield
         finally:
-            for holder, base in zip(holders, bases, strict=True):
-                holder.objective = base
+            for holder in holders:
+                holder.objective = self.base
 
-    def objective_for(self, base: Objective[L, E]) -> Objective[L, E]:
-        """`base`, the run's objective at the last phase's count, at the step's count (`current`): a copy of
-        it whose looped modules run that many passes, kept for every step of the count, which a step and
-        its host runner hold while validation and the model the run hands on read `base`."""
-        if self.current is None or self.current == self.counts[-1]:
-            return base
-        if self.current not in self.built:
-            self.built[self.current] = base.substituted(_counted(base, self.current))
-        return self.built[self.current]
+    def objective_for(self, passes: int | None) -> Objective[L, E]:
+        """The run's objective (`base`, at the last phase's count) at `passes` (a phase's `count`, the
+        step's `current`): a copy of it whose looped modules run that many passes, kept for every step of
+        the count, which a step, its host runner and its batches' counts (`Trainer._counted_batch`, on the
+        prefetch worker) hold while validation and the model the run hands on read `base`. Read off
+        `base`, never off a holder that holds a count's copy meanwhile; one copy a count, whichever thread
+        asks first."""
+        if passes is None or passes == self.counts[-1]:
+            return self.base
+        if passes not in self.built:
+            self.built.setdefault(passes, self.base.substituted(_counted(self.base, passes)))
+        return self.built[passes]

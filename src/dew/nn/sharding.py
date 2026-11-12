@@ -50,6 +50,7 @@ import optax
 from flax import linen as nn
 from flax.typing import Initializer
 
+from dew import _cache
 from dew.batch import FROZEN
 from dew.mesh import (
     SEQUENCE_AXIS,
@@ -110,21 +111,16 @@ class Schedule:
 _SCHEDULE: contextvars.ContextVar[Schedule | None] = contextvars.ContextVar(
     'pipeline_schedule', default=None)
 
-_WHOLE: contextvars.ContextVar[bool] = contextvars.ContextVar('whole_stack', default=False)
-
-
 @contextlib.contextmanager
 def whole() -> Iterator[None]:
     """Run the model's layer stack and sequences whole: under it `pipeline_stages()` and `sequence_shards()`
     read 1, so a model traced on a mesh with a stage or sequence axis runs every layer on every token as
     one device does, while the mesh, its expert axis among it, stays in context for the layers that read
     it (an expert exchange). A server decodes a run trained on such a mesh under it (`dew.inference.Server`),
-    one token a step leaving no microbatches to pipeline and no sequence to split."""
-    token = _WHOLE.set(True)
-    try:
+    one token a step leaving no microbatches to pipeline and no sequence to split. A JAX user context
+    (`dew._cache.WHOLE`): what a trace reads through it is part of its call's identity."""
+    with _cache.WHOLE(new_value=True):
         yield
-    finally:
-        _WHOLE.reset(token)
 
 
 def pipeline_stages() -> int:
@@ -136,7 +132,7 @@ def pipeline_stages() -> int:
     runs its layer stack whole.
     """
     mesh = jax.sharding.get_abstract_mesh()
-    return 1 if mesh.empty or _WHOLE.get() else mesh.shape.get(STAGE_AXIS, 1)
+    return 1 if mesh.empty or _cache.WHOLE.value else mesh.shape.get(STAGE_AXIS, 1)
 
 
 @contextlib.contextmanager
@@ -382,7 +378,7 @@ def sequence_shards() -> int:
     which is how Ulysses's exchange runs a whole-sequence kernel.
     """
     mesh = jax.sharding.get_abstract_mesh()
-    if mesh.empty or _WHOLE.get() or SEQUENCE_AXIS in mesh.manual_axes:
+    if mesh.empty or _cache.WHOLE.value or SEQUENCE_AXIS in mesh.manual_axes:
         return 1
     return mesh.shape.get(SEQUENCE_AXIS, 1)
 

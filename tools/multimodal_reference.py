@@ -3,6 +3,7 @@
 Run with transformers 5.16.1, Torch and tokenizers installed:
     PYTHONPATH=src python tools/multimodal_reference.py
     PYTHONPATH=src:. python tools/multimodal_reference.py float64 [family ...]  # the float64 truths
+    PYTHONPATH=src python tools/multimodal_reference.py processors  # each fixture's processor alone
 
 No network access or pretrained downloads are used. Each family's existing
 tiny fixture supplies the weights, and every reference lands in
@@ -37,23 +38,37 @@ from multimodal_families import DRAWN, FAMILIES, LEARNING_RATE
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 
 
-def _tokenizer(vocab_size: int, special: dict[str, int], **token_attributes: str) -> GemmaTokenizer:
-    """A local vocabulary with stable IDs under the public tokenizer serializer."""
+def _tokenizer(vocab_size: int, special: dict[str, int], **token_attributes: str | None) -> GemmaTokenizer:
+    """A local vocabulary with stable IDs under the public tokenizer serializer, every id inside the model's
+    table of `vocab_size` rows: each special token, the bos, eos, pad and unk tokens and every one
+    `token_attributes` names (its family's own, as its real tokenizer names them: `GemmaTokenizer`'s mask
+    token none unless named), a row `special` places; a token past the table embeds as no row (jnp.take's
+    fill, a NaN loss), so one named without a row is refused."""
+    attributes = {"bos_token": "<bos>", "eos_token": "<eos>", "pad_token": "<pad>", "unk_token": "<unk>",
+                  "mask_token": None, **token_attributes}
+    unplaced = sorted(token for token in attributes.values() if token is not None and token not in special)
+    if unplaced or any(not 0 <= index < vocab_size for index in special.values()):
+        raise SystemExit(f"special tokens {unplaced or sorted(special)} take no row of the {vocab_size}-row "
+                         "table: place each in `special`")
     vocab = {f"token{i}": i for i in range(vocab_size)}
     for token, index in special.items():
         del vocab[f"token{index}"]
         vocab[token] = index
     backend = Tokenizer(models.WordLevel(vocab, unk_token="<unk>"))
     backend.pre_tokenizer = pre_tokenizers.Whitespace()
-    tokenizer = GemmaTokenizer(
-        tokenizer_object=backend, bos_token="<bos>", eos_token="<eos>", pad_token="<pad>",
-        unk_token="<unk>", boi_token="<start_of_image>", eoi_token="<end_of_image>",
-        image_token="<image_soft_token>", padding_side="left", **token_attributes)
+    tokenizer = GemmaTokenizer(tokenizer_object=backend, padding_side="left", **attributes)
     tokenizer.add_tokens([AddedToken(word, single_word=True, normalized=False)
                           for word in vocab if word.startswith("token")])
     tokenizer.add_tokens([AddedToken(word, special=True, normalized=False)
                           for word in special if word not in tokenizer.all_special_tokens])
+    if max(tokenizer.get_vocab().values()) >= vocab_size:
+        raise SystemExit(f"the tokenizer holds ids past the {vocab_size}-row table")
     return tokenizer
+
+
+GEMMA_IMAGE = {"boi_token": "<start_of_image>", "eoi_token": "<end_of_image>",
+               "image_token": "<image_soft_token>"}
+"""The image tokens Gemma's tokenizer names (`GemmaTokenizer`'s), which its processors read."""
 
 
 
@@ -275,7 +290,8 @@ def qwen3_vl_processor(directory: Path):
     special = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
                "<image_soft_token>": 200, "<video>": 201,
                "<start_of_image>": 202, "<end_of_image>": 203}
-    tokenizer = _tokenizer(256, special, video_token="<video>",
+    # Qwen's tokenizer names no mask token.
+    tokenizer = _tokenizer(256, special, **GEMMA_IMAGE, video_token="<video>",
                            vision_start_token="<start_of_image>", vision_end_token="<end_of_image>")
     processor = Qwen3VLProcessor(
         Qwen2VLImageProcessor(patch_size=8, temporal_patch_size=2, merge_size=2, do_resize=False),
@@ -284,17 +300,23 @@ def qwen3_vl_processor(directory: Path):
     return AutoProcessor.from_pretrained(directory, local_files_only=True), tokenizer
 
 
+def gemma3_processor(destination: Path):
+    """Gemma 3's processor over a 256-token tokenizer, saved to `destination` and read back as a checkpoint's
+    is: Gemma's tokenizer names a mask token, here a row of the table no prompt's word holds."""
+    special = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
+               "<start_of_image>": 200, "<end_of_image>": 201, "<image_soft_token>": 202, "<mask>": 203}
+    tokenizer = _tokenizer(256, special, **GEMMA_IMAGE, mask_token="<mask>")
+    processor = Gemma3Processor(
+        Gemma3ImageProcessorPil(size={"height": 28, "width": 28}), tokenizer, image_seq_length=4)
+    processor.save_pretrained(destination)
+    return AutoProcessor.from_pretrained(destination, local_files_only=True, backend="pil")
+
+
 def write_gemma3_native() -> None:
     """The actual public processor and conditional model over unequal image rows."""
     model, destination = _copied("gemma3-tiny-mm", "gemma3-native-tiny", Gemma3Config,
                                  Gemma3ForConditionalGeneration, mm_tokens_per_image=4)
-    special = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
-               "<start_of_image>": 200, "<end_of_image>": 201, "<image_soft_token>": 202}
-    tokenizer = _tokenizer(256, special)
-    processor = Gemma3Processor(
-        Gemma3ImageProcessorPil(size={"height": 28, "width": 28}), tokenizer, image_seq_length=4)
-    processor.save_pretrained(destination)
-    processor = AutoProcessor.from_pretrained(destination, local_files_only=True, backend="pil")
+    processor = gemma3_processor(destination)
     generator = np.random.default_rng(903)
     images = generator.integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
     prompts = ["token7 <start_of_image> token9",
@@ -302,16 +324,27 @@ def write_gemma3_native() -> None:
     _write_forward_backward(model, processor, destination, images, prompts)
 
 
+def gemma4_processor():
+    """Gemma 4's processor over a 64-token tokenizer: Gemma's tokenizer names a mask token, here a row of
+    the table no prompt's word holds."""
+    from transformers import Gemma4AudioFeatureExtractor, Gemma4Processor, Gemma4VideoProcessor
+    from transformers.models.gemma4.image_processing_pil_gemma4 import Gemma4ImageProcessorPil
+
+    special = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
+               "<|video|>": 56, "<audio>": 57, "<start_of_audio>": 58, "<end_of_audio>": 59,
+               "<image_soft_token>": 60, "<start_of_image>": 61, "<end_of_image>": 62, "<mask>": 63}
+    tokenizer = _tokenizer(64, special, **GEMMA_IMAGE, mask_token="<mask>", audio_token="<audio>",
+                           boa_token="<start_of_audio>", eoa_token="<end_of_audio>")
+    return Gemma4Processor(
+        Gemma4AudioFeatureExtractor(),
+        Gemma4ImageProcessorPil(patch_size=8, pooling_kernel_size=2,
+                                max_soft_tokens=70, do_resize=False),
+        tokenizer, Gemma4VideoProcessor())
+
+
 def write_gemma4_native() -> None:
     """Released patch preprocessing, active clipping and frozen standardization."""
-    from transformers import (
-        Gemma4AudioFeatureExtractor,
-        Gemma4Config,
-        Gemma4ForConditionalGeneration,
-        Gemma4Processor,
-        Gemma4VideoProcessor,
-    )
-    from transformers.models.gemma4.image_processing_pil_gemma4 import Gemma4ImageProcessorPil
+    from transformers import Gemma4Config, Gemma4ForConditionalGeneration
 
     source = ROOT / "gemma4-tiny-mm"
     destination = ROOT / "gemma4-native-tiny"
@@ -333,16 +366,7 @@ def write_gemma4_native() -> None:
     model.load_state_dict(tensors, strict=True)
     save_file(tensors, str(destination / "model.safetensors"))
     hf_config.save_pretrained(destination)
-    special = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
-               "<|video|>": 56, "<audio>": 57, "<start_of_audio>": 58, "<end_of_audio>": 59,
-               "<image_soft_token>": 60, "<start_of_image>": 61, "<end_of_image>": 62}
-    tokenizer = _tokenizer(64, special, audio_token="<audio>",
-                           boa_token="<start_of_audio>", eoa_token="<end_of_audio>")
-    processor = Gemma4Processor(
-        Gemma4AudioFeatureExtractor(),
-        Gemma4ImageProcessorPil(patch_size=8, pooling_kernel_size=2,
-                                max_soft_tokens=70, do_resize=False),
-        tokenizer, Gemma4VideoProcessor())
+    processor = gemma4_processor()
     processor.save_pretrained(destination)
     processor = AutoProcessor.from_pretrained(destination, local_files_only=True)
     images = np.random.default_rng(1304).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
@@ -382,17 +406,32 @@ def unified_draw(config, seed: int, *, side: int = 2) -> dict[str, np.ndarray]:
             "input_features_mask": np.asarray([[1, 0, 1, 1], [1, 1, 0, 0]], bool)}
 
 
-def write_gemma4_unified_native() -> None:
-    """The encoder-free wrapper's tiny source, with the release's public image/audio processor."""
-    from hf_reference import scatter_weights
+def gemma4_unified_processor():
+    """Gemma 4's encoder-free processor over a 64-token tokenizer: Gemma's tokenizer names a mask token,
+    here a row of the table no draw holds (`unified_draw` draws ids 4 to 49)."""
     from transformers import (
         Gemma4UnifiedAudioFeatureExtractor,
-        Gemma4UnifiedConfig,
-        Gemma4UnifiedForConditionalGeneration,
         Gemma4UnifiedImageProcessor,
         Gemma4UnifiedProcessor,
         Gemma4UnifiedVideoProcessor,
     )
+
+    special = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3,
+               "<|video|>": 56, "<audio>": 57, "<start_of_audio>": 58, "<end_of_audio>": 59,
+               "<image_soft_token>": 60, "<start_of_image>": 61, "<end_of_image>": 62, "<mask>": 63}
+    tokenizer = _tokenizer(64, special, **GEMMA_IMAGE, mask_token="<mask>", audio_token="<audio>",
+                           video_token="<|video|>", boa_token="<start_of_audio>", eoa_token="<end_of_audio>")
+    return Gemma4UnifiedProcessor(
+        Gemma4UnifiedAudioFeatureExtractor(feature_size=16, audio_samples_per_token=16),
+        Gemma4UnifiedImageProcessor(patch_size=2, pooling_kernel_size=2, max_soft_tokens=70, do_resize=False),
+        tokenizer, Gemma4UnifiedVideoProcessor(patch_size=2, pooling_kernel_size=2, max_soft_tokens=70),
+        audio_ms_per_token=1)
+
+
+def write_gemma4_unified_native() -> None:
+    """The encoder-free wrapper's tiny source, with the release's public image/audio processor."""
+    from hf_reference import scatter_weights
+    from transformers import Gemma4UnifiedConfig, Gemma4UnifiedForConditionalGeneration
 
     destination = ROOT / "gemma4-unified-native-tiny"
     destination.mkdir(parents=True, exist_ok=True)
@@ -425,17 +464,7 @@ def write_gemma4_unified_native() -> None:
     (text / "config.json").write_text(json.dumps(
         {**stated["text_config"], "transformers_version": stated["transformers_version"]},
         indent=2, sort_keys=True) + "\n")
-    special = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3,
-               "<|video|>": 56, "<audio>": 57, "<start_of_audio>": 58, "<end_of_audio>": 59,
-               "<image_soft_token>": 60, "<start_of_image>": 61, "<end_of_image>": 62}
-    tokenizer = _tokenizer(64, special, audio_token="<audio>", video_token="<|video|>",
-                           boa_token="<start_of_audio>", eoa_token="<end_of_audio>")
-    processor = Gemma4UnifiedProcessor(
-        Gemma4UnifiedAudioFeatureExtractor(feature_size=16, audio_samples_per_token=16),
-        Gemma4UnifiedImageProcessor(patch_size=2, pooling_kernel_size=2, max_soft_tokens=70, do_resize=False),
-        tokenizer, Gemma4UnifiedVideoProcessor(patch_size=2, pooling_kernel_size=2, max_soft_tokens=70),
-        audio_ms_per_token=1)
-    processor.save_pretrained(destination)
+    gemma4_unified_processor().save_pretrained(destination)
     inputs = unified_draw(config, 0)
     with torch.no_grad():
         result = model(**{name: torch.from_numpy(value) for name, value in inputs.items()}, use_cache=False)
@@ -465,22 +494,30 @@ def write_float64_truths(references: str, checkpoint: str) -> None:
     print(destination, "float64 loss", float(found["loss"]), flush=True)
 
 
-def write_llama4_native() -> None:
-    """The actual Llama4Processor tiling: local tiles, a global tile and separators."""
-    from transformers import Llama4Config, Llama4ForConditionalGeneration, Llama4Processor
+def llama4_processor(destination: Path, vocab_size: int):
+    """Llama 4's processor over a tokenizer of `vocab_size` ids, saved to `destination` and read back as a
+    checkpoint's is: Llama 4's tokenizer names no mask token and none of Gemma's image tokens."""
+    from transformers import Llama4Processor
     from transformers.models.llama4.image_processing_llama4 import Llama4ImageProcessor
 
-    model, destination = _copied("llama4-tiny-mm", "llama4-native-tiny", Llama4Config,
-                                 Llama4ForConditionalGeneration)
     special = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3,
                "<|image_start|>": 90, "<|image_end|>": 91, "<|patch|>": 92, "<|image|>": 93,
                "<|tile_x_separator|>": 94, "<|tile_y_separator|>": 95}
-    tokenizer = _tokenizer(model.config.text_config.vocab_size, special)
+    tokenizer = _tokenizer(vocab_size, special)
     processor = Llama4Processor(
         Llama4ImageProcessor(size={"height": 28, "width": 28}, max_patches=4, resize_to_max_canvas=False),
         tokenizer, patch_size=14, pixel_shuffle_ratio=0.5)
     processor.save_pretrained(destination)
-    processor = AutoProcessor.from_pretrained(destination, local_files_only=True)
+    return AutoProcessor.from_pretrained(destination, local_files_only=True)
+
+
+def write_llama4_native() -> None:
+    """The actual Llama4Processor tiling: local tiles, a global tile and separators."""
+    from transformers import Llama4Config, Llama4ForConditionalGeneration
+
+    model, destination = _copied("llama4-tiny-mm", "llama4-native-tiny", Llama4Config,
+                                 Llama4ForConditionalGeneration)
+    processor = llama4_processor(destination, model.config.text_config.vocab_size)
     images = np.random.default_rng(1707).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
     prompts = ["token7 <|image|> token9", "token5 <|image|> token8 <|image|> token6"]
     # Its numerics are its drawn site's (tools/multimodal_worker.py, multimodal_families.DRAWN).
@@ -503,9 +540,29 @@ def write_qwen35_native() -> None:
 
 
 
+def write_processors() -> None:
+    """Each native fixture's processor alone, its tokenizer's every id inside its model's table, and its
+    recordings, which no special token's id enters, left as they are: Gemma 3's, Gemma 4's and its
+    encoder-free wrapper's, Llama 4's, and the Qwen3-VL processor of Qwen3.5's, its MoE's and Qwen4-Exp's."""
+    gemma3_processor(ROOT / "gemma3-native-tiny")
+    gemma4_processor().save_pretrained(ROOT / "gemma4-native-tiny")
+    gemma4_unified_processor().save_pretrained(ROOT / "gemma4-unified-native-tiny")
+    llama4 = json.loads((ROOT / "llama4-native-tiny" / "config.json").read_text())
+    llama4_processor(ROOT / "llama4-native-tiny", llama4["text_config"]["vocab_size"])
+    for name in ("qwen35-native-tiny", "qwen35-moe-native-tiny"):
+        qwen3_vl_processor(ROOT / name)
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from qwen4_exp_reference import native_processor
+
+    native_processor(ROOT / "qwen4-exp-native-tiny")
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["gemma4-unified"]:
         write_gemma4_unified_native()
+        sys.exit()
+    if sys.argv[1:] == ["processors"]:
+        write_processors()
         sys.exit()
     if sys.argv[1:2] == ["float64"]:
         for family in sys.argv[2:] or sorted(set(FAMILIES) - DRAWN):

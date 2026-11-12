@@ -23,6 +23,7 @@ from typing_extensions import TypeVar, get_protocol_members
 
 from dew._distributions import draw, wellformed
 from dew.batch import Variables, coordinates, real_slots, token_id, token_ids
+from dew.inputs.spec import Field
 from dew.interop.weights import decoding_storage
 from dew.nn import categorical
 from dew.nn.inputs import (
@@ -341,6 +342,8 @@ def _validated(model: nn.Module, process: BlockProcess, inputs: ModelInputs, max
     _, prompt_length = inputs.tokens.shape
     if prompt_length == 0:
         raise ValueError("a block-diffusion prompt must contain at least one token")
+    # A prompt's ids within the model's table, as every request's are (`check_inputs`).
+    Field.indexing("tokens", (), model).bounded(local_rows(inputs.tokens))
     blocks = (max_new_tokens + process.canvas_length - 1) // process.canvas_length
     if prompt_length + blocks * process.canvas_length > model.max_seq_len:
         raise ValueError("prompt plus rounded-up canvases exceeds max_seq_len")

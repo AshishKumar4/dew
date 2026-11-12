@@ -18,11 +18,12 @@ that: `dew.data` writes the envelope and `dew.checkpoints` reads it.
 
 from __future__ import annotations
 
+import base64
 import dataclasses
 import json
 from collections.abc import Mapping
 
-from dew._records import integer, record
+from dew._records import integer, record, text
 
 ENVELOPE = "dew_global_position"
 """The key a global position is written under.
@@ -157,6 +158,21 @@ def ramped(position: bytes) -> Ramped | None:
                   integer(held["skip"], "records skipped"), integer(held["records"], "records handed over"))
 
 
+STEP_PHASES = "dew_step_phases"
+"""The key a read of phases each its own stream writes its position under (`dew.data.dataset.StepPhases`):
+the phase it stands in, the steps it has read, the phases it finished and how, and that phase's own
+reader's position (`position`, base64), which is what a process count reads."""
+
+
+def phase_position(position: bytes) -> bytes | None:
+    """The position of the phase's own reader inside a read of phases' `position` (`STEP_PHASES`), or None
+    for any other kind."""
+    held = _enveloped(position, STEP_PHASES)
+    if held is None:
+        return None
+    return base64.b64decode(text(held["position"], "the saved phase's position"))
+
+
 def _enveloped(position: bytes, key: str) -> dict | None:
     """The object `position` holds under dew's `key`, None where it is not JSON or holds no object
     there."""
@@ -173,5 +189,8 @@ def _enveloped(position: bytes, key: str) -> dict | None:
 def translates(position: bytes) -> bool:
     """Whether a process count other than the one that wrote `position` can
     read it: true for a global position, an elastic read's and a ramp's over
-    one, false for one shard's own offset."""
+    one, false for one shard's own offset; a read of phases' as its phase's
+    own reader's (`phase_position`)."""
+    if (phased := phase_position(position)) is not None:
+        return translates(phased)
     return decode(position) is not None or replicated(position) is not None or ramped(position) is not None

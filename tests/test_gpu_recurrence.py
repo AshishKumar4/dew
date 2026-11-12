@@ -202,14 +202,19 @@ def template_stability_cells() -> list[Cell]:
             for name, regime, product, forms in template_stability.CASES]
 
 
-def portable_and_ssd_port_cells() -> list[Cell]:
-    """The portable backward as a GPU compiles it, and the SSD port's forward and gradient under every
-    regime, and the SSD on the template against mamba_ssm."""
+def portable_cells() -> list[Cell]:
+    """The portable backward as a GPU compiles it in a user's process (`USERS`): its products at the
+    precision a user's run gives them, JAX's default unless they state one."""
+    exact = stability.test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences
+    label = "the portable backward as a GPU compiles it is as exact as the recurrence's"
+    return [Cell(f"{label}: {name} {regime}", functools.partial(exact, name, regime))
+            for name, regime in stability.ACCELERATED]
+
+
+def ssd_port_cells() -> list[Cell]:
+    """The SSD port's forward and gradient under every regime, and the SSD on the template against
+    mamba_ssm."""
     return [
-        *(Cell(f"the portable backward as a GPU compiles it is as exact as the recurrence's: {name} {regime}",
-               functools.partial(stability.test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences,
-                                 name, regime))
-          for name, regime in stability.ACCELERATED),
         *(Cell(f"the SSD port stays finite and exact where chunked forms break: {regime}",
                functools.partial(stability.the_ssd_port_stays_finite_and_exact_where_chunked_forms_break,
                                  regime))
@@ -276,7 +281,7 @@ def decode_cells() -> list[Cell]:
 
 
 FAMILIES = {"two-role walk": walk_cells, "template stability": template_stability_cells,
-            "portable and SSD port": portable_and_ssd_port_cells, "selective scan": selective_cells,
+            "portable": portable_cells, "SSD port": ssd_port_cells, "selective scan": selective_cells,
             "port training and decode": lambda: [*port_training_cells(), *decode_cells()]}
 """The recurrence cells by family, each family a test of its own: the planner times and packs each, and one
 family's failure hides no other's (a single flow of every family ran past a GPU job's 50 minutes). A
@@ -284,8 +289,16 @@ layer's port training and its decode run as one flow. The Mosaic mainloop's forw
 the model flows' (tests/test_gpu_flows.py: Kimi's delta attention, Qwen3-Next's gated delta net, MiniMax's
 lightning attention), its cases the CPU's, interpreted and through the compile gate (row 5461)."""
 
+USERS = {"portable"}
+"""The families whose claim is what a user's process computes, run in a process computing as a user's does
+(`users_process`, tests/conftest.py) and not in the suite's, whose JAX_DEFAULT_MATMUL_PRECISION=highest
+(tests/lane_environment.py) gives every product that states no precision IEEE float32: the portable math's
+state products, stating none, ran there exact and in a user's A100 process as TF32, 1823 times the fp32
+recurrence's distance from float64 (M-JS-96), which no cell saw (the recurrence lane, 11-11)."""
 
-@pytest.mark.parametrize("family", list(FAMILIES))
+
+@pytest.mark.parametrize("family", [
+    pytest.param(family, marks=pytest.mark.users_process if family in USERS else ()) for family in FAMILIES])
 def test_the_recurrences_run_on_this_gpu(family):
     """A family's recurrence cells on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
     together."""

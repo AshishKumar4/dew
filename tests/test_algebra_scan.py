@@ -15,7 +15,7 @@ import pytest
 from reference_error import assert_as_exact
 
 from dew.algebra import SATURATION, cost, linear_scan, scan
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, recurrence_algebra
 from dew.nn.precision import float32_matmul
 
 TOKENS, STATE, WIDTH, CHUNK = 128, 16, 32, 32
@@ -361,7 +361,8 @@ def test_a_chunks_form_is_the_one_its_target_derives():
     for target in ("sm90", "sm86", "sm90"):
         with generation.assumed(target):
             assert scan._form(extents, corrected=True) == linear_scan.derive(
-                extents, corrects=True, schedule=cost.fused(cost.target()))
+                extents, corrects=True, schedule=cost.fused(cost.target()),
+                precision=recurrence_algebra.STATE_PRECISION)
 
 
 def test_a_scans_carry_derived_for_one_target_serves_no_other():

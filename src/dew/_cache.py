@@ -10,6 +10,7 @@ import dataclasses
 import functools
 import hashlib
 import importlib.metadata
+import logging
 import os
 import sys
 import threading
@@ -20,6 +21,8 @@ import jax
 
 from dew._builds import dew_cache_dir
 from dew._devices import cuda_builds, deterministic_ops_requested, xla_flag
+
+_log = logging.getLogger(__name__)
 
 VERSION_FILE = "_version.py"
 """The release's version (`dew._version`), which no code of Dew's computes from: no part of its
@@ -273,7 +276,8 @@ def cuda_libraries() -> tuple[tuple[str, int | None], ...]:
         # (jax_plugins/cuda: `_version_check`).
         try:
             return read() // 100
-        except RuntimeError:
+        except RuntimeError as refused:
+            _log.debug("a CUDA library does not load, so a compile writes none of its state: %s", refused)
             return None
 
     return (("cublas", loaded(cuda_versions.cublas_get_version)),
@@ -334,6 +338,11 @@ DERIVED = jax.make_user_context(default_value=False)
 """Whether the templates take their algebra's derived forms (`dew.algebra.forms.derived`) in place of their
 hand-written ones, keyed on as `ALGEBRA` is: a program traced under one set of forms is never run under the
 other, and check 1 drives both (docs/design/algebra.md §6.9)."""
+
+WHOLE = jax.make_user_context(default_value=False)
+"""Whether a model runs its layer stack and sequences whole (`dew.nn.sharding.whole`), keyed on as `ALGEBRA`
+is: a trace reads it, so a call's identity states it with JAX's trace context, and a program traced whole
+is never run staged."""
 
 KERNEL_SEEN = jax.make_user_context(default_value=None)
 """The collection a lowering records its kernel launches into as it traces them

@@ -609,11 +609,12 @@ def _leaves(extents: Extents) -> list:
             for fact in (set_(rows_of(value)).to(i64(rows)), set_(columns_of(value)).to(i64(columns)))]
 
 
-def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, checked: bool = False) -> Form:
-    """The chunk's cheapest form (the module's account) under `schedule`: the e-graph saturated under the
-    identities, extracted by each node's work (`_work`; a solve, which no node computes until an identity
-    rewrites it, costs past every form), and the extracted form priced exactly, its shared nodes once and
-    its critical path along its chains (`_priced`)."""
+def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precision: jax.lax.PrecisionLike,
+           checked: bool = False) -> Form:
+    """The chunk's cheapest form (the module's account) under `schedule`, its products at `precision`: the
+    e-graph saturated under the identities, extracted by each node's work (`_work`; a solve, which no node
+    computes until an identity rewrites it, costs past every form), and the extracted form priced exactly,
+    its shared nodes once and its critical path along its chains (`_priced`)."""
     graph = EGraph()
     values = Chunk.token("U")
     loop = Chunk.loop(values) if corrects else Chunk.plain(values)
@@ -625,7 +626,7 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, checked
     def marginal(egraph: EGraph, node) -> cost.Seconds:
         if get_callable_args(node, Chunk.solve) is not None:
             return cost.Seconds(Work(), schedule, math.inf)
-        return cost.Seconds(_work(node, extents, lambda child: _shape_of(egraph, child)), schedule)
+        return cost.Seconds(_work(node, extents, lambda child: _shape_of(egraph, child), precision), schedule)
 
     model = DagCostModel(marginal_cost=marginal, identity=cost.Seconds(Work(), schedule))
     extracted, _ = extract.cheapest(graph, root, model, checked=checked)
@@ -634,7 +635,8 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, checked
     parts = get_callable_args(extracted, Chunk.pair)
     outputs, state = parts if parts is not None else (extracted.outputs(), extracted.state())
     shape_of = functools.partial(_shape_of, graph)
-    return Form(outputs, state, cost.Seconds(_priced((outputs, state), extents, shape_of), schedule))
+    priced = _priced((outputs, state), extents, shape_of, precision)
+    return Form(outputs, state, cost.Seconds(priced, schedule))
 
 
 def _shape_of(graph: EGraph, value: Chunk) -> tuple[int, int]:
@@ -644,12 +646,12 @@ def _shape_of(graph: EGraph, value: Chunk) -> tuple[int, int]:
             terms.integer(columns) if columns is not None else 0)
 
 
-def _priced(roots: tuple[Chunk, ...], extents: Extents, shape_of) -> Work:
+def _priced(roots: tuple[Chunk, ...], extents: Extents, shape_of, precision: jax.lax.PrecisionLike) -> Work:
     """The candidate's work, each distinct node once (`terms`' keys), and its span, its critical path's
     dependent steps, each node's own along its longest chain of operands."""
     work, spans = Work(), {}
     for node in _nodes(roots):
-        own = _work(node, extents, shape_of)
+        own = _work(node, extents, shape_of, precision)
         work = work + dataclasses.replace(own, span=0.0)
         spans[terms.key(node)] = own.span + max((spans[terms.key(child)] for child in _children(node)),
                                                 default=0.0)
@@ -686,14 +688,14 @@ CONSTRUCTORS = (Chunk.token, Chunk.entering, Chunk.decay, Chunk.loop, Chunk.plai
 """Every constructor of the chunk's language, as `get_callable_args` matches a node."""
 
 
-def _work(node: Chunk, extents: Extents, shape_of) -> Work:
-    """A node's own work and dependent steps at the chunk's extents: products as fp32 products at the default
-    precision (`cost._mode`), elementwise work on the CUDA cores, exponentials on the special-function units,
+def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionLike) -> Work:
+    """A node's own work and dependent steps at the chunk's extents: products as fp32 products at `precision`
+    (`cost._mode`), elementwise work on the CUDA cores, exponentials on the special-function units,
     a reduction's and a product's kernel (each a root of XLA's fusion, `cost.work`'s), and a loop's and a
     substitution's rows a step each, whose launches the step's latency holds (`GpuTarget.step_seconds`, a
     loop iteration's, measured with its kernels)."""
     c, k, v, d = extents.tokens, extents.keys, extents.values, extents.decay_keys
-    product = cost.product_work
+    product = functools.partial(cost.product_work, precision=precision)
     if get_callable_args(node, Chunk.loop) is not None or get_callable_args(node, Chunk.plain) is not None:
         corrected = get_callable_args(node, Chunk.loop) is not None
         # A token's step: the state decayed, read by its correction (a contraction over keys) and corrected,

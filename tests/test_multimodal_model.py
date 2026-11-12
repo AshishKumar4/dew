@@ -720,20 +720,28 @@ def test_a_drawn_site_is_on_par_with_its_reference(arms):
     """A drawn site's leaves, on par with the reference's (check 1), the truth the reference's float64 twin
     taking the same step: a family's valid logits, its summed next-token loss, its pixel gradient and its
     logits after one SGD step of every parameter over drawn images and audio, or all but the pixel gradient
-    over drawn token rows alone; its characteristic slip, and one layer's gradient with its sign flipped,
-    each alone, fail the same check."""
+    over drawn token rows alone."""
+    family, _, kind = arms.partition("/")
+    site = f"multimodal-{family}" + (f"-{kind}" if kind else "")
+    assert_arms_as_recorded(pipeline_arms(arms), site, SEEDS[arms], arms, weighed=arms in WEIGHED)
+
+
+@pytest.mark.parametrize("slipped", ["inputs", "gradient"])
+@pytest.mark.parametrize("arms", DRAWN_SITES)
+def test_a_drawn_sites_slip_fails_its_check(arms, slipped):
+    """`test_a_drawn_site_is_on_par_with_its_reference`'s site with its characteristic slip, or one layer's
+    gradient with its sign flipped, in its narrow arm alone fails the same check: a test of its own, as
+    each is a check-1 run of the site's whole draws (qwen35/text's three in one task ran past its 1,680 s
+    deadline, the CPU suite at 87e689ba5)."""
     family, _, kind = arms.partition("/")
     site = f"multimodal-{family}" + (f"-{kind}" if kind else "")
     recording, draw, dew, leaves = pipeline_arms(arms)
-    weighed = arms in WEIGHED
-    assert_arms_as_recorded((recording, draw, dew, leaves), site, SEEDS[arms], arms, weighed=weighed)
-    for slipped in ("inputs", "gradient"):
-        slip = computing(family, slipped=slipped, text=kind == "text")
-        with pytest.raises(GateFailure):
-            # The slip is the narrow arm's alone: the truth stays the recorded one's (`dew`'s float64 run).
-            assert_arms_as_recorded(
-                (recording, draw, lambda dtype, inputs, slip=slip: (dew if dtype == jnp.float64 else slip)(
-                    dtype, inputs), leaves), site, SEEDS[arms], f"{arms} slipped {slipped}", weighed=weighed)
+    slip = computing(family, slipped=slipped, text=kind == "text")
+    with pytest.raises(GateFailure):
+        # The slip is the narrow arm's alone: the truth stays the recorded one's (`dew`'s float64 run).
+        assert_arms_as_recorded(
+            (recording, draw, lambda dtype, inputs: (dew if dtype == jnp.float64 else slip)(dtype, inputs),
+             leaves), site, SEEDS[arms], f"{arms} slipped {slipped}", weighed=arms in WEIGHED)
 
 
 def _float32_values_in_float64(loaded, inputs) -> int:

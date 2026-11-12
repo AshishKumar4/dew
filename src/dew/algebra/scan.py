@@ -50,7 +50,7 @@ from dew._cache import ALGEBRA
 from dew.algebra import carry, cost, derive, linear_scan, program, terms
 from dew.algebra.forms import Derived, Refused, aval, environment, evaluate
 from dew.nn.derivatives import Protected, contracted
-from dew.nn.precision import at_least_fp32, compensated_add, float32_einsum, float32_matmul, vanishing
+from dew.nn.precision import at_least_fp32, compensated_add, vanishing
 from dew.nn.programs import read_by
 
 Axes = tuple[str, ...]
@@ -371,20 +371,21 @@ TOKENS = ("B", "U", "s", "C", "Q", "R")
 
 def _form(extents: linear_scan.Extents, corrected: bool) -> linear_scan.Form:
     """The chunk's form at its extents, derived by the identities of affine scans and extracted by the
-    work-span model under XLA's schedule (`linear_scan.derive`) on the target the trace compiles for and at
-    the products' configured precision, each of which prices the forms (`cost.target`, `cost.product_work`):
-    a derivation under one target is no other's."""
-    return _derived_form(extents, corrected, cost.target(), jax.config.jax_default_matmul_precision,
-                         ALGEBRA.value.checked)
+    work-span model under XLA's schedule (`linear_scan.derive`) on the target the trace compiles for, which
+    prices the forms (`cost.target`, `cost.product_work`): a derivation under one target is no other's. Its
+    products are priced at the precision they run at (`_portable`'s, IEEE float32 whatever the configured
+    one), so the configured precision is no fact of the form."""
+    return _derived_form(extents, corrected, cost.target(), ALGEBRA.value.checked)
 
 
 @functools.cache
-def _derived_form(extents: linear_scan.Extents, corrected: bool, target, precision,
-                  checked: bool) -> linear_scan.Form:
-    """`_form`'s, once for each of its facts, `precision` the configured one its products read, `checked`
-    whether the extractor oracle holds its extraction (`Passes.checked`)."""
-    del precision
-    return linear_scan.derive(extents, corrects=corrected, schedule=cost.fused(target), checked=checked)
+def _derived_form(extents: linear_scan.Extents, corrected: bool, target, checked: bool) -> linear_scan.Form:
+    """`_form`'s, once for each of its facts, `checked` whether the extractor oracle holds its extraction
+    (`Passes.checked`)."""
+    from dew.nn.kernels import recurrence_algebra
+
+    return linear_scan.derive(extents, corrects=corrected, schedule=cost.fused(target),
+                              precision=recurrence_algebra.STATE_PRECISION, checked=checked)
 
 
 def _magnitude(bound: float | tuple[float, float] | None) -> float | None:
@@ -469,11 +470,16 @@ def _chunk(form: linear_scan.Form, held: tuple, values_read: bool, h, entering, 
 
 def _plain(name: str, left, right):
     """A chunk's products as the language's plain ones, `dot_general`s, as the trace `carry.split` derives
-    from takes them (`_chunk`): the split's forms issue every product themselves (its roles), so this trace
-    states only which. `float32_matmul` here traced a float64 run's product inside a protected span the
-    language cannot read, and the split refused the state it read (Kimi Linear's float64 truth)."""
+    from takes them (`_chunk`): a mainloop's forms issue every product themselves (its roles); where none
+    issues it, the portable walk's, the split's evaluator takes the product at the precision this trace
+    states (`forms.evaluator`'s `float32_dot_general`), the portable math's (`_portable`): stated nowhere,
+    the walk's state products ran at JAX's configured precision, TF32 on an A100 (M-JS-96). `float32_matmul`
+    here traced a float64 run's product inside a protected span the language cannot read, and the split
+    refused the state it read (Kimi Linear's float64 truth)."""
     del name
-    return jnp.matmul(left, right)
+    from dew.nn.kernels import recurrence_algebra
+
+    return jnp.matmul(left, right, precision=recurrence_algebra.STATE_PRECISION)
 
 
 def _prepared(form: linear_scan.Form, tokens: Mapping, decays: _Decays, issue: Callable) -> dict:
@@ -566,9 +572,9 @@ def _looped(tokens: Mapping, decays: _Decays, h, values, *, corrected: bool, val
         decay = decays.entering[0] if t == 0 else decays.between[t, t - 1]
         h = decay[:, None] * h
         if corrected:
-            h = h - s[t] * B[t][:, None] * float32_matmul(C[t][None, :], h)
+            h = h - s[t] * B[t][:, None] * _portable(C[t][None, :], h)
         h = h + B[t][:, None] * values[t][None, :]
-        read = float32_matmul(h, Q[t][:, None])[:, 0] if values_read else float32_matmul(Q[t][None, :], h)[0]
+        read = _portable(h, Q[t][:, None])[:, 0] if values_read else _portable(Q[t][None, :], h)[0]
         outputs = outputs + placed[:, t][:, None] * (read + R[t])[None, :]
     return outputs, h
 
@@ -577,7 +583,7 @@ def _substituted(lower, given):
     """`(I + lower)^-1 given` by forward substitution, `lower` strictly lower: a row a step, each reading the
     rows before it."""
     def row(index, solved):
-        return solved.at[index].set(given[index] - float32_matmul(lower[index][None, :], solved)[0])
+        return solved.at[index].set(given[index] - _portable(lower[index][None, :], solved)[0])
 
     return lax.fori_loop(0, given.shape[0], row, jnp.zeros_like(given))
 
@@ -662,7 +668,8 @@ def _factored(left, right, between, joined, issue: Callable, role: str):
                 blocks.append(jnp.zeros((own.stop - own.start, keys.stop - keys.start),
                                         at_least_fp32(jnp.result_type(left, right, joined))))
             elif start == first:
-                blocks.append(float32_einsum("ik,ijk->ij", left[own], right[None, keys] * joined[own, keys]))
+                blocks.append(_portable_einsum("ik,ijk->ij", left[own],
+                                               right[None, keys] * joined[own, keys]))
             else:
                 reference = first - 1
                 blocks.append(issue(role, left[own] * between[own, reference],
@@ -690,7 +697,7 @@ def _spread(readers, values, keys, between, issue: Callable):
     rows = []
     for first in range(0, count, sub):
         own = slice(first, min(first + sub, count))
-        row = float32_einsum("ij,jk,ijk->ik", reads[own, own], keys[own], between[own, own])
+        row = _portable_einsum("ij,jk,ijk->ik", reads[own, own], keys[own], between[own, own])
         if first:
             reference = first - 1
             earlier = issue("apply", reads[own, :first], keys[:first] * between[reference, :first])
@@ -723,18 +730,34 @@ def _doubled(overlaps, issue: Callable | None = None):
 
 
 def _issued(name: str, left, right):
-    """A derived scan's products as Dew's (`float32_matmul`), the doubling's among them
-    (`recurrence_algebra.doubled`'s issuer); `transfer_decay` a transfer's columns scaled, `right * left`;
-    a readout (`carry.EMIT_ROLES`) the portable math's (`recurrence_algebra.remembered` by its issuer), its
-    gradient in what it reads summed from the chunk's last token (row 4466: from the first, the entering
-    memory's gradient 1.9 times the portable math's distance from float64)."""
+    """A derived scan's products as the portable math's (`recurrence_algebra.portable`), the doubling's
+    among them (`recurrence_algebra.doubled`'s issuer); `transfer_decay` a transfer's columns scaled,
+    `right * left`; a readout (`carry.EMIT_ROLES`) the portable math's (`recurrence_algebra.remembered` by
+    its issuer), its gradient in what it reads summed from the chunk's last token (row 4466: from the first,
+    the entering memory's gradient 1.9 times the portable math's distance from float64)."""
     if name == "transfer_decay":
         return right * left[None, :]
     if name in carry.EMIT_ROLES:
         from dew.nn.kernels import recurrence_algebra
 
         return recurrence_algebra.remembered(left, right, recurrence_algebra.portable, name)
-    return float32_matmul(left, right)
+    return _portable(left, right)
+
+
+def _portable(left, right):
+    """`left @ right` as the portable math issues it (`recurrence_algebra.portable`, at its
+    `STATE_PRECISION`): the derived scan's products carry the recurrent state."""
+    # The template's algebra imports the compile point, which imports this package: read at a call.
+    from dew.nn.kernels import recurrence_algebra
+
+    return recurrence_algebra.portable("product", left, right)
+
+
+def _portable_einsum(subscripts: str, *operands):
+    """`_portable`'s contraction as an einsum (`recurrence_algebra.portable_einsum`)."""
+    from dew.nn.kernels import recurrence_algebra
+
+    return recurrence_algebra.portable_einsum(subscripts, *operands)
 
 
 def _inverse_cotangent(lower, d_lower):
@@ -746,7 +769,7 @@ def _inverse_cotangent(lower, d_lower):
 
 def _applied(lower, given):
     """`(I + lower) @ given`, the identity outside the product."""
-    return given + float32_matmul(lower, given)
+    return given + _portable(lower, given)
 
 
 def _below(square):

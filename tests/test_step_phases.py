@@ -202,3 +202,48 @@ def test_phases_name_what_each_shares_reader_reads_as_a_pool_agrees_it():
     assert alone_none != alone_two, "a share's read names its workers"
     assert phased_none != phased_two
     assert alone_none in phased_none and alone_two in phased_two
+
+
+def _unthird(row) -> bool:
+    """Keeps a record whose id three does not divide: a filter, which makes the order a share's own."""
+    return bool(int(row["id"]) % 3)
+
+
+def _elastic(tag: int):
+    """A shuffled, filtered corpus read elastically (`Pipeline.elastic`): one order every share reads,
+    each keeping its share of each batch, so its position is every share's."""
+    from dew.data.pipeline import Pipeline
+
+    rows = tuple({"id": np.int64(1000 * tag + index)} for index in range(96))
+    return (Pipeline(Memory(rows)).shuffle(5).repeat().filter(_unthird)
+            .batch(8).elastic())
+
+
+def _ids(batch) -> list[int]:
+    keep = batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool))
+    return np.asarray(batch["id"])[keep].tolist()
+
+
+@pytest.mark.parametrize(("saved", "resumed"), [(2, 1), (2, 4)])
+def test_phases_of_elastic_reads_resume_on_another_share_count(saved, resumed):
+    """Phases on the step clock over elastic reads, each its own stream: after three steps, the second
+    phase's first read, every share holds one position, which a checkpoint lets another share count read
+    (`dew._position.translates`, as the phase's own elastic position is), and the shares of another count
+    restored from it read the next steps' rows one reader reads, between them."""
+    from dew import _position
+
+    def loader():
+        return compile(phases((_elastic(1), 2), (_elastic(2), None)), loading=READ, seed=3)
+
+    shares = [loader().train(DataPartition(index, saved)) for index in range(saved)]
+    for share in shares:
+        list(itertools.islice(share, 3))
+    (state,) = {share.get_state() for share in shares}
+    assert _position.translates(state)
+    whole = [_ids(batch) for batch in itertools.islice(loader().train(DataPartition()), 5)][3:]
+    again = [loader().train(DataPartition(index, resumed)) for index in range(resumed)]
+    for share in again:
+        share.set_state(state)
+    for step in range(2):
+        held = itertools.chain.from_iterable(_ids(next(share)) for share in again)
+        assert sorted(held) == sorted(whole[step])

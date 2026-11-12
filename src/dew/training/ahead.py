@@ -36,11 +36,13 @@ and `LMObjective.head_tile`. No run times plans itself.
 from __future__ import annotations
 
 import contextlib
+import copyreg
 import dataclasses
 import functools
 import hashlib
 import importlib.metadata
 import importlib.util
+import io
 import json
 import logging
 import os
@@ -56,6 +58,7 @@ import jax
 import jax.experimental.topologies as topologies
 import numpy as np
 from jax.experimental import serialize_executable
+from jaxlib import xla_client
 
 from dew import communicators
 from dew._cache import cuda_libraries, plugin_builds, topology_digest, uncached
@@ -80,6 +83,8 @@ from dew.training import identity
 from dew.training.profiling import pgle_runs
 
 if TYPE_CHECKING:
+    from jaxlib._jax import Traceback
+
     from dew.checkpoints import Resume
     from dew.data.compile import Handed
     from dew.data.dataset import DataPartition, Dataset, Loader
@@ -195,6 +200,33 @@ def host_gpus(generation: str, topology: str | Path, count: int) -> tuple:
 
 
 @dataclasses.dataclass(frozen=True)
+class HeldTraceback:
+    """A traceback a program's trees hold, as its file holds it: its frames as text. A checkified program's
+    error tree holds each check's (`jax.experimental.checkify`'s `FailedCheckError.traceback_info`), which
+    no pickle holds as JAX holds it; its check's message is its own, so a loaded program's failed check
+    says what the kept one's would."""
+
+    frames: tuple[str, ...]
+
+    def __str__(self) -> str:
+        return "\n".join(self.frames)
+
+
+def _held_traceback(traceback: Traceback) -> tuple[type[HeldTraceback], tuple[tuple[str, ...]]]:
+    """A traceback of JAX's reduced to its frames (`HeldTraceback`), as a program file holds it."""
+    return HeldTraceback, (tuple(str(frame) for frame in traceback.frames),)
+
+
+def filed(value: Executable | AheadPrograms | AheadOfTime) -> bytes:
+    """`value` as a program file holds it: pickled, a traceback of JAX's as its frames (`HeldTraceback`)."""
+    held = io.BytesIO()
+    pickler = pickle.Pickler(held, protocol=pickle.HIGHEST_PROTOCOL)
+    pickler.dispatch_table = {**copyreg.dispatch_table, xla_client.Traceback: _held_traceback}
+    pickler.dump(value)
+    return held.getvalue()
+
+
+@dataclasses.dataclass(frozen=True)
 class Executable:
     """A program compiled ahead, serialized, and the trees of its inputs and outputs, as
     `serialize_executable.serialize` gives them."""
@@ -204,8 +236,15 @@ class Executable:
 
     @staticmethod
     def of(compiled: jax.stages.Compiled) -> Executable:
+        """`compiled` serialized with its trees, as a file holds them (`filed`); refused (ValueError) where a
+        tree holds what no file holds, so a file that would hold it is never written short."""
         executable, in_tree, out_tree = serialize_executable.serialize(compiled)
-        return Executable(executable, (in_tree, out_tree))
+        held = Executable(executable, (in_tree, out_tree))
+        try:
+            filed(held)
+        except (TypeError, pickle.PicklingError) as refusal:
+            raise ValueError(f"its trees hold what no file holds: {refusal}") from refusal
+        return held
 
     def loaded(self, devices: Sequence) -> jax.stages.Compiled:
         """The executable, loaded onto `devices` (the ones it was compiled for, which its loader checks:
@@ -355,7 +394,7 @@ class AheadOfTime:
 
     def save(self, path: str | Path) -> None:
         """Write the step to `path`, for `load` on a host of its topology."""
-        Path(path).write_bytes(pickle.dumps(self))
+        Path(path).write_bytes(filed(self))
 
     @staticmethod
     def load(path: str | Path) -> AheadOfTime:
@@ -478,8 +517,10 @@ class BuildTarget:
     could not load, which then wrote none of its state; empty for a target of no CUDA GPU."""
     topology: str | None = None
     """The digest of the GPU topology the programs were compiled over (`dew._cache.topology_digest`): a
-    host's own GPUs, serialized (`host_gpus`, or the GPUs attached), None for a generation's canonical
-    ones (`compile_only_gpus`) and for any other platform's. It names the compile, which no loader holds
+    host's own GPUs as a file serialized them (`host_gpus`), None for a generation's canonical ones
+    (`compile_only_gpus`), for the GPUs attached and for any other platform's. The attached GPUs'
+    serialization differs call to call (two calls on one A100 differ from byte 207 on, probe UB-TOPO,
+    2026-11-11), so its digest names nothing. It names the compile, which no loader holds
     (`differences`)."""
 
     @staticmethod
@@ -510,10 +551,8 @@ class BuildTarget:
         limits = [stats["bytes_limit"] for device in devices
                   if "bytes_limit" in (stats := device.memory_stats() or {})]
         own = device_target(devices[0])
-        # Attached CUDA GPUs are their client's topology, as a host serializes it for a prepare (`host_gpus`).
-        attached = (topologies.get_attached_topology("cuda").serialize()
-                    if devices[0].platform == "gpu" and capability(own.generation) is not None else None)
-        built = BuildTarget.built(own, len(devices), min(limits, default=None), topology=attached)
+        # No topology: the attached GPUs' serialization differs call to call (`topology`).
+        built = BuildTarget.built(own, len(devices), min(limits, default=None))
         # A CPU's program is its host's code (`cpu`).
         return dataclasses.replace(built, cpu=host_cpu()) if devices[0].platform == "cpu" else built
 
@@ -561,7 +600,7 @@ class AheadPrograms:
 
     def save(self, path: str | Path) -> None:
         """Write the programs to `path`, for `load` in a process of their target."""
-        Path(path).write_bytes(pickle.dumps(self))
+        Path(path).write_bytes(filed(self))
 
     @staticmethod
     def load(path: str | Path) -> AheadPrograms:

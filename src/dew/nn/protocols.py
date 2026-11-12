@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Literal, Protocol, Self, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -575,6 +575,23 @@ class MediaWrapper(Protocol):
 
     @property
     def family(self) -> str: ...
+
+
+@runtime_checkable
+class ReplacesTokens(Protocol):
+    """A model that replaces the embeddings of its media placeholder tokens before its table reads them
+    (`dew.nn.multimodal.MultimodalTransformer`): those ids hold no row of the table of their own."""
+
+    image_token_id: int | None
+    extra_placeholder_ids: tuple[int, ...]
+
+
+@runtime_checkable
+class WrapsDecoder(Protocol):
+    """A module around one decoder, which it holds in the field `wraps` names
+    (`dew.nn.wrapping.DecoderWrapper`)."""
+
+    wraps: ClassVar[str]
 
 
 @runtime_checkable

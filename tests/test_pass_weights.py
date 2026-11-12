@@ -14,7 +14,7 @@ from flax import linen as nn
 from model_support import float64_twin
 from reference_error import assert_as_exact
 
-from dew.batch import PHASE, Phase
+from dew.batch import PHASE, VALID_ROWS, Phase
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
@@ -163,11 +163,13 @@ def test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_wei
                     seeds=PASS_SEEDS, truth_fn=jax.jit(apart(float64_twin(model), float64_twin(head))))
 
 
-def test_a_validation_reports_each_pass_beside_the_run():
-    """A pass-weighed run's validation reports each pass's metrics and loss under `val/pass_<k>/` beside the
-    run's own, whose metrics stay the last pass's: the last pass's accuracy is the run's, and each pass's
-    the accuracy of that pass's own model (`with_passes(k)`). Each pass's loss is the training loss's
-    term, which `test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_weight` holds."""
+@pytest.mark.parametrize("loss", [False, True], ids=["metrics alone", "with the loss"])
+def test_a_validation_reports_each_pass_beside_the_run(loss):
+    """A pass-weighed run's validation reports each pass's metrics under `val/pass_<k>/` beside the run's
+    own, whether or not it scores the loss (each pass's loss too where it does), the run's metrics staying
+    the last pass's: the last pass's accuracy is the run's, and each pass's the accuracy of that pass's own
+    model (`with_passes(k)`). Each pass's loss is the training loss's term, which
+    `test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_weight` holds."""
     from dew.decision import Accuracy
     from dew.training.evaluation import Evaluation
 
@@ -176,13 +178,13 @@ def test_a_validation_reports_each_pass_beside_the_run():
     data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
     variables = objective.init(jax.random.key(0))
     metrics = (Accuracy(),)
-    scores = Evaluation.run(objective, variables, data.val, key=0, metrics=metrics, loss=True).scores
-    assert {f"val/pass_{k}/loss" for k in range(1, STEPS + 1)} <= set(scores)
+    scores = Evaluation.run(objective, variables, data.val, key=0, metrics=metrics, loss=loss).scores
+    assert ({f"val/pass_{k}/loss" for k in range(1, STEPS + 1)} <= set(scores)) == loss
     assert {f"val/pass_{k}/accuracy" for k in range(1, STEPS + 1)} <= set(scores)
     assert scores[f"val/pass_{STEPS}/accuracy"] == scores["val/accuracy"]
     for k in range(1, STEPS + 1):
         own = decision_objective(model.with_passes(k, exits=False), None)
-        alone = Evaluation.run(own, variables, data.val, key=0, metrics=metrics, loss=True).scores
+        alone = Evaluation.run(own, variables, data.val, key=0, metrics=metrics, loss=loss).scores
         assert scores[f"val/pass_{k}/accuracy"] == alone["val/accuracy"]
 
 
@@ -290,34 +292,45 @@ def test_a_phases_objective_is_its_own_whatever_objectives_it_holds():
     run = DistillationObjective(LMObjective(looped(), 16, ema_decay=None),
                                 LMObjective(teacher, 16, ema_decay=None), alpha=0.5, temperature=1.0)
     phases = PhasePasses.of(run, (1, STEPS))
-    phases.current = 1
-    first = phases.objective_for(run)
+    first = phases.objective_for(1)
     assert first.student.model.loop.steps == 1 and run.student.model.loop.steps == STEPS
     assert first.student is not run.student and first.teacher is not run.teacher
-    assert phases.objective_for(run) is first
+    assert phases.objective_for(1) is first
 
 
-def test_a_phased_fit_steps_each_phase_as_a_run_of_its_own_pass_count_does(tmp_path):
+def corpus(tag: int):
+    """Thirty-two rows of 17 tokens, read on in batches of eight, each `tag`'s own."""
+    from dew.data import Memory
+
+    rows = [{"text": (np.arange(17, dtype=np.int32) * (tag + 3) + index) % 256} for index in range(32)]
+    return Memory(rows).repeat().batch(8)
+
+
+def remade(state, batch, key):
+    """A rollout that makes its batch afresh of the rows it reads, as a sampler's does: none of the read's
+    own fields (its phase among them) on what it makes."""
+    return {"text": np.asarray(batch["text"])}
+
+
+@pytest.mark.parametrize("rollout", [None, remade], ids=["read", "rollout"])
+def test_a_phased_fit_steps_each_phase_as_a_run_of_its_own_pass_count_does(tmp_path, rollout):
     """A fit over two phases of data on the step clock, its loop one pass in the first (two steps) and
     three in the second (`phase_passes`), each step's count read off its batch's phase: its parameters
-    after four steps are the same bits as a one-pass run's two steps resumed by a three-pass run's two."""
+    after four steps are the same bits as a one-pass run's two steps resumed by a three-pass run's two. A
+    rollout's batch, made afresh of the read's rows, is stepped at the phase its read was (`carried`)."""
     import optax
     from test_data_mixtures import READ, assert_same, parameters
 
-    from dew.data import Memory, phases
+    from dew.data import phases
     from dew.data.compile import compile
     from dew.training import Checkpoints, Layout, Trainer
-
-    def corpus(tag: int):
-        rows = [{"text": (np.arange(17, dtype=np.int32) * (tag + 3) + index) % 256} for index in range(32)]
-        return Memory(rows).repeat().batch(8)
 
     data = compile(phases((corpus(1), 2), (corpus(2), None)), read="indexed", loading=READ)
     model = looped()
 
     def trainer_of(model, directory, **phased):
         return Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0),
-                       layout=Layout(min_shard=1, tolerance=1.0),
+                       layout=Layout(min_shard=1, tolerance=1.0), rollout=rollout,
                        checkpoints=Checkpoints(str(directory), keep=8), **phased)
 
     whole = trainer_of(model, tmp_path / "phased", phase_passes=(1, STEPS)).fit(
@@ -326,3 +339,103 @@ def test_a_phased_fit_steps_each_phase_as_a_run_of_its_own_pass_count_does(tmp_p
     apart = trainer_of(model, tmp_path / "apart").fit(data, steps=4, log_every=100, checkpoint_every=1)
     assert int(apart.step) == 4
     assert_same(parameters(whole), parameters(apart), "the phased fit is not its phases' runs")
+
+
+class Flops:
+    """A tracker of each logged step's `train/flops`."""
+
+    def __init__(self):
+        self.at: dict[int, float] = {}
+
+    def log(self, scalars, step: int) -> None:
+        if "train/flops" in scalars:
+            self.at[step] = scalars["train/flops"]
+
+    def artifact(self, value, step: int) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_a_phased_runs_work_counts_each_step_at_its_phases_pass_count():
+    """A fit over two phases, its loop one pass in the first and three in the second (`phase_passes`),
+    counts each step's work (`train/flops`, which train/mfu divides) as a run of its phase's pass count
+    counts the same step: the first phase's at one pass, not the model the run hands on."""
+    import optax
+    from test_data_mixtures import READ
+
+    from dew.data import phases
+    from dew.data.compile import compile
+    from dew.training import Layout, Trainer
+
+    def counted(model, data, steps, **phased):
+        flops = Flops()
+        Trainer(LMObjective(model, 16), optax.sgd(0.1), key=jax.random.key(0), tracker=flops,
+                layout=Layout(min_shard=1, tolerance=1.0), **phased).fit(
+            compile(data, read="indexed", loading=READ), steps=steps, log_every=1, checkpoint_every=None)
+        return flops.at
+
+    phased = counted(looped(), phases((corpus(1), 2), (corpus(2), None)), 4, phase_passes=(1, STEPS))
+    one = counted(looped().with_passes(1), corpus(1), 1)
+    three = counted(looped(), corpus(2), 1)
+    assert one[1] < three[1]
+    assert [phased[step] for step in (1, 2, 3, 4)] == [one[1], one[1], three[1], three[1]]
+
+
+def test_an_lm_validation_of_metrics_alone_reports_each_pass():
+    """A pass-weighed LM's validation of its perplexity alone (no loss asked) reports each pass's under
+    `val/pass_<k>/perplexity`, the last pass's the run's own."""
+    from dew.objectives.lm.objective import Perplexity
+    from dew.training.evaluation import Evaluation
+
+    objective = LMObjective(looped(), 16, pass_weights="mean")
+    rows = np.random.default_rng(4).integers(0, 256, (2, jax.device_count(), 17), dtype=np.int32)
+    variables = objective.init(jax.random.key(0))
+
+    def split(partition):
+        return iter([{"text": rows[index]} for index in range(2)])
+
+    scores = Evaluation.run(objective, variables, split, key=1, metrics=(Perplexity(),)).scores
+    assert {f"val/pass_{k}/perplexity" for k in range(1, STEPS + 1)} <= set(scores)
+    assert scores[f"val/pass_{STEPS}/perplexity"] == scores["val/perplexity"]
+
+
+def test_a_qk_clip_reads_every_scored_exits_head():
+    """A decision loss weighing a looped backbone's passes, the first weighed and the last not, sows for
+    QK-Clip its head's logit maxima over every scored exit: each row and head's the largest any pass count's
+    own model's head reads (`with_passes(k)`), on par from float64 (check 1), the first pass's among them."""
+    from flax.traverse_util import flatten_dict
+
+    from dew.decision.task import laid_out
+    from dew.nn.inspection import QK
+
+    model = looped()
+    weighed = decision_objective(model, (1.0, 0.0, 0.0))
+    (batch,) = list(decision_rows(EXAMPLES, 8, EXAMPLES, objective=weighed.data()).val(DataPartition()))
+    batch = {name: value for name, value in batch.items() if name != VALID_ROWS}
+    inputs = laid_out(batch, weighed.bounds.segments)
+    step = Step(jnp.asarray(0), jax.random.key(0), None, qk_stats=True)
+
+    def maxima(tree):
+        """The logit maxima a QK-Clip reads of the head's attention layers, by their paths."""
+        return {"/".join(path): leaf for path, leaf in flatten_dict(tree).items() if path[-1] == "max_logits"}
+
+    def sown(variables):
+        _, aux = weighed.loss(variables, batch, step)
+        return maxima(aux.qk_stats["head"])
+
+    def apart(backbone):
+        def run(variables):
+            found = [decision_objective(backbone.with_passes(k, exits=False), None).model.observed_logits(
+                variables, inputs, opened=[QK])[1][QK]["head"] for k in range(1, STEPS + 1)]
+            return jax.tree.map(lambda *leaves: jnp.max(jnp.stack(leaves), axis=0), *map(maxima, found))
+        return run
+
+    init = jax.jit(weighed.init)
+
+    def draw(seed):
+        return (nn.unbox(init(jax.random.key(seed))),)
+
+    assert_as_exact(jax.jit(sown), jax.jit(apart(model)), draw, "every exit's head QK maxima",
+                    seeds=PASS_SEEDS, truth_fn=jax.jit(apart(float64_twin(model))))

@@ -1738,10 +1738,6 @@ class PhasedStream:
         self._current = None
 
 
-STEP_PHASES = "dew_step_phases"
-"""The key a read of phases each its own stream writes its position under (`StepPhases`)."""
-
-
 class StepPhases(Forwarding):
     """Reads phases on the step clock one after another, each its own stream, opened at the step the
     phase before it ends: a read per share among them, cut per share where its order is (a stream batched
@@ -1812,7 +1808,7 @@ class StepPhases(Forwarding):
         if not isinstance(stream, Checkpointable):
             raise TypeError(f"phase {phase}'s stream keeps no position")
         own = stream.get_state()
-        return json.dumps({STEP_PHASES: {
+        return json.dumps({_position.STEP_PHASES: {
             "steps": self._steps, "phase": phase, "ends": self._ends[:phase],
             "identities": [self._identity(index) for index in range(phase + 1)],
             "position": base64.b64encode(own if isinstance(own, bytes)
@@ -1820,7 +1816,7 @@ class StepPhases(Forwarding):
             "encoded": isinstance(own, bytes)}}).encode()
 
     def set_state(self, state: bytes) -> None:
-        saved = record(record(json.loads(state), "saved phases' position").get(STEP_PHASES),
+        saved = record(record(json.loads(state), "saved phases' position").get(_position.STEP_PHASES),
                        "saved phases' position")
         phase = integer(saved["phase"], "the saved phase")
         ends = list(listed(saved["ends"], "saved phase ends", read=integer, what="a list of steps"))

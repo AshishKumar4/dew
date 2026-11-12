@@ -1317,9 +1317,9 @@ class Trainer(Generic[Loss, Effects]):
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
-            staged = isinstance(run.source, RampedStream | PhasedStream | StepPhases)
-            stages = run.source.stages if staged else ()
-            ramp = stages if isinstance(run.source, RampedStream) else ()
+            source = run.source
+            stages = source.stages if isinstance(source, RampedStream | PhasedStream | StepPhases) else ()
+            ramp = stages if isinstance(source, RampedStream) else ()
             # The steps a stage after the first begins at, each where an update does (`Ramp.stages`): a
             # ramp's and phases' of other batches here (`PhasedStream.stages`), a schedule's as each begins
             # (`_scheduled`); the step lays its window out there. Each stage's batch of a ramp is read whole:
@@ -1413,8 +1413,16 @@ class Trainer(Generic[Loss, Effects]):
                 f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
         run.opened(source, self._shape.examples)
         run.marked = marked(run.partition, self._counted_batch)
-        prepare = run.marked if self.rollout is None else functools.partial(
+        counted = run.marked if self.rollout is None else functools.partial(
             consumption_counted, clocked=self._shape.examples is not None, marks_rows=False)
+        inputs = self.objective.inputs
+
+        def prepare(batch: Batch) -> Batch:
+            # Every batch's token ids within its model's table, on the prefetch worker before it is placed
+            # (`InputSpec.bounded`): an id past the table reads no row, and its gather fills NaN.
+            if inputs is not None:
+                inputs.bounded(batch)
+            return counted(batch)
         if run.pooled:
             run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), run.marked,
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))
@@ -1800,12 +1808,16 @@ class Trainer(Generic[Loss, Effects]):
         log, and trains on. Its batches keep their work columns, as unknown work (`uncounted`), so every
         process runs one step program and the step's global sum leaves train/mfu unreported pool-wide. One
         thread prepares batches, the prefetch worker or a rollout's caller, and only it writes the reason.
-        A count asked of the objective directly stays strict.
+        A count asked of the objective directly stays strict. A phased run's batch is counted at its
+        phase's model (`phase_passes`).
         """
         batch = consumption_counted(batch, clocked=self._shape.examples is not None)
         if self._refusal is None:
+            # The model the batch's step runs: its phase's pass count (`phase_passes`), read off the batch,
+            # since this thread prepares it ahead of the step that takes the count.
+            objective = self.phase_passes.objective_for(self.phase_passes.count(batch))
             try:
-                return prepare_counts(self.objective, batch, count_model=True)
+                return prepare_counts(objective, batch, count_model=True)
             except MissingFlopsCount as missing:
                 self._refusal = str(missing)
                 _log.debug("train/mfu is not reported for %s: %s", type(self.objective).__name__, missing)

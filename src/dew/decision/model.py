@@ -12,7 +12,7 @@ from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import HOWS
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
-from dew.nn.inspection import QK
+from dew.nn.inspection import QK, observed_maxima
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import EXITS, Looped, TokenModel, VocabularyRows
 from dew.nn.visibility import block_ends, block_starts
@@ -203,14 +203,15 @@ class DecisionModel(HeadedModel):
         backbone = self.backbone
         assert isinstance(backbone, Looped), "a looped backbone's exits"
         earlier, gates = backbone.exit_passes(sown)
-        last, head_sown = self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs,
-                                           opened=opened)
-        logits = (*(self.head_logits(variables, state, inputs, spanned, train=train, rngs=rngs)[0]
-                    for state in earlier), last)
+        # Every exit through the head, each sowing what the step opened: a QK-Clip bounds the head by the
+        # largest logit any scored exit reads (`observed_maxima`).
+        read = [self.head_logits(variables, state, inputs, spanned, train=train, rngs=rngs, opened=opened)
+                for state in (*earlier, states)]
         sown = {name: value for name, value in sown.items() if name != EXITS}
         if QK in opened:
-            sown = {**sown, QK: {"backbone": sown.get(QK, {}), "head": head_sown.get(QK, {})}}
-        return logits, gates, sown
+            head = observed_maxima(*(held.get(QK, {}) for _, held in read))
+            sown = {**sown, QK: {"backbone": sown.get(QK, {}), "head": head}}
+        return tuple(logits for logits, _ in read), gates, sown
 
     def head_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
                     spanned: jax.Array | None = None, *, train: bool = False,

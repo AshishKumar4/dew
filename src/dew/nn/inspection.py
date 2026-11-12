@@ -19,6 +19,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.custom_derivatives import zero_from_primal
 
 from dew.batch import PROBES
@@ -33,6 +34,23 @@ QK = "qk"
 """The collection a model's attention sows its logit maxima in where a step opens it (`Step.qk_stats`): what
 a QK-Clip reads (`dew.optim`), the observation contract's beside `INSPECTED`, its producers' and readers'
 one name."""
+
+
+def observed_maxima(*passes: Mapping) -> dict:
+    """The attention logit maxima of several passes, merged by module path (`Aux.qk_stats`).
+
+    A module that more than one pass observed keeps the elementwise maximum of what each sowed: a logit is
+    bounded by the largest any of them reads, as a looped model's every scored exit runs its head
+    (`dew.decision.model.DecisionModel.pass_logits`). A module only one pass observed keeps what it sowed,
+    as an image's vision tower does, since the encoder pass alone runs it.
+    """
+    found: dict[tuple[str, ...], list[object]] = {}
+    for tree in passes:
+        for path, sown in flatten_dict(tree).items():
+            found.setdefault(path, []).append(sown)
+    return unflatten_dict({path: jax.tree.map(lambda *leaves: jnp.max(jnp.stack(leaves), axis=0), *sown)
+                           for path, sown in found.items()})
+
 
 HISTOGRAM_EDGES = tuple(float(edge) for edge in range(-8, 5))
 """The base-10 exponents bounding an opt-in histogram's bins of magnitudes: a value below 1e-8 in the

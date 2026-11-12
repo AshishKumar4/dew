@@ -7,7 +7,7 @@
   "image_token": "<image_soft_token>",
   "is_local": true,
   "local_files_only": true,
-  "mask_token": "<mask>",
+  "mask_token": null,
   "model_max_length": 1000000000000000019884624838656,
   "model_specific_special_tokens": {
     "boi_token": "<start_of_image>",
