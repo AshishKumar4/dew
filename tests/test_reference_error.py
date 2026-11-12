@@ -620,18 +620,9 @@ def test_further_references_judge_one_dew_arm_each_by_its_own_check_once_a_draw(
     reference and three times another's error fails against that one alone; a site with every
     reference on par passes; beside a plain Dew arm, a further reference of another kind than the
     reference's is refused."""
+    from test_gate_arms import noised as arm, noiseless as truth
+
     draw = noised_draw
-
-    def arm(scale, noise):
-        @as_given
-        def run(x, mine, theirs, other):
-            return {"value": x + scale * {"mine": mine, "theirs": theirs, "other": other}[noise]}
-        return run
-
-    @as_given
-    def truth(x, *_):
-        return {"value": x}
-
     assert_as_exact(arm(1.0, "mine"), arm(1.0, "theirs"), draw, "two references", seeds=16, truth_fn=truth,
                     also={"another": arm(1.0, "other")})
     with pytest.raises(GateFailure) as failed:
