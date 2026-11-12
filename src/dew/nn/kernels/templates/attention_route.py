@@ -119,23 +119,21 @@ def _on_mosaic() -> bool:
     return _on_gpu() or generation.backend() == 'tpu'
 
 
-DROPS_NOT = ("the template's GPU mainloops draw probability dropout over 16-bit operands at their own query "
-             "and key places alone (the Mosaic dropping walk's, forward and backward; the Triton mainloop "
-             "takes none): a dropping fp32 call there, or one drawing at a sequence slice's global query or "
-             "key places, would run the plain-JAX mainloop, so the selector leaves it to the reference path")
+DROPS_NOT = ("the template's GPU mainloops draw probability dropout over 16-bit operands alone (the Mosaic "
+             "dropping walk's, forward and backward; the Triton mainloop takes none): a dropping fp32 call "
+             "there would run the plain-JAX mainloop, so the selector leaves it to the reference path")
 """Why 'auto' leaves a dropping call on a GPU to the reference path where the Mosaic walk does not draw it
 (`drops`)."""
 
 
-def drops(dtype, *, placed: bool = False) -> bool:
+def drops(dtype) -> bool:
     """Whether the route's own mainloop here draws probability dropout over operands of `dtype`: the plain-JAX
     mainloop's off a GPU (or on one before sm80, where the GPU mainloops do not run, `_on_gpu`), and the
     Mosaic mainloop's dropping walk over bf16 or fp16 operands on an sm80 or later GPU, its forward and its
-    backward, at the call's own query and key places (`attention_mosaic_program.refused`: but for fp16 past
-    a rate of 1 - 2^-16, whose dropped weights pass its largest, which the plain-JAX one takes); fp32 there,
-    and a draw `placed` at a sequence slice's global queries or keys (`DropPlaces`, a gathered-keys
-    exchange's), run the plain-JAX one (`DROPS_NOT`)."""
-    return not _on_gpu() or (jnp.dtype(dtype).itemsize == 2 and not placed)
+    backward, at the call's own query and key places or a sequence slice's global ones (`DropPlaces`)
+    (`attention_mosaic_program.refused`: but for fp16 past a rate of 1 - 2^-16, whose dropped weights pass
+    its largest, which the plain-JAX one takes); fp32 there runs the plain-JAX one (`DROPS_NOT`)."""
+    return not _on_gpu() or jnp.dtype(dtype).itemsize == 2
 
 
 def _attending(config: _Config, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
