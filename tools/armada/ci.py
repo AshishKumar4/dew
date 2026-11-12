@@ -1096,9 +1096,9 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
                  kept: Mapping[tuple[str, str], str], timings: dict, target: float,
                  eager: Container[tuple[str, str]] = ()) -> list[dict]:
     """The plan's entries for each site of `marked` (`sites`, by its file) under `python`: a map task each
-    `per_task` of its units, or fewer where their measured rate puts a task past four of `target` (`cut_draws`),
-    which runs its test over them alone, records their draws among its
-    artifacts and judges nothing; and its judge, which runs once they all passed (armada's `after`), pools
+    `per_task` of its units, or fewer where their measured rate puts a task past four of `target`
+    (`cut_draws`), which runs its test over them alone, records their draws among its artifacts and judges
+    nothing; and its judge, which runs once they all passed (armada's `after`), pools
     their draws from its inputs and reports the site's row as a run that drew every unit itself would. A site
     whose judge's row ran green on exactly these inputs (`kept`, `reusable`) has none: a kept task reads its
     row, and no draw runs. A map task weighs what armada measured it at, under its task's name

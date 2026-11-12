@@ -689,14 +689,14 @@ def test_a_kept_judge_plans_no_map_task_and_its_key_covers_what_its_draws_ran(
 
 def test_a_judge_after_a_cut_finer_than_declared_is_kept_on_what_its_map_tasks_drew(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A site cut finer than its mark declares (its measured rate past the target, `cut_draws`) is judged over
-    the map tasks that ran, and its judge keys on their inputs whatever their spans, so it is kept whole as a
-    judge after its declared cut is, and a module only its draws ran, changed, plans it again (the review of
-    row 4376: a judge read its declared cut's map tasks alone, found none, and kept no key)."""
+    """A site cut finer than its mark declares (its measured rate past four targets, `cut_draws`) is judged
+    over the map tasks that ran, and its judge keys on their inputs whatever their spans, so it is kept whole
+    as a judge after its declared cut is, and a module only its draws ran, changed, plans it again (the review
+    of row 4376: a judge read its declared cut's map tasks alone, found none, and kept no key)."""
     first = ci.site_task("3.12", "tests/test_site.py", "test_site", (0, 4))
     run_cached(ci, tmp_path, monkeypatch, cache_worker, SITE, later=True, target=30.0,
-               timings={"rows": {first: 40.0}})
-    # 10 s a seed: 3 a task within 30 s, 8 map tasks where the declared cut makes 3.
+               timings={"rows": {first: 160.0}})
+    # 40 s a seed: 3 a task within four targets' 120 s, 8 map tasks where the declared cut makes 3.
     assert runs(tmp_path) == [1, 8, 1]
     ran = replanned_once_its_draws_change(ci, tmp_path)
     assert {ci.session.SITE.fullmatch(entry["split"])["test"] for entry in ran} == {"test_site"}
