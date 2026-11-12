@@ -44,7 +44,7 @@ def test_correction_is_explicit_and_uses_actual_recorded_behavior():
     trainer, collector = build()
     assert isinstance(trainer.objective, GRPOObjective)
     state = trainer.initial_state()
-    batch = trained_batch(collector, state)
+    batch = trained_batch(collector, state, trainer.objective)
     corrected = GRPOObjective(trainer.objective.model, PROMPT + RESPONSE - 1,
                               beta=.05, behavior_importance=2.)
     info = Step(state.microstep, jax.random.key(4), state.ema)
@@ -72,7 +72,7 @@ def test_corrected_objective_changes_a_real_trainer_update():
     original, collector = build()
     assert isinstance(original.objective, GRPOObjective)
     state = original.initial_state()
-    batch = trained_batch(collector, state)
+    batch = trained_batch(collector, state, original.objective)
     batch = {name: np.repeat(value, 2, axis=0) for name, value in batch.items()}
     copies = []
     for cap in (None, 2.):

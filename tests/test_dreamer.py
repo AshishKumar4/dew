@@ -243,11 +243,12 @@ def test_a_rollout_writes_its_replay_in_place(agent):
     rollout = DreamerRollout(objective, environments(), capacity=400, batch=8, length=16, train_ratio=8.0,
                              prefill=24)
     state = Trainer(objective, optax.adam(1e-3), key=jax.random.key(7), rollout=rollout).place()[0]
-    rollout(state, {}, jax.random.key(1))
+    rollout(state, {}, jax.random.key(1), objective=objective)
     begun = rollout.held_replay
     assert begun is not None
     # The next update owes steps the prefill did not take.
-    rollout(dataclasses.replace(state, updates=state.updates + 1), {}, jax.random.key(2))
+    rollout(dataclasses.replace(state, updates=state.updates + 1), {}, jax.random.key(2),
+            objective=rollout.objective)
     assert all(leaf.is_deleted() for leaf in jax.tree.leaves(begun.held))
 
 
@@ -658,7 +659,8 @@ def test_a_dreamer_rollout_restored_after_collecting_for_an_uncommitted_update_o
 
     def called(rollout, updates):
         for at, update in enumerate(updates):
-            rollout(SimpleNamespace(variables=variables, updates=update), batch, jax.random.key(at))
+            rollout(SimpleNamespace(variables=variables, updates=update), batch, jax.random.key(at),
+                    objective=rollout.objective)
 
     uninterrupted = dreamer_targets(objective, checkpointed=True)
     called(uninterrupted, (0, 1, 2, 2, 3, 4))
@@ -692,7 +694,8 @@ def test_a_dreamer_rollout_restored_in_a_later_phase_owes_each_update_at_its_own
 
     def called(rollout, updates):
         for update in updates:
-            rollout(SimpleNamespace(variables=variables, updates=update), {}, jax.random.key(update))
+            rollout(SimpleNamespace(variables=variables, updates=update), {}, jax.random.key(update),
+                    objective=rollout.objective)
         return rollout
 
     earlier = called(drawing(16), (0, 1, 2))

@@ -1390,7 +1390,7 @@ def mode_replicated_rollout(args) -> dict:
                       layout=Layout(min_shard=TINY), rollout=rollout)
     state, _, _ = trainer.place()
     partition = DataPartition.of(trainer.device_mesh)
-    packed = rollout(state, rollout_prompts(), jax.random.key(9))
+    packed = rollout(state, rollout_prompts(), jax.random.key(9), objective=objective)
     handed = {name: np.asarray(multihost_utils.process_allgather(np.asarray(packed[name])))
               for name in ("input_ids", "response_mask", "advantages", "old_log_probs")}
     rewarded = multihost_utils.process_allgather(np.asarray(len(scored), np.int64))
@@ -1399,7 +1399,7 @@ def mode_replicated_rollout(args) -> dict:
             "handed": {name: value.tolist() for name, value in handed.items()}}
 
 
-def _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank) -> dict:
+def _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank, objective) -> dict:
     """Each rank-local invalid input the pool must refuse on every rank (a
     token past the vocabulary, a zero prompt length, a split key, a
     component only one rank can describe), and the refusal it raised; both
@@ -1430,7 +1430,7 @@ def _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank) -
                 generate(model, state.variables, inputs_for(local), 4, key=key, sampling=sampling,
                          logits=(jax.tree_util.Partial(rewrite),))
             else:
-                rollout(state, broken, key)
+                rollout(state, broken, key, objective=objective)
         except (ValueError, RuntimeError) as error:
             # The refusal's category, which the test reads, not its wording.
             invalid_errors[fault] = type(error).__name__
@@ -1442,7 +1442,7 @@ def _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank) -
     return invalid_errors
 
 
-def _meshless_rollout(state, local, rollout, rank) -> dict:
+def _meshless_rollout(state, local, rollout, rank, objective) -> dict:
     """A rollout over weights on no mesh, which samples each process's own
     prompts: process 1's zero prompt length is its own refusal, and process
     0 samples its rows without waiting on it."""
@@ -1454,7 +1454,7 @@ def _meshless_rollout(state, local, rollout, rank) -> dict:
         broken["prompt_length"][0] = 0
     outcome = {}
     try:
-        outcome["rows"] = len(rollout(state, broken, jax.random.key(29))["input_ids"])
+        outcome["rows"] = len(rollout(state, broken, jax.random.key(29), objective=objective)["input_ids"])
     except (ValueError, RuntimeError) as error:
         outcome["refused"] = type(error).__name__
     reached = multihost_utils.process_allgather(np.asarray(rank, np.int32))
@@ -1500,7 +1500,7 @@ def mode_rollout(args) -> dict:
     state, _, _ = trainer.place()
     facts = sharding_facts(state.variables)
     began = time.monotonic()
-    rolled = rollout(state, local, jax.random.key(9))
+    rolled = rollout(state, local, jax.random.key(9), objective=objective)
     sampled_seconds = time.monotonic() - began
     # Bounded rendezvous: a rank stranded in a collective never reaches it.
     arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int64))
@@ -1524,8 +1524,9 @@ def mode_rollout(args) -> dict:
     ).host()
     invalid_errors, meshless = {}, {}
     if processes > 1:
-        invalid_errors = _rejected_inputs(model, state, local, rollout, sampling, prompt_inputs, rank)
-        meshless = _meshless_rollout(trainer.initial_state(), local, rollout, rank)
+        invalid_errors = _rejected_inputs(model, state, local, rollout, sampling, prompt_inputs, rank,
+                                          objective)
+        meshless = _meshless_rollout(trainer.initial_state(), local, rollout, rank, objective)
     single = None
     if processes == 1:
         single = rolled

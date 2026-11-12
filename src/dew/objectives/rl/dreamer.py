@@ -42,7 +42,16 @@ from dew.inference.models import ReleasesModel
 from dew.nn.categorical import kl_divergence
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32, divided
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, traced_update_flops
+from dew.objectives.base import (
+    Aux,
+    EMASpec,
+    Objective,
+    Ratio,
+    Shown,
+    Step,
+    own_objective,
+    traced_update_flops,
+)
 from dew.objectives.rl.tssm import TSSM, Cache, Window
 from dew.rl.aggregation import LABEL, Teacher, labelled, paired
 from dew.rl.distributions import (
@@ -1064,7 +1073,9 @@ class DreamerRollout:
             live = self._advanced(variables, live, min(self.length, self.prefill - flown), random=True)
         return live
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
+    def __call__[LossT, EffectsT](self, state: TrainState, batch: Batch, key: jax.Array, *,
+                                  objective: Objective[LossT, EffectsT]) -> Batch:
+        own_objective(type(self).__name__, self.objective, objective)
         act_key, sample_key = jax.random.split(key)
         variables = state.variables
         updates = int(state.updates)

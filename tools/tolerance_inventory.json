@@ -190,7 +190,7 @@
    "lane": "Training"
   },
   "tests/test_dpo.py": {
-   "comparisons": 7,
+   "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
   "tests/test_edm2.py": {
@@ -262,7 +262,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_grpo.py": {
-   "comparisons": 2,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_guidance_distillation.py": {
@@ -534,7 +534,7 @@
    "lane": "Training"
   },
   "tests/test_rl_surrogate.py": {
-   "comparisons": 8,
+   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_rollout.py": {

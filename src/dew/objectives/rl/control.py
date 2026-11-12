@@ -29,7 +29,7 @@ from flax import linen as nn
 from dew.batch import Batch, Variables, unboxed
 from dew.inference.models import ModelSettings, ReleasesModel
 from dew.nn.kernels.options import program
-from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, traced_update_flops
+from dew.objectives.base import Aux, Objective, Ratio, Shown, Step, own_objective, traced_update_flops
 from dew.rl.distributions import normal_entropy, normal_log_density, tanh_log_jacobian
 from dew.rl.env import Carry, Env, Memory, Observation, Params, Transition, Tree, env_rollout, view
 from dew.rl.evaluation import episodes
@@ -393,7 +393,9 @@ class ControlRollout:
             unrolled.append(steps)
         return carry, jax.tree.map(lambda *leaves: jnp.stack(leaves), *unrolled)
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
+    def __call__[LossT, EffectsT](self, state: TrainState, batch: Batch, key: jax.Array, *,
+                                  objective: Objective[LossT, EffectsT]) -> Batch:
+        own_objective(type(self).__name__, self.objective, objective)
         passes = self.epochs * self.minibatches
         # The rollout's own count of the minibatches served (row 3932); none yet, the updates' as before.
         served = (int(state.updates) % passes or passes) if self._served is None else self._served

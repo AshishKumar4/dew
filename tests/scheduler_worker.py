@@ -116,8 +116,8 @@ def main() -> None:
     trained = []
     scheduling = {}
 
-    def rollout(state, batch, key):
-        packed = scheduling["scheduler"](state, batch, key)
+    def rollout(state, batch, key, *, objective):
+        packed = scheduling["scheduler"](state, batch, key, objective=objective)
         trained.append(packed)
         return packed
 

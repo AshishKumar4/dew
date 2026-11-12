@@ -13,6 +13,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   compiled once (on Qwen3.5-4B, 4 x 12,288 tokens on one 80 GB GPU: one trace where three ran). Each probe
   in a compiled step's plan records its candidate's traced, lowered and compiled seconds (`spent`).
 
+- `GRPOObjective`, `PPOObjective`, `FlowGRPOObjective` and `DiffusionNFTObjective` mask repeated filler rows
+  (`VALID_ROWS`) out of their losses, weights, critic terms and reported metrics, leaving an all-invalid
+  batch with zero mass.
+
 - An fp32 call that runs on the gated delta rule's, Kimi delta attention's or the SSD's port on a GPU (Dew's
   ports of fla's and mamba_ssm's kernels; the SSD's training takes its port on an A100 and an H100) under the
   default numerics multiplies its fp32 products in one TF32, as fla's and mamba_ssm's own kernels do, where it
