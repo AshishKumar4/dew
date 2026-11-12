@@ -128,6 +128,7 @@ from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, res
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
+    Produced,
     check_batch,
     check_stream,
     marked,
@@ -153,7 +154,7 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process, sig
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
 from dew.training.staging import fetched_state
-from dew.training.startup import Startup, run_data
+from dew.training.startup import Startup, computation_differs, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
@@ -670,6 +671,12 @@ class Trainer(Generic[Loss, Effects]):
             state = rates_set(state, lambda held: with_bounds(with_rates(held, config.rates()),
                                                               config.bounds()))
         self._compiler.resume_rung(checkpoints.rung(resume))
+        # At the rung it trained on, the run's computation is the checkpoint's or the resume is refused.
+        differs = computation_differs(checkpoints.artifact(resume), self._artifact())
+        if differs:
+            raise ValueError(f"the checkpoint at step {resume} in {checkpoints.directory} trained another "
+                             f"computation ({', '.join(differs)}); resume it with the objective and model "
+                             "it recorded, or train in another directory")
         # A step an earlier Dew wrote records no key's implementation (`key_record`): its key data is the
         # run's own key's.
         key = state.key if jnp.issubdtype(state.key.dtype, jax.dtypes.prng_key) else (
@@ -1426,10 +1433,15 @@ class Trainer(Generic[Loss, Effects]):
         counted = run.marked if self.rollout is None else functools.partial(
             consumption_counted, clocked=self._shape.examples is not None, marks_rows=False)
         inputs = self.objective.inputs
+        # What the stream states it hands each step, a rollout's batches aside, which make their own rows.
+        produced = None if self.rollout is not None else Produced.of(plan.dataset, run.partition)
 
         def prepare(batch: Batch) -> Batch:
-            # Every batch's token ids within its model's table, on the prefetch worker before it is placed
-            # (`InputSpec.bounded`): an id past the table reads no row, and its gather fills NaN.
+            # Every batch as its loader states it, before it is placed (`Produced`), and its token ids within
+            # its model's table (`InputSpec.bounded`): an id past the table reads no row, and its gather
+            # fills NaN.
+            if produced is not None:
+                produced.checked(batch)
             if inputs is not None:
                 inputs.bounded(batch)
             return counted(batch)

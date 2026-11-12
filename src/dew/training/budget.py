@@ -21,15 +21,15 @@ from dew.training.evaluation import Summary
 
 def run_length(steps: int | None, epochs: int | None, tokens: int | None, examples: int | None = None, *,
                required: bool = True) -> None:
-    """Refuse a run whose length is named twice, by two of `steps`, `epochs` and `examples`, or, where
-    `required`, not at all; `tokens` caps any of them or bounds a run alone."""
-    named = [name for name, value in (("steps", steps), ("epochs", epochs), ("examples", examples))
-             if value is not None]
+    """Refuse a run whose length is named twice, by two of `steps`, `epochs`, `examples` and `tokens`, or,
+    where `required`, not at all: one budget (row 5725). The tokens a schedule's last stage ends its data at
+    bound a run of any length beside it (`budget_tokens`), as the data's own end does."""
+    named = [name for name, value in (("steps", steps), ("epochs", epochs), ("examples", examples),
+                                      ("tokens", tokens)) if value is not None]
     if len(named) > 1:
         raise ValueError(f"{' and '.join(named)} each name the run length; set one")
-    if required and not named and tokens is None:
-        raise ValueError("the run length is steps, epochs or examples, or tokens, which also caps any of "
-                         "them")
+    if required and not named:
+        raise ValueError("the run length is steps, epochs, examples or tokens; set one")
 
 
 def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int | None,
@@ -38,8 +38,9 @@ def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int
     `steps`, `epochs` of it, whose ramp stages begin where updates do, as the stream cuts them, or the
     steps that read the `examples` it is bounded to (`Loader.example_steps`), a read with no record count
     bounded to its epochs' source examples among them, or None where `tokens` alone bounds it. Refuses a
-    run with no length or two, and epochs of a stream with no count of either."""
-    run_length(steps, epochs, tokens, examples)
+    run with no length or two, and epochs of a stream with no count of either. `tokens` is the run's token
+    budget (`budget_tokens`), which a schedule's data bounds beside a length named otherwise."""
+    run_length(steps, epochs, None, examples, required=tokens is None)
     if examples is not None:
         return loader.example_steps(examples, accumulation)
     if epochs is None:

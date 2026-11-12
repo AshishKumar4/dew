@@ -7,7 +7,7 @@ Design record, 2026-10-12. This is the binding design for Dew's training and mod
 A `Trainer` runs an `Objective` (the loss and metrics for one kind of training: language modelling, diffusion, decision, preference, RL) with an Optax optimizer on a device mesh. `fit` takes a data chain and a budget. Everything between (sharding, micro-batches, rematerialization, kernels, compilation, checkpoints, resume) is chosen by Dew from the model, the mesh and the hardware, and every one of those choices can be overridden. The model is a plain Flax module, the optimizer is plain Optax, checkpoints are plain Orbax, and the mesh can be a plain `jax.Mesh`.
 
 ```python
-model = CausalTransformer(vocab=50_257, width=768, depth=12, heads=12)
+model = CausalTransformer(vocab_size=50_257, emb_features=768, num_layers=12, num_heads=12)
 trainer = Trainer(LMObjective(model, seq_len=1024), optax.adamw(3e-4), key=0)
 state = trainer.fit(train, validation=val, tokens=10e9)
 ```
@@ -118,10 +118,10 @@ On any mesh, the layout reports what it is about to do before the first step, as
 
 ## 3. Memory and speed are chosen for you
 
-Before it places the state it starts from, `fit` refuses a mesh whose devices cannot hold it (`Layout.validate`, §2). The memory planner then picks, per model, mesh and GPU, the cheapest combination that fits: micro-batch size, rematerialization policy and LM-head tiling. The ladder holds no host offload. XLA:GPU holds the optimizer state and the EMA whole on the device for the update wherever they rest between steps, so keeping them in host memory frees nothing at a step's peak (a decoder's step on an A100 peaked at 8.427 GB either way). A run keeps them there by its layout (`Layout.host`), which saves only the device memory they would take between steps; the step reads them past its gradient, so the forward and backward run without them. A remat policy that keeps its residuals in pinned host memory (`minimal_offloaded`) keeps as many on the device as `full` does, so it fits nowhere `full` does not; a run takes it by its own remat, and timing it against `full` is tracked in the roadmap. Parameter offload is the layout's too, and choosing it automatically is tracked in the [roadmap](../roadmap.md#training-and-parallelism). The planner's first candidate is derived from shapes before anything compiles (`dew.training.footprint`): the least-recomputation rung whose gradient program, traced, holds at its peak (its residuals as the target's fusion keeps them, the backward's cotangents and the gradient) less than the GPU has beside the state and the GEMM workspace XLA hands each cuBLAS matmul (32 MiB from Hopper on, 4 MiB before). Its compile decides: the planner checks each candidate against its compiled program's memory analysis, steps one rung where it misses, and logs each compile the derivation judged otherwise as a model miss, every plan record holding the derived headroom beside the measured one. A gate holds the derivation to the compile at 0.6 and 1.6 times a step's need over dense, hybrid and expert decoders on Ampere and Hopper. Where none fits, `fit` raises naming the split, rematerialization and head options it tried, and the closest candidate's temporary and argument bytes where the analysis gave them. The same `batch(1024)` works on one GPU or 256. You override any one of them:
+Before it places the state it starts from, `fit` refuses a mesh whose devices cannot hold it (`Layout.validate`, §2). The memory planner then picks, per model, mesh and GPU, the cheapest combination that fits: micro-batch size, rematerialization policy and LM-head tiling. The ladder holds no host offload. A run keeps the optimizer state and the EMA in host memory by its layout (`Layout.host`): the update stages them to the device a bounded chunk at a time (`dew.training.staging`; row 3526, where a whole fetch of them had peaked a decoder's step on an A100 at 8.427 GB either way), and the step reads them past its gradient, so the forward and backward run without them. A remat policy that keeps its residuals in pinned host memory (`minimal_offloaded`) keeps as many on the device as `full` does, so it fits nowhere `full` does not; a run takes it by its own remat, and timing it against `full` is tracked in the roadmap. Parameter offload is the layout's too, and choosing it automatically is tracked in the [roadmap](../roadmap.md#training-and-parallelism). The planner's first candidate is derived from shapes before anything compiles (`dew.training.footprint`): the least-recomputation rung whose gradient program, traced, holds at its peak (its residuals as the target's fusion keeps them, the backward's cotangents and the gradient) less than the GPU has beside the state and the GEMM workspace XLA hands each cuBLAS matmul (32 MiB from Hopper on, 4 MiB before). Its compile decides: the planner checks each candidate against its compiled program's memory analysis, steps one rung where it misses, and logs each compile the derivation judged otherwise as a model miss, every plan record holding the derived headroom beside the measured one. A gate holds the derivation to the compile at 0.6 and 1.6 times a step's need over dense, hybrid and expert decoders on Ampere and Hopper. Where none fits, `fit` raises naming the split, rematerialization and head options it tried, and the closest candidate's temporary and argument bytes where the analysis gave them. The same `batch(1024)` works on one GPU or 256. You override any one of them:
 
 ```python
-Trainer(objective, opt, key=0, accumulation=4)                    # fix the micro-batch split
+Trainer(objective, opt, key=0, split=4)                           # fix the micro-batch split
 Trainer(objective, opt, key=0, layout=Layout(host=("opt_state",)))  # keep optimizer state in host memory
 ```
 
@@ -137,7 +137,7 @@ state = trainer.fit(
     eval_every=1000,
     checkpoint_every=datetime.timedelta(minutes=30),
     best="validation/web/loss", restore_best=True,
-    stop=Plateau(patience=5),
+    stop=Plateau("validation/web/loss", evals=5),
 )
 ```
 

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import flax.linen as nn
 
+from dew._records import JSON
 from dew.data.compile import Handed, fitted
 from dew.data.dataset import DataPartition, Loader
 from dew.data.pipeline import Dataset, ObjectiveData
@@ -122,3 +123,26 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
         saved = checkpoints.position(step, DataPartition.of(trainer.device_mesh))
         if saved is not None:
             admitted(loader, trainer._stream_partition(), saved)
+
+
+def computation_differs(saved: JSON, now: JSON) -> list[str]:
+    """Where the computation a checkpoint trained, its inference record (`Objective.inference_record`, which
+    every step carries), and this run's differ: each path of the objective's class or its model's record where
+    both state it and they disagree, the fields that say how layers execute aside (the
+    configured path's own `RunConfig.EXECUTED`). Nothing where either records none (an unrecordable
+    model's, or a step that predates the record): only positive evidence refuses (row 5723)."""
+    from dew._records import without_fields
+    from dew.config import RunConfig
+
+    if not isinstance(saved, Mapping) or not isinstance(now, Mapping) or "unrecorded" in {*saved, *now}:
+        return []
+
+    def differing(before: JSON, after: JSON, path: str) -> list[str]:
+        if isinstance(before, Mapping) and isinstance(after, Mapping):
+            return [found for key in sorted({*before, *after})
+                    for found in differing(before.get(key), after.get(key), f"{path}.{key}")]
+        return [] if before == after else [path]
+
+    return [found for name in ("objective", "model") if name in saved and name in now
+            for found in differing(without_fields(saved[name], RunConfig.EXECUTED),
+                                   without_fields(now[name], RunConfig.EXECUTED), name)]

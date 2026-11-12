@@ -359,6 +359,43 @@ def budget_lm_trainer(tmp_path=None, **kwargs) -> Trainer:
     return make_trainer(tmp_path, objective=LMObjective(model, seq_len=LM_CONTEXT), **kwargs)
 
 
+def test_a_batch_of_other_rows_than_its_loader_states_is_refused_before_it_is_placed():
+    """A loader that states batches of BATCH rows and hands its third step twice as many (a step after the
+    batch that joined two) is refused at that batch, before it is placed (row 5724), where it once compiled
+    another step for it; one that hands what it states trains on."""
+    def stream():
+        for index, batch in enumerate(itertools.islice(Counting(), 4)):
+            joined = {name: np.concatenate([value, value]) for name, value in batch.items()}
+            yield joined if index == 2 else batch
+
+    with pytest.raises(ValueError):
+        make_trainer().fit(dataset(stream), steps=4)
+    assert int(make_trainer().fit(dataset(), steps=4).step) == 4
+
+
+def test_a_run_given_steps_and_tokens_is_refused_as_a_budget_named_twice():
+    """One budget (row 5725): a fit given both `steps` and `tokens` is refused before it reads, as one given
+    steps and epochs is; tokens alone bound it."""
+    with pytest.raises(ValueError):
+        budget_lm_trainer().fit(lm_data(), steps=2, tokens=96)
+    assert int(budget_lm_trainer().fit(lm_data(), tokens=96).step) == 2
+
+
+def test_a_direct_resume_into_another_models_computation_is_refused_and_its_own_resumes(tmp_path):
+    """A trainer built directly over a checkpoint directory whose run trained another computation of the same
+    shapes (its feed-forward's gating geglu, the run's swiglu) refuses to resume, as a configured run's
+    record refuses it (row 5723); the model that trained it resumes."""
+    def trainer(mlp: str) -> Trainer:
+        model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                                  mlp_features=32, max_seq_len=12, dtype="float32", mlp=mlp)
+        return make_trainer(tmp_path, objective=LMObjective(model, seq_len=LM_CONTEXT))
+
+    trainer("swiglu").fit(lm_data(), steps=1)
+    with pytest.raises(ValueError):
+        trainer("geglu").fit(lm_data(), steps=2)
+    assert int(trainer("swiglu").fit(lm_data(), steps=2).step) == 2
+
+
 @pytest.mark.parametrize("accumulation", [1, 2], ids=["one-step-updates", "two-step-windows"])
 @pytest.mark.parametrize("steps", [4, 20])
 def test_a_token_budget_stops_its_run_at_the_step_it_is_spent(accumulation, steps):

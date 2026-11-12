@@ -428,6 +428,25 @@ def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoi
         jax.config.update("jax_enable_x64", val=False)
 
 
+@pytest.mark.parametrize("features", [8, 1], ids=["dual", "primal"])
+def test_a_gauss_newton_window_the_stream_ends_inside_solves_the_rows_it_holds(features):
+    """Gauss-Newton read one row a microbatch in windows of four, over five rows: the run's last window,
+    which the stream ends inside, holding its fifth row alone, commits a solve of that row (row 5722), where
+    it once moved nothing and counted an update: its weights fit the row, as a row fewer than the weights
+    is fitted (the dual's least change) or one weight's is (the normal equations' least squares)."""
+    generator = np.random.default_rng(5)
+    x = generator.normal(size=(5, features)).astype(np.float32)
+    y = generator.normal(size=5).astype(np.float32)
+    rows = Memory([{"x": row, "y": target} for row, target in zip(x, y, strict=True)]).batch(1)
+    trainer = Trainer(LeastSquares(features), gauss_newton(damping=1e-6), key=0, layout=LAYOUT,
+                      accumulation=4)
+    state = trainer.fit(rows)
+    weights = np.asarray(state.variables["params"]["Dense_0"]["kernel"])[:, 0]
+    assert int(state.updates) == 2
+    # The last window's solve fits its one row: its residual nil beside the row's scale.
+    assert abs(float(x[4] @ weights - y[4])) < 1e-3 * (abs(float(y[4])) + 1)
+
+
 def test_a_gauss_newton_update_held_by_a_wrapper_that_drops_its_statistics_is_refused():
     """A Gauss-Newton update inside `optax.MultiSteps`, which hands its inner update no extra arguments and
     pools no system across the steps it holds, is refused as its step is traced, naming the accumulation
