@@ -51,8 +51,7 @@ COLLECTIVES = {
 }
 """NVIDIA JAX-Toolbox's collective options for a GPU step over several devices: the scheduler overlaps
 each collective with compute, and the collectives combine into few large ones. Measured in
-docs/performance.md, "Collectives over several GPUs". A part that measured its own all-gather threshold
-takes it (`GpuTarget.all_gather_combine`)."""
+docs/performance.md, "Collectives over several GPUs"."""
 
 
 def step_compiler_options(objective, tokens: float, frozen: bool,
@@ -95,11 +94,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     generation = device_generation()
     options: dict[str, Option] = {}
     if backend() == 'gpu' and devices > 1:
-        # The attached part's own threshold where a step measured one (`GpuTarget.all_gather_combine`).
-        measured = gpu_target().all_gather_combine
-        collectives = {**COLLECTIVES, **({} if measured is None else
-                                         {'xla_gpu_all_gather_combine_threshold_bytes': measured})}
-        options.update({name: value for name, value in collectives.items() if xla_flag(name) is None})
+        options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
     small = tokens <= 128
     if (backend() == 'gpu' and xla_flag('xla_gpu_dot_merger_threshold_mb') is None
             and not (frozen and small)):

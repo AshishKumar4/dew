@@ -1202,9 +1202,9 @@ def _placement(mesh: MeshSpec | Mesh | None, layout: Layout | None, *, on_host: 
     of a tree, a leaf at a time (`place`), by the layout as a model that places its own tree refines it
     (`_refined`), or none: refused beside `on_host`, which keeps the variables as host arrays, or a load
     without its weights, whose restore places them."""
-    if on_host and (mesh is not None or layout is not None):
-        raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
-                         "pass one")
+    from dew.checkpoints import host_or_placed
+
+    host_or_placed(on_host, mesh, layout)
     streaming = mesh is not None or layout is not None
     if streaming and not weights:
         raise ValueError("a source loaded without its weights has nothing to place; the restore that "

@@ -1969,8 +1969,7 @@ On the same pair, 2026-11-12, a Qwen3.5-4B decision step (random weights, 12,288
 remat, one or two rows a device a microbatch, Muon and AdamW; IG-SCALING-2XH100, row 5568) took the
 scheduler and three all-gather thresholds: the scheduler hid half the exposed communication (77 to 40 ms of
 a 1,078 ms step), and 1 GiB, 128 MiB and 30 MiB stepped within 1% of each other in all 15 timed cells, 128
-MiB holding 39.4 GiB of peak at two rows against 1 GiB's 44.6. An H100 SXM takes 128 MiB
-(`GpuTarget.all_gather_combine`); every other part keeps 1 GiB until a step measures it.
+MiB holding 39.4 GiB of peak at two rows against 1 GiB's 44.6.
 
 ```
 cd <dew checkout> && JAX_PLATFORMS=cuda XLA_FLAGS= XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 PYTHONPATH=src \

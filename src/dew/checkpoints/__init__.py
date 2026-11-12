@@ -600,6 +600,15 @@ def _host_devices() -> list:
                          "initializes, or load onto the accelerator") from error
 
 
+def host_or_placed(on_host: bool, mesh, layout) -> None:
+    """Refuse a read onto the host (`on_host`) beside a `mesh` or `layout`, which place what it reads: every
+    load that takes both checks them here (`Checkpoints.variables`, `dew.inference.models.ReleasedRun`,
+    `dew.interop.Pretrained.load`)."""
+    if on_host and (mesh is not None or layout is not None):
+        raise ValueError("on_host reads the variables into host arrays, and mesh and layout place them; "
+                         "pass one")
+
+
 def _host_read(*, from_local: bool) -> ocp.ArrayRestoreArgs:
     """How a leaf that no template places is read. It is typed as a host
     array, so Orbax reads no sharding file and warns about none. A local
@@ -1782,9 +1791,7 @@ class Checkpoints:
         with_ema = stored.get("ema") is not None if ema is None else ema
         if with_ema:
             template["ema"] = without(stored["ema"], unread)
-        if on_host and (mesh is not None or layout is not None):
-            raise ValueError("on_host reads the variables into host arrays, and mesh and layout place "
-                             "them; pass one")
+        host_or_placed(on_host, mesh, layout)
         if on_host and step == self._local_latest():
             raise ValueError(f"step {step} is held locally, on the devices that wrote it, which its read "
                              "places it on (`_check_placement`), so it reads onto no host; read a persistent "

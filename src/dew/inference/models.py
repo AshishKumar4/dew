@@ -202,9 +202,9 @@ class ReleasedRun(SavedRun):
                 return jax.ShapeDtypeStruct(leaf.shape, stored) if self.shapes else leaf.astype(stored)
 
             variables = jax.tree_util.tree_map_with_path(stored_as, variables)
-        if on_host and (mesh is not None or layout is not None):
-            raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
-                             "pass one")
+        from dew.checkpoints import host_or_placed
+
+        host_or_placed(on_host, mesh, layout)
         return variables if self.shapes or on_host else place(variables, mesh, layout)
 
 
