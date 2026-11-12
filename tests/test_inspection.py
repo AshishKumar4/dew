@@ -450,7 +450,7 @@ def test_a_model_applied_in_parts_names_each_module_by_its_path_in_the_variables
 
     both = ["activations/critic/value", "activations/policy/critic/value"]
     assert logged(("Dense",)) == logged(("*value",)) == logged(("critic/value",)) == both
-    assert logged(("policy/*",)) == ["activations/policy/critic/value"]
+    assert logged(("policy/*",)) == ["activations/policy/critic", "activations/policy/critic/value"]
     assert logged(("critic/v*",)) == both
     probes = {"params": {"policy": {}, "critic": {}}, PROBES: probes_of(sown(("Dense",)))}
     own, apart = (part(probes, name)[PROBES] for name in ("policy", "critic"))

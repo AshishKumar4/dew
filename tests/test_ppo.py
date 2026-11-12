@@ -591,6 +591,33 @@ def test_rejected_actor_tokens_leave_only_the_weighted_critic_support(coefficien
     assert changed == (coefficient > 0)
 
 
+def test_a_run_watching_its_actor_and_critic_names_each_by_its_path_in_the_variables():
+    """A PPO run watching a kind of module its actor and its critic both hold (`*Attention`) logs each one's
+    activations and the loss's cotangents under its path in the run's variables, the actor's under
+    `policy/` and the critic's under `critic/`, the same layer of the two never one name (row 5697: the
+    actor's were logged at the root, where a module of the actor's named as the critic's part would meet
+    the critic's)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.training import Inspection, inspected
+
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, qk_norm=False)
+    objective = PPOObjective(model, 5, critic=ValueHead(model))
+    trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(0),
+                      inspection=Inspection(modules=("*Attention",), targets=("params",), cotangents=True))
+    ids = jnp.tile(jnp.arange(6, dtype=jnp.int32), (jax.device_count(), 1))
+    mask = jnp.broadcast_to(jnp.arange(6) >= 3, ids.shape).astype(jnp.float32)
+    batch = {"input_ids": ids, "text_segment_ids": jnp.ones_like(ids),
+             "text_positions": jnp.broadcast_to(jnp.arange(6), ids.shape),
+             "response_mask": mask, "advantages": mask,
+             "behavior_log_probs": jnp.full(ids.shape, -3.),
+             "old_values": jnp.zeros_like(mask), "returns": mask}
+    logged = inspected(trainer, batch)
+    for log in ("activations", "cotangents"):
+        parts = {name.split("/")[2] for name in logged if name.startswith(f"inspect/{log}/")}
+        assert parts == {"policy", "critic"}, (log, sorted(logged))
+
+
 @pytest.mark.parametrize("modules", [("ValueHead",), ("critic/*",)], ids=["class", "path"])
 def test_a_run_watching_its_critic_alone_logs_the_critics_activations_and_cotangents(modules):
     """A PPO run watching only its critic, by its class (`ValueHead`) or by its path under its part
