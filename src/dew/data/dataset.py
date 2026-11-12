@@ -1858,7 +1858,8 @@ class StepPhases(Forwarding):
         own = reader.get_state()
         held = json_value(json.loads(own) if isinstance(own, bytes) else own, "a phase's position")
         state = continued(held, members, self._carried)
-        reader.set_state(json.dumps(state).encode() if isinstance(own, bytes) else state)
+        reader.set_state(json.dumps(state).encode() if isinstance(own, bytes)
+                         else record(state, "a phase's position"))
 
     def get_state(self) -> bytes:
         # The phase of the last step read: at a boundary nothing of the next phase is read yet.

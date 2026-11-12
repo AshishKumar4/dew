@@ -986,8 +986,11 @@ def _stamped_mixes(state: JSON) -> list[dict[str, JSON]]:
 def _drawing(mix: Mapping[str, JSON]) -> tuple[str, dict[str, JSON], dict[str, JSON]]:
     """A mix position's node, its pulls by member and its skips by member (`Stamping.state`)."""
     stamping = record(mix[STAMPING], "a mix's draws")
-    return (text(stamping["node"], "a mix's node"), dict(record(stamping["pulled"], "a mix's pulls")),
-            dict(record(stamping["skips"], "a mix's skipped pulls")))
+    pulled = record(stamping["pulled"], "a mix's pulls")
+    skips = record(stamping["skips"], "a mix's skipped pulls")
+    return (text(stamping["node"], "a mix's node"),
+            {member: json_value(count, f"member {member}'s pulls") for member, count in pulled.items()},
+            {member: json_value(held, f"member {member}'s skips") for member, held in skips.items()})
 
 
 def left_by(state: JSON, members: Mapping[str, str],
@@ -1029,14 +1032,15 @@ def continued(state: JSON, members: Mapping[str, str], left: Mapping[str, Sequen
     for mix in mixes:
         node, pulled, skips = _drawing(mix)
         at = nodes.index(node)
-        parents = dict(record(mix["parents"], "a mix's corpora"))
+        parents = {member: json_value(position, f"member {member}'s position")
+                   for member, position in record(mix["parents"], "a mix's corpora").items()}
         for member, corpus in members.items():
             if corpus in left:
                 where = left[corpus][at]
                 parents[member] = uncounted(where.position)
                 pulled[member], skips[member] = where.low, list(where.past)
         mix["parents"] = parents
-        mix[STAMPING] = {**record(mix[STAMPING], "a mix's draws"), "pulled": pulled, "skips": skips}
+        mix[STAMPING] = {"node": node, "pulled": pulled, "skips": skips}
     return state
 
 
