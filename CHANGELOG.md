@@ -7,6 +7,10 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- `GRPOObjective`, `PPOObjective`, `FlowGRPOObjective` and `DiffusionNFTObjective` mask repeated filler rows
+  (`VALID_ROWS`) out of their losses, weights, critic terms and reported metrics, leaving an all-invalid
+  batch with zero mass.
+
 - An fp32 call that runs on the gated delta rule's, Kimi delta attention's or the SSD's port on a GPU (Dew's
   ports of fla's and mamba_ssm's kernels; the SSD's training takes its port on an A100 and an H100) under the
   default numerics multiplies its fp32 products in one TF32, as fla's and mamba_ssm's own kernels do, where it

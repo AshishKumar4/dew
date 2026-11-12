@@ -153,3 +153,7 @@ Check resource release and primary-error preservation through the same lifecycle
 Run the scenario suite with branch coverage (coverage.py) on armada and publish the per-module report.
 
 Branch coverage directs scenario settings. Uncovered code that a real use case reaches gets a scenario setting. Uncovered code that no real use case reaches is a deletion candidate, decided by the user's surface review. A unit test whose lines the scenarios already cover, and which asserts nothing a scenario doesn't, is deleted. Existing flow files compose these scenarios through the same execution helpers, without a second flow framework.
+
+## What the suite costs
+
+`tests/test_durations.json` is the CPU plan's weights and nothing else: each test's seconds as the CPU suite's last green rows observed it, by which the plan cuts a file into tasks (`tools/armada/ci.py durations` folds it from main's CI). A test the CPU suite skips, one marked for a GPU, weighs its skip there, a thousandth of a second for a flow that trains for minutes on its device; a check-1 site's entry is its judge's pooling, not its draws. So the file is no ledger of cost. What the CPU suite costs is read from a run: its rows' seconds and its sites' map tasks, which armada times. What a GPU test costs is read from its tier's receipts, each row's own tests' seconds on its device.

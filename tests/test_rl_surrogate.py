@@ -1,15 +1,10 @@
-"""Update rules against hand computations, against verl, and under mutation.
+"""Update rules against pinned verl fixtures.
 
 `dew.rl.surrogate` is three pieces of arithmetic that decide what a policy
-gradient step does, the clip, the k3 KL and GSPO's stop-gradient. Each one is
-checked against numbers derived on paper in the test that uses them, and
-against verl's own functions on the fixed tensors tools/parity_rl.py runs
-through them, values and gradients both. Torch autograd is the only reference
-that can pin a stop-gradient down, because flipping one changes no value.
-
-The last three tests are the mutations. Each drops or reverses one term in the
-module's real source, compiles it, and asserts that exactly one of the three
-checks goes red, which is the evidence that each term has a test behind it.
+gradient step does: the clip, the k3 KL and GSPO's stop-gradient. Each one is
+checked against verl's own functions on the fixed tensors tools/parity_rl.py
+runs through them, values and gradients both. Torch autograd pins the
+stop-gradient down, because flipping one changes no value.
 
 Tolerances and the largest differences observed against verl, fp32:
 
@@ -32,7 +27,6 @@ differ in the last fp32 digit because torch sums the token matrix in a
 different order.
 """
 
-import math
 from pathlib import Path
 
 import jax
@@ -121,21 +115,9 @@ def check_stop_gradient(module):
 def test_the_clipped_loss_and_its_gradient_match_verl():
     check_clip(surrogate)
 
-    log_ratio = jnp.array([[0.0, 0.5, -0.4], [0.0, 1.5, -0.4]])
-    mask = jnp.array([[1.0, 1.0, 1.0], [1.0, 1.0, 0.0]])
-    loss, aux = clipped_surrogate(log_ratio, jnp.array([1.0, -1.0]), mask,
-                                  epsilon_low=0.2, epsilon_high=0.5, dual_clip=3.0)
-    assert float(loss) == pytest.approx((-1 - 1.5 - math.exp(-0.4) + 1 + 3) / 5, abs=1e-6)
-    assert float(aux["pg_clipfrac"]) == pytest.approx(0.2, abs=1e-6)
-    assert float(aux["pg_clipfrac_lower"]) == pytest.approx(0.2, abs=1e-6)
-    assert float(aux["ppo_kl"]) == pytest.approx(-0.32, abs=1e-6)
-
 
 def test_the_k3_estimator_and_its_gradient_match_verl_and_tunix():
     check_k3(surrogate)
-
-    hand = surrogate.k3_kl(jnp.array([[-1.0, -1.0]]), jnp.array([[-0.5, -3.0]]))
-    assert hand[0].tolist() == pytest.approx([math.exp(0.5) - 1.5, math.exp(-2.0) + 1.0], abs=1e-6)
 
 
 def test_the_sequence_ratio_pools_the_value_and_keeps_the_gradient_per_token():

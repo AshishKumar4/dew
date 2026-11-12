@@ -288,6 +288,41 @@ def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():
         (np.asarray(rollout.objective.values(final.variables, fixed))[keep] - fixed[RETURNS_KEY][keep]) ** 2
     )
     assert new_error < old_error
+    from rl_support import assert_filled_batch_invariants
+
+    from dew.batch import VALID_ROWS
+    from dew.data.dataset import FilledBatch
+
+    with np.load(FIXTURE) as reference:
+        params = {"policy": {"table": jnp.asarray(reference["objective_policy"])},
+                  "critic": {"backbone": {"scale": jnp.asarray(reference["objective_scale"])},
+                             "value": {"kernel": jnp.asarray(reference["objective_kernel"]),
+                                       "bias": jnp.asarray(reference["objective_bias"])}}}
+        info = Step(jnp.array(0), jax.random.key(1), initial.averaged)
+        actual, gradient = jax.value_and_grad(
+            lambda p: rollout.objective.scalar_loss({"params": p}, fixed, info)[0])(params)
+        assert abs(float(actual) - float(reference["objective_loss"])) < 2e-6
+        observed = {
+            "policy": gradient["policy"]["table"],
+            "kernel": gradient["critic"]["value"]["kernel"],
+            "bias": gradient["critic"]["value"]["bias"],
+            "scale": gradient["critic"]["backbone"]["scale"],
+        }
+        for name, value in observed.items():
+            difference = np.max(np.abs(np.asarray(value) - reference[f"objective_{name}_gradient"]))
+            assert difference < 2e-6, f"verl {name} gradient maximum difference {difference}"
+
+    rolled_three = rollout(initial, {"task_id": np.arange(3, dtype=np.int32)}, jax.random.key(24))
+    three_rows = jax.tree.map(lambda leaf: np.asarray(leaf)[:3],
+                              {name: value for name, value in rolled_three.items() if name != VALID_ROWS})
+    assert jax.tree.leaves(three_rows)[0].shape[0] == 3
+    filled_rows = FilledBatch(4).map(three_rows)
+    corrupted = jax.tree.map(lambda leaf: np.asarray(leaf).copy(), filled_rows)
+    corrupted[RETURNS_KEY][3] = np.nan
+    corrupted[OLD_VALUES_KEY][3] = np.nan
+    corrupted[ADVANTAGES_KEY][3] = np.nan
+    assert_filled_batch_invariants(rollout.objective, filled_rows, corrupted,
+                                   FilledBatch(4, real=False).map(three_rows))
 
 
 class OffsetFeatures(nn.Module):
@@ -400,33 +435,6 @@ def test_muonclip_steps_both_the_actor_and_a_transformer_critic():
             own = before["layers_0"]["self_attn"][projection]["kernel"]
             changed = after["layers_0"]["self_attn"][projection]["kernel"]
             assert np.linalg.norm(changed) < np.linalg.norm(own)
-
-
-def test_composite_objective_and_parameter_gradients_match_verl():
-    """verl combined loss differs by 3.26e-8; parameter gradients by at most 1.50e-8."""
-    trainer, rollout = build_ppo()
-    state = trainer.initial_state()
-    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23),
-                    objective=trainer.objective)
-    with np.load(FIXTURE) as reference:
-        params = {"policy": {"table": jnp.asarray(reference["objective_policy"])},
-                  "critic": {"backbone": {"scale": jnp.asarray(reference["objective_scale"])},
-                             "value": {"kernel": jnp.asarray(reference["objective_kernel"]),
-                                       "bias": jnp.asarray(reference["objective_bias"])}}}
-        info = Step(jnp.array(0), jax.random.key(1), state.averaged)
-        def loss(parameters):
-            return rollout.objective.scalar_loss({"params": parameters}, batch, info)[0]
-        actual, gradient = jax.value_and_grad(loss)(params)
-        assert float(actual) == pytest.approx(float(reference["objective_loss"]), abs=2e-6)
-        observed = {
-            "policy": gradient["policy"]["table"],
-            "kernel": gradient["critic"]["value"]["kernel"],
-            "bias": gradient["critic"]["value"]["bias"],
-            "scale": gradient["critic"]["backbone"]["scale"],
-        }
-        for name, value in observed.items():
-            difference = np.max(np.abs(np.asarray(value) - reference[f"objective_{name}_gradient"]))
-            assert difference < 2e-6, f"verl {name} gradient maximum difference {difference}"
 
 
 def ppo_equations(objective, options):
