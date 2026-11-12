@@ -124,9 +124,12 @@ def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, tr
         checkpoints.restore(share=DataPartition(0, saved_by))
         with pytest.raises(ValueError):
             checkpoints.restore(share=DataPartition(0, processes))
-        with pytest.raises(AssertionError):
-            run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
-                     cell=cell, name="matrix", steps=2 * STEPS, **prepared(cell))
+        # A pool of another count refuses it on every process, at the checkpoint it restored, no step taken.
+        refused = run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
+                           cell=cell, name="matrix", steps=2 * STEPS, refusal=True, **prepared(cell))
+        assert all(report["refused"] == "ValueError" for report in refused), refused
+        assert all(report["written_steps"] == [STEPS] and not report["batches"]
+                   for report in refused), refused
         return
     resumed = run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
                        cell=cell, name="matrix", steps=2 * STEPS, **prepared(cell))
