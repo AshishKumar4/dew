@@ -39,6 +39,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.batch import valid_order
 
+from .documents import document_windows
 from .inputs import MixerCall, PredictionPhase, coordinates_of
 from .mixer_base import MixerBase, MixerContext
 from .mla import INDEXER, IndexerFront, MultiHeadLatentAttention, latent_refusals
@@ -59,26 +60,6 @@ def _real_slots(valid, count: int):
     compact = jnp.arange(count)
     slots = order[:, jnp.minimum(compact, valid.shape[-1] - 1)]
     return jnp.where(compact[None] < real[:, None], slots, -1)
-
-
-def _document_pools(valid, segments, kpool: int, pools: int):
-    """`[B, pools, kpool]` token indices of a row of packed documents' pools: each document's real tokens in
-    their order cut into pools of `kpool` from its own first, the documents' pools one after another,
-    -1 past them and in a document's last pool past its tokens."""
-    batch, total = valid.shape
-    beyond = jnp.iinfo(jnp.int32).max
-    document = jnp.where(valid, jnp.asarray(segments, jnp.int32), beyond)
-    order = jnp.argsort(document, axis=-1, stable=True)
-    grouped = jnp.take_along_axis(document, order, axis=-1)
-    place = jnp.arange(total)
-    first = jax.lax.cummax(jnp.where((place == 0) | (grouped != jnp.roll(grouped, 1, axis=-1)), place, 0),
-                           axis=1)
-    rank = place - first
-    real = grouped != beyond
-    pool = jnp.where(real, jnp.cumsum(real & (rank % kpool == 0), axis=-1) - 1, pools)
-    rows = jnp.broadcast_to(jnp.arange(batch)[:, None], (batch, total))
-    return jnp.full((batch, pools, kpool), -1, jnp.int32).at[rows, pool, rank % kpool].set(
-        order.astype(jnp.int32), mode="drop")
 
 
 # wq_b, wk, k_norm and weights_proj carry the V3.2 indexer's declarations
@@ -142,13 +123,14 @@ class KPoolIndexer(IndexerFront, nn.Module):
             [keys, gate_scores.astype(keys.dtype), valid.astype(keys.dtype)[..., None]], axis=-1
         )
 
-    def _pools(self, packed, segments=None, documents: int = 1):
+    def _pools(self, packed, segments=None):
         """The pools of a packed state, `[B, P]` of them: their keys
         `[B, P, head_dim]`, their token indices `[B, P, kpool]` (-1 on a slot
         outside the row) and whether every slot is valid
         (`get_pooled_states`, modeling_glm5_next.py:899-967). A row of packed
-        documents (`segments`, at most `documents` of them) pools each
-        document's real tokens from its own first (`_document_pools`)."""
+        documents (`segments`) pools each document's real tokens from its own
+        first, its complete pools alone (`dew.nn.documents.document_windows`):
+        a part-full pool is never a candidate, the query's tail reads it."""
         keys, gate_scores, valid = jnp.split(packed, [self.head_dim, 2 * self.head_dim], axis=-1)
         valid = valid[..., 0] > 0
         batch, total = valid.shape
@@ -156,9 +138,10 @@ class KPoolIndexer(IndexerFront, nn.Module):
             pools = -(-total // self.kpool)
             indices = _real_slots(valid, pools * self.kpool)
         else:
-            # A document's last pool may be part full, and so may the padding's (segment 0).
-            pools = -(-total // self.kpool) + documents + 1
-            indices = _document_pools(valid, segments, self.kpool, pools).reshape(batch, pools * self.kpool)
+            windows = document_windows(segments, valid, self.kpool)
+            pools = windows.live.shape[1]
+            indices = jnp.where(windows.live[..., None], windows.sources, -1).reshape(
+                batch, pools * self.kpool)
         safe = jnp.maximum(indices, 0)
         grouped_keys = jnp.take_along_axis(keys, safe[..., None], axis=1).reshape(
             batch, pools, self.kpool, self.head_dim)
@@ -193,7 +176,7 @@ class KPoolIndexer(IndexerFront, nn.Module):
         return jnp.pad(tail, [(0, 0)] * (tail.ndim - 1) + [(0, self.kpool - 1 - tail.shape[-1])],
                        constant_values=-1)
 
-    def select_indices(self, x, q_resid, packed, visible, segments=None, documents: int = 1):
+    def select_indices(self, x, q_resid, packed, visible, segments=None):
         """Complete selected token indices `[B, S, N]`, -1 for an empty slot.
 
         `packed` is the state of every candidate (the cache on decode),
@@ -204,13 +187,13 @@ class KPoolIndexer(IndexerFront, nn.Module):
         torch's `topk` promises no tie order, so a selection a tie decides
         may differ from the reference's. A pool the query cannot see is
         never chosen, whatever the tie rule. A row of packed documents
-        (`segments`, at most `documents`) pools each document apart (`_pools`);
-        `visible` keeps each query to its own document's keys.
+        (`segments`) pools each document apart (`_pools`); `visible` keeps each
+        query to its own document's keys.
         """
         x, q_resid, packed = (jax.lax.stop_gradient(part) for part in (x, q_resid, packed))
         batch, length, _ = x.shape
         total = packed.shape[1]
-        pool_keys, pool_indices, pool_valid = self._pools(packed, segments, documents)
+        pool_keys, pool_indices, pool_valid = self._pools(packed, segments)
         scores = self.scored(self.queries(q_resid), pool_keys, x)
         # A pool is a candidate iff the query sees its last token
         # (modeling_glm5_next.py:832-839); its indices are clamped only so
@@ -311,9 +294,8 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
         """Select pools, retaining the complete token list for opted-in draft reuse."""
         if not call.decode or (prediction_phase == "ordinary"
                                and not self.has_variable("cache", "selection_position")):
-            laid = coordinates_of(call.metadata, *x.shape[:2])
-            return self.indexer.select_indices(x, q_resid, index_keys, keep, laid.segments,
-                                               laid.max_segments), None
+            segments = coordinates_of(call.metadata, *x.shape[:2]).segments
+            return self.indexer.select_indices(x, q_resid, index_keys, keep, segments), None
         # SGLang 97c6978 index_topk_share.py:22-28,48-64 carries the complete token list;
         # a draft hit must not append the new query's tail.
         batch, length = x.shape[:2]
