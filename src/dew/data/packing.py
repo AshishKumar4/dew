@@ -156,7 +156,10 @@ class LastPieces:
         for at, (window, held) in enumerate(laid):
             ids = np.asarray(window[segments])
             for segment, document in enumerate(held, start=1):
-                ends[document] = (at, int(np.flatnonzero(ids == segment)[-1]))
+                # A document of no tokens holds no place in its window, nor any count to move.
+                places = np.flatnonzero(ids == segment)
+                if places.size:
+                    ends[document] = (at, int(places[-1]))
         pieces: list[int] = []
         for document in sorted(ends):
             at, token = ends[document]

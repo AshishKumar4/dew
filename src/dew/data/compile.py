@@ -2010,10 +2010,11 @@ def iterate(
     plan_version: int = PLAN_VERSIONS[-1],
 ) -> pygrain.IterDataset:
     """A finite record pass through the same lowering, for publication and export, read by data plan
-    `plan_version` (`compile`'s), automatic workers read in the process (`Loading.unsized`) and those the
-    chain names in theirs (row 5735)."""
+    `plan_version` (`compile`'s), in the process: automatic workers (`Loading.unsized`) and those the chain
+    names (row 5735), whose turns would interleave the records out of the order the pass publishes."""
     read_by(plan_version)
     loading = loading.unsized()
+    pipeline = _in_process(pipeline)
     if any(isinstance(stage, (RandomMap, BatchStage, MapBatch, Repeat)) for stage in _steps(pipeline)):
         raise ValueError("publication needs deterministic, unbatched pipelines without repeat")
     (pipeline,) = _made(_prepared((pipeline,), read, provision=provision, counts=({},)), read, ({},),
@@ -2022,6 +2023,13 @@ def iterate(
     build = _build(pipeline, read, loading, batch=1, training=False, version=plan_version)
     rows = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
+
+
+def _in_process(pipeline: Pipeline) -> Pipeline:
+    """`pipeline` and each chain it mixes without the loading workers they name (`Workers`)."""
+    held = with_children(pipeline, _in_process)
+    kept = tuple(stage for stage in held.stages if not isinstance(stage, Workers))
+    return dataclasses.replace(held, stages=kept)
 
 
 type Handed = pygrain.MapDataset | pygrain.IterDataset | Mapping[str, np.ndarray]

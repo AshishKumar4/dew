@@ -87,6 +87,7 @@ from dew.data.handoff import (
 )
 from dew.data.mixing import (
     Accepted,
+    Carried,
     Chunked,
     CorpusCounts,
     KeyedMix,
@@ -146,7 +147,7 @@ from dew.data.pipeline import (
     member_record,
     members_held,
 )
-from dew.data.plan import PLAN_VERSIONS, Manifest
+from dew.data.plan import PLAN_VERSIONS, STRUCTURED, Manifest
 from dew.data.readers import WorkerMirrors, _FillShare
 from dew.data.shards import bounded as shards_bounded, bounded_places, cut, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
@@ -1915,10 +1916,15 @@ class _Build:
             rows = stage.function(given.seed(self.stage_seed(pipeline, at, partition)))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
-            rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage))
-            # A group it makes no rows of is refused and counted here, its examples carried to the next row.
-            rows = Accepted(rows, _name(pipeline), _label(pipeline), rows=False,
-                            members=self.counted_members(pipeline))
+            refusing = self.version >= STRUCTURED
+            rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage, refusing=refusing))
+            # A group it makes no rows of is refused and counted here, its examples carried to the next row;
+            # a plan of 13 carried them uncounted, as its positions hold.
+            if refusing:
+                rows = Accepted(rows, _name(pipeline), _label(pipeline), rows=False,
+                                members=self.counted_members(pipeline))
+            elif self.counting(pipeline):
+                rows = Carried(rows)
         else:
             return self.layout_stage(rows, stage, pipeline, at)
         return rows

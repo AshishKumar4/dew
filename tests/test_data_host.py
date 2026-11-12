@@ -163,19 +163,19 @@ def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_
     assert free.resolved(rows, reads=1, batches=1).workers == 3
 
 
-def odd(row) -> bool:
-    """Whether a record's id is odd."""
-    return int(row["id"]) % 2 == 1
+def nonzero(row) -> bool:
+    """Whether a record's id is past the first."""
+    return int(row["id"]) != 0
 
 
-def test_an_offline_pass_reads_a_chain_in_the_workers_it_names():
-    """A finite record pass for publication and export (`iterate`) reads a chain that names its workers in
-    them, its filter's rejections dropped as in the process, the same records in the same order (row 5735):
-    such a chain was refused, though only automatic workers stay out of an offline pass."""
+def test_an_offline_pass_reads_a_chain_that_names_workers_in_its_own_order():
+    """A finite record pass for publication and export (`iterate`) of a chain that names its workers reads
+    it, in the order it reads in the process (row 5735): such a chain was refused, and two workers taking
+    turns over its inputs, one of whose first it filters, would publish 2, 1, 4, 3, 5."""
     from dew.data.compile import iterate
 
     def ids(chain) -> list[int]:
         return [int(row["id"]) for row in iterate(chain)]
 
-    chain = Pipeline(Memory([{"id": np.int64(index)} for index in range(24)])).filter(odd)
-    assert ids(chain.workers(2)) == ids(chain) == list(range(1, 24, 2))
+    chain = Pipeline(Memory([{"id": np.int64(index)} for index in range(6)])).filter(nonzero)
+    assert ids(chain.workers(2)) == ids(chain) == [1, 2, 3, 4, 5]

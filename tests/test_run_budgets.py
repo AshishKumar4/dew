@@ -813,26 +813,29 @@ def test_each_batch_consumes_the_examples_whose_last_rows_it_holds(packed, worke
     assert total == 23
 
 
+@dataclasses.dataclass(frozen=True)
 class Pieced:
-    """An objective's expansion of each record `id` into pieces of 2, 5 and 3 tokens, each token `id`."""
+    """An objective's expansion of each record `id` into pieces of `lengths` tokens, each token `id`."""
 
+    lengths: tuple[int, ...]
     identity = "pieced@1"
 
     def flat_map(self, element):
-        return tuple({"text": np.full(length, int(element["id"]), np.int32)} for length in (2, 5, 3))
+        return tuple({"text": np.full(length, int(element["id"]), np.int32)} for length in self.lengths)
 
 
-def test_an_example_first_fit_lays_apart_completes_in_the_window_emitted_after_its_every_piece():
+@pytest.mark.parametrize("lengths", [(2, 5, 3), (2, 0, 5, 3)], ids=["pieces", "an-empty-piece"])
+def test_an_example_first_fit_lays_apart_completes_in_the_window_emitted_after_its_every_piece(lengths):
     """A run bounded in examples whose objective makes pieces of 2, 5 and 3 tokens of each, packed first-fit
     into two windows of 5 at a time: the first window holds the first and last pieces, the second the 5, so
     an example completes in the batch that holds its second window, not its first, which holds its last
     piece; each batch, one window, consumes the examples whose every piece it and the batches before hold
-    (row 5713)."""
+    (row 5713). A piece of no tokens, laid nowhere, changes none of it."""
     from dew.batch import EXAMPLES_CONSUMED
     from dew.data.pipeline import ObjectiveData, Pack
 
     chain = Pipeline(Memory({"id": np.arange(1, 7, dtype=np.int32)}))
-    objective = ObjectiveData(train=(Pieced(),), pack=Pack(5, fields=("text",), bins=2))
+    objective = ObjectiveData(train=(Pieced(lengths),), pack=Pack(5, fields=("text",), bins=2))
     loader = compile(chain.batch(1), read="streamed", objective=objective, examples=6,
                      loading=Loading(workers=0))
     seen: collections.Counter[int] = collections.Counter()

@@ -275,21 +275,22 @@ class _KeepAccepted:
         self._touched.clear()
         return self._states
 
-    def restored(self) -> None:
+    def restored(self, rejections: int | None) -> None:
         """Every member's counts and the rejections as a restore left them: each member's state made again
-        at its next capture, the rejections counted afresh."""
+        at its next capture, the rejected rows as the position saved them, or, of a position that holds
+        none, counted afresh, one a refusal, as each was before a row of several members' was refused under
+        each (row 5716)."""
         self._touched = set(self.members)
-        self.rejections = sum(sum(counts.rejected.values())
-                              for counts in (self.counts, *self.members.values()))
+        self.rejections = rejections if rejections is not None else sum(
+            sum(counts.rejected.values()) for counts in (self.counts, *self.members.values()))
 
     def __call__(self, element: Batch | Rejected) -> TypeGuard[Batch]:
         self.counts.attempted += 1
         if isinstance(element, Rejected):
             reason = element.reason
             self.owed.owe(element.consumed, element.drawn)
-            refusing = self._refusing(element.member, element.members)
-            self.rejections += len(refusing)
-            for counts in refusing:
+            self.rejections += 1
+            for counts in self._refusing(element.member, element.members):
                 counts.dropped(element)
         else:
             count = None if self.tokens is None else self.tokens(element)
@@ -301,9 +302,8 @@ class _KeepAccepted:
                 return True
             reason = "zero_targets"
             self.owed.owe(accounts(element)[0], drawn_of(element))
-            refusing = self._refusing(member_of(element), members_of(element))
-            self.rejections += len(refusing)
-            for counts in refusing:
+            self.rejections += 1
+            for counts in self._refusing(member_of(element), members_of(element)):
                 counts.rejected[reason] += 1
         self.consecutive += 1
         if not self.warned and self.rejections / self.counts.attempted > _WARN_OVER:
@@ -422,6 +422,7 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         # A mixture's counter keeps its members' counts beside its own, by member key (`MEMBERS`).
         return {**super()._counted(), "consecutive": self._predicate.consecutive,
                 "warned": self._predicate.warned, "consumed": self._predicate.owed.examples,
+                "rejections": self._predicate.rejections,
                 **self._predicate.owed.saved_draws(), "members": self._predicate.member_states()}
 
     def _restore(self, counted: Mapping[str, object]) -> None:
@@ -435,7 +436,48 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         for key, counts in self._predicate.members.items():
             if key in members:
                 counts.restore(record(record(members[key], "member counter")["counts"], "member counts"))
-        self._predicate.restored()
+        held = counted.get("rejections")
+        self._predicate.restored(None if held is None else integer(held, "rejected rows"))
+
+
+class Carried(pygrain.IterDataset[Batch]):
+    """`parent`'s rows, each marker's source examples (`Rejected.consumed`) carried on to the next row and
+    the markers dropped, counting nothing: the carrier after a batched map's group it makes no rows of
+    (`dew.data.pipeline.BatchedGroups`) where a plan of 13 reads, whose positions hold it. The examples it
+    owes are checkpointed with its parent's position; those the stream ends owing are its end's
+    (`dew.training._fit.drained`)."""
+
+    def __init__(self, parent: pygrain.IterDataset[Batch | Rejected]):
+        super().__init__(parent)
+        self._records = parent
+
+    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
+        return _CarriedIterator(iter(self._records))
+
+
+class _CarriedIterator(pygrain.DatasetIterator[Batch]):
+    def __init__(self, parent: pygrain.DatasetIterator):
+        super().__init__(parent)
+        self._read, self._owed = parent, Owed()
+
+    def __next__(self) -> Batch:
+        while True:
+            element = next(self._read)
+            if isinstance(element, Rejected):
+                self._owed.owe(element.consumed, element.drawn)
+                continue
+            return self._owed.paid(element)
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"parent": self._read.get_state(), "owed": self._owed.examples, **self._owed.saved_draws()}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self._read.set_state(record(state["parent"], "carried parent"))
+        self._owed = Owed.restored(integer(state["owed"], "examples owed"),
+                                   json_value(state.get("drawn"), "draws owed"))
+
+    def close(self) -> None:
+        self._read.close()
 
 
 class Accepted(pygrain.IterDataset[Batch]):

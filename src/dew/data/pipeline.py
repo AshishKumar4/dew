@@ -350,6 +350,10 @@ class BatchedGroups:
     (row 5717), which a reader's position holds; a position of a read before it holds no such count."""
 
     stage: Batched
+    refusing: bool = True
+    """Whether a group it makes no rows of is refused (`REFUSALS`), as a plan of 14 or later reads it; a
+    plan of 13 left it on a marker only where it held examples, carried uncounted (`dew.data.mixing.Carried`),
+    and reads so still."""
     max_fan_out: int = 1 << 20
 
     def flat_map(self, group: list[Record]) -> Sequence[Record]:
@@ -392,11 +396,16 @@ class BatchedGroups:
         outputs = [{name: values[index] for name, values in made.items()} for index in range(count)]
         if common is not None:
             outputs = [{**row, MEMBER: common} for row in outputs]
+        if not outputs and not self.refusing:
+            held = sum(consumed)
+            return [Rejected("empty_expansion", consumed=held, member=common,
+                             drawn=tuple(itertools.chain.from_iterable(drawn)))] if held else []
         if not outputs:
             # A group it makes no rows of is refused as an empty expansion, as a record step's is, counted
-            # where the step stands, its examples on the marker for the next row kept to carry on
-            # (`dew.data.mixing.Accepted`), completing no member's.
+            # where the step stands under each member it held (`dew.data.mixing.Accepted`), its examples on
+            # the marker for the next row kept to carry on, completing no member's.
             return [Rejected("empty_expansion", consumed=sum(consumed), member=common,
+                             members=joined(*members) if common is None and counted_by else {},
                              drawn=tuple(itertools.chain.from_iterable(drawn)))]
         if not consumed:
             return outputs
