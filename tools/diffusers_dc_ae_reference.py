@@ -144,8 +144,9 @@ def main(destination: str) -> None:
     for name, config in CONFIGS.items():
         arrays = build(config, root / name)
         np.savez_compressed(root / name / "reference.npz", **arrays)
-    record = {"diffusers": DIFFUSERS, "configs": CONFIGS, "batch": BATCH, "height": HEIGHT,
-              "width": WIDTH, "small": SMALL, "seed": SEED}
+    # Each variant's release, which a fixture extended by one variant keeps for those it holds already.
+    record = {"diffusers": DIFFUSERS, "releases": dict.fromkeys(CONFIGS, DIFFUSERS), "configs": CONFIGS,
+              "batch": BATCH, "height": HEIGHT, "width": WIDTH, "small": SMALL, "seed": SEED}
     (root / "dc_ae.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
     print(f"{root}: {size / 1e6:.2f} MB")
