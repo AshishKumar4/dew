@@ -80,6 +80,17 @@ def encode(place: Global) -> bytes:
     return json.dumps({ENVELOPE: dataclasses.asdict(place)}).encode()
 
 
+class PlanChanged(ValueError):
+    """A saved data position whose plan this read does not make again: each part that differs by name
+    (`differs`: "version", "rules.mix", "derived.0/shards", "manifest.steps", "order.seed", "topology"),
+    which a relaxed resume names where it starts the data again and an exact one refuses by
+    (`dew.training.TrainerConfig.data_resume`); `dew.data.plan` names it."""
+
+    def __init__(self, differs: tuple[str, ...], message: str):
+        self.differs = differs
+        super().__init__(message)
+
+
 def decode(position: bytes) -> Global | None:
     """The global position `position` holds, or None when it is a shard offset.
 
@@ -90,7 +101,11 @@ def decode(position: bytes) -> Global | None:
     envelope = _enveloped(position, ENVELOPE)
     if envelope is None:
         return None
-    fields = {"records", "order", "completed", "tokens"}
+    if "tokens" not in envelope:
+        raise PlanChanged(("version",), "the saved global data position holds no committed tokens its phases "
+                                        "ended at, which a Dew before data plan version 13 wrote: resume it "
+                                        "with the Dew that wrote it, or relaxed (`data_resume='relaxed'`)")
+    fields = {"records", "order", "completed"}
     if fields - set(envelope):
         raise ValueError(
             f"a saved global data position is missing {sorted(fields - set(envelope))}; "

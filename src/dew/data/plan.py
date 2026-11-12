@@ -21,7 +21,7 @@ import numpy as np
 
 from dew import _checkout
 from dew._hashing import array_header
-from dew._position import PER_SHARE, unplaced
+from dew._position import PER_SHARE, PlanChanged, unplaced
 from dew._records import ADDED, JSON, json_value, listed, record, set_added
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
@@ -57,17 +57,6 @@ DataResume = Literal["relaxed", "exact"]
 reads on at the saved position where the plan makes the same rows, a source or step of no identity taken as
 unchanged, and starts the data again where it differs, naming what differs (`PlanChanged`); exact refuses
 any difference, and a source or step it cannot check."""
-
-
-class PlanChanged(ValueError):
-    """A saved data position whose plan this read does not make again: each part that differs by name
-    (`differs`: "version", "rules.mix", "derived.0/shards", "manifest.steps", "order.seed", "topology"),
-    which a relaxed resume names where it starts the data again and an exact one refuses by
-    (`dew.training.TrainerConfig.data_resume`)."""
-
-    def __init__(self, differs: tuple[str, ...], message: str):
-        self.differs = differs
-        super().__init__(message)
 
 
 class PlanOrderChanged(PlanChanged):

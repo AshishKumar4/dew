@@ -1299,6 +1299,13 @@ class Trainer(Generic[Loss, Effects]):
         found = agreed_same("data resume", differs)
         if not found:
             return position
+        if self._shape.examples is not None:
+            # A run bounded in examples ends where its stream of that many examples does, which its clock
+            # counts from the examples it consumed: a stream started again holds them all again.
+            raise PlanChanged(tuple(found), f"the saved data position's plan differs from this run's in "
+                              f"{', '.join(found)}, and the run is bounded in examples, which it counts from "
+                              "the examples its saved position consumed, so its data cannot start again: "
+                              "resume it exactly with the data that wrote it, or bound it in steps")
         run.restarted = tuple(found)
         _log.warning("the saved data position's plan differs from this run's in %s, so its data starts again "
                      "from the beginning of its order while its state resumes (data_resume='relaxed'; "

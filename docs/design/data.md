@@ -526,7 +526,9 @@ data's alone.
   (a source or step with no identity is taken as unchanged). Where the plan differs (a rule, a fact, the
   order, the sources or steps, the topology, or a version this Dew does not read), the stream starts again
   from the beginning of its order, and the run says so: a warning names each part that differs, and the
-  run's records hold it (`DataRestarted`). It guarantees the model's state, not which rows come next.
+  run's records hold it (`DataRestarted`). It guarantees the model's state, not which rows come next. A
+  run bounded in examples counts them from its saved position, so its data cannot start again, and a
+  difference refuses it as an exact resume does.
 - `exact`: any difference refuses the resume, naming it, and a source or step with no identity is refused
   too, since nothing checks it. It guarantees the rows that come next are the ones the saved run would have
   read.
