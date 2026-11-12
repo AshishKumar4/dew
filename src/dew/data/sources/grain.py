@@ -11,7 +11,7 @@ import numpy as np
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
-from .base import Read, Shard, ShardManifest, unnamed
+from .base import Read, Shard, ShardManifest, _single_indexed_manifest, source_record, unnamed
 
 
 @dataclass(frozen=True, eq=False)
@@ -45,20 +45,17 @@ class Grain(Dataset):
     def records(self, read: Read) -> Records:
         if not isinstance(self.dataset, grain.MapDataset):
             raise ValueError(f"{self.describe()} is a Grain IterDataset, read only as a stream")
-        return self.dataset
+        rows = self.dataset.map(source_record)
+        return tuple(rows[index] for index in range(len(rows))) if read == "memory" else rows
 
     def manifest(self) -> ShardManifest:
         if isinstance(self.dataset, grain.MapDataset):
-            rows = len(self.dataset)
-            # One shard, the MapDataset's records in their index order.
-            return ShardManifest((Shard(self.describe(), self.describe(), 0, rows, rows),), self._read_shard,
-                                 index_ordered=True)
+            return _single_indexed_manifest(self, self.describe())
         return ShardManifest((Shard(self.describe(), self.describe()),), self._read_shard)
 
     def _read_shard(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
-        if isinstance(self.dataset, grain.MapDataset):
-            return self.dataset.to_iter_dataset(options)
-        return self.dataset
+        assert isinstance(self.dataset, grain.IterDataset)
+        return self.dataset.map(source_record)
 
     def metadata(self) -> Mapping[str, object]:
         return {"rows": len(self.dataset)} if isinstance(self.dataset, grain.MapDataset) else {}

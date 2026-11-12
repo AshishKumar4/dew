@@ -383,6 +383,36 @@ def _indexed_manifest(source: Source, uri: str, rows: int,
     )
 
 
+def _single_indexed_manifest(source: Source, uri: str) -> ShardManifest:
+    """One whole-store shard `(0..count)` for a single-reader stream, preserving the single-shard
+    positions earlier runs saved, with row-wise `subdivide` when readers × workers exceed one."""
+    count = len(source.records("indexed"))
+
+    def subdivide(required: int) -> tuple[Shard, ...]:
+        parts = min(required, count)
+        if parts < required:
+            return ()
+        step, remainder = divmod(count, parts)
+        bounds = [index * step + min(index, remainder) for index in range(parts + 1)]
+        return tuple(
+            Shard(
+                f"{uri}:{bounds[index]}:{bounds[index + 1]}",
+                uri,
+                bounds[index],
+                bounds[index + 1],
+                bounds[index + 1] - bounds[index],
+            )
+            for index in range(parts)
+        )
+
+    return ShardManifest(
+        (Shard(uri, uri, 0, count, count),),
+        _IndexedSlice(source),
+        subdivide=subdivide,
+        index_ordered=True,
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class _IndexedSlice:
     """Reads a shard of `_indexed_manifest` as the slice of `source`'s indexed
