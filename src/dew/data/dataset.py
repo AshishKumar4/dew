@@ -2160,6 +2160,9 @@ class RampedStream(Forwarding):
         self._ramp = Ranges.ending(tuple(stage.records for stage in stages[1:]))
         self._partition = partition
         self._records = 0
+        # The records the run had handed over where its source was opened at its start, a restart's
+        # (`_position.Global.origin`): the ramp's count less the source's own position at its restore.
+        self._origin = 0
         self._held: Batch | None = None
         # Over an elastic read: its position before the ramp's last read of it, the records handed over
         # before that read, and the records of the next read a restore skips.
@@ -2238,8 +2241,7 @@ class RampedStream(Forwarding):
                                                             self._records))
         place = _position.read(_global_position(self._source.get_state()))
         # The source's own count lags the ramp's where a restart opened it at its start (`origin`).
-        return _position.encode(dataclasses.replace(place, records=self._records,
-                                                    origin=self._records - place.records))
+        return _position.encode(dataclasses.replace(place, records=self._records, origin=self._origin))
 
     def set_state(self, state: bytes) -> None:
         self._held, self._mark = None, None
@@ -2257,7 +2259,7 @@ class RampedStream(Forwarding):
             place = _position.read(state)
             self._source.set_state(_position.encode(dataclasses.replace(
                 place, records=place.records - place.origin, origin=0)))
-            self._records = place.records
+            self._records, self._origin = place.records, place.origin
         stage = self._stage()
         if (self._records - stage.records) % stage.batch:
             raise ValueError(

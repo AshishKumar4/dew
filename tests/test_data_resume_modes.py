@@ -106,7 +106,7 @@ def test_a_position_read_by_other_rules_names_every_one():
 
 
 def _phased(seed: int):
-    """Two phases of 4-row batches: corpus `a` for three steps, then a mix of `b` and `c` shuffled by
+    """Two phases of 8-row batches: corpus `a` for three steps, then a mix of `b` and `c` shuffled by
     `seed`, read on; each record's id names its corpus."""
     from dew.data.pipeline import mix, phases
 
@@ -116,7 +116,7 @@ def _phased(seed: int):
                         name=str(tag))
 
     later = mix([corpus(2).repeat(), corpus(3).repeat()], seed=seed)
-    return phases((corpus(1).repeat().batch(4), 3), (later.batch(4), None))
+    return phases((corpus(1).repeat().batch(8), 3), (later.batch(8), None))
 
 
 def _phased_fit(directory, seed: int, steps: int):
@@ -144,7 +144,7 @@ def test_a_phased_run_resumed_relaxed_after_a_changed_mix_opens_its_phase_at_its
         saved = checkpoints.position(6, DataPartition())
     held = json.loads(saved)["dew_global_position"]
     # Three steps of the first phase, two of the second before the restart, one after it.
-    assert (held["records"], held["completed"][0][1], held["origin"]) == (24, 12, 8)
+    assert (held["records"], held["completed"][0][1], held["origin"]) == (48, 24, 16)
     fresh = compile(_phased(2)).train(DataPartition())
     try:
         ids = [np.asarray(next(fresh)["id"]) for _ in range(5)]
