@@ -659,7 +659,8 @@ def test_a_dreamer_rollout_restored_after_collecting_for_an_uncommitted_update_o
 
     def called(rollout, updates):
         for at, update in enumerate(updates):
-            rollout(SimpleNamespace(variables=variables, updates=update), batch, jax.random.key(at))
+            rollout(SimpleNamespace(variables=variables, updates=update), batch, jax.random.key(at),
+                    objective=rollout.objective)
 
     uninterrupted = dreamer_targets(objective, checkpointed=True)
     called(uninterrupted, (0, 1, 2, 2, 3, 4))
@@ -693,7 +694,8 @@ def test_a_dreamer_rollout_restored_in_a_later_phase_owes_each_update_at_its_own
 
     def called(rollout, updates):
         for update in updates:
-            rollout(SimpleNamespace(variables=variables, updates=update), {}, jax.random.key(update))
+            rollout(SimpleNamespace(variables=variables, updates=update), {}, jax.random.key(update),
+                    objective=rollout.objective)
         return rollout
 
     earlier = called(drawing(16), (0, 1, 2))

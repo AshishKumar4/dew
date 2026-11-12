@@ -614,7 +614,7 @@ def grpo_step(objective, rollout, **trainer):
     trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(1), rollout=rollout,
                       **trainer)
     initial = trainer.initial_state()
-    prepared = rollout(initial, batch_for(objective, 4), jax.random.PRNGKey(2))
+    prepared = rollout(initial, batch_for(objective, 4), jax.random.PRNGKey(2), objective=objective)
     started = [np.asarray(leaf) for leaf in jax.tree.leaves(initial.variables["params"])]
     state, _, _, _, accepted, _ = trainer.compile(initial, prepared)(initial, prepared)
     assert bool(accepted)
