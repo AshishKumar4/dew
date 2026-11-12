@@ -153,6 +153,9 @@ class Candidate:
     """Where the candidate was traced alone (its derivation's), its step lowered from the trace it made,
     at most one trace of the step whoever asks (`FitSearch.lowering`); None for a lowered candidate or one
     whose lowering measures configs (`tune_kernels`), which lowers afresh for each."""
+    floored: bool = False
+    """Whether its footprint is its whole logits' floor alone (`dew.training._candidates.logits_floor`),
+    which leaves no device room, so its gradient was never traced: the walk climbs past it untraced."""
 
     @property
     def lowered(self) -> jax.stages.Lowered:
@@ -615,6 +618,18 @@ class Lower(Protocol):
                  lowering: bool = True) -> Candidate: ...
 
 
+class _Traced(NamedTuple):
+    """A rung the derivation traced short (`FitSearch.walked`): its footprint, the bytes its first call
+    builds, and what it stood at: its narrow copies, remat and head."""
+
+    footprint: Footprint
+    built: int
+    narrow: bool
+    remat: str
+    tile: tuple[int, int] | None
+    fused: bool
+
+
 @dataclasses.dataclass
 class FitSearch[LossT, EffectsT]:
     """A step's search over the fit ladder (`planned`): the first of the run's split candidates (`splits`)
@@ -685,6 +700,9 @@ class FitSearch[LossT, EffectsT]:
     derivations: dict[tuple[str, int], Candidate] = dataclasses.field(default_factory=dict)
     """Each candidate the derivation traced (`judged`), until the search compiles it, lowered from it
     (`lowering`)."""
+    built_at: dict[tuple[str, int], int] = dataclasses.field(default_factory=dict)
+    """The bytes each candidate the derivation read builds on its first call (`Candidate.built`), which the
+    rungs derived from its footprint without a trace build less of (`derived_bounds`)."""
     under: dict[str, int] = dataclasses.field(default_factory=dict)
     """By remat rung (`remat_rung`), the most bytes a compile there needed past its derived headroom: a
     candidate there is judged to fit only where its derived headroom holds that much more, in proportion
@@ -845,11 +863,29 @@ class FitSearch[LossT, EffectsT]:
                              "against (a CPU, or a compile-only GPU given no capacity), so the derivation "
                              "picks no plan and the compiles decide it", self.remat_rung())
             return "unstated", narrow
+        # The last rung traced short, from whose footprint the rungs after it are bounded without a trace
+        # of their own (`derived_bounds`): it is traced where its bounds leave it undecided.
+        last: _Traced | None = None
         while True:
-            headroom = self.judged(split, narrow)
-            label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
-            if label != "refuses":
-                break
+            bounds = None if last is None else self.derived_bounds(last, narrow)
+            if bounds is not None and bounds[1] < 0:
+                self.derived.append({**self.current(), "narrow": narrow, "split": split,
+                                     "headroom": bounds[1], "label": "refuses by the last trace",
+                                     "terms": None})
+                label = "refuses"
+            else:
+                headroom = self.judged(split, narrow)
+                label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
+                if bounds is not None and bounds[0] >= 0 and label == "refuses":
+                    # The bounds said the rung fits and its trace says it does not: the derivation's miss.
+                    self.derived[-1] = {**self.derived[-1], "miss": bounds[0]}
+                if label != "refuses":
+                    break
+                key = self.candidate_key(split, narrow)
+                footprint = self.footprints.get(key)
+                if footprint is not None:
+                    last = _Traced(footprint, self.built_at[key], narrow, self.remat_rung(),
+                                   head_tile_of(self.objective), head_fused_of(self.objective))
             # The search's own climb drops the narrow copies first, at the same head and remat.
             if narrow and self.copies_at[self.candidate_key(split, narrow)]:
                 narrow = False
@@ -860,6 +896,35 @@ class FitSearch[LossT, EffectsT]:
                                                  self.objective, self.base)):
                 break
         return label, narrow
+
+    def derived_bounds(self, last: _Traced, narrow: bool) -> tuple[int, int] | None:
+        """The least and the most headroom the step at the objective's rung and `narrow` can have, derived
+        from `last`, a rung traced short, without a trace of this one; None where it moved past what a
+        footprint bounds (its remat, or its head past the first tile). Without the narrow copies `last`
+        kept, it holds their bytes no more and converts its weights in the step at most all at once; with
+        its head tiled where `last` kept the whole logits, it holds `last`'s peak but for the logits and a
+        tile's share of them at most (`HeadTerms.tiled`)."""
+        footprint = last.footprint
+        tile, fused = head_tile_of(self.objective), head_fused_of(self.objective)
+        if footprint.peak is None or self.remat_rung() != last.remat or (narrow and not last.narrow):
+            return None
+        if (tile, fused) == (last.tile, last.fused):
+            least = most = footprint.peak
+        elif last.tile is None and tile is not None and footprint.head is not None:
+            least, most = footprint.head.headless, footprint.head.tiled(tile, fused=fused)
+        else:
+            return None
+        copies = footprint.resident.get("compute", 0) if last.narrow and not narrow else 0
+        resident = {**footprint.resident, "compute": footprint.resident.get("compute", 0) - copies}
+        devices = local_devices(self.mesh)
+
+        def headroom(peak: int) -> int | None:
+            bounded = dataclasses.replace(footprint, resident=resident, held=footprint.held - copies,
+                                          peak=peak)
+            return derived_headroom(bounded, devices, self.capacity, last.built - copies)
+
+        low, high = headroom(most + copies), headroom(least)
+        return None if low is None or high is None else (pooled_headroom(low), pooled_headroom(high))
 
     def judged(self, split: int, narrow: bool) -> int | None:
         """The derived headroom of the step at `split` and `narrow` at the objective's rung, traced once a
@@ -876,10 +941,15 @@ class FitSearch[LossT, EffectsT]:
             headroom = pooled_headroom(None if footprint is None else derived_headroom(
                 footprint, local_devices(self.mesh), self.capacity, candidate.built))
             label = "unknown" if headroom is None else "fits" if headroom >= 0 else "refuses"
+            if candidate.floored:
+                # Its whole logits alone leave it short: no trace of its gradient was made.
+                label = "refuses by its whole logits"
             self.derived.append({**self.current(), "narrow": narrow, "split": split, "headroom": headroom,
                                  "label": label, "terms": None if footprint is None else footprint.record()})
             self.judged_at[key], self.copies_at[key] = headroom, bool(candidate.copies)
-            self.footprints[key] = footprint
+            # A floor is no trace's footprint: its lowering, and the rungs after it, trace their own.
+            self.footprints[key] = None if candidate.floored else footprint
+            self.built_at[key] = candidate.built
         return self.judged_at[key]
 
     def lowering(self, split: int) -> Candidate:

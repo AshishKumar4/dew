@@ -1383,7 +1383,7 @@ class Trainer(Generic[Loss, Effects]):
         them where the step does not fit with them (`dew.training.planning.FitSearch`)."""
         micro = microbatch_shapes(split_fields(batch)[0], split)
         with self._traced_on(self.device_mesh) as schedule:
-            _, _, whole = prepared_for(self._stepping(), state, micro, schedule, split, narrow=False)
+            _, _, whole, _ = prepared_for(self._stepping(), state, micro, schedule, split, narrow=False)
         return self._validated(whole, capacity)[1]
 
     def _fitting(self, state: TrainState, batch: Batch, capacity: int | None = None) -> Validation:

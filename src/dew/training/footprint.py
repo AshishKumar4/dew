@@ -20,7 +20,7 @@ import contextlib
 import contextvars
 import dataclasses
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import NamedTuple
 
 import jax
@@ -109,19 +109,23 @@ class Footprint:
 class HeadTerms(NamedTuple):
     """What a gradient program's peak (`peak_bytes`) holds of its head's whole logits, the values shaped by
     the head's rows and the step's tokens (`logits_shaped`): its peak with none of them held
-    (`headless`), the most bytes of them held at once (`held`), and the elements of the largest
-    (`elements`). A step whose head takes the backward a tile at a time holds the rest as the whole-logits
-    step does, and of them a tile's share at most: its peak is at most `headless + tile * held /
-    elements`, read off the whole-logits step's one trace (row 5556: on Qwen3.5-4B's step, 4 x 12288
-    tokens, the headless peak of its whole-logits trace is its tiled trace's peak to the byte)."""
+    (`headless`), the most bytes of them held at once (`held`), the elements of the largest
+    (`elements`), and the head's `rows`. A step whose head takes the backward a tile at a time holds the
+    rest as the whole-logits step does, and of them a tile's share at most, a fused head's chunk the
+    tile's tokens over every row: its peak is at least `headless` and at most `tiled`'s, read off the
+    whole-logits step's one trace (row 5556: on Qwen3.5-4B's step, 4 x 12288 tokens, the headless peak of
+    its whole-logits trace is its tiled trace's peak to the byte)."""
 
     headless: int
     held: int
     elements: int
+    rows: int
 
-    def tiled(self, tile: tuple[int, int]) -> int:
-        """The most the step's gradient program holds at its head's `tile`: its peak bounded above."""
-        return self.headless + math.ceil(tile[0] * tile[1] * self.held / self.elements)
+    def tiled(self, tile: tuple[int, int], *, fused: bool) -> int:
+        """The most the step's gradient program holds at its head's `tile`, fused or not: its peak bounded
+        above."""
+        share = tile[0] * (self.rows if fused else tile[1])
+        return self.headless + math.ceil(share * self.held / self.elements)
 
 
 class Peak(NamedTuple):
@@ -263,7 +267,7 @@ def head_terms(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Works
             terms.append(_peak(lowered, count, platform, workspace, consumed, deferred).bytes)
         finally:
             _COUNTED.reset(token)
-    return HeadTerms(*terms, max(found))
+    return HeadTerms(*terms, max(found), table[0])
 
 
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str,
@@ -1054,6 +1058,40 @@ def late_weight_gradients(device) -> bool:
     return bool(capability) and gpu_target(f"sm{capability.replace('.', '')}").late_weight_gradients
 
 
+def resident_bytes(prepared: TrainState) -> dict[str, int]:
+    """The prepared state's device bytes by field (`Footprint.resident`)."""
+    return {name: device_bytes(value) for name, value in {
+        "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
+        "accumulation": prepared.accumulation, "compute": prepared.compute, "groups": prepared.inner}.items()}
+
+
+def logits_floor[LossT, EffectsT](objective: Objective[LossT, EffectsT], forward: jcore.Jaxpr,
+                                  prepared: TrainState, held: int) -> Footprint | None:
+    """The least a step whose head keeps its whole logits holds beside its state, read off its loss's
+    `forward` program before its gradient is traced: those logits in fp32, as the head keeps them for
+    the backward pass (`HeadedObjective.keeps_whole_logits`), the largest value of the head's table's shape
+    the forward makes (`logits_shaped`), with `held` beside them; a footprint whose headroom is an upper
+    bound (`exact` False), so a step it leaves no room refuses on it untraced (`Candidate.floored`). None
+    for a head that keeps no whole logits, or a forward that makes none of them (row 5556: Qwen3.5-4B's
+    4 x 12288 tokens hold 48.8 GB of them, where the state holds 51.9 GB of an 80 GB device)."""
+    table = head_table_shape(objective, prepared.variables)
+    if table is None:
+        return None
+
+    def made(program: jcore.Jaxpr) -> Iterator[int]:
+        for equation in program.eqns:
+            yield from (math.prod(value.aval.shape) for value in equation.outvars
+                        if logits_shaped(value, table))
+            for body in bodies(equation):
+                yield from made(body)
+
+    elements = max(made(forward), default=0)
+    if not elements:
+        return None
+    return Footprint(None, device_bytes(prepared.variables["params"]), held, resident_bytes(prepared),
+                     elements * np.dtype(np.float32).itemsize, exact=False)
+
+
 def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: TrainState, window: int,
                                  split: int) -> tuple[Callable, tuple]:
     """The loss the step evaluates for `objective` over `state`, its update a `window` of microbatches,
@@ -1128,8 +1166,5 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                 trained, arguments[0]["params"], arguments, platform=target.platform,
                 workspace=gemm_workspace(target), lowering=lowering, consumed=reads, deferred=late,
                 table=head_table_shape(objective, variables))
-    resident = {name: device_bytes(value) for name, value in {
-        "variables": prepared.variables, "optimizer": prepared.opt_state, "ema": prepared.ema,
-        "accumulation": prepared.accumulation, "compute": prepared.compute, "groups": prepared.inner}.items()}
-    return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident,
+    return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident_bytes(prepared),
                      None if peak is None else peak.bytes, peak is None or peak.exact, staged, reads, head)
