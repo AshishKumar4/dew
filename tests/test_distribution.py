@@ -413,7 +413,10 @@ def a_launched_process_keeps_every_device_inside_a_slurm_step():
     still place it:
     it pins a process it finds in Slurm's variables to the GPU at the step's
     SLURM_LOCALID, one device of the launcher's several. A process dew launch
-    started takes its placement from the launcher."""
+    started takes its placement from the launcher: it counts every device
+    this process counts."""
+
+    import jax
 
     env = {**outside_any_cluster(os.environ), **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src")}
     program = ("from dew.training.runtime import prepare_process\n"
@@ -425,6 +428,7 @@ def a_launched_process_keeps_every_device_inside_a_slurm_step():
          sys.executable, "-c", program],
         cwd=REPO_ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True), timeout=300)
     assert done.returncode == 0, done.stdout + done.stderr
+    assert f"local devices {jax.local_device_count()}\n" in done.stdout, done.stdout + done.stderr
 
 
 @pytest.mark.mesh(devices=2)
