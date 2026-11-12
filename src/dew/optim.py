@@ -338,7 +338,10 @@ def _coefficients(ns_coeffs, ns_steps: int) -> jax.Array:
                              f"{sorted(_muon._NS_COEFFS_PRESET_DICT)} or 'polar_express'")
         ns_coeffs = (polar_express(ns_steps) if ns_coeffs == "polar_express"
                      else _muon._NS_COEFFS_PRESET_DICT[ns_coeffs])
-    return jnp.asarray(optax.contrib.scale_by_muon(ns_coeffs, ns_steps).init({}).ns_coeffs)
+    state = optax.contrib.scale_by_muon(ns_coeffs, ns_steps).init({})
+    if not isinstance(state, optax.contrib.MuonState):
+        raise TypeError(f"optax's Muon holds its coefficients in a MuonState, not a {type(state).__name__}")
+    return jnp.asarray(state.ns_coeffs)
 
 
 def _scale_by_shape(consistent_rms: float | None, per_head: Mapping[str, int] | None = None
