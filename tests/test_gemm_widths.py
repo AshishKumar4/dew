@@ -51,9 +51,12 @@ def test_a_tma_family_runs_a_partial_step_and_column_tile_where_its_rows_are_who
         (depth_ran, width_ran), tile, padded = ran(depth, width)
         assert tile == padded and tile is not None
         family = mosaic_gpu.family_of(tile, jnp.bfloat16)
-        assert (width_ran == width) is (mosaic_gpu.tile_columns(tile, family) <= width)
-        assert (depth_ran == depth) is (tile.block_k == step)
-    assert ran(1000, 1400)[0] == (1000, 1400)
+        # A pair's tile (a B200's, `paired_first`) is padded yet: each CTA's copy of its half of the pair's
+        # block is not partitioned under a partial extent until the fork's partitioned untiling (row 5727).
+        alone = not family.pairs_product
+        assert (width_ran == width) is (alone and mosaic_gpu.tile_columns(tile, family) <= width)
+        assert (depth_ran == depth) is (alone and tile.block_k == step)
+    assert ran(1000, 1400)[0] == ((1000, 1400) if generation_name == "sm90" else (1024, 1408))
     assert ran(200, 100)[0][1] == 128
     assert ran(200, 136, gather=jax.ShapeDtypeStruct((4096,), jnp.int32))[0][0] > 200
     assert ran(200, 136, name="sm80")[0] != (200, 136)
