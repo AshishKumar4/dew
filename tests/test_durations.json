@@ -15433,7 +15433,6 @@
 "tests/test_discrete.py::test_masked_generation_reads_its_ids_as_every_parser_of_ids_does": 6.21,
 "tests/test_discrete.py::test_sample_walks_the_grid_to_a_fully_revealed_row": 2.799,
 "tests/test_discrete.py::test_the_denoiser_normalizes_bf16_logits_in_fp32": 1.524,
-"tests/test_discrete.py::test_the_loss_is_the_mean_of_the_terms_evaluation_reports_under_the_weights_it_is_handed": 3.849,
 "tests/test_discrete.py::test_the_masked_objective_refuses_a_causal_model": 0.012,
 "tests/test_discrete.py::test_the_mdlm_preset_is_registered_and_takes_no_conditions": 0.515,
 "tests/test_discrete.py::test_training_times_are_mdlms_antithetic_draw": 1.467,
