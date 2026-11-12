@@ -761,7 +761,7 @@ def test_a_sites_judge_and_map_tasks_leave_its_files_cut_and_recorded_times_as_t
                                                 "tests/test_site.py::test_new": 1.0}
     timings = {"rows": {"3.12:tests/test_site.py": 2.0, "3.12:tests/test_site.py#test_site": 5.0,
                         ci.site_task("3.12", "tests/test_site.py", "test_site", (0, 8)): 70.0}}
-    assert ci.cuts.measured_cut(timings, "3.12", "tests/test_site.py") == (2.0, 1)
+    assert ci.measured_cut(timings, "3.12", "tests/test_site.py") == (2.0, 1)
     assert ci.borrowed(timings, "3.14")["rows"] == {**timings["rows"], "3.14:tests/test_site.py": 2.0,
                                                     "3.14:tests/test_site.py#test_site": 5.0}
 

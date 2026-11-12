@@ -1,33 +1,19 @@
 """How tools/armada/ci.py's plan cuts a test file heavier than its target into groups (`weighed`): from the
 cut armada measured its rows at (`measured_cut`), whose seconds past the file's recorded tests are what each
 group of that cut paid besides them (`split`), else from an estimate of its seconds alone, spread over its
-tests. Loaded by ci.py by its path, beside session.py, whose runs of consecutive tests (`session.groups`) a
-task cuts a file by."""
+tests. The standard library alone, loaded by ci.py by its path: the runs of consecutive tests a task cuts a file
+by are session.py's (`session.groups`), which ci.py hands each function that cuts (`session`)."""
 
-import importlib.util
 import math
 import re
-import types
-from pathlib import Path
+from collections.abc import Mapping
 
-
-def _loaded(path: Path, name: str) -> types.ModuleType:
-    """The module at `path`, loaded by its path as ci.py loads its neighbours."""
-    spec = importlib.util.spec_from_file_location(name, path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-session = _loaded(Path(__file__).resolve().with_name("session.py"), "armada_session")
-rows = _loaded(Path(__file__).resolve().with_name("rows.py"), "armada_rows")
 CUT = re.compile(r"(\d+)/(\d+)")
-"""A row's group that is one of a file's cut: `G/N`; a collection's, a site's judge's or a GPU lane's
-process variant's is none (`measured_cut`)."""
+"""A row's group that is one of a file's cut: `G/N`; a collection's, a site's judge's or a GPU lane's process
+variant's is none (`measured_cut`)."""
 
 
-def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> list[float]:
+def split(session, tests: list[float], seconds: float, target: float, cut: int = 1) -> list[float]:
     """The weights of the groups a file that took `seconds` as `cut` groups runs as. Of those
     seconds, what its recorded `tests`' times leave is what each group paid besides its tests (its
     module's fixtures, imports and compiles, which a test's least recorded time does not hold), so
@@ -59,31 +45,24 @@ KEPT = 1.5
 """How far past the target a split file's heaviest group may run before the file is cut again."""
 
 
-def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | None:
-    """What `name` took under `python` at the cut its rows in `timings` name, and that cut's count: its
-    groups' rows summed where every group of a count has its row (the most groups if several counts do),
-    else its whole row, else None. A row's median is measured at the cut its name holds, unlike the file's
-    median, which mixes the cuts of the runs it remembers. A map task's seconds are kept under its task's
-    name, no row's, and a collection's row, a site's judge's and a GPU lane's process variant's are no group
-    of a cut (`CUT`)."""
-    whole, counts = None, {}
-    for row_name, seconds in timings.get("rows", {}).items():
-        if ":" not in row_name:
-            continue
-        python_, name_, group = rows.parsed_row(row_name)
-        if (python_, name_) != (python, name):
-            continue
-        if not group:
-            whole = seconds
-        elif found := CUT.fullmatch(group):
+def measured_cut(groups: Mapping[str, float]) -> tuple[float, int] | None:
+    """What a file took at the cut its rows name, and that cut's count, from its rows' seconds by their `groups`
+    (a whole file's row under ""; ci.py's `measured_cut` reads them from armada's timings): its groups' rows
+    summed where every group of a count has its row (the most groups if several counts do), else its whole row,
+    else None. A row's median is measured at the cut its name holds, unlike the file's median, which mixes the
+    cuts of the runs it remembers. A collection's row, a site's judge's and a GPU lane's process variant's are no
+    group of a cut (`CUT`)."""
+    counts: dict[int, dict[int, float]] = {}
+    for group, seconds in groups.items():
+        if found := CUT.fullmatch(group):
             counts.setdefault(int(found[2]), {})[int(found[1])] = seconds
     complete = [count for count, held in counts.items() if len(held) == count]
     if complete:
         return sum(counts[max(complete)].values()), max(complete)
-    return None if whole is None else (whole, 1)
+    return (groups[""], 1) if "" in groups else None
 
 
-def weighed(tests: list[float], seconds: float, target: float,
+def weighed(session, tests: list[float], seconds: float, target: float,
             measured: tuple[float, int] | None) -> list[float]:
     """The weights of the groups the plan runs a file as, from its recorded `tests`: cut from the seconds
     and the cut its rows were `measured` at (`measured_cut`, `split`). Where no run measured it at a cut,
@@ -96,6 +75,6 @@ def weighed(tests: list[float], seconds: float, target: float,
     hours; armada sized the run by its longest tasks, gave the sites' 874 map tasks 20 of its 688
     containers, and train 772's CI ran out its deadline)."""
     if measured is not None:
-        return split(tests, measured[0], target, measured[1])
+        return split(session, tests, measured[0], target, measured[1])
     total = sum(tests)
-    return split([each * seconds / total for each in tests] if total > 0 else tests, seconds, target)
+    return split(session, [each * seconds / total for each in tests] if total > 0 else tests, seconds, target)

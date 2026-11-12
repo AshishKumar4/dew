@@ -20,7 +20,7 @@ tests in node-id order, each as light as that many runs let it be, a heavier
 test alone. Each group also pays the file's setup (its module's fixtures,
 imports and compiles), which is what armada measured the file at beyond its
 tests' times in tests/test_durations.json, at the cut its rows were last timed
-at and shared among that cut's groups (`cuts.measured_cut`), so the file takes the
+at and shared among that cut's groups (`measured_cut`), so the file takes the
 fewest groups whose heaviest, setup included, holds to `target` (`cuts.split`). A file weighs armada's
 median of its last green runs, or its tests' sum in tests/test_durations.json where that is more
 (those runs may predate the file's current tests), else that sum scaled to armada, else the mean.
@@ -757,6 +757,15 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
             else recorded[name] * slower if name in recorded else None for name in files}
 
 
+def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | None:
+    """What `name` took under `python` at the cut its rows in `timings` name, and that cut's count
+    (`cuts.measured_cut`, over its rows by their groups); a map task's seconds are kept under its task's name,
+    no row's."""
+    return cuts.measured_cut({group: seconds for row_name, seconds in timings.get("rows", {}).items()
+                              if ":" in row_name for python_, name_, group in [parsed_row(row_name)]
+                              if (python_, name_) == (python, name)})
+
+
 APART = re.compile(r"\bpytest\.mark\.torchax\b")
 """A file marked `torchax` imports torchax, which renames torch's privateuse1 backend to "jax" for
 the whole process, so a torch.compile in a later file of its task fails (test_reference_helpers'
@@ -1126,8 +1135,8 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
         groups: dict[str, list[tuple[str, float]]] = {}
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
-                cut = cuts.weighed(recorded.get(name, []), seconds, target,
-                                   cuts.measured_cut(timings, python, name))
+                cut = cuts.weighed(session, recorded.get(name, []), seconds, target,
+                                   measured_cut(timings, python, name))
                 groups[name] = [(f"{group}/{len(cut)}" if len(cut) > 1 else "", weight)
                                 for group, weight in enumerate(cut, start=1)]
         # Each check-1 site its file's marks shard is a row of its own, its judge's.
@@ -2225,10 +2234,10 @@ def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut
     `observed` (one added, removed or renamed); a file within `target` (it took `seconds`), or one with no
     tests to cut, is recorded past it, so the plan would split what runs whole; or, for a file past it (as
     `cut` groups), the groups the plan cuts from the record (`cuts.split`) run a group past `cuts.KEPT` of
-    the target as its tests ran, setup included, and those it would cut from what they took run their heaviest shorter. A cut that fits is
-    kept whatever its tests' times drift, as the plan keeps it, and so is one whose heaviest group no cut
-    shortens (a test heavier than the budget, which runs alone either way): a fold rewrites a file only
-    where its plan changes for the better."""
+    the target as its tests ran, setup included, and those it would cut from what they took run their
+    heaviest shorter. A cut that fits is kept whatever its tests' times drift, as the plan keeps it, and so
+    is one whose heaviest group no cut shortens (a test heavier than the budget, which runs alone either
+    way): a fold rewrites a file only where its plan changes for the better."""
     if own.keys() != observed.keys():
         return True
     if seconds <= target or not own:
@@ -2239,7 +2248,7 @@ def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut
     setup = max(seconds - sum(ran), 0.0) / cut
 
     def heaviest(weights: list[float]) -> float:
-        count = len(cuts.split(weights, seconds, target, cut))
+        count = len(cuts.split(session, weights, seconds, target, cut))
         return max(sum(ran[run.start:run.stop]) + setup for run in session.groups(weights, count) if run)
 
     return heaviest(recorded) > cuts.KEPT * target and heaviest(ran) < heaviest(recorded)
