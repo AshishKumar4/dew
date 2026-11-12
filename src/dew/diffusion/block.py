@@ -27,6 +27,7 @@ from dew.inputs.spec import Field
 from dew.interop.weights import decoding_storage
 from dew.nn import categorical
 from dew.nn.inputs import (
+    MEDIA_INDEX_FIELDS,
     ModelInputs,
     Request,
     continuation_keys,
@@ -342,8 +343,11 @@ def _validated(model: nn.Module, process: BlockProcess, inputs: ModelInputs, max
     _, prompt_length = inputs.tokens.shape
     if prompt_length == 0:
         raise ValueError("a block-diffusion prompt must contain at least one token")
-    # A prompt's ids within the model's table, as every request's are (`check_inputs`).
-    Field.indexing("tokens", (), model).bounded(local_rows(inputs.tokens))
+    # A prompt's ids within the model's table, as every request's are (`check_inputs`): a slot its media
+    # fill reads its tower where the model says so (`Field.media`).
+    media = {name: local_rows(value) for name, value in inputs.token_fields.items()
+             if name in MEDIA_INDEX_FIELDS and isinstance(value, jax.Array)}
+    Field.indexing("tokens", (), model).bounded(local_rows(inputs.tokens), fields=media)
     blocks = (max_new_tokens + process.canvas_length - 1) // process.canvas_length
     if prompt_length + blocks * process.canvas_length > model.max_seq_len:
         raise ValueError("prompt plus rounded-up canvases exceeds max_seq_len")

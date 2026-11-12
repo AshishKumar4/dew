@@ -175,6 +175,36 @@ def test_a_request_holding_a_placeholder_no_media_fill_is_refused_and_one_its_im
     task(media_rows([[4, PLACEHOLDER + 1, 5, 6]], [[-1, 0, -1, -1]]), 2, key=0)
 
 
+def test_a_masked_request_whose_image_fills_a_placeholder_past_the_table_is_filled():
+    """A masked generation over a bidirectional multimodal model is bounded as a text request is: an id
+    past the table at a slot its image fills (the tower's, never the table's) is served, and a response
+    filled; at a slot no image fills, refused, naming it."""
+    import jax.numpy as jnp
+
+    from dew.diffusion.discrete import DiscreteProcess, LogLinear
+    from dew.inference import MaskedGeneration
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import GemmaProjector, SiglipVision
+
+    text = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                             mlp_features=32, max_seq_len=16, causal=False, mask_token_id=31)
+    model = MultimodalTransformer(
+        text, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
+                           image_size=8, patch_size=4),
+        GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1),
+        family="gemma3", image_token_id=40, dtype=jnp.float32)
+    inputs = media_rows([[2, 40, 3, 4]], [[-1, 0, -1, -1]])
+    variables = model.init(jax.random.key(0), inputs.tokens, conditioning=inputs.conditioning,
+                           image_indices=inputs.token_fields["image_indices"])
+    task = MaskedGeneration(model, variables, DiscreteProcess(LogLinear(), mask_id=31), steps=4)
+    generated = task(inputs, 5, key=0).host()
+    assert generated.tokens.shape == (1, 9) and not np.any(generated.tokens[:, 4:] == 31)
+    with pytest.raises(OutsideTable) as raised:
+        task(media_rows([[2, 40, 3, 4]], [[-1, -1, -1, -1]]), 5, key=0)
+    assert outside(raised) == (40, 32)
+
+
 def test_a_training_batch_whose_media_fill_ids_past_the_table_trains_and_one_its_table_reads_is_refused():
     """A multimodal run's rows whose media slots hold ids past its model's table, which the towers fill and
     the table never reads, pass the bound a run's every batch passes (`InputSpec.bounded`) and train to a
