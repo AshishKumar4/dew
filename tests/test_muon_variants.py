@@ -16,6 +16,7 @@ from torch_layout import node
 from dew.newton_schulz import (
     NEWTON_SCHULZ,
     POLAR_EXPRESS_TABLE,
+    ns_operands,
     orthogonalized,
     orthogonalized_leaf,
     polar_express,
@@ -269,7 +270,8 @@ def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(precondi
     """Dew's orthogonalization of wide, tall, square and 2-D updates, on the matrices as they are stored
     (`newton_schulz`: a tall matrix's Gram product and polynomial taken from its shorter side, where optax
     transposes it), whole or walked a matrix at a time (`chunk_bytes`), on par from float64 with optax's
-    own iteration (`orthogonalized_leaf`) of each matrix at `preconditioning` (check 1)."""
+    own iteration (`orthogonalized_leaf`) of each matrix at `preconditioning`, in the dtype Dew's numerics
+    iterate in (check 1)."""
     stacked = optax.contrib.MuonDimensionNumbers((1,), (2,))
     numbers = (stacked, stacked, stacked, optax.contrib.MuonDimensionNumbers(0, 1))
     one = 1 if chunked else None
@@ -279,9 +281,13 @@ def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(precondi
                                    chunk_bytes=one))
 
     def optax_arm(*stacks):
-        return [orthogonalized_leaf(jnp.asarray(stack), 5, shape, coeffs=NEWTON_SCHULZ,
-                                    preconditioning=preconditioning)
-                for stack, shape in zip(stacks, numbers, strict=True)]
+        # optax iterates in the update's own dtype: here in the one Dew's numerics iterate in (`ns_operands`).
+        def one(stack, shape):
+            given = jnp.asarray(stack)
+            work = ns_operands(given.dtype, preconditioning)
+            return orthogonalized_leaf(given.astype(work), 5, shape, coeffs=NEWTON_SCHULZ,
+                                       preconditioning=preconditioning).astype(given.dtype)
+        return [one(stack, shape) for stack, shape in zip(stacks, numbers, strict=True)]
 
     assert_as_exact(dew, optax_arm, shaped_draw, f"Muon's Newton-Schulz at {preconditioning}",
                     seeds=UPDATE_SEEDS)

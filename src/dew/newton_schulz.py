@@ -147,9 +147,12 @@ def _spread_orthogonalized(updates, *, numbers, coeffs, steps: int, eps: float,
             1, chunk_bytes // working_bytes(rows, columns, jnp.dtype(work)))
 
         def chunk(matrices: jax.Array) -> jax.Array:
+            # Its devices' shares as one stack, each device's still its own (its first axis the major one),
+            # so each product batches over one axis, as optax's do.
+            flat = matrices.reshape(-1, *matrices.shape[2:]).astype(work)
             with configured_precision(algorithm):
-                return newton_schulz(matrices.astype(work), coeffs, steps, eps, preconditioning
-                                     ).astype(stack.dtype)
+                done = newton_schulz(flat, coeffs, steps, eps, preconditioning)
+            return done.astype(stack.dtype).reshape(matrices.shape)
         return split(_walked(shared, count, chunk)).reshape(stack.shape)
 
     leaves, structure = jax.tree.flatten(updates)

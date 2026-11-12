@@ -266,8 +266,8 @@ def test_muons_state_is_optaxs_tree_and_steps_its_moments_bit_for_bit():
 
 
 def iteration_products(update, *arguments) -> list:
-    """The precision, operand dtype and shapes of each of the Newton-Schulz products `update` traces
-    (`dot_precisions`): X X^T and A A, each over a stack of matrices' batch."""
+    """The precision and operand dtype of each of the Newton-Schulz products `update` traces
+    (`dot_precisions`): X Xᴴ, A A and B X, each over a stack of matrices' batch."""
     return [(precision, dtype) for precision, dtype, shapes in dot_precisions(update, *arguments)
             if all(len(shape) == 3 for shape in shapes)]
 
