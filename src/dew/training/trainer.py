@@ -1279,7 +1279,7 @@ class Trainer(Generic[Loss, Effects]):
         position, differs = data_resumed(
             dataset, self._stream_partition(),
             functools.partial(checkpoints.position, start.resume, DataPartition.of(self.device_mesh)),
-            examples=self._shape.examples)
+            resume=self.data_resume, examples=self._shape.examples)
         if differs:
             run.restarted = differs
             _log.warning("the saved data position's plan differs from this run's in %s, so its data starts "

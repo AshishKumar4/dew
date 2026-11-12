@@ -45,7 +45,7 @@ from dew.data.dataset import (
     stream_ends,
 )
 from dew.data.pipeline import Dataset
-from dew.data.plan import PlanChanged
+from dew.data.plan import DataResume, PlanChanged
 from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_position, split_fields
 from dew.distributed.placement import MeshSpec, Placement
 from dew.held_updates import waiting
@@ -943,8 +943,9 @@ def _opened_at(loader: Loader, partition: DataPartition, position: bytes | None)
 
 
 def data_resumed(loader: Loader, partition: DataPartition, position: Callable[[], bytes | None],
-                 *, examples: int | None) -> tuple[bytes | None, tuple[str, ...]]:
-    """Where a resume's data reads on from, as its loader's mode says (`Loader.resume`), and what differs
+                 *, resume: DataResume, examples: int | None) -> tuple[bytes | None, tuple[str, ...]]:
+    """Where a resume's data reads on from, as the run's mode `resume` says (`Trainer.data_resume`, which a
+    loader compiled already resumes by too: `dew.data.compile.fitted`), and what differs
     between its saved plan and the run's: the saved `position` (read here, its share's), and none, where
     its plan makes the same rows; else, resumed relaxed, the position its stream starts at afresh, the
     beginning of its order, and the names of what differs (`PlanChanged.differs`), every process alike
@@ -964,7 +965,7 @@ def data_resumed(loader: Loader, partition: DataPartition, position: Callable[[]
                 admitted(loader, partition, held[0])
             return []
         except PlanChanged as changed:
-            if loader.resume == "exact":
+            if resume == "exact":
                 raise
             return list(changed.differs)
 

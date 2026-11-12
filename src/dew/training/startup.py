@@ -109,8 +109,8 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
     position of this process's share at the step it continues (`Checkpoints.resumed`,
     `Checkpoints.position`), and the stream of that share fit opens (`Trainer._stream_partition`), under
     the layout's rules, restored and closed (`_fit.data_resumed`). Nothing where it continues no step or
-    saved no position; a relaxed resume (`Loader.resume`) refuses no position whose data can start again,
-    the one decision fit makes too (`_fit.data_resumed`)."""
+    saved no position; a relaxed resume (`Trainer.data_resume`) refuses no position whose data can start
+    again, the one decision fit makes too (`_fit.data_resumed`)."""
     checkpoints = trainer.checkpoints
     step = None if checkpoints is None else checkpoints.resumed(resume)
     if checkpoints is None or step is None:
@@ -119,4 +119,4 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
     with nn.logical_axis_rules(trainer.layout.axis_rules):
         data_resumed(loader, trainer._stream_partition(),
                      functools.partial(checkpoints.position, step, DataPartition.of(trainer.device_mesh)),
-                     examples=loader.examples)
+                     resume=trainer.data_resume, examples=loader.examples)
