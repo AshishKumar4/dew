@@ -1019,10 +1019,12 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
         if depths:
-            depth_scores, (sown, qk, kls) = self._depth_pass(
-                params, gathered['prediction_inputs']['states'] if stream_depth else hidden, inputs, targets,
-                prepared, roles, losses.dtype, table, rows, (sown, qk, kls), (routing, qk_stats, indexer),
-                train=train, rngs=rngs, collections=collections, packing=packing)
+            with self._watched(prepared, watched):
+                depth_scores, (sown, qk, kls, inspected) = self._depth_pass(
+                    params, gathered['prediction_inputs']['states'] if stream_depth else hidden, inputs,
+                    targets, prepared, roles, losses.dtype, table, rows, (sown, qk, kls, inspected),
+                    (routing, qk_stats, indexer, watched), train=train, rngs=rngs, collections=collections,
+                    packing=packing)
         passes = self._exit_scores(params, gathered, targets, (losses, correct), before) if exits else None
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
                       whole, inspected, moved, passes)
@@ -1030,14 +1032,15 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     def _depth_pass(self, params, source, inputs, targets, prepared, roles, dtype, table, rows, records,
                     asked, *, train, rngs, collections: list[str], packing: dict):
         """The prediction depths' scores (`_depth_scores`) from the trunk's `source` states, and the
-        trunk's `records` (`(sown, qk, kls)`) with the depths' added to each the call `asked` for: a routed
-        depth balances, counts and indexes like a trunk layer. Depth d's state at p scores the target d
-        further out, so its targets are the shifted row's from d on."""
+        trunk's `records` (`(sown, qk, kls, inspected)`) with the depths' added to each the call `asked`
+        for: a routed depth balances, counts and indexes like a trunk layer, and a watched one sows its
+        summary under its own path (`mtp_<d>`), over the positions its caller names. Depth d's state at p
+        scores the target d further out, so its targets are the shifted row's from d on."""
         states = self.model.apply(params, source, inputs, train=train, rngs=rngs, method="mtp_hidden_states",
                                   mutable=collections or False, **packing)
         if collections:
             states, depth_sown = states
-            names = (ROUTER_COLLECTION, QK, INDEXER_COLLECTION)
+            names = (ROUTER_COLLECTION, QK, INDEXER_COLLECTION, INSPECTED)
             records = tuple({**(held or {}), **depth_sown.get(name, {})} if wanted else held
                             for held, name, wanted in zip(records, names, asked, strict=True))
         return self._depth_scores(params, states, targets, prepared, roles, dtype, table, rows), records

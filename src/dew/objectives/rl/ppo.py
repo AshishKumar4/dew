@@ -18,7 +18,6 @@ from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites, part_stage_sites
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
-from dew.nn.inspection import QK
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import ForkedCalls, HiddenStates
@@ -267,20 +266,18 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         """
         return self._critic_scores(variables, batch, progress=progress)[0]
 
-    def _critic_scores(self, variables: Variables, batch: Mapping[str, object], *, qk_stats: bool = False,
-                       progress: Progress = END) -> tuple[jax.Array, Variables | None]:
-        """The critic's values and, when requested, the QK collection from that same forward, at the run's
-        `progress` where the critic reads it."""
+    def _critic_scores(self, variables: Variables, batch: Mapping[str, object], *, opened: Sequence[str] = (),
+                       progress: Progress = END) -> tuple[jax.Array, Variables]:
+        """The critic's values and what that same forward sowed into the `opened` collections (the step's
+        `Step.sown`: its attention logit maxima, its watched activations), at the run's `progress` where the
+        critic reads it."""
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         # The rollout's packed columns laid out once (`Coordinates`), the layout the backbone reads, its
         # groups' shared prompts among them (`packed_coordinates`).
         laid = packed_coordinates(batch, -1)
         values = self.critic.apply(part(variables, "critic"), ids[:, :-1], coordinates=laid,
-                                   mutable=[QK] if qk_stats else False, **progressed(self.critic, progress))
-        qk = None
-        if qk_stats:
-            values, gathered = values
-            qk = gathered.get(QK, {})
+                                   mutable=list(opened) or False, **progressed(self.critic, progress))
+        values, sown = values if opened else (values, {})
         if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
         # Each action's value its prefix's, read at its predecessor's slot as a token's score is
@@ -288,7 +285,7 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         # branch packed before it.
         before = _target_predecessors(packed_coordinates(batch))
         values = values if before is None else _predicted(values, before)
-        return onto_ids(batch, values.astype(at_least_fp32(values.dtype))), qk
+        return onto_ids(batch, values.astype(at_least_fp32(values.dtype))), sown
 
     def trace_key(self) -> Hashable | None:
         """Its actor's key (none where its actor states none), its critic and its value settings
@@ -313,8 +310,9 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         raw_mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
         real = (self.row_weights(batch, raw_mask.shape[0]) > 0)[:, None]
         mask = jnp.where(real, raw_mask, 0)
-        values, critic_qk = self._critic_scores(variables, batch, qk_stats=step.qk_stats,
-                                                progress=self.progress(step))
+        values, critic_sown = self._critic_scores(variables, batch, opened=step.sown(),
+                                                  progress=self.progress(step))
+        critic_qk, critic_inspected = step.observed(critic_sown)
         returns = jnp.where(real, jnp.asarray(batch[RETURNS_KEY], values.dtype), 0)
         old_values = jnp.where(real, jnp.asarray(batch[OLD_VALUES_KEY], values.dtype), 0)
         terms = clipped_value_loss_terms(values, returns, old_values, self.value_clip)
@@ -323,8 +321,11 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         qk = None if aux.qk_stats is None else {"policy": aux.qk_stats}
         if critic_qk is not None:
             qk = {**(qk or {}), "critic": critic_qk}
-        return PPOStatistics(pg, critic), Aux(metrics, qk_stats=qk, effects=aux.effects,
-                                              inspected=aux.inspected)
+        # The critic's watched activations under its part of the variables (`critic`), beside the actor's
+        # own paths, as a step's cotangent probes nest them for each part's call (`dew.batch.part`).
+        inspected = (aux.inspected if not critic_inspected
+                     else {**(aux.inspected or {}), "critic": critic_inspected})
+        return PPOStatistics(pg, critic), Aux(metrics, qk_stats=qk, effects=aux.effects, inspected=inspected)
 
     def reduce_loss(self, stats: PPOStatistics | Ratio) -> tuple[jax.Array, jax.Array]:
         """Combine the independently normalized actor and weighted critic losses, or the validation NLL."""

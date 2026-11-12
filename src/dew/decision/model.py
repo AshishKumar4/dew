@@ -176,16 +176,13 @@ class DecisionModel(HeadedModel):
                         rngs: dict[str, jax.Array] | None = None, progress: Progress = END,
                         opened: Sequence[str] = ()) -> tuple[jax.Array, Variables]:
         """The option logits (`logits`), and what the row's pass sowed into the `opened` collections
-        (`dew.objectives.base.Step.sown`): the backbone's, and the attention logit maxima (`qk`) of the
-        backbone and the head each under its own parameters' name, which each applies apart, so a
-        QK-Clip finds every layer's maxima where it finds its weights (row 1608)."""
+        (`dew.objectives.base.Step.sown`): the backbone's and the head's, each of which it applies apart
+        (`beside_head`)."""
         states, spanned, sown = self._read(variables, inputs, media=media, train=train, rngs=rngs,
                                            progress=progress, opened=opened)
         logits, head_sown = self.head_logits(variables, states, inputs, spanned, train=train, rngs=rngs,
                                              opened=opened)
-        if QK in opened:
-            sown = {**sown, QK: {"backbone": sown.get(QK, {}), "head": head_sown.get(QK, {})}}
-        return logits, sown
+        return logits, beside_head(sown, head_sown, opened)
 
     def pass_logits(self, variables: Variables, inputs: DecisionInputs, *,
                     media: ModelInputs | None = None, train: bool = False,
@@ -204,14 +201,15 @@ class DecisionModel(HeadedModel):
         assert isinstance(backbone, Looped), "a looped backbone's exits"
         earlier, gates = backbone.exit_passes(sown)
         # Every exit through the head, each sowing what the step opened: a QK-Clip bounds the head by the
-        # largest logit any scored exit reads (`observed_maxima`).
+        # largest logit any scored exit reads (`observed_maxima`); a watched module keeps its latest call's
+        # summary, the last pass's, as a module run more than once does (`dew.nn.inspection.watching`).
         read = [self.head_logits(variables, state, inputs, spanned, train=train, rngs=rngs, opened=opened)
                 for state in (*earlier, states)]
         sown = {name: value for name, value in sown.items() if name != EXITS}
+        head = dict(read[-1][1])
         if QK in opened:
-            head = observed_maxima(*(held.get(QK, {}) for _, held in read))
-            sown = {**sown, QK: {"backbone": sown.get(QK, {}), "head": head}}
-        return tuple(logits for logits, _ in read), gates, sown
+            head[QK] = observed_maxima(*(held.get(QK, {}) for _, held in read))
+        return tuple(logits for logits, _ in read), gates, beside_head(sown, head, opened)
 
     def head_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
                     spanned: jax.Array | None = None, *, train: bool = False,
@@ -222,13 +220,12 @@ class DecisionModel(HeadedModel):
         which reads its questions' spans from `spanned`, the pass that holds them, where the head pools
         them."""
         head = thaw(part(variables, "head"))
-        clipped = QK in opened
         head_sown: dict = {}
 
         def applied(*args, **kwargs) -> jax.Array:
-            if not clipped:
+            if not opened:
                 return _array(self.head.apply(head, *args, **kwargs))
-            out, held = self.head.apply(head, *args, mutable=[QK], **kwargs)
+            out, held = self.head.apply(head, *args, mutable=list(opened), **kwargs)
             head_sown.update(held)
             return _array(out)
         # The questions' spans are pooled from the pass that holds them: the context's, where it holds
@@ -258,6 +255,22 @@ class DecisionModel(HeadedModel):
         (`HeadedModel.label_logits`)."""
         answers = answer_states(states, inputs)
         return self.label_logits(variables, answers, labels)[:, :, :inputs.options.shape[-1]]
+
+
+def beside_head(sown: Variables, head: Variables, opened: Sequence[str]) -> Variables:
+    """What a row's backbone sowed (`sown`) with what its head sowed (`head`) beside it, in each collection
+    the step `opened`: the attention logit maxima (`qk`) of each under its own parameters' name
+    (`backbone`, `head`), so a QK-Clip finds every layer's maxima where it finds its weights (row 1608);
+    every other collection's, the watched activations (`inspected`) among them, the head's under `head`,
+    its part of the model's variables, beside the backbone's own paths, as a step's cotangent probes nest
+    them for each part's call (`dew.batch.part`)."""
+    merged = dict(sown)
+    for name in opened:
+        if name == QK:
+            merged[QK] = {"backbone": sown.get(QK, {}), "head": head.get(QK, {})}
+        elif head.get(name):
+            merged[name] = {**sown.get(name, {}), "head": head[name]}
+    return merged
 
 
 def key_runs(slots: jax.Array, segments: jax.Array, options: int, *, causal: bool = False) -> jax.Array:
