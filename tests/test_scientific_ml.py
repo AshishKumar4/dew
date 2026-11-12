@@ -37,11 +37,12 @@ SIZED: dict[str, int] = {
     **{f"grouped gauss-newton {named}": 256 for named in ("gauss_newton", "dew.gauss_newton:gauss_newton")},
     "configured whole gauss-newton step clip 0.0": 128, "configured whole gauss-newton step clip 0.05": 128,
     "configured gauss-newton": 8,
-    "accumulated gauss-newton dual": 8, "accumulated gauss-newton primal": 8,
+    "accumulated gauss-newton dual": 8, "accumulated gauss-newton primal": 256,
     "accumulated gauss-newton short-microbatches": 128,
 }
 """Each site's declared check-1 seeds, by its label: `seeds_for` as each site calls it (paired where it
-judges Dew's arm against a reference of its own), on armada's CPU (mc-sizing at dde08fb8d, 11-12)."""
+judges Dew's arm against a reference of its own), on armada's CPU (mc-sizing at dde08fb8d, 11-12), the largest
+where a second sizing of a site read more (the accumulated primal update: 256 at 0aed05577, eg-sized2)."""
 
 
 def spectral(grid: np.ndarray, x: np.ndarray, derivative: int) -> np.ndarray:
