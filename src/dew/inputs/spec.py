@@ -101,34 +101,35 @@ class Field:
         return cls(key, shape, variable_axes, rows=table.rows, replaced=table.replaced, media=table.media)
 
     def bounded(self, value: object, spelling: Callable[[int], str] | None = None,
-                fields: Mapping[str, object] | None = None) -> None:
+                slots: jax.typing.ArrayLike | None = None) -> None:
         """Refuse `value`, this field's rows (a `ModelInputs`'s token rows), where it holds an id outside
         `[0, rows)` its model reads from its table: not `replaced`, nor at a slot the rows' media fill where
-        its model replaces those (`media`; the media index fields of a `ModelInputs`, or of `fields`, a
-        request's). Such an id reads no row of the table, whose gather fills it with NaN (`jnp.take`'s
-        out-of-bounds fill), a run's loss and a served token NaN with finite logits beside it. Names the
-        id, its token where `spelling` knows it, and the table's rows. Rows a caller gave already placed (a
-        batch of device arrays) are bounded where they lie, their least and greatest id read back alone
-        (two scalars, outside any step), and read back whole only to name a refused id."""
+        its model replaces those (`media`; a `ModelInputs`'s own, or `slots`, a request's, as
+        `dew.nn.inputs.media_slots` reads them). Such an id reads no row of the table, whose gather fills it
+        with NaN (`jnp.take`'s out-of-bounds fill), a run's loss and a served token NaN with finite logits
+        beside it. Names the id, its token where `spelling` knows it, and the table's rows. Rows a caller
+        gave already placed (a batch of device arrays) are bounded where they lie, their least and greatest
+        id read back alone (two scalars, outside any step), and read back whole only to name a refused id."""
         if self.rows is None:
             return
         held = value.tokens if isinstance(value, ModelInputs) else value
-        filled = value.token_fields if isinstance(value, ModelInputs) else fields or {}
+        if isinstance(value, ModelInputs):
+            slots = media_slots(value.token_fields, value.tokens.shape)
         if isinstance(held, jax.Array):
             if held.size == 0 or not jnp.issubdtype(held.dtype, jnp.integer):
                 return
             # The ids its model replaces counted as a row's, so a valid batch reads back two scalars alone.
             kept = (held if not self.replaced
                     else jnp.where(jnp.isin(held, jnp.asarray(sorted(self.replaced), held.dtype)), 0, held))
-            kept = jnp.where(media_slots(filled, held.shape), 0, kept) if self.media else kept
+            kept = jnp.where(jnp.asarray(slots), 0, kept) if self.media and slots is not None else kept
             low, high = (int(bound) for bound in jax.device_get((jnp.min(kept), jnp.max(kept))))
             if low >= 0 and high < self.rows:
                 return
         ids = np.asarray(held)
         if ids.size == 0 or ids.dtype.kind not in "iu":
             return
-        if self.media:
-            ids = np.where(media_slots(filled, ids.shape, xp=np), 0, ids)
+        if self.media and slots is not None:
+            ids = np.where(np.asarray(slots), 0, ids)
         low, high = int(ids.min()), int(ids.max())
         if low >= 0 and high < self.rows:
             return
