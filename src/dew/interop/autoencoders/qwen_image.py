@@ -6,7 +6,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -14,6 +14,7 @@ import jax.numpy as jnp
 from dew import _records
 from dew.batch import Variables
 from dew.interop.components import bind_component
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.unread import Stored
 from dew.interop.weights import indexed_path
 from dew.nn.autoencoders.qwen_image import QwenImageAutoencoder, QwenImageVAE
@@ -27,17 +28,7 @@ PUBLISHED = ("AutoencoderKLQwenImage21",)
 """The `_class_name` a published AutoencoderKLQwenImage21's config states."""
 
 
-class QwenImageVAEFields(TypedDict):
-    base_dim: int
-    decoder_base_dim: int
-    latent_channels: int
-    dim_mult: tuple[int, ...]
-    num_res_blocks: int
-    temporal_downsample: tuple[bool, ...]
-    image_channels: int
-
-
-def qwen_image_vae_fields(config: Mapping[str, object]) -> QwenImageVAEFields:
+def qwen_image_vae_fields(config: Mapping[str, object]) -> NativeFields[QwenImageVAE]:
     """Read an `AutoencoderKLQwenImage21` config into `QwenImageVAE` fields.
 
     Refused: `is_residual: false`, whose stack is laid out differently (flat
@@ -84,11 +75,15 @@ def qwen_image_vae_fields(config: Mapping[str, object]) -> QwenImageVAEFields:
         if decoder[index + 1] * (2 if doubles_time else 1) * 4 % decoder[index]:
             raise ValueError(f"Decoder level {index} cannot duplicate {decoder[index]} channels into "
                              f"{decoder[index + 1]}")
-    return QwenImageVAEFields(base_dim=base_dim, decoder_base_dim=decoder_base_dim,
-                              latent_channels=_records.integer(config.get("z_dim"), "z_dim"),
-                              dim_mult=dim_mult,
-                              num_res_blocks=_records.integer(config.get("num_res_blocks"), "num_res_blocks"),
-                              temporal_downsample=temporal, image_channels=image_channels)
+    return native_fields(QwenImageVAE)(
+        base_dim=base_dim,
+        decoder_base_dim=decoder_base_dim,
+        latent_channels=_records.integer(config.get("z_dim"), "z_dim"),
+        dim_mult=dim_mult,
+        num_res_blocks=_records.integer(config.get("num_res_blocks"), "num_res_blocks"),
+        temporal_downsample=temporal,
+        image_channels=image_channels,
+    )
 
 
 _PARAMETER = r"\.(?:weight|bias)"
@@ -146,7 +141,7 @@ def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revisio
     (`dew.interop.weights.record_layouts`)."""
     directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED,
                                          weights=params is None and tensors is None)
-    model = QwenImageVAE(**qwen_image_vae_fields(config), dtype=compute)
+    model = qwen_image_vae_fields(config).value.clone(dtype=compute)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
     return bind_component(
