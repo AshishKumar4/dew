@@ -212,6 +212,10 @@ class HeldTraceback:
     def __str__(self) -> str:
         return "\n".join(self.frames)
 
+    def as_python_traceback(self) -> None:
+        """No Python traceback, which a failed check's error is raised with (checkify's `check_impl`): its
+        frames are text, which no live frame stands behind; the error says its check's message alone."""
+
 
 def _held_traceback(traceback: Traceback) -> tuple[type[HeldTraceback], tuple[tuple[str, ...]]]:
     """A traceback of JAX's reduced to its frames (`HeldTraceback`), as a program file holds it."""

@@ -55,6 +55,7 @@ from dew.training.tracker import Tracker, write_artifact
 from dew.training.transaction import with_ema
 
 if TYPE_CHECKING:
+    from dew.inputs.spec import InputSpec
     from dew.state import TrainState
     from dew.training._fit import FitPlan
     from dew.training.display import TrainingDisplay
@@ -633,8 +634,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
             held, available = _next_batch(iterator, scored)
             if not available:
                 break
-            _bounded(objective, held)
-            held, last, batch = _covered(mesh, held, last, scored)
+            held, last, batch = _covered(mesh, held, last, scored, objective.inputs)
             _admitted(objective, batch, seen)
             # This rank's own real rows, counted on the host; the pool's count
             # is summed once after the split.
@@ -711,13 +711,6 @@ def _counted_tokens(objective: Objective[Loss, Effects], held: Batch, tokens: li
     return [tokens[0] + int(np.sum(np.where(real, scored, 0))), tokens[1] + rows_of(held) * per_row]
 
 
-def _bounded(objective: Objective[Loss, Effects], batch: Batch | None) -> None:
-    """Refuse a validation batch, on the host before it is placed, where its token ids fall outside its
-    model's table (`InputSpec.bounded`), as each training batch is."""
-    if batch is not None and objective.inputs is not None:
-        objective.inputs.bounded(batch)
-
-
 def _admitted(objective: Objective[Loss, Effects], batch: Batch, seen: set) -> None:
     """Check a batch of a shape the split has not shown (`seen`) against what the objective declares
     (`InputSpec.check`), as a training step checks its own (`Trainer.fit`)."""
@@ -751,8 +744,7 @@ def admit_split(objective: Objective[Loss, Effects], batches: Reader | Episodes,
         # The phases `_score_split` walks for its first batch, so every rank meets its peers.
         held, available = _next_batch(iterator, 0)
         if available:
-            _bounded(objective, held)
-            _, _, batch = _covered(mesh, held, None, 0)
+            _, _, batch = _covered(mesh, held, None, 0, objective.inputs)
             _admitted(objective, batch, set())
     finally:
         _close_source(iterator if iterator is not None else source)
@@ -822,17 +814,21 @@ def _next_batch(iterator: Iterator, index: int) -> tuple[Batch | None, int]:
     return batch, available
 
 
-def _covered(mesh: Mesh, batch: Batch | None, last: Batch | None, index: int
+def _covered(mesh: Mesh, batch: Batch | None, last: Batch | None, index: int, inputs: InputSpec | None
              ) -> tuple[Batch, Batch, Batch]:
     """The batch this rank scores at `index`, the one it keeps to cover the
     next, and the first placed on the mesh, under one agreement.
 
     Its own batch carries `VALID_ROWS`, every row real where the reader
-    marked none. A rank whose share has run out while a peer's has not
-    scores a copy of its last batch with every row a repeat.
+    marked none, and is refused on the host before it is placed where its token ids fall outside its
+    model's table (`InputSpec.bounded`, as each training batch is), inside the agreement, so every
+    process refuses with the one that holds the id. A rank whose share has run out while a peer's has
+    not scores a copy of its last batch with every row a repeat.
     """
     def cover() -> tuple[Batch, Batch, Batch]:
         if batch is not None:
+            if inputs is not None:
+                inputs.bounded(batch)
             held = kept = _validated(batch)
         elif last is None:
             raise ValueError(
