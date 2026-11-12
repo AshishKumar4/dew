@@ -1839,7 +1839,7 @@ class StepPhases(Forwarding):
         state = json_value(json.loads(own) if isinstance(own, bytes) else own, "a phase's position")
 
         def trained(node: str, member: str, low: int) -> tuple[int, ...]:
-            return self._trained.get((node, member), _Frontier()).past(low)
+            return tuple(self._trained.get((node, member), _Frontier()).past(low))
 
         self._carried.update(left_by(state, members, trained))
         self._trained.clear()
