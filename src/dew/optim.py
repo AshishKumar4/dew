@@ -386,7 +386,8 @@ def muon_update_flops(params, steps: int, per_head: Mapping[str, int] | None = N
             continue
         stack = jax.eval_shape(lambda held, shape=shape, width=width: headed(as_matrices(held, shape)[0],
                                                                                width)[0], leaf)
-        total += newton_schulz_flops(*stack.shape, steps)
+        matrices, rows, columns = stack.shape
+        total += newton_schulz_flops(matrices, rows, columns, steps)
     return total
 
 

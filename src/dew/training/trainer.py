@@ -1105,8 +1105,10 @@ class Trainer(Generic[Loss, Effects]):
                                                   resumed=initial is None and interval.last_saved is not None)
         if complete:
             return state
-        run.update_flops = (None if self._config is None
-                            else self._config.update_flops(state.variables["params"]))
+        if self._config is not None:
+            # Read under the parameters' logical axes, as the update reads them (`declaring`).
+            with boxed(self._boxed_axes()):
+                run.update_flops = self._config.update_flops(state.variables["params"])
         compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]] = run.compiled
         seen = 0
         run.notice = PreemptionNotice()
