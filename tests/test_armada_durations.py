@@ -83,6 +83,26 @@ def test_a_file_no_run_measured_at_a_cut_weighs_its_estimate_and_no_setup_paid_a
     assert groups == [96.0] * 16 + [64.0]
 
 
+def test_a_file_armada_holds_only_rows_of_weighs_what_its_rows_took(ci, tmp_path):
+    """A file armada holds no file timing of, but whose rows it holds at a cut, weighs those rows' sum, as its
+    file timing would say, not its record scaled by the other files' ratio: armada keeps a plan's rows from run
+    to run and drops the file timings a run did not itself measure (ledger 5579: after one run that reused most
+    rows it held 1 file timing of 1,067, and 688 of 689 files were weighed by a guess)."""
+    for name in ("test_measured", "test_rows", "test_neither"):
+        (tmp_path / "tests" / f"{name}.py").write_text("")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {**{f"tests/test_measured.py::test_cell[{n}]": 10.0 for n in range(10)},
+         **{f"tests/test_rows.py::test_cell[{n}]": 10.0 for n in range(20)},
+         **{f"tests/test_neither.py::test_cell[{n}]": 10.0 for n in range(5)}}))
+    timings = {"files": {"3.12:tests/test_measured.py": 160.0},
+               "rows": {"3.12:tests/test_measured.py": 160.0, "3.12:tests/test_rows.py#1/2": 120.0,
+                        "3.12:tests/test_rows.py#2/2": 130.0, "3.12:tests/test_rows.py#collect": 1.0}}
+    names = ["tests/test_measured.py", "tests/test_rows.py", "tests/test_neither.py"]
+    # The file neither times is its record scaled by how much slower armada ran the two measured (1.6, 1.25).
+    assert ci.weights(names, timings, "3.12") == {
+        "tests/test_measured.py": 160.0, "tests/test_rows.py": 250.0, "tests/test_neither.py": 80.0}
+
+
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
     """Each task of a split file runs its own group (split.py) of the same
     cut, so the groups together run every test, none twice, a test the
