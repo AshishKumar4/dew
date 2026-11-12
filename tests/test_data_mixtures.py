@@ -1202,8 +1202,9 @@ def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream():
         return {"length": np.asarray([len(caption) for caption in captions], np.int32)}
 
     def captioned(batch: int) -> Loader:
-        return compile(Pipeline(Memory(Captioned(1, 64))).shuffle(0).repeat().batch(batch).map(
-                           EncodeCaptions(lengths)), read="memory", seed=0, loading=READ)
+        encode = EncodeCaptions(lengths, declared="lengths@1")
+        return compile(Pipeline(Memory(Captioned(1, 64))).shuffle(0).repeat().batch(batch).map(encode),
+                       read="memory", seed=0, loading=READ)
 
     flat = [value for step in taken(captioned(4).train(DataPartition()), 12) for value in step]
     schedule = Ramp(start=2, increment=1, samples=6)

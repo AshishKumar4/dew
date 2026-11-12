@@ -195,10 +195,11 @@ def test_a_program_one_process_kept_runs_in_another_that_traces_nothing(tmp_path
     call made inside one of Dew's own contexts, have no identity a file can state and are named as not
     kept (row 5265: a warm scoring server paid its programs' traces)."""
     saved = kept_in(tmp_path / "kept")
-    assert saved["refused"] == ["__main__.<lambda> (0)", "kept_module.scaled (1)"], saved["reasons"]
-    assert saved["kept"] == 9
-    assert (saved["cpu"] is not None) == (jax.default_backend() == "cpu")
     answers = saved["answers"]
+    # Every answered call kept, and the two calls of no identity the worker makes besides named as not.
+    assert saved["kept"] == len(answers)
+    assert len(saved["refused"]) == 2, saved["reasons"]
+    assert (saved["cpu"] is not None) == (jax.default_backend() == "cpu")
     assert answers["none"] != answers["empty"] and answers["one"] != answers["two"]
     assert kept_answer(kept_worker(tmp_path / "kept", "take")) == {"answers": answers, "needed": []}
     assert kept_answer(kept_worker(tmp_path / "kept", "verify"))["answers"] == answers

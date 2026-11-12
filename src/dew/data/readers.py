@@ -307,7 +307,7 @@ class _PerShare(Forwarding):
             self._publish(state)
         # The position alone: the loading workers' mirror counters it carried are this read's metrics, not
         # its place (`PositionText` empties them), so every reader of an elastic read saves one position.
-        saved = {"dew_data_plan": self._plan_record, "counters": COUNTERS, "iterator": state}
+        saved = {_position.PLAN: self._plan_record, "counters": COUNTERS, "iterator": state}
         return self._position_text({_position.REPLICATED: saved} if self._replicated else saved)
 
     def set_state(self, state: bytes) -> None:
