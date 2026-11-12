@@ -254,8 +254,8 @@ fitted to them, and a rule set ships only with measured receipts.
 - **Template hooks (compile time):** a hook is user code Dew cannot know in advance, a jaxpr, so it and its
   derivative pass through the same pass before the Pallas fuser places them in a kernel: a stage that runs
   inside a launch is rewritten where the fuser takes it, and a derivative's XLA glue by the outer pass, as
-  `KernelGlue` (§1.3). (Today the GEMM's producer and both derivatives' glue are; its consumer's in-kernel
-  epilogue is pulled and tiled as written, the GEMM lane's open item.)
+  `KernelGlue` (§1.3): the GEMM's producer and consumer each traced once rewritten
+  (`fused_gemm._split`, `_rewritten_consumer`), its prologue's JVP and epilogue's VJP the glue.
 - **Template algebra (dev time):** a template's online, tiled and combine forms, forward and backward, are
   generated from a declaration (§6.9):
   - attention's score function, mask and reduction;

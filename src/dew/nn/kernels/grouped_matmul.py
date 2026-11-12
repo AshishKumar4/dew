@@ -42,6 +42,7 @@ from jax._src.pallas.mosaic_gpu import (
 )
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from ...algebra import bits
 from ..derivatives import marked_call_p
 from ..programs import equations
 from . import generation, selection, tuning
@@ -1533,8 +1534,10 @@ class MosaicPackedGmm(MosaicGmm):
     def registers(self, ba, config: mosaic_gpu.Tiles) -> int | None:
         # Beside the plain product's live set, a step's decode holds a 128-depth group's words, the code
         # being decoded and the stage's block scales, each a `[block_n, 16]` register tile over a role's
-        # threads (`mosaic_gpu._stage_decoded`).
-        return _beside(super().registers(ba, config), 3 * config.block_n * 16 // resources.THREADS)
+        # threads (`mosaic_gpu._stage_decoded`), and a word's decode in flight, its form's live registers
+        # (`bits.BitForm.live`).
+        return _beside(super().registers(ba, config),
+                       3 * config.block_n * 16 // resources.THREADS + bits.NVFP4_BFLOAT16_FORM.live)
 
 
 @dataclasses.dataclass(frozen=True)

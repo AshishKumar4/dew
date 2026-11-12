@@ -203,7 +203,7 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
     serializes none (its note C7514, a wait for each HGMMA). A guard on every step of a rotation, a cond
     between a warpgroup's products, had it serialize the walk (K40's SASS: 16 waits for 16 HGMMAs), a loop
     the gate's registers and spills called clean."""
-    from kernel_compile import _compiled, ptxas_notes
+    from kernel_compile import _compiled, ptxas_notes, ptxas_read
 
     from dew.nn.kernels.templates.gemm import mosaic_gpu
 
@@ -224,8 +224,9 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
         assert "error" not in record, record["error"]
         (ptx,) = Path(directory).glob("*.ptx")
         notes = ptxas_notes(ptx.read_text(), "sm90")
-    assert "bytes spill stores" in notes, notes
-    assert "serialized" not in notes, notes
+    assembled = ptxas_read(notes)
+    # A report that states the kernel's registers was read; none of its serialization codes is there.
+    assert assembled.registers > 0 and assembled.losses == (), notes
 
 
 def _spilling_forward(launch, rows: int, devices):
@@ -1000,7 +1001,8 @@ def test_an_amperes_nvfp4_product_compiles_and_runs_its_packed_kernel(rows, name
     """An NVFP4 projection on a compile-only A100, its packed kernel named, or at a decode step's rows with no
     kernel named (`gemm.NVFP4_CELLS`' A100 decode cell, receipt W13-a100-4-M-NS-8b-a100: 2.6-3.6x the matrix
     decoded once a call): its program launches the template's packed product (`kernel_compile.Expected`, its
-    route evidence), which ptxas compiles, its E4M3 block scales decoded by integer arithmetic
+    route evidence), which ptxas compiles, its E2M1 codes decoded by their form's PTX inline
+    (`inline_forms.registers`, row 3733), its E4M3 block scales by integer arithmetic
     (`mosaic_gpu._e4m3_values`) where their FP8 conversion took sm89's `cvt .e4m3x2` and an A100's ptxas
     refused the kernel (W8-a100, M-NS-8; row 3621)."""
     from kernel_compile import Expected, compile_mosaic_kernels, route_failures

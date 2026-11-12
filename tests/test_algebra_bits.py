@@ -190,6 +190,23 @@ def test_a_forms_depth_counts_a_constant_as_the_start_of_a_chain():
         assert 1 < encoding.depth <= len(encoding.steps)
 
 
+def test_a_forms_live_registers_hold_each_value_until_its_last_reader_and_each_output_to_the_end():
+    """A form's live registers are the most values its decode holds at once: the word and each step's value
+    until the step that last reads it, whose result may take its register, an output register's to the
+    end. A word, its shift and a constant all read by one join hold three before it; with the shift an
+    output too, it is held past the join beside the join's result, still three at most; a chain whose every
+    value is read once, by the next step, holds one."""
+    alu = bits.Unit.ALU
+    joined = bits.BitForm((bits.BitStep(bits.BitOp.SHR, (0,), 1, alu),
+                           bits.BitStep(bits.BitOp.IADD3, (), 3, alu),
+                           bits.BitStep(bits.BitOp.LOGIC, (0, 1, 2), 0, alu, 0xFC)), (3,), (1, 2))
+    assert joined.live == 3
+    assert dataclasses.replace(joined, outputs=(1, 3)).live == 3
+    chain = bits.BitForm((bits.BitStep(bits.BitOp.SHR, (0,), 1, alu),
+                          bits.BitStep(bits.BitOp.SHR, (1,), 1, alu)), (2,), (1, 2))
+    assert chain.live == 1
+
+
 def test_a_transform_kept_off_the_fma_pipe_takes_its_shifts_on_the_alu():
     """The NVFP4 decode declared for a consumer whose FMA pipe is its own (`units`): its form's every shift
     issues on the ALU, its price the ALU's, and it is proven."""

@@ -63,6 +63,7 @@ from dew.nn.kernels.templates import (
     bodies,
     bundles,
     cost as unit_cost,
+    inline_forms,
     mosaic,
     mosaic_sm100,
     product as product_formats,
@@ -1695,7 +1696,7 @@ def _stage_decoded(words, scales, out, interpret: bool) -> None:
     owed = _e4m3_values(loaded(scales)) * jnp.float32(1 / bits.NVFP4_OWED)
     which = jax.lax.broadcasted_iota(jnp.int32, owed.shape, 1)
     for group, group_words in enumerate(words):
-        for code, lane in enumerate(_nvfp4_lanes(loaded(group_words))):
+        for code, lane in enumerate(_nvfp4_lanes(loaded(group_words), layout)):
             # The block's scale a column: its group's code-th, picked from the loaded row by a mask (a
             # column slice of a register tile has no layout).
             scale = jnp.sum(jnp.where(which == 8 * group + code, owed, 0.0), axis=1)
@@ -1710,12 +1711,15 @@ def _e4m3_values(codes: jax.Array) -> jax.Array:
     return bits.decoded(jax.lax.bitcast_convert_type(codes, jnp.uint8).astype(jnp.uint32), bits.E4M3)
 
 
-def _nvfp4_lanes(words: jax.Array) -> list[jax.Array]:
-    """Dew: the eight codes of each of `words` (uint32), each code's E2M1 value in float32, code by code
-    (`bits.NVFP4_BFLOAT16_FORM`'s four bfloat16x2 registers, each split low half first), each restored by
-    the form's one decoded-value rule (`bits.restored`), so `0.0`, `0.5` and each normal code come out
-    exact."""
-    return [bits.restored(half) for register in bits.NVFP4_BFLOAT16_FORM.traced(words)
+def _nvfp4_lanes(words: jax.Array, layout) -> list[jax.Array]:
+    """Dew: the eight codes of each of `words` (uint32, a register tile in `layout`), each code's E2M1 value
+    in float32, code by code (`bits.NVFP4_BFLOAT16_FORM`'s four bfloat16x2 registers, each split low half
+    first), each restored by the form's one decoded-value rule (`bits.restored`), so `0.0`, `0.5` and each
+    normal code come out exact. The registers are the form's PTX inline (`inline_forms.registers`, row
+    3733), its `jax.numpy` reading where interpreted (`layout` None), where no inline assembly runs."""
+    form = bits.NVFP4_BFLOAT16_FORM
+    decoded = form.traced(words) if layout is None else inline_forms.registers(form, words, layout)
+    return [bits.restored(half) for register in decoded
             for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
 
 
