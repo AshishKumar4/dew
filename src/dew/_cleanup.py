@@ -8,8 +8,8 @@ closes, as it does when the owner dies however it dies (a SIGKILL, a SIGTERM tha
 or stops the group (`stop`). A group that ends on its own, its leader's or the last process its leader
 left, ends its lifeline, which then kills nothing: its id is free for another process. The group stays in
 a session of its own, so a rank's cleanup signals its own (the maintainer, 2026-10-28: a worker outlived its
-killed owner 43 hours at 195% CPU on the VM). The standard library alone: the CI harness loads this file by path (tools/armada/child_groups.py),
-as importing `dew` sets the process's XLA flags."""
+killed owner 43 hours at 195% CPU on the VM). The standard library alone: the CI harness loads this file by
+path (tools/armada/child_groups.py), as importing `dew` sets the process's XLA flags."""
 
 import contextlib
 import os
@@ -401,9 +401,9 @@ RESCAN_SECONDS = 1.0
 without `os.pidfd_open`)."""
 
 
-PIDFD = getattr(os, "pidfd_open", None)
-"""Opens a descriptor of a process, readable when it ends (Linux's); None on a system or a Python build without
-it, where a lifeline reads its group again each `RESCAN_SECONDS` instead."""
+PIDFD: Callable[[int], int] | None = getattr(os, "pidfd_open", None)
+"""Opens a descriptor of a process, readable when it ends (Linux's); None on a system or a Python build
+without it, where a lifeline reads its group again each `RESCAN_SECONDS` instead."""
 
 
 def _grouped(pid: int, group: int) -> bool:
@@ -414,10 +414,11 @@ def _grouped(pid: int, group: int) -> bool:
         return False
 
 
-def _opened(pid: int) -> list[int]:
-    """A descriptor of process `pid`, readable when it ends (`PIDFD`); none where the process is gone."""
+def _opened(opener: Callable[[int], int], pid: int) -> list[int]:
+    """A descriptor of process `pid`, readable when it ends, by `opener` (`PIDFD`); none where the process is
+    gone."""
     try:
-        return [PIDFD(pid)]
+        return [opener(pid)]
     except ProcessLookupError:
         return []
 
@@ -428,7 +429,7 @@ def _watched(pid: int, group: int) -> int | None:
     another group's (its number taken again), or no such descriptor can be opened here (`PIDFD`)."""
     if PIDFD is None:
         return None
-    for found in _opened(pid):
+    for found in _opened(PIDFD, pid):
         if _grouped(pid, group):
             return found
         os.close(found)
