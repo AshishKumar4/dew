@@ -306,15 +306,11 @@ def cut(nodes: list[str], seconds: list[float], count: int) -> list[list[str]]:
 
 
 @functools.cache
-def bound(text: str) -> frozenset[str] | None:
+def bound(text: str) -> frozenset[str]:
     """The names a test file's source `text` binds at its top level (a function's, a class's, an assignment's,
-    an import's), which a test's node id begins with; None for a source that does not parse."""
-    try:
-        tree = ast.parse(text)
-    except SyntaxError:
-        return None
+    an import's), which a test's node id begins with."""
     names: set[str] = set()
-    for node in tree.body:
+    for node in ast.parse(text).body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             names.add(node.name)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
@@ -334,8 +330,12 @@ def standing(name: str, recorded: Mapping[str, float]) -> dict[str, float]:
     defines them; a file that is gone or does not parse keeps its record as it is. What the plan cuts a file
     by (ci.py's `own_tests`) and every task of it cuts alike (split.py)."""
     path = Path(name)
-    names = bound(path.read_text()) if path.is_file() else None
-    if names is None:
+    if not path.is_file():
+        return dict(recorded)
+    try:
+        names = bound(path.read_text())
+    except SyntaxError:
+        # Its collection fails its row, saying why (ci.py's `collect`); its record stands meanwhile.
         return dict(recorded)
     return {node: seconds for node, seconds in recorded.items()
             if node.partition("::")[2].split("[")[0].split("::")[0] in names}
