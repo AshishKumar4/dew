@@ -399,7 +399,7 @@ class Reading:
         if module not in self.modules:
             self.modules[module] = units(module)
         found = self.modules[module]
-        return found.get(executed, b"missing") if isinstance(found, dict) else found
+        return found.get(executed, digests.MISSING) if isinstance(found, dict) else found
 
 
 def cache_key(common: str, name: str, split: str, depends: list[str],
@@ -505,6 +505,68 @@ def green_key(python: str, row_name: str, held: str, key: str) -> str:
     return f"{CACHE_PREFIX}-green/{python}/{row_place(row_name, held)}/{key}"
 
 
+SETS_KEPT = 8
+"""How many of a row's green runs' distinct executed sets its list keeps (`sets_key`), the most recently used
+first. A row's key hashes the inputs its run executed (`cache_key`), and runs of other trees, which trains,
+base/kernels' CI and lanes' runs make all day, execute other sets; the list holds as many sets as a row meets
+in a day, measured in the records (2026-11-12: ... sets a row at most), so main's set is still there when its
+tree runs again."""
+
+
+def sets_key(python: str, row_name: str, held: str) -> str:
+    """Where row `row_name`'s list on class `held` of its green runs' executed sets is (`remembered`,
+    `green_record`): their digests (`set_digest`), as ccache's direct mode keeps a source's manifests; each
+    set's inputs are kept once by its digest (`set_key`), as a set runs to thousands of inputs and files one
+    process ran share theirs."""
+    return f"{CACHE_PREFIX}-sets/{python}/{row_place(row_name, held)}"
+
+
+def set_key(digest: str) -> str:
+    """Where the executed set of digest `digest` is kept, its inputs in order (`executed_set`)."""
+    return f"{CACHE_PREFIX}-set/{digest}"
+
+
+@functools.lru_cache(maxsize=1024)
+def executed_set(digest: str, token: str) -> tuple[str, ...] | None:
+    """The inputs of the executed set of digest `digest` (`set_key`), read once a process however many rows
+    name it (a plan's threads share them); None where the Worker holds none, or one whose inputs hash
+    otherwise."""
+    found = recorded(set_key(digest), token)
+    held = tuple(found.get("depends", ())) if isinstance(found, dict) else ()
+    return held if held and set_digest(held) == digest else None
+
+
+def set_digest(depends: Sequence[str]) -> str:
+    """The digest of an executed set, its inputs in order."""
+    return hashlib.sha256(json.dumps(sorted(depends)).encode()).hexdigest()
+
+
+def matchable(depends: Sequence[str], reading: Reading) -> bool:
+    """Whether an executed set can be this checkout's: a set naming a unit a module here lacks
+    (`digests.MISSING`) was run by a tree that held it, so no key of it can be this one's, and no green run is
+    looked up for it."""
+    return not any(followed.CODE in path and path.partition(followed.CODE)[2] not in ("", followed.WHOLE)
+                   and reading.part(path) == digests.MISSING for path in depends)
+
+
+def remembered(python: str, row_name: str, held: str, depends: Sequence[str], token: str) -> None:
+    """Row `row_name`'s executed set `depends` made the first of its list on class `held` (`sets_key`), the
+    least recently used leaving past `SETS_KEPT`: by every green run that records it, and by every task that
+    reuses a green run by it, so a burst of other trees' runs evicts no set a tree still reuses. A write lost
+    to another at once loses a set from the list, never adds a wrong one: a miss, a run, never a wrong reuse.
+    """
+    digest = set_digest(depends)
+    held_sets = (recorded(sets_key(python, row_name, held), token) or {}).get("sets", [])
+    if held_sets[:1] == [digest]:
+        return
+    # The set's inputs first, so a list never names a set the Worker lacks; once a set is in the row's list.
+    if digest not in held_sets and not written(set_key(digest), token, json.dumps(
+            {"depends": sorted(depends)}).encode()):
+        return
+    kept = [digest, *(each for each in held_sets if each != digest)][:SETS_KEPT]
+    written(sets_key(python, row_name, held), token, json.dumps({"sets": kept}).encode())
+
+
 def recorded(key: str, token: str) -> dict | None:
     """The record at `key`, read (`record_of`), or None where there is none or the Worker did not give it."""
     found = record_of(key, token)
@@ -560,9 +622,9 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tupl
         for each in held:
             found = green_record(python, name, group, common, token, [each], reading)
             # Kept only where its green run is kept by its key, as the task reads it.
-            if found is not None and recorded(green_key(python, row(python, name, group), each, found["key"]),
-                                              token) is not None:
-                return f"{each}:{found['key']}"
+            if found is not None and recorded(
+                    green_key(python, row(python, name, group), each, found[0]["key"]), token) is not None:
+                return f"{each}:{found[0]['key']}"
         return None
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
@@ -645,22 +707,43 @@ def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[st
 
 
 def green_record(python: str, name: str, split: str, common: str, token: str,
-                 classes: list[str], reading: Reading | None = None) -> dict | None:
+                 classes: list[str], reading: Reading | None = None) -> tuple[dict, str] | None:
     """The record of test file `name`'s row (in `split`'s group) that ran green on exactly these inputs on one
-    of `classes`, the first found; else None. The plan (`reusable`) and a task (`reused`) read it alike, from
-    one reading of the inputs (`Reading`)."""
+    of `classes`, the first found, with its class; else None. The plan (`reusable`) and a task (`reused`) read
+    it alike, from one reading of the inputs (`Reading`). A row's key hashes the inputs its run executed, so
+    these inputs are keyed with each executed set a green run of the row recorded: the last run's on these
+    shared inputs first, then each set of the row's list (`sets_key`), most recently used first. A hit is
+    sound: its key equals a green run's only where every input that run executed, its units among them, holds
+    here what it held then, so this tree's run would execute the same set; a set naming a unit this tree lacks
+    is skipped unread (`matchable`). Keyed by the last run's set alone, a row run green on main was found by
+    no plan once a run of another tree came after it (2026-11-12: train 781's CI kept 2 of 4,180 tasks; a
+    reach of a comment's change planned 7,161 rows)."""
+    reading = Reading() if reading is None else reading
+    place = row(python, name, split)
     for each in classes:
-        found = recorded(record_key(python, row(python, name, split), each, common), token)
-        if found is None or found["depends"] is None:
-            continue
-        # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of exactly
-        # these, kept by that key (`green_key`) whatever ran since.
-        key = cache_key(common, name, split, found["depends"], reading)
-        if found["key"] is not None and found["key"] == key:
-            return found
-        kept = recorded(green_key(python, row(python, name, split), each, key), token)
-        if kept is not None and kept["key"] == key:
-            return kept
+        tried: set[str] = set()
+        found = recorded(record_key(python, place, each, common), token)
+        if found is not None and found["depends"] is not None:
+            # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of
+            # exactly these, kept by that key (`green_key`) whatever ran since.
+            key = cache_key(common, name, split, found["depends"], reading)
+            if found["key"] is not None and found["key"] == key:
+                return found, each
+            kept = recorded(green_key(python, place, each, key), token)
+            if kept is not None and kept["key"] == key:
+                return kept, each
+            tried.add(set_digest(found["depends"]))
+        for digest in (recorded(sets_key(python, place, each), token) or {}).get("sets", []):
+            if digest in tried:
+                continue
+            tried.add(digest)
+            depends = executed_set(digest, token)
+            if depends is None or not matchable(depends, reading):
+                continue
+            key = cache_key(common, name, split, list(depends), reading)
+            kept = recorded(green_key(python, place, each, key), token)
+            if kept is not None and kept["key"] == key:
+                return kept, each
     return None
 
 
@@ -682,12 +765,18 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
+    place = row(python, name, split)
     if kept is not None:
-        found = recorded(green_key(python, row(python, name, split), *kept), token)
+        found = recorded(green_key(python, place, *kept), token)
         if found is not None and found["key"] == kept[1] and fresh(found, name, common, reading):
+            remembered(python, place, kept[0], found["depends"], token)
             return found["row"]
-    found = green_record(python, name, split, common, token, reused_classes(network), reading)
-    return None if found is None else found["row"]
+    hit = green_record(python, name, split, common, token, reused_classes(network), reading)
+    if hit is None:
+        return None
+    # Its executed set the first of its row's list: a set reused stays while other trees' runs come and go.
+    remembered(python, place, hit[1], hit[0]["depends"], token)
+    return hit[0]["row"]
 
 
 def fresh(recorded: dict, name: str, common: str, reading: Reading | None = None) -> bool:
@@ -1827,6 +1916,8 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
                 common, name, parsed_row(row_["name"])[2], ran["depends"])
             if ran_on is not None:
                 written(green_key(python, row_["name"], held, ran_on), token, body)
+            if key is not None:
+                remembered(python, row_["name"], held, ran["depends"], token)
 
 
 def written(key: str, token: str, body: bytes) -> bool:
