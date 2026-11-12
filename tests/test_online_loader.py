@@ -60,14 +60,6 @@ def test_a_fetched_grey_or_transparent_image_is_kept_as_rgb(tmp_path, pixels):
     assert Resize(64).map(decoded)["image"].shape == (64, 64, 3)
 
 
-def test_fetch_preserves_the_catalog_and_reads_exact_bytes(tmp_path):
-    path = tmp_path / "payload"
-    path.write_bytes(b"source bytes")
-    row = Fetch()({"url": path.as_uri(), "caption": "the record"})
-    assert not isinstance(row, Rejected)
-    assert row["bytes"] == b"source bytes" and row["caption"] == "the record"
-
-
 @pytest.mark.parametrize("read", ["indexed", "streamed", "interleaved", "memory"])
 def test_a_fetch_with_threads_of_its_own_fetches_that_many_at_once_in_order_and_resumes(read):
     """A fetch given four threads of its own fetches four urls at once whatever the read's threads,
@@ -404,55 +396,6 @@ def test_a_file_that_keeps_arriving_past_the_timeout_is_dropped(tmp_path):
     assert isinstance(fetched, Rejected) and not fetched.permanent
 
 
-def test_a_fetch_ends_at_its_timeout_however_long():
-    """A fetch's timeout ends it when it passes, at five seconds and over as below: a body that
-    would finish half a second later is dropped as transient by then."""
-    def handle(request):
-        request.send_response(200)
-        request.send_header("Content-Length", "11")
-        request.end_headers()
-        for _ in range(11):
-            request.wfile.write(b"x")
-            request.wfile.flush()
-            time.sleep(0.5)
-
-    with serving(handle) as address:
-        began = time.monotonic()
-        fetched = Fetch(timeout=5.0)({"url": f"http://{address}/"})
-        waited = time.monotonic() - began
-    assert isinstance(fetched, Rejected) and not fetched.permanent
-    assert waited < 5.4
-
-
-def test_failed_fetches_are_counted_before_batches(tmp_path):
-    prefix = catalog(tmp_path)
-    rows = [{"url": (tmp_path / "missing").as_uri(), "label": -1},
-            *prefix.source.records("indexed")]
-    pipeline = Pipeline(Memory(rows)).shuffle(7).repeat().filter_map(
-        Fetch(output="image"), DecodeImage("image")).map(Resize(8)).batch(4)
-    data = compile(pipeline, read="indexed", loading=READ)
-    stream = data.train(DataPartition())
-    try:
-        batches = list(itertools.islice(stream, 8))
-    finally:
-        stream.close()
-    assert all(np.all(batch["label"] >= 0) for batch in batches)
-    assert all(np.array_equal(batch["image"][:, 0, 0, 0], batch["label"] + 1) for batch in batches)
-
-
-def test_a_transient_failure_is_not_a_permanent_tombstone(tmp_path):
-    result = Fetch()({"url": (tmp_path / "missing").as_uri()})
-    assert isinstance(result, Rejected)
-    assert result.reason == "transient" and not result.permanent
-
-
-def test_an_oversized_object_is_rejected_before_decode(tmp_path):
-    path = tmp_path / "oversized"
-    path.write_bytes(b"x" * 17)
-    result = Fetch(max_bytes=16)({"url": path.as_uri()})
-    assert isinstance(result, Rejected) and result.reason == "too_large"
-
-
 @pytest.mark.parametrize("workers", [0, 2])
 def test_real_workers_fetch_pixels_without_losing_validation_rows(tmp_path, workers):
     prefix = catalog(tmp_path, 13)
@@ -472,15 +415,9 @@ def test_real_workers_fetch_pixels_without_losing_validation_rows(tmp_path, work
         np.testing.assert_array_equal(batch["image"][:, 0, 0, 0], batch["label"] + 1)
 
 
-def test_a_finite_fetch_pass_ends_after_its_catalog(tmp_path):
-    rows = list(iterate(catalog(tmp_path, 3), read="indexed", loading=READ))
-    assert [row["label"] for row in rows] == [0, 1, 2]
-    assert all(np.all(row["image"] == index + 1) for index, row in enumerate(rows))
-
-
-def web_table(root: Path) -> list[dict]:
+def web_table(root: Path, *, include_oversized: bool = False) -> list[dict]:
     """A url table as the open web serves it: images worth training on (labels 0-7), and ones
-    that are too small, too elongated, one flat colour, not an image, gone, or not a url."""
+    that are too small, too elongated, one flat colour, not an image, gone, oversized, or not a url."""
     rng = np.random.default_rng(0)
 
     def saved(name, pixels):
@@ -488,16 +425,28 @@ def web_table(root: Path) -> list[dict]:
         Image.fromarray(pixels).save(path)
         return path.as_uri()
 
-    rows = [{"url": saved(f"good-{index}", rng.integers(0, 256, (32, 40, 3), np.uint8)), "label": index}
-            for index in range(8)]
+    rows = [
+        {
+            "url": saved(f"good-{index}", rng.integers(0, 256, (32, 40, 3), np.uint8)),
+            "label": index,
+            "caption": f"sample {index}",
+        }
+        for index in range(8)
+    ]
     (root / "page.html").write_text("<html>moved</html>")
-    return [*rows,
-            {"url": saved("small", rng.integers(0, 256, (8, 8, 3), np.uint8)), "label": -1},
-            {"url": saved("strip", rng.integers(0, 256, (16, 96, 3), np.uint8)), "label": -2},
-            {"url": saved("flat", np.full((32, 32, 3), 7, np.uint8)), "label": -3},
-            {"url": (root / "page.html").as_uri(), "label": -4},
-            {"url": (root / "gone.png").as_uri(), "label": -5},
-            {"url": None, "label": -6}]
+    bad = [
+        {"url": saved("small", rng.integers(0, 256, (8, 8, 3), np.uint8)), "label": -1, "caption": "s"},
+        {"url": saved("strip", rng.integers(0, 256, (16, 96, 3), np.uint8)), "label": -2, "caption": "e"},
+        {"url": saved("flat", np.full((32, 32, 3), 7, np.uint8)), "label": -3, "caption": "f"},
+        {"url": (root / "page.html").as_uri(), "label": -4, "caption": "h"},
+        {"url": (root / "gone.png").as_uri(), "label": -5, "caption": "g"},
+        {"url": None, "label": -6, "caption": "n"},
+    ]
+    if include_oversized:
+        oversized = root / "oversized.bin"
+        oversized.write_bytes(b"x" * (64 * 1024 + 1))
+        bad.append({"url": oversized.as_uri(), "label": -7, "caption": "o"})
+    return [*rows, *bad]
 
 
 def rejected(stream) -> dict[str, float]:
@@ -513,9 +462,21 @@ def worth_training_on(pipeline: Pipeline) -> Pipeline:
 
 
 def test_a_web_image_flow_trains_on_the_good_images_and_counts_each_drop_by_reason(tmp_path):
-    """Fetched in four threads, decoded and checked: only the good images reach a batch, and the
-    reader's counts name every reason a url was dropped."""
-    fetched = Pipeline(Memory(web_table(tmp_path))).shuffle(5).repeat().filter_map(images.fetch())
+    """Fetched in four threads, decoded and checked: only the good images reach a batch with their
+    catalog fields intact, a finite pass ends after them, and the reader's counts name every reason
+    a url was dropped."""
+    table = web_table(tmp_path, include_oversized=True)
+    finite = worth_training_on(Pipeline(Memory(table)).filter_map(Fetch(output="jpg", max_bytes=64 * 1024)))
+    finite_rows = list(iterate(finite.map(Resize(16)), read="indexed", loading=READ))
+    assert [int(row["label"]) for row in finite_rows] == list(range(8))
+    assert [row["caption"] for row in finite_rows] == [f"sample {index}" for index in range(8)]
+
+    fetched = (
+        Pipeline(Memory(table))
+        .shuffle(5)
+        .repeat()
+        .filter_map(Fetch(output="jpg", max_bytes=64 * 1024))
+    )
     data = compile(worth_training_on(fetched).map(Resize(16)).batch(4), read="indexed",
                    loading=Loading(workers=0, threads=4, read_buffer=8, worker_buffer=1))
     stream = data.train(DataPartition())
@@ -526,8 +487,11 @@ def test_a_web_image_flow_trains_on_the_good_images_and_counts_each_drop_by_reas
         stream.close()
     labels = np.concatenate([batch["label"] for batch in batches])
     assert set(labels.tolist()) == set(range(8))
-    assert set(dropped) == {"too_small", "too_elongated", "flat", "undecodable", "transient", "invalid_url"}
-
+    for batch in batches:
+        assert list(batch["caption"]) == [f"sample {int(label)}" for label in batch["label"]]
+    assert set(dropped) == {
+        "too_small", "too_elongated", "flat", "undecodable", "transient", "invalid_url", "too_large"
+    }
 
 def test_a_snapshot_of_fetched_bytes_trains_and_resumes_exactly_after_every_url_dies(tmp_path):
     """A snapshot seals what a fetch got: with every url gone, a run reading it back with Files

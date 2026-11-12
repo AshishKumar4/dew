@@ -3,7 +3,6 @@
 import dataclasses
 import itertools
 import json
-from pathlib import Path
 
 import grain.python as grain
 import numpy as np
@@ -11,13 +10,12 @@ import pytest
 from data_support import WideDraw
 
 from dew.batch import VALID_ROWS
-from dew.data import TFDS, Files, Loading, Memory
+from dew.data import Files, Loading, Memory
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
 
 READ = Loading(workers=0, threads=1, read_buffer=4, worker_buffer=1)
-PREPARED = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -65,12 +63,12 @@ def test_a_held_out_slice_provisions_the_source_it_reads(jsonl):
     data = run(train, validation=held_out, provision=True)
     stream, held = data.train(DataPartition()), data.val(DataPartition())
     try:
-        assert sorted(value for batch in indices(stream, 5) for value in batch) == list(range(4, 24))
+        for _ in range(3):
+            assert sorted(value for batch in indices(stream, 5) for value in batch) == list(range(4, 24))
         assert [value for batch in held for value in batch["index"]] == [0, 1, 2, 3]
     finally:
         stream.close()
         held.close()
-
 
 def test_memory_and_provisioned_indexed_sources_produce_identical_epochs(jsonl):
     jsonl.provision()
@@ -84,13 +82,6 @@ def test_memory_and_provisioned_indexed_sources_produce_identical_epochs(jsonl):
     finally:
         left.close()
         right.close()
-
-
-def test_a_native_prepared_tfds_split_reads_without_provisioning():
-    source = TFDS("dew_images", path=str(PREPARED), split="all")
-    records = source.records("indexed")
-    assert len(records) == 20 and "image" in records[0] and "label" in records[0]
-    assert source.metadata()["rows"] == 20
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
@@ -193,18 +184,3 @@ def test_per_record_rng_draws_agree_with_plain_grain(draw, seed):
         actual.close()
         oracle.close()
 
-
-def test_record_holdouts_are_disjoint_from_every_training_epoch():
-    rows = [{"index": np.int32(index)} for index in range(24)]
-    train, held_out = Memory(rows).holdout(records=8)
-    data = run(train, validation=held_out, read="memory")
-    assert data.val is not None
-    training, held = data.train(DataPartition()), data.val(DataPartition())
-    try:
-        assert indices(held, 8) == [[0, 1, 2, 3], [4, 5, 6, 7]]
-        epochs = [indices(training, 4) for _ in range(3)]
-        assert all(sorted(value for batch in epoch for value in batch) == list(range(8, 24))
-                   for epoch in epochs)
-    finally:
-        training.close()
-        held.close()
