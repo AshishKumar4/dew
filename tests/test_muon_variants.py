@@ -13,7 +13,13 @@ from reference_error import as_given, assert_as_exact
 from test_optim import UPDATE_SEEDS, assert_updates_as, muon_solver, stacked_draw
 from torch_layout import node
 
-from dew.newton_schulz import NEWTON_SCHULZ, POLAR_EXPRESS_TABLE, orthogonalized, polar_express
+from dew.newton_schulz import (
+    NEWTON_SCHULZ,
+    POLAR_EXPRESS_TABLE,
+    orthogonalized,
+    orthogonalized_leaf,
+    polar_express,
+)
 
 QUERY = ('params', 'layers_0', 'self_attn', 'q_proj', 'kernel')
 """The decoder's first query projection, `[embed 32, heads 2 * head_dim 16]`."""
@@ -247,3 +253,35 @@ def test_a_flat_attentions_projections_are_the_matrices_muon_steps():
         stepped = optax.apply_updates(params, updates)
         for before, after in zip(jax.tree.leaves(params), jax.tree.leaves(stepped), strict=True):
             assert np.all(np.isfinite(np.asarray(after))) and not np.array_equal(after, before)
+
+
+def shaped_draw(seed):
+    """A wide stack of three 24 x 40 matrices, a tall one of two 40 x 24, a square one of two 32 x 32 and
+    one 2-D 24 x 40 matrix, drawn at `seed`."""
+    keys = jax.random.split(jax.random.key(seed), 4)
+    shapes = ((3, 24, 40), (2, 40, 24), (2, 32, 32), (24, 40))
+    return tuple(np.asarray(jax.random.normal(key, shape)) for key, shape in zip(keys, shapes, strict=True))
+
+
+@pytest.mark.parametrize("preconditioning", ["frobenius", "spectral", "aol", "schatten"])
+@pytest.mark.parametrize("chunked", [False, True], ids=["whole", "a matrix at a time"])
+def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(preconditioning, chunked):
+    """Dew's orthogonalization of wide, tall, square and 2-D updates, on the matrices as they are stored
+    (`newton_schulz`: a tall matrix's Gram product and polynomial taken from its shorter side, where optax
+    transposes it), whole or walked a matrix at a time (`chunk_bytes`), on par from float64 with optax's
+    own iteration (`orthogonalized_leaf`) of each matrix at `preconditioning` (check 1)."""
+    stacked = optax.contrib.MuonDimensionNumbers((1,), (2,))
+    numbers = (stacked, stacked, stacked, optax.contrib.MuonDimensionNumbers(0, 1))
+    one = 1 if chunked else None
+
+    def dew(*stacks):
+        return list(orthogonalized(stacks, numbers, jnp.asarray(NEWTON_SCHULZ), 5, 1e-8, preconditioning,
+                                   chunk_bytes=one))
+
+    def optax_arm(*stacks):
+        return [orthogonalized_leaf(jnp.asarray(stack), 5, shape, coeffs=jnp.asarray(NEWTON_SCHULZ),
+                                    preconditioning=preconditioning)
+                for stack, shape in zip(stacks, numbers, strict=True)]
+
+    assert_as_exact(dew, optax_arm, shaped_draw, f"Muon's Newton-Schulz at {preconditioning}",
+                    seeds=UPDATE_SEEDS)
