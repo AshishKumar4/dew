@@ -294,10 +294,7 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
     `ns_precision`'s dot algorithm (`ns_operands`), run whole on one device, the matrices spread across the
     devices (`orthogonalized`). Each parameter's matrix is its dimension numbers'
     (`muon_weight_dimension_numbers`), or each of its heads' where `per_head` names it (`head_widths`)."""
-    # Read now, whatever traces the transform's construction (a schedule's hyperparameters injected).
-    with jax.ensure_compile_time_eval():
-        coefficients = _coefficients(ns_coeffs, ns_steps)
-    static = np.asarray(coefficients)
+    coefficients = _coefficients(ns_coeffs, ns_steps)
     algorithm = dot_algorithm(ns_precision)
 
     def init_fn(params):
@@ -314,9 +311,9 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
                                   optax.tree.bias_correction(updates, beta, count))
         else:
             mu_hat = optax.tree.bias_correction(mu, beta, count)
-        # The coefficients the transform was built with, constants of its program (`newton_schulz`); its
-        # state holds them too, as optax's does.
-        orthogonal = orthogonalized(mu_hat, muon_weight_dimension_numbers(mu_hat), static, ns_steps,
+        # The coefficients the transform was built with, constants of its program (`newton_schulz`), where
+        # its state's are read at run time; the state holds them too, as optax's does.
+        orthogonal = orthogonalized(mu_hat, muon_weight_dimension_numbers(mu_hat), coefficients, ns_steps,
                                     eps, preconditioning, algorithm, head_widths(mu_hat, per_head))
         if adaptive:
             # The orthogonal update scaled by the dual norm of the momentum's (arXiv 2409.20325), each
