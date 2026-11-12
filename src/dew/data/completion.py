@@ -32,6 +32,7 @@ from dew.data.pipeline import (
     DRAWN,
     MEMBERS,
     REFUSED,
+    Drawn,
     Members,
     Pack,
     Stage,
@@ -131,7 +132,7 @@ class _Held:
     consumed: int
     refused: int
     members: dict[str, int] = dataclasses.field(default_factory=dict)
-    drawn: tuple[tuple[str, str, int], ...] = ()
+    drawn: Drawn = ()
     """The draws of a phase's shared corpora the unit is the last of (`DRAWN`); none in a position saved
     before units held draws."""
     missing: int = dataclasses.field(default=0, init=False)
@@ -249,7 +250,7 @@ def released(units: Numbered, window: int | None, seed: int) -> pygrain.IterData
     # A mixture's examples by member, sparse: of the units whose draws release any; and the draws of a
     # phase's shared corpora they release.
     split: dict[int, dict[str, int]] = {}
-    draws: dict[int, tuple[tuple[str, str, int], ...]] = {}
+    draws: dict[int, Drawn] = {}
     # The latest place among each span's units, the spans' first units never falling back (`Numbered`):
     # the units still in the latest span, by falling place.
     latest: collections.deque[int] = collections.deque()
@@ -278,9 +279,9 @@ class _Released:
     consumed: int = 0
     refused: int = 0
     members: dict[str, int] = dataclasses.field(default_factory=dict)
-    drawn: tuple[tuple[str, str, int], ...] = ()
+    drawn: Drawn = ()
 
-    def add(self, consumed: int, refused: int, members: Members, drawn: tuple[tuple[str, str, int], ...]
+    def add(self, consumed: int, refused: int, members: Members, drawn: Drawn
             ) -> None:
         self.consumed, self.refused = self.consumed + consumed, self.refused + refused
         self.members = joined(self.members, members)
@@ -306,7 +307,7 @@ class _Release:
     table: np.ndarray
     members: Mapping[int, Mapping[str, int]]
     counted: bool
-    draws: Mapping[int, tuple[tuple[str, str, int], ...]] = dataclasses.field(default_factory=dict)
+    draws: Mapping[int, Drawn] = dataclasses.field(default_factory=dict)
     drawing: bool = False
 
     def __call__(self, row: Batch) -> Batch:

@@ -42,6 +42,20 @@ def chain(*ends):
     return phases((source(1), ends[0]), (source(2), None))
 
 
+def resumes_as_read(loader, whole, stops) -> None:
+    """A read of `loader` stopped at each of `stops`, saved and resumed, reads `whole` (an unstopped read's
+    steps) on from where it stopped."""
+    for stop in stops:
+        head, stopped = read(loader, stop)
+        saved = stopped.get_state()
+        stopped.close()
+        resumed = loader.train(DataPartition())
+        resumed.set_state(saved)
+        rest, resumed = read(loader, len(whole) - stop, resumed)
+        resumed.close()
+        assert head + rest == whole, stop
+
+
 def read(loader, steps: int, stream=None):
     """`steps` batches of `loader`'s training read, each its real rows' ids and its phase; and the stream."""
     stream = stream if stream is not None else loader.train(DataPartition())
@@ -63,15 +77,7 @@ def test_phases_over_reads_cut_per_share_each_read_their_own_rows_and_resume_as_
     stream.close()
     assert [phase for _, phase in whole] == [Phase(0)] * 3 + [Phase(1)] * 4
     assert all(ids and {row // 1000 for row in ids} == {phase.index + 1} for ids, phase in whole)
-    for stop in range(1, 7):
-        head, stopped = read(loader, stop)
-        saved = stopped.get_state()
-        stopped.close()
-        resumed = loader.train(DataPartition())
-        resumed.set_state(saved)
-        rest, resumed = read(loader, 7 - stop, resumed)
-        resumed.close()
-        assert head + rest == whole, stop
+    resumes_as_read(loader, whole, range(1, 7))
 
 
 def test_a_resume_into_phases_that_moved_an_end_the_run_passed_is_refused():
@@ -150,15 +156,7 @@ def test_phases_that_share_a_corpus_train_each_of_its_records_once_across_their_
     trained = sorted(first + second)
     assert len(trained) == len(set(trained)) and trained == KEPT[:len(trained)]
     assert first != sorted(first), "the first phase's shuffle reorders the draws it trains"
-    for stop in (2, 3, 4, 6):
-        head, stopped = read(loader, stop)
-        saved = stopped.get_state()
-        stopped.close()
-        resumed = loader.train(DataPartition())
-        resumed.set_state(saved)
-        rest, resumed = read(loader, 24 - stop, resumed)
-        resumed.close()
-        assert head + rest == whole, stop
+    resumes_as_read(loader, whole, (2, 3, 4, 6))
 
 
 def test_three_phases_sharing_a_corpus_through_a_short_shuffled_middle_train_each_record_once():
@@ -179,15 +177,7 @@ def test_three_phases_sharing_a_corpus_through_a_short_shuffled_middle_train_eac
     trained = [row for ids, _ in passed for row in ids if row // 1000 == 1]
     assert {phase.index for _, phase in passed} == {0, 1, 2}
     assert len(trained) == len(set(trained)) and sorted(trained) == KEPT[:len(trained)]
-    for stop in (3, 4, 5):
-        head, stopped = read(loader, stop)
-        saved = stopped.get_state()
-        stopped.close()
-        resumed = loader.train(DataPartition())
-        resumed.set_state(saved)
-        rest, resumed = read(loader, 24 - stop, resumed)
-        resumed.close()
-        assert head + rest == whole, stop
+    resumes_as_read(loader, whole, (3, 4, 5))
 
 
 def test_phases_that_share_a_corpus_continue_it_on_every_share_of_their_reads():

@@ -2000,8 +2000,9 @@ class _Frontier:
         return Left(self.at, self.low, tuple(sorted(self.trained)))
 
     def record(self) -> dict[str, JSON]:
-        return {"low": self.low, "at": self.at, "trained": sorted(self.trained),
-                "positions": [[pull, where] for pull, where in sorted(self.positions.items())]}
+        trained: list[JSON] = sorted(self.trained)
+        positions: list[JSON] = [[pull, where] for pull, where in sorted(self.positions.items())]
+        return {"low": self.low, "at": self.at, "trained": trained, "positions": positions}
 
     @classmethod
     def of(cls, saved: Mapping[str, JSON]) -> _Frontier:
