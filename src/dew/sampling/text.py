@@ -848,9 +848,8 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
     vocab = model.vocab_size if isinstance(model, Bounded) else None
     if np.any(ids < 0):
         raise ValueError("token ids must be non-negative")
-    # A media position's id is its tower's, never the table's.
-    media = np.asarray(fields.get("image_indices", np.full(ids.shape, -1))) >= 0
-    Field.indexing("tokens", (), model).bounded(np.where(media, 0, ids), spelling)
+    # A media slot's id is its tower's where its model says so (`Field.media`), never the table's.
+    Field.indexing("tokens", (), model).bounded(ids, spelling, fields)
     if vocab is not None and (sampling.pad >= vocab or any(token >= vocab for token in sampling.stops)):
         raise ValueError("sampling token ids must be inside the vocabulary")
     return valid
