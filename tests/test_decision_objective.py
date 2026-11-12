@@ -13,6 +13,7 @@ import optax
 import pytest
 from decision_support import decision_rows
 from flax import linen as nn
+from reference_error import as_given, assert_as_exact
 
 from dew.artifacts import Decisions
 from dew.batch import FROZEN, VALID_ROWS
@@ -131,25 +132,51 @@ EXAMPLES = [Example(state, {"team": INTENT}, {"team": label})
                                  ("double charge", "billing"), ("cannot log in", "technical"))]
 
 
-def test_the_loss_scores_a_soft_target_as_its_rule_does():
-    """The log loss of a row whose gold is a distribution is the cross-entropy
-    against that distribution, not against its most likely option."""
-    from dew.decision.task import laid_out
-    from dew.objectives.base import Step
+SOFT_SEEDS = {"loss": 256, "held log_loss": 256, "held brier": 64}
+"""Check 1's declared seeds for the soft target's sites, by site, a draw a model's variables, sized paired
+by `seeds_for` on armada."""
 
+
+def soft_objective(rule: LogLoss | Brier) -> tuple[DecisionObjective, dict]:
+    """An objective of `rule` over rows whose gold is a distribution, and its held-out batch."""
     soft = [Example(f"charged twice {index}", {"team": INTENT}, targets={"team": (0.6, 0.3, 0.1)})
             for index in range(8)]
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
-                                  shuffle_options=False)
-    data = decision_rows(soft, 8, soft, objective=objective.data())
+                                  loss=rule, shuffle_options=False)
+    return objective, decision_rows(soft, 8, soft, objective=objective.data())
+
+
+def drawn_variables(objective: DecisionObjective):
+    """A draw of the objective's variables a seed, by one compiled init: the gate's draw."""
+    init = jax.jit(objective.init)
+    return lambda seed: (nn.unbox(init(jax.random.key(seed))),)
+
+
+def test_the_loss_scores_a_soft_target_as_its_rule_does():
+    """The log loss of a row whose gold is a distribution is the cross-entropy
+    against that distribution, not against its most likely option: as exact as
+    that cross-entropy written over the model's logits (check 1)."""
+    from dew.decision.task import laid_out
+    from dew.objectives.base import Step
+
+    objective, data = soft_objective(LogLoss())
     (batch,) = list(data.val(DataPartition()))
     batch = {name: value for name, value in batch.items() if name != VALID_ROWS}
-    variables = nn.unbox(objective.init(jax.random.key(0)))
-    loss, _ = objective.scalar_loss(variables, batch, Step(jnp.asarray(0), jax.random.key(0), None))
-    logits = np.asarray(objective.model.logits(variables, laid_out(batch, objective.bounds.segments)))
-    logits = logits[np.asarray(batch["questions"])][:, :3]
-    expected = -np.mean(np.sum(np.array([0.6, 0.3, 0.1]) * jax.nn.log_softmax(logits), axis=-1))
-    assert float(loss) == pytest.approx(float(expected), rel=1e-5)
+    step = Step(jnp.asarray(0), jax.random.key(0), None)
+    inputs = laid_out(batch, objective.bounds.segments)
+    # Each asked question's row and slot, as int32 indices, which the float64 truth reads alike.
+    asked = tuple(index.astype(np.int32) for index in np.nonzero(np.asarray(batch["questions"])))
+
+    def loss(variables):
+        return objective.scalar_loss(variables, batch, step)[0]
+
+    def cross_entropy(variables):
+        logits = objective.model.logits(variables, inputs)[asked][:, :3]
+        gold = jnp.asarray([0.6, 0.3, 0.1], logits.dtype)
+        return -jnp.mean(jnp.sum(gold * jax.nn.log_softmax(logits), axis=-1))
+
+    assert_as_exact(loss, cross_entropy, drawn_variables(objective), "a soft target's log loss",
+                    seeds=SOFT_SEEDS["loss"])
 
 
 
@@ -157,19 +184,22 @@ def test_the_loss_scores_a_soft_target_as_its_rule_does():
 @pytest.mark.parametrize("rule", [LogLoss(), Brier()], ids=lambda rule: rule.name)
 def test_a_held_pass_scores_a_soft_target_as_its_training_charges_it(rule):
     """Held-out rows whose gold is a distribution are scored against that
-    distribution: a scoring rule's held-out metric equals the objective's own
-    validation loss under the same rule, not a charge against the most likely
-    option."""
+    distribution: a scoring rule's held-out metric is the objective's own
+    validation loss under the same rule, as exact as it (check 1), not a charge
+    against the most likely option."""
     from dew.training.evaluation import Evaluation
 
-    soft = [Example(f"charged twice {index}", {"team": INTENT}, targets={"team": (0.6, 0.3, 0.1)})
-            for index in range(8)]
-    objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
-                                  loss=rule, shuffle_options=False)
-    data = decision_rows(soft, 8, soft, objective=objective.data())
-    result = Evaluation.run(objective, objective.init(jax.random.key(0)), data.val, key=0, metrics=(rule,),
-                            loss=True)
-    assert result.scores[f"val/{rule.name}"] == pytest.approx(result.scores["val/loss"], rel=1e-5)
+    objective, data = soft_objective(rule)
+
+    def scored(name):
+        @as_given
+        def score(variables):
+            result = Evaluation.run(objective, variables, data.val, key=0, metrics=(rule,), loss=True)
+            return jnp.asarray(result.scores[name])
+        return score
+
+    assert_as_exact(scored(f"val/{rule.name}"), scored("val/loss"), drawn_variables(objective),
+                    f"a soft target's held-out {rule.name}", seeds=SOFT_SEEDS[f"held {rule.name}"])
 
 
 HELD = [Example(f"{index}" if index % 3 == 0 else f"{index} " + "x" * (12 + index),

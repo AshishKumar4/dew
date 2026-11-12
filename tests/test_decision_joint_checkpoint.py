@@ -21,6 +21,7 @@ from one_draw import assert_as_exact_as_the_reference
 from PIL import Image
 from reference_error import ieee_fixture
 from safetensors.numpy import load_file
+from steady_state import guarded
 
 from dew.checkpoints import Checkpoints
 from dew.data.text import HFTokenizer
@@ -323,49 +324,31 @@ def test_a_decision_release_exports_every_tensor_it_saves(tmp_path, kind):
 
 
 @pytest.mark.parametrize("kind", ["joint", "slot", "slot_lm", "laya"])
-def test_a_decision_releases_export_reads_its_readout_home_only_as_each_tensor_is_read(tmp_path, kind,
-                                                                                     monkeypatch):
-    """A release's export (`PretrainedDecision.export`) reads no array home (`read_home`) as it is made,
-    listed or planned (`tensor_specs`), as a weight push plans its chunks before it reads any (ledger
-    4370); each of its readout's tensors reads its own leaves home as it is read, every readout leaf once
-    over a pass. A release saved by a process that does not publish (`reading_home`'s `writes` false, a
-    pool's other processes) reads its readout home as the publisher does and writes none of it."""
+def test_a_decision_releases_export_reads_its_readout_home_only_as_each_tensor_is_read(tmp_path, kind):
+    """A release's export (`PretrainedDecision.export`) reads no array home as it is made, listed or
+    planned (`tensor_specs`), as a weight push plans its chunks before it reads any (ledger 4370): all of
+    it passes the transfer guard (`steady_state.guarded`). Each of its readout's tensors reads its leaves
+    home as it is read, which the guard refuses. A release saved by a process that does not publish
+    (`reading_home`'s `writes` false, a pool's other processes) writes none of its readout."""
     from dew import _coordination
-    from dew.decision import slot_source
-    from dew.interop import streaming
     from dew.interop.safetensors_io import tensor_specs
 
-    reads = []
-
-    def counted(value):
-        if isinstance(value, jax.Array):
-            reads.append(value.shape)
-        return _coordination.read_home(value)
-
-    # Every reader of an array home through its module's name for it (`raising=False`: a release whose
-    # codec reads none so holds its tensors read before, which the counts below find).
-    for module in (streaming, slot_source):
-        monkeypatch.setattr(module, "read_home", counted, raising=False)
     bundle = Pretrained.load(released(kind, tmp_path / "release"), dtype="float32", attention_impl="xla")
-    exported = bundle.export()
-    names = list(exported)
-    assert tensor_specs(exported).keys() == set(names)
-    assert reads == []
+    moves = ("host_to_device", "device_to_device")
+    with guarded(allow=moves):
+        exported = bundle.export()
+        names = list(exported)
+        assert tensor_specs(exported).keys() == set(names)
     backbone = {name for name in names if name.startswith("encoder.")} if kind == "laya" else set(
         bundle.backbone().export())
     readout = [name for name in names if name not in backbone]
     assert bool(readout) == (kind != "slot_lm")
     for name in readout:
-        before = len(reads)
-        exported[name]
-        assert len(reads) > before, name
-    head = len(jax.tree.leaves(bundle.head_variables.get("params", {})))
-    assert len(reads) == head
+        with guarded(allow=moves), pytest.raises(RuntimeError):
+            exported[name]
     if kind in ("joint", "slot"):
-        reads.clear()
         with _coordination.reading_home("weight export", writes=False):
             bundle.save(tmp_path / "other")
-        assert len(reads) >= head
         written = {path.name for path in (tmp_path / "other").iterdir()}
         assert not {"readout_head.pt", "joint_head.safetensors"} & written, written
 
