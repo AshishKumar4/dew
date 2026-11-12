@@ -237,7 +237,7 @@ import mmap
 
 import numpy as np
 
-from dew.telemetry.benchmark import resident_memory, resident_peak
+from dew.telemetry.benchmark import allocated_memory, resident_memory, resident_peak
 
 # The heap serves 64 MiB (glibc's M_MMAP_THRESHOLD, -3), and a freed 64 MiB block stays resident under
 # a live one: memory a process's earlier work left for its allocator to hand out again.
@@ -252,8 +252,12 @@ with mmap.mmap(-1, size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS) as pages, 
     for offset in range(0, size, mmap.PAGESIZE):
         pages[offset] = 1
     after = resident_memory()
+# An array of the freed block's size, which the allocator serves from it: its bytes, which no new page holds.
+with resident_peak(counter=allocated_memory) as allocated:
+    again = np.ones(64 * 2**20, np.uint8)
 print(json.dumps({"before": before, "after": after, "size": size, "rise": peak.rise("Anonymous"),
-                  "ended": resident_memory()["Anonymous"] - peak.before["Anonymous"]}))
+                  "ended": resident_memory()["Anonymous"] - peak.before["Anonymous"],
+                  "allocated": allocated.rise("Allocated")}))
 """
 
 
@@ -263,7 +267,10 @@ def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation
     writer ran on (where the kernel's running counters lagged by a batch a CPU), even in a process whose
     allocator holds a freed block of that size resident, which an array of that size would be served from
     without a new page; and a region's peak (`resident_peak`) holds the pages it holds as it ends, which
-    the reading after they are unmapped no longer does."""
+    the reading after they are unmapped no longer does. Over the bytes the allocator holds allocated
+    (`allocated_memory`), a region's peak rises by such an array, served from the freed block, by all of
+    it (rows 5266, 5562: a tree held home after an identical one was freed rose by under a fiftieth of
+    itself in resident pages)."""
     import json
     import subprocess
     import sys
@@ -275,39 +282,7 @@ def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation
     assert after["Anonymous"] >= before["Anonymous"] + size
     assert after["Rss"] >= after["Anonymous"]
     assert measured["rise"] >= size > measured["ended"]
-
-
-SERVED_AGAIN = """
-import ctypes
-import json
-
-import numpy as np
-
-from dew.telemetry.benchmark import allocated_memory, resident_memory, resident_peak
-
-# A freed 64 MiB block stays resident under a live one (as NEIGHBOURED), for the array below to come from.
-ctypes.CDLL(None).mallopt(-3, 1 << 30)
-held = np.ones(64 * 2**20, np.uint8)
-guard = np.ones(2**20, np.uint8)
-del held
-with resident_peak(counter=lambda: {**resident_memory(), **allocated_memory()}) as peak:
-    again = np.ones(64 * 2**20, np.uint8)
-print(json.dumps({"allocated": peak.rise("Allocated"), "size": again.nbytes}))
-"""
-
-
-def test_a_regions_allocated_peak_counts_what_its_allocator_serves_from_pages_freed_before():
-    """A region's peak over the bytes the allocator holds allocated (`allocated_memory`, sampled by
-    `resident_peak` beside the resident pages) rises by a 64 MiB array the allocator serves from a block
-    an earlier array freed, which no new resident page holds (rows 5266, 5562: a tree held home after an
-    identical one was freed rose by under a fiftieth of itself in resident pages)."""
-    import json
-    import subprocess
-    import sys
-
-    measured = json.loads(subprocess.run([sys.executable, "-c", SERVED_AGAIN], check=True,
-                                         capture_output=True, text=True).stdout.splitlines()[-1])
-    assert measured["allocated"] >= measured["size"]
+    assert measured["allocated"] >= size
 
 
 @pytest.mark.gpu(reason="CUPTI times a GPU's kernels")
