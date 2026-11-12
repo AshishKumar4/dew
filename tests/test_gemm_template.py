@@ -947,15 +947,15 @@ def test_a_band_walks_every_tile_once_and_reads_a_groups_rows_once_where_a_wave_
         (row, column) for row in range(rows) for column in range(columns)]
 
 
-@pytest.mark.parametrize("dynamic", [False, True], ids=["static", "traced"])
+@pytest.mark.parametrize("form", ["static", "traced", "host"])
 @pytest.mark.parametrize("minor_dim", [0, 1])
 @pytest.mark.parametrize(("major", "minor", "width"),
                          [(3, 45, 16), (8, 48, 16), (1, 5, 4), (5, 7, 1), (4, 3, 8)])
-def test_the_planar_snake_walks_every_tile_once_in_its_bands(major, minor, width, minor_dim, dynamic):
-    """The persistent walk's tile order (`tail.planar_snake`), jitted, its grid's sides static or traced:
-    the minor dimension in bands `width` tiles wide (a last one narrower), each band a line at a time along
-    the major dimension, every other band's major order reversed; full bands of a power-of-two width and of
-    another, a last band partial or none."""
+def test_the_planar_snake_walks_every_tile_once_in_its_bands(major, minor, width, minor_dim, form):
+    """The persistent walk's tile order (`tail.planar_snake`), jitted, its grid's sides static or traced, and
+    the host's walk a plan prices (`tail.snaked`): the minor dimension in bands `width` tiles wide (a last one
+    narrower), each band a line at a time along the major dimension, every other band's major order reversed;
+    full bands of a power-of-two width and of another, a last band partial or none."""
     shape = (minor, major) if minor_dim == 0 else (major, minor)
     expected = []
     for band in range(-(-minor // width)):
@@ -966,10 +966,11 @@ def test_the_planar_snake_walks_every_tile_once_in_its_bands(major, minor, width
                 expected.append((across, along) if minor_dim == 0 else (along, across))
 
     def walked(indices, first, second):
-        grid = (first, second) if dynamic else shape
+        grid = (first, second) if form == "traced" else shape
         return jax.vmap(lambda index: tail.planar_snake(index, grid, minor_dim, width))(indices)
 
-    walk = jax.jit(walked)(jnp.arange(major * minor, dtype=jnp.int32), *shape)
+    walk = (tail.snaked(np.arange(major * minor), shape, minor_dim, width) if form == "host"
+            else jax.jit(walked)(jnp.arange(major * minor, dtype=jnp.int32), *shape))
     np.testing.assert_array_equal(np.stack(walk, axis=1), np.asarray(expected))
 
 

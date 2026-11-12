@@ -372,6 +372,21 @@ def test_a_pairs_step_is_the_pairs_block_its_ctas_split_and_its_bundle_is_a_conf
                         for family in group]
 
 
+def test_a_launchs_register_model_runs_the_programs_its_shared_memory_holds():
+    """A launch's register model states the programs its plan runs: its registers' residency bounded by the
+    programs its staged bytes hold on the target it derives for, named or not (row 5523: a B200's gathered
+    input gradient staging 230,580 bytes was stated three programs, which its registers held, and ran one)."""
+    from dew.nn.kernels.templates import resources
+    from dew.nn.kernels.templates.mosaic_sm90 import WGMMA
+
+    with generation.assumed("sm90"):
+        unstaged = resources.register_model(WGMMA, 1, 112)
+        staged = resources.register_model(WGMMA, 1, 112, shared=200 * 1024)
+        named = resources.register_model(WGMMA, 1, 112, shared=200 * 1024, target=generation.gpu_target())
+    assert unstaged.most > 1
+    assert staged.most == named.most == 1
+
+
 def test_a_kernel_named_with_its_register_model_states_it_on_its_launch():
     """A kernel named with its register model (`report.named`'s `model`) records it on the launch tracing it
     (`report.Launch.kernels`), by its name less the launch's suffix, where the compile point reads it before a

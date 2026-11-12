@@ -180,6 +180,29 @@ class Unpriced(Doubling):
         raise ValueError("no cost facts")
 
 
+def test_a_recording_holds_its_own_contexts_records():
+    """A `recording` scope holds every rewrite the algebra pass records within it, none from before it,
+    whatever the process's registry holds: a search's plan reports its own compiles' (audit K4)."""
+    from dew import algebra
+    from dew.nn.kernels.templates import report
+
+    def program(x, y, a, b):
+        x, y, a = jnp.tanh(x), jnp.tanh(y), jnp.tanh(a)
+        return jnp.sum(a * x, -1) + jnp.sum(a * y, -1), jnp.dot(x, y.T) * 0.5 + jnp.dot(b, y.T) * 0.5
+
+    def lower(rows):
+        shape = jax.ShapeDtypeStruct((rows, 64), jnp.float32)
+        jax.jit(algebra.rewritten(program)).lower(shape, shape, shape, shape)
+
+    with report.refusals():
+        lower(8)
+        before = report.rewrites()
+        with report.recording() as recorded:
+            lower(16)
+        assert before and recorded.rewritten
+        assert list(report.rewrites()) == [*before, *recorded.rewritten]
+
+
 def test_chosen_names_a_declared_choice_and_no_other():
     """`generation.chosen` names a choice by the name its declaration gives it (`generation.Choice`), which a
     site deciding by that declaration reads (`chosen_kernel`), and refuses a name no choice is declared by (a

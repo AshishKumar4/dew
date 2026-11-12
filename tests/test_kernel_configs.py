@@ -228,16 +228,6 @@ def test_a_dense_gemm_mainloop_keeps_each_steps_products_running_past_it():
     assert "serialized" not in notes, notes
 
 
-class _OnlyTile(Uncounted):
-    """A launch with one tile, the wide one on a producer's layout, so refusing it exhausts its derivation
-    (a tile refused at the planner's first stage count, two, gives way to the next layout, which takes the
-    same shape: `wgmma.fed`)."""
-
-    def candidate(self, ba, config, target):
-        return (config.block_m == 128 and config.block_n == 256 and config.warpgroups == 2
-                and config.family == "wgmma" and super().candidate(ba, config, target))
-
-
 def _spilling_forward(launch, rows: int, devices):
     """A paired SwiGLU forward of `launch` at `rows` rows, its abstract operands placed on `devices`."""
     placed = jax.sharding.NamedSharding(devices, PartitionSpec())
@@ -264,46 +254,38 @@ def _lowering(forward, shapes, traced: list):
 
 
 @lowers("sm90")
-@pytest.mark.parametrize("exhausted", [False, True])
-def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_until_one_fits(exhausted):
+def test_a_spilling_launch_is_refused_and_its_derivation_steps_down_until_one_fits():
     """A compile that finds a template launch's kernel spilling (`report.compiled`, owner 10-29) refuses that
     launch's config and lowers again, where the derivation takes its next tile by its own rule, for as long
     as a config not refused before spills; the kept program's own spills are recorded and not stepped. A
     paired SwiGLU forward whose model counts no registers, compiled for a compile-only H100 on this CPU
-    through ptxas. A derivation with no replacement keeps its first program; the refusals saved with that
-    program must derive it again."""
+    through ptxas; the refusals saved with the kept program derive it again. A derivation left no config
+    refuses the program (test_kernel_spills)."""
     from dew.nn.kernels.templates import report
     from dew.training.ahead import compile_only_gpus
 
     devices = jax.sharding.Mesh(np.array(compile_only_gpus("sm90")), ("data",))
     traced = []
-    lowered = _lowering(*_spilling_forward(_OnlyTile() if exhausted else Uncounted(), 4096, devices), traced)
+    lowered = _lowering(*_spilling_forward(Uncounted(), 4096, devices), traced)
 
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         original = lowered()
         report.compiled(original, relower=lowered)
         misses, refused = report.misses(), report.refused_launches()
-    first = traced[0]
-    if exhausted:
-        assert len(traced) == 1
-        assert [(miss.config, miss.stepped) for miss in misses] == [(first, False)]
-        assert not refused
-        kept = first
-    else:
-        *stepped, kept = traced
-        assert stepped and kept not in stepped
-        assert [miss.config for miss in misses if miss.stepped] == stepped
-        assert all(miss.config == kept for miss in misses if not miss.stepped)
-        assert {config for _, config, _ in refused} == set(stepped)
+    *stepped, kept = traced
+    assert stepped and kept not in stepped
+    assert [miss.config for miss in misses if miss.stepped] == stepped
+    assert all(miss.config == kept for miss in misses if not miss.stepped)
+    assert {config for _, config, _ in refused} == set(stepped)
     # Another process seeded with the run's refusals (its plan's) derives the tile this compile kept.
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         report.refuse(refused)
         lowered()
     assert traced[-1] == kept
-    # An already compiled artifact emits no new ptxas report. A fresh decision scope still steps past
-    # its observed spill, while an exhausted derivation retains the artifact without a false refusal.
+    # An already compiled artifact emits no new ptxas report; a fresh decision scope still steps past its
+    # observed spill.
     with (report.refusals(), generation.assumed("sm90"),
           jax.sharding.use_abstract_mesh(generation.gpu_mesh(devices, "sm90"))):
         report.compiled(original, relower=lowered)

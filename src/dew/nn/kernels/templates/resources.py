@@ -591,10 +591,14 @@ def register_model(family: "Family", consumers: int, registers: int | None, *,
     """`family`'s register decision for a launch of `consumers` whose consumer thread holds `registers`
     (`RegisterModel`): its producer's registers where its layout has one (`Family.warpgroups`), lowered to
     `producer` (`producer_floor` where None), and the most programs a multiprocessor holds of it at those
-    registers (`register_programs`), as its plan's."""
+    registers (`register_programs`), its `shared` bytes and its `tmem` columns, as its plan's: on `target`,
+    else the target its launches derive for (`facts`'). A residency its staging forbids is no launch's (a
+    B200's gathered input gradient staging 230,580 bytes runs one program, where its registers held three
+    and its gathering producer spilled at three's raise, row 5523)."""
     warpgroups = family.warpgroups(consumers)
     most = family.programs(consumers, registers, producer)
-    if target is not None:
+    if shared is not None or tmem:
+        target = generation.gpu_target() if target is None else target
         if shared is not None:
             most = shared_programs(most, shared, generation.shared_budget(target))
         if tmem:

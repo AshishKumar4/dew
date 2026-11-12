@@ -8,6 +8,7 @@ a kernel and the PTX Mosaic prints as it compiles one, whose registers and spill
 own compile (tests/kernel_compile.py). Each kernel's name carries the launch that traced it (`named`), so a
 binary names its launch and its config."""
 
+import collections
 import contextlib
 import contextvars
 import dataclasses
@@ -20,7 +21,7 @@ import struct
 import subprocess
 import tempfile
 import threading
-from collections.abc import Callable, Hashable, Iterator, Sequence
+from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, overload
@@ -116,17 +117,38 @@ class _Pending:
 _TRACING: contextvars.ContextVar[_Pending | None] = contextvars.ContextVar("tracing_launch", default=None)
 """The pending launch whose Mosaic kernels acquire their digest through `named`."""
 _LAUNCHES: dict[str, Launch] = {}
-"""Each launch this process traced, by its digest."""
+"""Each launch this process traced, by its digest, for the process's life: a program's compile reads its
+launches whenever it comes (`compiled`), a pullback's trace whenever JAX makes it (`relaunched`), and JAX
+hands a cached trace back without tracing it again, so no trace states when its launches are read last."""
+RECORDS_HELD = 4096
+"""The misses, rewrites and pass timings a registry keeps (`_Registry`), the latest; a reader of one
+search's own takes them in a `recording` scope."""
 @dataclasses.dataclass
 class _Registry:
     """Each (launch identity, config) a compile refused (`compiled`: its kernel spilled), by the names of its
     kernels that spilled, and each miss."""
     refused: dict[tuple[str, Hashable], frozenset[str]] = dataclasses.field(default_factory=dict)
+    missed: collections.deque["Miss"] = dataclasses.field(
+        default_factory=lambda: collections.deque(maxlen=RECORDS_HELD))
+    rewritten: collections.deque = dataclasses.field(
+        default_factory=lambda: collections.deque(maxlen=RECORDS_HELD))
+    """Each region the algebra pass rewrote, its report (`dew.algebra.program.AlgebraReport`)."""
+    passes: collections.deque[float] = dataclasses.field(
+        default_factory=lambda: collections.deque(maxlen=RECORDS_HELD))
+    """Each program's whole pass, in seconds: its walks of its bodies and windows beside its regions'."""
+
+
+@dataclasses.dataclass
+class Recorded:
+    """The misses, rewrites and pass timings recorded within a `recording` scope, every one: one search's
+    own, which its plan reports."""
     missed: list["Miss"] = dataclasses.field(default_factory=list)
     rewritten: list = dataclasses.field(default_factory=list)
-    """Each region the algebra pass rewrote, its report (`dew.algebra.program.AlgebraReport`)."""
     passes: list[float] = dataclasses.field(default_factory=list)
-    """Each program's whole pass, in seconds: its walks of its bodies and windows beside its regions'."""
+
+
+_RECORDING: contextvars.ContextVar[tuple[Recorded, ...]] = contextvars.ContextVar("recording", default=())
+"""The `recording` scopes open in this context, innermost last."""
 
 
 _PROCESS = _Registry()
@@ -144,7 +166,7 @@ def _registry() -> _Registry:
 
 class Exhausted(ValueError):
     """A derivation that finds no config left for a launch (`base.Unfitted`): a relowering after a spill
-    that ends so keeps the first program (`compiled`)."""
+    that ends so refuses the program (`compiled`), which no compile keeps spilling."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -325,8 +347,8 @@ def refuse(entries) -> None:
 
 
 def misses() -> tuple[Miss, ...]:
-    """The kernels this process's compiles found spilling (`compiled`), for a run's telemetry: a `refusals`
-    scope's own within it."""
+    """The kernels this process's compiles found spilling (`compiled`), the latest `RECORDS_HELD`, for a run's
+    telemetry: a `refusals` scope's own within it."""
     with _GUARD:
         return tuple(_registry().missed)
 
@@ -334,28 +356,39 @@ def misses() -> tuple[Miss, ...]:
 def record_rewrite(made) -> None:
     """Record one region the algebra pass rewrote (`dew.algebra.program.AlgebraReport`) beside the kernels'
     misses, as each program traces."""
-    with _GUARD:
-        _registry().rewritten.append(made)
+    _add(rewritten=(made,))
 
 
 def record_pass(seconds: float) -> None:
     """Record one program's whole algebra pass, its seconds (`dew.algebra.program._passed`)."""
-    with _GUARD:
-        _registry().passes.append(seconds)
+    _add(passes=(seconds,))
 
 
 def passes() -> tuple[float, ...]:
-    """Each program's whole algebra pass, in seconds, as this process's programs traced (`record_pass`): its
-    regions' (`rewrites`) and its walks of the program around them."""
+    """Each program's whole algebra pass, in seconds, as this process's programs traced (`record_pass`), the
+    latest `RECORDS_HELD`: its regions' (`rewrites`) and its walks of the program around them."""
     with _GUARD:
         return tuple(_registry().passes)
 
 
 def rewrites() -> tuple:
-    """The regions the algebra pass rewrote as this process's programs traced (`record_rewrite`), for a
-    run's telemetry: a `refusals` scope's own within it."""
+    """The regions the algebra pass rewrote as this process's programs traced (`record_rewrite`), the latest
+    `RECORDS_HELD`, for a run's telemetry: a `refusals` scope's own within it."""
     with _GUARD:
         return tuple(_registry().rewritten)
+
+
+@contextlib.contextmanager
+def recording() -> Iterator[Recorded]:
+    """Within the block, every miss, rewrite and pass timing this context records (`Recorded`), as well as
+    its registry's: a search's own, whatever the registry holds besides. A replacement's are recorded once
+    it is kept (`_commit`)."""
+    recorded = Recorded()
+    token = _RECORDING.set((*_RECORDING.get(), recorded))
+    try:
+        yield recorded
+    finally:
+        _RECORDING.reset(token)
 
 
 @contextlib.contextmanager
@@ -371,30 +404,38 @@ def refusals() -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[_Registry]:
+def _proposing(entries: list[tuple[tuple[str, Hashable], str]]) -> Iterator[Recorded]:
     """Refusals visible while deriving and compiling a replacement, without changing the kept program's
-    registry or its file; the scope's registry, whose rewrites and passes the replacement's trace recorded. A
-    successful replacement commits them after this scope ends (`_commit`)."""
+    registry or its file; every rewrite and pass the replacement's trace records, which a successful
+    replacement commits after this scope ends (`_commit`)."""
     registry = _registry()
     with _GUARD:
         proposed = dict(registry.refused)
     for identity, kernel in entries:
         proposed[identity] = proposed.get(identity, frozenset()) | {kernel}
-    scope = _Registry(refused=proposed)
-    token = _SCOPE.set(scope)
+    # A replacement's records reach the registry and a `recording` only once it is kept (`_commit`).
+    proposal = Recorded()
+    token, held = _SCOPE.set(_Registry(refused=proposed)), _RECORDING.set((proposal,))
     try:
-        yield scope
+        yield proposal
     finally:
+        _RECORDING.reset(held)
         _SCOPE.reset(token)
 
 
-def _commit(proposal: _Registry) -> None:
-    """A successful replacement's rewrites and its passes' seconds (`_proposing`'s scope) recorded as the
-    kept program's."""
+def _commit(proposal: Recorded) -> None:
+    """A successful replacement's rewrites and its passes' seconds (`_proposing`'s) recorded as the kept
+    program's."""
+    _add(rewritten=proposal.rewritten, passes=proposal.passes)
+
+
+def _add(**records: Iterable) -> None:
+    """Each of `records`, a `Recorded` field's entries, added to this context's registry and to every
+    `recording` open in it."""
     with _GUARD:
-        registry = _registry()
-        registry.rewritten.extend(proposal.rewritten)
-        registry.passes.extend(proposal.passes)
+        for held in (_registry(), *_RECORDING.get()):
+            for name, entries in records.items():
+                getattr(held, name).extend(entries)
 
 
 def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
@@ -404,7 +445,7 @@ def _record(refusal: tuple[str, Hashable] | None, miss: "Miss | None",
         if refusal is not None:
             registry.refused[refusal] = registry.refused.get(refusal, frozenset()) | kernels
         if miss is not None:
-            registry.missed.append(miss)
+            _add(missed=(miss,))
 
 
 def compiled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
@@ -532,11 +573,12 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     launch spills at a config not yet refused; `relower` traces afresh, so each refused launch's derivation
     takes the next config by its own rule, through every composition its device has (`bundles.groups`), and
     a launch whose every legal config spilled derives none, its call taking the next route (it leaves the
-    template only so). The last compile's own spills are recorded,
-    neither refused nor stepped, so every process derives the program this compile keeps; a relowering whose
-    derivations find no config left (`Exhausted`: a launch a call pins) keeps the program before it, its
-    misses recorded as not stepped. Each relowering's refused launches compile alone until none spills
-    (`_stepped_alone`), the whole program once after them. Refusals commit only as a replacement compiles,
+    template only so). The last compile's own spills are recorded, neither refused nor stepped, so every
+    process derives the program this compile keeps; a relowering whose derivations find no config left
+    (`Exhausted`: a launch a call pins) raises, its misses recorded as not stepped: a derived kernel never
+    spills and a pin is legal (docs/design/kernel-templates.md), so no program found spilling is kept. Each
+    relowering's refused launches compile alone until none spills (`_stepped_alone`), the whole program once
+    after them. Refusals commit only as a replacement compiles,
     so a later process derives the program kept here. A program loaded from the persistent compilation
     cache carries its kernels' binaries as one compiled here does. A program whose block XLA refuses steps
     its asking Triton launches down (`_unblocked`)."""
@@ -560,8 +602,10 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
                 program, alone = _stepped_alone(relower, options, {identity for (identity, _), _ in refusals})
                 replacement, spilling = _compiled_reported(program, options)
         except Exhausted as failed:
-            _log.warning("relowering after a spill found no config: %s; the program before it runs", failed)
-            break
+            _recorded(found, stepped=False)
+            kernels = ", ".join(sorted({report.kernel for _, report, _ in found}))
+            raise Exhausted(f"kernels {kernels} spill and their launches have no config left: {failed}"
+                            ) from failed
         _commit(proposal)
         for refusal, kernel in [*refusals, *((refusal, report.kernel) for refusal, report, _ in alone)]:
             _record(refusal, None, frozenset({kernel}))
@@ -920,7 +964,11 @@ def _kernels(message: bytes, decoded: bool = False) -> tuple[list[Binary], int]:
     """The kernels of each `MosaicGpuKernelProto` within a thunk's serialized proto (a message of jaxlib's
     version, field 1, whose binary, 8, is an ELF, whose kernel name, 9, its function's, and whose
     `SHARED_BYTES` its launch's dynamic shared memory), and how many Mosaic GPU custom calls it names
-    (`MOSAIC_TARGET`, a custom call thunk's target)."""
+    (`MOSAIC_TARGET`, a custom call thunk's target). A message holding neither the target's bytes nor an ELF's
+    holds neither, and is not parsed: most of a program's thunks and their messages (a 4B decoder's step read
+    223,561 messages, 1.8 of its compile point's 3.5 seconds)."""
+    if MOSAIC_TARGET not in message and ELF not in message:
+        return [], 0
     fields = _fields(message)
     binary, name, shared = fields.get(8, []), fields.get(9, []), fields.get(SHARED_BYTES, [])
     if (fields.get(1) == [KERNEL_PROTO_VERSION] and len(binary) == len(name) == 1
