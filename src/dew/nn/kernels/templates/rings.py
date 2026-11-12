@@ -218,6 +218,8 @@ class Ring:
     @property
     def stages(self) -> int:
         """The ring's slots: its allocation's leading dimension."""
+        if os.environ.get("DBG_LOGICAL_ONE"):
+            return 1
         return int(self.smem.shape[0])
 
     @property
