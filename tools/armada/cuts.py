@@ -1,8 +1,9 @@
-"""How tools/armada/ci.py's plan cuts a test file heavier than its target into groups (`weighed`): from the
-cut armada measured its rows at (`measured_cut`), whose seconds past the file's recorded tests are what each
-group of that cut paid besides them (`split`), else from an estimate of its seconds alone, spread over its
-tests. The standard library alone, loaded by ci.py by its path: the runs of consecutive tests a task cuts a file
-by are session.py's (`session.groups`), which ci.py hands each function that cuts (`session`)."""
+"""How tools/armada/ci.py's plan cuts a test file heavier than its target into groups (`weighed`): from
+the cut armada measured its rows at (`measured_cut`), whose seconds past the file's recorded tests are
+what each group of that cut paid besides them (`split`), else from an estimate of its seconds alone,
+spread over its tests. The standard library alone, loaded by ci.py by its path: the runs of consecutive
+tests a task cuts a file by are session.py's (`session.groups`), which ci.py hands each function that cuts
+(`session`)."""
 
 import math
 import re
@@ -46,12 +47,12 @@ KEPT = 1.5
 
 
 def measured_cut(groups: Mapping[str, float]) -> tuple[float, int] | None:
-    """What a file took at the cut its rows name, and that cut's count, from its rows' seconds by their `groups`
-    (a whole file's row under ""; ci.py's `measured_cut` reads them from armada's timings): its groups' rows
-    summed where every group of a count has its row (the most groups if several counts do), else its whole row,
-    else None. A row's median is measured at the cut its name holds, unlike the file's median, which mixes the
-    cuts of the runs it remembers. A collection's row, a site's judge's and a GPU lane's process variant's are no
-    group of a cut (`CUT`)."""
+    """What a file took at the cut its rows name, and that cut's count, from its rows' seconds by their
+    `groups` (a whole file's row under ""; ci.py's `measured_cut` reads them from armada's timings): its
+    groups' rows summed where every group of a count has its row (the most groups if several counts do),
+    else its whole row, else None. A row's median is measured at the cut its name holds, unlike the file's
+    median, which mixes the cuts of the runs it remembers. A collection's row, a site's judge's and a GPU
+    lane's process variant's are no group of a cut (`CUT`)."""
     counts: dict[int, dict[int, float]] = {}
     for group, seconds in groups.items():
         if found := CUT.fullmatch(group):

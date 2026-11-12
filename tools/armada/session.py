@@ -305,6 +305,42 @@ def cut(nodes: list[str], seconds: list[float], count: int) -> list[list[str]]:
     return [[nodes[index] for unit in held[run.start:run.stop] for index in unit] for run in runs]
 
 
+@functools.cache
+def bound(text: str) -> frozenset[str] | None:
+    """The names a test file's source `text` binds at its top level (a function's, a class's, an assignment's,
+    an import's), which a test's node id begins with; None for a source that does not parse."""
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names.update((alias.asname or alias.name).split(".")[0] for alias in node.names)
+        else:
+            names.update(target.id for target in ast.walk(node) if isinstance(target, ast.Name)
+                         and isinstance(target.ctx, ast.Store))
+    return frozenset(names)
+
+
+def standing(name: str, recorded: Mapping[str, float]) -> dict[str, float]:
+    """Of test file `name`'s `recorded` tests (node id to seconds), those whose function or class the file
+    still binds at its top level (`bound`): a test a lane renamed or cut leaves its record behind until main's
+    CI folds the file again, and cut by it the file ran as groups that held nothing (2026-11-12:
+    tests/test_recurrence.py, 37 tests, was planned as 133 groups by a record of 262, 244 of them a renamed
+    function's; 113 tasks ran nothing, 2,720 task-seconds). A class's tests stay while its class does, whoever
+    defines them; a file that is gone or does not parse keeps its record as it is. What the plan cuts a file
+    by (ci.py's `own_tests`) and every task of it cuts alike (split.py)."""
+    path = Path(name)
+    names = bound(path.read_text()) if path.is_file() else None
+    if names is None:
+        return dict(recorded)
+    return {node: seconds for node, seconds in recorded.items()
+            if node.partition("::")[2].split("[")[0].split("::")[0] in names}
+
+
 def own(recorded: Mapping[str, float], sites: Container[str]) -> dict[str, float]:
     """Of a test file's `recorded` tests (node id to seconds, in node-id order), those but its `sites'`
     (`declared_marks`, `site_name`), which run apart: what the plan cuts the file by (ci.py's `own_tests`)

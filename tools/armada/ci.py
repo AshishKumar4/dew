@@ -718,8 +718,9 @@ def parted_record(path: Path = session.DURATIONS) -> dict[str, dict[str, float]]
 
 
 def own_tests(name: str, tests: dict[str, float]) -> dict[str, float]:
-    """Of file `name`'s recorded `tests`, those but its check-1 sites', which run apart (`sites`)."""
-    return session.own(tests, sites(name))
+    """Of file `name`'s recorded `tests`, those the file still defines (`session.standing`) but its check-1
+    sites', which run apart (`sites`)."""
+    return session.own(session.standing(name, tests), sites(name))
 
 
 def durations_record(path: Path = session.DURATIONS) -> dict[str, float]:
@@ -776,7 +777,8 @@ GROUPED: list = [None, {}]
 
 def grouped_rows(measured: Mapping[str, float]) -> dict[tuple[str, str], dict[str, float]]:
     """Armada's row timings `measured` by their Python and file, each row's seconds under its group; a map
-    task's seconds are kept under its task's name, no row's. Grouped once for the rows it was last asked of."""
+    task's seconds are kept under its task's name, no row's. Grouped once for the rows it was last asked
+    of."""
     if GROUPED[0] is not measured:
         found: dict[tuple[str, str], dict[str, float]] = {}
         for row_name, seconds in measured.items():
