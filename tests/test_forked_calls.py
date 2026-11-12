@@ -735,18 +735,15 @@ def test_a_windowed_block_over_forks_reads_its_block_whole_and_its_window_else()
                 assert found[row, query, key] == (windowed or blocked), (row, query, key)
 
 
-def test_rollouts_share_their_prompts_where_their_scorer_does_from_its_runs_plan():
-    """A rollout scheduler built before its run binds its plan packs a task's samples over one copy of
-    their prompt where the objective that trains on them shares, read at each call (`RolloutScheduler.
-    scorer`, its `shares_prefixes(train=True)`): a GRPO policy over a forked decoder, and a PPO objective
-    whose critic reads forks too; after a plan from before `SHARED_STATE` binds (`TokenScorer.bind_plan`,
-    a run saved before forks resuming) the same call packs every sample whole, as it does where the critic's
-    backbone reads no forks or no scorer is named."""
+def test_rollouts_share_their_prompts_where_their_scorer_does():
+    """A rollout scheduler packs a task's samples over one copy of their prompt where the objective that
+    trains on them shares, read at each call (`RolloutScheduler.scorer`, its `shares_prefixes(train=True)`):
+    a GRPO policy over a forked decoder, and a PPO objective whose critic reads forks too; it packs every
+    sample whole where the critic's backbone reads no forks or no scorer is named."""
     import optax
     from model_support import TINY_DECODER
     from test_rl_methods import Scripted, session
 
-    from dew.data.plan import PLAN_VERSIONS, SHARED_STATE
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.rl.grpo import GRPOObjective
     from dew.objectives.rl.ppo import PPOObjective, ValueHead
@@ -772,10 +769,6 @@ def test_rollouts_share_their_prompts_where_their_scorer_does_from_its_runs_plan
     policy = GRPOObjective(model, Scripted.width - 1)
     critic = PPOObjective(model, Scripted.width - 1, critic=ValueHead(model))
     for objective in (policy, critic):
-        shares = packed(objective, policy)
-        assert shares()
-        objective.bind_plan(SHARED_STATE - 1)
-        assert not shares()
-        objective.bind_plan(PLAN_VERSIONS[-1])
+        assert packed(objective, policy)()
     assert not packed(PPOObjective(model, Scripted.width - 1, critic=ValueHead(Plain())), policy)()
     assert not packed(None, policy)()

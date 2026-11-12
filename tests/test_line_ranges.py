@@ -7,7 +7,6 @@ import itertools
 import json
 
 import pytest
-from data_support import LATEST
 
 from dew.data.sources import Files
 
@@ -17,7 +16,7 @@ def test_an_empty_file_holds_no_range_beside_one_that_holds_records(tmp_path):
     other file is cut into its own."""
     (tmp_path / "empty.jsonl").write_text("")
     (tmp_path / "rows.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(3)))
-    shards = Files(str(tmp_path), format="jsonl", shard_bytes=10).manifest(LATEST).shards
+    shards = Files(str(tmp_path), format="jsonl", shard_bytes=10).manifest().shards
     assert shards and all(shard.uri.endswith("rows.jsonl") for shard in shards)
 
 
@@ -28,9 +27,9 @@ def test_a_files_byte_ranges_are_equal_and_never_shorter_than_its_shard_bytes(tm
     lines = [json.dumps({"id": index, "pad": "y" * (index % 5)}) for index in range(40)]
     (tmp_path / "rows.jsonl").write_text("".join(line + "\n" for line in lines))
     stored = Files(str(tmp_path / "rows.jsonl"), shard_bytes=100)
-    shards = stored.manifest(LATEST).shards
+    shards = stored.manifest().shards
     assert all(100 <= shard.stop - shard.start < 200 for shard in shards)
-    read = [[row["id"] for row in stored.manifest(LATEST).reader(shard)] for shard in shards]
+    read = [[row["id"] for row in stored.manifest().reader(shard)] for shard in shards]
     assert all(read)
     assert list(itertools.chain(*read)) == list(range(40))
 
@@ -44,11 +43,11 @@ def test_a_record_longer_than_shard_bytes_is_read_whole_by_the_range_it_starts_i
     lines = [json.dumps({"id": 0}), json.dumps({"id": 1, "pad": "x" * 5_000}), json.dumps({"id": 2})]
     (tmp_path / "rows.jsonl").write_text("".join(line + "\n" for line in lines))
     stored = Files(str(tmp_path / "rows.jsonl"), format=kind, shard_bytes=1_000)
-    shards = stored.manifest(LATEST).shards
+    shards = stored.manifest().shards
     spanned = [shard for shard in shards
                if shard.start > len(lines[0]) + 1 and shard.stop < len(lines[0]) + len(lines[1]) + 2]
     assert spanned
-    read = [list(stored.manifest(LATEST).reader(shard)) for shard in shards]
+    read = [list(stored.manifest().reader(shard)) for shard in shards]
     assert all(not rows for shard, rows in zip(shards, read, strict=True) if shard in spanned)
     ids = [row["id"] if kind == "jsonl" else json.loads(row["text"])["id"] for rows in read for row in rows]
     assert ids == [0, 1, 2]

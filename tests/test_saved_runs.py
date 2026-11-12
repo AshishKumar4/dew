@@ -28,7 +28,6 @@ from saved_run_products import unpacked
 
 from dew.checkpoints import Checkpoints
 from dew.config import RunConfig
-from dew.decision.task import Decide
 from dew.inference.tasks import SavedRun
 from dew.registry import objectives
 from dew.training import LocalTracker
@@ -237,69 +236,28 @@ def test_a_run_an_earlier_main_saved_exports_and_loads_back_answering_as_its_run
     assert answered_alike(answers(pipeline(str(release))), answers(task.from_run(str(run))))
 
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
-def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monkeypatch, recorded, kind):
-    """A kind's run saved at an earlier main resumes from its last checkpoint for one step more, in the
-    compute it trained in (a main that recorded no evidence: every corpus run's model draws fresh or loads
-    a decision backbone, in float32 unless its model names a dtype; train 328's review of ledger 2500):
-    the fit starts at that step, from that checkpoint, and trains the one step past it. Where its main
-    recorded what it serialized (`evidence`), the resumed run holds its parameters in the dtypes it
-    stored them in, scales its loss as it did, its count of finite steps going on, counts on from the
-    examples it consumed (a run on the examples clock paused before its bound trains on to it), and
-    compiles its step at the rung it was admitted at. A decision run's new step lays a request's rows out
-    as the step it resumed does, whatever a later plan's layout derives."""
+def test_a_run_an_earlier_main_saved_is_refused_where_it_resumes_its_data(tmp_path, monkeypatch, recorded,
+                                                                          kind):
+    """A kind's run saved at an earlier main, resumed from its last checkpoint, is refused before it trains a
+    step: its data position was written under a data plan this Dew reads none of (`dew.data.plan.Plan.check`,
+    `dew._position.decode`), which the Dew that wrote it resumes, or a new run goes on from its weights."""
     run = extracted(tmp_path, recorded, kind)
     recorded_run = RunConfig.load(str(run))
-    seen = evidence(recorded, kind)
-    compute = recorded_run.model.fields.get("dtype", "float32") if seen is None else seen["compute"]
-    assert recorded_run.compute_dtype() == compute
     with Checkpoints(str(run)) as checkpoints:
         last = checkpoints.latest
     here = SAVED_KINDS[kind](tmp_path, drawn=False)
     # A source the repo holds is recorded by its path in the repo (a decision run's backbone), read from
     # the checkout's root as the run that wrote it read it.
     monkeypatch.chdir(checkout_of(tmp_path, recorded))
-    # A run on the examples clock paused before its bound (`Pause`) trains on to it, its progress the
-    # examples it consumed; a run counted in steps trains one step more.
-    clocked = seen is not None and recorded_run.trainer.examples is not None
+    # A run counted in examples reads on to its bound; one counted in steps, one step more.
+    steps = {} if recorded_run.trainer.examples is not None else {"steps": last + 1}
     trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), stop=None,
-                                  **({} if clocked else {"steps": last + 1}), resume="require",
-                                  compilation_cache_dir=None, multi_host=False)
+                                  resume="require", compilation_cache_dir=None, multi_host=False, **steps)
     sources = {"data": here.data, "validation": here.validation}
-    state = dataclasses.replace(recorded_run, trainer=trainer, **sources).prepare().train(kind)
-    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
-    resumed = max(index for index, row in enumerate(records) if row["type"] == "FitStarted")
-    started = records[resumed]["value"]
-    assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
+    with pytest.raises(ValueError):
+        dataclasses.replace(recorded_run, trainer=trainer, **sources).prepare().train(kind)
     stepped = [step for step, _ in LocalTracker(run / "tracking").scalars()]
-    assert max(stepped) > last if clocked else max(stepped) == last + 1
-    task = objectives[recorded_run.objective.name].saved_task
-    if task is Decide:
-        # The step the resume saved lays a request's rows out as the step it resumed does: a run saved
-        # under a data plan from before a request's questions shared a state reads a question a row,
-        # trains on so, and declares so at every step it saves (`DecisionObjective.bind_plan`).
-        saved, resumed_task = (Decide.from_run(str(run), step=step) for step in (last, int(state.step)))
-        assert resumed_task.layout == saved.layout
-    if seen is not None:
-        stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])})
-        assert stored == seen["params"]
-        # The scale as it was, and its count of finite steps on from the recorded one, not from none.
-        assert (None if state.scale is None else float(state.scale.scale)) == seen["scale"]
-        assert (None if state.scale is None else int(state.scale.fin_steps)) == (
-            None if seen["finite_steps"] is None else seen["finite_steps"] + int(state.step) - last)
-        # The examples it consumed count on from the recorded ones to the bound.
-        consumed = None if state.consumed is None else int(state.consumed)
-        assert (consumed is None) == (seen["consumed"] is None)
-        assert consumed is None or consumed > seen["consumed"]
-        assert not clocked or consumed == recorded_run.trainer.examples
-        # The model the resumed fit trained computes as the saved one did: the task its new step saves.
-        # Where its main recorded them: a run whose objective declared no task then recorded none.
-        if task is not None and seen["version"] >= PRODUCTS and seen["products"] is not None:
-            found = computed(run, int(state.step), wide=seen["version"] < USERS_PRODUCTS)
-            assert found["products"] == unpacked(seen["products"], found["packs"])
-        # The step the resumed fit compiled, at the rung it was admitted at.
-        compiled = [row["value"] for row in records[resumed:] if row["type"] == "StepCompiled"][-1]
-        assert compiled["remat"] == seen["remat"]
-        assert {name: (compiled["plan"] or {}).get(name) for name in seen["plan"]} == seen["plan"]
+    assert max(stepped) <= last
 
 
 def rebuilt(tmp_path: Path, monkeypatch, recorded: str, kind: str, **stated) -> tuple[Path, int, object]:
@@ -319,69 +277,6 @@ def rebuilt(tmp_path: Path, monkeypatch, recorded: str, kind: str, **stated) -> 
     here = SAVED_KINDS[kind](tmp_path, drawn=False)
     sourced = {"pretrained": recorded_run.pretrained} if hasattr(recorded_run, "pretrained") else {}
     return run, last, dataclasses.replace(here, trainer=trainer, **sourced, **stated)
-
-
-@pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
-def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_path, monkeypatch, recorded,
-                                                                         kind):
-    """A kind's run saved at an earlier main resumes from its last checkpoint when the run that made it is
-    built again from its command (`rebuilt`): every field it leaves for its build to resolve takes the
-    saved run's value (`RunConfig.BUILT`: a decision run's option text, its rows' writing, row 3848, and
-    its source's storage), so the resume compares alike and fits the one step past its checkpoint."""
-    run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
-    built.prepare().train(kind)
-    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
-    started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
-    assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
-
-
-@pytest.mark.parametrize("given", ["chain", "loader"])
-@pytest.mark.parametrize("named", [None, "another"])
-@pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
-def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, monkeypatch, recorded, kind,
-                                                                      named, given):
-    """A kind's run saved at an earlier main resumes from its last checkpoint as a Python experiment trains
-    it: its objective built, then handed to `RunConfig.train` with its data, the chain it states uncompiled
-    as the examples hand it (`run.data`), or the loader its build compiled (`given`), the run naming no data
-    plan version, as one written in Python does. The train resolves it itself, the saved run's (`resumed`,
-    which `readied` asks of a chain; a loader reads by the version it was compiled at), so the resume
-    compares alike and fits the one step past its checkpoint, and the record it writes names the version
-    the saved run states (train 589's review: a run trained so read by this Dew's version and recorded
-    none, so a saved run's resume was refused; train 627's: the chain's path was not the one proven). The
-    run it resumes is the one `train` is given the name of, whatever its trainer names, none or another
-    (`named`)."""
-    run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
-    stated = RunConfig.load(str(run)).data_plan_version
-    prepared = built.prepare()
-    python = dataclasses.replace(prepared.run, data_plan_version=None,
-                                 trainer=dataclasses.replace(prepared.run.trainer, name=named))
-    data, validation = ((built.chain(), built.validation) if given == "chain"
-                        else (prepared.dataset, prepared.validation))
-    python.train(prepared.objective, data, name=kind, metrics=prepared.metrics, rollout=prepared.rollout,
-                 summary=prepared.summary, validation=validation, after=prepared.after)
-    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
-    started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
-    assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
-    assert RunConfig.load(str(run)).data_plan_version == stated
-
-
-@pytest.mark.parametrize(("landed", "version"), [(9, 9), (None, 9)])
-def test_a_run_saved_while_its_version_was_data_plan_loads_and_resumes_by_it(tmp_path, monkeypatch, landed,
-                                                                             version):
-    """A run a Dew saved while a run's data plan version was its field `data_plan` (main 1af304d0, before
-    the field was `data_plan_version`, train 589's review) records the version it compiled at, or None
-    where it was trained in Python, which that Dew compiled at this Dew's, 9: it loads by that version and
-    resumes when its command runs again (row 4107)."""
-    recorded, kind = next((recorded, kind) for recorded, kind in SAVED if kind == "lm")
-    run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
-    record = json.loads((run / "run.json").read_text())
-    fields = {name: value for name, value in record["fields"].items() if name != "data_plan_version"}
-    (run / "run.json").write_text(json.dumps({**record, "fields": {**fields, "data_plan": landed}}))
-    assert RunConfig.load(str(run)).data_plan_version == version
-    built.prepare().train(kind)
-    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
-    started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
-    assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
 
 
 def test_reading_a_saved_run_opens_no_device_before_its_process_is_prepared(tmp_path):
