@@ -258,7 +258,7 @@ def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(
 
 def test_a_server_handed_the_programs_an_earlier_one_kept_traces_none_and_answers_the_same(tmp_path):
     """A scoring server started with the programs an earlier process of its task kept
-    (`dew.training.ahead.keeping`, `ScoringServer.from_task(programs=...)`) loads each pass's program in
+    (`dew.training.ahead.keeping`, its `ScoringServer.from_task` within `kept`) loads each pass's program in
     place of tracing and compiling it: in a fresh process it needs no trace and no compile of the
     forward, before its first pass or while it serves, and answers each request exactly as the server
     that compiled them did. Every program the first server compiled up front is kept, none refused, and

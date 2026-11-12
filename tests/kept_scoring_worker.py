@@ -46,7 +46,8 @@ elif mode == "verify":
     responses = served(server)
 else:
     with Compiles("logits") as compiles:
-        server = ScoringServer.from_task(*task.scoring(), programs=path)
+        with kept(path):
+            server = ScoringServer.from_task(*task.scoring())
         responses = served(server)
     found = {"programs": len(server.programs),
              "needed": sorted(program.kind for program in compiles.programs)}

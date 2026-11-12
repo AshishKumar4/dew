@@ -335,19 +335,22 @@ def test_a_run_that_states_its_split_and_remat_derives_nothing_and_compiles_once
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
     free(monkeypatch, LIMIT)
+    def derivations(trainer) -> int:
+        """`trainer` compiled, and each candidate step's footprint its plan derived
+        (`footprint.candidate_footprint`), counted by the profiler."""
+        profiler = cProfile.Profile()
+        profiler.runcall(compiled, trainer)
+        return sum(calls for (file, _, name), (_, calls, *_) in pstats.Stats(profiler).stats.items()
+                   if name == "candidate_footprint" and file == footprint.__file__)
+
     stated = deep(REMAT_POLICIES["full"], split=1)
-    # Each candidate step's footprint derived (`footprint.candidate_footprint`), counted by the profiler.
-    profiler = cProfile.Profile()
     with Compiles("step") as compiles:
-        profiler.runcall(compiled, stated)
-    derived = sum(calls for (file, _, name), (_, calls, *_) in pstats.Stats(profiler).stats.items()
-                  if name == "candidate_footprint" and file == footprint.__file__)
+        derived = derivations(stated)
     assert compiles.count == 1 and not derived
     assert [entry["label"] for entry in stated.plan["derived"]] == ["stated"]
     assert stated.plan["probes"][0]["derived_headroom"] is None and stated.plan["probes"][0]["fits"]
     for left in (deep(REMAT_POLICIES["full"], split=None), deep(None, split=1)):
-        compiled(left)
-        assert derived and "stated" not in [entry["label"] for entry in left.plan["derived"]]
+        assert derivations(left) and "stated" not in [entry["label"] for entry in left.plan["derived"]]
 
 
 def test_a_run_that_sets_its_remat_derives_its_own_rung_alone_and_compiles_there_once(monkeypatch, tmp_path):
