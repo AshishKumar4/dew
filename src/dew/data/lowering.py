@@ -79,7 +79,6 @@ from dew.data.handoff import (
     _Ended,
     _Grouped,
     _handoff,
-    _input_draws,
     _Spread,
     _threads,
     _Ungrouped,
@@ -581,23 +580,22 @@ def _through(rows: Rows, run: tuple[RecordStage, ...], name: str, label: str, lo
 
 @dataclasses.dataclass(frozen=True)
 class _PerInput:
-    """A run of record stages from an expansion over one input, by its index among the inputs (`index`), in a
-    read's workers (`_Build.spreads`): `_chained`'s rows and markers, each random stage drawing for each row
-    from its seed, the input's index and the row's place among the input's rows there, the same in any count
-    of workers. A marker of an input dropped before the run goes on as it is."""
+    """A run of record stages from an expansion over one input in a read's workers (`_Build.spreads`):
+    `_chained`'s rows and markers. It holds no random stage: one after the expansion draws in the reading
+    process by the row's place among the rows handed on, Grain's draw (`_handoff`). A marker of an input
+    dropped before the run goes on as it is."""
 
     stages: tuple[RecordStage, ...]
-    seeds: tuple[int | None, ...]
     unplaced: bool = False
 
-    def __call__(self, index: int, element: Record) -> Record | _Spread:
+    def __call__(self, element: Record) -> Record | _Spread:
         if isinstance(element, Rejected):
             return element
         position = _position(element)
         held: tuple[Record, ...] = (element if position is None else _unplaced(element),)
-        for stage, seed in zip(self.stages, self.seeds, strict=True):
-            held = tuple(made for row, given in enumerate(held) for made in consumed_by(
-                given, functools.partial(_outputs, stage, position, rng=_input_draws(seed, index, row))))
+        for stage in self.stages:
+            made = functools.partial(_outputs, stage, position, rng=None)
+            held = tuple(output for given in held for output in consumed_by(given, made))
         if position is not None and not self.unplaced:
             held = tuple(_placed(output, position) for output in held)
         return _Spread(held)
@@ -1719,7 +1717,7 @@ class _Build:
                 # The expansion and the record steps after it, to the hand-off, over each input in the
                 # workers; the reading process counts what they hand on (`unspread`).
                 rows, spread, examples, counting, ran = self.spread(
-                    rows, pipeline, partition, index, carried, last, examples=examples, counting=counting)
+                    rows, pipeline, index, carried, last, examples=examples, counting=counting)
                 continue
             if isinstance(stage, FlatMap) and stage.examples and not self.global_order and counting:
                 # The corpus's counts are of its source examples (`FlatMap.examples`): a run bounded in
@@ -1786,12 +1784,11 @@ class _Build:
                                             spread=spreading))
         return carried, spreading
 
-    def spread(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, at: int, carried: int,
-               last: int, *, examples: bool,
+    def spread(self, rows: Rows, pipeline: Pipeline, at: int, carried: int, last: int, *, examples: bool,
                counting: bool) -> tuple[Rows, tuple[int, bool], bool, bool, int]:
         """`rows` through the record stages from the expansion at `at` to the hand-off at `carried`, over
-        each input in its workers (`_PerInput`), each random stage's seed its own (`stage_seed`); the
-        spread `handed_on` reads, whether the read counts its examples and its rows (`records`), an
+        each input in its workers (`_PerInput`), none of them drawing (`_handoff`); the spread `handed_on`
+        reads, whether the read counts its examples and its rows (`records`), an
         objective's expansion counting the source examples it makes rows of (`FlatMap.examples`), and the
         stage the read goes on from."""
         stage = pipeline.stages[at]
@@ -1800,10 +1797,8 @@ class _Build:
         # The hand-off ends a spread at its first stage that is no record step (`_handoff`).
         run = tuple(stage for stage in pipeline.stages[at:carried] if record_stage_of(stage))
         assert len(run) == carried - at, "a spread runs record steps alone"
-        seeds = tuple(self.stage_seed(pipeline, index, partition) if isinstance(step, RandomMap) else None
-                      for index, step in enumerate(run, start=at))
         assert isinstance(rows, pygrain.MapDataset), "a spread read's rows are indexed to its expansion"
-        spread = rows.map_with_index(_PerInput(run, seeds, unplaced=at <= last < carried))
+        spread = rows.map(_PerInput(run, unplaced=at <= last < carried))
         return spread, (at, counted and not counting), examples, counting, carried
 
     def handed_on(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, pool: Workers, carried: int,
