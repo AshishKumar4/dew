@@ -46,7 +46,7 @@ timed by those alone). A check-1 site too long for one task, marked
 check1_shards(seeds, per_task) on its test
 (`sites`), runs apart from its file's tasks as armada's map and judge
 (`site_entries`): map tasks of per_task of its seeds each, or fewer where their
-measured seconds put a task past the group target (`cut_draws`), which draw them into
+measured seconds put a task past four group targets (`cut_draws`), which draw them into
 their artifacts and judge nothing, and a judge that waits on them, pools their
 draws from its inputs and reports the site's row, `<file>#<test>`, as a run
 that drew every seed itself would; a map task that does not pass exits 1, and
@@ -997,14 +997,17 @@ def draws_of(mark: Mark, per_task: int | None = None, weighed_per_task: int | No
 def cut_draws(mark: Mark, rates: Mapping[bool, costs.Cost | None], target: float) -> list[tuple[int, int]]:
     """The spans of a site's map tasks (`draws_of`): its declared per_task each, or fewer where its
     measured cost (`site_rate`, the unweighted check's and the weighed check's apart, `rates` by whether
-    weighed) puts a task of its declared cut past `target`: as many as `target` holds past its setup
-    (`Cost.fitting`), at least one, so no map task is the run's longest for its mark's cut (row 4376: a
-    64-seed shard ran 966 s where every other group took 256 s or less). Its tasks' starts are among what
-    the cost measures, so a cut converges from above on the one that fills the target. A kind whose finer
-    cut would pass what its judges' job takes (`MAX_INPUTS`, the two kinds' tasks together) keeps the finest
-    of its own within it."""
+    weighed) puts a task of its declared cut past `costs.SITE_TARGETS` of `target`: as many as they hold
+    past its setup (`Cost.fitting`), at least one, so no map task is the run's longest for its mark's cut
+    (row 4376: a 64-seed shard ran 966 s where every other group took 256 s or less), and none is cut down
+    to one target, each task paying the site's setup again. Its tasks' starts are among what the cost
+    measures, so a cut converges from above on the one that fills them. A kind whose finer cut would pass
+    what its judges' job takes (`MAX_INPUTS`, the two kinds' tasks together) keeps the finest of its own
+    within it."""
+    most = target * costs.SITE_TARGETS
+
     def fitting(units: int, declared: int, cost: costs.Cost | None) -> int:
-        return declared if cost is None else max(1, min(units, cost.fitting(declared, target)))
+        return declared if cost is None else max(1, min(units, cost.fitting(declared, most)))
 
     per_task = fitting(mark.units, mark.per_task, rates[False])
     weighed = fitting(mark.weighed, mark.weighed_per_task, rates[True]) if mark.weighed else None
@@ -1093,9 +1096,9 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
                  kept: Mapping[tuple[str, str], str], timings: dict, target: float,
                  eager: Container[tuple[str, str]] = ()) -> list[dict]:
     """The plan's entries for each site of `marked` (`sites`, by its file) under `python`: a map task each
-    `per_task` of its units, or fewer where their measured rate puts a task past `target` (`cut_draws`),
-    which runs its test over them alone, records their draws among its
-    artifacts and judges nothing; and its judge, which runs once they all passed (armada's `after`), pools
+    `per_task` of its units, or fewer where their measured rate puts a task past four of `target`
+    (`cut_draws`), which runs its test over them alone, records their draws among its artifacts and judges
+    nothing; and its judge, which runs once they all passed (armada's `after`), pools
     their draws from its inputs and reports the site's row as a run that drew every unit itself would. A site
     whose judge's row ran green on exactly these inputs (`kept`, `reusable`) has none: a kept task reads its
     row, and no draw runs. A map task weighs what armada measured it at, under its task's name
@@ -2360,19 +2363,20 @@ def slow(verdict: dict, target: float, base: dict[str, float] | None = None) -> 
     reported as running on the whole suite alone (`whole_suite`, as pytest marked it in its row:
     executed.py), which train CI never runs (bible §7: every test past the target is reported). With `base`
     (main's durations record), only the tests it lacks: a new slow test (owner, 2026-10-28), a cell newly
-    marked whole_suite too. A check-1 site's map task past the target is reported whatever the record holds
-    (its test is recorded whole): its mark gives a task too many units, which fewer a task (per_task,
-    conditioning_per_task) bring within it (row 3729: one ran 1,366 s unreported)."""
+    marked whole_suite too. A check-1 site's map task past the plan's bound on one (`cut_draws`: four
+    targets) is reported whatever the record holds (its test is recorded whole): its mark gives a task too
+    many units, which fewer a task (per_task, conditioning_per_task) bring within it (row 3729: 1,366 s)."""
     found = []
     for row_ in verdict["rows"]:
         cells = set(row_.get("whole_suite", []))
         drawn = session.SITE.fullmatch(parsed_row(row_["name"])[2]) if "name" in row_ else None
         mapped = drawn is not None and drawn["start"] is not None
+        most = target * costs.SITE_TARGETS if mapped else target
         for test, seconds in (row_.get("tests") or {}).items():
-            if seconds <= target or (base is not None and test in base and not mapped):
+            if seconds <= most or (base is not None and test in base and not mapped):
                 continue
             found.append({"test": test, "file": test.partition("::")[0], "seconds": round(seconds, 1),
-                          "target": target, **({"whole_suite": True} if test in cells else {}),
+                          "target": most, **({"whole_suite": True} if test in cells else {}),
                           **({"map_task": row_["name"], "fix": "fewer units a task (per_task, "
                               "conditioning_per_task)"} if mapped else {})})
     return sorted(found, key=lambda item: (-item["seconds"], item["test"]))

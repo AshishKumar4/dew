@@ -782,6 +782,44 @@ def test_a_runs_step_rows_read_the_steps_their_trees_prepare_compiled_ahead(gate
         assert handed == (str(tmp_path / "ahead" / "head") if tree == "head" else None), (tree, command)
 
 
+def test_ahead_fails_where_a_trees_compile_ahead_fails_and_asks_none_of_a_tree_that_has_none(
+        gate, tmp_path, monkeypatch):
+    """`ahead` ends nonzero where a tree whose benchmark_step compiles ahead fails to, so the job's prepare
+    fails: it had printed the failure and returned 0, and the run then compiled on the GPU (the audit of
+    2026-11-12, PT7). A tree whose own benchmark_step has no `--compile-ahead` (one before the handoff),
+    asked of the tool itself, is asked to compile none, which is no failure; a tool that cannot say what it
+    takes is one. Each tree's benchmark_step process is stood in, by what it answers."""
+    from types import SimpleNamespace
+
+    standing_in_environments(gate, monkeypatch)
+    battery = gate.subprocess.run
+    trees = {name: locked_tree(tmp_path / name) for name in ("main", "head")}
+    ran: list[tuple[str, bool]] = []
+    takes = {"main": (0, "usage: benchmark_step.py [--cases CASES]"),
+             "head": (0, "usage: benchmark_step.py [--cases CASES] [--compile-ahead DIR]")}
+    compiles = {"head": 1}
+
+    def child(command, **kwargs):
+        if len(command) < 2 or Path(command[1]).name != "benchmark_step.py":
+            return battery(command, **kwargs)
+        tree, asking = Path(kwargs["cwd"]).name, command[2:] == ["--help"]
+        ran.append((tree, asking))
+        code, said = takes[tree] if asking else (compiles.get(tree, 0), "")
+        return subprocess.CompletedProcess(command, code, said, "the step did not lower" if code else "")
+
+    monkeypatch.setattr(gate.subprocess, "run", child)
+    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", kind="a100",
+                           lock="cpu", environments=str(tmp_path / "environments"),
+                           out=str(tmp_path / "ahead"), only=["step lm-dense 4x1024"])
+    assert gate.ahead_battery(args) == 1
+    # The tree before the handoff was asked what it takes and never asked to compile ahead; the head was.
+    assert ran == [("main", True), ("head", True), ("head", False)]
+    compiles["head"] = 0
+    assert gate.ahead_battery(args) == 0
+    takes["head"] = (1, "")
+    assert gate.ahead_battery(args) == 1
+
+
 def test_a_steps_compiled_ahead_on_a_host_with_no_gpu_are_named_for_their_cases(tmp_path):
     """benchmark_step --compile-ahead, a GPU node's prepare on its CPU: each case's step planned and compiled
     for one compile-only GPU of the generation named, saved under the name its run's `--ahead` reads
