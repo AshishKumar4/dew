@@ -29,6 +29,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   advantage moments and return percentiles once across a split step's microbatches
   (`Objective.batch_statistics`, `Step.batch_statistics`, `Objective.real_rows`).
 
+- `DreamerRollout` compiles its JAX environment reset once (`saved_shapes` reading shapes via
+  `jax.eval_shape`), and `dew.rl.evaluation` fuses `episodes` into a single compiled program.
+
 - A paged `Server` keeps a prefix cache by default (`prefix_cache=None` derives it on wherever the layout pages,
   the rows sample a token a step on the server's own mesh and the model computes a split prompt as a whole
   one); a request draws what it draws without it. Pass `prefix_cache=False` to keep pages private. A
