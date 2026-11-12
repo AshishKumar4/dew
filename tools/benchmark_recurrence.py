@@ -25,9 +25,9 @@ operands included, each arm a shape in a process of its own, so no other arm's o
 
 The JAX arms run in Dew's environment (`jax` mode, a process an arm and shape, which `jax` mode spawns) and
 the torch arms in their own (`torch` mode, which imports neither JAX nor Dew), one after another on the same
-GPU; `row` mode reads their JSON lines and prints the markdown rows. Each time is the median of
-`--repeats` calls after `--warmup`, in milliseconds, each call its kernels' device time summed on either
-side (JAX's by CUPTI, `dew.telemetry.benchmark.device_time`; torch's by its profiler's CUDA events), so
+GPU; `row` mode reads their JSON lines and prints the markdown rows. Each time is the mean of
+`--repeats` calls after `--warmup`, in milliseconds, each call's kernels' device time summed on
+either side (JAX's by CUPTI, `dew.telemetry.benchmark.device_time`; torch's by its profiler's CUDA events), so
 no host dispatch enters either: a JAX arm timed by the host's clock around one call carried its dispatch,
 which put the short conv's template at 1.19 times fla's forward where its kernels took 165 us against fla's
 200 to 209 (ncu, A100, LF-PROF-a100). Forward plus backward is one call returning the outputs and their VJP
@@ -246,7 +246,7 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int, only: str) -> l
             try:
                 with device_time() as device:
                     measured = [device.seconds(compiled, *given_args) for _ in range(warmup + repeats)]
-                row[part] = 1e3 * statistics.median(measured[warmup:])
+                row[part] = 1e3 * statistics.fmean(measured[warmup:])
             except jax.errors.JaxRuntimeError as error:
                 row[part], row['error'] = None, _failure(error)
             row[part.replace('_ms', '_peak_mb')] = _jax_peak()
@@ -347,7 +347,7 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
             for _ in range(warmup):
                 fn()
             torch.cuda.synchronize()
-            row[part] = statistics.median(_kernel_milliseconds(torch, fn) for _ in range(repeats))
+            row[part] = _kernel_milliseconds(torch, fn, repeats)
         except torch.OutOfMemoryError as error:
             row[part], row['error'] = None, _failure(error)
             torch.cuda.empty_cache()
@@ -355,16 +355,18 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
     return row
 
 
-def _kernel_milliseconds(torch, fn) -> float:
-    """One call of `fn`'s device milliseconds, its CUDA kernels' summed as torch's profiler reads them
-    (CUPTI's, as the JAX arms' are), no host dispatch among them."""
+def _kernel_milliseconds(torch, fn, repeats: int) -> float:
+    """A call of `fn`'s mean device milliseconds over `repeats` synchronized calls under one capture, their
+    CUDA kernels summed as torch's profiler reads them (CUPTI's, as the JAX arms' are), no host dispatch
+    among them: a capture a call lost events (the measurement lane's LF-RECDEV runs)."""
     from torch.profiler import ProfilerActivity, profile
 
     with profile(activities=[ProfilerActivity.CUDA]) as profiled:
-        fn()
-        torch.cuda.synchronize()
+        for _ in range(repeats):
+            fn()
+            torch.cuda.synchronize()
     return sum(event.device_time for event in profiled.events()
-               if event.device_type == torch.autograd.DeviceType.CUDA) / 1e3
+               if event.device_type == torch.autograd.DeviceType.CUDA) / 1e3 / repeats
 
 
 def markdown(rows: list[dict], sha: str) -> list[str]:
