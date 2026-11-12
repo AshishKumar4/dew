@@ -80,7 +80,8 @@ checked-in output yet. The text stays as the design to resume.
   - `KernelGlue`: the XLA glue of a kernel's custom derivative around its Pallas launches, which rules rewrite as
     any other math; the launches stay opaque leaves.
 - **Control flow:** the bodies of `scan`, `while`, `cond`, nested `jit` (`pjit`) and checkpoint (remat) are regions
-  of their own, rewritten in place and recursively. Bodies are never unrolled, so a step's program depth stays
+  of their own, rewritten in place and recursively (a body whose constants are not all at hand, or one of
+  whose inputs is no array, is left as traced). Bodies are never unrolled, so a step's program depth stays
   fixed. Nothing moves across a body boundary or a loop carry.
 
 Reassociation would cancel exactly the residual the error-free transforms exist to keep: `compensated_add`'s low
@@ -97,7 +98,7 @@ the cotangent, and neither the cotangent nor the learned rate has a range the pr
 reordering to that form meets the dominance rule (§6.3). Autodiff's own backward is no safer: it forms the same
 unscaled products (the pullback of `x r` to `r` is `sum(g x)`), and over residual, branch and cotangent scales
 of 1 to 1e38 in fp32 the hand backward was never non-finite where autodiff's was finite, and finite in 137 cases
-where autodiff's was not (row 4124). The engine sees through every site: it rewrites inside each custom VJP's and
+where autodiff's was not (row 4124). The engine sees through every site (a `Protected` body it reads and leaves as written): it rewrites inside each custom VJP's and
 JVP's forward and backward bodies, by the site's declared class:
 
 - **Kernel** (the norm and SwiGLU kernels, the GEMM and attention templates, the recurrence kernels, the paged and
@@ -243,7 +244,7 @@ fitted to them, and a rule set ships only with measured receipts.
   - The host-master phases (`dew.training.transaction`) and the RL rollouts (`dew.objectives.rl.control`,
     `dreamer`, `dew.rl.simulator`, `dew.rl.flight`, `dew.rl.hyperlux`) jit theirs the same way: the rollout over
     an environment through `Objective.program`, the rest through `options.program` and `owned_program`, so none
-    is built as an `OuterProgram` of its own (SLOP025).
+    is built as an `OuterProgram` outside that one seam (SLOP025).
   - A training step's traced jaxpr already holds the backward, since autodiff runs at trace time.
   - Rewrites stay within checkpoint (remat) regions and never change what a step saves.
   - The planner's gradient trace (`dew.training.footprint`) traces the same rewritten function before it prices
@@ -309,6 +310,11 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
 
   The rule's left side is the reference arm, the left side at float64 the truth, and the right side the
   candidate; `assert_certified` is added where a bound applies. Each rule's check 1 site names the rule.
+  (Today a registered set's rewrite is qualified numerically by one instance, whatever its layouts and
+  directions, `rules.instances`; each rule of the registered sets and of the carried set is proven an
+  identity over the reals, its stated magnitudes at least the true ones, rule by rule
+  (tests/test_algebra_rules_sound.py); and the decoupled set's rules, a derivation's own, are held through
+  the forms they derive (tests/algebra_laws.py), not rule by rule.)
 - **Each program site the pass changes,** in one of two ways:
   - at a site the gate compiles itself: `assert_as_exact(rewritten(fn), fn, draw, truth_fn=fn at float64)`;
   - at a site running Dew's own programs (`dew_programs`, `as_given` trainer steps): the same arm under
@@ -401,11 +407,14 @@ because its Python API is still marked as subject to change.
 
 ### 6.2 Terms
 
-`Term` is one egglog sort, `class Term(Expr)`. Each constructor is one jaxpr primitive of the language in §1.2, with
-the primitive's parameters as primitive sorts:
+`Term` is one egglog sort, `class Term(Expr)`. Each kind of operation of the language in §1.2 is one
+constructor (`terms.WRITTEN`: a binary, a comparison, a unary and a layout operation each hold their
+primitive's symbol; a reduction its monoid; a cast, a selection and a product have one operation each), beside
+the constructors that write no operation (a leaf, a literal, a bundle of roots, a derivation's state):
 
-- shapes, axes and permutations as `Vec[i64]`;
-- dtypes as `String`;
+- a reduction's axes as `Vec[i64]`;
+- every other parameter of an equation (its dtype, shape, permutation, a product's dimension numbers and
+  precision) by its index in the region's table of them (`Region.params`, interned by a structural key);
 - literals by their index in the region's table of them (`Term.literal`), each held as the program holds
   it and keyed by its dtype, shape and bits (`terms.literal_key`).
 
@@ -436,7 +445,8 @@ class Term(Expr):
 
 - A term's `params` index the region's table of its equation's parameters (`terms.parameter_key`'s structural
   key, `Region.params`), so a rule reads a parameter as a fact of its own (a product's dimension numbers, a
-  literal's value) and an equation's every parameter rebuilds it as traced.
+  literal's value) and an equation's every parameter rebuilds it as interned: as traced, but a product whose
+  preferred type is its operands' own held as one of none, and consecutive broadcasts composed.
 - The error-free transformations (`two_sum`, `two_product`, the correctly rounded divide's significand) are
   `Protected` spans (§6.10): one leaf of the region each, no rule touching them, rather than a `semantic`
   constructor. An `iota`, a prefix sum (`cumsum`, `cummax`) and every other primitive outside the language are
@@ -467,7 +477,8 @@ class Term(Expr):
   every maximal set. It never crosses:
   - a checkpoint (remat) boundary;
   - an opaque equation;
-  - a marker (§6.10): a `Protected` span is a leaf, and a `Surrogate` or `KernelGlue` span a region of its own;
+  - a marker (§6.10): a `Protected` span is a leaf, and a `Surrogate` or `KernelGlue` span a region of its own
+    (an `Algebra` span is no boundary: it opens into the region around it, §6.10);
   - a `scan`, `while`, `cond` or `pjit` body (those are regions of their own).
 
 ### 6.3 Facts
@@ -494,7 +505,9 @@ constants, its declared ranges and its equations, or none. The region states it 
 constant's bound is its largest element's magnitude (a complex one's modulus), and a declared operand's is its
 range (`scan.Scan.ranges`, `derive.Reduction.ranges`, by input, the program's constants apart: l2-normalised
 keys 1, a sigmoid's gate 1, a recurrence's decays 1). An operand with no declared range, and an equation
-outside the language, has none. Each equation in the language composes its operands' bounds: sums take twice
+outside the language, has none. Each equation in the language composes its operands' bounds (today those whose transfer is stated here do; a
+quotient, a logarithm and a general power prove none whatever their operands, and a comparison or a bounded
+function proves its own): sums take twice
 the larger, products add their powers, contractions and sums along an axis add their length's, and a bounded
 function (`tanh`, `sin`, `logistic` of a real operand) is 2, one power past the reals' 1 because no native
 implementation is certified within its range, a comparison or `sign` 1, a complex operand's sine
@@ -503,7 +516,8 @@ operand's or 1 (`ceil(2**-126)` is 1). Each bound is its output dtype's too: a b
 made it (a tiny float converted is 1); an integer at most its dtype's range, within which a sum or a product
 wraps, and at that range for a bitwise operation and where an unsigned result may wrap from below zero
 (`uint32(0) - 1`, a negation, int32's -1 converted: `2**32 - 1`). A conversion keeps a value at most 0 only
-between signed dtypes. An exponential of an unbounded operand, or a quotient, has no
+into a floating dtype from a floating or signed one, or between signed integers no narrower. An exponential of
+an operand with neither a bound nor a sign, or a quotient, has no
 bound; an exponential of an operand at most 0 is at most 2, its native implementation's rounding given one
 power past 1 (`ex2.approx`'s error is more than an ulp of 1). Every bound holds under its arithmetic's
 contract: IEEE rounding to nearest, a contraction's mode one that rounds each operand once (its real bound)
@@ -521,7 +535,8 @@ finite. A reordering is admitted only when every new intermediate it makes has a
 program's reach, the narrowest float's largest power of two, taken exactly (`math.frexp`: float64's `log2` of
 its largest rounds to 1024) (`rules.reach`; `rules.dominated`): a number bound
 under the float's largest is a finite value's wherever the program's values are. A value no number bounds
-admits nothing: the reference's value may sit far below any bound over it while the new intermediate
+admits nothing (but a positive scale out of a maximum or a minimum, which makes no new intermediate a bound
+would have to hold): the reference's value may sit far below any bound over it while the new intermediate
 overflows: `0.5 x + 0.5 y` at `x = y = 3e38` is finite, and `0.5 (x + y)` is not. Each rule computes its new
 intermediates' bounds from its operands' (`rules.log2_bound`) and states them for the rules after it
 (`rules.made`); a new reduction bounds its new sum of terms and itself, its length's power above them
@@ -540,7 +555,8 @@ form (two state products a chunk where the derivation keeps three): the values h
 Notes on the table:
 - Every fact is invariant under equality, as congruence requires. Error is not: it is measured per candidate
   (§1.5, §6.5).
-- The inputs' facts come from the traced avals, their shardings, and a declaration's roles (§6.9).
+- The inputs' facts come from the traced avals and a declaration's roles (§6.9); a sharding is no fact of a
+  value here (it keys the trace's context alone).
 
 A reduction names its monoid in the language (`Term.reduce`'s name), from the closed set the language holds
 (the reductions' declarations, `terms.OPERATIONS`: `sum`, `max`, `min`). There is no open registry: the derivation reads each monoid's
@@ -721,14 +737,15 @@ class Saturation:
   equations, iterations at `depth` times its longest chain, each of them at least one (`Saturation` refuses a limit
   below one where it is built; a region of no
   equation or no chain keeps `growth` nodes and `depth` iterations). egglog has no node limit of its own, so
-  the count is checked between iterations: a graph past its nodes, or one that has run its iterations,
-  stops there.
+  the count (every row of the graph's tables) is checked between iterations: a graph past its nodes, or one
+  that has run its iterations, stops there, so one iteration may pass the count before it is read.
 - `growth` and `depth` are measured per mode. At compile time they sit above the largest the compile-time sets
   reach at their fixpoint on Dew's step programs: none of 756 windows (a UNet's fsdp2 x tensor2 matrix cell,
   benchmark_step's cpu-smoke steps) reached either of 64 and 4, the largest using under a quarter of each,
   and none priced lower at four times both (`SATURATION`'s receipt). At dev time they are measured on the
   declarations when the generator resumes. They are re-measured when a set changes.
-- A region a limit stops keeps the cheapest form found so far, and the report says so; one that reaches its
+- A region a limit stops keeps the cheapest form found so far (as extraction prices the forms it holds,
+  §6.5), and the report says so; one that reaches its
   fixpoint first was not stopped by a limit.
 - Sets run in registry order, one iteration each, until no set changes the graph or a limit is reached.
 - The e-graph runs with one thread and is built in equation order, so the same input gives the same output in any
@@ -788,8 +805,8 @@ class Rewrite:                        # one region's
   multiply, whose sum distributivity takes (`a * 2 + a * 4` as `a * 6`), and a value a literal scales under a
   maximum or a minimum, whose scale moves out making no new magnitude. Most of a training step's regions are its own math
   over unbounded values: a gemma3n step's 2879 each fired commutativity alone.
-- A region's rewrite is derived once per structure in a process (`program._derived`, bounded by
-  `WINDOWS_HELD`): keyed by what its derivation reads (`program.structure`: its values' avals, their
+- A region's rewrite is derived once per structure in a process while its entry is held (`program._derived`,
+  bounded by `WINDOWS_HELD`; two traces that miss together each derive it): keyed by what its derivation reads (`program.structure`: its values' avals, their
   placement included, each equation's primitive, parameters as the region holds them, protection,
   operands by position or literal value, and the values it yields), the numerics' forms, the saturation
   and the target it is priced for.
@@ -809,7 +826,8 @@ class Rewrite:                        # one region's
 
 `AlgebraReport` joins the one kernel report (`dew.nn.kernels.templates.report.rewrites`), beside the kernels'
 misses, as each program traces; a relowering's rewrites join it only where its replacement compiles. A compiled
-step records its search's rewrites with its kernels (`StepCompiled.plan`'s `kernels`). It is one record a
+step records its search's rewrites with its kernels (`StepCompiled.plan`'s `kernels`: its `rewrites`, and
+beside them `passes`, the seconds of each traced program's whole pass, `report.passes`). It is one record a
 region the pass read (`report.rewrites`), each holding:
 - the region's equations, and the roots whose cheaper form the program took;
 - the price before and after, none for a region no rule may fire in (`rules.reorderable`), which is never
@@ -1059,8 +1077,10 @@ def surrogate(forward, derivative, *, nondiff_argnums=()) -> Callable: ...
 - A prototype test holds the marker before anything builds on it: a body's forward, tangent and cotangent each
   arrive as marked calls of their kind through `jax.grad`, `jvp`, `linearize`, `vmap`, `jax.checkpoint` and
   `shard_map`.
-- The pass reads `kind` as an object (`isinstance`), never a name or a scope string, and the pass inlines every
-  marked call (`dew.nn.programs.inlined`, through `program._opened`), so the compiled program holds none.
+- The pass reads `kind` as an object (`isinstance`), never a name or a scope string, and the pass opens an
+  `Algebra` span where a rewrite across its boundary lands (`dew.nn.programs.inlined`, through
+  `program._opened`); every other marked call stays a call in the program the pass returns, and JAX's lowering
+  of the call inlines its body, so the compiled program holds none.
 - `dew.nn.precision`'s error-free transforms are `marked(Protected(), …)`, replacing the name scope the first cut
   reads.
 - Every custom-derivative site declares itself through one of the three declarations, in place of a bare
@@ -1110,7 +1130,7 @@ def generate(names: Sequence[str] | None = None, *, check: bool = False) -> tupl
 ```
 
 - `python -m dew.algebra.generate [names] [--check]` traces each registered declaration at each of its cases,
-  saturates it with every set (`Mode.DEV`), measures each candidate's error on its cases' draws against the
+  saturates it with every set (`rules.admitted(dev=True)`; no `Mode` type exists), measures each candidate's error on its cases' draws against the
   declaration at float64 (`dew.algebra.error`), extracts per §1.5 under each policy the cases name, priced for
   each target, and writes the module and its tests. `Reduction` and `Scan` carry `cases` as well.
 - The output is ordinary Python: plain JAX functions with no import of `dew.algebra`, formatted, linted and typed
@@ -1146,7 +1166,8 @@ about it is an estimate.
 
 ### 7.2 Vocabulary and price
 
-- The instructions are those a decode needs, each GF(2)-linear (`BitOp`): a logical right shift and a left shift
+- The instructions the linear search composes are those a decode needs, each GF(2)-linear (the `linear`
+  ones of `BitOp`, whose other members the nonlinear references below use): a logical right shift and a left shift
   (SHF on the ALU, or IMAD.HI and IMAD.SHL, a multiply by a power of two, on the FMA pipe), a rotation (SHF's
   funnel shift, the ALU's alone), and LOP3 masking the XOR of one or two values (the mask an immediate). Every
   architecture from sm75 to sm120 issues them alike.
@@ -1164,7 +1185,8 @@ about it is an estimate.
   word, at most one right shift or rotation of it by any amount, and up to `lefts` left shifts of it or of
   that, each by at most `reach` places; a register may read an earlier one, and a fixed layout's mask leaves
   out the bits its transform holds zero. Shapes (which shifts) are walked in increasing price,
-  so the first form found is the cheapest the vocabulary holds. A free layout's registers need only be
+  so the first form found is the cheapest the vocabulary holds, within the search's shape (one LOP3 an
+  output, one right move at most, left shifts and reach bounded as stated). A free layout's registers need only be
   independent over GF(2) (an invertible read), checked row by row as each register is chosen, after a
   necessary count (each register's bit a parity of the sources' bits at its place) rejects most shift sets
   before any; a fixed layout's must equal the transform's rows. Every shift must be read, else a cheaper
@@ -1202,7 +1224,7 @@ about it is an estimate.
   FP8 word's four codes into two bfloat16 pairs in their natural byte order take 13 steps a register (11
   issues on the ALU, two IMADs placing two fields in one multiply), from a seed of 15 or 16; the free layout's
   linear form takes 2 a register (the linear search, a shift and a masked XOR), so a consumer of FP8 weights
-  stores them in its free layout once (`BitForm.prepared`), as NVFP4's does, and no natural-order form is
+  would store them in its free layout once (`BitForm.prepared`), as NVFP4's does, and no natural-order form is
   checked in. MX's E8M0 scale into fp32 bits, its endpoints 2^-127 and NaN, keeps its seed's 8 steps: no
   cheaper program within the windows (none found within the search's budgets: windows of at most three
   inputs, bounded rounds and solver timeouts; not a proof that none exists). Neither has a consumer yet (sm80's
