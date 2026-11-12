@@ -799,10 +799,11 @@ def emptied(batch: Batch) -> Batch:
             CONSUMED_COUNT: ConsumedCount(0)}
 
 
-def read_batch(run: FitRun, interval: Interval, state: TrainState, rollout: Rollout | None, mesh: Mesh,
-               marked, examples: int | None, *, agree: bool, phase: str = "training read",
-               branch: bool = False, objective: Callable[[Batch], Objective] | None = None
-               ) -> tuple[Batch, Batch, bytes | None] | None:
+def read_batch[LossT, EffectsT](run: FitRun, interval: Interval, state: TrainState, rollout: Rollout | None,
+                                mesh: Mesh, marked, examples: int | None, *, agree: bool,
+                                phase: str = "training read", branch: bool = False,
+                                objective: Callable[[Batch], Objective[LossT, EffectsT]] | None = None
+                                ) -> tuple[Batch, Batch, bytes | None] | None:
     """The one way a training loop's next batch becomes its step's input, the run's and a cooldown
     branch's alike (row 4125): read (`waited_read`), drawn past the rollout (`rolled_out`) and its device
     fields apart (`split_fields`), a run on the examples clock closing its update window where its batch
