@@ -69,15 +69,15 @@ SAMPLED = 0.005
 def allocated_growth(into: list[int]) -> Iterator[None]:
     """How far the bytes this process holds allocated (`dew.telemetry.benchmark.allocated_memory`) rise
     above where they start within the block, appended to `into` however it ends: the most of its counts
-    every `SAMPLED` seconds and as it ends (`resident_peak` over that counter), after a collection. What a
+    every `SAMPLED` seconds and as it ends (`resident_peak`), after a collection. What a
     block holds home past a sample's interval is counted: a whole tree read home before it is written,
     which the export's bound is about."""
-    from dew.telemetry.benchmark import allocated_memory, resident_peak
+    from dew.telemetry.benchmark import resident_peak
 
     gc.collect()
     peak = None
     try:
-        with resident_peak(SAMPLED, counter=allocated_memory) as peak:
+        with resident_peak(SAMPLED) as peak:
             yield
     finally:
         if peak is not None:

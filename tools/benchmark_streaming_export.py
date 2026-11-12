@@ -24,14 +24,14 @@ from pathlib import Path
 
 from dew.distributed.placement import MeshSpec
 from dew.interop import Pretrained
-from dew.telemetry.benchmark import allocated_memory, resident_memory, resident_peak
+from dew.telemetry.benchmark import resident_peak
 
 
 def main() -> None:
     repo, shard_size, out = sys.argv[1], sys.argv[2], Path(sys.argv[3])
     revision = sys.argv[4] if len(sys.argv) > 4 else None
     loaded = Pretrained.load(repo, revision=revision, param_dtype="bfloat16", mesh=MeshSpec())
-    with resident_peak(counter=lambda: {**resident_memory(), **allocated_memory()}) as peak:
+    with resident_peak() as peak:
         start = time.perf_counter()
         if shard_size == "main":
             loaded.save(out)

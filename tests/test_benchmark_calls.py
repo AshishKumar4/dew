@@ -237,7 +237,7 @@ import mmap
 
 import numpy as np
 
-from dew.telemetry.benchmark import allocated_memory, resident_memory, resident_peak
+from dew.telemetry.benchmark import resident_memory, resident_peak
 
 # The heap serves 64 MiB (glibc's M_MMAP_THRESHOLD, -3), and a freed 64 MiB block stays resident under
 # a live one: memory a process's earlier work left for its allocator to hand out again.
@@ -252,12 +252,12 @@ with mmap.mmap(-1, size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS) as pages, 
     for offset in range(0, size, mmap.PAGESIZE):
         pages[offset] = 1
     after = resident_memory()
+ended = resident_memory()["Anonymous"] - peak.before["Anonymous"]
 # An array of the freed block's size, which the allocator serves from it: its bytes, which no new page holds.
-with resident_peak(counter=allocated_memory) as allocated:
+with resident_peak() as allocated:
     again = np.ones(64 * 2**20, np.uint8)
 print(json.dumps({"before": before, "after": after, "size": size, "rise": peak.rise("Anonymous"),
-                  "ended": resident_memory()["Anonymous"] - peak.before["Anonymous"],
-                  "allocated": allocated.rise("Allocated")}))
+                  "ended": ended, "allocated": allocated.rise("Allocated")}))
 """
 
 
