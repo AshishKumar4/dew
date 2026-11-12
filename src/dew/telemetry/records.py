@@ -182,6 +182,15 @@ class CheckpointRequested:
 
 
 @dataclasses.dataclass(frozen=True)
+class DataRestarted:
+    """A relaxed resume's data started again from the beginning of its order at `step`, its saved position's
+    plan differing from the run's in each of `differs` (`dew.data.plan.PlanChanged`), while the run's state
+    resumed as saved (`dew.training.TrainerConfig.data_resume`)."""
+    step: int
+    differs: tuple[str, ...]
+
+
+@dataclasses.dataclass(frozen=True)
 class ProfileTraced:
     """The directory a fit's profile window (`dew.training.ProfileWindow`) wrote and the steps it traced."""
     directory: str
@@ -243,8 +252,8 @@ class TrialFinished:
                       for field in dataclasses.fields(cls)})
 
 
-type Record = (RunRecord | FitStarted | StepCompiled | CheckpointRequested | ProfileTraced | FitEnded
-               | TrialFinished)
+type Record = (RunRecord | FitStarted | StepCompiled | CheckpointRequested | DataRestarted | ProfileTraced
+               | FitEnded | TrialFinished)
 # A PEP 695 alias holds its union in `__value__`; `get_args` of the alias
 # itself is empty, and these are the classes `isinstance` is given.
 RECORD_TYPES = typing.get_args(Record.__value__)

@@ -143,6 +143,7 @@ from dew.data.pipeline import (
 from dew.data.plan import (
     PLAN_VERSIONS,
     STRUCTURED,
+    DataResume,
     Plan,
     StepIdentity,
     fingerprint,
@@ -776,7 +777,7 @@ def compile(
     loading: Loading | None = None,
     seed: int = 0,
     rejections: Literal["drop", "mask"] = "drop",
-    resume: Literal["exact", "non-exact"] = "exact",
+    resume: DataResume = "exact",
     examples: int | None = None,
     widths: Mapping[str, object] | None = None,
     measured: _TrainingMeasured | None = None,
@@ -1117,7 +1118,7 @@ def _compiled(
     packed: tuple[Coordinated, ...],
     *,
     host: tuple[HostStep, ...],
-    resume: Literal["exact", "non-exact"],
+    resume: DataResume,
     batches: int | None = None,
 ) -> Loader:
     """The readers of `staged`, each training batch's packed windows laid out
@@ -1342,7 +1343,7 @@ def _consumed_by(phases: Sequence[_Staged], ends: Sequence[int]) -> dict[str, in
 
 def _built_phases(source: Phases, staged: Sequence[tuple[_Staged, int | None]],
                   packed: tuple[Coordinated, ...], *,
-                  host: tuple[HostStep, ...], resume: Literal["exact", "non-exact"], steps: int | None,
+                  host: tuple[HostStep, ...], resume: DataResume, steps: int | None,
                   budget: int | None, tokens: bool) -> list[tuple[Loader, int | None]]:
     """Each staged phase compiled (`_compiled`) at the batches it reads (`_phase_batches`), beside its end:
     every phase of a run runs the first's device steps, so a phase whose own differ is refused."""
@@ -1370,7 +1371,7 @@ def _compile_phases(
     loading: Loading,
     seed: int,
     rejections: Literal["drop", "mask"],
-    resume: Literal["exact", "non-exact"],
+    resume: DataResume,
     plan_version: int = PLAN_VERSIONS[-1],
     steps: int | None = None,
     budget: int | None = None,
@@ -1610,7 +1611,7 @@ def _training_reader(
     plan: Plan,
     planned: Callable[[int], Plan],
     host: tuple[HostStep, ...],
-    resume: Literal["exact", "non-exact"],
+    resume: DataResume,
     statistics: _Statistics,
 ) -> Iterator[Batch]:
     partition.rows(build.batch)
@@ -2001,6 +2002,7 @@ def fitted[Entry](
     plan_version: int = PLAN_VERSIONS[-1],
     steps: int | None = None,
     tokens: int | None = None,
+    resume: DataResume = "relaxed",
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
     compiled with the objective's own stages and the run's data `seed`,
@@ -2010,7 +2012,8 @@ def fitted[Entry](
     length is its steps, epochs or tokens, or with `examples` reads that many
     records before they are packed and ends (`compile`'s `examples`); a
     validation dataset without a batch takes the
-    training batch, and is read and loaded as it asks. A Loader is already
+    training batch, and is read and loaded as it asks. A resume reads its position as `resume` says
+    (`dew.data.plan.DataResume`), the run's. A Loader is already
     compiled, and an entry that is no Dataset (a reader, an evaluation suite)
     is passed on as it is. A run of `epochs` over a chain whose read has no
     record count, but states the source examples a pass holds
@@ -2056,7 +2059,7 @@ def fitted[Entry](
         loader = compile(trained, objective=objective, provision=True, seed=seed, examples=examples,
                          widths=widths, read=read, measured=measured,
                          epochs=epochs if examples is None else None, plan_version=plan_version,
-                         steps=steps, tokens=tokens)
+                         steps=steps, tokens=tokens, resume=resume)
     else:
         widths = run_widths(list(scored.values()), objective) if scored else {}
         loader = dataset

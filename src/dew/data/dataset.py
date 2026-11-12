@@ -50,7 +50,7 @@ _log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from dew.data.mixing import CorpusCounts, Left
     from dew.data.pipeline import DeviceStep
-    from dew.data.plan import Plan
+    from dew.data.plan import DataResume, Plan
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1340,7 +1340,7 @@ class GlobalStream:
         plan: Plan,
         loading: Loading,
         *,
-        resume: Literal["exact", "non-exact"] = "exact",
+        resume: DataResume = "exact",
         endless: bool = True,
         published: Callable[[Mapping[str, object] | None], None] | None = None,
     ):
@@ -1355,7 +1355,7 @@ class GlobalStream:
         self._reads: pygrain.DatasetIterator[Batch] | None = None
         self._loading = loading
         self._plan = plan
-        self._resume: Literal["exact", "non-exact"] = resume
+        self._resume: DataResume = resume
         self.manifest_changes: tuple[str, ...] = ()
         self.stop_seconds = loading.stop_seconds
 
@@ -1657,11 +1657,14 @@ class PhasedStream:
                                  f"{len(self._ends) + 1}")
             finished = self._tokens[:len(saved.completed)]
             if saved.tokens != finished:
+                from dew.data.plan import PlanChanged
+
                 # Its records end where the saved run's commits reached the phases' tokens, which a phase
                 # ending at other tokens would read on from as though the run had reached them.
-                raise ValueError(f"the saved run finished its phases at {list(saved.tokens)} committed "
-                                 f"tokens, and this run's end at {list(finished)}; a phase the run has read "
-                                 "cannot change under it")
+                raise PlanChanged(("phases.tokens",),
+                                  f"the saved run finished its phases at {list(saved.tokens)} committed "
+                                  f"tokens, and this run's end at {list(finished)}; a phase the run has read "
+                                  "cannot change under it")
             # The ends the saved run reached, and none past them, which this run reaches as it reads.
             for index in range(len(self._ends)):
                 self._resolve(index, saved.completed[index][1] if index < len(saved.completed) else None)
@@ -1909,10 +1912,14 @@ class StepPhases(Forwarding):
                              f"at {end}")
         rule = saved.get("phases")
         if (rule == self.CONTINUES) != any(self._shared):
-            raise ValueError(f"the saved run's phases continue a corpus they share by the phases rule "
-                             f"{rule!r}, and this run's by {self.CONTINUES if any(self._shared) else None!r} "
-                             "(docs/design/data.md, the rules): resume it by the data plan version it was "
-                             "saved under, as a run config's resume does")
+            from dew.data.plan import PlanChanged
+
+            raise PlanChanged(("rules.phases",),
+                              f"the saved run's phases continue a corpus they share by the phases rule "
+                              f"{rule!r}, and this run's by "
+                              f"{self.CONTINUES if any(self._shared) else None!r} "
+                              "(docs/design/data.md, the rules): resume it by the data plan version it was "
+                              "saved under, as a run config's resume does")
         own = base64.b64decode(text(saved["position"], "the saved phase's position"))
         # What a position saved before phases shared corpora holds of them: none.
         from dew.data.mixing import Left

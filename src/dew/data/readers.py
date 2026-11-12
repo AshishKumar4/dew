@@ -10,7 +10,6 @@ import os
 import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from types import MappingProxyType
-from typing import Literal
 
 import grain.python as pygrain
 import numpy as np
@@ -33,7 +32,7 @@ from dew.data.dataset import (
 )
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
-from dew.data.plan import COUNTERS, PLAN_VERSIONS, STRUCTURED, Plan
+from dew.data.plan import COUNTERS, PLAN_VERSIONS, STRUCTURED, DataResume, Plan, PlanChanged
 from dew.data.shared import SharedMapping
 from dew.data.storage import MIRRORED, Mirrored, PositionText, carried_mirrors
 
@@ -236,7 +235,7 @@ class _PerShare(Forwarding):
         self,
         open_reader: Callable[[], pygrain.DatasetIterator[Batch]],
         plan: Plan,
-        resume: Literal["exact", "non-exact"],
+        resume: DataResume,
         *,
         stop_seconds: float,
         endless: bool = True,
@@ -247,7 +246,7 @@ class _PerShare(Forwarding):
         # The reader and plan of a position saved under another version this lowering reads by
         # (`resumed_at`), in the workers it names.
         self._saved_as = saved_as
-        self._resume: Literal["exact", "non-exact"] = resume
+        self._resume: DataResume = resume
         self._stop_seconds = stop_seconds
         self._endless = endless
         # An elastic read's position (`position.REPLICATED`), the same on every reader.
@@ -310,7 +309,8 @@ class _PerShare(Forwarding):
     def set_state(self, state: bytes) -> None:
         held = _position.replicated(state)
         if self._replicated != (held is not None):
-            raise ValueError(
+            raise PlanChanged(
+                ("topology",),
                 "this read is elastic, and the saved position is one share's own offset; resume it with the "
                 "chain that saved it (without .elastic())" if self._replicated else
                 "the saved position is an elastic read's, and this read is per share; resume it with "
@@ -337,10 +337,11 @@ class _PerShare(Forwarding):
             self._reader()
         except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
             self.close()
-            raise ValueError(f"the saved data position's iterator state was written by grain {written}, "
-                             f"which this grain {GRAIN} does not read (docs/design/data.md, the rules): "
-                             f"resume with grain=={written}, or go on from the run's weights as a new run "
-                             "that reads its data afresh") from error
+            raise PlanChanged(("rules.grain",),
+                              f"the saved data position's iterator state was written by grain {written}, "
+                              f"which this grain {GRAIN} does not read (docs/design/data.md, the rules): "
+                              f"resume with grain=={written}, or go on from the run's weights as a new run "
+                              "that reads its data afresh") from error
 
     def resumed_at(self, decoded: Mapping[str, object]) -> None:
         """Read on as the saved position `decoded` was read where it was saved under another plan version

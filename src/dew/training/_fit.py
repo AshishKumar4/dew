@@ -336,6 +336,9 @@ class FitRun:
     started: float
     startup: Startup
     """Its startup phases, as its plan timed them (`FitPlan.startup`)."""
+    restarted: tuple[str, ...] | None = None
+    """What differed between a relaxed resume's saved data plan and the run's, which started its data
+    again (`dew.data.plan.PlanChanged.differs`); None where the data read on or the run did not resume."""
     current: int = 0
     loss: jax.Array | None = None
     evaluation: Evaluation | None = None

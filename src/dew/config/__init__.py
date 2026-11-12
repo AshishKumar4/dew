@@ -1227,6 +1227,7 @@ class RunConfig:
         assert planned is not None
         trainer = self.trainer
         return fitted(dataset, validation, objective=objective, seed=self.data_seed, plan_version=planned,
+                      resume=trainer.data_resume,
                       examples=trainer.examples, epochs=trainer.epochs, steps=trainer.steps,
                       tokens=trainer.tokens)
 
@@ -1633,7 +1634,7 @@ class RunConfig:
             dynamic_scale=(self.compute_dtype() == "float16" if trainer.dynamic_scale is None
                            else trainer.dynamic_scale), rollout=rollout,
             tune_kernels=trainer.tune_kernels, param_dtype=self.drawn_dtype(), inspection=trainer.inspection,
-            diloco=trainer.diloco, **{"links": trainer.links, **resources})
+            diloco=trainer.diloco, data_resume=trainer.data_resume, **{"links": trainer.links, **resources})
 
     def compute_dtype(self) -> str:
         """The dtype the run's model computes in: the one its record states, else its numerics'

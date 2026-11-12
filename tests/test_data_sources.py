@@ -1505,7 +1505,7 @@ def test_an_unnamed_foreign_source_trains_and_resumes_only_where_told_its_conten
         tmp_path, kind, read):
     """A torch, Grain or iterator source given no name reads and trains; nothing says a later run
     reads the same records, so an exact resume of its position is refused, one with
-    `resume="non-exact"` reads on from it, and no cache keys it."""
+    `resume="relaxed"` reads on from it, and no cache keys it."""
     import grain.python as grain
     import torch
     from torch.utils.data import TensorDataset
@@ -1533,7 +1533,7 @@ def test_an_unnamed_foreign_source_trains_and_resumes_only_where_told_its_conten
         remaining = [next(original)["id"].tolist() for _ in range(2)]
     finally:
         original.close()
-    exact, loose = reader("exact"), reader("non-exact")
+    exact, loose = reader("exact"), reader("relaxed")
     try:
         with pytest.raises(ValueError):
             exact.set_state(saved)
@@ -1551,7 +1551,7 @@ def test_an_unnamed_foreign_source_trains_and_resumes_only_where_told_its_conten
 
 @pytest.mark.parametrize("kind,read", [("torch", "memory"), ("torch", "indexed"),
                                        ("grain", "indexed"), ("iterator", "streamed")])
-@pytest.mark.parametrize("resume", ["exact", "non-exact"])
+@pytest.mark.parametrize("resume", ["exact", "relaxed"])
 def test_foreign_sources_resume_only_their_declared_content_identity(kind, read, resume):
     """A source version resumes its remaining records; another version cannot take its position."""
     import grain.python as grain

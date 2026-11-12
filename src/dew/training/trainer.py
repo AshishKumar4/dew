@@ -48,6 +48,7 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.data.pipeline import Dataset
+from dew.data.plan import DataResume, PlanChanged
 from dew.distributed.batches import (
     PREFETCH_DEPTH,
     DevicePrefetchIterator,
@@ -91,7 +92,15 @@ from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, ke
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
-from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitStarted, Record, StepCompiled
+from dew.telemetry.records import (
+    AxisLink,
+    CheckpointRequested,
+    DataRestarted,
+    FitEnded,
+    FitStarted,
+    Record,
+    StepCompiled,
+)
 from dew.training._candidates import RunShape, Stepping, StepSettings, prepared_for
 from dew.training._fit import (
     Emptied,
@@ -103,6 +112,7 @@ from dew.training._fit import (
     _rollout_admitted,
     _rollout_resumed,
     _rollout_saved,
+    admitted,
     afresh,
     check_inputs,
     clocked,
@@ -213,6 +223,7 @@ class Trainer(Generic[Loss, Effects]):
         param_dtype: str | None = None,
         diloco: DiLoCo | None = None,
         phase_passes: Sequence[int] | None = None,
+        data_resume: DataResume = "relaxed",
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -258,6 +269,8 @@ class Trainer(Generic[Loss, Effects]):
         self.layout = layout
         self.accumulation = accumulation
         self.split = split
+        # How a resume treats its data (`DataResume`): relaxed starts it again where its plan differs.
+        self.data_resume: DataResume = data_resume
         self._microbatches, self._loss_scale = microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         # A loss scale stated by a flag alone is a value a step's trace can be kept by (`_step_key`).
@@ -1044,7 +1057,7 @@ class Trainer(Generic[Loss, Effects]):
         startup = Startup()
         loader, held, tokens, steps, examples = run_data(
             self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
-            examples=examples, accumulation=self.accumulation, startup=startup)
+            examples=examples, accumulation=self.accumulation, startup=startup, resume=self.data_resume)
         self.reading(loader, device_prefetch, examples=examples, steps=steps)
         self.scheduled(None if steps is None else steps // self.accumulation)
         # Its cadences resolved against the run's length, its scores declared, its best and stop policies,
@@ -1263,8 +1276,34 @@ class Trainer(Generic[Loss, Effects]):
             run.stop_control = checkpoints.control(checkpoints.latest)
         if checkpoints is None or start.resume is None:
             return 0, None, lambda: self._placed(start, positioned=False)[:2], start.abstract
-        return (start.resume, checkpoints.position(start.resume, DataPartition.of(self.device_mesh)),
-                lambda: self._placed(start, positioned=False)[:2], start.abstract)
+        position = self._data_resumed(run, dataset, checkpoints.position(
+            start.resume, DataPartition.of(self.device_mesh)))
+        return start.resume, position, lambda: self._placed(start, positioned=False)[:2], start.abstract
+
+    def _data_resumed(self, run: FitRun, dataset: Loader, position: bytes | None) -> bytes | None:
+        """The saved data `position` the run reads on from, or None where a relaxed resume
+        (`data_resume`) starts its data again: its plan differs from the run's in what the pool agrees
+        (`PlanChanged.differs`, held in `run.restarted`), warned of here and recorded once the run starts
+        (`DataRestarted`). An exact resume, and a position no plan check refuses, read on as saved; a
+        refusal of another kind (a damaged position) refuses either way."""
+        if position is None or self.data_resume == "exact":
+            return position
+
+        def differs() -> list[str]:
+            try:
+                admitted(dataset, self._stream_partition(), position)
+            except PlanChanged as changed:
+                return list(changed.differs)
+            return []
+
+        found = agreed_same("data resume", differs)
+        if not found:
+            return position
+        run.restarted = tuple(found)
+        _log.warning("the saved data position's plan differs from this run's in %s, so its data starts again "
+                     "from the beginning of its order while its state resumes (data_resume='relaxed'; "
+                     "'exact' refuses it)", ", ".join(found))
+        return None
 
     def _stream_partition(self) -> DataPartition:
         """The share of the run's data this process's training stream reads: the mesh's, its ramp's stages
@@ -1319,7 +1358,7 @@ class Trainer(Generic[Loss, Effects]):
             partition = self._stream_partition()
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
-                         resumed=current if resumed and position is None else None)
+                         resumed=current if resumed and position is None and run.restarted is None else None)
             source = run.source
             stages = source.stages if isinstance(source, RampedStream | PhasedStream | StepPhases) else ()
             ramp = stages if isinstance(source, RampedStream) else ()
@@ -1349,8 +1388,9 @@ class Trainer(Generic[Loss, Effects]):
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
         check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(rated(state)))
+        resumed_from = position is not None or run.restarted is not None
         started = FitStarted(current, steps,
-            checkpoints.source(current) if checkpoints is not None and position is not None else None,
+            checkpoints.source(current) if checkpoints is not None and resumed_from else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
@@ -1358,6 +1398,10 @@ class Trainer(Generic[Loss, Effects]):
             cadences=plan.recorded(self._config, self.accumulation, clocked=self._shape.examples is not None),
             groups=self._groups(state))
         self._report(started, current)
+        if run.restarted is not None:
+            self._report(DataRestarted(current, run.restarted), current)
+            self._display.note(f"Data starts again at step {current}: its saved plan differs in "
+                               f"{', '.join(run.restarted)}")
         if plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
         if plan.observe:

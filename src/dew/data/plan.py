@@ -52,7 +52,25 @@ def _absent(value: JSON | None) -> str:
     return "absent" if value is None else repr(value)
 
 
-class PlanOrderChanged(ValueError):
+DataResume = Literal["relaxed", "exact"]
+"""How a resume treats its data (`dew.training.TrainerConfig.data_resume`, docs/design/data.md): relaxed
+reads on at the saved position where the plan makes the same rows, a source or step of no identity taken as
+unchanged, and starts the data again where it differs, naming what differs (`PlanChanged`); exact refuses
+any difference, and a source or step it cannot check."""
+
+
+class PlanChanged(ValueError):
+    """A saved data position whose plan this read does not make again: each part that differs by name
+    (`differs`: "version", "rules.mix", "derived.0/shards", "manifest.steps", "order.seed", "topology"),
+    which a relaxed resume names where it starts the data again and an exact one refuses by
+    (`dew.training.TrainerConfig.data_resume`)."""
+
+    def __init__(self, differs: tuple[str, ...], message: str):
+        self.differs = differs
+        super().__init__(message)
+
+
+class PlanOrderChanged(PlanChanged):
     """A saved data position's plan whose order is not the chain's now: each path of the order `changed`
     (`selection_seed`, `phases[1].selection_seed`), its saved value and its value now (None where one holds
     none), and the `routes` its run goes on by (`REBUILD`, `RECORD`, `SCHEDULE`), a mix saved unseeded and
@@ -62,7 +80,8 @@ class PlanOrderChanged(ValueError):
         self.changed, self.routes = dict(changed), routes
         keys = "; ".join(f"{key}: {_absent(before)} -> {_absent(now)}"
                          for key, (before, now) in changed.items())
-        super().__init__(f"saved data plan order changed ({keys}); {', or '.join(routes)}")
+        super().__init__(tuple(f"order.{key}" for key in changed),
+                         f"saved data plan order changed ({keys}); {', or '.join(routes)}")
 
     @classmethod
     def between(cls, saved: Mapping[str, object], now: Mapping[str, object]) -> PlanOrderChanged:
@@ -800,7 +819,7 @@ class Plan:
                    for name, value in self.manifest.semantic(self.version).items()}}
 
     def check(
-        self, saved: Mapping[str, object], *, resume: Literal["exact", "non-exact"] = "exact"
+        self, saved: Mapping[str, object], *, resume: DataResume = "exact"
     ) -> tuple[str, ...]:
         """Refuse a saved plan whose rows this plan does not make again: another
         version, order, derived order fact, per-share topology or semantic
@@ -814,17 +833,19 @@ class Plan:
             route = (f"compile the chain with plan_version={written!r}, as a run config's resume does, or "
                      if written in PLAN_VERSIONS
                      else f"this Dew reads versions {', '.join(map(str, PLAN_VERSIONS))} alone: ")
-            raise ValueError(
+            raise PlanChanged(
+                ("version",),
                 f"the saved data position was written under data plan version {written!r}, and this read is "
                 f"of version {current['version']!r}, which makes other rows or draws from the same plan; "
                 f"{route}{_RESUMED}")
         if self.version >= STRUCTURED:
             self._rules_alike(record(saved.get("rules", {}), "saved data plan rules"))
-        if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
-            raise ValueError(
+        if (not self.manifest.exact or not saved.get("exact", False)) and resume != "relaxed":
+            raise PlanChanged(
+                ("exact",),
                 "data plan contains a step without stable identity or a store given no name "
-                "(from_grain(..., identity=), from_iter(..., identity=)); resume='non-exact' is required"
-            )
+                "(from_grain(..., identity=), from_iter(..., identity=)), which an exact resume cannot "
+                "check; name it, or resume relaxed (`data_resume='relaxed'`)")
         edited = self._edited_members(saved)
         # A mix whose members changed is compared member by member (`_edited_members`): each kept
         # member's order, sources, steps, facts and caches are its digest's, and the rest is the
@@ -832,7 +853,8 @@ class Plan:
         member_scoped = () if edited is None else ("cache",)
         for name in ("lowering", "rejections", "cache", "volatile"):
             if name not in member_scoped and current[name] != saved.get(name):
-                raise ValueError(f"saved data plan {name} changed: {saved.get(name)!r} -> {current[name]!r}")
+                raise PlanChanged((name,), f"saved data plan {name} changed: {saved.get(name)!r} -> "
+                                           f"{current[name]!r}")
         # An order is the same wherever its sources are mounted (`same_order`), or reads on past a bound
         # it grows (`grown_limits`).
         saved_order = unplaced(json_value(saved.get("order"), "saved order"))
@@ -846,7 +868,7 @@ class Plan:
                    else {name: value for name, value in self.derived.items() if not name.endswith("/shards")})
         for name in sorted(set(previous) | set(derived)) if edited is None else ():
             if previous.get(name) != derived.get(name):
-                raise ValueError(f"saved data plan derived order {name} changed")
+                raise PlanChanged((f"derived.{name}",), f"saved data plan derived order {name} changed")
         if self.lowering == "per-share":
             topology = record(current["topology"], "data plan topology")
             saved_topology = record(saved.get("topology", {}), "saved data plan topology")
@@ -857,8 +879,8 @@ class Plan:
             if ({name: value for name, value in topology.items() if name != "pools"}
                     != {name: value for name, value in saved_topology.items() if name != "pools"}
                     or any(pools.get(name) != saved_pools.get(name) for name in compared)):
-                raise ValueError(f"saved per-share data plan topology changed (shares, workers or cycle "
-                                 f"length): {PER_SHARE}")
+                raise PlanChanged(("topology",), f"saved per-share data plan topology changed (shares, "
+                                                 f"workers or cycle length): {PER_SHARE}")
         manifest = record(saved.get("manifest"), "saved data manifest")
         semantic = self.manifest.semantic(self.version)
         # A bound the order grew is its steps' limit too.
@@ -868,7 +890,8 @@ class Plan:
         if edited is not None:
             changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))
         if changed:
-            raise ValueError(
+            raise PlanChanged(
+                tuple(f"manifest.{name}" for name in changed),
                 f"saved data plan {', '.join(changed)} changed, so the records the saved position counts "
                 "are not this run's; resume with the sources, steps and tokenizers that wrote it"
             )
@@ -881,7 +904,7 @@ class Plan:
         # The plan's steps state what they compute (`Manifest.semantic`), so a resume of an unchanged plan
         # and topology reads on under another Dew, a global order's or a share's, the change reported.
         changes = _changed(saved_environment, environment)
-        if resume != "non-exact" and edited is None:
+        if resume != "relaxed" and edited is None:
             # A function outside Dew that declares no identity, a step's or the factory's that configured
             # it, is what its code computes: its module's bytes changed, it may make other rows from the
             # same records (row 3938).
@@ -892,10 +915,12 @@ class Plan:
                 if isinstance(before, list) and len(before) == len(step.modules)
                 and any(before[place] != step.modules[place] for place in step.code)]
             if rewritten:
-                raise ValueError(
+                raise PlanChanged(
+                    tuple(f"code.{name}" for name in rewritten),
                     f"the code of data step {', '.join(rewritten)} changed since the position was saved, "
                     "and it declares no identity saying it computes the same; declare one "
-                    "(identity='name@version') to resume exactly, or resume='non-exact'")
+                    "(identity='name@version') to resume exactly, or resume relaxed "
+                    "(`data_resume='relaxed'`)")
         if changes:
             _log.warning("data environment changed under an unchanged plan: %s", ", ".join(changes))
         if self.volatile:
@@ -910,7 +935,8 @@ class Plan:
         compares itself (`dew.data.readers._PerShare.set_state`), is not compared here."""
         for name in sorted((set(saved) | set(self.rules)) - {"grain"}):
             if saved.get(name) != self.rules.get(name):
-                raise ValueError(
+                raise PlanChanged(
+                    (f"rules.{name}",),
                     f"the saved data position read by the {name} rule {saved.get(name)!r}, and this Dew "
                     f"reads by {self.rules.get(name)!r}, which decides other rows next (docs/design/data.md, "
                     f"the rules): {_RESUMED}")
@@ -929,11 +955,12 @@ class Plan:
                 or (before == dict(self.members) and order.get("weights") == self.order.get("weights"))):
             return None
         if before.get("") != self.members.get(""):
-            raise ValueError("saved data plan mixture stages changed")
+            raise PlanChanged(("members",), "saved data plan mixture stages changed")
         kept = (set(before) & set(self.members)) - {""}
         for key in sorted(kept):
             if before[key] != self.members[key]:
-                raise ValueError(f"saved data plan member {key} changed what it reads or runs")
+                raise PlanChanged((f"members.{key}",),
+                                  f"saved data plan member {key} changed what it reads or runs")
         mixture = ("corpora", "members", "weights")
         spelled_order = json_value(self.spelled_order(), "order")
         if not isinstance(spelled_order, dict):

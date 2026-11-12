@@ -16,6 +16,7 @@ import flax.linen as nn
 from dew.data.compile import Handed, fitted
 from dew.data.dataset import DataPartition, Loader
 from dew.data.pipeline import Dataset, ObjectiveData
+from dew.data.plan import DataResume, PlanChanged
 from dew.telemetry.instrumentation import count_compilation_cache
 from dew.training._fit import admitted
 from dew.training.budget import run_length, run_steps, run_tokens
@@ -77,18 +78,18 @@ class DataObjective(Protocol):
 def run_data(objective: DataObjective, dataset: Dataset | Loader | Handed,
              validation: Dataset | Mapping[str, Dataset | Split | EvalSuite] | None, *,
              steps: int | None, epochs: int | None, tokens: int | None, examples: int | None,
-             accumulation: int, startup: Startup,
+             accumulation: int, startup: Startup, resume: DataResume = "relaxed",
              ) -> tuple[Loader, Mapping[str, Split | EvalSuite] | None, int | None, int | None, int | None]:
-    """A fit's data and its length: its length named once (`run_length`), the process readied, the data
-    and its validation compiled with the objective's steps (`fitted`), its token budget, its microsteps
-    and its bound in examples, `epochs` of a read with no record count read as passes over its source
-    examples among them (`Loader.pass_examples`) (`run_tokens`, `run_steps`), each long phase reported
-    (`Startup`)."""
+    """A fit's data and its length: its length named once (`run_length`), the process readied, the data and
+    its validation compiled with the objective's steps for a resume of `resume` (`fitted`), its token budget,
+    its microsteps and its bound in examples, `epochs` of a read with no record count read as passes over
+    its source examples among them (`Loader.pass_examples`) (`run_tokens`, `run_steps`), each long phase
+    reported (`Startup`)."""
     run_length(steps, epochs, tokens, examples, required=False)
     ready_process()
     with startup.phase("data", "preparing the data"):
         loader, validation = fitted(dataset, validation, objective=objective.data(), examples=examples,
-                                    epochs=epochs, steps=steps, tokens=tokens)
+                                    epochs=epochs, steps=steps, tokens=tokens, resume=resume)
     # The widths the data bound: what a saved run of the objective records.
     objective.bind_widths(loader.widths)
     # A schedule whose last stage ends its data bounds the run as tokens= does (`run_tokens`).
@@ -107,7 +108,8 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
     position of this process's share at the step it continues (`Checkpoints.resumed`,
     `Checkpoints.position`), and the stream of that share fit opens (`Trainer._stream_partition`), under
     the layout's rules, restored and closed (`_fit.admitted`). Nothing where it continues no step or
-    saved no position."""
+    saved no position, and a relaxed resume (`Trainer.data_resume`) refuses no position its plan differs
+    from, whose data starts again (`Trainer._data_resumed`)."""
     checkpoints = trainer.checkpoints
     step = None if checkpoints is None else checkpoints.resumed(resume)
     if checkpoints is None or step is None:
@@ -116,4 +118,8 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
     with nn.logical_axis_rules(trainer.layout.axis_rules):
         saved = checkpoints.position(step, DataPartition.of(trainer.device_mesh))
         if saved is not None:
-            admitted(loader, trainer._stream_partition(), saved)
+            try:
+                admitted(loader, trainer._stream_partition(), saved)
+            except PlanChanged:
+                if trainer.data_resume == "exact":
+                    raise
