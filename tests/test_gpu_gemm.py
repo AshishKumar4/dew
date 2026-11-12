@@ -2,6 +2,9 @@
 one process (`gpu_flow`), each cell its own file's property:
 
 - A dense product's exact sums survive one row tile through Triton's MMA accumulation (test_gemm_template).
+- A pair of multiprocessors' cooperative tile, a cluster multicasting its shared blocks, holds check 1 with
+  its hooks, and a dense kernel gradient's balanced tail, its partials fixed up across programs, holds
+  check 1, on an H100 (test_gemm_template).
 - CUTLASS runs the grouped projection as exactly as XLA wherever it is chosen, over every grouping that
   routes a row (test_grouped_gemm).
 - The blockwise FP8 kernel gradient (rows contiguous, step scales) holds check 1 on an H100
@@ -125,6 +128,12 @@ PARTIAL_TILE = "a TMA copy of a partial tile, which reads zeros and clips stores
 RING = "a ring's asynchronous slots, which the interpreter walks in one order"
 """Why the toolkit's rings stay on the GPU (the GEMM lane, 11-11)."""
 
+CLUSTER = "a cluster's multicast of a shared block, which the interpreter loads whole in each program"
+"""Why a pair of multiprocessors' cooperative tile stays on the GPU (the GEMM lane, 11-12)."""
+
+BALANCED_TAIL = "a balanced tail's partials fixed up across programs, which the interpreter runs in one order"
+"""Why a dense kernel gradient's balanced tail stays on the GPU (the GEMM lane, 11-12)."""
+
 
 def test_the_gemm_kernels_run_on_this_gpu():
     """The GEMM and toolkit cells above a GPU runs (`gpu_flow.covering`: each kept for a GPU-only fault by
@@ -156,6 +165,15 @@ def test_the_gemm_kernels_run_on_this_gpu():
                functools.partial(gemm_widths.unaligned_widths_run_on_the_template, depth, width,
                                  interpret=False), fault=PARTIAL_TILE)
           for depth, width in gemm_widths.WIDTHS),
+        *(Cell(f"a pair's cooperative tile holds check 1 with its hooks: {case}",
+               functools.partial(gemm_template.a_cooperative_tile_holds_check_1_with_its_hooks, case,
+                                 gemm_template.PAIRED), "sm90", fault=CLUSTER)
+          for case in ("scaled", "row scaled")),
+        *(Cell(f"a dense kernel gradient's balanced tail holds check 1: {rows}x{depth}x{width} into "
+               f"{jnp.dtype(dtype).name}",
+               functools.partial(gemm_template.a_dense_kernel_gradients_balanced_tail_holds_check_1, rows,
+                                 depth, width, dtype), "sm90", fault=BALANCED_TAIL)
+          for rows, depth, width in gemm_template.BALANCED_TAILS for dtype in (jnp.bfloat16, jnp.float32)),
         Cell("the blockwise FP8 kernel gradient is on par",
              gemm_blockwise.a_blockwise_kernel_gradient_is_on_par, "sm90", fault="red at 475913063"),
         Cell("the blockwise FP8 kernel gradient's portable arm sums exactly",
