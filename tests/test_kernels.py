@@ -129,28 +129,48 @@ FLAX_SEEDS = 8
 def a_fused_kernel_takes_forward_mode_through_the_reference(implementation, without_deterministic_ops):
     """A fused kernel defines only its reverse-mode derivative, so a JVP
     traced under `forward_mode_attention` takes its tangent from the
-    reference (`forward_differentiable`): the tangent agrees with the xla
-    kernel's within two bf16 ulps of its scale. Outside the context, jax
-    refuses the JVP of the kernel's custom_vjp, which this also holds."""
+    reference (`forward_differentiable`): the tangent on par with the xla
+    kernel's from float64 (check 1). Outside the context, jax refuses the
+    JVP of the kernel's custom_vjp, which this also holds."""
     from dew.nn.attention import forward_mode_attention
     if implementation == "flash":
         flash_here()
-    query, key, value = qkv((2, 256, 8, 64))
-    tangents = qkv((2, 256, 8, 64), seed=1)
+    shape = (2, 256, 8, 64)
 
     def attend(name):
         return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=name, causal=True)
 
     def tangent(name):
-        with forward_mode_attention():
-            return np.asarray(jax.jit(lambda *a: jax.jvp(attend(name), a[:3], a[3:])[1])(
-                query, key, value, *tangents), np.float32)
+        def run(*arrays):
+            with forward_mode_attention():
+                return jax.jvp(attend(name), arrays[:3], arrays[3:])[1]
+        return run
 
+    query, key, value = qkv(shape)
     with pytest.raises(TypeError):
-        jax.jvp(attend(implementation), (query, key, value), tangents)
+        jax.jvp(attend(implementation), (query, key, value), qkv(shape, seed=1))
+    # The truth the reference path's own float64 run, as `test_cpu_fp32_attention_summed_in_float64_takes_
+    # forward_mode` takes it.
+    draw = normal_drawn(0xF0E, *[shape] * 6, dtype=jnp.bfloat16)
+    assert_as_exact(jax.jit(tangent(implementation)), jax.jit(tangent("xla")), draw,
+                    f"{implementation}'s forward-mode tangent", seeds=FORWARD_MODE_SEEDS,
+                    truth_fn=tangent("reference"))
 
-    got, want = tangent(implementation), tangent("xla")
-    assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+
+def trains_on_par_with_xla(implementation: str, q_len: int, kv_len: int, heads: int, kv_heads: int,
+                           head_dim: int, causal: bool) -> None:
+    """A bf16 call of `implementation`, `heads` query heads over `kv_heads`, its output and every gradient on
+    par with the xla kernel's from float64 (check 1, `attention_on_par`), each entry sized by the terms
+    attention's gradients carry over the keys each query keeps."""
+    draw = normal_drawn(0x7A1 + head_dim, (2, q_len, heads, head_dim), (2, kv_len, kv_heads, head_dim),
+                        (2, kv_len, kv_heads, head_dim), (2, q_len, heads, head_dim), dtype=jnp.bfloat16)
+
+    def attend(name):
+        return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=name, causal=causal)
+
+    attention_on_par(attend(implementation), attend('xla'), draw,
+                     f"{implementation} {q_len}x{kv_len} {heads}/{kv_heads} {head_dim}",
+                     keep=kept(q_len, kv_len, causal=causal))
 
 
 @pytest.mark.parametrize("q_len, kv_len, causal, head_dim", [
@@ -162,22 +182,14 @@ def a_fused_kernel_takes_forward_mode_through_the_reference(implementation, with
 def cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal, head_dim):
     """cudnn's kernel has no backward pass for an odd length; the padded call
     trains, and what it computes for the real rows is what the xla kernel
-    computes: within two bf16 ulps of the output scale, forward and backward,
-    which is also how far the two kernels sit apart at an even length. A pad
-    key left unmasked shifts every output by 1/(kv+1) of the value mass, 12%
-    at 7 keys, and a pad query row left in the output changes its shape."""
+    computes, forward and backward, on par from float64 (check 1,
+    `trains_on_par_with_xla`). A pad key left unmasked shifts every output by
+    1/(kv+1) of the value mass, 12% at 7 keys, and a pad query row left in the
+    output changes its shape."""
     from dew.nn.attention_kernels import cudnn_max_head_dim
     if head_dim > cudnn_max_head_dim():
         pytest.skip(f"cudnn takes heads at most {cudnn_max_head_dim()} wide on {kernels.device_generation()}")
-    query, _, _ = qkv((2, q_len, 4, head_dim))
-    _, key, value = qkv((2, kv_len, 4, head_dim), seed=1)
-
-    fused = value_and_grads('cudnn', query, key, value, causal=causal)
-    reference = value_and_grads('xla', query, key, value, causal=causal)
-
-    for got, want in zip(fused, reference, strict=True):
-        assert got.shape == want.shape
-        assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+    trains_on_par_with_xla('cudnn', q_len, kv_len, 4, 4, head_dim, causal)
 
 
 @pytest.mark.parametrize("q_len, kv_len, heads, kv_heads, head_dim, causal", [
@@ -190,20 +202,12 @@ def cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal, head_dim
 ])
 def triton_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_dim, causal):
     """tokamax's kernel at its heuristic config, the one 'auto' runs, at the
-    shapes it is sent: within two bf16 ulps of the output scale of the xla
-    kernel, forward and backward, as cudnn is. One of its VJP configs returns
+    shapes it is sent, on par with the xla kernel forward and backward
+    (`trains_on_par_with_xla`), as cudnn is. One of its VJP configs returns
     gradients off by orders of magnitude (64/32/32/64 blocks at 1024 causal
     tokens), so each shape's gradients are checked, not its forward alone."""
     pytest.importorskip("tokamax")
-    query, _, _ = qkv((2, q_len, heads, head_dim))
-    _, key, value = qkv((2, kv_len, kv_heads, head_dim), seed=1)
-
-    fused = value_and_grads('triton', query, key, value, causal=causal)
-    reference = value_and_grads('xla', query, key, value, causal=causal)
-
-    for got, want in zip(fused, reference, strict=True):
-        assert got.shape == want.shape
-        assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+    trains_on_par_with_xla('triton', q_len, kv_len, heads, kv_heads, head_dim, causal)
 
 
 LARGE_LOGIT_SEEDS = 16
@@ -267,35 +271,6 @@ def triton_at_saturated_large_logits_is_finite_where_xla_is():
             mine, theirs = np.asarray(mine, np.float32), np.asarray(theirs, np.float32)
             lost = np.isfinite(theirs) & ~np.isfinite(mine)
             assert not lost.any(), f"{name} seed {seed}: {int(lost.sum())} values not finite where xla's are"
-
-
-@pytest.mark.parametrize("q_len, kv_len, heads, kv_heads, head_dim, causal", [
-    (1024, 1024, 16, 8, 128, True),  # Qwen3-0.6B's grouped heads
-    (512, 512, 8, 8, 256, True),     # 256-wide heads, which cudnn takes on Hopper alone
-    (256, 256, 12, 12, 64, False),   # SimpleDiT-B's image tokens
-    (333, 333, 4, 4, 64, True),      # an odd length
-    (1024, 77, 4, 4, 64, False),     # cross-attention over CLIP's 77 tokens
-    (256, 256, 8, 8, 80, True),      # a head width that is no power of two
-])
-def flash_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_dim, causal,
-                                          without_deterministic_ops):
-    """FlashAttention at the shapes 'auto' sends it, FlashAttention-3 on
-    Hopper and FlashAttention-2 elsewhere: within two bf16 ulps of the output
-    scale of the xla kernel, forward and backward, as cudnn and triton are.
-    FlashAttention-2's backward takes heads over 192 wide only on sm80 and
-    sm90 ("requires A100/A800 or H100/H800", measured on an L4)."""
-    flash_here()
-    if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
-        pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80 and sm90")
-    query, _, _ = qkv((2, q_len, heads, head_dim))
-    _, key, value = qkv((2, kv_len, kv_heads, head_dim), seed=1)
-
-    fused = value_and_grads('flash', query, key, value, causal=causal)
-    reference = value_and_grads('xla', query, key, value, causal=causal)
-
-    for got, want in zip(fused, reference, strict=True):
-        assert got.shape == want.shape
-        assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
 def float64_attention(query, key, value, causal, window=(-1, -1), sinks=None):
@@ -795,46 +770,41 @@ def test_key_lengths_attend_as_the_mask_they_mean(implementation, causal):
     (78, 78, True),            # an even length, which the kernel takes unpadded
 ])
 def cudnn_takes_key_lengths_and_agrees_with_xla(q_len, kv_len, causal, as_mask):
-    """cuDNN reads the lengths as its padding mask, odd lengths included:
-    within two bf16 ulps of the output scale of the xla kernel, forward and
-    backward, as `test_cudnn_trains_odd_lengths_and_agrees_with_xla` bounds
-    the unpadded call. The same keys ended by a `[B, 1, 1, K]` mask, the
-    shape CLIP's text tower builds, agree the same way: the mask broadcasts
-    over the queries on the cudnn path as it does on xla."""
-    query, _, _ = qkv((2, q_len, 4, 64))
-    _, key, value = qkv((2, kv_len, 4, 64), seed=1)
+    """cuDNN reads the lengths as its padding mask, odd lengths included, on
+    par with the xla kernel forward and backward (check 1), as
+    `cudnn_trains_odd_lengths_and_agrees_with_xla` holds the unpadded call.
+    The same keys ended by a `[B, 1, 1, K]` mask, the shape CLIP's text tower
+    builds, agree the same way: the mask broadcasts over the queries on the
+    cudnn path as it does on xla."""
     lengths = jnp.asarray([kv_len, kv_len - 40], jnp.int32)
-    fused = key_length_call('cudnn', query, key, value, lengths, causal=causal, as_mask=as_mask)
-    reference = key_length_call('xla', query, key, value, lengths, causal=causal, as_mask=as_mask)
-    for got, want in zip(fused, reference, strict=True):
-        assert got.shape == want.shape
-        assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+    keep = (np.arange(kv_len)[None, :] < np.asarray(lengths)[:, None])[:, None, None, :]
+    keep = keep & kept(q_len, kv_len, causal=causal)
+    draw = normal_drawn(0xC1D7, (2, q_len, 4, 64), (2, kv_len, 4, 64), (2, kv_len, 4, 64), (2, q_len, 4, 64),
+                        dtype=jnp.bfloat16)
+
+    def attend(implementation):
+        mask = ({"mask": (jnp.arange(kv_len) < lengths[:, None])[:, None, None, :]} if as_mask
+                else {"key_value_seq_lengths": lengths})
+        return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
+                                                            causal=causal, **mask)
+
+    attention_on_par(attend('cudnn'), attend('xla'), draw, f"cudnn key lengths {q_len}x{kv_len}", keep=keep)
 
 
 def single_query_cudnn_decode_matches_float64_attention_and_gradients():
-    """One query, GQA and distinct key counts against the highest-precision path.
-
-    The single query is padded for the cuDNN backward even though the
-    forward accepts an odd length. The numerical bound is the existing
-    two-bf16-ulp bound, not a new tolerance.
-    """
-    query, _, _ = qkv((3, 1, 4, 64))
-    _, key, value = qkv((3, 17, 2, 64), seed=1)
+    """One query a row over grouped key heads and distinct key counts (17, 8 and 1), which cuDNN's backward
+    takes padded though its forward takes an odd length: on par with the xla kernel, forward and backward,
+    from float64 (check 1); the row of one key's query gradient float64 zero."""
     lengths = jnp.asarray([17, 8, 1], jnp.int32)
-    actual = key_length_call("cudnn", query, key, value, lengths)
-    with jax.enable_x64():
-        def loss(q, k, v):
-            attended = scaled_dot_product_attention(
-                q, k, v, implementation="reference", key_value_seq_lengths=lengths,
-                force_fp32_for_softmax=False, precision=jax.lax.Precision.HIGHEST)
-            return jnp.sum(attended ** 2), attended
+    keep = (np.arange(17)[None, :] < np.asarray(lengths)[:, None])[:, None, None, :]
+    draw = normal_drawn(0xDEC0, (3, 1, 4, 64), (3, 17, 2, 64), (3, 17, 2, 64), (3, 1, 4, 64),
+                        dtype=jnp.bfloat16)
 
-        (_, expected), gradients = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True))(
-            query.astype(jnp.float64), key.astype(jnp.float64), value.astype(jnp.float64))
-        for got, want in zip(actual, (expected, *gradients), strict=True):
-            want = np.asarray(want)
-            assert got.shape == want.shape
-            assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+    def attend(implementation):
+        return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
+                                                            key_value_seq_lengths=lengths)
+
+    attention_on_par(attend('cudnn'), attend('xla'), draw, "a single-query cudnn decode", keep=keep)
 
 
 FORWARD_MODE_SEEDS = 8

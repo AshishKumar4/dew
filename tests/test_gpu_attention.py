@@ -19,12 +19,12 @@ interpreted and through the compile gate:
   and each kernel's requirements are what it takes on this GPU (test_kernels); a row that sees no key
   reads nothing on the fused kernels (test_attention_masked_rows). Flash's plain training step is the
   dense flow's, a user's.
-- The Mosaic template on an H100, each test its own cells: its forward and backward over every call form,
-  head width and hook it declares, its natural forward, a call over runs, a chunked prefill's backward, its
-  one launch backward and a span call's (test_attention_mosaic, attention_inplace_operands); an fp16 call
-  through the route, and a long sequence on par with the reference path (test_attention_route); the fast
-  form's default route not on par with IEEE fp32, the accurate form's control
-  (test_attention_accurate_form). Its causal forward and backward at a flow's widths are the flows'.
+- The Mosaic template on an H100, each test its own cells: the hooked backward's sites the CPU cannot
+  afford, the geometries that faulted on an H100, its one launch backward and a span call's
+  (test_attention_mosaic, attention_inplace_operands); an fp16 call through the route, and a long sequence
+  on par with the reference path (test_attention_route). Every other call form, hook and width is the
+  interpreted sites' and the compile gate's (row 5461); its causal forward and backward at a flow's widths
+  are the flows'.
 - The check-1 matrices of attention, its kernels and decode (tests/kernel_matrix.py), each over the
   combinations of the axes a GPU runs natively, its GPU, kernel or launch and precision
   (`kernel_matrix.native_cells`), and the cases a red found on a GPU (`kernel_matrix.SEEDED`).
@@ -40,7 +40,6 @@ import jax.numpy as jnp
 import kernel_matrix
 import numpy as np
 import pytest
-import test_attention_accurate_form as accurate_form
 import test_attention_decode_template as decode_template
 import test_attention_dropout as dropout
 import test_attention_masked_rows as masked_rows
@@ -165,18 +164,15 @@ def test_the_fused_attention_routes_run_on_this_gpu(without_deterministic_ops):
     ])
 
 
-MOSAIC_CELLS = (mosaic.the_natural_forward_is_on_par_on_an_h100,
-                mosaic.the_forward_is_on_par_over_every_call_form_on_an_h100,
-                mosaic.the_forward_is_on_par_at_head_widths_on_an_h100,
-                mosaic.the_forward_is_on_par_under_every_hook_on_an_h100,
-                mosaic.the_backward_is_on_par_at_head_widths_on_an_h100,
-                mosaic.the_backward_is_on_par_over_every_call_form_on_an_h100,
-                mosaic.the_backward_is_on_par_under_every_score_hook_on_an_h100,
-                mosaic.a_call_over_runs_is_on_par_on_an_h100,
-                mosaic.a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100)
-"""The Mosaic template's H100 checks, each test its own cells, so a red names its form: every call form and
-hook its forward and backward declare, its head widths, a call over runs and a chunked prefill's backward. Its
-causal forward, training forward and backward at a flow's widths are the model flows' (row 5461)."""
+MOSAIC_CELLS = (mosaic.the_backward_is_on_par_under_the_hopper_hook_sites,
+                mosaic.a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100,
+                mosaic.the_backward_at_its_faulting_geometry_is_on_par_on_an_h100,
+                mosaic.the_backward_256_wide_under_a_softcap_is_on_par_on_an_h100)
+"""The Mosaic template's H100 checks a GPU alone holds, each test its own cells: the hooked backward's sites
+the CPU cannot afford, and the geometries that faulted on an H100 (a chunked prefill's hang, row 2254's two
+launches, row 3704's shared keys 256 wide). Every other call form, hook and width is the interpreted sites'
+and the compile gate's; its programs at each native combination the attention matrix's
+(`test_the_attention_matrix_holds_on_this_gpu`, row 5461), and its flows' widths the model flows'."""
 
 KERNEL_CELLS = (kernels.flash_through_dews_attention_refuses_rows_it_would_misread,
                 kernels.a_fused_kernel_takes_forward_mode_through_the_reference,
@@ -243,9 +239,8 @@ def test_the_decode_matrix_holds_on_this_gpu():
     run_cells(kernel_matrix.native_cells("decode"))
 
 
-MOSAIC_PARTS = 8
-"""The Mosaic flow's parts (`in_parts`): past the 3600 s deadline whole on a GH200 (MAINGPU-df3e6ac66), its
-cells' kernels' compiles most of it."""
+MOSAIC_PARTS = 2
+"""The Mosaic flow's parts (`in_parts`): its twelve cells' kernels' compiles most of it."""
 
 
 @pytest.mark.usefixtures("without_deterministic_ops")
@@ -260,7 +255,6 @@ def test_the_mosaic_template_holds_on_an_h100(part):
         *(cell for check in MOSAIC_CELLS for cell in cells_of(check, "sm90")),
         *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90"),
         *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path),
-        *cells_of(accurate_form.the_fast_form_on_a_gpus_default_route_is_not_on_par_with_ieee_fp32, "sm90"),
         *cells_of(inplace.a_routes_one_launch_backward_is_on_par_on_an_h100, "sm90"),
         *cells_of(inplace.a_span_calls_one_launch_is_on_par_on_an_h100, "sm90"),
     ], part, MOSAIC_PARTS))

@@ -390,21 +390,26 @@ def test_bf16_values_at_two_to_the_124_under_a_steep_draw_stay_finite_where_the_
     assert bool(jnp.all(jnp.isfinite(dew)))
 
 
-def test_fp16_values_at_two_to_the_minus_ten_under_a_near_total_draw_stay_finite_where_the_reference_does():
-    """The fp16 witness: a rate of 1 - 2^-16, so z = 2^16, with exactly one of two equal-logit keys kept.
-    Its unnormalized weight is z, past fp16's largest, where its normalized weight of one half times z is
-    not, as the reference's is."""
+@pytest.mark.parametrize("forms", ["fast", "accurate"])
+def test_a_near_total_fp16_draw_keeps_its_one_kept_weight_finite_on_every_path(forms):
+    """The fp16 witness: a rate of 1 - 2^-16 (a kept weight's multiplier z = 2^16), exactly one of two
+    equal-logit keys kept, values 2^-10. Its unnormalized weight times z is past fp16's largest, its
+    normalized weight of one half times z is not: the template's reference, which narrows the normalized
+    coefficient, gives 2^5 = 32 exactly; the portable mainloop in either form and the public reference path
+    give finite outputs, as the reference does."""
     rate = 1.0 - 2.0 ** -16
     words = first_seed(rate, 2, lambda kept: int(kept.sum()) == 1)
     query = jnp.zeros((1, 1, 1, 8), jnp.float16)
     key = jnp.zeros((1, 2, 1, 8), jnp.float16)
     value = jnp.full((1, 2, 1, 8), 2.0 ** -10, jnp.float16)
-    spans = template.spans(1, 2, 1)
-    dew = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
-                                          hooked(words, 1, 1, rate))
-    ref = reference_attention(query, key, value, dropout_rate=rate, dropout_seed=words)
-    assert bool(jnp.all(jnp.isfinite(ref)))
-    assert bool(jnp.all(jnp.isfinite(dew)))
+    spans, hooks = template.spans(1, 2, 1), hooked(words, 1, 1, rate)
+    narrowed = template.reference(query, key, value, spans, hooks)
+    np.testing.assert_array_equal(np.asarray(narrowed, np.float32), np.full((1, 1, 1, 8), 32.0, np.float32))
+    with generation.run_precision(dataclasses.replace(generation.numerics(), forms=forms)):
+        walked = attention_portable.xla_mainloop(attention_portable.Tiles(8, 8, 8), query, key, value, spans,
+                                                 hooks)
+    public = reference_attention(query, key, value, dropout_rate=rate, dropout_seed=words)
+    assert bool(jnp.all(jnp.isfinite(walked))) and bool(jnp.all(jnp.isfinite(public)))
 
 
 def test_the_mosaic_dropping_walk_refuses_fp16_weights_past_fp16s_largest():
@@ -460,19 +465,6 @@ def test_a_kept_bf16_weight_is_scaled_in_fp32_and_rounded_once():
     row = np.asarray(out, np.float32)[0, 0, 0]
     np.testing.assert_array_equal(row[kept], np.full(int(kept.sum()), 0.37109375, np.float32))
     np.testing.assert_array_equal(row[~kept], np.zeros(int((~kept).sum()), np.float32))
-
-
-def test_the_template_reference_narrows_the_normalized_dropped_coefficient():
-    """The fp16 witness on the template's reference: rate 1 - 2^-16 (z = 2^16), one of two equal-logit keys
-    kept. Narrowed unnormalized, its weight z is past fp16's largest and the output is infinite. Normalized
-    first, the weight is z / 2 = 2^15 and the output is 2^5 = 32, exactly."""
-    rate = 1.0 - 2.0 ** -16
-    words = first_seed(rate, 2, lambda kept: int(kept.sum()) == 1)
-    query = jnp.zeros((1, 1, 1, 8), jnp.float16)
-    key = jnp.zeros((1, 2, 1, 8), jnp.float16)
-    value = jnp.full((1, 2, 1, 8), 2.0 ** -10, jnp.float16)
-    out = template.reference(query, key, value, template.spans(1, 2, 1), hooked(words, 1, 1, rate))
-    np.testing.assert_array_equal(np.asarray(out, np.float32), np.full((1, 1, 1, 8), 32.0, np.float32))
 
 
 def test_a_dropping_call_under_x64_on_fp32_inputs_keeps_fp32_gradients():

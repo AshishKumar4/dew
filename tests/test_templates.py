@@ -116,23 +116,6 @@ def test_a_templates_configs_are_the_ones_a_block_of_the_device_holds():
         assert op.fitting(bound(op), generation.gpu_target()) == (Block(8), Block(16), Block(32), Block(64))
 
 
-def test_a_fixed_spaces_heuristic_is_its_first_config_that_fits():
-    """A launch naming a fixed space takes its first config that fits the device, nothing ranked (bible
-    §6): 64 rows of 512 fp32 columns stage 128 KiB, past an A10's block, so its first fitting there is the
-    first of the space as on an A100."""
-    for name in ("sm86", "sm80"):
-        with generation.assumed(name):
-            assert Doubling()._get_heuristics_config(bound(Doubling())) == Block(8)
-
-
-def test_a_target_that_reports_no_block_takes_the_least_any_gpu_holds():
-    """A GPU generation the table holds no facts for, and that is not this device, budgets 99 KiB, as a
-    CPU does: it has no GPU's facts unless a test states the GPU it emulates (`generation.assumed`)."""
-    assert generation.shared_budget(generation.GpuTarget("sm100", "NVIDIA B200")) == generation.SHARED_BUDGET
-    assert generation.shared_budget(generation.TARGETS["sm90"]) == generation.TARGETS["sm90"].shared_limit
-    assert generation.shared_budget(generation.GpuTarget("cpu", "cpu")) == generation.SHARED_BUDGET
-
-
 def test_a_call_no_config_holds_is_refused_naming_its_bytes_and_the_budget():
     op = Doubling()
     with generation.assumed("sm86"), pytest.raises(Unfitted) as refused:

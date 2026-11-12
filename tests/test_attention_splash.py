@@ -28,6 +28,8 @@ from attention_oracle import (
     attention_and_grads,
     exact_attention,
     exact_value_and_grads,
+    float64_weights,
+    kept,
     packed_ids,
     qkv,
     reference,
@@ -37,6 +39,7 @@ from gpu_flow import cells_of, run_cells
 from reference_error import (
     FEWEST_SEEDS,
     ORDERS,
+    as_given,
     assert_as_exact,
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
@@ -51,30 +54,11 @@ from dew.nn.precision import FP32_SUMS
 
 on_tpu = pytest.mark.tpu(reason="needs a TPU; the interpreter covers the rest here")
 
-# How far two correct kernels sit apart, as a fraction of each array's own
-# scale. bf16 gets the two ulps the cudnn parity in tests/test_kernels.py
-# pins; fp32 gets 2^-18, against a measured worst case of 2^-19.5 over every
-# case below, forward and in all three gradients. The distance is the order
-# splash sums its blocks in, not an approximation: it runs the same fp32
-# softmax the reference does.
-#
-# That is why the reference runs in fp32 on the bf16 inputs rather than in
-# bf16. Splash keeps its logits, softmax and accumulators in fp32 whatever it
-# reads, so the fp32 attention of the same bf16 numbers is what it computes.
-# The reference in bf16 is a different computation whose distance from it
-# depends on the backend: XLA:CPU widens the bf16 dots and drops the rounding
-# between them, so there it equals the fp32 path exactly, while XLA:GPU rounds
-# the logits and the probabilities to bf16 as written, which alone moves a
-# query gradient by 2% of its scale (2^-5.5), outside the bound, while splash
-# sits at 2^-8 from the fp32 attention on both backends.
-#
-# On a TPU Mosaic runs splash's fp32 matmuls as bf16 passes, the way XLA's
-# DEFAULT precision runs its own, so fp32 there gets the bf16 bound. On one v6e
-# at 2048 keys the kernel sat at most 8.7e-3 (2^-6.8) of each array's scale
-# from this reference, forward and in every gradient, where XLA's own fp32
-# attention at DEFAULT precision sat at most 9.7e-3.
-TOLERANCE = {jnp.bfloat16: 2. ** -6,
-             jnp.float32: 2. ** -6 if jax.default_backend() == 'tpu' else 2. ** -18}
+INTERPRETED_FP32 = 2. ** -18
+"""How far the interpreted kernel's fp32 output and gradients sit from the fp32 reference's on a CPU, as a
+fraction of each array's own scale (`assert_agrees`), against a measured worst of 2^-19.5 over every oracle
+case: interpreted, the kernel's dots are XLA:CPU's, which sum 2.6 times less exactly than the reference's
+contraction, so this site holds the function and `test_splash_is_on_par_on_a_tpu` the numerics (check 1)."""
 
 
 SHARDED_SEEDS = 8
@@ -82,172 +66,89 @@ SHARDED_SEEDS = 8
 `seeds_for`: the fewest for which one device compared with itself resolves the factor."""
 
 
-def assert_agrees(splash, reference, dtype):
+def assert_agrees(splash, reference):
     for got, want in zip(splash, reference, strict=True):
         assert got.shape == want.shape
-        assert np.abs(got - want).max() <= TOLERANCE[dtype] * np.abs(want).max()
+        assert np.abs(got - want).max() <= INTERPRETED_FP32 * np.abs(want).max()
 
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("structure", [
-    {},                            # every key, the descriptor's FullMask
-    {"causal": True},              # CausalMask, the decoder shape
-    {"sliding_window": 64},        # LocalMask, Gemma's and Mistral's band
-    {"sliding_window": 384},       # a window wider than the sequence keeps every key
-])
-def test_splash_computes_the_reference_attention(dtype, structure):
-    """The kernel applies no scale of its own, groups its own key heads and
-    reads its mask off a descriptor rather than an array, so each of those is
-    a place the output could drift from the reference. It does not: forward
-    and in all three gradients, in both dtypes."""
-    query, key, value = qkv((2, 256, 4, 64), dtype)
-    assert_agrees(value_and_grads('tpu', query, key, value, **structure),
-                  reference(query, key, value, **structure), dtype)
+def _on_par_on_a_tpu(q_shape, kv_shape, dtype, structure, label: str, *, sunk: bool = False, bias=None):
+    """Splash compiled by Mosaic on a TPU, its output and every gradient (the sinks' included), held to check
+    1 over fresh draws and cotangents against XLA's own attention of the same operands at the precision a TPU
+    runs it (DEFAULT), the truth attention written out in float64 on the host's CPU (`float64_weights`, its
+    derivative anchored; JAX_PLATFORMS=tpu,cpu), the rows a packed call's padding holds (`live`) read as
+    zero by all three."""
+    structure = dict(structure)
+    live = structure.pop("live", None)
+    softcap = structure.pop("softcap", None)
+    keep = kept(q_shape[1], (kv_shape or q_shape)[1], **structure)
+    group = np.arange(q_shape[2]) // (q_shape[2] // (kv_shape or q_shape)[2])
 
+    def draw(seed):
+        # Host arrays, which the gate widens to float64 on the host for the truth; the arms take them onto
+        # the TPU as they run.
+        query, _, _ = qkv(q_shape, dtype, seed=10 * seed)
+        _, key, value = qkv(kv_shape or q_shape, dtype, seed=10 * seed + 1)
+        sinks = 2.0 + jax.random.normal(jax.random.PRNGKey(10 * seed + 2), (q_shape[2],), jnp.float32)
+        cotangent = jax.random.normal(jax.random.PRNGKey(10 * seed + 3), q_shape, dtype)
+        return tuple(np.asarray(x) for x in (query, key, value, *((sinks,) if sunk else ()), cotangent))
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_splash_groups_key_heads_without_repeating_them(dtype):
-    """Splash reads q_heads % kv_heads itself, so unlike every other fused
-    path this one never materializes the repeated keys. Query head n has to
-    keep reading key head n // (N // K) anyway, which is what the reference
-    gets from `repeat_kv_heads`."""
-    query, _, _ = qkv((2, 256, 8, 64), dtype)
-    _, key, value = qkv((2, 256, 2, 64), dtype, seed=1)
-    assert_agrees(value_and_grads('tpu', query, key, value, causal=True),
-                  reference(query, key, value, causal=True), dtype)
+    def read(out):
+        return out if live is None else jnp.where(jnp.asarray(live)[:, :, None, None], out, 0)
 
+    def attend(implementation, **options):
+        def run(query, key, value, *sinks):
+            return read(scaled_dot_product_attention(
+                query, key, value, implementation=implementation, sinks=sinks[0] if sinks else None,
+                softcap=softcap, **({} if bias is None else {"bias": bias}), **structure, **options))
+        return with_gradients(run)
 
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_splash_reads_a_key_sequence_of_its_own_length(dtype):
-    """Cross attention: the mask blocks the query and the key axis
-    separately, so the two lengths take their own block size."""
-    query, key, value = qkv((2, 256, 4, 64), dtype, kv_shape=(2, 512, 4, 64))
-    assert_agrees(value_and_grads('tpu', query, key, value),
-                  reference(query, key, value), dtype)
+    @as_given
+    def truth(*inputs):
+        # On the host's CPU, which runs float64 a TPU does not: inputs, bias and kept rows brought there.
+        host = jax.devices("cpu")[0]
+        with jax.enable_x64(new_val=True), jax.default_device(host):
+            wide_bias = None if bias is None else jnp.asarray(np.asarray(bias, np.float64))
+
+            def exact(query, key, value, *sinks):
+                weights, _ = float64_weights(query, key, keep, sinks[0] if sinks else None, softcap,
+                                             anchored=True, bias=wide_bias)
+                out = jnp.einsum("bhqk,bkhd->bqhd", weights, value[:, :, group])
+                return out if live is None else jnp.where(np.asarray(live)[:, :, None, None], out, 0)
+
+            wide = [jnp.asarray(np.asarray(x, np.float64)) for x in inputs]
+            return [np.asarray(x) for x in jax.jit(with_gradients(exact))(*wide)]
+
+    assert_as_exact(attend('tpu'), attend('reference', precision=jax.lax.Precision.DEFAULT), draw,
+                    f"{label}, {jnp.dtype(dtype).name}", seeds=FEWEST_SEEDS, truth_fn=truth)
 
 
 @on_tpu
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("call", ["causal", "softcap", "sinks", "packed_window"])
-def test_the_mosaic_kernel_agrees_at_a_length_only_a_tpu_affords(dtype, call):
-    """Everything above runs under pallas's interpreter off a TPU, which is
-    the same arithmetic and not the same kernel: Mosaic compiles the tiling,
-    the lane padding and the block skipping for real. This is that kernel, at
-    a 2048-key sequence and a 128-wide head over grouped keys, which is the
-    shape a decoder trains at and far past what the interpreter is worth
-    running, for each argument the kernel takes."""
-    query, _, _ = qkv((2, 2048, 8, 128), dtype)
-    _, key, value = qkv((2, 2048, 2, 128), dtype, seed=1)
-    structure = {"causal": True}
+def test_the_mosaic_kernel_is_on_par_at_a_length_only_a_tpu_affords(dtype, call):
+    """Splash at a decoder's training shape, 2048 keys and a 128-wide head over grouped keys, far past what
+    the interpreter is worth running, for each argument the kernel takes (`_on_par_on_a_tpu`): Mosaic
+    compiles its tiling, lane padding and block skipping for real."""
+    structure: dict = {"causal": True}
     if call == "softcap":
         structure["softcap"] = 1.0
-    elif call == "sinks":
-        structure["sinks"] = 2.0 + jax.random.normal(jax.random.PRNGKey(2), (8,), jnp.float32)
     elif call == "packed_window":
         segment_ids = packed_ids((700, 600, 500), (1000, 1000), length=2048)
         structure.update(sliding_window=256, segment_ids=segment_ids, live=segment_ids != 0)
-    assert_agrees(value_and_grads('tpu', query, key, value, **structure),
-                  reference(query, key, value, **structure), dtype)
+    _on_par_on_a_tpu((2, 2048, 8, 128), (2, 2048, 2, 128), dtype, structure, f"splash at 2048 keys, {call}",
+                     sunk=call == "sinks")
 
 
 @on_tpu
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 def test_the_flash_fallback_keeps_packed_documents_apart_by_their_segment_ids(dtype):
-    """A bias keeps an explicit 'tpu' off splash, onto the flash kernel,
-    which now reads the segment ids rather than a [B, H, S, S] mask bias."""
-    query, key, value = qkv((2, 1024, 4, 128), dtype)
+    """A bias keeps an explicit 'tpu' off splash, onto the flash kernel, which reads the segment ids rather
+    than a [B, H, S, S] mask bias (`_on_par_on_a_tpu`)."""
     bias = 0.5 * jax.random.normal(jax.random.PRNGKey(5), (1, 4, 1024, 1024), jnp.float32)
     segment_ids = packed_ids((300, 500, 100), (1000,), length=1024)
     structure = {"causal": True, "segment_ids": segment_ids, "live": segment_ids != 0}
-    assert_agrees(value_and_grads('tpu', query, key, value, bias=bias.astype(dtype), **structure),
-                  reference(query, key, value, bias=bias, **structure), dtype)
-
-
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_splash_carries_a_concrete_mask_as_dense_blocks(dtype):
-    """A concrete block-diagonal mask, three documents in one 256-token row,
-    has no structural form, so it reaches the kernel as dense blocks of a
-    NumpyMask ANDed with the causal descriptor; what comes out is still the
-    reference's attention."""
-    query, key, value = qkv((2, 256, 4, 64), dtype)
-    packed = np.asarray(document_mask(packed_ids((100, 84, 72))[:1]))[:, None]
-    assert_agrees(value_and_grads('tpu', query, key, value, mask=packed, causal=True),
-                  reference(query, key, value, mask=jnp.asarray(packed), causal=True), dtype)
-
-
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_splash_leaves_padded_rows_out_of_the_real_rows(dtype):
-    """Splash's mask blocking needs a length that is a multiple of 128, so a
-    200-token sequence reaches it padded to 256 with the 56 pad keys masked
-    off. Every real query then reads exactly the keys it had, which is the
-    same argument `cudnn_attention` makes for its own padding to an even
-    length."""
-    real = 200
-    query, key, value = qkv((2, 256, 4, 64), dtype)
-    valid = np.zeros((1, 1, 256, 256), bool)
-    valid[..., :real] = True
-    splash = value_and_grads('tpu', query, key, value, mask=valid, causal=True)
-    expected = reference(query, key[:, :real], value[:, :real], causal=True)
-    assert_agrees([splash[0][:, :real]], [expected[0][:, :real]], dtype)
-
-
-def assert_sensitive(with_term, without_term, dtype):
-    """The case can fail: dropping the term moves the output by four times
-    the tolerance the kernel is held to."""
-    assert (np.abs(with_term[0] - without_term[0]).max()
-            > 4 * TOLERANCE[dtype] * np.abs(with_term[0]).max())
-
-
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_splash_applies_gemma_softcap_between_the_scale_and_the_softmax(dtype):
-    """Gemma 2 caps the scaled logits with a tanh before the mask and the
-    softmax (modeling_gemma2.py:192-208), at 50. At unit-scale logits a cap
-    of 50 is the identity to a part in 10^4, and logits scaled up to its knee
-    make the softmax so sharp that one bf16 pass over a logit moves a
-    gradient by 4% (measured on a v6e, for XLA's attention and splash
-    alike). So the same tanh runs at 1 over unit-scale logits, where it
-    bends every row. Grouped key heads, as Gemma's are."""
-    query, _, _ = qkv((2, 256, 8, 64), dtype)
-    _, key, value = qkv((2, 256, 2, 64), dtype, seed=1)
-    capped = reference(query, key, value, causal=True, softcap=1.0)
-    assert_sensitive(capped, reference(query, key, value, causal=True), dtype)
-    assert_agrees(value_and_grads('tpu', query, key, value, causal=True, softcap=1.0),
-                  capped, dtype)
-
-
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("structure", [{"causal": True}, {"sliding_window": 128}])
-def test_splash_puts_gpt_oss_sinks_in_the_denominator(dtype, structure):
-    """GPT-OSS gives each query head one learned logit that enters the
-    softmax's denominator and reads no value, on its full and its 128-key
-    sliding layers alike. Splash seeds its running maximum and sum with it,
-    and its backward returns the sinks' own gradient, the fourth array
-    compared here."""
-    query, _, _ = qkv((2, 256, 8, 64), dtype)
-    _, key, value = qkv((2, 256, 2, 64), dtype, seed=1)
-    sinks = 2.0 + jax.random.normal(jax.random.PRNGKey(2), (8,), jnp.float32)
-    expected = reference(query, key, value, sinks=sinks, **structure)
-    assert_sensitive(expected, reference(query, key, value, **structure), dtype)
-    assert_agrees(value_and_grads('tpu', query, key, value, sinks=sinks, **structure),
-                  expected, dtype)
-
-
-@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("sliding_window", [None, 64])
-def test_splash_keeps_packed_documents_apart_by_their_segment_ids(dtype, sliding_window):
-    """Two rows packed differently, each ending in padding, with and
-    without a window narrower than the longest document. Splash reads the
-    ids per block rather than an [S, S] mask; every row a packed loss reads
-    gets the reference's document-masked attention, forward and backward."""
-    query, key, value = qkv((2, 256, 4, 64), dtype)
-    segment_ids = packed_ids((100, 84, 50), (30, 190, 10))
-    live = segment_ids != 0
-    structure = {"causal": True, "sliding_window": sliding_window,
-                 "segment_ids": segment_ids, "live": live}
-    expected = reference(query, key, value, **structure)
-    unpacked = reference(query, key, value, causal=True, sliding_window=sliding_window, live=live)
-    assert_sensitive(expected, unpacked, dtype)
-    assert_agrees(value_and_grads('tpu', query, key, value, **structure), expected, dtype)
+    _on_par_on_a_tpu((2, 1024, 4, 128), None, dtype, structure, "the flash fallback", bias=bias.astype(dtype))
 
 
 ORACLE_CASES = {
@@ -291,7 +192,7 @@ def oracle_layout(case: str) -> tuple[tuple, tuple | None, dict, bool]:
 @pytest.mark.parametrize("case", ORACLE_CASES)
 def test_splash_agrees_with_the_reference_the_oracle_holds(case):
     """Splash in fp32, forward and every gradient (the sinks' included),
-    within `TOLERANCE` of the fp32 reference attention it replaces, whose own
+    within `INTERPRETED_FP32` of the fp32 reference attention it replaces, whose own
     arithmetic in float64 is first held to attention computed in float64
     apart from every Dew path (`exact_value_and_grads`). Each argument the
     kernel takes, grouped key heads among them. Interpreted on a CPU, a
@@ -327,7 +228,7 @@ def test_splash_agrees_with_the_reference_the_oracle_holds(case):
         assert_computes_the_oracle(wide_theirs, want, f"{case} {name}",
                                    roundings=query.shape[-1] + key.shape[1])
         if name != ordered:
-            assert_agrees((mine,), (theirs,), jnp.float32)
+            assert_agrees((mine,), (theirs,))
     if ordered is not None:
         sinks = structure.get("sinks")
         kwargs = {name: value for name, value in structure.items() if name != "sinks"}
@@ -366,27 +267,7 @@ def test_splash_is_on_par_on_a_tpu(case, dtype):
     truth takes the host's CPU backend beside the TPU (JAX_PLATFORMS=tpu,cpu, as the TPU tier and
     tools/qualify_splash.py start it)."""
     q_shape, kv_shape, structure, sunk = oracle_layout(case)
-    host = jax.devices("cpu")[0]
-
-    def draw(seed):
-        query, _, _ = qkv(q_shape, dtype, seed=10 * seed)
-        _, key, value = qkv(kv_shape or q_shape, dtype, seed=10 * seed + 1)
-        sinks = 2.0 + jax.random.normal(jax.random.PRNGKey(10 * seed + 2), (q_shape[2],), jnp.float32)
-        return query, key, value, sinks
-
-    def splash(query, key, value, sinks):
-        return value_and_grads('tpu', query, key, value, **({"sinks": sinks} if sunk else {}), **structure)
-
-    def reference(query, key, value, sinks):
-        return value_and_grads('reference', query, key, value, **({"sinks": sinks} if sunk else {}),
-                               precision=jax.lax.Precision.DEFAULT, **structure)
-
-    def truth(query, key, value, sinks):
-        with jax.default_device(host):
-            return exact_value_and_grads(query, key, value, **({"sinks": sinks} if sunk else {}), **structure)
-
-    assert_as_exact(splash, reference, draw, f"splash on a tpu, {case}, {jnp.dtype(dtype).name}",
-                    seeds=FEWEST_SEEDS, truth_fn=truth)
+    _on_par_on_a_tpu(q_shape, kv_shape, dtype, structure, f"splash on a tpu, {case}", sunk=sunk)
 
 
 @pytest.mark.mesh(devices=2)

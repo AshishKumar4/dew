@@ -646,14 +646,6 @@ def test_the_training_forward_is_on_par_interpreted(call, natural):
                    training=template.Kept.SPLIT)
 
 
-@ON_HOPPER
-@pytest.mark.parametrize("call", CALLS)
-def the_training_forward_is_on_par_on_an_h100(call):
-    """The training forward's output, bf16, compiled on an H100."""
-    _check_forward(call, jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False,
-                   training=template.Kept.SPLIT)
-
-
 @ON_EACH_FAMILY
 @INTERPRETS
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
@@ -1467,8 +1459,8 @@ def test_a_causal_backward_whose_consumers_stage_shared_logits_walks_each_query_
 
 
 HOPPER_HOOK_SITES = ("alibi", "resumed", "softcap-sinks-alibi")
-"""The hooked backward's sites the H100 alone runs (`…_under_every_score_hook_on_an_h100`, compiled, at the
-template site's shape and seeds): a head's ALiBi slope or a resumed state is one value a draw, so check 1
+"""The hooked backward's sites the H100 alone runs (`the_backward_is_on_par_under_the_hopper_hook_sites`, at
+the template site's shape and seeds): a head's ALiBi slope or a resumed state is one value a draw, so check 1
 takes 128 draws at any head count, past the CPU suite's 240 s target interpreted (1.9 s a draw a row of two
 heads: 270 to 650 s, row 1849); the CPU keeps every other hook, sinks and softcap among them."""
 
@@ -1817,72 +1809,6 @@ def test_the_training_forward_under_every_score_hook_lowers_for_an_h100(hooks, n
 
 
 @ON_HOPPER
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
-@pytest.mark.parametrize("call", CALLS)
-def the_forward_is_on_par_on_an_h100(call, dtype):
-    """The forward, the base-2 fold, compiled on an H100."""
-    _check_forward(call, dtype, SHAPES["compiled"], natural=False, interpret=False)
-
-
-@ON_HOPPER
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
-@pytest.mark.parametrize("call", CALLS)
-def the_natural_forward_is_on_par_on_an_h100(call, dtype):
-    """The forward with natural logits compiled on an H100."""
-    _check_forward(call, dtype, SHAPES["compiled"], natural=True, interpret=False)
-
-
-@ON_HOPPER
-@pytest.mark.parametrize("form", CASES)
-def the_forward_is_on_par_over_every_call_form_on_an_h100(form):
-    """The forward over each of the template core's call forms compiled on an H100."""
-    _check_call_form(form, interpret=False)
-
-
-@ON_HOPPER
-@pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
-def the_forward_is_on_par_at_head_widths_on_an_h100(width, value_width):
-    """The forward of query heads `width` wide and value heads `value_width` over a causal call at
-    `_form_tiles`, compiled on an H100."""
-    _check_forward("causal", jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False, width=width,
-                   value_width=value_width, tiles=_form_tiles("sm90"))
-
-
-@ON_HOPPER
-@pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
-def the_backward_is_on_par_at_head_widths_on_an_h100(width, value_width):
-    """The backward in its derived form of query heads `width` wide and value heads `value_width` over a
-    causal call, compiled on an H100."""
-    _check_backward("causal", SHAPES["compiled"], form=None, interpret=False, width=width,
-                    value_width=value_width)
-
-
-@ON_HOPPER
-@pytest.mark.parametrize(("dtype", "natural"), HOOK_FORMS.values(), ids=HOOK_FORMS)
-@pytest.mark.parametrize("hooks", FORWARD_HOOKS)
-def the_forward_is_on_par_under_every_hook_on_an_h100(hooks, dtype, natural):
-    """The forward under each hook compiled on an H100."""
-    _check_hooks(hooks, dtype, natural, interpret=False)
-
-
-@ON_HOPPER
-@pytest.mark.parametrize("form", BACKWARD_FORMS)
-@pytest.mark.parametrize("case", CASES)
-def the_backward_is_on_par_over_every_call_form_on_an_h100(case, form):
-    """The backward in both forms over each of the template core's call forms compiled on an H100."""
-    _check_call_form(case, interpret=False, backward=True, form=form)
-
-
-@ON_HOPPER
-@pytest.mark.parametrize("form", ["forward", *BACKWARD_FORMS])
-@pytest.mark.parametrize("case", RUN_CASES)
-def a_call_over_runs_is_on_par_on_an_h100(case, form):
-    """A decision row's runs compiled on an H100, the forward and the backward in each form."""
-    backward = form != "forward"
-    _check_call_form(case, interpret=False, backward=backward, form=form if backward else "default")
-
-
-@ON_HOPPER
 def a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
     """A causal call of 64 queries over 256 keys compiled on an H100, where a consumer waiting for a load
     the producer never issues hangs (the interpreted test's case)."""
@@ -1899,18 +1825,12 @@ def the_backward_at_its_faulting_geometry_is_on_par_on_an_h100():
 
 
 @ON_HOPPER
-@pytest.mark.parametrize("form", BACKWARD_FORMS)
-@pytest.mark.parametrize("call", CALLS)
-def the_backward_is_on_par_on_an_h100(call, form):
-    """The backward in both forms compiled on an H100."""
-    _check_backward(call, SHAPES["compiled"], form=form, interpret=False, width=FORM_WIDTHS.get(form, 128))
-
-
-@ON_HOPPER
 @pytest.mark.parametrize("form", ["default", "accurate"])
-@pytest.mark.parametrize("hooks", BACKWARD_HOOKS)
-def the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
-    """The backward in both forms under each score hook compiled on an H100."""
+@pytest.mark.parametrize("hooks", HOPPER_HOOK_SITES)
+def the_backward_is_on_par_under_the_hopper_hook_sites(hooks, form):
+    """The backward in both forms under each score hook the CPU cannot afford to check (`HOPPER_HOOK_SITES`),
+    compiled on an H100; every other call form, hook and width is the interpreted sites' and the compile
+    gate's, a GPU's own programs the native matrix's (`kernel_matrix.NATIVE`, row 5461)."""
     _check_hooked_backward(hooks, form=form, interpret=False)
 
 

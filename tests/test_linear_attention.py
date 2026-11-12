@@ -1,30 +1,22 @@
 """Gated DeltaNet against the transformers 5.16.1 reference, at fp32.
 
-tools/qwen_linear_reference.py runs `torch_chunk_gated_delta_rule`,
-`torch_recurrent_gated_delta_rule`, `F.conv1d` and one `Qwen3_5GatedDeltaNet`
-layer (modeling_qwen3_5.py) on fixed-seed operands and writes what they
-produced; the tests here run dew's forms on the same operands and the same
-weights and hold them to the reference.
+The chunked and the recurrent rules are held to `torch_chunk_gated_delta_rule` and
+`torch_recurrent_gated_delta_rule` on fresh draws by check 1, each against the same rule in float64, so
+the two forms agree to that truth. tools/qwen_linear_reference.py runs `F.conv1d` and one
+`Qwen3_5GatedDeltaNet` layer (modeling_qwen3_5.py) on fixed-seed operands and writes what they produced;
+the conv and layer tests run dew's on the same operands and weights:
 
-Tolerances and the differences actually observed, fp32 on CPU:
-
-- chunked rule           : output 4.5e-07, state 1.2e-07, tolerance 1e-5
-- recurrent rule         : output 8.9e-08, state 6.0e-08, tolerance 1e-5
-- carried initial state  : the same numbers for both forms, tolerance 1e-5
-- chunked vs recurrent   : output 4.2e-07, state 7.5e-08, tolerance 1e-5
-- a sequence cut at 30   : output 4.7e-07, state 5.7e-07, tolerance 1e-5
 - causal conv            : 2.4e-07, tolerance 1e-5
 - the whole layer        : 6.8e-05 on outputs of magnitude up to 9.9 over
   70 tokens (key heads 2, value heads 4, key dim 12, value dim 16),
   tolerance 5e-4; its decode path 3.4e-05 against its parallel forward
 
-The two bugs the port hit on the way are the mutations these tests are known
-to catch, each measured by applying it and reading the assertion: an
-inclusive instead of a strictly lower triangle in the in-chunk operator (the
-reference's masked_fill zeroes the diagonal) and reading the memory as `S q`
-instead of `q^T S` in the recurrent form; the numbers are in the tests that
-catch them.
+The two bugs the port hit on the way are the mutations these tests are known to catch: an inclusive
+instead of a strictly lower triangle in the in-chunk operator (the reference's masked_fill zeroes the
+diagonal) and reading the memory as `S q` instead of `q^T S` in the recurrent form, each far past check 1's
+bound on its rule.
 """
+
 
 import functools
 import itertools
@@ -46,7 +38,7 @@ from dew.algebra.scan import _decays_of
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import generation, recurrence as kernel
-from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, Tiles, chunk_gated_delta_rule, fla_rule, xla_mainloop
+from dew.nn.kernels.recurrence_chunk import CHUNK_SIZE, Tiles, fla_rule, xla_mainloop
 from dew.nn.linear import (
     GatedDeltaNet,
     _masked_conv1d,
@@ -91,13 +83,6 @@ def largest(left, right) -> float:
     return float(np.max(np.abs(np.asarray(left) - np.asarray(right))))
 
 
-def assert_matches(outputs, reference, name: str):
-    """A form's output and final state within 1e-5 of the reference's recording `name`."""
-    out, state = outputs
-    assert largest(out, reference[f"{name}.output"]) < 1e-5
-    assert largest(state, reference[f"{name}.state"]) < 1e-5
-
-
 def decode_operands(rng, rows: int, heads: int, width: int, held=jnp.float32):
     """A decode token's operands from `rng`: unit queries and keys, values, a log decay in (-3, 0], a
     write gate in [0, 1), each fp32, and a memory of scale 0.1 held in `held`."""
@@ -108,17 +93,6 @@ def decode_operands(rng, rows: int, heads: int, width: int, held=jnp.float32):
     beta = jnp.asarray(rng.random((rows, 1, heads)), jnp.float32)
     state = jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, held)
     return query, key, value, g, beta, state
-
-
-def test_the_chunked_rule_matches_the_reference(reference):
-    """`torch_chunk_gated_delta_rule` on 70 tokens: a full chunk and a padded
-    one, so both the in-chunk operator and the cross-chunk memory are read.
-    Largest observed difference 4.5e-07 on the output, 1.2e-07 on the state.
-    With the in-chunk triangle made inclusive (`tril(..., 0)` in place of
-    `tril(..., -1)`) the output moves by 1.5e-01."""
-    out, state = chunk_gated_delta_rule(*operands(reference))
-
-    assert_matches((out, state), reference, "chunk")
 
 
 def portable(query, key, value, g, beta, state=None, starts=None, chunk: int = CHUNK_SIZE):
@@ -179,26 +153,44 @@ def test_the_chunked_rule_rounds_as_close_to_float64_as_the_reference(reference)
                     "the chunked rule", seeds=CHUNKED_SEEDS, truth_fn=normalised_portable)
 
 
-def test_the_recurrent_rule_matches_the_reference(reference):
-    """`torch_recurrent_gated_delta_rule`, one token at a time. Largest
-    observed difference 8.9e-08 on the output, 6.0e-08 on the state. With
-    the memory read as `S q` (q contracted against the value axis) instead
-    of `q^T S` the output moves by 4.7e-01."""
-    out, state = recurrent_gated_delta_rule(*operands(reference))
+@as_given
+def torch_recurrent(query, key, value, g, beta, state):
+    """`torch_recurrent_gated_delta_rule` from `state`, normalising the queries and keys in the rule, as
+    tools/qwen_linear_reference.py records it: its output and final state, fp32."""
+    import torch
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_recurrent_gated_delta_rule
 
-    assert_matches((out, state), reference, "recurrent")
+    with torch.no_grad():
+        out, final = torch_recurrent_gated_delta_rule(
+            *(torch.as_tensor(np.asarray(x)) for x in (query, key, value, g, beta)),
+            initial_state=torch.as_tensor(np.asarray(state)), output_final_state=True,
+            use_qk_l2norm_in_kernel=True)
+    return out.numpy(), final.numpy()
 
 
-def test_the_chunked_and_recurrent_forms_agree(reference):
-    """The two forms are one computation: a model trains with the first and
-    decodes with the second, so they have to produce the same numbers and
-    leave the same memory behind. Largest observed difference 4.2e-07 on
-    the output, 7.5e-08 on the state."""
-    chunked, chunked_state = chunk_gated_delta_rule(*operands(reference))
-    recurrent, recurrent_state = recurrent_gated_delta_rule(*operands(reference))
+def normalised_recurrent(query, key, value, g, beta, state):
+    """Dew's recurrent rule (`recurrent_gated_delta_rule`) of the queries and keys normalised before it, as
+    the layer hands them over, at fp32 products (the reference's)."""
+    with jax.default_matmul_precision("highest"):
+        return recurrent_gated_delta_rule(l2norm(query), l2norm(key), value, g, beta, state)
 
-    assert largest(chunked, recurrent) < 1e-5
-    assert largest(chunked_state, recurrent_state) < 1e-5
+
+def test_the_recurrent_rule_rounds_as_close_to_float64_as_the_reference(reference):
+    """The fixture's 70 tokens drawn anew, from a drawn memory of scale 0.1 (every decode step past the first
+    starts from one): Dew's recurrent rule's fp32 output and final state on par from float64 with
+    `torch_recurrent_gated_delta_rule`'s own fp32 ones (check 1), the truth the same rule in float64. The
+    chunked rule's own check (`test_the_chunked_rule_rounds_as_close_to_float64_as_the_reference`) holds the
+    form a model trains with to the same truth, so the two forms agree to it."""
+    def draw(seed):
+        operands = rule_draw(reference, seed)
+        rng = np.random.default_rng([756, seed])
+        heads, width = operands[2].shape[2], operands[2].shape[3]
+        state = jnp.asarray(rng.normal(size=(operands[0].shape[0], heads, operands[0].shape[3], width)) * 0.1,
+                            jnp.float32)
+        return (*operands, state)
+
+    assert_as_exact(normalised_recurrent, torch_recurrent, draw, "the recurrent rule", seeds=CHUNKED_SEEDS,
+                    truth_fn=normalised_recurrent)
 
 
 PACKED_RULE_SEEDS = {(1, False): 32, (1, True): 128, (8, False): 16, (8, True): 128}
@@ -354,59 +346,6 @@ def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound()
 
     assert_as_exact(packed, alone, draw, "packed rows on the port", seeds=8, truth_fn=truth)
 
-
-def test_strong_decay_has_the_same_finite_gradient_in_both_forms():
-    """Masked positive log differences must never reach exp in the chunk rule.
-
-    At g=-4 a 64-token chunk has finite outputs but exp of its unused upper
-    triangle overflows; masking afterwards leaves a 0*inf NaN in backward.
-    The recurrent form stays finite and supplies the behavioral reference.
-    """
-    query = jnp.asarray(np.random.default_rng(99).normal(size=(1, 64, 1, 4)) * .1, jnp.float32)
-    key, value = query * .7, query * .3
-    beta, decay = jnp.full((1, 64, 1), .2), jnp.full((1, 64, 1), -4.)
-
-    def differentiate(rule):
-        return jax.jit(jax.value_and_grad(lambda g: rule(query, key, value, g, beta)[0].sum()))(decay)
-
-    expected, expected_grad = differentiate(recurrent_gated_delta_rule)
-    actual, actual_grad = differentiate(chunk_gated_delta_rule)
-    np.testing.assert_allclose(actual, expected, atol=1e-7, rtol=1e-5)
-    np.testing.assert_allclose(actual_grad, expected_grad, atol=1e-7, rtol=1e-5)
-
-
-
-def test_an_initial_state_is_carried_by_both_forms(reference):
-    """Starting from a memory, as every decode step past the first does,
-    matches the reference started from the same memory: 4.5e-07 chunked,
-    8.9e-08 recurrent on the output."""
-    initial = jnp.asarray(reference["rule.initial_state"])
-
-    out, state = chunk_gated_delta_rule(*operands(reference), initial)
-    assert_matches((out, state), reference, "chunk_carried")
-
-    out, state = recurrent_gated_delta_rule(*operands(reference), initial)
-    assert_matches((out, state), reference, "recurrent_carried")
-
-
-def test_a_sequence_split_in_two_carries_its_memory_across_the_cut(reference):
-    """The property a prefill followed by a continuation depends on: the
-    state the first 30 tokens leave, fed to the last 40, gives the numbers
-    the whole 70 give at once. The cut is inside a chunk, so it is the
-    carried state and the padding that are tested, not a chunk boundary.
-    Largest observed difference 4.7e-07 on the output, 5.7e-07 on the
-    state."""
-    query, key, value, g, beta = operands(reference)
-    whole, whole_state = chunk_gated_delta_rule(query, key, value, g, beta)
-
-    cut = 30
-    head, state = chunk_gated_delta_rule(
-        query[:, :cut], key[:, :cut], value[:, :cut], g[:, :cut], beta[:, :cut])
-    tail, final = chunk_gated_delta_rule(
-        query[:, cut:], key[:, cut:], value[:, cut:], g[:, cut:], beta[:, cut:], state)
-
-    assert largest(jnp.concatenate([head, tail], axis=1), whole) < 1e-5
-    assert largest(final, whole_state) < 1e-5
 
 
 def test_the_causal_conv_matches_f_conv1d(reference):

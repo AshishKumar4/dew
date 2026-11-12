@@ -491,6 +491,8 @@ def test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100
     page, where pages under 8 keys derived no launch before."""
     from kernel_compile import lowered_for
 
+    from dew.nn.kernels.lowered import kernel_calls
+
     keys, kv_heads, width = 4096, 8, 128
     spans = template.spans(1, keys, 2, lengths=jnp.asarray([keys, keys - 77], jnp.int32))
     query = jax.ShapeDtypeStruct((2, 1, 32, width), jnp.bfloat16)
@@ -500,7 +502,9 @@ def test_a_paged_decode_step_of_pages_smaller_than_its_tile_compiles_for_an_h100
     def decode(query, key_pool, value_pool, table):
         return attention_decode.attend(query, key_pool, value_pool, spans, table=table)
 
-    assert "mosaic_gpu" in lowered_for(decode, (query, pool, pool, table), "sm90").compile().as_text()
+    lowered = lowered_for(decode, (query, pool, pool, table), "sm90")
+    lowered.compile()
+    assert any(call.kind == "mosaic_gpu" for call in kernel_calls(lowered, unrun=True))
 
 
 @pytest.mark.parametrize("slices", [1, 3, 7])
