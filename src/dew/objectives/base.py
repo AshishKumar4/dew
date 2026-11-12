@@ -73,7 +73,7 @@ from dew.nn.precision import (
     weighted_total,
 )
 from dew.nn.progress import END, Progress, ReadsProgress
-from dew.nn.protocols import HiddenStates, ProjectionGroup, ProjectsParameters, StagedStacks
+from dew.nn.protocols import HiddenStates, ProjectsParameters, StagedStacks
 from dew.nn.sharding import LogicalAxes, abstract, boxed_axes, rows_taken
 
 if TYPE_CHECKING:
@@ -1715,14 +1715,6 @@ class Objective(ABC, Generic[Loss, Effects]):
         process. `inference_record` puts them beside the model's record.
         """
         return None
-
-    def served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]:
-        """The projection groups, their paths from the `params` root, that a checkpoint of this
-        objective's run may hold packed as a served task holds them, which a resume splits back
-        (`dew.checkpoints`): none, but where a run trained a task's packed tree (`DecisionObjective`).
-        Carried to 1.0, when it is deleted (ledger 1552)."""
-        del variables
-        return ()
 
     def progress(self, step: Step) -> Progress:
         """The run's progress this step's loss passes a model that reads it (`dew.nn.progress`): the
