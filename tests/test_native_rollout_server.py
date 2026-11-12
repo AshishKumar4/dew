@@ -161,6 +161,50 @@ def pieces(tmp_path_factory):
     return AutoTokenizer.from_pretrained(path, local_files_only=True)
 
 
+def test_a_policy_rebound_over_new_weights_and_progress_compiles_its_stop_strings_once(pieces):
+    """A collection rebinds its policy over each snapshot's weights and progress (`TextGeneration.bind`):
+    the rebound task draws what the first one draws, stopping on its string, and the strings compile against
+    the processor's vocabulary once, at the first draw, where each rebinding compiled them twice again
+    (audit3 inference F5). The processor counts the vocabulary listings its stop strings compile from."""
+    from dew.nn.progress import Progress
+
+    ids = {piece: pieces.convert_tokens_to_ids(piece) for piece in ("<eos>", "st", "op", "a")}
+    listed = []
+
+    class Listing:
+        """`pieces` as a processor, counting each listing of its vocabulary."""
+
+        def get_vocab(self):
+            listed.append(1)
+            return pieces.get_vocab()
+
+        def convert_tokens_to_string(self, tokens):
+            return pieces.convert_tokens_to_string(tokens)
+
+        def convert_ids_to_tokens(self, index):
+            return pieces.convert_ids_to_tokens(index)
+
+        def __call__(self, text, *, add_special_tokens):
+            return pieces(text, add_special_tokens=add_special_tokens)
+
+    def scripted():
+        table = np.full((VOCAB_PIECES, VOCAB_PIECES), -1e4, np.float32)
+        for before, after in itertools.pairwise([ids["a"], ids["st"], ids["op"], ids["<eos>"]]):
+            table[before, after] = 1e4
+        return table
+
+    model = ToolPolicy(vocab_size=VOCAB_PIECES, max_seq_len=64, logits=scripted)
+    params = model.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32))
+    task = TextGeneration(model, params, Listing(), sampling=Sampling(temperature=1.0, stop=("stop",)))
+    first = task([[ids["a"]]], 6, key=5).host()
+    for update in range(3):
+        task = task.bind(params, Progress(jnp.asarray(update + 1, jnp.int32)))
+    again = task([[ids["a"]]], 6, key=5).host()
+    np.testing.assert_array_equal(again.tokens, first.tokens)
+    assert bool(first.terminated[0]) and int(first.lengths[0]) == 2
+    assert len(listed) == 1
+
+
 def test_a_native_draw_ends_on_the_stop_string_it_completes(pieces):
     """A bigram policy that spells "st", "op", "yy", "<eos>" after "a". A stop string ends the draw on
     the id that completes it, terminated, and the draw keeps that id, as `TextGeneration` and the
