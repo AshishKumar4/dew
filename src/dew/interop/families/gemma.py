@@ -148,7 +148,7 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
     return theta, (None if local == theta else local), partial
 
 
-def _whole_head(entry: Mapping[str, object]) -> dict[str, object]:
+def _whole_head(entry: Mapping[str, object]) -> Mapping[str, object]:
     """A plain rope entry without its whole-head `partial_rotary_factor` (1), which the family's reader
     has accepted, for the shared parser, which takes a plain entry's base frequency and type alone."""
     return {key: value for key, value in entry.items() if key != 'partial_rotary_factor'}

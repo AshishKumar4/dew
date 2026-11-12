@@ -121,7 +121,7 @@ def pipeline(
     # recorded average included (`pinned_run`, every saved-run loader's rule).
     from dew.interop.saved_sources import pinned_run
 
-    pinned_run(root, step=step, ema=ema)
+    pinned_run(str(root), step=step, ema=ema)
     if root.is_dir() and released_model(root):
         if revision is not None or (options is not None and options != SourceOptions()) or (
                 precision is not None):
