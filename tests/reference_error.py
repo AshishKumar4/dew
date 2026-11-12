@@ -89,7 +89,7 @@ from arm_forms import (
     stacked_on_host as stacked_on_host,
     windows as windows,
 )
-from check1_wire import CENSUS, DRAWS, STAGES
+from check1_wire import CENSUS, DRAWS, QUALIFY, STAGES
 from float64_terms import evaluated_on, float64_terms, lowered, scan_groups
 from map_judge import PoolRefused, ask_later, drawing, judging, pooled_units, record_units
 from truth_sketch import SKETCH_DEVIATIONS, sketch_rounding, truth_sketch
@@ -1371,6 +1371,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                           terms=terms)
             return
         truth_fn, terms = store.site(label)
+    elif os.environ.get(QUALIFY) and not (drawing() or judging()):
+        _qualified(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
+                   examples=examples, plain=not (library_fn or also or terms or conditioning))
     if conditioning is not None:
         _deferred(dew_fn, reference_fn, draw, label, seeds=seeds, conditioning=conditioning,
                   truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
@@ -1410,6 +1413,41 @@ def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditionin
     else:
         if drawing():
             weighed()
+
+
+class StaleSeeds(AssertionError):
+    """A site whose declared seeds are fewer than its own sizing takes where it runs (`_qualified`): the count
+    was sized on other arithmetic, an arm's rounding having changed since (8eff72712a6 moved one site's from 8
+    to 256 and two others' down), or on another host level."""
+
+
+def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, examples: bool,
+               plain: bool) -> None:
+    """A qualification run's sizing of one site (`QUALIFY`) before its verdict: the count `seeds_for` sizes
+    here, Dew paired with its reference as the verdict pairs them, on sizing seeds no verdict draws, as every
+    site's count is sized (without its terms: `seeds_for` reads none); above the site's declared `seeds` it
+    raises StaleSeeds. Each site appends a line to the run's file (`QUALIFY`'s value): its test, its label,
+    its declared count and the count sized, or why it is not sized: its reference is a recording without
+    pilots, whose count is its recording's, or its verdict is not the `plain` pair's (a library arm, further
+    references, terms of its own, a weighed check), which this sizing does not judge. A site whose draw
+    cannot draw a sizing seed (one that indexes a fixed set of draws) fails with its draw's own error: it has
+    no pilot stream, so its count cannot be sized again (`seeds_for`'s contract). No sizing runs under a
+    prepared store or in a map task or its judge."""
+    import json
+
+    record = {"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0], "label": label,
+              "declared": seeds}
+    recorded = getattr(reference_fn, "recorded", False) and getattr(reference_fn, "pilots", None) is None
+    if not plain or recorded:
+        record["unsized"] = "its verdict is not the plain pair's" if not plain else "a recording's count"
+    else:
+        record["sized"] = seeds_for(reference_fn, draw, label, truth_fn=truth_fn, dew_fn=dew_fn,
+                                    orders=orders, examples=examples)
+    with open(os.environ[QUALIFY], "a", encoding="utf-8") as log:
+        log.write(json.dumps(record) + "\n")
+    if (sized := record.get("sized", 0)) > seeds:
+        raise StaleSeeds(f"{label}: this site sizes {sized} seeds here and declares {seeds}: its count was "
+                         f"sized on other arithmetic or another host level; declare what it sizes now")
 
 
 def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,
