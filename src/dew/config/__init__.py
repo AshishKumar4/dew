@@ -969,6 +969,10 @@ class RunConfig:
                          and now.get(name) != before.get(name))
         if "objective" in changed and _learns_alike(recorded.objective, self.objective):
             changed.remove("objective")
+        # A relaxed resume reads by this Dew's data plan where the saved run's is none it reads, its data
+        # started again (`resumed`): its state resumes as it trained.
+        if "data_plan_version" in changed and self.trainer.data_resume == "relaxed":
+            changed.remove("data_plan_version")
         if recorded.trainer.quantization != self.trainer.quantization:
             changed.append("trainer.quantization")
         if recorded.trainer.precision != self.trainer.precision:
