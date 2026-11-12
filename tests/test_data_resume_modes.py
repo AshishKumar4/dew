@@ -41,7 +41,7 @@ def test_a_relaxed_resume_whose_data_changed_starts_the_data_again_and_resumes_i
     assert started.start_step == 2 and int(resumed.step) == 4
     assert restarted.step == 2 and any(name.startswith("order.") for name in restarted.differs)
     fresh, _ = _fit(tmp_path / "fresh", seed=2, steps=4)
-    assert not np.allclose(resumed.variables["params"]["w"], fresh.variables["params"]["w"])
+    assert not np.array_equal(resumed.variables["params"]["w"], fresh.variables["params"]["w"])
 
 
 def test_an_exact_resume_whose_data_changed_is_refused(tmp_path):

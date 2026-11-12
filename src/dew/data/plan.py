@@ -723,8 +723,8 @@ def read_by(version: int) -> int:
     """`version`, refused where this Dew reads by none of it (`PLAN_VERSIONS`): what every read
     (`dew.data.compile`'s `compile`, `iterate` and `publish`) asks before it prepares anything."""
     if version not in PLAN_VERSIONS:
-        raise ValueError(f"this Dew reads data plans by version {', '.join(map(str, PLAN_VERSIONS))}, not "
-                         f"{version}: {_RESUMED}")
+        raise PlanChanged(("version",), f"this Dew reads data plans by version "
+                                        f"{', '.join(map(str, PLAN_VERSIONS))}, not {version}: {_RESUMED}")
     return version
 
 

@@ -1338,6 +1338,9 @@ class Trainer(Generic[Loss, Effects]):
         mesh, checkpoints, steps = self.device_mesh, self.checkpoints, plan.steps
         if steps is not None and current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
+        bound = self._shape.examples
+        if bound is not None and interval.consumed > bound:
+            raise ValueError(f"the run consumed {interval.consumed} examples, past the {bound} asked for")
         if plan.checkpoint_every and checkpoints is None:
             raise ValueError(
                 "checkpoint_every asks for checkpoints and this trainer has no "

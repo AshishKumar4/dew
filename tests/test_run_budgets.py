@@ -1313,15 +1313,16 @@ def test_a_clocked_run_resumed_with_a_larger_bound_trains_on_to_it(tmp_path):
 
 
 def test_a_resume_refuses_a_limit_grown_before_a_repeat(tmp_path):
-    """A limit a repeat reads after (`take(5).repeat()`), grown on resume, reads other records past the
-    saved position (its second pass the larger limit's next records, not the first five again), so the
-    resume is refused: only a bound with nothing but a batch after it reads on (row 2649)."""
+    """A limit a repeat reads after (`take(5).repeat()`), grown on resume, reads other records past the saved
+    position (its second pass the larger limit's next records, not the first five again), so an exact
+    resume is refused (a relaxed one starts its data again): only a bound with nothing but a batch after
+    it reads on (row 2649)."""
     (x,) = clocked_records(0)
 
     def fit(count: int, steps: int):
         chain = Pipeline(Memory({"x": x})).read("streamed").take(count).repeat().batch(BATCH)
         trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
-                          checkpoints=Checkpoints(str(tmp_path)))
+                          checkpoints=Checkpoints(str(tmp_path)), data_resume="exact")
         return trainer.fit(chain, steps=steps, log_every=1)
 
     fit(5, 2)
@@ -1330,9 +1331,9 @@ def test_a_resume_refuses_a_limit_grown_before_a_repeat(tmp_path):
 
 
 def test_a_resume_refuses_a_mixed_corpus_limit_grown_beneath_the_mixtures_repeat(tmp_path):
-    """A mixed corpus's limit, grown on resume, holds records its mixture's own shuffle and repeat read
-    after it (`mix([member.take(5)]).shuffle(window=2).take(100).repeat()`), so the resume is refused: only
-    the run's own chain's bound grows (row 2649)."""
+    """A mixed corpus's limit, grown on resume, holds records its mixture's own shuffle and repeat read after
+    it (`mix([member.take(5)]).shuffle(window=2).take(100).repeat()`), so an exact resume is refused (a
+    relaxed one starts its data again): only the run's own chain's bound grows (row 2649)."""
     from dew.data.pipeline import mix
 
     (x,) = clocked_records(0)
@@ -1341,7 +1342,7 @@ def test_a_resume_refuses_a_mixed_corpus_limit_grown_beneath_the_mixtures_repeat
         member = Pipeline(Memory({"x": x})).take(count)
         chain = mix([member]).read("streamed").shuffle(window=2).take(100).repeat().batch(BATCH)
         trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
-                          checkpoints=Checkpoints(str(tmp_path)))
+                          checkpoints=Checkpoints(str(tmp_path)), data_resume="exact")
         return trainer.fit(chain, steps=steps, log_every=1)
 
     fit(5, 2)
