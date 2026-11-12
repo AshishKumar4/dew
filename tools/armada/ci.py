@@ -543,29 +543,57 @@ UNREAD = "unread"
 stands (`standing`)."""
 
 
-def epoch(python: str, row_name: str, held: str, common: str, token: str) -> str | None:
-    """The name of row `row_name`'s epoch on class `held` on these shared inputs (`epoch_key`), None where it
-    has none; `Unread` where the Worker did not answer. A red run begins a new epoch, a fresh name each
-    (`record`), and a green run records the epoch it ran in, beginning one where there is none; a green run is
-    reused only within its epoch (`standing`). So a red run, whatever set it executed and whatever tree it ran
-    on, revokes every green run recorded before it: no lookup by another executed set, no plan's kept token
-    and no set published again brings one back (review, 2026-11-12: a flaky red's set differs from its
-    green's, so its own key revoked nothing). A name is never reused and no green run stands where a row has
-    no epoch, so neither two reds at once, nor a green written after a red it read nothing of, nor an epoch
-    the bucket's expiry took, lets an earlier green run stand again: each costs a miss."""
+def epoch(python: str, row_name: str, held: str, common: str, token: str) -> tuple[str | None, str | None]:
+    """The name of row `row_name`'s epoch on class `held` on these shared inputs (`epoch_key`) and its ETag,
+    the Worker's version of it; (None, None) where it has none; `Unread` where the Worker did not answer. A
+    red run begins a new epoch, a fresh name each, and a green run records the epoch it ran in, beginning one
+    where there is none (`begun`); a green run is reused only within its epoch (`standing`). So a red run,
+    whatever set it executed and whatever tree it ran on, revokes every green run recorded before it: no
+    lookup by another executed set, no plan's kept token and no set published again brings one back (review,
+    2026-11-12: a flaky red's set differs from its green's, so its own key revoked nothing). A name is never
+    reused, and no green run stands where a row has no epoch, so neither a green written after a red it read
+    nothing of nor an epoch the bucket's expiry took lets an earlier green run stand again: each costs a miss.
+    """
     try:
-        body = store(token).get(epoch_key(python, row_name, held, common))
+        with store(token).request("GET", epoch_key(python, row_name, held, common)) as reply:
+            if reply.body is None:
+                return None, None
+            tag = {name.lower(): value for name, value in reply.headers.items()}.get("etag")
+            return json.loads(reply.body.whole()).get("epoch"), tag
     except (r2.R2Error, ValueError) as error:
         raise Unread(f"the epoch of {row_name} on {held} was not read: {error}") from error
-    return None if body is None else json.loads(body).get("epoch")
 
 
-def begun(python: str, row_name: str, held: str, common: str, token: str) -> str:
-    """A new epoch of row `row_name` on class `held` on these shared inputs, its fresh name written (`epoch`);
-    or `UNREAD` where the Worker did not take it."""
-    name = uuid.uuid4().hex
-    return name if written(epoch_key(python, row_name, held, common), token,
-                           json.dumps({"epoch": name}).encode()) else UNREAD
+def begun(python: str, row_name: str, held: str, common: str, token: str, after: str | None = None,
+          fresh_only: bool = False) -> str:
+    """A new epoch of row `row_name` on class `held` on these shared inputs, its fresh name written over the
+    epoch of ETag `after` (`epoch`; none: only where the row has none), and its name; `UNREAD` where the
+    Worker did not take it. Written only on that condition (If-Match, If-None-Match), so a write sent again
+    later, by a retry or by a connection that replays its request, never puts back an epoch a later one
+    replaced (review, 2026-11-12). A red run (`fresh_only` false) whose condition another write beat reads the
+    epoch again and begins the next after it, as it must revoke whatever stands; a green one gives up
+    (`UNREAD`): an epoch it did not read may be a red's."""
+    for attempt in range(RECORD_TRIES * 2):
+        if attempt:
+            time.sleep(min(2 ** attempt, 8) / 4)
+        name = uuid.uuid4().hex
+        condition = {"If-Match": after} if after is not None else {"If-None-Match": "*"}
+        try:
+            with store(token).request("PUT", epoch_key(python, row_name, held, common), headers=condition,
+                                      body=json.dumps({"epoch": name}).encode()):
+                return name
+        except r2.Conflict:
+            if fresh_only:
+                return UNREAD
+            try:
+                after = epoch(python, row_name, held, common, token)[1]
+            except Unread:
+                return UNREAD
+        except (r2.R2Error, ValueError) as error:
+            print(f"the test cache did not take a new epoch of {row_name}: {error}", file=sys.stderr)
+            if not isinstance(error, r2.Unavailable):
+                return UNREAD
+    return UNREAD
 
 
 def standing(found: dict, current: str | None) -> bool:
@@ -781,7 +809,7 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
     for each in classes:
         tried: set[str] = set()
         try:
-            current = epoch(python, place, each, common, token)
+            current = epoch(python, place, each, common, token)[0]
         except Unread:
             continue
         if current is None:
@@ -833,7 +861,7 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
     if kept is not None:
         found = recorded(green_key(python, place, *kept), token)
         try:
-            current = epoch(python, place, kept[0], common, token)
+            current = epoch(python, place, kept[0], common, token)[0]
         except Unread:
             found = None
         if found is not None and found["key"] == kept[1] and fresh(found, name, common, reading) and standing(
@@ -1975,17 +2003,16 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         # A red run begins the row's next epoch first, so every green run recorded before it stands no
         # more (`epoch`); a green one keeps the epoch it ran in, begun where the row has none, or none where
         # neither was read or written.
+        try:
+            current, tag = epoch(python, row_["name"], held, common, token)
+        except Unread:
+            current, tag = UNREAD, None
         if row_["exitCode"] != 0:
-            if begun(python, row_["name"], held, common, token) == UNREAD:
+            if current == UNREAD or begun(python, row_["name"], held, common, token, after=tag) == UNREAD:
                 continue
             current = None
-        else:
-            try:
-                current = epoch(python, row_["name"], held, common, token)
-            except Unread:
-                current = UNREAD
-            if current is None:
-                current = begun(python, row_["name"], held, common, token)
+        elif current is None:
+            current = begun(python, row_["name"], held, common, token, fresh_only=True)
         body = json.dumps({"key": key,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"],
