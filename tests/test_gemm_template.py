@@ -639,13 +639,17 @@ def test_an_adapted_products_fp32_cotangent_reaches_its_wide_gradients_unrounded
 @INTERPRETS
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 @pytest.mark.parametrize("transpose_rhs", [False, True])
-def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_name, transpose_rhs):
-    """A dense product of fewer rows than a role's (a decode step's 4 rows by 256 by 384) derives a swapped
-    tile on mma.sync (its matrix the MMA's rows, the rows its narrow columns, row 1762) and its own on
-    warpgroup MMA, whose swapped tile ran slower (NS-SWAP2-h100), and the Mosaic product interpreted at it
-    holds check 1 against the plain program over the draws, the matrix stored either way (read transposed
-    where it lies `[depth, width]`)."""
-    rows, depth, width = 4, 256, 384
+@pytest.mark.parametrize(("depth", "width"), [(256, 384), (2048, 1024)])
+def test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1(generation_name, transpose_rhs, depth,
+                                                                    width):
+    """A dense product of fewer rows than a role's (a decode step's 4 rows by 256 by 384, or by 2048 by 1024,
+    whose depth the derivation may split over the wave, `_decode_split`: unsplit, a GH200's 4096 x 4096
+    decode ran 16 programs on 132 multiprocessors at 4.3x XLA's time, M-EM-38) derives a swapped tile on
+    mma.sync (its matrix the MMA's rows, the rows its narrow columns, row 1762) and its own on warpgroup
+    MMA, whose swapped tile ran slower (NS-SWAP2-h100), and the Mosaic product interpreted at it holds check
+    1 against the plain program over the draws, the matrix stored either way (read transposed where it lies
+    `[depth, width]`)."""
+    rows = 4
 
     def draw(seed):
         rng = np.random.default_rng(seed)
@@ -719,6 +723,31 @@ def test_an_amperes_decode_product_splits_its_depth_over_the_wave(rows, transpos
     assert tile.block_m <= grouped_matmul.SWAPPED_ROWS, tile
     programs = 2048 // tile.block_m * -(-rows // tile.block_n) * tile.splits
     assert programs >= target.multiprocessors // 2, (tile, programs)
+
+
+@runs("sm90")
+def test_a_hoppers_split_decode_product_holds_check_1():
+    """An H100's dense product of a decode step's 4 rows pinned at an unswapped tile whose depth splits in
+    four (`Tiles.splits`, its fp32 partials summed after), interpreted: on par with the plain program from
+    float64 truth over the draws (check 1)."""
+    rows, depth, width = 4, 1024, 512
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(depth, width)) / 16, jnp.bfloat16))
+
+    def dew(x, w):
+        return gemm.gemm(x, w, None, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+    def plain(x, w, wide=jnp.float32, out=jnp.bfloat16):
+        return jnp.dot(x.astype(wide), w.astype(wide)).astype(out)
+
+    split = mosaic_gpu.Tiles(64, 256, 64, 2, 2, warpgroups=1, family="wgmma", splits=4)
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), \
+            tuning.pinned({grouped_matmul.MosaicGmm: split}):
+        assert_as_exact(dew, jax.jit(plain), draw, f"split {rows}x{depth}x{width}", seeds=SEEDS,
+                        truth_fn=functools.partial(plain, wide=jnp.float64, out=jnp.float64))
 
 
 def test_a_named_kernels_derivative_pulled_after_its_block_holds_check_1():

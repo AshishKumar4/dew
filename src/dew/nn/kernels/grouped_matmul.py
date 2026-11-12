@@ -1384,17 +1384,17 @@ class MosaicGmm(_Mosaic):
         return split if splits > 1 and self.legal(ba, split, target) else swapped_tile
 
     def _decode_split(self, ba, tile: mosaic_gpu.Tiles | None, target) -> mosaic_gpu.Tiles | None:
-        """`tile`, a grouped call's of decode-sized groups (each group's rows within one row tile: a MoE
-        decode step's experts) its depth split where the busiest program then walks shorter
-        (`mosaic_gpu.split_count` over each active expert's one row tile, its matrix's stream the walk): its
-        one wave of tiles streamed each expert's matrix at a program's share of the memory rate, 1.28-1.46x
-        Triton's time at the same DRAM bytes, 48% of the peak rate against Triton's 80% (FS-3622-NCU1,
-        FS-3622-WAVES1, row 3622). None, a dense call, exact sums (`legal`), hooks or a pair keep it
-        unsplit."""
+        """`tile`, a call's of decode-sized groups (each group's rows within one row tile: a MoE decode
+        step's experts, or a dense product's decode step run unswapped, its one group) its depth split where
+        the busiest program then walks shorter (`mosaic_gpu.split_count` over each active group's one row
+        tile, its matrix's stream the walk): one wave of tiles streamed each expert's matrix at a program's
+        share of the memory rate, 1.28-1.46x Triton's time at the same DRAM bytes, 48% of the peak rate
+        against Triton's 80% (FS-3622-NCU1, FS-3622-WAVES1, row 3622); a dense decode on a GH200, unsplit,
+        ran Llama-3-8B's 4096 x 4096 at one row on 16 programs of 132, 4.3x XLA's time (M-EM-38). None,
+        exact sums (`legal`), hooks or a pair keep it unsplit."""
         hooks = ba.arguments['hooks']
-        if (tile is None or ba.arguments['dense'] or ba.arguments['exact_sums']
-                or ba.arguments.get('paired') is not None or hooks.prologue is not None
-                or hooks.epilogue is not None):
+        if (tile is None or ba.arguments['exact_sums'] or ba.arguments.get('paired') is not None
+                or hooks.prologue is not None or hooks.epilogue is not None):
             return tile
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
         groups = ba.arguments['sizes'].shape[0]
@@ -1466,12 +1466,13 @@ class MosaicGmm(_Mosaic):
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         if config.swapped and (self._swapped(ba, target) is None or not self._left_fits(ba, config)):
             return False
-        # A split is a swapped dense call's or a grouped call's (a decode step's), each run some steps, of no
-        # exact sums: their runs sum exactly (`mosaic_gpu.gmm`), but an A100's exact input gradient split four
-        # ways at 64 x 128 x 32 (six stages, two programs) spilled 24 bytes where its register model held 187
-        # (the GEMM compile gate, EM-G1), its runs' traced steps beside the running sum.
+        # A split is a decode step's (a dense call's, swapped or not, or a grouped one's), each run some
+        # steps, of no exact sums: their runs sum exactly (`mosaic_gpu.gmm`), but an A100's exact input
+        # gradient split four ways at 64 x 128 x 32 (six stages, two programs) spilled 24 bytes where its
+        # register model held 187 (the GEMM compile gate, EM-G1), its runs' traced steps beside the running
+        # sum.
         depth = ba.arguments['tokens'].shape[1]
-        if config.splits > 1 and ((ba.arguments['dense'] and not config.swapped) or ba.arguments['exact_sums']
+        if config.splits > 1 and (ba.arguments['exact_sums']
                                   or not mosaic_gpu.split_runs(-(-depth // config.block_k), config.splits)):
             return False
         return super().legal(ba, config, target)
