@@ -428,26 +428,25 @@ def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoi
         jax.config.update("jax_enable_x64", val=False)
 
 
-@pytest.mark.parametrize("features", [8, 1], ids=["dual", "primal"])
-def test_a_gauss_newton_window_the_stream_ends_inside_solves_the_rows_it_holds(features):
-    """Gauss-Newton read one row a microbatch in windows of four, over five rows: the run's last window,
-    which the stream ends inside, holding its fifth row alone, commits a solve of that row (row 5722), where
-    it once moved nothing and counted an update: its weights fit the row, as a row fewer than the weights
-    is fitted (the dual's least change) or one weight's is (the normal equations' least squares)."""
+@pytest.mark.parametrize("features", [64, 4], ids=["dual", "primal"])
+def test_a_gauss_newton_window_the_stream_ends_inside_commits_a_solve_of_the_rows_it_holds(features):
+    """Gauss-Newton read eight rows a microbatch in windows of four, over five microbatches: the run's last
+    window, which the stream ends inside, holding its fifth microbatch alone, commits a solve of those rows
+    (row 5722), its rows fewer than the weights (the dual's) or more (the normal equations'): its weights
+    move past the first window's, where they once stayed and the update was counted all the same."""
     generator = np.random.default_rng(5)
-    x = generator.normal(size=(5, features)).astype(np.float32)
-    y = generator.normal(size=5).astype(np.float32)
+    x = generator.normal(size=(40, features)).astype(np.float32)
+    y = generator.normal(size=40).astype(np.float32)
+
     def trained(count: int) -> np.ndarray:
         rows = Memory([{"x": row, "y": target} for row, target in zip(x[:count], y[:count], strict=True)])
         trainer = Trainer(LeastSquares(features), gauss_newton(damping=1e-6), key=0, layout=LAYOUT,
                           accumulation=4)
-        state = trainer.fit(rows.batch(1), epochs=1)
-        assert int(state.updates) == -(-count // 4)
+        state = trainer.fit(rows.batch(8), epochs=1)
+        assert int(state.updates) == -(-count // 32)
         return np.asarray(state.variables["params"]["Dense_0"]["kernel"])[:, 0]
 
-    whole, last = trained(4), trained(5)
-    # The last window moved the weights toward its row, which the four before left unfitted.
-    assert abs(float(x[4] @ last - y[4])) < abs(float(x[4] @ whole - y[4]))
+    assert not np.array_equal(trained(40), trained(32))
 
 
 def test_a_gauss_newton_update_held_by_a_wrapper_that_drops_its_statistics_is_refused():

@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Protocol
 
 import flax.linen as nn
 
+from dew._records import JSON
 from dew.data.compile import Handed, fitted
 from dew.data.dataset import DataPartition, Loader
 from dew.data.pipeline import Dataset, ObjectiveData
@@ -124,7 +125,7 @@ def resume_admitted[LossT, EffectsT](trainer: "Trainer[LossT, EffectsT]", loader
             admitted(loader, trainer._stream_partition(), saved)
 
 
-def computation_differs(saved: object, now: object) -> list[str]:
+def computation_differs(saved: JSON, now: JSON) -> list[str]:
     """Where the computation a checkpoint trained, its inference record (`Objective.inference_record`, which
     every step carries), and this run's differ: each path of the objective's class or its model's record where
     both state it and they disagree, the fields that say how layers execute aside (the configured path's own
@@ -133,16 +134,19 @@ def computation_differs(saved: object, now: object) -> list[str]:
     from dew._records import without_fields
     from dew.config import RunConfig
 
-    def differing(before: object, after: object, path: str) -> list[str]:
-        # A field one record holds and the other predates is no evidence: only fields both state compare.
-        if isinstance(before, Mapping) and isinstance(after, Mapping):
-            return [found for key in sorted(before.keys() & after.keys())
-                    for found in differing(before[key], after[key], f"{path}.{key}")]
-        return [] if before == after else [path]
+    def differing(before: JSON, after: JSON, path: str) -> list[str]:
+        match before, after:
+            # A field one record holds and the other predates is no evidence: only fields both state compare.
+            case dict(), dict():
+                return [found for key in sorted(before.keys() & after.keys())
+                        for found in differing(before[key], after[key], f"{path}.{key}")]
+            case _:
+                return [] if before == after else [path]
 
-    if not isinstance(saved, Mapping) or not isinstance(now, Mapping) or "unrecorded" in {*saved, *now}:
-        return []
-
-    return [found for name in ("objective", "model") if name in saved and name in now
-            for found in differing(without_fields(saved[name], RunConfig.EXECUTED),
-                                   without_fields(now[name], RunConfig.EXECUTED), name)]
+    match saved, now:
+        case dict(), dict() if "unrecorded" not in {*saved, *now}:
+            return [found for name in ("objective", "model") if name in saved and name in now
+                    for found in differing(without_fields(saved[name], RunConfig.EXECUTED),
+                                           without_fields(now[name], RunConfig.EXECUTED), name)]
+        case _:
+            return []
