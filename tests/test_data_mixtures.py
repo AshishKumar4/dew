@@ -1304,11 +1304,14 @@ class Pooled(Regression):
         return Ratio(jnp.sum(errors), jnp.asarray(errors.shape[0], errors.dtype)), Aux({})
 
 
+def checkpointed_trainer(objective, rate: float, directory: Path) -> Trainer:
+    """A trainer of `objective` by plain SGD at `rate`, its checkpoints in `directory`: a data test's run."""
+    return Trainer(objective, optax.sgd(rate), key=jax.random.key(0),
+                   layout=Layout(min_shard=1, tolerance=1.0), checkpoints=Checkpoints(str(directory), keep=8))
+
+
 def regression_trainer(directory: Path) -> Trainer:
-    return Trainer(
-        Regression(), optax.sgd(0.5), key=jax.random.key(0),
-        layout=Layout(min_shard=1, tolerance=1.0),
-        checkpoints=Checkpoints(str(directory), keep=8))
+    return checkpointed_trainer(Regression(), 0.5, directory)
 
 
 def parameters(state) -> dict:
@@ -2074,6 +2077,11 @@ def test_a_token_mixture_of_published_generations_weighs_the_rows_and_targets_ea
         stream.close()
 
 
+def _short_and_long() -> Pipeline:
+    """Short rows of two tokens and long rows of ten, each corpus read on past its end, mixed by tokens."""
+    return mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat()], by="tokens")
+
+
 def _token_rows(name: str, tag: int, tokens: int, count: int = 200) -> Pipeline:
     """`count` rows of `tokens` tokens each, so `tokens - 1` targets a row, whose ids name the member."""
     from dew.data.steps.text import CountTargets
@@ -2089,9 +2097,7 @@ def test_a_token_mixture_recurring_in_a_later_phase_continues_each_member_where_
     the rows the first phase took, so no row repeats and none is skipped."""
     from dew.data.pipeline import Phases
 
-    def members():
-        return mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat()], by="tokens")
-
+    members = _short_and_long
     data = compile(Pipeline(Phases((members(), members()), (10, None))).batch(1), read="memory",
                    loading=READ)
     read = [int(batch["id"][0]) for batch in itertools.islice(data.train(DataPartition()), 40)]
@@ -2309,10 +2315,7 @@ def test_a_phase_on_the_token_clock_of_a_mix_weighed_by_tokens_streamed_is_refus
     order on that clock is (on the step clock, each such phase reads its own stream, `StepPhases`)."""
     from dew.data import schedule
 
-    def members():
-        return mix([_token_rows("short", 1, 2).repeat(), _token_rows("long", 2, 10).repeat()], by="tokens")
-
-    chain = schedule([(members(), 40), (members(), None)]).batch(1)
+    chain = schedule([(_short_and_long(), 40), (_short_and_long(), None)]).batch(1)
     with pytest.raises(ValueError):
         compile(chain, read=read, loading=READ)
 

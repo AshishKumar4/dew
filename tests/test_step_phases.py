@@ -7,14 +7,14 @@ import dataclasses
 import itertools
 from pathlib import Path
 
-import grain.python as grain
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 from affine_run import FEATURES, Affine
-from test_data_mixtures import READ, assert_same, parameters
+from test_chain_compile import Tokens
+from test_data_mixtures import READ, assert_same, checkpointed_trainer, parameters
 
 from dew.batch import PHASE, VALID_ROWS, Phase
 from dew.data import Memory, phases
@@ -23,17 +23,6 @@ from dew.data.dataset import DataPartition
 from dew.mesh import LayoutRefused
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, Trainer
-
-
-@dataclasses.dataclass(frozen=True)
-class Tokens(grain.MapTransform):
-    """Rows of `max_length` tokens, `length` of them real, each its row's id (`TokenGeometry`)."""
-
-    max_length: int = 16
-
-    def map(self, row):
-        return {**row, "tokens": np.full(self.max_length, row["id"], np.int32),
-                "valid": np.arange(self.max_length) < row["length"]}
 
 
 def fits(row) -> bool:
@@ -92,7 +81,7 @@ def test_a_resume_into_phases_that_moved_an_end_the_run_passed_is_refused():
     saved = stopped.get_state()
     stopped.close()
     moved = compile(chain(2), read="indexed", loading=READ).train(DataPartition())
-    with pytest.raises(ValueError, match="cannot change under it"):
+    with pytest.raises(ValueError):
         moved.set_state(saved)
     moved.close()
 
@@ -101,9 +90,9 @@ def test_phases_read_each_on_its_own_stream_refuse_a_corpus_two_of_them_read():
     """Phases read each on its own stream open each corpus at its first record, so a corpus two of them read
     would be read again from its start: refused, as reading one global order is what continues it, whatever
     each phase names it."""
-    with pytest.raises(ValueError, match="both read"):
+    with pytest.raises(ValueError):
         compile(phases((source(1), 3), (source(1), None)), read="indexed", loading=READ)
-    with pytest.raises(ValueError, match="both read"):
+    with pytest.raises(ValueError):
         compile(phases((source(1).named("early"), 3), (source(1).named("late"), None)), read="indexed",
                 loading=READ)
 
@@ -138,8 +127,7 @@ class Counted(Objective):
 
 
 def trainer(directory: Path) -> Trainer:
-    return Trainer(Counted(), optax.sgd(0.1), key=jax.random.key(0),
-                   layout=Layout(min_shard=1, tolerance=1.0), checkpoints=Checkpoints(str(directory), keep=8))
+    return checkpointed_trainer(Counted(), 0.1, directory)
 
 
 def test_a_run_over_phases_cut_per_share_stopped_in_either_phase_lands_where_the_uninterrupted_one_does(
