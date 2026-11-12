@@ -588,6 +588,17 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
         raise ValueError("checkpoint EMA configuration differs from this run")
 
 
+def _host_devices() -> list:
+    """This process's first CPU device, which a read onto the host restores onto (`Checkpoints.variables`'
+    `on_host`); refused where the process opened no CPU backend."""
+    try:
+        return jax.local_devices(backend="cpu")[:1]
+    except RuntimeError as error:
+        raise ValueError("a read onto the host restores onto this process's CPU device, and it opened none; "
+                         "launch with JAX_PLATFORMS=cuda,cpu (or your accelerator,cpu) before JAX "
+                         "initializes, or load onto the accelerator") from error
+
+
 def _host_read(*, from_local: bool) -> ocp.ArrayRestoreArgs:
     """How a leaf that no template places is read. It is typed as a host
     array, so Orbax reads no sharding file and warns about none. A local
@@ -1750,8 +1761,8 @@ class Checkpoints:
                   parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS,
                   unread: tuple[tuple[str, ...], ...] = (), on_host: bool = False) -> Variables:
         """Read the selected step's live or averaged variables onto the requested layout, or with
-        `on_host` into host arrays, read straight from storage and placed on no device (no `mesh` or
-        `layout` beside it).
+        `on_host` into host arrays, restored onto this process's CPU device and fetched, no accelerator
+        holding them on the way (no `mesh` or `layout` beside it).
 
         Parameter storage conversion applies only to the owner's parameter
         roots; other collections retain their recorded dtypes and placement.
@@ -1777,13 +1788,13 @@ class Checkpoints:
         with_ema = stored.get("ema") is not None if ema is None else ema
         if with_ema:
             template["ema"] = without(stored["ema"], unread)
-        if on_host:
-            if mesh is not None or layout is not None:
-                raise ValueError("on_host reads the variables into host arrays, and mesh and layout place "
-                                 "them; pass one")
-            return self.materialized(template, None, step=step, param_dtype=param_dtype,
-                                     parameter_roots=parameter_roots)
-        device_mesh = resolve_mesh(DefaultMesh() if mesh is None else mesh)
+        if on_host and (mesh is not None or layout is not None):
+            raise ValueError("on_host reads the variables into host arrays, and mesh and layout place "
+                             "them; pass one")
+        # On the host, restored onto this process's CPU device, every collection as a placed read restores
+        # it, then fetched as host arrays: no accelerator holds them on the way.
+        device_mesh = resolve_mesh(DefaultMesh().build(_host_devices()) if on_host
+                                   else DefaultMesh() if mesh is None else mesh)
         chosen_layout = DefaultLayout() if layout is None else layout
         # A CPU-owned run stores its frozen collection banked; the layout places
         # its layers, and each bank reads onto its first layer's placement.
@@ -1800,18 +1811,17 @@ class Checkpoints:
                                    parameter_roots=parameter_roots)
         if frozen is not None:
             params = {**params, FROZEN: spread(params[FROZEN], placed_rows)}
-        return params
+        return jax.device_get(params) if on_host else params
 
-    def materialized(self, template: Mapping[str, Variables],
-                     placement: Mapping[str, Variables] | None, *, step: int,
-                     param_dtype: jax.typing.DTypeLike | None = None,
+    def materialized(self, template: Mapping[str, Variables], placement: Mapping[str, Variables], *,
+                     step: int, param_dtype: jax.typing.DTypeLike | None = None,
                      parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS) -> Variables:
         """The variables at `step` whose leaves `template` names (`stored`'s, under `"variables"`, and
-        under `"ema"` the averaged ones, merged over them), restored onto `placement`'s shardings, or
-        into host arrays where `placement` is None, no other leaf read; the floating leaves under
-        `parameter_roots` read as `param_dtype` where one is given, the rest in their stored dtypes.
-        Every load of a run's variables restores through it: a whole run's onto its layout or the host
-        (`variables`) and a bank's rows onto theirs (`dew.inference.banks.CheckpointBanks`)."""
+        under `"ema"` the averaged ones, merged over them), restored onto `placement`'s shardings, no
+        other leaf read; the floating leaves under `parameter_roots` read as `param_dtype` where one is
+        given, the rest in their stored dtypes. Every load of a run's variables restores through it: a
+        whole run's onto its layout (`variables`) and a bank's rows onto theirs
+        (`dew.inference.banks.CheckpointBanks`)."""
         from dew.batch import merge
         from dew.registry import resolve_dtype
 
@@ -1826,25 +1836,12 @@ class Checkpoints:
                         if jnp.issubdtype(leaf.dtype, jnp.floating) and under_roots(path, parameter_roots)}
         # Each leaf in the dtype it is asked in, or else in the dtype this process holds its stored one in: a
         # stored float64 a float32 where x64 is off.
-        def wanted(path, leaf):
-            return target if path[1:] in selected else jax.dtypes.canonicalize_dtype(
-                leaf.dtype, allow_extended_dtype=True)
-
-        if placement is None:
-            # Host arrays, read from storage as Orbax reads them, no device holding them on the way; a
-            # local step knows device arrays only, so its come home from one of this process's devices.
-            local = step == self._local_latest()
-            typed = jax.tree_util.tree_map_with_path(
-                lambda path, leaf: jax.ShapeDtypeStruct(leaf.shape, wanted(path, leaf)), dict(template))
-            values = jax.tree.map(np.asarray, self._restored(step, typed, jax.tree.map(
-                lambda leaf: _host_read(from_local=True) if local
-                else ocp.ArrayRestoreArgs(restore_type=np.ndarray, dtype=leaf.dtype), typed), local=local))
-        else:
-            typed = jax.tree_util.tree_map_with_path(
-                lambda path, leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, wanted(path, leaf),
-                                                                  sharding=sharding),
-                dict(template), dict(placement))
-            values, _ = self.restore(typed, step=step)
+        typed = jax.tree_util.tree_map_with_path(
+            lambda path, leaf, sharding: jax.ShapeDtypeStruct(
+                leaf.shape, target if path[1:] in selected else jax.dtypes.canonicalize_dtype(
+                    leaf.dtype, allow_extended_dtype=True), sharding=sharding),
+            dict(template), dict(placement))
+        values, _ = self.restore(typed, step=step)
         params = values.pop("variables")
         return merge(params, values["ema"]) if "ema" in values else params
 
