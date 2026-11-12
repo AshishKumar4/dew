@@ -1,11 +1,8 @@
 """Dew's rounding error held to the reference's own, both measured from float64.
 
-The gate the suite converts to holds every element over orders: a comparison drawn over
-exact symmetries of its computation (`assert_leaves_as_exact_over_orders`), each element against the
-worst admitted member of the reference's ensemble (`assert_elements_as_exact`), and a kernel held where
-it rounds, as a graph of the values it rounds and holds (`assert_graph_as_exact`), all three in
-tests/reference_ensemble.py. The one-draw rules below hold the comparisons that have not converted
-yet.
+The gate is check 1 over a site's sized seeds (`assert_as_exact`, docs/design/testing.md) beside check 2's
+certified bounds (tests/certified.py). The one-draw rules below hold the comparisons that have not
+converted yet.
 
 A port that computes what its reference computes, at the same precision,
 differs from it only by rounding: the two sum the same terms in other
@@ -2120,7 +2117,7 @@ def _assert_rows_over_orders(dew, members, label: str, sizes=None) -> None:
     sizes = np.ones(dew.shape[1]) if sizes is None else np.asarray(sizes, np.float64)
     sized = sizes > 0
     if not sized.any():
-        return  # rows of float64 zero, which the element rule holds (`assert_elements_as_exact`)
+        return  # every row is float64 zero: this rule sizes a row by its float64 value and holds none
     mine = np.sqrt(np.mean(np.square(dew), axis=0))[sized] / sizes[sized]
     theirs = np.max(np.sqrt(np.mean(np.square(members), axis=1)), axis=0)[sized] / sizes[sized]
     worst, their_worst = float(np.max(mine)), float(np.max(theirs))
