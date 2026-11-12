@@ -307,8 +307,10 @@ def test_a_shortcut_update_read_as_halves_targets_each_example_as_its_whole_batc
 
 
 def test_each_examples_posterior_draw_is_its_own():
-    """A latent objective draws each example's posterior noise by its place: a half of an update draws at
-    the whole update's places for its examples, exactly. The draw over a place is the example's own on
+    """A latent objective draws each example's posterior noise by its place under its update's key: a
+    half of an update draws at the whole update's places for its examples, exactly, and the noise the
+    encoder takes is the update's alone, each example's its own, the same bits whatever attempt's key the
+    step holds and other noise under another update's key. The draw over a place is the example's own on
     any batch by check 1 (`test_an_examples_draw_is_its_own_whatever_batch_it_is_drawn_in`): a half's
     program may round a lane of a float draw otherwise (ledger 1364)."""
     from test_autoencoder import tiny_vae
@@ -323,18 +325,25 @@ def test_each_examples_posterior_draw_is_its_own():
     params = objective.init(jax.random.PRNGKey(0))
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (4, 8, 8, 3), 0, 256), np.uint8)}
 
-    def recorded(part: slice) -> tuple[np.ndarray, tuple[int, ...]]:
+    def recorded(part: slice, attempt: int = 2, update=UPDATE) -> tuple[np.ndarray, np.ndarray]:
         recorder = Recorder()
         examples = jnp.asarray(np.arange(4)[part], jnp.int32)
-        step = Step(jnp.asarray(0), jax.random.key(2), None, example_key=UPDATE, example_index=examples,
+        step = Step(jnp.asarray(0), jax.random.key(attempt), None, example_key=update, example_index=examples,
                     example_count=4, recorder=recorder)
         objective.loss(params, jax.tree.map(lambda value: value[part], batch), step)
         (places, noise), = recorder.values["posterior"]
-        return np.asarray(places), noise.shape[1:]
+        return np.asarray(places), np.asarray(noise)
 
-    (half, half_shape), (whole, whole_shape) = recorded(slice(2, 4)), recorded(slice(0, 4))
+    (half, half_noise), (whole, noise) = recorded(slice(2, 4)), recorded(slice(0, 4))
     np.testing.assert_array_equal(half, whole[2:])
-    assert half_shape == whole_shape
+    assert half_noise.shape[1:] == noise.shape[1:]
+    # Each example draws its own noise, never one draw every row of the update shares.
+    assert all(not np.array_equal(noise[first], noise[second])
+               for first in range(len(noise)) for second in range(first + 1, len(noise)))
+    _, retried = recorded(slice(0, 4), attempt=3)
+    assert retried.tobytes() == noise.tobytes()
+    _, other = recorded(slice(0, 4), update=jax.random.fold_in(UPDATE, 1))
+    assert all(not np.array_equal(row, again) for row, again in zip(noise, other, strict=True))
 
 
 def test_a_posterior_noise_of_another_shape_is_refused():

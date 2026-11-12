@@ -35,7 +35,6 @@ from dew.decision.rows import (
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.shared_state import asked_over, fork_depth, joint, shared_for
 from dew.decision.task import Budget, Decide, DecideSettings, Weights, laid_out, trained_tree, whole_blocks_of
-from dew.inference.projections import declared_groups
 from dew.inference.tasks import Processor as TaskProcessor, RunProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
@@ -54,7 +53,6 @@ from dew.nn.protocols import (
     CrossAttending,
     Lacks,
     Looped,
-    ProjectionGroup,
     TokenModel,
 )
 from dew.objectives.base import (
@@ -877,15 +875,6 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             else self.image_processor.source,
             self.model.context_encoder,
             self.options)
-
-    def served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]:
-        """The backbone's projection groups a served task packs (`Decide._served`), their paths from
-        the `params` root: what a checkpoint holds packed where its run trained a loaded task's packed
-        tree (mains 947ac9262 up to ledger 2299's fix), which a resume splits back
-        (`dew.checkpoints`). Carried to 1.0, when it is deleted (ledger 1552)."""
-        backbone = part(thaw(variables), "backbone")
-        return tuple(dataclasses.replace(group, path=("backbone", *group.path))
-                     for group in declared_groups(self.model.backbone, backbone))
 
     def recorded_model(self) -> nn.Module:
         """The backbone; the head is a task setting of its own."""

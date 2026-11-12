@@ -61,18 +61,29 @@ def evidence(recorded: str, kind: str) -> dict | None:
     return json.loads((CORPUS / recorded / f"{kind}.evidence.json").read_text())
 
 
-def resumed_by_its_format(run: Path, resume: Callable[[], object], *, exact: bool = False) -> bool:
+def resumed_by_its_format(run: Path, objective, resume: Callable[[], object]) -> bool:
     """Whether `run`'s last checkpoint is of a format this Dew resumes, the current one or the one before it,
     `resume` run on it then; else, a step that holds its whole state as one item (`dew.checkpoints.ONE_ITEM`)
-    as an older Dew wrote it, or, resumed `exact`ly, a data position of a plan version this Dew reads none
-    of (`dew.data.plan.PLAN_VERSIONS`; a relaxed resume starts that data again), `resume` refused."""
+    as an older Dew wrote it, or a decision backbone's projections packed as one before ledger 2299's fix
+    stored them (`laid_out_otherwise`, of `objective`'s model), `resume` refused, naming it."""
     with Checkpoints(str(run)) as checkpoints:
         whole = (Path(checkpoints.path(checkpoints.latest)) / ONE_ITEM).is_dir()
-    if whole or (exact and RunConfig.load(str(run)).data_plan_version not in PLAN_VERSIONS):
+    if whole or laid_out_otherwise(run, objective):
         with pytest.raises(ValueError):
             resume()
         return False
     resume()
+    return True
+
+
+def refused_by_its_plan(run: Path, train: Callable[[], object], *, exact: bool) -> bool:
+    """Whether this Dew reads none of the data plan version `run` was saved under
+    (`dew.data.plan.PLAN_VERSIONS`) and `train`, which prepares it and trains, resumes it `exact`ly,
+    refused then before a step; a relaxed resume starts that data again (`TrainerConfig.data_resume`)."""
+    if not exact or RunConfig.load(str(run)).data_plan_version in PLAN_VERSIONS:
+        return False
+    with pytest.raises(ValueError):
+        train()
     return True
 
 
@@ -153,6 +164,33 @@ def checkout_of(tmp_path: Path, recorded: str) -> Path:
         (here / place.name).unlink(missing_ok=True)
         (here / place.name).write_bytes(given.read_bytes())
     return mirror
+
+
+def laid_out_otherwise(run: Path, objective) -> bool:
+    """Whether `run`'s last checkpoint holds a decision backbone's projections packed, as a run trained from
+    a loaded task stored them before ledger 2299's fix: a group the backbone declares
+    (`dew.inference.projections.declared_groups`) stored as its packed leaf in place of its members. A
+    resume refuses such a checkpoint (Dew continues no earlier Dew's layout); the run's weights still load
+    (`Decide.from_run`)."""
+    from dew.batch import part, thaw
+    from dew.decision.objective import DecisionObjective
+    from dew.inference.projections import declared_groups
+
+    if not isinstance(objective, DecisionObjective):
+        return False
+    with Checkpoints(str(run)) as checkpoints:
+        stored = checkpoints.stored()["variables"]["params"]["backbone"]
+    today = part(thaw(jax.eval_shape(objective.init, jax.random.key(0))), "backbone")
+
+    def held(tree, path):
+        for key in path:
+            if key not in tree:
+                return False
+            tree = tree[key]
+        return True
+
+    return any(held(stored, (*group.path, group.packed)) and not held(stored, (*group.path, group.members[0]))
+               for group in declared_groups(objective.model.backbone, today))
 
 
 def extracted(tmp_path: Path, recorded: str, kind: str) -> Path:
@@ -262,10 +300,14 @@ def test_an_earlier_mains_run_resumes_its_state_and_its_data_by_its_mode(
                                   resume="require", compilation_cache_dir=None, multi_host=False,
                                   data_resume=data_resume, **steps)
     sources = {"data": here.data, "validation": here.validation}
-    if not resumed_by_its_format(run, lambda: dataclasses.replace(
+    if refused_by_its_plan(run, lambda: dataclasses.replace(
             recorded_run, trainer=trainer, **sources).prepare().train(kind), exact=data_resume == "exact"):
         stepped = [step for step, _ in LocalTracker(run / "tracking").scalars()]
         assert max(stepped) <= last
+        return
+    prepared = dataclasses.replace(recorded_run, trainer=trainer, **sources).prepare()
+    trained = []
+    if not resumed_by_its_format(run, prepared.objective, lambda: trained.append(prepared.train(kind))):
         return
     records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
     started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
@@ -297,9 +339,13 @@ def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_pat
     """A kind's run saved at an earlier main resumes from its last checkpoint when the run that made it is
     built again from its command (`rebuilt`): every field it leaves for its build to resolve takes the
     saved run's value (`RunConfig.BUILT`: a decision run's option text, its rows' writing, row 3848, and
-    its source's storage), so the resume compares alike and fits the one step past its checkpoint."""
+    its source's storage), so the resume compares alike and fits the one step past its checkpoint. A run
+    whose checkpoint is of an older format than the one before the current is refused instead
+    (`resumed_by_its_format`); one whose data plan version this Dew reads none of resumes relaxed, the
+    default, its data started again."""
     run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
-    if not resumed_by_its_format(run, lambda: built.prepare().train(kind)):
+    prepared = built.prepare()
+    if not resumed_by_its_format(run, prepared.objective, lambda: prepared.train(kind)):
         return
     records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
     started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
@@ -320,7 +366,8 @@ def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, 
     the saved run states (train 589's review: a run trained so read by this Dew's version and recorded
     none, so a saved run's resume was refused; train 627's: the chain's path was not the one proven). The
     run it resumes is the one `train` is given the name of, whatever its trainer names, none or another
-    (`named`)."""
+    (`named`). A run whose checkpoint is of an older format than the one before the current is refused
+    instead (`resumed_by_its_format`)."""
     run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
     stated = RunConfig.load(str(run)).data_plan_version
 
@@ -333,9 +380,7 @@ def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, 
         python.train(prepared.objective, data, name=kind, metrics=prepared.metrics, rollout=prepared.rollout,
                      summary=prepared.summary, validation=validation, after=prepared.after)
 
-    # Relaxed, the default, it resumes whatever plan wrote its data, started again where this Dew reads
-    # none of that plan.
-    if not resumed_by_its_format(run, train):
+    if not resumed_by_its_format(run, built.prepare().objective, train):
         return
     records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
     started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
@@ -350,15 +395,17 @@ def test_a_run_saved_while_its_version_was_data_plan_loads_and_resumes_by_it(tmp
                                                                              version):
     """A run a Dew saved while a run's data plan version was its field `data_plan` (main 1af304d0, before
     the field was `data_plan_version`, train 589's review) records the version it compiled at, or None
-    where it was trained in Python, which that Dew compiled at this Dew's, 9: it loads by that version and
-    resumes when its command runs again (row 4107)."""
+    where it was trained in Python, which that Dew compiled at this Dew's, 9: it loads by that version,
+    which this Dew reads none of, so its command run again resumes relaxed, the default, its data started
+    again (row 4107)."""
     recorded, kind = next((recorded, kind) for recorded, kind in SAVED if kind == "lm")
     run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
     record = json.loads((run / "run.json").read_text())
     fields = {name: value for name, value in record["fields"].items() if name != "data_plan_version"}
     (run / "run.json").write_text(json.dumps({**record, "fields": {**fields, "data_plan": landed}}))
     assert RunConfig.load(str(run)).data_plan_version == version
-    if not resumed_by_its_format(run, lambda: built.prepare().train(kind)):
+    prepared = built.prepare()
+    if not resumed_by_its_format(run, prepared.objective, lambda: prepared.train(kind)):
         return
     records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
     started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]

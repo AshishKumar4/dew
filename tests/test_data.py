@@ -1238,45 +1238,51 @@ def test_from_grain_scores_a_validation_pass_that_ends():
     assert _indices(data.val(DataPartition()), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
 
 
-def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path):
-    """The seam is only worth having if the trainer treats it as any other
-    dataset: a run over it checkpoints its iterator position, and a resume
-    reads the batches after the checkpoint rather than replaying them."""
+@pytest.mark.parametrize("source", ["grain", "records in memory"])
+def test_a_run_over_a_data_source_checkpoints_and_resumes_where_it_stopped(tmp_path, source):
+    """The seams to a caller's Grain dataset and to records in memory are only worth having if the trainer
+    treats each as any other dataset: a run over it checkpoints its iterator position, and a resume reads
+    the batches after the checkpoint rather than replaying them, ending where an uninterrupted run ends:
+    its weights, its optimizer's moments, and the step and data position its last checkpoint holds."""
     import optax
     from flax import linen as nn
 
     from dew.objectives.base import Aux, Objective
     from dew.training import Checkpoints, Layout, Trainer
 
+    # The simulated mesh is eight devices wide, so a step is eight records.
+    width, outputs, steps, data, target = {
+        "grain": (3, 2, 4, lambda: compile(Pipeline(Memory(_grain_points())).repeat().batch(8),
+                                           read="indexed", **WORKERS), lambda batch: batch["y"]),
+        "records in memory": (2, 1, 5, lambda: _records(_columns(16), 8),
+                              lambda batch: batch["index"][:, None].astype(jnp.float32)),
+    }[source]
+
     class Regression(Objective):
-        """Squared error of an affine map against twice its input."""
+        """Squared error of an affine map against the source's target."""
 
         def __init__(self):
-            self.model = nn.Dense(2)
+            self.model = nn.Dense(outputs)
 
         def fresh_variables(self, key, held):
-            return self.model.init(key, jnp.zeros((1, 3)))
+            return self.model.init(key, jnp.zeros((1, width)))
 
         def loss(self, variables, batch, step):
-            return jnp.mean((self.model.apply(variables, batch["x"]) - batch["y"]) ** 2), Aux({})
+            return jnp.mean((self.model.apply(variables, batch["x"]) - target(batch)) ** 2), Aux({})
 
-    def run(steps, directory=None):
-        trainer = Trainer(
-            Regression(), optax.sgd(0.1), key=jax.random.key(0),
-            layout=Layout(min_shard=1, tolerance=1.0),
-            checkpoints=None if directory is None else Checkpoints(str(directory)))
-        # The simulated mesh is eight devices wide, so a step is eight records.
-        return trainer.fit(compile(Pipeline(Memory(_grain_points())).repeat().batch(8), read="indexed",
-            **WORKERS),
-                           steps=steps, log_every=1,
-                           checkpoint_every=None if directory is None else 2)
+    def run(steps, directory):
+        trainer = Trainer(Regression(), optax.sgd(0.01, momentum=0.9), key=jax.random.key(0),
+                          layout=Layout(min_shard=1, tolerance=1.0), checkpoints=Checkpoints(str(directory)))
+        state = trainer.fit(data(), steps=steps, log_every=1, checkpoint_every=2)
+        trainer.checkpoints.wait()
+        held, _, position = trainer.place()
+        return state, (int(held.step), None if position is None else position.decode())
 
     run(2, tmp_path / "run")
-    resumed = run(4, tmp_path / "run")
-    whole = run(4)
-
-    for expected, actual in zip(jax.tree.leaves(whole.variables),
-                                jax.tree.leaves(resumed.variables), strict=True):
+    (resumed, resumed_end), (whole, whole_end) = run(steps, tmp_path / "run"), run(steps, tmp_path / "whole")
+    assert resumed_end == whole_end and resumed_end[1] is not None
+    for expected, actual in zip(jax.tree.leaves((whole.variables, whole.opt_state)),
+                                jax.tree.leaves((resumed.variables, resumed.opt_state)), strict=True):
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
@@ -1472,44 +1478,6 @@ def test_an_epoch_of_records_too_few_for_one_batch_is_one_step():
     finally:
         stream.close()
     assert data.epoch_steps(1) == 1
-
-
-def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(tmp_path):
-    """The in-memory route exists so a first run can checkpoint. A resumed run
-    reads the records after the checkpoint and ends where an uninterrupted
-    run ends."""
-    import optax
-    from flax import linen as nn
-
-    from dew.objectives.base import Aux, Objective
-    from dew.training import Checkpoints, Layout, Trainer
-
-    class Regression(Objective):
-        def __init__(self):
-            self.model = nn.Dense(1)
-
-        def fresh_variables(self, key, held):
-            return self.model.init(key, jnp.zeros((1, 2)))
-
-        def loss(self, variables, batch, step):
-            target = batch["index"][:, None].astype(jnp.float32)
-            return jnp.mean((self.model.apply(variables, batch["x"]) - target) ** 2), Aux({})
-
-    def run(steps, directory=None):
-        trainer = Trainer(
-            Regression(), optax.sgd(0.01), key=jax.random.key(0),
-            layout=Layout(min_shard=1, tolerance=1.0),
-            checkpoints=None if directory is None else Checkpoints(str(directory)))
-        return trainer.fit(_records(_columns(16), 8), steps=steps, log_every=1,
-                           checkpoint_every=None if directory is None else 2)
-
-    run(2, tmp_path / "run")
-    resumed = run(5, tmp_path / "run")
-    whole = run(5)
-
-    for expected, actual in zip(jax.tree.leaves(whole.variables),
-                                jax.tree.leaves(resumed.variables), strict=True):
-        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 def test_a_batch_encoders_reader_is_part_of_the_plan_a_resume_checks():

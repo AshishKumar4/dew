@@ -133,8 +133,9 @@ def test_moe_fixtures_are_what_the_generator_writes(tmp_path):
 
 def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
     """Exact checkpoint, tokenizer and pixels, and the recorded outputs' names, shapes and dtypes; each
-    output an evaluation of transformers' float32 towers on those inputs (`assert_same_artifact`, an
-    artifact check against the float64 run, not a parity)."""
+    output, the generator's written now and the committed one, an evaluation of transformers' float32
+    towers on those inputs (`assert_same_artifact`, an artifact check against the float64 run, not a
+    parity): a generator writing zeros or another output of the same shape fails."""
     import torch
 
     load("clip_reference").write_tiny(tmp_path)
@@ -152,8 +153,29 @@ def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
         recomputed, wide = (transformers_clip(tmp_path, inputs, dtype, CLIP_OUTPUTS)
                             for dtype in (torch.float32, torch.float64))
         for name in CLIP_OUTPUTS:
-            assert_same_artifact(np.asarray(recomputed[name], np.float64),
-                                 np.asarray(theirs[name], np.float64), wide[name], name)
+            for written in (ours, theirs):
+                assert_same_artifact(np.asarray(recomputed[name], np.float64),
+                                     np.asarray(written[name], np.float64), wide[name], name)
+
+
+# ---------------------------------------------------------------------------
+# tools/saved_runs_reference.py
+# ---------------------------------------------------------------------------
+
+def test_a_recording_of_some_kinds_extends_its_generations_manifest(tmp_path):
+    """A second recording of other kinds at the same commit names them beside the first's in its
+    generation's manifest, which test_saved_runs.py reads its kinds from, so no recorded kind's checks
+    drop out; a recording at another commit into the same manifest is refused, the manifest as it was."""
+    tool = load("saved_runs_reference")
+    manifest, commit = tmp_path / "source.json", "a" * 40
+    tool.publish(manifest, commit, ["lm"])
+    tool.publish(manifest, commit, ["diffusion", "lm"])
+    held = json.loads(manifest.read_text())
+    assert held == {"commit": commit, "kinds": ["diffusion", "lm"], "evidence": tool.EVIDENCE}
+    with pytest.raises(ValueError):
+        tool.publish(manifest, "b" * 40, ["decision"])
+    assert json.loads(manifest.read_text()) == held
+    assert [path.name for path in tmp_path.iterdir()] == ["source.json"]
 
 
 # ---------------------------------------------------------------------------
