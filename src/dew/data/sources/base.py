@@ -19,6 +19,7 @@ in a run's metrics, never its identity.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import itertools
 import logging
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
@@ -143,6 +144,12 @@ class ShardManifest:
     index_ordered: bool = False
     counted: Callable[[int], tuple[int, ...]] | None = None
     fixed_parts: bool = False
+
+    @property
+    def digest(self) -> str:
+        """The shards' ids in their order as one digest: what a stream reads in turn, which a plan records
+        as its `shards` rule's fact (`dew.data.compile._derived`) and a resume compares."""
+        return hashlib.sha256("\n".join(shard.id for shard in self.shards).encode()).hexdigest()[:16]
 
     def parts(self) -> tuple[Shard, ...]:
         """The store's finer shards its subdivision always cuts (`fixed_parts`), as a read by more readers

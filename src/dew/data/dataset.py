@@ -30,7 +30,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
 import jax
@@ -1732,6 +1732,12 @@ class PhasedStream:
 
 
 class StepPhases(Forwarding):
+    CONTINUES: ClassVar[str] = "stamped"
+    """The `phases` rule a read of phases that share a corpus records in its position (docs/design/data.md,
+    the rules): a later phase continues a shared corpus from the stamped draws the run trained
+    (`_Frontier`). A position of a plan of 13, whose phases each read a corpus from its start, records
+    none, and resumes under that plan, which shares nothing (`dew.data.compile`)."""
+
     """Reads phases on the step clock one after another, each its own stream, opened at the step the
     phase before it ends: a read per share among them, cut per share where its order is (a stream batched
     by its tokens after steps that drop rows), whose records no global count places. Phase `p` reads
@@ -1875,9 +1881,9 @@ class StepPhases(Forwarding):
         from dew.data.mixing import Left
 
         carried = {corpus: [to_record(left, Left) for left in held] for corpus, held in self._carried.items()}
-        shared = {"carried": carried, "trained": [[node, member, frontier.record()]
-                                                  for (node, member), frontier in self._trained.items()]
-                  } if any(self._shared) else {}
+        trained = [[node, member, frontier.record()] for (node, member), frontier in self._trained.items()]
+        shared = ({"phases": self.CONTINUES, "carried": carried, "trained": trained}
+                  if any(self._shared) else {})
         return json.dumps({_position.STEP_PHASES: {
             "steps": self._steps, "phase": phase, "ends": self._ends[:phase], **shared,
             "identities": [self._identity(index) for index in range(phase + 1)],
@@ -1901,6 +1907,12 @@ class StepPhases(Forwarding):
         if end is not None and steps > end:
             raise ValueError(f"the saved run has read {steps} steps, past this run's end of phase {phase} "
                              f"at {end}")
+        rule = saved.get("phases")
+        if (rule == self.CONTINUES) != any(self._shared):
+            raise ValueError(f"the saved run's phases continue a corpus they share by the phases rule "
+                             f"{rule!r}, and this run's by {self.CONTINUES if any(self._shared) else None!r} "
+                             "(docs/design/data.md, the rules): resume it by the data plan version it was "
+                             "saved under, as a run config's resume does")
         own = base64.b64decode(text(saved["position"], "the saved phase's position"))
         # What a position saved before phases shared corpora holds of them: none.
         from dew.data.mixing import Left

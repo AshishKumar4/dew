@@ -591,6 +591,12 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
             read.close()
 
 
+MIX = "declared-order"
+"""The `mix` rule a plan of a weighted mix records (`Proportions`): Grain's whole proportions of its weights,
+its members in the order the mix declares them, each window's choices permuted by its seed. A behaviour
+change of it is a new value (docs/design/data.md, the rules)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Proportions:
     """A weighted mix's selection policy, Grain's (`MapDataset.mix`): the weights scaled so the least

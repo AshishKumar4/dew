@@ -139,8 +139,17 @@ from dew.data.pipeline import (
     with_children,
     with_stores,
 )
-from dew.data.plan import PLAN_VERSIONS, Plan, StepIdentity, fingerprint, read_by, spelled, unplaced
-from dew.data.readers import Opener, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
+from dew.data.plan import (
+    PLAN_VERSIONS,
+    STRUCTURED,
+    Plan,
+    StepIdentity,
+    fingerprint,
+    read_by,
+    spelled,
+    unplaced,
+)
+from dew.data.readers import GRAIN, Opener, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
     Read,
     Rows,
@@ -564,6 +573,10 @@ def _derived(pipeline: Pipeline, build: _Build) -> Mapping[str, str]:
             arrays[f"{index}/physical_shards"] = fingerprint(list(sizes))
         if read != "streamed":
             arrays[f"{index}/index"] = fingerprint([len(source.records(read)), seed])
+        elif build.version >= STRUCTURED:
+            # The `shards` rule's fact: the shards a stream reads in turn (`ShardManifest.digest`), which a
+            # plan of 13 recorded none of.
+            arrays[f"{index}/shards"] = source.manifest().digest
         metadata = source.metadata()
         if "valid_targets" in metadata:
             arrays[f"{index}/valid_targets"] = fingerprint(
@@ -1139,6 +1152,7 @@ def _compiled(
         _derived(train, build),
         cache=_cache_references(original, read, build.version),
         members={key: fingerprint(manifest) for key, manifest in members.items()},
+        rules=build.rules(train),
         volatile=any(_volatile(stage) for stage in
                      (*_steps(original), *(stage for source in sources for stage in _written(source, ())))),
         version=build.version,
@@ -1369,7 +1383,10 @@ def _compile_phases(
     # Phases on the step clock whose first reads per share (its order cut where each share reads it: a
     # stream batched by its tokens after steps that drop rows) read each its own stream (`StepPhases`).
     per_share = not tokens and not first.build.global_order
-    shared = _shared(source) if per_share else tuple({} for _ in source.pipelines)
+    # A plan of 13 read each phase's corpora from their start, which its resume reads again
+    # (`StepPhases.CONTINUES`).
+    shared = (_shared(source) if per_share and plan_version >= STRUCTURED
+              else tuple({} for _ in source.pipelines))
     staged: list[tuple[_Staged, int | None]] = (
         _own_streams(source, first, shared, staged_at) if per_share else [])
     for index, until in () if per_share else enumerate(source.ends):
@@ -1617,8 +1634,9 @@ def _training_reader(
     else:
         def per_share(chosen: _Build) -> tuple[Opener, Plan]:
             """The reader `chosen` opens over this share and the plan its positions name."""
+            # Its rules its build's, and Grain's, whose iterator state its position holds (`GRAIN`).
             return functools.partial(chosen.batches, pipeline, partition), dataclasses.replace(
-                plan, version=chosen.version,
+                plan, version=chosen.version, rules={**chosen.rules(pipeline), "grain": GRAIN},
                 # An elastic read's order is one reader's at any count, its position every reader's.
                 topology={"elastic": True} if chosen.elastic else {
                     "shares": partition.count,

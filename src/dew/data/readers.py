@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import importlib.metadata
 import json
 import os
 import uuid
@@ -32,9 +33,24 @@ from dew.data.dataset import (
 )
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
-from dew.data.plan import COUNTERS, PLAN_VERSIONS, Plan
+from dew.data.plan import COUNTERS, PLAN_VERSIONS, STRUCTURED, Plan
 from dew.data.shared import SharedMapping
 from dew.data.storage import MIRRORED, Mirrored, PositionText, carried_mirrors
+
+GRAIN = importlib.metadata.version("grain")
+"""The `grain` rule a per-share read's plan records (`dew.data.plan.Plan.rules`): the Grain whose iterators'
+states its position holds, which a resume under another compares by their layout (`layout`)."""
+
+
+def layout(state: object) -> object:
+    """`state`, an iterator's saved state, as its keys and their nesting alone: a mapping's keys each with
+    its value's layout, a sequence's entries', any other value's type's name."""
+    if isinstance(state, Mapping):
+        return {key: layout(value) for key, value in state.items()}
+    if isinstance(state, (list, tuple)):
+        return [layout(value) for value in state]
+    return type(state).__name__
+
 
 READER_FIELDS = (EXAMPLES_CONSUMED, VALID_ROWS)
 """A batch's fields its reader owns, which a host step after the batch neither reads nor writes
@@ -310,11 +326,32 @@ class _PerShare(Forwarding):
                 ".elastic() on the chain")
         decoded = record(json.loads(state), "saved per-share position") if held is None else held
         self.resumed_at(decoded)
-        self._plan.check(record(decoded.get("dew_data_plan"), "saved data plan"), resume=self._resume)
+        written = record(decoded.get("dew_data_plan"), "saved data plan")
+        self._plan.check(written, resume=self._resume)
         saved = record(decoded.get("iterator"), "saved Grain iterator")
+        if self._plan.version >= STRUCTURED:
+            self._grain_alike(record(written.get("rules", {}), "saved data plan rules").get("grain"), saved)
         self.close()
         self._saved = saved
         self._statistics.publish(None)
+
+    def _grain_alike(self, saved: object, iterator: Mapping[str, object]) -> None:
+        """Refuse a position whose iterator state a Grain of another version wrote (`saved`, its `grain`
+        rule, `GRAIN`) in another layout than this read's: its keys and their nesting (`layout`), which
+        a Grain that changed its iterators' states writes otherwise. A state of the same layout resumes."""
+        if saved == GRAIN:
+            return
+        reader = self._open()
+        try:
+            today = reader.get_state()
+        finally:
+            if isinstance(reader, Closeable):
+                reader.close()
+        if layout(today) != layout(iterator):
+            raise ValueError(f"the saved data position's iterator state was written by grain {saved}, in "
+                             f"another layout than this grain {GRAIN}'s reads (docs/design/data.md, the "
+                             f"rules): resume with grain=={saved}, or go on from the run's weights as a new "
+                             "run that reads its data afresh")
 
     def resumed_at(self, decoded: Mapping[str, object]) -> None:
         """Read on as the saved position `decoded` was read where it was saved under another plan version

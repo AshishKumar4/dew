@@ -27,7 +27,7 @@ import itertools
 import logging
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Protocol, overload, runtime_checkable
 
 import grain.experimental as gx
 import grain.python as pygrain
@@ -137,6 +137,7 @@ from dew.data.pipeline import (
     Windows,
     Workers,
     accounts,
+    chains,
     children,
     consumed_by,
     drawn_of,
@@ -1257,6 +1258,22 @@ class _Build:
     each draw of them says which it is (`DRAWN`, `dew.data.mixing.Stamping`), so the phase that reads one
     next continues it from the draws the run trained. Empty for any other read."""
 
+    def rules(self, pipeline: Pipeline) -> dict[str, str]:
+        """The rules deciding which rows come next that a read of `pipeline` by this build reads by, each
+        its owner's one statement (docs/design/data.md, the rules): how its steps are named
+        (`dew.data.plan.IDENTITY`), a shuffle's key (`SHUFFLE`), a mix's schedule (`dew.data.mixing.MIX`),
+        and, where its loading workers read its inputs in their order, how they are dealt
+        (`dew.data.elastic_order.DEALING`); only those the read uses. A plan records them
+        (`dew.data.plan.Plan.rules`) and a resume compares them."""
+        from dew.data.elastic_order import DEALING
+        from dew.data.mixing import MIX
+        from dew.data.plan import IDENTITY
+
+        mixed = any(isinstance(chain.source, Mixture) for chain in chains(pipeline))
+        shuffled = any(isinstance(stage, Shuffle) for stage in _steps(pipeline))
+        return {"identity": IDENTITY, **({"shuffle": self.SHUFFLE} if shuffled else {}),
+                **({"mix": MIX} if mixed else {}), **({"dealing": DEALING} if self.in_order else {})}
+
     def counting(self, pipeline: Pipeline) -> bool:
         """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
         examples marks them (`_consumes`), and a phase's mix whose members other phases read on marks each
@@ -1811,6 +1828,10 @@ class _Build:
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline), rows=False,
                             members=members, credits=True)
         return rows
+
+    SHUFFLE: ClassVar[str] = "corpus-key"
+    """The `shuffle` rule a plan of a shuffled read records (`ordered`): each shuffle's seed keyed by its
+    corpus's own key. A behaviour change of it is a new value (docs/design/data.md, the rules)."""
 
     def ordered(self, stage: Shuffle) -> Shuffle:
         """`stage` as this build reads it: a shuffle draws from its seed and its corpus's own key, the one

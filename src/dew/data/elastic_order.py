@@ -63,6 +63,12 @@ class _Gathered(pygrain.MapDataset):
         return f"_Gathered(start={self._start}, size={self._size})"
 
 
+DEALING = "input-order-groups"
+"""The `dealing` rule a plan records where its loading workers read its inputs in their order (`_InputOrder`,
+`dew.data.lowering._Build.in_order`): consecutive groups dealt to the workers in turn and handed on in
+turn. A behaviour change of it is a new value (docs/design/data.md, the rules)."""
+
+
 class _InputOrder(pygrain.IterDataset):
     """An elastic read's indexed rows read in its loading workers (`_Build.handed`), in the inputs'
     order whatever their count: groups of `size` consecutive inputs (`handoff._Grouped`), group k read by

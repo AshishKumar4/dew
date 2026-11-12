@@ -277,6 +277,12 @@ def _dependencies(step: DataclassInstance) -> Mapping[str, object]:
     return dependencies
 
 
+IDENTITY = "structured"
+"""The `identity` rule a plan records (`StepIdentity`, `structured`): each step's configuration described by
+its structure. A plan of 13 printed it (`StepIdentity.printed`), which this Dew reads; a behaviour change of
+it is a new value (docs/design/data.md, the rules)."""
+
+
 def structured(value: object) -> JSON:
     """`value`, a step or any part of one, described by its structure, the one description a plan of version
     `STRUCTURED` or later records: a dataclass by its class and each field it records (`repr=True`, and an
@@ -720,12 +726,19 @@ class Plan:
     """A mixture's members, each what it reads and runs as one digest under its key, and its own
     stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
     resume reads of a member that joined or left (`check`)."""
+    rules: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    """The rules deciding which rows come next that its read reads by, by name, each its owner's value
+    (`dew.data.lowering._Build.rules`, and `grain` for a per-share read's Grain-owned state,
+    `dew.data.readers.GRAIN`): recorded from `STRUCTURED` on, as 13 read by rules of its own its version
+    names, and compared by name where a position resumes (`check`)."""
     version: int = PLAN_VERSIONS[-1]
     """The version the plan is read into rows by (`PLAN_VERSIONS`): this Dew's, or the one a run saved
     under, which reads it as it did (`dew.data.compile.compile`'s `plan_version`)."""
 
     def record(self) -> dict[str, JSON]:
+        rules: dict[str, JSON] = {} if self.version < STRUCTURED else {"rules": dict(self.rules)}
         return {
+            **rules,
             "version": self.version,
             "lowering": self.lowering,
             "manifest": self.manifest.semantic(self.version),
@@ -789,6 +802,8 @@ class Plan:
                 f"the saved data position was written under data plan version {written!r}, and this read is "
                 f"of version {current['version']!r}, which makes other rows or draws from the same plan; "
                 f"{route}{_RESUMED}")
+        if self.version >= STRUCTURED:
+            self._rules_alike(record(saved.get("rules", {}), "saved data plan rules"))
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(
                 "data plan contains a step without stable identity or a store given no name "
@@ -869,6 +884,17 @@ class Plan:
         if edited:
             _log.warning("resuming a mixture whose members changed: %s", ", ".join(edited))
         return changes + (edited or ())
+
+    def _rules_alike(self, saved: Mapping[str, object]) -> None:
+        """Refuse a saved plan that read by a rule (`rules`) whose value is not this Dew's, naming the rule:
+        its rows come next by another rule than this read's. Grain's, whose iterator state a reader
+        compares itself (`dew.data.readers._PerShare.set_state`), is not compared here."""
+        for name in sorted((set(saved) | set(self.rules)) - {"grain"}):
+            if saved.get(name) != self.rules.get(name):
+                raise ValueError(
+                    f"the saved data position read by the {name} rule {saved.get(name)!r}, and this Dew "
+                    f"reads by {self.rules.get(name)!r}, which decides other rows next (docs/design/data.md, "
+                    f"the rules): {_RESUMED}")
 
     def _edited_members(self, saved: Mapping[str, object]) -> tuple[str, ...] | None:
         """How a streamed mix's members changed from `saved`'s, which a resume takes: members that
