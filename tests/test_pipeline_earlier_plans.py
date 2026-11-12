@@ -11,7 +11,8 @@ import pytest
 from dew.data import Memory
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
-from dew.data.pipeline import Pipeline
+from dew.data.pipeline import Pipeline, mix
+from dew.data.sources import Files
 
 
 def test_a_position_a_plan_this_dew_reads_none_of_saved_is_refused():
@@ -73,3 +74,119 @@ def test_a_position_resumes_under_the_plan_version_that_saved_it_through_a_grown
     with pytest.raises(ValueError):
         changed.set_state(saved)
     changed.close()
+
+
+def test_a_streamed_position_of_13_resumes_in_a_read_compiled_by_this_dew_as_13_read_it():
+    """A streamed read per share saved under plan 13 resumes in the same chain compiled at this Dew's
+    version, as 13 read it (`dew.data.readers._PerShare.resumed_at`): onto the rows 13 read next, its
+    positions naming 13 still."""
+    stream = compile(_taken(20), read="streamed", loading=Loading(workers=0), plan_version=13).train(
+        DataPartition())
+    _ids(stream, 3)
+    saved = stream.get_state()
+    after = _ids(stream, 4)
+    stream.close()
+    resumed = compile(_taken(20), read="streamed", loading=Loading(workers=0)).train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        assert _ids(resumed, 4) == after
+        assert json.loads(resumed.get_state())["dew_data_plan"]["version"] == 13
+    finally:
+        resumed.close()
+
+
+def _saved(chain, **options) -> tuple[bytes, list[list[int]]]:
+    """A streamed per-share read of `chain`, saved after two batches, and the two it reads next."""
+    stream = compile(chain, read="streamed", loading=Loading(workers=0), **options).train(DataPartition())
+    try:
+        _ids(stream, 2)
+        return stream.get_state(), _ids(stream, 2)
+    finally:
+        stream.close()
+
+
+def _edited(state: bytes, edit) -> bytes:
+    """`state`, a per-share position, with `edit` applied to its decoded record."""
+    decoded = json.loads(state)
+    edit(decoded)
+    return json.dumps(decoded).encode()
+
+
+def test_a_position_read_by_another_rule_is_refused_naming_it():
+    """A position whose plan read by a rule this Dew reads otherwise (a mix's schedule) is refused, the
+    refusal naming the rule (docs/design/data.md, the rules); the position as saved resumes."""
+    chain = mix([_named("a", 1), _named("b", 2)], seed=4).batch(2)
+    saved, after = _saved(chain)
+
+    def other_mix(decoded):
+        decoded["dew_data_plan"]["rules"]["mix"] = "another-schedule"
+
+    for state, refused in ((_edited(saved, other_mix), True), (saved, False)):
+        stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+        try:
+            if refused:
+                with pytest.raises(ValueError, match="mix"):
+                    stream.set_state(state)
+            else:
+                stream.set_state(state)
+                assert _ids(stream, 2) == after
+        finally:
+            stream.close()
+
+
+def test_a_position_another_grain_wrote_resumes_where_its_state_is_laid_out_alike():
+    """A position whose iterator state another Grain wrote (its `grain` rule) resumes where the state is
+    laid out as this Grain's, and is refused where a key of it differs."""
+    chain = _taken(20)
+    saved, after = _saved(chain)
+
+    def other_grain(decoded):
+        decoded["dew_data_plan"]["rules"]["grain"] = "0.0.1"
+
+    def other_layout(decoded):
+        other_grain(decoded)
+        decoded["iterator"] = {"renamed": decoded["iterator"]}
+
+    stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+    try:
+        stream.set_state(_edited(saved, other_grain))
+        assert _ids(stream, 2) == after
+    finally:
+        stream.close()
+    stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+    try:
+        with pytest.raises(ValueError, match="grain"):
+            stream.set_state(_edited(saved, other_layout))
+    finally:
+        stream.close()
+
+
+def test_a_stream_whose_store_holds_other_shards_is_refused(tmp_path):
+    """A streamed position of a store of files resumes where the store holds the shards the read that saved
+    it read in turn, and is refused where it holds others (its `shards` fact)."""
+    root = tmp_path / "rows"
+    root.mkdir()
+    for part in range(2):
+        rows = "".join(f'{{"id": {part * 10 + row}}}\n' for row in range(8))
+        (root / f"part-{part}.jsonl").write_text(rows)
+    chain = Pipeline(Files(str(root), format="jsonl")).repeat().batch(2)
+    saved, after = _saved(chain)
+    stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+    try:
+        stream.set_state(saved)
+        assert _ids(stream, 2) == after
+    finally:
+        stream.close()
+    (root / "part-2.jsonl").write_text('{"id": 99}\n')
+    stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+    try:
+        with pytest.raises(ValueError, match="shards"):
+            stream.set_state(saved)
+    finally:
+        stream.close()
+
+
+def _named(name: str, tag: int) -> Pipeline:
+    """A corpus of 16 ids named `name`, each the `tag`th corpus's, read on without end."""
+    return Pipeline(Memory({"id": np.arange(tag * 100, tag * 100 + 16, dtype=np.int32)}, shard_rows=4),
+                    name=name).repeat()
