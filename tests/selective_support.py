@@ -1,6 +1,6 @@
 """Mamba's selective scan held to recorded mamba_ssm (tools/mamba_selective_reference.py): a recorded case's
-seeded inputs drawn again without torch, and Dew's portable scan over them with every gradient, the
-recorder's sizing proxy and its float64 cross-check."""
+seeded inputs drawn again without torch, and Dew's portable scan over them with every gradient, whose
+float64 run is the recorder's cross-check of its oracle."""
 
 import jax
 import jax.numpy as jnp

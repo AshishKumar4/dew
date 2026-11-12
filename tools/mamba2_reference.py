@@ -289,7 +289,7 @@ PAIRED = frozenset({"starts", "padded", "tangent", "model_padded", "model_scored
 reference compared with itself resolved within no 512 draws: the resets' final state, only the last
 document's tokens writing it, the padded rows' outputs, twelve tokens and seven (m2-seeded-rec4 at
 c868cbbc6), the tangent's 24 tokens of one row and the tiny model's (eight wide) hidden states and logits
-(m2-sizing at 4412b99f9: each unresolved in the recorder's own planning)."""
+(m2-sizing at 4412b99f9: each unresolved where the recorder sized Dew's twin alone, as it then did)."""
 
 WEIGHED = frozenset({"tangent"})
 """The sites that declare check 1's weighed check (`assert_as_exact`'s `conditioning`), recorded whole with
@@ -334,8 +334,7 @@ def _recorded(site, draw, twin, reference) -> dict[str, np.ndarray]:
     if site in PAIRED:
         return record_case(site, draw, evaluate, store_inputs=False, summary=True,
                            dew=jax.jit(lambda inputs: twin(site, inputs)))
-    return record_case(site, draw, evaluate, lambda inputs: twin(site, inputs), store_inputs=False,
-                       summary=True)
+    return record_case(site, draw, evaluate, store_inputs=False, summary=True)
 
 
 def write_seeded(only: str | None = None) -> None:

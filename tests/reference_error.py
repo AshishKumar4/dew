@@ -968,8 +968,12 @@ def _conditioning(reference_fn, truth_fn, draw, seeds, ran=None, scale=None) -> 
     """Check 1's conditioning of `reference_fn` (dew.parity's `Conditioning`): its rounding scale at a draw as
     its arm runs (`summed_as_run`, a window loop's by window), or `scale(inputs, seed)` where its program is
     not one here (`assert_as_exact`'s `conditioning_scale`), its heavy elements over `seeds` as `ran`, its
-    compiled arm where given, runs it; the reference and its truth unrewritten, as their arms run."""
+    compiled arm where given, runs it; the reference and its truth unrewritten, as their arms run. A
+    recording that keeps no outputs gives its conditioning whole (`recorded_weighing`: the scale, the heavy
+    elements and the reference's weighed evidence, each read when it was made), and nothing here is run."""
     from rounding_bound import rounding_scale
+    if isinstance(scale, Conditioning):
+        return scale
     scaled = reference_fn.fn if isinstance(reference_fn, _Windowed) else reference_fn
 
     def scale_of(inputs, seed):
@@ -1840,14 +1844,30 @@ def recorded_weighing(stored, site: str) -> dict:
     """The weighed check a recorded `site` declares (`assert_as_exact`'s `conditioning` and
     `conditioning_scale`): its declared seeds, and each draw's rounding scale as recorded beside the
     reference's outputs (`<site>.scale.<leaf>`, tools/recorded_references.py's `record_case(scale=...)`),
-    read at the draw's index, the first of the indexed inputs (`indexed_recording`)."""
+    read at the draw's index, the first of the indexed inputs (`indexed_recording`). A recording that keeps
+    no outputs (`record_case(scale=..., summary=True)`) holds the reference's side of the weighed check as
+    its recorder read it, and gives the conditioning whole: the scale, each leaf's heavy elements
+    (`<site>.heavy.<leaf>`) and the reference's weighed evidence a draw (`<site>.weighed`, a recording of
+    evidence whose leaves are the classes', `dew.parity.Conditioning.recorded_evidence`)."""
     scales = {name.removeprefix(f"{site}.scale."): value for name, value in stored.items()
               if name.startswith(f"{site}.scale.")}
 
     def scale(inputs, seed):
         return {name: value[int(inputs[0])] for name, value in scales.items()}
 
-    return {"conditioning": int(stored[f"{site}.conditioning"]), "conditioning_scale": scale}
+    declared = int(stored[f"{site}.conditioning"])
+    if f"{site}.weighed.input_digest" not in stored:
+        return {"conditioning": declared, "conditioning_scale": scale}
+    # The masks in the leaves' order, a truth's tree's (`heavy_masks`), None for a leaf of no heavy element.
+    heavy = [stored.get(f"{site}.heavy.{name}") for name in sorted(scales)]
+    evidence = _recorded_evidence(stored, f"{site}.weighed")
+    dtypes = _recorded_tree(stored, f"{site}.weighed", "dtype")
+
+    def recorded_of(inputs, seed):
+        return {path: _recorded_leaf(evidence, str(dtypes[path]), path, int(inputs[0]))
+                for path in evidence["mse"]}
+
+    return {"conditioning": declared, "conditioning_scale": Conditioning(scale, heavy, recorded_of)}
 
 
 def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn=None, leaves=None):
@@ -1949,16 +1969,41 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     return draw, lookup(reference), lookup(truth)
 
 
+def _recorded_tree(stored, site: str, kind: str) -> dict[str, np.ndarray]:
+    """A recording's entries of `kind` (`<site>.<kind>.<leaf>`), by leaf."""
+    prefix = f"{site}.{kind}."
+    return {name.removeprefix(prefix): np.asarray(value) for name, value in stored.items()
+            if name.startswith(prefix)}
+
+
+def _recorded_evidence(stored, site: str) -> dict[str, dict[str, np.ndarray]]:
+    """A summary's evidence under `site`, each kind as the recording's layout holds it
+    (`dew.parity.RECORDED_KINDS`), by leaf: a site's own, its pilots' (`<site>.pilot`), or its weighed
+    check's (`<site>.weighed`, the classes' leaves)."""
+    return {kind: _recorded_tree(stored, site, kind) for kind in recorded_kinds("seed", "span", "offsets")}
+
+
+def _recorded_leaf(evidence, dtype: str, name: str, row: int) -> RecordedLeaf:
+    """The leaf `name`'s recorded evidence at a seed's `row` of `evidence` (`_recorded_evidence`)."""
+    start, stop = evidence["zero_offsets"][name][row], evidence["zero_offsets"][name][row + 1]
+    examples = {field: evidence[field][name][row] for field in ("example_mse", "example_worst")
+                if name in evidence[field]}
+    # A recording made before its worst rows' shares were kept holds none: the gate then reads the row by
+    # its width's factor (`_Draws.factor`).
+    share = float(evidence["share"][name][row]) if name in evidence["share"] else None
+    return RecordedLeaf(float(evidence["mse"][name][row]), float(evidence["worst"][name][row]),
+                        evidence["zero_rows"][name][start:stop], evidence["zero_errors"][name][start:stop],
+                        finite=bool(evidence["finite"][name][row]), dtype=dtype, share=share,
+                        **{field: None if np.isnan(value).all() else value
+                           for field, value in examples.items()})
+
+
 def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     """`indexed_recording` of a recording of the reference's evidence alone."""
     def tree(kind):
-        prefix = f"{site}.{kind}."
-        return {name.removeprefix(prefix): np.asarray(value) for name, value in stored.items()
-                if name.startswith(prefix)}
+        return _recorded_tree(stored, site, kind)
 
-    # A summary's evidence, each kind as the recording's layout holds it (`dew.parity.RECORDED_KINDS`).
-    kinds = recorded_kinds("seed", "span", "offsets")
-    verdict, pilot = ({kind: tree(prefix + kind) for kind in kinds} for prefix in ("", "pilot."))
+    verdict, pilot = (_recorded_evidence(stored, under) for under in (site, f"{site}.pilot"))
     mse, worst, finite, sketch, zero_offsets = (verdict[kind] for kind in
                                                 ("mse", "worst", "finite", "sketch", "zero_offsets"))
     shapes, dtypes = tree("shape"), tree("dtype")
@@ -1995,19 +2040,7 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
 
     def reference(index, inputs):
         evidence, _, row = held(int(index))
-
-        def leaf(name):
-            start, stop = evidence["zero_offsets"][name][row], evidence["zero_offsets"][name][row + 1]
-            examples = {field: evidence[field][name][row] for field in ("example_mse", "example_worst")
-                        if name in evidence[field]}
-            return RecordedLeaf(float(evidence["mse"][name][row]), float(evidence["worst"][name][row]),
-                                evidence["zero_rows"][name][start:stop],
-                                evidence["zero_errors"][name][start:stop],
-                                finite=bool(evidence["finite"][name][row]), dtype=str(dtypes[name]),
-                                **{field: None if np.isnan(value).all() else value
-                                   for field, value in examples.items()})
-
-        return {name: leaf(name) for name in mse}
+        return {name: _recorded_leaf(evidence, str(dtypes[name]), name, row) for name in mse}
 
     reference.recorded = True
     if pilots:

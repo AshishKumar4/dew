@@ -186,11 +186,8 @@ def main(destination: Path) -> None:
                     truth = torch_rule(reference, rule, inputs, torch.float64)
                 return found, truth
 
-            def proxy(inputs, rule=rule):
-                return rule_gradients(oracle_rule(rule), inputs)
-
-            recorded.update(record_case(f"{rule} rule", rule_inputs, evaluate, proxy, truth_proxy=proxy,
-                                        store_inputs=False, summary=True))
+            recorded.update(record_case(f"{rule} rule", rule_inputs, evaluate, store_inputs=False,
+                                        summary=True))
             recorded[f"{rule} rule.provenance"] = provenance(
                 "Transformers modeling_glm5_next", REVISION, "cpu", "python tools/kda_reference.py",
                 torch=torch.__version__)

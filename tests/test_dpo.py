@@ -68,9 +68,9 @@ def test_dpo_loss_rewards_and_gradient_match_trl(reference):
     the truth."""
     seeds = declared_seeds(FIXTURE)["dpo"]
     draw, recorded, truth = indexed_recording(reference, "dpo", seeds)
-    # Dew's composition over the TRL-layout batch, the one the recorder planned its seeds by: token
-    # log-probabilities off the shifted logits and `preference_logsigmoid_terms` over the halves.
-    composed = load("parity_dpo").proxy
+    # Dew's composition over the TRL-layout batch: token log-probabilities off the shifted logits and
+    # `preference_logsigmoid_terms` over the halves.
+    composed = load("parity_dpo").composed
 
     @jax.jit
     def dew(index, arrays):

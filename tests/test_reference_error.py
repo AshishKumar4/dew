@@ -1342,7 +1342,7 @@ def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
         return lambda inputs: fn(inputs["x"], inputs["w"])
 
     with jax.enable_x64(new_val=True):
-        recorded = recorder.record_case("site", draw, evaluate, as_inputs(live), summary=True)
+        recorded = recorder.record_case("site", draw, evaluate, summary=True)
     seeds = int(recorded["site.seeds"])
     assert_as_exact(dew, live, _draw, "live", seeds=seeds)
     drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
@@ -1353,8 +1353,7 @@ def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
     assert raised.type is GateFailure
 
 
-@pytest.mark.parametrize("planned", [False, True])
-def test_a_recording_keeps_the_larger_count_sized_on_another_backend(planned):
+def test_a_recording_keeps_the_larger_count_sized_on_another_backend():
     """A reference recorded on a CPU keeps the larger count a GPU's held-out paired sizing declared,
     including every draw its second stage may read."""
     from tool_support import load
@@ -1366,8 +1365,7 @@ def test_a_recording_keeps_the_larger_count_sized_on_another_backend(planned):
         return _product(inputs["x"], inputs["w"])
 
     with jax.enable_x64(new_val=True):
-        recorded = recorder.record_case("site", draw, evaluate, product if planned else None,
-                                        summary=True, start=256)
+        recorded = recorder.record_case("site", draw, evaluate, summary=True, start=256)
     seeds = int(recorded["site.seeds"])
     assert seeds >= 256
     assert len(recorded["site.input_digest"]) == staged_units(seeds)
@@ -1449,8 +1447,7 @@ def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
     draw, evaluate = _tiny_row_recording(live)
 
     with jax.enable_x64(new_val=True):
-        whole = recorder.record_case("site", draw, evaluate, lambda inputs: live(inputs["x"], inputs["w"]),
-                                     summary=True)
+        whole = recorder.record_case("site", draw, evaluate, summary=True)
         kept = len(whole["site.input_digest"])
         cut = kept // 3
         shards = [recorder.record_shard("site", draw, evaluate, seeds)
@@ -1524,7 +1521,7 @@ def test_a_recording_with_pilot_shards_sizes_paired_on_them_as_the_live_draws_do
     pilots = range(SIZING_FROM, SIZING_FROM + 2 * live)
 
     with jax.enable_x64(new_val=True):
-        whole = recorder.record_case("site", draw, evaluate, product, summary=True)
+        whole = recorder.record_case("site", draw, evaluate, summary=True)
         kept = len(whole["site.input_digest"])
         cut = SIZING_FROM + live // 2
         shards = [recorder.record_shard("site", draw, evaluate, seeds)
@@ -1600,8 +1597,7 @@ def test_a_recording_read_for_some_of_its_leaves_judges_them_alone():
 
     draw, evaluate = _tiny_row_recording(both)
     with jax.enable_x64(new_val=True):
-        whole = recorder.record_case("site", draw, evaluate, lambda inputs: both(inputs["x"], inputs["w"]),
-                                     summary=True)
+        whole = recorder.record_case("site", draw, evaluate, summary=True)
         recorded = recorder.with_pilots("site", whole, [recorder.record_shard(
             "site", draw, evaluate, range(SIZING_FROM, SIZING_FROM + 16))])
         seeds = int(recorded["site.seeds"])
@@ -1647,7 +1643,7 @@ def test_a_recorded_truth_over_windows_counts_one_window_and_checks_every_one():
         return {"y": product(inputs)["y"] * jnp.where(inputs["x"][0, 0] == last, 1 + 1e-6, 1.0)}
 
     with jax.enable_x64(new_val=True):
-        recorded = recorder.record_case("site", draw, evaluate, jax.vmap(product), summary=True)
+        recorded = recorder.record_case("site", draw, evaluate, summary=True)
         seeds = int(recorded["site.seeds"])
         for truth_fn, holds in ((product, True), (moved_last, False)):
             _, _, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
@@ -1766,8 +1762,7 @@ def _squared_case(first: int):
     return draw, evaluate
 
 
-@pytest.mark.parametrize("proxy", [True, False])
-def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path, proxy):
+def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path):
     """tools/recorded_references.py records a reference over the seeds its own recording resolves, and
     their redraw; check 1 then judges Dew against the recording by its index."""
     from tool_support import load
@@ -1779,7 +1774,7 @@ def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path
     def squared(inputs):
         return {"y": inputs["x"] * inputs["x"] - 1}
 
-    recorded = recorder.record_case("site", draw, evaluate, squared if proxy else None)
+    recorded = recorder.record_case("site", draw, evaluate)
     seeds = int(recorded["site.seeds"])
     assert seeds >= 8 and len(recorded["site.input.x"]) == 5 * seeds
     path = tmp_path / "recorded.npz"
@@ -1793,9 +1788,6 @@ def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path
             assert_as_exact(lambda index, inputs: {"y": jnp.asarray(inputs["x"]) ** 2}, reference,
                             draw_recorded, "recorded with its subtraction missing", seeds=seeds,
                             truth_fn=truth)
-    if not proxy:
-        with pytest.raises(ValueError):
-            recorder.record_case("site", draw, evaluate, None, truth_proxy=squared)
 
 
 def test_a_paired_recording_holds_its_sizing_draws_one_at_a_time():
@@ -1849,24 +1841,6 @@ def test_check_one_holds_an_empty_leaf_exact_by_construction():
                         truth_fn=fuller)
 
 
-def test_a_recording_keeps_the_confirmed_count_where_the_proxy_planned_more():
-    """A proxy whose one element needs more seeds than the recorded reference's 64 do: the recording
-    keeps (1 + REDRAW) times the count the recorded reference confirms, not what the proxy planned."""
-    from tool_support import load
-
-    recorder = load("recorded_references")
-
-    draw, evaluate = _squared_case(200)
-
-    def one_element(inputs):
-        return {"y": jnp.sum(inputs["x"] * inputs["x"])[None]}
-
-    planned = seeds_for(jax.jit(lambda inputs: one_element(inputs)), lambda seed: (draw(seed),), "proxy")
-    recorded = recorder.record_case("site", draw, evaluate, one_element)
-    seeds = int(recorded["site.seeds"])
-    assert planned > seeds and len(recorded["site.input.x"]) == 5 * seeds
-
-
 def test_an_input_digest_tells_apart_a_scalar_from_its_vector_and_two_formats_of_one_width():
     """Inputs drawn again in another shape or format with the same bytes are not the recorded ones."""
     assert input_digest({"x": np.float32(1)}) != input_digest({"x": np.ones(1, np.float32)})
@@ -1889,7 +1863,7 @@ def test_a_recording_of_outputs_alone_draws_its_inputs_again(tmp_path):
     def squared(inputs):
         return {"y": inputs["x"] * inputs["x"] - 1}
 
-    recorded = recorder.record_case("site", draw, evaluate, squared, store_inputs=False)
+    recorded = recorder.record_case("site", draw, evaluate, store_inputs=False)
     assert not any(name.startswith("site.input.") for name in recorded)
     seeds = int(recorded["site.seeds"])
     with pytest.raises(AssertionError):
@@ -1970,7 +1944,7 @@ def test_a_recording_of_the_references_evidence_alone_holds_the_recomputed_truth
     def wide(inputs):
         return {"y": jnp.dot(jnp.asarray(inputs["x"], jnp.float64), jnp.asarray(inputs["w"], jnp.float64))}
 
-    recorded = recorder.record_case("site", draw, evaluate, product, summary=True)
+    recorded = recorder.record_case("site", draw, evaluate, summary=True)
     assert not any(name.startswith(("site.reference.", "site.truth.", "site.input.")) for name in recorded)
     seeds = int(recorded["site.seeds"])
     drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=wide)
@@ -2214,7 +2188,7 @@ def test_a_summarized_recording_reads_back_as_its_reference_reads_live():
         return live(inputs["x"], inputs["w"])
 
     with jax.enable_x64(new_val=True):
-        recorded = recorder.record_case("site", draw, evaluate, truth_fn, summary=True)
+        recorded = recorder.record_case("site", draw, evaluate, summary=True)
         _, reference, _ = indexed_recording(recorded, "site", int(recorded["site.seeds"]), inputs_of=draw,
                                             truth_fn=truth_fn)
         zero_rows = 0
@@ -2222,7 +2196,7 @@ def test_a_summarized_recording_reads_back_as_its_reference_reads_live():
             outputs, truth = evaluate(draw(seed))
             for name, kept in reference(np.int32(seed), draw(seed)).items():
                 read = leaf_summary(outputs[name], truth[name])
-                fields = ("mse", "worst", "zero_rows", "zero_errors", "finite", "dtype")
+                fields = ("mse", "worst", "share", "zero_rows", "zero_errors", "finite", "dtype")
                 assert _bits([getattr(kept, field) for field in fields]) == _bits(
                     [getattr(read, field) for field in fields]), (seed, name)
                 zero_rows += len(kept.zero_rows)

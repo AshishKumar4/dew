@@ -645,17 +645,19 @@ NO_ZERO_ROWS: ZeroRows = (np.zeros(0, np.int64), np.zeros(0), np.zeros(0))
 
 RECORDED_KINDS = {
     "reference": "output", "truth": "output",
-    "mse": "seed", "worst": "seed", "finite": "seed", "sketch": "seed", "example_mse": "seed",
-    "example_worst": "seed", "scale": "seed",
+    "mse": "seed", "worst": "seed", "share": "seed", "finite": "seed", "sketch": "seed",
+    "example_mse": "seed", "example_worst": "seed", "scale": "seed",
     "zero_rows": "span", "zero_errors": "span", "zero_offsets": "offsets",
-    "shape": "whole", "dtype": "whole",
+    "shape": "whole", "dtype": "whole", "heavy": "whole",
 }
 """A recording's entries kept one a leaf, `<site>.<kind>.<leaf>` (a pilot's `<site>.pilot.<kind>.<leaf>`),
 each kind by how it is held: a full recording's outputs and truths over its seeds (`output`); a summarized
 one's evidence, one row a seed (`seed`: a `RecordedLeaf`'s summary, its truth's sketch, a stacked site's
 examples, a weighed site's rounding scales); its rows of float64 zero joined over the seeds (`span`), each
 seed's span of them between consecutive `offsets`; and what the whole recording holds once a leaf
-(`whole`). The one statement of the layout: the recorder writes and cuts by it
+(`whole`: its shape and dtype, and a weighed site's heavy elements, a mask). A summarized weighed site's
+reference's weighed evidence is a summary of its own under `<site>.weighed`, its leaves the weighed classes'
+(`classed_paths`). The one statement of the layout: the recorder writes and cuts by it
 (tools/recorded_references.py) and the gate reads by it (tests/reference_error.py). Every other entry
 (inputs, digests, counts, provenance) is the whole recording's."""
 
@@ -702,14 +704,17 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
     return leaf_summaries([reference], [truth])[0]
 
 
-def leaf_summaries(references, truths) -> list[RecordedLeaf]:
+def leaf_summaries(references, truths, terms=None) -> list[RecordedLeaf]:
     """Each reference leaf's `leaf_summary` against its truth, read at once (`_summaries`), each held to
-    its truth's shape first: a recording's record (tools/recorded_references.py)."""
+    its truth's shape first: a recording's record (tools/recorded_references.py). With `terms`, a leaf's
+    rows are sized by them as check 1 sizes a row by what it sums (`_LaidTruths.of`): a weighed arm's
+    residuals against their truth of zeros, every row of unit size (`Weighed.ones`)."""
     for reference, truth in zip(references, truths, strict=True):
         if np.shape(reference) != np.shape(truth):
             raise AssertionError(f"a leaf {np.shape(reference)} against a truth {np.shape(truth)}")
     # Every reference given, so every leaf has its summary (`_summaries`' None is a reference of None's).
-    return [summary for summary in _summaries(references, _LaidTruths.of(truths)) if summary is not None]
+    return [summary for summary in _summaries(references, _LaidTruths.of(truths, terms))
+            if summary is not None]
 
 
 def _missed(mse, missed):
@@ -1410,6 +1415,10 @@ class Weighed:
     heavy: list | None = None
     """Each floating leaf's heavy elements (`_heavy`), a mask, None for a leaf of none: its residuals
     judged as a leaf of their own beside the light ones' (`classed`)."""
+    recorded: object = None
+    """A recorded reference's own weighed evidence at this draw, where its recording keeps no outputs to
+    weigh: its residuals' `RecordedLeaf` a leaf of the classed tree (`recorded_evidence`), read when the
+    recording was made, with its outputs and their truth in hand."""
 
     def classed(self, tree):
         """`tree`, of the truth's structure (its leaves by the truth's treedef, a structural None kept out),
@@ -1431,7 +1440,14 @@ class Weighed:
         of unit size (`ones`, the
         terms `_prepared` sizes rows by). Each leaf's shape is checked before any arithmetic. An element
         no rounding reaches (c = 0) is exact in the reference's program, and an arm not exact there fails,
-        by name, as does an element whose scale is not finite, which no error can be read against."""
+        by name, as does an element whose scale is not finite, which no error can be read against. An arm
+        that is a recording's evidence (its leaves `RecordedLeaf`) holds no element to weigh: its weighed
+        evidence is the recording's own for this draw (`recorded`), and one that holds none is refused."""
+        if any(isinstance(leaf, RecordedLeaf) for leaf in jax.tree.leaves(tree)):
+            if self.recorded is None:
+                raise AssertionError(f"{arm}: a recording of its evidence alone, which holds no weighed "
+                                     f"evidence of this draw; record the site's weighed check with it")
+            return self.recorded, self.classed(self.zeros)
         structure = jax.tree.structure(self.truth)
         paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(self.truth)]
         leaves = structure.flatten_up_to(jax.device_get(tree))
@@ -1503,6 +1519,9 @@ class Conditioning:
 
     scale_of: Callable
     heavy: list | None = None
+    recorded_of: Callable | None = None
+    """`recorded_of(inputs, seed)`, a recorded reference's weighed evidence at a draw by its leaf's path
+    (`recorded_evidence`), where its recording keeps no outputs: read into each draw's weighing (`of`)."""
 
     def digest(self) -> str:
         """The classes' digest (`heavy`, each mask's shape and values), which every map task of a sharded
@@ -1528,7 +1547,37 @@ class Conditioning:
         zeros = jax.tree.map(lambda leaf: np.zeros(np.shape(leaf)) if float_leaf(leaf) else leaf, truth)
         ones = jax.tree.map(lambda leaf: np.ones(np.shape(leaf)) if float_leaf(leaf) else None, truth)
         weighing = Weighed(truth, scale, zeros, ones, self.heavy)
-        return dataclasses.replace(weighing, ones=weighing.classed(ones))
+        weighing = dataclasses.replace(weighing, ones=weighing.classed(ones))
+        if self.recorded_of is None:
+            return weighing
+        # The recording's evidence laid as this draw's classed tree, each leaf found by its path.
+        classed, found = weighing.classed(zeros), self.recorded_of(inputs, seed)
+        paths = classed_paths(classed)
+        if not set(paths) <= set(found):
+            raise AssertionError(f"seed {seed}: the recording holds no weighed evidence of "
+                                 f"{sorted(set(paths) - set(found))}, classes of this draw's leaves")
+        return dataclasses.replace(
+            weighing, recorded=jax.tree.structure(classed).unflatten([found[path] for path in paths]))
+
+    def recorded_evidence(self, reference, truth, inputs, seed) -> tuple[dict, dict]:
+        """A reference's weighed evidence at a draw, as a recording keeps it where it keeps no outputs: by
+        each class leaf's path (`classed_paths`), its residuals' summary as check 1 reads a weighed arm's
+        (`Weighed.weighed`, its rows of unit size), and beside it the truth of zeros each is read against.
+        The recorder's one writer (tools/recorded_references.py), which `of` reads back (`recorded_of`)."""
+        weighing = self.of(truth, inputs, seed)
+        residuals, zeros = weighing.weighed(reference, "the reference")
+        paths, leaves = classed_paths(zeros), jax.tree.leaves(zeros)
+        summaries = leaf_summaries(jax.tree.leaves(residuals), leaves,
+                                   jax.tree.structure(zeros).flatten_up_to(weighing.ones))
+        return dict(zip(paths, summaries, strict=True)), dict(zip(paths, leaves, strict=True))
+
+
+def classed_paths(tree) -> list[str]:
+    """Each leaf of a weighed arm's classed tree (`Weighed.classed`) by its path, in the tree's leaf order:
+    a leaf's name, then where it is split its class and the count of that class's values a row
+    (`logits/heavy/3`); the names a recording keeps its weighed evidence by."""
+    return [jax.tree_util.keystr(path, simple=True, separator="/")
+            for path, _ in jax.tree_util.tree_leaves_with_path(tree)]
 
 
 def _compacted(leaf: np.ndarray, mask: np.ndarray) -> dict:
