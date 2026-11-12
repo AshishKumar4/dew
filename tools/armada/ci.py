@@ -509,9 +509,11 @@ def green_key(python: str, row_name: str, held: str, key: str) -> str:
 SETS_KEPT = 8
 """How many of a row's green runs' distinct executed sets its list keeps (`sets_key`), the most recently used
 first. A row's key hashes the inputs its run executed (`cache_key`), and runs of other trees, which trains,
-base/kernels' CI and lanes' runs make all day, execute other sets; the list holds as many sets as a row meets
-in a day, measured in the records (2026-11-12: ... sets a row at most), so main's set is still there when its
-tree runs again."""
+base/kernels' CI and lanes' runs make all day, execute other sets: in the records on 2026-11-12, every one of
+40 green runs sampled per row had a set of its own, and a row kept a median of 57 green runs over the bucket's
+14 days (about 4 a day) and at most 732 (about 52 a day). Eight hold the median row's last two days and the
+busiest row's last four hours, a tree's own set reused since staying first (`remembered`); each candidate
+costs a lookup only where its units are this tree's (`matchable`)."""
 
 
 def sets_key(python: str, row_name: str, held: str) -> str:
