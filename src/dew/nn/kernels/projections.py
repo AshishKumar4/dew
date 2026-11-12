@@ -303,7 +303,7 @@ def dot_general(xla):
             if _launched(rows, rhs, out_dtype, precision):
                 product = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
                 return product.reshape(*lhs.shape[:-1], rhs.shape[1])
-        # A CPU sums a layer's float32 projection as a vectorized dot does (row 4863).
+        # A CPU sums a layer's float32 projection as XLA's own dot does (row 5448).
         return projected(xla)(lhs, rhs, dimension_numbers, precision=precision,
                               preferred_element_type=preferred_element_type, **kwargs)
 
