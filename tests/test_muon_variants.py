@@ -289,5 +289,10 @@ def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(precondi
                                        preconditioning=preconditioning).astype(given.dtype)
         return [one(stack, shape) for stack, shape in zip(stacks, numbers, strict=True)]
 
+    def truth(*stacks):
+        return [orthogonalized_leaf(jnp.asarray(stack), 5, shape, coeffs=NEWTON_SCHULZ,
+                                    preconditioning=preconditioning)
+                for stack, shape in zip(stacks, numbers, strict=True)]
+
     assert_as_exact(dew, optax_arm, shaped_draw, f"Muon's Newton-Schulz at {preconditioning}",
-                    seeds=UPDATE_SEEDS)
+                    seeds=UPDATE_SEEDS, truth_fn=truth)
