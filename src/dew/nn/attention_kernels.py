@@ -593,15 +593,19 @@ class Timed:
 
 
 MEASURED: dict[CallKind, Timed] = {
-    CallKind.of(jnp.bfloat16): Timed(1024, 32768, (64, 128)),
+    CallKind.of(jnp.bfloat16): Timed(0, 32768),
     CallKind.of(jnp.float32): Timed(0, 1024),
 }
-"""The shapes each kind of call's DECLARED receipts timed; a call outside them is a cell none declares
-(`AttentionCase.cell`). A 16-bit call's: FlashAttention against the template from 1024 to 32768 tokens at
-widths 64 and 128, causal and full, its forward and training step, FlashAttention faster at every one on an
-A100 and a GH200 (M-ET-51: W126-a100, W126-sm90; its forward 1.02 to 1.75 times faster on the A100, its
-training step 1.5 to 3.1). An fp32 call's: a training step's attention at Qwen3-8B's widths, 1 x 1024
-(CELLS-h100, CELLS-a100)."""
+"""The shapes each kind of call's DECLARED receipts hold for; a call outside them is a cell none declares
+(`AttentionCase.cell`). A 16-bit call's: up to 32768 tokens, from FlashAttention against the template from
+1024 to 32768 tokens at widths 64 and 128, causal and full, its forward and training step, FlashAttention
+faster at every one on an A100 and a GH200 (M-ET-51: W126-a100, W126-sm90), and at width 256 on an RTX PRO
+6000 (a gated Qwen3.5 step's attention, 2.72 against 4.55 ms, G4-ET-ATT-SCOREBOARD). A shorter call is
+FlashAttention's too: on the A100 its forward's lead grows as the calls shorten (at width 128, causal, 1.44
+times at 32768 tokens to 1.75 at 1024; at width 64 full 1.02 to 1.17), its training step's stays near two to
+three times (1.87 to 2.82 at 1024), far from a crossover; a longer one is not, where the forward's lead
+falls toward 1.02. An fp32 call's: a training step's attention at Qwen3-8B's widths, 1 x 1024 (CELLS-h100,
+CELLS-a100)."""
 
 
 FLASH = Kernel[AttentionCase]('flash', FLASH_SUPPORTS)
