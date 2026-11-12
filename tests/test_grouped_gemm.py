@@ -212,6 +212,36 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
         held(dw[index], held_products, FLOAT32, f"dw of group {index}")
 
 
+def test_a_16_bit_products_stated_dot_algorithm_reaches_xla():
+    """A dense float16 product through Dew's selector's portable arm (`gemm.gemm`, `grouped_matmul` chosen
+    `xla`, on this CPU) stating an explicit dot algorithm multiplies by it, as XLA's own dot does, where a
+    precision level on 16-bit operands is the default product's: one XLA:CPU lacks (`F16_F16_F16`, its
+    float16 accumulator) is refused as XLA's own dot refuses it, not run as the default product (audit
+    K2-7), and one it has (`BF16_BF16_F32` on bfloat16 operands) is XLA's own dot with it."""
+    preset = jax.lax.DotAlgorithmPreset
+
+    def through_dew(x, w, algorithm, out_dtype):
+        with generation.chosen(grouped_matmul="xla"):
+            return gemm.gemm(x, w, out_dtype=out_dtype, precision=algorithm)
+
+    def xla_own(x, w, algorithm, out_dtype):
+        return jax.lax.dot_general(x, w, (((1,), (0,)), ((), ())), precision=algorithm,
+                                   preferred_element_type=out_dtype)
+
+    x, w = jnp.asarray([[2048.0] + [1.0] * 6 + [-2048.0]], jnp.float16), jnp.ones((8, 1), jnp.float16)
+    refusals = []
+    for arm in (xla_own, through_dew):
+        with pytest.raises(jax.errors.JaxRuntimeError) as refused:
+            jax.block_until_ready(jax.jit(arm, static_argnums=(2, 3))(x, w, preset.F16_F16_F16, jnp.float16))
+        refusals.append(str(refused.value).splitlines()[0])
+    assert refusals[0] == refusals[1]
+    rng = np.random.default_rng(0)
+    xb, wb = (jnp.asarray(rng.normal(size=shape), jnp.bfloat16) for shape in ((4, 64), (64, 8)))
+    np.testing.assert_array_equal(
+        np.asarray(jax.jit(through_dew, static_argnums=(2, 3))(xb, wb, preset.BF16_BF16_F32, jnp.float32)),
+        np.asarray(jax.jit(xla_own, static_argnums=(2, 3))(xb, wb, preset.BF16_BF16_F32, jnp.float32)))
+
+
 def test_a_kept_calls_identity_states_the_installed_cutlass_wheel(tmp_path, monkeypatch):
     """A call's identity (`dew.training.identity.facts`, what a kept program is handed by) states which
     generations' kernels the installed dew-cutlass holds, as CUTLASS's eligibility reads them
