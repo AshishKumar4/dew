@@ -5,6 +5,7 @@ template's (`template.planned`, `template.backward_holds`)."""
 
 import dataclasses
 import functools
+import os
 from collections.abc import Sequence
 from typing import NamedTuple
 
@@ -1122,6 +1123,8 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
 
         read = prefix_reader(family, streamed, vectors, first, span)
         prologue = None if streamed or group > 1 else lambda: read(None)
+        if os.environ.get("DBG_NO_PROLOGUE"):
+            prologue = None
         return mosaic.Walk(views, step, steps=group, prologue=prologue)
 
     tiles = stream_blocks(queries=((chunk, width), given), keys=((chunk, width), given),

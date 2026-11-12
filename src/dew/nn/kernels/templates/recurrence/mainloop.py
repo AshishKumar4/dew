@@ -48,6 +48,7 @@ import contextvars
 import dataclasses
 import functools
 import math
+import os
 from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
@@ -717,7 +718,11 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
     launching with `entry` registers a thread at least (`resources.Launch.entry`)."""
     if stages is None:
         most = 1 if call.family.walks_scoped else 2
+        if os.environ.get("DBG_RING_ONE"):
+            most = 1
         found = _planned_launch(call, scope, registers, floor=1, most=most, producer=producer, entry=entry)
+        if os.environ.get("DBG_TILE_ONE"):
+            return found, tiles
         return found, min(tiles, (call.target.multiprocessors or 1) * (found.programs if found else 1))
     floor, most = stages if isinstance(stages, tuple) else (stages, stages)
     return _planned_launch(call, scope, registers, floor=floor, most=most, consumers=consumers,
