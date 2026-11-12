@@ -15,6 +15,16 @@ id, so the shares' returns spread apart. The pool fits one update on
 `--mesh`, and process 0 writes the rows each process handed the step and the
 parameters the pool ended with. The same script on one process is the
 reference.
+
+With `--draws N` it fits N independent updates in one launch, one Trainer
+and one step for them all, each from the model's one initialization, draws
+`--first-draw` on: draw d
+reads tasks whose prompts and completions d shifts, each draw's batch its
+own for the first 140 (the shifts' periods, 7, 5 and 4), so the pool, one
+process and a float64 process (`--float64`: the float64 twin, x64 on, the
+float32 initialization widened, `float64_held`) take each draw's one update
+apart by their arithmetic and topology alone, which check 1 judges
+(tests/test_distribution.py `launches_as_exact`).
 """
 
 import argparse
@@ -46,6 +56,11 @@ def main() -> None:
     parser.add_argument("--truncate", action="store_true", help="the second half of the tasks truncate")
     parser.add_argument("--estimator", default="group",
                         help="the advantage estimator; under global, each task's rewards scale with its id")
+    parser.add_argument("--draws", type=int, default=1,
+                        help="independent updates, each from an initialization and tasks of its own")
+    parser.add_argument("--first-draw", type=int, default=0, help="the first of those draws")
+    parser.add_argument("--float64", action="store_true",
+                        help="the float64 twin, each draw's float32 initialization widened")
     args = parser.parse_args()
 
     from dew.training.runtime import prepare_process
@@ -55,7 +70,9 @@ def main() -> None:
     import jax
     import jax.numpy as jnp
     import optax
+    from arm_arithmetic import float64_held
     from jax.experimental import multihost_utils
+    from model_support import float64_twin
     from rl_support import Published, ScriptedSource
 
     from dew.data.dataset import DataPartition, Loader
@@ -68,17 +85,23 @@ def main() -> None:
 
     process = jax.process_index()
     mixture = Mixture(experts=4, top_k=2, expert_features=16) if args.records else None
-    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                              mlp_features=32, max_seq_len=12, dtype="float32", attention_impl="xla",
-                              mixture=mixture)
-    params = nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    narrow = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                               mlp_features=32, max_seq_len=12, dtype="float32", attention_impl="xla",
+                               mixture=mixture)
+    model = float64_twin(narrow) if args.float64 else narrow
+    # The run's initial parameters: the float32 model's, widened under `--float64`.
+    initial = nn.unbox(narrow.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)))
+    initial = float64_held(initial) if args.float64 else initial
+
+    current = {"draw": 0}
 
     def drawn(task, sample, version):
-        draw = int(task.id) * 10 + sample + (process if args.vary else 0)
+        shift = current["draw"]
+        draw = int(task.id) * 10 + sample + shift + (process if args.vary else 0)
         sampled = (3 + draw % 4, 4 + sample)
         recorded = {"routed_experts": np.asarray([[[draw % 4, (draw + 1) % 4]]] * 3, np.uint8),
                     "support": tuple((token, 11) for token in sampled)} if args.records else {}
-        call = Call((1 + int(task.id) % 7, 2 + int(task.id) % 5), sampled,
+        call = Call((1 + (int(task.id) + shift) % 7, 2 + (int(task.id) + 3 * shift) % 5), sampled,
                     (-0.5 - 0.01 * sample, -0.25), "stop", version, **recorded)
         truncating = args.records or args.truncate
         status = Status.TRUNCATED if truncating and int(task.id) > TASKS // 2 else Status.COMPLETED
@@ -91,40 +114,50 @@ def main() -> None:
         return itertools.repeat({"task_id": mine})
 
     trained = []
+    scheduling = {}
 
     def rollout(state, batch, key):
-        packed = scheduler(state, batch, key)
+        packed = scheduling["scheduler"](state, batch, key)
         trained.append(packed)
         return packed
 
-    objective = GRPOObjective(model, seq_len=7, variables=params, behavior_importance=2.0)
-    trainer = Trainer(
-        objective,
-        optax.sgd(0.1),
-        key=jax.random.key(5),
-        mesh=MeshSpec(**json.loads(args.mesh)),
-        layout=Layout(min_shard=TINY_SHARD),
-        rollout=rollout,
-    )
-    partition = DataPartition.of(trainer.device_mesh)
-    # Two samples a task, two chains of four ids a row of eight.
-    scheduler = RolloutScheduler(
-        Asynchronous(ScriptedSource(drawn), Published(), objective, width=8, rows=partition.rows(TASKS),
-                     max_lag=1, ahead=1),
-        groups=2, support_capacity=16 if args.records else None, estimator=args.estimator,
-        scorer=objective if args.truncate else None)
-    data = scheduler.tasks(Loader(train=share, val=None, records=TASKS, batch=TASKS))
-    final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
-    rows = multihost_utils.process_allgather({name: trained[0][name] for name in PACKED})
-    leaves = {jax.tree_util.keystr(path): np.asarray(multihost_utils.process_allgather(leaf, tiled=True))
-              for path, leaf in jax.tree_util.tree_flatten_with_path(final.variables["params"])[0]}
+    # The float64 twin runs with x64 on, the float32 runs as a user's: the initialization above is the
+    # float32 model's in both.
+    with jax.enable_x64(new_val=args.float64):
+        objective = GRPOObjective(model, seq_len=7, variables=initial, behavior_importance=2.0)
+        trainer = Trainer(
+            objective,
+            optax.sgd(0.1),
+            key=jax.random.key(5),
+            mesh=MeshSpec(**json.loads(args.mesh)),
+            layout=Layout(min_shard=TINY_SHARD),
+            rollout=rollout,
+        )
+        partition = DataPartition.of(trainer.device_mesh)
+        draws, leaves = [], {}
+        for index in range(args.draws):
+            current["draw"] = args.first_draw + index
+            trained.clear()
+            # Two samples a task, two chains of four ids a row of eight: a scheduler of its own a draw, so no
+            # rollout another draw's stream opened ahead reaches this one's step.
+            scheduler = scheduling["scheduler"] = RolloutScheduler(
+                Asynchronous(ScriptedSource(drawn), Published(), objective, width=8,
+                             rows=partition.rows(TASKS), max_lag=1, ahead=1),
+                groups=2, support_capacity=16 if args.records else None, estimator=args.estimator,
+                scorer=objective if args.truncate else None)
+            data = scheduler.tasks(Loader(train=share, val=None, records=TASKS, batch=TASKS))
+            final = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
+            rows = multihost_utils.process_allgather({name: trained[0][name] for name in PACKED})
+            leaves.update({f"{index}/{jax.tree_util.keystr(path)}": np.asarray(
+                multihost_utils.process_allgather(leaf, tiled=True))
+                for path, leaf in jax.tree_util.tree_flatten_with_path(final.variables["params"])[0]})
+            draws.append({"step": int(final.step), "shared": FORK_PARENTS_KEY in trained[0],
+                          "rows": {name: np.asarray(rows[name]).tolist() for name in PACKED}})
     if process == 0:
         np.savez(args.out.with_suffix(".npz"), **leaves)
         args.out.write_text(json.dumps({
-            "processes": jax.process_count(), "step": int(final.step),
-            "shared": FORK_PARENTS_KEY in trained[0],
-            "partition": {"count": partition.count, "readers": partition.readers},
-            "rows": {name: np.asarray(rows[name]).tolist() for name in PACKED}}))
+            "processes": jax.process_count(),
+            "partition": {"count": partition.count, "readers": partition.readers}, "draws": draws}))
 
 
 if __name__ == "__main__":

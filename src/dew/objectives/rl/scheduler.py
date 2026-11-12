@@ -152,6 +152,7 @@ from dew.batch import VALID_ROWS, Batch, Variables
 from dew.data.dataset import DataPartition, Loader, tapped
 from dew.distributed.batches import first_reader_batch, shard_batch
 from dew.nn.inputs import local_rows, mesh_of
+from dew.nn.precision import at_least_fp32
 from dew.nn.progress import Progress
 from dew.objectives.base import Shown
 from dew.sampling.text import Sampling
@@ -575,12 +576,12 @@ def scored_rows(objective: GRPOObjective, variables: Variables, packed: Mapping[
                 progress: Progress) -> np.ndarray:
     """This process's packed rows' sampled ids' log-probabilities under `variables` (`packed_log_probs`)
     at the run's `progress`, over a mesh scored once over the pool's rows, placed as the step places the
-    batch."""
+    batch, in float32 or the scores' own wider dtype (a float64 truth's twin keeps its float64)."""
     mesh = mesh_of(variables)
     rescore = objective.program("packed log probs", objective.packed_log_probs)
     placed = packed if mesh is None else shard_batch(mesh, dict(packed))
-    scored = rescore(variables, placed, progress=progress)
-    return local_rows(scored).astype(np.float32) * packed[RESPONSE_MASK_KEY]
+    scored = local_rows(rescore(variables, placed, progress=progress))
+    return scored.astype(at_least_fp32(scored.dtype)) * packed[RESPONSE_MASK_KEY]
 
 
 def _within[T](mesh, phase: str, operation: Callable[[], T]) -> T:

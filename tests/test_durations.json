@@ -14936,7 +14936,7 @@
 "tests/test_distribution.py::test_a_rank_whose_backend_fails_to_open_after_joining_ends_the_pool": 17.065,
 "tests/test_distribution.py::test_a_rank_whose_data_fails_mid_fit_stops_the_pool": 21.947,
 "tests/test_distribution.py::test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight": 7.313,
-"tests/test_distribution.py::test_a_share_that_trains_nothing_holds_the_shared_prompts_parents_its_peer_packed": 52.68,
+"tests/test_distribution.py::test_a_share_that_trains_nothing_holds_the_shared_prompts_parents_its_peer_packed": 141.58,
 "tests/test_distribution.py::test_a_share_whose_calls_recorded_nothing_holds_the_records_its_peer_packed": 67.115,
 "tests/test_distribution.py::test_a_slurm_step_that_leaves_gpus_idle_is_refused_before_it_joins": 5.844,
 "tests/test_distribution.py::test_a_stopped_pool_ends_its_ranks_without_aborts": 19.223,
