@@ -542,8 +542,9 @@ class MosaicForward(_Mainloop[Tiles]):
         a decode step of 128 rows over 4096 keys took 0.70 ms at 64-key tiles against 0.73 at 128 on an
         H100, and of 32 over 32768 1.35 against 1.38, its 128-wide K and V 32 KB a stage, two of them past
         the 45 KB a program keeps in flight (ET-STAGES2-h100).
-        Its natural rewalk's tiles derived again (`_relaunched`); `config` itself where no smaller tile
-        dividing the call's keys holds, or the part's stream is unmeasured."""
+        Its natural rewalk's tiles derived again (`_relaunched`); where no tile dividing the call's keys keeps
+        the stream in flight, the largest that divides them, else `config` itself, as where the part's
+        stream is unmeasured."""
         in_flight = self._in_flight(ba, config, target)
         if in_flight is None:
             return config
@@ -555,13 +556,18 @@ class MosaicForward(_Mainloop[Tiles]):
         # together (`resident`): a larger tile holding fewer of them keeps no more in flight (an A100's
         # 16-row d64 decode at 256-key tiles staged 146 KB, one program a multiprocessor, 1.17x the hand
         # kernel's five resident programs of 20 KB, M-DD-7 W34).
-        for extent in reversed(walked_extents(family, query.dtype, config.block_k)):
-            candidate = dataclasses.replace(config, block_k=extent)
-            if not (self.keys % extent == 0 and self._launch_legal(ba, candidate, target)):
-                continue
+        dividing = [candidate for candidate in (dataclasses.replace(config, block_k=extent) for extent in
+                                                reversed(walked_extents(family, query.dtype, config.block_k)))
+                    if self.keys % candidate.block_k == 0 and self._launch_legal(ba, candidate, target)]
+        for candidate in dividing:
             held = self.resident(ba, candidate, target)
             if held * self._staged_keys(ba, candidate) >= in_flight:
                 return self._relaunched(ba, candidate, target) or config
+        # Where none keeps the stream in flight, the largest dividing tile before a derived one that does not
+        # divide the keys: a GH200's bounded decode at 192-key tiles over 32768 padded its cache, 84.5 of its
+        # 134 us a step at width 128 (M-ET-70), where its 128-key walk alone is 49.5.
+        if self.keys % config.block_k and dividing:
+            return self._relaunched(ba, dividing[-1], target) or dividing[-1]
         return config
 
     def streamed(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
