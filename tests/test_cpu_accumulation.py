@@ -322,16 +322,6 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     def choices(found) -> int:
         return sum(equation.primitive.name == "platform_index" for equation in found)
 
-    def contractions(found) -> int:
-        # A float32 contraction's platform choices: those a conditional reads one of whose branches is a
-        # product, each once (contractions of one trace share it; a conditional's nested in a branch read
-        # their own).
-        chosen = {equation.outvars[0] for equation in found if equation.primitive.name == "platform_index"}
-        return len({equation.invars[0] for equation in found
-                    if equation.primitive.name == "cond" and equation.invars[0] in chosen
-                    and any(inner.primitive.name == "dot_general" for branch in equation.params["branches"]
-                            for inner in equations(branch))})
-
     sites = {
         "product": traced(lambda a, b: float32_dot_general(a, b, (((1,), (0,)), ((), ()))), lhs, rhs),
         "bias": traced(jax.grad(lambda params: jnp.sum(layer.apply({"params": params}, lhs))),

@@ -8,6 +8,8 @@ is broadcast over, is the fp32 sum torch's addmm and convolution take, and a
 biased bf16 projection's output is as close to float64 as torch's.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -153,6 +155,36 @@ def test_a_batched_kernel_draws_its_members_where_its_names_place_them():
     assert placed.value.sharding.spec == PartitionSpec(None, None, "model")
     np.testing.assert_array_equal(np.asarray(placed.value),
                                   np.asarray(layer.init(jax.random.key(0), x)["params"]["kernel"].value))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_headed_projection_on_an_explicit_data_split_trains_in_a_users_process(monkeypatch):
+    """A `DenseGeneral` projection into heads (an attention block's) of a batch of sequences an Explicit
+    data axis splits, in a process as a user's runs, without the suite's wide CPU arithmetic: its value and
+    the inputs' and kernel's gradients those of the plain contraction, every sum exact (small integers),
+    each placed as that one's (row 5422: a reshape of its result splitting the split rows raised
+    ShardingTypeError)."""
+    from dew.nn import precision
+
+    monkeypatch.delenv(precision.WIDE_CPU_ARITHMETIC, raising=False)
+    rng = np.random.default_rng(5422)
+    inputs = jnp.asarray(rng.integers(-3, 4, size=(4, 3, 4)), jnp.float32)
+    kernel = jnp.asarray(rng.integers(-3, 4, size=(4, 2, 3)), jnp.float32)
+    layer = DenseGeneral((2, 3), use_bias=False)
+
+    def trained(product, kernel, inputs):
+        value, pull = jax.vjp(product, kernel, inputs)
+        return value, *pull(jnp.round(4 * jnp.cos(value)))
+
+    projected = functools.partial(trained, lambda k, x: layer.apply({"params": {"kernel": k}}, x))
+    plain = functools.partial(trained, lambda k, x: jnp.einsum("btd,dhk->bthk", x, k))
+    mesh = jax.make_mesh((2,), ("data",), (jax.sharding.AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        split = jax.device_put(inputs, jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data")))
+        got_all, want_all = jax.jit(projected)(kernel, split), jax.jit(plain)(kernel, split)
+    for got, want in zip(got_all, want_all, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+        assert jax.typeof(got).sharding.spec == jax.typeof(want).sharding.spec
 
 
 BIAS_SEEDS = 64
