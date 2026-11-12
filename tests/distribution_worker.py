@@ -214,6 +214,8 @@ def main() -> None:
     rows = partition.rows(BATCH)
     placed = shard_batch(mesh, {"wide": wide[partition.index * rows:(partition.index + 1) * rows]})
     gathered = multihost_utils.process_allgather(placed["wide"], tiled=True)
+    # Every process gathers the state whole, a collective, before process 0 writes it.
+    digest = state_digest(state)
     if jax.process_index() == 0:
         args.out.write_text(json.dumps({
             "processes": jax.process_count(),
@@ -224,7 +226,7 @@ def main() -> None:
             "partition": {"count": partition.count, "readers": partition.readers},
             "placed_whole": bool(np.array_equal(np.asarray(gathered), wide)),
             **first,
-            "state_digest": state_digest(state),
+            "state_digest": digest,
             "draws": draws,
             "loss_dtype": losses.dtype,
         }))
