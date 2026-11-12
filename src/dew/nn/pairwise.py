@@ -253,9 +253,9 @@ def _rows_blocked(rows: jax.Array, matrices: jax.Array, group_sizes: jax.Array, 
 
     def plain(rows, matrices):
         # Placed as XLA's ragged product places it on a mesh with Explicit axes, where JAX infers no
-        # placement for a ragged dot (`grouped_matmul.ragged_placement`): this branch is traced on every
+        # placement for a ragged dot (`xla_products.ragged_placement`): this branch is traced on every
         # platform (`precision.projection_product`'s `platform_dependent`).
-        from dew.nn.kernels.grouped_matmul import ragged_placement
+        from dew.nn.kernels.xla_products import ragged_placement
 
         return jax.lax.ragged_dot(rows, matrices, group_sizes, precision=precision,
                                   preferred_element_type=jnp.float32,

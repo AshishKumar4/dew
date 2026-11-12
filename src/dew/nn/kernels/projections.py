@@ -117,7 +117,7 @@ def _projected_apart(rows, matrix, group_sizes, *, out_dtype, bias, placed) -> j
         assert out is not None, "the recipe takes the projection on every device as on the whole"
         return out
 
-    # The recipe's own loops start their sums typed for no device (`grouped_matmul.step_scaled`'s carry), so
+    # The recipe's own loops start their sums typed for no device (`xla_products.step_scaled`'s carry), so
     # the program is not checked for the devices' varying values (`check_vma`); each device's rows are its
     # own by the specs, and the whole operands' gradients sum over the devices as shard_map transposes them.
     return jax.shard_map(projected, mesh=placed.mesh, in_specs=(split, whole, *(whole,) * len(extra)),

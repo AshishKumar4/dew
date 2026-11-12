@@ -77,7 +77,7 @@ SCALE_DEPTH = 128
 """The depth one block scale of a blockwise-scaled FP8 product covers: DeepSeek-V3's 1 x 128 activation and
 128 x 128 weight blocks (row 4518), each block's fp32 partial times its scales before its add. The template's
 step-scaled launches step it whole (`gemm.mosaic_gpu.gmm`'s and `tgmm`'s `step_scales`), and the portable
-product sums it a block at a time (`grouped_matmul.step_scaled`)."""
+product sums it a block at a time (`xla_products.step_scaled`)."""
 
 SUMMED_DEPTH = 128
 """The depth an exactly summed partial covers on a family whose accumulator carries across steps

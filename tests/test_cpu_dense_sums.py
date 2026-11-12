@@ -317,10 +317,10 @@ def test_a_grouped_float32_projection_on_an_explicit_data_split_traces_and_place
     """A float32 grouped projection, its input gradient and its kernel gradient (`gemm.gemm`, `gemm.gemm_t`,
     their CPU branch `pairwise.pairwise_ragged_dot_general`, which a platform choice traces on every platform)
     of rows an Explicit data axis splits over two devices: each traced and run (JAX infers no placement for a
-    ragged dot, so each block's states its own, `grouped_matmul.ragged_placement`, and a kernel gradient's
+    ragged dot, so each block's states its own, `xla_products.ragged_placement`, and a kernel gradient's
     gathers read whole rows), each value XLA's ragged products' bit for bit over small integers, and placed as
     `ragged_placement` places them."""
-    from dew.nn.kernels.grouped_matmul import ragged_placement
+    from dew.nn.kernels.xla_products import ragged_placement
 
     rng = np.random.default_rng(4864)
     tokens, cotangent = (jnp.asarray(rng.integers(-3, 4, size=shape), jnp.float32)

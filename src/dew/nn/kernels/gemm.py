@@ -40,7 +40,7 @@ from flax.typing import PrecisionLike
 from jax.custom_derivatives import zero_from_primal
 
 from dew.nn.derivatives import KernelGlue, contracted, declared_tangent
-from dew.nn.kernels import generation, grouped_matmul, selection
+from dew.nn.kernels import generation, grouped_matmul, selection, xla_products
 from dew.nn.kernels.formats import MxFp8, NvFp4, NvFp4Block
 from dew.nn.kernels.templates import axes as side_axes_of, mosaic_sm100
 from dew.nn.kernels.templates.axes import GROUPS
@@ -72,7 +72,7 @@ def gemm(lhs: jax.Array, rhs: "jax.Array | NvFp4", group_sizes: jax.Array | None
     dtype the products take, `lhs` rounded to it as `rhs` is, where `lhs`'s own dtype is what its
     cotangent takes, summed in fp32 and rounded once to it (an fp32 input's of a bf16 product); the
     rounding passes tangents through unrounded, the MoE projection's law
-    (`grouped_matmul.portable_projection`), and there is no prologue. `layer`, where given (a traced
+    (`xla_products.portable_projection`), and there is no prologue. `layer`, where given (a traced
     index), picks one layer of a stacked `rhs` (`[layers, *matrices]`: a layer's groups, or its one
     matrix for a dense product), read in place: the launches take the layer's groups and read their
     matrices where they lie in the stack, from the layer's first (`_grouped`), so no slice of the stack
@@ -316,19 +316,19 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         # 2.72 for the bf16 product).
         # A sum over rows an Explicit axis splits lands whole (`ragged_placement`), the depth and width placed
         # as the rows' and the cotangent's columns are. A dense call's is XLA's own dot over the rows, as the
-        # forward's (`grouped_matmul.xla_dot`): its ragged dot of one group took an A100's gate_up weight
+        # forward's (`xla_products.xla_dot`): its ragged dot of one group took an A100's gate_up weight
         # gradient 470 ms against the template's 11.4 (W121-a100), where DENSE1 timed XLA's dot.
         # Each summed as `precision.accumulated` sums a contraction (a CPU's float32 product as a vectorized
         # dot sums it, row 4863).
         if dense:
             product = functools.partial(jax.lax.dot_general, dimension_numbers=(((0,), (0,)), ((), ())),
                                         precision=precision,
-                                        out_sharding=grouped_matmul.ragged_placement(((lhs, 1), (rhs, 1))))
+                                        out_sharding=xla_products.ragged_placement(((lhs, 1), (rhs, 1))))
             return accumulated(product, lhs.astype(compute), rhs.astype(compute),
                                preferred_element_type=wide)[None].astype(out_dtype)
         product = functools.partial(
             jax.lax.ragged_dot_general, ragged_dot_dimension_numbers=_CONTRACTED_ROWS, precision=precision,
-            out_sharding=grouped_matmul.ragged_placement((None, (lhs, 1), (rhs, 1))))
+            out_sharding=xla_products.ragged_placement((None, (lhs, 1), (rhs, 1))))
         return accumulated(product, lhs.astype(compute), rhs.astype(compute), group_sizes,
                            preferred_element_type=wide).astype(out_dtype)
 
@@ -514,7 +514,7 @@ def _packed(rows: jax.Array, words: jax.Array, scales: jax.Array, sizes: jax.Arr
 
     def portable(rows, words, scales, sizes, gather, first):
         matrices = decoded(words, scales, first)
-        return grouped_matmul.xla_ragged_dot(rows if gather is None else rows[gather],
+        return xla_products.xla_ragged_dot(rows if gather is None else rows[gather],
                                              matrices if not dense else matrices[None], sizes,
                                              precision=jax.lax.Precision.DEFAULT,
                                              preferred_element_type=jnp.float32)
@@ -549,7 +549,7 @@ BLOCKWISE_FP8: selection.Op[BlockwiseCase] = selection.Op(generation.Choice.BLOC
 """A blockwise-scaled FP8 product's selector (`blockwise_fp8_product`): the template's exactly summed walk,
 each step's partial scaled before its add (`mosaic_gpu.gmm`'s `step_scales`), where named
 (`generation.chosen(blockwise_fp8='mosaic')`) and planned, past the measured requirement no receipt has
-met yet; else the scaled blocks summed in XLA (`grouped_matmul.step_scaled`)."""
+met yet; else the scaled blocks summed in XLA (`xla_products.step_scaled`)."""
 
 
 def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Array, row_scales: jax.Array,
@@ -578,7 +578,7 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     else:
         # Each product of two FP8 values is exact in bfloat16's range and in fp32.
         matrices = jnp.swapaxes(kernel, 1, 2).astype(jnp.bfloat16)
-        summed = grouped_matmul.step_scaled(lhs.astype(jnp.bfloat16), matrices, group_sizes, row_scales,
+        summed = xla_products.step_scaled(lhs.astype(jnp.bfloat16), matrices, group_sizes, row_scales,
                                             column_scales, precision=jax.lax.Precision.DEFAULT)
     return summed.astype(out_dtype)
 
@@ -624,7 +624,7 @@ def _planned(launch, bound) -> mosaic_gpu.Tiles | None:
 
 def _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales) -> jax.Array:
     """`blockwise_fp8_kernel_gradient`'s portable arm: each 128-row block's scaled partial as the blockwise
-    product's portable arm forms one (`grouped_matmul.step_scaled`: the block's FP8 values' products,
+    product's portable arm forms one (`xla_products.step_scaled`: the block's FP8 values' products,
     exact in bfloat16, summed into fp32 by the ragged dot XLA folds into no FP8 GEMM, then its depth rows'
     and columns' scales), added in order into its group's fp32 sum. A dot of the widened codes was folded
     by XLA into cuBLASLt's narrower-summing FP8 GEMM under deterministic ops (4.43e-5 from float64 against
@@ -638,7 +638,7 @@ def _blocks_summed(lhs_t, rhs_t, group_blocks, row_scales, column_scales) -> jax
         rows = jax.lax.dynamic_slice_in_dim(lhs_t, index * SCALE_DEPTH, SCALE_DEPTH, axis=1)
         columns = jax.lax.dynamic_slice_in_dim(rhs_t, index * SCALE_DEPTH, SCALE_DEPTH, axis=1)
         # The block as a one-block product: the depth's rows its rows, the block's columns its one matrix.
-        scaled = grouped_matmul.step_scaled(rows, columns.T[None], every_row, row_scales[index][None],
+        scaled = xla_products.step_scaled(rows, columns.T[None], every_row, row_scales[index][None],
                                             column_scales[index][None, None])
         return total.at[owner[index]].add(scaled)
 
@@ -708,7 +708,7 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
                                                                 'scales': _abstract(*scales)}))
     if selection.select(op, MxCase(tile)).kernel != 'mosaic':
         values = lhs.decoded() if gather is None else lhs.decoded()[gather]
-        return grouped_matmul.xla_ragged_dot(values, jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
+        return xla_products.xla_ragged_dot(values, jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
                                              precision=jax.lax.Precision.DEFAULT,
                                              preferred_element_type=jnp.float32)
     assert tile is not None, "the selector names the template where it plans a tile"
@@ -1116,9 +1116,9 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
     """The template's portable mainloop at `config` (docs/design/kernel-templates.md's `xla_mainloop`):
     `gemm`'s arithmetic in XLA, the kernels' products of `lhs`'s dtype summed in at least fp32 (an fp64
     product's in fp64, which no kernel takes), one rounding, a dense call's as XLA's own dot
-    (`grouped_matmul.xla_dot`: one group of every row, nothing to mask, no ragged dot to trace);
+    (`xla_products.xla_dot`: one group of every row, nothing to mask, no ragged dot to trace);
     with `config.compute`, the products of the operands rounded to it, its tangent the MoE projection's
-    (`grouped_matmul.portable_projection`, whose sum, at least fp32, it reads); with `paired`, both matrices'
+    (`xla_products.portable_projection`, whose sum, at least fp32, it reads); with `paired`, both matrices'
     products, the epilogue's two accumulators; with `first`, the groups' matrices of a stacked `rhs` from
     that one (`_grouped`), sliced out, as XLA's ragged dot reads a matrix a group."""
     transpose_rhs, precision, compute, dense = (config.transpose_rhs, config.precision, config.compute,
@@ -1132,14 +1132,14 @@ def xla_mainloop(config: XlaConfig, lhs, rhs, group_sizes, prologue, prologue_ar
     if compute is not None:
         # Summed and kept at least fp32 (an fp64 product's in fp64), the accumulator the epilogue reads.
         wide = at_least_fp32(compute)
-        accs = tuple(grouped_matmul.portable_projection(lhs, matrix, group_sizes, compute, precision, wide)
+        accs = tuple(xla_products.portable_projection(lhs, matrix, group_sizes, compute, precision, wide)
                      for matrix in matrices)
     else:
         product = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
         wide = at_least_fp32(lhs.dtype)
-        accs = tuple(grouped_matmul.xla_dot(product, each[0].astype(lhs.dtype), precision=precision,
+        accs = tuple(xla_products.xla_dot(product, each[0].astype(lhs.dtype), precision=precision,
                                             preferred_element_type=wide) if dense
-                     else grouped_matmul.xla_ragged_dot(product, each.astype(lhs.dtype), group_sizes,
+                     else xla_products.xla_ragged_dot(product, each.astype(lhs.dtype), group_sizes,
                                                         precision=precision, preferred_element_type=wide)
                      for each in matrices)
     outs = accs if epilogue is None else _as_tuple(epilogue(*accs, *epilogue_arrays))
@@ -1309,13 +1309,13 @@ def _routed(group_sizes: jax.Array, rows: int) -> jax.Array:
 
 def _dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
     """`kernel` where the call lowers for CUDA, interpreted on the CPU where asked, `portable` elsewhere
-    (`grouped_matmul._on_platform`). Evaluated eagerly, `platform_dependent` knows its platform and runs
+    (`xla_products._on_platform`). Evaluated eagerly, `platform_dependent` knows its platform and runs
     its branch alone, so a CPU's would skip the selection the kernel's branch makes (its routes, a named
     kernel's refusal): an eager call is first traced abstractly as a jit traces it, every branch
     selecting, then runs its platform's branch eagerly, op by op as any eager call does: run under a jit
     of its own (23c59c5fb), a quantized block's reload no longer computed its logits bit for bit
     (test_wrapped_runs)."""
-    branches, default = grouped_matmul._on_platform(kernel, portable, interpret_on_cpu)
+    branches, default = xla_products._on_platform(kernel, portable, interpret_on_cpu)
 
     def dispatched(*operands):
         return jax.lax.platform_dependent(*operands, default=default, **branches)

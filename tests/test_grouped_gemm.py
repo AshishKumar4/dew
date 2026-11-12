@@ -25,7 +25,7 @@ from native_certificates import (
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 from reference_error import assert_as_exact, equations, with_gradients
 
-from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels import gemm, generation, grouped_matmul, tuning, xla_products
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 from dew.nn.moe import expert_projection
 
@@ -991,10 +991,10 @@ def test_the_tuners_group_sizes_route_every_row(groups):
 
 
 def test_a_ragged_products_portable_route_places_its_output_on_an_explicit_mesh():
-    """XLA's ragged products (`grouped_matmul.xla_ragged_dot`, and `gemm.gemm_t`'s portable route a fused
+    """XLA's ragged products (`xla_products.xla_ragged_dot`, and `gemm.gemm_t`'s portable route a fused
     producer's analysis replays) of rows an Explicit data axis splits, as a device step's are
     (test_device_image_augmentation): JAX infers no placement for a ragged dot, so each states its own
-    (`grouped_matmul.ragged_placement`): the forward's rows split as the tokens' are, the kernel gradient's
+    (`xla_products.ragged_placement`): the forward's rows split as the tokens' are, the kernel gradient's
     sum over the split rows whole; a replicated operand on that mesh, placed too. Integers, so each value is
     the unplaced program's bit for bit."""
     from dew.distributed.placement import MeshSpec
@@ -1006,7 +1006,7 @@ def test_a_ragged_products_portable_route_places_its_output_on_an_explicit_mesh(
     sizes = jnp.asarray([40, 24], jnp.int32)
 
     def products(tokens, cotangent):
-        return (grouped_matmul.xla_ragged_dot(tokens, kernel, sizes, preferred_element_type=jnp.float32),
+        return (xla_products.xla_ragged_dot(tokens, kernel, sizes, preferred_element_type=jnp.float32),
                 gemm.gemm_t(tokens, cotangent, sizes, out_dtype=jnp.float32))
 
     expected = jax.jit(products)(tokens, cotangent)

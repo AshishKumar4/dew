@@ -630,7 +630,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     hooks, pair, exact sums, cluster or split. With `step_scales` (`row_scales` `[depth / 128, rows]`,
     `column_scales` `[groups, depth / 128, width / c]`, fp32), each 128-deep step's exactly summed partial
     is multiplied by its rows' scales and its group's scales of its columns, `c` columns a scale, before it
-    is added (`grouped_matmul.step_scaled`: DeepSeek-V3's blockwise FP8, row 4518); its step is 128 deep,
+    is added (`xla_products.step_scaled`: DeepSeek-V3's blockwise FP8, row 4518); its step is 128 deep,
     with no hooks, pair, packed matrix or split. With `mx_scales`, an MX product (`_mx_refused`; row 4519).
     With `gather` (int32 `[rows]`), row `i` is `lhs[gather[i]]`, read where it lies by the producer
     (`gathered.Ring`; interpreted, `Ring.parts`); with `scatter` (int32 `[rows]`, a permutation), row `i`

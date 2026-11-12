@@ -14,7 +14,7 @@ from jax.sharding import Mesh
 from reference_error import assert_as_exact, with_gradients
 from test_gemm_template import CASES, SEEDS, _dew, _draw, _drop, _rounded_through
 
-from dew.nn.kernels import gemm, generation, grouped_matmul
+from dew.nn.kernels import gemm, generation, grouped_matmul, xla_products
 from dew.nn.kernels.templates import mosaic_sm90, resources
 from dew.nn.kernels.templates.gemm import mosaic_gpu, triton_dense
 
@@ -145,7 +145,7 @@ def test_a_paired_products_epilogue_reads_its_fp32_accumulators_in_every_mode(ge
                              out_dtype=jnp.float32, precision="default", interpret_on_cpu=True)
 
     def plain(x, gate, up, dtype=jnp.bfloat16):
-        g, u = (grouped_matmul.portable_projection(x, matrix, sizes, dtype, "default",
+        g, u = (xla_products.portable_projection(x, matrix, sizes, dtype, "default",
                                                    out_dtype=jnp.promote_types(dtype, jnp.float32))
                 for matrix in (gate, up))
         return g * u
@@ -174,7 +174,7 @@ def test_a_paired_product_at_a_named_compute_dtype_holds_check_1(generation_name
     projection's law: the operands rounded, the products summed wide and rounded once, each tangent
     through the rounded operands) as one paired product without an epilogue: its two outputs and every
     gradient (the rows' in fp32, both masters' in fp32) as exact as the two unfused projections'
-    (`grouped_matmul.portable_projection`) from float64 truth."""
+    (`xla_products.portable_projection`) from float64 truth."""
     rows, depth, width = 136, 128, 256
     sizes = jnp.asarray([70, 66], jnp.int32)
 
@@ -189,7 +189,7 @@ def test_a_paired_product_at_a_named_compute_dtype_holds_check_1(generation_name
                              out_dtypes=(jnp.bfloat16, jnp.bfloat16), interpret_on_cpu=True)
 
     def plain(x, gate, up, dtype=jnp.bfloat16):
-        return tuple(grouped_matmul.portable_projection(x, matrix, sizes, dtype, None)
+        return tuple(xla_products.portable_projection(x, matrix, sizes, dtype, None)
                      for matrix in (gate, up))
 
     def truth(x, gate, up):
