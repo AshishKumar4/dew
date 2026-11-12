@@ -10,13 +10,14 @@ call, small beside the activations, and their gradients unstack the same way.
 
 import dataclasses
 from collections.abc import Sequence
+from typing import TypeGuard
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
 
-from dew.nn.dense import _biased, _plain_dense, _promoted, intercepted
+from dew.nn.dense import Dense, _biased, _plain_dense, _promoted, intercepted
 from dew.nn.precision import float32_dot_general
 
 from .kernels.generation import INHERENT, Choice, device_generation
@@ -51,7 +52,7 @@ JOIN_SUPPORTS: tuple[Requirement[JoinCase], ...] = (
                 "a projection takes a dot_general other than the join's (`float32_dot_general`)",
                 row=INHERENT, kind='handoff'),
     Requirement('uniform', lambda case: case.uniform,
-                "the projections differ in width, bias, dtype, precision or promotion", row=INHERENT,
+                "the projections differ in width, bias, dtype, precision, promotion or product", row=INHERENT,
                 kind='handoff'),
     Requirement('intercepted', lambda case: not case.intercepted,
                 "the model computes under a wrapper (an adapter, a quantization) that intercepts each "
@@ -112,17 +113,18 @@ JOINS = {choice: _join(choice) for choice in CHOICES}
 """The join's selector of each choice a layer joins projections for."""
 
 
-def joins(choice: Choice, projections: Sequence[nn.Module]) -> bool:
-    """Whether `projections` run as one GEMM (`joined_dense`), as the join's selector for `choice`
-    reports it (`JOINS`): where the join measured faster on the device and their calls take nothing the
-    join does not reproduce. Initialization creates each projection's parameters through
-    its own call."""
+def joins(projections: Sequence[nn.Module], choice: Choice) -> TypeGuard[Sequence[Dense]]:
+    """Whether `projections` run as one GEMM (`joined_dense`), as the join's selector for `choice` reports it
+    (`JOINS`): where the join measured faster on the device and their calls take nothing the join does not
+    reproduce, so each a bare `Dense` (the join's `dense` requirement), which the answer states of them for
+    `joined_dense` (a guard narrows its first argument). Initialization creates each projection's parameters
+    through its own call."""
     if projections[0].is_initializing():
         return False
     return select(JOINS[choice], join_case(projections)).kernel == 'joined'
 
 
-def joined_dense(x: jax.Array, projections: Sequence[nn.Dense], *, axis: int) -> jax.Array:
+def joined_dense(x: jax.Array, projections: Sequence[Dense], *, axis: int) -> jax.Array:
     """`projections`' outputs of `x` from one GEMM, stacked on output axis `axis`: -2 gives
     `[..., n, features]`, -1 `[..., features, n]`. Each kernel and bias is read and cast as its
     own call casts it, and the product taken and biased by a Dense's own arithmetic (`dense._biased`: a
