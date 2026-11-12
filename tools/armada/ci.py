@@ -2363,19 +2363,20 @@ def slow(verdict: dict, target: float, base: dict[str, float] | None = None) -> 
     reported as running on the whole suite alone (`whole_suite`, as pytest marked it in its row:
     executed.py), which train CI never runs (bible §7: every test past the target is reported). With `base`
     (main's durations record), only the tests it lacks: a new slow test (owner, 2026-10-28), a cell newly
-    marked whole_suite too. A check-1 site's map task past the target is reported whatever the record holds
-    (its test is recorded whole): its mark gives a task too many units, which fewer a task (per_task,
-    conditioning_per_task) bring within it (row 3729: one ran 1,366 s unreported)."""
+    marked whole_suite too. A check-1 site's map task past the plan's bound on one (`cut_draws`: four
+    targets) is reported whatever the record holds (its test is recorded whole): its mark gives a task too
+    many units, which fewer a task (per_task, conditioning_per_task) bring within it (row 3729: 1,366 s)."""
     found = []
     for row_ in verdict["rows"]:
         cells = set(row_.get("whole_suite", []))
         drawn = session.SITE.fullmatch(parsed_row(row_["name"])[2]) if "name" in row_ else None
         mapped = drawn is not None and drawn["start"] is not None
+        most = target * costs.SITE_TARGETS if mapped else target
         for test, seconds in (row_.get("tests") or {}).items():
-            if seconds <= target or (base is not None and test in base and not mapped):
+            if seconds <= most or (base is not None and test in base and not mapped):
                 continue
             found.append({"test": test, "file": test.partition("::")[0], "seconds": round(seconds, 1),
-                          "target": target, **({"whole_suite": True} if test in cells else {}),
+                          "target": most, **({"whole_suite": True} if test in cells else {}),
                           **({"map_task": row_["name"], "fix": "fewer units a task (per_task, "
                               "conditioning_per_task)"} if mapped else {})})
     return sorted(found, key=lambda item: (-item["seconds"], item["test"]))

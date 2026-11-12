@@ -767,17 +767,17 @@ def test_a_sites_judge_and_map_tasks_leave_its_files_cut_and_recorded_times_as_t
 
 
 def test_a_sites_map_task_past_the_target_is_reported_though_its_test_is_recorded(ci):
-    """A check-1 site's map task that runs twice the target is a slow test to report, though main's record
-    holds the site's test (its whole run's time): it names its map task and the fix, fewer units a task,
-    where the site's judge and a recorded test of a file's own row pass unreported (row 3729: a map task ran
-    1,366 s, and nothing said so)."""
+    """A check-1 site's map task that runs past the plan's bound on one (four targets, `cut_draws`) is a slow
+    test to report, though main's record holds the site's test (its whole run's time): it names its map task
+    and the fix, fewer units a task, where a map task within the bound, the site's judge and a recorded test
+    of a file's own row pass unreported (row 3729: a map task ran 1,366 s, and nothing said so)."""
     test = "tests/test_site.py::test_site"
-    rows = [{"name": "3.12:tests/test_site.py#test_site.draws-0-512", "tests": {test: 240.0}},
-            {"name": "3.12:tests/test_site.py#test_site.draws-512-1024", "tests": {test: 60.0}},
+    rows = [{"name": "3.12:tests/test_site.py#test_site.draws-0-512", "tests": {test: 600.0}},
+            {"name": "3.12:tests/test_site.py#test_site.draws-512-1024", "tests": {test: 240.0}},
             {"name": "3.12:tests/test_site.py#test_site", "tests": {test: 240.0}},
             {"name": "3.12:tests/test_other.py", "tests": {"tests/test_other.py::test_old": 240.0}}]
-    base = {test: 300.0, "tests/test_other.py::test_old": 240.0}
+    base = {test: 700.0, "tests/test_other.py::test_old": 240.0}
     assert ci.slow({"rows": rows}, 120.0, base) == [
-        {"test": test, "file": "tests/test_site.py", "seconds": 240.0, "target": 120.0,
+        {"test": test, "file": "tests/test_site.py", "seconds": 600.0, "target": 480.0,
          "map_task": "3.12:tests/test_site.py#test_site.draws-0-512",
          "fix": "fewer units a task (per_task, conditioning_per_task)"}]
