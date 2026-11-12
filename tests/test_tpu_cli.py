@@ -371,6 +371,28 @@ def test_a_dry_run_writes_nothing_it_would_keep(fake):
     assert {path: path.read_bytes() for path in config_dir().rglob("*") if path.is_file()} == before
 
 
+def test_commands_writing_different_tpus_ssh_entries_at_once_keep_every_entry(tmp_path):
+    """Eight processes each writing their own TPU's block to one ~/.ssh/config at once, beside a large file of
+    the user's own entries, leave all eight blocks and every other entry: each read the file, dropped its own
+    block and replaced the whole file with what it had read, so the last to publish erased the others' (the
+    audit of 2026-11-12, A6). A block forgotten while others are written leaves theirs."""
+    home = tmp_path / "home"
+    (home / ".ssh").mkdir(parents=True)
+    own = "".join(f"Host other{n}\n    HostName 10.9.{n // 250}.{n % 250}\n" for n in range(20000))
+    (home / ".ssh" / "config").write_text(own + "# dew tpu gone\nHost gone\n# end dew tpu gone\n")
+    program = ("import sys\nfrom dew._cli import ssh_config\nname = sys.argv[1]\n"
+               "ssh_config.forget('gone') if name == 'gone' else "
+               "ssh_config.write(name, ssh_config.block(name, ['10.0.0.1'], 'alice'))\n")
+    environment = {**os.environ, "HOME": str(home),
+                   "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+    writers = [subprocess.Popen([sys.executable, "-c", program, name], env=environment)
+               for name in [*(f"slice{n}" for n in range(8)), "gone"]]
+    assert [writer.wait(timeout=120) for writer in writers] == [0] * 9
+    written = (home / ".ssh" / "config").read_text()
+    assert [written.count(f"# dew tpu slice{n}\n") for n in range(8)] == [1] * 8
+    assert written.startswith(own) and "gone" not in written
+
+
 def test_ssh_config_refuses_a_block_without_its_end_marker_and_keeps_the_file(fake):
     """The TPU's ~/.ssh/config block lies between its two markers. A file holding the start marker
     without the end one is refused, and every entry in it is kept as it was; with the end marker

@@ -270,6 +270,22 @@ def test_a_rank_over_ssh_is_stopped_with_sigterm_and_its_connection_waits_for_it
         assert (tmp_path / f"checkpoint{rank}").read_text() == "written"
 
 
+def test_hosts_named_with_their_ssh_logins_join_at_the_first_hosts_network_name(tmp_path):
+    """Hosts given as ssh destinations with a login (`alice@node-a`) are reached over ssh at those
+    destinations, and their ranks join the pool at the first host's network name alone: `alice@node-a:PORT`
+    is no address a rank can reach, so a pool named that way could not join (the audit of 2026-11-12, A4)."""
+    binaries = ssh_stand_in(tmp_path)
+    done = launched("--hosts", "alice@node-a,alice@node-b", "--processes-per-host", "1", "--port", "12345",
+                    "--dry-run", "--", "python", "train.py",
+                    env={**ENV, "JAX_PLATFORMS": "cpu", "PATH": f"{binaries}:{ENV['PATH']}"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    ranks = [line for line in done.stdout.splitlines() if "train.py" in line]
+    assert len(ranks) == 2, done.stdout
+    assert all("JAX_COORDINATOR_ADDRESS=node-a:12345" in line for line in ranks), done.stdout
+    assert ["alice@node-a" in line.split() for line in ranks] == [True, False]
+    assert "alice@node-b" in ranks[1].split()
+
+
 def test_a_failing_rank_over_ssh_leaves_none_of_its_processes_on_its_host(tmp_path):
     """Rank 1, on another host over ssh, starts a worker of its own and fails: the
     launch exits with its code, and the worker, which no signal from this host
