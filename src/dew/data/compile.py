@@ -2010,12 +2010,11 @@ def iterate(
     plan_version: int = PLAN_VERSIONS[-1],
 ) -> pygrain.IterDataset:
     """A finite record pass through the same lowering, for publication and export, read by data plan
-    `plan_version` (`compile`'s), automatic workers read in the process (`Loading.unsized`)."""
+    `plan_version` (`compile`'s), automatic workers read in the process (`Loading.unsized`) and those the
+    chain names in theirs (row 5735)."""
     read_by(plan_version)
     loading = loading.unsized()
-    if any(
-        isinstance(stage, (RandomMap, BatchStage, MapBatch, Workers, Repeat)) for stage in _steps(pipeline)
-    ):
+    if any(isinstance(stage, (RandomMap, BatchStage, MapBatch, Repeat)) for stage in _steps(pipeline)):
         raise ValueError("publication needs deterministic, unbatched pipelines without repeat")
     (pipeline,) = _made(_prepared((pipeline,), read, provision=provision, counts=({},)), read, ({},),
                         training=False)

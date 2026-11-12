@@ -161,3 +161,21 @@ def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_
     # A host whose workers start at no cost takes as many as its CPUs hold over any stated run.
     free = Loading(workers="auto", worker_buffer=2, host=Host(3, 2**40, worker_start=0.0))
     assert free.resolved(rows, reads=1, batches=1).workers == 3
+
+
+def odd(row) -> bool:
+    """Whether a record's id is odd."""
+    return int(row["id"]) % 2 == 1
+
+
+def test_an_offline_pass_reads_a_chain_in_the_workers_it_names():
+    """A finite record pass for publication and export (`iterate`) reads a chain that names its workers in
+    them, its filter's rejections dropped as in the process, the same records in the same order (row 5735):
+    such a chain was refused, though only automatic workers stay out of an offline pass."""
+    from dew.data.compile import iterate
+
+    def ids(chain) -> list[int]:
+        return [int(row["id"]) for row in iterate(chain)]
+
+    chain = Pipeline(Memory([{"id": np.int64(index)} for index in range(24)])).filter(odd)
+    assert ids(chain.workers(2)) == ids(chain) == list(range(1, 24, 2))
