@@ -1356,10 +1356,11 @@ class MosaicGmm(_Mosaic):
         # walks shorter, its fp32 partials' passes and their sum's launch counted (`mosaic_gpu.split_count`,
         # the kernel gradient's rule; rows 1762 and 483), every run in the one launch (`mosaic_gpu.gmm`).
         weight, padded = swapped.arguments['tokens'], swapped.arguments['kernel']
+        itemsizes = (weight.dtype.itemsize, padded.dtype.itemsize)
         splits = 1 if ba.arguments['exact_sums'] else mosaic_gpu.split_count(
             tile, groups=1, rows=weight.shape[1], depth=weight.shape[0], width=padded.shape[1],
-            itemsizes=(weight.dtype.itemsize, padded.dtype.itemsize),
-            multiprocessors=_multiprocessors(target), step_seconds=mosaic_gpu.step_seconds(tile, target),
+            itemsizes=itemsizes, multiprocessors=_multiprocessors(target),
+            step_seconds=mosaic_gpu.step_seconds(tile, target, itemsizes),
             bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
         swapped_tile = dataclasses.replace(tile, swapped=True)
         split = dataclasses.replace(swapped_tile, splits=splits)
@@ -1386,11 +1387,12 @@ class MosaicGmm(_Mosaic):
         assert depth is not None, "a product's steps run over its depth"
         # A decode step's rows bound its active experts, each one row tile, and its partials hold its rows.
         active = min(groups, tokens.shape[0])
+        itemsizes = (tokens.dtype.itemsize, kernel.dtype.itemsize)
         splits = mosaic_gpu.split_count(
             tile, groups=active, rows=depth * active, depth=tile.block_m, width=width,
             partial_rows=-(-tokens.shape[0] // mosaic_gpu.TMA_ROWS) * mosaic_gpu.TMA_ROWS,
-            itemsizes=(tokens.dtype.itemsize, kernel.dtype.itemsize),
-            multiprocessors=_multiprocessors(target), step_seconds=mosaic_gpu.step_seconds(tile, target),
+            itemsizes=itemsizes, multiprocessors=_multiprocessors(target),
+            step_seconds=mosaic_gpu.step_seconds(tile, target, itemsizes),
             bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
         split = dataclasses.replace(tile, splits=splits)
         return split if splits > 1 and self.legal(ba, split, target) else tile
@@ -1768,10 +1770,11 @@ class MosaicTgmm(_Mosaic):
         ba = self._aligned(ba)
         depth, _, width = self._generated_extents(ba)
         tokens, cotangent = ba.arguments['tokens'], ba.arguments['cotangent']
+        itemsizes = (tokens.dtype.itemsize, cotangent.dtype.itemsize)
         return {'groups': ba.arguments['sizes'].shape[0], 'rows': _rows_of(_TGMMS, ba.args), 'depth': depth,
-                'width': width, 'itemsizes': (tokens.dtype.itemsize, cotangent.dtype.itemsize),
-                'multiprocessors': _multiprocessors(target),
-                'step_seconds': mosaic_gpu.step_seconds(tile, target), 'bandwidth': target.memory_rate,
+                'width': width, 'itemsizes': itemsizes, 'multiprocessors': _multiprocessors(target),
+                'step_seconds': mosaic_gpu.step_seconds(tile, target, itemsizes),
+                'bandwidth': target.memory_rate,
                 'launch_seconds': target.launch_seconds}
 
     def _partials(self, ba):

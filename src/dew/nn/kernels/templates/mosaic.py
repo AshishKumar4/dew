@@ -811,6 +811,16 @@ class Issuer[Accumulator](abc.ABC):
     program goes on (warpgroup MMA's), where each mma.sync product completes before the next: a launch's
     products issued in turn hold their accumulators at once on the one, one at a time on the other."""
 
+    def shared_reads(self, rows: int) -> tuple[int, int]:
+        """The times a consumer's products of `rows` rows read a step's left block (its rows' share) and its
+        right block from shared memory: an issuer reading its operands into registers loads each fragment
+        once a warp holding it (`lhs_copies`, `rhs_copies`, reused across the products that read it); one
+        reading them by descriptor (warpgroup MMA's, tcgen05's) reads the left block once and the right once
+        an instruction of its `rows` (a 128-row consumer's two m64 warpgroup MMAs read it twice)."""
+        if self.operands_in_registers:
+            return self.lhs_copies, self.rhs_copies
+        return 1, -(-rows // self.rows)
+
     @property
     def lhs_copies(self) -> int:
         """The warps of a role each holding the left operand's fragment for the same rows (mma.sync's warps

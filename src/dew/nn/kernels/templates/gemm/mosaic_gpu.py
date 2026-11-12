@@ -2256,13 +2256,37 @@ def _zero_neighbours_of(family: mosaic.Issuer, refs: list, step, start, end, ste
     return first | last
 
 
-def step_seconds(tiles: Tiles, target) -> float | None:
-    """One MMA step of `tiles`, in seconds: its FLOPs at one multiprocessor's 16-bit tensor rate
-    (`templates.cost.rates`, the architecture's a clock at the part's clock, whatever the multiprocessors a
-    target states), the unit the kernel gradient's split (`split_count`) and a balanced tail
-    (`handoff_steps`) price their walks in; None where the target states no rate."""
-    rate = unit_cost.rates(target, device=False)[0]
-    return None if rate is None else 2 * tiles.block_m * tiles.block_n * tiles.block_k / rate
+def step_seconds(tiles: Tiles, target, itemsizes: tuple[int, int]) -> float | None:
+    """One step of `tiles` on one multiprocessor, in seconds, the unit the kernel gradient's split
+    (`split_count`) and a balanced tail (`handoff_steps`) price their walks in: the longer of its products'
+    FLOPs at the multiprocessor's 16-bit tensor rate and its operands' bytes through its shared memory at
+    that memory's rate (`templates.cost.rates`, each the architecture's a clock at the part's clock; their
+    units overlapped, `cost.units`), a step's `step_shared_bytes` of operands of `itemsizes` (the left's
+    and the right's); None where the target states no tensor rate. A pair's step is a CTA's: its rows by
+    the pair's columns (`tile_columns`)."""
+    rates = unit_cost.rates(target, device=False)
+    tensor, shared = rates[0], rates[5]
+    if tensor is None:
+        return None
+    family = family_of(tiles, jnp.bfloat16)
+    products = 2 * tiles.block_m * tile_columns(tiles, family) * tiles.block_k / tensor
+    return products if shared is None else max(products, step_shared_bytes(tiles, family, itemsizes) / shared)
+
+
+def step_shared_bytes(tiles: Tiles, family: mosaic.Family, itemsizes: tuple[int, int]) -> int:
+    """The bytes a step of `tiles` passes through one multiprocessor's shared memory: its rows' and its
+    matrix's blocks staged once (each CTA its own: a pair's CTA half the pair's columns), then read by its
+    products as its issuer reads them (`Issuer.shared_reads`: a fragment's warps' loads, or a descriptor's
+    reads an instruction), each consumer its share of the rows and the matrix's block. A pair's CTA's half of
+    the matrix is counted read by both CTAs' products (`Transport.pairs_product`): an assumption of this
+    model, not a measured fact, which M-EM-35's pinned one-CTA arm against the derived pair tests (rows
+    5671, 5363)."""
+    rows = tiles.block_m * tiles.block_k * itemsizes[0]
+    matrix = tiles.block_n * tiles.block_k * itemsizes[1]
+    share = tiles.block_m // tiles.warpgroups
+    lhs_reads, rhs_reads = family.specialized(share, tile_columns(tiles, family)).shared_reads(share)
+    readers = tiles.warpgroups * (2 if family.pairs_product else 1)
+    return rows + matrix + rows * lhs_reads + matrix * rhs_reads * readers
 
 
 def fixes_up(tiles: Tiles, dtype) -> bool:
@@ -2282,7 +2306,7 @@ def balanced_tail(tiles: Tiles, grid: tuple[int, int], steps: int, itemsizes: tu
     memory's rate and L2 (`GpuTarget.memory_rate`, `l2_bytes`), its operands' blocks a step (`itemsizes`,
     the left's and the right's) and its hand-off (`handoff_steps`); walked where the target states no
     rate."""
-    step, rate = step_seconds(tiles, target), target.memory_rate
+    step, rate = step_seconds(tiles, target, itemsizes), target.memory_rate
     if step is None or rate is None:
         return None
     left, right = itemsizes
@@ -2290,14 +2314,14 @@ def balanced_tail(tiles: Tiles, grid: tuple[int, int], steps: int, itemsizes: tu
                               tiles.block_n * tiles.block_k * right, step,
                               target.multiprocessors or programs, rate, target.l2_bytes)
     return tail_of.balanced(grid[0] * grid[1], steps, programs, traffic,
-                            handoff_steps=handoff_steps(tiles, target))
+                            handoff_steps=handoff_steps(tiles, target, itemsizes))
 
 
-def handoff_steps(tiles: Tiles, target) -> float:
+def handoff_steps(tiles: Tiles, target, itemsizes: tuple[int, int]) -> float:
     """A balanced tail's hand-off of a partial between programs (`GpuTarget.handoff_seconds`) in MMA steps
     of `tiles` (`step_seconds`), as `tail.balanced` prices it; none where the part's hand-off or its rate is
     unmeasured."""
-    step, handoff = step_seconds(tiles, target), target.handoff_seconds
+    step, handoff = step_seconds(tiles, target, itemsizes), target.handoff_seconds
     return 0.0 if step is None or handoff is None else handoff / step
 
 
@@ -2386,9 +2410,11 @@ def split_walk(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int, 
                multiprocessors: int, step_seconds: float | None, bandwidth: float | None,
                launch_seconds: float | None, partial_rows: int | None = None) -> SplitWalk | None:
     """Dew: the walk `split_count` prices at `tiles` (its arguments'), None where the device states no rate
-    or the call has no whole tile: its wave every program a multiprocessor runs at once, `step_seconds`
-    a step at the multiprocessor's whole rate (`SplitWalk.walk` shares it among the programs running)."""
-    output = groups * -(-depth // tiles.block_m) * (width // tiles.block_n)
+    or the call has no whole tile: its wave every program a multiprocessor runs at once, its output tiles
+    each program's (a pair's CTA's its rows by the pair's columns, `tile_columns`), `step_seconds` a step
+    at the multiprocessor's whole rate (`SplitWalk.walk` shares it among the programs running)."""
+    columns = tile_columns(tiles, family_of(tiles, jnp.bfloat16))
+    output = groups * -(-depth // tiles.block_m) * (width // columns)
     steps = -(-rows // max(groups, 1) // tiles.block_k)
     if step_seconds is None or bandwidth is None or output == 0:
         return None

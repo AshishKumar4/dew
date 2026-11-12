@@ -19,7 +19,7 @@ from reference_error import as_given, assert_as_exact, with_gradients
 from tuned import each_config
 
 from dew.nn.kernels import fused_gemm, gemm, generation, grouped_matmul, low_rank, projections, tuning
-from dew.nn.kernels.templates import mosaic_sm90, product, resources, tail
+from dew.nn.kernels.templates import cost, mosaic_sm90, product, resources, tail
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 pytestmark = pytest.mark.kernel
@@ -981,6 +981,39 @@ def test_the_planar_snake_walks_every_tile_once_in_its_bands(major, minor, width
     np.testing.assert_array_equal(np.stack(walk, axis=1), np.asarray(expected))
 
 
+def test_a_step_is_priced_at_the_longer_of_its_products_and_its_shared_traffic():
+    """A step's price (`mosaic_gpu.step_seconds`) is the longer of its products at the tensor rate and its
+    operands' bytes through shared memory (`step_shared_bytes`), read as each issuer reads them
+    (`Issuer.shared_reads`):
+    - warpgroup MMA reads the matrix's block once an m64 instruction, so one consumer of 128 rows passes as
+      many bytes a step as two consumers of 64 rows each (the cooperative tile);
+    - on a B200 one CTA's 128 x 128 x 64 tcgen05 step is shared memory's, so a FLOP of it costs more than a
+      FLOP of a pair's step, each CTA staging half the pair's columns;
+    - on an H100 the cooperative 128 x 256 wgmma step's shared traffic stays within its products' time;
+    - a pair's walk covers the product's output once: its output tiles, each a CTA's rows by the pair's
+      columns, tile the product exactly."""
+    b200, h100 = generation.gpu_target("sm100"), generation.gpu_target("sm90")
+    wgmma = mosaic_gpu.family_of(COOPERATIVE, jnp.bfloat16)
+    alone = dataclasses.replace(COOPERATIVE, warpgroups=1)
+    assert (mosaic_gpu.step_shared_bytes(alone, wgmma, (2, 2))
+            == mosaic_gpu.step_shared_bytes(COOPERATIVE, wgmma, (2, 2)))
+    one_cta = mosaic_gpu.Tiles(128, 128, 64, 6, 8, warpgroups=1, family="tcgen05")
+    pair = mosaic_gpu.Tiles(128, 128, 64, 5, 8, warpgroups=1, cluster=2, family="tcgen05.pair")
+
+    def per_flop(tiles, target):
+        family = mosaic_gpu.family_of(tiles, jnp.bfloat16)
+        flops = 2 * tiles.block_m * mosaic_gpu.tile_columns(tiles, family) * tiles.block_k
+        return mosaic_gpu.step_seconds(tiles, target, (2, 2)) / flops
+
+    assert per_flop(pair, b200) < per_flop(one_cta, b200)
+    cooperative = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, family="wgmma")
+    tensor = cost.rates(h100, device=False)[0]
+    assert mosaic_gpu.step_seconds(cooperative, h100, (2, 2)) == 2 * 128 * 256 * 64 / tensor
+    walk = mosaic_gpu.split_walk(pair, groups=1, rows=24576, depth=9216, width=2560, itemsizes=(2, 2),
+                                 multiprocessors=148, step_seconds=1.0, bandwidth=1.0, launch_seconds=None)
+    assert walk.output * pair.block_m * 2 * pair.block_n == 9216 * 2560
+
+
 def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiprocessors_a_target_states():
     """A balanced tail's hand-off is priced in MMA steps at one multiprocessor's tensor rate, so a part's
     8 multiprocessors or 64 move neither the step, nor the hand-off's steps, nor a tail of 8 programs'
@@ -988,8 +1021,10 @@ def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiproc
     times too short)."""
     h100 = generation.gpu_target("sm90")
     few, more = (dataclasses.replace(h100, multiprocessors=count) for count in (8, 64))
-    assert mosaic_gpu.step_seconds(COOPERATIVE, few) == mosaic_gpu.step_seconds(COOPERATIVE, more)
-    assert mosaic_gpu.handoff_steps(COOPERATIVE, few) == mosaic_gpu.handoff_steps(COOPERATIVE, more)
+    assert (mosaic_gpu.step_seconds(COOPERATIVE, few, (2, 2))
+            == mosaic_gpu.step_seconds(COOPERATIVE, more, (2, 2)))
+    assert (mosaic_gpu.handoff_steps(COOPERATIVE, few, (2, 2))
+            == mosaic_gpu.handoff_steps(COOPERATIVE, more, (2, 2)))
     for steps in (2, 4, 16, 64):
         decided = {mosaic_gpu.balanced_tail(COOPERATIVE, (1, 11), steps, (2, 2), target, 8) is not None
                    for target in (few, more)}
