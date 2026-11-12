@@ -67,7 +67,8 @@ def test_the_first_compile_is_at_the_least_recompute_rung_the_derivation_says_fi
     with Compiles("step") as compiles:
         compiled(trainer)
     labels = [entry["label"] for entry in trainer.plan["derived"]]
-    assert labels[0] == "refuses" and labels[-1] == "fits" and set(labels[1:-1]) <= {"refuses"}
+    assert labels[0] == "refuses" and labels[-1] == "fits"
+    assert set(labels[1:-1]) <= {"refuses", "refuses by the last trace"}
     assert trainer.plan["remat"] is not None and trainer.plan["derived"][-1]["remat"] == trainer.plan["remat"]
     assert compiles.count == 1 and trainer.plan["probes"][0]["fits"]
 
@@ -545,16 +546,18 @@ def test_the_derivation_decides_a_steps_fit_as_its_compile_does(layers, generati
 
 
 def wide(head_tile=None):
-    """`deep`'s decoder over a vocabulary of 4096, its remat stated and its batch read whole, so its whole
-    fp32 logits (2048 tokens by 4096 rows, 32 MiB) are most of what its step holds; its head tiled where
-    `head_tile` says so."""
-    model = CausalTransformer(vocab_size=4096, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
-                              max_seq_len=256, remat=REMAT_POLICIES["full"])
-    return one_device(Trainer(LMObjective(model, seq_len=256, head_tile=head_tile), optax.sgd(1e-2),
+    """`deep`'s decoder over a vocabulary of 32768 and rows of 1024 tokens, its remat stated and its batch
+    read whole, so its whole fp32 logits (8192 tokens by 32768 rows, `LOGITS`) are most of what its step
+    holds, and more than its head's tile; its head tiled where `head_tile` says so."""
+    model = CausalTransformer(vocab_size=32768, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
+                              max_seq_len=1024, remat=REMAT_POLICIES["full"])
+    return one_device(Trainer(LMObjective(model, seq_len=1024, head_tile=head_tile), optax.sgd(1e-2),
                               key=jax.random.key(0), split=1))
 
 
-WIDE = {"text": jnp.asarray((np.arange(8 * 257).reshape(8, 257) * 7) % 4096, jnp.int32)}
+WIDE = {"text": jnp.asarray((np.arange(8 * 1025).reshape(8, 1025) * 7) % 32768, jnp.int32)}
+LOGITS = 8192 * 32768 * 4
+"""The bytes of `wide`'s whole fp32 logits."""
 
 
 def test_a_step_whose_whole_logits_alone_leave_no_room_traces_its_tiled_step_alone(monkeypatch, tmp_path):
@@ -565,7 +568,7 @@ def test_a_step_whose_whole_logits_alone_leave_no_room_traces_its_tiled_step_alo
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
     tiled = wide("tiled")
     room = needs(monkeypatch, tiled, lambda: compiled(tiled, WIDE))
-    assert room < (2048 * 4096 * 4)
+    assert room < LOGITS
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
     free(monkeypatch, room)
     trainer = wide()
@@ -582,7 +585,7 @@ def test_a_whole_logits_trace_bounds_its_tiled_steps_peak(monkeypatch, tmp_path)
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
     whole = wide("whole")
     need = needs(monkeypatch, whole, lambda: compiled(whole, WIDE))
-    floor = 2048 * 4096 * 4
+    floor = LOGITS
     assert floor < need
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
     free(monkeypatch, (floor + need) // 2)

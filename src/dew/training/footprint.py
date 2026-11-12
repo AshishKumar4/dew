@@ -20,7 +20,7 @@ import contextlib
 import contextvars
 import dataclasses
 import math
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import NamedTuple
 
 import jax
@@ -1069,27 +1069,36 @@ def logits_floor[LossT, EffectsT](objective: Objective[LossT, EffectsT], forward
                                   prepared: TrainState, held: int) -> Footprint | None:
     """The least a step whose head keeps its whole logits holds beside its state, read off its loss's
     `forward` program before its gradient is traced: those logits in fp32, as the head keeps them for
-    the backward pass (`HeadedObjective.keeps_whole_logits`), the largest value of the head's table's shape
-    the forward makes (`logits_shaped`), with `held` beside them; a footprint whose headroom is an upper
-    bound (`exact` False), so a step it leaves no room refuses on it untraced (`Candidate.floored`). None
-    for a head that keeps no whole logits, or a forward that makes none of them (row 5556: Qwen3.5-4B's
-    4 x 12288 tokens hold 48.8 GB of them, where the state holds 51.9 GB of an 80 GB device)."""
+    the backward pass (`HeadedObjective.keeps_whole_logits`), a row of the head's table for each token of
+    the states it contracts the table with (`contracted_tokens`), with `held` beside them; a footprint
+    whose headroom is an upper bound (`exact` False), so a step it leaves no room refuses on it untraced
+    (`Candidate.floored`). None for a head that keeps no whole logits, or a forward whose head reads no
+    states (row 5556: Qwen3.5-4B's 4 x 12288 tokens hold 48.8 GB of them, where its state holds 51.9 GB of
+    an 80 GB device)."""
     table = head_table_shape(objective, prepared.variables)
-    if table is None:
-        return None
-
-    def made(program: jcore.Jaxpr) -> Iterator[int]:
-        for equation in program.eqns:
-            yield from (math.prod(value.aval.shape) for value in equation.outvars
-                        if logits_shaped(value, table))
-            for body in bodies(equation):
-                yield from made(body)
-
-    elements = max(made(forward), default=0)
-    if not elements:
+    tokens = None if table is None else contracted_tokens(forward, table)
+    if not tokens:
         return None
     return Footprint(None, device_bytes(prepared.variables["params"]), held, resident_bytes(prepared),
-                     elements * np.dtype(np.float32).itemsize, exact=False)
+                     tokens * table[0] * np.dtype(np.float32).itemsize, exact=False)
+
+
+def contracted_tokens(program: jcore.Jaxpr, table: tuple[int, int]) -> int:
+    """The most tokens of states `program` hands a head's table of `table`'s rows and features with, at
+    any depth: for each equation that reads the table (a value of its shape, or its transpose), the
+    elements of each other operand the features' width ends, over that width (the final states the table
+    contracts, `dew.nn.protocols.OutputTable`); none where the table meets no states."""
+    shapes = {table, table[::-1]}
+    most = 0
+    for equation in program.eqns:
+        operands = [getattr(value, "aval", None) for value in equation.invars]
+        if any(tuple(getattr(aval, "shape", ())) in shapes for aval in operands):
+            most = max([most, *(math.prod(aval.shape[:-1]) for aval in operands
+                                if aval is not None and tuple(getattr(aval, "shape", ())) not in shapes
+                                and len(aval.shape) > 1 and aval.shape[-1] == table[1])])
+        for body in bodies(equation):
+            most = max(most, contracted_tokens(body, table))
+    return most
 
 
 def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: TrainState, window: int,
