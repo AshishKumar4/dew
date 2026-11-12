@@ -37,7 +37,7 @@ from test_recurrence_stability import GRADIENT_SEEDS, REGIMES, SEEDS, SITES, cot
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.recurrence_chunk import Chunk
-from dew.nn.kernels.templates.recurrence import mainloop, template
+from dew.nn.kernels.templates.recurrence import template
 
 pytestmark = pytest.mark.kernel
 
@@ -75,19 +75,6 @@ def bf16(operands: Chunk, hooks) -> Chunk:
     names = ('query', 'key', 'value', 'beta') if hooks.delta else ('query', 'key', 'value')
     return dataclasses.replace(operands, **{name: getattr(operands, name).astype(jnp.bfloat16)
                                             for name in names})
-
-
-def fast_backward(operands: Chunk) -> bool:
-    """Whether the template's rule takes a gradient over `operands` on its fast backward: its launches hold at
-    the call's derived tiles on the device's bundle, or interpreted, the interpreted one's (`mosaic_rule`)."""
-    target = template.Mosaic.launched()
-    bound = template.MOSAIC.bind(operands.query, operands.key, operands.value, operands.log_decay,
-                                 operands.beta, operands.state, operands.starts, bound=HOOKS.inverse_bound)
-    tiles = template.MOSAIC.derived(bound, target)
-    return template.backward_holds(operands.query, operands.key, operands.value, operands.log_decay,
-                                   operands.beta, operands.state, tiles=tiles,
-                                   family=mainloop.issued()[0], target=target,
-                                   starts=operands.starts)
 
 
 def assert_finite(fn, truth, operands, regime: str) -> None:
@@ -231,16 +218,6 @@ def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, 
     the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, 'forward', forms)
 
 
-@pytest.mark.parametrize('regime', REGIMES)
-def test_the_template_gradient_takes_the_fast_backward_where_its_launches_hold(regime):
-    """The template's gradient over each regime's draw takes its fast backward, its launches holding at the
-    call's derived tiles (`fast_backward`): off a GPU by the interpreted bundle, on a GPU by its own, an
-    A100's too (its keys launch a key block a program, its query/key launch's memory sum a product: their
-    loops' operand fragments spilled 64 to 200 bytes a thread past its 255 registers)."""
-    operands, _ = cotangents(HOOKS, regime, 0)
-    assert fast_backward(restarting(lambda given: given, regime)(bf16(operands, HOOKS)))
-
-
 @pytest.mark.whole_suite  # 130 s interpreted, past a group's two minutes (ledger 2145).
 def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpreted():
     """The fast backward's log decay gradient, interpreted, as near float64 as recorded fla-core's
@@ -249,14 +226,11 @@ def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpret
     away the `exp(-30)` terms before it (65 to 169 times the port's distance on three draws, the H100's
     check 1 140 times, SE-numerics-h100-fd61e11eeb; 0.98 to 1.00 times after), held on one draw by the gate's
     one-draw rule, pooled (the recording keeps no rows of it). On a GPU whose launches do not hold the fast
-    backward the rule refuses the gradient (row 1926)."""
+    backward the rule refused the gradient (row 1926); every GPU's do now, so a refusal fails it."""
     regime = 'decays near zero'
     operands, (out, final) = cotangents(HOOKS, regime, 0)
     drawn = (bf16(operands, HOOKS), (out.astype(jnp.bfloat16), final))
     template = with_gradients(functools.partial(chunk_on, 'mosaic_gpu', HOOKS))
-    if not fast_backward(restarting(lambda given: given, regime)(drawn[0])):
-        refuses_its_gradient(template, *drawn)
-        return
     with jax.enable_x64(new_val=True):
         exact = jax.jit(with_gradients(functools.partial(token_by_token, HOOKS)))(*widened(drawn))
     mine = gate.distance(np.asarray(jax.jit(template)(*drawn)[1].log_decay), np.asarray(exact[1].log_decay))

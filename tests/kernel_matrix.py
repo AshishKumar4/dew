@@ -378,22 +378,27 @@ def covered(family: str) -> list[tuple[str, dict[str, str]]]:
 
 
 def covering(family: str) -> list[tuple[str, ...]]:
-    """Combinations the route serves in which every supported pair occurs (`supported_pairs`), each as its
-    values in `AXES`' order: the family's seeded cases (`SEEDED`) first, then the combination holding the most
-    pairs not yet covered, a tie to the first in `combinations`' order. A family's cell module takes these as
-    its cases, regenerated where its axes or its route's support change (tests/test_kernel_matrix.py fails
-    until they are)."""
-    left = supported_pairs(family)
+    """Combinations the route serves in which every supported pair occurs (`pairwise`), each as its values in
+    `AXES`' order, the family's seeded cases (`SEEDED`) first. A family's cell module takes these as its
+    cases, regenerated where its axes or its route's support change (tests/test_kernel_matrix.py fails until
+    they are)."""
     served = [combination for combination in combinations(family)
               if supported(family, tuple(combination.items()))]
-    chosen = []
-    for _, case in SEEDED.get(family, ()):
-        combination = dict(zip(AXES[family], case, strict=True))
-        chosen.append(case)
-        left -= set(itertools.combinations(combination.items(), 2))
+    seeded = [dict(zip(AXES[family], case, strict=True)) for _, case in SEEDED.get(family, ())]
+    return [tuple(combination.values()) for combination in pairwise(served, seeded)]
+
+
+def pairwise(served: list[dict], seeded: list[dict]) -> list[dict]:
+    """Combinations of `served` (each an axis's value by its name) in which every pair of axis values some
+    served combination holds occurs: `seeded` first, then the served combination holding the most pairs not
+    yet covered, a tie to the first in `served`'s order."""
+    def pairs(combination: dict) -> set:
+        return set(itertools.combinations(combination.items(), 2))
+
+    left = set().union(*map(pairs, served)) - set().union(*map(pairs, seeded))
+    chosen = list(seeded)
     while left:
-        best = max(served, key=lambda combination: len(
-            left & set(itertools.combinations(combination.items(), 2))))
-        chosen.append(tuple(best.values()))
-        left -= set(itertools.combinations(best.items(), 2))
+        best = max(served, key=lambda combination: len(left & pairs(combination)))
+        chosen.append(best)
+        left -= pairs(best)
     return chosen

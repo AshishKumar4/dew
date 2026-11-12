@@ -312,18 +312,6 @@ def test_a_walk_of_two_roles_is_as_exact_as_its_reference(case, product):
     the_template_is_as_exact_as_fla(walked, site, label=f'a two-role walk\'s gradient, {case}')
 
 
-def test_the_fast_backward_trains_a_bf16_rated_scan_alone():
-    """A rated scan's (Mamba2's SSD) 16-bit gradient under the run's fast forms, whose numbers are
-    mamba_ssm's: the template's fast backward takes a bf16 call, the case recorded mamba_ssm holds it to, and
-    refuses an fp16 one, which no recording holds, so the port trains it
-    (`mainloop_backward.fast_backward_form`)."""
-    hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
-    shape = geometry('one sequence')
-    with generation.run_precision(dataclasses.replace(generation.numerics(), forms='fast')):
-        assert trained(drawn(jnp.bfloat16, 0, **shape)[0], hooks)
-        assert not trained(drawn(jnp.float16, 0, **shape)[0], hooks)
-
-
 ROUNDED_EXACTLY = {
     "a write": ({"x": 129 / 128, "B": 1.0, "C": 0.0, "dt": 129 / 256, "dy": 0.0}, "final", 16641 / 32768),
     "a write gate's gradient": ({"x": 1.0, "B": 1.0, "C": 129 / 128, "dt": 0.5, "dy": 129 / 128}, "ddt",

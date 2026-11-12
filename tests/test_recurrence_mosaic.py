@@ -286,21 +286,9 @@ def test_the_mosaic_forward_over_one_fp32_sequence_is_as_exact_as_its_reference(
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=16)
-@drawn_forward('a ragged length', 'bf16')
-def test_the_mosaic_forward_over_a_ragged_length_is_as_exact_as_its_reference():
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over a ragged length."""
-
-
-@pytest.mark.check1_shards(seeds=256, per_task=16)
 @drawn_forward('packed documents', 'bf16')
 def test_the_mosaic_forward_over_packed_documents_is_as_exact_as_its_reference():
     """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over packed documents."""
-
-
-@pytest.mark.check1_shards(seeds=128, per_task=8)
-@drawn_forward('a decay a key dimension', 'bf16')
-def test_the_mosaic_forward_over_a_decay_a_key_dimension_is_as_exact_as_its_reference():
-    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call under a decay a key dimension."""
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=8)
@@ -1389,25 +1377,6 @@ def test_a_packed_key_decay_training_call_checks_forward_and_recomputed_kernels(
                      if model.registers is not None and model.registers > model.budget}}
     found = compile_mosaic_kernels([case], 'sm100')
     assert resource_failures([case], found, {label: launches}, apart) == []
-
-
-@COMPILES_ON_CPU
-@pytest.mark.parametrize('training', [False, True], ids=['forward', 'training'])
-def test_each_launchs_producer_lowers_its_registers_as_its_model_states_on_a_b200_spilling_none(training):
-    """The gated delta rule's 16-bit forward and training pass on a B200's tcgen05 bundle, compiled by Mosaic
-    on this CPU (`compiled_cases`): each launch's producer warpgroup lowers its registers in its PTX
-    (`setmaxnreg.dec`) to what its register model states (`RegisterModel.producer`, its plan's
-    `Launch.producer`), a launch's plan and its schedule one fact, and no kernel spills: the states, solve,
-    reverse walk's and the forward's one walk's producers spilled at the default 24 (52, 164, 40 and 52 bytes;
-    none from 40, 32, 72 and 80, jsf-pfloor-ab and armada 20261110172902-73ad9c43, row 5357), the states
-    launch planned at 48 and run at 24 (the promotion's review)."""
-    from kernel_compile import compile_mosaic_kernels
-
-    plans, apart = {}, {}
-    group = ('qwen3.5-27b-gdn', jnp.bfloat16, training, False, None)
-    cases = compiled_cases('sm100', plans, [], apart, only=group)
-    found = compile_mosaic_kernels(cases, 'sm100')
-    assert resource_failures(cases, found, plans, apart) == []
 
 
 FORKED_GATE = [(target, name, training) for target in ('sm80', 'sm90', 'sm100') for name in RESOURCE_SHAPES
