@@ -23,8 +23,8 @@ fold's reach, and its overflowed rows again shifting under headroom). Its legali
 
 import dataclasses
 import functools
-from collections.abc import Callable
-from typing import Any, NamedTuple
+from collections.abc import Callable, Sequence
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -36,6 +36,7 @@ from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, opera
 from dew.nn.kernels.templates.attention import (
     Hooks,
     KeySpans,
+    PaddedCall,
     Param,
     Split,
     by_power,
@@ -77,6 +78,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     transposed_swizzles,
 )
 from dew.nn.kernels.templates.cost import estimate
+from dew.nn.kernels.templates.rings import Ref
 
 
 def _out_types(batch: int, queries: int, heads: int, value_width: int, out_dtype, *, splits: int, peaks: bool,
@@ -300,8 +302,6 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
     call, spec, (raw, k, v), (spans_of, hooked), taken = _prepared(
         query, key, value, spans, hooks, scale=scale, natural=natural, tiles=tiles, family=family,
         table=table, inference=True, subtracted=subtracted, scales=scales, scaled=scaled)
-    # The values' dtype as the walk reads them: a quantized call's converted to the query's (`_Codes`).
-    computed = query.dtype if scales is not None else value.dtype
     # A paged call's table, its rows' pages whole blocks of the call's, and its pools' page (`_launch`'s
     # `table`).
     paged = (None if call.table is None or call.page is None
@@ -321,7 +321,7 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
         # The launch on the family arranged for its own tiles (`bundle_of`), as its derivation priced it: a
         # natural rewalk's key tile its own (`Tiles.relaunch`).
         walk = _InferenceWalk(bundle_of(at, query.dtype), spec, call, hooks, hooked, k, v, interpret, rows,
-                              out_dtype, masked, splits, paged, sources, computed, parts, counts, registered)
+                              out_dtype, masked, splits, paged, sources, parts, counts, registered)
         return _plain_launches(walk, q, form, at, at_spans, flags, in_place, stated=stated, into=into)
 
     return (spec, launch, functools.partial(_walked_outputs, queries=call.queries, width=value.shape[3],
@@ -330,24 +330,23 @@ def _inference_walk(query: jax.Array, key: jax.Array, value: jax.Array, spans: K
 
 class _InferenceWalk(NamedTuple):
     """What an inference walk's launches share (`_inference_walk`'s `launch`): its family and form, the padded
-    call and its hooks (`_prepared`), its keys and values, the walk's options, and the dtype its values are
-    read in (a quantized call's converted to its query's, `_Codes`)."""
+    call and its hooks (`_prepared`), its keys and values, and the walk's options: its output's dtype by name
+    (`MosaicForward.out_dtype`), the query's where None."""
 
     family: mosaic.Family
     spec: algebra.Forward
-    call: Any
+    call: PaddedCall
     hooks: Hooks
     hooked: _Hooked
     k: jax.Array
     v: jax.Array
     interpret: bool
     rows: bool
-    out_dtype: Any
+    out_dtype: str | None
     masked: bool
     splits: int
     paged: tuple | None
     sources: jax.Array | None
-    computed: Any
     parts: int = 1
     counts: bool = True
     """Whether its launches state their work to Dew's FLOP count (`_launch_flops`)."""
@@ -644,26 +643,28 @@ class _Refs(NamedTuple):
     """A forward program's refs as `_launched` lays them out (`_Layout.unpacked`): its operands, what it
     reads (`_Read`), its outputs, the query's, rows' and output's stages and the rest, the query loads'
     barriers and the consumers' turns' barrier."""
-    q: Any
-    k: Any
-    v: Any
+    q: Ref
+    k: Ref
+    v: Ref
     read: _Read
     written: tuple
-    q_smem: Any
-    row_smem: Any
-    out_smem: Any
+    q_smem: Ref
+    row_smem: Ref
+    out_smem: Ref | None
     stages: tuple
-    q_loaded: Any
-    schedule: Any
-    relay: Any = None
-    converted: tuple | None = None
+    q_loaded: Ref
+    schedule: Ref
+    relay: Ref | None = None
+    converted: tuple[Ref, Ref] | None = None
 
 
 class _Layout(NamedTuple):
-    """How `_launched` lays its kernel's refs out: its read arrays' tree, its outputs' count, the stages'
-    count (`_forward_allocations`'), and whether the output stores through the query's stage or one scoped
-    after the walks."""
-    treedef: Any
+    """How `_launched` lays its kernel's refs out: its read refs' count and how they make its `_Read` again
+    (`unflatten`, its arrays' tree's, `jax.tree.flatten`'s), its outputs' count, the stages' count
+    (`_forward_allocations`'), and whether the output stores through the query's stage or one scoped after
+    the walks."""
+    reads: int
+    unflatten: Callable[[Sequence[Ref]], _Read]
     outputs: int
     arrays: int
     reuse: bool
@@ -676,7 +677,7 @@ class _Layout(NamedTuple):
         """A program's refs, its kernel's then its scoped allocations': the weights' relay tile last where
         the launch `relays` them (`relays`), a quantized call's converted keys' and values' tiles before it
         where it `converts` them (`_forward_allocations`' `codes`)."""
-        read, refs = refs[:self.treedef.num_leaves], refs[self.treedef.num_leaves:]
+        read, refs = refs[:self.reads], refs[self.reads:]
         written, refs = refs[:self.outputs], refs[self.outputs:]
         (q_smem, row_smem, *stages), (q_loaded, schedule) = refs[:self.arrays], refs[self.arrays:]
         relay = stages.pop() if self.relays else None
@@ -686,12 +687,12 @@ class _Layout(NamedTuple):
             out_smem = q_smem if self.reuse else None
         else:
             out_smem, stages = stages[0], stages[1:]
-        return _Refs(q_ref, k_ref, v_ref, self.treedef.unflatten(read), tuple(written), q_smem, row_smem,
+        return _Refs(q_ref, k_ref, v_ref, self.unflatten(read), tuple(written), q_smem, row_smem,
                      out_smem, tuple(stages), q_loaded, schedule, relay, converted)
 
     def read(self, refs: tuple) -> _Read:
         """What a kernel's entry `refs` (its three operands first) read."""
-        return self.treedef.unflatten(refs[3:3 + self.treedef.num_leaves])
+        return self.unflatten(refs[3:3 + self.reads])
 
 
 class _Block(NamedTuple):
@@ -1427,7 +1428,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
             finishes: bool = False, splits: int = 1,
             table: tuple[jax.Array, int] | None = None, column_width: int | None = None,
             walks: "_Flags | None" = None, sources: jax.Array | None = None, shared_by: int = 1,
-            column_blocks: int = 1, certified: bool = False, into: tuple | None = None,
+            certified: bool = False, into: tuple | None = None,
             keeping: jax.Array | None = None, flags: bool = False, parts: int = 1,
             registered: ForwardRegisters | None = None):
     """The forward's launch in `spec`'s form: its rows' status `[1, B, H, Qp]` fp32, their maxima in the
@@ -1452,9 +1453,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
     columns (each block's launch recomputes it whole). With `walks` (a masked launch's,
     `algebra.walked_launches`': `[B, Qp // block_q]` int32, nonzero at a query block holding a row it
     walks), a program none of whose query blocks it names loads and writes nothing, its outputs there
-    unread. With `column_blocks`, a launch walks that many blocks of `column_width` columns from the first,
-    a program a block (its heads' grid axis the heads by the blocks), its output every block's columns; its
-    per-row outputs each block's alike, as its logits are the row's whole. With `certified`, the certify
+    unread. With `certified`, the certify
     form's (`certified_walk`): its plain walk's state after each key tile beside its outputs. With `into`
     (refs holding its outputs but its status, `_Read.into`), it writes its rows `keeping` (every row where
     None) into them in place and gives nothing: a masked rewalk's rows, every other row the plain launch's
@@ -1478,8 +1477,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
     # A block of the values' columns its index a scalar the programs read, so every block's launch is one
     # kernel (`_key_views`): a static index compiled a kernel a block, four at width 256 (the forward's
     # resource gate's cases 50 to 150 s on a CPU).
-    block = (None if column_width is None or column_blocks > 1
-             else jnp.full((1,), (columns or 0) // column_width, jnp.int32))
+    block = None if column_width is None else jnp.full((1,), (columns or 0) // column_width, jnp.int32)
     target = generation.gpu_target()
     return _launched(query, key, value,
                      _Read(spans, hooked, anchors, None if table is None else table[0],
@@ -1490,7 +1488,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *,
                      counted=counted, finishes=finishes, target=target,
                      name=name if splits == 1 else f"{name}_split", splits=splits,
                      page=None if table is None else table[1],
-                     column_width=column_width, shared_by=shared_by, column_blocks=column_blocks,
+                     column_width=column_width, shared_by=shared_by,
                      certified=certified, flags=flags,
                      walk_rows=None if walks is None else walks.granule, parts=parts,
                      registers=None if registered is None else registered.at(family, tiles, peaks=peaks,
@@ -1531,7 +1529,7 @@ def _parted_views(views: dict, named: dict, row, kv_head, *, batch: int, parts: 
             for (name, (_, index)), ref in zip(views.items(), named.values(), strict=True)}
 
 def _entry(program: _Program, layout: "_Layout", body: Callable, allocations: tuple, *refs,
-           column_blocks: int, queries: int, walk_rows: int | None) -> None:
+           queries: int, walk_rows: int | None) -> None:
     """A forward launch's kernel entry (`_launched`'s): its `body` in its scoped allocations and rings, where
     a masked launch walks it alone (`_walked_program`: else its program loads and writes nothing; its
     `walk_rows` the walks' granule, which a masked launch states)."""
@@ -1546,19 +1544,18 @@ def _entry(program: _Program, layout: "_Layout", body: Callable, allocations: tu
         scoped_body()
     else:
         assert walk_rows is not None, "a masked launch states its walks' granule"
-        head = lax.div(program.family.program_index("heads"), column_blocks)
-        pl.when(_walked_program(program, walks, program.family.program_index("batch"), head, queries,
-                                walk_rows))(
+        pl.when(_walked_program(program, walks, program.family.program_index("batch"),
+                                program.family.program_index("heads"), queries, walk_rows))(
             scoped_body)
 
 @tuning.lowered_once(("hooks", "spec", "tiles", "family", "training", "interpret", "peaks", "out_dtype",
                       "counted", "finishes", "target", "name", "splits", "page", "column_width", "shared_by",
-                      "column_blocks", "certified", "flags", "walk_rows", "parts", "registers"))
+                      "certified", "flags", "walk_rows", "parts", "registers"))
 def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.Forward, tiles: Tiles,
               family: mosaic.Family, training: bool, interpret: bool,
               peaks: bool, out_dtype, counted: bool, finishes: bool, target: generation.GpuTarget,
               name: str, splits: int = 1, page: int | None = None,
-              column_width: int | None = None, shared_by: int = 1, column_blocks: int = 1,
+              column_width: int | None = None, shared_by: int = 1,
               certified: bool = False, flags: bool = False, walk_rows: int | None = None, parts: int = 1,
               registers: int | None = None):
     """`_launch`'s kernel launched on its operands and the arrays its programs read beside them (`read`, the
@@ -1588,11 +1585,12 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
                                          program.stages, peaks=peaks, out_dtype=out_dtype, page=page,
                                          certified=certified, codes=_codes_of(key, read.hooked.scales),
                                          parts=parts, interpret=bool(interpret))
-    out_type = _out_types(batch, queries, heads, value_width * column_blocks, out_dtype, splits=splits,
+    out_type = _out_types(batch, queries, heads, value_width, out_dtype, splits=splits,
                           peaks=peaks, training=training, finishes=finishes,
                           certified=steps if certified else 0, flags=flags,
                           in_place=read.into is not None)
-    layout = _Layout(treedef, len(out_type), len(scoped) - 2, peaks or (reuse and not training),
+    layout = _Layout(treedef.num_leaves, treedef.unflatten, len(out_type), len(scoped) - 2,
+                     peaks or (reuse and not training),
                      relays(family, tiles, peaks=peaks), _codes_of(key, read.hooked.scales) is not None,
                      bool(after))
 
@@ -1600,7 +1598,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
         refs = layout.unpacked(*refs)
         read = refs.read
         located = functools.partial(_program_views, family, refs, read, peaks=peaks, group=group, page=page,
-                                    block_k=block_k, column_blocks=column_blocks, batch=batch, parts=parts)
+                                    block_k=block_k, batch=batch, parts=parts)
         # The rings opened once, before the roles' split (a gathered ring's barriers set once).
         streams = family.opened(streams, located()[3])
         turn = functools.partial(family.turn, refs.schedule, consumers)
@@ -1625,7 +1623,7 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
             written = _written_refs(refs.written, read)
             # A block of the columns writes its own of the output's, the whole call's in place.
             columns_at = (pl.ds(column * value_width, value_width)
-                          if column is not None and (column_blocks > 1 or read.into is not None) else None)
+                          if column is not None and read.into is not None else None)
             viewed = functools.partial(_written_views, family, written=written,
                                        stages=tuple(stage.at[index] for stage in refs.stages),
                                        training=training, finishes=finishes, columns_at=columns_at,
@@ -1658,11 +1656,10 @@ def _launched(query, key, value, read: _Read, *, hooks: Hooks, spec: algebra.For
 
     products = forward_products(tiles, value_width, query.dtype, peaks=peaks, parts=parts)
     entry = functools.partial(_entry, program, layout, body, (scoped, rings, after, products),
-                              column_blocks=column_blocks,
                               queries=queries, walk_rows=walk_rows)
     cost, model = _launch_flops(spec, family, query, key, value, keys_count, value_width, tiles,
                                 peaks=peaks, training=training, counted=counted, shared_by=shared_by)
-    grid = (heads * column_blocks, queries // pair * splits, batch)
+    grid = (heads, queries // pair * splits, batch)
     return family.kernel(entry, out_type=out_type, grid=grid,
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
                          interpret=interpret,
@@ -1701,17 +1698,13 @@ def _placed(program: _Program, located: Callable, spans: _Spans | None, *, queri
 
 
 def _program_views(family: mosaic.Family, refs, read: _Read, *, peaks: bool, group: int, page: int | None,
-                   block_k: int, column_blocks: int, batch: int, parts: int, fresh: bool = False) -> tuple:
+                   block_k: int, batch: int, parts: int, fresh: bool = False) -> tuple:
     """A forward program's place and the key views it streams (`_launched`'s): its batch row, the query head
-    and column block of the values it walks (a launch of several column blocks a program a block along its
-    heads' grid axis, else the block `read` names), and its key and value views
+    and column block of the values it walks (the block `read` names), and its key and value views
     (`_key_views`; a peak walk's keys alone, an fp32 call's its parts', `_parted_views`); its grid
     coordinates read where they are used where `fresh` (`Family.program_index`)."""
-    row, axis = family.program_index("batch", fresh=fresh), family.program_index("heads", fresh=fresh)
-    if column_blocks > 1:
-        head, column = lax.div(axis, column_blocks), lax.rem(axis, column_blocks)
-    else:
-        head, column = axis, None if read.block is None else family.scalar_of(read.block)
+    row, head = family.program_index("batch", fresh=fresh), family.program_index("heads", fresh=fresh)
+    column = None if read.block is None else family.scalar_of(read.block)
     named = {"keys": refs.k} if peaks else {"keys": refs.k, "values": refs.v}
     views = _key_views(named, row, lax.div(head, group), read.sources, read.table, page=page, block_k=block_k,
                        column_block=column)

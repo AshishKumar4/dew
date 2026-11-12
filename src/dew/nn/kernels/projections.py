@@ -343,30 +343,37 @@ def _launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: Precisio
     """Whether a launch takes any of the dense product `rows @ matrix`'s products on the call's target
     (`grouped_matmul.GROUPED`): its forward, its input gradient or its kernel gradient, as `gemm` and
     its reverse mode make them, each read without its report (`selection.selected`). Where none does, the
-    forward's route is reported, as XLA runs it. Decided
-    once a key (`_DECIDED`: the operands' shapes and dtypes, the product, the target and the kernels a
-    block names or pins), its routes reported again at every call: a model's projections ask the same
-    question at every layer's trace (row 3213: a warm start spent 10.9 of its 75.6 seconds selecting)."""
+    forward's route is reported, as XLA runs it. Decided once a key (`_decided`), its routes reported again
+    at every call: a model's projections ask the same question at every layer's trace (row 3213: a warm
+    start spent 10.9 of its 75.6 seconds selecting)."""
     product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
     whole = seen_whole(rows) and seen_whole(matrix)
-    key = (rows.shape, jnp.dtype(rows.dtype), matrix.shape, jnp.dtype(matrix.dtype), jnp.dtype(out_dtype),
-           repr(precision), whole, product, generation.gpu_target(), _cache.KERNEL_CHOICES.value,
-           _cache.KERNEL_PINS.value)
-    if (decided := _DECIDED.get(key)) is None:
-        with generation.routes() as found:
-            taken = _launched_once(rows, matrix, out_dtype, product, whole)
-        decided = _DECIDED[key] = (taken, tuple(found))
-    else:
-        for route in decided[1]:
-            generation.route(route.choice, kernel=route.kernel, preferred=route.preferred,
-                             refusal=route.refusal, forced=route.forced)
-    return decided[0]
-
-_DECIDED: dict[tuple, tuple[bool, tuple]] = {}
-"""`_launched`'s decisions by their key, and the routes each reported."""
+    taken, found = _decided(jax.ShapeDtypeStruct(rows.shape, rows.dtype),
+                            jax.ShapeDtypeStruct(matrix.shape, matrix.dtype), jnp.dtype(out_dtype), product,
+                            whole, generation.gpu_target(), _cache.KERNEL_CHOICES.value,
+                            _cache.KERNEL_PINS.value)
+    for route in found:
+        generation.route(route.choice, kernel=route.kernel, preferred=route.preferred, refusal=route.refusal,
+                         forced=route.forced)
+    return taken
 
 
-def _launched_once(rows: jax.Array, matrix: jax.Array, out_dtype, product, whole: bool) -> bool:
+@functools.lru_cache(maxsize=1024)
+def _decided(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype: jnp.dtype, product,
+             whole: bool, target: generation.GpuTarget, choices: tuple, pins: tuple
+             ) -> tuple[bool, tuple[generation.Route, ...]]:
+    """`_launched`'s decision and the routes it found, once a key, the most recent keys kept: the operands'
+    shapes and dtypes, the product, whether each is seen whole, and the target and the kernels a block names
+    or pins, which the decision reads from its context, so they key it alone. Its routes are collected apart
+    (`generation.routes`' `alone`), `_launched` reporting them at every call."""
+    del target, choices, pins
+    with generation.routes(alone=True) as found:
+        taken = _launched_once(rows, matrix, out_dtype, product, whole)
+    return taken, tuple(found)
+
+
+def _launched_once(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype, product,
+                   whole: bool) -> bool:
     """`_launched`'s decision, its routes reported."""
     width = matrix.shape[1]
     abstract = functools.partial(jax.ShapeDtypeStruct, dtype=rows.dtype)

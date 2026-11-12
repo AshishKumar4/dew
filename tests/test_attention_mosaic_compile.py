@@ -54,11 +54,15 @@ def _takes(generation_name: str, accurate: bool, hooks: str) -> bool:
                                                                                                  parametrized)
 
 
+COMPILED_HOOKS = [hooks for hooks in BACKWARD_HOOKS if hooks not in ("none", "resumed")]
+"""The score hooks whose launches the gates compile: every one but a resumed partial, an initial state as
+sinks are (`template.sinks`: a numerator of zeros), which a launch reads as arrays whatever their values, so
+its every kernel is the sinks' (the same module hash at each gate cell, 2026-11-12)."""
+
 BACKWARD_GATE = [(generation_name, width, accurate, "none") for generation_name in BACKWARD_GATED
                  for width in (64, 128, 256) for accurate in (False, True)]
 BACKWARD_GATE += [(generation_name, width, accurate, hooks) for generation_name in BACKWARD_GATED
-                  for width in (64, 128) for accurate in (False, True)
-                  for hooks in BACKWARD_HOOKS if hooks != "none"]
+                  for width in (64, 128) for accurate in (False, True) for hooks in COMPILED_HOOKS]
 BACKWARD_GATE += [("sm90", 256, False, "softcap")]
 BACKWARD_GATE = [case for case in BACKWARD_GATE if _takes(case[0], case[2], case[3])]
 SPILLING = {("sm86", 64, False, "temperature"), ("sm89", 64, False, "temperature")}
@@ -138,7 +142,7 @@ FORWARD_GATE = [(generation_name, width, training, "none") for generation_name i
                 for training in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)]
 FORWARD_GATE += [(generation_name, width, training, hooks) for generation_name in GATED for width in (64, 128)
                  for training in (template.Kept.NONE, template.Kept.OUTPUT, template.Kept.SPLIT)
-                 for hooks in BACKWARD_HOOKS if hooks != "none"]
+                 for hooks in COMPILED_HOOKS]
 FORWARD_GATE += [(generation_name, 256, template.Kept.NONE, "softcap") for generation_name in GATED]
 FORWARD_GATE = [(*case, jnp.bfloat16) for case in FORWARD_GATE]
 FORWARD_GATE += [(generation_name, width, training, "none", jnp.float16) for generation_name in GATED

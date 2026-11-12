@@ -1234,11 +1234,10 @@ def test_records_a_failed_process_of_their_own_wrote_are_refused():
         compiled_apart((9, 0), test, 0)
 
 
-def test_a_capabilitys_cells_compile_in_one_process_of_their_own(monkeypatch, tmp_path):
-    """Every cell of the session that states a capability other than the one the process compiles for
-    (`kernel_compile.Gated`) runs in one pytest process of its own, the first to ask starting it, and each
-    reads its own records from it, none where its call did not pass there (a skip); a test that states none
-    runs in one of its own (`compiled_apart`)."""
+def test_a_capabilitys_cells_read_their_own_records_from_a_process_of_their_own(monkeypatch, tmp_path):
+    """A cell of the session that states a capability other than the one the process compiles for
+    (`kernel_compile.Gated`), and a test that states none, each read their own records from the process
+    that compiled them (`compiled_apart`), none where its call did not pass there (a skip)."""
     from types import SimpleNamespace
 
     import apart_records
@@ -1252,12 +1251,8 @@ def test_a_capabilitys_cells_compile_in_one_process_of_their_own(monkeypatch, tm
                cell("b", generation_name=Gated("sm90"), index=1),
                cell("c", generation_name=Gated("sm100"), index=0), SimpleNamespace(nodeid="d"),
                cell("e", generation_name=Gated("sm90"), index=2)]
-    started = []
-
     def ran_apart(tests):
-        started.append(tests)
-        directory = tmp_path / str(len(started))
-        directory.mkdir()
+        directory = Path(tempfile.mkdtemp(dir=tmp_path))
         monkeypatch.setenv(apart_records.RECORDS, str(directory))
         for test in tests:
             apart_records.written(directory, test, 0, [{"name": test}])
@@ -1276,7 +1271,6 @@ def test_a_capabilitys_cells_compile_in_one_process_of_their_own(monkeypatch, tm
     assert kernel_compile.compiled_apart((9, 0), "d", 0) == [{"name": "d"}]
     with pytest.raises(RuntimeError):
         kernel_compile.compiled_apart((9, 0), "e", 0)
-    assert started == [["a", "b", "e"], ["d"]]
 
 
 def test_the_resource_gate_refuses_spills_and_invalid_allocations():

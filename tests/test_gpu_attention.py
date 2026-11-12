@@ -123,10 +123,10 @@ def test_the_attention_kernels_run_on_this_gpu(part):
           for edge in contracts.EDGES),
         *(Cell(f"the Mosaic mainloop's default is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "mosaic"), "sm90")
-          for family in stability.MOSAIC_FAMILIES),
+          for family in stability.mosaic_families()),
         *(Cell(f"the Mosaic backward in two launches is finite at fp32's edges: {family}",
                functools.partial(stability.default_is_finite, family, "mosaic two launches"), "sm90")
-          for family in stability.HOOKLESS_FAMILIES),
+          for family in stability.hookless_families()),
         *(Cell(f"a step with a bias every row shares repeats bit for bit: {name}",
                functools.partial(a_shared_bias_step_repeats_bit_for_bit, shape, kv_heads))
           for name, shape, kv_heads in (("a tile of the logits", (2048, 2048), 8),

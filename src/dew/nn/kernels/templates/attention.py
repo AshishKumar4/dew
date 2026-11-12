@@ -567,17 +567,46 @@ def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:
     some = jnp.any(whole, axis=-1)
     full_lo = jnp.where(some, jnp.take_along_axis(whole_lo, widest, axis=-1)[..., 0], lo)
     full_hi = jnp.where(some, jnp.take_along_axis(whole_hi, widest, axis=-1)[..., 0], full_lo)
-    # The query blocks reading each key block: those some range of which holds it.
-    j = jnp.arange(key_blocks)[None, None, :, None]
-    reads = jnp.any((ranges[:, :, None, :, 0] <= j) & (j < ranges[:, :, None, :, 1]), axis=-1)
-    i = jnp.arange(lo.shape[1])[None, :, None]
-    # The first and last query block reading each key block, one reduction as the bounds above.
-    first_q, q_hi = jnp.moveaxis(jnp.max(jnp.stack([jnp.where(reads, -i, -big), jnp.where(reads, i + 1, 0)],
-                                                   axis=-1), axis=1, initial=-big), -1, 0)
-    q_hi = jnp.maximum(q_hi, 0)
-    q_lo = jnp.where(q_hi > 0, -first_q, 0)
+    # The first and last query block reading each key block, those some range of which holds it.
+    q_lo, q_hi = _readers(ranges, key_blocks)
     return BlockMap(lo, hi, full_lo, full_hi, q_lo, q_hi, _uniform_doc(spans.query_ids, block_q),
                     _uniform_doc(spans.key_ids, block_k), block_q, block_k, ranges if runs else None)
+
+
+def _readers(ranges: jax.Array, key_blocks: int) -> tuple[jax.Array, jax.Array]:
+    """Each key block's first query block and one past its last whose ranges `[B, Qb, R, 2]` hold it, `(0, 0)`
+    where none does (`BlockMap.q_lo`, `q_hi`): each range an update of the key blocks it holds, never a query
+    block by key block relation (docs/design/kernel-templates.md §5, "never a dense map"). A segment tree over
+    the key blocks takes each range's least and greatest query block at the O(log Kb) nodes that cover it,
+    and a key block reads the nodes above it: O((Qb R + Kb) log Kb) a row."""
+    big = jnp.iinfo(jnp.int32).max
+    leaves = 1 << max(key_blocks - 1, 0).bit_length()
+    levels = leaves.bit_length()
+    lo, hi = (ranges[..., side].astype(jnp.int32) for side in (0, 1))
+    block = jnp.broadcast_to(jnp.arange(ranges.shape[1], dtype=jnp.int32)[:, None], lo.shape[1:])
+
+    def row(lo: jax.Array, hi: jax.Array) -> tuple[jax.Array, jax.Array]:
+        first = jnp.full((2 * leaves,), big, jnp.int32)
+        last = jnp.zeros((2 * leaves,), jnp.int32)
+        left, right = lo + leaves, jnp.where(hi > lo, hi, lo) + leaves
+        # Node 0 is no node of the tree: an update a range does not make lands there, never read.
+        for _ in range(levels):
+            taken = (left < right) & (left % 2 == 1)
+            node = jnp.where(taken, left, 0)
+            first, last = first.at[node].min(jnp.where(taken, block, big)), last.at[node].max(
+                jnp.where(taken, block + 1, 0))
+            left = jnp.where(taken, left + 1, left)
+            taken = (left < right) & (right % 2 == 1)
+            right = jnp.where(taken, right - 1, right)
+            node = jnp.where(taken, right, 0)
+            first, last = first.at[node].min(jnp.where(taken, block, big)), last.at[node].max(
+                jnp.where(taken, block + 1, 0))
+            left, right = left // 2, right // 2
+        above = (jnp.arange(key_blocks, dtype=jnp.int32)[:, None] + leaves) >> jnp.arange(levels)[None, :]
+        q_hi = jnp.max(last[above], axis=-1)
+        return jnp.where(q_hi > 0, jnp.min(first[above], axis=-1), 0), q_hi
+
+    return jax.vmap(row)(lo, hi)
 
 
 def _merged(lo: jax.Array, hi: jax.Array, held: jax.Array, key_blocks: int) -> jax.Array:

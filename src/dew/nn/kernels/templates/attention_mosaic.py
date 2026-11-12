@@ -133,11 +133,11 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     traded for the larger tile; fewer consumers where no tile of the family's count holds the block (a GPU
     of a smaller one). Where an `overlapped` step's family runs one consumer a program on registers it
     budgets (no partner whose products a softmax runs under: mma.sync's), its consumer's rows twice the unit
-    too, each warp two of the products' row tiles, FlashAttention 2's 128-row tile on one warpgroup: of the
-    two, the more keys and queries a step takes, on a tie the more rows, each key tile's loads and fragments
-    read once for twice the queries (an A100 at width 128, 128 x 32 against 64 x 64, ptxas 250 and 189
-    registers spilling none; width 64, 128 x 64 against 64 x 128, two programs a multiprocessor against
-    one, et-a100tile2). `tiles(rows, walked, consumers)` builds the config; `rows` a consumer's where given
+    too, each warp two of the products' row tiles, FlashAttention 2's 128-row tile on one warpgroup, first,
+    where its first key tile holds, each key tile's loads and fragments read once for twice the queries (an
+    A100 at width 128, 128 x 32 against 64 x 64, ptxas 250 and 189 registers spilling none; width 64, 128 x
+    64 against 64 x 128, two programs a multiprocessor against one, et-a100tile2); then the unit, then
+    fewer rows. `tiles(rows, walked, consumers)` builds the config; `rows` a consumer's where given
     (a backward's `fewer_rows`), else `least_held`'s for the `held` rows: a forward's least query tile
     (`query_rows`: the issuer's rows for a decode step's few), a backward's a role's rows (`_role_rows`).
     None where no tile fits."""
@@ -162,18 +162,15 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
                         return config
         return None
 
-    # Twice the unit where the held rows take it, padding them by no more than an eighth beyond the unit's.
-    candidates = [2 * unit] if wide and padded(2 * unit, 1) - padded(unit, 1) <= held // 8 else []
-    found = [config for config in map(first, [*candidates, unit]) if config is not None]
-    if not found and rows is None and few_rows(family, held):
-        # A call of fewer rows than a role's at fewer of them a tile, its issuer's rows at least, where no
-        # tile of them all holds: a 48-row training walk's scaled op on mma.sync held 278 registers of 255
-        # at 48 x 64, the least key tile so few rows take (`_least_keys`), and derived none (et-sm86scaled).
-        found = [config for config in map(first, range(unit - family.rows, 0, -family.rows))
-                 if config is not None][:1]
-    if not found:
-        return None
-    return max(found, key=lambda config: (config.block_q * config.block_k * config.consumers, config.block_q))
+    # Twice the unit where the held rows take it, padding them by no more than an eighth beyond the unit's;
+    # then the unit; then, for a call of fewer rows than a role's, fewer of them a tile, its issuer's rows at
+    # least, where no tile of them all holds (a 48-row training walk's scaled op on mma.sync held 278
+    # registers of 255 at 48 x 64, the least key tile so few rows take, `_least_keys`, et-sm86scaled). The
+    # first that holds is the config: legality steps down, nothing is ranked (design §7).
+    heights = [2 * unit] if wide and padded(2 * unit, 1) - padded(unit, 1) <= held // 8 else []
+    heights.append(unit)
+    fewer = range(unit - family.rows, 0, -family.rows) if rows is None and few_rows(family, held) else ()
+    return next((config for config in map(first, (*heights, *fewer)) if config is not None), None)
 
 
 def _role_rows(family: mosaic.Family, dtype, held: int) -> int:
@@ -1120,33 +1117,31 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The dK/dV launch's consumers a backward's at most (`BACKWARD_CONSUMERS`), whatever its layout's.
         dkv = ({"dkv_family": fed[0].name, "dkv_consumers": min(fed[0].consumers, BACKWARD_CONSUMERS)}
                if fed else {})
-        found = []
-        # Legal where the form, the hooks, the widths, the registers and the mode allow (`legal`): of the
-        # one launch keys first and queries first, the larger query tile (`_derived`'s order).
+        # The one launch, legal where the form, the hooks, the widths, the registers and the mode allow
+        # (`legal`), the first that holds (design §7: legality steps down, nothing is ranked). Queries first
+        # on the layout whose consumers feed their rings, each consumer its own keys over the query stream
+        # it feeds (FlashAttention 3's CTA), at the layout's consumers, whom no producer's warpgroup shares
+        # the registers with (ET-FFED3-h100, the fused launch: 2.40 against 2.71 ms causal and 4.32 against
+        # 5.54 full at Qwen3-8B's widths; at width 64, 64 x 64 on two consumers 0.47 ms against 128 x 64 on
+        # one, 0.59): another layout than the dQ launch's, whose own fed layout the next launches name, and
+        # at two consumers or more, one's softmax under the other's products, which one consumer has not.
+        for layout in (layout for layout in fed if layout.name != family.name):
+            def fed_fused(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
+                return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name)
+
+            config = derive(layout, query.dtype, key.shape[1], query.shape[1], fed_fused, fits,
+                            overlapped=True)
+            if config is not None and config.consumers > 1:
+                return config
+        # Else keys first on the dQ launch's layout, its dK/dV on the fed one where there is one, the logits'
+        # queries a stream of their own, then staged a step, then on the dQ launch's layout alone.
         for shared in [*({**dkv, "staged_logits": staged} for staged in (False, True) if dkv), {}]:
             def fused(rows: int, walked: int, consumers: int, shared=shared) -> BackwardTiles:
                 return BackwardTiles(walked, rows, 2, consumers, fused=True, family=family.name, **shared)
 
             if config := derive(family, query.dtype, key.shape[1], query.shape[1], fused, fits,
                                   overlapped=False):
-                found.append(config)
-        # Queries first on the layout whose consumers feed their rings, each consumer its own keys over
-        # the query stream it feeds (FlashAttention 3's CTA), at the layout's consumers, whom no
-        # producer's warpgroup shares the registers with (ET-FFED3-h100, the fused launch: 2.40 against
-        # 2.71 ms causal and 4.32 against 5.54 full at Qwen3-8B's widths, 0.47 against 0.59 at width 64).
-        for layout in fed:
-            def fed_fused(rows: int, walked: int, consumers: int, layout=layout) -> BackwardTiles:
-                return BackwardTiles(walked, rows, 2, consumers, fused=True, family=layout.name)
-
-            if config := derive(layout, query.dtype, key.shape[1], query.shape[1], fed_fused, fits,
-                                  overlapped=True):
-                found.append(config)
-        if found:
-            # The most keys and queries a program's step takes, its consumers' keys over its query tile;
-            # on a tie the more consumers, one's softmax under the other's products (ET-FFED3-h100 at
-            # width 64: 64 x 64 on two consumers 0.47 ms against 128 x 64 on one, 0.59).
-            return max(found, key=lambda config: (config.block_q * config.block_k * config.consumers,
-                                                  config.consumers))
+                return config
         # Where no consumer's registers hold its own keys' whole dK and dV sums, the consumers share
         # one key block, each its share of the columns (FlashAttention 3's width 256: ET-COOP1-h100,
         # 0.68 ms against the two launches' 1.30 at Qwen3-8B's heads 256 wide, causal; where the sums

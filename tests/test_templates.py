@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.nn.kernels import generation, tuning
+from dew.nn.kernels import generation
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Refusal, Requirement, analysed, select
 from dew.nn.kernels.templates.base import Call, Template, Unfitted, call
 from dew.nn.kernels.tuning import Unpinnable
@@ -180,38 +180,6 @@ class Unpriced(Doubling):
         raise ValueError("no cost facts")
 
 
-DERIVATIONS: list[int] = []
-"""Each derivation `Deriving` ran, by the rows of its call."""
-
-
-@dataclasses.dataclass(frozen=True)
-class Deriving(Doubling):
-    """`Doubling`, generating its config: the most rows of a block the device holds, at most the call's."""
-
-    GENERATES: ClassVar[bool] = True
-
-    def derived(self, ba, target):
-        DERIVATIONS.append(ba.arguments["x"].shape[0])
-        return max(config for config in Doubling.space(self, ba) if self.legal(ba, config, target))
-
-
-def test_a_launch_derives_once_for_what_its_derivation_reads():
-    """A launch's derivation (`Template.derived`) runs once for what it reads: the call (its arguments'
-    shapes and dtypes, its hooks) and the target, every eligibility check and planner candidate after
-    reading that once; a call or a target of other facts derives again (row 4259: the GEMM tile derived at
-    every check took 36 s of a Qwen3.5-4B step's compile_ahead)."""
-    DERIVATIONS.clear()
-    op = Deriving()
-    with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        for rows in (2048, 2048, 4096, 2048):
-            op.derived(op.bind(jax.ShapeDtypeStruct((rows, 512), jnp.float32)), target)
-        halved = dataclasses.replace(target, multiprocessors=target.multiprocessors // 2)
-        with generation.assumed(halved):
-            op.derived(op.bind(jax.ShapeDtypeStruct((2048, 512), jnp.float32)), halved)
-    assert DERIVATIONS == [2048, 4096, 2048]
-
-
 def test_chosen_names_a_declared_choice_and_no_other():
     """`generation.chosen` names a choice by the name its declaration gives it (`generation.Choice`), which a
     site deciding by that declaration reads (`chosen_kernel`), and refuses a name no choice is declared by (a
@@ -297,20 +265,3 @@ def test_an_explicit_config_the_call_cannot_hold_is_refused_as_a_pin_is():
         assert jnp.array_equal(Doubling().replace(config=Block(64))(x), x * 2)
 
 
-def test_a_launch_builds_its_key_only_where_something_reads_it():
-    """A launch with no collector, pin or tuning read never builds its key (`KernelOp.keyed`, which traces
-    its hooks; row 1866 K4); a collector reads it."""
-    built = []
-
-    class Counted(Doubling):
-        def keyed(self, ba):
-            built.append(1)
-            return super().keyed(ba)
-
-    x = jnp.ones((64, 8), jnp.float32)
-    with generation.assumed("sm80"):
-        Counted()(x)
-        assert built == []
-        with tuning.seen():
-            Counted()(x)
-    assert built == [1]

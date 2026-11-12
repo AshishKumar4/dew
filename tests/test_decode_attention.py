@@ -119,14 +119,20 @@ def spanned(starts, lengths, capacity):
 DECODE_KERNEL_SEEDS = 8
 """The decode kernel's declared check-1 seeds a config, sized by `seeds_for` paired."""
 
+CHECKED_SPLITS = (1, 2, decode_attention.SPLITS[-1])
+"""The slice counts check 1 holds the decode kernel at: one slice a row (no merge), two (the merge of its
+slices' fp32 sums) and the most (slices of a block or of none, whose empty partial states the merge reads).
+A count between two and the most runs the two slices' merge at another count, and the compile gate holds
+every count's kernel within its GPU's block (`COMPILED`)."""
+
 
 @pytest.mark.parametrize("windowed", [False, True], ids=["prefix", "window"])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 def test_the_decode_kernel_reads_each_row_to_its_length_at_every_config(dtype, windowed):
     """`dew.nn.kernels.decode_attention` reads each row's keys up to its length, from its start where
-    a window gives one, block by block, at each slice count it may take (`SPLITS`, `tuning.pinned`:
-    one slice a row, or more whose fp32 sums XLA combines), on par with jax.nn's xla attention under the
-    same keys' mask over drawn inputs (check 1, the truth its float64 run). Compiled
+    a window gives one, block by block, at the slice counts check 1 holds it at (`CHECKED_SPLITS`,
+    `tuning.pinned`: one slice a row, or more whose fp32 sums XLA combines), on par with jax.nn's xla
+    attention under the same keys' mask over drawn inputs (check 1, the truth its float64 run). Compiled
     on a GPU at the default precision, which the GPU lane otherwise sets to the highest
     (tests/lane_environment.py), its fp32 products must be fp32 ones, held to jax.nn's at fp32
     precision; Triton's default is one TF32 product. Elsewhere it runs interpreted."""
@@ -144,7 +150,7 @@ def test_the_decode_kernel_reads_each_row_to_its_length_at_every_config(dtype, w
         with jax.default_matmul_precision("float32"):
             return jax.nn.dot_product_attention(query, key, value, mask=mask, implementation='xla')
 
-    for config in map(decode_attention.Split, decode_attention.SPLITS):
+    for config in map(decode_attention.Split, CHECKED_SPLITS):
         def attend(query, key, value, config=config):
             pin = tuning.pinned({decode_attention.DecodeAttention: config})
             with on_the_gpu(), pin, jax.default_matmul_precision("default"):
@@ -188,7 +194,7 @@ DECODE_HOOKS = {"sinks": {"sinks": True}, "softcap": {"softcap": True},
                 "both": {"sinks": True, "softcap": True}}
 """The hooked decode cases' hooks by name: sinks, a softcap, both."""
 SINK_CASES = [(dtype, hooks, natural, splits) for dtype in ("bfloat16", "float32") for hooks in DECODE_HOOKS
-              for natural in ("fold", "natural") for splits in decode_attention.SPLITS]
+              for natural in ("fold", "natural") for splits in CHECKED_SPLITS]
 """The hooked decode cases, `(dtype, hooks, form, slice count)`, by name."""
 LONG_SINK_CASES = [("float32", "both", "natural", 32), ("float32", "both", "fold", 32)]
 """The hooked cases past two minutes in one process (137 and 126 s on armada in a verdict on main 495ef4e0e),
@@ -200,14 +206,14 @@ their check 1's draws run as armada's map tasks and a judge (`check1_shards`), e
                          ids=["-".join(map(str, case)) for case in SINK_CASES if case not in LONG_SINK_CASES])
 def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, hooks, natural, splits):
     """Sinks (one value-free logit a query head in each row's softmax) and a logit softcap
-    (`cap · tanh(logit / cap)`) inside the decode kernel, over query heads grouped on their key heads:
-    each row read to its length at each slice count it may take, the sink carried by the first slice alone
-    so the combine counts it once, within tests/reference_error.py's rule of the reference path's
-    attention over the same keys, against float64 (`exact_attention`). The idle row of one key keeps
-    its sink's share. The dispatch takes such a call to the decode kernel where it runs (`decodes`). In
-    both forms of the exponent, the fold and the accurate one (`natural`); each slice count held to
-    check 1 over fresh draws of the case's shapes (`grouped_draw`), a slice count a case (row 2195's CI: the
-    six together took 153 s of a CPU task)."""
+    (`cap · tanh(logit / cap)`) inside the decode kernel, over query heads grouped on their key heads: each
+    row read to its length at each slice count check 1 holds (`CHECKED_SPLITS`), the sink carried by the
+    first slice alone so the combine counts it once, within tests/reference_error.py's rule of the
+    reference path's attention over the same keys, against float64 (`exact_attention`). The idle row of one
+    key keeps its sink's share. The dispatch takes such a call to the decode kernel where it runs
+    (`decodes`). In both forms of the exponent, the fold and the accurate one (`natural`); each slice count
+    held to check 1 over fresh draws of the case's shapes (`grouped_draw`), a slice count a case (row 2195's
+    CI: the six together took 153 s of a CPU task)."""
     _sinks_and_softcap_hold_check_1(dtype, hooks, natural, splits)
 
 
@@ -760,17 +766,17 @@ PAGED_SEEDS = 8
 """The paged decode kernel's declared check-1 seeds a config, sized by `seeds_for` paired."""
 
 
-@pytest.mark.parametrize("splits", decode_attention.SPLITS)
+@pytest.mark.parametrize("splits", CHECKED_SPLITS)
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("windowed", [False, True], ids=["prefix", "window"])
 @pytest.mark.parametrize("page_size", [16, 32])
 def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_config(page_size, windowed,
                                                                                   natural, splits):
     """`decode_attention.attend_paged` reads a row's pages through its table to the row's length, from
-    its start where a window gives one, at each slice count it may take (`SPLITS`, a case each: the six
-    together took up to 101 s of a CPU task), on par with jax.nn's xla attention over the gathered rows
-    under the same keys' mask over drawn inputs (check 1, the truth its float64 run), compiled on a GPU
-    and interpreted elsewhere, in both forms of the exponent (`natural`)."""
+    its start where a window gives one, at each slice count check 1 holds (`CHECKED_SPLITS`, a case each:
+    the six counts together took up to 101 s of a CPU task), on par with jax.nn's xla attention over the
+    gathered rows under the same keys' mask over drawn inputs (check 1, the truth its float64 run),
+    compiled on a GPU and interpreted elsewhere, in both forms of the exponent (`natural`)."""
     from dew.nn.kernels import tuning
     from dew.nn.kv_cache import PAGED, PagedCase
 

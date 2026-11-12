@@ -1234,21 +1234,38 @@ def test_a_hook_shaped_to_the_launchs_tile_is_taken():
                     seeds=SEEDS)
 
 
+WALKED_CASES = ("full", "causal", "causal-window", "documents", "cross-causal-lengths-starts", "block-causal",
+                "valid", "widest-window", "runs", "runs-documents-valid")
+"""The call forms a one-launch walk (`WGMMA_FORMS`) is checked over: one of each mechanism its block map and
+masks meet (`attention.block_map`, `algebra.seen`), whole tiles, causality's diagonal, a window's band,
+documents' ids, another sequence's documents aligned with key lengths and starts, block groups, key validity
+and its empty rows, a window at int32's largest, and runs alone and beside documents and validity. Every
+other call form combines these mechanisms, each checked on the two launches' walks and the accurate form's,
+which every call form runs on (`test_the_backward_is_on_par_over_every_call_form_interpreted`)."""
+
+
+def _walked(cases, forms) -> list[tuple[str, str]]:
+    """Each `(case, form)` of `cases` and `forms` a backward check takes: every case on a form of two launches
+    or the accurate form's, the `WALKED_CASES` on a one-launch walk."""
+    return [(case, form) for form in forms for case in cases
+            if form not in WGMMA_FORMS or case in WALKED_CASES]
+
+
 @INTERPRETS
-@on_each_family_for("form", BACKWARD_FORMS)
-@pytest.mark.parametrize("case", CASES)
+@on_each_family_for(("case", "form"), _walked(CASES, BACKWARD_FORMS), ids=str)
 def test_the_backward_is_on_par_over_every_call_form_interpreted(case, form):
-    """The backward in both forms over each of the template core's call forms under the interpreter."""
+    """The backward over the template core's call forms under the interpreter: every call form in the fast
+    form's two launches and in the accurate form, the call forms of `WALKED_CASES` on each one-launch walk."""
     _check_call_form(case, interpret=True, backward=True, form=form)
 
 
 @INTERPRETS
-@on_each_family_for("form", ["forward", *BACKWARD_FORMS])
-@pytest.mark.parametrize("case", RUN_CASES)
+@on_each_family_for(("case", "form"), _walked(RUN_CASES, ["forward", *BACKWARD_FORMS]), ids=str)
 def test_a_call_over_runs_is_on_par_interpreted(case, form):
     """A decision row's runs (`test_attention_template.RUN_CASES`), several key intervals a query, under the
     interpreter: each block walks its runs' envelope (`attention.block_map`), each tile masked by the union
-    of its queries' runs (`algebra.seen`), the forward and the backward in each form."""
+    of its queries' runs (`algebra.seen`), the forward and the backward in each form, a one-launch walk over
+    the runs of `WALKED_CASES`."""
     backward = form != "forward"
     _check_call_form(case, interpret=True, backward=backward, form=form if backward else "default")
 

@@ -58,11 +58,12 @@ from dew.nn.linear import (
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "linear_attention"
 
-SHARDED_SEEDS = 128
-"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
-`seeds_for`: the fewest for which one device compared with itself resolves the factor. Run as map tasks of
-16 (`check1_shards`, whose counts the plan reads as literals): the interpreted step took over 180 s a case
-on CI's CPU, past its group's deadline."""
+SHARDED_SEEDS = 8
+"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized paired by
+`seeds_for(one device, draw, label, dew_fn=split)`, as its verdict judges the pair: 8 at every site and
+split, a shard's rows its one device's to the bit over every draw sized, where the one device compared with
+itself had asked 128 (2026-11-12). Run as one map task (`check1_shards`, whose counts the plan reads as
+literals): the interpreted step took over 180 s a case on CI's CPU, past its group's deadline."""
 
 
 @pytest.fixture(scope="module")
@@ -861,7 +862,7 @@ def test_the_chunked_rule_holds_with_aligned_keys():
     np.testing.assert_allclose(state, want_state, atol=2e-4)
 
 
-@pytest.mark.check1_shards(seeds=128, per_task=16)
+@pytest.mark.check1_shards(seeds=8, per_task=8)
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("axis, split", [("data", 0), ("tensor", 2)])
 def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
@@ -909,7 +910,7 @@ RATED = kernel.Hooks(decay='scalar', rated=True, delta=False, skip=True)
 (`linear.KEY_STEP`) and Mamba-2's rated scan with its skip (`mamba2.SSD`)."""
 
 
-@pytest.mark.check1_shards(seeds=128, per_task=16)
+@pytest.mark.check1_shards(seeds=8, per_task=8)
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("axis, split", [("data", 0), ("tensor", 2)])
 @pytest.mark.parametrize("form", ["a decay a key dimension", "a rated decay"])
@@ -1159,7 +1160,7 @@ def test_a_token_with_nothing_to_fuse_naming_the_fused_step_runs_the_step(value_
                         "nothing to fuse", seeds=FEWEST_SEEDS, truth_fn=_widths_exact)
 
 
-@pytest.mark.check1_shards(seeds=128, per_task=16)
+@pytest.mark.check1_shards(seeds=8, per_task=8)
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("value_heads", [4, 2])
 def test_a_decode_token_over_a_tensor_mesh_runs_the_step_where_each_shards_heads_fit_it(value_heads):
