@@ -15,6 +15,7 @@ import dataclasses
 import datetime
 import functools
 import logging
+import math
 import os
 import sys
 import time
@@ -1105,10 +1106,13 @@ class Trainer(Generic[Loss, Effects]):
                                                   resumed=initial is None and interval.last_saved is not None)
         if complete:
             return state
-        if self._config is not None:
+        # The update's work beyond the model's, of an optimizer the objective steps its params with whole: one
+        # that phases it apart (`Objective.optimizer`, a consistency distillation's two networks) states none.
+        if self._config is not None and type(self.objective).optimizer is Objective.optimizer:
+            spread = math.prod(size for axis, size in self.device_mesh.shape.items() if axis != STAGE_AXIS)
             # Read under the axes the modules boxed, a stage-local run's stacked by stage, as `_groups` reads.
             with self._staging.held(boxed(self._boxed_axes())):
-                run.update_flops = self._config.update_flops(state.variables["params"])
+                run.update_flops = self._config.update_flops(state.variables["params"], devices=spread)
         compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]] = run.compiled
         seen = 0
         run.notice = PreemptionNotice()

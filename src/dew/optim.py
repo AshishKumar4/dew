@@ -51,6 +51,7 @@ from dew.newton_schulz import (
     newton_schulz_flops,
     orthogonalized,
     polar_express,
+    spread_matrices,
 )
 from dew.nn.inspection import QK
 from dew.nn.precision import at_least_fp32
@@ -242,7 +243,7 @@ def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, *, ns_
                  ns_precision: jax.lax.DotAlgorithmPreset | str | None = None,
                  per_head: Mapping[str, int] | None = None, neuron_beta2: float | None = None,
                  adam_b1: float = 0.9, adam_b2: float = 0.999, adam_eps_root: float = 0.0,
-                 adam_learning_rate=None) -> optax.GradientTransformation:
+                 adam_learning_rate=None, ns_group: int | None = None) -> optax.GradientTransformation:
     """Run Muon over the matrices and AdamW over the rest, on one schedule. The AdamW group decays
     its norms and biases too, at `adam_weight_decay` or else `weight_decay`: Moonlight shares the
     decay among matrix and non-matrix parameters, RMSNorm's included (arXiv 2502.16982, 2.2).
@@ -271,7 +272,8 @@ def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, *, ns_
                             muon_weight_dimension_numbers(params), is_leaf=muon_leaf)
     muon = optax.chain(
         scale_by_muon(ns_coeffs, ns_steps, beta, eps, mu_dtype, nesterov=nesterov, adaptive=adaptive,
-                      preconditioning=preconditioning, ns_precision=ns_precision, per_head=per_head),
+                      preconditioning=preconditioning, ns_precision=ns_precision, per_head=per_head,
+                      ns_group=ns_group),
         *(() if neuron_beta2 is None else (scale_by_neuron_norm(neuron_beta2, per_head=per_head),)),
         _scale_by_shape(consistent_rms, per_head),
         optax.add_decayed_weights(weight_decay, weight_decay_mask),
@@ -288,13 +290,16 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
                   mu_dtype=None, *, nesterov: bool = True, adaptive: bool = False,
                   preconditioning: Preconditioning = "frobenius",
                   ns_precision: jax.lax.DotAlgorithmPreset | str | None = None,
-                  per_head: Mapping[str, int] | None = None) -> optax.GradientTransformation:
+                  per_head: Mapping[str, int] | None = None, ns_group: int | None = None
+                  ) -> optax.GradientTransformation:
     """optax.contrib.scale_by_muon, its momentum, Nesterov step, bias correction and state (`MuonState`) as
     optax's, its coefficients `ns_coeffs` as optax's Muon reads them (a preset's name too,
     `_coefficients`), and each matrix's Newton-Schulz optax's own in the run's numerics, or at
     `ns_precision`'s dot algorithm (`ns_operands`), run whole on one device, the matrices spread across the
-    devices (`orthogonalized`). Each parameter's matrix is its dimension numbers'
-    (`muon_weight_dimension_numbers`), or each of its heads' where `per_head` names it (`head_widths`)."""
+    devices (`orthogonalized`), the stacks of one shape joined `ns_group` at a time, all where None
+    (`spread_stacks`): the fewer joined, the more products and the less their copies hold, which a plan sets
+    from its room. Each parameter's matrix is its dimension numbers' (`muon_weight_dimension_numbers`), or
+    each of its heads' where `per_head` names it (`head_widths`)."""
     coefficients = _coefficients(ns_coeffs, ns_steps)
     algorithm = dot_algorithm(ns_precision)
 
@@ -315,7 +320,8 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
         # The coefficients the transform was built with, constants of its program (`newton_schulz`), where
         # its state's are read at run time; the state holds them too, as optax's does.
         orthogonal = orthogonalized(mu_hat, muon_weight_dimension_numbers(mu_hat), coefficients, ns_steps,
-                                    eps, preconditioning, algorithm, head_widths(mu_hat, per_head))
+                                    eps, preconditioning, algorithm, head_widths(mu_hat, per_head),
+                                    group=ns_group)
         if adaptive:
             # The orthogonal update scaled by the dual norm of the momentum's (arXiv 2409.20325), each
             # stored layer's its own, summed over its own axes alone (`layers_of`).
@@ -329,19 +335,15 @@ def scale_by_muon(ns_coeffs=NEWTON_SCHULZ, ns_steps: int = 5, beta: float = 0.95
 
 def _coefficients(ns_coeffs, ns_steps: int) -> jax.Array:
     """The Newton-Schulz coefficients optax's Muon iterates by for `ns_coeffs`, a preset's name (`"dion"`,
-    or Dew's `"polar_express"`, `polar_express`) or one triple or a schedule of them, as the state it
-    builds holds them (`scale_by_muon`'s state): its last `ns_steps` triples of a schedule, a preset's by
-    optax's table of them."""
-    if isinstance(ns_coeffs, str):
-        if ns_coeffs != "polar_express" and ns_coeffs not in _muon._NS_COEFFS_PRESET_DICT:
-            raise ValueError(f"ns_coeffs {ns_coeffs!r} names no preset: optax's "
-                             f"{sorted(_muon._NS_COEFFS_PRESET_DICT)} or 'polar_express'")
-        ns_coeffs = (polar_express(ns_steps) if ns_coeffs == "polar_express"
-                     else _muon._NS_COEFFS_PRESET_DICT[ns_coeffs])
-    state = optax.contrib.scale_by_muon(ns_coeffs, ns_steps).init({})
-    if not isinstance(state, optax.contrib.MuonState):
-        raise TypeError(f"optax's Muon holds its coefficients in a MuonState, not a {type(state).__name__}")
-    return jnp.asarray(state.ns_coeffs)
+    or Dew's `"polar_express"`, `polar_express`) or one triple or a schedule of them, as the state optax's
+    public Muon builds holds them: its last `ns_steps` triples of a schedule, a preset's by its name."""
+    if isinstance(ns_coeffs, str) and ns_coeffs == "polar_express":
+        ns_coeffs = polar_express(ns_steps)
+    built = optax.contrib.muon(0.0, ns_coeffs=ns_coeffs, ns_steps=ns_steps)
+    state = built.init({"matrix": jnp.zeros((1, 1))})
+    found = [leaf for leaf in jax.tree.leaves(state, is_leaf=lambda node: isinstance(
+        node, optax.contrib.MuonState)) if isinstance(leaf, optax.contrib.MuonState)]
+    return jnp.asarray(found[0].ns_coeffs)
 
 
 def _scale_by_shape(consistent_rms: float | None, per_head: Mapping[str, int] | None = None
@@ -374,21 +376,20 @@ def _scale_by_shape(consistent_rms: float | None, per_head: Mapping[str, int] | 
     return optax.GradientTransformation(lambda params: optax.EmptyState(), update_fn)
 
 
-def muon_update_flops(params, steps: int, per_head: Mapping[str, int] | None = None) -> float:
+def muon_update_flops(params, steps: int, per_head: Mapping[str, int] | None = None, *, devices: int = 1,
+                      group: int | None = None) -> float:
     """Muon's Newton-Schulz FLOPs an update over `params` (`newton_schulz_flops`): each parameter it takes
     (`muon_weight_dimension_numbers`) as the stack of matrices it orthogonalizes, a head's alone where
-    `per_head` names its width (`head_widths`), at `steps` iterations."""
+    `per_head` names its width (`head_widths`), joined `group` at a time and padded for its `devices` as the
+    iteration runs them (`spread_matrices`), at `steps` iterations."""
     numbers = jax.tree.leaves(muon_weight_dimension_numbers(params), is_leaf=muon_leaf)
     widths = jax.tree.leaves(head_widths(params, per_head), is_leaf=lambda node: node is None)
-    total = 0.0
-    for leaf, shape, width in zip(jax.tree.leaves(params), numbers, widths, strict=True):
-        if shape is None:
-            continue
-        stack = jax.eval_shape(lambda held, shape=shape, width=width: headed(as_matrices(held, shape)[0],
-                                                                               width)[0], leaf)
-        matrices, rows, columns = stack.shape
-        total += newton_schulz_flops(matrices, rows, columns, steps)
-    return total
+    stacks = [jax.eval_shape(lambda held, shape=shape, width=width: headed(as_matrices(held, shape)[0],
+                                                                         width)[0], leaf)
+              for leaf, shape, width in zip(jax.tree.leaves(params), numbers, widths, strict=True)
+              if shape is not None]
+    return sum(newton_schulz_flops(matrices, rows, columns, steps)
+               for matrices, rows, columns in spread_matrices(stacks, devices, group))
 
 
 def head_widths(updates, per_head: Mapping[str, int] | None):
@@ -2328,18 +2329,23 @@ class OptimConfig:
             solver = power_profiles(solver, self.ema_profiles)
         return solver
 
-    def update_flops(self, params) -> float | None:
+    def update_flops(self, params, devices: int = 1) -> float | None:
         """One update's analytic matrix work over `params` beyond the model's, the FLOPs a run reports as
         `train/update_flops` beside the model's `train/flops`: Muon's Newton-Schulz products over each matrix
-        it orthogonalizes (a head's alone where `per_head` names its width, `muon_update_flops`); None for
-        any other optimizer, whose update multiplies no matrices."""
+        it orthogonalizes as it runs them over its `devices` (`muon_update_flops`), at the iterations its
+        coefficients hold (a schedule's rows); None for any other optimizer, whose update multiplies no
+        matrices."""
         if self.optimizer not in ('muon', 'muonclip'):
             return None
-        steps = self.optimizer_opts.get('ns_steps', 5)
-        per_head = self.optimizer_opts.get('per_head')
-        if not isinstance(steps, int) or not (per_head is None or isinstance(per_head, Mapping)):
-            raise TypeError(f"Muon's ns_steps is a count and per_head a mapping, got {steps!r}, {per_head!r}")
-        return muon_update_flops(params, steps, per_head)
+        opts = self.optimizer_opts
+        steps, per_head, group = opts.get('ns_steps', 5), opts.get('per_head'), opts.get('ns_group')
+        if not isinstance(steps, int) or not (per_head is None or isinstance(per_head, Mapping)) or not (
+                group is None or isinstance(group, int)):
+            raise TypeError(f"Muon's ns_steps and ns_group are counts and per_head a mapping, got {steps!r}, "
+                            f"{group!r}, {per_head!r}")
+        table = _coefficients(opts.get('ns_coeffs', NEWTON_SCHULZ), steps)
+        return muon_update_flops(params, steps if table.ndim == 1 else table.shape[0], per_head,
+                                 devices=devices, group=group)
 
     def _spares(self, make: Callable[..., optax.GradientTransformation]) -> bool:
         """Whether the optimizer's decay takes timm's split (`weight_decay_mask`): a factory that takes a

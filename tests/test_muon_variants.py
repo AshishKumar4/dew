@@ -265,17 +265,19 @@ def shaped_draw(seed):
 
 
 @pytest.mark.parametrize("preconditioning", ["frobenius", "spectral", "aol", "schatten"])
-def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(preconditioning):
+@pytest.mark.parametrize("group", [None, 1], ids=["joined", "one-at-a-time"])
+def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(preconditioning, group):
     """Dew's orthogonalization of wide, tall, square and 2-D updates, on the matrices as they are stored
     (`newton_schulz`: a tall matrix's Gram product and polynomial taken from its shorter side, where optax
-    transposes it), on par from float64 with optax's
+    transposes it), its stacks of one shape joined or each its own (`ns_group`), on par from float64 with
+    optax's
     own iteration (`orthogonalized_leaf`) of each matrix at `preconditioning`, in the dtype Dew's numerics
     iterate in (check 1)."""
     stacked = optax.contrib.MuonDimensionNumbers((1,), (2,))
     numbers = (stacked, stacked, stacked, optax.contrib.MuonDimensionNumbers(0, 1))
 
     def dew(*stacks):
-        return list(orthogonalized(stacks, numbers, NEWTON_SCHULZ, 5, 1e-8, preconditioning))
+        return list(orthogonalized(stacks, numbers, NEWTON_SCHULZ, 5, 1e-8, preconditioning, group=group))
 
     def optax_arm(*stacks):
         # optax iterates in the update's own dtype: here in the one Dew's numerics iterate in (`ns_operands`).
@@ -295,8 +297,9 @@ def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(precondi
                     seeds=UPDATE_SEEDS, truth_fn=truth)
 
 
+@pytest.mark.parametrize("group", [None, 1], ids=["joined", "one-at-a-time"])
 @pytest.mark.parametrize("per_head", [None, HEADS])
-def test_muons_reported_update_work_is_its_compiled_updates_matrix_work(per_head):
+def test_muons_reported_update_work_is_its_compiled_updates_matrix_work(per_head, group):
     """The work a Muon run reports beside the model's (`OptimConfig.update_flops`, `train/update_flops`) is
     the matrix work its update runs: the compiled update over the decoder's parameters, whole or each head's
     block alone (`per_head`), multiplies exactly that many FLOPs, its AdamW group none."""
@@ -306,8 +309,8 @@ def test_muons_reported_update_work_is_its_compiled_updates_matrix_work(per_head
     from dew.telemetry.instrumentation import hlo_flops
 
     params = decoder_params()
-    config = OptimConfig(optimizer="muon", learning_rate=LR,
-                         optimizer_opts={} if per_head is None else {"per_head": per_head})
+    opts = {**({} if per_head is None else {"per_head": per_head}), **({} if group is None else {"ns_group": group})}
+    config = OptimConfig(optimizer="muon", learning_rate=LR, optimizer_opts=opts)
     solver = config.build(10)
     _, grads = drawn_tree(params, 0)
     with drawn_axes(decoder_draw()):
