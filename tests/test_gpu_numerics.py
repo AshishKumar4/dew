@@ -15,9 +15,6 @@
   the seeds it needs (test_chunked_cross_entropy).
 - A Dense layer's float64 terms on a GPU host are its inputs' placement's own, CPU or GPU, in either order
   (test_float64_terms).
-- The fused norms' and SiLU products' check-1 matrix (tests/kernel_matrix.py): a training step through each
-  entry on par with its XLA arithmetic, at each combination of the axes a GPU runs natively
-  (norm_swiglu_matrix, `kernel_matrix.native_cells`).
 """
 
 import functools
@@ -56,7 +53,7 @@ def numerics_cells(tmp_path_factory) -> list[Cell]:
                  fp8_base.a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower, "fp8")), fault=OWN),
         *(Cell(f"the {kind} audio encoder compiles with its mask built in the same jit",
                lambda kind=kind: audio.encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(
-                   audio._audio(kind)), native={"compile": "an encoder's mask in its jit"})
+                   audio._audio(kind)), native={"compile": f"the {kind} encoder's mask in its jit"})
           for kind in ("gemma3n", "gemma4")),
         Cell("a GPU reports its block and multiprocessors whether or not a row names it",
              lowering.a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it, fault=OWN),

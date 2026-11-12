@@ -37,7 +37,7 @@ one process (`gpu_flow`), each cell its own file's property:
   (join_matrix).
 - The NVFP4, MX, blockwise FP8 and adapted products' check-1 matrices (tests/kernel_matrix.py). Each matrix
   runs here over the combinations of the axes a GPU runs natively, its kernel or form and precision, and the
-  cases a red found on a GPU (`kernel_matrix.native_cells`); its other pairs are the CPU's.
+  cases a red found on a GPU (`kernel_matrix.seeded_cells`); its other pairs are the CPU's.
 """
 
 import functools
@@ -56,7 +56,7 @@ import test_gemm_widths as gemm_widths
 import test_grouped_gemm as grouped_gemm
 import test_mosaic_toolkit as mosaic_toolkit
 import test_warpgroup_scan as warpgroup_scan
-from gpu_flow import Cell, covering, run_cells, when
+from gpu_flow import Cell, cells_of, covering, run_cells, when
 from jax.experimental.pallas import fuser
 from reference_error import assert_as_exact
 
@@ -254,35 +254,45 @@ def test_the_gemm_kernels_run_on_this_gpu_as_a_users_process_runs_them():
 
 def test_the_gemm_matrix_holds_on_this_gpu():
     """GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the
-    reference path's (XLA's ragged dot), at each combination of the axes a GPU runs natively
-    (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    reference path's (XLA's ragged dot), at each case a GPU-only red seeded
+    (`kernel_matrix.seeded_cells`), each cell on its own GPU; its other pairs are the CPU's."""
     run_cells(kernel_matrix.seeded_cells("gemm"))
 
 
 def test_the_fused_gemm_matrix_holds_on_this_gpu():
     """The fused GEMM's check-1 matrix (tests/kernel_matrix.py): a region's training step with its producer
-    and consumers fused into the template's stages on par with the same region's stages and product in XLA, at
-    each combination of the axes a GPU runs natively (`kernel_matrix.native_cells`), each cell on its own
-    GPU."""
+    and consumers fused into the template's stages on par with the same region's stages and product in XLA,
+    at each case a GPU-only red seeded (`kernel_matrix.seeded_cells`), each cell on its own GPU; its other
+    pairs are the CPU's."""
     run_cells(kernel_matrix.seeded_cells("fused_gemm"))
 
 
 def test_the_nvfp4_matrix_holds_on_this_gpu():
     """The NVFP4 product's check-1 matrix (tests/kernel_matrix.py): its training step with the matrix decoded
-    in the mainloop on par with it decoded once a call, at each combination of the axes a GPU runs natively
-    (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    in the mainloop on par with it decoded once a call, at each case a GPU-only red seeded
+    (`kernel_matrix.seeded_cells`), each cell on its own GPU; its other pairs are the CPU's."""
     run_cells(kernel_matrix.seeded_cells("nvfp4"))
+
+
+def test_the_mx_matrix_holds_on_this_gpu():
+    """The block-scaled product's check-1 matrix (tests/kernel_matrix.py): its forward through the template's
+    block-scaled products, MXFP8's and NVFP4's, on par with the decoded operands' product in XLA, over a
+    covering of its cells by block format and output dtype (`gpu_flow.covering`), each on its own GPU: a
+    Blackwell's block-scaled MMA and its scale loads, which no interpreter runs, though no red seeded them."""
+    run_cells(covering(cells_of(
+        kernel_matrix.check("mxfp8"),
+        native=lambda case: dict(zip(("format", "out_dtype"), (case[1], case[4]), strict=True)))))
 
 
 def test_the_blockwise_matrix_holds_on_this_gpu():
     """The blockwise-scaled FP8 product's check-1 matrix (tests/kernel_matrix.py): its forward through the
-    template's step-scaled walk on par with the scaled blocks summed in XLA, at each combination of the axes a
-    GPU runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    template's step-scaled walk on par with the scaled blocks summed in XLA, at each case a GPU-only red
+    seeded (`kernel_matrix.seeded_cells`), each cell on its own GPU; its other pairs are the CPU's."""
     run_cells(kernel_matrix.seeded_cells("blockwise_fp8"))
 
 
 def test_the_low_rank_matrix_holds_on_this_gpu():
     """The adapted product's check-1 matrix (tests/kernel_matrix.py): a LoRA-adapted projection's training
-    step with its base product and update fused on par with them apart, at each combination of the axes a GPU
-    runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    step with its base product and update fused on par with them apart, at each case a GPU-only red seeded
+    (`kernel_matrix.seeded_cells`), each cell on its own GPU; its other pairs are the CPU's."""
     run_cells(kernel_matrix.seeded_cells("low_rank"))

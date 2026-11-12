@@ -25,9 +25,8 @@ interpreted and through the compile gate:
   through the route, and a long sequence on par with the reference path (test_attention_route); the fast
   form's default route not on par with IEEE fp32, the accurate form's control
   (test_attention_accurate_form). Its causal forward and backward at a flow's widths are the flows'.
-- The check-1 matrices of attention, its kernels and decode (tests/kernel_matrix.py), each over the
-  combinations of the axes a GPU runs natively, its GPU, kernel or launch and precision
-  (`kernel_matrix.native_cells`), and the cases a red found on a GPU (`kernel_matrix.SEEDED`).
+- The check-1 matrices of attention, its kernels and decode (tests/kernel_matrix.py), each at the cases a
+  red found on a GPU (`kernel_matrix.seeded_cells`); their other pairs are the CPU's, interpreted.
 """
 
 import dataclasses
@@ -234,7 +233,7 @@ def mosaic_cells() -> list[Cell]:
                                   "logits": "fold"}),
         *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90",
                   native=lambda case: {"pass": "backward", "launch": "route", "dtype": "float16",
-                                       "logits": "fold"}),
+                                       "logits": "fold", "hooks": case}),
         *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path,
                   native=lambda length, dtype: {"pass": "backward", "launch": "route", "dtype": _dtype(dtype),
                                                 "logits": "fold", "length": str(length)}),
@@ -305,16 +304,16 @@ def test_the_fused_kernels_hold_on_this_gpu(without_deterministic_ops, part):
 @pytest.mark.usefixtures("without_deterministic_ops")
 def test_the_attention_matrix_holds_on_this_gpu():
     """Attention's check-1 matrix (tests/kernel_matrix.py): the route's training step on par with the
-    reference path at each combination of the axes a GPU runs natively (`kernel_matrix.native_cells`), each
-    cell on its own GPU, without XLA's deterministic ops (a deterministic run never derives the one launch its
-    cells pin)."""
+    reference path at each case a GPU-only red seeded (`kernel_matrix.seeded_cells`), each cell on its own
+    GPU, its other pairs the CPU's, without XLA's deterministic ops (a deterministic run never derives the
+    one launch its cells pin)."""
     run_cells(kernel_matrix.seeded_cells("attention"))
 
 
 def test_the_decode_matrix_holds_on_this_gpu():
     """Decode's check-1 matrix (tests/kernel_matrix.py): a serving step's decode, dense and paged, on par with
-    the reference path at each combination of the axes a GPU runs natively, each cell on its own GPU, under
-    the lane's deterministic ops."""
+    the reference path at each case a GPU-only red seeded (`kernel_matrix.seeded_cells`), each cell on its own
+    GPU, its other pairs the CPU's, under the lane's deterministic ops."""
     run_cells(kernel_matrix.seeded_cells("decode"))
 
 

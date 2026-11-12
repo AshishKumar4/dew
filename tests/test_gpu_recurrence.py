@@ -26,8 +26,8 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
 - The check-1 matrices of the recurrence's choices (tests/kernel_matrix.py): the chunked op on each kernel
   against its form's port (recurrence_matrix), the short conv against XLA's (short_conv_matrix), the
   selective scan against recorded mamba_ssm (selective_matrix), and the decode tokens on each decode kernel
-  against the portable step (delta_decode_matrix), each over the combinations of the axes a GPU runs
-  natively, its form, kernel and precision, and the cases a red found on a GPU (`kernel_matrix.native_cells`).
+  against the portable step (delta_decode_matrix), each at the cases a red found on a GPU
+  (`kernel_matrix.seeded_cells`); their other pairs are the CPU's, interpreted.
 
 The Mosaic mainloop's forward and gradient, and each recurrence's chunked op, short conv and decode on its
 default kernels at a model's widths, are the model flows' (tests/test_gpu_flows.py, row 5461's covering
@@ -355,7 +355,7 @@ layer's port training and its decode run as one flow. The Mosaic mainloop's forw
 the model flows' (tests/test_gpu_flows.py: Kimi's delta attention, Qwen3-Next's gated delta net, MiniMax's
 lightning attention), its cases the CPU's, interpreted and through the compile gate (row 5461)."""
 
-USERS = {"portable", "fp32 template"}
+USERS = {"portable", "fp32 template", "forked template"}
 """The families whose claim is what a user's process computes, run in a process computing as a user's does
 (`users_process`, tests/conftest.py) and not in the suite's, whose JAX_DEFAULT_MATMUL_PRECISION=highest
 (tests/lane_environment.py) gives every product that states no precision IEEE float32: the portable math's
@@ -374,12 +374,14 @@ def test_the_recurrences_run_on_this_gpu(family):
 
 def test_the_recurrence_matrix_holds_on_this_gpu():
     """The recurrence's check-1 matrix (tests/kernel_matrix.py): the chunked op's training step, its kernel
-    named, on par with its form's port's, or the portable math's where no port takes it, at each combination
-    of the axes a GPU runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
+    named, on par with its form's port's, or the portable math's where no port takes it, at each case a
+    GPU-only red seeded (`kernel_matrix.seeded_cells`), each cell on its own GPU; its other pairs are the
+    CPU's."""
     run_cells(kernel_matrix.seeded_cells("recurrence"))
 
 
 def test_the_short_conv_matrix_holds_on_this_gpu():
     """The short conv's check-1 matrix: a delta net's conv at its training shapes on the kernels, on par with
-    XLA's conv, in each precision on each GPU (`kernel_matrix.native_cells`)."""
+    XLA's conv, at each case a GPU-only red seeded (`kernel_matrix.seeded_cells`); its other pairs are the
+    CPU's."""
     run_cells(kernel_matrix.seeded_cells("short_conv"))
