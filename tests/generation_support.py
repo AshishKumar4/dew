@@ -105,16 +105,20 @@ CUBLAS = {"xla_gpu_enable_triton_gemm": False}
 def cublas_compiled(fn, inputs, call: str):
     """`fn`, a program whose dots are a library's GEMMs, compiled as cuBLAS runs each (`CUBLAS`): a library
     arm held to cuBLAS's on the same inputs (docs/design/testing.md). On a GPU its compiled program on
-    `inputs` is checked to hold cuBLAS's `call` (`__cublas$gemm`, cuBLASLt's FP8 `__cublas$lt$matmul$f8`)
-    among its instructions' custom-call targets, as XLA's own schema reads them
-    (`dew.telemetry.instrumentation.hlo_instructions`), so no lane flag or fusion choice gives it another
-    GEMM; on a CPU its dots are XLA's own."""
+    `inputs` is checked, by its instructions as XLA's own schema reads them
+    (`dew.telemetry.instrumentation.hlo_instructions`), to call cuBLAS's `call` and to run no dot of XLA's
+    own, fused or not, so no lane flag or fusion choice gives it another GEMM: `__cublas$lt$matmul`, as XLA
+    calls a GEMM through cuBLASLt on a Hopper (a deviceless sm90 compile's), cuBLASLt's FP8
+    `__cublas$lt$matmul$f8`. On a CPU its dots are XLA's own."""
     from reference_error import without_ynn
 
     from dew.telemetry.instrumentation import hlo_instructions
 
     compiled = without_ynn(fn, compiler_options=CUBLAS)
     if jax.default_backend() == "gpu":
-        targets = {each.target for each in hlo_instructions(compiled.lower(*inputs).compile()).values()}
-        assert call in targets, f"the library arm calls {sorted(targets - {''})}, no {call}"
+        instructions = hlo_instructions(compiled.lower(*inputs).compile()).values()
+        targets = {each.target for each in instructions} - {""}
+        assert call in targets, f"the library arm calls {sorted(targets)}, no {call}"
+        assert not any(each.op == "dot" or "dot" in each.fused for each in instructions), \
+            "the library arm runs a dot of XLA's own"
     return compiled
