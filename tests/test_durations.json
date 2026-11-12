@@ -16646,6 +16646,7 @@
 "tests/test_gpu_gemm.py::test_the_blockwise_matrix_holds_on_this_gpu": 0,
 "tests/test_gpu_gemm.py::test_the_fused_gemm_matrix_holds_on_this_gpu": 0,
 "tests/test_gpu_gemm.py::test_the_gemm_kernels_run_on_this_gpu": 0.001,
+"tests/test_gpu_gemm.py::test_the_gemm_kernels_run_on_this_gpu_as_a_users_process_runs_them": 0.001,
 "tests/test_gpu_gemm.py::test_the_gemm_matrix_holds_on_this_gpu": 0.001,
 "tests/test_gpu_gemm.py::test_the_join_matrix_holds_on_this_gpu": 0,
 "tests/test_gpu_gemm.py::test_the_low_rank_matrix_holds_on_this_gpu": 0,

@@ -126,14 +126,16 @@ def assert_identical_parameters(left: dict, right: dict) -> None:
         np.testing.assert_array_equal(left[name], right[name], err_msg=name)
 
 
-def token_corpus(directory: Path, records: int, seq_len: int) -> Corpus:
+def token_corpus(directory: Path, records: int, seq_len: int, rows: int | None = None) -> Corpus:
     """A tokenized corpus whose windows say which record they are.
 
     The stream is a ramp, so the window of record i opens with token
     i * seq_len and a process can report the records it read by index, with
-    no contents.
+    no contents. A model that reads it with a table of `rows` reads it wrapped below them, each window
+    still opening with its own token where the ramp stays below them.
     """
     tokens = np.arange(records * seq_len + 1, dtype=np.uint16)
+    tokens = tokens if rows is None else tokens % rows
     return write_token_corpus(directory, tokens, tokens, vocab_size=int(tokens.max()) + 1)
 
 
@@ -153,7 +155,8 @@ def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
 
 
 def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_path):
-    corpus = token_corpus(tmp_path / "tokens", records=16, seq_len=4)
+    # The worker's model reads 64 rows (multiprocess_worker.VOCAB); the ramp's last target is the 65th id.
+    corpus = token_corpus(tmp_path / "tokens", records=16, seq_len=4, rows=64)
     reports = run_pool("token_budget", tmp_path / "pool", 2, devices=1, tokens=corpus.train, seq_len=4)
     assert [report["step"] for report in reports] == [3, 3]
     assert [report["updates"] for report in reports] == [3, 3]
@@ -1553,11 +1556,11 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
 
     assert [report["arrivals"] for report in reports] == [[0, 1], [0, 1]]
     # Every rank refuses each rank-local invalid input, both returning from it (the worker fails on one
-    # accepted), by its category whatever its words: rank 1, whose input it is, as invalid, and rank 0 as
-    # its peer's failure.
+    # accepted), by its category whatever its words: rank 1, whose input it is, as invalid (a token past
+    # the model's table as `OutsideTable`), and rank 0 as its peer's failure.
     faults = ("token", "length", "key", "component")
-    assert [report["invalid_errors"] for report in reports] == [dict.fromkeys(faults, "PeerFailure"),
-                                                              dict.fromkeys(faults, "ValueError")]
+    invalid = {**dict.fromkeys(faults, "ValueError"), "token": "OutsideTable"}
+    assert [report["invalid_errors"] for report in reports] == [dict.fromkeys(faults, "PeerFailure"), invalid]
     # Over weights on no mesh, rank 1's zero prompt length is its own refusal
     # and rank 0 samples its rows without hearing of it.
     assert reports[0]["meshless"] == {"rows": 2 * len(reports[0]["prompt_lengths"])}

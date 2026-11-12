@@ -1,11 +1,12 @@
 """What a GPU lane (tools/armada/ci.py `gpu-lane`) needs to run each test file as measured: the most any
-GPU class's last whole run of it held with its children (`ci.gpu_needs`), in bytes, as JSON by file; a file
-no class measured is absent. A GPU tier sizes each part's job by it, so the lane admits every file at its need
-(2026-11-10: a part given a default 8 GiB had a 4 GiB lane for a file measured at 5.9 GiB).
+GPU class's last run of it held with its children (`ci.gpu_needs`), whole or a group's, in bytes, as JSON by
+file; a file no class measured is absent. A GPU tier sizes each part's job by it, so the lane admits every
+file at its need (2026-11-10: a part given a default 8 GiB had a 4 GiB lane for a file measured at 5.9 GiB).
 
     DEW_XLA_CACHE_URL=... DEW_XLA_CACHE_TOKEN=... python3 tools/armada/gpu_holds.py --tests "FILE..."
 
-A group (`<file>#G/N`) is its file's: its whole measured run holds any group of it."""
+A group (`<file>#G/N`) is its file's: a tier cuts a file's groups anew, so one's measure is the most any run
+of its file held, which is what its lane admits it at."""
 
 import argparse
 import importlib.util
@@ -16,8 +17,8 @@ from pathlib import Path
 
 
 def holds(tests: list[str]) -> dict[str, float]:
-    """Each of `tests`' files by the most a GPU class's last whole run of it held (`ci.borrowed_records`, over
-    every class)."""
+    """Each of `tests`' files by the most a GPU class's last run of it held, whole or a group's
+    (`ci.borrowed_records`, over every class)."""
     # ci.py, beside this file, loaded by its path as ci.py loads its neighbours.
     spec = importlib.util.spec_from_file_location("armada_ci", Path(__file__).resolve().with_name("ci.py"))
     assert spec is not None and spec.loader is not None
