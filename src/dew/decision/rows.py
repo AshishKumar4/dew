@@ -376,10 +376,10 @@ class Fit(pygrain.MapTransform):
     def _fitted(self, element: Batch) -> Batch | Rejected:
         held = element.get("example", element)
         if isinstance(held, GroupedExamples) or (isinstance(held, Mapping) and "examples" in held):
-            grouped = GroupedExamples.of(held)
+            grouped = GroupedExamples.of(held, groups=self.grouped)
             # Without a consistency term the examples are rows of their own, which no window ties.
             return self._unit(grouped) if self.grouped else self._apart(grouped)
-        example = Example.of(held)
+        example = Example.of(held, groups=self.grouped)
         if self.grouped and example.groups and not self.layout.joint:
             # Its grouped questions stand in rows of their own, which train as one unit.
             return self._unit(GroupedExamples((example,)))
