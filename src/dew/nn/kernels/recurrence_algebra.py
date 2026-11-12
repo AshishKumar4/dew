@@ -419,6 +419,8 @@ def _lags(shape) -> jax.Array:
     column 0 the row index): the one int tile a mask comparing a row with its column holds (`lag > 0` strictly
     lower), where `_grid`'s two stay live."""
     rows, cols = _grid(shape)
+    if os.environ.get("DBG_LAGS_HERE"):
+        rows, cols = jax.lax.optimization_barrier((rows, cols))
     return rows - cols
 
 
@@ -1305,7 +1307,8 @@ def summed_pairs(pairs, issue: Issue = portable, columns: Callable[[jax.Array], 
     and each token's sum its column's (`columns`, a mainloop's own reduction across its rows' warps, where
     given)."""
     lag = _lags(pairs.shape)
-    triangle = jnp.where(lag < 0, 1.0, 0.0)
+    triangle_lag = jax.lax.optimization_barrier(lag) if os.environ.get("DBG_TRIANGLE_HERE") else lag
+    triangle = jnp.where(triangle_lag < 0, 1.0, 0.0)
     if os.environ.get("DBG_TRIANGLE_ONES"):
         triangle = jnp.ones_like(triangle)
     terms = jnp.where(lag >= 0, issue("summed", pairs, Exact(triangle)), 0.0)
