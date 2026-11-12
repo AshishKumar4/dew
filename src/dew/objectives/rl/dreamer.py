@@ -1073,7 +1073,8 @@ class DreamerRollout:
             live = self._advanced(variables, live, min(self.length, self.prefill - flown), random=True)
         return live
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array, *, objective: Objective) -> Batch:
+    def __call__[LossT, EffectsT](self, state: TrainState, batch: Batch, key: jax.Array, *,
+                                  objective: Objective[LossT, EffectsT]) -> Batch:
         own_objective(type(self).__name__, self.objective, objective)
         act_key, sample_key = jax.random.split(key)
         variables = state.variables

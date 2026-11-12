@@ -393,7 +393,8 @@ class ControlRollout:
             unrolled.append(steps)
         return carry, jax.tree.map(lambda *leaves: jnp.stack(leaves), *unrolled)
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array, *, objective: Objective) -> Batch:
+    def __call__[LossT, EffectsT](self, state: TrainState, batch: Batch, key: jax.Array, *,
+                                  objective: Objective[LossT, EffectsT]) -> Batch:
         own_objective(type(self).__name__, self.objective, objective)
         passes = self.epochs * self.minibatches
         # The rollout's own count of the minibatches served (row 3932); none yet, the updates' as before.

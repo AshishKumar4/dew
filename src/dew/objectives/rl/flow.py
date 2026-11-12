@@ -375,7 +375,8 @@ class GroupedRollout:
 
         return jax.tree.map(repeat, batch), owned, count
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array, *, objective: Objective) -> Batch:
+    def __call__[LossT, EffectsT](self, state: TrainState, batch: Batch, key: jax.Array, *,
+                                  objective: Objective[LossT, EffectsT]) -> Batch:
         """Collect one batch of samples and return this process's training rows.
 
         It expands each prompt into its group, generates on every process,
