@@ -15,7 +15,6 @@ from collections.abc import Callable, Hashable, Mapping
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
-import jax.extend.core as jcore
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
@@ -360,7 +359,7 @@ class Prepared(NamedTuple):
     shapes: tuple | None
     copies: dict
     prepared: TrainState
-    traced: jcore.ClosedJaxpr | None
+    traced: jax.core.ClosedJaxpr | None
 
 
 def prepared_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: TrainState, batch: Batch,
