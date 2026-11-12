@@ -864,10 +864,13 @@ def _band(mask: np.ndarray) -> int | None:
     pattern, or every key at or before its query (plain causality)."""
     queries, keys = mask.shape[-2:]
     distance = np.arange(queries)[:, None] - np.arange(keys)[None, :]
-    for width in range(1, keys):
-        if np.array_equal(np.broadcast_to((distance >= 0) & (distance < width), mask.shape), mask):
-            return width
-    return None
+    # The one width a band of these entries can have, one past the farthest key any query keeps, held to
+    # the whole mask once (each width from 1 compared with it cost a square mask its keys' count again).
+    width = int(np.max(np.where(mask, distance, 0), initial=0)) + 1
+    if not 1 <= width < keys:
+        return None
+    band = np.broadcast_to((distance >= 0) & (distance < width), mask.shape)
+    return width if np.array_equal(band, mask) else None
 
 
 KEPT = frozenset({"xla", "reference"})

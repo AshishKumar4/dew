@@ -578,9 +578,9 @@ def test_a_products_mode_prices_it():
     the highest) takes the tensor cores' TF32 mode, one of 16-bit operands their 16-bit mode, and one at
     `Precision.HIGHEST` the CUDA cores (`cost.work`): an H100's TF32 rate is half its 16-bit one and its
     CUDA cores' far below both, so the three price apart."""
-    def product(precision, dtype):
+    def product(precision, dtype, result=jnp.float32):
         def contracted(a, b):
-            return jnp.dot(a, b, precision=precision, preferred_element_type=jnp.float32)
+            return jnp.dot(a, b, precision=precision, preferred_element_type=result)
 
         a, b = (jnp.ones((64, 64), dtype) for _ in range(2))
         region = terms.region(jax.make_jaxpr(contracted)(a, b))
@@ -597,6 +597,11 @@ def test_a_products_mode_prices_it():
     spelled = jax.lax.DotAlgorithm(jnp.bfloat16, jnp.bfloat16, jnp.float32, num_primitive_operations=3)
     assert product(spelled, jnp.float32) == product(jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X3, jnp.float32)
     assert product(spelled, jnp.float32).flops == 3 * flops
+    # A preset is priced by what JAX lowers it to, whatever its operands' storage: bf16 products of fp32
+    # storage accumulated in bf16 are the 16-bit mode's, where a preset not named `..._F32` was the CUDA
+    # cores'.
+    narrow = product(jax.lax.DotAlgorithmPreset.BF16_BF16_BF16, jnp.float32, jnp.bfloat16)
+    assert (narrow.flops, narrow.operations) == (flops, 0.0)
     # An FP8 dot algorithm's products are the 8-bit mode's, as FP8 operands' are.
     eight = jax.lax.DotAlgorithm(jnp.float8_e4m3fn, jnp.float8_e4m3fn, jnp.float32)
     assert product(eight, jnp.float8_e4m3fn).fp8_flops == flops
@@ -905,7 +910,7 @@ import json
 import jax
 import jax.numpy as jnp
 import numpy as np
-from egglog import i64, rewrite, var
+from egglog import eq, i64, rule, union, var
 from jax.core import eval_jaxpr
 
 from dew import algebra
@@ -921,6 +926,10 @@ def branched(x, y):
     return jax.lax.cond(jnp.sum(x) > 0, sums, lambda x, y: sums(y, x), x, y)
 
 
+def alone(x, y):
+    return jnp.exp(jnp.tanh(x))
+
+
 rng = np.random.default_rng(0)
 x, y = (jnp.asarray(rng.standard_normal((5, 38)), jnp.float32) for _ in range(2))
 closed = jax.make_jaxpr(branched)(x, y)
@@ -930,25 +939,32 @@ def computed():
     window = jax.jit(algebra.rewritten(sums))(x, y)
     rewritten = algebra.rewritten_program(closed)
     body = eval_jaxpr(rewritten.jaxpr, rewritten.consts, x, y)[0]
-    return float(jnp.max(jnp.abs(window - sums(x, y)))), float(jnp.max(jnp.abs(body - sums(x, y))))
+    lone = jax.jit(algebra.rewritten(alone))(x, y)
+    return (float(jnp.max(jnp.abs(window - sums(x, y)))), float(jnp.max(jnp.abs(body - sums(x, y)))),
+            float(jnp.max(jnp.abs(lone - alone(x, y)))))
 
 
 before = computed()
-variable, params = var("x", Term), var("params", i64)
-exponential = rules.RuleFamily("the exponential as its argument", (rewrite(variable.unary("exp", params)).to(
-    variable),), (jnp.exp, lambda x: x, None))
+variable, root, params = var("x", Term), var("root", Term), var("params", i64)
+rewritten = rule(eq(variable.unary("exp", params)).to(root)).then(union(root).with_(variable))
+exponential = rules.RuleFamily("the exponential as its argument", (rewritten,), (jnp.exp, lambda x: x, None))
 rules.register(rules.Rules.declared("registered after", "reorders", (exponential,), "a test's"))
 print(json.dumps({"before": before, "after": computed()}))
 """
-"""A process that rewrites a program's window and a branch body of one held program, registers a rule set
-(one that rewrites an exponential to its argument), and rewrites them again."""
+"""A process that rewrites a program's window, a branch body of one held program and a program holding an
+exponential alone, registers a rule set (one that rewrites an exponential to its argument), and rewrites
+them again."""
 
 
 def test_a_rule_set_registered_after_a_rewrite_reaches_the_programs_rewritten_after_it():
     """A window's and a body's rewrite are kept by everything their derivation reads, the rule sets the
     registry admits among them: a set registered after a program was rewritten (a user extending the
     algebra in a running process) reaches the next rewrite of a window of its structure and of the same held
-    branch body, where a rewrite kept from before it would stand."""
+    branch body, where a rewrite kept from before it would stand; and a program whose only math the set
+    reads is the set's left side (an exponential alone, no sum beside it) is rewritten too: the pass opens
+    its windows at each registered rule's own head (`rules.heads`), read from the term its union rewrites
+    however the rule spells that term's equality (here the term first, its root second), where a table
+    written beside the rules listed no exponential and left such a rule unreachable."""
     done = subprocess.run([sys.executable, "-c", REGISTERED_AFTER], capture_output=True, text=True,
                           check=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
     found = json.loads(done.stdout.strip().splitlines()[-1])

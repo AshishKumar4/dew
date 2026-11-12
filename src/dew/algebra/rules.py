@@ -8,6 +8,7 @@ value it makes is constant along `axis`, so a sum along that axis may take it ou
 
 from __future__ import annotations
 
+import collections
 import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
@@ -22,6 +23,7 @@ from egglog import (
     Unit,
     Vec,
     birewrite,
+    declarations,
     eq,
     function,
     i64,
@@ -583,16 +585,80 @@ def _identities() -> tuple[RuleFamily, ...]:
 
 FACTS = _facts()
 RULES: dict[str, Rules] = {}
+_HEADS: dict[str, set[tuple[str, ...]]] = {}
+"""What each registered rule's left side reads at its head (`_head`), by the operation it heads at: the
+operations that make its operands, where the left side states them. The program pass opens a window at an
+equation one of them matches (`heads`, `program.WINDOW` deep), so a rule is reachable from the moment it is
+registered; a set that only aids the others (`Rules.aid`: commutativity leaves every price as it was) or runs
+at dev time alone (`Rules.dev`) opens none."""
+
+
+def _operation(pattern) -> declarations.CallDecl | None:
+    """A left side's term where it writes an operation: a call of a method of the term it reads
+    (`Term.binary`, `Term.dot`); None for a variable, which any value answers, and for a leaf, a literal or
+    a state, the class's own constructors."""
+    held = pattern.expr if isinstance(pattern, declarations.TypedExprDecl) else pattern
+    if isinstance(held, declarations.CallDecl) and isinstance(held.callable, declarations.MethodRef):
+        return held
+    return None
+
+
+def _spoken(pattern) -> str | None:
+    """The symbol a left side's term is spoken as (`terms.written_as`), None where it writes no operation
+    (`_operation`)."""
+    call = _operation(pattern)
+    if call is None or not isinstance(call.callable, declarations.MethodRef):
+        return None
+    named = call.args[1].expr if len(call.args) > 1 else None
+    name = named.value if isinstance(named, declarations.LitDecl) else None
+    return terms.written_as(call.callable.method_name, name if isinstance(name, str) else None)
+
+
+def _left_side(decl):
+    """A rule's left side: a rewrite's own; a rule's the term its union rewrites, read from the equality
+    that binds the root it unions (`eq(t).to(...)`, either way round and wherever among its facts), or the
+    union's own left where it is written out; None where it states none."""
+    if not isinstance(decl, declarations.RuleDecl):
+        return decl.lhs
+    rewritten = next((action.lhs for action in decl.head if isinstance(action, declarations.UnionDecl)), None)
+    if rewritten is None or isinstance(rewritten, declarations.CallDecl):
+        return rewritten
+    for fact in decl.body:
+        if isinstance(fact, declarations.EqDecl) and rewritten in (fact.left, fact.right):
+            return fact.right if fact.left == rewritten else fact.left
+    return None
+
+
+def _head(written) -> tuple[str, tuple[str, ...]] | None:
+    """The head of a rule's left side (`_left_side`): the operation it heads at and those that make its
+    operands where it states them, in order of their names; None where it heads at no operation."""
+    left = _left_side(written.decl)
+    call, root = (None, None) if left is None else (_operation(left), _spoken(left))
+    if call is None or root is None:
+        return None
+    made = (_spoken(operand) for operand in call.args if isinstance(operand, declarations.TypedExprDecl))
+    return root, tuple(sorted(symbol for symbol in made if symbol is not None))
 
 
 def register(rules: Rules) -> None:
     """Add a set of rules to the registry, which runs them in the order they were registered: a set states
-    its rewrites, each with the instance that qualifies it (`Rules.declared`, `instances`), or is refused."""
+    its rewrites, each with the instance that qualifies it (`Rules.declared`, `instances`), or is refused;
+    each rule of a set that may change a program opens the pass's windows at its own left side's head
+    (`_HEADS`), and one whose left side heads at no operation of the language, which no window could open
+    for, is refused."""
     if rules.name in RULES:
         raise ValueError(f"a rule set named {rules.name!r} is registered already")
     if not rules.families:
         raise ValueError(f"the rule set {rules.name!r} declares no rewrites to qualify it by")
+    found = [] if rules.aid or rules.dev else [
+        (family.name, _head(written)) for family in rules.families for written in family.rules]
+    headless = [name for name, head in found if head is None]
+    if headless:
+        raise ValueError(f"the rule set {rules.name!r}: the left side of {headless} heads at no operation "
+                         f"of the language, so no window of a program opens for it")
     RULES[rules.name] = rules
+    for root, made in (head for _, head in found if head is not None):
+        _HEADS.setdefault(root, set()).add(made)
 
 
 register(Rules.declared("identities", "exact", _identities(), "docs/design/algebra.md §1", aid=True))
@@ -605,24 +671,14 @@ register(Rules.declared("linear", "reorders", _linear(), "docs/design/algebra.md
 register(Rules.declared("joined", "reorders", _joined(), "docs/design/algebra.md §1; ledger 1308"))
 
 
-HEADS = {"add": frozenset({"reduce_sum", "mul", "dot_general"}), "reduce_sum": frozenset({"mul"}),
-         "reduce_max": frozenset({"mul"}), "reduce_min": frozenset({"mul"}),
-         "mul": frozenset({"dot_general"}), "dot_general": frozenset({"mul"})}
-"""What a rule's left side that may lower a price reads at its head: a sum (`add`) of two reductions, two
-products or two contractions of one kind (`linear`), a reduction of a product (a sum's, or an extremum's of a
-positive scale), a contraction scaled, or a contraction of a scaled operand (a dequant's matrix scale, its
-broadcast within `program.WINDOW`). Commutativity alone (`identities`) leaves every price as it was."""
-
-
 def heads(primitive: str, operands: Sequence[str | None]) -> bool:
     """Whether an equation binding `primitive` over operands made by `operands` (each producer's primitive, or
-    None for a value from outside) is a head a rule may lower the price at (`HEADS`)."""
-    kinds = HEADS.get(primitive)
-    if kinds is None:
-        return False
-    if primitive == "add":
-        return len(operands) == 2 and operands[0] == operands[1] and operands[0] in kinds
-    return any(operand in kinds for operand in operands)
+    None for a value from outside) is a head a registered rule may lower the price at: some rule's left side
+    heads at that operation over operands of those makers (`_HEADS`, each rule's own as it is registered),
+    each of the equation's operands answering one of the left side's at most, in any order (commutativity
+    may have swapped them)."""
+    made = collections.Counter(operand for operand in operands if operand is not None)
+    return any(not collections.Counter(needed) - made for needed in _HEADS.get(primitive, ()))
 
 
 def reorderable(region: terms.Region) -> bool:

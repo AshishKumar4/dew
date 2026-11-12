@@ -851,7 +851,7 @@ def packed[Words: (np.ndarray, jax.Array)](codes: Words, minifloat: Minifloat, x
     places = xp.arange(per, dtype=xp.uint32) * xp.uint32(minifloat.width)
     # The codes' bits are disjoint, so their sum is their union.
     natural = xp.sum(grouped << places, axis=-1, dtype=xp.uint32)
-    return _parities(natural, NVFP4_BFLOAT16_FORM.encoder, xp) if minifloat is E2M1 else natural
+    return _parities(natural, NVFP4_BFLOAT16_FORM.encoder, xp) if minifloat == E2M1 else natural
 
 
 def nvfp4_quantized(x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:

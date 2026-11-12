@@ -326,14 +326,17 @@ def test_each_encode_is_the_reference_cast_on_every_fp32_word():
     sharded("every fp32 word's encode", checked, len(cases))
 
 
-def test_an_nvfp4_tile_packed_from_its_encode_decodes_to_its_rounded_values():
+@pytest.mark.parametrize("e2m1", [bits.E2M1, bits.Minifloat(*bits.E2M1)], ids=["the format", "an equal one"])
+def test_an_nvfp4_tile_packed_from_its_encode_decodes_to_its_rounded_values(e2m1):
     """fp32 values encoded to e2m1 (`bits.encoded`) and packed eight a word (`bits.packed`), with a block
     scale of 1 (an e4m3 scale of 2^8, `NVFP4_OWED`), decode (`nvfp4_decoded`) to their e2m1 rounding: the
-    pack is the stored NVFP4 order the decode reads, in jax.numpy as a kernel's portable path runs it."""
+    pack is the stored NVFP4 order the decode reads, in jax.numpy as a kernel's portable path runs it,
+    whichever object states the format: one built equal to `bits.E2M1` packs as it does, where it packed
+    its codes in their natural order, which the decode read as other values."""
     rng = np.random.default_rng(4050)
     x = rng.standard_normal((64, 8)).astype(np.float32) * 3
-    codes = bits.encoded(jnp.asarray(x).view(jnp.uint32), bits.E2M1)
-    words = bits.packed(codes.T, bits.E2M1).T
+    codes = bits.encoded(jnp.asarray(x).view(jnp.uint32), e2m1)
+    words = bits.packed(codes.T, e2m1).T
     scales = jnp.full((4, 8), 2.0 ** 8, ml_dtypes.float8_e4m3fn)
     decoded = np.asarray(bits.nvfp4_decoded(words, scales), np.float32)
     rounded = np.clip(x, -6, 6).astype(ml_dtypes.float4_e2m1fn).astype(np.float32)

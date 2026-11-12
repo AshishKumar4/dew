@@ -16,7 +16,7 @@ import hashlib
 import math
 import types
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
-from typing import overload
+from typing import Literal, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
@@ -41,6 +41,8 @@ from jax._src import core as jax_core
 from jax._src.literals import TypedNdArray
 from jax.core import ShapedArray
 from jax.extend import core as jcore
+
+from dew.nn import programs
 
 
 @dataclasses.dataclass(frozen=True)
@@ -106,6 +108,25 @@ _speaks("select", jax.lax.select_n_p)
 _speaks("product", jax.lax.dot_general_p)
 
 
+class Written(NamedTuple):
+    """How an operation of a kind is written as a term (`Term`): the constructor it is a call of, the
+    operands it reads, and what the term holds of the operation beside them: its symbol, its reduction's
+    monoid, or nothing where the kind has one operation."""
+
+    constructor: str
+    arity: int
+    names: Literal["symbol", "monoid"] | None
+
+
+WRITTEN = {"binary": Written("binary", 2, "symbol"), "comparison": Written("compare", 2, "symbol"),
+           "unary": Written("unary", 1, "symbol"), "shape": Written("shaped", 1, "symbol"),
+           "reduction": Written("reduce", 1, "monoid"), "cast": Written("convert", 1, None),
+           "select": Written("select", 3, None), "product": Written("dot", 2, None)}
+"""Each kind of operation (`Operation.kind`) as its term, the one statement of the correspondence: an
+equation is written as a term by it (`_term`, `spoken_as`) and a term's operation read back by it
+(`written_as`, a rule's left side's head)."""
+
+
 def symbol(primitive: jcore.Primitive) -> str | None:
     """`primitive`'s symbol in the language (`OPERATIONS`), None for one it does not speak."""
     spoken_as = OPERATIONS.get(primitive)
@@ -117,13 +138,8 @@ def _symbols(chosen: Callable[[Operation], bool]) -> frozenset[str]:
     return frozenset(operation.symbol for operation in OPERATIONS.values() if chosen(operation))
 
 
-BINARY = _symbols(lambda operation: operation.kind == "binary")
-UNARY = _symbols(lambda operation: operation.kind == "unary")
 COMPARISONS = _symbols(lambda operation: operation.kind == "comparison")
-SHAPES = _symbols(lambda operation: operation.kind == "shape")
-REDUCTIONS = {operation.symbol: operation.monoid for operation in OPERATIONS.values()
-              if operation.monoid is not None}
-"""The language's symbols by the term each is written as, read from the declarations (`OPERATIONS`)."""
+"""The language's comparisons' symbols, read from the declarations (`OPERATIONS`)."""
 RESCALE = "rescale"
 """A binary no program holds: a derived walk's rescale of a carried state from its first operand's anchor to
 its second's where the declaration states its own (`derive.Reduction.rescale`), evaluated by that function
@@ -738,7 +754,7 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> M
         shape = _shape(equation.invars[0])
         return given[0] + _log2(math.prod(shape[axis] for axis in equation.params["axes"]))
     if name == "dot_general":
-        slack = _contraction_slack(equation.params.get("precision"))
+        slack = _contraction_slack(equation)
         if slack is None:
             return None
         (contracted, _), _ = equation.params["dimension_numbers"]
@@ -747,23 +763,25 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> M
     return None
 
 
-SPLIT_PRESETS = frozenset({"BF16_BF16_F32_X3", "BF16_BF16_F32_X6", "BF16_BF16_F32_X9", "TF32_TF32_F32_X3"})
-"""The dot algorithms that split each operand into parts and sum their products (`_contraction_slack`)."""
-SINGLE_PRESETS = frozenset({"DEFAULT", "F16_F16_F16", "F16_F16_F32", "BF16_BF16_BF16", "BF16_BF16_F32",
-                            "TF32_TF32_F32", "F32_F32_F32", "F64_F64_F64"})
-"""The dot algorithms that round each operand once to nearest and accumulate (`_contraction_slack`)."""
-
-
-def _contraction_slack(precision) -> int | None:
-    """The powers a contraction's bound adds for its mode (`dot_general`'s `precision`): none where it rounds
-    each operand once to nearest (`SINGLE_PRESETS`, `Precision.DEFAULT` and `HIGHEST`); one where it splits
-    them into parts whose products it sums (`SPLIT_PRESETS`, `Precision.HIGH`: a TPU's bf16 x3); None, no
-    bound, where no source states its rounding (an FP8 preset's fast accumulation, an algorithm given by
-    its own types)."""
+def _contraction_slack(equation: jcore.JaxprEqn) -> int | None:
+    """The powers a contraction's bound adds for its mode (a `dot_general`'s `precision`): none where it
+    rounds each operand once to nearest and accumulates (no precision stated, `Precision.DEFAULT` and
+    `HIGHEST`, the default preset, a preset of one primitive operation over operands of 16 bits or wider);
+    one where it splits them into parts whose products it sums (`Precision.HIGH`, a TPU's bf16 x3: a preset
+    of several primitive operations); None, no bound, where no source states its rounding (an FP8 preset's
+    accumulation, an algorithm given by its own types). A preset's facts are JAX's own
+    (`programs.dot_arithmetic`)."""
+    precision = equation.params.get("precision")
     if precision is None:
         return 0
     if isinstance(precision, jax.lax.DotAlgorithmPreset):
-        return 0 if precision.name in SINGLE_PRESETS else 1 if precision.name in SPLIT_PRESETS else None
+        left, right = (atom.aval.dtype for atom in equation.invars if isinstance(atom.aval, ShapedArray))
+        arithmetic = programs.dot_arithmetic(precision, left, right)
+        if arithmetic is None:
+            return 0
+        if arithmetic.imprecise or min(arithmetic.operand_bits) < 16:
+            return None
+        return 0 if arithmetic.operations == 1 else 1
     if isinstance(precision, tuple) and all(isinstance(part, jax.lax.Precision) for part in precision):
         return 1 if jax.lax.Precision.HIGH in precision else 0
     if isinstance(precision, jax.lax.Precision):
@@ -817,16 +835,28 @@ def stocked() -> Mapping[str, tuple[jcore.Primitive, Mapping]]:
             for equation in traced.jaxpr.eqns}
 
 
+def written_as(constructor: str, named: str | None = None) -> str | None:
+    """The symbol of the operation a term of `constructor` (a `Term` method's name) writes, `_term`'s writing
+    read back (`WRITTEN`): the name the term holds (`named`) where its kind's terms hold their symbol, the
+    operation of its monoid (`named`) for a reduction, its kind's one operation otherwise; None for a
+    constructor that writes no operation (a leaf, a literal, a state)."""
+    kind = next((kind for kind, written in WRITTEN.items() if written.constructor == constructor), None)
+    if kind is None:
+        return None
+    if WRITTEN[kind].names == "symbol":
+        return named
+    chosen = [operation.symbol for operation in OPERATIONS.values()
+              if operation.kind == kind and (WRITTEN[kind].names is None or operation.monoid == named)]
+    return chosen[0] if len(chosen) == 1 else None
+
+
 def spoken_as(equation: jcore.JaxprEqn) -> str | None:
     """The symbol `equation` is spoken as in the language (`_term` makes a term of it), None for one outside
     it: a protected span is one marked call (`dew.nn.derivatives.Protected`), no equation of it."""
-    name, arity = symbol(equation.primitive), len(equation.invars)
-    if name is None or len(equation.outvars) != 1:
+    operation = OPERATIONS.get(equation.primitive)
+    if operation is None or len(equation.outvars) != 1:
         return None
-    binary = name in BINARY or name in COMPARISONS or name == "dot_general"
-    unary = name in UNARY or name in SHAPES or name in REDUCTIONS or name == "convert_element_type"
-    within = (binary and arity == 2) or (unary and arity == 1) or (name == "select_n" and arity == 3)
-    return name if within else None
+    return operation.symbol if len(equation.invars) == WRITTEN[operation.kind].arity else None
 
 
 def form_value(region_: Region, form: Term, values: list) -> jax.Array:
@@ -886,29 +916,25 @@ def _shape(atom) -> tuple[int, ...]:
 
 def _term[Node: (Term, Skeleton)](equation: jcore.JaxprEqn, read: Callable[..., Node],
                                    param: Callable) -> Node | None:
-    """`equation` as a term over its inputs' (`read`), or None where it is outside the language."""
-    name, primitive = symbol(equation.primitive), equation.primitive
-    if len(equation.outvars) != 1:
+    """`equation` as a term over its inputs' (`read`), written as its operation's kind is (`WRITTEN`), or
+    None where it is outside the language."""
+    operation, primitive = OPERATIONS.get(equation.primitive), equation.primitive
+    if operation is None or len(equation.outvars) != 1:
         return None
-    if name in BINARY and len(equation.invars) == 2:
-        return read(equation.invars[0]).binary(name, read(equation.invars[1]),
-                                               param(primitive, equation.params))
-    if name in COMPARISONS and len(equation.invars) == 2:
-        return read(equation.invars[0]).compare(name, read(equation.invars[1]),
-                                                param(primitive, equation.params))
-    if name in UNARY and len(equation.invars) == 1:
-        return read(equation.invars[0]).unary(name, param(primitive, equation.params))
-    if name == "convert_element_type" and len(equation.invars) == 1:
-        return read(equation.invars[0]).convert(param(primitive, equation.params))
-    if name == "select_n" and len(equation.invars) == 3:
-        predicate, false, true = (read(atom) for atom in equation.invars)
-        return predicate.select(false, true)
-    if name in SHAPES and len(equation.invars) == 1:
-        return read(equation.invars[0]).shaped(name, param(primitive, equation.params))
-    if name in REDUCTIONS and len(equation.invars) == 1:
+    written = WRITTEN[operation.kind]
+    if len(equation.invars) != written.arity:
+        return None
+    first, *others = (read(atom) for atom in equation.invars)
+    write = getattr(first, written.constructor)
+    if operation.kind == "select":
+        # Its operands in the equation's order: the predicate, then the value where it is false.
+        return write(*others)
+    if operation.kind == "cast":
+        return write(param(primitive, equation.params))
+    if operation.kind == "reduction":
         axes = Vec[i64](*(i64(int(axis)) for axis in equation.params["axes"]))  # the reduced axes
-        return read(equation.invars[0]).reduce(REDUCTIONS[name], axes, param(primitive, equation.params))
-    if name == "dot_general" and len(equation.invars) == 2:
+        return write(operation.monoid, axes, param(primitive, equation.params))
+    if operation.kind == "product":
         given = dict(equation.params)
         dtypes = {var.aval.dtype for var in equation.invars if isinstance(var.aval, ShapedArray)}
         if dtypes == {given.get("preferred_element_type")}:
@@ -916,8 +942,8 @@ def _term[Node: (Term, Skeleton)](equation: jcore.JaxprEqn, read: Callable[..., 
             given["preferred_element_type"] = None
         operands = tuple(np.dtype(var.aval.dtype) if isinstance(var.aval, ShapedArray) else None
                          for var in equation.invars)
-        return read(equation.invars[0]).dot(read(equation.invars[1]), param(primitive, given, operands))
-    return None
+        return write(others[0], param(primitive, given, operands))
+    return write(operation.symbol, *others, param(primitive, equation.params))
 
 
 def _literal(argument: object, kind: type[i64] | type[String] | type[f64]) -> int | str | float:

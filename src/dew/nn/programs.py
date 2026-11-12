@@ -11,8 +11,9 @@ from __future__ import annotations
 
 import contextlib
 import enum
+import functools
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import TypeGuard
+from typing import NamedTuple, TypeGuard
 
 import jax
 import jax.extend.core as jcore
@@ -117,6 +118,67 @@ class RaggedLayout(enum.Enum):
     GROUPS = "groups"
     """Each group's rows contracted: `[rows, depth]` by `[rows, width]` into `[groups, depth, width]`, a
     grouped matrix's gradient."""
+
+
+class DotArithmetic(NamedTuple):
+    """What a dot algorithm states of its arithmetic, as JAX lowers it (`dot_arithmetic`): each operand's
+    precision in bits, whether those are TF32's, its accumulation's bits, the primitive products it sums (an
+    X3's three) and whether its accumulation may be imprecise."""
+
+    operand_bits: tuple[int, int]
+    tf32: bool
+    accumulation_bits: int
+    operations: int
+    imprecise: bool
+
+
+@functools.cache
+def _preset_arithmetic(preset: jax.lax.DotAlgorithmPreset, lhs, rhs) -> DotArithmetic | None:
+    """`preset`'s arithmetic over operands of dtypes `lhs` and `rhs`, read from the attribute JAX's own
+    conversion lowers it to (`DotAlgorithmPreset._convert_to_hlo_attr`, the one account of a preset's
+    precision types, its component counts and its operations); None for the default preset, which names no
+    algorithm."""
+    from jax.extend.mlir import ir
+    from jax.interpreters import mlir
+
+    with mlir.make_ir_context():
+        lowered = preset._convert_to_hlo_attr(lhs, rhs)
+        if lowered is None:
+            return None
+        sides = (lowered.lhs_precision_type, lowered.rhs_precision_type)
+        # Each a float type of the bindings (`ir.FloatType`'s cast holds it to one), whose width is its bits.
+        left, right = (ir.FloatType(side).width for side in sides)
+        return DotArithmetic(operand_bits=(left, right),
+                             tf32=all(isinstance(side, ir.FloatTF32Type) for side in sides),
+                             accumulation_bits=ir.FloatType(lowered.accumulation_type).width,
+                             operations=lowered.num_primitive_operations,
+                             imprecise=lowered.allow_imprecise_accumulation)
+
+
+def dot_arithmetic(precision: jax.lax.PrecisionLike, lhs_dtype, rhs_dtype) -> DotArithmetic | None:
+    """The arithmetic the dot algorithm `precision` names runs a product of operands of those dtypes in, as
+    JAX lowers it: a preset's by JAX's own conversion of it (`_preset_arithmetic`), a `jax.lax.DotAlgorithm`'s
+    by its fields; None where `precision` names no algorithm (none stated, a `jax.lax.Precision` or a pair of
+    them, the default preset), the backend's choice by the operands. The one reading of a preset: the
+    algebra's cost prices a product's mode by it (`dew.algebra.cost`) and its rounding bound admits a
+    contraction by it (`dew.algebra.terms`), no list of preset names beside JAX's."""
+    from jax._src.lax import lax as lax_internal
+
+    named = lax_internal.canonicalize_precision(precision)
+    if isinstance(named, jax.lax.DotAlgorithm):
+        sides = (named.lhs_precision_type, named.rhs_precision_type)
+        return DotArithmetic(operand_bits=(_bits(sides[0]), _bits(sides[1])), tf32=False,
+                             accumulation_bits=_bits(named.accumulation_type),
+                             operations=named.num_primitive_operations,
+                             imprecise=named.allow_imprecise_accumulation)
+    if isinstance(named, jax.lax.DotAlgorithmPreset):
+        return _preset_arithmetic(named, jnp.dtype(lhs_dtype), jnp.dtype(rhs_dtype))
+    return None
+
+
+def _bits(dtype) -> int:
+    """A dtype's width in bits."""
+    return 8 * jnp.dtype(dtype).itemsize
 
 
 def ragged_layout(lhs_rank: int, rhs_rank: int, numbers) -> RaggedLayout | None:

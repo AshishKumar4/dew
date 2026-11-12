@@ -885,8 +885,14 @@ a derived form replaces a hand-written one only where it states the walk, passes
   (`Reduction.rescale`, the language's binary `rescale`, `terms.RESCALE`, which no rule rewrites), and may
   hold its largest weight to 1 by a select (`exp(where(x < b, x - b, 0))`, `b` the broadcast of `x`'s own
   maximum). A compensated walk's running sums are the mainloop's own additions over the derived forms
-  (`Derived.step`'s `stepped`, the mainloop's one step over each sum's parts, `Accumulated` and `Added`). The template's hand forms run until it
-  takes these (row 4228); the guard's shifted sums follow, its control flow the template's. Error-aware
+  (`Derived.step`'s `stepped`, the mainloop's one step over each sum's parts, `Accumulated` and `Added`). The
+  attention template runs these forms: its step, its merge and its output are the derived ones
+  (`attention_algebra.plain_step`, `merge` and `finish`, through `_derived_step`, `_derived_merge` and
+  `_derived_output`), compensated and scaled walks among them. Two hand branches remain, each a gap: a
+  dropping call's step (the derivation narrows a dropped weight unnormalized, past fp16's largest at a rate
+  near 1, where the hand step's scaled parts keep it, a representation the declaration states none of), and
+  a normalized state's output, whose sums are its output already. The guard's shifted sums follow, its
+  control flow the template's. Error-aware
   extraction (§1.5) waits for a cell whose cheapest form fails check 1 where an equal one passes: row 3310's
   was the test's schedule, not a form.
 - The chunk's decays (`scan._decays`: the compensated prefix and its exponentials) and a gram's evaluation
