@@ -504,7 +504,7 @@ this Dew still reads that value (the version before, 13, below).
 | `shuffle` | `corpus-key` | `dew.data.lowering._Build.SHUFFLE` | A shuffle's seed, keyed by its corpus's own key in the mix that reads it, or a named chain's. |
 | `mix` | `declared-order` | `dew.data.mixing.MIX` | A weighted mix's schedule: Grain's whole proportions, members in declared order, each window permuted by its seed. |
 | `dealing` | `input-order-groups` | `dew.data.elastic_order.DEALING` | How loading workers that read inputs in their order are dealt them: consecutive groups in turn. |
-| `grain` | Grain's version | `dew.data.readers.GRAIN` | The Grain whose iterator states a per-share position holds. Another Grain's position resumes where its state has this Grain's layout (keys and nesting), and is refused, naming both versions, where it does not. |
+| `grain` | Grain's version | `dew.data.readers.GRAIN` | The Grain whose iterator states a per-share position holds. Another Grain's position is restored at once through the iterators that own its state, and refused, naming both versions, where they cannot read it. |
 | `phases` | `stamped` | `dew.data.dataset.StepPhases.CONTINUES` | How a phase on its own stream continues a corpus an earlier phase shared: from the draws the run trained. Recorded in a read of phases' position. |
 
 A streamed source's shards, the ids it reads in turn, are recorded as a fact of the plan (`{source}/shards`,

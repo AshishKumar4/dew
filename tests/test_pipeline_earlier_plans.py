@@ -12,7 +12,6 @@ from dew.data import Memory
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
 from dew.data.pipeline import Pipeline, mix
-from dew.data.sources import Files
 
 
 def test_a_position_a_plan_this_dew_reads_none_of_saved_is_refused():
@@ -76,24 +75,30 @@ def test_a_position_resumes_under_the_plan_version_that_saved_it_through_a_grown
     changed.close()
 
 
-def test_a_streamed_position_of_13_resumes_in_a_read_compiled_by_this_dew_as_13_read_it():
-    """A streamed read per share saved under plan 13 resumes in the same chain compiled at this Dew's
-    version, as 13 read it (`dew.data.readers._PerShare.resumed_at`): onto the rows 13 read next, its
-    positions naming 13 still."""
-    stream = compile(_taken(20), read="streamed", loading=Loading(workers=0), plan_version=13).train(
-        DataPartition())
-    _ids(stream, 3)
+@pytest.mark.parametrize("mixed", [False, True], ids=["one corpus", "mixture"])
+def test_a_streamed_position_of_13_resumes_in_a_read_compiled_by_this_dew_as_13_read_it(mixed):
+    """A streamed read per share saved under plan 13, of one store or a mixture of two, resumes in the same
+    chain compiled at this Dew's version as 13 read it (`dew.data.readers._PerShare.resumed_at`): onto the
+    rows 13 read next, its plan 13's whole (its spelling, facts and members), so the position it saves in
+    turn resumes again onto the rows after."""
+    chain = mix([_named("a", 1), _named("b", 2)], seed=4).batch(2) if mixed else _taken(40)
+    at_13 = compile(chain, read="streamed", loading=Loading(workers=0), plan_version=13)
+    whole = at_13.train(DataPartition())
+    ids = _ids(whole, 8)
+    whole.close()
+    stream = at_13.train(DataPartition())
+    _ids(stream, 2)
     saved = stream.get_state()
-    after = _ids(stream, 4)
     stream.close()
-    resumed = compile(_taken(20), read="streamed", loading=Loading(workers=0)).train(DataPartition())
-    try:
-        resumed.set_state(saved)
-        assert _ids(resumed, 4) == after
-        assert json.loads(resumed.get_state())["dew_data_plan"]["version"] == 13
-    finally:
-        resumed.close()
-
+    for start in (2, 5):
+        resumed = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+        try:
+            resumed.set_state(saved)
+            assert _ids(resumed, 3) == ids[start:start + 3]
+            saved = resumed.get_state()
+            assert json.loads(saved)["dew_data_plan"]["version"] == 13
+        finally:
+            resumed.close()
 
 def _saved(chain, **options) -> tuple[bytes, list[list[int]]]:
     """A streamed per-share read of `chain`, saved after two batches, and the two it reads next."""
@@ -134,16 +139,17 @@ def test_a_position_read_by_another_rule_is_refused_naming_it():
             stream.close()
 
 
-def test_a_position_another_grain_wrote_resumes_where_its_state_is_laid_out_alike():
-    """A position whose iterator state another Grain wrote (its `grain` rule) resumes where the state is
-    laid out as this Grain's, and is refused where a key of it differs."""
-    chain = _taken(20)
+def test_a_position_another_grain_wrote_resumes_where_its_iterators_read_it():
+    """A consumed mixture's position whose iterator state another Grain wrote (its `grain` rule) is restored
+    through the iterators that own it, and resumes onto the rows read next where they read it; one they
+    cannot read (a state of another shape) is refused when it is restored."""
+    chain = mix([_named("a", 1), _named("b", 2)], seed=4).batch(2)
     saved, after = _saved(chain)
 
     def other_grain(decoded):
         decoded["dew_data_plan"]["rules"]["grain"] = "0.0.1"
 
-    def other_layout(decoded):
+    def unreadable(decoded):
         other_grain(decoded)
         decoded["iterator"] = {"renamed": decoded["iterator"]}
 
@@ -156,34 +162,39 @@ def test_a_position_another_grain_wrote_resumes_where_its_state_is_laid_out_alik
     stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
     try:
         with pytest.raises(ValueError):
-            stream.set_state(_edited(saved, other_layout))
+            stream.set_state(_edited(saved, unreadable))
     finally:
         stream.close()
 
 
-def test_a_stream_its_store_cuts_into_other_shards_is_refused(tmp_path):
-    """A streamed position of a store of lines resumes where the store cuts its content into the shards the
-    read that saved it read in turn, and is refused where they differ (its `shards` fact): a Dew that cuts
-    the same files, of the same read options, otherwise reads them in another order."""
-    root = tmp_path / "rows"
-    root.mkdir()
-    for part in range(2):
-        rows = "".join(f'{{"id": {part * 10 + row}}}\n' for row in range(8))
-        (root / f"part-{part}.jsonl").write_text(rows)
-    chain = Pipeline(Files(str(root), format="jsonl", shard_bytes=64)).repeat().batch(2)
-    saved, after = _saved(chain)
+@dataclasses.dataclass(frozen=True)
+class Recut(Memory):
+    """A store of the same content and options as `Memory`'s, cut into its shards in reverse: a store a
+    later Dew cuts otherwise, read in another order."""
 
-    def cut_otherwise(decoded):
-        decoded["dew_data_plan"]["derived"]["0/shards"] = "another cut"
+    def manifest(self):
+        cut = super().manifest()
+        return dataclasses.replace(cut, shards=cut.shards[::-1])
 
-    for state, refused in ((saved, False), (_edited(saved, cut_otherwise), True)):
-        stream = compile(chain, read="streamed", loading=Loading(workers=0)).train(DataPartition())
+
+def test_a_stream_its_store_cuts_into_other_shards_is_refused():
+    """A streamed position resumes where its store cuts its content into the shards the read that saved it
+    read in turn, and is refused where a store of the same content and options cuts it otherwise (its
+    `shards` fact)."""
+    ids = {"id": np.arange(1, 25, dtype=np.int32)}
+
+    def chain(kind) -> Pipeline:
+        return Pipeline(kind(ids, identity="ids", shard_rows=4)).repeat().batch(2)
+
+    saved, after = _saved(chain(Memory))
+    for kind, refused in ((Memory, False), (Recut, True)):
+        stream = compile(chain(kind), read="streamed", loading=Loading(workers=0)).train(DataPartition())
         try:
             if refused:
                 with pytest.raises(ValueError):
-                    stream.set_state(state)
+                    stream.set_state(saved)
             else:
-                stream.set_state(state)
+                stream.set_state(saved)
                 assert _ids(stream, 2) == after
         finally:
             stream.close()

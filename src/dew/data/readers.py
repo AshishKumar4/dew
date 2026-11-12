@@ -39,18 +39,8 @@ from dew.data.storage import MIRRORED, Mirrored, PositionText, carried_mirrors
 
 GRAIN = importlib.metadata.version("grain")
 """The `grain` rule a per-share read's plan records (`dew.data.plan.Plan.rules`): the Grain whose iterators'
-states its position holds, which a resume under another compares by their layout (`layout`)."""
-
-
-def layout(state: JSON) -> JSON:
-    """`state`, an iterator's saved state, as its keys and their nesting alone: a mapping's keys each with
-    its value's layout, a sequence's entries', any other value's type's name."""
-    match state:
-        case dict():
-            return {key: layout(value) for key, value in state.items()}
-        case list():
-            return [layout(value) for value in state]
-    return type(state).__name__
+states its position holds, which a resume under another restores through its iterators at once
+(`_PerShare._grain_restores`)."""
 
 
 READER_FIELDS = (EXAMPLES_CONSUMED, VALID_ROWS)
@@ -330,30 +320,27 @@ class _PerShare(Forwarding):
         written = record(decoded.get("dew_data_plan"), "saved data plan")
         self._plan.check(written, resume=self._resume)
         saved = record(decoded.get("iterator"), "saved Grain iterator")
-        if self._plan.version >= STRUCTURED:
-            rules = record(written.get("rules", {}), "saved data plan rules")
-            self._grain_alike(json_value(rules.get("grain"), "saved grain rule"), saved)
         self.close()
         self._saved = saved
         self._statistics.publish(None)
+        if self._plan.version >= STRUCTURED:
+            rules = record(written.get("rules", {}), "saved data plan rules")
+            self._grain_restores(json_value(rules.get("grain"), "saved grain rule"))
 
-    def _grain_alike(self, saved: JSON, iterator: Mapping[str, object]) -> None:
-        """Refuse a position whose iterator state a Grain of another version wrote (`saved`, its `grain`
-        rule, `GRAIN`) in another layout than this read's: its keys and their nesting (`layout`), which
-        a Grain that changed its iterators' states writes otherwise. A state of the same layout resumes."""
-        if saved == GRAIN:
+    def _grain_restores(self, written: JSON) -> None:
+        """Restore the saved iterator state now, through the iterators that own it, where a Grain of another
+        version wrote it (`written`, its `grain` rule): a state that Grain's iterators read otherwise
+        than this Grain's is refused, naming both, where its restore fails; one they read alike resumes."""
+        if written == GRAIN:
             return
-        reader = self._open()
         try:
-            today = reader.get_state()
-        finally:
-            if isinstance(reader, Closeable):
-                reader.close()
-        if layout(json_value(today, "an iterator's state")) != layout(json_value(iterator, "a saved state")):
-            raise ValueError(f"the saved data position's iterator state was written by grain {saved}, in "
-                             f"another layout than this grain {GRAIN}'s reads (docs/design/data.md, the "
-                             f"rules): resume with grain=={saved}, or go on from the run's weights as a new "
-                             "run that reads its data afresh")
+            self._reader()
+        except (KeyError, TypeError, ValueError, IndexError, AttributeError) as error:
+            self.close()
+            raise ValueError(f"the saved data position's iterator state was written by grain {written}, "
+                             f"which this grain {GRAIN} does not read (docs/design/data.md, the rules): "
+                             f"resume with grain=={written}, or go on from the run's weights as a new run "
+                             "that reads its data afresh") from error
 
     def resumed_at(self, decoded: Mapping[str, object]) -> None:
         """Read on as the saved position `decoded` was read where it was saved under another plan version

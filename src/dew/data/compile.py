@@ -1132,32 +1132,42 @@ def _compiled(
         build.global_order,
     )
     sources = [source for _, source in _leaves(original)]
-    manifest = _manifest(
-        {"sources": [source.fingerprint() for source in sources]},
-        sources,
-        (
-            *(_identity(stage) for stage in written(tuple(_steps(original)))
-              if not isinstance(stage, (Workers, Prefetch))),
-            *(StepIdentity.of(step) for step in host),
-        ),
-        version=build.version,
-    )
-    members = _member_manifests(train, build, host)
-    plan = Plan(
-        "global" if global_order else "per-share",
-        manifest,
-        # A named chain's own key, which its shuffles draw by from version 9 (`_own_key`), so a position
-        # saved under another name is refused, as another permutation of its records.
-        {"read": read, "seed": seed, **({"named": build.named} if _keys_shuffles(build) else {}),
-         **build.lowering.order},
-        _derived(train, build),
-        cache=_cache_references(original, read, build.version),
-        members={key: fingerprint(manifest) for key, manifest in members.items()},
-        rules=build.rules(train),
-        volatile=any(_volatile(stage) for stage in
-                     (*_steps(original), *(stage for source in sources for stage in _written(source, ())))),
-        version=build.version,
-    )
+    staged_build = build
+
+    @functools.cache
+    def planned(version: int) -> Plan:
+        """The plan of this read as data plan `version` records it, whole: its manifest's spelling, its
+        facts, its members' digests, its caches and its rules each that version's, as a position saved
+        under it names them (`dew.data.readers._PerShare.resumed_at`)."""
+        at = dataclasses.replace(staged_build, version=version)
+        manifest = _manifest(
+            {"sources": [source.fingerprint() for source in sources]},
+            sources,
+            (
+                *(_identity(stage) for stage in written(tuple(_steps(original)))
+                  if not isinstance(stage, (Workers, Prefetch))),
+                *(StepIdentity.of(step) for step in host),
+            ),
+            version=version,
+        )
+        members = _member_manifests(train, at, host)
+        return Plan(
+            "global" if global_order else "per-share",
+            manifest,
+            # A named chain's own key, which its shuffles draw by (`_own_key`), so a position saved under
+            # another name is refused, as another permutation of its records.
+            {"read": read, "seed": seed, **({"named": at.named} if _keys_shuffles(at) else {}),
+             **at.lowering.order},
+            _derived(train, at),
+            cache=_cache_references(original, read, version),
+            members={key: fingerprint(manifest) for key, manifest in members.items()},
+            rules=at.rules(train),
+            volatile=any(_volatile(stage) for stage in (*_steps(original), *(
+                stage for source in sources for stage in _written(source, ())))),
+            version=version,
+        )
+
+    plan = planned(build.version)
     tuned = build.tuned(train, batches=batches)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
     build = tuned.pooled(train)
@@ -1169,6 +1179,7 @@ def _compiled(
         pipeline=train,
         build=build,
         plan=plan,
+        planned=planned,
         host=train_host,
         resume=resume,
         statistics=statistics,
@@ -1597,6 +1608,7 @@ def _training_reader(
     pipeline: Pipeline,
     build: _Build,
     plan: Plan,
+    planned: Callable[[int], Plan],
     host: tuple[HostStep, ...],
     resume: Literal["exact", "non-exact"],
     statistics: _Statistics,
@@ -1636,8 +1648,9 @@ def _training_reader(
         def per_share(chosen: _Build) -> tuple[Opener, Plan]:
             """The reader `chosen` opens over this share and the plan its positions name."""
             # Its rules its build's, and Grain's, whose iterator state its position holds (`GRAIN`).
+            whole = plan if chosen.version == plan.version else planned(chosen.version)
             return functools.partial(chosen.batches, pipeline, partition), dataclasses.replace(
-                plan, version=chosen.version, rules={**chosen.rules(pipeline), "grain": GRAIN},
+                whole, rules={**chosen.rules(pipeline), "grain": GRAIN},
                 # An elastic read's order is one reader's at any count, its position every reader's.
                 topology={"elastic": True} if chosen.elastic else {
                     "shares": partition.count,
