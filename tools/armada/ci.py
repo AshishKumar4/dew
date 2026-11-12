@@ -1929,6 +1929,11 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
                 written(green_key(python, row_["name"], held, ran_on), token, body)
             if key is not None:
                 remembered(python, row_["name"], held, ran["depends"], token, ran=True)
+            elif row_["exitCode"] != 0:
+                # A red run forgets the row's executed sets on this class, whatever set it ran: no lookup
+                # by another set finds an earlier green run of these inputs after it (a flaky red; a red that
+                # died before its report keeps none), and the next green run starts the list again.
+                written(sets_key(python, row_["name"], held), token, json.dumps({"sets": []}).encode())
 
 
 def written(key: str, token: str, body: bytes) -> bool:
