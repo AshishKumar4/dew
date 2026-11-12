@@ -1788,8 +1788,9 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
                ("src/other/optional.py", "VALUE = 1\n", [1, 2]), ("src/other/optional.py", None, [1, 2]),
                ("src/other/lone/__init__.py", "def value(): return 5\n", [1, 3]),
                ("src/other/lone/__init__.py", None, [1, 3]), ("tests/test_added.py", None, [1, 3]),
-               # test_lone's green run kept since its first, which ran in one process with test_uses, holds the
-               # package lookups that process made: they changed, it runs too, as a key reads what its run read.
+               # test_lone's green run kept since its first, which ran in one process with test_uses,
+               # holds the package lookups that process made: they changed, it runs too, as a key reads
+               # what its run read.
                ("src/pkg/space/__init__.py", "", [2, 4]), ("src/pkg/space/__init__.py", None, [2, 4]),
                ("src/top/__init__.py", "", [3, 5])]
     for path, source, runs in changes:
