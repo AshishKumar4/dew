@@ -34,7 +34,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew._records import integer, record, strings
-from dew.batch import EXAMPLES_CONSUMED, Batch
+from dew.batch import DRAWS, EXAMPLES_CONSUMED, Batch, Draws
 from dew.data.analysis import (
     _LOCAL,
     _VIEWS,
@@ -102,13 +102,13 @@ from dew.data.packing import FirstFitPacked, _Concatenated, _OverlappedCuts, win
 from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
-    COUNTING,
     DOCUMENT,
+    DRAWN,
     MEMBER,
     MEMBERS,
-    REFUSED,
     Artifact,
     Batched,
+    BatchedGroups,
     BatchStage,
     Documents,
     Expansion,
@@ -139,6 +139,7 @@ from dew.data.pipeline import (
     accounts,
     children,
     consumed_by,
+    drawn_of,
     examples_bound,
     joined,
     member_of,
@@ -446,13 +447,14 @@ def _chained(
 def _consumes(pipeline: Pipeline) -> bool:
     """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
     examples marks each where its bound is (`examples_bound`), among its stages or those a memory read ran
-    as it held its rows (`_written`), so every row after it holds a count."""
+    as it held its rows (`_written`), so every row after it holds a count. A phase whose mix other phases
+    read on counts its draws too (`_Build.counting`)."""
     source = pipeline.source
     stages = pipeline.stages if isinstance(source, (Mixture, Phases)) else _written(source, pipeline.stages)
     return examples_bound(stages) is not None
 
 
-def _completes(pipeline: Pipeline, at: int) -> bool:
+def _completes(pipeline: Pipeline, at: int, counting: bool) -> bool:
     """Whether a shuffle at `at` in `pipeline` draws windows holding pieces of the examples a run bounded in
     examples counts (`_consumes`): a layout before it lays them across windows (`cuts`), among its
     stages or those a memory read ran as it held its rows (`_written`), so each count waits for its
@@ -460,7 +462,7 @@ def _completes(pipeline: Pipeline, at: int) -> bool:
     source = pipeline.source
     before = pipeline.stages[:at]
     laid = before if isinstance(source, (Mixture, Phases)) else _written(source, before)
-    return _consumes(pipeline) and cuts(laid)
+    return counting and cuts(laid)
 
 
 def _reach(pipeline: Pipeline, at: int) -> int | None:
@@ -597,60 +599,6 @@ class _PerInput:
         if position is not None and not self.unplaced:
             held = tuple(_placed(output, position) for output in held)
         return _Spread(held)
-
-
-@dataclasses.dataclass(frozen=True)
-class _Groups:
-    """A `map_batches` step over one group: its records, as Grain's flat map takes them."""
-
-    stage: Batched
-    max_fan_out: int = 1 << 20
-
-    def flat_map(self, group: list[Record]) -> Sequence[Record]:
-        rows = [record(value, "batched input") for value in group]
-        # The source examples the group's rows consume are the run's accounting, out of the step's sight:
-        # a step that keeps its rows keeps each row's, and one that makes others gives their sum to its
-        # last row, as a record step's expansion does (`consumed_by`).
-        counted = [row for row in rows if CONSUMED in row]
-        held = [accounts(row) for row in counted]
-        consumed, refused = [count for count, _ in held], [part for _, part in held]
-        # Each row's mixture member and its counts by member (`MEMBERS`), and the member every output is
-        # of where the group's rows are all one member's.
-        tags = [member_of(row) for row in rows]
-        members = [members_held(row, tag) for row, tag in zip(rows, tags, strict=True) if CONSUMED in row]
-        alike = bool(tags) and tags[0] is not None and len(set(tags)) == 1
-        common = tags[0] if alike else None
-        counted_by = any(MEMBERS in row or MEMBER in row for row in rows if CONSUMED in row)
-        rows = [{name: value for name, value in row.items() if name not in COUNTING} for row in rows]
-        columns = {name: [row[name] for row in rows] for name in rows[0]}
-        made = dict(self.stage.step(columns))
-        counts = {len(values) for values in made.values()}
-        if len(counts) > 1:
-            raise ValueError(f"a batched step returned columns of different lengths, {sorted(counts)}")
-        count = counts.pop() if counts else 0
-        if self.stage.same_rows:
-            if count != len(rows):
-                raise ValueError(f"map(batched=True) keeps the {len(rows)} rows it reads, and its step "
-                                 f"returned {count}; flat_map(batched=True) changes the count")
-            kept = [{**row, **{name: values[index] for name, values in made.items()},
-                     **({} if tag is None else {MEMBER: tag})}
-                    for index, (row, tag) in enumerate(zip(rows, tags, strict=True))]
-            return kept if not consumed else [
-                {**row, CONSUMED: held, REFUSED: carried, **({MEMBERS: split} if counted_by else {})}
-                for row, held, carried, split in zip(kept, consumed, refused, members, strict=True)]
-        outputs = [{name: values[index] for name, values in made.items()} for index in range(count)]
-        if common is not None:
-            outputs = [{**row, MEMBER: common} for row in outputs]
-        if not consumed:
-            return outputs
-        if not outputs:
-            # A group it makes no rows of leaves its examples on a marker, which the next row carries on
-            # (`Carried`), completing no member's.
-            held = sum(consumed)
-            return [Rejected("empty_expansion", consumed=held, member=common)] if held else []
-        none, last = ({MEMBERS: {}}, {MEMBERS: joined(*members)}) if counted_by else ({}, {})
-        return [*({**row, CONSUMED: 0, REFUSED: 0, **none} for row in outputs[:-1]),
-                {**outputs[-1], CONSUMED: sum(consumed), REFUSED: sum(refused), **last}]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -957,23 +905,25 @@ class _Ruled(pygrain.IterDataset):
     member's where its documents are all one member's (`Documents`)."""
 
     def __init__(self, documents: pygrain.IterDataset, stage: Pack | Windows, consumed: bool = False,
-                 members: bool = False):
+                 members: bool = False, drawn: bool = False):
         super().__init__(documents)
         self._documents, self._stage, self._consumed, self._members = documents, stage, consumed, members
+        self._drawn = drawn
 
     def __iter__(self) -> pygrain.DatasetIterator:
         from dew.data.steps.windows import CausalWindows
 
         seen = LayoutRule()
         documents, stage = self._documents.map(seen), self._stage
-        held = Documents() if self._consumed and self._members else None
+        held = Documents() if self._consumed and (self._members or self._drawn) else None
         if self._consumed:
             documents = documents.map(_ConsumedAt(stage.fields[0], held))
             laid = (*ACCOUNTS, *(() if held is None else (DOCUMENT,)))
             stage = dataclasses.replace(stage, fields=(*stage.fields, *laid))
         windows = (_packed(documents.map(stage.document), stage)
                    if isinstance(stage, Pack) else CausalWindows(documents, stage, held))
-        return _RuledIterator(iter(windows), seen, stage.fields[0], consumed=self._consumed, documents=held)
+        return _RuledIterator(iter(windows), seen, stage.fields[0], consumed=self._consumed, documents=held,
+                              drawn=self._drawn)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -996,20 +946,21 @@ class _ConsumedAt:
             laid[name] = held
         if self.documents is not None:
             member = member_of(document)
-            ids = np.full(length, self.documents.laid(member, members_held(document, member)), np.int64)
+            laid_id = self.documents.laid(member, members_held(document, member), drawn_of(document))
+            ids = np.full(length, laid_id, np.int64)
             if length:
                 ids[-1] = -ids[-1]
             laid[DOCUMENT] = ids
-        unseen = {name: value for name, value in document.items() if name not in (MEMBER, MEMBERS)}
+        unseen = {name: value for name, value in document.items() if name not in (MEMBER, MEMBERS, DRAWN)}
         return {**unseen, **laid}
 
 
 class _RuledIterator(pygrain.DatasetIterator):
     def __init__(self, windows: pygrain.DatasetIterator, seen: LayoutRule, field: str, *,
-                 consumed: bool = False, documents: Documents | None = None):
+                 consumed: bool = False, documents: Documents | None = None, drawn: bool = False):
         super().__init__(windows)
         self._windows, self._seen, self._field, self._consumed = windows, seen, field, consumed
-        self._documents = documents
+        self._documents, self._drawn = documents, drawn
 
     def __next__(self) -> Batch:
         window = counted_window(next(self._windows), self._seen.rule, self._field)
@@ -1025,9 +976,12 @@ class _RuledIterator(pygrain.DatasetIterator):
         held = self._documents.held
         present, ends = np.unique(np.abs(ids[ids != 0])).tolist(), np.unique(-ids[ids < 0]).tolist()
         owners = {held[document][0] for document in present if document in held}
-        ended = [held.pop(document)[1] for document in ends if document in held]
+        ended = [held.pop(document) for document in ends if document in held]
         owner = owners.pop() if len(owners) == 1 else None
-        return {**counted, MEMBERS: joined(*ended), **({} if owner is None else {MEMBER: owner})}
+        # The draws of the documents that end in it (`DRAWN`), where the run draws any.
+        drawn = {DRAWN: tuple(draw for _, _, draws in ended for draw in draws)} if self._drawn else {}
+        return {**counted, MEMBERS: joined(*(members for _, members, _ in ended)), **drawn,
+                **({} if owner is None else {MEMBER: owner})}
 
     def get_state(self) -> Mapping[str, object]:
         # A mixture's documents' next id: a packer restored lays the documents it reads again anew.
@@ -1206,6 +1160,11 @@ class _ElasticIterator(pygrain.DatasetIterator):
         pool = self._pool
         made = [batches.mapped(row) for row in mine] if pool is None else list(pool.map(batches.mapped, mine))
         batch = batches.batch_fn(made)
+        if any(isinstance(row, Mapping) and DRAWN in row for row in group):
+            # Every reader's rows of the step are trained with its own: the draws of the whole step's
+            # (`DRAWS`), so each reader's phases continue a shared corpus where the run left it.
+            batch = {**batch, DRAWS: Draws(tuple(draw for row in group if isinstance(row, Mapping)
+                                                 for draw in drawn_of(row)))}
         if not batches.fill:
             return batch
         return FilledBatch(batches.partition.rows(batches.size), real=real).map(batch)
@@ -1289,6 +1248,20 @@ class _Build:
     """The key of the chain this builds, read outside any mixture, where it was given a name: the key a
     mixture keys it by as its first member of that name (`dew.data.compile._own_key`), which its shuffles
     draw by (`ordered`)."""
+    grouped: int | None = None
+    """The rows its loading workers hand on a group at a time (`handed`) where phases share its corpora:
+    every such phase's alike (the first's batch), so a member's position one phase leaves is a position in
+    the next phase's read of it; None for its own batch."""
+    stamped: frozenset[str] = frozenset()
+    """The keys of its mix's members that later phases read on, read on their own streams (`StepPhases`):
+    each draw of them says which it is (`DRAWN`, `dew.data.mixing.Stamping`), so the phase that reads one
+    next continues it from the draws the run trained. Empty for any other read."""
+
+    def counting(self, pipeline: Pipeline) -> bool:
+        """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
+        examples marks them (`_consumes`), and a phase's mix whose members other phases read on marks each
+        of its draws (`stamped`, `dew.data.mixing.Stamping`)."""
+        return _consumes(pipeline) or bool(self.stamped)
 
     @property
     def global_order(self) -> bool:
@@ -1323,8 +1296,9 @@ class _Build:
         pool = (None if self.pool is None
                 else Workers(_shared_pool(self.pool.count, len(members), index), self.pool.buffer))
         loading = self.loading if pool is None else dataclasses.replace(self.loading, workers=pool.count)
+        # A member's own mixes stamp nothing: only the phase's mix draws what other phases read on.
         return dataclasses.replace(self, lowering=self.lowering.children[index], loading=loading, pool=pool,
-                                   corpus=(*self.corpus, _member_key(members, index)))
+                                   corpus=(*self.corpus, _member_key(members, index)), stamped=frozenset())
 
     def pooled(self, pipeline: Pipeline) -> _Build:
         """This build with its loading workers moved before the first step that can't carry what it
@@ -1405,7 +1379,9 @@ class _Build:
         # member it was drawn from (`MEMBER`, `counted_members`).
         keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         tagged = bool(self.counted_members(pipeline))
-        if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
+        # A mix whose members later phases read on draws each by its own read, whose positions it saves by
+        # key and whose draws it stamps (`Stamping`).
+        if not self.stamped and all(isinstance(parent, pygrain.MapDataset) for parent in parents):
             mapped = [parent.map(functools.partial(member_record, member=key)) if tagged else parent
                       for key, parent in zip(keys, parents, strict=True)
                       if isinstance(parent, pygrain.MapDataset)]
@@ -1429,15 +1405,16 @@ class _Build:
                 tokens=source.tokens,
                 names=[_name(child) for child in source.pipelines],
                 labels=[_label(child) for child in source.pipelines],
+                stamped=self.stamped,
             )
-        return KeyedMix(streams, source.weights, keys, source.seed)
+        return KeyedMix(streams, source.weights, keys, source.seed, stamped=self.stamped)
 
     def counted_members(self, pipeline: Pipeline) -> tuple[tuple[str, str, str], ...]:
         """The members of `pipeline`'s mixture, each's key (`_member_keys`), name and label, where a read
         per share counts each member's source examples where its rows are delivered (a run bounded in
         examples, `_consumes`); none elsewhere, a global order's counting nothing as it reads."""
         source = pipeline.source
-        if self.global_order or not isinstance(source, Mixture) or not _consumes(pipeline):
+        if self.global_order or not isinstance(source, Mixture) or not self.counting(pipeline):
             return ()
         keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         return tuple((key, _name(child), _label(child))
@@ -1723,7 +1700,7 @@ class _Build:
                 # those it carries for refused ones, `REFUSED`), in the reading process; any other counts
                 # each before the objective's step makes rows of it, and not again after, nor where a
                 # memory read made rows of them before (`_counts_rows`).
-                examples, counting = True, _consumes(pipeline)
+                examples, counting = True, self.counting(pipeline)
                 rows = rows if counting else Accepted(_as_iter(rows, self.loading), _name(pipeline),
                                                       _label(pipeline), rows=_counts_rows(pipeline, index))
             if record_stage_of(stage):
@@ -1785,7 +1762,7 @@ class _Build:
         stage the read goes on from."""
         stage = pipeline.stages[at]
         counted = isinstance(stage, FlatMap) and stage.examples and counting
-        examples, counting = (True, _consumes(pipeline)) if counted else (examples, counting)
+        examples, counting = (True, self.counting(pipeline)) if counted else (examples, counting)
         # The hand-off ends a spread at its first stage that is no record step (`_handoff`).
         run = tuple(stage for stage in pipeline.stages[at:carried] if record_stage_of(stage))
         assert len(run) == carried - at, "a spread runs record steps alone"
@@ -1863,7 +1840,7 @@ class _Build:
             return _repeated(rows, stage.epochs, _name(pipeline), self.loading, certain=certain)
         from dew.data.ordering import WindowShuffle
 
-        if isinstance(stage, Shuffle) and _completes(pipeline, at):
+        if isinstance(stage, Shuffle) and _completes(pipeline, at, self.counting(pipeline)):
             # Each example's count waits for every window holding a piece of it (`dew.data.completion`).
             units = Numbered(_as_iter(rows, self.loading), reach=_reach(pipeline, at))
             if self.read == "memory":
@@ -1900,8 +1877,8 @@ class _Build:
             rows = stage.function(given.seed(self.stage_seed(pipeline, at, partition)))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
-            rows = gx.FlatMapIterDataset(groups, _Groups(stage))
-            if _consumes(pipeline):
+            rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage))
+            if self.counting(pipeline):
                 rows = Carried(rows)
         else:
             return self.layout_stage(rows, stage, pipeline, at)
@@ -1914,8 +1891,8 @@ class _Build:
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
             rows = _TokenSplit(rows, stage)
         elif isinstance(stage, (Pack, Windows)):
-            ruled = _Ruled(_as_iter(rows, self.loading), stage, consumed=_consumes(pipeline),
-                           members=bool(self.counted_members(pipeline)))
+            ruled = _Ruled(_as_iter(rows, self.loading), stage, consumed=self.counting(pipeline),
+                           members=bool(self.counted_members(pipeline)), drawn=bool(self.stamped))
             rows = self.targeted(ruled, stage.fields[0], pipeline, at + 1)
         elif isinstance(stage, Artifact):
             if not isinstance(rows, pygrain.MapDataset) or isinstance(pipeline.source, (Mixture, Phases)):
@@ -1983,7 +1960,8 @@ class _Build:
         # A worker hands on its rows and markers a share's batch count at a time, the fields that
         # stack stacked as a batch's are, as many groups in flight as it had batches; an elastic read's
         # a whole batch's count, the same on every topology.
-        size = self.batch if self.elastic else partition.rows(self.batch)
+        batch = self.batch if self.grouped is None else self.grouped
+        size = batch if self.elastic else partition.rows(batch)
         read = functools.partial(self.read_in, pipeline=pipeline, partition=partition, pool=pool)
         if self.in_order and not isinstance(rows, pygrain.MapDataset):
             # Its rows come as a stream (a streamed read, a cache of each input's outputs), which every
@@ -2466,6 +2444,9 @@ class _Batched:
         if any(EXAMPLES_CONSUMED in row for row in payload):
             # A row a run bounded in examples reads without a count of its own consumes none.
             payload = [{EXAMPLES_CONSUMED: np.int32(0), **row} for row in payload]
-        if self.batch_fn is not None:
-            return stacked(payload, self.batch_fn)
-        return stacked(payload, functools.partial(record_batch, shared=self.shared))
+        batch = (stacked(payload, self.batch_fn) if self.batch_fn is not None
+                 else stacked(payload, functools.partial(record_batch, shared=self.shared)))
+        if not any(DRAWN in row for row in rows):
+            return batch
+        # The draws of a phase's shared corpora its rows are the last of, which no device holds (`DRAWS`).
+        return {**batch, DRAWS: Draws(tuple(draw for row in rows for draw in drawn_of(row)))}
