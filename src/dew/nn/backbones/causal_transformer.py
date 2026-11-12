@@ -1361,15 +1361,18 @@ class CausalTransformer(LinearProducts):
         if documents is not None or given_valid is not None:
             valid = jnp.ones(tokens.shape, bool) if given_valid is None else given_valid
         states = []
-        # A watched depth's summary reads the positions both of whose tokens its caller names
-        # (`watched_positions`), each depth's rows one shorter than the last's.
+        # A watched depth's summary reads the positions its caller names (`watched_positions`) carried as
+        # its validity is: each depth's rows one shorter, a position kept where every token its span reaches
+        # is named and in its document.
         named = current_positions()
         if named is not None and named.shape[:2] != hidden.shape[:2]:
             named = None
         for depth, block in enumerate(self.mtp, start=1):
+            within = None if documents is None else documents[:, depth - 1:]
             if valid is not None:
-                valid = shifted_span(valid.shape, 1, valid=valid,
-                                     segments=None if documents is None else documents[:, depth - 1:])
+                valid = shifted_span(valid.shape, 1, valid=valid, segments=within)
+            if named is not None:
+                named = shifted_span(named.shape, 1, valid=named, segments=within)
             segments, places = (None if field is None else field[:, depth:] for field in (documents, given))
             metadata = AttentionMetadata(
                 # Cross-document pairs leave holes even when the token rows were right-padded.
@@ -1379,7 +1382,7 @@ class CausalTransformer(LinearProducts):
                 image_groups=None if image_groups is None else image_groups[:, depth:],
                 block_groups=None if block_groups is None else block_groups[:, depth:],
                 rotary_positions=None if rotary_positions is None else rotary_positions[:, depth:])
-            with watched_positions(None if named is None else named[:, :-depth] & named[:, depth:]):
+            with watched_positions(named):
                 hidden = block(hidden[:, :-1], embeds[:, depth:], train=train, attention_metadata=metadata)
             states.append(hidden)
         return states
