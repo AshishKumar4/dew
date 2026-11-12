@@ -149,7 +149,6 @@ from dew.data.plan import (
     identified,
     read_by,
     spelled,
-    unplaced,
 )
 from dew.data.readers import GRAIN, Opener, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
