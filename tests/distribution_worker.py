@@ -9,9 +9,10 @@ process 0 writes the losses, the partition and, for every fsdp group of the
 mesh, the processes its devices sit on. The same script on one process is
 the reference the pool is compared with, and with `--float64` the float64
 truth both are held to (check 1, `test_distribution.launches_as_exact`):
-`--draws` trains that many further runs, each from the run's one initial
-state on a packed batch of its own (the draw's seed, from `--first-draw`),
-and writes each one's losses.
+`--draws` trains that many runs in the one run's place, each from the run's
+one initial state on a packed batch of its own (the draw's seed, from
+`--first-draw`), and writes each one's losses and the dtype its loss is
+computed in.
 """
 
 import argparse
@@ -54,6 +55,16 @@ def rows_of(partition, batch):
     return jax.tree.map(lambda leaf: leaf[partition.index * rows:(partition.index + 1) * rows], batch)
 
 
+def drawn(seed: int):
+    """A loader's share of the packed batch `seed` draws, for ever."""
+    def batches(partition):
+        mine = rows_of(partition, packed_batch(seed))
+        while True:
+            yield mine
+
+    return batches
+
+
 class Stream:
     """A partition's share of a new packed batch at every step, drawn from
     the step's index, each after `step_seconds`, and where it stands, so a
@@ -93,6 +104,35 @@ def state_digest(state) -> str:
     return digest.hexdigest()
 
 
+def placed_whole(mesh, partition) -> bool:
+    """Whether a leaf whose second dimension the sequence axis splits, placed
+    from this process's share, gathers back whole."""
+    from jax.experimental import multihost_utils
+
+    from dew.distributed.batches import shard_batch
+
+    wide = np.arange(BATCH * SEQ_LEN, dtype=np.float32).reshape(BATCH, SEQ_LEN)
+    rows = partition.rows(BATCH)
+    placed = shard_batch(mesh, {"wide": wide[partition.index * rows:(partition.index + 1) * rows]})
+    gathered = multihost_utils.process_allgather(placed["wide"], tiled=True)
+    return bool(np.array_equal(np.asarray(gathered), wide))
+
+
+def loss_dtype(trainer, state, batch) -> str:
+    """The dtype `trainer`'s objective computes its loss in on a run's own
+    trained `state`, as its step traces it: the tracker logs the loss as a
+    float, which says no dtype."""
+    import jax
+
+    from dew.objectives.base import Step
+
+    step = Step(state.microstep, jax.random.key(0), state.ema)
+    with jax.set_mesh(trainer.device_mesh):
+        ratio, _ = jax.eval_shape(lambda variables: trainer.objective.loss(variables, batch, step),
+                                  state.variables)
+    return ratio.mean()[0].dtype.name
+
+
 class Losses:
     """The tracker the fit reports to: the loss of every step, in order, and
     the step each was logged at."""
@@ -100,14 +140,11 @@ class Losses:
     def __init__(self):
         self.losses: list[float] = []
         self.steps: list[int] = []
-        self.dtype: str | None = None
 
     def log(self, scalars, step):
         if "train/loss" in scalars:
             self.losses.append(float(scalars["train/loss"]))
             self.steps.append(int(step))
-            # The dtype the run computed its loss in, which a float written to JSON no longer says.
-            self.dtype = np.asarray(scalars["train/loss"]).dtype.name
 
     def artifact(self, value, step):
         pass
@@ -128,7 +165,8 @@ def main() -> None:
     parser.add_argument("--vary", action="store_true",
                         help="a new packed batch every step, from a stream a checkpoint can put back")
     parser.add_argument("--draws", type=int, default=0,
-                        help="further runs, each on a packed batch of its own from the one initial state")
+                        help="runs in the one run's place, each on a packed batch of its own from the one "
+                             "initial state")
     parser.add_argument("--first-draw", type=int, default=0, help="the first of those draws' seeds")
     parser.add_argument("--float64", action="store_true",
                         help="the float64 model under x64, each draw from the float32 initial state widened")
@@ -141,7 +179,6 @@ def main() -> None:
     import jax
     import optax
     from arm_arithmetic import float64_held
-    from jax.experimental import multihost_utils
     from sharded import split_axes
 
     if args.float64:
@@ -149,7 +186,6 @@ def main() -> None:
 
     from dew.checkpoints import Checkpoints
     from dew.data.dataset import DataPartition, Loader
-    from dew.distributed.batches import shard_batch
     from dew.objectives.lm import LMObjective
     from dew.registry import models
     from dew.training import Layout, MeshSpec, Trainer
@@ -178,9 +214,14 @@ def main() -> None:
     trainer = trainer_of("float64" if args.float64 else None, tracker=losses,
                          checkpoints=None if args.checkpoints is None else Checkpoints(str(args.checkpoints)))
     stream = functools.partial(Stream, step_seconds=args.step_seconds)
-    state = trainer.fit(Loader(train=stream if args.vary else share, val=None, records=None, batch=BATCH),
-                        steps=args.steps, log_every=1)
-    first = {"losses": list(losses.losses), "loss_steps": list(losses.steps)}
+
+    def run(train, **options):
+        """One run of the trainer on `train`'s shares (`Trainer.fit`): its trained state, and the losses
+        it logged with the steps they were logged at."""
+        before = len(losses.losses)
+        state = trainer.fit(Loader(train=train, val=None, records=None, batch=BATCH), steps=args.steps,
+                            log_every=1, **options)
+        return state, {"losses": losses.losses[before:], "loss_steps": losses.steps[before:]}
 
     def started() -> dict:
         """What a draw's fit starts from: the run's own initial state, which the float64 run takes as the
@@ -193,29 +234,21 @@ def main() -> None:
                                         opt_state=float64_held(narrow.opt_state),
                                         ema=float64_held(narrow.ema))}
 
-    def drawn(seed: int) -> list[float]:
-        """The losses of a run of the trainer on the packed batch `seed` draws."""
-        def batches(partition):
-            mine = rows_of(partition, packed_batch(seed))
-            while True:
-                yield mine
-
-        before = len(losses.losses)
-        trainer.fit(Loader(train=batches, val=None, records=None, batch=BATCH), steps=args.steps,
-                    log_every=1, **started())
-        return losses.losses[before:]
-
-    draws = [drawn(seed) for seed in range(args.first_draw, args.first_draw + args.draws)]
-    # A leaf whose second dimension the sequence axis splits, placed from the
-    # share and gathered back whole.
+    if args.draws:
+        # Every judged run is a draw: from the one initial state (`started`) on a packed batch of its own,
+        # the record's state the first draw's.
+        seeds = range(args.first_draw, args.first_draw + args.draws)
+        runs = (run(drawn(seed), **started()) for seed in seeds)
+        state, logged = next(runs)
+        first, draws = {}, [logged["losses"], *(later["losses"] for _, later in runs)]
+        computed = loss_dtype(trainer, state, packed_batch(args.first_draw))
+    else:
+        state, first = run(stream if args.vary else share)
+        draws, computed = [], None
     mesh = trainer.device_mesh
     partition = DataPartition.of(mesh)
-    wide = np.arange(BATCH * SEQ_LEN, dtype=np.float32).reshape(BATCH, SEQ_LEN)
-    rows = partition.rows(BATCH)
-    placed = shard_batch(mesh, {"wide": wide[partition.index * rows:(partition.index + 1) * rows]})
-    gathered = multihost_utils.process_allgather(placed["wide"], tiled=True)
-    # Every process gathers the state whole, a collective, before process 0 writes it.
-    digest = state_digest(state)
+    # Every process gathers, collectives both, before process 0 writes.
+    whole, digest = placed_whole(mesh, partition), state_digest(state)
     if jax.process_index() == 0:
         args.out.write_text(json.dumps({
             "processes": jax.process_count(),
@@ -224,11 +257,11 @@ def main() -> None:
             "fsdp_groups": fsdp_group_processes(mesh),
             "split_axes": sorted(split_axes(state.variables["params"])),
             "partition": {"count": partition.count, "readers": partition.readers},
-            "placed_whole": bool(np.array_equal(np.asarray(gathered), wide)),
+            "placed_whole": whole,
             **first,
             "state_digest": digest,
             "draws": draws,
-            "loss_dtype": losses.dtype,
+            "loss_dtype": computed,
         }))
 
 
