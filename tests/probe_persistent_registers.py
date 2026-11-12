@@ -7,12 +7,6 @@ os.environ['JAX_PLATFORMS'] = 'cpu'
 sys.path[:0] = ['src', 'tests']
 import jax
 import jax.numpy as jnp
-if os.environ.get('DBG_LOAD4'):
-    import inspect
-    from jax.experimental.mosaic.gpu import tcgen05 as tc
-    source=inspect.getsource(tc._transfer_32xcols)
-    assert '32 // regs_per_instr' in source
-    exec(source.replace('32 // regs_per_instr','4 // regs_per_instr'),tc.__dict__)
 import kernel_compile as kc
 import test_recurrence_mosaic as t
 from fla_gdn_support import KernelCase
