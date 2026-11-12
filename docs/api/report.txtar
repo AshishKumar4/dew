@@ -88,14 +88,18 @@ class Evaluation(step: int, split: str, scores: dict[str, float], coordinated_ba
   .branched(self) -> Evaluation
   .run(cls, objective: Objective[Loss, Effects], variables: Variables, batches: Reader | Dataset | Episodes | None, *, key: int | jax.Array, metrics: Sequence[Metric] = (), step: int | jax.Array = 0, averaged: Variables | None = None, preview: bool = False, mesh: Mesh | None = None, split: str = 'val', schedule_step: int | jax.Array | np.ndarray | None = None, loss: bool = False, training: Mapping[str, jax.Array] | None = None, warm: bool = False, updates: int | jax.Array | None = None, scored_to: str | os.PathLike[str] | None = None) -> Evaluation  [classmethod]
   .scalars: property -> dict[str, float]
-class Field(key: str, shape: tuple[int, ...], variable_axes: tuple[int, ...] = ()) -> None  [dew.inputs.spec]
+class Field(key: str, shape: tuple[int, ...], variable_axes: tuple[int, ...] = (), rows: int | None = None, replaced: frozenset[int] = frozenset()) -> None  [dew.inputs.spec]
+  .admits(self, token: int) -> bool
+  .bounded(self, value: object, spelling: Callable[[int], str] | None = None) -> None
   .held(self, batch: Batch) -> tuple[int, ...]
+  .indexing(cls, key: str, shape: tuple[int, ...], model: nn.Module | HeadedModel, *, variable_axes: tuple[int, ...] = ()) -> Field  [classmethod]
   .of(cls, key: str, batch: Batch) -> Field  [classmethod]
 class GpuFacts(part: str, generation: str, capability: tuple[int, int] | None, multiprocessors: int | None, clock_hz: float | None, memory_bandwidth: float | None, l2_bytes: int | None, shared_per_block: int, registers: int | None, thread_registers: int | None, resident_threads: int | None, resident_blocks: int | None, dense_peaks: Mapping[str, float], instruction_families: tuple[str, ...], bundles: tuple[str, ...]) -> None  [dew.nn.kernels.generation]
 class ImageGrid(images: jax.Array, captions: tuple[str, ...] = ()) -> None  [dew.artifacts]
   .replace(self, **updates)
 class InputSpec(sample: Field, conditions: Mapping[str, Condition] = <factory>, mask: Field | None = None) -> None  [dew.inputs.spec]
   .bound(record: Mapping[str, object], *, params: Mapping[str, Variables] | None = None) -> InputSpec  [staticmethod]
+  .bounded(self, batch: Batch, spelling: Callable[[int], str] | None = None) -> None
   .check(self, batch: Batch, *, whole: bool = True) -> None
   .dependencies(self) -> Mapping[str, object]
   .encode_fields(self, batch: Batch) -> dict[str, Mapping[str, np.ndarray]]

@@ -76,7 +76,7 @@ class Said:
     """What an observation adds to the model's context: its `ids`, and the chat `messages` they hold."""
 
     ids: tuple[int, ...]
-    messages: tuple[Mapping[str, object], ...] = ()
+    messages: tuple[Mapping[str, JSON], ...] = ()
 
 
 @dataclass(frozen=True)
