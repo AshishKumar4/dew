@@ -803,12 +803,15 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def _families(self, ba, target) -> tuple[mosaic.Family, ...]:
         """The bundles the launch may run on `target`, in preference order: the most capable issuer's whose
         bundle takes the call (`bundles.groups`, its kernels stating their tiles' accumulators,
-        `mosaic_gpu.gmm`'s and `tgmm`'s; `_takes`), so a call tcgen05's bundle refuses runs on mma.sync's
-        (row 4727), a TPU core's its MXU's (`mosaic_tpu.MXU`); none where no issuer's does (a CPU interprets
-        a GPU's or a TPU's only where `generation.assumed` names it)."""
+        `mosaic_gpu.gmm`'s and `tgmm`'s; `_takes`), so a call tcgen05's bundle refuses runs on mma.sync's (row
+        4727), a TPU core's its MXU's (`mosaic_tpu.MXU`); of that issuer's, each bundle that takes the call (a
+        tcgen05 pair's, which gathers and scatters no rows, `Transport.gathers_rows`, not for a routed call);
+        none where no issuer's does (a CPU interprets a GPU's or a TPU's only where `generation.assumed` names
+        it)."""
         found = bundles.groups(target.generation, ba.arguments['tokens'].dtype, stated=True,
                                tpu=generation.tpu(target))
-        return next((group for group in found if self._takes(ba, group[0])), ())
+        group = next((group for group in found if self._takes(ba, group[0])), ())
+        return tuple(family for family in group if self._takes(ba, family))
 
     def _takes(self, ba, family: mosaic.Family) -> bool:
         """Whether `family`'s bundle runs the call: 16-bit operands, or FP8 ones it takes (`_fp8`); gathered
@@ -854,14 +857,21 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if not layouts:
             return None
         rows, depth, width = self._generated_extents(ba)
-        return mosaic_gpu.derived(layouts, rows=rows, depth=depth, width=width,
-                                  dtype=ba.arguments['tokens'].dtype,
-                                  multiprocessors=_multiprocessors(target), target=target,
-                                  candidate=lambda tile: (self.candidate(ba, tile, target)
-                                                          and (admits is None or admits(tile))),
-                                  launch_of=lambda tile: self.launch_of(ba, tile), grouped=depth is not None,
-                                  depths=self.STEPS, ragged=self._ragged(ba, layouts[0]),
-                                  units=self._vector_units(ba, layouts[0]))
+        # A pair's layouts first where the rows hold its tile (`mosaic_gpu.paired_first`), each its own
+        # derivation, the first that holds a tile taken.
+        for tried in mosaic_gpu.paired_first(layouts, rows):
+            tile = mosaic_gpu.derived(tried, rows=rows, depth=depth, width=width,
+                                      dtype=ba.arguments['tokens'].dtype,
+                                      multiprocessors=_multiprocessors(target), target=target,
+                                      candidate=lambda tile: (self.candidate(ba, tile, target)
+                                                              and (admits is None or admits(tile))),
+                                      launch_of=lambda tile: self.launch_of(ba, tile),
+                                      grouped=depth is not None, depths=self.STEPS,
+                                      ragged=self._ragged(ba, tried[0]),
+                                      units=self._vector_units(ba, tried[0]))
+            if tile is not None:
+                return tile
+        return None
 
     def _vector_units(self, ba, family: mosaic.Family) -> tuple[int, int, int]:
         """The units a tile's rows, columns and step take from the call's side vectors (`candidate`'s, each
@@ -985,6 +995,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         spilling (`report.refused`), so the derivation takes the next tile by its own rule."""
         family = next((bundle for bundle in self._families(ba, target) if bundle.name == config.family), None)
         if (family is None or config.cluster > family.cluster or not mosaic_gpu.pair_takes(config, family)
+                or self._pair_refuses(ba, config, family)
                 or not self._divides(ba, config) or report.refused(self, ba, config)):
             return False
         # A family fixing its accumulator's rows takes a tile of exactly them a consumer, and one holding its
@@ -1007,6 +1018,20 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return all((extent is None or self.extents(config)[axis] <= extent)
                    and self.extents(config)[axis] % family.vector_unit(dtype) == 0
                    for axis, dtype in vectors)
+
+    @property
+    def _scaled(self) -> bool:
+        """Whether the launch's call carries scales beside its matrix (a packed matrix's, step or block
+        scales), its layout its own: none of `_Mosaic`'s."""
+        return False
+
+    def _pair_refuses(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> bool:
+        """Whether a pair's product refuses the call at `config` (`mosaic_gpu.pair_refuses`, the statement
+        `gmm` refuses it by): its prologue, second matrix, scales and gathered rows, its exact sums."""
+        return mosaic_gpu.pair_refuses(config, family, transpose_lhs=False,
+                                       exact_sums=bool(ba.arguments.get('exact_sums')), scaled=self._scaled,
+                                       parts=(ba.arguments['hooks'].prologue, ba.arguments.get('paired'),
+                                              ba.arguments.get('gather')))
 
     def _ran(self, ba, config: mosaic_gpu.Tiles) -> tuple:
         """The call and tile a launch at `config` runs, which its legality, registers and launch read: the
@@ -1140,6 +1165,11 @@ class MosaicGmm(_Mosaic):
     BLOCK_SCALED: ClassVar[bool] = False
     """Whether its kernel streams an MX product's block scales beside its rings (`MosaicMxGmm`)."""
 
+    @property
+    def _scaled(self) -> bool:
+        # A packed matrix's words (`STEPS`), a step's row scales or an MX product's block scales.
+        return self.STEPS is not None or self.STEP_SCALED or self.BLOCK_SCALED
+
     def output_sides(self, ba) -> tuple[int, int]:
         return _product_sides(ba)
 
@@ -1221,7 +1251,7 @@ class MosaicGmm(_Mosaic):
         of a partial extent takes one of: a float32 side's 64 columns are two); the depth's where the rows are
         not gathered and the width's where they are not scattered (a gather's and a scatter's piecewise copies
         are unbounded)."""
-        if (self.STEPS is not None or self.STEP_SCALED or self.BLOCK_SCALED or not family.bounded_loads
+        if (self._scaled or not family.bounded_loads
                 or family.operands_in_registers or ba.arguments['interpret']
                 or self._swapped(ba, generation.gpu_target()) is not None):
             return False, False
@@ -1288,7 +1318,7 @@ class MosaicGmm(_Mosaic):
 
     def _padded_extents(self, ba) -> dict[str, int]:
         # A packed, step-scaled or block-scaled matrix's layout is its own: such a call is not padded.
-        if self.STEPS is not None or self.STEP_SCALED or self.BLOCK_SCALED:
+        if self._scaled:
             return {}
         kernel = ba.arguments['kernel']
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]

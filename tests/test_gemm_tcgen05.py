@@ -300,3 +300,27 @@ def test_a_pairs_tile_is_legal_for_a_dense_product_on_a_b200():
                          out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
         assert launch.legal(ba, dataclasses.replace(PAIRED, stages=5), target)
 
+
+def test_a_b200s_products_lower_at_the_tiles_their_launch_derives():
+    """On a B200, where the derivation tries a pair's bundle first (`mosaic_gpu.paired_first`), a dense
+    product over a step's rows and a routed one, its outputs scattered to their slots (which a pair's
+    bundle does not take, `Transport.gathers_rows`), each lower through Mosaic for sm100 at the tile their
+    launch derives, which it holds legal."""
+    from kernel_compile import lowered_for
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
+    slots = jax.ShapeDtypeStruct((4096,), jnp.int32)
+    calls = {"dense": (lambda x, w: gemm.gemm(x, w, None, out_dtype=jnp.bfloat16),
+                       (bf16((4096, 1024)), bf16((1024, 2048)))),
+             "scattered": (lambda x, w, sizes, slots: gemm.gemm(x, w, sizes, scatter=slots,
+                                                                out_dtype=jnp.bfloat16),
+                           (bf16((4096, 1024)), bf16((4, 1024, 2048)), sizes, slots))}
+    for name, (call, specs) in calls.items():
+        with generation.assumed("sm100"), generation.chosen(grouped_matmul="mosaic"), tuning.seen() as seen:
+            lowered_for(call, specs, "sm100")
+        taken = [(op, config, ba) for (op, _), (config, ba) in zip(seen, seen.taken, strict=True)
+                 if isinstance(op, grouped_matmul.MosaicGmm)]
+        assert taken, name
+        with generation.assumed("sm100"):
+            assert all(op.legal(ba, config, generation.gpu_target()) for op, config, ba in taken), name

@@ -206,7 +206,8 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       takes (`Family.cluster`: a pair on warpgroup MMA), that many multiprocessors a cluster, running row
       tiles of one group that load its matrix block once between them (multicast), CUTLASS's and
       cuBLASLt's pair on an H100; each multiprocessor's tile, stages and staged bytes as alone, its
-      legality unchanged.
+      legality unchanged. On layouts whose products span a pair (tcgen05's 2-SM MMA, which the caller
+      tries first where the rows hold its two row tiles, `paired_first`), every tile the pair's.
     - Band: the planar snake's column tiles a band (`resources.band`), the rows' and the columns' blocks
       balanced over a wave or, grouped, wider while a wave spans each group's row tiles whole, a
       cluster's tiles one program's.
@@ -266,6 +267,23 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         if tile is not None:
             return tile
     return None
+
+
+def paired_first(layouts: tuple, rows: int) -> tuple[tuple, ...]:
+    """Dew: `derived`'s layouts in the order it tries them: those whose products span a pair
+    (`mosaic.Transport.pairs_product`, tcgen05's 2-SM MMA) apart and first, where the call's rows hold a
+    pair's two row tiles (each CTA's role), then the rest; each its own derivation, the first that holds a
+    tile taken. A pair's product reads each CTA's half of the right operand's block, so a step stages half
+    its columns a CTA. Measured: the 4B's dense products on a B200 ran 0.49-0.61 of the MMA's rate on one
+    CTA's 128 x 128 and 128 x 192 tiles (M-EM-35). A hypothesis, not yet measured (M-EM-35's pinned pair arm
+    and its ncu, rows 5671 and 5363): that one CTA's step is shared memory's, its operands passing it twice
+    (staged, then read) at 128 bytes a clock, 0.50 and 0.60 of the MMA's rate, which the pair halves for the
+    right operand."""
+    paired = tuple(layout for layout in layouts if layout.pairs_product)
+    alone = tuple(layout for layout in layouts if not layout.pairs_product)
+    if not paired or rows < 2 * paired[0].role_rows:
+        return (alone,) if alone else ()
+    return (paired, alone) if alone else (paired,)
 
 
 def _derived_columns(family: mosaic.Family, width: int, dtype, unit_of_call: int) -> list[int]:
@@ -340,8 +358,10 @@ def _shaped(layout, block_m: int, block_n: int, step: int, *, consumers: int, pr
     """`derived`'s tile of a shape and step on `layout`: a pair of multiprocessors a cluster runs two row
     tiles of one group where its layout's loads multicast and a group averages a tile's rows, which then
     read its matrix's blocks once; a pair is two consumers' (`Tiles`), so a one-consumer tile, the
-    fallback, runs alone."""
-    cluster = layout.cluster if grouped and consumers > 1 and rows >= block_m else 1
+    fallback, runs alone; a layout whose products span a pair (`mosaic.Transport.pairs_product`, tcgen05's
+    2-SM MMA) runs every tile on its pair."""
+    multicast = grouped and consumers > 1 and rows >= block_m
+    cluster = layout.cluster if layout.pairs_product or multicast else 1
     band = resources.band(multiprocessors * programs, block_m, block_n, width // block_n,
                           -(-rows // (block_m * cluster)) if grouped else None, cluster=cluster)
     return Tiles(block_m, block_n, step, 2, band, warpgroups=consumers, cluster=cluster, family=layout.name,
@@ -1287,13 +1307,23 @@ def pair_takes(tiles: Tiles, family: mosaic.Family) -> bool:
     return tiles.cluster == family.cluster and (widest is None or tiles.block_n <= widest)
 
 
+def pair_refuses(tiles: Tiles, family: mosaic.Family, *, transpose_lhs: bool, exact_sums: bool,
+                 scaled: bool, parts: tuple) -> bool:
+    """Dew: whether a pair's product (`mosaic.Transport.pairs_product`) refuses a call at `tiles`: any but
+    a plain one's at a pair's tile (`pair_takes`), its step views its rows' and its matrix's alone
+    (`_gmm_views`), so none of `parts` (a prologue, a second matrix, gathered rows), no scales (`scaled`:
+    a packed matrix's, step or block scales), transposed rows, exact sums or a split. The one statement
+    `gmm`'s refusal (`_pair_refused`) and a launch's candidate (`grouped_matmul._Mosaic.candidate`) read, so
+    a derivation never takes a tile its call refuses."""
+    return family.pairs_product and (not pair_takes(tiles, family) or transpose_lhs or exact_sums or scaled
+                                     or tiles.splits > 1 or any(part is not None for part in parts))
+
+
 def _pair_refused(tiles: Tiles, family: mosaic.Family, *, transpose_lhs: bool, exact_sums: bool,
-                  parts: tuple) -> None:
-    """Dew: `gmm`'s refusal of a pair's product (`mosaic.Transport.pairs_product`) but a plain one's at a
-    pair's tile (`pair_takes`): its step views are its rows' and its matrix's alone (`_gmm_views`), so none of
-    `parts` (a prologue, a second matrix, scales, gathered rows), transposed rows, exact sums or a split."""
-    if family.pairs_product and (not pair_takes(tiles, family) or transpose_lhs or exact_sums
-                                 or tiles.splits > 1 or any(part is not None for part in parts)):
+                  scaled: bool, parts: tuple) -> None:
+    """Dew: `gmm`'s refusal of a pair's product a pair refuses (`pair_refuses`)."""
+    if pair_refuses(tiles, family, transpose_lhs=transpose_lhs, exact_sums=exact_sums, scaled=scaled,
+                    parts=parts):
         raise ValueError(f"a pair's product is a pair's tile's, of no prologue, transposed or gathered rows, "
                          f"second matrix, scales, exact sums or split, not {tiles}")
 
@@ -1312,8 +1342,8 @@ def _gmm_shape_refused(lhs, rhs, tiles: Tiles, extents: tuple, interpret, *, dty
     _gmm_refused(rhs, tiles, extents, columns=columns, dense=dense, first=first, paired=paired,
                  partial=partial_runs(tiles, dtype, interpret, transpose_rhs=transpose_rhs, plain=plain,
                                       gathered=gather is not None, scattered=scatter is not None))
-    _pair_refused(tiles, family, transpose_lhs=transpose_lhs, exact_sums=exact_sums,
-                  parts=(prologue, paired, scales, step_scales, mx_scales, gather))
+    _pair_refused(tiles, family, transpose_lhs=transpose_lhs, exact_sums=exact_sums, scaled=not plain,
+                  parts=(prologue, paired, gather))
     _tables_refused(gather, scatter, tiles, family, prologue=prologue, dense=dense,
                     transpose_lhs=transpose_lhs)
 
@@ -1356,14 +1386,19 @@ def partial_runs(tiles: Tiles, dtype, interpret, *, transpose_rhs: bool, plain: 
     step is one swizzled tile (`partial_step`) and the rows are not gathered (a producer's gather copies by
     cp.async, unbounded); a width where the stores are not scattered (piecewise, unbounded) and the matrix
     lies `[width, depth]` (`transpose_rhs`) or its copy is one swizzled tile wide (`tile_columns`: a CTA
-    pair's both halves); on a family whose products read the staged blocks by descriptor
+    pair's both halves); not yet on a family whose products span a pair (`Transport.pairs_product`: each CTA
+    copies its half of the pair's block, `rings.Split`, which the fork's untiled view of a partial extent
+    does not yet partition, row 5727: an unaligned call's pair tile failed to lower, its 128-row half
+    reshaped as the pair's 256), so such a call is padded; on a
+    family whose products read the staged blocks by descriptor
     (`Issuer.operands_in_registers` False: wgmma's, tcgen05's), staged at the widest swizzle, a step's copy
     one tile along its depth, where a family reading them into registers is staged narrower by layout
     inference (mma.sync.fed's 32-byte rows on an sm120: a 64-deep step four 16-element tiles). Elsewhere the
     launch's call is padded to whole tiles (`grouped_matmul._Mosaic. _aligned`), as it is where a stride is no
     whole 16 bytes, which no TMA copy takes."""
     family = family_of(tiles, dtype)
-    bounded = family.bounded_loads and not family.operands_in_registers and not interpret and plain
+    bounded = (family.bounded_loads and not family.operands_in_registers and not family.pairs_product
+               and not interpret and plain)
     one = partial_step(dtype)
     return (bounded and not gathered and tiles.block_k == one,
             bounded and not scattered and (transpose_rhs or tile_columns(tiles, family) == one))
