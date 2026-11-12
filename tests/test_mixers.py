@@ -250,8 +250,8 @@ per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
 
 SEEDS = {"attention": 64, "deepseek_v4": 256, "deepseek_v4 csa": 256, "deepseek_v4 csa2": 256,
          "deepseek_v4 hca": 256, "gated_delta_net": 512, "kimi_delta_attention": 64,
-         "kpool_sparse_attention": 16, "lightning_attention": 64, "llama4": 128, "mamba": 32, "mamba2": 256,
-         "mamba3": 512, "memory": 256,
+         "kpool_sparse_attention": 16, "kpool_sparse_attention notail": 64, "lightning_attention": 64,
+         "llama4": 128, "mamba": 32, "mamba2": 256, "mamba3": 512, "memory": 256,
          "mla": 64,
          "mlp": 64, "parallel": 64, "qsa_attention": 128, "short_conv": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` per kind (on armada): the
@@ -354,6 +354,21 @@ def test_a_packed_row_pools_each_documents_compressed_windows_as_it_alone_does(c
     variables = model.init(jax.random.key(4), jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB))
     assert_packed_as_alone(model, variables, f"packed deepseek_v4 {compressor}",
                            SEEDS[f"deepseek_v4 {compressor}"])
+
+
+def test_a_packed_row_of_kpool_attention_without_tails_computes_what_its_documents_compute_alone():
+    """The k-pool layer selecting whole pools alone (`index_kpool_always_select_tail=False`): a document's
+    first queries, before its first pool completes, select nothing and read every key of their own
+    document alike, as the document alone reads its row's, so a row packing documents gives each
+    document's logits and the parameters' gradients its documents give run one at a time (check 1);
+    those queries read the whole packed row's keys alike, other documents' and the padding's among them
+    (the spec pass's review of T2)."""
+    total = sum(DOCUMENTS)
+    model = tiny(mixer=mixers.build("kpool_sparse_attention", index_kpool_always_select_tail=False),
+                 max_seq_len=max(128, total + PADDING))
+    variables = model.init(jax.random.key(4), jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB))
+    assert_packed_as_alone(model, variables, "packed kpool_sparse_attention without tails",
+                           SEEDS["kpool_sparse_attention notail"])
 
 
 def assert_packed_as_alone(model, variables, what: str, seeds: int):
