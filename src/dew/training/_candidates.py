@@ -248,7 +248,7 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
                                 mesh: Mesh | AbstractMesh | None = None,
                                 platforms: tuple[str, ...] | None = None, capacity: int | None = None,
                                 footprint: Footprint | None = None, derived: bool = True,
-                                floored: bool = False, made: Prepared | None = None) -> Candidate:
+                                floored: bool = False, ready: Prepared | None = None) -> Candidate:
     """The step reading `batch` in `split` microbatches, lowered at the objective's current rung (traced
     alone where not `lowering`, for its derived footprint), with what the fit check holds beside it.
     `launches` are its kernel launches where a record holds them, which settle their configs before it
@@ -260,11 +260,11 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
     derivation where it was compiled, and a run handed it does none of that work on its devices. A
     derivation's candidate (`floored`, traced alone) whose head keeps its whole logits is their floor
     (`logits_floor`), its gradient traced where the search asks (`Candidate.unfloored`), from the loss it
-    traced (`made`, `prepared_for`'s)."""
+    traced (`ready`, `prepared_for`'s)."""
     settings = stepping.settings
     micro = microbatch_shapes(batch, split)
-    made = made or prepared_for(stepping, state, micro, schedule, split, narrow)
-    shapes, copies, prepared, loss = made
+    ready = ready or prepared_for(stepping, state, micro, schedule, split, narrow)
+    shapes, copies, prepared, loss = ready
     shardings = stepping.shardings(prepared)
     if mesh is not None:
         shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
@@ -327,7 +327,7 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
     if floor is not None:
         traces = functools.partial(_candidate, stepping, state, batch, schedule, placement, replicated, split,
                                    narrow, launches, lowering, mesh=mesh, platforms=platforms,
-                                   capacity=capacity, derived=derived, made=made)
+                                   capacity=capacity, derived=derived, ready=ready)
         return Candidate(micro, shapes, copies, shardings, prepared, held, built, None, launches or "[]",
                          KernelReport((), ()), floor, floored=True, traces=traces)
     if derived and footprint is None and shapes is not None and mesh is None:
