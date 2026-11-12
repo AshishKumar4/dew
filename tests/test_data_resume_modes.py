@@ -103,3 +103,78 @@ def test_a_position_read_by_other_rules_names_every_one():
     finally:
         resumed.close()
     assert {"rules.mix", "rules.shuffle"} <= set(refused.value.differs)
+
+
+def _phased(seed: int):
+    """Two phases of 4-row batches: corpus `a` for three steps, then a mix of `b` and `c` shuffled by
+    `seed`, read on; each record's id names its corpus."""
+    from dew.data.pipeline import mix, phases
+
+    def corpus(tag: int):
+        x = np.random.default_rng(tag).normal(size=(32, 4)).astype(np.float32)
+        return Pipeline(Memory({"x": x, "id": np.arange(tag * 100, tag * 100 + 32, dtype=np.int32)}),
+                        name=str(tag))
+
+    later = mix([corpus(2).repeat(), corpus(3).repeat()], seed=seed).repeat()
+    return phases((corpus(1).repeat().batch(4), 3), (later.batch(4), None))
+
+
+def _phased_fit(directory, seed: int, steps: int):
+    tracker = RecordingTracker()
+    trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
+                      checkpoints=Checkpoints(str(directory)), tracker=tracker)
+    return trainer.fit(_phased(seed), steps=steps, log_every=1, checkpoint_every=1), tracker
+
+
+def test_a_phased_run_resumed_relaxed_after_a_changed_mix_opens_its_phase_at_its_start(tmp_path):
+    """A phased run saved two steps into its second phase, resumed relaxed with that phase's mix seeded
+    otherwise, starts its data again where its progress stands: its first phase kept as completed at the
+    records it ended at, its second phase's new order opened at its own start, every boundary on the run's
+    record count (the position's `origin`), and its state resumed; the position it saves reads on there."""
+    import json
+
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+
+    _phased_fit(tmp_path, seed=1, steps=5)
+    resumed, tracker = _phased_fit(tmp_path, seed=2, steps=6)
+    (restarted,) = _reported(tracker, DataRestarted)
+    assert restarted.step == 5 and int(resumed.step) == 6
+    with Checkpoints(str(tmp_path)) as checkpoints:
+        saved = checkpoints.position(6, DataPartition())
+    held = json.loads(saved)["dew_global_position"]
+    # Three steps of the first phase, two of the second before the restart, one after it.
+    assert (held["records"], held["completed"][0][1], held["origin"]) == (24, 12, 8)
+    fresh = compile(_phased(2)).train(DataPartition())
+    try:
+        ids = [np.asarray(next(fresh)["id"]) for _ in range(5)]
+    finally:
+        fresh.close()
+    stream = compile(_phased(2)).train(DataPartition())
+    try:
+        stream.set_state(saved)
+        # Its second phase's new order from its start: the step after the restart read its first batch.
+        assert np.array_equal(np.asarray(next(stream)["id"]), ids[4])
+    finally:
+        stream.close()
+
+
+def test_a_run_bounded_in_examples_resumed_relaxed_after_its_data_changed_ends_at_its_bound(tmp_path):
+    """A run bounded in examples, paused halfway and resumed relaxed over data shuffled otherwise, starts
+    its data again and ends where its own count of consumed examples reaches its bound."""
+    from dew.training import Pause
+
+    (x,) = records(0)
+
+    def fit(seed: int, **flags):
+        chain = Pipeline(Memory({"x": x})).shuffle(seed=seed).batch(BATCH)
+        tracker = RecordingTracker()
+        trainer = Trainer(Pulled(), OptimConfig(learning_rate=PEAK), key=0,
+                          checkpoints=Checkpoints(str(tmp_path)), tracker=tracker)
+        return trainer.fit(chain, examples=40, log_every=1, **flags), tracker
+
+    paused, _ = fit(1, stop=Pause(0.5))
+    assert 0 < int(paused.consumed) < 40
+    ended, tracker = fit(2)
+    assert _reported(tracker, DataRestarted)
+    assert int(ended.consumed) == 40
