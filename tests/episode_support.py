@@ -131,9 +131,10 @@ def build(harness=None, *, record=None, accumulation=1, **changes):
     return trainer, replace(collector, **changes)
 
 
-def episode_scheduler(collector, **changes) -> RolloutScheduler:
-    """The trainer's rollout over `collector`: `GROUPS` episodes of each task, collected at each call."""
-    return RolloutScheduler(Synchronous(collector), groups=GROUPS, **changes)
+def episode_scheduler(collector, objective, **changes) -> RolloutScheduler:
+    """The trainer's rollout over `collector`, whose policy `objective`'s: `GROUPS` episodes of each task,
+    collected at each call."""
+    return RolloutScheduler(Synchronous(collector), groups=GROUPS, scorer=objective, **changes)
 
 
 def cohort_snapshot(state, key=23) -> Snapshot:
@@ -143,8 +144,9 @@ def cohort_snapshot(state, key=23) -> Snapshot:
 def trained_batch(collector, state, objective, key=23, tasks=(31,)):
     """The batch the trainer's scheduler (`episode_scheduler`) packs from one cohort of `tasks`' episodes
     for a step of `objective`."""
-    return episode_scheduler(collector)(state, {"task_id": np.asarray(tasks, np.int32)}, jax.random.key(key),
-                                        objective=objective)
+    scheduler = episode_scheduler(collector, objective)
+    batch = {"task_id": np.asarray(tasks, np.int32)}
+    return scheduler(state, batch, jax.random.key(key), objective=objective)
 
 
 def collect(collector, state, key=23, tasks=(31,)):

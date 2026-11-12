@@ -658,6 +658,12 @@ class RolloutScheduler:
         self.overlong = overlong
         self.penalized = penalized
         self.generation_batches = generation_batches
+        if (isinstance(acquisition, Synchronous) and isinstance(acquisition.collector, EpisodeCollector)
+                and scorer is None):
+            raise ValueError("an episode collector draws from a policy bound when it was built; name the "
+                             "objective that policy was made for (scorer=), which a step training another is "
+                             "refused against, or collect through a PolicyCollector, which draws from each "
+                             "step's own")
         self.scorer = scorer
         self.metrics: dict[str, float] = {}
         self._branch: str | None = None

@@ -209,7 +209,7 @@ class Tasks:
 
 def run(directory, steps, records, accumulation=1):
     trainer, collector = build(record=records.append, accumulation=accumulation)
-    trainer.rollout = episode_scheduler(collector)
+    trainer.rollout = episode_scheduler(collector, trainer.objective)
     trainer.checkpoints = Checkpoints(str(directory))
     data = Loader(train=lambda partition: Tasks(), val=None, records=None, batch=jax.device_count())
     return trainer.fit(data, steps=steps, log_every=1)
@@ -270,7 +270,7 @@ def test_aborted_episode_leaves_the_previous_trainer_checkpoint_intact(tmp_path,
     expected = np.asarray(first.variables["params"]["table"]).copy()
     records = []
     trainer, collector = build(Harness(failure), record=records.append)
-    trainer.rollout = episode_scheduler(collector)
+    trainer.rollout = episode_scheduler(collector, trainer.objective)
     trainer.checkpoints = Checkpoints(str(directory))
     data = Loader(train=lambda partition: Tasks(), val=None, records=None, batch=jax.device_count())
     exception = EpisodeFailure if failure == "tool" else EpisodeCancelled

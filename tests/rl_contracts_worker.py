@@ -26,7 +26,8 @@ def replicated_readers(args):
         rollout = functools.partial(ppo, objective=ppo.objective)
     else:
         trainer, collector = build(harness, verifier=verifier)
-        rollout = functools.partial(episode_scheduler(collector), objective=trainer.objective)
+        scheduler = episode_scheduler(collector, trainer.objective)
+        rollout = functools.partial(scheduler, objective=trainer.objective)
     trainer.mesh = MeshSpec(tensor=args.processes)
     state = trainer.place()[0]
     partition = DataPartition.of(trainer.device_mesh)
