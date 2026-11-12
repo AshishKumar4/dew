@@ -198,15 +198,15 @@ def test_the_gemm_kernels_run_on_this_gpu_as_a_users_process_runs_them():
     precision set, XLA's own schedules and autotuning as `lane_environment.USERS_GPU_FLAGS` state them), not
     in the suite's, whose JAX_DEFAULT_MATMUL_PRECISION=highest has gemm.gemm promote each step's sum: the
     gathered product at the default precision, its default form (the tensor cores' running sum) against the
-    selector's XLA arm as a user's process compiles it, at the cooperative tile a user can pin and at the
-    tile it derives. Its bare running sum read 1.658x a Triton fusion's error under the suite's flags on a
-    GH200 (M-EM-19); the default form's contract is the fastest form passing check 1 (kernel-templates.md,
-    testing.md), what a user's process gets."""
+    selector's XLA arm as a user's process compiles it and against cuBLAS on the same inputs (the library
+    arm, row 5491: the owner's "Ofcourse Cublas parity!"), at the cooperative tile a user can pin and at the
+    tile it derives. Its running sum read 1.658x XLA's default product's error, a Triton fusion on mma.sync,
+    in a user's process on a GH200 (M-EM-19c), where cuBLAS's is the template's."""
     run_cells([
         Cell(f"a gathered grouped product is on par in a user's process: "
              f"{'pinned' if pinned else 'derived'}{', paired and scattered' if paired else ''}",
              functools.partial(gemm_gather.a_gathered_product_is_on_par, paired=paired, scattered=paired,
-                               pinned=pinned), "sm90")
+                               pinned=pinned, cublas=True), "sm90")
         for pinned in (True, False) for paired in (False, True)])
 
 

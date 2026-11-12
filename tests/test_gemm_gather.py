@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import cublas_compiled
 from reference_error import assert_as_exact, equations
 
 from dew.nn.kernels import formats, gemm, generation, grouped_matmul, tuning
@@ -56,7 +57,7 @@ def a_deep_gathered_step_reads_its_rows_as_their_copy_would(interpret):
 
 
 def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = False, scattered: bool = False,
-                                 pinned: bool = True):
+                                 pinned: bool = True, cublas: bool = False):
     """A grouped product whose rows are gathered from the tokens by a table (`gmm`'s `gather`: a MoE's sort
     fused into the rows' loads, row 1376), its groups ragged, one empty, rows past them, a token read by
     several slots and some by none, through the template named (`gemm.gemm`, `grouped_matmul` chosen `mosaic`:
@@ -68,7 +69,12 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
     row stored at its entry of a permutation (`gmm`'s `scatter`: the MoE's un-permute fused into the stores).
     Called through `mosaic_gpu.gmm` itself, the tile summed its products in the tensor cores' running sum
     whatever the precision asked: 1.658x the reference at the suite's highest precision on a GH200 (M-EM-19),
-    as summed through gemm.gemm its error is the reference's."""
+    as summed through gemm.gemm its error is the reference's. `cublas`, at the default precision on a Hopper
+    (a user's process's cells): the template's default form, warpgroup MMA's running sum as cuBLAS's own, is
+    held to cuBLAS on the same inputs by the library arm (BIBLE §7's exception, row 5491; the owner's
+    ruling of 2026-11-12, "Ofcourse Cublas parity!"), within 1.5 of the larger of the reference's error and
+    cuBLAS's: XLA's default product there is a Triton fusion on mma.sync, whose running sum the template's
+    read 1.658 times the error of (M-EM-19c), where cuBLAS's equals the template's."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
     sizes, depth = jnp.asarray([70, 0, 129, 51], jnp.int32), 128
 
@@ -96,9 +102,26 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
             return jnp.stack(outs) if paired else outs
         return run
 
+    def by_cublas(tokens, table, matrices, slots):
+        # cuBLAS's GEMM of each group's gathered rows by its matrix into fp32 (XLA's dot, its Triton GEMMs
+        # off: `generation_support.cublas_compiled`), the groups' rows and the unrouted rows' zeros placed as
+        # the product places them, its rows stored at their slots: no arithmetic past the library's.
+        rows = tokens[table]
+        firsts = np.concatenate([[0], np.cumsum(np.asarray(sizes))])
+
+        def product(matrices):
+            parts = [jnp.dot(rows[first:last], matrix, preferred_element_type=jnp.float32)
+                     for first, last, matrix in zip(firsts[:-1], firsts[1:], matrices, strict=True)]
+            out = jnp.concatenate([*parts, jnp.zeros((rows.shape[0] - firsts[-1], 256), jnp.float32)])
+            return jnp.zeros_like(out).at[slots].set(out) if scattered else out
+
+        return jnp.stack([product(matrices[0]), product(matrices[1])]) if paired else product(matrices[0])
+
+    library = ({'library_fn': cublas_compiled(by_cublas, draw(0), "__cublas$gemm"), 'library_row': 5491,
+                'library_leaves': ("",)} if cublas else {})
     with tuning.seen() as launches:
         assert_as_exact(jax.jit(through("mosaic")), jax.jit(through("xla")), draw,
-                        "a gathered grouped product", seeds=SEEDS, truth_fn=through("xla"))
+                        "a gathered grouped product", seeds=SEEDS, truth_fn=through("xla"), **library)
     taken = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
              if type(op) is grouped_matmul.MosaicGmm]
     assert taken and all(config == tiles for config in taken) if pinned else taken, taken
