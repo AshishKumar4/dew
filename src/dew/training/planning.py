@@ -949,8 +949,8 @@ class FitSearch[LossT, EffectsT]:
                                           peak=peak)
             return derived_headroom(bounded, devices, self.capacity, last.built - copies)
 
-        low, high = headroom(most + copies), headroom(least)
-        return None if low is None or high is None else (pooled_headroom(low), pooled_headroom(high))
+        low, high = pooled_headroom(headroom(most + copies)), pooled_headroom(headroom(least))
+        return None if low is None or high is None else (low, high)
 
     def judged(self, split: int, narrow: bool) -> int | None:
         """The derived headroom of the step at `split` and `narrow` at the objective's rung, traced once a

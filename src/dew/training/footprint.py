@@ -240,11 +240,17 @@ _COUNTED: contextvars.ContextVar[Callable[[jcore.Var], bool] | None] = contextva
 """Which values `device_share` counts the bytes of, every one where None: `head_terms`'s peaks."""
 
 
+def shape_of(value: jcore.Var | jcore.Literal) -> tuple[int, ...]:
+    """`value`'s array shape, none for one that holds no array (a token)."""
+    aval = value.aval
+    return tuple(aval.shape) if isinstance(aval, ShapedArray) else ()
+
+
 def logits_shaped(value: jcore.Var, table: tuple[int, int]) -> bool:
     """Whether `value` is a head's logits, or a value of their shape, of a table of `table`'s rows and
     features: one that holds the rows and more elements than the table, each token's row of them, where the
     table's own shape and its gradient's hold no more."""
-    shape = getattr(value.aval, "shape", ())
+    shape = shape_of(value)
     return table[0] in shape and math.prod(shape) > table[0] * table[1]
 
 
@@ -256,7 +262,7 @@ def head_terms(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Works
     def shaped(value) -> bool:
         return logits_shaped(value, table)
 
-    found = [math.prod(value.aval.shape) for equation in lowered.eqns for value in equation.outvars
+    found = [math.prod(shape_of(value)) for equation in lowered.eqns for value in equation.outvars
              if shaped(value)]
     if not found:
         return None
@@ -267,7 +273,8 @@ def head_terms(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Works
             terms.append(_peak(lowered, count, platform, workspace, consumed, deferred).bytes)
         finally:
             _COUNTED.reset(token)
-    return HeadTerms(*terms, max(found), table[0])
+    headless, held = terms
+    return HeadTerms(headless, held, max(found), table[0])
 
 
 def residual_bytes(loss: Callable, params, arguments: Sequence, *, platform: str,
@@ -1088,8 +1095,10 @@ def logits_floor[LossT, EffectsT](objective: Objective[LossT, EffectsT], forward
     states, or a layout that splits more than the rows (row 5556: Qwen3.5-4B's 4 x 12288 tokens hold
     48.8 GB of them, where its state holds 51.9 GB of an 80 GB device)."""
     table, shards = objective.whole_head_table(prepared.variables), row_shards(micro)
-    tokens = None if table is None or shards is None else contracted_tokens(forward, table)
-    if not tokens or shards is None:
+    if table is None or shards is None:
+        return None
+    tokens = contracted_tokens(forward, table)
+    if not tokens:
         return None
     return Footprint(None, device_bytes(prepared.variables["params"]), held, resident_bytes(prepared),
                      math.ceil(tokens / shards) * table[0] * np.dtype(np.float32).itemsize, exact=False)
@@ -1103,11 +1112,10 @@ def contracted_tokens(program: jcore.Jaxpr, table: tuple[int, int]) -> int:
     shapes = {table, table[::-1]}
     most = 0
     for equation in program.eqns:
-        operands = [getattr(value, "aval", None) for value in equation.invars]
-        if any(tuple(getattr(aval, "shape", ())) in shapes for aval in operands):
-            most = max([most, *(math.prod(aval.shape[:-1]) for aval in operands
-                                if aval is not None and tuple(getattr(aval, "shape", ())) not in shapes
-                                and len(aval.shape) > 1 and aval.shape[-1] == table[1])])
+        operands = [shape_of(value) for value in equation.invars]
+        if any(shape in shapes for shape in operands):
+            most = max([most, *(math.prod(shape[:-1]) for shape in operands
+                                if shape not in shapes and len(shape) > 1 and shape[-1] == table[1])])
         for body in bodies(equation):
             most = max(most, contracted_tokens(body, table))
     return most
