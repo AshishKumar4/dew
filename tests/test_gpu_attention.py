@@ -19,15 +19,13 @@ interpreted and through the compile gate:
   and each kernel's requirements are what it takes on this GPU (test_kernels); a row that sees no key
   reads nothing on the fused kernels (test_attention_masked_rows). Flash's plain training step is the
   dense flow's, a user's.
-- The Mosaic template on an H100, each test its own cells: the hooked backward's sites the CPU cannot
-  afford, the geometries that faulted on an H100, its one launch backward and a span call's
-  (test_attention_mosaic, attention_inplace_operands); an fp16 call through the route, and a long sequence
-  on par with the reference path (test_attention_route). Every other call form, hook and width is the
-  interpreted sites' and the compile gate's (row 5461); its causal forward and backward at a flow's widths
-  are the flows'.
-- The check-1 matrices of attention, its kernels and decode (tests/kernel_matrix.py), each over the
-  combinations of the axes a GPU runs natively, its GPU, kernel or launch and precision
-  (`kernel_matrix.native_cells`), and the cases a red found on a GPU (`kernel_matrix.SEEDED`).
+- The Mosaic template on an H100, each test its own cells: its forward and backward over every call form,
+  head width and hook it declares, its natural forward, a call over runs, a chunked prefill's backward, its
+  one launch backward and a span call's (test_attention_mosaic, attention_inplace_operands); an fp16 call
+  through the route, and a long sequence on par with the reference path (test_attention_route). Its causal
+  forward and backward at a flow's widths are the flows'.
+- The check-1 matrices of attention, its kernels and decode (tests/kernel_matrix.py), each at the cases a
+  red found on a GPU (`kernel_matrix.seeded_cells`); their other pairs are the CPU's, interpreted.
 """
 
 import dataclasses
@@ -50,7 +48,17 @@ import test_contracts_attention as contracts
 import test_decode_attention as decode
 import test_kernels as kernels
 import test_local_attention as local
-from gpu_flow import BF16_PRODUCTS, Cell, cells_of, in_parts, parted, repeats_bit_for_bit, run_cells, when
+from gpu_flow import (
+    BF16_PRODUCTS,
+    Cell,
+    cells_of,
+    covering,
+    in_parts,
+    parted,
+    repeats_bit_for_bit,
+    run_cells,
+    when,
+)
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.generation import bf16_dot_runs
@@ -164,15 +172,76 @@ def test_the_fused_attention_routes_run_on_this_gpu(without_deterministic_ops):
     ])
 
 
-MOSAIC_CELLS = (mosaic.the_backward_is_on_par_under_the_hopper_hook_sites,
-                mosaic.a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100,
-                mosaic.the_backward_at_its_faulting_geometry_is_on_par_on_an_h100,
-                mosaic.the_backward_256_wide_under_a_softcap_is_on_par_on_an_h100)
-"""The Mosaic template's H100 checks a GPU alone holds, each test its own cells: the hooked backward's sites
-the CPU cannot afford, and the geometries that faulted on an H100 (a chunked prefill's hang, row 2254's two
-launches, row 3704's shared keys 256 wide). Every other call form, hook and width is the interpreted sites'
-and the compile gate's; its programs at each native combination the attention matrix's
-(`test_the_attention_matrix_holds_on_this_gpu`, row 5461), and its flows' widths the model flows'."""
+UNEVEN_WALKS = ("lengths-starts", "cross-causal-lengths-starts", "causal-chunk")
+"""The call forms whose programs in one launch walk very different key-tile counts, none among them: an
+mbarrier phase or a ring slot a producer and its consumers disagree on shows on a GPU alone, whose roles run
+asynchronously, where the interpreter runs them in sequence (the attention lane, 11-11)."""
+
+TRANSCENDENTAL = "softcap"
+"""The score hook whose transcendental (tanh) a GPU computes on its approximate instruction (MUFU), which the
+interpreter computes exactly (the attention lane, 11-11)."""
+
+
+def _dtype(dtype) -> str:
+    return jnp.dtype(dtype).name
+
+
+def mosaic_cells() -> list[Cell]:
+    """The Mosaic template's H100 checks, each with its native axes (`Cell.native`: the pass and the
+    backward's launch form, the dtype, fold or natural logits) and the GPU-only faults it is kept for by
+    name (`Cell.fault`): a walk uneven across one launch's programs (`UNEVEN_WALKS`), the softcap's
+    approximate tanh (`TRANSCENDENTAL`), the one-launch backward's red at 475913063 and row 3171's span calls.
+    A long sequence's length is native: its D, refinement and denominator are sums its mainloop runs in
+    sequence over the key tiles, a ratio that grows with the length. Its causal forward,
+    training forward and backward at a flow's widths are the model flows' (row 5461); the covering of the
+    rest runs here (`gpu_flow.covering`), every other cell interpreted on the CPU and through the compile
+    gate."""
+    forward = {"pass": "forward", "launch": "forward"}
+    return [
+        *cells_of(mosaic.the_natural_forward_is_on_par_on_an_h100, "sm90",
+                  native=lambda call, dtype: {**forward, "dtype": _dtype(dtype), "logits": "natural"}),
+        *cells_of(mosaic.the_forward_is_on_par_over_every_call_form_on_an_h100, "sm90",
+                  native=lambda form: {**forward, "dtype": "bfloat16", "logits": "fold"},
+                  fault=lambda form: "uneven walks" if form in UNEVEN_WALKS else None),
+        *cells_of(mosaic.the_forward_is_on_par_at_head_widths_on_an_h100, "sm90",
+                  native=lambda width, value_width: {**forward, "dtype": "bfloat16", "logits": "fold"}),
+        *cells_of(mosaic.the_forward_is_on_par_under_every_hook_on_an_h100, "sm90",
+                  native=lambda hooks, dtype, natural: {**forward, "dtype": _dtype(dtype),
+                                                        "logits": "natural" if natural else "fold"},
+                  fault=lambda hooks, dtype, natural: (
+                      "approximate tanh" if hooks == TRANSCENDENTAL and _dtype(dtype) == "bfloat16"
+                      and not natural else None)),
+        *cells_of(mosaic.the_backward_is_on_par_at_head_widths_on_an_h100, "sm90",
+                  native=lambda width, value_width: {"pass": "backward", "launch": "default",
+                                                     "dtype": "bfloat16", "logits": "fold"}),
+        *cells_of(mosaic.the_backward_is_on_par_over_every_call_form_on_an_h100, "sm90",
+                  native=lambda case, form: {"pass": "backward", "launch": form, "dtype": "bfloat16",
+                                             "logits": "natural" if form == "accurate" else "fold"},
+                  fault=lambda case, form: "uneven walks" if case in UNEVEN_WALKS else None),
+        *cells_of(mosaic.the_backward_is_on_par_under_every_score_hook_on_an_h100, "sm90",
+                  native=lambda hooks, form: {"pass": "backward", "launch": form, "dtype": "bfloat16",
+                                              "logits": "natural" if form == "accurate" else "fold"},
+                  fault=lambda hooks, form: "approximate tanh" if hooks == TRANSCENDENTAL else None),
+        *cells_of(mosaic.a_call_over_runs_is_on_par_on_an_h100, "sm90",
+                  native=lambda case, form: {"pass": "forward" if form == "forward" else "backward",
+                                             "launch": form, "dtype": "bfloat16",
+                                             "logits": "natural" if form == "accurate" else "fold"}),
+        *cells_of(mosaic.a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100, "sm90",
+                  native=lambda: {"pass": "backward", "launch": "default", "dtype": "bfloat16",
+                                  "logits": "fold"}),
+        *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90",
+                  native=lambda case: {"pass": "backward", "launch": "route", "dtype": "float16",
+                                       "logits": "fold", "hooks": case}),
+        *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path,
+                  native=lambda length, dtype: {"pass": "backward", "launch": "route", "dtype": _dtype(dtype),
+                                                "logits": "fold", "length": str(length)}),
+        *cells_of(inplace.a_routes_one_launch_backward_is_on_par_on_an_h100, "sm90",
+                  fault=lambda name, causal: "red at 475913063 (its float64 truth's float32 product)"),
+        *cells_of(inplace.a_span_calls_one_launch_is_on_par_on_an_h100, "sm90",
+                  fault=lambda name: "row 3171's packed windowed call, its dK and dV wrong and unrepeatable "
+                                     "on an H100 before row 3180"),
+    ]
+
 
 KERNEL_CELLS = (kernels.flash_through_dews_attention_refuses_rows_it_would_misread,
                 kernels.a_fused_kernel_takes_forward_mode_through_the_reference,
@@ -196,6 +265,19 @@ KERNEL_CELLS = (kernels.flash_through_dews_attention_refuses_rows_it_would_misre
 """test_kernels' fused and Triton kernels on a GPU of cuDNN's bf16 floor (sm80) or later; its mesh cell
 is the two-GPU flow's (tests/test_gpu_mesh.py)."""
 
+LIBRARY_AXES = ("implementation", "kernel", "causal", "sunk", "window", "sinks", "as_mask", "call", "case")
+"""A library kernel's native axes, the parameters of its checks a GPU alone shows (Main, 11-11): a library's
+kernel (FlashAttention's, cuDNN's, tokamax's Triton) has no CPU form, so the kernel and every axis of how it
+takes Dew's call (its mask, packing, offsets, window and sinks, and the call a requirement names) enter its
+class's covering, beside each check itself; its shapes do not."""
+
+
+def library_cells(check, **fixtures) -> list[Cell]:
+    """`check`'s cells (`gpu_flow.cells_of`), each with its native axes: the check and its parameters a GPU
+    alone shows (`LIBRARY_AXES`)."""
+    return cells_of(check, native=lambda **given: {"check": check.__name__, **{
+        name: repr(value) for name, value in given.items() if name in LIBRARY_AXES}}, **fixtures)
+
 
 FUSED_PARTS = 2
 """The fused kernels' flow's parts (`in_parts`): 155 s whole on a GH200 (MAINGPU-709ddea7a)."""
@@ -203,58 +285,46 @@ FUSED_PARTS = 2
 
 @in_parts(FUSED_PARTS)
 def test_the_fused_kernels_hold_on_this_gpu(without_deterministic_ops, part):
-    """Every test_kernels and masked-rows cell above on this GPU (`gpu_flow.cells_of`), without XLA's
-    deterministic ops, each one's failure kept and all raised together, a part's share of them."""
-    run_cells(parted([
+    """The test_kernels and masked-rows cells above a GPU runs (`gpu_flow.covering` over each library
+    kernel's native axes, `library_cells`), without XLA's deterministic ops, each one's failure kept and all
+    raised together, a part's share of them."""
+    run_cells(parted(covering([
         *(cell for check in KERNEL_CELLS
-          for cell in cells_of(check, without_deterministic_ops=without_deterministic_ops)
+          for cell in library_cells(check, without_deterministic_ops=without_deterministic_ops)
           for cell in [dataclasses.replace(cell, run=when(bf16_dot_runs(), BF16_PRODUCTS, cell.run))]),
-        *cells_of(masked_rows.a_row_that_sees_no_key_reads_nothing_on_the_fused_gpu_kernels,
-                  without_deterministic_ops=without_deterministic_ops),
-    ], part, FUSED_PARTS))
+        *library_cells(masked_rows.a_row_that_sees_no_key_reads_nothing_on_the_fused_gpu_kernels,
+                       without_deterministic_ops=without_deterministic_ops),
+    ]), part, FUSED_PARTS))
 
 
 @pytest.mark.usefixtures("without_deterministic_ops")
 def test_the_attention_matrix_holds_on_this_gpu():
     """Attention's check-1 matrix (tests/kernel_matrix.py): the route's training step on par with the
-    reference path at each combination of the axes a GPU runs natively (`kernel_matrix.native_cells`), each
-    cell on its own GPU, without XLA's deterministic ops (a deterministic run never derives the one launch its
-    cells pin)."""
-    run_cells(kernel_matrix.native_cells("attention"))
-
-
-@pytest.mark.usefixtures("without_deterministic_ops")
-def test_the_attention_kernels_matrix_holds_on_this_gpu():
-    """The attention op's kernels' check-1 matrix (tests/kernel_matrix.py): each GPU kernel's training step
-    through the public call on par with the reference path at each combination of the axes a GPU runs
-    natively, each cell on its own GPU, without XLA's deterministic ops (FlashAttention's and cuDNN's refuse
-    a deterministic call)."""
-    run_cells(kernel_matrix.native_cells("attention_kernels"))
+    reference path at each case a GPU-only red seeded (`kernel_matrix.seeded_cells`), each cell on its own
+    GPU, its other pairs the CPU's, without XLA's deterministic ops (a deterministic run never derives the
+    one launch its cells pin)."""
+    run_cells(kernel_matrix.seeded_cells("attention"))
 
 
 def test_the_decode_matrix_holds_on_this_gpu():
     """Decode's check-1 matrix (tests/kernel_matrix.py): a serving step's decode, dense and paged, on par with
-    the reference path at each combination of the axes a GPU runs natively, each cell on its own GPU, under
-    the lane's deterministic ops."""
-    run_cells(kernel_matrix.native_cells("decode"))
+    the reference path at each case a GPU-only red seeded (`kernel_matrix.seeded_cells`), each cell on its own
+    GPU, its other pairs the CPU's, under the lane's deterministic ops."""
+    run_cells(kernel_matrix.seeded_cells("decode"))
 
 
-MOSAIC_PARTS = 2
-"""The Mosaic flow's parts (`in_parts`): its twelve cells' kernels' compiles most of it."""
+MOSAIC_PARTS = 8
+"""The Mosaic flow's parts (`in_parts`): past the 3600 s deadline whole on a GH200 (MAINGPU-df3e6ac66), its
+cells' kernels' compiles most of it."""
 
 
 @pytest.mark.usefixtures("without_deterministic_ops")
 @in_parts(MOSAIC_PARTS)
 def test_the_mosaic_template_holds_on_an_h100(part):
-    """Every Mosaic template cell above on an H100 (`gpu_flow.cells_of`), and the route's fp16 call and
-    long sequence, each one's failure kept and all raised together, a part's share of them, without XLA's
+    """The Mosaic template's cells on an H100 (`mosaic_cells`) a GPU runs (`gpu_flow.covering`: each cell
+    kept for a GPU-only fault by name, and the fewest others covering its native axes), each one's failure
+    kept and all raised together, a part's share of them, without XLA's
     deterministic ops: the fused backward forms its cells pin add dQ atomically, which a deterministic run
     never derives (`MosaicBackward.derived`), so held to a bitwise repeat there (check 1's
     `_repeat_promised`) they failed as unpaired draws (row 3171)."""
-    run_cells(parted([
-        *(cell for check in MOSAIC_CELLS for cell in cells_of(check, "sm90")),
-        *cells_of(route.an_fp16_call_on_an_h100_is_on_par, "sm90"),
-        *cells_of(route.a_long_sequence_is_on_par_with_the_reference_path),
-        *cells_of(inplace.a_routes_one_launch_backward_is_on_par_on_an_h100, "sm90"),
-        *cells_of(inplace.a_span_calls_one_launch_is_on_par_on_an_h100, "sm90"),
-    ], part, MOSAIC_PARTS))
+    run_cells(parted(covering(mosaic_cells()), part, MOSAIC_PARTS))

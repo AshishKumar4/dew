@@ -25,7 +25,7 @@ from native_certificates import (
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 from reference_error import assert_as_exact, equations, with_gradients
 
-from dew.nn.kernels import gemm, generation, grouped_matmul, tuning, xla_products
+from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 from dew.nn.moe import expert_projection
 
@@ -991,36 +991,44 @@ def test_the_tuners_group_sizes_route_every_row(groups):
 
 
 def test_a_ragged_products_portable_route_places_its_output_on_an_explicit_mesh():
-    """XLA's ragged products (`xla_products.xla_ragged_dot`, and `gemm.gemm_t`'s portable route a fused
-    producer's analysis replays) of rows an Explicit data axis splits, as a device step's are
+    """XLA's ragged products on a CPU (`gemm.gemm` and its reverse pass, `gemm.gemm_t`, the portable route a
+    fused producer's analysis replays) of rows an Explicit data axis splits, as a device step's are
     (test_device_image_augmentation): JAX infers no placement for a ragged dot, so each states its own
-    (`xla_products.ragged_placement`): the forward's rows split as the tokens' are, the kernel gradient's
-    sum over the split rows whole; a replicated operand on that mesh, placed too. Integers, so each value is
-    the unplaced program's bit for bit."""
+    (`xla_products.ragged_placement`): the forward's and the input gradient's rows split as the tokens'
+    are, the kernel gradient's sum over the split rows whole; a replicated operand on that mesh, placed too.
+    Integers, so each value is the unplaced program's bit for bit; and of no rows, each the empty product,
+    the kernel gradient each group's zeros."""
     from dew.distributed.placement import MeshSpec
 
     rng = np.random.default_rng(23)
     tokens = jnp.asarray(rng.integers(-3, 4, size=(64, 32)), jnp.float32)
     kernel = jnp.asarray(rng.integers(-3, 4, size=(2, 32, 16)), jnp.float32)
     cotangent = jnp.asarray(rng.integers(-3, 4, size=(64, 16)), jnp.float32)
+
+    def products(tokens, cotangent, sizes):
+        forward, pull = jax.vjp(lambda t, k: gemm.gemm(t, k, sizes, out_dtype=jnp.float32), tokens, kernel)
+        return (forward, *pull(cotangent), gemm.gemm_t(tokens, cotangent, sizes, out_dtype=jnp.float32))
+
     sizes = jnp.asarray([40, 24], jnp.int32)
-
-    def products(tokens, cotangent):
-        return (xla_products.xla_ragged_dot(tokens, kernel, sizes, preferred_element_type=jnp.float32),
-                gemm.gemm_t(tokens, cotangent, sizes, out_dtype=jnp.float32))
-
-    expected = jax.jit(products)(tokens, cotangent)
+    expected = jax.jit(products)(tokens, cotangent, sizes)
     mesh = MeshSpec(explicit=("data",)).build(jax.devices()[:8])
     with jax.set_mesh(mesh):
         rows = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
-        forward, gradient = jax.jit(products)(jax.device_put(tokens, rows), jax.device_put(cotangent, rows))
+        split = jax.jit(products)(jax.device_put(tokens, rows), jax.device_put(cotangent, rows), sizes)
+        forward, input_gradient, kernel_gradient, gradient = split
         assert jax.typeof(forward).sharding.spec[0] == "data"
-        assert all(entry is None for entry in jax.typeof(gradient).sharding.spec)
+        assert jax.typeof(input_gradient).sharding.spec[0] == "data"
+        for whole_sum in (kernel_gradient, gradient):
+            assert all(entry is None for entry in jax.typeof(whole_sum).sharding.spec)
         whole = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-        replicated = jax.jit(products)(jax.device_put(tokens, whole), jax.device_put(cotangent, whole))
-    np.testing.assert_array_equal(np.asarray(forward), np.asarray(expected[0]))
-    np.testing.assert_array_equal(np.asarray(gradient), np.asarray(expected[1]))
-    for got, want in zip(replicated, expected, strict=True):
+        replicated = jax.jit(products)(jax.device_put(tokens, whole), jax.device_put(cotangent, whole), sizes)
+    for found in (split, replicated):
+        for got, want in zip(found, expected, strict=True):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    empty = jax.jit(products)(tokens[:0], cotangent[:0], jnp.zeros((2,), jnp.int32))
+    for got, want in zip(empty, (cotangent[:0], tokens[:0], jnp.zeros_like(kernel), jnp.zeros_like(kernel)),
+                         strict=True):
+        assert got.dtype == want.dtype
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 

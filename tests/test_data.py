@@ -10,6 +10,7 @@ Record factories, holdout hashes and batch shares are Dew policies; Grain oracle
 
 import atexit
 import dataclasses
+import functools
 import itertools
 import json
 import os
@@ -39,7 +40,7 @@ from dew.data.dataset import (
     take_rows,
 )
 from dew.data.image_codec import decode_image
-from dew.data.images import EncodeCaptions
+from dew.data.images import EncodeCaptions, EncodeFields
 from dew.data.pipeline import Pipeline
 from dew.data.sinks import export
 from dew.data.sources import Source, from_torch, source as stored_source
@@ -1579,6 +1580,28 @@ def test_a_batch_encoders_reader_is_part_of_the_plan_a_resume_checks():
             other.set_state(saved)
     finally:
         other.close()
+
+
+def test_a_batch_encoders_reader_that_binds_what_it_reads_states_what_it_computes():
+    """A reader one function makes bound to its words (a partial) computes what its binding says, which
+    its function's name, the one a plan held of it, does not: the same function over other words would
+    resume as it. An encoder of one encodes by it and trains as any step does, a step of no stable
+    identity, which an exact resume or a cache refuses; declared, it is exact, and two declared apart are
+    two steps."""
+    from dew.data.plan import StepIdentity
+
+    reader = functools.partial(_words_of, words=("a", "b"))
+    for encoder in (EncodeCaptions, EncodeFields):
+        assert not StepIdentity.of(encoder(reader)).exact
+        ab, cd = encoder(reader, declared="words@ab"), encoder(reader, declared="words@cd")
+        assert StepIdentity.of(ab).exact and StepIdentity.of(ab).semantic() != StepIdentity.of(cd).semantic()
+    encoded = EncodeCaptions(reader)({"caption": ["x", "y", "z"]})
+    np.testing.assert_array_equal(encoded["words"], ["a", "b", "a"])
+
+
+def _words_of(rows, words: tuple[str, ...]):
+    """The `words` a batch's rows name by index, as a vocabulary reads them."""
+    return {"words": np.asarray([words[index % len(words)] for index in range(len(rows))])}
 
 
 def _captions_again(captions):

@@ -216,6 +216,26 @@ def test_each_form_the_template_takes_stays_finite_and_on_par_interpreted(name, 
     the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, 'forward', forms)
 
 
+ORDINARY = tuple(regime for regime, (_, tokens) in REGIMES.items()
+                 if tokens is None and regime not in INTERPRETED)
+"""The regimes of a draw's own tokens beside `INTERPRETED`'s, which the CPU interprets each form's forward
+under too (`test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted`):
+a long sequence's and a fading memory's (`LONG` tokens) and decays near zero's (`NEAR_ZERO`) are past a task
+interpreted, and their gradients everywhere, which the GPU tier runs whole (tests/test_gpu_recurrence.py's
+`STRESS`, row 5461's ruling)."""
+
+
+@pytest.mark.parametrize(('name', 'regime', 'forms'),
+                         [(name, regime, forms) for name, regime, product, forms in CASES
+                          if product == 'forward' and regime in ORDINARY])
+@pytest.mark.check1_shards(seeds=128, per_task=16)
+def test_each_form_the_template_takes_stays_on_par_in_its_ordinary_regimes_interpreted(name, regime, forms):
+    """`test_each_form_the_template_takes_stays_finite_and_on_par_interpreted` under the regimes of a draw's
+    own tokens (`ORDINARY`): the CPU twin of each form's forward cell of the GPU tier's, a site each, sharded
+    over the most seeds a cell declares, sixteen draws a task."""
+    the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, 'forward', forms)
+
+
 @pytest.mark.whole_suite  # 130 s interpreted, past a group's two minutes (ledger 2145).
 def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpreted():
     """The fast backward's log decay gradient, interpreted, as near float64 as recorded fla-core's

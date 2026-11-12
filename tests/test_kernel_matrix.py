@@ -83,16 +83,11 @@ def test_every_kernel_an_op_serves_is_run_under_test_by_a_familys_matrix():
     assert not untested, f"kernels no family's matrix runs under test: {untested}"
 
 
-@pytest.mark.parametrize("family", sorted(kernel_matrix.NATIVE))
-def test_a_gpu_runs_a_cell_of_each_native_combination_and_each_seeded_case(family):
-    """The GPU tier's cells of a family (`kernel_matrix.native_cells`) hold every combination of its native
-    axes' values its cells cover, and every case a ledger row names: the rest of its pairs are the CPU's
-    (row 5461's covering set)."""
-    native = kernel_matrix.NATIVE[family]
-    assert set(native) <= set(kernel_matrix.AXES[family]) and "generation" in native
+@pytest.mark.parametrize("family", sorted(kernel_matrix.SEEDED))
+def test_a_gpu_runs_each_seeded_case_of_a_family_and_no_other(family):
+    """The GPU tier's cells of a family (`kernel_matrix.seeded_cells`) are its seeded cases, each a GPU-only
+    red a ledger row names, every one of them and no other: the rest of its pairs are the CPU's (row 5461's
+    covering set)."""
     cells = dict(kernel_matrix.covered(family))
-    kept = {cell.label: cells[cell.label] for cell in kernel_matrix.native_cells(family)}
-    assert {tuple(combination[axis] for axis in native) for combination in kept.values()} == {
-        tuple(combination[axis] for axis in native) for combination in cells.values()}
-    assert {case for _, case in kernel_matrix.SEEDED.get(family, ())} <= {
-        tuple(combination.values()) for combination in kept.values()}
+    kept = [tuple(cells[cell.label].values()) for cell in kernel_matrix.seeded_cells(family)]
+    assert sorted(kept) == sorted({case for _, case in kernel_matrix.SEEDED[family]})

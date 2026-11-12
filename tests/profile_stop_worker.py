@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from multiprocess_worker import BATCH, indexed_loader, make_objective
+from multiprocess_worker import make_objective
+from pool_records import BATCH, indexed_loader
 from process_support import serve_mode, worker_parser
 
 

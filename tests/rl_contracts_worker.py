@@ -1,5 +1,6 @@
 """Real CPU readers of one native or PPO episode share."""
 
+import functools
 from dataclasses import replace
 
 import jax
@@ -20,11 +21,13 @@ def replicated_readers(args):
     if args.mode == "ppo":
         from test_ppo import build_ppo
 
-        trainer, rollout = build_ppo(verifier)
-        rollout = replace(rollout, episodes=replace(rollout.episodes, environment=harness))
+        trainer, ppo = build_ppo(verifier)
+        ppo = replace(ppo, episodes=replace(ppo.episodes, environment=harness))
+        rollout = functools.partial(ppo, objective=ppo.objective)
     else:
         trainer, collector = build(harness, verifier=verifier)
-        rollout = episode_scheduler(collector)
+        scheduler = episode_scheduler(collector, trainer.objective)
+        rollout = functools.partial(scheduler, objective=trainer.objective)
     trainer.mesh = MeshSpec(tensor=args.processes)
     state = trainer.place()[0]
     partition = DataPartition.of(trainer.device_mesh)

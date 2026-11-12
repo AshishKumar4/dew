@@ -62,6 +62,19 @@ def run(root: Path, steps, data) -> DecisionRunConfig:
                              loop_implicit=True)
 
 
+def test_a_phased_decision_run_resumes_with_its_loops_passes_recomputed(tmp_path):
+    """A run stopped inside its second phase resumes with its loop's passes recomputed in the backward
+    (`loop_remat`), memory alone: the resume takes it and trains on through the phase, where a change of
+    what the run computes (its phases' passes) it refuses (row 5558)."""
+    data = phased(tmp_path)
+    trained(run(tmp_path, STEPS, data), tmp_path, "stopped", trainer={"steps": 3, "checkpoint_every": 1})
+    recomputed = dataclasses.replace(run(tmp_path, STEPS, data), loop_remat=True)
+    resumed, _ = trained(recomputed, tmp_path, "stopped", trainer={"steps": 4, "checkpoint_every": 1})
+    assert int(resumed.step) == 4
+    with pytest.raises(ValueError):
+        trained(run(tmp_path, (1, 3), data), tmp_path, "stopped", trainer={"steps": 5, "checkpoint_every": 1})
+
+
 def phased(root: Path):
     return phases((asked(tickets(root, "first", "billing")), PHASE),
                   (asked(tickets(root, "second", "sales")), None))

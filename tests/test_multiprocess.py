@@ -34,6 +34,7 @@ import numpy as np
 import pytest
 from lane_environment import MESH_DEVICES
 from interop_support import assert_same_stored_tensors, written_tensors
+from pool_records import served_image
 from process_support import (
     ProcessGroup,
     free_port,
@@ -152,6 +153,23 @@ def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
         # A stand-in of the placed rows, which the executable checks and drops.
         assert report["unused_shape"] == [MESH_DEVICES]
         assert report["sum"] == 3 * MESH_DEVICES
+
+
+def test_a_pool_whose_held_out_share_holds_a_token_past_its_table_refuses_on_every_rank(tmp_path):
+    """A two-process fit whose held-out split holds a token past its model's 64-row table in one rank's
+    share (multiprocess_worker.VOCAB) refuses on every rank, the rank holding it naming the token
+    (`OutsideTable`) and its peer its failure, inside the agreement each batch's cover is: no rank waits on
+    a peer that left."""
+    tokens = np.arange(65, dtype=np.uint16) % 64
+    held = tokens.copy()
+    held[61] = 100
+    # Both stores of one tokenizer, of 101 ids, which a table of 64 rows does not hold.
+    train = write_token_corpus(tmp_path / "tokens", tokens, tokens, vocab_size=101)
+    corpus = write_token_corpus(tmp_path / "held", held, held, vocab_size=101)
+    reports = run_pool("bounded_validation", tmp_path / "pool", 2, devices=1, tokens=train.train,
+                       held_tokens=corpus.train, seq_len=4, timeout=300,
+                       script=Path(__file__).with_name("bounded_validation_worker.py"))
+    assert sorted(report["refused"] for report in reports) == ["OutsideTable", "PeerFailure"]
 
 
 def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_path):
@@ -896,10 +914,36 @@ def test_a_pool_position_resumes_on_another_process_count(tmp_path, request, rec
                                dumped_params(tmp_path / "whole" / f"process{index}.json"))
 
 
+@pytest.mark.distributed
+def test_a_pool_that_mounts_its_records_at_different_paths_resumes_where_it_stopped(tmp_path):
+    """Two processes read one file of records, each at its own path, into one global order: the
+    positions they save name one place in it, their bytes apart in the paths alone, so the pool resumes
+    from them and lands where the pool nobody stopped does."""
+    mounts = tmp_path / "mounts"
+    for index in range(2):
+        (mounts / f"process{index}").mkdir(parents=True)
+    written = mounts / "process0" / "records.jsonl"
+    written.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(RECORDS)))
+    shutil.copy2(written, mounts / "process1" / "records.jsonl")
+
+    def flags(run_dir: Path, steps: int) -> dict:
+        return {"name": "mounted", "mounts": str(mounts), "fsdp_size": 1, "records": RECORDS,
+                "run_dir": run_dir, "steps": steps}
+
+    run_pool("fit", tmp_path / "saved", 2, **flags(tmp_path / "run", POOL_STEPS))
+    resumed, _ = run_pools(("fit", tmp_path / "resumed", 2, flags(tmp_path / "run", 2 * POOL_STEPS)),
+                           ("fit", tmp_path / "whole", 2, flags(tmp_path / "whole-run", 2 * POOL_STEPS)))
+    for index, report in enumerate(resumed):
+        assert report["restored_step"] == POOL_STEPS
+        assert report["step"] == 2 * POOL_STEPS
+        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
 def served(request) -> None:
-    """A pool's server: each record's url answered with its image (`worker.served_image`), a pure
+    """A pool's server: each record's url answered with its image (`pool_records.served_image`), a pure
     function of the path, so processes that fetch at once read what one would."""
-    body = worker.served_image(int(request.path.strip("/")))
+    body = served_image(int(request.path.strip("/")))
     request.send_response(200)
     request.send_header("Content-Length", str(len(body)))
     request.end_headers()

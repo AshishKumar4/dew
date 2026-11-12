@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew._records import integer, record
+from dew._records import record
 from dew.artifacts import Decisions
 from dew.batch import FROZEN, Batch, Variables, dicts, part, thaw, unboxed
 from dew.data.pipeline import Configured, ObjectiveData
@@ -347,7 +347,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                  none_of_the_above_options: int = 3, input_lm: float = 0.0,
                  pass_weights: PassWeighting | None = None, exit_entropy: float | None = None):
         held: Variables | None = None
-        widths: tuple[int | None, int] | None = None
+        options: int | None = None
         self.image_processor = None
         match backbone:
             case Decide():
@@ -365,9 +365,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
                 module = model.backbone
                 # A task's passes pad its questions to its budget's options, kept until the run's data
                 # binds its own; a pass's question slots are its windows' (`Decide.pass_shapes`).
-                budget = backbone.budget
-                if budget.options is not None:
-                    widths = (None, budget.options)
+                options = backbone.budget.options
             case Adapter() | Source():
                 module, held = backbone.model, joined({"backbone": backbone.variables})
                 if isinstance(backbone, Source):
@@ -429,10 +427,10 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         self.none_of_the_above_options = none_of_the_above_options
         self.temperatures = temperatures
         self.segments = segments
-        # The most questions a row and options a question of the run's data hold, which its run records
-        # (`DecideSettings.questions`, `DecideSettings.options`), its saved task padding each pass's
-        # questions to the options, as its data binds them (`bind_widths`).
-        self.widths = widths
+        # The most options a question of the run's data holds, which its run records
+        # (`DecideSettings.options`), its saved task padding each pass's questions to them, as its data
+        # binds them (`bind_widths`).
+        self.options = options
         held_context = self.context_length
         if context_window is not None and (held_context is None or context_window < held_context):
             raise ValueError(f"context_window={context_window} holds a window's contexts, at least one row's "
@@ -885,14 +883,13 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         )
 
     def bind_widths(self, widths: Mapping[str, object]) -> None:
-        """Keep the most questions a row and options a question of the run's data hold, as its layout
-        steps bound them (`widths`' `slots`, `ConfigureLayout`), which its saved task pads each pass to
-        (`DecideSettings.questions`); data that binds none keeps those of the task it fine-tunes."""
+        """Keep the most options a question of the run's data holds, as its layout steps bound them
+        (`widths`' `slots`, `ConfigureLayout`), which its saved task pads each pass's questions to
+        (`DecideSettings.options`); data that binds none keeps those of the task it fine-tunes."""
         if "slots" not in widths:
             return
-        slots = record(widths["slots"], "decision slots")
-        self.widths = (self.layout.row_questions(integer(slots.get("questions"), "slots.questions")),
-                       option_width(slots, self.none_of_the_above, self.none_of_the_above_options))
+        self.options = option_width(record(widths["slots"], "decision slots"), self.none_of_the_above,
+                                    self.none_of_the_above_options)
 
     def task_settings(self) -> DecideSettings:
         """What a saved run rebuilds its task from beside the backbone.
@@ -912,7 +909,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             None if self.image_processor is None or self.image_processor.directory is None
             else self.image_processor.source,
             self.model.context_encoder,
-            *(self.widths or (None, None)))
+            self.options)
 
     def served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]:
         """The backbone's projection groups a served task packs (`Decide._served`), their paths from
@@ -946,7 +943,6 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         if processor is not OMITTED:
             raise TypeError("a Decide task encodes with the objective's tokenizer and takes no processor")
         averaged = not (ema is False or (ema is None and state.ema is None))
-        _, options = self.widths or (None, None)
         return Decide(
             self.model,
             self._pipeline_weights(state, ema),
@@ -955,6 +951,6 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             self.specials,
             weights=Weights(int(state.step), averaged),
             processor=self.image_processor,
-            budget=Budget(options=options),
+            budget=Budget(options=self.options),
             derives_sharing=self._plan >= SHARED_STATE,
         )

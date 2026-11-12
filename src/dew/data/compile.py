@@ -27,6 +27,7 @@ from typing import ClassVar, Literal, Protocol, runtime_checkable
 import grain.python as pygrain
 import numpy as np
 
+from dew._position import unplaced
 from dew._records import JSON, integer, json_value
 from dew.batch import Batch
 from dew.data.analysis import (
@@ -139,7 +140,7 @@ from dew.data.pipeline import (
     with_children,
     with_stores,
 )
-from dew.data.plan import DECLARED_MIX, PLAN_VERSIONS, Plan, StepIdentity, fingerprint, read_by, unplaced
+from dew.data.plan import DECLARED_MIX, PLAN_VERSIONS, Plan, StepIdentity, fingerprint, read_by
 from dew.data.readers import Opener, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
     Read,

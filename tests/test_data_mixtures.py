@@ -29,7 +29,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import FEATURES, Affine
-from recording import RecordingTracker
+from recording import RecordingTracker, finite
 from token_support import write_token_corpus
 
 from dew import _position
@@ -1202,8 +1202,9 @@ def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream():
         return {"length": np.asarray([len(caption) for caption in captions], np.int32)}
 
     def captioned(batch: int) -> Loader:
-        return compile(Pipeline(Memory(Captioned(1, 64))).shuffle(0).repeat().batch(batch).map(
-                           EncodeCaptions(lengths)), read="memory", seed=0, loading=READ)
+        encode = EncodeCaptions(lengths, declared="lengths@1")
+        return compile(Pipeline(Memory(Captioned(1, 64))).shuffle(0).repeat().batch(batch).map(encode),
+                       read="memory", seed=0, loading=READ)
 
     flat = [value for step in taken(captioned(4).train(DataPartition()), 12) for value in step]
     schedule = Ramp(start=2, increment=1, samples=6)
@@ -1324,10 +1325,7 @@ def assert_same(left: dict, right: dict, why: str) -> None:
     comparison, so two runs trained to NaN would pass as one."""
     assert set(left) == set(right)
     for name in left:
-        for side in (left[name], right[name]):
-            values = np.asarray(side)
-            finite = values.dtype.kind not in "fc" or np.all(np.isfinite(values))
-            assert finite, f"{why}: {name} is not finite"
+        assert finite(left[name]) and finite(right[name]), f"{why}: {name} is not finite"
         np.testing.assert_array_equal(left[name], right[name], err_msg=f"{why}: {name}")
 
 

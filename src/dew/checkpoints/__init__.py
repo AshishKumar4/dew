@@ -104,6 +104,7 @@ from dew.checkpoints._payloads import (
     _profile_path,
     _refuse_cut_resume,
     _refuse_profiles_alone,
+    _refuse_whole_item,
     _StepFacts,
 )
 from dew.checkpoints._replicas import Grid, _covered, _from_replicas, _zeros
@@ -111,7 +112,6 @@ from dew.checkpoints._state_trees import (
     TreePath,
     _at,
     _averaged,
-    _averages_of,
     _by_path,
     _decode_delta,
     _ema_deltas,
@@ -120,13 +120,11 @@ from dew.checkpoints._state_trees import (
     _item_metadata,
     _named,
     _plane_template,
-    _power_profiles,
     _profile_record,
     _profiles_at,
     _snapshot_weights,
     _variable_trees,
     _with,
-    _with_averages,
     _with_ema_deltas,
 )
 from dew.checkpoints._step_records import counted_processes, gather_positions, read_position, step_record
@@ -1586,16 +1584,8 @@ class Checkpoints:
             restored = self._restored(step, None, {PROFILES: jax.tree.map(lambda _: host, held)}, local=False,
                                       partial=False, by_payload=True)
             return tuple(restored[PROFILES]['averages'])
-        # A step of one item, as an earlier Dew wrote it: its averages where its optimizer state keeps them.
-        metadata = _item_metadata(facts)
-        found = _profiles_at(metadata)
-        if found is None:
-            raise ValueError(f"the checkpoint at step {step} holds no post-hoc EMA profiles")
-        path, profiles = found
-        wanted = _with({}, path, _with_averages(jax.tree.map(lambda _: ocp.PLACEHOLDER, _at(metadata, path)),
-                                                tuple(_averages_of(profiles))))
-        restored = self._restored(step, wanted, jax.tree.map(lambda _: host, wanted), local=False)
-        return tuple(_averages_of(_power_profiles(_at(restored, path))))
+        raise ValueError(f"the checkpoint at step {step} holds its post-hoc EMA profiles in its optimizer's "
+                         "state, one item, as an earlier Dew wrote it: read them with the Dew that wrote it")
 
     def posthoc_ema(self, std: float, step: int | None = None) -> Variables:
         """Return the post-hoc EMA with relative standard deviation `std` at checkpoint `step`.
@@ -1870,6 +1860,10 @@ class Checkpoints:
         arrays = jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), dict(pending))
         arrays["statistics"] = tuple(arrays["statistics"])
         arrays["effects"] = tuple(arrays["effects"])
+        if arrays.get("batch_statistics") is not None:
+            arrays["batch_statistics"] = tuple(arrays["batch_statistics"])
+        if arrays.get("replayed_statistics") is not None:
+            arrays["replayed_statistics"] = tuple(arrays["replayed_statistics"])
         return Accumulation(**arrays)
 
     def position(self, step: int, share: DataPartition) -> bytes | None:
@@ -1960,6 +1954,8 @@ class Checkpoints:
             raise ValueError(f"step {step} of {self.directory} holds {_payload(self._payloads(step))} alone: "
                              "a weights-only snapshot, or a step kept for its weights or profiles, resumes "
                              "nothing; resume a whole checkpoint")
+        if resumes and not from_local:
+            _refuse_whole_item(step, snapshot, self.directory)
         _refuse_profiles_alone(step, snapshot)
         metadata = _item_metadata(snapshot)
         stored = metadata.keys()

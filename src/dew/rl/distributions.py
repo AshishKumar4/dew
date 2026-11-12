@@ -101,11 +101,18 @@ def tanh_log_jacobian(raw: jax.Array) -> jax.Array:
     return 2 * (math.log(2.0) - raw - jax.nn.softplus(-2 * raw))
 
 
-def onehot_sample(key: jax.Array, log_probs: jax.Array) -> jax.Array:
+def onehot_sample(key: jax.Array | None, log_probs: jax.Array, *,
+                  gumbel: jax.Array | None = None) -> jax.Array:
     """A one-hot draw from the categorical `log_probs`, its gradient the probabilities' (straight
-    through)."""
+    through), from `gumbel` noise where given, else drawn from `key`."""
     probs = jnp.exp(log_probs)
-    drawn = jax.nn.one_hot(jax.random.categorical(key, log_probs), log_probs.shape[-1], dtype=probs.dtype)
+    if gumbel is None:
+        if key is None:
+            raise ValueError("a categorical draw needs a key or Gumbel noise")
+        chosen = jax.random.categorical(key, log_probs)
+    else:
+        chosen = jnp.argmax(gumbel.astype(log_probs.dtype) + log_probs, axis=-1)
+    drawn = jax.nn.one_hot(chosen, log_probs.shape[-1], dtype=probs.dtype)
     return drawn + probs - jax.lax.stop_gradient(probs)
 
 

@@ -36,7 +36,7 @@ class Recorder:
         self.keys = []
         self.steps = []
 
-    def __call__(self, state, batch, key):
+    def __call__(self, state, batch, key, *, objective):
         self.keys.append(np.asarray(jax.random.key_data(key)).tobytes())
         self.steps.append(int(state.step))
         return batch
@@ -54,7 +54,7 @@ def test_an_identity_rollout_leaves_the_loop_byte_identical():
     assert frozen_trainer().rollout is None
     plain, ident = RecordingTracker(), RecordingTracker()
     alone = frozen_trainer(tracker=plain).fit(dataset(), steps=2, log_every=1)
-    rolled = frozen_trainer(rollout=lambda state, batch, key: batch,
+    rolled = frozen_trainer(rollout=lambda state, batch, key, *, objective: batch,
                             tracker=ident).fit(dataset(), steps=2, log_every=1)
 
     for left, right in zip(jax.tree.leaves(alone), jax.tree.leaves(rolled), strict=True):
@@ -106,9 +106,9 @@ def test_a_rollouts_metrics_log_as_of_its_latest_call():
     class Counting(Recorder):
         metrics: dict[str, float]
 
-        def __call__(self, state, batch, key):
+        def __call__(self, state, batch, key, *, objective):
             self.metrics = {"reward/mean": float(state.step) + 0.5}
-            return super().__call__(state, batch, key)
+            return super().__call__(state, batch, key, objective=objective)
 
     tracking = RecordingTracker()
     frozen_trainer(rollout=Counting(), tracker=tracking).fit(dataset(), steps=4, log_every=2)
@@ -174,9 +174,10 @@ def test_a_rollout_packs_into_the_objectives_rows_and_refuses_a_draw_too_long_fo
     rows, each chain where a narrow objective's sits and padding after it; one
     too narrow for a prompt and its draw is refused by the packer."""
     def drawn(seq):
-        rollout = RolloutScheduler.sampled(tiny_objective(seq=seq), Calls(), groups=GROUPS,
+        objective = tiny_objective(seq=seq)
+        rollout = RolloutScheduler.sampled(objective, Calls(), groups=GROUPS,
                                            max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
-        return rollout(FakeState(params), prompt_batch(), jax.random.key(1))
+        return rollout(FakeState(params), prompt_batch(), jax.random.key(1), objective=objective)
 
     params = tiny_objective().init(jax.random.key(0))
     width = PROMPT_WIDTH + NEW_TOKENS
@@ -200,7 +201,7 @@ def test_a_sampled_rollout_packs_its_completions():
                                        max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
     batch = prompt_batch()
 
-    out = rollout(FakeState(params, updates=3), batch, jax.random.key(1))
+    out = rollout(FakeState(params, updates=3), batch, jax.random.key(1), objective=objective)
 
     for name in ("input_ids", "text_segment_ids", "text_positions", "response_mask",
                  "old_log_probs", "behavior_log_probs", "advantages"):
@@ -214,7 +215,7 @@ def test_a_sampled_rollout_packs_its_completions():
         rescored = np.asarray(objective.per_token_log_probs(params, chain["input_ids"][None]))[0]
         sampled = chain["response_mask"] != 0
         np.testing.assert_allclose(chain["old_log_probs"][sampled], rescored[sampled[1:]], rtol=1e-5)
-    again = rollout(FakeState(params, updates=3), batch, jax.random.key(1))
+    again = rollout(FakeState(params, updates=3), batch, jax.random.key(1), objective=objective)
     for key in out:
         np.testing.assert_array_equal(np.asarray(out[key]), np.asarray(again[key]))
 
@@ -226,13 +227,14 @@ def test_a_schedulers_branch_calls_reach_no_log_and_leave_the_runs_metrics():
     params = objective.init(jax.random.key(0))
     rollout = RolloutScheduler.sampled(objective, Calls(), groups=GROUPS, max_new_tokens=NEW_TOKENS,
                                        sampling=Sampling(temperature=0.0), log=records.append)
-    rollout(FakeState(params, updates=3), prompt_batch(), jax.random.key(1))
+    rollout(FakeState(params, updates=3), prompt_batch(), jax.random.key(1), objective=objective)
     run = dict(rollout.metrics)
     with rollout.branch("cooldown-4"):
-        branched = rollout(FakeState(params, updates=5), prompt_batch(), jax.random.key(2))
+        branched = rollout(FakeState(params, updates=5), prompt_batch(), jax.random.key(2),
+                           objective=objective)
     assert [record.updates for record in records] == [3]
     assert rollout.metrics == run
-    plain = rollout(FakeState(params, updates=5), prompt_batch(), jax.random.key(2))
+    plain = rollout(FakeState(params, updates=5), prompt_batch(), jax.random.key(2), objective=objective)
     assert [record.updates for record in records] == [3, 5]
     for name, value in plain.items():
         np.testing.assert_array_equal(np.asarray(branched[name]), np.asarray(value), name)
@@ -260,15 +262,15 @@ def test_a_branch_cancels_what_it_left_in_flight_and_restores_the_scheduler_howe
     rollout = Cancelling.sampled(objective, Calls(), groups=GROUPS, max_new_tokens=NEW_TOKENS,
                                  sampling=Sampling(temperature=0.0), log=records.append)
     with rollout.branch("cooldown-4"):
-        rollout(FakeState(params, updates=5), prompt_batch(), jax.random.key(2))
+        rollout(FakeState(params, updates=5), prompt_batch(), jax.random.key(2), objective=objective)
     assert rollout.closed == 1
     rollout.fails = True
     with pytest.raises(OSError), rollout.branch("cooldown-8"):
-        rollout(FakeState(params, updates=9), prompt_batch(), jax.random.key(3))
+        rollout(FakeState(params, updates=9), prompt_batch(), jax.random.key(3), objective=objective)
     with pytest.raises(KeyError), rollout.branch("cooldown-12"):
         raise KeyError("the branch's own failure")
     assert rollout.closed == 3
-    rollout(FakeState(params, updates=13), prompt_batch(), jax.random.key(4))
+    rollout(FakeState(params, updates=13), prompt_batch(), jax.random.key(4), objective=objective)
     assert [record.updates for record in records] == [13]
 
 
@@ -282,7 +284,7 @@ def test_a_prompts_group_is_the_policys_continuations_of_one_request():
     rollout = RolloutScheduler.sampled(objective, Calls(), groups=GROUPS, max_new_tokens=NEW_TOKENS,
                                        sampling=sampling)
     batch = prompt_batch()
-    out = rollout(FakeState(params), batch, jax.random.key(4))
+    out = rollout(FakeState(params), batch, jax.random.key(4), objective=objective)
     drawn = objective.policy(params, sampling)(batch["prompt"], NEW_TOKENS, key=jax.random.key(4),
                                                n=GROUPS).host()
     found = chains(out)
@@ -300,7 +302,7 @@ def test_the_reward_sees_each_rows_own_context():
     rollout = RolloutScheduler.sampled(objective, reward, groups=GROUPS,
                                        max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0))
 
-    rollout(FakeState(params), prompt_batch(), jax.random.key(1))
+    rollout(FakeState(params), prompt_batch(), jax.random.key(1), objective=objective)
 
     assert [record.data_source for _, record in reward.seen] == ["rulé", "rulé", "other", "other"]
     assert [record.ground_truth for _, record in reward.seen] == ["1", "1", "2", "2"]
@@ -320,7 +322,7 @@ def test_each_estimator_turns_the_calls_rewards_into_the_packed_advantages(estim
     rollout = RolloutScheduler.sampled(objective, reward, groups=groups, max_new_tokens=NEW_TOKENS,
                                        sampling=Sampling(temperature=1.3, top_k=5), estimator=estimator)
 
-    out = rollout(FakeState(params), prompt_batch(), jax.random.key(1))
+    out = rollout(FakeState(params), prompt_batch(), jax.random.key(1), objective=objective)
 
     assert len(reward.seen) == 2 * groups
     scores = np.asarray([reward(*seen) for seen in reward.seen[:2 * groups]], np.float32)

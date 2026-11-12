@@ -267,7 +267,14 @@ def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, forward):
     reused across the program's tiles), interpreted, at an epilogue's column or row scale: each
     consumer multiplies its half of the stage's rows
     and computes their epilogue, as exact as the plain program from float64 truth. An fp32 output's sums are
-    the default precision's, which the launches take (exact sums are the kernel gradient's alone)."""
+    the default precision's, which the launches take (exact sums are the kernel gradient's alone). A pair's
+    runs on an H100 too (tests/test_gpu_gemm.py)."""
+    a_cooperative_tile_holds_check_1_with_its_hooks(case, forward)
+
+
+def a_cooperative_tile_holds_check_1_with_its_hooks(case: str, forward: mosaic_gpu.Tiles) -> None:
+    """`test_a_cooperative_tile_holds_check_1_with_its_hooks`'s check at one case and forward tile,
+    interpreted on a CPU and compiled on a Hopper GPU."""
     spec = CASES[case]
     pinned = {grouped_matmul.MosaicGmm: forward, grouped_matmul.MosaicTgmm: COOPERATIVE}
     with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic"), tuning.pinned(pinned):
@@ -989,16 +996,29 @@ def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiproc
         assert len(decided) == 1, steps
 
 
+BALANCED_TAILS = ((320, 128, 2816), (200, 128, 2816), (320, 256, 1408))
+"""The dense kernel gradients' rows, depth and width whose 11 output tiles leave a Hopper part of 8
+multiprocessors' last wave at most half full: at rows a step does not divide, and at a tile of 256 x 128."""
+
+
 @runs("sm90")
 @pytest.mark.parametrize("out_dtype", [jnp.bfloat16, jnp.float32], ids=["bf16", "fp32, exact sums"])
-@pytest.mark.parametrize(("rows", "depth", "width"), [(320, 128, 2816), (200, 128, 2816), (320, 256, 1408)])
+@pytest.mark.parametrize(("rows", "depth", "width"), BALANCED_TAILS)
 def test_a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width, out_dtype):
     """A dense kernel gradient on a Hopper part of 8 multiprocessors whose 11 output tiles leave its last
     wave at most half full (`mosaic_gpu.balanced_tail`, its hand-off unmeasured, so the tail is taken at
     these few steps a tile): its tail's steps balanced over the programs, a program's range crossing a tile's
     boundary, each tile fixed up across them, on par with XLA's over the draws (check 1), truth float64's;
     at rows a step does not divide, and at a tile of 256 x 128; into fp32 at the highest precision too, its
-    programs' partials exactly summed (`templates.product.promoted`) and added by IEEE adds."""
+    programs' partials exactly summed (`templates.product.promoted`) and added by IEEE adds. It runs on an
+    H100 too (tests/test_gpu_gemm.py)."""
+    a_dense_kernel_gradients_balanced_tail_holds_check_1(rows, depth, width, out_dtype)
+
+
+def a_dense_kernel_gradients_balanced_tail_holds_check_1(rows: int, depth: int, width: int,
+                                                         out_dtype) -> None:
+    """`test_a_dense_kernel_gradients_balanced_tail_holds_check_1`'s check at one shape and output dtype,
+    interpreted on a CPU and compiled on a Hopper GPU."""
     draw = _dense_draw(rows, depth, width, cotangent=True)
     target = dataclasses.replace(generation.gpu_target("sm90"), multiprocessors=8, measured={})
     spec = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)

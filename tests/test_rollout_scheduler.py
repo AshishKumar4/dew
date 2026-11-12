@@ -251,10 +251,10 @@ class Recording(RolloutScheduler):
         super().__init__(*arguments, **options)
         self.before_first, self.calls = before_first, []
 
-    def __call__(self, state, batch, key):
+    def __call__(self, state, batch, key, further=None, *, objective):
         if not self.calls:
             self.before_first()
-        packed = super().__call__(state, batch, key)
+        packed = super().__call__(state, batch, key, further, objective=objective)
         self.calls.append((bits(state), np.asarray(batch["task_id"]), packed))
         return packed
 

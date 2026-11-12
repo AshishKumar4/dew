@@ -1226,7 +1226,7 @@ def test_a_global_position_is_read_by_any_process_count(tmp_path):
     count that wrote it."""
     trainer = make_trainer(tmp_path)
     trainer.fit(dataset(), steps=1, log_every=1)
-    global_position = _position.encode(_position.Global(records=16, order="Counting"))
+    global_position = _position.encode(_position.Global(records=16, order=json.dumps({"read": "counting"})))
     _rewrite_position(trainer, 2, [global_position, global_position], shares=[[0, 2], [1, 2]])
 
     assert Checkpoints(str(tmp_path / "run")).restore(step=2, share=DataPartition())[1] == global_position
@@ -1505,7 +1505,7 @@ class NoisedTargets:
     def __init__(self):
         self.steps: list[int] = []
 
-    def __call__(self, state, batch, key):
+    def __call__(self, state, batch, key, *, objective):
         self.steps.append(int(state.step))
         noise = np.asarray(jax.random.normal(key, np.shape(batch["y"])), np.float32)
         return {**batch, "y": np.asarray(batch["y"]) + np.float32(0.01) * (1 + int(state.step)) * noise}

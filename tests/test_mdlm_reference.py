@@ -102,6 +102,34 @@ def test_the_nelbo_and_its_gradient_are_mdlms():
                                 "MDLM's NELBO")
 
 
+def test_the_loss_is_every_positions_mean_of_the_terms_evaluation_reports_under_the_weights_it_is_handed():
+    """The training loss is the batch's per-token NELBO terms averaged over every position, masked or
+    not, and evaluation reports those terms, zero where a token stayed visible, each of weight one, under
+    the averaged weights it is handed: so a validation pass's perplexity is exp of this bound per token.
+    On the fixture's weights with one token masked of 64 (`Step.tape`), every other term is zero, so the
+    mean is that term over 64, a power of two: the same number however the reduction sums. The terms
+    themselves are MDLM's (`test_the_nelbo_and_its_gradient_are_mdlms`)."""
+    model = objective()
+    variables = {"params": {"hidden": jnp.asarray(REFERENCE["hidden"]),
+                            "head": jnp.asarray(REFERENCE["head"])}}
+    tokens = jnp.asarray(REFERENCE["tokens"], jnp.int32)
+    batch = {"text": tokens}
+    tape = {"times": jnp.full(tokens.shape[0], 0.5), "mask": jnp.zeros(tokens.shape, bool).at[1, 5].set(True)}
+    step = Step(jnp.asarray(0), jax.random.key(0), None, tape=tape)
+
+    terms = model.evaluate(variables, batch, step)
+    np.testing.assert_array_equal(terms.weights, 1.0)
+    term = terms.losses[1, 5]
+    assert term > 0 and np.count_nonzero(terms.losses) == 1
+    loss, _ = model.scalar_loss(variables, batch, step)
+    np.testing.assert_array_equal(loss, term / tokens.size)
+
+    averaged = jax.tree.map(lambda leaf: 1.5 * leaf, variables)
+    handed = model.evaluate(variables, batch, Step(jnp.asarray(0), jax.random.key(0), averaged, tape=tape))
+    np.testing.assert_array_equal(handed.losses, model.evaluate(averaged, batch, step).losses)
+    assert not np.array_equal(handed.losses, terms.losses)
+
+
 def test_the_masked_metrics_count_the_masked_tokens_and_the_right_ones():
     """The step's masked accuracy and masked fraction, each a count over a count, on the fixture's draw:
     the masked tokens the reference's corruption masked, and those its float64 logits rank first."""

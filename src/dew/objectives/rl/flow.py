@@ -36,7 +36,7 @@ from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inspection import INSPECTED
 from dew.nn.precision import at_least_fp32, weighted_total
-from dew.objectives.base import OMITTED, Aux, Omitted, Ratio, Shown, Step
+from dew.objectives.base import OMITTED, Aux, Objective, Omitted, Ratio, Shown, Step, own_objective
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms
@@ -197,15 +197,21 @@ class FlowGRPOObjective(DiffusionObjective):
         """
         latents, following, times, next_times = self._window(batch)
         old = jax.lax.stop_gradient(jnp.asarray(batch[OLD_LOG_PROBS_KEY], jnp.float32))
-        mask = jax.lax.stop_gradient(jnp.asarray(batch["transition_mask"], jnp.bool_))
+        real = (self.row_weights(batch, times.shape[0]) > 0)[:, None]
+        raw_mask = jax.lax.stop_gradient(jnp.asarray(batch["transition_mask"], jnp.bool_))
         advantages = jax.lax.stop_gradient(jnp.asarray(batch[ADVANTAGES_KEY], jnp.float32))
-        if old.shape != times.shape or mask.shape != times.shape:
+        if old.shape != times.shape or raw_mask.shape != times.shape:
             raise ValueError("old_log_probs and transition_mask must mark every transition")
         if advantages.shape == times.shape[:1]:
             advantages = jnp.broadcast_to(advantages[:, None], times.shape)
         if advantages.shape != times.shape:
             raise ValueError("advantages must hold one value per trajectory or per transition")
-        advantages = jnp.clip(advantages, -self.adv_clip_max, self.adv_clip_max)
+        expanded = real.reshape(times.shape[0], *(1,) * (latents.ndim - 1))
+        latents = jnp.where(expanded, latents, 0)
+        following = jnp.where(expanded, following, 0)
+        mask = raw_mask & real
+        old = jnp.where(mask, old, 0)
+        advantages = jnp.where(mask, jnp.clip(advantages, -self.adv_clip_max, self.adv_clip_max), 0)
         # A watched step's policy calls return what they sow, through its guidance's own outputs
         # (`Guidance`), so the step summarizes the forward that trains.
         opened = (INSPECTED,) if step.watched is not None else ()
@@ -249,7 +255,7 @@ class FlowGRPOObjective(DiffusionObjective):
         if self.beta > 0:
             metrics["transition_kl"] = kl / denominator
         if REWARDS_KEY in batch:
-            metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
+            metrics["reward"] = self.row_mean(jnp.asarray(batch[REWARDS_KEY], jnp.float32), batch).mean()[0]
         # The policy's forward at each trajectory's first transition, its own trained call's.
         inspected = None if sown is None else jax.tree.map(lambda summary: summary[0], sown).get(
             INSPECTED, {})
@@ -375,7 +381,8 @@ class GroupedRollout:
 
         return jax.tree.map(repeat, batch), owned, count
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch:
+    def __call__[LossT, EffectsT](self, state: TrainState, batch: Batch, key: jax.Array, *,
+                                  objective: Objective[LossT, EffectsT]) -> Batch:
         """Collect one batch of samples and return this process's training rows.
 
         It expands each prompt into its group, generates on every process,
@@ -383,6 +390,7 @@ class GroupedRollout:
         generation into training rows (`_training_rows`). The processes agree
         that each phase succeeded before the next collective runs.
         """
+        own_objective(type(self).__name__, self.objective, objective)
         # The text a reward reads stays on each host (`split_fields`); the rest is placed. Every process
         # agrees which host fields there are before any of them gathers them.
         batch, host = split_fields(batch)

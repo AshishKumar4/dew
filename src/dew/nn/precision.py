@@ -13,20 +13,12 @@ their operands bf16 instead (`bf16_dot_general`, which the dot family runs
 for it): an A100 computes the algorithm wrong where a dot has a vector side
 or sits below XLA's GEMM rewrite threshold.
 
-On a CPU, every process sums each float32 contraction Dew forms (its dot family, `float32_dot_general`,
-`float32_einsum` and `float32_matmul`, a layer's projection, a grouped GEMM's ragged dot) whose
-precision keeps its float32 operands whole (DEFAULT, HIGH, HIGHEST, `FP32_SUMS`) in blocks, each
-block's products one FMA chain, the blocks' sums added as a pairwise tree (`dew.nn.pairwise`,
-`accumulated`), where XLA:CPU's one chain an output grew its error with the contraction (row 4863). The
-block is the longest whose rounding path is no longer than a vectorized dot's on the host, read from
-its float32 vector lanes (16 with AVX-512, 8 with AVX or AVX2 or an x86 CPU stating no flags, 4
-otherwise), so a product's bits are the host's, as a BLAS dot's are, and the program's (`dew.nn.pairwise`:
-two programs summing one row agree by check 1, testing.md's row 3177). A precision that narrows the operands
-(TF32, bf16 parts) or widens them (F64), a quantized module's product and a library's product that states its
-own derivative keep XLA's sum; a GPU's and a TPU's products are their backend's. Dew's test processes run wide
-CPU arithmetic instead (`WIDE_CPU_ARITHMETIC`, which tests/lane_environment.py sets): a CPU sums those
-products in float64 and rounds once, outside a scope stating `FP32_SUMS`, which sums them as every
-process's CPU does.
+On a CPU, a float32 contraction's sums are XLA's own, one sequential FMA chain an output, on every mesh,
+which GSPMD partitions natively (row 5448: CPU is not where Dew competes, and a blocked sum of Dew's own
+reached a product whole on one device alone). A GPU's and a TPU's products are their backend's. Dew's test
+processes run wide CPU arithmetic instead (`WIDE_CPU_ARITHMETIC`, which tests/lane_environment.py sets): a
+CPU sums those products in float64 and rounds once, outside a scope stating `FP32_SUMS`, which sums them
+as every process's CPU does.
 Convolutions, depthwise ones included, keep XLA's fp32 sum on a CPU: no convolution's check 1
 failed there, and XLA:CPU's float64 convolution cost a 3x3 one's training step 44 times (15.5 to
 675 ms on a 4x32x32x128 map), its best rewrite 2 to 4. Should a convolution's check 1 resolve above
@@ -60,7 +52,7 @@ from dew.nn.derivatives import (
     surrogate,
 )
 from dew.nn.nested import nested
-from dew.nn.programs import UNROUNDED, equations, purely_called, ragged_layout
+from dew.nn.programs import UNROUNDED, equations
 from dew.nn.sharding import explicit_spec
 
 __all__ = [
@@ -559,15 +551,10 @@ def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
 def accumulated(product: Callable[..., jax.Array], *operands,
                 preferred_element_type: DTypeLike | None = None) -> jax.Array:
     """`product(*operands, preferred_element_type=...)`, a sum of products of `operands` (a dot, an
-    einsum, a matmul): where a CPU runs one of JAX's contractions (`CONTRACTIONS`) of float32 operands,
-    each of its float32 products summed as a vectorized dot sums it (`_summed_pairwise`: a layer's
-    projection's sum, `projection_product`, row 4863), the algebra's derived products and a mixer's
-    alike: sums that cancel each other (attention's dP and D on a one-key row) cancel bit for bit only
-    where both sum in one order, and XLA's one FMA chain left a Mamba layer's chunk einsums apart from
-    their sources' (Jamba's and Falcon-H1's logits and gradients). Elsewhere the plain product, but in a
-    process running wide CPU arithmetic
-    (`WIDE_CPU_ARITHMETIC`, Dew's tests), where they multiply in float32 (`products_dtype`) a CPU
-    sums the products in float64 and rounds the sum once to the dtype the product returns.
+    einsum, a matmul): the plain product, XLA's own sum on every platform (row 5448), but in a process
+    running wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`, Dew's tests), where they multiply in float32
+    (`products_dtype`) a CPU sums the products in float64 and rounds the sum once to the dtype the
+    product returns.
     Each fp32 product is exact in float64, so the result is within half an fp32 ulp of the float64
     sum at every shape, where XLA's CPU dot chooses its fp32 accumulation by shape, instruction set
     and release (jax 0.12's sums twice numpy's error from float64 at widths where jax 0.11's summed
@@ -584,9 +571,8 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     and its backward, read from the trace that gives the product's dtype (`_own_backward`).
 
     The wide sum is Dew's test setting, not a user option: a process without `WIDE_CPU_ARITHMETIC`
-    traces the blocked sum on a CPU and the plain product elsewhere. Under it, it is real CPU execution's
-    policy alone, chosen by the
-    platform the program is lowered for
+    traces the plain product. Under it, it is real CPU execution's policy alone, chosen by the platform
+    the program is lowered for
     (`platform_dependent`), which keys every compiled program: a step a CPU lowers for a GPU target
     (`dew.training.trainer.Trainer.lower_for`, `lowering_platforms=('cuda',)`) takes the target's
     fp32 sum, and a Pallas kernel's body, interpreted on a CPU to stand in for a GPU, never forms its
@@ -599,15 +585,8 @@ def accumulated(product: Callable[..., jax.Array], *operands,
         *multiplied, _ = operands
         if _sums_in_float64(*multiplied):
             return _summed_wide(product, preferred_element_type, *operands, counts=1)
-        if (all(isinstance(operand, jax.Array | np.ndarray) for operand in multiplied)
-                and products_dtype(*multiplied) == jnp.dtype(jnp.float32)):
-            return _summed_pairwise(product, preferred_element_type, *operands)
         return product(*operands, preferred_element_type=preferred_element_type)
     if not _sums_in_float64(*operands):
-        if ((key := _contraction(product, preferred_element_type)) is not None
-                and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
-                and products_dtype(*operands) == jnp.dtype(jnp.float32)):
-            return _traced_once(key, _summed_pairwise)(*operands)
         return product(*operands, preferred_element_type=preferred_element_type)
     if (key := _contraction(product, preferred_element_type)) is not None:
         return _traced_once(key, _summed_wide)(*operands)
@@ -620,63 +599,6 @@ def _ragged(product: Callable) -> bool:
     while isinstance(product, functools.partial) and type(product) is functools.partial:
         product = product.func
     return product is jax.lax.ragged_dot_general
-
-
-def projection_product(product: Callable, lhs, rhs, dimension_numbers, precision,
-                       preferred_element_type, group_sizes=None) -> jax.Array | None:
-    """A layer's projection (`product`, its own `jax.lax.dot_general`, as `projections.dot_general` takes a
-    layer's product past the template) of float32 operands into float32, summed as a vectorized dot sums it
-    where a CPU runs it (`pairwise.pairwise_dot_general`, row 4863) and as `product` sums it on any other
-    platform; None where `product` is the CPU's sum already (Dew's wide test arithmetic, `_sums_in_float64`),
-    a quantized model's rule matching its module owns it (`products_quantized`; a module the rules leave alone
-    sums as the plain model's), its declared algorithm narrows the operands (`exact_products`: its own product
-    keeps the declaration), or its dtypes are others. Every float32 contraction `accumulated` sums takes it
-    too (`_paired`). With `group_sizes`, `product` is a ragged dot (`jax.lax.ragged_dot_general`, its
-    `dimension_numbers` the ragged ones) of a grouped GEMM's layout (`programs.ragged_layout`), summed so by
-    `pairwise.pairwise_ragged_dot_general`; None for any other form."""
-    from dew.nn import pairwise
-
-    if (_sums_in_float64(lhs, rhs) or products_quantized() or not exact_products(precision, jnp.float32)
-            or jnp.dtype(preferred_element_type or jnp.float32) != jnp.float32
-            or not all(isinstance(operand, jax.Array | np.ndarray) and operand.dtype == jnp.float32
-                       for operand in (lhs, rhs))
-            or (group_sizes is not None
-                and ragged_layout(jnp.ndim(lhs), jnp.ndim(rhs), dimension_numbers) is None)):
-        return None
-
-    if group_sizes is not None:
-        def plain_grouped(lhs, rhs, sizes):
-            return product(lhs, rhs, sizes, dimension_numbers, precision=precision,
-                           preferred_element_type=preferred_element_type)
-
-        # Placed where the ragged product is (its `out_sharding`, a mesh with Explicit axes stating it).
-        placement = product.keywords.get('out_sharding') if isinstance(product, functools.partial) else None
-        blocked_grouped = functools.partial(pairwise.pairwise_ragged_dot_general,
-                                            ragged_dot_dimension_numbers=dimension_numbers,
-                                            precision=precision, out_sharding=placement)
-        return jax.lax.platform_dependent(lhs, rhs, group_sizes, cpu=blocked_grouped, default=plain_grouped)
-
-    def plain(lhs, rhs):
-        return product(lhs, rhs, dimension_numbers, precision=precision,
-                       preferred_element_type=preferred_element_type)
-
-    blocked = functools.partial(pairwise.pairwise_dot_general, dimension_numbers=dimension_numbers,
-                                precision=precision)
-    return jax.lax.platform_dependent(lhs, rhs, cpu=blocked, default=plain)
-
-
-def projected(product: Callable) -> Callable:
-    """`product`, a layer's projection (a `jax.lax.dot_general`), summed on a CPU as `projection_product` sums
-    it where that takes it: whether or not the GEMM template's dispatch runs it (`projections.dot_general`,
-    which a wrapper's scope skips: an adapter's, `dew.nn.dense.intercepted`), a layer's projection is summed
-    alike."""
-    def summed(lhs, rhs, dimension_numbers, precision=None, preferred_element_type=None, **kwargs):
-        if not kwargs and (projection := projection_product(
-                product, lhs, rhs, dimension_numbers, precision, preferred_element_type)) is not None:
-            return projection
-        return product(lhs, rhs, dimension_numbers, precision=precision,
-                       preferred_element_type=preferred_element_type, **kwargs)
-    return summed
 
 
 CONTRACTIONS = (jnp.einsum, jnp.matmul, jnp.dot, jnp.tensordot, jnp.vdot, jnp.inner, jax.lax.dot_general)
@@ -727,7 +649,7 @@ def _contraction(product: Callable, preferred_element_type) -> tuple | None:
 
 @functools.lru_cache(maxsize=1024)
 def _traced_once(key: tuple, summed: Callable) -> Callable:
-    """`summed` (`_summed_wide`, `_summed_pairwise`) of the contraction `key` names (`_contraction`) as one
+    """`summed` (`_summed_wide`) of the contraction `key` names (`_contraction`) as one
     program JAX traces once for its operands' types: a gated delta net layer's portable chunked math sums
     some 64 contractions a call, each traced afresh at about 6.6 ms (the wide sum, its derivative and the
     narrow one each traced again), 130 s of a decision witness's trace under Dew's test arithmetic (row
@@ -737,56 +659,6 @@ def _traced_once(key: tuple, summed: Callable) -> Callable:
     arguments, keywords, preferred_element_type = jax.tree.unflatten(tree, leaves)
     product = functools.partial(function, *arguments, **keywords)
     return nested(functools.partial(summed, product, preferred_element_type))
-
-
-def _summed_pairwise(product: Callable, preferred_element_type, *operands) -> jax.Array:
-    """`accumulated`'s product of float32 operands: its trace's float32 products each summed as a layer's
-    projection's is (`_paired`); the plain product where its library states its derivative
-    (`_own_backward`)."""
-    narrow = functools.partial(product, preferred_element_type=preferred_element_type)
-    traced = jax.make_jaxpr(narrow)(*operands)
-    if _own_backward(traced.jaxpr):
-        return narrow(*operands)
-    (summed,) = _paired(traced.jaxpr, traced.consts, *operands)
-    return summed
-
-
-def _paired(jaxpr: core.Jaxpr, consts: Sequence, *operands) -> list:
-    """`jaxpr` evaluated on `operands`, each `dot_general` in it, a call's program's included where the
-    call does nothing but run it (`dew.nn.programs.purely_called`: `jnp.einsum`'s jit), and each grouped
-    GEMM's `ragged_dot_general`, the product `projection_product` takes where it takes it: a CPU's
-    vectorized-dot sum of float32 operands into float32. A call that does more than its program (a custom
-    batching rule's, a checkpoint's, in a product's own callback) is bound as it is, its rule kept."""
-    values = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, operands, strict=True))
-
-    def read(atom):
-        return atom.val if isinstance(atom, core.Literal) else values[atom]
-
-    for equation in jaxpr.eqns:
-        given = [read(atom) for atom in equation.invars]
-        params = equation.params
-        product = functools.partial(jax.lax.dot_general, out_sharding=params.get("out_sharding"))
-        made, body = None, purely_called(equation)
-        if equation.primitive is jax.lax.dot_general_p:
-            made = projection_product(product, given[0], given[1], params["dimension_numbers"],
-                                      params["precision"], params["preferred_element_type"])
-        elif (equation.primitive is core.primitives.ragged_dot_general_p
-              and params.get("group_offset") is None):
-            made = projection_product(
-                functools.partial(jax.lax.ragged_dot_general, out_sharding=params.get("out_sharding")),
-                given[0], given[1], params["ragged_dot_dimension_numbers"], params["precision"],
-                params["preferred_element_type"], group_sizes=given[2])
-        if made is not None:
-            outputs = [made]
-        elif body is not None:
-            outputs = _paired(body, body.consts, *given)
-        else:
-            # As JAX evaluates an equation (`jax.core.eval_jaxpr`): its context, its bind's parameters.
-            with equation.ctx.manager:
-                made = equation.primitive.bind(*given, **equation.primitive.get_bind_params(params))
-            outputs = made if equation.primitive.multiple_results else [made]
-        values.update(zip(equation.outvars, outputs, strict=True))
-    return [read(atom) for atom in jaxpr.outvars]
 
 
 def _summed_wide(product: Callable, preferred_element_type, *operands, counts: int = 0) -> jax.Array:

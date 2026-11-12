@@ -310,11 +310,14 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
                 raise ValueError(f"PPO requires response-aligned {column} from the rollout")
         policy_step = replace(step, ema=None if step.ema is None else part(step.ema, "policy"))
         pg, aux = self.actor.loss(part(variables, "policy"), batch, policy_step)
-        mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
+        raw_mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
+        real = (self.row_weights(batch, raw_mask.shape[0]) > 0)[:, None]
+        mask = jnp.where(real, raw_mask, 0)
         values, critic_qk = self._critic_scores(variables, batch, qk_stats=step.qk_stats,
                                                 progress=self.progress(step))
-        terms = clipped_value_loss_terms(values, jnp.asarray(batch[RETURNS_KEY]),
-                                         jnp.asarray(batch[OLD_VALUES_KEY]), self.value_clip)
+        returns = jnp.where(real, jnp.asarray(batch[RETURNS_KEY], values.dtype), 0)
+        old_values = jnp.where(real, jnp.asarray(batch[OLD_VALUES_KEY], values.dtype), 0)
+        terms = clipped_value_loss_terms(values, returns, old_values, self.value_clip)
         critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), jnp.sum(mask))
         metrics = {**aux.metrics, "critic/loss": critic.mean()[0]}
         qk = None if aux.qk_stats is None else {"policy": aux.qk_stats}
@@ -460,10 +463,11 @@ class PPORollout:
                 RETURNS_KEY: placed_returns.reshape(shape)}
 
     def __call__(
-        self, state: TrainState, batch: Mapping[str, object], key: jax.Array
+        self, state: TrainState, batch: Mapping[str, object], key: jax.Array, *, objective: PPOObjective
     ) -> dict[str, np.ndarray]:
-        """Collect one cohort of episodes and return its packed rows with critic targets."""
-        projected = self.rollout(state, batch, key)
+        """Collect one cohort of episodes for a step of `objective`, the one the step trains (its phase's,
+        `dew.training.phase_passes`), and return its packed rows with its critic's targets."""
+        projected = self.rollout(state, batch, key, objective=objective)
         episodes = len(task_ids(batch)) * self.groups
         count = sum(from_every_process(min(2, int(np.count_nonzero(projected[RESPONSE_MASK_KEY])))))
         if int(count) == 0:
@@ -476,7 +480,7 @@ class PPORollout:
         device = agreed(
             "PPO critic inputs", lambda: projected if mesh is None else shard_batch(mesh, projected)
         )
-        critic = self.objective.program("values", self.objective.values)
+        critic = objective.program("values", objective.values)
         # The critic at the run's committed updates, the progress its loss trains it at (ledger 3008).
         values = agreed("PPO critic values",
                         lambda: local_rows(critic(state.variables, device, Progress(state.updates))))

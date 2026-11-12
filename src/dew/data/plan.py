@@ -20,7 +20,7 @@ import numpy as np
 
 from dew import _checkout
 from dew._hashing import array_header
-from dew._position import PER_SHARE
+from dew._position import PER_SHARE, PLAN, unplaced
 from dew._records import ADDED, JSON, integer, json_value, listed, record, set_added, strings, without_removed
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
@@ -161,6 +161,22 @@ def callable_name(step: Callable[..., Batch]) -> str:
     return f"{kind.__module__}.{kind.__qualname__}"
 
 
+def reader_name(reader: Callable[..., Batch], declared: str | None) -> str | None:
+    """What the reader a batch encoder runs computes, as the encoder's identity states it: `declared`
+    where the encoder is given it, else a module function's qualified name (`callable_name`), or a
+    configured object's method's, whose object's dependencies the encoder's identity records
+    (`_dependencies`). Any other reader, a partial, a lambda, a function defined in another, another
+    object's method or callable, computes what its binding says, which no name holds: None, an encoder
+    of it a step of no stable identity (`StepIdentity.of`), which trains as any step does and which an
+    exact resume or a cache refuses until the encoder is given what it computes (`declared`)."""
+    if declared is not None:
+        return declared
+    named = inspect.isfunction(reader) and "<" not in reader.__qualname__
+    if named or (inspect.ismethod(reader) and isinstance(reader.__self__, _Dependencies)):
+        return callable_name(reader)
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class StepIdentity:
     """What a step computes (`semantic`), and the bytes of each external
@@ -185,10 +201,13 @@ class StepIdentity:
         module = kind.__module__
         name = f"{module}.{kind.__qualname__}"
         frozen = dataclasses.is_dataclass(step) and not isinstance(step, type)
+        # A step that declares its identity and states none (a batch encoder of a reader no name holds,
+        # `reader_name`) computes what no record holds.
+        stating = identity is None and isinstance(step, _DeclaredIdentity)
         declared = identity or (step.identity if isinstance(step, _DeclaredIdentity) else None)
         config = repr(step) if frozen else declared or name
         unstable = any(marker in name or marker in config for marker in ("<lambda>", "<locals>", " at 0x"))
-        exact = bool(declared) or (not unstable and (frozen or inspect.isfunction(step)))
+        exact = bool(declared) or (not stating and not unstable and (frozen or inspect.isfunction(step)))
         external = not module.startswith("dew.")
         path = (
             None if inspect.isbuiltin(step) or kind.__module__ == "builtins" else inspect.getsourcefile(kind)
@@ -241,7 +260,7 @@ class StepIdentity:
 
 @runtime_checkable
 class _DeclaredIdentity(Protocol):
-    identity: str
+    identity: str | None
 
 
 @runtime_checkable
@@ -471,16 +490,6 @@ def same_order(saved: str, current: str) -> bool:
     return unplaced(json.loads(saved)) == unplaced(json.loads(current))
 
 
-def unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
-    """`order` without its sources' descriptions, which name where a host
-    mounted them, its corpora's and phases' included."""
-    if isinstance(order, dict):
-        return {name: unplaced(value) for name, value in order.items() if name != "source"}
-    if isinstance(order, list):
-        return [unplaced(value) for value in order]
-    return order
-
-
 _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
 """A limit's record in an order's stages (`Limit`'s repr)."""
 
@@ -497,7 +506,7 @@ def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[s
     from dew.data.mixing import COUNTER, CUT_COUNTS
     from dew.data.pipeline import CONSUMED, REFUSED
 
-    written = record(saved.get("dew_data_plan"), "saved data plan")
+    written = record(saved.get(PLAN), "saved data plan")
     iterator = json_value(saved.get("iterator"), "saved Grain iterator")
 
     def counted(branch: JSON) -> JSON:

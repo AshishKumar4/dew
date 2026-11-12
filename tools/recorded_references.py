@@ -141,7 +141,8 @@ class _Records:
 
 def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, store_inputs: bool = True,
                 summary: bool = False, dew=None, start: int = FEWEST_SEEDS,
-                examples: bool = False, scale=None, ahead: int = 1) -> dict[str, np.ndarray]:
+                examples: bool = False, scale=None, ahead: int = 1,
+                judged: bool = False) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
     reference's outputs and their float64 truth (dicts), and `proxy(inputs)` (with `truth_proxy`) a function
     that can run here, which plans the count. With no proxy, the recorded reference alone sizes the count,
@@ -159,7 +160,9 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
     + REDRAW) times the seeds are gigabytes. With `dew(inputs)`, Dew's own outputs on a seed's inputs, the
     recorded reference confirms the count paired, as check 1's verdict pairs it (`seeds_for`'s `dew_fn`), for
     a site whose errors are heavy-tailed across draws alike in both arms (a lognormal training sigma), where
-    the reference compared with itself on other draws never resolves. A site whose GPU paired sizing needs
+    the reference compared with itself on other draws never resolves. With `judged`, the recording is the
+    arm the site's check 1 judges and `dew` its reference (another library running what Dew exports for it),
+    and the count is confirmed with the two in those places. A site whose GPU paired sizing needs
     more seeds than the recording CPU's declares that count through `start`: the recording confirms it here
     and keeps its whole redraw. A site whose leaves stack independent examples (`examples`) is sized as its
     verdict judges it. A site that declares the weighed check (`assert_as_exact`'s `conditioning`) gives
@@ -189,13 +192,18 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
             return np.int32(seed), record(int(seed))[0]
 
         ensure(staged_units(planned))
-        # The recorded reference is read by index from the host's records, as given.
+        # The recorded arm is read by index from the host's records, as given; it is the reference, Dew's
+        # run beside it the arm judged, or with `judged` the other way round, as the site's verdict has them.
+        recorded = as_given(lambda index, inputs: record(int(index))[1])
+        live = None if dew is None else as_given(lambda index, inputs: dew(inputs))
+        if judged and (live is None or scale is not None):
+            raise ValueError(f"{label}: a recording judged takes `dew`, the reference it is judged against, "
+                             f"and no `scale`, which is a recorded reference's own")
+        reference, arm = (live, recorded) if judged else (recorded, live)
         try:
-            confirmed = seeds_for(as_given(lambda index, inputs: record(int(index))[1]), recorded_draw, label,
-                                  start=start,
+            confirmed = seeds_for(reference, recorded_draw, label, start=start,
                                   truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
-                                  dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)),
-                                  examples=examples)
+                                  dew_fn=arm, examples=examples)
         except Inconclusive:
             # A weighed site whose unweighted sizing never resolves declares the cap (docs/design/testing.md).
             if scale is None:
@@ -212,10 +220,9 @@ def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, sto
             return scales[seed]
 
         if scale is not None:
-            weighed = seeds_for(as_given(lambda index, inputs: record(int(index))[1]), recorded_draw, label,
-                                start=start, truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
-                                dew_fn=None if dew is None else as_given(lambda index, inputs: dew(inputs)),
-                                conditioning=True,
+            weighed = seeds_for(recorded, recorded_draw, label, start=start,
+                                truth_fn=as_given(lambda index, inputs: record(int(index))[2]),
+                                dew_fn=live, conditioning=True,
                                 conditioning_scale=lambda inputs, seed: scaled(int(inputs[0])))
             # The weighed check draws its own stages' seeds from the first, as the unweighted check does.
             kept = max(kept, staged_units(weighed))

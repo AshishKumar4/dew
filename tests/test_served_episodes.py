@@ -1,6 +1,7 @@
 """An episode cohort served in process (`EpisodeCollector.kv_cache`): its turns run through the serving
 engine, each turn prefilling only what follows its row's last, and draw what the policy draws whole."""
 
+import hashlib
 import logging
 from contextlib import contextmanager
 from dataclasses import replace
@@ -121,9 +122,10 @@ def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
     """A cohort of conversations served over a paged cache, each turn's context continuing its row's last
     (the server reading that history's pages, and an attention-and-delta-net hybrid its recurrent state,
     and prefilling the rest), draws what the policy draws prefilling every turn whole: every context and
-    action token for token, greedy and sampled alike (the key stream folded by the global row, however a
-    prompt was split), and the likelihoods it draws them with on par with the whole policy's, by check 1
-    against the actions teacher-forced in the float64 twin, over drawn weights."""
+    action token for token on every draw check 1 takes, greedy and sampled alike (the key stream folded
+    by the global row, however a prompt was split), and the likelihoods it draws them with on par with
+    the whole policy's, by check 1 against the actions teacher-forced in the float64 twin, over drawn
+    weights."""
     model = MODELS[kind]()
     initialized = jax.jit(model.init)
 
@@ -132,19 +134,18 @@ def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
 
     served = collector(model, draw(0)[0], sampling, kv_cache=KVCache(page_size=2))
     whole = collector(model, draw(0)[0], sampling)
-    for seed in range(4):
-        ours, theirs = collected(served, *draw(seed)), collected(whole, *draw(seed))
-        np.testing.assert_array_equal(ours["contexts"], theirs["contexts"])
-        np.testing.assert_array_equal(ours["tokens"], theirs["tokens"])
-
     names = ("raw", "behavior") if sampling.temperature else ("raw",)
     truth_score = scored(float64_twin(model), sampling)
+    # Each arm's contexts and actions by the bytes of the weights it drew them over: the draws check 1 takes.
+    discrete: dict[str, dict[bytes, tuple[np.ndarray, np.ndarray]]] = {"served": {}, "whole": {}}
 
-    def likelihoods(arm):
+    def likelihoods(arm, name):
         @as_given
         def run(variables):
             drawn = collected(arm, variables)
-            return {name: drawn[name] for name in names}
+            key = hashlib.sha256(b"".join(np.asarray(leaf).tobytes() for leaf in jax.tree.leaves(variables)))
+            discrete[name][key.digest()] = (drawn["contexts"], drawn["tokens"])
+            return {held: drawn[held] for held in names}
         return run
 
     @as_given
@@ -155,8 +156,13 @@ def test_a_served_cohort_draws_what_its_policy_draws_whole(kind, sampling):
             wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
             return truth_score(wide, drawn["contexts"], drawn["tokens"])
 
-    assert_as_exact(likelihoods(served), likelihoods(whole), draw, f"served {kind} episodes",
-                    seeds=SEEDS, truth_fn=truth)
+    assert_as_exact(likelihoods(served, "served"), likelihoods(whole, "whole"), draw,
+                    f"served {kind} episodes", seeds=SEEDS, truth_fn=truth)
+    # Every draw the served arm took, the whole one took too.
+    assert discrete["served"].keys() <= discrete["whole"].keys() and len(discrete["served"]) >= SEEDS
+    for key, (contexts, tokens) in discrete["served"].items():
+        np.testing.assert_array_equal(contexts, discrete["whole"][key][0])
+        np.testing.assert_array_equal(tokens, discrete["whole"][key][1])
 
 
 def test_a_served_row_whose_context_does_not_continue_its_last_turn_is_prefilled_whole(caplog):

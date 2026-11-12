@@ -453,7 +453,8 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
 
     rollout = RolloutScheduler.sampled(objective, reward, groups=2, max_new_tokens=4,
                                        sampling=Sampling(temperature=0, eos_token_ids=eos, pad_token_id=12))
-    result = rollout(SimpleNamespace(variables=params, step=0, updates=0), batch, jax.random.key(1))
+    result = rollout(SimpleNamespace(variables=params, step=0, updates=0), batch, jax.random.key(1),
+                     objective=objective)
     assert seen[:2] == [("a", "", "1", "")] * 2
     for index, (_, text, _, _) in enumerate(seen):
         chain = session_chain(result, "input_ids", index)
@@ -487,7 +488,7 @@ def test_a_synchronous_collection_draws_from_the_policy_at_the_runs_updates():
     rollout = RolloutScheduler.sampled(objective, lambda text, record: 1.0, groups=2, max_new_tokens=3,
                                        sampling=Sampling(temperature=0))
     held = {updates: rollout(SimpleNamespace(variables=params, step=0, updates=updates), prompts(),
-                             jax.random.key(1)) for updates in (0, 5)}
+                             jax.random.key(1), objective=objective) for updates in (0, 5)}
     assert not np.array_equal(held[0]["old_log_probs"], held[5]["old_log_probs"])
 
 
@@ -576,7 +577,8 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     def rolled_from(key):
         run_key = jax.random.split(key)[1]
         rollout_key = jax.random.fold_in(jax.random.fold_in(run_key, 0), 1)
-        return rollout(SimpleNamespace(variables=params, step=0, updates=0), batch, rollout_key)
+        return rollout(SimpleNamespace(variables=params, step=0, updates=0), batch, rollout_key,
+                       objective=objective)
 
     def draw(seed):
         """A key and the rollout the trainer's first step takes from it, realized once, in float32."""
@@ -730,8 +732,8 @@ def test_a_rollout_draws_the_same_rows_from_a_legacy_key_as_from_its_typed_one()
         lambda episode: float(sum(sum(turn.action.tokens) for turn in episode.transitions) % 5),
         objective=objective, max_prompt_tokens=4, max_new_tokens=4, max_turns=1, groups=2, sampling=sampling)
     for rollout, batch in ((sampled, prompts()), (episodes, {"task_id": np.array([31], np.int32)})):
-        typed = rollout(state, batch, jax.random.key(3))
-        legacy = rollout(state, batch, jax.random.PRNGKey(3))
+        typed = rollout(state, batch, jax.random.key(3), objective=objective)
+        legacy = rollout(state, batch, jax.random.PRNGKey(3), objective=objective)
         assert typed.keys() == legacy.keys()
         for name in typed:
             np.testing.assert_array_equal(np.asarray(typed[name]), np.asarray(legacy[name]))
