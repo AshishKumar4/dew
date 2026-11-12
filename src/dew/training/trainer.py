@@ -1106,8 +1106,8 @@ class Trainer(Generic[Loss, Effects]):
         if complete:
             return state
         if self._config is not None:
-            # Read under the parameters' logical axes, as the update reads them (`declaring`).
-            with boxed(self._boxed_axes()):
+            # Read under the axes the modules boxed, a stage-local run's stacked by stage, as `_groups` reads.
+            with self._staging.held(boxed(self._boxed_axes())):
                 run.update_flops = self._config.update_flops(state.variables["params"])
         compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]] = run.compiled
         seen = 0
