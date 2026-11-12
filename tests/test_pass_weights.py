@@ -39,6 +39,16 @@ EXAMPLES = [Example(state, {"team": INTENT}, {"team": label})
                                  ("double charge", "billing"), ("cannot log in", "technical"))]
 
 
+def drawn(init, *inputs):
+    """A check's draw of variables: `init` (an objective's or a model's, over `inputs`) at each seed's key,
+    one program."""
+    compiled = jax.jit(init)
+
+    def draw(seed):
+        return (nn.unbox(compiled(jax.random.key(seed), *inputs)),)
+    return draw
+
+
 def looped(implicit: bool = False, steps: int = STEPS) -> CausalTransformer:
     """A tiny decoder whose middle layer runs `steps` passes before its last layer, a coda every pass
     exits through; `implicit` takes each later pass by the θ-method (`Loop.implicit`), which reads each
@@ -83,10 +93,7 @@ def test_an_lm_loss_weighing_its_passes_is_each_pass_models_loss_at_its_weight(w
     model = looped(implicit)
     stated = PassWeights.of(weights).over(STEPS)
     tokens = jnp.asarray(np.random.default_rng(0).integers(0, 256, (2, 17)), jnp.int32)
-    init = jax.jit(model.init)
-
-    def draw(seed):
-        return (nn.unbox(init(jax.random.key(seed), tokens[:, :-1])),)
+    draw = drawn(model.init, tokens[:, :-1])
 
     label = f"pass-weighed LM loss ({weights}, {'θ' if implicit else 'explicit'})"
     assert_as_exact(jax.jit(lm_loss(model, weights, tokens)), jax.jit(by_passes(model, stated, tokens)), draw,
@@ -135,8 +142,9 @@ def test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_wei
     reader = decision_rows([NEGATED, NEGATED], None, objective=weighed.data(), tokens=LAYOUT.max_len)
     [batch] = list(itertools.islice(reader.train(DataPartition()), 1))
     step = Step(jnp.asarray(0), jax.random.key(0), None)
-    init = jax.jit(weighed.init)
-    stats, _ = weighed.loss(nn.unbox(init(jax.random.key(0))), batch, step)
+    draw = drawn(weighed.init)
+    (variables,) = draw(0)
+    stats, _ = weighed.loss(variables, batch, step)
     assert float(stats.terms[1].total) > 0.0, "the group's divergence has support"
 
     def loss_of(objective):
@@ -156,8 +164,6 @@ def test_a_decision_loss_weighing_its_passes_is_each_pass_models_loss_at_its_wei
             return loss, grad
         return run
 
-    def draw(seed):
-        return (nn.unbox(init(jax.random.key(seed))),)
 
     assert_as_exact(jax.jit(loss_of(weighed)), jax.jit(apart(model)), draw, "pass-weighed decision loss",
                     seeds=PASS_SEEDS, truth_fn=jax.jit(apart(float64_twin(model), float64_twin(head))))
@@ -262,10 +268,7 @@ def test_an_lm_loss_weighing_a_cut_loops_passes_is_its_exits_loss_at_their_weigh
     model = looped().clone(loop=Loop(STEPS, layers=(1, 2), backprop_steps=1))
     weights = (0.2, 0.3, 0.5)
     tokens = jnp.asarray(np.random.default_rng(3).integers(0, 256, (2, 17)), jnp.int32)
-    init = jax.jit(model.init)
-
-    def draw(seed):
-        return (nn.unbox(init(jax.random.key(seed), tokens[:, :-1])),)
+    draw = drawn(model.init, tokens[:, :-1])
 
     assert_as_exact(jax.jit(lm_loss(model, weights, tokens)), jax.jit(cut_loop_loss(model, weights, tokens)),
                     draw, "pass-weighed LM loss under a cut", seeds=PASS_SEEDS,
@@ -432,10 +435,7 @@ def test_a_qk_clip_reads_every_scored_exits_head():
             return jax.tree.map(lambda *leaves: jnp.max(jnp.stack(leaves), axis=0), *map(maxima, found))
         return run
 
-    init = jax.jit(weighed.init)
-
-    def draw(seed):
-        return (nn.unbox(init(jax.random.key(seed))),)
+    draw = drawn(weighed.init)
 
     assert_as_exact(jax.jit(sown), jax.jit(apart(model)), draw, "every exit's head QK maxima",
                     seeds=PASS_SEEDS, truth_fn=jax.jit(apart(float64_twin(model))))

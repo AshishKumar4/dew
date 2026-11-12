@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING
@@ -94,6 +94,19 @@ def perturb(generator: torch.Generator, scale: float, *modules: torch.nn.Module)
         for module in modules:
             for parameter in module.parameters():
                 parameter.add_(scale * torch.randn(parameter.shape, generator=generator))
+
+
+def seeded[M: torch.nn.Module](build: Callable[[], M], seed: int) -> tuple[M, torch.Generator]:
+    """`build`'s module drawn from `seed`, each parameter moved off its draw by 0.1 times a standard normal
+    from `seed + 1` (`perturb`) and rounded to bfloat16's grid (`on_bfloat16_grid`): a generator's model,
+    its weights a bfloat16 run reads exactly and away from any initialization's symmetry. With it the
+    `seed + 1` stream where the perturbation left it, which a generator's inputs draw on from."""
+    torch.manual_seed(seed)
+    module = build()
+    generator = torch.Generator().manual_seed(seed + 1)
+    perturb(generator, 0.1, module)
+    on_bfloat16_grid(module)
+    return module, generator
 
 
 def on_bfloat16_grid(*modules: torch.nn.Module) -> None:

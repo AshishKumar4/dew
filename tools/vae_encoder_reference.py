@@ -48,16 +48,13 @@ def walk(encoder, image, probe, dtype):
 
 def main():
     # The generator's siblings, beside it where it runs (tests/test_models.py imports `walk` alone).
-    from diffusers_reference_helpers import on_bfloat16_grid, perturb
+    from diffusers_reference_helpers import seeded
     from reference_source import saved_fixture
 
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
     torch.set_num_threads(1)
-    torch.manual_seed(SEED)
-    encoder = AutoencoderKL.from_config(CONFIG).encoder.eval()
-    perturb(torch.Generator().manual_seed(SEED + 1), 0.1, encoder)
-    on_bfloat16_grid(encoder)
+    encoder, _ = seeded(lambda: AutoencoderKL.from_config(CONFIG).encoder.eval(), SEED)
     arrays = {f"param.{name}": value.detach().numpy().astype(ml_dtypes.bfloat16).view(np.uint16)
               for name, value in encoder.named_parameters()}
     meta = {"diffusers": __import__("diffusers").__version__, "torch": torch.__version__, "config": CONFIG,
