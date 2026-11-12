@@ -9,7 +9,9 @@ import fractions
 import functools
 import math
 
+import jax
 import numpy as np
+from jax.extend.core import primitives
 from op_certificates import (
     DTYPES,
     EXP_RANGE,
@@ -25,6 +27,8 @@ from op_certificates import (
     stepped as oc_stepped,
     two_sum,
 )
+
+from dew.nn.precision import correctly_rounded_divide_p
 
 STORAGE = {"float32": np.uint32, "bfloat16": np.uint16}
 """Each format's storage bits, which a move of data is compared by."""
@@ -47,7 +51,8 @@ class Lane:
     subnormals unless `--xla_gpu_ftz` is set. A move of data, a sign operation (neg, abs) and a cast
     between float formats are bit manipulation: they keep subnormals on every lane.
 
-    `reach`: by rounding primitive and format, the largest level (`LEVELS`) of the lane's own results
+    `reach`: by rounding primitive (the object, JAX's own) and format, the largest level (`LEVELS`) of
+    the lane's own results
     over its probes (`_probes`): 0 where every one was its exact value rounded to nearest, 1 where each
     was one of the two neighbours of its exact value on the lane's grid (faithful), n where each was
     within n - 1 steps of the grid past them; a division by a size-1 broadcast divisor its own form's
@@ -58,13 +63,13 @@ class Lane:
     a subnormal argument where its multiply reads one as zero (ledger 4023). Each is held as a lane that
     keeps subnormals (`flushes_in`)."""
     flushes: bool
-    reach: dict[tuple[str, str], int]
-    kept: frozenset[tuple[str, str]] = frozenset()
+    reach: dict[tuple[object, str], int]
+    kept: frozenset[tuple[object, str]] = frozenset()
 
-    def flushes_in(self, name: str, fmt: Format) -> bool:
-        """Whether the rounding primitive `name` flushes in `fmt` on this lane: the lane's, but where it
-        reads a subnormal operand as it is (`kept`)."""
-        return self.flushes and (name, fmt.name) not in self.kept
+    def flushes_in(self, primitive, fmt: Format) -> bool:
+        """Whether the rounding `primitive` flushes in `fmt` on this lane: the lane's, but where it reads a
+        subnormal operand as it is (`kept`)."""
+        return self.flushes and (primitive, fmt.name) not in self.kept
 
 
 def _grid_index(value, fmt: Format, flushes: bool) -> np.ndarray:
@@ -93,8 +98,6 @@ def _inexact(dtype) -> bool:
 
 def _host(value):
     """A value on the host: an array as NumPy's, a typed key as it is (its bits are its data)."""
-    import jax
-
     if jax.dtypes.issubdtype(getattr(value, "dtype", np.float32), jax.dtypes.prng_key):
         return value
     return np.asarray(value)
@@ -460,8 +463,8 @@ def _remainder(dividend, divisor):
     return np.where(divisor == 0, dividend, np.where(defined, remainders, 0))
 
 
-def _rounding(name: str, integral):
-    """A rounding primitive's contract: each float result's level (`LEVELS[name]`) within the lane's
+def _rounding(primitive, integral):
+    """A rounding primitive's contract: each float result's level (`LEVELS[primitive]`) within the lane's
     reach for it (`lane`); an integer result bit for bit (`integral`), where the primitive has one."""
     def contract(params, operands, result, fmt):
         if fmt is None:
@@ -470,9 +473,10 @@ def _rounding(name: str, integral):
         # A division by a divisor broadcast along a size-1 axis of its own rank is held at that form's own
         # reach (`BROADCAST`); a scalar divisor's (a literal's, ledger 1402) is the division's.
         divisor = np.shape(operands[-1])
-        broadcast = name == "div" and len(divisor) == np.ndim(result) and divisor != np.shape(result)
-        reach = measured.reach[name + BROADCAST if broadcast else name, fmt.name]
-        return LEVELS[name](operands, result, fmt, measured.flushes_in(name, fmt)) <= reach
+        broadcast = (primitive is jax.lax.div_p and len(divisor) == np.ndim(result)
+                     and divisor != np.shape(result))
+        reach = measured.reach[(primitive, BROADCAST) if broadcast else primitive, fmt.name]
+        return LEVELS[primitive](operands, result, fmt, measured.flushes_in(primitive, fmt)) <= reach
     return contract
 
 
@@ -480,16 +484,16 @@ def _correctly_divided(params, operands, result, fmt):
     """Dew's correctly rounded division's contract (`dew.nn.precision.correctly_rounded_divide_p`): its exact
     quotient rounded to nearest, whatever the lane's own division reaches, a subnormal operand read as the
     lane's division reads it and a subnormal quotient kept, which it never flushes."""
-    hi, lo = _quotient(*_floats(operands, lane().flushes_in("div", fmt)))
+    hi, lo = _quotient(*_floats(operands, lane().flushes_in(jax.lax.div_p, fmt)))
     return _same(np.asarray(result, np.float64), rounded_on_lane(hi, lo, fmt, flushes=False))
 
 
-BROADCAST = " broadcast"
+BROADCAST = "broadcast"
 """A division's form whose divisor is broadcast along a size-1 axis within the one equation (lax's implicit
-broadcast), its reach measured apart (`lane`): XLA on the CPU computes it as a multiply by the divisor's
-reciprocal, two roundings. A divisor broadcast by an equation of its own (`broadcast_in_dim`) reaches its
-division materialized, which check 2 runs alone and the lane rounds correctly (row 4011: none of 2048
-such quotients off, though the same jitted whole was off at 545)."""
+broadcast), its reach measured apart (`lane`, under `(jax.lax.div_p, BROADCAST)`): XLA on the CPU computes
+it as a multiply by the divisor's reciprocal, two roundings. A divisor broadcast by an equation of its
+own (`broadcast_in_dim`) reaches its division materialized, which check 2 runs alone and the lane rounds
+correctly (row 4011: none of 2048 such quotients off, though the same jitted whole was off at 545)."""
 
 
 def _product(a, b):
@@ -612,8 +616,6 @@ def _scatter_targets(params, operand, indices, updates):
     placed on `scatter_dims_to_operand_dims` and the operand's batching axes, clamped so the window fits
     (the clip mode) or dropped whole where it does not (every other mode), then offset by the update's
     window coordinates on the operand's axes a window keeps."""
-    import jax
-
     numbers = params["dimension_numbers"]
     clip = params["mode"] == jax.lax.GatherScatterMode.CLIP
     window_axes = [axis for axis in range(operand.ndim)
@@ -777,8 +779,6 @@ def _integer_power(params, operands, result, fmt):
 
 
 def _keyed(value) -> bool:
-    import jax
-
     dtype = getattr(value, "dtype", None)
     return dtype is not None and jax.dtypes.issubdtype(dtype, jax.dtypes.prng_key)
 
@@ -847,7 +847,7 @@ def _softmax_held(params, operands, results, fmt) -> list[np.ndarray]:
     held = [_same(np.asarray(results[0], np.float64), peak)]
     nan = np.any(np.isnan(logits), -1)
     u, lost = fmt.unit_roundoff, _underflow(fmt)
-    reach = 2 * u * lane().reach["exp", fmt.name]
+    reach = 2 * u * lane().reach[jax.lax.exp_p, fmt.name]
     empty = peak == -np.inf
     with np.errstate(invalid="ignore", over="ignore"):
         shifted = np.where(empty[..., None], 0.0, logits - peak[..., None])
@@ -895,8 +895,6 @@ def _moved(oracle):
     subnormals and NaN payloads kept. A move of PRNG keys moves their data: each word of a key's data moved
     as its keys are (`oracle` over that word of every keyed operand), so its every word is held."""
     def contract(params, operands, result, fmt):
-        import jax
-
         if _keyed(result):
             words = np.asarray(jax.random.key_data(result))
             data = [np.asarray(jax.random.key_data(value)) if _keyed(value) else None for value in operands]
@@ -1037,8 +1035,6 @@ def _gathered(params, operand, indices):
     its batching axes, clamped so the slice fits (the clip and promise-in-bounds modes) or the whole slice
     the fill value where it does not (fill-or-drop), then offset by the output's offset coordinates on the
     operand's axes a slice keeps."""
-    import jax
-
     numbers = params["dimension_numbers"]
     sizes, mode = tuple(params["slice_sizes"]), params["mode"]
     fill = jax.lax.GatherScatterMode.FILL_OR_DROP
@@ -1154,8 +1150,6 @@ def _rounded_to(params, value) -> np.ndarray:
 def _rounded_integral(params, value) -> np.ndarray:
     """lax.round's result: each value's nearest integer, a tie away from zero or to even
     (`rounding_method`), in the value's type, its sign kept."""
-    import jax
-
     value = np.asarray(value)
     wide = value.astype(np.float64)
     if params["rounding_method"] == jax.lax.RoundingMethod.TO_NEAREST_EVEN:
@@ -1193,8 +1187,6 @@ def _logical_shift(direction):
 def _random_bits(params, operands, result, fmt):
     """Random bits are integers, whatever program computes them: the bits a separate `jax.random.bits`
     of the same key draws under the equation's own context, bit for bit."""
-    import jax
-
     (key,) = operands
     dtype = np.dtype(f"uint{params['bit_width']}")
     expected = jax.jit(lambda key: jax.random.bits(key, params["shape"], dtype))(key)
@@ -1210,22 +1202,16 @@ def _unset(params, operands, result, fmt):
 
 def _wrapped(params, operands, result, fmt):
     """A key wrapped from its data: the key's data is the operand, bit for bit."""
-    import jax
-
     return _bits(np.asarray(jax.random.key_data(result))) == _bits(operands[0])
 
 
 def _unwrapped(params, operands, result, fmt):
-    import jax
-
     return _bits(result) == _bits(np.asarray(jax.random.key_data(operands[0])))
 
 
 def _seeded(params, operands, result, fmt):
     """A key made from a seed is integers: its data is a separate `jax.random.key` of the seed's, of the
     equation's own implementation, bit for bit."""
-    import jax
-
     expected = jax.random.key_data(jax.random.key(operands[0], impl=params["impl"]))
     return _bits(np.asarray(jax.random.key_data(result))) == _bits(np.asarray(expected))
 
@@ -1233,31 +1219,29 @@ def _seeded(params, operands, result, fmt):
 def _folded(params, operands, result, fmt):
     """A key folded with data is integers: its data is a separate `jax.random.fold_in` of the same key and
     data's, bit for bit."""
-    import jax
-
     key, data = operands
     expected = jax.jit(jax.random.fold_in)(key, data)
     return _bits(np.asarray(jax.random.key_data(result))) == _bits(np.asarray(jax.random.key_data(expected)))
 
 
 LEVELS = {
-    "add": _arithmetic(two_sum),
-    "sub": _arithmetic(lambda a, b: two_sum(a, -b)),
-    "mul": _arithmetic(_product),
-    "square": _arithmetic(lambda a: _product(a, a)),
-    "div": _arithmetic(_quotient),
-    "sqrt": _arithmetic(_root),
-    "log": _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
-    "exp": _transcendental(_exp_interval, _exp_special),
-    "log1p": _transcendental(_near_zero_interval(lambda iv, x: iv.log(1 + x)), _log1p_special),
-    "expm1": _transcendental(_expm1_interval, _expm1_special),
-    "erf_inv": _transcendental(_erfinv_enclosed, _erfinv_special),
-    "rsqrt": _transcendental(_interval(lambda iv, x: 1 / iv.sqrt(x)), _rsqrt_special),
-    "logistic": _transcendental(_logistic_interval, _logistic_special),
+    jax.lax.add_p: _arithmetic(two_sum),
+    jax.lax.sub_p: _arithmetic(lambda a, b: two_sum(a, -b)),
+    jax.lax.mul_p: _arithmetic(_product),
+    jax.lax.square_p: _arithmetic(lambda a: _product(a, a)),
+    jax.lax.div_p: _arithmetic(_quotient),
+    jax.lax.sqrt_p: _arithmetic(_root),
+    jax.lax.log_p: _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
+    jax.lax.exp_p: _transcendental(_exp_interval, _exp_special),
+    jax.lax.log1p_p: _transcendental(_near_zero_interval(lambda iv, x: iv.log(1 + x)), _log1p_special),
+    jax.lax.expm1_p: _transcendental(_expm1_interval, _expm1_special),
+    jax.lax.erf_inv_p: _transcendental(_erfinv_enclosed, _erfinv_special),
+    jax.lax.rsqrt_p: _transcendental(_interval(lambda iv, x: 1 / iv.sqrt(x)), _rsqrt_special),
+    jax.lax.logistic_p: _transcendental(_logistic_interval, _logistic_special),
     # mpmath's interval sine and cosine reduce their argument at the enclosure's own precision, rigorously:
     # an argument too large for it leaves the enclosure wide, undecided, and its precision is raised.
-    "sin": _transcendental(_interval(lambda iv, x: iv.sin(x)), _sin_special),
-    "cos": _transcendental(_interval(lambda iv, x: iv.cos(x)), _cos_special),
+    jax.lax.sin_p: _transcendental(_interval(lambda iv, x: iv.sin(x)), _sin_special),
+    jax.lax.cos_p: _transcendental(_interval(lambda iv, x: iv.cos(x)), _cos_special),
 }
 """Each rounding primitive's measure, `levels(operands, result, fmt, flushes) -> level`, element by
 element, on a lane that flushes or not: 0 where the result is its exact value rounded to nearest (an
@@ -1272,8 +1256,8 @@ it is a finding there, and the probes grow; few enough that the transcendentals'
 one interval evaluation each, take seconds once a process."""
 
 
-def _probes(name: str, fmt: Format) -> list[np.ndarray]:
-    """PROBES operands of the rounding primitive `name` in `fmt`, over its domain at every scale its
+def _probes(primitive, fmt: Format) -> list[np.ndarray]:
+    """PROBES operands of the rounding `primitive` in `fmt`, over its domain at every scale its
     results reach: sums of every alignment, a quarter of them nearly cancelling; products and quotients
     from about 2^-140 (subnormal on a lane that keeps subnormals) to 2^126; roots of every binade,
     subnormals included; logarithms of every binade, a quarter near one, a quarter in [1, 4) and the
@@ -1285,25 +1269,25 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     and a quarter across a few periods; and each transcendental at its exact value (exp(0), log(1),
     erf_inv(0), logistic(0), sin(0), cos(0)), which a lane must return exactly. One fixed draw per primitive
     and format."""
-    rng = np.random.default_rng([*name.encode(), fmt.precision])
+    rng = np.random.default_rng([*primitive.name.encode(), fmt.precision])
     quarter = PROBES // 4
 
     def scaled(low: int, high: int) -> np.ndarray:
         signs = rng.choice([-1.0, 1.0], PROBES)
         return signs * rng.uniform(1, 2, PROBES) * 2.0 ** rng.integers(low, high, PROBES)
 
-    if name in ("add", "sub"):
+    if primitive in (jax.lax.add_p, jax.lax.sub_p):
         a, b = scaled(-30, 30), scaled(-30, 30)
         near = a[:quarter] * (1 + rng.uniform(-2.0 ** -10, 2.0 ** -10, quarter))
-        b[:quarter] = -near if name == "add" else near
+        b[:quarter] = -near if primitive is jax.lax.add_p else near
         drawn = [a, b]
-    elif name in ("mul", "square"):
-        drawn = [scaled(-70, 63) for _ in range(1 if name == "square" else 2)]
-    elif name == "div":
+    elif primitive in (jax.lax.mul_p, jax.lax.square_p):
+        drawn = [scaled(-70, 63) for _ in range(1 if primitive is jax.lax.square_p else 2)]
+    elif primitive is jax.lax.div_p:
         drawn = [scaled(-70, 63), scaled(-63, 70)]
-    elif name == "sqrt":
+    elif primitive is jax.lax.sqrt_p:
         drawn = [np.abs(scaled(-149, 127))]
-    elif name == "log":
+    elif primitive is jax.lax.log_p:
         value = np.abs(scaled(-126, 127))
         value[:quarter] = 1 + rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         # A quarter where a logsumexp's sums of exponentials sit, and XLA:CPU's float32 log a step past
@@ -1313,12 +1297,12 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
         value[1] = np.float32(np.uint32(0x402C81FC).view(np.float32))
         value[0] = 1.0
         drawn = [value]
-    elif name in ("exp", "logistic"):
+    elif primitive in (jax.lax.exp_p, jax.lax.logistic_p):
         value = rng.uniform(-104, 89, PROBES)
         value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         value[0] = 0.0
         drawn = [value]
-    elif name in ("log1p", "expm1"):
+    elif primitive in (jax.lax.log1p_p, jax.lax.expm1_p):
         # Every normal binade near zero, where the functions are their argument to within a last bit (their
         # enclosures' precision raised there, `_near_zero_interval`); a quarter densest across (-0.5, 1),
         # where XLA's log1p rounds farthest, and out to 8; and their domains' reach: log1p's down to just
@@ -1326,17 +1310,17 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
         # lane reads as its own primitive does (`Lane.flushes_in`: XLA:CPU's expm1 keeps one its multiply
         # flushes, ledger 4023).
         value = scaled(fmt.emin - fmt.precision + 1, 0)
-        value[quarter:2 * quarter] = (rng.uniform(-1, 0, quarter) if name == "log1p"
+        value[quarter:2 * quarter] = (rng.uniform(-1, 0, quarter) if primitive is jax.lax.log1p_p
                                       else rng.uniform(-104, 89, quarter))
         value[2 * quarter:3 * quarter] = rng.uniform(-0.5, 1, quarter) * 2.0 ** rng.integers(0, 4, quarter)
         value[3 * quarter:] = np.abs(scaled(0, 127))[:PROBES - 3 * quarter]
         value[0] = 0.0
         drawn = [value]
-    elif name == "rsqrt":
+    elif primitive is jax.lax.rsqrt_p:
         value = np.abs(scaled(-149, 127))
         value[:quarter] = 4.0 ** rng.integers(-74, 64, quarter)
         drawn = [value]
-    elif name in ("sin", "cos"):
+    elif primitive in (jax.lax.sin_p, jax.lax.cos_p):
         # Every binade from 2^-30 to 2^20, the angles a rotary table reaches, and a quarter across a few
         # periods, where the functions turn.
         value = scaled(-30, 21)
@@ -1353,28 +1337,33 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
 
 
 SUBNORMAL_OPERANDS = {
-    "add": lambda tiny: (tiny, tiny), "sub": lambda tiny: (tiny, -tiny),
-    "mul": lambda tiny: (tiny, 2.0 ** 100), "div": lambda tiny: (tiny, 2.0 ** -100),
-    "sqrt": lambda tiny: (tiny,), "rsqrt": lambda tiny: (tiny,),
-    "log": lambda tiny: (tiny,), "log1p": lambda tiny: (tiny,), "expm1": lambda tiny: (-tiny,),
-    "erf_inv": lambda tiny: (tiny,), "sin": lambda tiny: (tiny,),
+    jax.lax.add_p: lambda tiny: (tiny, tiny), jax.lax.sub_p: lambda tiny: (tiny, -tiny),
+    jax.lax.mul_p: lambda tiny: (tiny, 2.0 ** 100), jax.lax.div_p: lambda tiny: (tiny, 2.0 ** -100),
+    jax.lax.sqrt_p: lambda tiny: (tiny,), jax.lax.rsqrt_p: lambda tiny: (tiny,),
+    jax.lax.log_p: lambda tiny: (tiny,), jax.lax.log1p_p: lambda tiny: (tiny,),
+    jax.lax.expm1_p: lambda tiny: (-tiny,),
+    jax.lax.erf_inv_p: lambda tiny: (tiny,), jax.lax.sin_p: lambda tiny: (tiny,),
 }
 """Each rounding primitive's operands at a subnormal `tiny` whose result tells a subnormal read as it is from
 one read as zero (`lane`'s `kept`); exp, logistic, square and cos return the same result either way, so a
 lane's flushing holds them as it holds every other operation."""
 
 
-def _keeps_subnormals(name: str, fmt: Format) -> bool:
-    """Whether the lane's `name` in `fmt` reads a subnormal operand as it is: its result at
-    `SUBNORMAL_OPERANDS`' subnormal differs from its result with that operand zero."""
-    import jax
+def _function(primitive):
+    """`jax.lax`'s function of a rounding primitive, which bears the primitive's own name: what binds it
+    with the parameters it needs (a transcendental's `accuracy`)."""
+    return getattr(jax.lax, primitive.name)
 
+
+def _keeps_subnormals(primitive, fmt: Format) -> bool:
+    """Whether the lane's `primitive` in `fmt` reads a subnormal operand as it is: its result at
+    `SUBNORMAL_OPERANDS`' subnormal differs from its result with that operand zero."""
     tiny = 2.0 ** (fmt.emin - 4)
-    subnormal = [np.asarray(value, DTYPES[fmt.name]) for value in SUBNORMAL_OPERANDS[name](tiny)]
+    subnormal = [np.asarray(value, DTYPES[fmt.name]) for value in SUBNORMAL_OPERANDS[primitive](tiny)]
     # Each subnormal zeroed with its sign, as a lane that flushes it reads it.
     zeroed = [np.asarray(np.copysign(0.0, value) if abs(float(value)) == tiny else value, DTYPES[fmt.name])
-              for value in SUBNORMAL_OPERANDS[name](tiny)]
-    run = getattr(jax.lax, name)
+              for value in SUBNORMAL_OPERANDS[primitive](tiny)]
+    run = _function(primitive)
     return bool(np.any(_bits(np.asarray(run(*subnormal))) != _bits(np.asarray(run(*zeroed)))))
 
 
@@ -1386,131 +1375,126 @@ def lane() -> Lane:
     (`LEVELS`) of the lane's own results on its probes (`_probes`), each operation run as `certified`
     runs it, eagerly and alone, at the primitive's own flushing. A lane result that breaks an exact case
     (UNREACHED) is a finding no reach admits, raised here."""
-    import jax
-
     flushes = float(jax.lax.mul(np.float32(2.0 ** -140), np.float32(2.0 ** 100))) == 0.0
-    kept = frozenset((name, fmt.name) for name in SUBNORMAL_OPERANDS for fmt in FORMATS.values()
-                     if flushes and _keeps_subnormals(name, fmt))
+    kept = frozenset((primitive, fmt.name) for primitive in SUBNORMAL_OPERANDS for fmt in FORMATS.values()
+                     if flushes and _keeps_subnormals(primitive, fmt))
     measured = Lane(flushes, {}, kept)
     reach = measured.reach
-    for name, levels in LEVELS.items():
+    for primitive, levels in LEVELS.items():
         for fmt in FORMATS.values():
-            operands = _probes(name, fmt)
-            # Each primitive is `jax.lax`'s function of its own name.
-            found = levels(operands, np.asarray(getattr(jax.lax, name)(*operands)), fmt,
-                           measured.flushes_in(name, fmt))
+            operands = _probes(primitive, fmt)
+            found = levels(operands, np.asarray(_function(primitive)(*operands)), fmt,
+                           measured.flushes_in(primitive, fmt))
             if np.any(found == UNREACHED):
                 at = int(np.argmax(found == UNREACHED))
-                raise ArithmeticError(f"the lane's {name} in {fmt.name} breaks an exact case at "
+                raise ArithmeticError(f"the lane's {primitive.name} in {fmt.name} breaks an exact case at "
                                       f"{[operand[at] for operand in operands]}")
-            reach[name, fmt.name] = int(np.max(found))
+            reach[primitive, fmt.name] = int(np.max(found))
     for fmt in FORMATS.values():
         # A division whose divisor is broadcast along a size-1 axis, a row's scale's, which XLA on the CPU
         # computes as a multiply by the divisor's reciprocal, two roundings: measured as a form of its own.
-        dividend, divisor = _probes("div", fmt)
+        dividend, divisor = _probes(jax.lax.div_p, fmt)
         rows = PROBES // 32
         operands = [dividend[:rows * 32].reshape(rows, 32), divisor[:rows].reshape(rows, 1)]
-        found = LEVELS["div"](operands, np.asarray(jax.lax.div(*operands)), fmt,
-                              measured.flushes_in("div", fmt))
+        found = LEVELS[jax.lax.div_p](operands, np.asarray(jax.lax.div(*operands)), fmt,
+                                      measured.flushes_in(jax.lax.div_p, fmt))
         if np.any(found == UNREACHED):
             raise ArithmeticError(f"the lane's broadcast div in {fmt.name} breaks an exact case")
-        reach["div" + BROADCAST, fmt.name] = int(np.max(found))
+        reach[(jax.lax.div_p, BROADCAST), fmt.name] = int(np.max(found))
     return measured
 
 
 CONTRACTS = {
-    "add": _rounding("add", _wrapping(np.add)),
+    jax.lax.add_p: _rounding(jax.lax.add_p, _wrapping(np.add)),
     # A cotangents' sum, the add its transpose emits, lowered as `add` is: held at add's reach.
-    "add_any": _rounding("add", _wrapping(np.add)),
-    "sub": _rounding("sub", _wrapping(np.subtract)),
-    "mul": _rounding("mul", _wrapping(np.multiply)),
-    "square": _rounding("square", _wrapping(lambda a: a * a)),
-    "div": _rounding("div", _truncated),
-    "correctly_rounded_divide": _correctly_divided,
+    primitives.add_jaxvals_p: _rounding(jax.lax.add_p, _wrapping(np.add)),
+    jax.lax.sub_p: _rounding(jax.lax.sub_p, _wrapping(np.subtract)),
+    jax.lax.mul_p: _rounding(jax.lax.mul_p, _wrapping(np.multiply)),
+    jax.lax.square_p: _rounding(jax.lax.square_p, _wrapping(lambda a: a * a)),
+    jax.lax.div_p: _rounding(jax.lax.div_p, _truncated),
+    correctly_rounded_divide_p: _correctly_divided,
     # A remainder (C's, the dividend's sign) is exact in IEEE arithmetic and in integers, and a sign is a
     # sign operation, each kept zero's sign: bit for bit.
-    "rem": _moved(lambda params, a, b: _remainder(a, b)),
-    "sign": _moved(lambda params, a: np.where(a == 0, a, np.sign(a))),
-    "sqrt": _rounding("sqrt", None),
-    "neg": _moved(lambda params, a: -a),
-    "abs": _moved(lambda params, a: np.abs(a)),
-    "max": _extreme(_signed_max, np.maximum),
-    "min": _extreme(_signed_min, np.minimum),
-    "convert_element_type": _converted,
-    "log": _rounding("log", None),
-    "exp": _rounding("exp", None),
-    "log1p": _rounding("log1p", None),
-    "expm1": _rounding("expm1", None),
-    "erf_inv": _rounding("erf_inv", None),
-    "rsqrt": _rounding("rsqrt", None),
-    "logistic": _rounding("logistic", None),
-    "sin": _rounding("sin", None),
-    "cos": _rounding("cos", None),
-    "reduce_sum": _reduced_sum,
-    "cumsum": _cumulative,
-    "dot_general": _dot,
-    "eq": _compared(lambda params, a, b: np.equal(a, b)),
-    "ne": _compared(lambda params, a, b: np.not_equal(a, b)),
-    "lt": _compared(lambda params, a, b: np.less(a, b)),
-    "le": _compared(lambda params, a, b: np.less_equal(a, b)),
-    "gt": _compared(lambda params, a, b: np.greater(a, b)),
-    "ge": _compared(lambda params, a, b: np.greater_equal(a, b)),
-    "and": _moved(lambda params, a, b: np.bitwise_and(a, b)),
-    "or": _moved(lambda params, a, b: np.bitwise_or(a, b)),
-    "not": _moved(lambda params, a: np.invert(a)),
-    "shift_right_logical": _moved(_logical_shift(1)),
-    "shift_left": _moved(_logical_shift(-1)),
-    "bitcast_convert_type": _moved(_bitcast),
-    "reduce_and": _moved(lambda params, a: np.all(a, axis=tuple(params["axes"]))),
-    "reduce_or": _moved(lambda params, a: np.any(a, axis=tuple(params["axes"]))),
-    "reduce_max": _extremum(_signed_max, _integral_extremum(np.max, "max")),
-    "reduce_min": _extremum(_signed_min, _integral_extremum(np.min, "min")),
-    "select_n": _moved(_selected),
-    "broadcast_in_dim": _moved(_broadcast),
-    "reshape": _moved(_reshaped),
-    "squeeze": _moved(lambda params, a: np.squeeze(a, tuple(params["dimensions"]))),
-    "expand_dims": _moved(lambda params, a: np.expand_dims(a, tuple(params["dimensions"]))),
-    "transpose": _moved(lambda params, a: np.transpose(a, params["permutation"])),
-    "slice": _moved(lambda params, a: a[tuple(slice(start, limit, step) for start, limit, step in zip(
+    jax.lax.rem_p: _moved(lambda params, a, b: _remainder(a, b)),
+    jax.lax.sign_p: _moved(lambda params, a: np.where(a == 0, a, np.sign(a))),
+    jax.lax.sqrt_p: _rounding(jax.lax.sqrt_p, None),
+    jax.lax.neg_p: _moved(lambda params, a: -a),
+    jax.lax.abs_p: _moved(lambda params, a: np.abs(a)),
+    jax.lax.max_p: _extreme(_signed_max, np.maximum),
+    jax.lax.min_p: _extreme(_signed_min, np.minimum),
+    jax.lax.convert_element_type_p: _converted,
+    jax.lax.log_p: _rounding(jax.lax.log_p, None),
+    jax.lax.exp_p: _rounding(jax.lax.exp_p, None),
+    jax.lax.log1p_p: _rounding(jax.lax.log1p_p, None),
+    jax.lax.expm1_p: _rounding(jax.lax.expm1_p, None),
+    jax.lax.erf_inv_p: _rounding(jax.lax.erf_inv_p, None),
+    jax.lax.rsqrt_p: _rounding(jax.lax.rsqrt_p, None),
+    jax.lax.logistic_p: _rounding(jax.lax.logistic_p, None),
+    jax.lax.sin_p: _rounding(jax.lax.sin_p, None),
+    jax.lax.cos_p: _rounding(jax.lax.cos_p, None),
+    jax.lax.reduce_sum_p: _reduced_sum,
+    jax.lax.cumsum_p: _cumulative,
+    jax.lax.dot_general_p: _dot,
+    jax.lax.eq_p: _compared(lambda params, a, b: np.equal(a, b)),
+    jax.lax.ne_p: _compared(lambda params, a, b: np.not_equal(a, b)),
+    jax.lax.lt_p: _compared(lambda params, a, b: np.less(a, b)),
+    jax.lax.le_p: _compared(lambda params, a, b: np.less_equal(a, b)),
+    jax.lax.gt_p: _compared(lambda params, a, b: np.greater(a, b)),
+    jax.lax.ge_p: _compared(lambda params, a, b: np.greater_equal(a, b)),
+    jax.lax.and_p: _moved(lambda params, a, b: np.bitwise_and(a, b)),
+    jax.lax.or_p: _moved(lambda params, a, b: np.bitwise_or(a, b)),
+    jax.lax.not_p: _moved(lambda params, a: np.invert(a)),
+    jax.lax.shift_right_logical_p: _moved(_logical_shift(1)),
+    jax.lax.shift_left_p: _moved(_logical_shift(-1)),
+    jax.lax.bitcast_convert_type_p: _moved(_bitcast),
+    jax.lax.reduce_and_p: _moved(lambda params, a: np.all(a, axis=tuple(params["axes"]))),
+    jax.lax.reduce_or_p: _moved(lambda params, a: np.any(a, axis=tuple(params["axes"]))),
+    jax.lax.reduce_max_p: _extremum(_signed_max, _integral_extremum(np.max, "max")),
+    jax.lax.reduce_min_p: _extremum(_signed_min, _integral_extremum(np.min, "min")),
+    jax.lax.select_n_p: _moved(_selected),
+    jax.lax.broadcast_in_dim_p: _moved(_broadcast),
+    jax.lax.reshape_p: _moved(_reshaped),
+    jax.lax.squeeze_p: _moved(lambda params, a: np.squeeze(a, tuple(params["dimensions"]))),
+    jax.lax.transpose_p: _moved(lambda params, a: np.transpose(a, params["permutation"])),
+    jax.lax.slice_p: _moved(lambda params, a: a[tuple(slice(start, limit, step) for start, limit, step in zip(
         params["start_indices"], params["limit_indices"], params["strides"] or (1,) * a.ndim, strict=True))]),
-    "concatenate": _moved(lambda params, *parts: np.concatenate(parts, axis=params["dimension"])),
-    "copy": _moved(lambda params, a: a),
-    "copy_p": _moved(lambda params, a: a),
-    "optimization_barrier": _moved(lambda params, a: a),
-    "name": _moved(lambda params, a: a),
-    "rev": _moved(lambda params, a: np.flip(a, tuple(params["dimensions"]))),
-    "split": _moved(lambda params, a: a),
-    "pad": _moved(_padded),
-    "iota": _moved(_iota),
-    "gather": _moved(_gathered),
-    "stack": _moved(lambda params, *parts: np.stack(parts, axis=params["axis"])),
-    "dynamic_slice": _moved(_dynamic_sliced),
+    jax.lax.concatenate_p: _moved(lambda params, *parts: np.concatenate(parts, axis=params["dimension"])),
+    jax.lax.copy_p: _moved(lambda params, a: a),
+    jax.lax.optimization_barrier_p: _moved(lambda params, a: a),
+    primitives.name_p: _moved(lambda params, a: a),
+    jax.lax.rev_p: _moved(lambda params, a: np.flip(a, tuple(params["dimensions"]))),
+    jax.lax.split_p: _moved(lambda params, a: a),
+    jax.lax.pad_p: _moved(_padded),
+    jax.lax.iota_p: _moved(_iota),
+    jax.lax.gather_p: _moved(_gathered),
+    jax.lax.stack_p: _moved(lambda params, *parts: np.stack(parts, axis=params["axis"])),
+    jax.lax.dynamic_slice_p: _moved(_dynamic_sliced),
     # Exact functions of a value as the lane's arithmetic reads it (a flushed subnormal a zero).
-    "floor": _moved(lambda params, a: np.floor(_read(a, lane().flushes)).astype(a.dtype)),
-    "nextafter": _moved(lambda params, a, b: np.nextafter(a, b)),
-    "scatter": _moved(_scattered),
-    "scatter-add": _scatter_added,
-    "ragged_dot_general": _ragged_dot,
-    "integer_pow": _integer_power,
-    "sort": _moved(lambda params, part: part),
-    "top_k": _moved(lambda params, part: part),
-    "unstack": _moved(lambda params, part: part),
-    "tile": _moved(lambda params, a: np.tile(a, params["reps"])),
-    "stop_gradient": _moved(lambda params, a: a),
-    "xor": _moved(lambda params, a, b: np.bitwise_xor(a, b)),
+    jax.lax.floor_p: _moved(lambda params, a: np.floor(_read(a, lane().flushes)).astype(a.dtype)),
+    jax.lax.nextafter_p: _moved(lambda params, a, b: np.nextafter(a, b)),
+    jax.lax.scatter_p: _moved(_scattered),
+    jax.lax.scatter_add_p: _scatter_added,
+    primitives.ragged_dot_general_p: _ragged_dot,
+    jax.lax.integer_pow_p: _integer_power,
+    jax.lax.sort_p: _moved(lambda params, part: part),
+    jax.lax.top_k_p: _moved(lambda params, part: part),
+    jax.lax.unstack_p: _moved(lambda params, part: part),
+    jax.lax.tile_p: _moved(lambda params, a: np.tile(a, params["reps"])),
+    jax.lax.stop_gradient_p: _moved(lambda params, a: a),
+    jax.lax.xor_p: _moved(lambda params, a, b: np.bitwise_xor(a, b)),
     # A shift by the operand's width or more (an amount read unsigned) leaves its sign in every bit.
-    "shift_right_arithmetic": _moved(lambda params, a, b: np.right_shift(a, np.minimum(
+    jax.lax.shift_right_arithmetic_p: _moved(lambda params, a, b: np.right_shift(a, np.minimum(
         b.astype(a.dtype).view(f"u{a.dtype.itemsize}").astype(np.uint64), 8 * a.dtype.itemsize - 1)
         .astype(a.dtype))),
-    "round": _moved(_rounded_integral),
-    "reduce_precision": _moved(_rounded_to),
-    "is_finite": _compared(lambda params, a: np.isfinite(a)),
-    "random_seed": _seeded,
-    "random_fold_in": _folded,
-    "random_bits": _random_bits,
-    "empty2": _unset,
-    "random_wrap": _wrapped,
-    "random_unwrap": _unwrapped,
+    jax.lax.round_p: _moved(_rounded_integral),
+    jax.lax.reduce_precision_p: _moved(_rounded_to),
+    jax.lax.is_finite_p: _compared(lambda params, a: np.isfinite(a)),
+    primitives.random_seed_p: _seeded,
+    primitives.random_fold_in_p: _folded,
+    primitives.random_bits_p: _random_bits,
+    primitives.empty2_p: _unset,
+    primitives.random_wrap_p: _wrapped,
+    primitives.random_unwrap_p: _unwrapped,
 }
 """Each primitive's contract, `contract(params, operands, result, fmt) -> ok`, the result's elements
 that hold it, `fmt` the result's float format (None for an integer or boolean result): a rounding
@@ -1528,11 +1512,11 @@ def _piece(params, value, index):
 
 
 RESULT_OPERANDS = {
-    "optimization_barrier": lambda params, operands, index: [operands[index]],
-    "split": lambda params, operands, index: [_piece(params, operands[0], index)],
-    "unstack": lambda params, operands, index: [np.take(operands[0], index, axis=params["axis"])],
-    "sort": lambda params, operands, index: [_sorted(params, operands)[index]],
-    "top_k": lambda params, operands, index: [_top(params, operands[0])[index]],
+    jax.lax.optimization_barrier_p: lambda params, operands, index: [operands[index]],
+    jax.lax.split_p: lambda params, operands, index: [_piece(params, operands[0], index)],
+    jax.lax.unstack_p: lambda params, operands, index: [np.take(operands[0], index, axis=params["axis"])],
+    jax.lax.sort_p: lambda params, operands, index: [_sorted(params, operands)[index]],
+    jax.lax.top_k_p: lambda params, operands, index: [_top(params, operands[0])[index]],
 }
 """The primitives of several results whose each result is a move of its operands of its own position,
 `parts(params, operands, index)`, which its contract reads alone (`_held`): an optimization barrier's i-th
@@ -1550,7 +1534,6 @@ def certified(fn, *arguments) -> tuple:
     time, each step's equations by the step's path, and a call of one of JAX's high-level primitives as the
     program JAX lowers it to (`float64_terms.lowered`), so no equation is held as a call it cannot open.
     This certifies the op-by-op program; a fused program's internals are check 1's."""
-    import jax
     from float64_terms import evaluated_on, lowered, walked
 
     closed, shape = jax.make_jaxpr(fn, return_shape=True)(*arguments)
@@ -1591,8 +1574,8 @@ _OBSERVING: list[list] = []
 
 @contextlib.contextmanager
 def observing():
-    """Every equation `certified` holds within, `(name, params, operands, results)` in the order held: what
-    each contract was given (`_held`), read where it is given."""
+    """Every equation `certified` holds within, `(primitive, params, operands, results)` in the order held:
+    what each contract was given (`_held`), read where it is given."""
     seen: list = []
     _OBSERVING.append(seen)
     try:
@@ -1603,12 +1586,12 @@ def observing():
 
 
 def _held(eqn, operands, results, findings, at) -> None:
-    import jax
-
-    name = eqn.primitive.name
+    # An operation is its primitive object: one of another library's or a user's that bears a name of
+    # JAX's has no contract here, and is refused by that name.
+    primitive, name = eqn.primitive, eqn.primitive.name
     for seen in _OBSERVING:
-        seen.append((name, eqn.params, list(operands), list(results)))
-    if name not in CONTRACTS and name != "reduce":
+        seen.append((primitive, eqn.params, list(operands), list(results)))
+    if primitive not in CONTRACTS and primitive is not jax.lax.reduce_p:
         findings.append(f"{at}: uncertifiable, no contract for {name}")
         return
     hosted = [_host(value) for value in operands]
@@ -1618,7 +1601,7 @@ def _held(eqn, operands, results, findings, at) -> None:
         if dtype is not None and not keyed and _inexact(dtype) and _format(dtype) is None:
             findings.append(f"{at}: uncertifiable, no format for {dtype}")
             return
-    if name == "reduce":
+    if primitive is jax.lax.reduce_p:
         # A variadic reduction's results are held together, by the reduction its combine is.
         try:
             held = _reduced(eqn, hosted, [_host(result) for result in results])
@@ -1632,9 +1615,10 @@ def _held(eqn, operands, results, findings, at) -> None:
     for index, result in enumerate(results):
         fmt = _format(getattr(_host(result), "dtype", np.float32))
         # A result of its own position reads its own part of the operands alone (a barrier's, a split's).
-        given = RESULT_OPERANDS[name](eqn.params, hosted, index) if name in RESULT_OPERANDS else hosted
+        given = (RESULT_OPERANDS[primitive](eqn.params, hosted, index) if primitive in RESULT_OPERANDS
+                 else hosted)
         try:
-            ok = np.asarray(CONTRACTS[name](eqn.params, given, _host(result), fmt))
+            ok = np.asarray(CONTRACTS[primitive](eqn.params, given, _host(result), fmt))
         except TypeError:
             findings.append(f"{at}: uncertifiable, {name} of these operands has no contract")
             return
