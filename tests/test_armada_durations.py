@@ -75,7 +75,8 @@ def test_a_file_no_run_measured_at_a_cut_weighs_its_estimate_and_no_setup_paid_a
         {**{f"tests/test_measured.py::test_cell[{n}]": 10.0 for n in range(10)},
          **{f"tests/test_unmeasured.py::test_cell[{n}]": 10.0 for n in range(100)}}))
     # The one file measured took 1.6 times its record, as one whole row.
-    timings = {"files": {"3.12:tests/test_measured.py": 160.0}, "rows": {"3.12:tests/test_measured.py": 160.0}}
+    timings = {"files": {"3.12:tests/test_measured.py": 160.0},
+               "rows": {"3.12:tests/test_measured.py": 160.0}}
     groups = [entry["weight"] for entry in ci.plan(100.0, timings)
               if entry["python"] == "3.12" and entry["tests"] == "tests/test_unmeasured.py"]
     assert sum(groups) == pytest.approx(1600.0) and max(groups) <= 100.0
