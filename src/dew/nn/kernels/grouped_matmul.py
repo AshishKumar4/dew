@@ -683,17 +683,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # (`Issuer.chunk_columns`).
         held_second = -(-config.block_m * family.chunk_columns(config.block_n) // config.warpgroups
                         // resources.THREADS)
-        plain += held_second if ba.arguments.get('paired') is not None else 0
+        second = held_second if ba.arguments.get('paired') is not None else 0
+        plain += second
         if ba.arguments.get('exact_sums'):
-            # The running sum, a second fp32 accumulator (`mosaic_gpu.tgmm`'s exact sums), is carried as a
-            # loop value beside each step's product (`mosaic.Issuer.summed_apart`), awaited before its add:
-            # the two accumulators and the walk's control, no step's descriptors beside them
-            # (`resources.CONTROL_REGISTERS`), else the staged rows above them (FS-K01 model2: 144 at 64 a
-            # thread over stages 2-5, 208 at 96). A family whose products read registers holds each step's
-            # fragments beside both (mma.sync's, one step's product at a time: 201 at its 128 x 128 forward
-            # tile, NSDBG-5).
+            # Each product's running sum, a second fp32 accumulator (`mosaic_gpu.tgmm`'s exact sums), is
+            # carried as a loop value beside its step's product (`mosaic.Issuer.summed_apart`), awaited before
+            # its add: a pair's two running sums beside its two steps' products (the gathered cells' paired
+            # product into fp32 spilled 324 bytes on a GH200 where one product's two were counted, M-EM-19c),
+            # and the walk's control, no step's descriptors beside them (`resources.CONTROL_REGISTERS`), else
+            # the staged rows above them (FS-K01 model2: 144 at 64 a thread over stages 2-5, 208 at 96). A
+            # family whose products read registers holds each step's fragments beside both (mma.sync's, one
+            # step's product at a time: 201 at its 128 x 128 forward tile, NSDBG-5).
             held = plain + (accumulator if family.operands_in_registers else 0)
-            return max(2 * accumulator + resources.CONTROL_REGISTERS, held + max(phases))
+            return max(2 * (accumulator + second) + resources.CONTROL_REGISTERS, held + max(phases))
         return plain + max(phases)
 
     def _prologue_registers(self, ba, config: mosaic_gpu.Tiles) -> int:
@@ -2222,7 +2224,7 @@ def xla_dot(tokens: jax.Array, matrix: jax.Array, *, precision: PrecisionLike = 
     """A dense product, every row through one matrix (`[depth, width]`), as `xla_ragged_dot` multiplies a
     group's rows (`_as_multiplied`), as XLA's own dot: no group, so no row masked, and no ragged dot to
     trace or to expand (a dense call's portable branch, `gemm`'s), summed as `precision.accumulated` sums a
-    contraction (a CPU's float32 product as a vectorized dot sums it, row 4863)."""
+    contraction (XLA's own on a CPU, row 5448)."""
     tokens, matrix, precision = _as_multiplied(tokens, matrix, precision)
     return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (0,)), ((), ())),
                                          precision=precision),
@@ -2241,8 +2243,8 @@ def xla_ragged_dot(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     XLA's TPU kernel writes values into the rows past the groups, where
     other backends write zeros, and its lhs cotangent is the same kernel.
     Those rows are zeroed going in and coming out, so neither the output
-    nor a dropped row's gradient carries them. Its sums are `precision.accumulated`'s (a CPU's float32
-    product as a vectorized dot sums it, row 4863).
+    nor a dropped row's gradient carries them. Its sums are `precision.accumulated`'s (XLA's own on a CPU,
+    row 5448).
     """
     tokens, kernel, precision = _as_multiplied(tokens, kernel, precision)
     # bincount widens under x64; TPU ragged-dot only lowers int32 counts.

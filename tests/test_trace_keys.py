@@ -23,6 +23,8 @@ def tiny(**fields) -> CausalTransformer:
 BUILT = {
     "lm": (lambda **settings: LMObjective(tiny(), 8, **settings), {"z_loss": 1e-4}),
     "dpo": (lambda **settings: DPOObjective(tiny(), 8, **settings), {"beta": 0.5}),
+    "dpo pairs": (lambda **settings: DPOObjective(tiny(), 8, **settings), {"pairs": 2}),
+    "dpo segments": (lambda **settings: DPOObjective(tiny(), 8, **settings), {"segments": 1}),
     "grpo": (lambda **settings: GRPOObjective(tiny(), 8, **settings), {"beta": 0.5}),
     "masked": (lambda **settings: MaskedDiffusionObjective(tiny(causal=False), MDLM(mask_id=7)(), 8,
                                                            **settings), {"steps": 3}),

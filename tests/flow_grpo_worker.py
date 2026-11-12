@@ -104,11 +104,12 @@ def main() -> None:
     refusal = None
     if processes > 1:
         try:
-            rollout(initial, local, jax.random.key(71))
+            rollout(initial, local, jax.random.key(71), objective=objective)
         except ValueError as error:
             refusal = type(error).__name__
     device, host = split_fields(local)
-    rolled = rollout(initial, with_host(shard_batch(trainer.device_mesh, device), host), jax.random.key(71))
+    rolled = rollout(initial, with_host(shard_batch(trainer.device_mesh, device), host), jax.random.key(71),
+                     objective=rollout.objective)
     reassembled = shard_batch(trainer.device_mesh, rolled)
     scores = objective.log_probs(initial.variables, reassembled)
     compared = collective_host((scores, reassembled["old_log_probs"], reassembled["rewards"],

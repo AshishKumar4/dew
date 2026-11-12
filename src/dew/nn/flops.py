@@ -26,6 +26,7 @@ from .programs import (
     opaque,
     platform_branch,
     positionwise,
+    prng_operation,
     rearranges,
     reduction,
     scan_body,
@@ -295,6 +296,11 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
             total += max(_program_flops(branch) for branch in chosen)
         elif primitive is jaxpr_core.primitives.ragged_dot_general_p:
             total += _grouped_flops(equation)
+        elif primitive is jax.lax.reduce_p:
+            step_flops = _program_flops(equation.params["jaxpr"].jaxpr)
+            if step_flops:
+                steps = math.prod(_shape(equation.invars[0])[axis] for axis in equation.params["dimensions"])
+                total += max(steps - 1, 0) * math.prod(_shape(equation.outvars[0])) * step_flops
         elif primitive is jax.lax.while_p:
             raise MissingFlopsCount("a while loop's trips are unknown to a traced count")
         elif (body := called(equation)) is not None:
@@ -308,12 +314,12 @@ def _program_flops(program: jaxpr_core.Jaxpr) -> float:
 
 
 def _productless(equation: jaxpr_core.JaxprEqn) -> bool:
-    """Whether `equation` does no product, by what JAX states of its primitive (`dew.nn.programs`): an
-    entrywise or positionwise operation, one that moves entries, a reduction, a cumulative one or a
-    scatter, whose work is pointwise in the entries it reads, or one that reads no operand (an `iota`)."""
+    """Whether `equation` does no product, by what JAX states of its primitive and values
+    (`dew.nn.programs`): an entrywise or positionwise operation, one on PRNG keys (`prng_operation`), one
+    that moves entries, a reduction, a cumulative one, a scatter, or one that reads no operand (an `iota`)."""
     primitive = equation.primitive
-    return (positionwise(primitive) or rearranges(primitive) or reduction(primitive)
-            or cumulative(primitive) or scatter(primitive) or not equation.invars)
+    return (positionwise(primitive) or prng_operation(equation) or rearranges(primitive)
+            or reduction(primitive) or cumulative(primitive) or scatter(primitive) or not equation.invars)
 
 
 def _grouped_flops(equation: jaxpr_core.JaxprEqn) -> float:

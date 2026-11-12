@@ -614,7 +614,7 @@ def grpo_step(objective, rollout, **trainer):
     trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(1), rollout=rollout,
                       **trainer)
     initial = trainer.initial_state()
-    prepared = rollout(initial, batch_for(objective, 4), jax.random.PRNGKey(2))
+    prepared = rollout(initial, batch_for(objective, 4), jax.random.PRNGKey(2), objective=objective)
     started = [np.asarray(leaf) for leaf in jax.tree.leaves(initial.variables["params"])]
     state, _, _, _, accepted, _ = trainer.compile(initial, prepared)(initial, prepared)
     assert bool(accepted)
@@ -737,7 +737,8 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
 
     def rolled(objective):
         state = started(objective)
-        drawn = rollout.build(objective)(state, batch_for(objective, 16), jax.random.PRNGKey(2))
+        drawn = rollout.build(objective)(state, batch_for(objective, 16), jax.random.PRNGKey(2),
+                                         objective=objective)
         fields = {name: np.asarray(drawn[name]) for name in (
             "latents", "next_latents", "timesteps", "next_timesteps", OLD_LOG_PROBS_KEY, REWARDS_KEY)}
         assert all(np.all(np.isfinite(field)) for field in fields.values())

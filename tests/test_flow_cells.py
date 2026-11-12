@@ -147,3 +147,27 @@ def test_a_mosaic_cell_runs_only_where_the_device_lowers_its_generations_copies(
                              Cell("mosaic sm90", lambda: ran.append("mosaic sm90"), "sm90", mosaic=True)])
     assert ran == ["triton sm80", "mosaic sm90"]
     assert skipped == ["mosaic sm80"]
+
+
+def test_a_classs_covering_holds_every_native_value_and_pair_and_every_named_fault():
+    """A class's covering (`gpu_flow.covering`) keeps each cell named for a GPU-only fault, and of the rest
+    the fewest whose native axes hold every value and every pair of values the class's cells hold, each
+    generation apart; a cell no native axis and no fault distinguishes is the CPU's."""
+    def cell(label, generation=None, fault=None, **native):
+        return Cell(label, lambda: None, generation, native=native, fault=fault)
+
+    cells = [cell("bf16 forward", launch="forward", dtype="bfloat16"),
+             cell("bf16 forward, another shape", launch="forward", dtype="bfloat16"),
+             cell("fp16 forward", launch="forward", dtype="float16"),
+             cell("bf16 backward", launch="backward", dtype="bfloat16"),
+             cell("fp16 backward", launch="backward", dtype="float16"),
+             cell("fp16 backward, a hook", launch="backward", dtype="float16"),
+             cell("an uneven walk", launch="forward", dtype="bfloat16", fault="uneven walks"),
+             cell("an A100's forward", "sm80", launch="forward", dtype="bfloat16")]
+    kept = {kept.label for kept in gpu_flow.covering(cells)}
+    assert {"an uneven walk", "an A100's forward", "fp16 forward", "bf16 backward"} <= kept
+    assert len(kept & {"fp16 backward", "fp16 backward, a hook"}) == 1
+    assert not kept & {"bf16 forward", "bf16 forward, another shape"}
+    mine = [cell for cell in cells if cell.generation is None]
+    held = set().union(*(gpu_flow.held(cell.native) for cell in mine if cell.label in kept))
+    assert held >= set().union(*(gpu_flow.held(cell.native) for cell in mine))

@@ -8,7 +8,8 @@ from reference_error import as_given, assert_as_exact, indexed_recording, record
 
 
 def assert_as_exact_as_recorded(fixture, site: str, seeds: int, draw, dew, label: str, *,
-                                host: bool = False, narrow=jnp.float32, weighed: bool = False) -> None:
+                                host: bool = False, narrow=jnp.float32, weighed: bool = False,
+                                judged: bool = False) -> None:
     """`dew(dtype, inputs)`, Dew's outputs at `dtype` on a seed's inputs `draw(seed)`, as exact as the
     reference's float32 run against its float64 run over `site`'s recording in `fixture` (check 1), Dew's
     float64 run its truth, held to the recorded truth's sketch (`indexed_recording`). Dew's arm runs at
@@ -16,11 +17,17 @@ def assert_as_exact_as_recorded(fixture, site: str, seeds: int, draw, dew, label
     `narrow`). A `host` computation (a data processor on the host, which no trace reads) runs as given,
     `dew(narrow, inputs)` alone, against a recording of the reference's outputs whole, its truth the
     recorded one. A `weighed` site is judged weighed where it stays undecided, at its recording's declared
-    seeds and rounding scales (`recorded_weighing`)."""
+    seeds and rounding scales (`recorded_weighing`). A `judged` recording is of another library running
+    what Dew wrote for it (an export llama.cpp reads): the recorded outputs are the arm check 1 judges, and
+    Dew's own run of the same weights their reference, so the site holds that the export loses nothing,
+    whichever of the two libraries sums nearer float64."""
+    if judged and not host:
+        raise ValueError(f"{label}: a recording judged is its outputs whole against a run on the host")
     if host:
-        drawn, reference, truth = indexed_recording(recording(fixture), site, seeds, inputs_of=draw)
-        assert_as_exact(as_given(lambda index, inputs: dew(narrow, inputs)), reference, drawn, label,
-                        seeds=seeds, truth_fn=truth)
+        drawn, recorded, truth = indexed_recording(recording(fixture), site, seeds, inputs_of=draw)
+        live = as_given(lambda index, inputs: dew(narrow, inputs))
+        arm, reference = (recorded, live) if judged else (live, recorded)
+        assert_as_exact(arm, reference, drawn, label, seeds=seeds, truth_fn=truth)
         return
     # Dew's float64 run compiled once for every seed, where run op by op it dispatched each seed's every op.
     stored = recording(fixture)

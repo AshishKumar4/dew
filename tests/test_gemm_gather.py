@@ -13,6 +13,7 @@ from generation_support import cublas_compiled
 from reference_error import assert_as_exact, equations
 
 from dew.nn.kernels import formats, gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels.templates import product
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 SEEDS = 8
@@ -77,6 +78,11 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
     read 1.658 times the error of (M-EM-19c), where cuBLAS's equals the template's."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
     sizes, depth = jnp.asarray([70, 0, 129, 51], jnp.int32), 128
+    # A pair summed apart (into fp32 above the default precision) carries four accumulators, which the
+    # cooperative 128 x 128 tile's threads spill (the compile gate's "paired forward exact fp32"; 324 bytes
+    # on a GH200, M-EM-19c): a pin of it is refused, and its 128 x 64 holds them.
+    apart = paired and product.declared(jnp.bfloat16, None, outputs=(jnp.float32,)).promoted
+    refused, tiles = (tiles, dataclasses.replace(tiles, block_n=64)) if apart else (None, tiles)
 
     def draw(seed):
         rng = np.random.default_rng(seed)
@@ -87,13 +93,13 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
         slots = jnp.asarray(rng.permutation(256), jnp.int32)
         return tokens, table, matrices, slots
 
-    def through(kernel):
+    def through(kernel, pin=tiles if pinned else None):
         def run(tokens, table, matrices, slots):
             # The call through Dew's selector (`grouped_matmul` chosen `kernel`): the template's at the pinned
             # tile, or XLA's ragged dot of the gathered rows as they are (bf16 products summed into fp32), its
             # rows stored at their slots; the float64 truth XLA's over the gate's widened draws.
             wide = jnp.promote_types(tokens.dtype, jnp.float32)
-            pins = {grouped_matmul.MosaicGmm: tiles} if pinned else {}
+            pins = {} if pin is None else {grouped_matmul.MosaicGmm: pin}
             with generation.chosen(grouped_matmul=kernel), tuning.pinned(pins):
                 outs = gemm.gemm(tokens, matrices[0], sizes, out_dtype=wide,
                                  out_dtypes=(wide,) * 2 if paired else None,
@@ -120,6 +126,9 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
 
     library = ({'library_fn': cublas_compiled(by_cublas, draw(0), "__cublas$lt$matmul"), 'library_row': 5491,
                 'library_leaves': ("",)} if cublas else {})
+    if refused is not None and pinned:
+        with pytest.raises(tuning.Unpinnable):
+            jax.eval_shape(through("mosaic", refused), *draw(0))
     with tuning.seen() as launches:
         assert_as_exact(jax.jit(through("mosaic")), jax.jit(through("xla")), draw,
                         "a gathered grouped product", seeds=SEEDS, truth_fn=through("xla"), **library)

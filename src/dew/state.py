@@ -40,6 +40,8 @@ class Accumulation:
     snapshot of what each record read. `tokens` is the real tokens of the
     window's accepted microbatches, as two uint32 words, which its commit
     counts toward a run's tokens; None where the objective counts none.
+    `batch_statistics` holds detached statistics of the current step's
+    logical minibatch (`Objective.batch_statistics`) across its `split` parts.
     """
     gradient: Variables | None
     mass: jax.Array | None
@@ -50,6 +52,9 @@ class Accumulation:
     variables: Variables | None
     attempts: jax.Array | None
     tokens: jax.Array | None = None
+    batch_statistics: tuple[jax.Array, ...] | None = None
+    replayed_statistics: tuple[jax.Array, ...] | None = None
+    statistics_stamp: jax.Array | None = None
 
     def replays(self, other: Accumulation | None) -> bool:
         """Whether this window's replay slots hold batches of the shapes `other`'s do, so a step
@@ -197,7 +202,8 @@ class TrainState:
 def without_empty_window(state: TrainState) -> TrainState:
     """`state` as a checkpoint holds it: its window (`window`) left out where it holds no microbatch, at
     an update's boundary, under DiLoCo every group's. A commit clears every field of the window but its
-    gradient sum, which the next window's first microbatch replaces unread (`dew.training.transaction`),
+    gradient sum and batch statistics, which the next window's first microbatch replaces unread
+    (`dew.training.transaction`),
     so the empty window a resume allocates (`Trainer._initialize_accumulation`) is the same window, and
     the sum, a trainable-size float32 tree, is no checkpoint's (row 4309: ~36 GB of a 9B run's ~112 GB).
     A window part filled is saved whole."""

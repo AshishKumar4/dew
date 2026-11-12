@@ -50,7 +50,7 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
                    "distribution": ("maxtext", "0.2.5")} for site in ("gpt3", "engram")},
          "llama-cpp": {"test": "test_llama_cpp_export", "worker": "llama_cpp_worker.py",
                        "reference": "ggml-org/llama.cpp 7fe450e19305b828c199d602c23a8337aaa1f03b (v0.5.0)",
-                       "license": "MIT", "host": True, "outputs": True},
+                       "license": "MIT", "host": True, "outputs": True, "judged": True},
          "vllm-replay": {"test": "test_engine_replay", "worker": "vllm_replay_worker.py", "device": "cuda",
                          "reference": ("vllm-project/vllm 0.30.0 (its CUDA 12.9 build) with "
                                        "huggingface/transformers 5.16.1"),
@@ -147,7 +147,9 @@ SITES = {"conv": {"test": "test_dreamerv3_conv", "worker": "dreamerv3_worker.py"
 environment must hold, where the reference is one, and the device its worker's float32 run takes, the CPU
 unless named; `narrow` the precision the reference's narrow run and Dew's take where not float32; `host`
 where its `dew` runs on the host as given (a pipeline's walk, its own programs inside), `outputs` where
-the recording keeps the outputs whole, and `weighed` where its test declares check 1's weighed check: the
+the recording keeps the outputs whole, `judged` where the recording is the arm its test's check 1 judges
+and `dew` that arm's reference (another library running what Dew exports for it), so its seeds are sized
+with the two in those places, and `weighed` where its test declares check 1's weighed check: the
 recording keeps the outputs whole and each draw's rounding scale, the reference's own computation's, which
 its worker reads from its float64 twin with every operation tapped (`<draw>.scale_seed`)."""
 
@@ -228,7 +230,8 @@ def recording(site: str, python: str, source: str | None, given=None) -> dict[st
                else jax.jit(lambda inputs: run(narrow, inputs)))
         return record_case(site, draw, evaluate, store_inputs=False,
                            summary=not (known.get("outputs") or weighed), dew=dew,
-                           scale=scale if weighed else None, ahead=len(pool))
+                           scale=scale if weighed else None, ahead=len(pool),
+                           judged=known.get("judged", False))
 
 
 def main() -> None:

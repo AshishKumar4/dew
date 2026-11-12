@@ -26,7 +26,7 @@ def main() -> None:
     trainer, collector = build(
         environment, journal=EpisodeJournal(str(directory / "journal")), record=records.append
     )
-    trainer.rollout = episode_scheduler(collector)
+    trainer.rollout = episode_scheduler(collector, trainer.objective)
     data = Loader(
         train=lambda partition: itertools.repeat({"task_id": np.arange(jax.device_count(), dtype=np.int32)}),
         val=None,

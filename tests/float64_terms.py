@@ -313,9 +313,8 @@ def walked(jaxpr, consts, args, rule: Rule, *, compiling: bool = False) -> list:
     structure the gate's one: a call's body (`dew.nn.programs.called`), a scan, a loop, a branch and a
     shard_map walked inside, only the equations its outputs read, a static run compiled where `compiling`
     (`_evaluated`). Every program evaluator of the gate walks here: float64's replay
-    (tests/float64_replay.py), a reference under a summation tree (tests/reference_trees.py), a tapped
-    evaluation (tests/rounding_bound.py). Within `evaluated_on`, whose device a branch its platform picks
-    reads."""
+    (tests/float64_replay.py) and a tapped evaluation (tests/rounding_bound.py). Within `evaluated_on`,
+    whose device a branch its platform picks reads."""
     return _evaluated(jaxpr, consts, args, compiling=compiling, rule=rule)[0]
 
 

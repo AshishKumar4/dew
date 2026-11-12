@@ -85,7 +85,8 @@ def test_episode_gae_crosses_turns_without_discounting_observations_or_padding()
     """verl episode GAE: advantage 2.39e-7, return 5.97e-8 maximum differences."""
     trainer, rollout = build_ppo()
     state = trainer.initial_state()
-    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23),
+                    objective=trainer.objective)
     episodes = collect(rollout.episodes, state)
     with np.load(FIXTURE) as reference:
         # The fixture holds verl's GAE in the old one-row-per-call layout,
@@ -138,7 +139,7 @@ def test_each_step_reward_lands_on_the_last_action_of_the_call_it_paid_for():
     @functools.cache
     def drawn(seed):
         """One rollout's returns and, per completed episode, its rewards and values."""
-        batch = rollout(state, task, jax.random.key(seed))
+        batch = rollout(state, task, jax.random.key(seed), objective=rollout.objective)
         episodes = collect(rollout.episodes, state, seed, tasks=task["task_id"])
         mine, rewards_of, values_of = [], [], []
         for index, episode in enumerate(episodes):
@@ -182,7 +183,7 @@ def test_episode_advantages_hold_at_values_and_rewards_far_above_them():
         level = {"kernel": jnp.zeros_like(value["kernel"]), "bias": jnp.full_like(value["bias"], value_shift)}
         variables = {**state.variables, "params": {**params, "critic": {**params["critic"], "value": level}}}
         batch = rollout(state.replace(variables=variables), {"task_id": np.array([31], np.int32)},
-                        jax.random.key(23))
+                        jax.random.key(23), objective=rollout.objective)
         actions = batch["response_mask"] != 0
         assert np.all(batch[OLD_VALUES_KEY][actions] == np.float32(value_shift))
         return batch["advantages"][actions]
@@ -228,7 +229,7 @@ def test_whitened_advantages_of_rewards_far_above_the_values_are_as_exact_as_the
     @functools.cache
     def drawn(seed):
         """One rollout's whitened advantages and, per completed episode, its rewards and values."""
-        batch = rollout(state, task, jax.random.key(seed))
+        batch = rollout(state, task, jax.random.key(seed), objective=rollout.objective)
         episodes = collect(rollout.episodes, state, seed, tasks=task["task_id"])
         advantages, rewards, values = [], [], []
         for index, episode in enumerate(episodes):
@@ -277,7 +278,8 @@ def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():
         assert max(differences) > 1e-5
     for before, after in zip(jax.tree.leaves(initial.ema), jax.tree.leaves(final.ema), strict=True):
         np.testing.assert_array_equal(before, after)
-    fixed = rollout(initial, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    fixed = rollout(initial, {"task_id": np.array([31], np.int32)}, jax.random.key(23),
+                    objective=rollout.objective)
     keep = fixed["response_mask"] != 0
     old_error = np.mean(
         (np.asarray(rollout.objective.values(initial.variables, fixed))[keep] - fixed[RETURNS_KEY][keep]) ** 2
@@ -286,6 +288,42 @@ def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():
         (np.asarray(rollout.objective.values(final.variables, fixed))[keep] - fixed[RETURNS_KEY][keep]) ** 2
     )
     assert new_error < old_error
+    from rl_support import assert_filled_batch_invariants
+
+    from dew.batch import VALID_ROWS
+    from dew.data.dataset import FilledBatch
+
+    with np.load(FIXTURE) as reference:
+        params = {"policy": {"table": jnp.asarray(reference["objective_policy"])},
+                  "critic": {"backbone": {"scale": jnp.asarray(reference["objective_scale"])},
+                             "value": {"kernel": jnp.asarray(reference["objective_kernel"]),
+                                       "bias": jnp.asarray(reference["objective_bias"])}}}
+        info = Step(jnp.array(0), jax.random.key(1), initial.averaged)
+        actual, gradient = jax.value_and_grad(
+            lambda p: rollout.objective.scalar_loss({"params": p}, fixed, info)[0])(params)
+        assert abs(float(actual) - float(reference["objective_loss"])) < 2e-6
+        observed = {
+            "policy": gradient["policy"]["table"],
+            "kernel": gradient["critic"]["value"]["kernel"],
+            "bias": gradient["critic"]["value"]["bias"],
+            "scale": gradient["critic"]["backbone"]["scale"],
+        }
+        for name, value in observed.items():
+            difference = np.max(np.abs(np.asarray(value) - reference[f"objective_{name}_gradient"]))
+            assert difference < 2e-6, f"verl {name} gradient maximum difference {difference}"
+
+    rolled_three = rollout(initial, {"task_id": np.arange(3, dtype=np.int32)}, jax.random.key(24),
+                           objective=rollout.objective)
+    three_rows = jax.tree.map(lambda leaf: np.asarray(leaf)[:3],
+                              {name: value for name, value in rolled_three.items() if name != VALID_ROWS})
+    assert jax.tree.leaves(three_rows)[0].shape[0] == 3
+    filled_rows = FilledBatch(4).map(three_rows)
+    corrupted = jax.tree.map(lambda leaf: np.asarray(leaf).copy(), filled_rows)
+    corrupted[RETURNS_KEY][3] = np.nan
+    corrupted[OLD_VALUES_KEY][3] = np.nan
+    corrupted[ADVANTAGES_KEY][3] = np.nan
+    assert_filled_batch_invariants(rollout.objective, filled_rows, corrupted,
+                                   FilledBatch(4, real=False).map(three_rows))
 
 
 class OffsetFeatures(nn.Module):
@@ -351,7 +389,8 @@ def test_ppos_rollout_baseline_scores_the_critic_at_the_runs_committed_updates()
                                 PROMPT, RESPONSE, TURNS, sampling=SAMPLING)
     rollout = PPORollout(reading, episodes, groups=GROUPS, gamma=.97, lam=.9)
     state = replace(initial, updates=jnp.asarray(3, jnp.int32))
-    rolled = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    rolled = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23),
+                     objective=rollout.objective)
     keep = rolled["response_mask"] != 0
     committed = np.asarray(objective(3.0).values(state.variables, rolled), np.float32)
     ended = np.asarray(objective(-1.0).values(state.variables, rolled), np.float32)
@@ -397,32 +436,6 @@ def test_muonclip_steps_both_the_actor_and_a_transformer_critic():
             own = before["layers_0"]["self_attn"][projection]["kernel"]
             changed = after["layers_0"]["self_attn"][projection]["kernel"]
             assert np.linalg.norm(changed) < np.linalg.norm(own)
-
-
-def test_composite_objective_and_parameter_gradients_match_verl():
-    """verl combined loss differs by 3.26e-8; parameter gradients by at most 1.50e-8."""
-    trainer, rollout = build_ppo()
-    state = trainer.initial_state()
-    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
-    with np.load(FIXTURE) as reference:
-        params = {"policy": {"table": jnp.asarray(reference["objective_policy"])},
-                  "critic": {"backbone": {"scale": jnp.asarray(reference["objective_scale"])},
-                             "value": {"kernel": jnp.asarray(reference["objective_kernel"]),
-                                       "bias": jnp.asarray(reference["objective_bias"])}}}
-        info = Step(jnp.array(0), jax.random.key(1), state.averaged)
-        def loss(parameters):
-            return rollout.objective.scalar_loss({"params": parameters}, batch, info)[0]
-        actual, gradient = jax.value_and_grad(loss)(params)
-        assert float(actual) == pytest.approx(float(reference["objective_loss"]), abs=2e-6)
-        observed = {
-            "policy": gradient["policy"]["table"],
-            "kernel": gradient["critic"]["value"]["kernel"],
-            "bias": gradient["critic"]["value"]["bias"],
-            "scale": gradient["critic"]["backbone"]["scale"],
-        }
-        for name, value in observed.items():
-            difference = np.max(np.abs(np.asarray(value) - reference[f"objective_{name}_gradient"]))
-            assert difference < 2e-6, f"verl {name} gradient maximum difference {difference}"
 
 
 def ppo_equations(objective, options):
@@ -511,7 +524,7 @@ def test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged(o
     # Sixteen prompts a draw: over one, the critic's bias gradient, a sum whose signs cancel, did not
     # resolve within 512 seeds.
     rolled = functools.cache(lambda seed: rollout(state, {"task_id": np.arange(16, dtype=np.int32)},
-                                                  jax.random.key(seed)))
+                                                  jax.random.key(seed), objective=rollout.objective))
 
     def draw(seed):
         batch = rolled(int(seed))
@@ -559,7 +572,8 @@ def test_rejected_actor_tokens_leave_only_the_weighted_critic_support(coefficien
     objective = rollout.objective
     objective.value_coefficient = coefficient
     state = trainer.initial_state()
-    batch = rollout(state, {"task_id": np.arange(31, 35, dtype=np.int32)}, jax.random.key(23))
+    batch = rollout(state, {"task_id": np.arange(31, 35, dtype=np.int32)}, jax.random.key(23),
+                    objective=rollout.objective)
     old = objective.actor.packed_log_probs(part(state.variables, "policy"), batch)
     batch = {name: value for name, value in batch.items() if name != OLD_LOG_PROBS_KEY}
     if rejection == "sequence":

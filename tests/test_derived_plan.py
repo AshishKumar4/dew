@@ -265,9 +265,9 @@ def test_a_miss_orders_the_compiles_and_rules_out_only_what_the_derivation_itsel
 
 
 def traced(trainer) -> tuple[int, int]:
-    """`trainer` compiled, and how often its plan traced its step and made a candidate of it,
-    counted by the profiler: its step's traces (`_lowering.routed`, each one's dispatches' routes) and its
-    candidates (`_candidates._candidate`), a derivation's and a lowering's alike."""
+    """`trainer` compiled, and how often its plan traced its step and prepared a candidate of it, counted by
+    the profiler: its step's traces (`_lowering.routed`, each one's dispatches' routes) and its loss's
+    forward traces (`_candidates.prepared_for`), a derivation's and a lowering's alike."""
     from dew.training import _candidates, _lowering
 
     profiler = cProfile.Profile()
@@ -276,7 +276,7 @@ def traced(trainer) -> tuple[int, int]:
     return (sum(calls for (file, _, name), (_, calls, *_) in stats
                 if name == "routed" and file == _lowering.__file__),
             sum(calls for (file, _, name), (_, calls, *_) in stats
-                if name == "_candidate" and file == _candidates.__file__))
+                if name == "prepared_for" and file == _candidates.__file__))
 
 
 def test_a_stated_remat_whose_whole_batch_fits_traces_its_step_once(monkeypatch, tmp_path):
@@ -351,6 +351,24 @@ def test_a_miss_corrects_each_split_by_its_share_of_the_derived_temporaries():
     search.learned(357 * kb, -606 * kb, fit=False, temporaries=1229 * kb)
     assert not search.refused(2) and search.likely(2)
     assert search.shortfall(2) == 963 * kb * 615 // 1229
+
+
+def test_a_compile_past_its_derived_headroom_lifts_the_refusals_its_excess_covers():
+    """A compile that measured more headroom than its derivation foresaw lifts a split's refusal only where
+    that excess, scaled by the split's derived temporaries against the compile's (`FitSearch.excess`),
+    covers the split's derived shortfall: 1 KB past at eight microbatches leaves four, judged 1 MB short,
+    refused, and 2 MB past lifts it (row 5448: eight measured 1.28 MB past; four, judged short, fit)."""
+    from dew.training.footprint import Footprint
+
+    kb = 1000
+    for past, refused in ((1 * kb, True), (2000 * kb, False)):
+        search = bare_search(deep(split=None).objective)
+        for split, headroom, temporaries in ((4, -1000 * kb, 600 * kb), (8, 500 * kb, 300 * kb)):
+            key = search.candidate_key(split, narrow=False)
+            search.judged_at[key] = headroom
+            search.footprints[key] = Footprint(residuals=0, gradients=0, held=0, peak=temporaries)
+        search.learned(500 * kb, 500 * kb + past, fit=True, temporaries=300 * kb)
+        assert search.refused(4) is refused
 
 
 def test_a_split_the_derivation_refuses_is_still_asked_at_its_half_rung():
@@ -589,8 +607,8 @@ def test_a_step_whose_whole_logits_alone_leave_no_room_traces_its_tiled_step_alo
 
 def test_a_whole_logits_trace_bounds_its_tiled_steps_peak(monkeypatch, tmp_path):
     """With room for the whole logits' floor and not for the whole-logits step, the derivation traces that
-    step, refused, and bounds the tiled step from it (`HeadTerms`): the tiled step's traced peak holds at
-    least the whole-logits peak without its logits, and at most their share beside it."""
+    step, refused, and bounds the tiled step from it (`HeadTerms`): the headroom the tiled step's own trace
+    leaves lies within the bounds the whole-logits trace gave it."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
     whole = wide("whole")
     need = needs(monkeypatch, whole, lambda: compiled(whole, WIDE))
@@ -601,6 +619,6 @@ def test_a_whole_logits_trace_bounds_its_tiled_steps_peak(monkeypatch, tmp_path)
     trainer = wide()
     compiled(trainer, WIDE)
     refused, tiled = trainer.plan["derived"][:2]
-    head = refused["terms"]["head"]
     assert refused["label"] == "refuses" and tiled["label"] == "fits"
-    assert head["headless"] <= tiled["terms"]["peak"] <= head["headless"] + head["held"]
+    least, most = tiled["bounds"]
+    assert least <= tiled["headroom"] <= most

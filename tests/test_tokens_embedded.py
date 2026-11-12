@@ -122,6 +122,114 @@ def test_a_request_holding_an_id_outside_its_models_table_is_refused_by_a_task_a
     assert outside(raised) == (250, ROWS)
 
 
+PLACEHOLDER = ROWS + 50
+"""A multimodal model's image placeholder that its table holds no row of: as `_fused` reads it, only the
+slots a call's media fill replace it, and the table reads it at any other."""
+
+
+def placeholder_model():
+    """A Gemma 3 wrapper over `short()`'s table, a tiny vision tower reading one image a slot, its image
+    placeholder `PLACEHOLDER`."""
+    import jax.numpy as jnp
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import GemmaProjector, SiglipVision
+
+    decoder = CausalTransformer(vocab_size=ROWS, emb_features=32, num_layers=1, num_heads=2, mlp_features=64,
+                                max_seq_len=64)
+    return MultimodalTransformer(
+        decoder, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2, image_size=8,
+                              patch_size=4),
+        GemmaProjector(text_width=32, patches_per_side=2, tokens_per_side=1), family="gemma3",
+        image_token_id=PLACEHOLDER, dtype=jnp.float32)
+
+
+def media_rows(ids, images):
+    """Token rows `ids` whose slots `images` marks (>= 0) read an image of their own."""
+    import jax.numpy as jnp
+
+    from dew.nn.inputs import ModelInputs
+
+    ids, images = jnp.asarray(ids, jnp.int32), jnp.asarray(images, jnp.int32)
+    count = ids.shape[0]
+    pixels = jnp.linspace(-.5, .5, count * 3 * 8 * 8, dtype=jnp.float32).reshape(count, 1, 3, 8, 8)
+    return ModelInputs(ids, {"image_indices": images}, {"pixel_values": pixels})
+
+
+def test_a_request_holding_a_placeholder_no_media_fill_is_refused_and_one_its_image_fills_is_served():
+    """A multimodal model replaces its image placeholder only at the slots a call's media fill (its
+    `_fused`), so a text request holding it, which its table would read, is refused as it is prepared,
+    naming it; the same ids with an image at that slot are served, the slot reading the tower, and a
+    second media slot holding an id past the table (a placeholder the processor wrote) is served too."""
+    model = placeholder_model()
+    request = media_rows([[4, PLACEHOLDER, 5, 6]], [[-1, 0, -1, -1]])
+    variables = model.init(jax.random.key(0), request.tokens, conditioning=request.conditioning,
+                           image_indices=request.token_fields["image_indices"])
+    task = TextGeneration(model, variables)
+    with pytest.raises(OutsideTable) as raised:
+        task([[4, PLACEHOLDER, 5, 6]], 2, key=0)
+    assert outside(raised) == (PLACEHOLDER, ROWS)
+    served = task(request, 2, key=0).host()
+    assert np.all(np.isfinite(served.raw_log_probs[0, :int(served.lengths[0])]))
+    task(media_rows([[4, PLACEHOLDER + 1, 5, 6]], [[-1, 0, -1, -1]]), 2, key=0)
+
+
+def test_a_masked_request_whose_image_fills_a_placeholder_past_the_table_is_filled():
+    """A masked generation over a bidirectional multimodal model is bounded as a text request is: an id
+    past the table at a slot its image fills (the tower's, never the table's) is served, and a response
+    filled; at a slot no image fills, refused, naming it."""
+    import jax.numpy as jnp
+
+    from dew.diffusion.discrete import DiscreteProcess, LogLinear
+    from dew.inference import MaskedGeneration
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import GemmaProjector, SiglipVision
+
+    text = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                             mlp_features=32, max_seq_len=16, causal=False, mask_token_id=31)
+    model = MultimodalTransformer(
+        text, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
+                           image_size=8, patch_size=4),
+        GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1),
+        family="gemma3", image_token_id=40, dtype=jnp.float32)
+    inputs = media_rows([[2, 40, 3, 4]], [[-1, 0, -1, -1]])
+    variables = model.init(jax.random.key(0), inputs.tokens, conditioning=inputs.conditioning,
+                           image_indices=inputs.token_fields["image_indices"])
+    task = MaskedGeneration(model, variables, DiscreteProcess(LogLinear(), mask_id=31), steps=4)
+    generated = task(inputs, 5, key=0).host()
+    assert generated.tokens.shape == (1, 9) and not np.any(generated.tokens[:, 4:] == 31)
+    with pytest.raises(OutsideTable) as raised:
+        task(media_rows([[2, 40, 3, 4]], [[-1, -1, -1, -1]]), 5, key=0)
+    assert outside(raised) == (40, 32)
+
+
+def test_a_training_batch_whose_media_fill_ids_past_the_table_trains_and_one_its_table_reads_is_refused():
+    """A multimodal run's rows whose media slots hold ids past its model's table, which the towers fill and
+    the table never reads, pass the bound a run's every batch passes (`InputSpec.bounded`) and train to a
+    finite loss; the same rows with such an id at a slot no image fills, which the table would read, are
+    refused, naming it."""
+    import optax
+
+    model = placeholder_model()
+    rows = jax.device_count()
+    ids = np.tile([[2, 3, PLACEHOLDER + 9, 4, 5, 6, 7, 8, 9]], (rows, 1))
+    images = np.tile([[-1, -1, 0, -1, -1, -1, -1, -1, -1]], (rows, 1))
+    objective = LMObjective(model, 8, head_chunks=1)
+    inputs = objective.inputs
+    assert inputs is not None
+    batch = {"text": media_rows(ids, images)}
+    inputs.bounded(batch)
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(5))
+    start, _, _ = trainer.place()
+    _, loss, *_ = trainer.compile(start, batch)(start, batch)
+    assert np.isfinite(float(loss))
+    with pytest.raises(OutsideTable) as raised:
+        inputs.bounded({"text": media_rows(ids, np.full_like(images, -1))})
+    assert outside(raised) == (PLACEHOLDER + 9, ROWS)
+
+
 def test_a_masked_run_whose_mask_id_is_outside_its_models_table_is_refused_as_its_objective_is_made():
     """A masked diffusion objective places its mask id inside the compiled step, where no host check of a
     batch sees it, so an objective whose mask id its model's table holds no row for is refused as it is

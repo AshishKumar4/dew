@@ -94,8 +94,10 @@ Sampling is effectful, host-side and sometimes remote, so the trainer receives i
 
 ```python
 class Rollout(Protocol):
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
+    def __call__(self, state: TrainState, batch: Batch, key: jax.Array, *, objective: Objective) -> Batch: ...
 ```
+
+`objective` is the objective the step the rollout feeds trains. It is the run's own, or, where the data's phases set the loop's pass count (`Trainer(phase_passes=)`), the copy at the count of the phase the step's first read batch was read in, so a policy drawn for the step samples as the step trains. One update's further draws read the first read's phase. A rollout whose policy is fixed where it was made (an environment or a dreamer rollout's compiled programs, an episode collector's bound policy, an asynchronous source's server) refuses any other objective (`own_objective`), so its rows never train under a policy that did not draw them.
 
 `Trainer(..., rollout=None)` runs without a rollout. With one, it reads a batch, calls the rollout, places its output and invokes the compiled step. The compiled `step=` interface owns optimizer work; external generation belongs outside it. The objective's loss and evaluation stay pure functions of variables, batch and step.
 

@@ -50,7 +50,8 @@ def main() -> None:
     episodes = support.collect(rollout.episodes, state)
     # verl reads one left-padded [prompt | response] row per call; rebuild that
     # layout from the actions and read Dew's packed critic values into it.
-    packed = rollout.rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
+    packed = rollout.rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23),
+                             objective=trainer.objective)
     packed_values = np.asarray(rollout.objective.values(state.variables, packed))
     turns, width = policy.TURNS, policy.PROMPT + policy.RESPONSE
     batch = {"input_ids": np.zeros((len(episodes) * turns, width), np.int32),

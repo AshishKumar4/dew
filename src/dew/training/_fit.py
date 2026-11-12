@@ -67,6 +67,7 @@ from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
 
 if TYPE_CHECKING:
+    from dew.objectives.base import Objective
     from dew.training.startup import Startup
 
 _log = logging.getLogger(__name__)
@@ -816,18 +817,22 @@ def emptied(batch: Batch) -> Batch:
             CONSUMED_COUNT: ConsumedCount(0)}
 
 
-def read_batch(run: FitRun, interval: Interval, state: TrainState, rollout: Rollout | None, mesh: Mesh,
-               marked, examples: int | None, *, agree: bool, phase: str = "training read",
-               branch: bool = False) -> tuple[Batch, Batch, bytes | None] | None:
+def read_batch[LossT, EffectsT](run: FitRun, interval: Interval, state: TrainState, rollout: Rollout | None,
+                                mesh: Mesh, marked, examples: int | None, *, agree: bool,
+                                phase: str = "training read", branch: bool = False,
+                                objective: Callable[[Batch], Objective[LossT, EffectsT]] | None = None
+                                ) -> tuple[Batch, Batch, bytes | None] | None:
     """The one way a training loop's next batch becomes its step's input, the run's and a cooldown
     branch's alike (row 4125): read (`waited_read`), drawn past the rollout (`rolled_out`) and its device
     fields apart (`split_fields`), a run on the examples clock closing its update window where its batch
     does (the run's step at its bound, `FitRun.closing`; a `branch`'s every step, `closes_window`). Returns
-    the batch, its device fields and the position a rollout read ahead to; None where the stream ran out."""
+    the batch, its device fields and the position a rollout read ahead to; None where the stream ran out.
+    A rollout draws for `objective(batch)`, the objective the read batch's step trains (`Rollout`)."""
     batch = waited_read(run, interval, agree=agree, phase=phase)
     if batch is None:
         return None
-    batch, ahead = rolled_out(rollout, state, batch, mesh, marked, interval, run,
+    trains = None if rollout is None or objective is None else objective(batch)
+    batch, ahead = rolled_out(rollout, state, batch, mesh, marked, interval, run, objective=trains,
                               examples=None if branch else examples, closes=not branch)
     device, _ = split_fields(batch)
     return batch, closes_window(device, examples) if branch else device, ahead

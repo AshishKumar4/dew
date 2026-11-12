@@ -1860,6 +1860,10 @@ class Checkpoints:
         arrays = jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), dict(pending))
         arrays["statistics"] = tuple(arrays["statistics"])
         arrays["effects"] = tuple(arrays["effects"])
+        if arrays.get("batch_statistics") is not None:
+            arrays["batch_statistics"] = tuple(arrays["batch_statistics"])
+        if arrays.get("replayed_statistics") is not None:
+            arrays["replayed_statistics"] = tuple(arrays["replayed_statistics"])
         return Accumulation(**arrays)
 
     def position(self, step: int, share: DataPartition) -> bytes | None:

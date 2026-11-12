@@ -15,15 +15,11 @@
   the seeds it needs (test_chunked_cross_entropy).
 - A Dense layer's float64 terms on a GPU host are its inputs' placement's own, CPU or GPU, in either order
   (test_float64_terms).
-- The fused norms' and SiLU products' check-1 matrix (tests/kernel_matrix.py): a training step through each
-  entry on par with its XLA arithmetic, at each combination of the axes a GPU runs natively
-  (norm_swiglu_matrix, `kernel_matrix.native_cells`).
 """
 
 import functools
 
 import jax.numpy as jnp
-import kernel_matrix
 import pytest
 import test_audio as audio
 import test_chunked_cross_entropy as chunked_cross_entropy
@@ -33,7 +29,7 @@ import test_lowering as lowering
 import test_moe_precision as moe_precision
 import test_norm_swiglu as norm_swiglu_tests
 import test_precision_policy as precision_policy
-from gpu_flow import Cell, isolated, run_cells, when
+from gpu_flow import Cell, covering, isolated, run_cells, when
 
 from dew.nn.kernels import grouped_matmul, norm_swiglu
 from dew.nn.kernels.generation import triton_runs
@@ -43,25 +39,30 @@ pytestmark = pytest.mark.gpu(reason="a GPU's own numerics, its kernels' configs 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 
 
+OWN = "the GPU's own arithmetic, facts or placement, which a CPU does not have"
+"""Why a numerics cell stays on the GPU: what it holds is the device's own."""
+
+
 def numerics_cells(tmp_path_factory) -> list[Cell]:
     """The GPU's own arithmetic and driver facts, its encoders' compiles and a Dense layer's float64 terms."""
     return [
         Cell("the GPU divides fp32 to the nearest float",
-             precision_policy.the_gpu_divides_fp32_to_the_nearest_float),
+             precision_policy.the_gpu_divides_fp32_to_the_nearest_float, fault=OWN),
         Cell("a frozen FP8 site's products take no FP8 GEMM whose sum is narrower",
              when(fp8_base.FP8_CORES, "this GPU has no FP8 tensor cores", isolated(tmp_path_factory)(
-                 fp8_base.a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower, "fp8"))),
+                 fp8_base.a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower, "fp8")), fault=OWN),
         *(Cell(f"the {kind} audio encoder compiles with its mask built in the same jit",
                lambda kind=kind: audio.encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(
-                   audio._audio(kind)))
+                   audio._audio(kind)), native={"compile": f"the {kind} encoder's mask in its jit"})
           for kind in ("gemma3n", "gemma4")),
         Cell("a GPU reports its block and multiprocessors whether or not a row names it",
-             lowering.a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it),
+             lowering.a_gpu_reports_its_block_and_multiprocessors_whether_or_not_a_row_names_it, fault=OWN),
         Cell("a GPU reports its clock and memory bandwidth from its driver",
-             lowering.a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver),
+             lowering.a_gpu_reports_its_clock_and_memory_bandwidth_from_its_driver, fault=OWN),
         Cell("a Dense layer's float64 terms are its placement's own on a GPU host",
              isolated(tmp_path_factory)(
-                 float64_terms_tests.a_dense_layers_terms_are_its_placements_own_on_a_gpu_host, "placed")),
+                 float64_terms_tests.a_dense_layers_terms_are_its_placements_own_on_a_gpu_host, "placed"),
+             fault=OWN),
     ]
 
 
@@ -70,12 +71,15 @@ def norm_cells(_) -> list[Cell]:
     return [
         *(Cell(f"every config of {kernel.__name__} holds the float64 gate: {dtype.__name__} {operands}",
                functools.partial(norm_swiglu_tests.every_config_of_the_norm_kernels_holds_the_float64_gate,
-                                 kernel, dtype, operands))
+                                 kernel, dtype, operands),
+               # Its operands native: a step's rows, rows two tiles wide and rows for the tallest tiles
+               # each take launches of their own.
+               native={"kernel": kernel.__name__, "dtype": dtype.__name__, "operands": operands})
           for kernel in (norm_swiglu.RmsForward, norm_swiglu.RmsBackward) for dtype in DTYPES
           for operands in ("full step", "wide rows", "narrow rows")),
         *(Cell(f"every config of {kernel.__name__} holds the float64 gate: {dtype.__name__}",
                functools.partial(norm_swiglu_tests.every_config_of_the_swiglu_kernels_holds_the_float64_gate,
-                                 kernel, dtype))
+                                 kernel, dtype), native={"kernel": kernel.__name__, "dtype": dtype.__name__})
           for kernel in (norm_swiglu.SwigluForward, norm_swiglu.SwigluBackward) for dtype in DTYPES),
     ]
 
@@ -88,14 +92,14 @@ def grouped_cells(_) -> list[Cell]:
                when(triton_runs(), pallas, functools.partial(
                    moe_precision.every_tile_of_the_grouped_kernels_holds_the_float64_gate,
                    kernel, width, features)),
-               generation)
+               generation, native={"kernel": kernel.__name__})
           for kernel, width, features, generation in (
               (grouped_matmul.Gmm, 192, 320, None), (grouped_matmul.Tgmm, 192, 320, None),
               (grouped_matmul.MosaicGmm, 768, 768, "sm90"), (grouped_matmul.MosaicTgmm, 768, 768, "sm90"))),
         *(Cell(f"a projection on a GPU host's CPU runs without the Triton kernels: {implementation}",
                when(triton_runs(), pallas, functools.partial(
                    moe_precision.a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels,
-                   implementation)))
+                   implementation)), fault=OWN)
           for implementation in ("auto", "pallas")),
     ]
 
@@ -104,7 +108,8 @@ def vocabulary_cells(_) -> list[Cell]:
     """A Gemma-sized vocabulary's chunked cross entropy, every chunking in one check."""
     check = chunked_cross_entropy.a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits
     return [Cell(f"a Gemma-sized vocabulary is as exact as the whole logits at "
-                 f"{chunked_cross_entropy.CHUNKS} chunks: {softcap}", functools.partial(check, softcap))
+                 f"{chunked_cross_entropy.CHUNKS} chunks: {softcap}", functools.partial(check, softcap),
+                 native={"logits": "plain" if softcap is None else "softcapped"})
             for softcap in (None, 30.0)]
 
 
@@ -117,7 +122,7 @@ GROUPS = {"numerics": numerics_cells, "norms": norm_cells, "grouped": grouped_ce
 def test_a_gpus_numerics_and_kernels_hold_on_this_gpu(group, tmp_path_factory):
     """Every cell of `group` on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
     together."""
-    run_cells(GROUPS[group](tmp_path_factory))
+    run_cells(covering(GROUPS[group](tmp_path_factory)))
 
 
 def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_deterministic_ops):
@@ -128,18 +133,3 @@ def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_determinis
              functools.partial(norm_swiglu_tests.a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses,
                                without_deterministic_ops, implementation))
         for implementation in ("auto", "pallas")])
-
-
-def test_the_norm_swiglu_matrix_holds_on_this_gpu():
-    """The fused norms' and SiLU products' check-1 matrix (tests/kernel_matrix.py): a training step through
-    the RMS norm's plain, stream and gated entries and the SwiGLU product's apart and packed ones, the Pallas
-    kernel on par with XLA's arithmetic at each combination of the axes a GPU runs natively
-    (`kernel_matrix.native_cells`), each cell on its own GPU."""
-    run_cells(kernel_matrix.native_cells("norm_swiglu"))
-
-
-def test_the_narrow_copies_matrix_holds_on_this_gpu():
-    """The narrow copies' check-1 matrix (tests/kernel_matrix.py): a decoder's training run through the copies
-    of its weights the update writes on par with the forward's own casts at each combination of the axes a
-    GPU runs natively (`kernel_matrix.native_cells`), each cell on its own GPU."""
-    run_cells(kernel_matrix.native_cells("narrow_copies"))

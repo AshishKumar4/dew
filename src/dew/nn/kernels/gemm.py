@@ -318,8 +318,7 @@ def _gemm_t(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, *, 
         # as the rows' and the cotangent's columns are. A dense call's is XLA's own dot over the rows, as the
         # forward's (`grouped_matmul.xla_dot`): its ragged dot of one group took an A100's gate_up weight
         # gradient 470 ms against the template's 11.4 (W121-a100), where DENSE1 timed XLA's dot.
-        # Each summed as `precision.accumulated` sums a contraction (a CPU's float32 product as a vectorized
-        # dot sums it, row 4863).
+        # Each summed as `precision.accumulated` sums a contraction (XLA's own on a CPU, row 5448).
         if dense:
             product = functools.partial(jax.lax.dot_general, dimension_numbers=(((0,), (0,)), ((), ())),
                                         precision=precision,
