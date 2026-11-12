@@ -38,8 +38,10 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     "torch": {"torch": "2.14.0"},
     # GPT-OSS's exchange gradients, recorded on torch's CPU build (gpt_oss_reference.write_exchange_cases).
     "gpt-oss-exchange": {"transformers": "5.16.1", "torch": "2.14.0"},
-    # fla's kernels and Qwen3.5's fla path, in their own environment (joint_checkpoint_reference.on_fla).
-    "fla": {"torch": "2.8.0", "transformers": "5.16.1", "fla-core": "0.5.2"},
+    # fla's kernels and Qwen3.5's fla path, in their own environment (joint_checkpoint_reference.on_fla): the
+    # fleet's DEW_FLA_PYTHON (dew-ops' session.FLA, torch 2.14.1 past fla #640's Hopper miscompile), whose
+    # 2.8.0 pin no node could record against (M-JS-92's refusal, 11-12).
+    "fla": {"torch": "2.14.1", "transformers": "5.22.2", "fla-core": "0.5.2"},
     "diffusers": {"diffusers": tested("diffusers")},
     # The pipelines diffusers 0.34.0 builds read transformers 4's text towers.
     "diffusers-pipelines": {"diffusers": tested("diffusers"), "transformers": "4.49.0"},
