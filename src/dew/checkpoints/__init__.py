@@ -1766,7 +1766,7 @@ class Checkpoints:
         """Read the selected step's live or averaged variables onto the requested layout, or with
         `on_host` into host arrays, restored onto this process's CPU device and fetched, no accelerator
         holding them on the way (no `mesh` or `layout` beside it); a local step, which knows the devices
-        it was written on alone, restores there and is fetched.
+        it was written on alone, is refused it.
 
         Parameter storage conversion applies only to the owner's parameter
         roots; other collections retain their recorded dtypes and placement.
@@ -1795,11 +1795,13 @@ class Checkpoints:
         if on_host and (mesh is not None or layout is not None):
             raise ValueError("on_host reads the variables into host arrays, and mesh and layout place "
                              "them; pass one")
+        if on_host and step == self._local_latest():
+            raise ValueError(f"step {step} is held locally, on the devices that wrote it, which its read "
+                             "places it on (`_check_placement`), so it reads onto no host; read a persistent "
+                             "step, or read this one without on_host")
         # On the host, restored onto this process's CPU device, every collection as a placed read restores
-        # it, then fetched as host arrays: no accelerator holds them on the way. A local step restores
-        # where it was written, the devices its shards name (`_check_placement`), and is fetched from there.
-        host = on_host and step != self._local_latest()
-        device_mesh = resolve_mesh(DefaultMesh().build(_host_devices()) if host
+        # it, then fetched as host arrays: no accelerator holds them on the way.
+        device_mesh = resolve_mesh(DefaultMesh().build(_host_devices()) if on_host
                                    else DefaultMesh() if mesh is None else mesh)
         chosen_layout = DefaultLayout() if layout is None else layout
         # A CPU-owned run stores its frozen collection banked; the layout places
