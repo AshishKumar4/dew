@@ -31,7 +31,7 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .profile_steps(self) -> list[int]
   .python_run(self, reasons: Sequence[str]) -> None
   .resolve(self, step: int | str | None) -> int | None
-  .restore(self, template=None, step: int | str | None = None, *, share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ())
+  .restore(self, template=None, step: int | str | None = None, *, share: DataPartition | None = None)
   .restore_profiles(self, step: int) -> tuple[Variables, ...]
   .resumed(self, resume: Resume = 'auto') -> int | None
   .rollout_state(self, step: int, template: Mapping[str, object]) -> dict | None
@@ -181,7 +181,6 @@ class Objective()  [dew.objectives.base]
   .scalars: property -> TrainingScalars[Loss, Effects]
   .scored_tokens(self, batch: Batch) -> np.ndarray
   .scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, jax.Array] | None
-  .served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]
   .stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]
   .substitute(self, modules: Sequence[nn.Module]) -> None
   .substituted(self, modules: Sequence[nn.Module]) -> Self
@@ -284,7 +283,6 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .scalars: property -> TrainingScalars[Loss, Effects]
   .scored_tokens(self, batch: Batch) -> np.ndarray
   .scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, jax.Array]
-  .served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]
   .stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]
   .substitute(self, modules: Sequence[nn.Module]) -> None
   .substituted(self, modules: Sequence[nn.Module]) -> Self
