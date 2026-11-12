@@ -318,19 +318,22 @@ def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, 
     (`named`)."""
     run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
     stated = RunConfig.load(str(run)).data_plan_version
+
+    def train() -> None:
+        prepared = built.prepare()
+        python = dataclasses.replace(prepared.run, data_plan_version=None,
+                                     trainer=dataclasses.replace(prepared.run.trainer, name=named))
+        data, validation = ((built.chain(), built.validation) if given == "chain"
+                            else (prepared.dataset, prepared.validation))
+        python.train(prepared.objective, data, name=kind, metrics=prepared.metrics, rollout=prepared.rollout,
+                     summary=prepared.summary, validation=validation, after=prepared.after)
+
     if stated not in PLAN_VERSIONS:
-        # Its data, compiled at the version it states, is refused where its run is prepared.
+        # Its data, read at the version it states, which this Dew reads none of, is refused before a step.
         with pytest.raises(ValueError):
-            built.prepare()
+            train()
         return
-    prepared = built.prepare()
-    python = dataclasses.replace(prepared.run, data_plan_version=None,
-                                 trainer=dataclasses.replace(prepared.run.trainer, name=named))
-    data, validation = ((built.chain(), built.validation) if given == "chain"
-                        else (prepared.dataset, prepared.validation))
-    if not resumed_by_its_format(run, lambda: python.train(
-            prepared.objective, data, name=kind, metrics=prepared.metrics, rollout=prepared.rollout,
-            summary=prepared.summary, validation=validation, after=prepared.after)):
+    if not resumed_by_its_format(run, train):
         return
     records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
     started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
