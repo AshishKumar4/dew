@@ -1386,19 +1386,15 @@ def partial_runs(tiles: Tiles, dtype, interpret, *, transpose_rhs: bool, plain: 
     step is one swizzled tile (`partial_step`) and the rows are not gathered (a producer's gather copies by
     cp.async, unbounded); a width where the stores are not scattered (piecewise, unbounded) and the matrix
     lies `[width, depth]` (`transpose_rhs`) or its copy is one swizzled tile wide (`tile_columns`: a CTA
-    pair's both halves); not yet on a family whose products span a pair (`Transport.pairs_product`: each CTA
-    copies its half of the pair's block, `rings.Split`, which the fork's untiled view of a partial extent
-    does not yet partition, row 5727: an unaligned call's pair tile failed to lower, its 128-row half
-    reshaped as the pair's 256), so such a call is padded; on a
-    family whose products read the staged blocks by descriptor
+    pair's both halves; each CTA's copy of its half of the pair's block partitioned under a partial extent by
+    the fork from post84, row 5727); on a family whose products read the staged blocks by descriptor
     (`Issuer.operands_in_registers` False: wgmma's, tcgen05's), staged at the widest swizzle, a step's copy
     one tile along its depth, where a family reading them into registers is staged narrower by layout
     inference (mma.sync.fed's 32-byte rows on an sm120: a 64-deep step four 16-element tiles). Elsewhere the
     launch's call is padded to whole tiles (`grouped_matmul._Mosaic. _aligned`), as it is where a stride is no
     whole 16 bytes, which no TMA copy takes."""
     family = family_of(tiles, dtype)
-    bounded = (family.bounded_loads and not family.operands_in_registers and not family.pairs_product
-               and not interpret and plain)
+    bounded = family.bounded_loads and not family.operands_in_registers and not interpret and plain
     one = partial_step(dtype)
     return (bounded and not gathered and tiles.block_k == one,
             bounded and not scattered and (transpose_rhs or tile_columns(tiles, family) == one))
