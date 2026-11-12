@@ -296,3 +296,26 @@ def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(precondi
 
     assert_as_exact(dew, optax_arm, shaped_draw, f"Muon's Newton-Schulz at {preconditioning}",
                     seeds=UPDATE_SEEDS, truth_fn=truth)
+
+
+@pytest.mark.parametrize("per_head", [None, HEADS])
+def test_muons_reported_update_work_is_its_compiled_updates_matrix_work(per_head):
+    """The work a Muon run reports beside the model's (`OptimConfig.update_flops`, `train/update_flops`) is
+    the matrix work its update runs: the compiled update over the decoder's parameters, whole or each head's
+    block alone (`per_head`), multiplies exactly that many FLOPs, its AdamW group none."""
+    from optim_support import decoder_draw, drawn_axes
+
+    from dew.optim import OptimConfig
+    from dew.telemetry.instrumentation import hlo_flops
+
+    params = decoder_params()
+    config = OptimConfig(optimizer="muon", learning_rate=LR,
+                         optimizer_opts={} if per_head is None else {"per_head": per_head})
+    solver = config.build(10)
+    _, grads = drawn_tree(params, 0)
+    with drawn_axes(decoder_draw()):
+        compiled = jax.jit(solver.update).lower(grads, solver.init(params), params).compile()
+        reported = config.update_flops(params)
+    counted = hlo_flops(compiled)
+    assert counted is not None and reported is not None and reported > 0
+    assert counted.hardware == reported

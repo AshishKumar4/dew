@@ -1105,6 +1105,8 @@ class Trainer(Generic[Loss, Effects]):
                                                   resumed=initial is None and interval.last_saved is not None)
         if complete:
             return state
+        run.update_flops = (None if self._config is None
+                            else self._config.update_flops(state.variables["params"]))
         compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]] = run.compiled
         seen = 0
         run.notice = PreemptionNotice()
@@ -1981,7 +1983,8 @@ class Trainer(Generic[Loss, Effects]):
             return
         read, elapsed = reading
         scalars = {**logged_scalars(read, taken.counts, elapsed, self.device_mesh.devices.size,
-                                    rollout=self.rollout is not None), **run.startup.scalars()}
+                                    rollout=self.rollout is not None, update_flops=run.update_flops),
+                   **run.startup.scalars()}
         self._display.interval(taken.step, scalars)
         if self.tracker is not None:
             self.tracker.log(scalars, taken.step)

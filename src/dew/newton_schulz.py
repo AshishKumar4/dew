@@ -6,13 +6,14 @@ chunk of matrices at a time (`orthogonalized`), in the run's numerics or a state
 
 import functools
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
 from typing import Literal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from optax.contrib import _muon
 
 from dew.mesh import STAGE_AXIS
 from dew.nn.precision import configured_precision, iteration_dtype
@@ -70,25 +71,12 @@ def headed(stack: jax.Array, width: int | None) -> tuple[jax.Array, Callable[[ja
         matrices.reshape(batch, output // width, reduction, width), (0, 2, 1, 3)).reshape(stack.shape)
 
 
-def matrix_axes(x: jax.Array, numbers: optax.contrib.MuonDimensionNumbers
-                 ) -> tuple[tuple[int, ...], tuple[int, ...]]:
-    """The reduction and output axes `numbers` name of `x`, each a tuple of axes counted from its first."""
-    def axes(given: int | Sequence[int]) -> tuple[int, ...]:
-        return tuple(axis % x.ndim for axis in ((given,) if isinstance(given, int) else given))
-    return axes(numbers.reduction_axis), axes(numbers.output_axis)
-
-
 def as_matrices(x: jax.Array, numbers: optax.contrib.MuonDimensionNumbers
-                 ) -> tuple[jax.Array, Callable[[jax.Array], jax.Array]]:
-    """`x` as a stack of its matrices, `[batch, reduction, output]`, and the reshape back, as optax lays a
-    parameter out for its Newton-Schulz: its other axes the batch's, in order."""
-    reduction, output = matrix_axes(x, numbers)
-    batch = tuple(axis for axis in range(x.ndim) if axis not in (*reduction, *output))
-    order = (*batch, *reduction, *output)
-    moved = jnp.transpose(x, order)
-    stack = moved.reshape(*(math.prod(x.shape[axis] for axis in side) for side in (batch, reduction, output)))
-    back = tuple(sorted(range(x.ndim), key=order.__getitem__))
-    return stack, lambda matrices: jnp.transpose(matrices.reshape(moved.shape), back)
+                ) -> tuple[jax.Array, Callable[[jax.Array], jax.Array]]:
+    """`x` as a stack of its matrices, `[batch, reduction, output]`, and the reshape back: optax's own layout
+    for its Newton-Schulz (`_compute_muon_reshape`), its other axes the batch's, in order."""
+    reshape, back = _muon._compute_muon_reshape(x, numbers)
+    return reshape(x), back
 
 
 def orthogonalized(updates: optax.Updates, numbers, coeffs, steps: int, eps: float,
@@ -200,6 +188,14 @@ def _walked(shared: jax.Array, count: int, chunk: Callable[[jax.Array], jax.Arra
     return held
 
 
+def newton_schulz_flops(matrices: int, rows: int, columns: int, steps: int) -> float:
+    """The FLOPs of `steps` iterations of `newton_schulz` over `matrices` matrices of `rows` by `columns`, its
+    products' (each multiply and add two): of a short side m and a long side n, the Gram product `2 m² n`, its
+    square `2 m³` and the polynomial applied to the iterate `2 m² n` an iteration."""
+    short, long = sorted((rows, columns))
+    return float(matrices * steps * (4 * short * short * long + 2 * short ** 3))
+
+
 def working_bytes(rows: int, columns: int, dtype: jnp.dtype) -> int:
     """The bytes one `rows` by `columns` matrix's Newton-Schulz step holds at once in `dtype`
     (`newton_schulz`): its iterate, its Gram product on the shorter side, that product's square, the
@@ -307,22 +303,17 @@ def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
 
 
 def orthogonalized_leaf(update: jax.Array, steps: int,
-                    dimension_numbers: optax.contrib.MuonDimensionNumbers | None, *,
-                    coeffs=NEWTON_SCHULZ, eps: float = 1e-8,
-                    preconditioning: Preconditioning = "frobenius") -> jax.Array:
+                       dimension_numbers: optax.contrib.MuonDimensionNumbers | None, *,
+                       coeffs=NEWTON_SCHULZ, eps: float = 1e-8,
+                       preconditioning: Preconditioning = "frobenius") -> jax.Array:
     """`update` orthogonalized by Muon's `steps` quintic Newton-Schulz iterations at `coeffs`, one triple
-    or a schedule of them, after `preconditioning`, optax's own: its Muon transform with no momentum
-    (`scale_by_muon`, `beta` 0 and no Nesterov step) hands back the update it is given orthogonalized, in
-    its own dtype, bit for bit its `orthogonalize_via_newton_schulz`, which optax 0.2.8 does not export.
-    A leaf with no `dimension_numbers` is one matrix, its rows the reduction axis (a Linen kernel's), its
-    other axes a stack of such matrices."""
+    or a schedule of them, after `preconditioning`: optax's own iteration (`orthogonalize_via_newton_schulz`,
+    which optax 0.2.8 does not export), in the update's dtype. A leaf with no `dimension_numbers` is one
+    matrix, its rows the reduction axis (a Linen kernel's), its other axes a stack of such matrices."""
     numbers = optax.contrib.MuonDimensionNumbers() if dimension_numbers is None else dimension_numbers
-    muon = optax.contrib.scale_by_muon(coeffs, steps, beta=0.0, eps=eps, nesterov=False,
-                                       preconditioning=preconditioning, weight_dimension_numbers=numbers)
-    orthogonal, _ = muon.update(update, muon.init(update))
-    assert isinstance(orthogonal, jax.Array), "one array's update is an array"
-    return orthogonal
+    return _muon.orthogonalize_via_newton_schulz(update, jnp.asarray(coeffs), steps, preconditioning, eps,
+                                                 numbers)
 
 
-__all__ = ["NEWTON_SCHULZ", "POLAR_EXPRESS_TABLE", "Preconditioning", "newton_schulz", "ns_operands",
-           "orthogonalized", "orthogonalized_leaf", "polar_express", "working_bytes"]
+__all__ = ["NEWTON_SCHULZ", "POLAR_EXPRESS_TABLE", "Preconditioning", "newton_schulz", "newton_schulz_flops",
+           "ns_operands", "orthogonalized", "orthogonalized_leaf", "polar_express", "working_bytes"]

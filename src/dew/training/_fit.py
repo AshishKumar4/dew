@@ -350,6 +350,8 @@ class FitRun:
     last_local_saved: int | None = None
     stopped: bool = False
     training: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
+    update_flops: float | None = None
+    """One update's optimizer work beyond the model's (`OptimConfig.update_flops`), which its logs report."""
     source: Iterator[Batch] | None = None
     train: DevicePrefetchIterator | None = None
     partition: DataPartition | None = None

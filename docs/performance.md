@@ -23,7 +23,12 @@ steps, the whole mesh's analytical training work a step, logged on every device:
 sum(model_forward_flops)` where every counted network trains, the frozen and trainable work
 apart where some do not (an adapter, a frozen encoder). `train/mfu` is the interval's summed
 work over `non_compile_seconds * aggregate_peak`, `train/flops` over the time of a step at the
-mesh's peak, logged where the device's bf16 peak is known.
+mesh's peak, logged where the device's bf16 peak is known. An optimizer whose update multiplies
+matrices reports that work beside it as the pair `train/update_flops` and `train/update_mfu`, the same
+counts of the update's own work (`OptimConfig.update_flops`: Muon's Newton-Schulz products, once an
+update, `steps * (4 m² n + 2 m³)` a matrix of short side m and long side n). `train/mfu` stays the
+model's, so runs of one model under any optimizer compare, and the two shares add to the step's counted
+work over peak.
 The forward work is analytical, not inferred from HLO: `Counted.model_flops(lengths)`
 receives the real lengths of independent rows or packed segments. One multiply-add
 counts as two operations. A dense projection contributes `2 * in * out` per real
