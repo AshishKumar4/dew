@@ -52,16 +52,19 @@ def check_shapes[PathT](loaded: Iterable[tuple[PathT, tuple[int, ...]]],
             f"unexpected {unexpected}, mismatched {sorted(mismatched)}")
 
 
-def check_tree(variables: Mapping[str, object], module: nn.Module, *inputs) -> None:
+def check_tree(variables: Mapping[str, object], module: nn.Module, *inputs) -> Mapping[str, object]:
     """Check every collection against the module's abstract initialization, without another
-    copy of its parameters. Inputs may be arrays or jax.ShapeDtypeStruct values."""
+    copy of its parameters, and return that draw, its parameters boxed with the axes the module
+    declares (`dew.nn.sharding.boxed_axes` reads them). Inputs may be arrays or
+    jax.ShapeDtypeStruct values."""
     def shapes(tree) -> dict[str, tuple[int, ...]]:
         return {jax.tree_util.keystr(path, simple=True, separator="."): np.shape(leaf)
                 for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
 
     # A module's draw boxes the parameters it declares the axes of; their shapes are their values'.
-    expected = shapes(unboxed(abstract(module.init, jax.random.key(0), *inputs)))
-    check_shapes(shapes(unboxed(dict(variables))).items(), expected)
+    drawn = abstract(module.init, jax.random.key(0), *inputs)
+    check_shapes(shapes(unboxed(dict(variables))).items(), shapes(unboxed(drawn)))
+    return drawn
 
 
 AUTO = "auto"

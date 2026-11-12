@@ -50,7 +50,7 @@ import pytest
 from capability_modules import Denoiser, FamilyText, NNXDenoiser, NNXLanguageModel, NNXTokens, TokenModel
 from decision_support import decision_rows
 from flax.nnx import bridge
-from recording import RecordingTracker
+from recording import RecordingTracker, finite
 from steady_state import steady_state
 from test_text_rollout_contract import assert_generation_scores_as_full_forwards
 from tiny_configs import PER_ARCH, TINY
@@ -440,11 +440,6 @@ def loaded(family: Family) -> Loaded:
 
 
 # --- running a method ------------------------------------------------------
-
-def finite(tree) -> bool:
-    return all(bool(np.all(np.isfinite(leaf))) for leaf in jax.tree.leaves(tree)
-               if np.issubdtype(np.asarray(leaf).dtype, np.inexact))
-
 
 @dataclass(frozen=True)
 class Trained:

@@ -123,7 +123,7 @@ from dew.training._fit import (
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau
 from dew.training.cadence import Counted
-from dew.training.compiler import Compiled, CompiledStep, StepCompiler
+from dew.training.compiler import Compiled, CompiledStep, StepCompiler, laid_out
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -294,6 +294,9 @@ class Trainer(Generic[Loss, Effects]):
         # How the run's batches are cut and counted (`RunShape`): the microbatches a step's batch is read in
         # start 1 where `whole`, else as stated, until a pooling state's window or the first plan decides.
         self._shape = RunShape(split=1 if whole is not None else split)
+        # The split the run was given, which a phase planned afresh at an update's end plans under
+        # (`_compiled_for`); None where the planner chooses.
+        self._given_split = self._shape.split
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -1853,9 +1856,18 @@ class Trainer(Generic[Loss, Effects]):
         run's step, else at the state's.
         """
         state = self._staged(state, run.current)
+        signature = self.phase_passes.key(batch_signature(batch))
+        if signature not in compiled and self.phase_passes.begins(compiled) and (
+                state.window is None or int(state.microstep) % int(state.window_size) == 0):
+            # A phase of other passes begins at an update's end: its step is planned afresh, at the split
+            # the run was given or the planner's for its own passes, over the state as a fresh state holds
+            # it, no window laid out; one that begins inside an update keeps the run's, the one its open
+            # window is laid out for.
+            self._shape = dataclasses.replace(self._shape, split=self._given_split)
+            if state.inner is None:
+                state = laid_out(state, self.accumulation)
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
         trials = Trials(state, batch)
-        signature = self.phase_passes.key(batch_signature(batch))
         if signature not in compiled:
             self._read_taken(run)
             # A process whose reader changed a field or a shape would compile
