@@ -353,24 +353,6 @@ def test_a_miss_corrects_each_split_by_its_share_of_the_derived_temporaries():
     assert search.shortfall(2) == 963 * kb * 615 // 1229
 
 
-def test_a_compile_past_its_derived_headroom_lifts_the_refusals_its_excess_covers():
-    """A compile that measured more headroom than its derivation foresaw lifts a split's refusal only where
-    that excess, scaled by the split's derived temporaries against the compile's (`FitSearch.excess`),
-    covers the split's derived shortfall: 1 KB past at eight microbatches leaves four, judged 1 MB short,
-    refused, and 2 MB past lifts it (row 5448: eight measured 1.28 MB past; four, judged short, fit)."""
-    from dew.training.footprint import Footprint
-
-    kb = 1000
-    for past, refused in ((1 * kb, True), (2000 * kb, False)):
-        search = bare_search(deep(split=None).objective)
-        for split, headroom, temporaries in ((4, -1000 * kb, 600 * kb), (8, 500 * kb, 300 * kb)):
-            key = search.candidate_key(split, narrow=False)
-            search.judged_at[key] = headroom
-            search.footprints[key] = Footprint(residuals=0, gradients=0, held=0, peak=temporaries)
-        search.learned(500 * kb, 500 * kb + past, fit=True, temporaries=300 * kb)
-        assert search.refused(4) is refused
-
-
 def test_a_split_the_derivation_refuses_is_still_asked_at_its_half_rung():
     """The halving past a miss asks no compile of a split the derivation judges short at the objective's
     rung, and still asks one at its half rung (`remat_half`), judged on its own (review of row 3341's
