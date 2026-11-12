@@ -9,7 +9,6 @@ This page is generated from the maintainers' findings ledger as each change land
 ## Kernels and performance
 
 - Model consumers fused through the template's hooks. [1376, 1304, 3422, 3428, 820, 821, 822]
-- Owner, 2026-11-11: "can you launch a fresh audit of the whole jax fork we have . [5486]
 - Cached and block visibility on the template's spans. [1495, 245]
 - Later persistent-runtime B retained. [276]
 - Performance measurements. [569, 629, 285, 295, 1378]
@@ -23,7 +22,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Attention's separate tcgen05 mainloop. [5368]
 - Mosaic GPU's exp2 under approx_math=False lowered to math.exp2, which NVPTX selects as ex2.approx.f32. [5388]
 - Workaround (the owner, 11-11), for the fork. [5398]
-- Owner, 2026-11-11, choosing "tf32 default, fp32 if accurate" for the recurrence ports. [5473]
 - Recurrent layers on the template's hooks, decode and conv on the toolkit, and entering memory. [2077, 485, 1424, 3423, 3425, 1506]
 - Derived resources: tiles, registers, residency and issued work. [2943, 3087, 2940, 566]
 - GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 2109]
@@ -36,6 +34,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product. [4860]
 - Tests/test_local_attention.py::test_a_row_with_padding_among_its_tokens_bands_its_window_over_a_sequence_axis and…. [5323]
 - Attention's contract is finite inputs. [5327]
+- Src/dew/nn/kernels/templates/recurrence/key_backward.py's recurrence_key_scores_back states 130 registers. [5567]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
 - Exact on every path, every edge and every derivative order. [2656, 3723]
 - Inference through the templates. [3424, 3602]
@@ -47,10 +46,9 @@ This page is generated from the maintainers' findings ledger as each change land
 - The template's dense kernel gradient. [5271]
 - A forked recurrence (documents entering memories of their own, Chunk.entered) costs its packed row plus one chunk a document of the window's documents bound. [5353]
 - Gemm refuses, by name, combinations its spec does not define. [5391]
-- Attention | public | An indexed MLA layer. [5392]
-- Attention | public | A cached call over forks. [5437]
+- An indexed MLA layer (DSA's indexer) reads no forks. [5392]
+- A cached call over forks (a tree decode) on a windowed layer that reads bidirectional blocks clips its block to the window. [5437]
 - Perf gate: every MAINPERF job runs out its bound. [5478]
-- Kernels | public. [5487]
 - On a B200's gathered input gradient. [5523]
 
 ## Models and interop
@@ -85,7 +83,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Reported 2026-11-06: a 4B hybrid decision run on one H100 SXM, driver 570.148.08, twice stalled during step-43 evaluation inside capture after 60/101 and…. [5292]
 - Tests trained to NaN and passed. [5489]
 - A phased run whose phases are read each on its own stream. [5497]
-- Owner, 2026-11-12, in a question dialog. [5561]
 - Metamorphic run flows: a run equals its saved, reloaded and restarted self. [4511]
 - Shared-prefix forks (`dew.data.ForkedRows`, `dew.batch.Forks`) as the GPU default. [5476]
 
@@ -119,12 +116,10 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Tutorials and docs
 
-- Owner, 2026-11-07: "why are we soo cli and runConfig focused? I noticeed that the tutorial still live on the site for 12 and 14 have RunConfig based approaches…. [5465]
 - Site, docs and tutorials. [846, 1565]
 
 ## CI and tooling
 
 - Tests/lane_environment.py:121-125 sets JAX_DEFAULT_MATMUL_PRECISION=highest for every suite process but the users' arithmetic one. [5491]
-- Owner 10-29: after each base promotion, one reviewer audits main for duplication in meaning, the same concept built twice with different code. [2288]
 - 1364's ruling (docs/design/testing.md:78, :115). [3179]
 - Found 11-10 adding a gate test module. [5377]
