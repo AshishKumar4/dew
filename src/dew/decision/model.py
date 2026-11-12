@@ -12,7 +12,7 @@ from dew.decision.inputs import DecisionInputs
 from dew.decision.layout import HOWS
 from dew.nn.cross_attention import ContextEncoder, encode_context
 from dew.nn.inputs import CONTEXT, ModelInputs
-from dew.nn.inspection import QK, observed_maxima
+from dew.nn.inspection import QK, beside, component, observed_maxima
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import EXITS, Looped, TokenModel, VocabularyRows
 from dew.nn.visibility import block_ends, block_starts
@@ -225,7 +225,8 @@ class DecisionModel(HeadedModel):
         def applied(*args, **kwargs) -> jax.Array:
             if not opened:
                 return _array(self.head.apply(head, *args, **kwargs))
-            out, held = self.head.apply(head, *args, mutable=list(opened), **kwargs)
+            with component("head"):
+                out, held = self.head.apply(head, *args, mutable=list(opened), **kwargs)
             head_sown.update(held)
             return _array(out)
         # The questions' spans are pooled from the pass that holds them: the context's, where it holds
@@ -262,14 +263,13 @@ def beside_head(sown: Variables, head: Variables, opened: Sequence[str]) -> Vari
     the step `opened`: the attention logit maxima (`qk`) of each under its own parameters' name
     (`backbone`, `head`), so a QK-Clip finds every layer's maxima where it finds its weights (row 1608);
     every other collection's, the watched activations (`inspected`) among them, the head's under `head`,
-    its part of the model's variables, beside the backbone's own paths, as a step's cotangent probes nest
-    them for each part's call (`dew.batch.part`)."""
+    its part of the model's variables, beside the backbone's own paths (`dew.nn.inspection.beside`)."""
     merged = dict(sown)
     for name in opened:
         if name == QK:
             merged[QK] = {"backbone": sown.get(QK, {}), "head": head.get(QK, {})}
         elif head.get(name):
-            merged[name] = {**sown.get(name, {}), "head": head[name]}
+            merged[name] = beside(sown.get(name, {}), "head", head[name])
     return merged
 
 

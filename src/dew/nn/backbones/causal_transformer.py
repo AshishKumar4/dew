@@ -64,6 +64,7 @@ from dew.nn.continuum import (
 )
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
+from dew.nn.inspection import current_positions, watched_positions
 from dew.quantization import LinearProducts
 
 from ..activations import _SLOPES, UNGATED, GatedActivation, ungated_activation
@@ -1360,6 +1361,11 @@ class CausalTransformer(LinearProducts):
         if documents is not None or given_valid is not None:
             valid = jnp.ones(tokens.shape, bool) if given_valid is None else given_valid
         states = []
+        # A watched depth's summary reads the positions both of whose tokens its caller names
+        # (`watched_positions`), each depth's rows one shorter than the last's.
+        named = current_positions()
+        if named is not None and named.shape[:2] != hidden.shape[:2]:
+            named = None
         for depth, block in enumerate(self.mtp, start=1):
             if valid is not None:
                 valid = shifted_span(valid.shape, 1, valid=valid,
@@ -1373,7 +1379,8 @@ class CausalTransformer(LinearProducts):
                 image_groups=None if image_groups is None else image_groups[:, depth:],
                 block_groups=None if block_groups is None else block_groups[:, depth:],
                 rotary_positions=None if rotary_positions is None else rotary_positions[:, depth:])
-            hidden = block(hidden[:, :-1], embeds[:, depth:], train=train, attention_metadata=metadata)
+            with watched_positions(None if named is None else named[:, :-depth] & named[:, depth:]):
+                hidden = block(hidden[:, :-1], embeds[:, depth:], train=train, attention_metadata=metadata)
             states.append(hidden)
         return states
 

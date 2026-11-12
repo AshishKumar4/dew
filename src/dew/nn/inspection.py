@@ -109,6 +109,32 @@ def current_positions() -> jax.Array | None:
     return _POSITIONS.get()
 
 
+_COMPONENT: contextvars.ContextVar[str | None] = contextvars.ContextVar("watched_component", default=None)
+
+
+@contextlib.contextmanager
+def component(name: str) -> Iterator[None]:
+    """Within the block, a model applied apart as one part of a model's variables (a decision run's head,
+    a PPO critic), whose watched summaries its caller nests under `name`, the part (`beside`): a glob
+    names its modules by their path under it too (`head/*`), as the log names them."""
+    token = _COMPONENT.set(name)
+    try:
+        yield
+    finally:
+        _COMPONENT.reset(token)
+
+
+def beside(primary: Mapping, name: str, applied_apart: Mapping) -> dict:
+    """A sown collection's tree of a model's `primary` call with what a model applied apart sowed
+    (`applied_apart`, under `component(name)`) nested under `name` beside the primary's own paths, as a
+    step's cotangent probes nest them for each part's call (`dew.batch.part`). Refused where the primary
+    holds a module of that name at its root, whose summaries and probes the two would share."""
+    if name in primary:
+        raise ValueError(f"the model holds a module named {name!r} at its root, where its watched {name}'s "
+                         f"summaries go: give that module another name")
+    return {**primary, name: applied_apart}
+
+
 PROBE = "__probe__"
 """The name a watched module's probe is sown under while a step discovers its probes, and read under."""
 
@@ -275,14 +301,17 @@ def watching(modules: tuple[str, ...], *, histogram: bool = False,
         output = next_fun(*args, **kwargs)
         module = context.module
         path = "/".join(module.path)
+        # A model applied apart (`component`) names its modules by their path under its part too.
+        part = _COMPONENT.get()
+        paths = (path,) if part is None else (path, "/".join((part, *module.path)))
         named = any(fnmatch.fnmatchcase(name, glob)
-                    for glob in modules for name in (type(module).__name__, path))
+                    for glob in modules for name in (type(module).__name__, *paths))
         # A stacked run of layers (`layers_3_7`, a pipeline stage's `stages/layers_j`) is any of the layers
         # the log names its entries by: a glob over one of them takes the run, and the log keeps that layer's
         # entries alone (`flattened`).
-        widened = any_layer(path)
-        candidate = widened != path and any(
-            fnmatch.fnmatchcase(widened, any_layer(glob, pattern=True)) for glob in modules)
+        candidate = any(any_layer(each) != each
+                        and fnmatch.fnmatchcase(any_layer(each), any_layer(glob, pattern=True))
+                        for each in paths for glob in modules)
         if context.method_name != "__call__" or not (named or candidate):
             return output
         if not module.is_mutable_collection(INSPECTED):

@@ -1068,19 +1068,18 @@ class TextGeneration(_NativeTextTask):
 
     @functools.cached_property
     def _stops(self) -> tuple[Stopping, ...]:
-        """The policy's stop strings compiled (`_stop_criteria`), at the first draw that reads them, and
-        handed on to the task `bind` gives over other weights or progress, which changes none of what
-        they compile from: the processor, the strings and the model's head."""
+        """The policy's stop strings compiled (`_stop_criteria`), once a task's first draw or binding reads
+        them, and handed on to every task `bind` gives over other weights or progress, which changes none
+        of what they compile from: the processor, the strings and the model's head."""
         return self._stop_criteria(self.sampling.stop)
 
     def bind(self, variables: Variables, progress: Progress | None = None) -> Self:
         """This task over `variables` (`_NativeTextTask.bind`), drawing at the run's `progress` where one
-        is given, a collection's step's (`EpisodeInference.bind`), else at its own: one task, its stop
-        strings' criteria carried where they are compiled (`_stops`), so a collection's policy rebound at
-        every snapshot compiles them once."""
+        is given, a collection's step's (`EpisodeInference.bind`), else at its own: one task, carrying this
+        one's stop strings' criteria (`_stops`), so a collection that binds its policy at every snapshot
+        compiles them once."""
         bound = replace(self, variables=variables, **({} if progress is None else {"progress": progress}))
-        if "_stops" in self.__dict__:
-            bound.__dict__["_stops"] = self.__dict__["_stops"]
+        bound.__dict__["_stops"] = self._stops
         return bound
 
     def _controls(self, sampling: Sampling | None, logits: Transforms | None, stopping: Criteria | None

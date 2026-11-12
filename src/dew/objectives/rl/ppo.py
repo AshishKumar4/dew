@@ -18,6 +18,7 @@ from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites, part_stage_sites
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
+from dew.nn.inspection import beside, component
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import END, Progress, ReadsProgress, progressed
 from dew.nn.protocols import ForkedCalls, HiddenStates
@@ -275,8 +276,9 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         # The rollout's packed columns laid out once (`Coordinates`), the layout the backbone reads, its
         # groups' shared prompts among them (`packed_coordinates`).
         laid = packed_coordinates(batch, -1)
-        values = self.critic.apply(part(variables, "critic"), ids[:, :-1], coordinates=laid,
-                                   mutable=list(opened) or False, **progressed(self.critic, progress))
+        with component("critic"):
+            values = self.critic.apply(part(variables, "critic"), ids[:, :-1], coordinates=laid,
+                                       mutable=list(opened) or False, **progressed(self.critic, progress))
         values, sown = values if opened else (values, {})
         if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
@@ -322,9 +324,9 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         if critic_qk is not None:
             qk = {**(qk or {}), "critic": critic_qk}
         # The critic's watched activations under its part of the variables (`critic`), beside the actor's
-        # own paths, as a step's cotangent probes nest them for each part's call (`dew.batch.part`).
-        inspected = (aux.inspected if not critic_inspected
-                     else {**(aux.inspected or {}), "critic": critic_inspected})
+        # own paths (`dew.nn.inspection.beside`).
+        inspected = aux.inspected if not critic_inspected else beside(aux.inspected or {}, "critic",
+                                                                       critic_inspected)
         return PPOStatistics(pg, critic), Aux(metrics, qk_stats=qk, effects=aux.effects, inspected=inspected)
 
     def reduce_loss(self, stats: PPOStatistics | Ratio) -> tuple[jax.Array, jax.Array]:
