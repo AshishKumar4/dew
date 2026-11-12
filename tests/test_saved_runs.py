@@ -318,6 +318,11 @@ def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, 
     (`named`)."""
     run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
     stated = RunConfig.load(str(run)).data_plan_version
+    if stated not in PLAN_VERSIONS:
+        # Its data, compiled at the version it states, is refused where its run is prepared.
+        with pytest.raises(ValueError):
+            built.prepare()
+        return
     prepared = built.prepare()
     python = dataclasses.replace(prepared.run, data_plan_version=None,
                                  trainer=dataclasses.replace(prepared.run.trainer, name=named))
