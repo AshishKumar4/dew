@@ -481,9 +481,9 @@ class Allocations:
         staging = tuple(family.output_staging(self.outputs, consumers))
         rewrites = tuple(tiles.stages for _ in self.blocks) if rewritten else ()
         persisted, addresses = family.persist_scratch(consumers, rewrites)
-        multicast = ('matrix',) if tiles.cluster > 1 and 'matrix' in self.blocks else ()
-        streams = family.streams(self.blocks, tiles.stages, consumers, multicast=multicast,
-                                 gathered=self.gathered)
+        matrices = tuple(name for name in ('matrix', 'paired') if name in self.blocks)
+        streams = family.streams(self.blocks, tiles.stages, consumers,
+                                 multicast=multicast(tiles, family, matrices), gathered=self.gathered)
         held, walks = family.lifetimes(streams, steps)
         # A core holding its values in scratch memory holds them beside (`mosaic.Issuer.value_scratch`).
         values = family.value_scratch(self.blocks, self.outputs)
@@ -883,8 +883,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
 
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers,
-                                             multicast=matrices if pair > 1 and not family.pairs_product
-                                             else (),
+                                             multicast=multicast(tiles, family, matrices),
                                              swizzles=SCALE_SWIZZLES if step_scales is not None
                                              else None, **_gathered(gather, tiles, lhs.dtype, interpret)))
 
@@ -1265,6 +1264,16 @@ def depth_masked(prologue, tile, *sides):
     # `[1, depth]` reshape between took no layout Mosaic GPU infers ("Tiling rank different than broadcast
     # result rank, (8,) vs (1, 64)", the GEMM compile gate's unaligned projection on sm90).
     return jnp.where(valid > 0, transformed, jnp.zeros_like(transformed))
+
+
+def multicast(tiles: Tiles, family: mosaic.Family, matrices: tuple[str, ...]) -> tuple[str, ...]:
+    """Dew: the streams a cluster's programs share (`mosaic.Family.streams`' multicast): its `matrices`, the
+    group's blocks its row tiles load once between them, where its cluster's programs each run a tile of
+    their own; none on a family whose products span the pair (`mosaic.Transport.pairs_product`, each CTA
+    loading its half of the pair's block) or of one program a cluster. The one statement the kernel's
+    streams and the planner's (`Allocations.scope`) both read: the planner's multicast a pair's streams
+    refused, so no pair's tile was ever legal."""
+    return matrices if tiles.cluster > 1 and not family.pairs_product else ()
 
 
 def pair_takes(tiles: Tiles, family: mosaic.Family) -> bool:

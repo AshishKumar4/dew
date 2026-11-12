@@ -4,6 +4,7 @@ fold of the old Blackwell GEMM mainloop into it, template push piece 7, and its 
 a B300 itself (tests/test_gpu_gemm.py's cells)."""
 
 import dataclasses
+import functools
 
 import fla_gdn_support as support
 import jax
@@ -284,4 +285,18 @@ def test_a_pairs_tile_is_twice_a_ctas_and_takes_only_what_its_views_read():
     with generation.assumed("sm100"), pytest.raises(ValueError):
         mosaic_gpu.gmm(x, w, jnp.asarray([256], jnp.int32), tiles=PAIRED, transpose_rhs=False,
                        out_dtype=jnp.bfloat16, multiprocessors=2, dense=True, prologue=lambda rows: rows)
+
+
+def test_a_pairs_tile_is_legal_for_a_dense_product_on_a_b200():
+    """A pair's tile is a dense product's legal tile on a B200, its streams planned as its kernel loads them
+    (`mosaic_gpu.multicast`: each CTA its half of the pair's block, no multicast ring), at Qwen3.5-4B's up
+    projection over a step's 24,576 tokens; a pair's tile was never legal while the planner multicast its
+    matrix, which the pair's streams refuse."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    launch = grouped_matmul.MosaicGmm()
+    with generation.assumed("sm100"):
+        target = generation.gpu_target()
+        ba = launch.bind(bf16((24576, 2560)), bf16((1, 2560, 9216)), jax.ShapeDtypeStruct((1,), jnp.int32),
+                         out_dtype="bfloat16", trans_rhs=False, interpret=False, dense=True)
+        assert launch.legal(ba, dataclasses.replace(PAIRED, stages=5), target)
 
