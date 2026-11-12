@@ -89,10 +89,16 @@ INTERPRETED_FORWARD = {('one sequence', 'fp32'), ('a ragged length', 'bf16'), ('
                        ('a decay a key dimension', 'bf16'), ('a decay a key dimension', 'fp32'),
                        ('a decay a key dimension, packed', 'bf16'),
                        ('a decay a key dimension, packed', 'fp32')}
-"""The forward's cases the CPU interprets: each launch in each arithmetic (an fp32 call's three parts, a
-16-bit call's), over key blocks and key heads' groups, a ragged chunk, packed documents, a decay a key
-dimension's launches packed and not, in fp32 too (refused at exact products). Interpreted, the whole grid
-took 3.5 times these (2838 against 805 seconds)."""
+"""The forward's cases off the GPU flow (`native`): each launch in each arithmetic (an fp32 call's three
+parts, a 16-bit call's), over key blocks and key heads' groups, a ragged chunk, packed documents, a decay a
+key dimension's launches packed and not, in fp32 too (refused at exact products). The CPU interprets each as
+a drawn test of its own (`drawn_forward`) but the 16-bit call under a decay a key dimension, whose output
+and final memory test_recurrence_mosaic_gradient's cell judges on the same recorded site (`fla_sites.ruled`'s
+leaves) by the same launches: under a decay a key dimension the inference forward is the training forward's
+launches keeping nothing (`chunk_forward.forward`, `kept_forward`'s `keeps`). Under a decay a head a 16-bit
+inference forward walks once (`walks_once`: one scan launch, its own rounded expression), so its ragged and
+packed cases are drawn tests of their own. Interpreted, the whole grid took 3.5 times these (2838 against
+805 seconds)."""
 
 def interpreted(grid: list[tuple], chosen: set[tuple]) -> list:
     """`grid`'s parameters the CPU interprets, those in `chosen`, each id its values joined by '-'; the rest
@@ -283,6 +289,12 @@ def drawn_forward(case: str, dtype: str) -> Callable:
 def test_the_mosaic_forward_over_one_fp32_sequence_is_as_exact_as_its_reference():
     """`the_mosaic_forward_is_as_exact_as_its_reference` at an fp32 call over one sequence, under either
     forms."""
+
+
+@pytest.mark.check1_shards(seeds=256, per_task=16)
+@drawn_forward('a ragged length', 'bf16')
+def test_the_mosaic_forward_over_a_ragged_length_is_as_exact_as_its_reference():
+    """`the_mosaic_forward_is_as_exact_as_its_reference` at a 16-bit call over a ragged length."""
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=16)

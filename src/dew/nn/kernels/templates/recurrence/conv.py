@@ -105,11 +105,10 @@ def _stored(ref, at: tuple, value, when) -> None:
 
 
 def _activated(pre, activation: bool):
-    """The SiLU of the conv's sums, its sigmoid one quotient, and the sigmoid (None without one)."""
+    """The SiLU of the conv's sums, causal_conv1d's one quotient, and their sigmoid (None without one)."""
     if not activation:
         return pre, None
-    gate = 1.0 / (1.0 + jnp.exp(-pre))
-    return pre / (1.0 + jnp.exp(-pre)), gate
+    return pre / (1.0 + jnp.exp(-pre)), jax.nn.sigmoid(pre)
 
 
 class _Piece:

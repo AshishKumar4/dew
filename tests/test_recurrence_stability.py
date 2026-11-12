@@ -32,7 +32,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from port_support import row_names_port
-from reference_error import assert_as_exact, widened, with_gradients
+from reference_error import assert_as_exact, with_gradients
 from ssd_support import mamba_side
 from test_recurrence_chunk import (
     CHUNK,
@@ -333,22 +333,13 @@ def restarting(fn, regime: str):
     return lambda operands: fn(_reset(operands))
 
 
-def assert_finite_and_on_par(dew, reference, draws, label: str, *, seeds: int, finite_seeds: int,
-                             upstream=None) -> None:
-    """A scan path's claim here: every leaf of `dew` finite wherever the float64 `reference`'s is over
-    `finite_seeds` draws, and on par with `reference`'s from float64 over `seeds` (check 1), or where an
+def assert_finite_and_on_par(dew, reference, draws, label: str, *, seeds: int, upstream=None) -> None:
+    """A scan path's claim here: every leaf of `dew` finite and on par with `reference`'s from float64 over
+    `seeds` (check 1, which refuses a leaf a value of which is not finite on any of its draws), or where an
     `upstream` arm is given (a port's own library, `_mamba_ssm`), with that arm's, the float64 `reference`
-    the truth. Plain functions: the gate compiles both arms alike (`reference_error._arms`)."""
-    for seed in range(finite_seeds):
-        drawn = draws(seed)
-        mine = jax.jit(dew)(*drawn)
-        with jax.enable_x64(new_val=True):
-            truth = jax.jit(reference)(*widened(drawn))
-        leaves = zip(jax.tree_util.tree_leaves_with_path(mine), jax.tree.leaves(truth), strict=True)
-        for (path, ours), exact in leaves:
-            finite = np.isfinite(np.asarray(exact))
-            assert np.all(np.isfinite(np.asarray(ours))[finite]), (
-                f'{label}{jax.tree_util.keystr(path)}: not finite where float64 is, seed {seed}')
+    the truth. Plain functions: the gate compiles both arms alike (`reference_error._arms`). Each draw's
+    finiteness was checked apart first, Dew and the float64 reference computed twice over the same draws
+    (the kernel tests' audit, 11-12)."""
     if upstream is None:
         assert_as_exact(dew, reference, draws, label, seeds=seeds)
     else:
@@ -366,8 +357,7 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
     assert_finite_and_on_par(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK),
                              functools.partial(token_by_token, hooks),
                              functools.partial(stressed, hooks, regime),
-                             f'the portable math, {name} under {regime}', seeds=SEEDS[name, regime],
-                             finite_seeds=SEEDS[name, regime])
+                             f'the portable math, {name} under {regime}', seeds=SEEDS[name, regime])
 
 
 ACCELERATED = [(name, regime) for name in ('scalar delta', 'vector delta')
@@ -411,7 +401,7 @@ def _gradient_holds_check_1(name, regime):
         with_gradients(restarting(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK), regime)),
         with_gradients(restarting(functools.partial(token_by_token, hooks), regime)),
         functools.partial(cotangents, hooks, regime), f"the portable math's gradient, {name} under {regime}",
-        seeds=GRADIENT_SEEDS[name, regime], finite_seeds=2)
+        seeds=GRADIENT_SEEDS[name, regime])
 
 
 def ssd_port(hooks, *args, **kwargs):
@@ -485,8 +475,7 @@ def the_ssd_port_stays_finite_and_exact_where_chunked_forms_break(regime):
     draws, seeds = functools.partial(stressed, hooks, regime, value_heads=RATED_HEADS), PORT_SEEDS[regime]
     assert_finite_and_on_par(functools.partial(ssd_port, hooks, chunk_size=CHUNK),
                              functools.partial(token_by_token, hooks), draws, f'the SSD port under {regime}',
-                             seeds=seeds, finite_seeds=seeds,
-                             upstream=_mamba_ssm(regime, draws, seeds, gradients=False))
+                             seeds=seeds, upstream=_mamba_ssm(regime, draws, seeds, gradients=False))
 
 
 def the_ssd_ports_gradient_is_as_exact_as_the_recurrences(regime):
@@ -498,5 +487,5 @@ def the_ssd_ports_gradient_is_as_exact_as_the_recurrences(regime):
     assert_finite_and_on_par(
         with_gradients(restarting(functools.partial(ssd_port, hooks, chunk_size=CHUNK), regime)),
         with_gradients(restarting(functools.partial(token_by_token, hooks), regime)), draws,
-        f"the SSD port's gradient under {regime}", seeds=seeds, finite_seeds=2,
+        f"the SSD port's gradient under {regime}", seeds=seeds,
         upstream=_mamba_ssm(regime, draws, seeds, gradients=True))

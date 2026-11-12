@@ -162,9 +162,12 @@ def raised(whole, part):
 
 
 def _floor(x):
-    """`floor(x)` of fp32 `x` from its truncation toward zero, which Mosaic GPU lowers (it lowers no floor),
-    the same value (a zero's sign aside): every fp32 of magnitude 2^23 or more is an integer, and infinities
-    and NaNs are their own floor."""
+    """`floor(x)` of fp32 `x` from its truncation toward zero, the same value (a zero's sign aside): every
+    fp32 of magnitude 2^23 or more is an integer, and infinities and NaNs are their own floor. Mosaic GPU
+    lowers `jnp.floor` too (one cvt.rmi since post81), but there the sm100 Kimi delta attention two-role
+    training launch (`recurrence_intra`, the compensated prefix's whole part) spills 8 bytes at its
+    residency's 248-register share, which this form holds at with none: its least spill-free cap is 240
+    either way (audit K2-1, jsf-calib-floor), ptxas not monotone between them."""
     truncated = jnp.clip(x, -2.0 ** 23, 2.0 ** 23).astype(jnp.int32).astype(x.dtype)
     floor = jnp.where(truncated > x, truncated - 1.0, truncated)
     return jnp.where(jnp.abs(x) < 2.0 ** 23, floor, x)

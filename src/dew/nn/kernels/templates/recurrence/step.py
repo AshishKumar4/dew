@@ -330,7 +330,7 @@ class _Conv:
                     else None)
             pre = short_conv.preactivation(window, weights, bias)
             # SiLU as the reference's, the input times its sigmoid.
-            streams.append(pre if self.conv.activation is None else pre * _sigmoid(pre))
+            streams.append(pre if self.conv.activation is None else pre * jax.nn.sigmoid(pre))
         return tuple(streams)
 
     def held(self):
@@ -391,7 +391,7 @@ def _gates(hooks, inputs, row, head, layout):
         if hooks.gates.limit is not None:
             rate = jnp.clip(rate, *hooks.gates.limit)
         decay = jnp.exp(-jnp.exp(headed('log_a')) * rate)
-        return decay, rate if hooks.gates.write == 'step' else _sigmoid(scalar('beta'))
+        return decay, rate if hooks.gates.write == 'step' else jax.nn.sigmoid(scalar('beta'))
     if hooks.rated:
         write = scalar('beta')
         return jnp.exp(headed('rate') * write), write
@@ -402,11 +402,6 @@ def _gates(hooks, inputs, row, head, layout):
         decay = plgpu.load(inputs['log_decay'].at[row, head], layout=layout, optimized=False)
         return jnp.exp(decay.astype(jnp.float32)), write
     return jnp.exp(scalar('log_decay')), write
-
-
-def _sigmoid(x):
-    """The sigmoid, one quotient (`short_conv._sigmoid`'s): Mosaic GPU lowers no logistic."""
-    return 1.0 / (1.0 + jnp.exp(-x))
 
 
 def _softplus(x):

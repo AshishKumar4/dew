@@ -1563,8 +1563,7 @@ class SelectiveCase:
     its states' rows' narrower one (B's or C's, which stream each in its own: the narrower's rows are the
     shorter), its tokens, channels and states, whether the run's forms are the fast ones (its template forms
     its products whole in fp32 whatever the run's precision)
-    and its device's instruction family (None off a GPU), and whether its documents enter states of their
-    own (`documents`); the forward and the training step route alike."""
+    and its device's instruction family (None off a GPU); the forward and the training step route alike."""
 
     varying: bool
     dtype: np.dtype
@@ -1574,7 +1573,6 @@ class SelectiveCase:
     states: int
     fast: bool
     family: str | None = None
-    documents: bool = False
 
 
 def _selective():
@@ -1620,10 +1618,6 @@ SELECTIVE_SUPPORTS: tuple[Requirement[SelectiveCase], ...] = (
     Requirement('forms', lambda case: case.fast,
                 "the run's accurate forms, whose sums the portable math compensates (row 1698); the template "
                 "sums at mamba_ssm's rounding, the fast forms' bar", row='ledger 2968', kind='measured'),
-    Requirement('documents', lambda case: not case.documents,
-                "a forked call (`Chunk.loads`), whose documents enter its table's states, which the template "
-                "walks from a zero state alone: the portable scan takes each up at its chunk's edge",
-                row='ledger 5288'),
 )
 """What the template's selective scan (`templates.recurrence.selective`) needs of a call: no caller's
 `shard_map` that checks varying axes, a GPU of a family its bundles cover, 16-bit or fp32 operands, whole
@@ -1640,10 +1634,9 @@ atomically, took 11.3 ms at 8x2048x5120 and 9.22 at 4x2048x8192 (W3-a100-3-selec
 44bec4713f, whose backward base's is again)."""
 
 
-def selective_kernel(x, A, B, C, *, documents: bool = False) -> str:
+def selective_kernel(x, A, B, C) -> str:
     """The kernel the selective scan's selector (`SELECTIVE`) gives a scan over `x` `[B, S, D]` with rates
-    `A` `[D, N]` and states' rows `B`, `C` `[B, S, N]`, its documents entering states of their own where
-    `documents`, on the target, reported as its route."""
+    `A` `[D, N]` and states' rows `B`, `C` `[B, S, N]` on the target, reported as its route."""
     from .templates import bundles
 
     # A GPU's family where a bundle claims it (consumer Blackwell's, mma.sync fed by TMA, has one; tcgen05
@@ -1656,7 +1649,7 @@ def selective_kernel(x, A, B, C, *, documents: bool = False) -> str:
                                          key=lambda dtype: dtype.itemsize),
                          length=x.shape[1], channels=x.shape[-1], states=A.shape[-1],
                          fast=generation.numerics().forms == 'fast',
-                         family=family, documents=documents)
+                         family=family)
     return select(SELECTIVE, case).kernel
 
 
@@ -1667,9 +1660,9 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, load
     scan, interpreted off a GPU (where a call names it), per shard of rows on a mesh (`manual_map`: B and C
     serve every channel, so the channels stay whole); or `portable(x, dt, A, B, C, D, state, starts)`,
     the portable math. A forked call (`loads`, `stores`, `held`, as `Chunk.loads` takes them, `state` `[B,
-    S', D, N]` its table's given states) runs on the portable math, each document laid from a chunk's edge
-    and its state taken up there (`portable`'s `forked`, `AlignedDocuments`), which the template takes no
-    form of (`SelectiveCase.documents`); its final state is the row's last.
+    S', D, N]` its table's given states) lays each document from a chunk's edge and takes its state up
+    there (`AlignedDocuments`) on either: the template's walk over its table (`selective.Documents`) or
+    the portable math's (`portable`'s `forked`); its final state is the row's last.
     """
     forked = None
     if loads is not None:
@@ -1678,8 +1671,12 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, load
                         held)
     from .templates.recurrence import selective
 
-    def template(x, dt, A, B, C, D, state, *starts):
-        return selective.SELECTIVE(x, dt, A, B, C, D, state, *(starts or (None,)),
+    def template(x, dt, A, B, C, D, state, *given):
+        if forked is not None:
+            # A forked call's slots a row's (`Forked.walked`), its starts read into their firsts.
+            return selective.SELECTIVE(x, dt, A, B, C, D, state, forked=forked.carrying(*given),
+                                       interpret=generation.backend() != 'gpu')
+        return selective.SELECTIVE(x, dt, A, B, C, D, state, *(given or (None,)),
                                    interpret=generation.backend() != 'gpu')
 
     def run(kernel, x, dt, A, B, C, D, state, *walked):
@@ -1688,10 +1685,15 @@ def selective_scan(x, dt, A, B, C, D, state, starts, *, portable: Callable, load
             return portable(x, dt, A, B, C, D, state, starts, **laid)
         rows, _ = grouped_heads((*x.shape[:2], 1, x.shape[-1]), 1)
         three = P(rows, None, None)
+        if forked is not None:
+            operands = (x, dt, A, B, C, D, state, *walked)
+            specs = (three, three, P(None, None), three, three, P(None), P(rows, None, None, None),
+                     *(P(rows, None),) * len(walked))
+            return manual_map(template, specs, (three, three))(*operands)
         held = state if state is not None else jnp.zeros((x.shape[0], x.shape[-1], A.shape[-1]), x.dtype)
         operands = (x, dt, A, B, C, D, held, *([] if starts is None else [starts]))
         specs = (three, three, P(None, None), three, three, P(None), three, P(rows, None))
         return manual_map(template, specs[:len(operands)], (three, three))(*operands)
 
-    return _per_product(lambda product: selective_kernel(x, A, B, C, documents=forked is not None), run, x,
-                        dt, A, B, C, D, state, *(() if forked is None else forked.walked))
+    return _per_product(lambda product: selective_kernel(x, A, B, C), run, x, dt, A, B, C, D, state,
+                        *(() if forked is None else forked.walked))

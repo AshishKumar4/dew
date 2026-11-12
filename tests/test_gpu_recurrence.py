@@ -9,6 +9,9 @@ cases the CPU does not interpret, run in one process (`gpu_flow`), each cell its
   portable scan, on an H100 (test_selective_template).
 - A two-role walk's training on an H100, its two consumers a launch no flow's widths reach
   (test_recurrence_mosaic_gradient).
+- The template over a forked call, its walks taking each document's memory from the call's table and storing
+  the finals later documents take (test_recurrence_chunk), and its fp32 forward at the default precision on
+  each GPU's instruction family, its training on an H100's (test_recurrence_mosaic, its gradient's).
 - Each recurrence layer trained on its port's kernels, natively (`PORT_KERNELS`): a gated delta net on the
   FLA GDN kernels and a Kimi delta attention layer on FLA KDA's chunk_kda, packed rows, forward and every
   gradient on par from float64 with the portable rule's; their training step the same bit for bit each
@@ -40,6 +43,7 @@ import numpy as np
 import pytest
 import test_fla_gdn as fla_gdn
 import test_mamba_ssd as mamba_ssd
+import test_recurrence_chunk as chunked
 import test_recurrence_mosaic as forward
 import test_recurrence_mosaic_gradient as gradient
 import test_recurrence_stability as stability
@@ -235,6 +239,12 @@ def selective_cells() -> list[Cell]:
                functools.partial(selective_template.the_layer_is_as_exact_under_the_template, packed, held),
                "sm90")
           for packed, held in ((False, None), (True, None), (False, "through the template"))),
+        # A forked call: its documents' states taken from and stored to its table across a program's chunks,
+        # each read back by threads other than its writers' (`Family.kept`, `mosaic.synced`).
+        *(Cell(f"the selective template is as exact over a forked call: {layout}",
+               functools.partial(selective_template.the_template_is_as_exact_over_a_forked_call, layout),
+               "sm90")
+          for layout in selective_template.FORKED),
     ]
 
 
@@ -255,6 +265,31 @@ def port_training_cells() -> list[Cell]:
         *(Cell(f"the port is as exact as fla's own: {'kda' if per_key else 'gdn'} {dtypes}",
                functools.partial(fla_gdn.the_port_is_as_exact_as_fla, per_key, dtypes))
           for per_key in (False, True) for dtypes in fla_gdn.FLA_DTYPES),
+    ]
+
+
+def forked_cells() -> list[Cell]:
+    """The template over a forked call: its walks take each document's memory up from the call's table and
+    store the finals later documents take, across launches whose order the interpreter's one schedule fixes,
+    and no model flow forks a call."""
+    return [Cell(f"the template's forked documents are as exact as each alone: {hooks}",
+                 functools.partial(chunked.the_templates_forked_documents_are_as_exact_as_each_alone, hooks))
+            for hooks in chunked.FORKED_TEMPLATE]
+
+
+def default_fp32_cells() -> list[Cell]:
+    """The template's fp32 call at the default precision (the fast forms, `formed`'s, which set it whatever
+    the lane's): its products round as each instruction family rounds an fp32 operand (mma.sync's TF32 'rna',
+    a warpgroup MMA's TF32 read; the owner's "tf32 default") and its exponentials are ex2.approx's, which the
+    interpreter computes exactly. The forward each family takes at a GPU's widths (an sm80's, an sm90's, an
+    sm100's), its training an sm90's alone."""
+    return [
+        Cell("the template's fp32 forward at the default precision is as exact as fla's: one sequence",
+             functools.partial(forward.the_mosaic_forward_is_as_exact_as_its_reference, "one sequence",
+                               jnp.float32)),
+        Cell("the template's fp32 training step at the default precision is as exact as fla's: one sequence",
+             functools.partial(gradient.the_mosaic_gradient_is_as_exact_as_its_reference, "one sequence",
+                               jnp.float32, "kept"), "sm90"),
     ]
 
 
@@ -282,6 +317,7 @@ def decode_cells() -> list[Cell]:
 
 FAMILIES = {"two-role walk": walk_cells, "template stability": template_stability_cells,
             "portable": portable_cells, "SSD port": ssd_port_cells, "selective scan": selective_cells,
+            "forked template": forked_cells, "fp32 at the default precision": default_fp32_cells,
             "port training and decode": lambda: [*port_training_cells(), *decode_cells()]}
 """The recurrence cells by family, each family a test of its own: the planner times and packs each, and one
 family's failure hides no other's (a single flow of every family ran past a GPU job's 50 minutes). A
