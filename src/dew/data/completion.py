@@ -253,7 +253,7 @@ def released(units: Numbered, window: int | None, seed: int) -> pygrain.IterData
     # The latest place among each span's units, the spans' first units never falling back (`Numbered`):
     # the units still in the latest span, by falling place.
     latest: collections.deque[int] = collections.deque()
-    for unit, since, consumed, refused, members, drawn, *_ in held:
+    for unit, since, consumed, refused, members, unit_draws, *_ in held:
         while latest and place_of[latest[-1]] <= place_of[unit]:
             latest.pop()
         latest.append(unit)
@@ -264,8 +264,8 @@ def released(units: Numbered, window: int | None, seed: int) -> pygrain.IterData
             table[at] += (consumed, refused)
             if members:
                 split[at] = joined(split.get(at, {}), members)
-            if drawn:
-                draws[at] = (*draws.get(at, ()), *drawn)
+            if unit_draws:
+                draws[at] = (*draws.get(at, ()), *unit_draws)
     shuffled = gx.WindowShuffleIterDataset(units, window_size=size, seed=seed)
     return shuffled.map(_Release(table, split, any(counted for *_, counted, _ in held), draws,
                                  any(drawing for *_, drawing in held)))
