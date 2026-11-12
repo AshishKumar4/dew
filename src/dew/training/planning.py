@@ -971,19 +971,20 @@ class FitSearch[LossT, EffectsT]:
         """The bytes a step at `split` at the objective's remat is judged to need past its derived headroom
         (`under`): the most a compile there missed, scaled by the step's derived temporaries against that
         compile's (`missed_at`), or whole where either is not derived."""
-        rung = self.remat_rung()
-        return self._scaled(self.under.get(rung, 0), self.missed_at.get(rung), split)
+        return self._scaled(self.under, self.missed_at, split)
 
     def excess(self, split: int) -> int:
         """The headroom a step at `split` at the objective's remat is judged to hold past its derived headroom
         (`over`): the most a compile there measured past it, scaled by the step's derived temporaries against
         that compile's (`over_at`), or whole where either is not derived."""
-        rung = self.remat_rung()
-        return self._scaled(self.over.get(rung, 0), self.over_at.get(rung), split)
+        return self._scaled(self.over, self.over_at, split)
 
-    def _scaled(self, measured: int, at: int | None, split: int) -> int:
-        """`measured` bytes of a compile whose derived temporaries were `at`, in proportion to the step's at
-        `split` (what the derivation misses grows with what it derives), or whole where either is unknown."""
+    def _scaled(self, most: dict[str, int], at: dict[str, int], split: int) -> int:
+        """The bytes `most` holds at the objective's remat rung, a compile's whose derived temporaries `at`
+        holds, in proportion to the step's at `split` (what the derivation misses grows with what it
+        derives), or whole where either is unknown."""
+        rung = self.remat_rung()
+        measured, at = most.get(rung, 0), at.get(rung)
         footprint = self.footprints.get(self.candidate_key(split, self.narrow))
         temporaries = None if footprint is None else footprint.temporaries
         if not measured or not at or temporaries is None:
