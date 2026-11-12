@@ -667,30 +667,6 @@ def _ids(batches):
             for batch in batches]
 
 
-def test_a_cache_of_one_record_an_input_reads_each_share_as_the_uncached_order_does(tmp_path):
-    """A cache whose steps keep one record for each input, then a shuffle: two shares of an
-    indexed read each read what the uncached chain's share reads, the shuffle one order over every
-    input. A position saved at two shares restores at one, reading on as the uncached chain does."""
-    from dew.data.compile import compile
-    from dew.data.dataset import Loading
-    from dew.data.pipeline import Pipeline
-
-    loading = Loading(workers=0, threads=1, read_buffer=1)
-    source = Memory([{"id": index} for index in range(12)])
-
-    def built(cache):
-        stepped = Pipeline(source).map(Offset(10))
-        return compile((stepped if cache is None else stepped.cache(cache)).shuffle(0).repeat().batch(2),
-                       read="indexed", loading=loading)
-
-    uncached, cached = built(None), built(str(tmp_path / "cache"))
-    for index in range(2):
-        assert share(cached, index, 2, 4)[0] == share(uncached, index, 2, 4)[0]
-    _, saved = share(cached, 0, 2, 3)
-    _, uncached_saved = share(uncached, 0, 2, 3)
-    assert share(cached, 0, 1, 3, saved)[0] == share(uncached, 0, 1, 3, uncached_saved)[0]
-
-
 def test_a_cache_skips_the_inputs_a_store_misses_as_the_uncached_read_does_and_publishes_them(tmp_path):
     """A store in memory missing two of its inputs: a cache of one record for each input reads the
     rest as the uncached chain does, and completes its fill with the missing ones, so a later run
@@ -986,11 +962,14 @@ def test_a_cache_after_views_of_the_inputs_reads_as_the_uncached_chain(tmp_path,
     assert (reading.calls == []) == (views != "taken")
 
 
-@pytest.mark.parametrize("read", ["memory", "indexed"])
-def test_a_cache_of_one_record_an_input_after_views_reads_each_share_as_the_uncached_chain(tmp_path, read):
-    """A shuffle and a take of the inputs, then a step that keeps one record for each and a cache:
-    each of two shares reads what the uncached chain's share reads, the take one over every input,
-    and a position saved at two shares restores at one as the uncached chain's does."""
+@pytest.mark.parametrize("views, read", [("shuffled after", "indexed"),
+                                         ("shuffled and taken before", "memory"),
+                                         ("shuffled and taken before", "indexed")])
+def test_a_cache_of_one_record_an_input_reads_each_share_as_the_uncached_chain(tmp_path, views, read):
+    """A step that keeps one record for each input, then a cache, its inputs' views a shuffle after it or a
+    shuffle and a take before it: each of two shares reads what the uncached chain's share reads, the
+    shuffle one order over every input and the take one over every input it keeps, and a position saved
+    at two shares restores at one, reading on as the uncached chain's does."""
     from dew.data.compile import compile
     from dew.data.dataset import Loading
     from dew.data.pipeline import Pipeline
@@ -999,9 +978,13 @@ def test_a_cache_of_one_record_an_input_after_views_reads_each_share_as_the_unca
     source = Memory([{"id": index} for index in range(12)])
 
     def built(cache):
-        stepped = Pipeline(source).shuffle(0).take(10).map(Offset(10))
-        return compile((stepped if cache is None else stepped.cache(cache)).repeat().batch(2), read=read,
-                       loading=loading)
+        if views == "shuffled after":
+            stepped = Pipeline(source).map(Offset(10))
+            chain = (stepped if cache is None else stepped.cache(cache)).shuffle(0)
+        else:
+            stepped = Pipeline(source).shuffle(0).take(10).map(Offset(10))
+            chain = stepped if cache is None else stepped.cache(cache)
+        return compile(chain.repeat().batch(2), read=read, loading=loading)
 
     uncached, cached = built(None), built(str(tmp_path / "cache"))
     for index in range(2):
@@ -1813,11 +1796,6 @@ def test_real_r2_generation_publication_mirror_and_cleanup(tmp_path):
         assert not fs.exists(path + "/CURRENT")
 
 
-def _tagged(pipeline):
-    """`pipeline`'s rows with a tag beside their id: other rows than its inputs, one for each."""
-    return pipeline.map(lambda row: {**row, "tag": row["id"] * 10}, identity="tag@1")
-
-
 def _tags(pipeline, read="memory"):
     from dew.data.compile import iterate
     from dew.data.dataset import Loading
@@ -1834,11 +1812,11 @@ def test_a_generation_of_the_store_stands_in_for_both_parts_of_a_hash_holdout(re
     from dew.data.pipeline import Pipeline
 
     source = Memory([{"id": index} for index in range(24)])
-    generation = publish(_tagged(Pipeline(source)), _cache(), read="memory")
+    generation = publish(tagged(Pipeline(source)), _cache(), read="memory")
     parts = Pipeline(source).holdout(0.25)
-    uncached = [_tags(_tagged(part)) for part in parts]
+    uncached = [_tags(tagged(part)) for part in parts]
     assert uncached[0] and uncached[1]
-    assert [_tags(_tagged(part).cache(generation), read) for part in parts] == uncached
+    assert [_tags(tagged(part).cache(generation), read) for part in parts] == uncached
 
 
 def test_a_holdout_by_a_field_its_cached_step_drops_reads_the_parts_it_reads_uncached():
@@ -1906,16 +1884,16 @@ def test_a_records_holdout_over_a_stream_filled_generation_serves_where_the_stre
     from dew.data.pipeline import Pipeline
 
     memory = Memory([{"id": index} for index in range(12)])
-    generation = publish(_tagged(Pipeline(memory)), _cache(), read="streamed")
+    generation = publish(tagged(Pipeline(memory)), _cache(), read="streamed")
     parts = Pipeline(memory).holdout(records=5)
-    cached = [_tags(_tagged(part).cache(generation)) for part in parts]
-    assert cached == [_tags(_tagged(part)) for part in parts]
+    cached = [_tags(tagged(part).cache(generation)) for part in parts]
+    assert cached == [_tags(tagged(part)) for part in parts]
     (tmp_path / "rows.jsonl").write_text("".join(f'{{"id": {index}}}\n' for index in range(12)))
     files = Files(str(tmp_path / "rows.jsonl"))
-    streamed = publish(_tagged(Pipeline(files)), _cache(), read="streamed")
+    streamed = publish(tagged(Pipeline(files)), _cache(), read="streamed")
     trained, _ = Pipeline(files).holdout(records=5)
     with pytest.raises(ValueError):
-        _tags(_tagged(trained).cache(streamed))
+        _tags(tagged(trained).cache(streamed))
 
 
 def test_a_hash_part_of_a_generation_reads_in_worker_processes_as_uncached():
@@ -1928,7 +1906,7 @@ def test_a_hash_part_of_a_generation_reads_in_worker_processes_as_uncached():
     from dew.data.pipeline import Pipeline
 
     source = Memory([{"id": index} for index in range(48)])
-    generation = publish(_tagged(Pipeline(source)), _cache(), read="memory")
+    generation = publish(tagged(Pipeline(source)), _cache(), read="memory")
     trained, _ = Pipeline(source).holdout(0.25)
 
     def epoch(chain):
@@ -1941,7 +1919,7 @@ def test_a_hash_part_of_a_generation_reads_in_worker_processes_as_uncached():
         finally:
             reader.close()
 
-    assert epoch(_tagged(trained).cache(generation)) == epoch(_tagged(trained))
+    assert epoch(tagged(trained).cache(generation)) == epoch(tagged(trained))
 
 
 def test_stacked_records_parts_that_read_other_records_are_other_plans():
@@ -1968,19 +1946,19 @@ def test_stacked_holdouts_over_a_generation_pick_the_inputs_they_pick_uncached(o
     from dew.data.pipeline import Pipeline
 
     source = Memory([{"id": index} for index in range(40)])
-    generation = publish(_tagged(Pipeline(source)), _cache(), read="memory")
+    generation = publish(tagged(Pipeline(source)), _cache(), read="memory")
     store = Pipeline(source)
     first = store.holdout(0.25) if order == "records of hash" else store.holdout(records=6)
     stacked = [part for outer in first for part in
                (outer.holdout(records=3) if order == "records of hash" else outer.holdout(0.5))]
-    uncached = [_tags(_tagged(part)) for part in stacked]
+    uncached = [_tags(tagged(part)) for part in stacked]
     assert all(uncached)
-    assert [_tags(_tagged(part).cache(generation)) for part in stacked] == uncached
+    assert [_tags(tagged(part).cache(generation)) for part in stacked] == uncached
     def held_out(chain):
         return compile(chain.repeat().batch(1), read="memory", loading=Loading(workers=0)).held_out
 
     for part in stacked:
-        assert held_out(_tagged(part).cache(generation)) == held_out(_tagged(part))
+        assert held_out(tagged(part).cache(generation)) == held_out(tagged(part))
 
 
 def test_a_generation_a_stream_filled_from_files_mounted_elsewhere_serves_under_a_holdout(tmp_path):
@@ -1999,11 +1977,11 @@ def test_a_generation_a_stream_filled_from_files_mounted_elsewhere_serves_under_
     (tmp_path / "a").mkdir()
     pq.write_table(pa.table({"id": list(range(24))}), tmp_path / "a" / "rows.parquet")
     shutil.copytree(tmp_path / "a", tmp_path / "b")
-    generation = publish(_tagged(Pipeline(Files(str(tmp_path / "a"), format="parquet"))), _cache(),
+    generation = publish(tagged(Pipeline(Files(str(tmp_path / "a"), format="parquet"))), _cache(),
                          read="streamed")
     for mount in ("a", "b"):
         part, _ = Pipeline(Files(str(tmp_path / mount), format="parquet")).holdout(0.25)
-        assert _tags(_tagged(part).cache(generation), "streamed") == _tags(_tagged(part), "streamed")
+        assert _tags(tagged(part).cache(generation), "streamed") == _tags(tagged(part), "streamed")
 
 
 def test_a_generation_written_under_the_earlier_schema_is_refused_as_stale(tmp_path):
@@ -2036,17 +2014,17 @@ def test_a_generation_a_memory_read_filled_from_unindexed_files_serves_hash_and_
 
     (tmp_path / "rows.jsonl").write_text("".join(f'{{"id": {index}}}\n' for index in range(24)))
     files = Pipeline(Files(str(tmp_path / "rows.jsonl")))
-    generation = publish(_tagged(files), _cache(), read="memory")
+    generation = publish(tagged(files), _cache(), read="memory")
     for parts in (files.holdout(0.25), files.holdout(records=5)):
-        uncached = [_tags(_tagged(part)) for part in parts]
+        uncached = [_tags(tagged(part)) for part in parts]
         assert all(uncached)
-        assert [_tags(_tagged(part).cache(generation)) for part in parts] == uncached
+        assert [_tags(tagged(part).cache(generation)) for part in parts] == uncached
     trained, _ = files.holdout(0.25)
-    part = publish(_tagged(trained), _cache(), read="memory")
+    part = publish(tagged(trained), _cache(), read="memory")
     stacked = trained.holdout(records=3)
-    uncached = [_tags(_tagged(selected)) for selected in stacked]
+    uncached = [_tags(tagged(selected)) for selected in stacked]
     assert all(uncached)
-    assert [_tags(_tagged(selected).cache(part)) for selected in stacked] == uncached
+    assert [_tags(tagged(selected).cache(part)) for selected in stacked] == uncached
 
 
 def test_a_named_stream_that_holds_other_inputs_than_its_generation_is_refused_under_a_holdout():
@@ -2060,10 +2038,10 @@ def test_a_named_stream_that_holds_other_inputs_than_its_generation_is_refused_u
         return from_iter(lambda: iter([{"id": index} for index in range(count)]), identity="rows@1",
                          replay=True)
 
-    generation = publish(_tagged(Pipeline(stream(10))), _cache(), read="streamed")
+    generation = publish(tagged(Pipeline(stream(10))), _cache(), read="streamed")
     trained, _ = Pipeline(stream(12)).holdout(0.25)
     with pytest.raises(ValueError):
-        _tags(_tagged(trained).cache(generation), "streamed")
+        _tags(tagged(trained).cache(generation), "streamed")
 
 
 def test_a_worker_reads_a_part_of_a_generation_without_its_store():
@@ -2076,9 +2054,9 @@ def test_a_worker_reads_a_part_of_a_generation_without_its_store():
     from dew.data.pipeline import Pipeline
 
     source = Memory([{"id": index, "blob": bytes(1 << 16)} for index in range(32)])
-    generation = publish(_tagged(Pipeline(source)), _cache(), read="memory")
+    generation = publish(tagged(Pipeline(source)), _cache(), read="memory")
     trained, _ = Pipeline(source).holdout(0.25)
-    part = _promoted(_tagged(trained).cache(generation)).source
+    part = _promoted(tagged(trained).cache(generation)).source
     assert len(pickle.dumps(part.manifest().reader)) * 100 < len(pickle.dumps(source))
 
 
@@ -2097,11 +2075,11 @@ def test_a_records_holdout_over_a_stream_filled_generation_of_a_dataset_read_in_
     rows = [{"id": index} for index in range(12)]
     source = (from_grain(grain.MapDataset.source(rows), identity="rows@1") if store == "grain"
               else from_hf(datasets.Dataset.from_list(rows), identity="rows@1"))
-    generation = publish(_tagged(Pipeline(source)), _cache(), read="streamed")
+    generation = publish(tagged(Pipeline(source)), _cache(), read="streamed")
     parts = Pipeline(source).holdout(records=5)
-    uncached = [_tags(_tagged(part)) for part in parts]
+    uncached = [_tags(tagged(part)) for part in parts]
     assert all(uncached)
-    assert [_tags(_tagged(part).cache(generation)) for part in parts] == uncached
+    assert [_tags(tagged(part).cache(generation)) for part in parts] == uncached
 
 
 @pytest.mark.parametrize("store", ["hash part", "concatenation"])
@@ -2118,8 +2096,8 @@ def test_a_records_holdout_over_a_stream_filled_generation_of_a_part_or_a_concat
         source, _ = Pipeline(Memory(rows)).holdout(0.25)
     else:
         source = concat([Memory(rows[:10]), Memory(rows[10:])])
-    generation = publish(_tagged(source), _cache(), read="streamed")
+    generation = publish(tagged(source), _cache(), read="streamed")
     parts = source.holdout(records=5)
-    uncached = [_tags(_tagged(part)) for part in parts]
+    uncached = [_tags(tagged(part)) for part in parts]
     assert all(uncached)
-    assert [_tags(_tagged(part).cache(generation)) for part in parts] == uncached
+    assert [_tags(tagged(part).cache(generation)) for part in parts] == uncached

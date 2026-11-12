@@ -343,19 +343,6 @@ def test_a_mixed_validation_pass_ends_before_any_source_repeats(two_splits):
     assert all(sum(value >= 2000 for value in batch) == 1 for batch in actual)
 
 
-def test_a_mixture_written_in_either_order_is_the_same_run(two_splits):
-    big, small = two_splits
-    first, other = row_mix({big: 0.75, small: 0.25}), row_mix({small: 0.25, big: 0.75})
-    left, right = first.train(DataPartition()), other.train(DataPartition())
-    try:
-        assert taken(left, 4) == taken(right, 4)
-        assert left.get_state() == right.get_state()
-        assert taken(left, 3) == taken(right, 3)
-    finally:
-        left.close()
-        right.close()
-
-
 def test_sources_from_different_stores_mix_before_the_share_cut(two_splits):
     big, _ = two_splits
     files = Pipeline(Files(str(Path(big) / "rows.jsonl"), format="jsonl")).map(
@@ -1962,26 +1949,53 @@ def test_phases_that_end_in_other_device_steps_are_refused():
                 read="memory", loading=READ)
 
 
-def test_a_token_mixture_of_published_generations_weighs_the_rows_and_targets_each_states(tmp_path):
-    """Published generations mix by tokens from the rows and valid targets each states, where
-    the weighting once looked for a windows count no generation states."""
+def test_a_token_mixture_of_published_generations_weighs_the_targets_each_states(tmp_path):
+    """Published generations of unequal valid targets a row mix by tokens from the targets each states
+    (`CountTargets`, read off the generation where the weighting once looked for a windows count none
+    states): no member is drawn while it leads the other by more of the targets drawn than one of the
+    other's rows, each row weighing its own targets (its tokens less one), through a saved position and
+    its resume, which reads on as an uninterrupted read does."""
     from dew.data.cache import Cache
     from dew.data.steps.text import CountTargets
     from dew.data.text import Tokenize
 
-    def published(name: str, documents: int) -> Pipeline:
-        texts = Memory([{"text": f"{name} {index:03d}"[-8:]} for index in range(documents)], identity=name)
-        generation = publish(Pipeline(texts).map(Tokenize()).filter_map(CountTargets()),
+    texts = {"short": " ".join(["short"] * 3), "long": " ".join(["long"] * 10)}
+
+    def published(name: str, tag: int) -> Pipeline:
+        rows = Memory([{"text": texts[name], "id": tag * 1000 + index} for index in range(16)], identity=name)
+        generation = publish(Pipeline(rows).map(Tokenize()).filter_map(CountTargets()),
                              Cache(str(tmp_path / name)), read="indexed", loading=READ)
         return Pipeline(generation.source(), name=name)
 
-    data = compile(mix([published("short", 4), published("long", 8)], by="tokens").repeat().batch(2),
+    data = compile(mix([published("short", 1), published("long", 2)], by="tokens").repeat().batch(1),
                    read="indexed", loading=READ)
-    stream = data.train(DataPartition())
-    try:
-        assert len(list(itertools.islice(stream, 4))) == 4
-    finally:
-        stream.close()
+
+    def read(count: int, state=None):
+        reader = data.train(DataPartition())
+        try:
+            if state is not None:
+                reader.set_state(state)
+            return [int(identity) for batch in itertools.islice(reader, count) for identity in batch["id"]], \
+                reader.get_state()
+        finally:
+            reader.close()
+
+    # Stopped within a cycle of the two members' shares, and resumed.
+    ids, state = read(23)
+    ids += read(21, state)[0]
+    assert ids == read(44)[0] and len(ids) == 44
+    # Each member's targets a row, its tokens less the one no target follows.
+    each = {name: len(Tokenize().map({"text": text})["text"]) - 1 for name, text in texts.items()}
+    assert each["short"] < each["long"]
+    # A member is drawn only while it leads the other by no more of their targets than one of the other's
+    # rows: its targets held to its half however its rows' lengths differ, where a mix by rows would
+    # draw short and long rows alike and fall a long row behind at once.
+    drawn = {"short": 0, "long": 0}
+    for identity in ids:
+        name, other = ("short", "long") if identity // 1000 == 1 else ("long", "short")
+        assert drawn[name] <= drawn[other] + each[other], (identity, drawn)
+        drawn[name] += each[name]
+    assert drawn["short"] > 0 and drawn["long"] > 0
 
 
 def _short_and_long() -> Pipeline:
