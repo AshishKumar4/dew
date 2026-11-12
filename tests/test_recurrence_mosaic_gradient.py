@@ -18,7 +18,9 @@ from generation_support import COMPILES_ON_CPU, runs
 from reference_error import assert_as_exact, with_gradients
 from test_recurrence_chunk import ROUTES, chunk_on, cotangents, formed, on_route, routed, token_by_token
 from test_recurrence_mosaic import (
+    COVERED,
     DTYPES,
+    INTERPRETED_GRADIENT,
     PACKED_DOCUMENTS,
     SHAPES,
     case_hooks,
@@ -40,12 +42,6 @@ from dew.nn.kernels.templates.recurrence.template import mosaic_rule
 from dew.nn.residuals import DELTA_RULE_RESIDUALS
 
 pytestmark = pytest.mark.kernel
-
-INTERPRETED_GRADIENT: set[tuple] = set()
-"""The gradient's cases the CPU interprets, each a check-1 site of its own (`interpreted_gradient`): the fast
-backward's launches over a ragged chunk, two key blocks and two key heads' groups, packed documents, its
-forward's memories kept and recomputed, under a decay a key dimension (`key_backward`'s), and an fp32 call's
-under the run's fast forms. Interpreted, the whole grid took 5.4 times these (7828 against 1452 seconds)."""
 
 REMATS = {'kept': ((), None), 'recomputed': (('delta_memory',), None), 'saved': ((), DELTA_RULE_RESIDUALS)}
 """The remat rungs a gradient case runs under, each the names its layers recompute (`recomputing`) and those a
@@ -76,10 +72,11 @@ def interpreted_gradient(case: str, dtype: str, remat: str) -> Callable:
     site of its own (its `check1_shards` mark). Whole, these cases took 122 to 225 seconds (train 270's CI on
     66a222273, ledger 2127), 483 to 653 (train 479's on e82eab19a) and 474 (the recomputed one, train 521's
     on e65403fc9); a map task of 80 seeds of the three 256-seed cases took 525 s, one of 15 of the two
-    128-seed cases 159 s (other-shards at 77a98366c), so each case is a site apart, on each route
-    (`routed`)."""
-    INTERPRETED_GRADIENT.add((case, dtype, remat))
-    return routed(lambda: the_mosaic_gradient_is_as_exact_as_its_reference(case, DTYPES[dtype], remat))
+    128-seed cases 159 s (other-shards at 77a98366c), so each case is a site apart, on the routes its
+    covering gives it (`COVERED`, `routed`)."""
+    assert (case, dtype, remat) in INTERPRETED_GRADIENT, (case, dtype, remat)
+    return routed(lambda: the_mosaic_gradient_is_as_exact_as_its_reference(case, DTYPES[dtype], remat),
+                  COVERED[case, dtype, remat])
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=20)

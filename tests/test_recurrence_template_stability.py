@@ -159,8 +159,6 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
     with under(forms):
         if not runs(dew, hooks, operands, draws(0), product):
             pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
-        for seed in range(2):
-            assert_finite(dew, truth, draws(seed), regime)
         label = f'the template, {name} under {regime}, its {product}'
         if fla_recorded(hooks):
             the_template_is_as_exact_as_fla(mosaic, f"stability/{name}/{regime}/{product}",

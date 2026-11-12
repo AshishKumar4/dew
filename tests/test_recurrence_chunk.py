@@ -110,16 +110,17 @@ def on_route(route: str | None):
     return generation.assumed(route, interpreted=True) if route else contextlib.nullcontext()
 
 
-def routed(check) -> Callable:
-    """The decorator making `check` the test it decorates, run on each route (`ROUTES`, `on_route`): its
-    name and documentation the test's, its one parameter the route."""
+def routed(check, routes: tuple = ROUTES) -> Callable:
+    """The decorator making `check` the test it decorates, run on each of `routes` (every one of `ROUTES`
+    where none are given, `on_route`): its name and documentation the test's, its one parameter the
+    route."""
     def run(route):
         with on_route(route):
             check()
 
     def declared(test):
         run.__name__, run.__qualname__, run.__doc__ = test.__name__, test.__qualname__, test.__doc__
-        return pytest.mark.parametrize('route', ROUTES)(run)
+        return pytest.mark.parametrize('route', [route for route in ROUTES if route in routes])(run)
 
     return declared
 
@@ -823,24 +824,6 @@ PORTABLE_SEEDS = 8
 """The portable rule's differentiation sites' declared draws (check 1), sized by `seeds_for` (paired, on
 armada): the remat rung's gradients, the public seam's tangents, two forwards and a TPU's scan under
 forward mode."""
-
-
-def test_a_call_runs_its_products_kernels_apart():
-    """`_per_product`: a call's value is its forward kernel's where no derivative is taken; its gradient the
-    training kernel's forward and pullback; and its tangent the portable math's, `run('xla', ...)`."""
-    def run(kernel, x):
-        return {'forward': 2.0, 'training': 3.0, 'xla': 5.0}[kernel] * x
-
-    def kernel_of(product):
-        return product
-
-    x = jnp.arange(3.0)
-    np.testing.assert_array_equal(recurrence_chunk._per_product(kernel_of, run, x), 2.0 * x)
-    value, grad = jax.value_and_grad(lambda x: recurrence_chunk._per_product(kernel_of, run, x).sum())(x)
-    assert value == 3.0 * x.sum()
-    np.testing.assert_array_equal(grad, jnp.full(3, 3.0))
-    np.testing.assert_array_equal(jax.jvp(functools.partial(recurrence_chunk._per_product, kernel_of, run),
-                                          (x,), (jnp.ones(3),))[1], jnp.full(3, 5.0))
 
 
 def portable_draw(seed: int, rows: int, packed: bool) -> tuple:

@@ -101,13 +101,12 @@ def _with_cotangents(draw: Callable[[int], Chunk]) -> Callable[[int], tuple[Chun
 
 def _mosaic_sites() -> dict[str, Site]:
     import test_recurrence_mosaic as mosaic
-    import test_recurrence_mosaic_gradient as gradient
 
     sites = {}
     # The interpreted geometry's gradient only where the CPU interprets the case's gradient
     # (`INTERPRETED_GRADIENT`): fla's packed per-key gradient there, which no test reads, resolved no count
     # within 512 seeds at dbeta (fla-unit09-6ac02f3ca).
-    interpreted_gradients = {(case, label) for case, label, _ in gradient.INTERPRETED_GRADIENT}
+    interpreted_gradients = {(case, label) for case, label, _ in mosaic.INTERPRETED_GRADIENT}
     for case in mosaic.SHAPES:
         hooks = mosaic.case_hooks(case)
         for label, dtype in mosaic.DTYPES.items():

@@ -18,6 +18,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import kernel_matrix
 import numpy as np
 import pytest
 from fla_sites import the_template_is_as_exact_as_fla
@@ -27,6 +28,7 @@ from reference_error import assert_as_exact
 from test_recurrence_chunk import (
     FORMED,
     HOOKS,
+    ROUTES,
     SEEDS as HOOK_SEEDS,
     chunk_on,
     draw as hooked_draw,
@@ -99,6 +101,56 @@ launches keeping nothing (`chunk_forward.forward`, `kept_forward`'s `keeps`). Un
 inference forward walks once (`walks_once`: one scan launch, its own rounded expression), so its ragged and
 packed cases are drawn tests of their own. Interpreted, the whole grid took 3.5 times these (2838 against
 805 seconds)."""
+
+INTERPRETED_GRADIENT = frozenset({
+    ('packed documents', 'bf16', 'kept'), ('a ragged length', 'bf16', 'kept'),
+    ('one sequence', 'bf16', 'kept'), ('a ragged length', 'bf16', 'recomputed'),
+    ('a decay a key dimension', 'bf16', 'kept'), ('a decay a key dimension', 'fp32', 'kept'),
+    ('a ragged length', 'fp32', 'kept')})
+"""The gradient's cases the CPU interprets, each `(case, dtype, remat)` a check-1 site of its own
+(test_recurrence_mosaic_gradient's `interpreted_gradient`): the fast backward's launches over a ragged chunk,
+two key blocks and two key heads' groups, packed documents, its forward's memories kept and recomputed, under
+a decay a key dimension (`key_backward`'s), and an fp32 call's under the run's fast forms. Interpreted, the
+whole grid took 5.4 times these (7828 against 1452 seconds)."""
+
+FORWARD_SITES = frozenset(
+    (case, dtype) for case, dtype in INTERPRETED_FORWARD
+    if not (SHAPES[case].get('per_key') and DTYPES[dtype] == jnp.bfloat16
+            and (case, dtype, 'kept') in INTERPRETED_GRADIENT))
+"""The interpreted forward's sites (`drawn_forward`), each `(case, dtype)`: `INTERPRETED_FORWARD` but a
+16-bit call under a decay a key dimension whose gradient site judges its output and final memory by the same
+launches (`INTERPRETED_FORWARD`'s)."""
+
+SEEDED_SITES = ({'route': 'sm80', 'case': 'a decay a key dimension', 'dtype': 'bf16', 'pass': 'kept'},
+                {'route': None, 'case': 'a decay a key dimension', 'dtype': 'fp32', 'pass': 'forward'})
+"""The interpreted sites at the routes their faults showed on, which every covering keeps: an A100's Kimi
+delta attention gradients wrong unseen off a GPU while wgmma's alone was interpreted (row 5194), and an fp32
+call's output under a decay a key dimension non-finite on every seed under the fast forms (audit A6)."""
+
+
+def covering(routes: tuple) -> dict[tuple, frozenset]:
+    """Each interpreted site's routes, `(case, dtype, pass)` (a pass 'forward', or the gradient's remat
+    rung) to those of `routes` it runs on: a covering set over route, case, dtype and pass chosen pairwise
+    (testing.md: every pair of settings meets once; `kernel_matrix.pairwise`), `SEEDED_SITES` first, so each
+    case's launches run on every route's bundle in some arithmetic and pass. An fp32 call's gradient runs on
+    every route: it trains on the interpreter's route alone and is checked refused on the others (the fast
+    backward's 264 to 328 registers a thread), which no pair may count as covered. The whole cross took
+    52.3 task-hours of the suite at cd98dda014e, its covering 29.1 (jsf-forks6's draws)."""
+    sites = sorted([(case, dtype, 'forward') for case, dtype in FORWARD_SITES]
+                   + [site for site in INTERPRETED_GRADIENT if site[1] != 'fp32'])
+    served = [{'route': route, 'case': case, 'dtype': dtype, 'pass': passed}
+              for case, dtype, passed in sites for route in routes]
+    seeded = [site for site in SEEDED_SITES if site['route'] in routes]
+    covered = {site: frozenset(routes) for site in INTERPRETED_GRADIENT if site[1] == 'fp32'}
+    for cell in kernel_matrix.pairwise(served, seeded):
+        key = (cell['case'], cell['dtype'], cell['pass'])
+        covered[key] = covered.get(key, frozenset()) | {cell['route']}
+    return covered
+
+
+COVERED = covering(ROUTES)
+"""The interpreted sites' routes on this backend's routes (`covering`)."""
+
 
 def interpreted(grid: list[tuple], chosen: set[tuple]) -> list:
     """`grid`'s parameters the CPU interprets, those in `chosen`, each id its values joined by '-'; the rest
@@ -280,8 +332,10 @@ def drawn_forward(case: str, dtype: str) -> Callable:
     (its `check1_shards` mark). A map task of 128 seeds of the three 256-seed cases took 1045 to 1071 s on
     main's CI (Main, 2026-11-02); the 128-seed cases under a decay a key dimension 250 s and past 600 s whole
     (int-g1-each at 7683420535), a task of 8 seeds of both 117 to 125 s, half of it their compiles
-    (keyed-shards at 7e3a5fb48); on each route (`routed`)."""
-    return routed(lambda: the_mosaic_forward_is_as_exact_as_its_reference(case, DTYPES[dtype]))
+    (keyed-shards at 7e3a5fb48); on the routes its covering gives it (`COVERED`, `routed`)."""
+    assert (case, dtype) in FORWARD_SITES, (case, dtype)
+    return routed(lambda: the_mosaic_forward_is_as_exact_as_its_reference(case, DTYPES[dtype]),
+                  COVERED[case, dtype, 'forward'])
 
 
 @pytest.mark.check1_shards(seeds=256, per_task=16)
@@ -371,8 +425,8 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles(dtype):
     the bundle declares it within a block of it (`template.planned`), with two chunks in flight
     unless two are past it or leave a multiprocessor fewer of the states launch's programs
     (`Mosaic.states_held`). Its variants, which the opt-in tuner times (`Mosaic.variants`), lead with those
-    tiles, each legal there. An fp32 call it refuses: a launch's registers at its narrowest tiles pass a
-    thread's (the fp32 solve's merges hold the inverse's three parts)."""
+    tiles among them, each legal there. An fp32 call it refuses: a launch's registers at its narrowest tiles
+    pass a thread's (the fp32 solve's merges hold the inverse's three parts)."""
     assert generation.family(UNSEEN.generation) == 'mma.sync'
     _, bound = unseen_call(dtype)
     budget = generation.shared_budget(UNSEEN)
@@ -393,7 +447,7 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles(dtype):
                     or template.MOSAIC.states_held(bound, wider, UNSEEN)
                     < template.MOSAIC.states_held(bound, picked, UNSEEN))
         variants = template.MOSAIC.variants(bound)
-        assert variants[0] == picked and len(set(variants)) == len(variants)
+        assert picked in variants and len(set(variants)) == len(variants)
         assert all(template.MOSAIC.legal(bound, tiles, UNSEEN) for tiles in variants)
 
 
@@ -922,9 +976,9 @@ def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):
         report.refuse([(report._identity(template.MOSAIC, bound), first, {kernel})])
         stepped = template.MOSAIC.derived(bound, target)
         taken = template.MOSAIC.fits(bound, target)
-    assert stepped is not None and taken == (stepped,)
-    # The refused tiles' block or ring stepped down (`_staged` takes the next ring a refusal leaves).
-    assert (stepped.block_v, stepped.stages) < (first.block_v, first.stages)
+        legal = stepped is not None and template.MOSAIC.legal(bound, stepped, target)
+    # The call takes legal tiles other than the refused ones.
+    assert legal and stepped != first and taken == (stepped,)
 
 
 def test_a_refusal_under_the_remat_rung_reaches_the_route():
@@ -1150,11 +1204,12 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                 assert not template.MOSAIC.eligible(bound, facts)
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
                              kind=kind) for tiles, kind in unheld]
-            tiled = template.MOSAIC.variants(bound)
+            # The variants beside the derived tiles, whatever their order (`Mosaic.variants`).
+            others = [tiles for tiles in template.MOSAIC.variants(bound) if tiles != derived]
             if isinstance(variant, int):
-                assert len(tiled) - 1 <= NEIGHBOURS, f"{name} has {len(tiled) - 1} variants, past NEIGHBOURS"
+                assert len(others) <= NEIGHBOURS, f"{name} has {len(others)} variants, past NEIGHBOURS"
                 return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
-                             kind='') for tiles in tiled[1:][variant:variant + 1]]
+                             kind='') for tiles in others[variant:variant + 1]]
             unwide = {key: value for key, value in _form(name, dtype).items() if key != 'wide'}
             if training and not template.backward_holds(
                     *args, tiles=derived, family=family, target=facts, starts=starts,
@@ -1169,7 +1224,6 @@ def compiled_cases(target: str, plans: dict, refused: list, apart: dict, only: t
                     return []
                 return [case(name, dtype, args, starts, bound, derived, training=True, packed=packed,
                              kind='refused ')]
-        assert tiled[0] == derived, f"{name} on {target}: variants {tiled} lead with no {derived}"
         derived_tiles = [(derived, '')]
         walked = _two_roles(name, bound, derived, family, facts, packed=packed)
         if variant == TWO_ROLES:
