@@ -973,20 +973,12 @@ def restamped(stamping: Stamping | None, state: Mapping[str, object]) -> None:
 class Left:
     """Where the run left a member of a mix, one mix read's: the member's `position` after the last pull the
     run trained before one it did not, the `low` pull there, and the pulls past it the run trained
-    (`past`), which a phase that continues the member draws past (`dew.data.dataset.StepPhases`)."""
+    (`past`), which a phase that continues the member draws past (`dew.data.dataset.StepPhases`). A saved
+    position holds its record, the registry's (`dew.registry.to_record`)."""
 
     position: JSON
     low: int
     past: tuple[int, ...]
-
-    def record(self) -> dict[str, JSON]:
-        return {"position": self.position, "low": self.low, "past": list(self.past)}
-
-    @classmethod
-    def of(cls, saved: JSON) -> Left:
-        held = record(saved, "a corpus left by a phase")
-        return cls(json_value(held["position"], "its position"), integer(held["low"], "its low pull"),
-                   tuple(integers(held["past"], "its trained pulls")))
 
 
 def _stamped_mixes(state: JSON) -> list[dict[str, JSON]]:

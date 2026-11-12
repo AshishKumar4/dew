@@ -43,6 +43,7 @@ from dew._records import JSON, boolean, integer, integers, json_value, listed, r
 from dew.batch import DRAWS, EXAMPLES_CONSUMED, PHASE, VALID_ROWS, Batch, Draws, Phase, padded_rows
 from dew.data import cgroups
 from dew.mesh import LayoutRefused, batch_axes
+from dew.registry import from_record, to_record
 
 _log = logging.getLogger(__name__)
 
@@ -1880,7 +1881,9 @@ class StepPhases(Forwarding):
         if not isinstance(stream, Checkpointable):
             raise TypeError(f"phase {phase}'s stream keeps no position")
         own = stream.get_state()
-        carried = {corpus: [left.record() for left in held] for corpus, held in self._carried.items()}
+        from dew.data.mixing import Left
+
+        carried = {corpus: [to_record(left, Left) for left in held] for corpus, held in self._carried.items()}
         shared = {"carried": carried, "trained": [[node, member, frontier.record()]
                                                   for (node, member), frontier in self._trained.items()]
                   } if any(self._shared) else {}
@@ -1911,7 +1914,7 @@ class StepPhases(Forwarding):
         # What a position saved before phases shared corpora holds of them: none.
         from dew.data.mixing import Left
 
-        self._carried = {corpus: [Left.of(entry) for entry in listed(
+        self._carried = {corpus: [from_record(Left, entry) for entry in listed(
             entries, f"carried corpus {corpus}", read=json_value, what="a list of mix reads")]
             for corpus, entries in record(saved.get("carried", {}), "carried corpora").items()}
         self._trained = {}
