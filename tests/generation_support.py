@@ -96,3 +96,21 @@ def interpreted_projection(x, kernel, group_sizes, dtype, precision=None):
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
     return gemm.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute,
                          precision=precision, interpret_on_cpu=True)
+
+
+CUBLAS = {"xla_gpu_enable_triton_gemm": False}
+"""XLA's options that make its GEMMs cuBLAS's at any lane flag: its Triton GEMMs off."""
+
+
+def cublas_compiled(fn, inputs, call: str):
+    """`fn`, a program whose dots are a library's GEMMs, compiled as cuBLAS runs each (`CUBLAS`): a library
+    arm held to cuBLAS's on the same inputs (docs/design/testing.md). On a GPU its compiled program on
+    `inputs` is checked to hold cuBLAS's `call` (`__cublas$gemm`, cuBLASLt's FP8 `__cublas$lt$matmul$f8`),
+    so no lane flag or fusion choice gives it another GEMM; on a CPU its dots are XLA's own."""
+    from reference_error import without_ynn
+
+    compiled = without_ynn(fn, compiler_options=CUBLAS)
+    if jax.default_backend() == "gpu":
+        program = compiled.lower(*inputs).compile().as_text()
+        assert call in program, f"the library arm holds no {call}"
+    return compiled

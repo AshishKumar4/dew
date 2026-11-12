@@ -21,10 +21,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import cublas_compiled
 from gpu_flow import cell
 from jax.sharding import Mesh
 from kernel_matrix import AXES
-from reference_error import assert_as_exact, without_ynn
+from reference_error import assert_as_exact
 
 from dew.nn.kernels import gemm, generation, projections
 
@@ -90,21 +91,12 @@ def _product(groups: int, out_dtype: str, kernel: str):
     return product
 
 
-CUBLASLT = {"xla_gpu_enable_triton_gemm": False}
-"""XLA's options that make an FP8 dot cuBLASLt's FP8 GEMM at any lane flag: its Triton GEMMs off."""
-
-
 def cublaslt_arm(fn, inputs):
     """`fn`, a program whose dots multiply FP8 codes into fp32, compiled as cuBLASLt's FP8 GEMM runs each
-    (`CUBLASLT`), the reference arm of a block-scaled FP8 form on Hopper (docs/design/testing.md, "FP8
-    products": held at parity with cuBLASLt, the owner's ruling of 2026-11-11). On a GPU its compiled program
-    on `inputs` is checked to hold the FP8 cuBLASLt call, so no lane flag or fusion choice gives it another
-    GEMM; on a CPU its dots are XLA's own, exact."""
-    compiled = without_ynn(fn, compiler_options=CUBLASLT)
-    if jax.default_backend() == "gpu":
-        program = compiled.lower(*inputs).compile().as_text()
-        assert "__cublas$lt$matmul$f8" in program, "the reference arm holds no cuBLASLt FP8 GEMM"
-    return compiled
+    (`generation_support.cublas_compiled`), the reference arm of a block-scaled FP8 form on Hopper
+    (docs/design/testing.md, "FP8 products": held at parity with cuBLASLt, the owner's ruling of 2026-11-11);
+    on a CPU its dots are XLA's own, exact."""
+    return cublas_compiled(fn, inputs, "__cublas$lt$matmul$f8")
 
 
 def cublaslt(sizes, out_dtype: str) -> callable:
