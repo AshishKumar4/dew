@@ -590,20 +590,27 @@ def test_each_red_names_itself_so_a_green_between_two_reds_stands_after_neither(
     assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
 
 
-def test_a_lookup_whose_last_red_is_unread_reuses_nothing(ci, tmp_path, monkeypatch, cache_worker):
+def test_a_lookup_whose_epoch_is_unread_or_gone_reuses_nothing(ci, tmp_path, monkeypatch, cache_worker):
     """Where the Worker gives no answer for a row's last red, no green run of the row stands: the plan keeps
     none, as an unread red may revoke any of them (review, 2026-11-12: an unread record read as none)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     armada_task(ci, monkeypatch, verdict)
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
 
-    # The Worker unavailable for the rows' last reds alone.
+    # The Worker unavailable for the rows' epochs alone.
     answered = ci.r2.Store.get
 
     def get(store, key: str, *args: object, **kwargs: object) -> bytes | None:
-        if "-reds/" in key:
+        if "-epochs/" in key:
             raise ci.r2.Unavailable("the R2 Worker answered 503")
         return answered(store, key, *args, **kwargs)
 
-    monkeypatch.setattr(ci.r2.Store, "get", get)
+    with monkeypatch.context() as patched:
+        patched.setattr(ci.r2.Store, "get", get)
+        assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+    # Its epochs gone (the bucket's expiry), every green run recorded in them stands no more: a green written
+    # after a red it read nothing of, kept past that red's epoch, is never reused (review, 2026-11-12).
+    stored = cache_worker[1]
+    for key in [key for key in stored if "-epochs/" in key]:
+        del stored[key]
     assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]

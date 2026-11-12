@@ -529,41 +529,48 @@ def set_key(digest: str) -> str:
     return f"{CACHE_PREFIX}-set/{digest}"
 
 
-def reds_key(python: str, row_name: str, held: str, common: str) -> str:
-    """Where row `row_name`'s last red run on class `held` on shared inputs `common` is named (`last_red`)."""
-    return f"{CACHE_PREFIX}-reds/{python}/{common[:16]}/{row_place(row_name, held)}"
+def epoch_key(python: str, row_name: str, held: str, common: str) -> str:
+    """Where row `row_name`'s epoch on class `held` on shared inputs `common` is named (`epoch`)."""
+    return f"{CACHE_PREFIX}-epochs/{python}/{common[:16]}/{row_place(row_name, held)}"
 
 
 class Unread(Exception):
-    """The Worker gave no answer for a row's last red run: no green run of it stands, none is recorded as one.
-    """
+    """The Worker gave no answer for a row's epoch: no green run of it stands, none is recorded as one."""
 
 
 UNREAD = "unread"
-"""What a green run records as the last red it follows where that could not be read: no red's name, so it
-never stands (`standing`)."""
+"""What a green run records as its epoch where none could be read or begun: no epoch's name, so it never
+stands (`standing`)."""
 
 
-def last_red(python: str, row_name: str, held: str, common: str, token: str) -> str | None:
-    """The name of row `row_name`'s last red run on class `held` on these shared inputs (`reds_key`), a fresh
-    one each red run writes (`record`), None where it has none; `Unread` where the Worker did not answer. A
-    green run records the red it follows, and is reused only while that red is the last (`standing`): a red
-    run, whatever set it executed and whatever tree it ran on, revokes every green run recorded before it, so
-    no lookup by another executed set, no plan's kept token and no set published again brings one back
-    (review, 2026-11-12: a flaky red's set differs from its green's, so its own key revoked nothing). A name
-    is never reused, so neither two reds at once nor a name the bucket's expiry took (14 days after its write,
-    by which every green run recorded before that red has expired too) lets an earlier green run stand again:
-    each costs a miss."""
+def epoch(python: str, row_name: str, held: str, common: str, token: str) -> str | None:
+    """The name of row `row_name`'s epoch on class `held` on these shared inputs (`epoch_key`), None where it
+    has none; `Unread` where the Worker did not answer. A red run begins a new epoch, a fresh name each
+    (`record`), and a green run records the epoch it ran in, beginning one where there is none; a green run is
+    reused only within its epoch (`standing`). So a red run, whatever set it executed and whatever tree it ran
+    on, revokes every green run recorded before it: no lookup by another executed set, no plan's kept token
+    and no set published again brings one back (review, 2026-11-12: a flaky red's set differs from its
+    green's, so its own key revoked nothing). A name is never reused and no green run stands where a row has
+    no epoch, so neither two reds at once, nor a green written after a red it read nothing of, nor an epoch
+    the bucket's expiry took, lets an earlier green run stand again: each costs a miss."""
     try:
-        body = store(token).get(reds_key(python, row_name, held, common))
+        body = store(token).get(epoch_key(python, row_name, held, common))
     except (r2.R2Error, ValueError) as error:
-        raise Unread(f"the last red of {row_name} on {held} was not read: {error}") from error
-    return None if body is None else json.loads(body).get("red")
+        raise Unread(f"the epoch of {row_name} on {held} was not read: {error}") from error
+    return None if body is None else json.loads(body).get("epoch")
 
 
-def standing(found: dict, red: str | None) -> bool:
-    """Whether green record `found` was recorded after `red`, its row's last red run (`last_red`)."""
-    return found.get("red") == red
+def begun(python: str, row_name: str, held: str, common: str, token: str) -> str:
+    """A new epoch of row `row_name` on class `held` on these shared inputs, its fresh name written (`epoch`);
+    or `UNREAD` where the Worker did not take it."""
+    name = uuid.uuid4().hex
+    return name if written(epoch_key(python, row_name, held, common), token,
+                           json.dumps({"epoch": name}).encode()) else UNREAD
+
+
+def standing(found: dict, current: str | None) -> bool:
+    """Whether green record `found` was recorded in `current`, its row's epoch (`epoch`), which exists."""
+    return current is not None and found.get("epoch") == current
 
 
 @functools.lru_cache(maxsize=1024)
@@ -774,18 +781,20 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
     for each in classes:
         tried: set[str] = set()
         try:
-            red = last_red(python, place, each, common, token)
+            current = epoch(python, place, each, common, token)
         except Unread:
+            continue
+        if current is None:
             continue
         found = recorded(record_key(python, place, each, common), token)
         if found is not None and found["depends"] is not None:
             # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of
             # exactly these, kept by that key (`green_key`) whatever ran since.
             key = cache_key(common, name, split, found["depends"], reading)
-            if found["key"] is not None and found["key"] == key and standing(found, red):
+            if found["key"] is not None and found["key"] == key and standing(found, current):
                 return found, each
             kept = recorded(green_key(python, place, each, key), token)
-            if kept is not None and kept["key"] == key and standing(kept, red):
+            if kept is not None and kept["key"] == key and standing(kept, current):
                 return kept, each
             tried.add(set_digest(found["depends"]))
         for digest in (recorded(sets_key(python, place, each), token) or {}).get("sets", []):
@@ -797,7 +806,7 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
                 continue
             key = cache_key(common, name, split, list(depends), reading)
             kept = recorded(green_key(python, place, each, key), token)
-            if kept is not None and kept["key"] == key and standing(kept, red):
+            if kept is not None and kept["key"] == key and standing(kept, current):
                 return kept, each
     return None
 
@@ -824,11 +833,11 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
     if kept is not None:
         found = recorded(green_key(python, place, *kept), token)
         try:
-            red = last_red(python, place, kept[0], common, token)
+            current = epoch(python, place, kept[0], common, token)
         except Unread:
             found = None
         if found is not None and found["key"] == kept[1] and fresh(found, name, common, reading) and standing(
-                found, red):
+                found, current):
             remembered(python, place, kept[0], found["depends"], token)
             return found["row"]
     hit = green_record(python, name, split, common, token, reused_classes(network), reading)
@@ -1963,23 +1972,24 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         # plan, which cuts by the record alone, may cut the file otherwise (`session.cut`).
         key = (cache_key(common, name, parsed_row(row_["name"])[2], ran["depends"])
                if green and name not in unkeyed else None)
-        # A red run names itself the row's last red first, so every green run recorded before it stands no
-        # more (`last_red`); a green one keeps the name of the red it follows, or one no red has where it was
-        # not read.
+        # A red run begins the row's next epoch first, so every green run recorded before it stands no
+        # more (`epoch`); a green one keeps the epoch it ran in, begun where the row has none, or none where
+        # neither was read or written.
         if row_["exitCode"] != 0:
-            red = uuid.uuid4().hex
-            if not written(reds_key(python, row_["name"], held, common), token,
-                           json.dumps({"red": red}).encode()):
+            if begun(python, row_["name"], held, common, token) == UNREAD:
                 continue
+            current = None
         else:
             try:
-                red = last_red(python, row_["name"], held, common, token)
+                current = epoch(python, row_["name"], held, common, token)
             except Unread:
-                red = UNREAD
+                current = UNREAD
+            if current is None:
+                current = begun(python, row_["name"], held, common, token)
         body = json.dumps({"key": key,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"],
-                           "red": red}).encode()
+                           "epoch": current}).encode()
         # The record under these inputs, which `reused` reads, and the last run's, which the GPU tier and
         # lane read, only once the first is written, so it is never newer.
         if written(record_key(python, row_["name"], held, common), token, body):
