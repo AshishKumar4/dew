@@ -12,7 +12,10 @@ times. Three algebraic laws (linearity of sums, pulling a per-row scalar out of 
 reduction independent, so all of them run in one pass. Today such rewrites are derived by hand as custom VJPs or
 template algebra. Dew instead holds every equivalent form of a computation in an e-graph, applies declared rules
 until no new form appears (equality saturation), and extracts the cheapest form whose error meets the precision
-policy. The engine runs in two modes. At dev time a generator derives Dew's own math once, and its output is
+policy. (Today: saturation also stops at limits derived from the region's size, §6.6; extraction is egglog's
+greedy DAG extractor under Dew's model, held to Dew's exact extractor where the oracle is on, §6.5; and the
+error a form meets at compile time is its rules' static rounding class, the sampled error-aware choice being
+the parked generator's, §1.5.) The engine runs in two modes. At dev time a generator derives Dew's own math once, and its output is
 ordinary checked-in, reviewed code. At compile time a small, fast pass rewrites the one thing Dew cannot know in
 advance: the autodiff output of the program a user composed. Nothing runs at runtime.
 
@@ -40,8 +43,10 @@ checked-in output yet. The text stays as the design to resume.
 - **Compile time** covers only what Dew cannot know in advance: the composition a user's model, objective and
   optimizer make, and the backward JAX's autodiff traces for it. It runs on every program Dew compiles at its
   seam: training steps, and the forwards of evaluation, rollouts, sampling and serving, which gain from it too,
-  serving above all. Inside a program, the bodies Dew owns are marked (§6.10) and stay as dev time made them; the
-  pass rewrites the composition and its autodiff output around them. Its rule sets are the ones whose saturation
+  serving above all. Inside a program, the bodies Dew owns are marked (§6.10): a protected
+  body stays as written, a surrogate's and kernel glue's are rewritten within their own marked call, and an
+  algebra span opens into the region around it; the pass rewrites the composition and its autodiff output
+  around them. Its rule sets are the ones whose saturation
   is fast and whose rounding class is static, so its cost is bounded by the program's size (§6.6) and it needs no
   sampling.
 - **Runtime** runs nothing of the engine: a compiled program is ordinary XLA, and a generated module is ordinary
@@ -52,7 +57,8 @@ checked-in output yet. The text stays as the design to resume.
 - **E-graphs:** [egglog](https://github.com/egraphs-good/egglog), used through its Python bindings, not forked.
   Saturation stops at limits derived from the input's size (§6.6), never at a wall-clock limit, so the same input
   gives the same output in any process. Dew writes one piece itself: extraction that prices shared values once (a
-  DAG cost), since a reduction read once and used twice costs one pass.
+  DAG cost), since a reduction read once and used twice costs one pass. Extraction under that cost is egglog's
+  greedy DAG extractor by default; Dew's exact extractor is its oracle (§6.5).
 - **Language:** the arithmetic core of a jaxpr:
   - elementwise operations, casts, broadcasts, reshapes and transposes;
   - reductions (sum, max), `dot_general` and select;
@@ -63,7 +69,9 @@ checked-in output yet. The text stays as the design to resume.
   transpose rules bracket the span's tangent and cotangent too, so a span keeps its marker through autodiff. A
   marker carries its kind as an object, never a name string:
   - `Protected`: the error-free transforms of `dew.nn.precision` (`two_sum`, `two_product`, `compensated_add`,
-    `compensated_difference`; `compensated_sum` and `widened_reduction` with their site's declaration, row 4026)
+    `compensated_difference`; `compensated_sum` and `widened_reduction` with their site's declaration, row 4026:
+    today `widened_reduction` marks nothing of its own, its one caller running it inside a derivative declared
+    `Protected`, so a caller outside one would keep no protection, an open gap)
     and the numerics bodies of custom derivatives (§1.3). A protected span is a boundary no region crosses. At compile time it is one opaque leaf. At dev time
     the generator may propose another form for it, which extraction admits only when its error estimate meets the
     span's own (§1.5), and which lands only as reviewed generated code.
@@ -147,7 +155,8 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     divisions a suite). A shared reciprocal `a (1/y)` overflows where `a / y` is finite (a subnormal `y`) and
     makes a NaN of a zero `a`, so the dominance rule (§6.3) refuses it. Not built;
   - **decoupled reductions** (dev time): dependent nonlinear reductions broken with correction terms (the running-max
-    rescale of online softmax, log-sum-exp merges and folds, moment merges);
+    rescale of online softmax, log-sum-exp merges and folds, moment merges; the moment merges are not built:
+    no rule, declaration or consumer of one exists);
   - **stable forms** (dev time; §1.5): `log1p` and `expm1`, and a sum's logarithm taken out of its exponent
     (the log-sum-exp fold), built; log-space divergences, compensated and widened sums, near-equal
     differences rearranged to cancel exactly, and products and quotients scaled to range are the generator's
@@ -156,7 +165,9 @@ glue is (§6.2), reorderings over its values held by the dominance rule alone (�
     (`error_free`, §6.9), not built;
   - **contracted** (compile time and dev time): a multiply its add or subtract reads first, as the fused
     multiply-add the compiler makes of the pair, a pricing aid that rounds as the form it replaces.
-- **Rounding:** a rewrite that rounds identically (`exact`) always applies. One that reorders rounding (`reorders`:
+- **Rounding:** a rewrite that rounds identically (`exact`) always applies. (Today its set is always
+  admitted, and it fires where a window opens at its head and its region saturates within its limits, §6.6,
+  §6.7; a region whose admitted sets are all aids is not saturated at all.) One that reorders rounding (`reorders`:
   linearity, hoisting, distributivity) applies at compile time under default numerics and never under
   the accurate numerics (`precision="accurate"`). The compile-time pass estimates no error per program: a `reorders` rule is admitted
   under default numerics on the strength of its own gate, the default form's contract for its rounding class
@@ -178,7 +189,8 @@ floating-point expressions:
   rows), as check 1 measures error.
 - **The declared accuracy** is the precision policy's (`dew.nn.precision`), read once:
   - default numerics: check 1 at the gate's parity (§3) against the form as written;
-  - the accurate numerics (`precision="accurate"`): check 1 at the gate's parity against the most accurate candidate measured.
+  - the accurate numerics (`precision="accurate"`): check 1 at the gate's parity against every other candidate proposed (§6.5; the gate
+is pairwise, so no single most accurate candidate is ranked, and none may be admitted).
 - **Among the candidates that meet it,** the generator takes the cheapest by time (§1.6). A candidate that
   misses it is never chosen, however cheap.
 - **At compile time no candidate is measured;** admission is by rounding class alone (§1.4).
@@ -239,7 +251,10 @@ fitted to them, and a rule set ships only with measured receipts.
   - `dew.algebra.rewritten(fn)` is a public transform, and the seam's switch (`dew.algebra.passes`, §6.7) lets the
     accuracy gate run Dew's own programs with the pass on or off per arm (§3).
 - **Template hooks (compile time):** a hook is user code Dew cannot know in advance, a jaxpr, so it and its
-  derivative pass through the same pass before the Pallas fuser places them in a kernel.
+  derivative pass through the same pass before the Pallas fuser places them in a kernel: a stage that runs
+  inside a launch is rewritten where the fuser takes it, and a derivative's XLA glue by the outer pass, as
+  `KernelGlue` (§1.3). (Today the GEMM's producer and both derivatives' glue are; its consumer's in-kernel
+  epilogue is pulled and tiled as written, the GEMM lane's open item.)
 - **Template algebra (dev time):** a template's online, tiled and combine forms, forward and backward, are
   generated from a declaration (§6.9):
   - attention's score function, mask and reduction;
@@ -262,7 +277,10 @@ fitted to them, and a rule set ships only with measured receipts.
   of a spelling is written anywhere. Around an equation of the primitive every declaration of a family holds
   (`exp`, `rsqrt`, `logistic`), the family names its candidates: the values the call would read and make,
   its static arguments read from the region's own constants (an epsilon, a softcap, a mask's fill, which the
-  kernels take as the program holds it), each choice the call takes tried. The region's equations and each
+  kernels take as the program holds it), each choice the call takes tried, within the search's bounds
+  (`REACH` equations from an anchor, `SPAN` a region, no barrier crossed, the first candidate proven equal
+  taken). A body that binds no anchor of the families asked, at any depth of the programs it nests, is
+  answered at once, before any key of it is built (row 5556). The region's equations and each
   candidate's declaration over the same operands are traced as one program and brought to a normal form
   (`normal_form.canonical`: nested programs inlined, constants of masks and divisors folded, a square a
   product, a narrow float's correctly rounded arithmetic its float32 arithmetic rounded once, axes of one
@@ -321,7 +339,9 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
   prices read only pool-agreed facts (§1.6).
 - **Compile time:** the pass's seconds per program are recorded (`report.passes`, §6.8) and measured on the 4B
   and 9B steps' compiles; the compiled step's record and perf_gate are to report them beside lowering and XLA
-  compile (row 5339). It is a reported measurement, not a gate.
+  compile (row 5339). Today the compiled step's plan holds the pass's seconds and each probe's compile
+  seconds; a probe's `spent` (its traced, lowered and compiled seconds, JAX's own events summed for that
+  candidate) joins them with the planner's head on row 5556, and the perf gate's columns are not there yet. It is a reported measurement, not a gate.
 - **Report:** each program's rule classes that fired and the pass's seconds go in the one kernel report
   (`dew.nn.kernels.templates.report`, `report.compiled`).
 
@@ -354,7 +374,8 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
 ## 6. Interface
 
 Draft, 2026-11-01. Every part of the work builds against this section, so a change to it is a change to the design.
-The engine runs egglog 14.0.0 (MIT; wheels for CPython 3.12–3.14 on Linux, macOS and Windows), pinned exactly,
+The engine runs egglog 14.0.0 (MIT; wheels for CPython 3.12–3.14 on Linux, macOS and Windows; on Linux Dew's
+own build of that release, 14.0.0.post1, from its package index), pinned exactly,
 because its Python API is still marked as subject to change.
 
 ### 6.1 Modules
@@ -487,7 +508,13 @@ bound; an exponential of an operand at most 0 is at most 2, its native implement
 power past 1 (`ex2.approx`'s error is more than an ulp of 1). Every bound holds under its arithmetic's
 contract: IEEE rounding to nearest, a contraction's mode one that rounds each operand once (its real bound)
 or splits it into parts (bf16 x3 to x9, TF32 x3, `Precision.HIGH`: one more power), and none for a mode
-whose rounding no source states (FP8 fast accumulation).
+whose rounding no source states (FP8 fast accumulation). The mode is read once (`terms.contraction_slack`, from
+JAX's own lowering of a preset, `dew.nn.programs.dot_arithmetic`), for a traced product's bound and for every
+product a rule makes: a product's parameters state their mode's power (`rules.mode_power`), which
+`rules.contracted_length` holds beside a traced product's length's and which the rules that bound a new
+product from its operand's shape add (a scale lifted out of a product, the carried set's associations,
+distributions and factorings); a product of a mode with no stated rounding states neither, nor that it is
+plain or a matrix product, so no rule factors it or makes another in its mode.
 
 The dominance rule decides which reorderings fire. Its contract is bible §6: no infinity where the reference is
 finite. A reordering is admitted only when every new intermediate it makes has a number bound under the
@@ -589,8 +616,17 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   stable extractions, and each root's variants) and takes the first its caller's `admits(candidate,
   reference)` passes, the gate's check of the two against the float64 truth (§1.5): under default numerics
   against the form as written, which is always a candidate, so one is always admitted; under the accurate
-  numerics against every other candidate, which may admit none, and then nothing is chosen. No module calls
-  `choose` yet (the generator is parked, §6.11).
+  numerics against every other candidate, which may admit none, and then nothing is chosen. A candidate is
+  measured where it is reached in that order, the form as written never against itself; candidates are
+  ordered by their seconds, where every rate of a GPU target is stated (`cost.cheaper`'s rule for work no
+  rate prices is the compile-time splice's). No module calls `choose` yet (the generator is parked, §6.11).
+- One choice of this kind is live: a product's dot algorithm for the accuracy its site asks
+  (`dew.algebra.error.product_precision`, row 5473). Its candidates are the algorithms JAX itself states for
+  the operands' dtype (`DotAlgorithmPreset.supported_lhs_types`), priced by `cost.product_work` in the mode
+  and passes JAX lowers each to, and it takes the cheapest the site's gate admits on its own family (a
+  three-pass TF32 product where one pass misses the accuracy and IEEE fp32 costs more); none admitted is
+  refused. A site reads it in place of a hand-picked preset; the recurrence ports, the template's accurate
+  parts and the GEMM's low-precision forms are to (their lanes' rows).
 - Extraction is egglog's `greedy-dag` (`dew.algebra.extract.cheapest`), each shared node priced once; its
   exact counterpart (`extract.extracted`) is the oracle. The exact extraction finds the roots' forms whose nodes
   together cost least as a mixed integer program, solved by HiGHS through SciPy: one binary choice per node; a
@@ -619,7 +655,8 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   algorithm's passes counted, and its operand bytes; a reduction's operations; a special function's
   exponentials, a conversion's conversions, any other elementwise node's operations, a layout change nothing;
   a leaf's bytes, read once). A template's instructions price through the same record. No per-operation price
-  exists anywhere else.
+  exists anywhere else. Today one does: a bit form's own price (`bits.BitForm.price`, its instructions' ALU and
+  FMA issues, §7) stands beside `Work`, which holds no integer or packed pipe yet (row 5386).
 - A schedule turns summed work into seconds over `GpuTarget`'s facts, the one source of device facts, each
   unit's rate from them (`templates.cost.rates`); a unit a target states no rate of (a TPU's vector and
   transcendental units, which no primary source states) is priced by none, and a form is cheaper only where it
@@ -628,7 +665,8 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   runtime's facts (`cost.target`):
   - XLA's fusion (`cost.fused`), for the compile-time pass over a program, error-aware extraction and the
     derived scan's carry split (`carry.split`, whose carry runs as a loop XLA lowers, a chunk an iteration, its
-    span priced at that loop's step). A program's operands are read from device memory once, however many
+    span priced at that loop's step; today the split's work states no span, so only its work is priced: the
+    loop's step latency is in no rate `Fused` reads, an open gap). A program's operands are read from device memory once, however many
     reductions read them (XLA's fusion reads a sibling reduction's inputs once), and elementwise work fuses
     into its consumer. Each unit's work runs at the whole device's rate, in series with the memory traffic.
   - The template's tile walk (`cost.walk`, `templates.cost.walked`), for a form a template's algebra interface
@@ -663,7 +701,10 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   pass and the derived scan's carry split price them through XLA's fusion. Each shared term is priced once either way.
 - The tile walk reads no registers or rings when pricing a candidate: both are properties of a whole chosen DAG
   at a tile size the derivation does not yet know. The template's register model (`MosaicForward.registers`,
-  `_hook_live`) sizes its tiles to the form chosen, and its compile gate refuses a spill.
+  `_hook_live`) sizes its tiles to the form chosen, and its compile gate refuses a spill. (Today the gate
+  refuses a template launch's spill by relowering it at another config; where no config is left it logs that
+  and keeps the program before it, spill and all, recorded as a miss, and a kernel no template derived is
+  recorded, never refused: `report.settled`.)
 
 ### 6.6 Saturation
 
@@ -677,7 +718,8 @@ class Saturation:
 ```
 
 - The limits are derived from the region's size where they are set (`limits`): nodes at `growth` times its
-  equations, iterations at `depth` times its longest chain, each of them at least one (a region of no
+  equations, iterations at `depth` times its longest chain, each of them at least one (`Saturation` refuses a limit
+  below one where it is built; a region of no
   equation or no chain keeps `growth` nodes and `depth` iterations). egglog has no node limit of its own, so
   the count is checked between iterations: a graph past its nodes, or one that has run its iterations,
   stops there.
@@ -823,7 +865,10 @@ chunk algorithm side by side:
 The cheapest under the work-span model is the chunk's form, which `scan.py` evaluates and `carry.py`
 splits. At a kernel's chunk on an A100 or an H100 (64 tokens, 128 keys and values) the extraction is the
 compact WY form with its inverse by doubling, the hand-written chunk's form. Both rule sets are proven
-sound over the reals from their declarations (tests/test_linear_scan.py).
+sound over the reals from their declarations (tests/test_linear_scan.py). Today that proof is a symbolic
+check at finite shapes (three tokens, the test's shape inventory), and the doubling is checked against the
+solved inverse it must equal, not derived from `scan`'s own implementation of it: a proof at every chunk
+size is an open gap.
 
 A derived algebra's laws are proven before its forms ship, in the suite (tests/algebra_laws.py): identity, associativity, consistency
 (a tile folded into a state is a walk of it merged), and the declared function (a walk of two tiles finishes
@@ -869,8 +914,12 @@ derived one replaced is deleted with it, check 1 holding the derived forms to XL
   joins selected away before its decay multiplies it. The Mosaic mainloop takes its system's pairs and its readout's scores from the derived forms of tile
   declarations (`recurrence_algebra.pairs_of`, `scores_of`) over its own products and its compensated
   prefix's decays, the one path: the derived forms are the hand-written ones' arithmetic, which they replace.
+  Today that holds for a decay a head; a decay a key dimension runs hand-written per-key arithmetic
+  (`key_block_pairs`, `key_diagonal_bands` and their backward) no tile declaration states, an open gap of the
+  recurrence's.
 
-The template's own forms run in three places:
+The template's own forms, kept by hand rather than derived, run on every mainloop, the portable plain-JAX
+one among them, in three places:
 - the accurate forms (the compensated exponent, the largest weight held to 1, raw logits, the anchor test,
   the keyed sums);
 - compensated running sums and the scaled walk's sums at each row's power of two (`SCALED_WALK`);
@@ -1085,7 +1134,8 @@ about it is an estimate.
   bits (`rows`), so a format's decode is one: its codes' fields placed where the consumer's multiply reads
   them (`BitTransform.placed`), the exponent's bias folded into the block scale's multiply (an E2M1 code at a
   bfloat16's mantissa's top bit and its exponent's two low bits is the code's value times 2^-126). A transform
-  that is not linear is not declarable: its proof over a 32-bit word would need a solver, and no consumer has
+  that is not linear is not declarable as a `BitTransform` (a nonlinear one is stated as a traced reference
+  and searched by the separate tool, below): its proof over a 32-bit word would need a solver, and no consumer has
   one yet (a rounding pack's own search waits for its consumer).
 - **Its layout** is fixed (the stored word is the input) or free: the stored word may be any invertible
   re-encoding of the input, chosen with the form. The encoder runs once where the weights are stored (Dew's
@@ -1154,7 +1204,9 @@ about it is an estimate.
   linear form takes 2 a register (the linear search, a shift and a masked XOR), so a consumer of FP8 weights
   stores them in its free layout once (`BitForm.prepared`), as NVFP4's does, and no natural-order form is
   checked in. MX's E8M0 scale into fp32 bits, its endpoints 2^-127 and NaN, keeps its seed's 8 steps: no
-  cheaper program within the windows. Neither has a consumer yet (sm80's FP8 weights, sm100's MX).
+  cheaper program within the windows (none found within the search's budgets: windows of at most three
+  inputs, bounded rounds and solver timeouts; not a proof that none exists). Neither has a consumer yet (sm80's
+  FP8 weights, sm100's MX): what this section says a consumer does with them is the design, not built.
 - **Not in the linear search**: PRMT and LOP3's other tables as a register's combiner. A register's LOP3
   must zero its other bits, and a three-way XOR with a mask takes four operands, which LOP3 does not; a
   byte selection adds nothing a free layout's encoder does not, and a fixed layout's byte moves are the

@@ -491,7 +491,7 @@ its constants', its declared ranges' and its equations' prove; a value no number
 sum's is twice the larger of its terms', a product's their product, a contraction's their product times its
 length. Proved under its arithmetic's contract (`_real_bound`): IEEE rounding to nearest, a native
 transcendental given one power past its real range, a contraction's mode one it states the rounding of
-(`_contraction_slack`); an equation outside the contract is unbounded, so overflow admission
+(`contraction_slack`); an equation outside the contract is unbounded, so overflow admission
 (`rules.dominated`) never reads a bound no argument holds."""
 
 NOTHING = -(2 ** 20)
@@ -714,7 +714,7 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> M
       rounds each operand once to nearest (a power of two rounds to itself) and accumulates monotonely; a
       mode that splits its operands into parts (bf16 x3, x6, x9, TF32 x3, `Precision.HIGH`'s bf16 x3 on a
       TPU) sums their products' rounding too, given one power; a mode whose rounding no source states (FP8
-      fast accumulation) proves none (`_contraction_slack`).
+      fast accumulation) proves none (`contraction_slack`).
     Any other equation proves none (a quotient, a logarithm, a power of a float exponent)."""
     name = symbol(equation.primitive)
     real = not any(isinstance(atom.aval, ShapedArray) and jnp.issubdtype(atom.aval.dtype, jnp.complexfloating)
@@ -754,7 +754,8 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> M
         shape = _shape(equation.invars[0])
         return given[0] + _log2(math.prod(shape[axis] for axis in equation.params["axes"]))
     if name == "dot_general":
-        slack = _contraction_slack(equation)
+        left, right = (atom.aval.dtype for atom in equation.invars if isinstance(atom.aval, ShapedArray))
+        slack = contraction_slack(equation.params.get("precision"), left, right)
         if slack is None:
             return None
         (contracted, _), _ = equation.params["dimension_numbers"]
@@ -763,19 +764,29 @@ def _real_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None]) -> M
     return None
 
 
-def _contraction_slack(equation: jcore.JaxprEqn) -> int | None:
-    """The powers a contraction's bound adds for its mode (a `dot_general`'s `precision`): none where it
+def product_slack(region: Region, index: int) -> int | None:
+    """The powers the product of `region`'s parameters `index` adds to its bound for its mode
+    (`contraction_slack` at its operands' dtypes, `Region.products`); None where an operand's dtype is
+    unknown or the mode's rounding is unstated."""
+    operands = region.products.get(index)
+    if operands is None or len(operands) != 2 or None in operands:
+        return None
+    return contraction_slack(region.params[index][1].get("precision"), *operands)
+
+
+def contraction_slack(precision, left, right) -> int | None:
+    """The powers a contraction's bound adds for its mode (a `dot_general`'s `precision`, over operands of
+    dtypes `left` and `right`): none where it
     rounds each operand once to nearest and accumulates (no precision stated, `Precision.DEFAULT` and
     `HIGHEST`, the default preset, a preset of one primitive operation over operands of 16 bits or wider);
     one where it splits them into parts whose products it sums (`Precision.HIGH`, a TPU's bf16 x3: a preset
     of several primitive operations); None, no bound, where no source states its rounding (an FP8 preset's
     accumulation, an algorithm given by its own types). A preset's facts are JAX's own
-    (`programs.dot_arithmetic`)."""
-    precision = equation.params.get("precision")
+    (`programs.dot_arithmetic`). The one reading of a contraction's mode: a traced product's bound
+    (`_bounded`) and a rewrite's bound of the product it makes in that mode (`program._products`)."""
     if precision is None:
         return 0
     if isinstance(precision, jax.lax.DotAlgorithmPreset):
-        left, right = (atom.aval.dtype for atom in equation.invars if isinstance(atom.aval, ShapedArray))
         arithmetic = programs.dot_arithmetic(precision, left, right)
         if arithmetic is None:
             return 0

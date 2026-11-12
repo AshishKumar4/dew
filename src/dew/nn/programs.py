@@ -176,6 +176,29 @@ def dot_arithmetic(precision: jax.lax.PrecisionLike, lhs_dtype, rhs_dtype) -> Do
     return None
 
 
+def dot_algorithms(dtype) -> tuple[jax.lax.DotAlgorithmPreset, ...]:
+    """The dot algorithm presets JAX runs a product of `dtype` operands in as they are stored: those whose
+    compute types JAX leaves the operands' own (`get_algorithm_compute_types`, which converts an operand a
+    preset does not take) and whose lowering JAX's conversion accepts for them (`dot_arithmetic`: an FP8
+    preset names no operand types and refuses any but FP8 ones there). The default preset names no
+    algorithm and is none of them."""
+    from jax._src.lax import lax as lax_internal
+
+    stored = jnp.dtype(dtype)
+    found = []
+    for preset in jax.lax.DotAlgorithmPreset:
+        left, right, _ = lax_internal.get_algorithm_compute_types(preset, stored, stored, stored)
+        if (jnp.dtype(left), jnp.dtype(right)) != (stored, stored):
+            continue
+        try:
+            named = dot_arithmetic(preset, stored, stored) is not None
+        except ValueError:  # JAX's own refusal of these operand types for the preset
+            continue
+        if named:
+            found.append(preset)
+    return tuple(found)
+
+
 def _bits(dtype) -> int:
     """A dtype's width in bits."""
     return 8 * jnp.dtype(dtype).itemsize

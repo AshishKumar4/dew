@@ -477,13 +477,13 @@ def main() -> None:
     reference = REFERENCES[args.name]
     form = seed(reference)
     if args.window is not None:
-        found = windows(form)
+        found = windows(form, args.longest)
         if args.window >= len(found):
             return
         window = found[args.window]
         budget = sum(form.steps[index - 1].op.issues for index in range(window.first, window.last + 1))
         began = time.perf_counter()
-        steps = replaced(form, window, budget, args.seconds)
+        steps = replaced(form, window, budget, args.seconds, args.steps)
         print(f"K window {args.window} {window} budget {budget} {time.perf_counter() - began:.0f}s -> "
               f"{None if steps is None else [(s.op.name, s.args, hex(s.immediate), s.table) for s in steps]}",
               flush=True)
@@ -493,7 +493,8 @@ def main() -> None:
     words = np.concatenate([words, edges])
     want = np.asarray(reference(jnp.asarray(words)))
     assert (form.decoded(words)[0] == want).all(), "the seed is not its reference"
-    print(f"K seed: {len(form.steps)} steps, price {form.price}, windows {len(windows(form))}", flush=True)
+    print(f"K seed: {len(form.steps)} steps, price {form.price}, "
+          f"windows {len(windows(form, args.longest))}", flush=True)
     for index, step in enumerate(form.steps, start=1):
         print(f"K step {index}: {step.op.name} {step.args} {step.immediate:#x} {step.table}", flush=True)
     better = improved(form, args.seconds, args.longest, args.steps)

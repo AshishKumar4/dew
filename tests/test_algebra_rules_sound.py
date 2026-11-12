@@ -58,7 +58,7 @@ class Inadmissible(Exception):
     """An instantiation a rule's conditions or its terms' shapes do not admit."""
 
 
-RANGE_FACTS = frozenset({"log2_bound", "reach", "log2_of", "sum_length", "contracted_length"})
+RANGE_FACTS = frozenset({"log2_bound", "reach", "log2_of", "sum_length", "contracted_length", "mode_power"})
 """The facts a magnitude condition reads: rounding's, which a real identity reads nothing of."""
 ROUNDING_FACTS = frozenset({"plain", "exact_scale"})
 """The facts a dtype or power-of-two condition reads: rounding's too."""
@@ -617,8 +617,19 @@ def _power(expr, rule, powers: dict, evaluated: Evaluated) -> int:
         product = _inner(args[0])
         (contracting, _), _ = evaluated.value(product.args[2])["dimension_numbers"]
         length = math.prod(np.shape(evaluated.value(product.args[0]))[axis] for axis in contracting)
-        return max(length - 1, 0).bit_length()
+        return max(length - 1, 0).bit_length() + _mode_power(evaluated.value(product.args[2]))
+    if ref.ident.name == "mode_power":
+        return _mode_power(evaluated.value(args[0]))
     raise TypeError(ref.ident.name)
+
+
+def _mode_power(params) -> int:
+    """The powers a product of `params` adds for its mode, as the engine reads it
+    (`terms.contraction_slack`) of fp32 operands; a mode whose rounding nothing states admits no rule."""
+    slack = terms.contraction_slack(params.get("precision"), jnp.float32, jnp.float32)
+    if slack is None:
+        raise Inadmissible("a product of a mode whose rounding nothing states")
+    return slack
 
 
 def _binding(rule, name: str):

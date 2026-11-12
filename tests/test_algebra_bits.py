@@ -214,6 +214,8 @@ FORMS = {
     "nibbles": lambda: bits.synthesized(_nibbles()),
     "nibbles-alu": lambda: bits.synthesized(_nibbles(ALU)),
     "encode-e4m3": lambda: bits.encode_form(bits.E4M3),
+    "encode-e5m2": lambda: bits.encode_form(bits.E5M2),
+    "encode-e2m1": lambda: bits.encode_form(bits.E2M1),
 }
 """Forms whose steps together take every instruction a form's PTX writes (`BitForm.ptx`): a rotation, left
 and right shifts on either pipe, and a mask of one value and of two values' XOR; and an encode's (every

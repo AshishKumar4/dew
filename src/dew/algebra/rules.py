@@ -116,13 +116,24 @@ def log2_of(size: i64Like) -> i64: ...
 
 
 @function(merge=lambda old, new: old)
+def mode_power(params: i64) -> i64: ...
+"""The powers a contraction of parameters `params` adds to its bound for its mode (`terms.product_slack`: none
+for one that rounds each operand once and accumulates, one where it splits its operands into parts whose
+products it sums), stated for each product of a region whose mode's rounding is stated and for none other: a
+rule that makes a product at `params` adds it to the product's length's power (`contracted_length` holds the
+two together for a traced product), so no rule makes a product of a mode nothing bounds."""
+
+
+@function(merge=lambda old, new: old)
 def contracted_length(product: Term) -> i64: ...
 """A contraction's (`Term.dot`'s, by its term) length's power of two, `ceil(log2(...))` of the elements each
 of its outputs sums: a rule that makes a contraction bounds its products' and its sum's magnitude by its
 operands' and this (`product_magnitude`), read off the product it replaces, which contracts the same
 elements. Stated per product, not per parameters' index, which two products of different lengths share
-(row 3577). A contraction of no stated length (an operand of no known shape) has none, so a rule that asks it
-does not fire."""
+(row 3577). Its mode's powers are in it (`terms.contraction_slack`: one more where the mode splits its
+operands into parts), so the product a rule makes in that mode is bounded as the mode computes it. A
+contraction of no stated length (an operand of no known shape, a mode whose rounding nothing states) has none,
+so a rule that asks it does not fire."""
 
 
 @function(merge=lambda old, new: old)
@@ -491,7 +502,8 @@ def _scale_lifts() -> tuple[RuleFamily, ...]:
     product_extent = var("product_extent", Vec[i64])
     length2, row_lift, column_lift = vars_("length2 row_lift column_lift", i64)
     left = var("left", Vec[i64])
-    contracted = (eq(left).to(shape(x)), eq(length2).to(log2_of(left[i64(1)])))
+    # The lifted product contracts x's columns in the mode of the one it replaces (`mode_power`).
+    contracted = (eq(left).to(shape(x)), eq(length2).to(log2_of(left[i64(1)]) + mode_power(params)))
     facts, power = product_magnitude(magnitude(x, "x"), magnitude(y, "y"), length2)
     product = x.dot(y, params)
     lifted_by: dict[str, list] = {"row": [], "column": []}

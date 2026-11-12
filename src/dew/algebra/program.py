@@ -11,7 +11,6 @@ import collections
 import contextlib
 import dataclasses
 import functools
-import inspect
 import math
 import threading
 import time
@@ -22,7 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from egglog import DagCostModel, EGraph, Schedule, String, Vec, get_callable_args, i64, set_
-from jax._src import config as jax_config
+from jax._src import api_util, config as jax_config
 from jax.core import ShapedArray, eval_jaxpr
 from jax.extend import core as jcore
 
@@ -38,10 +37,15 @@ from dew.nn.programs import called, control_flow, inlined, live, with_bodies
 @dataclasses.dataclass(frozen=True)
 class Saturation:
     """The limits a region's saturation stops at, from its size (`limits`): nodes at `growth` per equation,
-    iterations at `depth` per level of its longest chain of the language's equations."""
+    iterations at `depth` per level of its longest chain of the language's equations, each at least one."""
 
     growth: int
     depth: int
+
+    def __post_init__(self):
+        if self.growth < 1 or self.depth < 1:
+            raise ValueError(f"a saturation's limits are each at least one, not growth {self.growth} and "
+                             f"depth {self.depth}: none would stop a region before its first iteration")
 
     def limits(self, region: terms.Region) -> tuple[int, int]:
         """The nodes and iterations `region` may take."""
@@ -92,8 +96,8 @@ def passes(on: bool = True, target: str | None = None) -> Iterator[None]:
         yield
 
 
-def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tuple[int, ...] = (),
-              static_argnames: str | tuple[str, ...] = (), kernels: bool = False) -> Callable:
+def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tuple[int, ...] | None = None,
+              static_argnames: str | tuple[str, ...] | None = None, kernels: bool = False) -> Callable:
     """`fn` with its program rewritten where the switch is on (`passes`): its static arguments bound as the
     jit around it binds them (`static_argnums`, `static_argnames`), traced over the others, its terms
     saturated under the rule sets the run's numerics admit (`rules.admitted`: the `exact` sets alone under
@@ -102,18 +106,15 @@ def rewritten(fn: Callable, *, saturation: Saturation, static_argnums: int | tup
     Dew's kernels where they take them (`fusion.fused_program`), which a program a kernel itself traces (a
     fused prologue's producer, a score mod) never is. Its arguments, outputs and their structure are
     `fn`'s."""
-    # The static positions and names as jit resolves them: each given, and its other spelling read from the
-    # signature's positional parameters, so a static argument passed either way is bound.
-    numbers = {static_argnums} if isinstance(static_argnums, int) else set(static_argnums)
-    names = {static_argnames} if isinstance(static_argnames, str) else set(static_argnames)
-    try:
-        parameters = list(inspect.signature(fn).parameters.values())
-    except (TypeError, ValueError):
-        parameters = []
-    positional = [parameter.name for parameter in parameters
-                  if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD)]
-    numbers |= {number for number, name in enumerate(positional) if name in names}
-    names |= {positional[number] for number in numbers if -len(positional) <= number < len(positional)}
+    # The static positions and names as jit resolves them, by JAX's own inference: the spelling omitted is
+    # read from the signature, and where both are given each is taken as given (a union of the two made a
+    # static of an argument jit traces, passed the other way).
+    numbers, names = static_argnums, static_argnames
+    signature = api_util.fun_signature(fn)
+    if signature is not None:
+        numbers, names = api_util.infer_argnums_and_argnames(signature, numbers, names)
+    numbers = set(() if numbers is None else (numbers,) if isinstance(numbers, int) else numbers)
+    names = set(() if names is None else (names,) if isinstance(names, str) else names)
 
     @functools.wraps(fn)
     def run(*args, **kwargs):
@@ -510,7 +511,8 @@ def stated(graph: EGraph, region: terms.Region, *registered) -> None:
 
 
 def _products(region: terms.Region) -> list:
-    """The facts a region's products state: which compute in their operands' dtype (`rules.plain`: no
+    """The facts a region's products state, each of a mode whose rounding is stated
+    (`terms.contraction_slack`): which compute in their operands' dtype (`rules.plain`: no
     accumulation wider than their operands they round back from), which of those are matrix products
     (`rules.matrix_product`), which values are matrices (`rules.matrix`), and the broadcasts of a vector to
     each matrix's extent along either axis (`rules.lifted`), their parameters added to the region's table."""
@@ -523,12 +525,21 @@ def _products(region: terms.Region) -> list:
             continue
         index = terms.integer(args[2])
         _, params = region.params[index]
-        # Its contracted length's power, the elements each output sums (`rules.contracted_length`).
+        left, right = (region.dtypes.get(terms.key(operand)) for operand in args[:2])
+        # Its mode's powers (`terms.product_slack`): a product whose rounding nothing states has no
+        # bound, so nothing here says what a rule would need to factor it or to make another in its mode.
+        slack = terms.product_slack(region, index)
+        if slack is None:
+            continue
+        facts.append(set_(rules.mode_power(i64(index))).to(i64(slack)))
+        # Its contracted length's power, the elements each output sums, and its mode's beside it
+        # (`rules.contracted_length`): what a product a rule makes in its place, in its mode, adds to its
+        # operands' bounds (a split-precision product's one power more, as its own traced bound takes).
         (contracting, _), _ = params["dimension_numbers"]
         length = math.prod(region.shape(args[0])[axis] for axis in contracting)
-        facts.append(set_(rules.contracted_length(term)).to(i64(max(length - 1, 0).bit_length())))
+        facts.append(set_(rules.contracted_length(term)).to(i64(max(length - 1, 0).bit_length() + slack)))
         wanted = params.get("preferred_element_type")
-        operands = {region.dtypes.get(terms.key(args[0])), region.dtypes.get(terms.key(args[1]))}
+        operands = {left, right}
         if wanted is None or operands == {jnp.dtype(wanted)}:
             facts.append(rules.plain(i64(index)))
             if jax.tree.map(int, params["dimension_numbers"]) == plain_numbers:

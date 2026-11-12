@@ -70,6 +70,52 @@ def test_a_bodys_math_is_rewritten_in_place(kind):
     assert_as_exact(jax.jit(algebra.rewritten(fn)), jax.jit(fn), draw, f"two sums in a {kind}", seeds=16)
 
 
+def test_statics_given_both_ways_are_each_taken_as_given_as_jit_takes_them():
+    """Where both spellings are given, jit takes each as given and infers neither from the other: a count
+    static by name alone and passed by position is traced, and a loop over it is refused. The rewritten
+    function binds its statics by the same inference (`jax._src.api_util.infer_argnums_and_argnames`), so it
+    refuses the same call, where its own union of the two spellings bound the count and ran it; passed by
+    name, the rewritten function is on par with the function as written (check 1)."""
+    def repeated(scale, x, y, a, n):
+        for _ in range(n):
+            x = two_sums(x, y, a)[:, None] * x
+        return scale * two_sums(x, y, a)
+
+    statics = {"static_argnums": 0, "static_argnames": "n"}
+    x, y, a = rows(0, (8, 16), (8, 16), (8, 16))
+    for function in (jax.jit(repeated, **statics), algebra.rewritten(repeated, **statics)):
+        with pytest.raises(jax.errors.TracerIntegerConversionError):
+            function(2.0, x, y, a, 2)
+    rewritten = algebra.rewritten(repeated, **statics)
+    assert_as_exact(jax.jit(lambda x, y, a: rewritten(2.0, x, y, a, n=2)),
+                    jax.jit(lambda x, y, a: repeated(2.0, x, y, a, n=2)),
+                    lambda seed: rows(seed, (8, 16), (8, 16), (8, 16)), "statics bound as jit binds them",
+                    seeds=16)
+
+
+def test_a_product_whose_mode_states_no_rounding_is_factored_by_no_rule():
+    """A rule that factors a product makes another in its mode, bounded by that mode's rounding
+    (`terms.contraction_slack`). A scaled operand's product at the default precision is rewritten; the same
+    product under a dot algorithm given by its own types, whose rounding no source states, is left as
+    written: nothing bounds the product a rule would make, so none fires, where the guards read only the
+    operands' powers and the length and factored it as an ordinary product."""
+    x, y, s = rows(1, (64, 32), (32, 16), (64,))
+
+    def scaled(precision):
+        return lambda x, y, s: jnp.dot(jnp.tanh(x) * jnp.tanh(s)[:, None], jnp.tanh(y), precision=precision)
+
+    assert cheaper_spliced(scaled(None), x, y, s)
+    assert not cheaper_spliced(scaled(jax.lax.DotAlgorithm(np.float32, np.float32, np.float32)), x, y, s)
+
+
+def test_a_saturation_of_no_growth_or_depth_is_refused():
+    """A saturation's limits are each at least one (docs/design/algebra.md 6.6): one of none would stop
+    every region before its first iteration and report it saturated."""
+    for limits in ({"growth": 0, "depth": 4}, {"growth": 64, "depth": 0}):
+        with pytest.raises(ValueError):
+            algebra.Saturation(**limits)
+
+
 @pytest.mark.parametrize("pass_n", ["positionally", "by keyword"])
 @pytest.mark.parametrize("statics", [{"static_argnames": "n"}, {"static_argnums": 3}], ids=["name", "number"])
 def test_a_rewritten_function_binds_its_static_arguments_as_jit_does(statics, pass_n):
@@ -250,7 +296,8 @@ def test_factoring_products_keeps_finite_cancellation(shared, compiled, overflow
 def test_every_outer_program_is_rewritten_unless_its_arm_turns_the_pass_off():
     """An outer program (`options.program`) traces its function rewritten, so its lowering, its trace and its
     executable read one program; under `algebra.passes(on=False)`, which the gate opens for a reference arm,
-    the same program traces unrewritten, and a program already held retraces as the switch changes."""
+    the same program traces unrewritten, and a program already held retraces as the switch changes, and as
+    the target its forms are priced for does (`generation.assumed`): each a new executable."""
     x, y, a = rows(2, (8, 64), (8, 64), (8, 64))
     program = options.program(two_sums)
 
@@ -265,6 +312,9 @@ def test_every_outer_program_is_rewritten_unless_its_arm_turns_the_pass_off():
         off = program.executable(x, y, a)
     on = program.executable(x, y, a)
     assert off is not on
+    with generation.assumed("sm90"):
+        elsewhere = program.executable(x, y, a)
+    assert elsewhere is not on and elsewhere is not off
     np.testing.assert_array_equal(np.asarray(program(x, y, a)), np.asarray(on(x, y, a)))
 
 
