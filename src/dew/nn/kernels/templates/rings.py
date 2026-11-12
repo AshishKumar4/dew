@@ -5,6 +5,7 @@ producer's loads and drain (`loads`, `streamed`, `drain`) and a consumer's passi
 of (`passed`). The families and walks that compose them are `mosaic`'s."""
 
 import dataclasses
+import os
 from collections.abc import Iterable, Sequence
 from typing import Any
 
@@ -285,6 +286,8 @@ class Ring:
         once, its slot not refilled until released."""
         slot = opaque(turn.slot)
         plgpu.barrier_wait(self.full.at[slot], parity=turn.parity)
+        if os.environ.get("DBG_SLOT_ZERO"):
+            return self.smem.at[opaque(0)]
         return self.smem.at[slot]
 
     def release(self, turn: Turn) -> None:
