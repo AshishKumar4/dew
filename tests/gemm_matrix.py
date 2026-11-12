@@ -249,8 +249,8 @@ CASES = (
     ('v5e', 'mosaic', 'dense', 'k-major', 'paired', 'bfloat16'),
     ('sm90', 'triton', 'dense', 'k-major', 'row-scale', 'bfloat16'),
     ('sm90', 'triton', 'dense', 'n-major', 'plain', 'float16'),
-    ('sm90', 'cutlass', 'grouped', 'n-major', 'plain', 'bfloat16'),
     ('sm80', 'mosaic', 'grouped', 'n-major', 'paired', 'bfloat16'),
+    ('sm80', 'cutlass', 'grouped', 'n-major', 'plain', 'bfloat16'),
     ('v5e', 'mosaic', 'dense', 'n-major', 'plain', 'bfloat16'),
 )
 """The cells' cases, each its axis values in `AXES`' order: every pair of axis values the route serves
