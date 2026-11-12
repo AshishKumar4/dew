@@ -312,7 +312,8 @@ def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():
             difference = np.max(np.abs(np.asarray(value) - reference[f"objective_{name}_gradient"]))
             assert difference < 2e-6, f"verl {name} gradient maximum difference {difference}"
 
-    rolled_three = rollout(initial, {"task_id": np.arange(3, dtype=np.int32)}, jax.random.key(24))
+    rolled_three = rollout(initial, {"task_id": np.arange(3, dtype=np.int32)}, jax.random.key(24),
+                           objective=rollout.objective)
     three_rows = jax.tree.map(lambda leaf: np.asarray(leaf)[:3],
                               {name: value for name, value in rolled_three.items() if name != VALID_ROWS})
     assert jax.tree.leaves(three_rows)[0].shape[0] == 3
