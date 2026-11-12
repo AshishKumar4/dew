@@ -64,11 +64,12 @@ The reference compared with itself resolves the factor in every leaf; the count 
 """
 
 COVERING = [hooked(combination) for combination in kernel_matrix.pairwise(
-    COMBINATIONS, [combination for combination in COMBINATIONS if SEEDS[hooked(combination)] >= 128])]
+    sorted(COMBINATIONS, key=lambda combination: SEEDS[hooked(combination)]), [])]
 """The hook combinations a decode token's check holds (row 5492): every pair of hook values some combination
-serves, beginning with each combination whose difference from its float64 form took 128 seeds or more to
-resolve (`SEEDS`), its arithmetic the nearest its float64 form's. Every combination took 16,410 s of the
-suite; these hold a third of their seeds."""
+serves, of combinations covering as many pairs the one its float64 form resolves in the fewest seeds
+(`SEEDS`), 14 of 240 and 168 of their 7,120 seeds: with the formed sites 603 s of the suite, every case at
+90 s or less, where every combination took 16,410 s; seeded with the combinations of 128 seeds or more, 14
+conv cases ran past the 120 s target a task (a conv's interpreted step 1.2 s a call, row 5526)."""
 
 FORMED = [
     recurrence.Hooks(decay='scalar', gates=recurrence.Gates(write='step', limit=(0.0, 0.5)), delta=False,
