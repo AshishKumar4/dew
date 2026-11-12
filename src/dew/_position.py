@@ -267,4 +267,6 @@ def translates(position: bytes) -> bool:
     own reader's (`phase_position`)."""
     if (phased := phase_position(position)) is not None:
         return translates(phased)
-    return decode(position) is not None or replicated(position) is not None or ramped(position) is not None
+    # A global position by its envelope alone: one a reader refuses (`decode`) still translates.
+    return (_enveloped(position, ENVELOPE) is not None or replicated(position) is not None
+            or ramped(position) is not None)
