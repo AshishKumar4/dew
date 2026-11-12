@@ -239,7 +239,7 @@ def test_a_media_slot_a_model_reads_from_its_table_bounds_its_id():
 
     model = placeholder_model()
     hashing = model.clone(language_model=model.language_model.clone(engram=Engram(
-        layer_ids=(0,), num_embeddings=(88,), max_ngram_size=3, vocab_size=ROWS, n_heads=2, head_dim=4,
+        layer_ids=(0,), num_embeddings=(), max_ngram_size=3, vocab_size=ROWS, n_heads=2, head_dim=4,
         compressed_vocab_size=ROWS, media_stops=False)))
     request = media_rows([[4, PLACEHOLDER + 9, 5, 6]], [[-1, 0, -1, -1]])
     Field.indexing("tokens", (), model).bounded(request)
