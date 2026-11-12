@@ -88,9 +88,9 @@ def refused_by_its_plan(run: Path, train: Callable[[], object], *, exact: bool) 
 
 
 def resumes_one_step(run: Path, last: int, built, kind: str) -> None:
-    """`built`, `run`'s run built again, prepared and trained relaxed, the default: refused before a step where
-    this Dew reads none of its checkpoint's format (`resumed_by_its_format`), else its fit started at `last`,
-    from that step's checkpoint, whatever data plan it was saved under."""
+    """`built`, `run`'s run built again, prepared and trained relaxed, the default: refused before a step
+    where this Dew reads none of its checkpoint's format (`resumed_by_its_format`), else its fit started at
+    `last`, from that step's checkpoint, whatever data plan it was saved under."""
     prepared = built.prepare()
     if not resumed_by_its_format(run, prepared.objective, lambda: prepared.train(kind)):
         return
