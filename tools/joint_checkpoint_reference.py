@@ -212,10 +212,7 @@ def upstream_precision() -> str:
     from fla.ops.gated_delta_rule import chunk_fwd
     from fla.ops.utils import solve_tril
 
-    from _dew_torch.precision import recorded_matmuls
-
-    sys.path.insert(0, str(ROOT / "tests"))
-    from reference_error import UPSTREAM_DEFAULT
+    from _dew_torch.precision import UPSTREAM_DEFAULT, recorded_matmuls
 
     solve = chunk_fwd.SOLVE_TRIL_DOT_PRECISION
     modes = recorded_matmuls(FLA_TRIL_PRECISION=solve_tril.FLA_TRIL_PRECISION,

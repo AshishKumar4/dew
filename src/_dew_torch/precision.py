@@ -200,6 +200,12 @@ def float64_twin[M: torch.nn.Module](model: M, build: Callable[[], M] | None = N
     return twin.to(next(model.parameters()).device).eval()
 
 
+UPSTREAM_DEFAULT = "upstream default"
+"""What a port's upstream recording's precision record begins with (`recorded_matmuls`' after it): its
+generator ran the upstream at its own default precision, no switch set (testing.md: a port is held to its
+upstream); tests/reference_error.py's `upstream_fixture` reads it."""
+
+
 def recorded_matmuls(**solves) -> str:
     """What a reference's array file records of its run's matmuls (tests/reference_error.py's
     `PRECISION`): 'ieee' where torch, Triton's default and each of `solves` (its name to the mode it
