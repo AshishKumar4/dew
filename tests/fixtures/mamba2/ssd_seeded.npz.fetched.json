@@ -4,6 +4,6 @@
  "path": "recordings/d3488800262882eae6468e3df07df42409b6f5a91db8676a76915f1954e0a5ac.npz",
  "reference": "transformers 5.17.0",
  "repo": "dewml/fixtures",
- "revision": null,
+ "revision": "9dc62eeab92e3a7c86046f320846cc69d5aa4969",
  "sha256": "d3488800262882eae6468e3df07df42409b6f5a91db8676a76915f1954e0a5ac"
 }
