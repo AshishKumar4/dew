@@ -62,4 +62,10 @@ for record in kc.compile_mosaic_kernels([KernelCase(f'{name} {length}', call, mo
             consumer=ptx.split('setmaxnreg.inc',1)[-1]
             before=consumer.split('tcgen05.mma',1)[0]
             print('K PREFIXPOS',variant,'shared_loads_before_first_MMA',len(re.findall(r'ld.shared.b(?:32|64)',before)),flush=True)
+            if os.environ.get('DBG_ASSERT_MODEL'):
+                limit=(model.registers+7)//8*8
+                needed=kernel.get('least')
+                fits=needed is not None and needed<=limit
+                print('K CHECK',variant,'GREEN' if fits else 'RED','need',needed,'model_cap',limit,flush=True)
+                assert fits,(needed,limit)
     if record.get('error'): print('K ERROR', str(record['error'])[:300],flush=True)
