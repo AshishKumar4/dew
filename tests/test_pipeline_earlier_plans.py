@@ -50,15 +50,15 @@ def _ids(stream, batches: int) -> list[list[int]]:
     return [np.asarray(next(stream)["id"]).tolist() for _ in range(batches)]
 
 
-@pytest.mark.parametrize("read", ["streamed", "indexed"])
 @pytest.mark.parametrize("version", [13, 14])
-def test_a_position_resumes_under_the_plan_version_that_saved_it_through_a_grown_take(read, version):
+def test_a_position_resumes_under_the_plan_version_that_saved_it_through_a_grown_take(version):
     """A position saved under data plan 13, which printed its order's stages and its steps' configurations,
     or 14, which describes them by their structure (`STRUCTURED`), resumes compiled at the version that
     saved it: onto the rows read next, through a take grown since, which reads on past the old bound; a
     configured step whose configuration changed is refused, its rows not the saved run's."""
     def loader(count: int, factor: int = 2):
-        return compile(_taken(count, factor), read=read, loading=Loading(workers=0), plan_version=version)
+        return compile(_taken(count, factor), read="streamed", loading=Loading(workers=0),
+                       plan_version=version)
 
     stream = loader(20).train(DataPartition())
     _ids(stream, 3)

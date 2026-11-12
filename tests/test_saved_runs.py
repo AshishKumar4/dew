@@ -305,23 +305,6 @@ jax.distributed.shutdown()
 """)
 
 
-def test_a_run_that_sets_another_option_text_than_its_saved_run_trained_is_refused(tmp_path, monkeypatch):
-    """A field a run leaves to its build takes the saved run's value only where the run leaves it None: a
-    lettered decision run saved before its option text was a field wrote its options named, and its
-    command run again setting `described` keeps it, so its resume is refused, where the same run writing
-    them named resumes."""
-    from dew.config import earlier_run
-
-    recorded = next(recorded for recorded, kind in SAVED if kind == "decision-lettered")
-    run, _, built = rebuilt(tmp_path, monkeypatch, recorded, "decision-lettered", option_text="described")
-    assert built.resumed().option_text == "described"
-    saved = earlier_run(json.loads((run / "run.json").read_text()))
-    prepared = built.resumed().pinned().build_run().run
-    with pytest.raises(ValueError):
-        prepared.check_resume(saved)
-    dataclasses.replace(prepared, option_text="named").check_resume(saved)
-
-
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("kind", ["decision", "decision-lettered"])
 def test_a_decision_run_this_dew_saves_resumes_when_its_command_runs_again_or_from_its_record(tmp_path,

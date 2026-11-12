@@ -59,7 +59,7 @@ def test_a_field_added_after_runs_were_saved_keeps_their_identity_until_set(held
     for held_in in (lambda step: (step,), lambda step: {"inner": step}):
         nested = [identity(Holding(held_in(ScaledLater(2, shift=shift)))) for shift in (0, 1, 2)]
         assert len(set(nested)) == 3 and nested[0] == identity(Holding(held_in(Scaled(2)))).replace(
-            "Scaled(", "ScaledLater(")
+            '.Scaled"', '.ScaledLater"')
 
 
 @dataclasses.dataclass(frozen=True)

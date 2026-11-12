@@ -145,6 +145,7 @@ from dew.data.plan import (
     Plan,
     StepIdentity,
     fingerprint,
+    identified,
     read_by,
     spelled,
     unplaced,
@@ -573,9 +574,9 @@ def _derived(pipeline: Pipeline, build: _Build) -> Mapping[str, str]:
             arrays[f"{index}/physical_shards"] = fingerprint(list(sizes))
         if read != "streamed":
             arrays[f"{index}/index"] = fingerprint([len(source.records(read)), seed])
-        elif build.version >= STRUCTURED:
-            # The `shards` rule's fact: the shards a stream reads in turn (`ShardManifest.digest`), which a
-            # plan of 13 recorded none of.
+        elif build.version >= STRUCTURED and identified(json_value(source.fingerprint(), "source")):
+            # The `shards` fact: the shards a stream reads in turn (`ShardManifest.digest`), of a store
+            # that states its content (a store given no name names its shards by no content of its own).
             arrays[f"{index}/shards"] = source.manifest().digest
         metadata = source.metadata()
         if "valid_targets" in metadata:

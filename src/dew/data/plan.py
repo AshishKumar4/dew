@@ -211,7 +211,7 @@ class StepIdentity:
             else {}
         )
         printed = None
-        if frozen:
+        if frozen and dataclasses.is_dataclass(step) and not isinstance(step, type):
             printed = _printed_config(step, config, bool(dependencies))
             config = json.dumps(structured(step), sort_keys=True)
         code = (0,) if inspect.isfunction(step) and declared is None and modules else ()
@@ -286,11 +286,10 @@ it is a new value (docs/design/data.md, the rules)."""
 def structured(value) -> JSON:
     """`value`, a step or any part of one, described by its structure, the one description a plan of version
     `STRUCTURED` or later records: a dataclass by its class and each field it records (`repr=True`, and an
-    added one where set, `dew._records.ADDED`), a configured object by what it computes (`dependencies`),
-    a container entry by entry, an array by its fingerprint, a callable by its own identity
-    (`StepIdentity`), a scalar as JSON holds it, and anything else by its text, without addresses."""
-    if isinstance(value, _Dependencies):
-        return json_value(value.dependencies(), type(value).__qualname__)
+    added one where set, `dew._records.ADDED`), whatever it computes from beside (`dependencies`, which its
+    identity records apart), another configured object by what it computes, a container entry by entry (a
+    mapping's in its order), an array by its fingerprint, a callable by its own identity (`StepIdentity`), a
+    scalar as JSON holds it, and anything else by its text, without addresses."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         kind = type(value)
         described: dict[str, JSON] = {"class": f"{kind.__module__}.{kind.__qualname__}"}
@@ -299,6 +298,8 @@ def structured(value) -> JSON:
             if field.repr or (field.metadata.get(ADDED) and held != field.default):
                 described[field.name] = structured(held)
         return described
+    if isinstance(value, _Dependencies):
+        return json_value(value.dependencies(), type(value).__qualname__)
     match value:
         case None | bool() | int() | str():
             return value
@@ -309,8 +310,9 @@ def structured(value) -> JSON:
         case list() | tuple():
             return [structured(entry) for entry in value]
         case Mapping():
-            return {name if isinstance(name, str) else repr(name): structured(entry)
-                    for name, entry in value.items()}
+            # In its order, which a reader of it may take (a chat template's labels, rendered in turn).
+            return {"mapping": [[name if isinstance(name, str) else repr(name), structured(entry)]
+                                for name, entry in value.items()]}
         case np.ndarray() | jax.Array():
             return {"array": content_fingerprint(np.asarray(value)).hex()}
         case np.generic():
@@ -830,8 +832,11 @@ class Plan:
             raise PlanOrderChanged.between(record(saved.get("order"), "saved order"),
                                            record(current["order"], "order"))
         previous = record(saved.get("derived", {}), "saved derived order")
-        for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
-            if previous.get(name) != self.derived.get(name):
+        # A plan of 13 recorded no stream's shards (`STRUCTURED`'s `shards` fact).
+        derived = (self.derived if self.version >= STRUCTURED
+                   else {name: value for name, value in self.derived.items() if not name.endswith("/shards")})
+        for name in sorted(set(previous) | set(derived)) if edited is None else ():
+            if previous.get(name) != derived.get(name):
                 raise ValueError(f"saved data plan derived order {name} changed")
         if self.lowering == "per-share":
             topology = record(current["topology"], "data plan topology")
@@ -921,7 +926,9 @@ class Plan:
             if before[key] != self.members[key]:
                 raise ValueError(f"saved data plan member {key} changed what it reads or runs")
         mixture = ("corpora", "members", "weights")
-        spelled_order = record(self.spelled_order(), "order")
+        spelled_order = json_value(self.spelled_order(), "order")
+        if not isinstance(spelled_order, dict):
+            raise TypeError("a plan's order is a record of its fields")
         current = {name: value for name, value in spelled_order.items() if name not in mixture}
         before_order = {name: value for name, value in order.items() if name not in mixture}
         if unplaced(before_order) != unplaced(current):
