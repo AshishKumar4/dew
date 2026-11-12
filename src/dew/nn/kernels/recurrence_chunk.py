@@ -1480,10 +1480,6 @@ SSD_PORT = Kernel[ScanCase]('pallas', SSD_SUPPORTS, upstream='mamba_ssm')
 """Dew's port of mamba_ssm's SSD kernels (`mamba_ssd.ssd_scan`)."""
 
 SCAN_CELLS: dict[tuple[str | None, str], tuple[Kernel[ScanCase], str]] = {
-    ('wgmma', 'training'): (
-        SSD_PORT, "on an H100 80GB HBM3, the port's forward and gradient 1.592 ms against the template's "
-                  "1.877 on Nemotron-H 4B's SSD and 0.660 against 0.820 on 30B's, its query/key launch "
-                  "0.385 and 0.160 of them (window-h100-c70aaa8-b8109ee)"),
     ('mma.sync', 'training'): (
         SSD_PORT, "on an A100 SXM4 40GB, the port's forward and gradient 3.954 ms against the template's "
                   "4.217 on Nemotron-H 4B's SSD and 1.584 against 2.200 on 30B's (ssd-train-a100-fdab2424c)"),
@@ -1494,7 +1490,11 @@ mamba_ssm's kernels (`mamba_ssd.ssd_scan`; "the port" below) faster than the rec
 old route's kernel and that receipt; every time below sets the template against that port, not against
 mamba_ssm's own kernels (tools/benchmark_recurrence.py's `mamba_ssm` arm): the
 scan's selector runs the port on them where it takes the call (`Op.declared`); the list shrinks as the
-template wins its cells. An A100's forward is the template's: 1.418 ms against the port's 1.506 on Nemotron-H
+template wins its cells. Warpgroup MMA's training is the template's: on a GH200 480GB, by device time, its
+forward and gradient 1.475 ms against the port's 2.065 on Nemotron-H 4B's SSD (its 80-wide heads padded to
+the port's 128) and 0.865 against 0.836 on 30B's (LF-REC4-gh200 at 59b96a9b4c2), where an H100's had the
+port 1.592 against 1.877 and 0.660 against 0.820 (window-h100-c70aaa8-b8109ee). An A100's forward is the
+template's: 1.418 ms against the port's 1.506 on Nemotron-H
 4B's and 0.510 against 0.541 on 30B's (ssd-rounded-a100-fdab2424c), and warpgroup MMA's: on an H100 80GB HBM3
 0.211 ms against 0.241 on 30B's and 0.522 against 0.617 on 4B's, on a GH200 480GB 0.207 against 0.225 and
 0.509 against 0.595 (FS-RECROUTES-h100 and -gh200 at 26d3fdf5df: cold, exclusive, two rounds alternating the
