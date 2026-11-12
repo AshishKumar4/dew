@@ -683,17 +683,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # (`Issuer.chunk_columns`).
         held_second = -(-config.block_m * family.chunk_columns(config.block_n) // config.warpgroups
                         // resources.THREADS)
-        plain += held_second if ba.arguments.get('paired') is not None else 0
+        second = held_second if ba.arguments.get('paired') is not None else 0
+        plain += second
         if ba.arguments.get('exact_sums'):
-            # The running sum, a second fp32 accumulator (`mosaic_gpu.tgmm`'s exact sums), is carried as a
-            # loop value beside each step's product (`mosaic.Issuer.summed_apart`), awaited before its add:
-            # the two accumulators and the walk's control, no step's descriptors beside them
-            # (`resources.CONTROL_REGISTERS`), else the staged rows above them (FS-K01 model2: 144 at 64 a
-            # thread over stages 2-5, 208 at 96). A family whose products read registers holds each step's
-            # fragments beside both (mma.sync's, one step's product at a time: 201 at its 128 x 128 forward
-            # tile, NSDBG-5).
+            # Each product's running sum, a second fp32 accumulator (`mosaic_gpu.tgmm`'s exact sums), is
+            # carried as a loop value beside its step's product (`mosaic.Issuer.summed_apart`), awaited before
+            # its add: a pair's two running sums beside its two steps' products (the gathered cells' paired
+            # product into fp32 spilled 324 bytes on a GH200 where one product's two were counted, M-EM-19c),
+            # and the walk's control, no step's descriptors beside them (`resources.CONTROL_REGISTERS`), else
+            # the staged rows above them (FS-K01 model2: 144 at 64 a thread over stages 2-5, 208 at 96). A
+            # family whose products read registers holds each step's fragments beside both (mma.sync's, one
+            # step's product at a time: 201 at its 128 x 128 forward tile, NSDBG-5).
             held = plain + (accumulator if family.operands_in_registers else 0)
-            return max(2 * accumulator + resources.CONTROL_REGISTERS, held + max(phases))
+            return max(2 * (accumulator + second) + resources.CONTROL_REGISTERS, held + max(phases))
         return plain + max(phases)
 
     def _prologue_registers(self, ba, config: mosaic_gpu.Tiles) -> int:

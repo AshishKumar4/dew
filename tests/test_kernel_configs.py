@@ -436,7 +436,7 @@ PROLOGUE_FORMS = ("normed biased forward", "normed biased input gradient", "norm
 PROLOGUE_TILED_FORMS = ("gated forward", "gated kernel gradient")
 """The hooked forms whose prologue reads a side operand's tile (SwiGLU's gate)."""
 
-PAIRED_FORMS = ("paired swiglu forward", "paired forward")
+PAIRED_FORMS = ("paired swiglu forward", "paired forward", "paired forward exact fp32")
 """The paired products a family whose launches take a pair whole emits (`Family.takes_pairs`, row 2100)."""
 
 
@@ -513,6 +513,12 @@ def _gemm_forms(rows: int, depth: int, width: int, groups: int) -> list:
          {**forward, "hooks": hooks(epilogue=swiglu)}),
         ("paired forward", gmm, (x, w, sizes, (), (), w),
          {**forward, "hooks": hooks(out_dtypes=("bfloat16", "bfloat16"))}),
+        # Each product summed apart, two running sums beside two steps' products (a paired product into fp32
+        # at a precision above the default: the gathered cells' paired product spilled 324 bytes on a GH200
+        # where the model counted one product's pair, M-EM-19c).
+        ("paired forward exact fp32", gmm, (x, w, sizes, (), (), w),
+         {**forward, "out_dtype": "float32", "exact_sums": True,
+          "hooks": hooks(out_dtypes=("float32", "float32"))}),
     ]
 
 

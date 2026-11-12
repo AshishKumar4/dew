@@ -8,7 +8,9 @@ import functools
 import importlib
 import importlib.util
 import math
+from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -21,7 +23,33 @@ from .kernels.templates import attention_quantized, attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
 from .precision import wide_cpu_arithmetic
 
-CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
+SIXTEEN_BIT = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
+"""The operands FlashAttention's kernels and tokamax's Triton attention are built for, which neither states
+(`dew_flash_attn` holds its architectures alone; tokamax checks no query dtype), and a declared cell's 16-bit
+kind (`CallKind`), whose receipts timed both alike."""
+
+
+@functools.cache
+def _cudnn_takes(dtype: np.dtype) -> bool:
+    """Whether jax.nn's cuDNN attention takes operands of `dtype`: JAX's own check of a call's operands passes
+    them (`fused_attention_stablehlo.check_layout`), on the path jax.nn's call takes, which names no FP8
+    parameters (an 8-bit query is cuDNN's `use_fp8` path alone, its scales the caller's)."""
+    from jax._src.cudnn import fused_attention_stablehlo as cudnn
+
+    if dtype.itemsize == 1:
+        return False
+    operand = jax.ShapeDtypeStruct((1, 1, 1, 8), dtype)
+    try:
+        cudnn.check_layout(operand, operand, operand, None, None, None, None, None, None, None,
+                           cudnn.AttentionLayout.BTNH)
+    except NotImplementedError:
+        return False
+    return True
+
+
+def cudnn_takes(dtype) -> bool:
+    """Whether cuDNN's fused attention takes a call of `dtype` (`_cudnn_takes`)."""
+    return _cudnn_takes(jnp.dtype(dtype))
 
 
 def cudnn_max_head_dim() -> int:
@@ -180,21 +208,39 @@ class AttentionCase:
     the Mosaic dropping walk does not read (`attention_route.drops`)."""
 
     @property
-    def cell(self) -> tuple[str | None, str]:
+    def cell(self) -> tuple[str | None, "CallKind"]:
         """The call's cell among its selector's declared ones: attention's (`DECLARED`) the target's
-        instruction family and the kind of call, a 16-bit call's or an fp32 call's ('float32 attention'), each
-        its forward and its training alike, as the kernel is chosen before the call is differentiated
-        (`attention_route.attend`'s `custom_vjp`); a decode step's (`DECODE_DECLARED`, `decodes`) the
-        device's generation and 'decode' alike, as its kernels' speeds part by generation within a family.
-        An fp32 call longer than its receipts timed (`FP32_MEASURED`) is a cell of its own, which none
-        declares: a receipt is evidence for the shapes it measured alone, and past them the call takes the
-        template (row 5283)."""
-        kind = 'attention' if self.dtype in CUDNN_DTYPES else f"{jnp.dtype(self.dtype).name} attention"
+        instruction family and the kind of call (`CallKind`), each its forward and its training alike, as
+        the kernel is chosen before the call is differentiated (`attention_route.attend`'s `custom_vjp`); a
+        decode step's (`DECODE_DECLARED`, `decodes`) the device's generation and its kind, as its kernels'
+        speeds part by generation within a family. A call outside the shapes its kind's receipts timed
+        (`MEASURED`) is a cell of its own, which none declares: a receipt is evidence for the shapes it
+        measured alone, and past them the call takes the template (rows 5283, 5285)."""
         if decodes(self):
-            return device_generation(), kind.replace('attention', 'decode')
-        if self.dtype not in CUDNN_DTYPES and max(self.queries, self.keys) > FP32_MEASURED:
-            kind += f" past {FP32_MEASURED} tokens"
+            return device_generation(), CallKind.of(self.dtype, decode=True)
+        kind = CallKind.of(self.dtype)
+        # A kind no receipt declares (float64's) has no cell to leave.
+        measured = MEASURED.get(kind)
+        if measured is not None and not measured.holds(self):
+            kind = kind._replace(measured=False)
         return generation.family(device_generation()), kind
+
+
+class CallKind(NamedTuple):
+    """A call as its declared receipts measure it (`AttentionCase.cell`): its operands' `dtype`, bf16 standing
+    for both 16-bit dtypes, whose receipts timed them alike (`SIXTEEN_BIT`); whether it is a `decode` step;
+    and whether it lies within the shapes its kind's receipts timed (`measured`, `MEASURED`), a call outside
+    them a cell none declares."""
+
+    dtype: np.dtype
+    decode: bool = False
+    measured: bool = True
+
+    @classmethod
+    def of(cls, dtype, *, decode: bool = False) -> "CallKind":
+        """The kind of a call of `dtype` within its receipts' shapes."""
+        dtype = jnp.dtype(dtype)
+        return cls(SIXTEEN_BIT[0] if dtype in SIXTEEN_BIT else dtype, decode)
 
 
 _Need = Requirement[AttentionCase]
@@ -245,7 +291,7 @@ FLASH_SUPPORTS = (
                 lambda case: f"the call packs up to {case.max_segments} documents a row, past the "
                              f"{FLASH_PACKED_SEGMENTS} its empty sequences cost less than the document mask",
                 row='measured: flash packed-document cap (docs/performance.md)', kind='measured'),
-    _Need('dtype', lambda case: case.dtype in CUDNN_DTYPES, lambda case: f"the query is {case.dtype}",
+    _Need('dtype', lambda case: case.dtype in SIXTEEN_BIT, lambda case: f"the query is {case.dtype}",
                 row=INHERENT),
     _Need('head_dim', lambda case: case.head_dim % 8 == 0 and case.head_dim <= _flash_widest(),
                 lambda case: f"the heads are {case.head_dim} wide, past the {_flash_widest()} its "
@@ -294,7 +340,7 @@ CUDNN_SUPPORTS = (
     _ON_GPU,
     _Need('capability', lambda case: bf16_dot_runs(), "cuDNN takes bf16 and fp16 from sm80",
                 row=INHERENT),
-    _Need('dtype', lambda case: case.dtype in CUDNN_DTYPES, lambda case: f"the query is {case.dtype}",
+    _Need('dtype', lambda case: cudnn_takes(case.dtype), lambda case: f"the query is {case.dtype}",
                 row=INHERENT),
     _Need('head_dim', lambda case: case.head_dim % 8 == 0 and case.head_dim <= cudnn_max_head_dim(),
                 lambda case: f"the heads are {case.head_dim} wide, past the {cudnn_max_head_dim()} it "
@@ -338,7 +384,7 @@ TRITON_SUPPORTS = (
     _ON_GPU,
     _Need('capability', lambda case: bf16_dot_runs(), "tokamax's Triton kernel needs sm80",
                 row=INHERENT),
-    _Need('dtype', lambda case: case.dtype in CUDNN_DTYPES,
+    _Need('dtype', lambda case: case.dtype in SIXTEEN_BIT,
                 lambda case: f"the query is {case.dtype}, where it was measured on bf16 and fp16 alone",
                 row='measured: tokamax Triton attention (docs/performance.md)', kind='measured'),
     _Need('fp16', lambda case: case.dtype != np.dtype(np.float16),
@@ -531,10 +577,35 @@ on a GPU or a TPU runs it by default, where its cell's declared old route does n
 `generation.chosen(attention='template')`)."""
 
 
-FP32_MEASURED = 1024
-"""The longest call DECLARED's fp32 receipts timed, its queries and its keys alike: a training step's
-attention at Qwen3-8B's widths, 1 x 1024 (CELLS-h100, CELLS-a100); a longer fp32 call is a cell none declares
-(`AttentionCase.cell`)."""
+@dataclasses.dataclass(frozen=True)
+class Timed:
+    """The shapes a kind of call's declared receipts timed (`DECLARED`): its queries and keys alike from
+    `shortest` to `longest` tokens, at the head `widths` (any where None)."""
+
+    shortest: int
+    longest: int
+    widths: tuple[int, ...] | None = None
+
+    def holds(self, case: AttentionCase) -> bool:
+        """Whether `case` lies within these shapes."""
+        return (self.shortest <= min(case.queries, case.keys) and max(case.queries, case.keys) <= self.longest
+                and (self.widths is None or case.head_dim in self.widths))
+
+
+MEASURED: dict[CallKind, Timed] = {
+    CallKind.of(jnp.bfloat16): Timed(0, 32768),
+    CallKind.of(jnp.float32): Timed(0, 1024),
+}
+"""The shapes each kind of call's DECLARED receipts hold for; a call outside them is a cell none declares
+(`AttentionCase.cell`). A 16-bit call's: up to 32768 tokens, from FlashAttention against the template from
+1024 to 32768 tokens at widths 64 and 128, causal and full, its forward and training step, FlashAttention
+faster at every one on an A100 and a GH200 (M-ET-51: W126-a100, W126-sm90), and at width 256 on an RTX PRO
+6000 (a gated Qwen3.5 step's attention, 2.72 against 4.55 ms, G4-ET-ATT-SCOREBOARD). A shorter call is
+FlashAttention's too: on the A100 its forward's lead grows as the calls shorten (at width 128, causal, 1.44
+times at 32768 tokens to 1.75 at 1024; at width 64 full 1.02 to 1.17), its training step's stays near two to
+three times (1.87 to 2.82 at 1024), far from a crossover; a longer one is not, where the forward's lead
+falls toward 1.02. An fp32 call's: a training step's attention at Qwen3-8B's widths, 1 x 1024 (CELLS-h100,
+CELLS-a100)."""
 
 
 FLASH = Kernel[AttentionCase]('flash', FLASH_SUPPORTS)
@@ -545,25 +616,25 @@ INFERENCE = Kernel[AttentionCase]('inference', (_FAST, *TEMPLATE_SUPPORTS, _Need
     "densely: the template takes it", row=INHERENT), _FITS))
 """The template for a call no derivative is taken of and xla's attention for one differentiated."""
 
-DECLARED: dict[tuple[str | None, str], tuple[Kernel[AttentionCase], str]] = {
-    ('wgmma', 'attention'): (
+DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] = {
+    ('wgmma', CallKind.of(jnp.bfloat16)): (
         FLASH, "FlashAttention-3 measured faster than the Mosaic template on an H100 (llama-d128 bf16, "
                  "2 x 4096, 32 query heads over 8 key heads, CUPTI on an exclusive node): forward 0.588 "
                  "against 0.761 ms causal and 1.094 against 1.296 full, training forward and backward 2.53 "
                  "against 11.45 causal and 4.49 against 16.48 full (receipts DERIVED-benchx-h100, "
                  "BWDSTAGES-h100); a training step's attention at Qwen3-8B's widths, 2 x 4096 bf16, 2.44 "
                  "against 11.38 ms causal and 4.26 against 15.61 full (CELLS-h100)"),
-    ('wgmma', 'float32 attention'): (
+    ('wgmma', CallKind.of(jnp.float32)): (
         INFERENCE, "jax.nn's xla attention measured faster than the template's fp32 route on an H100 for a "
                      "training step's attention at Qwen3-8B's widths, 1 x 1024 fp32, 2.08 against 26.36 ms "
                      "causal and 2.19 against 46.21 full (CELLS-h100); the template's fp32 forward as bf16 "
                      "parts faster than xla's for a call no derivative is taken of where `template_infers` "
                      "(M-ET-16, W18-gh200-1)"),
-    ('mma.sync', 'attention'): (
+    ('mma.sync', CallKind.of(jnp.bfloat16)): (
         FLASH, "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
                  "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
                  "full (CELLS-a100, CUPTI, 11 interleaved rounds)"),
-    ('mma.sync', 'float32 attention'): (
+    ('mma.sync', CallKind.of(jnp.float32)): (
         XLA, "jax.nn's xla attention measured faster than the template's fp32 route on an A100 at "
                "Qwen3-8B's widths (32/8 heads x 128, CUPTI medians, one warm process, W76-a100, M-ET-28): a "
                "training step's attention 5.94 against 226.4 ms at 1 x 1024 causal and 6.00 against 373.0 "
@@ -581,7 +652,7 @@ list shrinks as the template wins."""
 def template_infers(dtype, width: int, causal: bool) -> bool:
     """Whether the template's forward measured faster than xla's attention for a call of `dtype` no
     derivative is taken of, `width` wide, where its kernel is 'inference'. An fp32 call's (its operands as
-    bf16 parts, the 'float32 attention' cell's): at width 64 everywhere (0.22 to 0.55 of xla's time, 8192
+    bf16 parts): at width 64 everywhere (0.22 to 0.55 of xla's time, 8192
     causal 3.54 against 16.47 ms) and causal at 128 (0.57 to 0.80), at an RMS error from float64 30 to 60
     times xla's lower; not at 128 full (1.19 to 1.37 of xla's, one consumer of 64 columns, its QK products'
     parts run twice), nor at widths unmeasured (M-ET-16, W18-gh200-1, GH200, CUPTI median of 7, 2048 and
@@ -713,12 +784,12 @@ _FP32_DECODE = ("jax.nn's xla attention measured faster than the decode kernel a
 DECODE_XLA = Kernel[AttentionCase]('xla', XLA_SUPPORTS, generic=True)
 """A decode step's xla attention (the folded attention, `folded_attention`)."""
 
-DECODE_DECLARED: dict[tuple[str | None, str], tuple[Kernel[AttentionCase], str]] = {
-    ('sm80', 'float32 decode'): (DECODE_XLA, _FP32_DECODE.format(
+DECODE_DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] = {
+    ('sm80', CallKind.of(jnp.float32, decode=True)): (DECODE_XLA, _FP32_DECODE.format(
         "on an A100 2.63 to 3.64 times the decode kernel's speed, 51.2 against 140.5 us at one row over "
         "4096 keys (ET-DFP32B-a100), and 25 to 161 times the template's, 52.5 against 5215.5 us there "
         "(ET-4312-a100)")),
-    ('sm90', 'float32 decode'): (DECODE_XLA, _FP32_DECODE.format(
+    ('sm90', CallKind.of(jnp.float32, decode=True)): (DECODE_XLA, _FP32_DECODE.format(
         "on an H100 2.75 to 3.60 times the decode kernel's speed, 23.8 against 72.4 us at one row over "
         "4096 keys (ET-DFP32B-h100), and 31 to 250 times the template's, 23.6 against 3669.2 us there "
         "(ET-4312-h100)")),
@@ -743,6 +814,7 @@ kernel first (`DECODE_DECLARED`), each fused kernel only where it computes the r
 (`decode_attention.PRODUCTS`); the attention template's decode (`attention_decode.attend`, through
 `attention_route.attend`) where a call or a run's context names it (`generation.chosen(decode='template')`),
 until it measures faster than the decode kernel (rows 4042 to 4045, 4075)."""
+
 
 
 def decodes(case: AttentionCase) -> bool:
