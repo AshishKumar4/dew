@@ -1,6 +1,6 @@
 """The actual DC-AE, saved and walked, for tests/fixtures.
 
-Two tiny `AutoencoderDC`s from diffusers 0.34.0 are constructed with the
+Three tiny `AutoencoderDC`s from diffusers 0.34.0 are constructed with the
 controls the published checkpoints use, at narrow widths:
 
 - `conv`, as `dc-ae-f32c32-sana-1.1`: strided-convolution downsampling,
@@ -10,7 +10,10 @@ controls the published checkpoints use, at narrow widths:
 - `shuffle`, as `dc-ae-f32c32-in-1.0`: pixel-unshuffle and pixel-shuffle
   resampling, no first level (its input and output convolutions are
   resampling blocks), batch norms and ReLU in the decoder's residual levels,
-  and no multiscale branch.
+  and no multiscale branch;
+- `plain`, `conv` without either end's channel shortcut and with a SiLU before
+  the decoder's last convolution (`encoder_out_shortcut`, `decoder_in_shortcut`,
+  `decoder_conv_act_fn`).
 
 Each is saved with `save_pretrained` - its real config and its real
 safetensors - and recorded in float32, channel-first, as `vae.encode(x).latent`
@@ -59,6 +62,13 @@ CONFIGS = {
                 "downsample_block_type": "pixel_unshuffle", "upsample_block_type": "pixel_shuffle",
                 "decoder_norm_types": ["batch_norm", "batch_norm", "rms_norm"],
                 "decoder_act_fns": ["relu", "relu", "silu"], "scaling_factor": 0.3189},
+    # `conv` with neither end's channel shortcut and a SiLU before the decoder's last convolution: the
+    # controls AutoencoderDC takes beside the published checkpoints' defaults.
+    "plain": {**COMMON, "encoder_layers_per_block": [1, 1, 2], "decoder_layers_per_block": [1, 1, 2],
+              "encoder_qkv_multiscales": [[], [], [5]], "decoder_qkv_multiscales": [[], [], [5]],
+              "downsample_block_type": "Conv", "upsample_block_type": "interpolate",
+              "decoder_norm_types": "rms_norm", "decoder_act_fns": "silu", "scaling_factor": 0.41407,
+              "encoder_out_shortcut": False, "decoder_in_shortcut": False, "decoder_conv_act_fn": "silu"},
 }
 BATCH = 2
 HEIGHT, WIDTH = 32, 48
@@ -126,7 +136,6 @@ def bundle(directory: str, destination: str) -> None:
 
 
 def main(destination: str) -> None:
-    import diffusers
 
     require("diffusers")
     torch.set_num_threads(2)

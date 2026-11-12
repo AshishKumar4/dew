@@ -1,9 +1,10 @@
 """Native DC-AE against the actual `AutoencoderDC`.
 
-`tools/diffusers_dc_ae_reference.py` builds two tiny instances with the
-published checkpoints' controls - `conv` as SANA 1.1's (strided convolutions,
-interpolation, multiscale attention) and `shuffle` as the `in-1.0` family's
-(pixel shuffles, resampling input and output blocks, batch norms, ReLU) -
+`tools/diffusers_dc_ae_reference.py` builds three tiny instances - `conv` with
+SANA 1.1's controls (strided convolutions, interpolation, multiscale attention),
+`shuffle` with the `in-1.0` family's (pixel shuffles, resampling input and
+output blocks, batch norms, ReLU), and `plain`, `conv` without its channel
+shortcuts and with a SiLU before the decoder's last convolution -
 saves them with `save_pretrained`, and records in float32 the latent of a
 rectangular batch, the decode of a fixed latent, their vector-Jacobian
 products against fixed probes for the input and every parameter, and the
@@ -37,7 +38,7 @@ from dew.nn.autoencoders.dc_ae import DCAE
 ROOT = Path(__file__).resolve().parents[1]
 FORWARD = 1e-5
 GRADIENT = 1e-4
-VARIANTS = ("conv", "shuffle")
+VARIANTS = ("conv", "shuffle", "plain")
 
 
 @pytest.fixture(scope="module")

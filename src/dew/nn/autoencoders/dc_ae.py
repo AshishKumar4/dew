@@ -251,6 +251,7 @@ class _Encoder(nn.Module):
     layers: tuple[int, ...]
     scales: tuple[tuple[int, ...], ...]
     unshuffle: bool
+    shortcut: bool = True
     dtype: Dtype = jnp.float32
 
     @nn.compact
@@ -275,9 +276,8 @@ class _Encoder(nn.Module):
             if _resamples(layers, level):
                 x = _Down(channels[level + 1], self.unshuffle, shortcut=True, dtype=self.dtype,
                           name=f"down_blocks_{level}_{count}")(x)
-        return _conv(self.latent_channels, 3, self.dtype, "conv_out")(x) + _group_mean(
-            x, self.latent_channels
-        )
+        latents = _conv(self.latent_channels, 3, self.dtype, "conv_out")(x)
+        return latents + _group_mean(x, self.latent_channels) if self.shortcut else latents
 
 
 class _Decoder(nn.Module):
@@ -291,13 +291,16 @@ class _Decoder(nn.Module):
     norms: tuple[str, ...]
     activations: tuple[str, ...]
     interpolate: bool
+    shortcut: bool = True
+    out_activation: str = "relu"
     dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, latents):
         channels, layers = self.channels, self.layers
         x = _conv(channels[-1], 3, self.dtype, "conv_in")(latents)
-        x = x + jnp.repeat(latents, channels[-1] // self.latent_channels, axis=-1)
+        if self.shortcut:
+            x = x + jnp.repeat(latents, channels[-1] // self.latent_channels, axis=-1)
         for level in reversed(range(len(channels))):
             count = layers[level]
             upsampled = _resamples(layers, level)
@@ -315,7 +318,7 @@ class _Decoder(nn.Module):
                            self.norms[level], self.activations[level], self.dtype,
                            f"up_blocks_{level}_{index + upsampled}")(x)
         features = channels[0] if layers[0] > 0 else channels[1]
-        x = nn.relu(_RMSNorm(features, self.dtype, name="norm_out")(x))
+        x = ACTIVATIONS[self.out_activation](_RMSNorm(features, self.dtype, name="norm_out")(x))
         if layers[0] > 0:
             return _conv(self.image_channels, 3, self.dtype, "conv_out")(x)
         return _Up(features, self.image_channels, self.interpolate, shortcut=False, dtype=self.dtype,
@@ -340,6 +343,14 @@ class DCAE(nn.Module):
     decoder_activations: tuple[str, ...] = ("silu",) * 6
     unshuffle: bool = False
     interpolate: bool = True
+    encoder_shortcut: bool = True
+    """Whether the encoder's last convolution adds its input's channel groups averaged down
+    (`AutoencoderDC`'s `encoder_out_shortcut`)."""
+    decoder_shortcut: bool = True
+    """Whether the decoder's first convolution adds its latents' channels repeated up
+    (`decoder_in_shortcut`)."""
+    decoder_out_activation: str = "relu"
+    """The activation before the decoder's last convolution (`decoder_conv_act_fn`), one of `ACTIVATIONS`."""
     dtype: Dtype = jnp.float32
 
     @property
@@ -358,11 +369,13 @@ class DCAE(nn.Module):
             self.encoder_layers,
             self.encoder_scales,
             self.unshuffle,
+            self.encoder_shortcut,
             self.dtype,
         )
         self.decoder = _Decoder(self.image_channels, self.latent_channels, self.head_dim, self.decoder_blocks,
                                 self.decoder_channels, self.decoder_layers, self.decoder_scales,
-                                self.decoder_norms, self.decoder_activations, self.interpolate, self.dtype)
+                                self.decoder_norms, self.decoder_activations, self.interpolate,
+                                self.decoder_shortcut, self.decoder_out_activation, self.dtype)
 
     def encode(self, image, key=None, noise=None):
         """The latent of `image`. The encoder is deterministic: `key` is unused, and a posterior's
