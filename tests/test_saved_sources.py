@@ -471,10 +471,17 @@ def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_pat
     banked store (each run's row read home as it is written, `stored_layers`, ledger 4103), every layer's
     attention extended by DEX, as a saved run's release (`export_run`, ledger 2874), in a score of shards,
     each output projection folded as it is written: each reads one tensor home at a time, together, so
+<<<<<<< Updated upstream
     neither host's resident pages rise during the export by half the model (2.0 to 5.5 MB of 31 MB on
     armada), where the pool reading the whole tree home first rises past half (23 to 39 MB), and the same
     measure over that tree held home rises at least half of it on each host, so the measure sees the bytes
     in that run (`saved_export_worker.resident_growth`, exact page counts, a decoder of 256 KiB tensors):
+=======
+    neither host's allocated bytes rise during the export by half the model, where the same measure over
+    that tree held home rises at least half of it on each host, so the measure sees the bytes in that run
+    (`saved_export_worker.allocated_growth`, glibc's own count, a decoder of 256 KiB tensors): resident
+    pages missed what the allocator served from pages freed before (rows 5266, 5562), and
+>>>>>>> Stashed changes
     tracemalloc never saw the buffers a tensor is read home into, and held a 1.3 MB decoder's export to
     its own fixed cost, which CI's process state crossed (ledger 3794). The publishing process writes the
     tensors one process writes of the same weights unplaced, byte for byte, though the restored tree's
@@ -497,17 +504,28 @@ def test_a_pool_exports_a_model_spanning_its_processes_a_shard_at_a_time(tmp_pat
 def test_a_pool_reads_a_saved_runs_release_through_one_publisher(tmp_path, monkeypatch):
     """Two real processes sharing Dew's cache read a saved language model run as a source (`released_run`,
     ledger 2992): the release is written once, the first process publishing it and the other reading
+<<<<<<< Updated upstream
     every tensor as it does, writing none, each host's resident pages rising inside the export by less
     than half the release, written in shards a fraction of it, where the same measure over the release
     held home rises at least half of it (`saved_export_worker.resident_growth`): at one shard, the 5 GB
+=======
+    every tensor as it does, writing none, each host's allocated bytes rising inside the export by less
+    than half the release, written in shards a fraction of it, where the same measure over the release
+    held home rises at least half of it (`saved_export_worker.allocated_growth`): at one shard, the 5 GB
+>>>>>>> Stashed changes
     default, the writer held the whole release, which tracemalloc did not see (ledger 3794). Both read
     the one release. `dew export` to a destination they share writes it once
     likewise, the tensors one process's export writes.
 
+<<<<<<< Updated upstream
     The release is sixteen layers deep, 67 MB, its tensors a megabyte at most: the pages a host's
     allocators keep from the tensors it read and freed, a few of its largest under contention (glibc's
     arenas, XLA's CPU allocator), stay under a sixth of it on armada at its worst (twelve busy processes
     beside the pool, two malloc arenas: row 4868), where at four layers, 17 MB, they reached past half."""
+=======
+    The release is sixteen layers deep, 67 MB, its tensors a megabyte at most, so the shards a writer
+    holds are a small fraction of it (row 4868)."""
+>>>>>>> Stashed changes
     from dew._cli.main import main
     from dew.registry import ModelConfig
 
