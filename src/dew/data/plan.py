@@ -905,9 +905,6 @@ def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object
     if (saved.get("version") == SHARED_STATE and plan.version >= DECLARED_MIX
             and read_otherwise_at_13(saved) is None):
         saved = {**saved, "version": DECLARED_MIX}
-    # A plan of 13 is one of 14 spelled as 13 spelled it (`STRUCTURED`): the rest of it is read as 14 reads
-    # it, in that spelling (`Plan.as_spelled`).
-    plan = plan.as_spelled(saved.get("version"))
     # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
     if saved.get("version") != plan.version:
         return saved
@@ -1147,8 +1144,8 @@ STRUCTURED = 14
 """The plan version from which a plan describes each stage and each step's configuration once, by its
 structure (`structured`): its class and fields, a callable by its own identity, an array by its fingerprint.
 13's printed them (their reprs) and read the printing back to compare a grown limit and fields a
-configuration lost; a plan of 13 or before is still recorded and compared in that spelling
-(`StepIdentity.printed`, `spelled`), which reads the rows 14 reads."""
+configuration lost; a chain compiled at an earlier version is still recorded in that spelling
+(`StepIdentity.printed`, `spelled`), so a position saved under it resumes compiled there."""
 
 PLAN_VERSIONS = (8, 9, FILE_SHARDS, IN_ORDER, SHARED_STATE, DECLARED_MIX, STRUCTURED)
 """The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a corpus's key, its name
@@ -1247,14 +1244,6 @@ class Plan:
         order = unplaced(self.spelled_order())
         return f"{json.dumps(order, sort_keys=True)} under plan {json.dumps(self.parts(), sort_keys=True)}"
 
-    def as_spelled(self, version: object) -> Plan:
-        """This plan as a saved plan of `version` spells it, where it makes the rows that one did: a plan of
-        `STRUCTURED` as `DECLARED_MIX` printed its stages and configurations, which read the same rows, else
-        itself."""
-        if version == DECLARED_MIX and self.version == STRUCTURED:
-            return dataclasses.replace(self, version=DECLARED_MIX)
-        return self
-
     def spelled_order(self) -> JSON:
         """The order as this plan's version records it (`spelled`): its stages, each the stage object the
         analysis read, described structurally (`structured`), or printed as before `STRUCTURED`."""
@@ -1284,9 +1273,6 @@ class Plan:
         whose code changed and that declares no identity. A changed environment
         (`Manifest.environment`) is returned and warned of, and refused for a
         per-share plan."""
-        spelled = self.as_spelled(saved.get("version"))
-        if spelled is not self:
-            return spelled.check(saved, resume=resume)
         current = self.record()
         if current["version"] != saved.get("version"):
             otherwise = (read_otherwise_at_8(saved) if saved.get("version") == 7 else
