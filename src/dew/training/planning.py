@@ -690,8 +690,8 @@ class FitSearch[LossT, EffectsT]:
     rows misses about half as much (a 64-token test step on a CPU: 963 KB short at one microbatch, 0.6 MB
     to spare at two, which a shortfall taken whole judged short and compiled four)."""
     overstated: set[str] = dataclasses.field(default_factory=set)
-    """The remat rungs (`remat_rung`) a compile fit at that the derivation judged short: its refusals
-    there rule no compile out (`refused`)."""
+    """The remat rungs (`remat_rung`) a compile measured more headroom at than the derivation foresaw (or fit
+    at where it judged it short): its refusals there rule no compile out (`refused`)."""
     kernels: dict[str, JSON] = dataclasses.field(default_factory=dict)
     """What the templates' reports found where the search compiled (`admitted`): each kernel its compiles
     found spilling (`report.misses`, `spill_record`), each launch config they refused
@@ -964,10 +964,10 @@ class FitSearch[LossT, EffectsT]:
                 temporaries: int | None) -> None:
         """What a compile at the objective's remat teaches the derivation's next judgments there:
         the headroom it `measured` short of the one `foreseen` corrects them (`under`), in proportion to the
-        derived `temporaries` it was short of (`missed_at`), and a compile that fit where the derivation
-        judged it short rules its refusals out (`overstated`)."""
+        derived `temporaries` it was short of (`missed_at`), and one that measured more than foreseen, or fit
+        where the derivation judged it short, rules its refusals out (`overstated`)."""
         rung = self.remat_rung()
-        if foreseen is not None and fit and foreseen < 0:
+        if foreseen is not None and (measured > foreseen if measured is not None else fit and foreseen < 0):
             self.overstated.add(rung)
         if foreseen is not None and measured is not None and foreseen - measured > self.under.get(rung, 0):
             self.under[rung] = foreseen - measured
@@ -979,8 +979,10 @@ class FitSearch[LossT, EffectsT]:
     def refused(self, split: int) -> bool:
         """Whether the derivation judges the step at `split` short by its own footprint, which the halving
         below a split that fits does not compile (`planned`): no split it cannot judge, and none at a remat
-        where a compile it judged short fit (`overstated`: a tiny model's derived peak, its fixed buffers,
-        over-states the step many times). What a compile at another split missed past the derivation
+        where a compile found the derivation overstating its step (`overstated`: a tiny model's derived peak,
+        its fixed buffers, over-states the step many times; under a CPU's own sums a step of eight
+        microbatches measured 1.28 MB more headroom than derived, and four, which it judged short, fit to the
+        byte). What a compile at another split missed past the derivation
         (`shortfall`) orders the compiles (`likely`) and rules none out: scaled from one split to another
         it states no bound on this one's need (row 5427: a correction from two microbatches judged four
         short by 658,639 bytes, and they fit to the byte, so the search took eight)."""
