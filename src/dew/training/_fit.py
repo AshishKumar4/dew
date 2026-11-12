@@ -614,14 +614,19 @@ def restored(state: TrainState, resume: int, examples: int | None) -> TrainState
     """`state`, restored from step `resume`'s checkpoint, as the run reads on from it. A run on the
     examples clock (`examples`) refuses a checkpoint of a run on another clock, which kept no examples
     consumed (`TrainState.consumed`) for its schedule to read on from. A checkpoint that kept no tokens
-    waiting for an update its optimizer holds back (`TrainState.deferred`), as one written before they
-    waited, holds none: each call's tokens were committed with it."""
+    waiting for an update its optimizer holds back (`TrainState.deferred`), as an earlier Dew wrote it
+    before they waited, is refused."""
     if examples is not None and state.consumed is None:
         raise ValueError(
             f"step {resume}'s checkpoint is of a run counted in steps or tokens, which kept no examples "
             "consumed, and this run reads its schedule off them: resume it on the clock it was written "
             "on, or start a fresh run from its weights")
-    return dataclasses.replace(state, deferred=waiting(state.opt_state)) if state.deferred is None else state
+    if state.deferred is None and waiting(state.opt_state) is not None:
+        raise ValueError(
+            f"step {resume}'s checkpoint keeps no tokens waiting for the update its optimizer holds back, as "
+            "an earlier Dew wrote it: resume it with the Dew that wrote it, or start a fresh run from its "
+            "weights")
+    return state
 
 
 def afresh(initial: TrainState, made: optax.OptState, examples: int | None) -> TrainState:
