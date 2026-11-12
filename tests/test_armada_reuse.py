@@ -589,7 +589,8 @@ def test_a_red_that_read_the_rows_state_before_another_red_still_revokes_the_gre
         with monkeypatch.context() as patched:
             patched.setattr(ci.r2.Store, "get", get)
             patched.setenv("FAIL", "1")
-            assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict, policy="off")] == [1, 0, 0]
+            rows = armada_task(ci, monkeypatch, verdict, policy="off")
+        assert [row["exitCode"] for row in rows] == [1, 0, 0]
 
     armada_task(ci, monkeypatch, verdict)
     red()
