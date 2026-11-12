@@ -1002,7 +1002,7 @@ def test_a_pool_whose_processes_fetched_other_records_is_refused_before_it_train
     # The same pool over a server that answers every url trains (`online_checkpoint`); this one
     # observed no step and saved none.
     assert [(report["refused"], report["observed"], report["written_steps"]) for report in reports] == [
-        ("ValueError", [], [])] * 2
+        ("PoolDiffers", [], [])] * 2
 
 
 @pytest.fixture(scope="module")
@@ -1894,7 +1894,7 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
                        else (("RuntimeError", False), ("PeerFailure", False)))
             assert (failed["error"], failed["own"]) in allowed, (failure, report)
             assert failure in report["closed"]
-        assert report["results"]["mismatched_plan"]["error"] == "ValueError", report
+        assert report["results"]["mismatched_plan"]["error"] == "PoolDiffers", report
 
 
 @pytest.mark.distributed

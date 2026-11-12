@@ -313,12 +313,7 @@ def agreed_reads[T](phase: str, stream: Iterator[T],
             raise error
         words = [word]
     else:
-        try:
-            words = _agree(phase, error, word)
-        except _Failed as failure:
-            if error is None:
-                raise PeerFailure(str(failure), phase=phase, rank=failure.rank) from failure
-            raise
+        words = _agree(phase, error, word)
     assert held is not None
     return held[0], [json.loads(spoken) for spoken in words]
 
@@ -331,12 +326,7 @@ def agreed_count[T](phase: str, operation: Callable[[], T], counted: Callable[[T
         held = (operation(),)
     except BaseException as failure:
         error = failure
-    try:
-        count = agree_process_phase(error, phase=phase, available=held is not None and counted(held[0]))
-    except _Failed as failure:
-        if error is None:
-            raise PeerFailure(str(failure), phase=phase, rank=failure.rank) from failure
-        raise
+    count = agree_process_phase(error, phase=phase, available=held is not None and counted(held[0]))
     assert held is not None
     return held[0], count
 
@@ -364,12 +354,7 @@ def agreed_same[T](phase: str, find: Callable[[], T]) -> T:
         assert held is not None
         return held[0]
     found = "" if held is None else json.dumps(held[0], sort_keys=True)
-    try:
-        digests = _agree(phase, error, hashlib.sha256(found.encode()).hexdigest())
-    except _Failed as failure:
-        if error is None:
-            raise PeerFailure(str(failure), phase=phase, rank=failure.rank) from failure
-        raise
+    digests = _agree(phase, error, hashlib.sha256(found.encode()).hexdigest())
     other = next((rank for rank, digest in enumerate(digests) if digest != digests[0]), None)
     if other is not None:
         # Every rank saw the same digests, so all take this second round, which names the values.
@@ -410,15 +395,6 @@ class StreamsEnded(ValueError):
     def __init__(self, message: str, *, phase: str, ended: int):
         super().__init__(message)
         self.phase, self.ended = phase, ended
-
-
-class _Failed(RuntimeError):
-    """`_agree`'s error on a rank that passed where another failed: the first `rank` that did, which its
-    caller raises as a `PeerFailure`."""
-
-    def __init__(self, message: str, rank: int):
-        super().__init__(message)
-        self.rank = rank
 
 
 _patience_seconds = 24 * 3600.0
@@ -475,7 +451,7 @@ def _agree(phase: str, error: BaseException | None, word: str) -> list[str]:
     if error is not None:
         error.add_note(context)
         raise error
-    raise _Failed(context, failed[0])
+    raise PeerFailure(context, phase=phase, rank=failed[0])
 
 
 def _round(word: str) -> list[str]:
