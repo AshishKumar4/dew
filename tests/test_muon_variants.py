@@ -309,7 +309,8 @@ def test_muons_reported_update_work_is_its_compiled_updates_matrix_work(per_head
     from dew.telemetry.instrumentation import hlo_flops
 
     params = decoder_params()
-    opts = {**({} if per_head is None else {"per_head": per_head}), **({} if group is None else {"ns_group": group})}
+    opts = {**({} if per_head is None else {"per_head": per_head}),
+            **({} if group is None else {"ns_group": group})}
     config = OptimConfig(optimizer="muon", learning_rate=LR, optimizer_opts=opts)
     solver = config.build(10)
     _, grads = drawn_tree(params, 0)
