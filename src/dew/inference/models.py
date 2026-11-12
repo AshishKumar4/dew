@@ -93,7 +93,7 @@ class SavedModel(SavedRunTask):
 
     @classmethod
     def source_of(cls, run: SavedRun, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
-                  dtype: DTypeLike | None, param_dtype: DTypeLike | None) -> Pretrained:
+                  dtype: DTypeLike | None, param_dtype: DTypeLike | None, on_host: bool) -> Pretrained:
         """Refused: a model's own release (a JEPA encoder's, a policy's) is its model alone, which
         `dew.pipeline` loads (`from_pretrained`); no source bundle states it for another run to start from
         (`ReleasedTask.source_of`)."""
@@ -178,11 +178,13 @@ class ReleasedRun(SavedRun):
 
     def variables(self, *, ema: bool | None, mesh: MeshSpec | Mesh | None = None,
                   layout: Layout | None = None, param_dtype: DTypeLike | None = None,
-                  parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS) -> Variables:
-        """The release's variables, placed on `mesh` under `layout`, the collections `parameter_roots` names
-        stored in `param_dtype` where given and the others as written, as a run's load stores them
-        (`Checkpoints.materialized`), or, where it holds their `shapes` alone, each a `jax.ShapeDtypeStruct`
-        placed nowhere. It holds the one average its export chose: an `ema` asked is refused."""
+                  parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS,
+                  on_host: bool = False) -> Variables:
+        """The release's variables, placed on `mesh` under `layout`, or the host arrays it reads with
+        `on_host`, the collections `parameter_roots` names stored in `param_dtype` where given and the
+        others as written, as a run's load stores them (`Checkpoints.materialized`), or, where it holds
+        their `shapes` alone, each a `jax.ShapeDtypeStruct` placed nowhere. It holds the one average its
+        export chose: an `ema` asked is refused."""
         from dew.inference.loading import place
         from dew.registry import resolve_dtype
 
@@ -200,7 +202,10 @@ class ReleasedRun(SavedRun):
                 return jax.ShapeDtypeStruct(leaf.shape, stored) if self.shapes else leaf.astype(stored)
 
             variables = jax.tree_util.tree_map_with_path(stored_as, variables)
-        return variables if self.shapes else place(variables, mesh, layout)
+        if on_host and (mesh is not None or layout is not None):
+            raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
+                             "pass one")
+        return variables if self.shapes or on_host else place(variables, mesh, layout)
 
 
 class ReleasesModel:
