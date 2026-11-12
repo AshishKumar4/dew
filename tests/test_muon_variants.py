@@ -265,20 +265,17 @@ def shaped_draw(seed):
 
 
 @pytest.mark.parametrize("preconditioning", ["frobenius", "spectral", "aol", "schatten"])
-@pytest.mark.parametrize("chunked", [False, True], ids=["whole", "a matrix at a time"])
-def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(preconditioning, chunked):
+def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(preconditioning):
     """Dew's orthogonalization of wide, tall, square and 2-D updates, on the matrices as they are stored
     (`newton_schulz`: a tall matrix's Gram product and polynomial taken from its shorter side, where optax
-    transposes it), whole or walked a matrix at a time (`chunk_bytes`), on par from float64 with optax's
+    transposes it), on par from float64 with optax's
     own iteration (`orthogonalized_leaf`) of each matrix at `preconditioning`, in the dtype Dew's numerics
     iterate in (check 1)."""
     stacked = optax.contrib.MuonDimensionNumbers((1,), (2,))
     numbers = (stacked, stacked, stacked, optax.contrib.MuonDimensionNumbers(0, 1))
-    one = 1 if chunked else None
 
     def dew(*stacks):
-        return list(orthogonalized(stacks, numbers, NEWTON_SCHULZ, 5, 1e-8, preconditioning,
-                                   chunk_bytes=one))
+        return list(orthogonalized(stacks, numbers, NEWTON_SCHULZ, 5, 1e-8, preconditioning))
 
     def optax_arm(*stacks):
         # optax iterates in the update's own dtype: here in the one Dew's numerics iterate in (`ns_operands`).

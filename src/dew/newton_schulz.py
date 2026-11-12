@@ -81,8 +81,7 @@ def as_matrices(x: jax.Array, numbers: optax.contrib.MuonDimensionNumbers
 
 def orthogonalized(updates: optax.Updates, numbers, coeffs, steps: int, eps: float,
                    preconditioning: Preconditioning = "frobenius",
-                   algorithm: jax.lax.DotAlgorithmPreset | None = None, widths=None,
-                   chunk_bytes: int | None = None) -> optax.Updates:
+                   algorithm: jax.lax.DotAlgorithmPreset | None = None, widths=None) -> optax.Updates:
     """Each update `numbers` makes a stack of matrices of (`as_matrices`) orthogonalized by optax's
     Newton-Schulz on the matrices as they are stored (`newton_schulz`), in the run's numerics or `algorithm`
     (`ns_operands`), as Moonlight distributes it (arXiv 2502.16982, 3): each stack spread across the mesh's
@@ -90,16 +89,16 @@ def orthogonalized(updates: optax.Updates, numbers, coeffs, steps: int, eps: flo
     across devices would exchange partial products at each of the iteration's products; spread whole, a
     step moves each matrix twice, there and back. A stack its devices divide spreads alone; stacks of one
     shape that they do not are gathered into one, which they do once padded, so no device idles on a
-    stack's remainder. Each device walks its share in place a chunk of matrices at a time, as many as
-    `chunk_bytes` holds of one's working set (`working_bytes`), its whole share where none is given, so the
-    iteration holds the update and one chunk's products, not every matrix's at once (row 5669). On a mesh
+    stack's remainder. XLA iterates the stacks' products in turn and reuses their buffers: the update of a
+    4B decision step holds 3.37 GB of temporaries beside its 15.2 GB of updates, the same walked a chunk of
+    matrices at a time down to 256 MiB, and under the backward's 5.01 GB (row 5669). On a mesh
     with Explicit axes the spreading runs with them Auto (`jax.sharding.auto_axes`), where a constraint may
     name them and a split stack slices, each update leaving where it came; on one device, or none in
     context, each stack iterates whole. A tree of head `widths` (`head_widths`) splits an update's output
     side into heads, each one matrix."""
     mesh = jax.sharding.get_abstract_mesh()
     spread = functools.partial(_spread_orthogonalized, numbers=numbers, coeffs=coeffs, steps=steps, eps=eps,
-                               preconditioning=preconditioning, algorithm=algorithm, chunk_bytes=chunk_bytes,
+                               preconditioning=preconditioning, algorithm=algorithm,
                                widths=jax.tree.map(lambda _: None, updates) if widths is None else widths)
     if mesh.empty or not mesh.explicit_axes:
         return spread(updates)
@@ -110,10 +109,10 @@ def orthogonalized(updates: optax.Updates, numbers, coeffs, steps: int, eps: flo
 
 def _spread_orthogonalized(updates, *, numbers, coeffs, steps: int, eps: float,
                            algorithm: jax.lax.DotAlgorithmPreset | None, widths,
-                           preconditioning: Preconditioning, chunk_bytes: int | None) -> optax.Updates:
+                           preconditioning: Preconditioning) -> optax.Updates:
     """`orthogonalized`'s iteration over a mesh of Auto axes: each stack laid out `[devices, share, rows,
     columns]`, its first axis split across every axis of the mesh but a pipeline's stages, so each device
-    walks its own share (`_walked`), which no exchange crosses; stacks of a shape the devices do not divide
+    iterates its own share, which no exchange crosses; stacks of a shape the devices do not divide
     gathered and padded with zero matrices first."""
     mesh = jax.sharding.get_abstract_mesh()
     axes = () if mesh.empty else tuple(axis for axis, size in mesh.shape.items()
@@ -130,18 +129,12 @@ def _spread_orthogonalized(updates, *, numbers, coeffs, steps: int, eps: float,
                              f"Newton-Schulz cannot take: state none, so it multiplies in complex64")
         work = ns_operands(stack.dtype, preconditioning, algorithm)
         shared = split(stack.reshape(devices, stack.shape[0] // devices, *stack.shape[1:]))
-        rows, columns = stack.shape[1:]
-        count = shared.shape[1] if chunk_bytes is None else max(
-            1, chunk_bytes // working_bytes(rows, columns, jnp.dtype(work)))
-
-        def chunk(matrices: jax.Array) -> jax.Array:
-            # Its devices' shares as one stack, each device's still its own (its first axis the major one),
-            # so each product batches over one axis, as optax's do.
-            flat = matrices.reshape(-1, *matrices.shape[2:]).astype(work)
-            with configured_precision(algorithm):
-                done = newton_schulz(flat, coeffs, steps, eps, preconditioning)
-            return done.astype(stack.dtype).reshape(matrices.shape)
-        return split(_walked(shared, count, chunk)).reshape(stack.shape)
+        # Its devices' shares as one stack, each device's still its own (its first axis the major one), so
+        # each product batches over one axis, as optax's do.
+        flat = shared.reshape(-1, *shared.shape[2:]).astype(work)
+        with configured_precision(algorithm):
+            done = newton_schulz(flat, coeffs, steps, eps, preconditioning)
+        return split(done.astype(stack.dtype).reshape(shared.shape)).reshape(stack.shape)
 
     leaves, structure = jax.tree.flatten(updates)
     stacks = []
@@ -167,41 +160,12 @@ def _spread_orthogonalized(updates, *, numbers, coeffs, steps: int, eps: float,
     return jax.tree.unflatten(structure, done)
 
 
-def _walked(shared: jax.Array, count: int, chunk: Callable[[jax.Array], jax.Array]) -> jax.Array:
-    """`shared`, `[devices, share, rows, columns]`, each device's share mapped by `chunk` `count` matrices at
-    a time in place: a loop whose carry is the stack, each step's chunk read out and written back where it
-    was (XLA updates a carried buffer in place), the share's remainder after it; the whole share at once
-    where `count` covers it."""
-    share = shared.shape[1]
-    if count >= share:
-        return chunk(shared)
-    whole = share // count
-
-    def step(index, held):
-        start = index * count
-        return jax.lax.dynamic_update_slice_in_dim(
-            held, chunk(jax.lax.dynamic_slice_in_dim(held, start, count, axis=1)), start, axis=1)
-    held = jax.lax.fori_loop(0, whole, step, shared)
-    if share % count:
-        rest = whole * count
-        held = jax.lax.dynamic_update_slice_in_dim(held, chunk(held[:, rest:]), rest, axis=1)
-    return held
-
-
 def newton_schulz_flops(matrices: int, rows: int, columns: int, steps: int) -> float:
     """The FLOPs of `steps` iterations of `newton_schulz` over `matrices` matrices of `rows` by `columns`, its
     products' (each multiply and add two): of a short side m and a long side n, the Gram product `2 m² n`, its
     square `2 m³` and the polynomial applied to the iterate `2 m² n` an iteration."""
     short, long = sorted((rows, columns))
     return float(matrices * steps * (4 * short * short * long + 2 * short ** 3))
-
-
-def working_bytes(rows: int, columns: int, dtype: jnp.dtype) -> int:
-    """The bytes one `rows` by `columns` matrix's Newton-Schulz step holds at once in `dtype`
-    (`newton_schulz`): its iterate, its Gram product on the shorter side, that product's square, the
-    polynomial of them, the polynomial applied to the iterate, and the next iterate."""
-    side = min(rows, columns)
-    return (3 * rows * columns + 3 * side * side) * dtype.itemsize
 
 
 def newton_schulz(x: jax.Array, coeffs, steps: int, eps: float,
@@ -316,4 +280,4 @@ def orthogonalized_leaf(update: jax.Array, steps: int,
 
 
 __all__ = ["NEWTON_SCHULZ", "POLAR_EXPRESS_TABLE", "Preconditioning", "newton_schulz", "newton_schulz_flops",
-           "ns_operands", "orthogonalized", "orthogonalized_leaf", "polar_express", "working_bytes"]
+           "ns_operands", "orthogonalized", "orthogonalized_leaf", "polar_express"]
