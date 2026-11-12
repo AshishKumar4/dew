@@ -169,7 +169,8 @@ def assert_filled_batch_invariants(objective, filled, corrupted, repeats) -> Non
 
     def snapshot(state):
         checked = bits((state.variables, state.opt_state, state.ema, state.updates))
-        assert all(np.all(np.isfinite(leaf)) for leaf in checked)
+        assert all(not jnp.issubdtype(leaf.dtype, jnp.inexact) or bool(jnp.all(jnp.isfinite(leaf)))
+                   for leaf in checked)
         return checked
 
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(3), checkpoints=None, tracker=None)

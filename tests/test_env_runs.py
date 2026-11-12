@@ -289,7 +289,12 @@ def test_a_resumed_run_ends_as_the_run_that_never_stopped(tmp_path, agent):
     resumed further in a harder race (and for Dreamer with longer windows and lower entropy) it trains on,
     while changing discount or horizon is refused."""
     run = resumable(tmp_path, agent)
-    whole = run.prepare().train("whole")
+    prepared_whole = run.prepare()
+    whole = prepared_whole.train("whole")
+    if agent == "dreamer":
+        assert isinstance(prepared_whole.rollout, DreamerRollout)
+        assert [path for path, leaf in jax.tree_util.tree_leaves_with_path(prepared_whole.rollout.saved())
+                if getattr(leaf, "weak_type", False)] == []
     run.override({"trainer.steps": 2}).prepare().train("stopped")
     assert_bitwise(whole, run.prepare().train("stopped"))
     next_run = run.override({"trainer.steps": 5, "env.difficulty": 0.5})
