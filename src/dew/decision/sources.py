@@ -93,6 +93,9 @@ class PretrainedDecision(Pretrained):
     """How its model encodes a row's context for its cross-attention (`DecisionModel.context_encoder`):
     a run's task's own, which a run started from the bundle trains on as it was trained (row 4797); a
     release, whose backbone reads no context, the token table's."""
+    named_encoder: str | None = None
+    """The encoder the release it was read from names for its readers (Laya's `encoder`), which a release
+    of it names again (`dew.decision.laya.head_files`); None where it named none or was not read from one."""
 
     def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
         return dataclasses.replace(self, variables=transform(self.variables),
@@ -153,13 +156,13 @@ class PretrainedDecision(Pretrained):
                 "numerics": task.precision}
         return cls(**held, head=head, head_variables=thaw(part(task.variables, "head")), layout=task.layout,
                    specials=task.specials, calibration=task.calibration, decision_tokenizer=task.tokenizer,
-                   context_encoder=task.model.context_encoder)
+                   context_encoder=task.model.context_encoder, named_encoder=task.named_encoder)
 
     @classmethod
     def from_components(cls, backbone: Pretrained, head: Head, head_variables: Variables,
                         directory: Path, tokenizer_folder: str, *, layout: Layout,
                         calibration: Calibration, strict_specials: bool,
-                        assumed: frozenset[str] = frozenset()) -> Self:
+                        assumed: frozenset[str] = frozenset(), named_encoder: str | None = None) -> Self:
         tokenizer = HFTokenizer(str(directory / tokenizer_folder), local_files_only=True)
         if strict_specials:
             hf = tokenizer.tokenizer
@@ -172,7 +175,8 @@ class PretrainedDecision(Pretrained):
         inherited = {field.name: getattr(backbone, field.name) for field in dataclasses.fields(Pretrained)}
         inherited["source"] = directory
         return cls(**inherited, head=head, head_variables=head_variables, layout=layout, specials=specials,
-                   calibration=calibration, decision_tokenizer=tokenizer, assumed=assumed)
+                   calibration=calibration, decision_tokenizer=tokenizer, assumed=assumed,
+                   named_encoder=named_encoder)
 
 
 
@@ -201,7 +205,7 @@ class DecisionSource(SourceKind):
             derived = layout
             layout, calibration = released_decision(directory, layout, calibration, kind=QuestionLayout)
             assumed = assumed if layout is derived else frozenset()
-            tokenizer_folder, strict_specials = laya.tokenizer_folder, True
+            tokenizer_folder, strict_specials, named = laya.tokenizer_folder, True, config.encoder
         elif (directory / HEAD_CONFIG).is_file():
             config = _records.record(json.loads((directory / HEAD_CONFIG).read_text()), HEAD_CONFIG)
             if _records.number(config.get("dropout", 0.0), "dropout"):
@@ -216,9 +220,9 @@ class DecisionSource(SourceKind):
                                       partial(_shaped, fields["hidden_size"]))
             layout, calibration = released_decision(directory, JointLayout(), Calibration(), kind=JointLayout)
             assumed = frozenset()
-            tokenizer_folder, strict_specials = decision_format("joint").tokenizer_folder, False
+            tokenizer_folder, strict_specials, named = decision_format("joint").tokenizer_folder, False, None
         else:
             return None
         return CompositeSource(backbone, head, PretrainedDecision.from_components, tokenizer_folder,
                                {"layout": layout, "calibration": calibration, "assumed": assumed,
-                                "strict_specials": strict_specials})
+                                "strict_specials": strict_specials, "named_encoder": named})

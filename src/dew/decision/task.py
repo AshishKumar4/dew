@@ -359,6 +359,9 @@ class Decide(SavedRunTask, InItsForm):
     """The run checkpoint the weights came from, when they came from a run."""
     processor: Processor | None = None
     """The backbone's own processor, which prepares a request's images for it."""
+    named_encoder: str | None = field(default=None, compare=False)
+    """The encoder the release it was read from names for its readers (`PretrainedDecision.named_encoder`),
+    which a release of it names again; None for a task read from none."""
     derives_sharing: bool = field(default=True, repr=False, compare=False)
     """Whether the task states how a request's questions share a state where its layout states none
     (`QuestionLayout.shared_for`), as a task built in code does; one read from a release or a run lays its
@@ -441,7 +444,8 @@ class Decide(SavedRunTask, InItsForm):
         # A release lays its rows out as it states them, sharing a state only where it says so.
         return cls(model, variables, bundle.layout, bundle.decision_tokenizer, bundle.specials,
                    bundle.calibration, name=name or str(bundle.origin or bundle.source),
-                   processor=bundle.processor, precision=bundle.numerics, derives_sharing=False)
+                   processor=bundle.processor, precision=bundle.numerics, derives_sharing=False,
+                   named_encoder=bundle.named_encoder)
 
     @classmethod
     def _recorded(cls, directory: str, record: Mapping[str, object], backbone, variables: Variables,
