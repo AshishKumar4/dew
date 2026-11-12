@@ -24,7 +24,6 @@ import itertools
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol, runtime_checkable
 
 import jax
@@ -156,23 +155,15 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
 
     @classmethod
     def from_task(cls, task: Scoring[Request, Row, Payload, Output, Answer], variables: Variables, *,
-                  rows: int | None = None, programs: str | Path | None = None
-                  ) -> ScoringServer[Request, Row, Payload, Output, Answer]:
+                  rows: int | None = None) -> ScoringServer[Request, Row, Payload, Output, Answer]:
         """A server over `task`'s passes with `variables`, held resident, every program its passes run
         compiled up front (`Scoring.compile`, the shapes `ScoringServer.programs` holds); a step looks at
         every waiting request, or at most `rows`. A server built directly compiles each program on its
-        first pass.
-
-        With `programs`, a file an earlier process of this task kept its programs in
-        (`dew.training.ahead.keeping`), each program the file holds for a pass is loaded in place of
-        tracing and compiling it (`dew.training.ahead.kept`), and one it holds none for compiles as
-        without it; the file is refused, naming what differs, where this process is not its target or
-        runs other code or settings than the one that kept it."""
-        from dew.training import ahead
-
+        first pass. Built within `dew.training.ahead.kept`, with the file an earlier process of this
+        task kept its programs in (`dew.training.ahead.keeping`), it loads each program the file holds
+        for a pass in place of tracing and compiling it."""
         server = cls(task, variables, rows=rows)
-        with contextlib.nullcontext() if programs is None else ahead.kept(programs):
-            server.programs = tuple(task.compile(server.variables))
+        server.programs = tuple(task.compile(server.variables))
         return server
 
     @property
