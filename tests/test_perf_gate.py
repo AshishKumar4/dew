@@ -808,9 +808,9 @@ def test_ahead_fails_where_a_trees_compile_ahead_fails_and_asks_none_of_a_tree_t
         return subprocess.CompletedProcess(command, code, said, "the step did not lower" if code else "")
 
     monkeypatch.setattr(gate.subprocess, "run", child)
-    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", kind="a100", lock="cpu",
-                           environments=str(tmp_path / "environments"), out=str(tmp_path / "ahead"),
-                           only=["step lm-dense 4x1024"])
+    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", kind="a100",
+                           lock="cpu", environments=str(tmp_path / "environments"),
+                           out=str(tmp_path / "ahead"), only=["step lm-dense 4x1024"])
     assert gate.ahead_battery(args) == 1
     # The tree before the handoff was asked what it takes and never asked to compile ahead; the head was.
     assert ran == [("main", True), ("head", True), ("head", False)]
