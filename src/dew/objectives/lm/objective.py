@@ -709,14 +709,19 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             lengths.extend(counts)
         return np.asarray(lengths, np.int64)
 
-    def model_flops(self, model, batch: Batch) -> float:
-        """Hidden states plus predictions within real documents; never padded logits."""
+    def _counted_trunk(self, model):
+        """The trunk a count reads (`model`, the objective's where None) as the loss runs it: every pass
+        leaving through the coda where the loss scores each exit. A trunk the counts cannot cost is
+        refused (`MissingFlopsCount`)."""
         model = self.model if model is None else model
         missing = self._missing_flops(model)
         if missing is not None:
             raise MissingFlopsCount(missing)
-        # The trunk as the loss runs it: every pass leaving through the coda where it scores each exit.
-        model = exiting(model) if self._reads_exits(model) else model
+        return exiting(model) if self._reads_exits(model) else model
+
+    def model_flops(self, model, batch: Batch) -> float:
+        """Hidden states plus predictions within real documents; never padded logits."""
+        model = self._counted_trunk(model)
         crossed = self._context_flops(model, batch)
         lengths = self._prediction_lengths(batch)
         heads = self._head_passes(model) * model.logits_flops(lengths)
@@ -727,12 +732,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
 
     def training_flops(self, model, batch: Batch) -> float:
         """The adapted trunk and prediction head on actual token geometry."""
-        model = self.model if model is None else model
-        missing = self._missing_flops(model)
-        if missing is not None:
-            raise MissingFlopsCount(missing)
-        # The trunk as the loss runs it: every pass leaving through the coda where it scores each exit.
-        model = exiting(model) if self._reads_exits(model) else model
+        model = self._counted_trunk(model)
         crossed = self._context_flops(model, batch)
         targets = self._prediction_lengths(batch)
         lengths = self.real_lengths(batch)

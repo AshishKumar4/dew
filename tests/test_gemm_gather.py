@@ -104,8 +104,9 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
 
     def by_cublas(tokens, table, matrices, slots):
         # cuBLAS's GEMM of each group's gathered rows by its matrix into fp32 (XLA's dot, its Triton GEMMs
-        # off: `generation_support.cublas_compiled`), the groups' rows and the unrouted rows' zeros placed as
-        # the product places them, its rows stored at their slots: no arithmetic past the library's.
+        # off: `generation_support.cublas_compiled`; on a Hopper XLA calls it through cuBLASLt,
+        # `__cublas$lt$matmul`), the groups' rows and the unrouted rows' zeros placed as the product places
+        # them, its rows stored at their slots: no arithmetic past the library's.
         rows = tokens[table]
         firsts = np.concatenate([[0], np.cumsum(np.asarray(sizes))])
 
@@ -117,7 +118,7 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
 
         return jnp.stack([product(matrices[0]), product(matrices[1])]) if paired else product(matrices[0])
 
-    library = ({'library_fn': cublas_compiled(by_cublas, draw(0), "__cublas$gemm"), 'library_row': 5491,
+    library = ({'library_fn': cublas_compiled(by_cublas, draw(0), "__cublas$lt$matmul"), 'library_row': 5491,
                 'library_leaves': ("",)} if cublas else {})
     with tuning.seen() as launches:
         assert_as_exact(jax.jit(through("mosaic")), jax.jit(through("xla")), draw,

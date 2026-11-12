@@ -488,36 +488,32 @@ _CUDNN_CAUSAL = ("CAUSAL", "PADDING_CAUSAL")
 """cuDNN's causal masks (`xla.gpu.CudnnfMHABackendConfig.mask_type`): the one alone, and with padding."""
 
 
-def _cudnn_mask(config: str) -> Mapping | None:
-    """cuDNN's fused attention's backend config (`cudnn_fmha_backend_config`), read as the JSON it is
-    stored as: an executable's module writes it as XLA prints a proto for people (`ProtoToHumanReadableJson`,
-    spaced), a module written as text as it was written. None for any other call's config, dew_flash_attn's
-    attributes' MLIR dictionary among them."""
-    try:
-        stated = json.loads(config)
-    except ValueError:
-        return None
-    return stated.get("cudnn_fmha_backend_config") if isinstance(stated, dict) else None
+def _window(attention: Attention, config: str) -> tuple[int, int]:
+    """The keys left and right of its own that a query of a fused attention's call reaches (-1 unbounded),
+    as its config states them. cuDNN's (`_Fused`) is its JSON backend config: an executable's module
+    writes it as XLA prints a proto for people (`ProtoToHumanReadableJson`, spaced), a module written as
+    text as it was written; its `cudnn_fmha_backend_config` states a `mask_type` and a
+    `sliding_window_length` of the window's left side and the query's own key (0 none). dew_flash_attn's is
+    its FFI call's attributes, an MLIR dictionary no schema of XLA's decodes: `is_causal` and
+    `window_size_left`/`_right`."""
+    if isinstance(attention, _Fused):
+        # A call that states no config states no mask.
+        cudnn = (json.loads(config) if config else {}).get("cudnn_fmha_backend_config") or {}
+        causal = cudnn.get("mask_type") in _CUDNN_CAUSAL
+        sliding = int(cudnn.get("sliding_window_length") or 0)
+        return (sliding - 1 if sliding else -1), (0 if causal else -1)
+    causal = bool(_CAUSAL.search(config))
+    sides = {side: int(size) for side, size in _SIDES.findall(config)}
+    return sides.get('left', -1), 0 if causal else sides.get('right', -1)
 
 
-def _reached(queries: int, keys: int, config: str) -> int:
+def _reached(queries: int, keys: int, window: tuple[int, int]) -> int:
     """How many (query, key) pairs a fused attention computes: each query row
     reaches the keys its call's mask leaves it, under a causal mask the keys up
     to its own position (aligned to the last key, as FlashAttention aligns
     them) and within a sliding window the ones it spans, left of the query
-    and right of it. cuDNN states its `mask_type` and a `sliding_window_length` of the window's left side
-    and the query's own key (0 none) in its call's JSON backend config (`_cudnn_mask`); dew_flash_attn
-    `is_causal` and `window_size_left`/`_right` (-1 unbounded) in its FFI call's attributes, an MLIR
-    dictionary no schema of XLA's decodes."""
-    cudnn = _cudnn_mask(config)
-    if cudnn is not None:
-        causal = cudnn.get("mask_type") in _CUDNN_CAUSAL
-        sliding = int(cudnn.get("sliding_window_length") or 0)
-        left, right = (sliding - 1 if sliding else -1), (0 if causal else -1)
-    else:
-        causal = bool(_CAUSAL.search(config))
-        sides = {side: int(size) for side, size in _SIDES.findall(config)}
-        left, right = sides.get('left', -1), 0 if causal else sides.get('right', -1)
+    and right of it (`window`, `_window`'s)."""
+    left, right = window
     diagonal = np.arange(queries) + (keys - queries)
     low = np.maximum(diagonal - left, 0) if left >= 0 else np.zeros(queries, np.int64)
     high = np.minimum(diagonal + right, keys - 1) if right >= 0 else np.full(queries, keys - 1)
@@ -556,7 +552,7 @@ def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[in
     if any(len(each) != 4 for each in (queries, key, value)):
         return None
     batch, length, heads, width = queries
-    pairs = _MAC * batch * heads * _reached(length, key[1], instruction.config)
+    pairs = _MAC * batch * heads * _reached(length, key[1], _window(attention, instruction.config))
     model = (2 if attention.backward else 1) * pairs * (width + value[3])
     return model, model + (pairs * width if attention.backward else 0.0)
 

@@ -122,7 +122,7 @@ UNARY = _symbols(lambda operation: operation.kind == "unary")
 COMPARISONS = _symbols(lambda operation: operation.kind == "comparison")
 SHAPES = _symbols(lambda operation: operation.kind == "shape")
 REDUCTIONS = {operation.symbol: operation.monoid for operation in OPERATIONS.values()
-              if operation.kind == "reduction"}
+              if operation.monoid is not None}
 """The language's symbols by the term each is written as, read from the declarations (`OPERATIONS`)."""
 RESCALE = "rescale"
 """A binary no program holds: a derived walk's rescale of a carried state from its first operand's anchor to
@@ -337,8 +337,8 @@ def key(term: BaseExpr | Skeleton) -> Hashable:
     return term.__egg_typed_expr__
 
 
-def _interned(params: list, products: dict, indexed: dict, primitive: jcore.Primitive, values: Mapping,
-              operands: tuple | None = None) -> int:
+def _interned(params: list, products: dict, indexed: dict[Hashable, int], primitive: jcore.Primitive,
+              values: Mapping, operands: tuple | None = None) -> int:
     """The index of `primitive` at `values` in a region's table `params`, added where it holds none: two
     entries are one where their primitive and parameters are (`parameters_key`) and, of a product, its
     `operands`' dtypes too, which key its mode (`cost.work`) and are kept in `products`. The one interning
@@ -516,7 +516,7 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
     """`region`'s terms, each of `forms`."""
     jaxpr = closed.jaxpr
     params: list[tuple[jcore.Primitive, Mapping]] = []
-    indexed: dict[tuple[jcore.Primitive, Hashable, tuple | None], int] = {}
+    indexed: dict[Hashable, int] = {}
     literals: list = []
     shapes: list[tuple[Node, tuple[int, ...]]] = []
     depths: dict[jcore.Var, int] = {}
@@ -813,19 +813,20 @@ def stocked() -> Mapping[str, tuple[jcore.Primitive, Mapping]]:
     scalar = jax.ShapeDtypeStruct((), jnp.float32)
     traced = jax.make_jaxpr(lambda a: (a / a, a - a, a + a, a * a, jnp.maximum(a, a), jnp.exp(a),
                                        jnp.log1p(a), jnp.expm1(a)))(scalar)
-    return {symbol(equation.primitive): (equation.primitive, dict(equation.params))
+    return {OPERATIONS[equation.primitive].symbol: (equation.primitive, dict(equation.params))
             for equation in traced.jaxpr.eqns}
 
 
-def spoken(equation: jcore.JaxprEqn) -> bool:
-    """Whether `equation` is of the language (`_term` makes a term of it): a protected span is one marked
-    call (`dew.nn.derivatives.Protected`), no equation of it."""
+def spoken_as(equation: jcore.JaxprEqn) -> str | None:
+    """The symbol `equation` is spoken as in the language (`_term` makes a term of it), None for one outside
+    it: a protected span is one marked call (`dew.nn.derivatives.Protected`), no equation of it."""
     name, arity = symbol(equation.primitive), len(equation.invars)
-    if len(equation.outvars) != 1:
-        return False
+    if name is None or len(equation.outvars) != 1:
+        return None
     binary = name in BINARY or name in COMPARISONS or name == "dot_general"
     unary = name in UNARY or name in SHAPES or name in REDUCTIONS or name == "convert_element_type"
-    return (binary and arity == 2) or (unary and arity == 1) or (name == "select_n" and arity == 3)
+    within = (binary and arity == 2) or (unary and arity == 1) or (name == "select_n" and arity == 3)
+    return name if within else None
 
 
 def form_value(region_: Region, form: Term, values: list) -> jax.Array:

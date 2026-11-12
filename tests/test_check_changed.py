@@ -43,6 +43,13 @@ def checkout(tmp_path: Path) -> Path:
     return root
 
 
+def typed_roots(root: Path) -> list[str]:
+    """The roots the type gate reads, as the checkout's tools/lint_inputs.sh declares them
+    (`pyright_inputs`)."""
+    return subprocess.run(["sh", "-c", '. tools/lint_inputs.sh; printf %s "$pyright_inputs"'], cwd=root,
+                          capture_output=True, text=True, check=True).stdout.split()
+
+
 def check(root: Path, *arguments: str, **environ: str) -> subprocess.CompletedProcess:
     return subprocess.run(["sh", "tools/check.sh", *arguments], cwd=root, capture_output=True, text=True,
                           timeout=600, env={**os.environ, "PYTHON": sys.executable, **environ})
@@ -163,19 +170,21 @@ def test_a_changed_type_check_reads_the_heads_files_under_every_root_its_gate_re
         f"pyright\tsh tools/typecheck.sh {command.split()[-1]}\n" if line.split("\t")[0] == "pyright"
         else f"{line}\n" for line in lines))
     git(root, "commit", "-qam", "the type gate stood in for, its inputs as the real gate's")
-    (root / "src/dew/fit.py").write_text("search: int = 'TYPE_ERROR'\n")
+    # A file under each root the gate reads, as its inputs declare them.
+    library, twin = typed_roots(root)
+    (root / library / "fit.py").write_text("search: int = 'TYPE_ERROR'\n")
     # A name holding a space, as git names it, is one file to the checker.
-    (root / "src/_dew_torch/fit search.py").write_text("search: int = 1\n")
+    (root / twin / "fit search.py").write_text("search: int = 1\n")
     git(root, "add", "-A")
-    git(root, "commit", "-qm", "a head whose src/dew file is a type error")
+    git(root, "commit", "-qm", "a head whose library file is a type error")
     assert check(root, "--changed", "pyright").returncode == 1
-    (root / "src/dew/fit.py").write_text("search: int = 1\n")
+    (root / library / "fit.py").write_text("search: int = 1\n")
     git(root, "commit", "-qam", "the type error fixed")
     (root / "typecheck.log").unlink()
     assert check(root, "--changed", "pyright").returncode == 0
     # It read the head's files under both inputs, never an input whole in their place.
-    assert sorted((root / "typecheck.log").read_text().splitlines()) == [
-        "src/_dew_torch/fit search.py", "src/dew/fit.py"]
+    assert sorted((root / "typecheck.log").read_text().splitlines()) == sorted(
+        [f"{twin}/fit search.py", f"{library}/fit.py"])
     (root / "typecheck.log").unlink()
     assert check(root, "--gate", "pyright").returncode == 0
-    assert (root / "typecheck.log").read_text().splitlines() == ["src/dew", "src/_dew_torch"]
+    assert (root / "typecheck.log").read_text().splitlines() == [library, twin]

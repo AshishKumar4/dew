@@ -45,13 +45,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from diffusers_reference_helpers import (
-    on_bfloat16_grid,
-    perturb,
-    recording,
-    restore_transformers_names,
-    saved_pipeline,
-)
+from diffusers_reference_helpers import perturb, recording, restore_transformers_names, saved_pipeline, seeded
 from reference_releases import RELEASES
 
 from _dew_torch.precision import default_dtype, float64, float64_twin, widened
@@ -138,11 +132,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     from diffusers import WanTransformer3DModel
 
     config = {**BASE, **case.config}
-    torch.manual_seed(SEED)
-    model = WanTransformer3DModel(**config).eval()
-    generator = torch.Generator().manual_seed(SEED + 1)
-    perturb(generator, 0.1, model)
-    on_bfloat16_grid(model)
+    model, generator = seeded(lambda: WanTransformer3DModel(**config).eval(), SEED)
     model.save_pretrained(root / name / "transformer", safe_serialization=True)
     batch = len(case.times)
     inputs = {"latents": torch.randn((batch, config["in_channels"], *case.size), generator=generator),

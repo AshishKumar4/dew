@@ -359,53 +359,53 @@ def _launch(entry: object) -> tokamax.BoundArguments:
     return ba
 
 
-def _metadata(value: _records.JSON, key: str) -> dict:
-    found = decoded(value)
-    if not isinstance(found, dict):
-        raise Unreadable(f"a stored timing's {key} is no mapping: {found!r}")
-    return found
+def _timing_json(timing: tokamax.BenchmarkData) -> dict[str, JSON]:
+    """Every field of one config's times as JSON, which `_timing` reads back."""
+    return {"compile_time_ms": timing.compile_time_ms, "lower_time_ms": timing.lower_time_ms,
+            "evaluation_times_ms": list(timing.evaluation_times_ms),
+            "metadata": encoded(dict(timing.metadata)), "peak_memory_mb": timing.peak_memory_mb}
 
 
-def _as_is(value: object) -> object:
-    return value
+def _timing(fields: dict[str, JSON]) -> tokamax.BenchmarkData:
+    """The times `_timing_json` wrote; `Unreadable` where a field is not its type."""
+    metadata = decoded(fields["metadata"])
+    if not isinstance(metadata, dict):
+        raise Unreadable(f"a stored timing's metadata is no mapping: {metadata!r}")
+    peak = fields["peak_memory_mb"]
+    return tokamax.BenchmarkData(
+        compile_time_ms=_field(_records.number, fields["compile_time_ms"], "compile_time_ms"),
+        lower_time_ms=_field(_records.number, fields["lower_time_ms"], "lower_time_ms"),
+        evaluation_times_ms=_field(_records.numbers, fields["evaluation_times_ms"], "evaluation_times_ms"),
+        metadata=metadata,
+        peak_memory_mb=None if peak is None else _field(_records.number, peak, "peak_memory_mb"))
 
 
-TIMING_CODEC: dict[str, tuple[Callable[[object], _records.JSON], Callable[[_records.JSON, str], object]]] = {
-    "compile_time_ms": (_as_is, functools.partial(_field, _records.number)),
-    "lower_time_ms": (_as_is, functools.partial(_field, _records.number)),
-    "evaluation_times_ms": (list, functools.partial(_field, _records.numbers)),
-    "metadata": (lambda value: encoded(dict(value)), _metadata),
-    "peak_memory_mb": (_as_is, lambda value, key: None if value is None
-                       else _field(_records.number, value, key)),
-}
-"""Each field of `tokamax.BenchmarkData` a launch's stored timings keep, its writer to JSON and its reader
-back (`_timings_json`, `_timings`): the one codec of both directions, which every field of the dependency's
-dataclass has one of."""
-if set(TIMING_CODEC) != {field.name for field in dataclasses.fields(tokamax.BenchmarkData)}:
+_TIMING_FIELDS = frozenset(_timing_json(tokamax.BenchmarkData(
+    compile_time_ms=0.0, lower_time_ms=0.0, evaluation_times_ms=(), metadata={}, peak_memory_mb=None)))
+"""The fields of `tokamax.BenchmarkData` a launch's stored timings keep (`_timing_json`, `_timing`): every
+field of the dependency's dataclass."""
+if {field.name for field in dataclasses.fields(tokamax.BenchmarkData)} != _TIMING_FIELDS:
     raise ImportError(f"tokamax.BenchmarkData's fields are {dataclasses.fields(tokamax.BenchmarkData)}, and "
-                      f"the stored timings' codec names {sorted(TIMING_CODEC)}")
+                      f"the stored timings keep {sorted(_TIMING_FIELDS)}")
 
 
 def _timings_json(timings: Timings) -> list[JSON]:
-    """The configs that ran and every field of their times, as JSON (`TIMING_CODEC`'s writers), which
-    `_timings` reads back."""
-    return [[encoded(config), {name: write(getattr(timing, name))
-                               for name, (write, _) in TIMING_CODEC.items()}]
-            for config, timing in timings.prune_errors().items()]
+    """The configs that ran and every field of their times, as JSON (`_timing_json`), which `_timings`
+    reads back."""
+    return [[encoded(config), _timing_json(timing)] for config, timing in timings.prune_errors().items()]
 
 
 def _timings(entries: object) -> Timings:
-    """The timings `_timings_json` wrote (`TIMING_CODEC`'s readers); `Unreadable` where they are not."""
+    """The timings `_timings_json` wrote (`_timing`); `Unreadable` where they are not."""
     if not isinstance(entries, list):
         raise Unreadable(f"stored timings are no list: {entries!r}")
     measured: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     for pair in entries:
         if not (isinstance(pair, list) and len(pair) == 2 and isinstance(pair[1], dict)
-                and set(pair[1]) == set(TIMING_CODEC)):
+                and set(pair[1]) == _TIMING_FIELDS):
             raise Unreadable(f"a stored timing is not this checkout's: {pair!r}")
         config, fields = pair
-        measured[_key(decoded(config))] = tokamax.BenchmarkData(
-            **{name: read(fields[name], name) for name, (_, read) in TIMING_CODEC.items()})
+        measured[_key(decoded(config))] = _timing(fields)
     return Timings(measured)
 
 
