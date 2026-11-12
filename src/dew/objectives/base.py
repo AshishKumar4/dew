@@ -1478,6 +1478,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         value, _ = self.reduce_loss(stats)
         return value, aux
 
+    def whole_head_table(self, variables: Variables) -> tuple[int, int] | None:
+        """The rows and features of the vocabulary table a head that keeps its whole logits for the backward
+        pass scores, over `variables`' shapes, which a planner bounds the step's logits by
+        (`dew.training.footprint.logits_floor`); None for an objective with no such head, or one tiled
+        already."""
+        return None
+
     def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
         """Move a head that keeps its whole logits for the backward pass to a bounded tile.
 
