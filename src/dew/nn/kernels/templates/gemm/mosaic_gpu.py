@@ -1186,18 +1186,12 @@ def _gathered(gather, tiles: Tiles, dtype, interpret) -> dict:
 GATHERED_STREAMS = ('rows',)
 """The streams a gathered product's producer gathers (`gmm`'s `gather`): its rows'."""
 
-GATHERING_PRODUCER = 40
-"""The registers a tcgen05 load warp's threads hold issuing a gathered product's four-row TMA gathers
-(`gathered.tma_rows`: every thread holds the step's row indices), past `resources.producer_floor`'s 24: the
-expert down projection's gathered input gradient spilled 56 and 64 bytes at 24 on a B200 (128 x 128 at six
-stages, 128 x 64 at eight; the hybrid compile-ahead step, row 5358) and nothing at 40."""
-
-
 def gmm_producer(family: mosaic.Family, gathered: bool) -> int | None:
     """Dew: the registers a GEMM launch's producer is lowered to where its issue loop holds more than its
-    family's least (`resources.Launch.producer`, `Family.persist`'s `producer`): a tcgen05 producer's
-    gathering rows (`GATHERING_PRODUCER`); None elsewhere (`resources.producer_floor`)."""
-    return GATHERING_PRODUCER if gathered and isinstance(family, mosaic_sm100.Tcgen05Rings) else None
+    family's least (`resources.Launch.producer`, `Family.persist`'s `producer`): its family's gathering
+    producer's (`Transport.gathering_producer`) where it gathers rows; None elsewhere
+    (`resources.producer_floor`)."""
+    return family.gathering_producer if gathered else None
 
 
 def _grouped_table(group_sizes: jax.Array, m: int, row_tile: int, first: jax.Array | None,

@@ -580,6 +580,9 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
 
     consumers = 1
     gathers_rows = True  # its load warp's TMA four-row gathers (`gathered.Committed`, row 1376)
+    # The expert down projection's gathered input gradient spilled 56 and 64 bytes at the floor's 24 on a B200
+    # (128 x 128 at six stages, 128 x 64 at eight; the hybrid compile-ahead step, row 5358) and nothing at 40.
+    gathering_producer = 40
 
     turns = 2
     """The accumulator turns a launch's tensor memory holds: an epilogue reads one while the products fill

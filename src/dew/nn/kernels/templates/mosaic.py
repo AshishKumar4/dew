@@ -1366,6 +1366,11 @@ class Transport[Allocated, Opened](abc.ABC):
     of one row: `gathered.Ring`, its threads' cp.async copies; a ring family's producer, or a consumer that
     feeds its rings; mma.sync's one warpgroup beside its pipeline, `mosaic_sm80._gathered_walk`)."""
 
+    gathering_producer: int | None = None
+    """The registers its producer's threads hold issuing a gathered stream's loads past
+    `resources.producer_floor`, where they hold more (`Launch.producer`): tcgen05's load warp's four-row TMA
+    gathers, every thread holding the step's row indices; None where the floor holds them."""
+
     gathers_alone: bool = True
     """Whether a walk gathering some streams' rows loads the others whole beside them (a GEMM's gathered
     rows beside its matrix); where not (mma.sync's walk, which gathers every stream's rows or none), only a

@@ -722,8 +722,9 @@ def test_a_b200s_gathered_input_gradient_fits_its_derived_resources():
     """The expert down projection's input gradient from the hybrid compile-ahead step (row 5358), its
     rows gathered by the load warp's TMA gathers, compiles at its derived tile without spilling and in the
     shared memory its plan sized: its producer lowered to the registers its gathers hold
-    (`mosaic_gpu.GATHERING_PRODUCER`; at the floor's 24 it spilled 56 bytes), its gathered stream's barriers
-    as its family allocates them (`Allocations.gathered`; planned as plain ones, 976 bytes short)."""
+    (`Transport.gathering_producer`, tcgen05's 40; at the floor's 24 it spilled 56 bytes), its gathered
+    stream's barriers as its family allocates them (`Allocations.gathered`; planned as plain ones, 976 bytes
+    short)."""
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     launch = grouped_matmul.MosaicGmm()
