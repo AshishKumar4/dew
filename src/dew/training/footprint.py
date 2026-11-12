@@ -260,20 +260,20 @@ def _ynn_eligible(equation: jcore.JaxprEqn) -> bool:
     if any(dtype not in YNN_ARRAY_TYPES for dtype in types):
         return False
     primitive = equation.primitive
-    result = types[-1]
+    output_type = types[-1]
     if primitive is jax.lax.iota_p:
-        return not equation.invars and result in ("float32", "int32")
+        return not equation.invars and output_type in ("float32", "int32")
     # The matcher accepts layout operations before applying the element-count preference.
     if bitcast(equation) or primitive in (
             jax.lax.transpose_p, jax.lax.copy_p, jax.lax.broadcast_in_dim_p, primitives.name_p):
-        if len(equation.invars) != 1 or types[0] != result:
+        if len(equation.invars) != 1 or types[0] != output_type:
             return False
         if primitive is jax.lax.broadcast_in_dim_p:
             axes = equation.params["broadcast_dimensions"]
             return all(left < right for left, right in itertools.pairwise(axes))
         return True
     if primitive is jax.lax.pad_p:
-        return (len(equation.invars) == 2 and all(dtype == result for dtype in types)
+        return (len(equation.invars) == 2 and all(dtype == output_type for dtype in types)
                 and all(interior == 0 and (size != 1 or (low == 0 and high == 0))
                         for size, (low, high, interior) in zip(
                             dimensions(equation.invars[0]), equation.params["padding_config"], strict=True)))
@@ -295,7 +295,7 @@ def _ynn_eligible(equation: jcore.JaxprEqn) -> bool:
         operation = inner[0].eqns[0]
         if (operation.primitive not in (jax.lax.add_p, jax.lax.max_p, jax.lax.min_p)
                 or set(operation.invars) != set(inner[0].invars)
-                or operation.outvars != inner[0].outvars or types[1] != result):
+                or operation.outvars != inner[0].outvars or types[1] != output_type):
             return False
         reducer = operation.primitive
     if reducer is None:
@@ -312,10 +312,10 @@ def _ynn_eligible(equation: jcore.JaxprEqn) -> bool:
     elif not equation.params.get("axes", equation.params.get("dimensions", ())):
         return False
     if reducer is jax.lax.add_p:
-        return (types[0], result) in {
+        return (types[0], output_type) in {
             ("float64", "float64"), ("float32", "float32"), ("float16", "float32"),
             ("bfloat16", "float32"), ("int8", "int32"), ("uint8", "int32")}
-    return types[0] == result and result in (
+    return types[0] == output_type and output_type in (
         "float64", "float32", "float16", "bfloat16", "int8", "uint8")
 
 
