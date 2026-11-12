@@ -201,7 +201,7 @@ class _Grouped:
         # a dataset of them does.
         elements = consumed_forward([element for element in elements if element is not None])
         markers = [element for element in elements if isinstance(element, Rejected)]
-        rows = [element for element in elements if not isinstance(element, Rejected)]
+        rows: list[Record] = [element for element in elements if not isinstance(element, Rejected)]
         records = [row for row in rows if isinstance(row, Mapping)]
         alike = (bool(rows) and len(records) == len(rows)
                  and all(row.keys() == records[0].keys() for row in records))

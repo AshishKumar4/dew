@@ -654,19 +654,25 @@ class Store:
         fs, path = self.resolve()
         if not isinstance(fs, HfFileSystem) or pinned_by_url(fs, path):
             return self
-        return Store("hf://" + _hub_commit(fs, path)[1], self.storage_options, self.retention)
+        return replace(self, url="hf://" + _hub_commit(fs, path)[1])
 
     def cached(self) -> Store:
         if self.url.startswith("dewcache::"):
             return self
         options = dict(self.storage_options or {})
         transport = options.pop("dewcache", {})
-        # Each link of the chain keeps the options fsspec gives it (`fsspec.core._un_chain`: a protocol's
-        # own under its name, the unscoped ones its first link's), each under its protocol's name once
-        # Dew's mirror leads the chain, as fsspec reads them there.
-        from fsspec.core import _un_chain
+        # Each link of the chain keeps the options fsspec deals it (a protocol's own under its name, the
+        # unscoped ones its first link's, over its own), each under its protocol's name once Dew's mirror
+        # leads the chain, as fsspec reads them there.
+        from fsspec.core import split_protocol
+        from fsspec.registry import available_protocols
 
-        links = {protocol: kwargs for _, protocol, kwargs in _un_chain(self.url, options)}
+        known = set(available_protocols())
+        protocols = [split_protocol(bit)[0] or (bit if bit in known else "file")
+                     for bit in self.url.split("::")]
+        unscoped = {name: value for name, value in options.items() if name not in protocols}
+        links = {protocol: dict(record(options.get(protocol, {}), protocol)) for protocol in protocols}
+        links[protocols[0]] = {**links[protocols[0]], **unscoped}
         return Store("dewcache::" + self.url, {**links, "dewcache": transport},
                      idle_seconds=self.idle_seconds)
 

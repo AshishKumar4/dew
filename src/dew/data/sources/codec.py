@@ -258,9 +258,11 @@ def _untagged(node: Mapping[str, JSON], leaves: Mapping[str, bytes]) -> tuple[Va
 
 def _pair(value: JSON, key: str) -> tuple[JSON, JSON]:
     """`value`, a node's list of two parts, refused otherwise, naming `key`."""
-    if not isinstance(value, list) or len(value) != 2:
-        raise ValueError(f"{key} is not two parts")
-    return value[0], value[1]
+    match value:
+        case [first, second]:
+            return first, second
+        case _:
+            raise ValueError(f"{key} is not two parts")
 
 
 def _dataclass_decoded(identity: list[JSON], fields: Mapping[str, JSON],
@@ -275,11 +277,12 @@ def _dataclass_decoded(identity: list[JSON], fields: Mapping[str, JSON],
 
 
 def _object_array_decoded(payload: JSON, leaves: Mapping[str, bytes]) -> Value:
-    shape = payload.get("shape") if isinstance(payload, dict) else None
-    if not isinstance(payload, dict) or not isinstance(shape, list):
-        raise ValueError("artifact object array has no shape")
-    return np.asarray(_restore(payload["values"], leaves), dtype=object).reshape(
-        [integer(size, "artifact object array shape") for size in shape])
+    match payload:
+        case {"shape": list(shape), "values": values}:
+            return np.asarray(_restore(values, leaves), dtype=object).reshape(
+                [integer(size, "artifact object array shape") for size in shape])
+        case _:
+            raise ValueError("artifact object array has no shape")
 
 
 def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> JSON:
@@ -328,10 +331,11 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
 
 
 def _restore(node: JSON, leaves: Mapping[str, bytes]) -> Value:
-    if node is None or isinstance(node, (bool, int, float, str)):
-        return node
-    if not isinstance(node, dict):
-        raise ValueError("artifact node is not a scalar or tagged object")
+    match node:
+        case None | bool() | int() | float() | str():
+            return node
+        case list():
+            raise ValueError("artifact node is not a scalar or tagged object")
     if "scalar" in node:
         return _array(node, leaves, "scalar")[()]
     if "array" in node:

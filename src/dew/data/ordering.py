@@ -92,7 +92,7 @@ class WindowShuffle(grain.IterDataset[Batch]):
         super().__init__(parent)
         self._rows, self._window, self._seed = parent, window, seed
 
-    def __iter__(self) -> _WindowShuffled:
+    def __iter__(self) -> grain.DatasetIterator[Batch]:
         return _WindowShuffled(self._rows.__iter__(), window=self._window, seed=self._seed)
 
 
@@ -101,7 +101,7 @@ class _WindowShuffled(_WindowShuffleDatasetIterator[Batch]):
     the position it saves), each window after the first read as the one before is given, a record of it
     for each record given (`_read_ahead`); Grain's own reads a window whole as its first record is asked."""
 
-    def __init__(self, parent: grain.DatasetIterator[Batch], *, window: int, seed: int):
+    def __init__(self, parent: grain.DatasetIterator, *, window: int, seed: int):
         super().__init__(parent, window_size=window, seed=seed)
         # The next window's start, captured once the current one is read, and its records read so far, one
         # a record given; None where the parent ended or no window was read yet.

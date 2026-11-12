@@ -722,8 +722,7 @@ class Decontaminated(Curated):
     reason = "contaminated"
 
     def curator(self) -> BaseFilter:
-        from datatrove.pipeline.decont import NGramsDecontConfig, NGramsDecontFilter
-        from datatrove.utils.text import ngrams, simplify_text
+        from datatrove.pipeline.decont import NGramsDecontConfig, NGramsDecontFilter, NGramsDecontIndexer
 
         from dew._files import write_atomically
 
@@ -731,11 +730,10 @@ class Decontaminated(Curated):
         held = hashlib.sha256(json.dumps([self.n, self.against]).encode()).hexdigest()
         folder = Path(tempfile.gettempdir()) / "dew-decontamination" / held
         decontaminate = NGramsDecontFilter(str(folder), config=config)
-        # The index the filter reads, each n-gram split, joined and hashed as its own filter reads a document.
-        words = [decontaminate.tokenizer.word_tokenize(simplify_text(text, config.norm_config))
-                 for text in self.against]
-        # Each hashed by the function the filter hashes a document's n-grams with (`hash_func`).
-        hashes = {decontaminate.hash_func(" ".join(gram)) for row in words for gram in ngrams(row, self.n)}
+        # The index the filter reads, each text's n-grams hashed as datatrove's own indexer hashes them
+        # (`NGramsDecontIndexer.compute_hashes`), as the filter reads a document's.
+        indexer = NGramsDecontIndexer(str(folder), config=config)
+        hashes = {hashed for text in self.against for hashed in indexer.compute_hashes(text)}
         folder.mkdir(parents=True, exist_ok=True)
         write_atomically(folder / "against.index.hashes",
                          np.array(sorted(hashes), dtype=config.hash_config.np_descr).tobytes())

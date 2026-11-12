@@ -650,10 +650,8 @@ class TensorBoardTracker(_OwnedTracker):
 
     def artifact(self, value: Reported, step: int) -> None:
         if isinstance(value, RECORD_TYPES):
-            from tensorboard.compat.proto.summary_pb2 import Summary
-
-            self._add(Summary(value=[_text(f'reporting/{type(value).__name__}',
-                                           json.dumps(tracker_json(value), allow_nan=False))]), step)
+            self._add(_text(f'reporting/{type(value).__name__}',
+                            json.dumps(tracker_json(value), allow_nan=False)), step)
             return
         self._add(_summarize(value), step)
 
@@ -666,12 +664,12 @@ class TensorBoardTracker(_OwnedTracker):
             writer.close()
 
 
-def _text(tag: str, payload: str) -> Summary.Value:
-    """A text-plugin summary value: the one-string tensor a text tab reads, built by TensorBoard's own
+def _text(tag: str, payload: str) -> Summary:
+    """A text-plugin summary: the one-string tensor a text tab reads, built by TensorBoard's own
     TensorFlow-free `text_pb`."""
     from tensorboard.plugins.text.summary_v2 import text_pb
 
-    return text_pb(tag, [payload]).value[0]
+    return text_pb(tag, [payload])
 
 
 def _picture(tag: str, encoded: bytes, frame: np.ndarray) -> Summary.Value:
@@ -697,10 +695,11 @@ def _frames_summary(frames, encode, shown, captions):
     """
     from tensorboard.compat.proto.summary_pb2 import Summary
 
-    pictures = [_picture(f'val/samples/{index}', encode(frame), shown(frame))
-                for index, frame in enumerate(frames)]
-    return Summary(value=[*pictures,
-                          _text('val/samples/captions', json.dumps(list(captions)))])
+    summary = Summary(value=[_picture(f'val/samples/{index}', encode(frame), shown(frame))
+                             for index, frame in enumerate(frames)])
+    # The captions' text value after the pictures.
+    summary.MergeFrom(_text('val/samples/captions', json.dumps(list(captions))))
+    return summary
 
 
 # A registered renderer cannot annotate its return: singledispatch resolves a
@@ -719,10 +718,7 @@ def _(value: VideoGrid):
 
 @_summarize.register
 def _(value: TextSamples):
-    from tensorboard.compat.proto.summary_pb2 import Summary
-
-    return Summary(value=[_text('val/samples', json.dumps(
-        {'prompt': value.prompt, 'texts': list(_texts(value))}))])
+    return _text('val/samples', json.dumps({'prompt': value.prompt, 'texts': list(_texts(value))}))
 
 
 def _histogram(tag: str, values: np.ndarray) -> Summary:

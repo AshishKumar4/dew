@@ -761,14 +761,15 @@ def read_otherwise_at_13(saved: Mapping[str, object]) -> str | None:
         return None
 
     def mixes(node: JSON) -> Iterator[dict[str, JSON]]:
-        if isinstance(node, dict):
-            if "corpora" in node and "members" in node:
-                yield node
-            for value in node.values():
-                yield from mixes(value)
-        elif isinstance(node, list):
-            for value in node:
-                yield from mixes(value)
+        match node:
+            case dict():
+                if "corpora" in node and "members" in node:
+                    yield node
+                for value in node.values():
+                    yield from mixes(value)
+            case list():
+                for value in node:
+                    yield from mixes(value)
 
     for mix in mixes(json_value(order, "saved order")):
         keys = _member_keys(strings(mix["members"], "a saved mix's members"))
