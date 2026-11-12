@@ -70,6 +70,7 @@ from dew.nn.precision import (
     running_sum,
     running_total,
     scaled_logits,
+    weighted_total,
     widened_reduction,
 )
 from dew.nn.protocols import (
@@ -626,12 +627,14 @@ def _softmax_cotangent(logits, first, excluded, peaks, masses, rests, labels, d_
     # A target at the excluded column scores a constant +inf, which no logit moves.
     selected = _without(jax.nn.one_hot(labels - first, logits.shape[-1], dtype=bool), first,
                         excluded, value=False)
+    safe_masses = jnp.where(masses != 0, masses, 1)
     coefficient = d_partition if picked else d_first + d_partition
-    share = exponentials * (coefficient / masses)[:, None]
-    entry = label_entry(exponentials / masses[:, None], (rests / masses)[:, None])
-    target = (exponentials * ((d_first + d_partition) / masses)[:, None] - d_first[:, None] * entry if picked
-              else exponentials * (d_partition / masses)[:, None] + d_first[:, None] * entry)
-    return jnp.where(selected, target, share)
+    share = exponentials * (coefficient / safe_masses)[:, None]
+    entry = label_entry(exponentials / safe_masses[:, None], (rests / safe_masses)[:, None])
+    target = (exponentials * ((d_first + d_partition) / safe_masses)[:, None] - d_first[:, None] * entry
+              if picked else exponentials * (d_partition / safe_masses)[:, None] + d_first[:, None] * entry)
+    active = (d_first != 0) | (d_partition != 0)
+    return jnp.where(active[:, None], jnp.where(selected, target, share), 0)
 
 
 def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, predict, temperature,
@@ -899,9 +902,11 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
             values.append(top[1])
         if gradients:
             weight = jax.lax.dynamic_slice_in_dim(weights, start, size).astype(work)
+            z_cotangent = (jnp.where(weight != 0, 2 * z_loss * log_z * weight, 0) if z_loss
+                           else jnp.zeros_like(weight))
             d_states, d_matrix, _, terms = _head_backward(
                 pullback, _softmax_cotangent(logits, 0, excluded, peaks, masses, rests, targets, weight,
-                                             2 * z_loss * log_z * weight),
+                                             z_cotangent),
                 product_matrix, jax.lax.dynamic_slice_in_dim(hidden, start, size).astype(operands), precision,
                 work)
             d_columns = jax.tree.map(added_to, d_columns, terms)
@@ -927,8 +932,10 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
 
 def _fused_total(losses, log_z, weights, z_loss: float):
     """The weighted sum of the losses and the z-loss, summed as `Objective.row_mean` sums."""
-    terms = weights.astype(losses.dtype) * (losses + z_loss * jnp.square(log_z) if z_loss else losses)
-    return compensated_sum(terms, (0,))
+    active = weights != 0
+    kept_losses = jnp.where(active, losses, 0)
+    terms = (kept_losses + z_loss * jnp.square(jnp.where(active, log_z, 0)) if z_loss else kept_losses)
+    return weighted_total(terms, weights, 0)[0]
 
 
 def _fused(hidden, table, labels, weights, columns, z_loss: float, cap, chunk: int,
