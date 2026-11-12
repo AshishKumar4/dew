@@ -26,6 +26,7 @@ from dew.data.pipeline import (
     CONSUMED,
     DRAWN,
     REFUSED,
+    Drawn,
     Owed,
     Record,
     Rejected,
@@ -888,12 +889,14 @@ class _MixReads:
 
 
 class Stamping:
-    """A mix read's draws of the members later phases read on (`keys`), each stamped as it is drawn
-    (`DRAWN`): the read's `node` (its loading worker's slice, `node_of`), the member's key and its
-    pull's number, `pulled` counting each member's pulls. A phase that continues a member from an earlier
-    phase's (`dew.data.dataset.StepPhases`) starts it at the earlier's low pull, its counter there, and
-    draws past the pulls the run trained already (`skips`). Saved and restored with the mix's position, so
-    a position the mix restores draws its pulls again under their numbers."""
+    """A mix read's draws of the members other phases read on (`keys`), each stamped as it is drawn
+    (`DRAWN`): the read's `node` (its loading worker's slice, `node_of`), the member's key, its pull's
+    number (`pulled` counting each member's pulls) and the member's position after it. A phase that
+    continues a member from an earlier one (`dew.data.dataset.StepPhases`) starts it at the position
+    after the last pull the run trained before an untrained one, its counter there, and draws past the
+    pulls past it the run trained already (`skips`), stamping each it passes on the next row it hands on.
+    Saved and restored with the mix's position, so a position the mix restores draws its pulls again under
+    their numbers."""
 
     def __init__(self, keys: Iterable[str], node: str):
         self.keys = frozenset(keys)
@@ -903,23 +906,25 @@ class Stamping:
         # The skips as a position holds them, made again only where a draw moves past one.
         self._held: dict[str, list[int]] = {key: [] for key in self.keys}
 
-    def read(self, key: str, pull: Callable[[], Batch]) -> Batch:
+    def read(self, key: str, pull: Callable[[], Batch], position: Callable[[], JSON]) -> Batch:
         """Member `key`'s next draw by `pull`, one consumed source example (`CONSUMED`), stamped where it is
-        a member other phases read on (`DRAWN`): every row of the mix holds the same counting fields."""
+        a member other phases read on (`DRAWN`), with each pull it drew past before it, each beside the
+        member's `position` after it: every row of the mix holds the same counting fields."""
         if key not in self.keys:
             return _marked(key, pull(), ())
-        skips = self.skips[key]
+        skips, passed = self.skips[key], []
         while self.pulled[key] in skips:
             # A pull an earlier phase's step trained: drawn past, never handed on again. The skips a position
             # holds are its own: a new mapping each time one is passed.
             pull()
+            passed.append((self.node, key, self.pulled[key], position()))
             skips.discard(self.pulled[key])
             self._held = {**self._held, key: sorted(skips)}
             self.pulled[key] += 1
-        draw = (self.node, key, self.pulled[key])
-        row = _marked(key, pull(), (draw,))
+        row = pull()
+        draw = (self.node, key, self.pulled[key], position())
         self.pulled[key] += 1
-        return row
+        return _marked(key, row, (*passed, draw))
 
     def state(self) -> Mapping[str, object]:
         return {"node": self.node, "pulled": dict(self.pulled), "skips": self._held}
@@ -944,7 +949,7 @@ def node_of(selection: slice | None) -> str:
     return f"{selection.start or 0}:{selection.step or 1}"
 
 
-def _marked(key: str, row: Batch, drawn: tuple[tuple[str, str, int], ...]) -> Batch:
+def _marked(key: str, row: Batch, drawn: Drawn) -> Batch:
     """A mix's draw of member `key` as one consumed source example, its draws `drawn`."""
     if not isinstance(row, Mapping):
         raise TypeError(f"mixture member {key!r} gives {type(row).__name__} records, which carry no draw; "
@@ -965,10 +970,9 @@ def restamped(stamping: Stamping | None, state: Mapping[str, object]) -> None:
 
 @dataclasses.dataclass(frozen=True)
 class Left:
-    """Where a phase left a member of its mix, one mix read's (`node`): the member's position at its earliest
-    in the phase's saved position, the low pull there (the first the run has not trained), and the pulls
-    past it the run trained (`past`), which a phase that continues the member draws past
-    (`dew.data.dataset.StepPhases`)."""
+    """Where the run left a member of a mix, one mix read's: the member's `position` after the last pull the
+    run trained before one it did not, the `low` pull there, and the pulls past it the run trained
+    (`past`), which a phase that continues the member draws past (`dew.data.dataset.StepPhases`)."""
 
     position: JSON
     low: int
@@ -1011,39 +1015,31 @@ def _drawing(mix: Mapping[str, JSON]) -> tuple[str, dict[str, JSON], dict[str, J
             {member: json_value(held, f"member {member}'s skips") for member, held in skips.items()})
 
 
-def left_by(state: JSON, members: Mapping[str, str],
-            trained: Callable[[str, str, int], tuple[int, ...]]) -> dict[str, list[Left]]:
-    """Where a phase whose saved position is `state` left each of `members` (mix member key: corpus), by
-    corpus, a `Left` for each mix read in the order its position names them: the member's position in
-    the mix read's earliest copy, which every stage after the mix replays from, its low pull there, and
-    the pulls past it `trained(node, member, low)` says the run trained."""
-    earliest: dict[str, tuple[int, dict[str, JSON]]] = {}
+def mix_reads(state: JSON, members: Mapping[str, str]) -> dict[str, dict[str, Left]]:
+    """Where each mix read in `state`, a phase's position, stands on each of `members` (mix member key:
+    corpus), by node (`Stamping.node`) in the order the position names them: the member's position, its
+    pulls, and the pulls past them it is yet to draw past (`Stamping.skips`). Read where a phase opens, the
+    start its draws continue from (`dew.data.dataset.StepPhases`)."""
+    reads: dict[str, dict[str, Left]] = {}
     for mix in _stamped_mixes(state):
-        node, pulled, _ = _drawing(mix)
-        drawn = sum(integer(count, "a mix's pulls") for count in pulled.values())
-        if node not in earliest or drawn < earliest[node][0]:
-            earliest[node] = (drawn, mix)
-    left: dict[str, list[Left]] = {}
-    for node, (_, mix) in earliest.items():
-        _, pulled, skips = _drawing(mix)
+        node, pulled, skips = _drawing(mix)
+        if node in reads:
+            continue
         parents = record(mix["parents"], "a mix's corpora")
-        for member, corpus in members.items():
-            low = integer(pulled[member], f"member {member}'s pulls")
-            position = json_value(parents[member], f"member {member}'s position")
-            # Past the low pull, those this phase trained and those an earlier one did that this phase had
-            # yet to draw past (its position's skips).
-            inherited = integers(skips.get(member, []), f"member {member}'s skipped pulls")
-            past = sorted({*trained(node, member, low), *(pull for pull in inherited if pull >= low)})
-            left.setdefault(corpus, []).append(Left(position, low, tuple(past)))
-    return left
+        reads[node] = {member: Left(json_value(parents[member], f"member {member}'s position"),
+                                    integer(pulled[member], f"member {member}'s pulls"),
+                                    tuple(integers(skips.get(member, []),
+                                                   f"member {member}'s skipped pulls")))
+                       for member in members}
+    return reads
 
 
 def continued(state: JSON, members: Mapping[str, str], left: Mapping[str, Sequence[Left]]) -> JSON:
     """`state`, a fresh phase's saved position, with each of its `members` (mix member key: corpus) that
-    `left` holds at where the phase before left it (`left_by`), in every copy of each mix read, the i-th mix
-    read taking the corpus's i-th: its position, its pulls counted from the low pull and drawn past the
-    trained ones, its counts its own from here (`uncounted`). Refused where the phase reads the corpus in
-    another count of mix reads than the phase that left it."""
+    `left` holds at where the run left it (`dew.data.dataset.StepPhases`), in every copy of each mix read,
+    the i-th mix read taking the corpus's i-th: its position, its pulls counted from the low pull and drawn
+    past the trained ones, its counts its own from here (`uncounted`). Refused where the phase reads the
+    corpus in another count of mix reads than the phase that left it."""
     mixes = _stamped_mixes(state)
     nodes = list(dict.fromkeys(_drawing(mix)[0] for mix in mixes))
     for corpus, held in left.items():
@@ -1096,7 +1092,8 @@ class _MixRead(pygrain.DatasetIterator[Batch]):
     def __next__(self) -> Batch:
         if self._stamping is None:
             return self._group.read(self._index)
-        return self._stamping.read(self._key, lambda: self._group.read(self._index))
+        return self._stamping.read(self._key, lambda: self._group.read(self._index),
+                                   lambda: json_value(copy.deepcopy(self.get_state()), "a corpus's position"))
 
     def get_state(self) -> Mapping[str, object]:
         state = self._group.state(self._index)

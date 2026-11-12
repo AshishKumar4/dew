@@ -39,7 +39,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import _position
-from dew._records import boolean, integer, integers, json_value, listed, record, strings, text
+from dew._records import JSON, boolean, integer, integers, json_value, listed, record, strings, text
 from dew.batch import DRAWS, EXAMPLES_CONSUMED, PHASE, VALID_ROWS, Batch, Draws, Phase, padded_rows
 from dew.data import cgroups
 from dew.mesh import LayoutRefused, batch_axes
@@ -1800,12 +1800,13 @@ class StepPhases(Forwarding):
         if phase != self._current:
             if self._current is not None:
                 closing = self._readers.pop(self._current)
-                self._carry_from(self._current, closing)
+                self._carry_from(self._current)
                 if isinstance(closing, Closeable):
                     closing.close()
             self._source, self._current = self._reader(phase), phase
             if carry:
                 self._carry_into(phase, self._source)
+                self._started(phase, self._source)
             self._opened(phase)
         assert self._source is not None
         return self._source
@@ -1820,14 +1821,29 @@ class StepPhases(Forwarding):
                 raise ValueError(f"phase {phase}'s batch holds no draws ({DRAWS!r}), which the phase "
                                  "after it continues its shared corpora from: a host step that rebuilds "
                                  "batches keeps the field")
-            for node, member, pull in draws.draws:
-                self._trained.setdefault((node, member), _Frontier()).add(pull)
+            for node, member, pull, position in draws.draws:
+                frontier = self._trained.get((node, member))
+                if frontier is None:
+                    raise ValueError(f"phase {phase} trained a draw of mix read {node}, which its position "
+                                     "at its start names not: read the phases that share a corpus in the "
+                                     "same loading workers")
+                frontier.add(pull, position)
         return {**batch, PHASE: Phase(phase)}
 
-    def _carry_from(self, phase: int, reader: Iterator[Batch]) -> None:
-        """Each corpus phase `phase` shares with a later phase, as it leaves it (`dew.data.mixing.left_by`),
-        carried to the phase that reads it next (`carried`)."""
-        from dew.data.mixing import left_by
+    def _carry_from(self, phase: int) -> None:
+        """Each corpus phase `phase` shares with a later phase, as the run left it (`_Frontier.left`), by mix
+        read in the order the phase's position named them, carried to the phase that reads it next
+        (`carried`)."""
+        members = self._shared[phase]
+        for member, corpus in members.items():
+            self._carried[corpus] = [frontier.left() for (_, held), frontier in self._trained.items()
+                                     if held == member]
+        self._trained.clear()
+
+    def _started(self, phase: int, reader: Iterator[Batch]) -> None:
+        """The draws phase `phase`, opening, continues each corpus it shares from (`trained`), by mix read
+        and member: each read's position of it at the start (`dew.data.mixing.mix_reads`)."""
+        from dew.data.mixing import mix_reads
 
         members = self._shared[phase]
         if not members:
@@ -1837,12 +1853,8 @@ class StepPhases(Forwarding):
                             "continue from")
         own = reader.get_state()
         state = json_value(json.loads(own) if isinstance(own, bytes) else own, "a phase's position")
-
-        def trained(node: str, member: str, low: int) -> tuple[int, ...]:
-            return tuple(self._trained.get((node, member), _Frontier()).past(low))
-
-        self._carried.update(left_by(state, members, trained))
-        self._trained.clear()
+        self._trained = {(node, member): _Frontier.started(left)
+                         for node, held in mix_reads(state, members).items() for member, left in held.items()}
 
     def _carry_into(self, phase: int, reader: Iterator[Batch]) -> None:
         """Phase `phase`'s reader with each corpus it shares with an earlier phase where that phase left it
@@ -1869,9 +1881,9 @@ class StepPhases(Forwarding):
             raise TypeError(f"phase {phase}'s stream keeps no position")
         own = stream.get_state()
         carried = {corpus: [left.record() for left in held] for corpus, held in self._carried.items()}
-        shared = {"carried": carried, "trained": [
-            [node, member, frontier.count, sorted(frontier.ahead)]
-            for (node, member), frontier in self._trained.items()]} if any(self._shared) else {}
+        shared = {"carried": carried, "trained": [[node, member, frontier.record()]
+                                                  for (node, member), frontier in self._trained.items()]
+                  } if any(self._shared) else {}
         return json.dumps({_position.STEP_PHASES: {
             "steps": self._steps, "phase": phase, "ends": self._ends[:phase], **shared,
             "identities": [self._identity(index) for index in range(phase + 1)],
@@ -1906,11 +1918,11 @@ class StepPhases(Forwarding):
         trained = listed(saved.get("trained", []), "trained draws", read=json_value, what="a list of draws")
         for entry in trained:
             match entry:
-                case [str(node), str(member), int(count), list(ahead)]:
-                    self._trained[(node, member)] = _Frontier(count, set(integers(ahead, "trained pulls")))
+                case [str(node), str(member), dict() as frontier]:
+                    self._trained[(node, member)] = _Frontier.of(frontier)
                 case _:
-                    raise ValueError(f"a phase's trained draws are a mix read, a member, a count and the "
-                                     f"pulls past it, got {entry!r}")
+                    raise ValueError(f"a phase's trained draws are a mix read, a member and its frontier, "
+                                     f"got {entry!r}")
         if self._current is not None and self._current != phase:
             # The phase it read until now, left without carrying: the saved position holds what it carries.
             closing = self._readers.pop(self._current)
@@ -1950,26 +1962,59 @@ class StepPhases(Forwarding):
 
 @dataclasses.dataclass
 class _Frontier:
-    """The pulls of one member of one mix read a phase trained (`StepPhases`): every pull below `count`,
-    and those past it in `ahead`, which a step after the mix that reorders its draws (a packer, a shuffle)
-    trains before the ones before them."""
+    """Where the run stands on one member of one mix read in a phase (`StepPhases`): from `low`, the pull
+    after the last the run trained before one it did not, and the member's position there (`at`), the
+    pulls at or past it the run trained (`trained`: those an earlier phase did, or this one did out of
+    order behind a packer or a shuffle), and the member's position after each this phase trained
+    (`positions`), which moves `low` on as the run trains every pull before one."""
 
-    count: int = 0
-    ahead: set[int] = dataclasses.field(default_factory=set)
+    low: int
+    at: JSON
+    trained: set[int] = dataclasses.field(default_factory=set)
+    positions: dict[int, JSON] = dataclasses.field(default_factory=dict)
 
-    def add(self, pull: int) -> None:
-        if pull != self.count:
-            self.ahead.add(pull)
-            return
-        self.count += 1
-        while self.count in self.ahead:
-            self.ahead.remove(self.count)
-            self.count += 1
+    @classmethod
+    def started(cls, left: Left) -> _Frontier:
+        """The frontier of a member a phase starts at `left` (`dew.data.mixing.mix_reads`)."""
+        return cls(left.low, left.position, set(left.past))
 
-    def past(self, low: int) -> list[int]:
-        """The pulls from `low` on it trained, which a phase that continues the member from `low` draws
-        past."""
-        return [*range(low, self.count), *sorted(pull for pull in self.ahead if pull >= low)]
+    def add(self, pull: int, position: JSON) -> None:
+        """A pull the run trained, the member's `position` after it."""
+        self.trained.add(pull)
+        self.positions[pull] = position
+        moved, at = self.low, self.low
+        while at in self.trained:
+            at += 1
+            if at - 1 in self.positions:
+                moved = at
+        if moved > self.low:
+            self.at = self.positions[moved - 1]
+            self.low = moved
+            self.trained = {held for held in self.trained if held >= moved}
+            self.positions = {held: where for held, where in self.positions.items() if held >= moved}
+
+    def left(self) -> Left:
+        """Where a phase continuing the member starts it (`dew.data.mixing.Left`)."""
+        from dew.data.mixing import Left
+
+        return Left(self.at, self.low, tuple(sorted(self.trained)))
+
+    def record(self) -> dict[str, JSON]:
+        return {"low": self.low, "at": self.at, "trained": sorted(self.trained),
+                "positions": [[pull, where] for pull, where in sorted(self.positions.items())]}
+
+    @classmethod
+    def of(cls, saved: Mapping[str, JSON]) -> _Frontier:
+        positions = listed(saved["positions"], "trained positions", read=json_value, what="a list of pulls")
+        held: dict[int, JSON] = {}
+        for entry in positions:
+            match entry:
+                case [int(pull), where]:
+                    held[pull] = where
+                case _:
+                    raise ValueError(f"a trained pull's position is its pull and the position, got {entry!r}")
+        return cls(integer(saved["low"], "a frontier's low pull"), json_value(saved["at"], "its position"),
+                   set(integers(saved["trained"], "its trained pulls")), held)
 
 
 @runtime_checkable

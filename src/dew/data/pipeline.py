@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, ove
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import ADDED, JSON, integer, record, text
+from dew._records import ADDED, JSON, integer, json_value, record, text
 from dew.batch import Batch
 from dew.data.dataset import WORKER_BUFFER, Records, phase_ends
 
@@ -64,8 +64,9 @@ Set with its `CONSUMED` where the mix draws it, and carried wherever that count 
 draws its step trains (`dew.batch.DRAWS`): a phase on its own stream continues each shared corpus from them
 (`dew.data.dataset.StepPhases`)."""
 
-type Draw = tuple[str, str, int]
-"""A draw of a phase's shared corpus (`DRAWN`): its mix read's node, the member's key and its pull."""
+type Draw = tuple[str, str, int, JSON]
+"""A draw of a phase's shared corpus (`DRAWN`): its mix read's node, the member's key, its pull, and the
+member's position after it, which a phase continuing the member past the draw starts it at."""
 
 type Drawn = tuple[Draw, ...]
 
@@ -171,9 +172,11 @@ def drawn_of(row: Batch | Rejected) -> Drawn:
         return row.drawn
     held = row.get(DRAWN, ())
     if not isinstance(held, (list, tuple)):
-        raise ValueError(f"a row's draws are a list of (node, member, pull), got {type(held).__name__}")
+        raise ValueError(f"a row's draws are a list of (node, member, pull, position), got "
+                         f"{type(held).__name__}")
     return tuple((text(node, "a draw's node"), text(member, "a draw's member"),
-                  integer(pull, "a draw's pull")) for node, member, pull in held)
+                  integer(pull, "a draw's pull"), json_value(position, "a draw's position"))
+                 for node, member, pull, position in held)
 
 
 def accounts(row: Batch | Rejected) -> tuple[int, int]:
