@@ -208,16 +208,20 @@ def _calls(row: Mapping[str, object], version: int | None,
         carried = {"prompt": tuple(full[:begin]), "tokens": tuple(full[begin:begin + length]),
                    "behavior_log_probs": tuple(logprobs[offset:offset + length]),
                    "routed_experts": None if record is None else routing_head(record, forwarded)}
-        # A call that states no finish (a native row's, an earlier Dew row's): the chain's last stopped it and
-        # every other ended on a tool call.
-        finished = "stop" if number == len(runs) - 1 else "tool_calls"
         if described is not None:
             own = {name: value for name, value in described[number].items() if name not in ("start", "count")}
-            calls.append(from_record(Call, {"finish_reason": finished, **own, **carried}, dtypes=False))
+            if "finish_reason" not in own:
+                raise ValueError(f"Dew's record of verl call {number} states no finish_reason, as only "
+                                 "an earlier Dew wrote it; export the sessions again with the Dew that "
+                                 "collected them")
+            calls.append(from_record(Call, {**own, **carried}, dtypes=False))
         elif version is None:
             raise ValueError("a native verl row names its policy version in extra_fields.min_global_steps; "
                              "this one has none, so pass version=")
         else:
+            # A native row states no finish: the chain's last call stopped it and every other ended on a
+            # tool call.
+            finished = "stop" if number == len(runs) - 1 else "tool_calls"
             calls.append(Call(**carried, finish_reason=finished, version=version))
     return tuple(calls)
 

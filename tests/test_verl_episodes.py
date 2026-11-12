@@ -9,6 +9,7 @@ import json
 from dataclasses import asdict, replace
 
 import numpy as np
+import pytest
 from episode_support import build, collect
 
 from dew.objectives.rl import session_of
@@ -87,6 +88,23 @@ def test_a_dew_row_writes_scores_as_they_are_and_reads_calls_that_leave_their_nu
     (restored,) = [trajectory.session for trajectory in from_verl(rows)]
     assert restored == replace(session, calls=tuple(
         replace(call, **dict.fromkeys(nullable)) for call in session.calls))
+
+
+def test_a_dew_row_whose_call_states_no_finish_is_refused_and_a_native_one_finishes_its_chain():
+    """Dew writes each call's finish (`finish_reason`) in its record of the row, so a Dew row whose call
+    states none was written by an earlier Dew: the same rows that read back whole are refused without it,
+    rather than its finish guessed; a native verl row, which states none, finishes its chain's last call with a stop."""
+    trainer, collector = build()
+    session = rollouts_of(collect(collector, trainer.initial_state()))[0]
+    rows = json.loads(json.dumps(to_verl([session])))
+    assert [trajectory.session for trajectory in from_verl(rows)] == [session]
+    del rows[0]["extra_fields"]["dew"]["calls"][0]["finish_reason"]
+    with pytest.raises(ValueError):
+        from_verl(rows)
+    native = json.loads(json.dumps(to_verl([session])))
+    for row in native:
+        del row["extra_fields"]["dew"]
+    assert all(trajectory.session.calls[-1].finish_reason == "stop" for trajectory in from_verl(native))
 
 
 def test_an_episode_record_reads_back_every_sampling_control():

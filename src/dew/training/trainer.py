@@ -659,10 +659,8 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, abstract.variables,
                 lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype)))
         share = DataPartition.of(self.device_mesh) if positioned else None
-        # The groups a checkpoint may hold packed, named on the stored layers it holds (`row_shapes`).
-        served = self.objective.served_groups(self._staging.row_shapes(abstract.variables))
         state, position = self._staging.restore(checkpoints, placed_shapes(abstract, shardings), resume,
-                                               share, served=served)
+                                               share)
         state = restored(state, resume, self._shape.examples)
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         if (config := self._config) is not None:

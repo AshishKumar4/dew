@@ -64,7 +64,6 @@ from __future__ import annotations
 import copy
 import dataclasses
 import datetime
-import functools
 import json
 import math
 import threading
@@ -133,7 +132,6 @@ from dew.checkpoints.averaging import (
     averaged as averaged,
     averaged_pinned as averaged_pinned,
 )
-from dew.checkpoints.served import unpacked
 from dew.mesh import LogicalAxes
 from dew.nn import sharding
 from dew.nn.precision import at_least_fp32
@@ -145,7 +143,6 @@ if TYPE_CHECKING:
     from flax.training.dynamic_scale import DynamicScale
 
     from dew.data.dataset import DataPartition
-    from dew.nn.protocols import ProjectionGroup
     from dew.state import Accumulation, TrainState
 
 # One field of the train state as a checkpoint holds it: a scalar array, a
@@ -529,8 +526,10 @@ def _refuse_lacking(lacking: set[str], where: str) -> None:
             f"The checkpoint at {where} holds no {', '.join(names[:6])}"
             f"{f' or {len(names) - 6} more leaves' if len(names) > 6 else ''}, "
             f"which this run's state has: the checkpoint was written by a model "
-            f"or objective without them. Restore it with the model it was "
-            f"written with.")
+            f"or objective without them, or by an earlier Dew that stored them "
+            f"otherwise (a decision run's projections packed as its served task "
+            f"packs them, before ledger 2299's fix). Restore it with the model and "
+            f"the Dew it was written with, or start a fresh run from its weights.")
 
 
 RETIRED_RATE = ("learning_rate_scale", "learning_rate_shape")
@@ -1906,16 +1905,14 @@ class Checkpoints:
 
     @overload
     def restore[StateT](self, template: StateT, step: int | str | None = None, *,
-                        share: DataPartition | None = None,
-                        served: Sequence[ProjectionGroup] = ()) -> tuple[StateT, bytes | None]: ...
+                        share: DataPartition | None = None) -> tuple[StateT, bytes | None]: ...
 
     @overload
     def restore(self, template: None = None, step: int | str | None = None, *,
-                share: DataPartition | None = None,
-                served: Sequence[ProjectionGroup] = ()) -> tuple[Variables, bytes | None]: ...
+                share: DataPartition | None = None) -> tuple[Variables, bytes | None]: ...
 
     def restore(self, template=None, step: int | str | None = None, *,
-                share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ()):
+                share: DataPartition | None = None):
         """Restore the state at `step` and the data position of `share`.
 
         `template` is a pytree of `jax.ShapeDtypeStruct` naming the state
@@ -1931,12 +1928,6 @@ class Checkpoints:
         returned as the bytes the reader of `share` resumes from (see
         `read_position`). Without a share, as for a caller that reads weights
         and no data, it is None.
-
-        `served` names the projection groups a step may hold packed where the
-        template holds their members (`Objective.served_groups`): each such
-        leaf, in any of the state's trees, is read packed and split back into
-        its members (`dew.checkpoints.served.unpacked`). Carried to 1.0, when it is deleted (ledger
-        1552).
         """
         resumes = template is not None and not isinstance(template, Mapping)
         step = self._pinned(step, RESUME if resumes else MODEL)
@@ -2014,8 +2005,6 @@ class Checkpoints:
                     f"and the gradient accumulation it was written with. Resume it "
                     f"with those, or start a fresh run in a directory of its own."
                 ) from mismatch
-            restored = unpacked(functools.partial(self._restored, step, local=from_local), metadata,
-                                dict(restored), served)
             _refuse_lacking({jax.tree_util.keystr(path) for path, leaf
                              in jax.tree_util.tree_flatten_with_path(dict(restored))[0]
                              if isinstance(leaf, jax.ShapeDtypeStruct)}, where)
