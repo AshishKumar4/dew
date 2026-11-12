@@ -5,6 +5,7 @@ programs on this machine, so what is checked is what a shell sees: the exit
 code, the output, and which processes are left alive.
 """
 
+import contextlib
 import errno
 import os
 import signal
@@ -74,6 +75,28 @@ WAITING_RANK = ("import os, pathlib, sys, time\n"
                 "pathlib.Path(sys.argv[1], 'rank' + os.environ['DEW_PROCESS_ID'])"
                 ".write_text(str(os.getpid()))\n"
                 "time.sleep(600)\n")
+
+
+def test_a_killed_launchers_ranks_end_with_it(tmp_path):
+    """A launcher killed outright (SIGKILL, the kernel's out-of-memory kill) runs no stop of its own: its
+    ranks, each in a session of its own and silent in a collective, end with it all the same, by the
+    lifeline each was started with, and no longer hold their accelerators with no launcher to stop them (the
+    audit of 2026-11-12, A1)."""
+    launch = launcher("--processes-per-host", "2", "--port", "1", "--", sys.executable, "-c", WAITING_RANK,
+                      str(tmp_path), env={**ENV, "JAX_PLATFORMS": "cpu"})
+    try:
+        ranks = started_ranks(tmp_path, 2)
+        launch.kill()
+        launch.wait(timeout=30)
+        deadline = time.monotonic() + 30
+        while any(alive(pid) for pid in ranks) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert [alive(pid) for pid in ranks] == [False, False]
+    finally:
+        launch.kill()
+        for pid in started_ranks(tmp_path, 2):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
 
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP, signal.SIGINT])
