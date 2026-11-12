@@ -7,6 +7,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A run's fit plan judges a head that keeps its whole logits by their fp32 bytes before it traces the step's
+  gradient (`Objective.whole_head_table` names the head's table), and bounds the rung after a traced one
+  from that trace, so a step whose whole logits leave no room is planned from one gradient trace and
+  compiled once (on Qwen3.5-4B, 4 x 12,288 tokens on one 80 GB GPU: one trace where three ran). Each probe
+  in a compiled step's plan records its candidate's traced, lowered and compiled seconds (`spent`).
+
 - An fp32 call that runs on the gated delta rule's, Kimi delta attention's or the SSD's port on a GPU (Dew's
   ports of fla's and mamba_ssm's kernels; the SSD's training takes its port on an A100 and an H100) under the
   default numerics multiplies its fp32 products in one TF32, as fla's and mamba_ssm's own kernels do, where it
