@@ -4,6 +4,7 @@ consumer role's tiles issued and finished in turn (`consumed`), and a tile's wal
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -40,7 +41,8 @@ def tiled(tiles: tuple[int, ...], schedule: Callable, visit: Callable, *, axis: 
         active, steps, views, tile = schedule(loop.index)
         visit(counter, active, steps, views, tile, done)
         taken = 1 if turns is None else turns(steps)
-        return counter + jnp.where(active, steps, 0), done + jnp.where(active, taken, 0)
+        increment = steps if os.environ.get("DBG_LINEAR_COUNTER") else jnp.where(active, steps, 0)
+        return counter + increment, done + jnp.where(active, taken, 0)
 
     return ended
 
