@@ -105,12 +105,16 @@ CUBLAS = {"xla_gpu_enable_triton_gemm": False}
 def cublas_compiled(fn, inputs, call: str):
     """`fn`, a program whose dots are a library's GEMMs, compiled as cuBLAS runs each (`CUBLAS`): a library
     arm held to cuBLAS's on the same inputs (docs/design/testing.md). On a GPU its compiled program on
-    `inputs` is checked to hold cuBLAS's `call` (`__cublas$gemm`, cuBLASLt's FP8 `__cublas$lt$matmul$f8`),
-    so no lane flag or fusion choice gives it another GEMM; on a CPU its dots are XLA's own."""
+    `inputs` is checked to hold cuBLAS's `call` (`__cublas$gemm`, cuBLASLt's FP8 `__cublas$lt$matmul$f8`)
+    among its instructions' custom-call targets, as XLA's own schema reads them
+    (`dew.telemetry.instrumentation.hlo_instructions`), so no lane flag or fusion choice gives it another
+    GEMM; on a CPU its dots are XLA's own."""
     from reference_error import without_ynn
+
+    from dew.telemetry.instrumentation import hlo_instructions
 
     compiled = without_ynn(fn, compiler_options=CUBLAS)
     if jax.default_backend() == "gpu":
-        program = compiled.lower(*inputs).compile().as_text()
-        assert call in program, f"the library arm holds no {call}"
+        targets = {each.target for each in hlo_instructions(compiled.lower(*inputs).compile()).values()}
+        assert call in targets, f"the library arm calls {sorted(targets - {''})}, no {call}"
     return compiled
