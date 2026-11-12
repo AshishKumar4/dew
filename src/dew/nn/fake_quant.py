@@ -14,7 +14,7 @@ import ml_dtypes
 import numpy as np
 from flax import linen as nn
 
-from dew.nn.precision import at_least_fp32, correctly_rounded_divide
+from dew.nn.precision import at_least_fp32, divided
 
 E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
 """Each E2M1 code's value in code order (ml_dtypes' float4_e2m1fn): 0 to 6
@@ -147,8 +147,7 @@ def fp4_scaled_blocks(x, block: int, e4m3_scale: bool):
         # constant compiles on the CPU to a multiply by RN(1/6), off by an ulp in a quarter of blocks
         # (ledger 1402). At a float64 truth's width, the float64 quotient rounded once to fp32, IEEE's
         # (53 >= 2 x 24 + 2), then rounded to E4M3 at that width, exactly.
-        quotient = (correctly_rounded_divide(floored, _E2M1_MAX) if wide == jnp.float32
-                    else (floored / _E2M1_MAX).astype(jnp.float32).astype(wide))
+        quotient = divided(floored, jnp.asarray(_E2M1_MAX, wide)).astype(jnp.float32).astype(wide)
         return blocks, _round_e4m3fn(jnp.minimum(quotient, _E4M3_MAX))
     return blocks, _power_of_two_ceil(jnp.maximum(amax, _E2M1_MAX * 2 ** -126) * jnp.float32(1 / _E2M1_MAX))
 

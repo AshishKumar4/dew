@@ -75,7 +75,9 @@ class EpisodeId:
     branch: str | None = None
 
     def __post_init__(self) -> None:
-        integer(self.task, "task"), integer(self.attempt, "attempt"), integer(self.sample, "sample")
+        integer(self.task, "task")
+        integer(self.attempt, "attempt")
+        integer(self.sample, "sample")
         object.__setattr__(self, "seed", integers(self.seed, "seed"))
         if self.branch is not None:
             text(self.branch, "branch")
@@ -166,7 +168,8 @@ class Episode:
         integer(self.policy_step, "policy_step")
         if not isinstance(self.status, EpisodeStatus):
             raise TypeError("episode status must be an EpisodeStatus")
-        text(self.detail, "an episode's detail"), text(self._binding_id, "_binding_id")
+        text(self.detail, "an episode's detail")
+        text(self._binding_id, "_binding_id")
         if self.reward is not None:
             object.__setattr__(self, "reward", finite_reward(self.reward))
 

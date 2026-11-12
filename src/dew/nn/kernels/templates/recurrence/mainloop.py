@@ -211,9 +211,9 @@ class Operand:
     dtype: jnp.dtype
 
     @property
-    def stored(self):
+    def stored(self) -> jnp.dtype:
         """The dtype its parts are stored in."""
-        return jnp.bfloat16 if self.parts > 1 else self.dtype
+        return jnp.dtype(jnp.bfloat16 if self.parts > 1 else self.dtype)
 
     def views(self, ref, row, rows: int, column, columns: int) -> list:
         """Its parts' views `[rows, columns]` from `row` and `column`."""

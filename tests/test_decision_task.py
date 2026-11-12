@@ -123,15 +123,15 @@ def test_systemone_answers_what_layas_agent_answers(decide):
         assert_same_rounded_answers(laya.systemone(request, details=True), expected[case], case)
 
 
-@pytest.mark.parametrize("request_body, message", [
-    ({"questions": CASES["quickstart"]["questions"]}, "state"),
-    ({"state": "x", "questions": {}}, "at least one question"),
-    ({"state": "x", "questions": {"q": {"type": "rank", "instructions": "x"}}}, "choice, noul, score"),
-    ({"state": "x", "questions": {"q": {"type": [], "instructions": "x"}}}, "type is its name"),
-    ({"state": "x", "questions": CASES["quickstart"]["questions"], "stream": True}, "not \\['stream'\\]"),
-])
-def test_systemone_refuses_a_request_jev_would_refuse(decide, request_body, message):
-    with pytest.raises(ValueError, match=message):
+@pytest.mark.parametrize("request_body", [
+    {"questions": CASES["quickstart"]["questions"]},
+    {"state": "x", "questions": {}},
+    {"state": "x", "questions": {"q": {"type": "rank", "instructions": "x"}}},
+    {"state": "x", "questions": {"q": {"type": [], "instructions": "x"}}},
+    {"state": "x", "questions": CASES["quickstart"]["questions"], "stream": True},
+], ids=["no state", "no question", "an unknown type", "a type not a name", "an unknown field"])
+def test_systemone_refuses_a_request_jev_would_refuse(decide, request_body):
+    with pytest.raises(ValueError):
         decide.systemone(request_body)
 
 

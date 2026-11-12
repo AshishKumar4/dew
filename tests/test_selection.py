@@ -15,11 +15,15 @@ class Call:
     rows: int
 
 
+class Unplanned(AssertionError):
+    """`planned` asked to plan a call it has no plan for: run past the requirement that refused it."""
+
+
 def planned(call: Call) -> Refusal | None:
     """A requirement that plans the call its predecessor admits: a call of more than four rows, which the
     'rows' requirement refuses, has no plan (the GEMM's split derivation past `rows`)."""
     if call.rows > 4:
-        raise AssertionError(f"planned a call of {call.rows} rows, which 'rows' refused")
+        raise Unplanned(f"planned a call of {call.rows} rows, which 'rows' refused")
     return None
 
 
@@ -46,7 +50,7 @@ def test_a_forced_kernel_raises_its_first_refusal_and_names_the_rest_on_request(
     with pytest.raises(KernelRefused) as refused:
         select(op(ROWS, PLANNED), Call(8), named='template')
     assert refused.value.first.code == 'rows'
-    with pytest.raises(AssertionError, match="planned a call of 8 rows"):
+    with pytest.raises(Unplanned):
         _ = refused.value.refusals
     with pytest.raises(KernelRefused) as refused:
         select(op(ROWS, WIDE), Call(8), named='template')

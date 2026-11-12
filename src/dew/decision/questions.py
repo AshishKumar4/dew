@@ -47,7 +47,7 @@ class Question(ABC):
 
     @classmethod
     @abstractmethod
-    def from_criteria(cls, instructions: JSON, criteria: object) -> "Question":
+    def from_criteria(cls, instructions: JSON, criteria: list[JSON] | dict[str, JSON] | None) -> "Question":
         """The question of this type with `instructions` and the `criteria` a Jev request gives it."""
 
     def wire(self) -> dict[str, JSON]:
@@ -70,8 +70,10 @@ class Question(ABC):
         kinds = {question.kind: question for question in KINDS}
         if kind not in kinds:
             raise ValueError(f"a question's type is {', '.join(sorted(kinds))}, got {kind!r}")
-        return kinds[kind].from_criteria(json_value(request.get("instructions"), "instructions"),
-                                         request.get("criteria"))
+        criteria = json_value(request.get("criteria"), "criteria")
+        if isinstance(criteria, bool | int | float | str):
+            raise ValueError(f"a question's criteria are a record, a list or none, got {criteria!r}")
+        return kinds[kind].from_criteria(json_value(request.get("instructions"), "instructions"), criteria)
 
     def index(self, label: object) -> int:
         """Return the position of the option that `label` names, given as its key or as an int index."""
@@ -120,7 +122,7 @@ class Noul(Question):
         return dict(self.criteria) if self.criteria else None
 
     @classmethod
-    def from_criteria(cls, instructions: JSON, criteria: object) -> "Noul":
+    def from_criteria(cls, instructions: JSON, criteria: list[JSON] | dict[str, JSON] | None) -> "Noul":
         return cls(instructions, {} if criteria is None else {
             key: json_value(value, f"criteria.{key}") for key, value in record(criteria, "criteria").items()})
 
@@ -172,7 +174,7 @@ class Choice(Question):
         return dict(zip(self.options, self.descriptions, strict=True))
 
     @classmethod
-    def from_criteria(cls, instructions: JSON, criteria: object) -> "Choice":
+    def from_criteria(cls, instructions: JSON, criteria: list[JSON] | dict[str, JSON] | None) -> "Choice":
         if isinstance(criteria, (list, tuple)):
             return cls(instructions, strings(criteria, "criteria"))
         return cls(instructions, {key: json_value(value, f"criteria.{key}")
@@ -218,7 +220,7 @@ class Score(Question):
         return list(self.descriptions)
 
     @classmethod
-    def from_criteria(cls, instructions: JSON, criteria: object) -> "Score":
+    def from_criteria(cls, instructions: JSON, criteria: list[JSON] | dict[str, JSON] | None) -> "Score":
         if not isinstance(criteria, (list, tuple)):
             raise ValueError("a score's criteria are a list of level descriptions, lowest first")
         return cls(instructions, [json_value(level, "criteria") for level in criteria])

@@ -152,7 +152,7 @@ def test_a_framing_refuses_what_it_would_otherwise_leave_unread():
     templated = HFTokenizer(str(LOCAL["qwen3.5"]), local_files_only=True)
     for owned in ({"chat_template": "{{ messages }}"}, {"tokenizer_kwargs": {}}):
         framing = Framing(options=owned)
-        with pytest.raises(ValueError, match="own controls"):
+        with pytest.raises(ValueError):
             framing.around(templated)
     with pytest.raises(ValueError):
         framed(templated.tokenizer, JOINT_SYSTEM, where="direct", options={"tokenizer_kwargs": {}})

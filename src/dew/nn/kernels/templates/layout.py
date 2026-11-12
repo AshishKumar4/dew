@@ -128,9 +128,18 @@ def _transpose(eqn, operand, **params):
     return eqn.primitive.bind(operand, **params)
 
 
+def _program(eqn, read=called) -> jax_core.Jaxpr:
+    """The program a call `eqn` runs on its operands one for one (`read`: `called`, or `purely_called` for a
+    call that does nothing else), refused where it runs none so."""
+    program = read(eqn)
+    if program is None:
+        raise Untransposable(f"a {eqn.primitive.name} whose program is not run on its operands one for one")
+    return program
+
+
 def _call(eqn, *operands, **params):
     # A nested program (`jit`, a call that only runs it), taken axis for axis.
-    closed = purely_called(eqn)
+    closed = _program(eqn, purely_called)
     return _run(closed.jaxpr, closed.consts, operands)
 
 
@@ -147,8 +156,9 @@ def _custom(eqn, *operands, **params):
 
     floating = [index for index, aval in enumerate(traced)
                 if jax.numpy.issubdtype(aval.dtype, jax.numpy.inexact)]
+    primal = _program(eqn)
     if eqn.primitive is jax_core.primitives.custom_jvp_call_p:
-        return _held_jvp(called(eqn), call, traced, floating)(*operands)
+        return _held_jvp(primal, call, traced, floating)(*operands)
 
     def pulled(*values_and_cotangents):
         values, given = values_and_cotangents[:len(traced)], values_and_cotangents[len(traced):]
@@ -158,7 +168,7 @@ def _custom(eqn, *operands, **params):
         return pull(list(given))
 
     shapes = {aval.shape for aval in (*traced, *cotangents)} - {()}
-    primal, pullback = called(eqn), jax.make_jaxpr(pulled)(*traced, *cotangents)
+    pullback = jax.make_jaxpr(pulled)(*traced, *cotangents)
     if len(shapes) > 1 or not all(_axis_free(program.jaxpr, *shapes) and not _tiles_in(program)
                                   for program in (primal, pullback)):
         raise Untransposable(f"a {eqn.primitive.name} whose program or derivative reads an axis or a "

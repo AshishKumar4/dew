@@ -328,6 +328,8 @@ def _backward_walk(piece: _Piece, dy_ref, outs, exchanged, *, head: int | None, 
     held = [piece.read(last - count + 2 + j) for j in range(count - 1)]
     carry = (held, [zero] * (count - 1), [jnp.int32(-2)] * (count - 1), [(zero, zero)] * (count + 1))
     *_, sums = lax.fori_loop(0, steps // unrolled, turn, carry)
+    # Each compensated sum's two halves added once, as it is stored.
+    totals = [high + low for high, low in sums]
     for tap in range(count):
-        plgpu.store(dw_ref.at[piece.row, block, tap, piece.columns], sum(sums[tap]), optimized=False)
-    plgpu.store(db_ref.at[piece.row, block, piece.columns], sum(sums[count]), optimized=False)
+        plgpu.store(dw_ref.at[piece.row, block, tap, piece.columns], totals[tap], optimized=False)
+    plgpu.store(db_ref.at[piece.row, block, piece.columns], totals[count], optimized=False)
