@@ -344,6 +344,17 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """Why the launch takes no call of `ba` on `family`, or None (`refused`)."""
         raise NotImplementedError
 
+    def resident(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> int:
+        """The programs of its launch at `config` a multiprocessor holds at once: its family's residency at
+        its registers (`Family.programs`) and its shared memory's, each program's reservation its own
+        (`resources.shared_programs`); one at the least, a legal config's."""
+        family = bundle_of(config, ba.arguments["query"].dtype)
+        resident = family.programs(config.consumers, self.registers(ba, config))
+        if target.shared_limit:
+            staged = self.staged_bytes(ba, config, target)
+            resident = max(1, resources.shared_programs(resident, staged, target.shared_limit))
+        return resident
+
 
 @dataclasses.dataclass(frozen=True)
 class MosaicForward(_Mainloop[Tiles]):
@@ -493,17 +504,6 @@ class MosaicForward(_Mainloop[Tiles]):
         page = _page(ba)
         return page is None or all(_pages_hold(page, tile, family) for tile in tiles)
 
-    def resident(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
-        """The programs of its launch at `config` a multiprocessor holds at once: its family's residency at
-        its registers (`Family.programs`) and its shared memory's, each program's reservation its own
-        (`resources.shared_programs`); one at the least, a legal config's."""
-        family = bundle_of(config, ba.arguments["query"].dtype)
-        resident = family.programs(config.consumers, self.registers(ba, config))
-        if target.shared_limit:
-            staged = self.staged_bytes(ba, config, target)
-            resident = max(1, resources.shared_programs(resident, staged, target.shared_limit))
-        return resident
-
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
         """Its tiles from the facts (`_derived`): each consumer a unit of queries, the key tile the largest
         its registers and the block hold, two stages; the family's consumers taking turns, a step's softmax
@@ -538,9 +538,9 @@ class MosaicForward(_Mainloop[Tiles]):
         """`config` for a call whose walk the device's memory bounds (`streams`), its key tile the least its
         ring still streams at: a program pays its ring's first `stages` tiles before its first product, and
         a launch of more programs than the device runs at once pays it a program, so the least tile pays
-        least, where its resident programs' `stages` slots hold the bytes a multiprocessor's share of the
-        device's stream keeps in flight (`GpuTarget.memory_rate` over its multiprocessors, for the part's
-        measured `Measured.fixed`):
+        least, where its resident programs' rings in flight (`_staged_keys`) hold the bytes a
+        multiprocessor's share of the device's stream keeps in flight (`GpuTarget.memory_rate` over its
+        multiprocessors, for the part's measured `Measured.fixed`):
         a decode step of 128 rows over 4096 keys took 0.70 ms at 64-key tiles against 0.73 at 128 on an
         H100, and of 32 over 32768 1.35 against 1.38, its 128-wide K and V 32 KB a stage, two of them past
         the 45 KB a program keeps in flight (ET-STAGES2-h100).
@@ -591,13 +591,16 @@ class MosaicForward(_Mainloop[Tiles]):
         return rate / target.multiprocessors * fixed
 
     def _staged_keys(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
-        """The bytes of keys and values a program's ring stages at `config`: its `stages` key tiles' rows of
-        both, at the widths its family stages them (`_width`)."""
+        """The bytes of keys and values a program's ring keeps in flight at `config`: its key tiles' rows of
+        both, at the widths its family stages them (`_width`), in every slot but the one its walk reads
+        while the others load (`stages - 1`): counted at all `stages`, an H100's decode step at 8 rows over
+        32768 keys, width 64, was cut into slices of two programs a multiprocessor and streamed 69% of the
+        device's memory rate where cuDNN's streamed 89% (232 against 181 us, M-ET-49b-h100)."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         family = bundle_of(config, query.dtype)
         itemsize = jnp.dtype(query.dtype).itemsize
         per_key = sum(_width(array.shape[3], family, query.dtype) for array in (query, value)) * itemsize
-        return config.stages * config.block_k * per_key
+        return max(1, config.stages - 1) * config.block_k * per_key
 
     def _relaunched(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
                     ) -> Tiles | None:
@@ -1171,18 +1174,25 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # score products once a share, where fewer rows keep the work and halve the tile (an A100's
         # bf16 backward 128 wide at 32 x 32 whole took 0.82 to 0.88 of 64 x 64 in two shares, 1 x 8192
         # causal 36.1 against 41.7 ms; M-ET-29b, W91-a100).
-        for columns in (1, 2, 4):
-            for rows in (None, *(fewer_rows(family) if self.score_mod is None else ())):
-                walks = extents if rows is None else functools.partial(_sides, rows)
-                for staged in (False, True):
-                    def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
-                              ) -> BackwardTiles:
-                        return BackwardTiles(walked, rows, 2, consumers, family=family.name, columns=columns,
-                                             staged_logits=staged, **dkv)
+        # Where its family's products complete before the next issues (mma.sync's, `products_overlap`), the
+        # largest tile a multiprocessor holds two programs of first, one program's warps issuing under the
+        # other's products (an A100's step at Qwen3-8B's heads, causal 2 x 8192: 32 x 32 at two programs
+        # 56.65 ms against 64 x 32 at one 69.06, 2 x 2048 over 128 heads 17.43 against 20.33, M-ET-56).
+        residing = [] if family.products_overlap else [
+            lambda config: fits(config) and self.resident(ba, config, target) >= 2]
+        for wanted in (*residing, fits):
+            for columns in (1, 2, 4):
+                for rows in (None, *(fewer_rows(family) if self.score_mod is None else ())):
+                    walks = extents if rows is None else functools.partial(_sides, rows)
+                    for staged in (False, True):
+                        def tiles(rows: int, walked: int, consumers: int, columns=columns, staged=staged
+                                  ) -> BackwardTiles:
+                            return BackwardTiles(walked, rows, 2, consumers, family=family.name,
+                                                 columns=columns, staged_logits=staged, **dkv)
 
-                    if config := derive(family, query.dtype, key.shape[1], query.shape[1], tiles, fits,
-                                          overlapped=False, walks=walks, rows=rows):
-                        return config
+                        if config := derive(family, query.dtype, key.shape[1], query.shape[1], tiles, wanted,
+                                              overlapped=False, walks=walks, rows=rows):
+                            return config
         return None
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
