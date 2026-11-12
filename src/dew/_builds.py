@@ -18,6 +18,18 @@ the kernel driver's major gives. docs/installation.md, "Which CUDA build",
 states the rule; site/scripts/gen_install.py generates the standalone install
 script's minima from this table."""
 
+TENSOR_MEMORY_SMS = (10, 11)
+"""The SM majors whose GPUs hold tensor memory (PTX ISA, tcgen05: sm_100a and sm_103a, a B200 and B300, and
+sm_110a): Dew's Blackwell kernels allocate it."""
+
+LEAST_CUBLAS_BESIDE_TENSOR_MEMORY = (13, 2)
+"""The least cuBLAS a GPU holding tensor memory runs Dew under: below it many cuBLAS kernels free their tensor
+memory twice, so a kernel beside one, as a Mosaic launch overlaps the kernel before it (programmatic dependent
+launch, its tensor memory allocated before its wait), can have its tensor memory taken or its allocation
+stranded: a silent wrong result or a hang (JAX's CUDA plugin warns of it at start; a B200 run under cuBLAS
+12.9.2 hung at its 97th step, ledger 5671). cuBLAS's major is its CUDA build's, so no cuda12 build runs on
+one."""
+
 PACKAGE_INDEX = "https://pypi.dewml.dev/simple"
 """Dew's package index, the one place Dew's JAX build (pyproject.toml's jax
 requirement) is served; every install names it as an extra index beside
@@ -45,11 +57,14 @@ def runs_on(build: str, driver: str, sm: tuple[int, int], cuda: int | None = Non
     """Whether JAX's `build` runs on a driver of version `driver` (`580.82.07`)
     and GPUs whose least SM is `sm` (`CUDA_BUILDS`): by the CUDA version the
     user-mode driver reports (`cuda`), where the caller can ask it, else by the
-    kernel driver's major."""
+    kernel driver's major; on a GPU holding tensor memory, only a build whose
+    cuBLAS can be 13.2 or newer (`LEAST_CUBLAS_BESIDE_TENSOR_MEMORY`). The least
+    SM is the GPUs' oldest, but a machine's GPUs are one model."""
     least, least_sm, least_cuda = next((major, s, version) for name, major, s, version in CUDA_BUILDS
                                        if name == build)
     supported = int(driver.split(".")[0]) >= least if cuda is None else cuda >= least_cuda
-    return supported and sm >= least_sm
+    cublas = least_cuda // 1000 >= LEAST_CUBLAS_BESIDE_TENSOR_MEMORY[0] or sm[0] not in TENSOR_MEMORY_SMS
+    return supported and sm >= least_sm and cublas
 
 
 def newest_build(gpus: tuple[str, tuple[int, int]] | None, cuda: int | None = None) -> str | None:

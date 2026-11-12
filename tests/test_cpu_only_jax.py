@@ -267,3 +267,26 @@ def test_an_application_that_routes_dews_records_receives_them_through_its_handl
     done = subprocess.run([sys.executable, "-c", ROUTED], capture_output=True, text=True, timeout=300,
                           cwd=tests, env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path})
     assert done.returncode == 0, done.stderr[-2000:]
+
+
+class _Device:
+    """A device as JAX lists one: its platform and kind."""
+
+    def __init__(self, platform: str, device_kind: str):
+        self.platform, self.device_kind = platform, device_kind
+
+
+@pytest.mark.parametrize(("kinds", "cublas", "refused"), [
+    (["NVIDIA B200"], 120902, True), (["NVIDIA B200"], 130100, True), (["NVIDIA B200"], 130200, False),
+    (["NVIDIA B200"], 130801, False), (["NVIDIA RTX PRO 6000 Blackwell Server Edition"], 120902, False),
+    (["NVIDIA H100 80GB HBM3"], 120902, False), (["NVIDIA H100 80GB HBM3", "NVIDIA B200"], 120902, True),
+    (["NVIDIA B200"], None, False)])
+def test_a_run_refuses_gpus_holding_tensor_memory_under_a_cublas_that_frees_it_twice(kinds, cublas, refused):
+    """A run's start (`dew._devices.unsafe_cublas`, over the devices JAX opened) refuses any GPU whose own
+    architecture holds tensor memory (a B200's) under a cuBLAS below 13.2, and passes it under 13.2 or newer;
+    GPUs without tensor memory (an RTX PRO 6000, an H100) pass under either, and a host with a B200 among
+    them is refused (ledger 5671); a process with no CUDA plugin selected no cuBLAS."""
+    from dew._devices import unsafe_cublas
+
+    devices = [_Device("gpu", kind) for kind in kinds] + [_Device("cpu", "cpu")]
+    assert (unsafe_cublas(devices, cublas, "570.124.06") is not None) == refused

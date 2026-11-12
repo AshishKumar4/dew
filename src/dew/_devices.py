@@ -17,7 +17,15 @@ import shutil
 import sys
 from collections.abc import Callable, Mapping, Sequence
 
-from dew._builds import CUDA_BUILDS, PACKAGE_INDEX, QUERY, listed_gpus, newest_build, runs_on
+from dew._builds import (
+    CUDA_BUILDS,
+    LEAST_CUBLAS_BESIDE_TENSOR_MEMORY,
+    PACKAGE_INDEX,
+    QUERY,
+    listed_gpus,
+    newest_build,
+    runs_on,
+)
 from dew._pool import answered, cuda_driver, runs_on_gpu
 
 _log = logging.getLogger(__name__)
@@ -394,6 +402,56 @@ def refuse_cpu_only_jax() -> None:
         f"This machine has an NVIDIA GPU (driver {gpus[0]}), and JAX opened with no GPU beside a CUDA "
         f"build that runs on it: {jax.devices()}. Read the CUDA plugin's warning above, or set "
         "JAX_PLATFORMS=cuda to see why it failed; to run on the CPU instead, set JAX_PLATFORMS=cpu."))
+
+
+def cublas_version() -> int | None:
+    """The version of the cuBLAS JAX's CUDA plugin selects (`cublasGetVersion`, 12.9.2 as 120902), asked of
+    the plugin's own version reader, which loads the library as the plugin does, before any program uses
+    it; None where no CUDA plugin is installed."""
+    for build in cuda_builds():
+        reader = importlib.import_module(f"jax_{build}_plugin._versions")
+        return reader.cublas_get_version()
+    return None
+
+
+def unsafe_cublas(devices: Sequence, cublas: int | None, driver: str | None) -> str | None:
+    """Why a process may not run its GPUs (`devices`, JAX's) under the cuBLAS it selected (`cublas`), with
+    what runs there; None where it may: any whose architecture holds tensor memory (its own target's
+    `tmem_columns`, `dew.nn.kernels.generation`) is refused under a cuBLAS below 13.2
+    (`dew._builds.LEAST_CUBLAS_BESIDE_TENSOR_MEMORY`)."""
+    major, minor = LEAST_CUBLAS_BESIDE_TENSOR_MEMORY
+    if cublas is None or cublas >= major * 10000 + minor * 100:
+        return None
+    from dew.nn.kernels import generation
+
+    holding = sorted({device.device_kind for device in devices if device.platform == "gpu"
+                      and generation.gpu_target(device.device_kind).architecture.tmem_columns})
+    if not holding:
+        return None
+    driver_least = next(least for name, least, _, _ in CUDA_BUILDS if name == "cuda13")
+    install = f'uv pip install --extra-index-url {PACKAGE_INDEX} "dewml[cuda13]"'
+    found = f" (this one is {driver})" if driver else ""
+    loaded = f"{cublas // 10000}.{cublas // 100 % 100}.{cublas % 100}"
+    return (f"{', '.join(holding)} holds tensor memory, and this process selected cuBLAS {loaded}: below "
+            f"{major}.{minor}, cuBLAS kernels free their tensor memory twice, which corrupts or hangs a "
+            "kernel running beside one, as Dew's kernels on it do. Run JAX's cuda13 build, which needs an "
+            f"NVIDIA driver of {driver_least} or newer{found}: {install}.")
+
+
+class UnsafeCublas(RuntimeError):
+    """A GPU holding tensor memory under a cuBLAS that frees it twice (`refuse_unsafe_cublas`)."""
+
+
+def refuse_unsafe_cublas() -> None:
+    """Stop a process whose JAX opened a GPU holding tensor memory under a cuBLAS below 13.2
+    (`unsafe_cublas`), where a cuBLAS kernel can corrupt or strand the tensor memory of a kernel beside it.
+    It reads the devices JAX opened, as `refuse_cpu_only_jax` does, and asks with it."""
+    import jax
+
+    listed = nvidia_gpus()
+    refusal = unsafe_cublas(jax.devices(), cublas_version(), listed[0] if listed else None)
+    if refusal:
+        raise UnsafeCublas(refusal)
 
 
 def deterministic_ops_requested() -> bool:
