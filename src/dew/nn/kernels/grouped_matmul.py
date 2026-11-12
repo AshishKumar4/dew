@@ -794,10 +794,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def _fp8(self, ba, dtype, family: mosaic.Family) -> bool:
         """Whether an FP8 call (`product.eight`) runs here: a forward product on warpgroup MMA, its matrix
-        K-major (`trans_rhs`, as Hopper's FP8 tensor cores read both operands; an N-major FP8 matrix is
-        refused, row 3620), with no hook, its running sum promoted every step (`exact_sums`)."""
+        streamed K-major (`_streamed_matrix`: as Hopper's FP8 tensor cores read both operands), with no hook,
+        its running sum promoted every step (`exact_sums`)."""
         return (jnp.dtype(dtype) in family.fp8_formats and self.FP8
-                and ba.arguments['trans_rhs']
                 and ba.arguments['hooks'] == NO_HOOKS and ba.arguments.get('paired') is None
                 and bool(ba.arguments.get('exact_sums')))
 
@@ -1227,8 +1226,9 @@ class MosaicGmm(_Mosaic):
                 or self._swapped(ba, generation.gpu_target()) is not None):
             return False, False
         tokens, kernel, hooks = ba.arguments['tokens'], ba.arguments['kernel'], ba.arguments['hooks']
-        trans_rhs = ba.arguments['trans_rhs']
-        depth, width = (kernel.shape[2], kernel.shape[1]) if trans_rhs else kernel.shape[1:]
+        depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
+        # The matrix as its stream reads it (`_matrix_transposed`): its rows run along the depth or the width.
+        trans_rhs = self._matrix_transposed(ba)
 
         def rows_of(extent: int, *dtypes) -> bool:
             # A call no narrower than a swizzled tile (`mosaic_gpu.partial_step`), which its last tile
@@ -1461,11 +1461,18 @@ class MosaicGmm(_Mosaic):
 
     def _streamed_matrix(self, kernel, trans_rhs: bool) -> tuple:
         """The matrix the mainloop streams, whether its blocks lie transposed, and the format operands its
-        stages take besides (`mosaic_gpu.gmm`'s): the call's own matrix, as it lies, none."""
+        stages take besides (`mosaic_gpu.gmm`'s): the call's own matrix, as it lies, none; an N-major FP8
+        matrix transposed by XLA to the K-major one Hopper's FP8 tensor cores read (no TMA or wgmma
+        transposes an 8-bit block), a copy of the matrix a call, where the grouped FP8 forward otherwise had
+        no launch but XLA's, 40.0 ms against Triton's broken lowering at an H100's refused-call shape
+        (GH200-EM-8c-TRITON)."""
+        if eight(kernel.dtype) and not trans_rhs:
+            return jnp.swapaxes(kernel, 1, 2), True, {}
         return kernel, trans_rhs, {}
 
     def _matrix_transposed(self, ba) -> bool:
-        return self._streamed_matrix(ba.arguments['kernel'], ba.arguments['trans_rhs'])[1]
+        # Read from the binding's facts alone, which a derivation binds abstract (`_streamed_matrix`).
+        return bool(ba.arguments['trans_rhs']) or eight(ba.arguments['kernel'].dtype)
 
     def _launched_call(self, tokens, kernel, sizes, prologue_operands, epilogue_operands, paired, first,
                        gather, scatter, *, out_dtype: str, trans_rhs: bool, interpret: bool, hooks: Hooks,
