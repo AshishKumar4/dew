@@ -6,9 +6,9 @@ A group `start`ed has a lifeline (`lifeline`) as well: this module run in a sess
 holds the read end of a pipe whose write end only the owner holds and kills the group once that pipe
 closes, as it does when the owner dies however it dies (a SIGKILL, a SIGTERM that unwinds no `with`)
 or stops the group (`stop`). A group that ends on its own, its leader's or the last process its leader
-left, ends its lifeline, which then kills nothing: its id is free for another process. The group stays in a session of its own, so a rank's cleanup
-signals its own (the maintainer, 2026-10-28: a worker outlived its killed owner 43 hours at 195% CPU on
-the VM). The standard library alone: the CI harness loads this file by path (tools/armada/child_groups.py),
+left, ends its lifeline, which then kills nothing: its id is free for another process. The group stays in
+a session of its own, so a rank's cleanup signals its own (the maintainer, 2026-10-28: a worker outlived its
+killed owner 43 hours at 195% CPU on the VM). The standard library alone: the CI harness loads this file by path (tools/armada/child_groups.py),
 as importing `dew` sets the process's XLA flags."""
 
 import contextlib
@@ -401,20 +401,37 @@ RESCAN_SECONDS = 1.0
 without `os.pidfd_open`)."""
 
 
+PIDFD = getattr(os, "pidfd_open", None)
+"""Opens a descriptor of a process, readable when it ends (Linux's); None on a system or a Python build without
+it, where a lifeline reads its group again each `RESCAN_SECONDS` instead."""
+
+
+def _grouped(pid: int, group: int) -> bool:
+    """Whether process `pid` is there and of process group `group`."""
+    try:
+        return os.getpgid(pid) == group
+    except ProcessLookupError:
+        return False
+
+
+def _opened(pid: int) -> list[int]:
+    """A descriptor of process `pid`, readable when it ends (`PIDFD`); none where the process is gone."""
+    try:
+        return [PIDFD(pid)]
+    except ProcessLookupError:
+        return []
+
+
 def _watched(pid: int, group: int) -> int | None:
     """A descriptor of process `pid`, readable when it ends, where it is a process of `group`: asked after the
     descriptor is open, so the answer is of the process the descriptor holds. None where it is gone, is
-    another group's (its number taken again), or this Python opens no such descriptor."""
-    try:
-        found = os.pidfd_open(pid)
-    except (AttributeError, ProcessLookupError):
+    another group's (its number taken again), or no such descriptor can be opened here (`PIDFD`)."""
+    if PIDFD is None:
         return None
-    try:
-        if os.getpgid(pid) == group:
+    for found in _opened(pid):
+        if _grouped(pid, group):
             return found
-    except ProcessLookupError:
-        pass
-    os.close(found)
+        os.close(found)
     return None
 
 
