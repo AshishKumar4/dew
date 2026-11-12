@@ -175,6 +175,7 @@ host = _loaded(HERE / "host.py")
 stalls = _loaded(HERE / "stalls.py")
 costs = _loaded(HERE / "costs.py")
 cuts = _loaded(HERE / "cuts.py")
+partition = _loaded(HERE / "partition.py")
 command_line = _loaded(HERE / "arguments.py")
 rows = _loaded(HERE / "rows.py")
 row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
@@ -2403,6 +2404,14 @@ def main() -> int:
         return flagged(args.verdict, args.new)
     if args.operation in ("release-plan", "release"):
         return releasing(args)
+    if args.operation == "partition":
+        nodes = partition.collected(line for listed in args.collected
+                                    for line in listed.read_text().splitlines())
+        wrong = partition.compared(nodes, json.loads(args.verdict.read_text())["rows"], PYTHONS[0], SKIPPED)
+        print(f"{sum(map(len, nodes.values()))} tests of {len(nodes)} files collected: "
+              + ("each in one row" if not wrong else f"{len(wrong)} lines of rows that are not their tests"),
+              *wrong, sep="\n")
+        return 1 if wrong or not nodes else 0
     if args.operation == "durations":
         target = json.loads(Path(".armada.json").read_text())["target"]
         before = durations_record()

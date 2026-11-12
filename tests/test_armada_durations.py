@@ -128,6 +128,34 @@ def test_a_recorded_test_the_file_no_longer_defines_cuts_it_into_no_group(ci, tm
     assert all(members)
 
 
+def test_a_whole_verdict_whose_rows_are_not_its_files_collected_tests_is_named(
+        ci, tmp_path, monkeypatch, capsys):
+    """`ci.py partition VERDICT COLLECTED...`: a whole run's rows on the floor Python against what pytest
+    collects: green where each collected test is in one row (a split file's groups and a site's judge
+    together, a file CI runs apart left out), and exit 1 naming the file and the tests where one is in no row,
+    in two, or in a row and not collected."""
+    listed = tmp_path / "collected.txt"
+    listed.write_text("tests/test_a.py::test_one\ntests/test_a.py::test_two[x]\ntests/test_b.py::test_site\n"
+                      "tests/test_gen_api.py::test_apart\n\n3 tests collected in 1.0s\n")
+
+    def judged(rows: list[dict]) -> tuple[int, list[str]]:
+        (tmp_path / "verdict.json").write_text(json.dumps({"rows": rows}))
+        monkeypatch.setattr(sys, "argv", ["ci.py", "partition", str(tmp_path / "verdict.json"), str(listed)])
+        return ci.main(), capsys.readouterr().out.splitlines()[1:]
+
+    whole = [{"name": "3.12:tests/test_a.py#1/2", "tests": {"tests/test_a.py::test_one": 1.0}},
+             {"name": "3.12:tests/test_a.py#2/2", "tests": {"tests/test_a.py::test_two[x]": 1.0}},
+             {"name": "3.12:tests/test_b.py#test_site", "tests": {"tests/test_b.py::test_site": 9.0}},
+             {"name": "3.14:tests/test_a.py", "tests": {"tests/test_a.py::test_one": 1.0}},
+             {"name": "3.12-test_b-0123456789ab-draws-0-8"}]
+    assert judged(whole) == (0, [])
+    assert judged([whole[0], whole[0], *whole[2:], {"name": "3.12:tests/test_c.py", "tests": {
+        "tests/test_c.py::test_gone": 1.0}}]) == (1, [
+            "tests/test_a.py: 1 of its 2 tests collected and in no row: test_two[x]",
+            "tests/test_a.py: 1 of its 2 tests in two rows: test_one",
+            "tests/test_c.py: 1 of its 0 tests in a row and not collected: test_gone"])
+
+
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
     """Each task of a split file runs its own group (split.py) of the same
     cut, so the groups together run every test, none twice, a test the
