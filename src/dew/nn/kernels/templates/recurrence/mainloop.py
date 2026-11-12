@@ -787,6 +787,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     `Tiles.walkers`) holds each staging and landing tile once a role, along a leading axis a role indexes
     (`role_tiles`): one role's products' tiles are no other's to write while its products read them."""
     family = call.family
+    if persistent and os.environ.get("DBG_PRODUCER32"):
+        producer = 32
     registers = held.registers(family, addressed(staging, landing or {}))
     allocations, scope, staging, landing = shared_allocation(call, blocks, staging, landing or {}, once=once,
                                                              consumers=consumers, swizzles=swizzles,
