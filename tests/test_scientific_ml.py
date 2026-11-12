@@ -439,16 +439,11 @@ def test_a_gauss_newton_window_the_stream_ends_inside_commits_a_solve_of_the_row
     y = generator.normal(size=40).astype(np.float32)
 
     def trained(count: int) -> np.ndarray:
-        from affine_run import dataset
-
-        def stream():
-            # A stream that ends after `count` rows, eight a microbatch.
-            return iter([{"x": x[start:start + 8], "y": y[start:start + 8]} for start in range(0, count, 8)])
-
+        rows = Memory([{"x": row, "y": target} for row, target in zip(x[:count], y[:count], strict=True)])
         trainer = Trainer(LeastSquares(features), gauss_newton(damping=1e-6), key=0, layout=LAYOUT,
                           accumulation=4)
-        # A run longer than the stream, which ends it inside the second window where it holds a fifth.
-        state = trainer.fit(dataset(stream, batch=8), steps=8)
+        # A run of its `count` examples, streamed: its stream ends inside the second window, holding a fifth.
+        state = trainer.fit(rows.read("streamed").batch(8), examples=count)
         assert int(state.updates) == -(-count // 32)
         return np.asarray(state.variables["params"]["Dense_0"]["kernel"])[:, 0]
 
