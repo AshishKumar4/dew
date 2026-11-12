@@ -102,6 +102,47 @@ def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
                     truth_fn=jax.jit(whole_step(wide, widened(layered))))
 
 
+SHARED_SEEDS = 64
+"""Check 1's declared seeds for a shared input's gradient through a run updating in its backward."""
+
+
+def test_what_every_layer_of_a_run_updating_in_its_backward_reads_takes_its_layers_gradient():
+    """A floating array every layer of a run updating in its backward reads beside its residual (a
+    cross-attention's context, which a trainable encoder computes upstream) takes the sum of the layers'
+    cotangents, the gradient an ordinary scan of the same layers gives it, on par (check 1, truth float64):
+    the run's rule gave it none, so whatever computed it never trained (audit3 nn-core P1)."""
+    from dew.nn import in_backward
+
+    def update(path, index, gradient, weights, moments):
+        return jax.tree.map(lambda w, g: w - 0.5 * g, weights, gradient), {}
+
+    def layer(weights, x, key, context):
+        return jnp.tanh(x @ weights["kernel"] + context)
+
+    def through_run(kernel, x, context):
+        norms = {"sumsq": jnp.zeros((3,), kernel.dtype), "nonfinite": jnp.zeros((3,), kernel.dtype)}
+        with in_backward.planned(in_backward.InBackward(update=update, moments=())):
+            y = in_backward.scanned_run(("layers_0_2",), layer, {"kernel": kernel}, None, {}, norms, x, None,
+                                        (context,))
+        return jnp.sum(y ** 2)
+
+    def through_scan(kernel, x, context):
+        y, _ = jax.lax.scan(lambda x, w: (layer({"kernel": w}, x, None, context), None), x, kernel)
+        return jnp.sum(y ** 2)
+
+    def draw(seed):
+        kernel, x, context = (jax.random.normal(key, shape) * scale for key, shape, scale in zip(
+            jax.random.split(jax.random.key(seed), 3), ((3, 4, 4), (2, 4), (2, 4)), (0.5, 1.0, 0.3),
+            strict=True))
+        return kernel, x, context
+
+    def gradient(loss):
+        return jax.jit(lambda kernel, x, context: jax.grad(loss, argnums=2)(kernel, x, context))
+
+    assert_as_exact(gradient(through_run), gradient(through_scan), draw, "a shared input's gradient",
+                    seeds=SHARED_SEEDS)
+
+
 EIGHT_BIT = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8")
 """Adamw keeping its moments in 8 bits (`OptimConfig.state_dtype`), codes and their blocks' scales no
 backward writes as a float cotangent: its step takes the whole gradient first."""
