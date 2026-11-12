@@ -10,6 +10,7 @@ import functools
 import hashlib
 import importlib.util
 import json
+import os
 import types
 from pathlib import Path
 
@@ -222,8 +223,11 @@ def looked_up(looked: Path) -> bytes:
         return b"missing"
     # The name first: whether an entry is a build's output walks into a directory, and a search's directory
     # holds hundreds of other names (2026-11-12: 47 million entries examined for a task's 156,000 lookups).
-    found = sorted(entry.name for entry in directory.iterdir() if (
-        entry.name == looked.name or entry.name.startswith(f"{looked.name}.")) and not built(entry))
+    # Its names are read as text: a path made of each was most of what the name-first search still took (284
+    # of a test's 336 s under a profile, 165 s of them making the paths).
+    name, dotted = looked.name, f"{looked.name}."
+    found = sorted(entry for entry in os.listdir(directory)
+                   if (entry == name or entry.startswith(dotted)) and not built(directory / entry))
     if looked.is_dir() and not looked.is_symlink():
         found += sorted(f"{looked.name}/{entry.name}" for entry in looked.iterdir()
                         if entry.name.partition(".")[0] == "__init__" and not built(entry))
