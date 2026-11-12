@@ -526,6 +526,26 @@ def set_key(digest: str) -> str:
     return f"{CACHE_PREFIX}-set/{digest}"
 
 
+def reds_key(python: str, row_name: str, held: str, common: str) -> str:
+    """Where the count of row `row_name`'s red runs on class `held` on shared inputs `common` is (`reds`)."""
+    return f"{CACHE_PREFIX}-reds/{python}/{common[:16]}/{row_place(row_name, held)}"
+
+
+def reds(python: str, row_name: str, held: str, common: str, token: str) -> int:
+    """How many red runs row `row_name` has had on class `held` on these shared inputs (`reds_key`). A green
+    run records the count it read (`record`), and is reused only while the count stands (`standing`): a red
+    run of the row, whatever set it executed and whatever tree it ran on, revokes every green run recorded
+    before it, so no lookup by another executed set, no plan's kept token and no set published again brings
+    one back (review, 2026-11-12: a flaky red's set differs from its green's, so its own key revoked nothing).
+    """
+    return int((recorded(reds_key(python, row_name, held, common), token) or {}).get("reds", 0))
+
+
+def standing(found: dict, count: int) -> bool:
+    """Whether green record `found` was recorded after the row's last red run (`reds`)."""
+    return int(found.get("reds", 0)) == count
+
+
 @functools.lru_cache(maxsize=1024)
 def executed_set(digest: str, token: str) -> tuple[str, ...] | None:
     """The inputs of the executed set of digest `digest` (`set_key`), read once a process however many rows
@@ -733,15 +753,16 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
     place = row(python, name, split)
     for each in classes:
         tried: set[str] = set()
+        count = reds(python, place, each, common, token)
         found = recorded(record_key(python, place, each, common), token)
         if found is not None and found["depends"] is not None:
             # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of
             # exactly these, kept by that key (`green_key`) whatever ran since.
             key = cache_key(common, name, split, found["depends"], reading)
-            if found["key"] is not None and found["key"] == key:
+            if found["key"] is not None and found["key"] == key and standing(found, count):
                 return found, each
             kept = recorded(green_key(python, place, each, key), token)
-            if kept is not None and kept["key"] == key:
+            if kept is not None and kept["key"] == key and standing(kept, count):
                 return kept, each
             tried.add(set_digest(found["depends"]))
         for digest in (recorded(sets_key(python, place, each), token) or {}).get("sets", []):
@@ -753,7 +774,7 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
                 continue
             key = cache_key(common, name, split, list(depends), reading)
             kept = recorded(green_key(python, place, each, key), token)
-            if kept is not None and kept["key"] == key:
+            if kept is not None and kept["key"] == key and standing(kept, count):
                 return kept, each
     return None
 
@@ -779,7 +800,8 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
     place = row(python, name, split)
     if kept is not None:
         found = recorded(green_key(python, place, *kept), token)
-        if found is not None and found["key"] == kept[1] and fresh(found, name, common, reading):
+        if (found is not None and found["key"] == kept[1] and fresh(found, name, common, reading)
+                and standing(found, reds(python, place, kept[0], common, token))):
             remembered(python, place, kept[0], found["depends"], token)
             return found["row"]
     hit = green_record(python, name, split, common, token, reused_classes(network), reading)
@@ -1914,9 +1936,16 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         # plan, which cuts by the record alone, may cut the file otherwise (`session.cut`).
         key = (cache_key(common, name, parsed_row(row_["name"])[2], ran["depends"])
                if green and name not in unkeyed else None)
+        # The row's red runs on these inputs counted first: a red one counts itself, so every green run
+        # recorded before it stands no more (`reds`), and a green one keeps the count it follows.
+        count = reds(python, row_["name"], held, common, token)
+        if row_["exitCode"] != 0 and not written(reds_key(python, row_["name"], held, common), token,
+                                                 json.dumps({"reds": count + 1}).encode()):
+            continue
         body = json.dumps({"key": key,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
-                           "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"]}).encode()
+                           "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"],
+                           "reds": count}).encode()
         # The record under these inputs, which `reused` reads, and the last run's, which the GPU tier and
         # lane read, only once the first is written, so it is never newer.
         if written(record_key(python, row_["name"], held, common), token, body):
@@ -1929,11 +1958,6 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
                 written(green_key(python, row_["name"], held, ran_on), token, body)
             if key is not None:
                 remembered(python, row_["name"], held, ran["depends"], token, ran=True)
-            elif row_["exitCode"] != 0:
-                # A red run forgets the row's executed sets on this class, whatever set it ran: no lookup
-                # by another set finds an earlier green run of these inputs after it (a flaky red; a red that
-                # died before its report keeps none), and the next green run starts the list again.
-                written(sets_key(python, row_["name"], held), token, json.dumps({"sets": []}).encode())
 
 
 def written(key: str, token: str, body: bytes) -> bool:

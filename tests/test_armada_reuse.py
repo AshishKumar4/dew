@@ -519,3 +519,46 @@ def test_two_trees_alternating_each_reuse_their_rows_and_a_changed_unit_of_a_set
     # The other tree's helper changed in the unit test_a ran: its row runs, the rest reused.
     tree(other=True, body="def value():\n    return 2 - 1\n")
     assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
+
+
+def test_a_red_run_of_a_row_revokes_its_earlier_green_runs_by_any_set_token_or_tree(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A red run of a row (a flaky one on the very inputs a green run recorded) revokes every green run of it
+    recorded before it, on that class and those shared inputs: a plan finds none by any executed set, a task
+    handed a plan's kept token from before the red runs the row, and a green run of another tree after the red
+    brings back none of this tree's earlier green runs (review, 2026-11-12: a red that executed another set
+    revoked nothing by its own key)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    test_a = tmp_path / "tests/test_a.py"
+    # Its red run executes a unit its green runs never do, so the red's executed set, and key, are its own.
+    (tmp_path / "src").mkdir(exist_ok=True)
+    (tmp_path / "src/flaky.py").write_text("def failing():\n    raise AssertionError('flaky')\n")
+    flaky = ("import os, sys\nfrom pathlib import Path\nsys.path.insert(0, 'src')\nimport flaky\n"
+             "def test_a():\n"
+             "    with Path('runs-a').open('a') as runs: runs.write('x')\n"
+             "    if os.environ.get('FAIL'):\n        flaky.failing()\n")
+    test_a.write_text(flaky)
+    armada_task(ci, monkeypatch, verdict)
+    entries = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"] and len(entries) == 1
+    # The flaky red, on these very inputs.
+    monkeypatch.setenv("FAIL", "1")
+    assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict, policy="off")] == [1, 0, 0]
+    monkeypatch.delenv("FAIL")
+    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
+    # Another tree's green run after the red, then this tree again: it brings back none of this tree's green
+    # runs from before the red.
+    test_a.write_text(flaky + "\nOTHER_TREE = 1\n")
+    armada_task(ci, monkeypatch, verdict)
+    test_a.write_text(flaky)
+    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
+    # The kept token the plan made before the red, handed to its task now: the row runs, and its green run,
+    # after the red, is reused from then on.
+    command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
+    values = {**entries[0], "out": verdict}
+    filled = [re.sub(r"\{(\w+)\}", lambda field: str(values[field[1]]), word) for word in command]
+    monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
+    before = len((tmp_path / "runs-a").read_text())
+    assert ci.main() == 0
+    assert len((tmp_path / "runs-a").read_text()) == before + 1
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
