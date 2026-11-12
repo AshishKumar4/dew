@@ -277,6 +277,39 @@ def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation
     assert measured["rise"] >= size > measured["ended"]
 
 
+SERVED_AGAIN = """
+import ctypes
+import json
+
+import numpy as np
+
+from dew.telemetry.benchmark import allocated_memory, resident_memory, resident_peak
+
+# A freed 64 MiB block stays resident under a live one (as NEIGHBOURED), for the array below to come from.
+ctypes.CDLL(None).mallopt(-3, 1 << 30)
+held = np.ones(64 * 2**20, np.uint8)
+guard = np.ones(2**20, np.uint8)
+del held
+with resident_peak(counter=lambda: {**resident_memory(), **allocated_memory()}) as peak:
+    again = np.ones(64 * 2**20, np.uint8)
+print(json.dumps({"allocated": peak.rise("Allocated"), "size": again.nbytes}))
+"""
+
+
+def test_a_regions_allocated_peak_counts_what_its_allocator_serves_from_pages_freed_before():
+    """A region's peak over the bytes the allocator holds allocated (`allocated_memory`, sampled by
+    `resident_peak` beside the resident pages) rises by a 64 MiB array the allocator serves from a block
+    an earlier array freed, which no new resident page holds (rows 5266, 5562: a tree held home after an
+    identical one was freed rose by under a fiftieth of itself in resident pages)."""
+    import json
+    import subprocess
+    import sys
+
+    measured = json.loads(subprocess.run([sys.executable, "-c", SERVED_AGAIN], check=True,
+                                         capture_output=True, text=True).stdout.splitlines()[-1])
+    assert measured["allocated"] >= measured["size"]
+
+
 @pytest.mark.gpu(reason="CUPTI times a GPU's kernels")
 def test_device_time_reads_a_calls_kernels_and_hands_cupti_to_a_profiler_however_it_ends(tmp_path):
     """A session reads each kernel a call launched with its device time and refuses a call that launched
