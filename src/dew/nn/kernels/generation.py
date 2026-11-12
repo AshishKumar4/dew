@@ -1405,6 +1405,33 @@ def placed_platform() -> str:
 
 
 @traced_fact
+def cutlass_built() -> dict[str, str | None]:
+    """The generation of the installed dew_cutlass's kernels each CUDA GPU Dew names runs, as the wheel
+    dispatches on its compute capability (`dew_cutlass.architecture`, the one statement of it), None for
+    one it runs none on or where the wheel is not installed: what CUTLASS's eligibility reads
+    (`grouped_matmul.cutlass_built_for`). A call's route reads the wheel's presence and its build, so a
+    program kept without it, or with another build, is not handed to a process that has it (training.md
+    §6); declared here, beside the facts a process's identity states whatever kernels it imported."""
+    import importlib.util
+
+    spec = importlib.util.find_spec('dew_cutlass')
+    return _cutlass_built_by(None if spec is None else spec.origin)
+
+
+@functools.cache
+def _cutlass_built_by(origin: str | None) -> dict[str, str | None]:
+    """`cutlass_built`'s map for the dew_cutlass found at `origin` (None, none installed): read once a
+    build, as every call's identity reads it."""
+    import importlib
+
+    capabilities = {name: found for name in sorted(TARGETS) if (found := capability(name)) is not None}
+    if origin is None:
+        return dict.fromkeys(capabilities)
+    wheel = importlib.import_module('dew_cutlass')
+    return {name: wheel.architecture(*found) for name, found in capabilities.items()}
+
+
+@traced_fact
 def gpu_placed() -> bool:
     """Whether a call runs on this process's own GPU: what a CUDA library call needs, which its trace
     asks the installed plugin about and its lowering the devices, where `backend()` also takes an

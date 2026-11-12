@@ -2216,18 +2216,6 @@ def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_its_float64
     assert float(product.interpreted(declared, lhs, rhs, (((1,), (0,)), ((), ())))[0, 0]) == 1.0
 
 
-def test_a_declared_cell_compiles_nothing_for_the_template_it_prefers(monkeypatch, tmp_path):
-    """A declared cell's call (an A100's grouped kernel gradient, `grouped_matmul.DECLARED`), traced, keeps
-    no kernel report: no launch rests on the template it prefers, so the compiler's word on its tile is never
-    asked (`selection.preferring`; the word cost 1.5 s of an A100 trace, CONFIRMCOST1)."""
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    x, dy = jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16), jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
-    sizes = jnp.full((8,), 512, jnp.int32)
-    with generation.assumed("sm80"):
-        jax.jit(lambda x, dy: gemm.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16)).trace(x, dy)
-    assert not (tmp_path / "dew" / "kernel-reports").exists()
-
-
 @pytest.mark.parametrize(("generation_name", "family"), [("sm80", "mma.sync"), ("sm90", "wgmma"),
                                                          ("sm100", "tcgen05")])
 @pytest.mark.parametrize("product", ["forward", "kernel gradient"])

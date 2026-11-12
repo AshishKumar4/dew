@@ -5,7 +5,9 @@ implementations; and the cost model (`dew.nn.kernels.templates.cost`) on analyti
 
 import dataclasses
 import functools
+import importlib
 import itertools
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -208,6 +210,39 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
     routed(dx, group, input_gradient_products(dy[:sum(sizes)], w, sizes), BFLOAT16, "dx")
     for index, held_products in enumerate(kernel_gradient_products(x, dy, sizes)):
         held(dw[index], held_products, FLOAT32, f"dw of group {index}")
+
+
+def test_a_kept_calls_identity_states_the_installed_cutlass_wheel(tmp_path, monkeypatch):
+    """A call's identity (`dew.training.identity.facts`, what a kept program is handed by) states which
+    generations' kernels the installed dew-cutlass holds, as CUTLASS's eligibility reads them
+    (`generation.cutlass_built`): a process that installs the wheel, or another build of it, after a
+    program was kept is not handed that program, its route to CUTLASS untraced (audit P9). Two builds, one
+    holding Hopper's kernels and one Ampere's, stand in for the wheel ahead of any installed one."""
+    from dew.training import identity
+
+    fact = "dew.nn.kernels.generation.cutlass_built"
+    before = identity.facts()[fact]
+    path = list(sys.path)
+
+    def installed(minimum: tuple[int, int], built: str):
+        # Each build its own directory ahead of the installed packages, so no build's bytecode stands in
+        # for another's.
+        wheel = tmp_path / built
+        wheel.mkdir()
+        dispatch = f"return {built!r} if (major, minor) >= {minimum} else None"
+        (wheel / "dew_cutlass.py").write_text(f"def architecture(major, minor):\n    {dispatch}\n")
+        monkeypatch.setattr(sys, "path", [str(wheel), *path])
+        monkeypatch.delitem(sys.modules, "dew_cutlass", raising=False)
+        importlib.invalidate_caches()
+        return identity.facts()[fact]
+
+    hopper = installed((9, 0), "sm90")
+    built = generation.cutlass_built()
+    assert built["sm90"] == "sm90" and built["sm80"] is None
+    assert grouped_matmul.cutlass_built_for("sm90") == "sm90"
+    assert grouped_matmul.cutlass_built_for("sm80") is None
+    assert hopper != before
+    assert installed((8, 0), "sm80") != hopper
 
 
 def cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):

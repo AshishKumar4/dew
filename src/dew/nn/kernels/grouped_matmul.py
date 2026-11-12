@@ -1886,10 +1886,7 @@ def cutlass_built_for(generation_name: str) -> str | None:
     """The generation of the installed dew_cutlass's kernels a GPU of `generation_name` runs, as the wheel
     dispatches on its compute capability (`dew_cutlass.architecture`, the one statement of it); None where
     the wheel is not installed or runs none there."""
-    capability = generation.capability(generation_name)
-    if capability is None or importlib.util.find_spec('dew_cutlass') is None:
-        return None
-    return importlib.import_module('dew_cutlass').architecture(*capability)
+    return generation.cutlass_built().get(generation_name)
 
 
 class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):

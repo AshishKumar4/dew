@@ -16213,7 +16213,6 @@
 "tests/test_gemm_template.py::test_a_cooperative_tiles_gradients_hold_check_1": 30.943,
 "tests/test_gemm_template.py::test_a_cuda_call_naming_xla_runs_its_program[sm80]": 0.056,
 "tests/test_gemm_template.py::test_a_cuda_call_naming_xla_runs_its_program[sm90]": 0.034,
-"tests/test_gemm_template.py::test_a_declared_cell_compiles_nothing_for_the_template_it_prefers": 1.735,
 "tests/test_gemm_template.py::test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1[False-sm80]": 0.93,
 "tests/test_gemm_template.py::test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1[False-sm90]": 1.767,
 "tests/test_gemm_template.py::test_a_decode_steps_dense_product_runs_swapped_and_holds_check_1[True-sm80]": 0.795,

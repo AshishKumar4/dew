@@ -871,7 +871,9 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
     # default), not as the forward's narrower outputs, whose rounding hid the tensor cores' sums within a
     # step (row 5406: an A100's fp16 row-scaled product's scale gradient 1.72 times XLA's error).
     acc = jax.ShapeDtypeStruct(acc_shape, at_least_fp32(compute))
-    if _reads_accumulators(epilogue, count, acc, sides):
+    # The epilogue's VJP, traced once, its accumulators' reads and pass-through cotangents read from it.
+    vjp = _epilogue_vjp(epilogue, count, acc, sides)
+    if _reads_accumulators(vjp, count):
         accs = _as_tuple(_gemm(lhs, matrices[0], group_sizes, prologue, prologue_arrays, prologue_axes, None,
                                (), (), (acc.dtype,) * count, several=count > 1,
                                paired=matrices[1] if count > 1 else None, summed_as=(acc.dtype,) * count,
@@ -885,8 +887,7 @@ def _cotangents(lhs, matrices: tuple, group_sizes, prologue, prologue_arrays, pr
 
     outs, pull = jax.vjp(epilogued, *accs, *epilogue_arrays)
     pulled = pull(tuple(c.astype(out.dtype) for c, out in zip(cotangents, outs, strict=True)))
-    narrow = tuple(_passes_cotangent(epilogue, count, at, acc, sides, dtypes, compute)
-                   for at in range(count))
+    narrow = tuple(_passes_cotangent(vjp, at, dtypes, compute) for at in range(count))
     return tuple(pulled[:count]), tuple(pulled[count:]), narrow
 
 
@@ -1199,19 +1200,18 @@ def _as_cotangent(cotangent, operand):
     return cotangent if cotangent.dtype == jax.dtypes.float0 else cotangent.astype(operand.dtype)
 
 
-def _reads_accumulators(epilogue, count: int, acc: jax.ShapeDtypeStruct, sides: tuple) -> bool:
-    """Whether the epilogue's VJP reads any of its `count` accumulators: a bias's does not, a product with
-    a side operand's does. Read from the VJP's own program, shapes alone."""
-    closed, _ = _epilogue_vjp(epilogue, count, acc, sides)
+def _reads_accumulators(vjp: tuple, count: int) -> bool:
+    """Whether the epilogue's VJP (`_epilogue_vjp`'s program) reads any of its `count` accumulators: a bias's
+    does not, a product with a side operand's does. Read from the VJP's own program, shapes alone."""
+    closed, _ = vjp
     return bool(set(closed.jaxpr.invars[:count]) & read_by(closed.jaxpr, closed.jaxpr.outvars))
 
 
-def _passes_cotangent(epilogue, count: int, at: int, acc: jax.ShapeDtypeStruct, sides: tuple, dtypes: tuple,
-                      narrow) -> bool:
-    """Whether the epilogue's VJP hands its accumulator `at` (of `count`) one output's cotangent unchanged
-    (a bias's, a cast's) whose dtype `narrow` holds exactly: read from the VJP's own program, its result
-    traced back through conversions alone."""
-    closed, cotangents = _epilogue_vjp(epilogue, count, acc, sides)
+def _passes_cotangent(vjp: tuple, at: int, dtypes: tuple, narrow) -> bool:
+    """Whether the epilogue's VJP (`_epilogue_vjp`'s program) hands its accumulator `at` one output's
+    cotangent unchanged (a bias's, a cast's) whose dtype `narrow` holds exactly: read from the VJP's own
+    program, its result traced back through conversions alone."""
+    closed, cotangents = vjp
     var = closed.jaxpr.outvars[at]
     producers = {out: equation for equation in closed.jaxpr.eqns for out in equation.outvars}
     while var in producers and producers[var].primitive is jax.lax.convert_element_type_p:
