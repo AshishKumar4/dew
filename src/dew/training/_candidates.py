@@ -314,9 +314,10 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
             traced()
     window = split * settings.accumulation
     # Every process reads the floor, and the pool's judgment of it, so all trace alike (`pooled_headroom`).
-    flooring = (floored and not lowering and derived and footprint is None and loss is not None
-                and mesh is None)
-    floor = logits_floor(settings.objective, loss.jaxpr, prepared, held, micro) if flooring else None
+    forward = None if loss is None else loss.jaxpr
+    flooring = floored and not lowering and derived and footprint is None and mesh is None
+    floor = (logits_floor(settings.objective, forward, prepared, held, micro)
+             if flooring and forward is not None else None)
     short = pooled_headroom(None if floor is None else derived_headroom(
         floor, local_devices(settings.device_mesh), capacity, built)) if flooring else None
     if floor is not None and short is not None and short < 0:
