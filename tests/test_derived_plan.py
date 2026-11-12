@@ -580,6 +580,8 @@ def test_a_step_whose_whole_logits_alone_leave_no_room_traces_its_tiled_step_alo
     assert not floor["terms"]["peak_exact"] and floor["terms"]["residuals"] is None
     assert judged["terms"]["residuals"] is not None
     assert compiles.count == 1 and trainer.plan["probes"][-1]["fits"]
+    # The probe records the seconds JAX spent on its candidate: its traces, its lowering and its compile.
+    assert {"traced", "lowered", "compiled"} <= set(trainer.plan["probes"][-1]["spent"])
     head = ("head_tile", "head_fused")
     assert [trainer.plan[name] for name in head] == [tiled.plan[name] for name in head]
     assert trainer.plan["head_tile"] is not None
