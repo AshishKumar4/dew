@@ -34,7 +34,7 @@ from typing import TYPE_CHECKING
 from dew._records import record as section
 from dew.inference.clients import decode_routed_experts
 from dew.objectives.rl.records import messages
-from dew.objectives.rl.sessions import Call, Transcript
+from dew.objectives.rl.sessions import Call, Transcript, json_object
 
 if TYPE_CHECKING:
     import httpx
@@ -248,7 +248,8 @@ def _transcript(trace: Mapping[str, object]) -> Transcript | None:
     asked, answered = trace.get("messages"), trace.get("response_message")
     listed = () if asked is None else messages(asked, "messages")
     # rllm-model-gateway writes an empty object for a response it holds no message of.
-    reply = None if answered is None else section(answered, "response_message") or None
+    reply = None if answered is None else json_object(section(answered, "response_message"),
+                                                      "response_message") or None
     if not listed and reply is None:
         return None
     return Transcript(listed, reply)
