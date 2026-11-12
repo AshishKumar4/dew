@@ -177,9 +177,11 @@ costs = _loaded(HERE / "costs.py")
 command_line = _loaded(HERE / "arguments.py")
 rows = _loaded(HERE / "rows.py")
 row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
-VARIED, varied, cut_of, whole_place = rows.VARIED, rows.varied, rows.cut_of, rows.whole_place
+VARIED, varied, cut_of, place_variant = rows.VARIED, rows.varied, rows.cut_of, rows.place_variant
 shares = _loaded(HERE / "shares.py")
 collection = _loaded(HERE / "collection.py")
+gpu_measures = _loaded(HERE / "measures.py")
+GPU_HEADROOM, gpu_needs = gpu_measures.GPU_HEADROOM, gpu_measures.gpu_needs
 apportioned, deadline_shares = shares.apportioned, shares.deadline_shares
 # The names the land queue's tools read from this module at every commit they run (land.sh's `ci.STALE`,
 # run_tests.py's `node_of`), older commits' and newer alike.
@@ -1963,70 +1965,45 @@ def collected(python: str, marks: str, files: list[str] | None = None,
                                 tolerant=files is not None)[0]
 
 
-GPU_HEADROOM = (1.25, 2 ** 30)
-"""A file's share of the GPU over its recorded peak, a factor and bytes beside it: the allocator's
-fragmentation, which can leave a share its own size short of a block it needs."""
-
-
-def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
-    """The GPU share a test file's process is given, as `XLA_PYTHON_CLIENT_MEM_FRACTION` of it, and what
-    the file holds with its children, by its last run's `recorded` peak (tools/armada/executed.py's
-    `gpu_peak`, or a child's that took its fraction, the larger) and `GPU_HEADROOM`: a child that took
-    the share's fraction holds one more share, and one that named its own fraction the pool it held.
-    A file no run measured, one that started a process it did not follow, and one whose last run left
-    no report take all of `budget`."""
-    if recorded is None or recorded["depends"] is None or recorded["peak"] is None:
-        return budget, budget
-    factor, slack = GPU_HEADROOM
-    share = min(recorded["peak"] * factor + slack, budget)
-    return share, min(share * (1 + recorded.get("shares", 0)) + recorded.get("pools", 0), budget)
-
-
-def borrowed_records(names: list[str], python: str, held: str, token: str,
-                     strict: bool = False) -> dict[str, dict]:
-    """For each of `names`, test files no run on class `held` measured, the last record of the whole
-    file on another class whose run measured its GPU peak, any of its processes' (`varied`: a file's
-    process under a user's flags may hold more than the lane's own), the one that holds the most
-    (`gpu_needs`): what a file has taken on a GPU, which a first lane on a class takes as its share.
-    One no class measured is absent, as every one is where the Worker does not list its records. Its run on
-    `held` records its own, which every later lane reads. With `strict`, a read the Worker does not answer is
-    an `r2.R2Error`, never a file taken for unmeasured: what sizes a job before it runs (gpu_holds.py) is read
+def largest_records(python: str, token: str, measures, under: str = "", strict: bool = False) -> dict:
+    """For each thing `measures` says a record's class, test file and group (`key_parts`) measures (None:
+    nothing asked for), of this Python's last records under `under` (a class's `<class>/`; none, every
+    class's), the most those whose runs measured it held, as one record (measures.py's `largest`); none
+    where the Worker does not list its records. With `strict`, a read the Worker does not answer is an
+    `r2.R2Error`, never a file taken for unmeasured: what sizes a job before it runs (gpu_holds.py) is read
     whole or not at all (2026-11-11: one record's read did not come back as a GPU tier was composed, its part
     took the default for a file measured at 5.9 GiB, and the file ran out of a 4 GiB lane)."""
-    if not names:
-        return {}
     prefix = f"{CACHE_PREFIX}/{python}/"
-    wanted = set(names)
     try:
-        every = listed(prefix, token)
-    # The Worker did not list its records: borrowing only packs a lane, so each such file runs alone with the
+        keys = [under + key for key in listed(prefix + under, token)]
+    # The Worker did not list its records: a measure only packs a lane, so each such file runs alone with the
     # lane's whole share, as one measured on no class does.
     except r2.R2Error as error:
         if strict:
             raise
-        print(f"the test cache did not list {prefix}: {error}; files unmeasured here run alone",
+        print(f"the test cache did not list {prefix}{under}: {error}; files unmeasured here run alone",
               file=sys.stderr)
         return {}
-    keys = [key for key in every
-            if (parts := key_parts(key))[0] != held and whole_place(parts[2]) and parts[1] in wanted]
 
-    def read(key: str) -> tuple[str, dict | None]:
+    def read(key: str) -> dict | None:
         if strict:
             found = store(token).get(f"{prefix}{key}")
-            return key_parts(key)[1], None if found is None else json.loads(found)
-        return key_parts(key)[1], recorded(f"{prefix}{key}", token)
+            return None if found is None else json.loads(found)
+        return recorded(f"{prefix}{key}", token)
 
-    def holds(found: dict) -> float:
-        return gpu_needs(found, float("inf"))[1]
+    return gpu_measures.largest(keys, read, lambda key: measures(*key_parts(key)))
 
-    borrowed: dict[str, dict] = {}
-    with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        for name, found in pool.map(read, keys):
-            if found is None or found.get("depends") is None or found.get("peak") is None:
-                continue
-            if name not in borrowed or holds(found) > holds(borrowed[name]):
-                borrowed[name] = found
-    return borrowed
+
+def borrowed_records(names: list[str], python: str, held: str, token: str,
+                     strict: bool = False) -> dict[str, dict]:
+    """For each of `names`, test files no run on class `held` measured, the most its last records on the
+    other classes measured (`largest_records`), any group's and any of its processes' (`varied`: a file's
+    process under a user's flags may hold more than the lane's own): what a file has taken on a GPU, which
+    a first lane on a class takes as its share. One no class measured is absent. Its run on `held`
+    records its own, which every later lane reads."""
+    wanted = set(names)
+    return largest_records(python, token, lambda at, name, _: name if at != held and name in wanted else None,
+                           strict=strict) if names else {}
 
 
 VARIANTS = {"users": ("users_process", {"DEW_TEST_USERS_ARITHMETIC": "1"})}
@@ -2110,6 +2087,42 @@ def gpu_prepared(python: str, tests: list[str], out: Path, *, processes: int, de
     return 0
 
 
+def lane_measures(python: str, units: dict[str, tuple[str, str, str]], held: str,
+                  token: str) -> dict[str, dict | None]:
+    """What each of a GPU lane's processes (`lane_units`: its file, group and variant) has held on class
+    `held`, a record `gpu_needs` reads: its last run's there, a group the tier cut the most its file's runs
+    measured there; else its file's on the other classes (`borrowed_records`); None where no run measured
+    it."""
+    # A group the tier cut by its own seconds holds tests another cut's group of its name did not, so its own
+    # last record is not its measure (2026-11-10: a group measured holding two tests was given their pool when
+    # it held five, one asking more than the pool): it reads its file's whole run's.
+    cut = bool(os.environ.get("DEW_SPLIT_DURATIONS"))
+
+    def needs(name: str) -> dict | None:
+        file, group, variant = units[name]
+        return recorded(record_key(python, row(python, file, varied("" if cut else group, variant)), held),
+                        token)
+
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        records = dict(zip(units, pool.map(needs, units), strict=True))
+    # Nor is the whole run alone such a group's measure, which a test added since has outgrown (2026-11-11: a
+    # whole run's 3.92 GiB gave a newer test a 5.9 GiB lane, which ran out): it is the most the runs of its
+    # file's process on this class measured, whole or a group of any cut. A whole run that measured nothing (a
+    # child it did not follow, no report) stays the file's, which so takes the lane's whole share.
+    if cut:
+        files = {file for file, _, _ in units.values()}
+        most = largest_records(python, token, under=f"{held}/", measures=lambda _, name, group: (
+            (name, place_variant(group)) if name in files else None))
+        records = {name: found if found is not None and not gpu_measures.measured(found)
+                   else most.get((units[name][0], units[name][2]), found) for name, found in records.items()}
+    # A group no run on this class measured borrows the most its file held on another, which holds at least
+    # its own; a file's process under other flags, its tests a part of the file's, the lane's own's first.
+    borrowed = borrowed_records(sorted({units[name][0] for name, found in records.items() if found is None}),
+                                python, held, token)
+    return {name: records[name] or records.get(f"{file}#{group}" if group else file) or borrowed.get(file)
+            for name, (file, group, _) in units.items()}
+
+
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes: int,
              deadline: float, network: bool = False) -> int:
     """Run `tests` on this process's share of the one GPU it sees, each once, as a task of its own
@@ -2123,22 +2136,22 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     cache reruns only those whose inputs changed (the maintainer, 2026-10-25: no CI run reached the published
     checkpoints' parity tests).
 
-    A file's process is given the share its last run on this GPU's class measured, green or red,
-    and files start heaviest first while what they hold with their children (`gpu_needs`) fits
-    the share this process was given (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at
-    most `processes` at once. A file that runs out of a measured share is red: it took more than
-    its last run, whose peak its next run is given. A file no run on this class measured borrows its
-    share from the largest any other GPU class's last run measured (`borrowed`), so a first lane on
-    a class packs its files as a measured one does; one red under it is red, run once, as every red is
-    (owner, 2026-11-07: a red under sharing is a red), and its measured peak is the next lane's. A file
-    given the lane's whole share (measured on no class, measured that large, or with a child the lane
-    did not follow, as the fla reference's in another environment's Python) grows its pool as it uses
-    it rather than taking the share at its first GPU op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a
-    child has what the file has not yet taken; a file that grows to the whole share still leaves its
-    child none. Each file's process takes its share of the CPUs this process may use, as of the files
-    that run at once (`OMP_NUM_THREADS`): a torch reference arm's small ops on all of a node's 30 CPUs
-    ran 13 times slower than on 4 (test_gemma3n's gradient reference on an A100 node, 1175 s against
-    armada's 326 s), and the more so as files share them.
+    A file's process is given the share its last run on this GPU's class measured, green or red (a group
+    the tier cut, the most any run of its file on the class did), and files start heaviest first while
+    what they hold with their children (`gpu_needs`) fits the share this process was given
+    (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at most `processes` at once. A file that runs
+    out of a measured share is red: it took more than its last run, whose peak its next run is given. A
+    file no run on this class measured borrows its share from the largest any other GPU class's last run
+    measured (`borrowed`), so a first lane on a class packs its files as a measured one does; one red
+    under it is red, run once, as every red is (owner, 2026-11-07: a red under sharing is a red), and its
+    measured peak is the next lane's. A file given the lane's whole share (measured on no class, measured
+    that large, or with a child the lane did not follow, as the fla reference's in another environment's
+    Python) grows its pool as it uses it rather than taking the share at its first GPU op
+    (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a child has what the file has not yet taken; a file that
+    grows to the whole share still leaves its child none. Each file's process takes its share of the CPUs
+    this process may use, as of the files that run at once (`OMP_NUM_THREADS`): a torch reference arm's
+    small ops on all of a node's 30 CPUs ran 13 times slower than on 4 (test_gemma3n's gradient reference
+    on an A100 node, 1175 s against armada's 326 s), and the more so as files share them.
 
     First the pinned fixtures the tests read offline are fetched while the Hub is reachable
     (tools/fetched_fixtures.py): a store file already whole is kept, and a pin whose upload is due stops
@@ -2163,24 +2176,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     units = lane_units(python, tests)
     tests = list(units)
 
-    # A group the tier cut by its own seconds holds tests another cut's group of its name did not: its
-    # file's whole measured run, which holds any group of it, is its measure (2026-11-10: a group measured
-    # holding two tests was given their pool when it held five, one asking more than the pool).
-    cut = bool(os.environ.get("DEW_SPLIT_DURATIONS"))
-
-    def needs(name: str) -> dict | None:
-        file, group, variant = units[name]
-        return recorded(record_key(python, row(python, file, varied("" if cut else group, variant)), held),
-                        token)
-
-    with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        records = dict(zip(tests, pool.map(needs, tests), strict=True))
-    # A group no run on this class measured borrows its whole file's measure, which holds at least its own;
-    # a file's process under other flags, its tests a part of the file's, the measure of the lane's own first.
-    borrowed = borrowed_records(sorted({units[name][0] for name, found in records.items() if found is None}),
-                                python, held, token)
-    measures = {name: records[name] or records.get(f"{file}#{group}" if group else file)
-                or borrowed.get(file) for name, (file, group, _) in units.items()}
+    measures = lane_measures(python, units, held, token)
     needed = {name: gpu_needs(measures[name], budget) for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}

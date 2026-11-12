@@ -55,19 +55,20 @@ def a_deep_gathered_step_reads_its_rows_as_their_copy_would(interpret):
                                   np.asarray(product(tokens[table], None)))
 
 
-def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = False, scattered: bool = False):
+def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = False, scattered: bool = False,
+                                 pinned: bool = True):
     """A grouped product whose rows are gathered from the tokens by a table (`gmm`'s `gather`: a MoE's sort
     fused into the rows' loads, row 1376), its groups ragged, one empty, rows past them, a token read by
-    several slots and some by none, through the template named at a pinned cooperative tile (`gemm.gemm`,
-    `grouped_matmul` chosen `mosaic`, `tuning.pinned`: the product the call's precision declares, its sums
-    promoted where it asks for them), on par with the arm Dew's selector runs for the same call where the
-    template is not taken (check 1: `grouped_matmul` chosen `xla`, the gathered rows' ragged dot), from
-    float64: on this GPU (test_gpu_gemm's cell, the producer's cp.async gather), or interpreted (`interpret`);
-    `paired`, a second matrix's product beside it; `scattered`, each row stored at its entry of a permutation
-    (`gmm`'s `scatter`: the MoE's un-permute fused into the stores). Called through `mosaic_gpu.gmm` itself,
-    the tile summed its products in the tensor cores' running sum whatever the precision asked: 1.658x the
-    reference at the suite's highest precision on a GH200 (M-EM-19), as summed through gemm.gemm its error is
-    the reference's."""
+    several slots and some by none, through the template named (`gemm.gemm`, `grouped_matmul` chosen `mosaic`:
+    the product the call's precision declares, its sums promoted where it asks for them) at a pinned
+    cooperative tile (`tuning.pinned`) or, not `pinned`, the tile it derives, on par with the arm Dew's
+    selector runs for the same call where the template is not taken (check 1: `grouped_matmul` chosen `xla`,
+    the gathered rows' ragged dot), from float64: on this GPU (test_gpu_gemm's cell, the producer's cp.async
+    gather), or interpreted (`interpret`); `paired`, a second matrix's product beside it; `scattered`, each
+    row stored at its entry of a permutation (`gmm`'s `scatter`: the MoE's un-permute fused into the stores).
+    Called through `mosaic_gpu.gmm` itself, the tile summed its products in the tensor cores' running sum
+    whatever the precision asked: 1.658x the reference at the suite's highest precision on a GH200 (M-EM-19),
+    as summed through gemm.gemm its error is the reference's."""
     tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2, family='wgmma')
     sizes, depth = jnp.asarray([70, 0, 129, 51], jnp.int32), 128
 
@@ -86,7 +87,8 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
             # tile, or XLA's ragged dot of the gathered rows as they are (bf16 products summed into fp32), its
             # rows stored at their slots; the float64 truth XLA's over the gate's widened draws.
             wide = jnp.promote_types(tokens.dtype, jnp.float32)
-            with generation.chosen(grouped_matmul=kernel), tuning.pinned({grouped_matmul.MosaicGmm: tiles}):
+            pins = {grouped_matmul.MosaicGmm: tiles} if pinned else {}
+            with generation.chosen(grouped_matmul=kernel), tuning.pinned(pins):
                 outs = gemm.gemm(tokens, matrices[0], sizes, out_dtype=wide,
                                  out_dtypes=(wide,) * 2 if paired else None,
                                  paired=matrices[1] if paired else None, gather=table,
@@ -99,7 +101,7 @@ def a_gathered_product_is_on_par(interpret: bool = False, *, paired: bool = Fals
                         "a gathered grouped product", seeds=SEEDS, truth_fn=through("xla"))
     taken = [config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
              if type(op) is grouped_matmul.MosaicGmm]
-    assert taken and all(config == tiles for config in taken), taken
+    assert taken and all(config == tiles for config in taken) if pinned else taken, taken
 
 
 @pytest.mark.parametrize("paired", [False, True])

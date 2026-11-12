@@ -192,6 +192,24 @@ def test_the_gemm_kernels_run_on_this_gpu():
     ])
 
 
+@pytest.mark.users_process
+def test_the_gemm_kernels_run_on_this_gpu_as_a_users_process_runs_them():
+    """The GEMM cells whose claim is what a user's process computes, run in one (`users_process`: no matmul
+    precision set, XLA's own schedules and autotuning as `lane_environment.USERS_GPU_FLAGS` state them), not
+    in the suite's, whose JAX_DEFAULT_MATMUL_PRECISION=highest has gemm.gemm promote each step's sum: the
+    gathered product at the default precision, its default form (the tensor cores' running sum) against the
+    selector's XLA arm as a user's process compiles it, at the cooperative tile a user can pin and at the
+    tile it derives. Its bare running sum read 1.658x a Triton fusion's error under the suite's flags on a
+    GH200 (M-EM-19); the default form's contract is the fastest form passing check 1 (kernel-templates.md,
+    testing.md), what a user's process gets."""
+    run_cells([
+        Cell(f"a gathered grouped product is on par in a user's process: "
+             f"{'pinned' if pinned else 'derived'}{', paired and scattered' if paired else ''}",
+             functools.partial(gemm_gather.a_gathered_product_is_on_par, paired=paired, scattered=paired,
+                               pinned=pinned), "sm90")
+        for pinned in (True, False) for paired in (False, True)])
+
+
 def test_the_gemm_matrix_holds_on_this_gpu():
     """GEMM's check-1 matrix (tests/kernel_matrix.py): the template route's training step on par with the
     reference path's (XLA's ragged dot), at each combination of the axes a GPU runs natively
