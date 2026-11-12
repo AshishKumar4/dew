@@ -360,23 +360,24 @@ def test_every_kinds_run_logs_the_activations_its_command_line_watches(kind, tmp
 
 def watching_alone(kind: str, root: Path):
     """`kind`'s run over data under `root` with a trained component its model call's every forward
-    reaches beside the backbone's, and the globs naming that component alone: a decision run's head
-    (`*Head`, `*Readout`: `DecisionModel.head_logits`), and an LM run's second prediction depth
-    (`mtp_1/*`), of a model of two (`LMObjective.mtp_weight`)."""
+    reaches beside the backbone's, and the globs naming that component alone: a decision run's head by its
+    class (`*Head`, `*Readout`: `DecisionModel.head_logits`) or by its path under its part (`head/*`), and
+    an LM run's second prediction depth (`mtp_1/*`), of a model of two (`LMObjective.mtp_weight`)."""
     import dataclasses
 
     from dew.config import ObjectiveConfig
     from dew.registry import ModelConfig
 
+    if kind.startswith("decision"):
+        globs = ["head/*"] if kind.endswith("path") else ["*Head", "*Readout"]
+        return KINDS["decision"](root, drawn=False), globs
     run = KINDS[kind](root, drawn=False)
-    if kind == "decision":
-        return run, ["*Head", "*Readout"]
     model = ModelConfig("causal_transformer", {**run.model.fields, "num_nextn_predict_layers": 2})
     depths = dataclasses.replace(run, model=model, objective=ObjectiveConfig("lm", {"mtp_weight": 0.3}))
     return depths, ["mtp_1/*"]
 
 
-@pytest.mark.parametrize("kind", ["decision", "lm"])
+@pytest.mark.parametrize("kind", ["decision", "decision-path", "lm"])
 def test_a_run_watching_a_trained_component_alone_logs_its_activations_and_cotangents(kind, tmp_path):
     """A run watching only a component its step trains beside the backbone, a decision run's head or an
     LM run's prediction depth (`watching_alone`), logs that component's output summary and its loss's
@@ -397,10 +398,36 @@ def test_a_run_watching_a_trained_component_alone_logs_its_activations_and_cotan
     assert main(["train", str(record / "run.json"),
                  *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
     logged = scalars(runs / "watched")[1]
-    component = "head" if kind == "decision" else "mtp_1"
+    component = "head" if kind.startswith("decision") else "mtp_1"
     for log in ("activations", "cotangents"):
         found = {name.rsplit("/", 1)[1] for name in logged if name.startswith(f"inspect/{log}/{component}/")}
         assert {"mean", "std", "non_finite"} <= found, (log, sorted(logged))
+
+
+def test_a_watched_prediction_depth_summarizes_its_rows_real_positions_alone():
+    """An LM run watching its second prediction depth (`mtp_1/*`) summarizes that depth's output over the
+    positions both of whose tokens are real (`CausalTransformer.mtp_hidden_states`, each depth's rows one
+    shorter): two batches that differ only in the ids at their rows' padded tail log the same summary, bit
+    for bit, where a depth's summary over every position read the padding's states (audit3 O2)."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=16, qk_norm=False, num_nextn_predict_layers=2)
+    trainer = Trainer(LMObjective(model, 11, mtp_weight=0.3), optax.sgd(0.), key=jax.random.key(0),
+                      inspection=Inspection(modules=("mtp_1/*",), targets=("params",)))
+    rows = jax.device_count()
+
+    def batch(pad):
+        real = np.r_[np.ones(8), np.zeros(4)].astype(np.int32)
+        return {"input_ids": np.tile(np.r_[np.arange(1, 9), [pad] * 4], (rows, 1)).astype(np.int32),
+                "text_segment_ids": np.tile(real, (rows, 1)),
+                "text_positions": np.tile(np.r_[np.arange(8), np.zeros(4)], (rows, 1)).astype(np.int32)}
+
+    first, second = (inspected(trainer, batch(pad)) for pad in (3, 7))
+    watched = sorted(name for name in first if name.startswith("inspect/activations/mtp_1/"))
+    assert watched
+    assert [first[name] for name in watched] == [second[name] for name in watched]
 
 
 class Headed(nn.Module):

@@ -162,10 +162,11 @@ def pieces(tmp_path_factory):
 
 
 def test_a_policy_rebound_over_new_weights_and_progress_compiles_its_stop_strings_once(pieces):
-    """A collection rebinds its policy over each snapshot's weights and progress (`TextGeneration.bind`):
-    the rebound task draws what the first one draws, stopping on its string, and the strings compile against
-    the processor's vocabulary once, at the first draw, where each rebinding compiled them twice again
-    (audit3 inference F5). The processor counts the vocabulary listings its stop strings compile from."""
+    """A collection binds its policy over each snapshot's weights and progress (`TextGeneration.bind`)
+    and draws from the bound task alone (`dew.objectives.rl.episodes`): each bound task draws what the
+    policy draws, stopping on its string, and the strings compile against the processor's vocabulary once,
+    where each binding compiled them twice again and its first draw a third time (audit3 inference F5).
+    The processor counts the vocabulary listings its stop strings compile from."""
     from dew.nn.progress import Progress
 
     ids = {piece: pieces.convert_tokens_to_ids(piece) for piece in ("<eos>", "st", "op", "a")}
@@ -195,13 +196,12 @@ def test_a_policy_rebound_over_new_weights_and_progress_compiles_its_stop_string
 
     model = ToolPolicy(vocab_size=VOCAB_PIECES, max_seq_len=64, logits=scripted)
     params = model.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32))
-    task = TextGeneration(model, params, Listing(), sampling=Sampling(temperature=1.0, stop=("stop",)))
-    first = task([[ids["a"]]], 6, key=5).host()
+    policy = TextGeneration(model, params, Listing(), sampling=Sampling(temperature=1.0, stop=("stop",)))
     for update in range(3):
-        task = task.bind(params, Progress(jnp.asarray(update + 1, jnp.int32)))
-    again = task([[ids["a"]]], 6, key=5).host()
-    np.testing.assert_array_equal(again.tokens, first.tokens)
-    assert bool(first.terminated[0]) and int(first.lengths[0]) == 2
+        bound = policy.bind(params, Progress(jnp.asarray(update + 1, jnp.int32)))
+        drawn = bound([[ids["a"]]], 6, key=5).host()
+        np.testing.assert_array_equal(drawn.tokens[0, 1:3], [ids["st"], ids["op"]])
+        assert bool(drawn.terminated[0]) and int(drawn.lengths[0]) == 2
     assert len(listed) == 1
 
 

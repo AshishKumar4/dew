@@ -591,8 +591,10 @@ def test_rejected_actor_tokens_leave_only_the_weighted_critic_support(coefficien
     assert changed == (coefficient > 0)
 
 
-def test_a_run_watching_its_critic_alone_logs_the_critics_activations_and_cotangents():
-    """A PPO run watching only its critic (`ValueHead`), a model its step trains beside the actor, logs the
+@pytest.mark.parametrize("modules", [("ValueHead",), ("critic/*",)], ids=["class", "path"])
+def test_a_run_watching_its_critic_alone_logs_the_critics_activations_and_cotangents(modules):
+    """A PPO run watching only its critic, by its class (`ValueHead`) or by its path under its part
+    (`critic/*`), a model its step trains beside the actor, logs the
     critic's output summary and the loss's cotangent there at its sampled step, under the critic's part of
     the variables (`critic/...`): the critic's forward opens the step's collections and the loss returns
     what it sowed beside the actor's (audit3 O2: it opened its attention maxima alone, so a watch of the
@@ -604,7 +606,7 @@ def test_a_run_watching_its_critic_alone_logs_the_critics_activations_and_cotang
                               max_seq_len=8, qk_norm=False)
     objective = PPOObjective(model, 5, critic=ValueHead(model))
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(0),
-                      inspection=Inspection(modules=("ValueHead",), targets=("params",), cotangents=True))
+                      inspection=Inspection(modules=modules, targets=("params",), cotangents=True))
     ids = jnp.tile(jnp.arange(6, dtype=jnp.int32), (jax.device_count(), 1))
     mask = jnp.broadcast_to(jnp.arange(6) >= 3, ids.shape).astype(jnp.float32)
     batch = {"input_ids": ids, "text_segment_ids": jnp.ones_like(ids),
