@@ -79,8 +79,8 @@ def test_a_file_no_run_measured_at_a_cut_weighs_its_estimate_and_no_setup_paid_a
                "rows": {"3.12:tests/test_measured.py": 160.0}}
     groups = [entry["weight"] for entry in ci.plan(100.0, timings)
               if entry["python"] == "3.12" and entry["tests"] == "tests/test_unmeasured.py"]
-    assert sum(groups) == pytest.approx(1600.0) and max(groups) <= 100.0
-    assert len(groups) == 16
+    # A hundred tests of 16 s each as estimated, six to a group within the target.
+    assert groups == [96.0] * 16 + [64.0]
 
 
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
