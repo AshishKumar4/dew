@@ -115,10 +115,10 @@ def kernel_report(routes, lowered: jax.stages.Lowered) -> KernelReport:
                         tuple((replace(call, ir=b""), runs) for call, runs in kernel_launches(lowered)))
 
 
-def routed[*Arguments](lower: Callable[[*Arguments], jax.stages.Lowered],
-                        *arguments: *Arguments) -> tuple[jax.stages.Lowered, list[Route]]:
-    """`lower(*arguments)`'s lowered program and the routes its dispatches reported as it traced
-    (`generation.routes`)."""
+def routed[Made, *Arguments](lower: Callable[[*Arguments], Made], *arguments: *Arguments
+                              ) -> tuple[Made, list[Route]]:
+    """`lower(*arguments)`'s program, traced or lowered, and the routes its dispatches reported as it
+    traced (`generation.routes`)."""
     with generation.routes() as found:
         lowered = lower(*arguments)
     return lowered, found

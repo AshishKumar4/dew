@@ -31,7 +31,7 @@ from dew.nn.kernels.templates import report
 from dew.nn.sharding import Link, Schedule
 from dew.state import TrainState, apart, together
 from dew.training import staging
-from dew.training._lowering import KernelReport, Routed
+from dew.training._lowering import KernelReport, Routed, kernel_report, routed
 from dew.training.diloco import group_of, windowed
 from dew.training.distributed import microbatch, microbatch_shapes
 from dew.training.footprint import Footprint, candidate_footprint
@@ -215,7 +215,9 @@ def candidate_for[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: T
         # Kept detached from this trainer: its batch as shapes, its inspection's step none (`_sampled`
         # builds the reader's own).
         with _KEEPING:
-            _CANDIDATES[key] = dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None)
+            # Its trace not kept (`lowers`): a kept derivation traces its step again where it is lowered.
+            _CANDIDATES[key] = dataclasses.replace(candidate, micro=_shapes(candidate.micro), sampled=None,
+                                                   lowers=None)
             while len(_CANDIDATES) > KEPT_CANDIDATES:
                 _CANDIDATES.popitem(last=False)
     return candidate
@@ -279,19 +281,33 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
     lower = Routed(functools.partial(
         lambda *arguments: jitted.trace(*arguments).lower(lowering_platforms=platforms),
         *apart(prepared), given, part))
+    tuned = settings.tune_kernels and platforms is None
+    # The step traced once, its dispatches' routes with it, whoever asks: a derivation's staged cut, its
+    # lowering (`Candidate.lowers`), the lowering here. A lowering that measures configs traces each.
+    traced = functools.cache(lambda: routed(lambda: jitted.trace(*apart(prepared), given, part)))
+
+    def lowers() -> tuple[jax.stages.Lowered, KernelReport]:
+        made, found = traced()
+        program = made.lower(lowering_platforms=platforms)
+        return program, kernel_report(found, program)
+
     # The bytes its host-resident commit fields hold at once are its own staged cut's
     # (`staging.measured`): read as the step is traced, by its lowering or, lowering none, a trace alone.
     staging_measured = (settings.step is None and mesh is None
                         and bool(set(COMMIT_FIELDS) & set(settings.layout.host)))
     with staging.measured() as cuts:
-        if settings.tune_kernels and lowering and platforms is None:
+        kernels = KernelReport((), ())
+        if tuned and lowering:
             # The configs it measures are not the ones a derivation traced: its footprint is traced again.
             lowered, launches, footprint = *tuning.tune(lower, measure=True), None
+            kernels = lower.report()
         else:
             # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
-            lowered, launches = lower() if lowering else None, launches or "[]"
+            lowered, launches = None, launches or "[]"
+            if lowering:
+                lowered, kernels = lowers()
         if staging_measured and not lowering:
-            jitted.trace(*apart(prepared), given, part)
+            traced()
     window = split * settings.accumulation
     if derived and footprint is None and shapes is not None and mesh is None:
         footprint = candidate_footprint(
@@ -299,8 +315,8 @@ def _candidate[LossT, EffectsT](stepping: Stepping[LossT, EffectsT], state: Trai
             (local_devices(settings.device_mesh) or [*settings.device_mesh.devices.flat])[0], split,
             functools.partial(consumes_where_made, stepping, prepared, micro, window, shapes),
             max(cuts, default=0), capacity)
-    candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches,
-                          lower.report() if lowering else KernelReport((), ()), footprint)
+    candidate = Candidate(micro, shapes, copies, shardings, prepared, held, built, lowered, launches, kernels,
+                          footprint, lowers=None if lowering or tuned else lowers)
     return dataclasses.replace(candidate, sampled=_sampled(stepping, candidate, batch, placement, replicated,
                                                            split, platforms))
 
