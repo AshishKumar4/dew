@@ -147,21 +147,18 @@ CONSUMERS = 2
 def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, target,
             candidate, launch_of, grouped: bool, depths: tuple[int, ...] | None = None,
             ragged: bool = False, units: tuple[int, int, int] = (1, 1, 1)) -> Tiles | None:
-    """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its
-    bundles in preference order, which share its facts but their loaders and registers) for a call whose
-    output has `rows` rows (a group's,
-    on average, where `grouped`: a product's rows split among its groups) and `width` columns and whose
-    steps run over `depth` (None: a group's rows, padded to whole steps), from the family's facts, the
-    call's extents and the device's multiprocessors alone (no table, no ranking;
-    docs/design/kernel-templates.md §7); `depths`, where given, the steps the launch's stage takes in place
-    of the family's (a packed matrix's decode, `NVFP4_STEP`); `ragged`, rows a tile need not divide (a kernel
+    """The one tile a GEMM mainloop runs on an instruction family's `layouts` (`bundles.layouts`, its bundles
+    in preference order, which share its facts but their loaders and registers) for a call whose output has
+    `rows` rows (a group's, on average, where `grouped`: a product's rows split among its groups) and `width`
+    columns and whose steps run over `depth` (None: a group's rows, padded to whole steps), from the family's
+    facts, the call's extents and the device's multiprocessors alone (no table, no ranking;
+    docs/design/kernel-templates.md §7); `depths`, where given, the steps the launch's stage takes in place of
+    the family's (a packed matrix's decode, `NVFP4_STEP`); `ragged`, rows a tile need not divide (a kernel
     gradient's whose last row tile is partial, `tgmm`); `units`, what the rows, the columns and the step are
     whole multiples of besides (a call's side vectors' copy units, `mosaic.Transport.vector_unit`).
-    `candidate(tile)` is the launch's legality apart
-    from its
-    resources (its granularity, its blocks dividing the call, its side operands' copies), and
-    `launch_of(tile)` the launch whose ring and residency the planner sizes (`resources.plan`: its
-    allocations a stage, its registers within a consumer's) on `target`.
+    `candidate(tile)` is the launch's legality apart from its resources (its granularity, its blocks dividing
+    the call, its side operands' copies), and `launch_of(tile)` the launch whose ring and residency the
+    planner sizes (`resources.plan`: its allocations a stage, its registers within a consumer's) on `target`.
 
     - Layout: at each shape and step, the first layout whose planner holds it (`resources.placed`): a
       producer's where its consumers' registers hold the tile, else one whose first consumer issues the
@@ -182,8 +179,15 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
       at least one consumer's; one where rows a tile must divide (not grouped) take no whole role for each,
       where a group averages fewer rows than one role (grouped), or where no cooperative tile holds.
     - Programs: the most a multiprocessor runs at once that the family's registers hold at those
-      consumers (`Family.programs`) and whose share of its shared memory (`resources.program_shared`) holds
-      a tile, one at least; a wave is all of them.
+      consumers (`Family.programs`) and whose share of its shared memory (`resources.program_shared`)
+      stages the balanced tile busy (`tiled`'s balanced pass); where no count does, the most whose share
+      holds a tile, one at least; a wave is all of them. Fewer programs before a smaller tile: programs
+      share the multiprocessor's tensor rate (`SplitWalk.walk`), so a second one adds overlap, never a
+      product's rate, where a halved share halves the tile and doubles its reads a FLOP: an RTX PRO
+      6000's two programs a multiprocessor held 64 x 64 tiles at two stages in their 49 KB shares, its
+      dense products 1.99x (forward), 3.00x (input gradient) and 1.72x (kernel gradient) cuBLASLt's time,
+      geomean of 13 projections at 8192 tokens (M-FS-9, receipts dew-g4-measure2), where the balanced
+      128 x 64 tile stages busy in that share at 32-deep steps (`MmaIssuer.depths`).
     - Rows: no more than the call's rows rounded up to a role's or, where grouped, half a group's in
       whole roles, at least one role (each group takes a partial tile more, so at half its rows that tile
       adds at most a third of its work).
@@ -211,12 +215,13 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
              if (depth is None or depth % step == 0) and step % units[2] == 0]
     busy = 1 + family.loads_ahead + family.in_flight
 
-    def tiled(consumers: int, programs: int) -> Tiles | None:
+    def tiled(consumers: int, programs: int) -> tuple[Tiles | None, bool]:
+        """The tile `consumers` take at `programs` a multiprocessor, and whether it is the balanced one
+        staged busy: at the widest width its registers hold, its rows at their balance."""
         role = math.lcm(family.role_rows * consumers, units[0])
         most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
         shaped = functools.partial(_shaped, consumers=consumers, programs=programs, rows=rows, width=width,
                                    multiprocessors=multiprocessors, grouped=grouped)
-
         held_tile = functools.partial(_held_tile, role=role, steps=steps, busy=busy, shaped=shaped,
                                       candidate=candidate, launch_of=launch_of, layouts=layouts,
                                       target=target, programs=programs)
@@ -232,13 +237,11 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
         busy_at, fallback = None, None
         for block_n, held_rows in widths:
             tile, staged = held_tile(block_n, held_rows)
-            if tile is None:
-                continue
-            if staged and tile.block_m >= min(held_rows, side):
-                return tile
+            if tile is not None and staged and tile.block_m >= min(held_rows, side):
+                return tile, block_n == widths[0][0]
             busy_at = busy_at or (tile if staged else None)
             fallback = fallback or tile
-        return busy_at or fallback
+        return busy_at or fallback, False
 
     # Rows a tile divides (a kernel gradient's) that take no whole role for each consumer take one, as
     # does a call no cooperative tile holds (a wide epilogue's outputs past a block), and a grouped call
@@ -253,8 +256,9 @@ def derived(layouts: tuple, *, rows: int, depth: int | None, width: int, dtype, 
     # faster on every H100 scoreboard row); where no tile of theirs holds, one. Each at the most programs
     # that hold its tile.
     for consumers in dict.fromkeys((most if whole else 1, 1)):
-        tile = next((tile for programs in range(family.programs(consumers), 0, -1)
-                     if (tile := tiled(consumers, programs)) is not None), None)
+        held = [tiled(consumers, programs) for programs in range(family.programs(consumers), 0, -1)]
+        tile = next((tile for tile, balanced in held if balanced), None)
+        tile = tile or next((tile for tile, _ in held if tile is not None), None)
         if tile is not None:
             return tile
     return None
@@ -1599,7 +1603,7 @@ def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, pro
         tiles_of = {i: fixed_tiles[i] if i in fixed_tiles
                     else read_tiles[i].at[pl.ds((first + index) * depth, depth)] if i in read_tiles
                     else slots[f'side_{i}'] for i in range(len(prologue_axes))}
-        left = _transformed(prologue, prologue_axes, stage.at[mine_rows], tiles_of, 'rows', mine_rows)
+        left = _transformed(prologue, prologue_axes, stage.at[mine_rows][...], tiles_of, 'rows', mine_rows)
         if summed:
             return nothing, tuple(total + family.registers_product(left, oriented[name])
                                   for total, name in zip(accumulators, matrices, strict=True))
@@ -1715,20 +1719,24 @@ def _nvfp4_lanes(words: jax.Array) -> list[jax.Array]:
             for half in (register & jnp.uint32(0xFFFF), register >> jnp.uint32(16))]
 
 
-def _transformed(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> jax.Array:
-    """Dew: `mine`, this warpgroup's half of a stage, transformed by the prologue on its side tiles
-    (`tiles_of`, by operand) cut to the same half along the `halved` launch axis, a side operand by group's
-    at each of its rows (`axes.by_rows`), in the stage's dtype."""
+def _transformed(prologue, axes_of: tuple, mine: jax.Array, tiles_of: dict, halved: str, half) -> jax.Array:
+    """Dew: `mine`, this warpgroup's half of a stage read into registers, transformed by the prologue on its
+    side tiles (`tiles_of`, by operand) cut to the same half along the `halved` launch axis, a side operand by
+    group's at each of its rows (`axes.by_rows`), in the stage's dtype."""
     rows = mine.shape[0]
     cut = [axes.by_rows(tiles_of[i].at[axes.placed(axes.held(side_axes), {halved: half})][...], side_axes,
                         rows) for i, side_axes in enumerate(axes_of)]
-    return prologue(mine[...], *cut).astype(mine.dtype)
+    return prologue(mine, *cut).astype(mine.dtype)
 
 
-def _rewritten(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> None:
-    """Dew: `mine` rewritten in place by the prologue (`_transformed`); its reader publishes the writes
-    (`mosaic.Family.published`)."""
-    mine[...] = _transformed(prologue, axes_of, mine, tiles_of, halved, half)
+def _rewritten(family: mosaic.Family, prologue, axes_of: tuple, mine, tiles_of: dict, halved: str,
+               half) -> None:
+    """Dew: `mine` rewritten in place by the prologue (`_transformed`), read in its family's accumulator
+    layout (`Family.tile_of`); its reader publishes the writes (`mosaic.Family.published`). Read
+    unannotated, Mosaic's layout inference seeds a shared-memory load from the warpgroup MMAs' 64- and
+    128-row layouts, none of which tiles a 32-row step of `tgmm`'s transposed stage on mma.sync, and
+    exhausts its search (a normed kernel gradient's 64 x 128 x 32 tile on sm120 and sm100)."""
+    mine[...] = _transformed(prologue, axes_of, family.tile_of(mine), tiles_of, halved, half)
 
 
 def _split(refs: tuple, prologue: int, epilogue: int) -> tuple:
@@ -2197,7 +2205,7 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
         prologue, axes_of, stepped, fixed, fixed_refs, read_refs = hook
         tiles_of = (dict(zip(stepped, side_stages, strict=True)) | dict(zip(fixed, fixed_refs, strict=True))
                     | read_refs)
-        _rewritten(prologue, axes_of, rows_stage.at[:, mine_depth], tiles_of, 'depth', mine_depth)
+        _rewritten(family, prologue, axes_of, rows_stage.at[:, mine_depth], tiles_of, 'depth', mine_depth)
     atom = zeroing_columns(family, cotangent_stage.dtype)
     atoms = cotangent_stage.shape[1] // atom
     # Its depth half's swizzled rows, each its own, and its share of the cotangent's, the last consumer's
@@ -2385,8 +2393,9 @@ def split_count(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int,
 class SplitWalk:
     """Dew: a contraction's walk at a tile as `split_count` prices it (`split_walk`): its `output` tiles
     over a wave of `wave` programs (`multiprocessors` x the tile's programs), `steps` MMA steps a tile, each
-    `step_seconds` long, its operands' `operand_bytes` streamed once at `bandwidth`, and, split, its fp32
-    partials' passes over the output (`passes` steps each) and their sum's `launch` (in steps)."""
+    `step_seconds` long at a multiprocessor's whole tensor rate, its operands' `operand_bytes` streamed once
+    at `bandwidth`, and, split, its fp32 partials' passes over the output (`passes` steps each) and their
+    sum's `launch` (in steps)."""
 
     output: int
     wave: int
@@ -2400,10 +2409,15 @@ class SplitWalk:
 
     def walk(self, splits: int) -> float:
         """The busiest program's walk at `splits` slices a tile, in steps: its waves' share of every tile's
-        slices, or its share of the operands' stream where that is longer."""
+        slices, each step at its share of its multiprocessor's tensor rate (the programs a wave runs on each
+        at once), or its share of the operands' stream where that is longer. Priced at the whole rate, two
+        programs a multiprocessor read as twice the part's peak: an RTX PRO 6000's dense 64 x 64 walks at
+        two programs priced 0.21-0.23 of their measured time (M-FS-9), where an underfilled wave, one
+        program a multiprocessor, runs at the whole rate."""
         programs = self.output * splits
         waves = -(-programs // self.wave)
-        busiest = waves * -(-self.steps // splits)
+        sharing = -(-min(programs, self.wave) // self.multiprocessors)
+        busiest = waves * -(-self.steps // splits) * sharing
         # A program's share of the operands, at its share of the memory's rate.
         rate = (self.bandwidth * min(programs, self.multiprocessors) / self.multiprocessors
                 / min(programs, self.wave))
@@ -2426,7 +2440,8 @@ def split_walk(tiles: Tiles, *, groups: int, rows: int, depth: int, width: int, 
                multiprocessors: int, step_seconds: float | None, bandwidth: float | None,
                launch_seconds: float | None, partial_rows: int | None = None) -> SplitWalk | None:
     """Dew: the walk `split_count` prices at `tiles` (its arguments'), None where the device states no rate
-    or the call has no whole tile."""
+    or the call has no whole tile: its wave every program a multiprocessor runs at once, `step_seconds`
+    a step at the multiprocessor's whole rate (`SplitWalk.walk` shares it among the programs running)."""
     output = groups * -(-depth // tiles.block_m) * (width // tiles.block_n)
     steps = -(-rows // max(groups, 1) // tiles.block_k)
     if step_seconds is None or bandwidth is None or output == 0:

@@ -191,6 +191,13 @@ class MmaIssuer(mosaic.Issuer[jax.Array]):
 
     operands_in_registers = True
 
+    def depths(self, dtype) -> tuple[int, ...]:
+        # A step's fragments read by ldmatrix from a block staged at a 128- or 64-byte swizzle, cp.async's
+        # (`Mma`, `swizzled`) or a TMA ring's at the widest that fits (`bundles.MmaFed`, `swizzling.staged`):
+        # the shallower step holds a balanced tile's ring where the deeper does not (an RTX PRO 6000's 99 KB
+        # block at 128 x 128, cuBLASLt's 32-deep rings).
+        return tuple(swizzling.swizzle_columns(dtype, swizzle) for swizzle in (swizzling.SWIZZLE_BYTES, 64))
+
     def column_unit(self, dtype) -> int:
         # A warp's lanes, whatever loader stages its tiles: the guarded attention walk's 32-column key
         # blocks held where its 64 held no tile's registers at width 128 (its fragments are registers), a
@@ -723,10 +730,6 @@ class Mma(MmaIssuer, CpAsync):
     # spilled where the forward derived them (sm80 width 64, split residuals), and no GEMM derived them;
     # FlashAttention 2's rows come from one warpgroup's wider tiles, not a second warpgroup.
     consumers = 1
-
-    def depths(self, dtype) -> tuple[int, ...]:
-        # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).
-        return tuple(swizzling.swizzle_columns(dtype, swizzle) for swizzle in (swizzling.SWIZZLE_BYTES, 64))
 
 
 def _one(consumers: int, *, clustered: bool = False) -> None:

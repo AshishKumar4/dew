@@ -2160,11 +2160,15 @@ XLA = selection.Kernel[GroupedCase]('xla', (), generic=True)
 DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {
     ('mma.sync', Kind(dense=True, made=Made.FORWARD)):
         (XLA, "DENSE1 (A100, a55c8ffb2, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
-             "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens"),
+             "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens; M-FS-9 (RTX PRO 6000, "
+             "d7014761a, mma.sync.fed at two 64 x 64 programs a multiprocessor): Mosaic 1.99x, Triton "
+             "1.09x, geomean of 13"),
     ('mma.sync', Kind(dense=True, made=Made.INPUT_GRADIENT)):
-        (XLA, "DENSE1 (A100, one program a multiprocessor): Mosaic 2.881x, Triton 1.839x XLA's dot"),
+        (XLA, "DENSE1 (A100, one program a multiprocessor): Mosaic 2.881x, Triton 1.839x XLA's dot; "
+             "M-FS-9 (RTX PRO 6000): Mosaic 3.00x, Triton 1.10x"),
     ('mma.sync', Kind(dense=True, made=Made.KERNEL_GRADIENT)):
-        (XLA, "DENSE1 (A100, one program a multiprocessor): Mosaic 1.964x, Triton 1.735x XLA's dot"),
+        (XLA, "DENSE1 (A100, one program a multiprocessor): Mosaic 1.964x, Triton 1.735x XLA's dot; "
+             "M-FS-9 (RTX PRO 6000): Mosaic 1.72x, Triton 1.28x"),
     ('wgmma', Kind(dense=False, made=Made.FORWARD)):
         (CUTLASS, "PAIR1-h100 (c771912a6, H100 SXM, a pair of multiprocessors a cluster multicasting each "
                  "group's matrix): the template 1.019x CUTLASS's time, geomean of 7 grouped MoE rows "
