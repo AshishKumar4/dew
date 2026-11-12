@@ -1080,8 +1080,13 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
 
         def step(index, slots, carry, accumulators, loaded=None):
             h = first + index
-            found = prefix_reader(family, streamed, vectors, h, span)(slots) if loaded is None else loaded
-            (gate, low), laid = found
+            read_step = lambda: prefix_reader(family, streamed, vectors, h, span)(slots)
+            late = bool(os.environ.get("DBG_LATE_PREFIX"))
+            if late:
+                gate = low = laid = None
+            else:
+                found = read_step() if loaded is None else loaded
+                (gate, low), laid = found
 
             column = functools.partial(column_tile, call, slots)
             value_column = functools.partial(column, width=call.value_block)
@@ -1092,7 +1097,8 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, beta, call: Call, *, scale:
                 width // call.block, functools.partial(value_column, "values", held),
                 functools.partial(value_column, "out", given), blocks, gate, low, scale,
                 grads.dtype if accumulated is None else jnp.float32, Issuer(call).summed, laid=laid,
-                column_scale=family.columns_of(beta_ref.at[h, span]) if call.gated_keys else None)
+                column_scale=family.columns_of(beta_ref.at[h, span]) if call.gated_keys else None,
+                prefix=read_step if late else None)
             # The pairs' sum before the scores' gradient's store, so an fp32 call's parts form after the
             # pairs are gone.
             decay_ref.at[h, span][...] = algebra.summed_pairs(pairs, summed, column_sums)

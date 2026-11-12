@@ -1065,7 +1065,7 @@ def key_diagonal_pairs_back(d_loads: list, own: list, prefix: tuple, behind: Cal
 
 def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: TileLoad, out_grads: TileLoad,
                     blocks: int, gate, low, scale: float, dtype, summed: Callable[[list], jax.Array], *,
-                    laid: tuple | None = None, column_scale=None) -> tuple[jax.Array, jax.Array]:
+                    laid: tuple | None = None, column_scale=None, prefix=None) -> tuple[jax.Array, jax.Array]:
     """A chunk and value head's scores' gradient under a decay a head, `ds = do v^T` over the value blocks
     `j` gated by its pairs' decays, causal and scaled, in `dtype` (which `memory_gradients`' `dq += ds k`
     and `dk += ds^T q` take), and the decay's pair terms `ds (q k^T)` (strictly lower, fp32,
@@ -1081,6 +1081,8 @@ def scores_gradient(queries: TileLoad, keys: TileLoad, columns: int, values: Til
     `dCB = (dout x^T) dt` (`_chunk_scan_bwd_dcb`)."""
     scores = summed([Blocks("local_t", queries, lambda c: keys(c).T, columns)])
     ds = summed([Blocks("values_ds", out_grads, lambda j: values(j).T, blocks)])
+    if prefix is not None:
+        (gate, low), laid = prefix()
     if column_scale is not None:
         ds = ds * column_scale[None, :]
     column_gate, column_low = (gate, low) if laid is None else laid
