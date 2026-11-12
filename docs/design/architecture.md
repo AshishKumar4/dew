@@ -85,8 +85,6 @@ The order of events for a training step is:
 
 ### The algebra pass
 
-*Rule sets beyond these, the dev-time generator and error-aware extraction are planned or parked.*
-
 Autodiff and plain code produce correct math, but not always cheap math. The spec's example is a unit norm's backward: a norm of norms makes its reductions wait on each other, so the backward reads each row several times, while three algebraic laws make every reduction independent, so they can all run in one pass. Dew holds every equal form of a region in an e-graph, applies declared rules until no new form appears, and extracts the cheapest one. It uses [egglog](https://github.com/egraphs-good/egglog) through its Python bindings, pinned exactly in `pyproject.toml`.
 
 ![The compile-time pass. It runs while jax.jit traces, on the jaxpr, before anything is lowered. Its price comes from Dew's own model of the device.](https://raw.githubusercontent.com/AshishKumar4/dew/main/docs/assets/architecture-pass.svg)
@@ -111,32 +109,11 @@ Autodiff and plain code produce correct math, but not always cheap math. The spe
 
 ## Kernel routing
 
-*One template per operation, with no selector, is planned.*
-
-When one of Dew's layers calls an operation, a selector decides which kernel runs, while the program traces, from static facts alone. Each operation is an `Op`, a list of kernels in order. A kernel takes a call only if all of its requirements hold: the device's family, dtype, head width, the mask's form, sinks, softcap, dropout, determinism. The operation's preferred kernel runs where it takes the call, else the first in the operation's order that does, and a declared cell's old route runs instead where it takes the call; the route taken is recorded. Nothing is timed or ranked at runtime.
-
-The device's family comes from its compute capability: sm80, sm86, sm89 and sm120 are `mma.sync`; sm90 is `wgmma`; sm100 and sm103 are `tcgen05`. An old route keeps a cell only where a measured receipt shows it faster, declared on the operation (`Op.declared`). The end state in the spec is no selector at all: one template per operation, and plain XLA by a fixed capability rule on a GPU outside every family a template claims.
-
-| Operation | Default today | Template's place |
-|---|---|---|
-| Attention, bf16 or fp16, on H100 or A100 | FlashAttention, version 3 on sm90 and 2 on sm80, where it takes the call (declared cells, built into Dew's `dew-flash-attn` wheel) | Runs what FlashAttention refuses and the template supports: span masks, block groups, sinks, softcap, key validity. The template reads masks as spans, so an arbitrary dense mask goes to XLA or the reference implementation. The Mosaic mainloop is qualified on wgmma only, so on sm80 the template runs its Pallas-Triton mainloop. |
-| Attention, fp32, on wgmma and mma.sync GPUs | XLA (declared) |  |
-| Attention, sm100 and sm103 | Template, Pallas-Triton mainloop, or plain JAX | The tcgen05 mainloop is built but not routed. |
-| Attention, decode-shaped | The Pallas-Triton decode kernel |  |
-| Dense GEMM, sm80 and sm90 | XLA's dot, which calls cuBLAS (declared from measurements) | Dense calls reach the template through `projections.dot_general`; every dense cell on these GPUs is declared to XLA by receipt. |
-| Grouped GEMM (MoE) | Template: Mosaic GPU, then Mosaic TPU, then Triton | CUTLASS keeps the wgmma forward and input-gradient cells where installed; Triton keeps one mma.sync cell. |
-| Linear recurrence: gated delta, SSD, selective scan | Template first | The ported kernels (fla, mamba_ssm's SSD) keep their declared wgmma and mma.sync cells. |
-| RMSNorm and SwiGLU | XLA | Pallas-Triton on declared sm80 and sm90 cells: RMSNorm in bf16 and fp16, SwiGLU in bf16. |
-| TPU | Splash attention; the Mosaic TPU grouped GEMM |  |
-| CPU, and GPUs older than sm80 | XLA, or the template's plain-JAX mainloop |  |
-
-So on today's H100 and A100, a plain causal bf16 attention runs FlashAttention and a dense projection runs cuBLAS. The templates run the calls those kernels cannot take, the grouped and recurrent operations, and every cell where they measured faster. The spec counts each declared old route as a defect in the template: the profile finds why it loses, the template is fixed, and the old route is deleted once the template matches it.
+When one of Dew's layers calls an operation, a selector decides which kernel runs, while the program traces, from static facts alone: each operation is an `Op`, a list of kernels in order, and a kernel takes a call only if all of its requirements hold. Nothing is timed or ranked at runtime. Which kernel takes which call, on which device, and what each route is held to are [kernel-templates.md](kernel-templates.md)'s to say, with its coverage tables (Appendices A to C); this page keeps no list of them.
 
 *Where it lives: `dew.nn.kernels.selection` (`Op`, `Kernel`, `select`), `dew.nn.kernels.generation` (`architecture`, `route`, `chosen`), `dew.nn.attention_kernels` (`ATTENTION`, `DECLARED`), `templates/attention_route.py`, `grouped_matmul.GROUPED`, `recurrence_chunk` (`GATED_DELTA`, `SCAN`, `SELECTIVE`), `norm_swiglu`.*
 
 ## The template engine
-
-*Routing the tcgen05 bundle and a TPU bundle are planned.*
 
 A template is one algorithm, written once, that generates the kernel for the device it runs on. Dew has three: attention, linear recurrence and GEMM. The spec's long-term goal is a whole forward and backward pass as one persistent kernel generated from the device's facts. That fixes two things about the templates: each derives its one kernel from facts, with no lookup tables and no sweeps, and each keeps its operands, outputs and resources explicit, so a later scheduler can place them.
 
@@ -152,43 +129,17 @@ The math of a template lives once, as named pure functions on tile values. For a
 
 Everything that differs by GPU architecture lives once, in the shared Mosaic toolkit, as one `Family` per instruction family. A family is an `Issuer` composed with a `Transport`. The issuer owns the matrix instructions, their waits, where accumulators live and the register facts. The transport owns loading and the pipeline: the roles and their register budgets, the walk that streams each operand's blocks through rings, persistent loops, loads, stores and the fix-up of split tiles. A mainloop holds only the order of its bundle's steps around the algebra. A template has one mainloop for every family whose overlap structure is the same, and a separate thin one only where it differs.
 
-Seven GPU bundles exist. `WGMMA` serves sm90: a producer warpgroup and two consumers, with 227 KiB of shared memory. `FED` is wgmma with no producer, each consumer feeding its own ring, for tiles whose consumers need more registers than a producer leaves them (attention's backward takes it). `Mma` serves sm80 to sm89 with `mma.sync` and a single consumer, with 163 KiB of shared memory on sm80 and 99 KiB on sm86 and sm89. `MmaFed` is the same instructions with TMA loads, for sm120. `RINGS` serves sm100's and sm103's tensor-memory accumulators for a launch that states them (the GEMM's), `PAIR` its two-CTA products where a launch's config names it, and `CHUNKS` the recurrence's products read back into registers.
+The bundles are `templates/bundles.py`'s, each naming the roles, the loads and the accumulator home it composes for one family and overlap structure. Which families a template's program runs on is read from their capabilities (attention's Mosaic program takes every family that issues its products in its consumers, `Family.issues_in_consumers`, mma.sync and the TPU's among them), never from a list kept here; the one-template, thin-mainloop rule they serve is [kernel-templates.md](kernel-templates.md)'s.
 
 ### Configs from device facts
 
-Each template is a `Template`, Dew's launch protocol. Its `derived(call, target)` returns the one config for the call, or None, and None refuses the call with its reason. `legal` holds the hard constraints: the staged bytes fit the program's share of shared memory, the registers a role needs are held without spilling, and the compile report has not refused the config. `variants` lists the derived config and a few legal neighbors, which only the opt-in tuner times.
-
-The facts come from `generation.GpuTarget`. The multiprocessor count, opt-in shared memory per block, clock and memory bandwidth are read from the device at runtime. Each architecture's facts are fixed per compute capability (`generation.Architecture`): tensor rates by precision, resident threads and blocks, its register file (64K registers per multiprocessor, at most 255 per thread, allocated in steps of 8), the shared memory each block reserves, its shared-memory and special-function rates, `setmaxnreg`'s range, whether it has wgmma and TMA, TMEM columns, a TPU's VMEM limits, and whether the GPU supports dependent launch; the resource and cost models read these facts, never the kind. Dew's resource model raises a wgmma consumer to its program's share of the register file, at most `resources.raise_ceiling()` (248), as the compile honours `setmaxnreg` ([lowering](#lowering-to-machine-code), `resources.RAISES_HONORED`). Attention's forward derivation takes two consumers on wgmma when the step overlaps, the largest walked tile that fits and two stages. The GEMM's Mosaic derivation is the most worked out: each rule names the fact it reads, from the tile that loads its operands the fewest times per FLOP within the consumers' registers, through the step, programs per multiprocessor, stages, cluster and raster band.
-
-The compile report checks each derived config against ptxas. It reads every Mosaic kernel's register count and spills from the compiled binary, refuses a spilling config and relowers the program once with the next one. Offline, a CPU compile gate in the tests holds the register model to ptxas at the cap each launch runs at.
+Each template is a `Template`, Dew's launch protocol: its `derived(call, target)` returns the one config for the call from the device's facts, or None, and None refuses the call with its reason. What is legal, where the facts come from and how a compiled kernel is held to its derived config are [kernel-templates.md](kernel-templates.md)'s.
 
 *Where it lives: `templates/base.py` (`Template`), `templates/mosaic.py` (`Issuer`, `Transport`, `Family`, `kernel`, `dependent`), `mosaic_sm80.py`, `mosaic_sm90.py`, `mosaic_sm100.py`, `bundles.py`, `resources.py`, `templates/cost.py`, `attention_algebra.py`, `attention_mosaic.py`, `templates/recurrence/`, `templates/gemm/`, `generation.py` (`GpuTarget`, `Architecture`).*
 
 ## Derived forms
 
-*Behind a switch that is off by default. The dev-time generator and error-aware extraction are parked, and the `error_free` rule set is not built.*
-
-The template's algebra is hand-written today. The aim is to derive it from a declaration of what the operation computes, using the same e-graph engine, and to swap the derived forms in behind one switch once they meet both bars: as fast on every scoreboard row the route serves, and on par by check 1 against float64.
-
-![The derivation path of a Reduction, attention's. A Scan takes a shorter one: its token update read as an affine map and its chunk form derived by identities in the e-graph (`linear_scan`), then the carry's extraction. Derivation runs at trace time today; the spec's dev-time generator, which would check the derived modules into the repository as reviewed code, is parked.](https://raw.githubusercontent.com/AshishKumar4/dew/main/docs/assets/architecture-derived.svg)
-
-*Figure 4. The derivation path of a Reduction, attention's. A Scan takes a shorter one: its token update read as an affine map and its chunk form derived by identities in the e-graph (`linear_scan`), then the carry's extraction. Derivation runs at trace time today; the spec's dev-time generator, which would check the derived modules into the repository as reviewed code, is parked.*
-
-**Declarations.** A declaration states semantics only, never a form. Attention's is a `Reduction`: on whole operands, `m = max(s)`, `p = exp(s − m)`, `out = (p·v) / Σp`, with the keys as the walked axis and the exponent base (2 for the folded form, e for the natural one) stated by the template. A recurrence's is a `Scan`: the update `h ← exp(g)·h − β·k(kᵀ exp(g)·h) + β·k·vᵀ` (the middle term for the delta rule only), the readout `scale·qᵀh`, and time as the walked axis.
-
-**Derivation.** `derive` traces the declaration at one tile into terms. Facts saturate first: which values lie along the walked axis, which reductions sum or take a maximum along it, and which values scale as `exp(−k)` of a walked maximum. Each walked reduction gets a slot, a carried state. The roots are the readings `stepped` and `merged` for each reduction and `finished` for each output, and the decoupled rules distribute them through the language: the running-maximum rescale of online softmax, log-sum-exp merges, moment merges. Extraction prices candidates with the tile walk. A reading no rule rewrote has no price, and the declaration is refused rather than emitted half-derived. The result is a `Derived` holding `init`, `step`, `merge` and `finish`.
-
-**Binding.** Attention's `plain_step`, `merge` and `finish` compute by the derived forms; the hand-written forms they replaced are gone, XLA's attention the reference check 1 holds them to. Those functions serve the Mosaic forward, Triton, portable and decode paths, for the forms the derivation covers, keys-first tiles among them. A dropping call's forward step stays hand-written: `plain_step` keeps its dropped weights as scaled parts, since the derivation narrows a dropped weight past fp16's range. The backward's derived forms do cover dropout, and mask each tile's score cotangents where its queries see no key; a query a score hook leaves seeing no key takes no output cotangent at all (`attention.launch_arguments`), as the reference's, and a common walk's holder wholly past the call's keys is masked (`Forward.walked_keys`). The recurrence's derived chunk restarts its decays' compensated prefix at a token whose decay vanishes in its dtype, and holds a walk's decay there, so no span's or walk's sum overflows. The forms it does not cover keep the template's hand-written implementation: headroom-guarded forms, which decode uses, and the accurate, natural and compensated forms. A derivation the engine starts and cannot complete refuses; it never falls back. The recurrence's portable branch takes its derived chunk form. The switch is off by default, and only tests turn it on.
-
-### One cost vocabulary, two schedules
-
-Both uses of the engine price their candidates in the same units, and the device facts come from one owner.
-
-![One vocabulary, two schedules. A candidate's terms sum to one Work record over the chosen DAG, each shared value counted once; the schedule turns that record into seconds. Neither schedule compiles anything.](https://raw.githubusercontent.com/AshishKumar4/dew/main/docs/assets/architecture-cost.svg)
-
-*Figure 5. One vocabulary, two schedules. A candidate's terms sum to one `Work` record over the chosen DAG, each shared value counted once; the schedule turns that record into seconds. Neither schedule compiles anything.*
-
-The algebra counts its terms into `Work`: each input of the program its bytes once, a product's FLOPs and the shared-memory bytes it stages, a reduction's operations, a special function's exponentials, a cast's conversions, any other elementwise operation's operations, and nothing for a layout change. `cost.fused` models what XLA will do with an ordinary program: the program's inputs are read once from memory, elementwise work fuses into its consumer, and each unit runs at the whole device's rate, in series with that traffic. `cost.walk` models a template's inner loop: one tile on one multiprocessor, its tensor, shared-memory, SFU and CUDA-core time overlapped, its operands staged by the walk, so it charges no device bytes. Today the tile walk does not read register pressure or the walk's rings when it prices a candidate. Those belong to a whole chosen form, and the compile gate checks them afterwards. XLA's schedule is checked against measured profiles ([algebra §1.6](algebra.md#16-cost)); the tile walk has no such receipt yet.
+A template's algebra is derived from a declaration of what the operation computes, by the same e-graph engine as the algebra pass, and both uses of the engine price their candidates in one cost vocabulary. The declarations, the derivation, what is bound and what is still written by hand, and the cost model are [algebra.md](algebra.md)'s (§6.9 Derived template forms; §1.6 and §6.5, cost).
 
 *Where it lives: `dew.algebra.derive` (`Reduction`, `derive`), `dew.algebra.scan` (`Scan`, `derive_scan`), `dew.algebra.carry`, `dew.algebra.forms` (`Derived`, `derived`), `dew.algebra.cost` (`work`, `fused`, `walk`), `templates/cost.py` (`Work`, `walked`), `attention_algebra` (`declaration`, `_derived_step`), `recurrence_chunk.xla_mainloop`.*
 
@@ -210,8 +161,6 @@ The other kernel paths are shorter. A Pallas-Triton kernel goes through XLA's Tr
 
 ## Runtime
 
-*Typed edges between launch pairs are planned.*
-
 A resident training step, the default, is one XLA executable. Kernels are custom calls inside it, so one kernel hands off to the next on the device, with no trip to the host, and the trainer calls the executable directly, once per micro-batch part. A host-master step instead runs its compiled phases from a Python loop. Importing Dew before JAX initializes its backend supplies three XLA flags the run has not set itself: `--xla_allow_excess_precision=false`, so XLA keeps the roundings the program states, and on CUDA, allocator spatial partitioning off and IEEE-rounded fp32 division in PTX. An import after the backend is up changes nothing.
 
 ### Dependent launches
@@ -226,22 +175,7 @@ On sm90 and later (sm90, sm100, sm103, sm120), every Mosaic launch is a programm
 
 ## Accuracy
 
-*Check 2 covers far fewer sites than check 1.*
-
-### The precision policy
-
-A run's numerics are a `Numerics`, set with `trainer.precision`. It holds three things. The dtypes: parameters in fp32, compute in bf16 and outputs in fp32 by default. The precision of every product that states none: `default`, which is TF32 for fp32 on a GPU, or `high` or `highest`. And the forms: `fast` or `accurate`. The preset `accurate` runs fp32 throughout, every unstated product at `highest`, with the accurate forms. Code takes it for a block with `generation.run_precision(...)`. The default's contract is the fastest form that passes the gate on ordinary inputs and stays finite on adversarial ones; for attention, that is the base-2 fold and FlashAttention's backward arithmetic, with the anchored correction term for dQ. The Pallas-Triton attention and decode kernels still miss that contract on some extreme-logit families, a defect the testing spec lists.
-
-Some choices hold whatever the policy says. RMS statistics are at least fp32 by default (RMSNorm's `fp32_statistics=False` keeps the input dtype), softmax is at least fp32 by default, gelu and silu compute in at least fp32, the vocabulary head returns fp32, the MoE router, recurrence state, SSD and chunked LM loss use exact fp32 products, and sums accumulate in fp32. The GEMM template sums in fp32 and rounds once.
-
-### The gate: two checks against float64
-
-Every numerical acceptance in Dew goes through one gate, with no tolerance of its own anywhere else.
-
-- **Check 1, on par.** Over a site's declared seeds of drawn inputs, each output's RMS error from the float64 truth, pooled over the seeds, must be within 1.5 times the reference implementation's error on the same inputs (`PARITY`), with no floor. The worst row must be within 4 times the reference's (`ROW_FACTOR`), with wider factors for rows of one or two values (`NARROW_FACTORS`). Every element must be finite, and a leaf the reference gets exactly right must be exact. The decision is statistical. A leaf passes when the pooled ratio's bootstrap interval lies at or under 1.5, or when a well-resolved interval that straddles 1.5 has a point ratio at or under it; a typical-draw procedure can still resolve a leaf the pooled test leaves inconclusive. Any leaf that does not pass the first stage gets a second, larger draw of seeds, and a leaf still unresolved fails. The gate is `assert_as_exact`, which the numerical test files call.
-- **Check 2, never wrong.** Every element of every equation must lie within a certified roundoff bound for that operation, on the operands the execution was given. A sum's bound is γ_n times the sum of absolute terms; comparisons, selections and moves must match bit for bit. Primitive certificates interpret one equation at a time. Native GEMM kernels are certified against intervals around their exact products, which account for tensor-core truncation and underflow, and the gated-delta recurrence has a native step witness (`tests/native_certificates.py`, `tests/recurrence_witness.py`). Attention, CUTLASS and the rest of the recurrence are still to come, and check 2 covers far fewer sites than check 1.
-
-The algebra engine plugs into the same gate. A compile-time rule is admitted by its rounding class and held to the gate's contract for that class. The gate runs every reference arm and float64 truth with `passes(on=False)` and the candidate as users run it, the pass on (`tests/arm_arithmetic.py`, `unrewritten`), so a program compared with its unrewritten self passes one function as both arms. The spec's error-aware extraction, the cheapest candidate whose measured check-1 error meets the policy, exists as `dew.algebra.error.choose`, with only tests calling it. It is meant for the dev-time generator, which is parked.
+Every numerical acceptance in Dew goes through one gate, two checks against float64, with no tolerance of its own anywhere else: its contract is [testing.md](testing.md)'s (Numerical accuracy). A run's numerics, the `Numerics` set with `trainer.precision`, are [training.md](training.md)'s.
 
 *Where it lives: `dew.nn.precision` (`Numerics`, `Dtypes`, `ACCURATE`, `numerics_of`), `generation.run_precision`, `tests/reference_error.py` (`assert_as_exact`), `src/dew/parity.py`, `tests/certified.py` (`assert_certified`), `docs/design/testing.md`.*
 

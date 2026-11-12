@@ -263,6 +263,53 @@ def test_a_miss_orders_the_compiles_and_rules_out_only_what_the_derivation_itsel
     assert not search.refused(1)
 
 
+def traced(trainer) -> tuple[int, int]:
+    """`trainer` compiled, and how often its plan traced its step and made a candidate of it, counted by the
+    profiler: its step's traces (`_lowering.routed`, each one's dispatches' routes) and its candidates
+    (`_candidates._candidate`), a derivation's and a lowering's alike."""
+    from dew.training import _candidates, _lowering
+
+    profiler = cProfile.Profile()
+    profiler.runcall(compiled, trainer)
+    stats = pstats.Stats(profiler).stats.items()
+    return (sum(calls for (file, _, name), (_, calls, *_) in stats
+                if name == "routed" and file == _lowering.__file__),
+            sum(calls for (file, _, name), (_, calls, *_) in stats
+                if name == "_candidate" and file == _candidates.__file__))
+
+
+def test_a_stated_remat_whose_whole_batch_fits_traces_its_step_once(monkeypatch, tmp_path):
+    """A run that states its remat and leaves its split to the plan, with room for its whole batch at once:
+    the derivation judges the fewest microbatches first, which fit, so the plan makes one candidate and
+    traces its step once, the compile lowering that trace, where the search judged the most first and
+    halved down, a candidate each, and traced the one it compiled again (row 5556)."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
+    free(monkeypatch, LIMIT)
+    trainer = deep(REMAT_POLICIES["full"], split=None)
+    with Compiles("step") as compiles:
+        steps, candidates = traced(trainer)
+    assert trainer.plan["split"] == 1 and [entry["split"] for entry in trainer.plan["derived"]] == [1]
+    assert (steps, candidates, compiles.count) == (1, 1, 1)
+
+
+def test_a_stated_remat_whose_whole_batch_does_not_fit_traces_only_the_splits_it_tries(monkeypatch, tmp_path):
+    """The run of the test above with room for its step at two microbatches and not one: the derivation
+    judges one, then the most, then halves between them, each split once, and the plan traces the step of
+    each split it compiles once, the first from the trace its derivation made."""
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "sizing"))
+    sizing = deep(REMAT_POLICIES["full"], split=2)
+    room = needs(monkeypatch, sizing, lambda: compiled(sizing))
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "run"))
+    free(monkeypatch, room)
+    trainer = deep(REMAT_POLICIES["full"], split=None)
+    steps, candidates = traced(trainer)
+    judged = [entry["split"] for entry in trainer.plan["derived"]]
+    compiled_splits = [probe["split"] for probe in trainer.plan["probes"]]
+    assert judged[0] == 1 and len(judged) == len(set(judged)) and trainer.plan["probes"][-1]["fits"]
+    assert steps == len(compiled_splits)
+    assert candidates == len(judged) + len(set(compiled_splits) - set(judged))
+
+
 def test_the_search_takes_the_fewest_microbatches_that_fit_however_a_miss_elsewhere_corrects_them(
         monkeypatch, tmp_path):
     """In the program a user's process runs (its CPU's products as XLA sums them), with room for the step at
@@ -326,31 +373,20 @@ def test_a_split_the_derivation_refuses_is_still_asked_at_its_half_rung():
     assert str(asked.value) != base
 
 
-def test_a_run_that_states_its_split_and_remat_derives_nothing_and_compiles_once(monkeypatch, tmp_path):
-    """A run that states its split and its remat leaves the derivation nothing to choose: no footprint is
-    derived, before the search or for its compile, and the one compile decides (row 5479: a 4B decoder's
-    derivation held its first step 47 minutes at a split and remat the run had stated). Its record says so
-    ("stated"), and a run that leaves either to the plan derives as it did."""
-    from dew.training import footprint
-
+def test_a_run_that_states_its_split_and_remat_derives_its_plan_from_one_trace_and_compiles_it_once(
+        monkeypatch, tmp_path):
+    """A run that states its split and its remat leaves the derivation its head's rungs and the narrow
+    copies to choose: where its own rung fits, it derives that one candidate, traces its step once and
+    compiles it once, lowered from the trace that judged it, where compiling each rung to learn which fits
+    cost a 4B decoder's plan seven compiles (row 5556); its record says it fits."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
     free(monkeypatch, LIMIT)
-    def derivations(trainer) -> int:
-        """`trainer` compiled, and each candidate step's footprint its plan derived
-        (`footprint.candidate_footprint`), counted by the profiler."""
-        profiler = cProfile.Profile()
-        profiler.runcall(compiled, trainer)
-        return sum(calls for (file, _, name), (_, calls, *_) in pstats.Stats(profiler).stats.items()
-                   if name == "candidate_footprint" and file == footprint.__file__)
-
     stated = deep(REMAT_POLICIES["full"], split=1)
     with Compiles("step") as compiles:
-        derived = derivations(stated)
-    assert compiles.count == 1 and not derived
-    assert [entry["label"] for entry in stated.plan["derived"]] == ["stated"]
-    assert stated.plan["probes"][0]["derived_headroom"] is None and stated.plan["probes"][0]["fits"]
-    for left in (deep(REMAT_POLICIES["full"], split=None), deep(None, split=1)):
-        assert derivations(left) and "stated" not in [entry["label"] for entry in left.plan["derived"]]
+        steps, candidates = traced(stated)
+    assert (steps, candidates, compiles.count) == (1, 1, 1)
+    assert [entry["label"] for entry in stated.plan["derived"]] == ["fits"]
+    assert stated.plan["probes"][0]["fits"]
 
 
 def test_a_run_that_sets_its_remat_derives_its_own_rung_alone_and_compiles_there_once(monkeypatch, tmp_path):
@@ -460,8 +496,7 @@ def gated(layers: str, generation: str, remat: str, capacity: int, records, prec
     model = models.build("causal_transformer", vocab_size=128, emb_features=64, num_layers=2, num_heads=4,
                          num_kv_heads=2, mlp_features=128, max_seq_len=128,
                          remat=None if remat == "none" else REMAT_POLICIES[remat], **GATE_LAYERS[layers])
-    # The split left to the plan, so the derivation judges the step it compiles (a run that states its
-    # split and remat derives nothing, `FitSearch.stated`).
+    # The split left to the plan, so the derivation judges each split it reads.
     trainer = Trainer(LMObjective(model, seq_len=128), optax.adamw(1e-3), key=jax.random.key(0),
                       mesh=MeshSpec().build(compile_only_gpus(generation, 1)))
     tokens = ((np.arange(4 * 129).reshape(4, 129) * 7) % 128).astype(np.int32)

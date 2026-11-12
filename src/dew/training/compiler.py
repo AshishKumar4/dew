@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
@@ -38,7 +39,7 @@ from dew.training.memory import (
     step_options,
 )
 from dew.training.model_flops import batch_consumed, batch_tokens, model_batch
-from dew.training.narrow import narrowing
+from dew.training.narrow import held_copies, narrowing
 from dew.training.phase_passes import PhasePasses
 from dew.training.planning import (
     Candidate,
@@ -306,16 +307,19 @@ class StepCompiler[L, E]:
         split, candidate = planned.split, planned.candidate
         parts = planned.parts(mesh)
         window = split * settings.accumulation
+        planned_copies = {path: jnp.dtype(dtype) for path, dtype in candidate.copies.items()}
 
         def run(current, batch, sampled: bool = False):
             # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
             executable = planned.sampled.executable if sampled and planned.sampled is not None else (
                 planned.executable)
             with stepping.traced_on(mesh):
-                # Each shape plans its copies (`at_base_rung`), and a step reads the state with its own.
+                # Each program plans its copies (`at_base_rung`), and a step reads the state with its own: a
+                # state another program's step left holds that program's (a phase of other passes, row
+                # 5560), which are made again from its variables, a pure function of them.
                 if not candidate.copies:
                     current = dataclasses.replace(current, compute=None)
-                elif current.compute is None:
+                elif held_copies(current.compute) != planned_copies:
                     # A run handed a step compiled ahead runs the program compiled with it: `fit` runs its
                     # steps within the hand (`Trainer._taking`).
                     copies = narrowing(candidate.copies, self.objective.towers(), candidate.shardings.compute)
