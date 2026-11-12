@@ -35,9 +35,32 @@ pytestmark = pytest.mark.gpu(reason="each model's own GPU kernels: flash, cuDNN,
 
 
 def test_the_models_run_their_gpu_kernels(without_deterministic_ops):
-    """Every model cell above on this GPU (`gpu_flow.run_cells`), each one's failure kept and all raised
-    together, without XLA's deterministic ops (`without_deterministic_ops`): the fused kernels' default
-    schedules, as a user's process runs them."""
+    """The model cells above whose properties hold under the suite's XLA flags (`gpu_flow.run_cells`), each
+    one's failure kept and all raised together, Dew's own kernels taking their default schedules
+    (`without_deterministic_ops`): XLA parsed the process's flags at its first compile, so taking the flag
+    out of the environment moves Dew's trace-time choice of a fused kernel's schedule, the joint head's flash
+    among them, and none of XLA's own (row 5491)."""
+    run_cells([
+        Cell("a packed window decides each row as the row alone: the joint arm",
+             functools.partial(decision_packing.packed_rows_decided_alone, "joint")),
+        Cell("a bf16 joint head on flash reads each packed row alone",
+             functools.partial(decision_packing.a_bf16_joint_head_on_flash_reads_each_packed_row_alone,
+                               without_deterministic_ops)),
+        Cell("a push whose replica refuses its join aborts its NCCL group",
+             rollout.a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting),
+        Cell("the paged decode kernel decodes on par with the gathered attention, a softcapped model too",
+             when(bf16_dot_runs(), BF16_PRODUCTS,
+                  kv_cache.the_paged_decode_kernel_decodes_on_par_with_the_gathered_attention)),
+    ])
+
+
+@pytest.mark.users_process
+def test_the_models_run_their_gpu_kernels_as_a_users_process_does():
+    """The model cells above whose properties are a user's process's, in a process of their own under a
+    user's XLA flags (`users_process`: no deterministic ops, JAX's own matmul precision), which XLA reads
+    once, at the process's first compile (row 5491): the GPU's attention kernels at their default schedules,
+    and the accurate precision policy clearing JAX's own TF32 default, each one's failure kept and all
+    raised together."""
     run_cells([
         Cell("a bf16 decoder trains on a packed batch and serves its cache through the GPU's kernels",
              causal.a_bf16_decoder_trains_and_serves_through_its_gpu_kernels),
@@ -49,14 +72,4 @@ def test_the_models_run_their_gpu_kernels(without_deterministic_ops):
           for fixture in ("qwen3-tiny", "llama-tiny")),
         Cell("ModernBERT's states in bf16 on its GPU kernels",
              modernbert.modernbert_states_in_bf16_on_the_gpu_kernels),
-        Cell("a packed window decides each row as the row alone: the joint arm",
-             functools.partial(decision_packing.packed_rows_decided_alone, "joint")),
-        Cell("a bf16 joint head on flash reads each packed row alone",
-             functools.partial(decision_packing.a_bf16_joint_head_on_flash_reads_each_packed_row_alone,
-                               without_deterministic_ops)),
-        Cell("a push whose replica refuses its join aborts its NCCL group",
-             rollout.a_push_whose_replica_refuses_its_join_aborts_its_group_rather_than_waiting),
-        Cell("the paged decode kernel decodes on par with the gathered attention, a softcapped model too",
-             when(bf16_dot_runs(), BF16_PRODUCTS,
-                  kv_cache.the_paged_decode_kernel_decodes_on_par_with_the_gathered_attention)),
     ])

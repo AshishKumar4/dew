@@ -377,15 +377,17 @@ grow as heads shrink. The H100 site (`_check_hooked_backward`, compiled) keeps t
 and seeds, at full resolution."""
 
 
-def _check_hooked_backward(hooks: str, *, form: str, interpret: bool, width: int = 64, shared: bool = False):
+def _check_hooked_backward(hooks: str, *, form: str, interpret: bool, width: int = 64, shared: bool = False,
+                           dtype=jnp.bfloat16):
     """The backward in the form `form` names (`_backward_form`) under the score hook `SCORE_HOOKS[hooks]` over
-    the template core's causal packed documents under a window (`_check_hooks`' site), heads `width` wide:
-    the gradients of the queries, keys, values, of the hook's parameters and of the initial state.
-    Interpreted, at the hook's own site (`INTERPRETED_HOOK_SITES`); with `shared` over two rows, the hook's
-    parameters one every row shares."""
+    the template core's causal packed documents under a window (`_check_hooks`' site), heads `width` wide, in
+    `dtype`: the gradients of the queries, keys, values, of the hook's parameters and of the initial state.
+    Interpreted, at the hook's own site (`INTERPRETED_HOOK_SITES`, an fp16 call's `INTERPRETED_FP16_SITES`);
+    with `shared` over two rows, the hook's parameters one every row shares."""
     case = CASES["causal-documents-window"]
     queries, keys = core_geometry(case)
-    (rows, heads, kv_heads), seeds = INTERPRETED_HOOK_SITES[hooks] if interpret else ((ROWS, 4, 2), None)
+    sites = INTERPRETED_FP16_SITES if jnp.dtype(dtype) == jnp.float16 else INTERPRETED_HOOK_SITES
+    (rows, heads, kv_heads), seeds = sites[hooks] if interpret else ((ROWS, 4, 2), None)
     rows = 2 if shared else rows
     # The call's documents of its first `rows` rows.
     called = {name: value[:rows] if hasattr(value, "shape") else value
@@ -393,7 +395,7 @@ def _check_hooked_backward(hooks: str, *, form: str, interpret: bool, width: int
     spans = template.spans(queries, keys, rows, **called)
     _check_spans("causal-documents-window", spans, (rows, queries, heads, kv_heads), interpret=interpret,
                  backward=True, form=form, score=SCORE_HOOKS[hooks], seeds=seeds, width=width,
-                 param_rows=1 if shared else None)
+                 param_rows=1 if shared else None, dtype=dtype)
 
 
 def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form: str = "default"):
@@ -1449,21 +1451,59 @@ def test_a_causal_backward_whose_consumers_stage_shared_logits_walks_each_query_
     _check_backward("causal", (1, 128, 2, 1), form=None, config=config, interpret=True, width=64)
 
 
-HOPPER_HOOK_SITES = ("alibi", "resumed", "softcap-sinks-alibi")
-"""The hooked backward's sites the H100 alone runs (`…_under_every_score_hook_on_an_h100`, compiled, at the
-template site's shape and seeds): a head's ALiBi slope or a resumed state is one value a draw, so check 1
-takes 128 draws at any head count, past the CPU suite's 240 s target interpreted (1.9 s a draw a row of two
-heads: 270 to 650 s, row 1849); the CPU keeps every other hook, sinks and softcap among them."""
+ONE_TASK_SEEDS = 16
+"""The most seeds an interpreted hooked backward's site draws in one task of the CPU suite's 240 s target (1.9
+s a draw a row of two heads, 7.5 s two rows of four); a site of more is sharded (`check1_shards`)."""
+
+SHARDED_HOOKS = [hooks for hooks in BACKWARD_HOOKS if INTERPRETED_HOOK_SITES[hooks][1] > ONE_TASK_SEEDS]
+"""The hooks whose interpreted site draws more than one task holds: a head's ALiBi slope or a resumed state
+is one value a draw, so check 1 takes 128 draws at any head count (270 to 650 s whole, row 1849)."""
 
 
 @INTERPRETS
 @on_each_family_for("form", ["default", "accurate"])
-@pytest.mark.parametrize("hooks", [hooks for hooks in BACKWARD_HOOKS if hooks not in HOPPER_HOOK_SITES])
+@pytest.mark.parametrize("hooks", [hooks for hooks in BACKWARD_HOOKS if hooks not in SHARDED_HOOKS])
 def test_the_backward_is_on_par_under_every_score_hook_interpreted(hooks, form):
     """The backward in both forms under each score hook over causal packed documents under a window, under
     the interpreter: the gradients of the queries, keys and values, of each hook parameter and of the initial
     state."""
     _check_hooked_backward(hooks, form=form, interpret=True)
+
+
+@INTERPRETS
+@on_each_family_for("form", ["default", "accurate"])
+@pytest.mark.parametrize("hooks", SHARDED_HOOKS)
+@pytest.mark.check1_shards(seeds=128, per_task=16)
+def test_the_backward_is_on_par_under_a_hook_of_one_value_a_draw_interpreted(hooks, form):
+    """`test_the_backward_is_on_par_under_every_score_hook_interpreted` under the hooks whose site draws past
+    one task (`SHARDED_HOOKS`), its draws sharded across the CPU suite's tasks."""
+    _check_hooked_backward(hooks, form=form, interpret=True)
+
+
+def test_a_sharded_hooks_mark_states_its_sites_seeds():
+    """The sharded hooks' mark (`check1_shards`, which the plan reads as literal counts) draws the seeds
+    their sites declare (`INTERPRETED_HOOK_SITES`), and a task the most one holds (`ONE_TASK_SEEDS`)."""
+    sharded = test_the_backward_is_on_par_under_a_hook_of_one_value_a_draw_interpreted
+    [mark] = [mark for mark in sharded.pytestmark if mark.name == "check1_shards"]
+    assert {INTERPRETED_HOOK_SITES[hooks][1] for hooks in SHARDED_HOOKS} == {mark.kwargs["seeds"]}
+    assert mark.kwargs["per_task"] <= ONE_TASK_SEEDS
+
+
+INTERPRETED_FP16_SITES = {"none": ((1, 2, 1), 8), "softcap": ((1, 2, 1), 8), "sinks": ((1, 4, 2), 16)}
+"""An fp16 call's interpreted hooked backward's sites: `INTERPRETED_HOOK_SITES`' shapes, their seeds sized
+by `seeds_for` at fp16 (the reference against itself; check 1's spread is fp16's own), each hook alike in
+both forms on both families' walks (armada, 11-11)."""
+
+
+@INTERPRETS
+@on_each_family_for("form", ["default", "accurate"])
+@pytest.mark.parametrize("hooks", list(INTERPRETED_FP16_SITES))
+def test_an_fp16_backward_over_packed_documents_under_its_hooks_is_on_par_interpreted(hooks, form):
+    """An fp16 call's backward in two launches (row 3497) over causal packed documents under a window,
+    without hooks, under a softcap and with sinks, in both forms, under the interpreter: the fp16 route's
+    packed-documents and sinks-softcap calls (`test_attention_route.an_fp16_call_on_an_h100_is_on_par`),
+    whose H100 cells the GPU tier's covering leaves to the CPU (row 5461)."""
+    _check_hooked_backward(hooks, form=form, interpret=True, dtype=jnp.float16)
 
 
 @ON_EACH_FAMILY

@@ -5,7 +5,7 @@ the forward and its backward in one program as a user calls them, held to check 
 its launch form pinned. Its cells cover every pair of axis values the family's route serves
 (docs/design/testing.md's covering scenarios): what it serves is read from the route's own analyses
 (`supported`, the cell module's), never a second list. The CPU runs every cell, interpreted. Main's GPU
-tier runs `FLOWS` on an H100 and an A100, each over the cells a GPU runs natively (`native_cells`: the
+tier runs `FLOWS` on an H100 and an A100, each over the cases a GPU-only red seeded (`seeded_cells`: the
 owner's ruling of 2026-11-11, row 5461's covering set), and tests/test_kernel_matrix.py holds each family's
 cells to its supported pairs (`covered`). A TPU tier runs `TPU_FLOWS`. Nothing here needs a GPU.
 """
@@ -239,68 +239,29 @@ CELLS: dict[str, tuple[str, str]] = {
 }
 """Each family's matrix cell function, by its module and name (`gpu_flow.cell`)."""
 
-NATIVE: dict[str, tuple[str, ...]] = {
-    "attention": ("generation", "width", "launch", "dtype", "form"),
-    "attention_kernels": ("generation", "kernel", "dtype"),
-    "decode": ("generation", "layout", "kernel", "dtype"),
-    "gemm": ("generation", "kernel", "form", "dtype"),
-    "fused_gemm": ("generation", "stage", "dtype"),
-    "join": ("generation", "join", "dtype"),
-    "low_rank": ("generation", "dtype"),
-    "nvfp4": ("generation", "out_dtype"),
-    "blockwise_fp8": ("generation", "out_dtype"),
-    "mxfp8": ("generation", "format", "out_dtype"),
-    "recurrence": ("generation", "form", "kernel", "dtype"),
-    "short_conv": ("generation", "model", "dtype", "documents"),
-    "selective_scan": ("generation", "case"),
-    "delta_decode": ("generation", "layer", "kernel", "state"),
-    "norm_swiglu": ("generation", "op", "form", "dtype"),
-    "narrow_copies": ("generation", "dtype", "form", "window"),
-}
-"""Each GPU family's axes that name what a GPU runs natively (row 5461's covering set): its GPU; the kernel,
-launch, layout or form its route takes, each a program of its own (attention's heads 256 wide among them: on
-wgmma the backward's shared-keys launch at 256, on sm100 the forward's value-column blocks); and the
-precision it computes in, whose summation order on the GPU is its own (rows 3522, 5268, 5404 and 5414: fp32
-cells red on a GPU alone, green interpreted). Every other axis is a shape or a hook, whose pairs the CPU's
-interpreted cells cover, and the compile gate. The selective scan's recorded cases are each a numerics regime
-of its own, and the short conv's shapes each a GPU's memory of its own: a 9B conv's packed fp32 rows ran out
-of an H100's memory where the CPU interprets them (the GPU tier at 475913063)."""
-
-
-def native_cells(family: str) -> list:
-    """The cells of `family`'s matrix a GPU runs (`FLOWS`): the first in its order to cover each combination
-    of its native axes' values (`NATIVE`), and each case a ledger row names (`SEEDED`), which proves the row
-    closed where it was found."""
+def seeded_cells(family: str) -> list:
+    """The cells of `family`'s matrix a GPU runs (`FLOWS`): each case a ledger row names (`SEEDED`), a red a
+    GPU alone showed, whose own case proves the row closed where it was found (row 5461's covering set); every
+    other pair the CPU's interpreted cells cover, and the compile gate, and a GPU's default routes the model
+    flows' (tests/test_gpu_flows.py)."""
     seeded = {case for _, case in SEEDED.get(family, ())}
-    seen: set[tuple[str, ...]] = set()
-    kept = []
-    for cell, (_, combination) in zip(gpu_flow.cells_of(check(family)), covered(family), strict=True):
-        native = tuple(combination[axis] for axis in NATIVE[family])
-        if native not in seen or tuple(combination.values()) in seeded:
-            seen.add(native)
-            kept.append(cell)
-    return kept
+    cells = zip(gpu_flow.cells_of(check(family)), covered(family), strict=True)
+    return [cell for cell, (_, combination) in cells if tuple(combination.values()) in seeded]
 
 
 FLOWS: tuple[str, ...] = (
     "tests/test_gpu_attention.py::test_the_attention_matrix_holds_on_this_gpu",
-    "tests/test_gpu_attention.py::test_the_attention_kernels_matrix_holds_on_this_gpu",
     "tests/test_gpu_attention.py::test_the_decode_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_gemm_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_fused_gemm_matrix_holds_on_this_gpu",
-    "tests/test_gpu_gemm.py::test_the_join_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_low_rank_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_nvfp4_matrix_holds_on_this_gpu",
     "tests/test_gpu_gemm.py::test_the_blockwise_matrix_holds_on_this_gpu",
-    "tests/test_gpu_gemm.py::test_the_mx_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_recurrence_matrix_holds_on_this_gpu",
     "tests/test_gpu_recurrence.py::test_the_short_conv_matrix_holds_on_this_gpu",
-    "tests/test_gpu_recurrence.py::test_the_selective_scan_matrix_holds_on_this_gpu",
-    "tests/test_gpu_recurrence.py::test_the_recurrent_decode_matrix_holds_on_this_gpu",
-    "tests/test_gpu_numerics.py::test_the_norm_swiglu_matrix_holds_on_this_gpu",
-    "tests/test_gpu_numerics.py::test_the_narrow_copies_matrix_holds_on_this_gpu",
 )
-"""The flows that run the matrices' native cells on the GPU tier (`native_cells`), by pytest node id."""
+"""The flows that run the matrices' seeded cases on the GPU tier (`seeded_cells`), by pytest node id: a
+family no GPU-only red seeded runs on the CPU alone."""
 
 TPU_FLOWS: tuple[str, ...] = (
     "tests/test_attention_splash.py::test_the_attention_kernels_matrix_holds_on_this_tpu",
@@ -368,7 +329,7 @@ def supported_pairs(family: str) -> set[tuple[tuple[str, str], tuple[str, str]]]
     pairs = set()
     for combination in combinations(family):
         if supported(family, tuple(combination.items())):
-            pairs |= set(itertools.combinations(combination.items(), 2))
+            pairs |= gpu_flow.held(combination, values=False)
     return pairs
 
 
@@ -388,12 +349,6 @@ def covering(family: str) -> list[tuple[str, ...]]:
               if supported(family, tuple(combination.items()))]
     chosen = []
     for _, case in SEEDED.get(family, ()):
-        combination = dict(zip(AXES[family], case, strict=True))
         chosen.append(case)
-        left -= set(itertools.combinations(combination.items(), 2))
-    while left:
-        best = max(served, key=lambda combination: len(
-            left & set(itertools.combinations(combination.items(), 2))))
-        chosen.append(tuple(best.values()))
-        left -= set(itertools.combinations(best.items(), 2))
-    return chosen
+        left -= gpu_flow.held(dict(zip(AXES[family], case, strict=True)), values=False)
+    return chosen + [tuple(served[index].values()) for index in gpu_flow.greedy(served, left, values=False)]
