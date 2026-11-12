@@ -16,11 +16,10 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
 
-from dew.nn.dense import _plain_dense, intercepted
-from dew.nn.precision import biased, float32_dot_general
+from dew.nn.dense import _biased, _plain_dense, _promoted, intercepted
+from dew.nn.precision import float32_dot_general
 
 from .kernels.generation import INHERENT, Choice, device_generation
-from .kernels.projections import dot_general
 from .kernels.selection import Kernel, Op, Requirement, select
 
 
@@ -123,27 +122,30 @@ def joins(choice: Choice, projections: Sequence[nn.Module]) -> bool:
     return select(JOINS[choice], join_case(projections)).kernel == 'joined'
 
 
-def joined_dense(x: jax.Array, projections: Sequence[nn.Module], *, axis: int) -> jax.Array:
+def joined_dense(x: jax.Array, projections: Sequence[nn.Dense], *, axis: int) -> jax.Array:
     """`projections`' outputs of `x` from one GEMM, stacked on output axis `axis`: -2 gives
     `[..., n, features]`, -1 `[..., features, n]`. Each kernel and bias is read and cast as its
-    own call casts it; `joins` says when the result is theirs."""
+    own call casts it, and the product taken and biased by a Dense's own arithmetic (`dense._biased`: a
+    16-bit product with an fp32-stored bias rounded once with it, as each projection apart rounds its own);
+    `joins` says when the result is theirs."""
     if axis not in (-2, -1):
         raise ValueError(f"the projections stack on output axis -2 or -1, not {axis}")
-    promoted = [projection.promote_dtype(
-        x, meta.unbox(projection.get_variable('params', 'kernel')),
-        meta.unbox(projection.get_variable('params', 'bias')) if projection.use_bias else None,
-        dtype=projection.dtype) for projection in projections]
+    first = projections[0]
+    stored = [meta.unbox(projection.get_variable('params', 'bias')) if first.use_bias else None
+              for projection in projections]
+    promoted = [_promoted(projection, x, meta.unbox(projection.get_variable('params', 'kernel')), bias)
+                for projection, bias in zip(projections, stored, strict=True)]
     inputs = promoted[0][0]
-    # A kernel is [inputs, features]; the stacked axis sits beside its features as it will in the output.
+    # A kernel is [inputs, features]; the stacked axis sits beside its features as it will in the output,
+    # and the biases beside theirs, so the kernels side by side and the biases flattened alike pair each
+    # output column with its own bias.
     kernel = jnp.stack([kernel for _, kernel, _ in promoted], axis=axis + 3)
-    biases = (jnp.stack([bias for _, _, bias in promoted], axis=axis + 2) if projections[0].use_bias
-              else None)
+
+    def flat(biases: list) -> jax.Array | None:
+        return None if biases[0] is None else jnp.stack(biases, axis=axis + 2).reshape(-1)
+
     dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
-    # One matrix product of the kernels side by side, as a Dense takes its own (`projections.dot_general`).
-    y = dot_general(float32_dot_general)(inputs, kernel.reshape(kernel.shape[0], -1), dimensions,
-                                         precision=projections[0].precision)
-    y = y.reshape(*y.shape[:-1], *kernel.shape[1:])
-    if biases is None:
-        return y
-    # Taken and biased as each Dense takes and biases its own (`dew.nn.dense`).
-    return biased(y, biases)
+    # One matrix product of the kernels side by side, as a Dense takes its own (`dense._biased`).
+    y = _biased(first, inputs, kernel.reshape(kernel.shape[0], -1), dimensions,
+                flat([bias for _, _, bias in promoted]), lambda bias: bias, flat(stored))
+    return y.reshape(*y.shape[:-1], *kernel.shape[1:])
