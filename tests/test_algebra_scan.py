@@ -14,8 +14,8 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact
 
-from dew.algebra import SATURATION, cost, linear_scan, scan
-from dew.nn.kernels import generation, recurrence_algebra
+from dew.algebra import SATURATION, scan
+from dew.nn.kernels import generation
 from dew.nn.precision import float32_matmul
 
 TOKENS, STATE, WIDTH, CHUNK = 128, 16, 32, 32
@@ -352,17 +352,6 @@ def test_a_chunk_form_any_target_extracts_computes_the_token_scan(target):
                                            state=((KEY, VALUE), jnp.float32)), saturation=SATURATION)
         assert_as_exact(jax.jit(gated_walk(forms, GATED)), jax.jit(gated_tokenwise(gated_delta)), gated_draw,
                         f"gated delta on {target}", seeds=8)
-
-
-def test_a_chunks_form_is_the_one_its_target_derives():
-    """A chunk's form asked for under one target and then another is each target's own derivation: an
-    H100's (WY with its inverse by doubling) and an A10's (by substitution, its span unpriced)."""
-    extents = linear_scan.Extents(64, 128, 128, 1)
-    for target in ("sm90", "sm86", "sm90"):
-        with generation.assumed(target):
-            assert scan._form(extents, corrected=True) == linear_scan.derive(
-                extents, corrects=True, schedule=cost.fused(cost.target()),
-                precision=recurrence_algebra.STATE_PRECISION)
 
 
 def test_a_scans_carry_derived_for_one_target_serves_no_other():

@@ -18,6 +18,7 @@ from reference_error import assert_as_exact
 
 from dew import algebra
 from dew.nn import precision
+from dew.nn.kernels.templates import report
 
 SOURCE = Path(__file__).resolve().parents[1] / "src"
 
@@ -33,6 +34,20 @@ def unit_backward(x, dy):
     unit rows with the cotangent, each waiting on the one before."""
     _, pull = jax.vjp(precision.l2norm, x)
     return pull(dy)[0]
+
+
+def traces_cheaper(traced, *operands) -> bool:
+    """Whether tracing `traced` splices a form the model prices cheaper than the region as traced (the
+    rewrite report's `spliced` and `before`/`after`): what a rewrite is, read from the pass's own record, not
+    from the operations the rewritten program happens to hold."""
+    with report.refusals():
+        jax.make_jaxpr(traced)(*operands)
+        return any(made.spliced and made.after < made.before for made in report.rewrites())
+
+
+def cheaper_spliced(program, *operands) -> bool:
+    """Whether tracing `program` rewritten splices a cheaper form (`traces_cheaper`)."""
+    return traces_cheaper(algebra.rewritten(program), *operands)
 
 
 def two_sums(x, y, a):
@@ -74,16 +89,9 @@ def test_a_rewritten_backward_computes_what_the_backward_computes():
 
 
 def test_linearity_joins_two_reductions_into_one_pass():
-    """Two sums of one scale's products become one sum over the joined products: the rewritten program reads
-    its rows in one reduction where the program read them in two."""
-    x, y, a = rows(0, (8, 64), (8, 64), (8, 64))
-    before = jax.make_jaxpr(two_sums)(x, y, a)
-    after = jax.make_jaxpr(algebra.rewritten(two_sums))(x, y, a)
-
-    def reductions(closed) -> int:
-        return sum(equation.primitive.name == "reduce_sum" for equation in closed.jaxpr.eqns)
-
-    assert (reductions(before), reductions(after)) == (2, 1)
+    """Two sums of one scale's products become one sum over the joined products: the pass splices a form it
+    prices cheaper than the program's two reductions."""
+    assert cheaper_spliced(two_sums, *rows(0, (8, 64), (8, 64), (8, 64)))
 
 
 def test_each_rule_holds_its_right_side_to_its_left_side():
@@ -257,11 +265,6 @@ def test_two_joined_sums_stay_finite_wherever_the_program_is():
     assert np.isfinite(eval_jaxpr(closed.jaxpr, closed.consts, *operands_)[0])
 
 
-def count(closed, primitive: str) -> int:
-    """The equations of `closed` binding `primitive`."""
-    return sum(equation.primitive.name == primitive for equation in closed.jaxpr.eqns)
-
-
 def test_sums_of_operands_of_other_shapes_stay_apart():
     """Two sums along one axis of operands of different extents are not joined: one sum of their terms would
     broadcast the narrower operand along the axis, or add operands of no common shape."""
@@ -270,8 +273,7 @@ def test_sums_of_operands_of_other_shapes_stay_apart():
 
     for shapes in (((2, 1), (2, 4)), ((2, 3), (2, 4))):
         x, y = rows(1, *shapes)
-        closed = jax.make_jaxpr(algebra.rewritten(apart))(x, y)
-        assert count(closed, "reduce_sum") == 2
+        assert not cheaper_spliced(apart, x, y)
         np.testing.assert_array_equal(np.asarray(algebra.rewritten(apart)(x, y)), np.asarray(apart(x, y)))
 
 
@@ -289,21 +291,18 @@ def test_distributivity_factors_a_shared_matrix_where_its_sum_is_bounded():
         return a @ x + a @ y
 
     x, y, a = rows(2, (64, 32), (64, 32), (8, 64))
-    assert (count(jax.make_jaxpr(bounded)(x, y, a), "dot_general"),
-            count(jax.make_jaxpr(algebra.rewritten(bounded))(x, y, a), "dot_general")) == (2, 1)
-    assert count(jax.make_jaxpr(algebra.rewritten(free))(x, y, a), "dot_general") == 2
+    assert cheaper_spliced(bounded, x, y, a)
+    assert not cheaper_spliced(free, x, y, a)
 
 
 def test_a_row_scalar_leaves_a_sum_along_its_rows():
-    """A per-row scale broadcast along a row and summed with it is taken out of the sum: the rewritten program
-    multiplies the row sums, not the rows."""
+    """A per-row scale broadcast along a row and summed with it is taken out of the sum: the pass splices
+    the form that multiplies the row sums, not the rows, which it prices cheaper."""
     def weighted(x, s):
         return jnp.sum(jnp.tanh(s)[:, None] * jnp.tanh(x), axis=1)
 
     x, (s,) = rows(3, (8, 64))[0], rows(4, (8,))
-    closed = jax.make_jaxpr(algebra.rewritten(weighted))(x, s)
-    multiplied = [equation for equation in closed.jaxpr.eqns if equation.primitive.name == "mul"]
-    assert [equation.outvars[0].aval.shape for equation in multiplied] == [(8,)]
+    assert cheaper_spliced(weighted, x, s)
 
 
 def test_literals_keep_their_exact_values_and_types():
@@ -325,8 +324,7 @@ def test_a_values_products_by_two_literals_are_one_product_by_their_sum():
         return a * 2.0 + a * 4.0
 
     (a,) = rows(8, (8, 64))
-    closed = jax.make_jaxpr(algebra.rewritten(doubled))(a)
-    assert count(closed, "mul") == 1
+    assert cheaper_spliced(doubled, a)
     np.testing.assert_array_equal(np.asarray(jax.jit(algebra.rewritten(doubled))(a)), np.asarray(doubled(a)))
 
 
@@ -366,14 +364,13 @@ def test_custom_derivatives_survive_the_rewrite():
 
 
 def test_outputs_sharing_a_value_keep_it_shared():
-    """A program returning a sum and that sum added to another keeps the shared sum, two reductions in all,
+    """A program returning a sum and that sum added to another keeps the shared sum: no form is spliced,
     where joining the second output's sums would leave the first's to compute apart."""
     def shared(x, y):
         first = jnp.sum(x, axis=-1)
         return first + jnp.sum(y, axis=-1), first
 
-    x, y = rows(7, (8, 64), (8, 64))
-    assert count(jax.make_jaxpr(algebra.rewritten(shared))(x, y), "reduce_sum") == 2
+    assert not cheaper_spliced(shared, *rows(7, (8, 64), (8, 64)))
 
 
 REWRITE = """

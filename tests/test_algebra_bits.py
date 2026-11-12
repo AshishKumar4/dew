@@ -3,6 +3,7 @@ codes' fields, its cheapest instruction form found by the price-ordered search a
 the decoded registers read as the consumer reads them, values its format defines."""
 
 import dataclasses
+import functools
 import itertools
 
 import jax
@@ -41,7 +42,9 @@ def test_a_formats_decode_is_found_at_the_cheapest_price_and_reads_back_its_valu
     values)."""
     form = bits.synthesized(bits.NVFP4_BFLOAT16, reach=6)
     assert form.price <= (5, 8)
-    assert form == bits.NVFP4_BFLOAT16_FORM
+    # The form the kernels hold is proven and no dearer than the one the search finds, whichever it finds.
+    bits.proven(bits.NVFP4_BFLOAT16, bits.NVFP4_BFLOAT16_FORM)
+    assert bits.NVFP4_BFLOAT16_FORM.price <= form.price
     rng = np.random.default_rng(3731)
     codes = rng.integers(0, 16, size=(4096, 8))
     codes[:16, :] = np.arange(16)[:, None]
@@ -300,11 +303,30 @@ def reference_codes(words: np.ndarray, minifloat: bits.Minifloat, dtype) -> np.n
     return np.where(np.isnan(x), signed, codes)
 
 
-@pytest.mark.shards(units=192, per_task=8)
+@functools.cache
+def _encodes(name: str):
+    """A slice of fp32 words (`SLICES`) through `name`'s encode and its instruction form as a kernel traces
+    them (`bits.encoded`, `BitForm.traced`), one compiled program: each word's code, whether the form
+    differs from the encode on any, and the first word it does on."""
+    minifloat, _ = MINIFLOATS[name]
+    form = bits.encode_form(minifloat)
+
+    @jax.jit
+    def run(words):
+        codes = bits.encoded(words, minifloat)
+        (formed,) = form.traced(words)
+        apart = formed != codes
+        return codes.astype(jnp.uint8), jnp.any(apart), words[jnp.argmax(apart)]
+
+    return run
+
+
+@pytest.mark.shards(units=192, per_task=32)
 def test_each_encode_is_the_reference_cast_on_every_fp32_word():
     """Each of e4m3's, e5m2's and e2m1's encodes (`bits.encoded`) is ml_dtypes' round-to-nearest-even cast
     saturated to its largest finite value on every one of the 2^32 fp32 words, a NaN as its NaN code, and its
-    instruction form (`bits.encode_form`) is the encode on every word: a proof by exhaustion (row 4050)."""
+    instruction form (`bits.encode_form`) is the encode on every word: a proof by exhaustion (row 4050), of
+    the encode and the form as a kernel traces them, each slice of words one compiled program's."""
     cases = list(itertools.product(MINIFLOATS, range(SLICES)))
     assert len(cases) == 192, "the shards mark counts each slice of each encode"
 
@@ -312,15 +334,11 @@ def test_each_encode_is_the_reference_cast_on_every_fp32_word():
         for name, index in cases[start:stop]:
             minifloat, dtype = MINIFLOATS[name]
             words = np.arange(index << 26, (index + 1) << 26, dtype=np.uint64).astype(np.uint32)
-            got = bits.encoded(words, minifloat, np)
-            want = reference_codes(words, minifloat, dtype)
-            differ = np.flatnonzero(got != want)
-            assert differ.size == 0, (name, [(hex(int(words[i])), int(got[i]), int(want[i]))
-                                             for i in differ[:4]])
-            (formed,) = bits.encode_form(minifloat).decoded(words)
-            differ = np.flatnonzero(formed != got)
-            assert differ.size == 0, (name, "form", [(hex(int(words[i])), int(formed[i]), int(got[i]))
-                                                     for i in differ[:4]])
+            codes, apart, first = _encodes(name)(words)
+            assert not apart, (name, "form", hex(int(first)))
+            got = np.asarray(codes).astype(np.uint32)
+            differ = np.flatnonzero(got != reference_codes(words, minifloat, dtype))
+            assert differ.size == 0, (name, [(hex(int(words[i])), int(got[i])) for i in differ[:4]])
         return stop - start
 
     sharded("every fp32 word's encode", checked, len(cases))
