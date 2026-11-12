@@ -190,7 +190,7 @@
    "lane": "Training"
   },
   "tests/test_distribution.py": {
-   "comparisons": 9,
+   "comparisons": 4,
    "lane": "Training"
   },
   "tests/test_dpo.py": {

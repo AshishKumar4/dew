@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -899,23 +900,38 @@ def handed(draw: dict, process: int) -> dict[str, np.ndarray]:
 
 
 class Updated:
-    """A RolloutScheduler launch's final parameters by draw (`launches_as_exact`), in the dtype the run
-    computed them in, and its first launch's record: the first SEEDS draws run with the launch, and the
-    further ones, which only check 1's second stage reads, in one more launch of the same pool when first
-    asked for."""
+    """A RolloutScheduler launch's values by draw (`launches_as_exact`): its final parameters, and where
+    `rows` reads a draw's rows (`every_row`, a process's `handed`) their proximal rescoring
+    (`old_log_probs`), each in the dtype the run computed it in; and its first launch's record. The first
+    SEEDS draws run with the launch, and the further ones, which only check 1's second stage reads, in one
+    more launch of the same pool when first asked for."""
 
-    def __init__(self, tmp_path: Path, mesh: dict, processes: int, *flags: str):
+    def __init__(self, tmp_path: Path, mesh: dict, processes: int, *flags: str,
+                 rows: Callable[[dict], dict[str, np.ndarray]] | None = None):
         def launched(draws: range) -> tuple[dict, list[dict[str, np.ndarray]]]:
             return scheduled(tmp_path, mesh, processes, *flags, draws=draws)
 
         self.record, self._first = launched(range(SEEDS))
-        self._further, self._second = functools.partial(launched, range(SEEDS, DRAWS)), None
+        self._further, self._second, self._rows = functools.partial(launched, range(SEEDS, DRAWS)), None, rows
 
-    def __getitem__(self, draw: int) -> dict[str, dict[str, np.ndarray]]:
-        if draw < SEEDS:
-            return {"params": self._first[draw]}
-        self._second = self._second or self._further()
-        return {"params": self._second[1][draw - SEEDS]}
+    def __getitem__(self, draw: int) -> dict[str, object]:
+        record, finals, at = self.record, self._first, draw
+        if draw >= SEEDS:
+            self._second = self._second or self._further()
+            (record, finals), at = self._second, draw - SEEDS
+        values: dict[str, object] = {"params": finals[at]}
+        if self._rows is not None:
+            drawn = record["draws"][at]
+            rescored = self._rows(drawn)["old_log_probs"]
+            values["old_log_probs"] = rescored.astype(drawn["dtypes"]["old_log_probs"])
+        return values
+
+
+def scheduled_three(tmp_path: Path, mesh: dict, *flags: str, rows=None) -> tuple[Updated, Updated, Updated]:
+    """A RolloutScheduler run's three launches (`Updated`): its pool of two processes, one process of both
+    devices, and one float64 process, the float64 twin of that one."""
+    return (Updated(tmp_path, mesh, 2, *flags, rows=rows), Updated(tmp_path, mesh, 1, *flags, rows=rows),
+            Updated(tmp_path, mesh, 1, *flags, "--float64", rows=rows))
 
 
 @pytest.mark.mesh(devices=2)
@@ -925,17 +941,17 @@ def test_every_process_schedules_its_own_rollouts_and_the_pool_trains_on_all_of_
     packs over the whole batch, the proximal rescoring over the pool's rows
     gives each row the likelihood one process gives it, and the update moves
     the parameters one process moves."""
-    (pool, [pooled]), (alone, [single]) = (scheduled(tmp_path, {"fsdp": 2}, 2),
-                                           scheduled(tmp_path, {"fsdp": 2}, 1))
-    assert pool["partition"] == {"count": 2, "readers": 1} and pool["draws"][0]["step"] == 1
-    together, reference = every_row(pool["draws"][0]), every_row(alone["draws"][0])
-    # The behavior log-probabilities are one sampling program's over one two-device mesh, whichever
-    # processes hold its devices (row 3177).
-    for name in ("input_ids", "response_mask", "behavior_log_probs"):
-        np.testing.assert_array_equal(together[name], reference[name])
-    np.testing.assert_allclose(together["old_log_probs"], reference["old_log_probs"], atol=TOLERANCE)
-    for name, value in single.items():
-        np.testing.assert_allclose(pooled[name], value, atol=TOLERANCE)
+    pool, alone, wide = scheduled_three(tmp_path, {"fsdp": 2}, rows=every_row)
+    assert pool.record["partition"] == {"count": 2, "readers": 1}
+    for drawn, reference in zip(pool.record["draws"], alone.record["draws"], strict=True):
+        assert drawn["step"] == 1
+        together, rows = every_row(drawn), every_row(reference)
+        # The behavior log-probabilities are one sampling program's over one two-device mesh, whichever
+        # processes hold its devices (row 3177).
+        for name in ("input_ids", "response_mask", "behavior_log_probs"):
+            np.testing.assert_array_equal(together[name], rows[name])
+    launches_as_exact("a pool's rescoring and update, scheduling its shares' rollouts", pool, alone, wide,
+                      seeds=SEEDS)
 
 
 @pytest.mark.mesh(devices=2)
@@ -970,16 +986,15 @@ def test_a_share_whose_calls_recorded_nothing_holds_the_records_its_peer_packed(
     truncate, so its calls train on nothing and pack no record. It holds
     the records' empty forms, so the pool hands the step one tree, and the
     pool trains on the rows and moves the parameters one process does."""
-    (pool, [pooled]), (alone, [single]) = (scheduled(tmp_path, {"fsdp": 2}, 2, "--records"),
-                                           scheduled(tmp_path, {"fsdp": 2}, 1, "--records"))
-    drawn = pool["draws"][0]
-    assert pool["partition"] == {"count": 2, "readers": 1} and drawn["step"] == 1
-    assert not handed(drawn, 1)["response_mask"].any(), "the second share was meant to train on nothing"
-    together, reference = every_row(drawn), every_row(alone["draws"][0])
-    for name in ("input_ids", "response_mask", "behavior_log_probs"):
-        np.testing.assert_array_equal(together[name], reference[name])
-    for name, value in single.items():
-        np.testing.assert_allclose(pooled[name], value, atol=TOLERANCE)
+    pool, alone, wide = scheduled_three(tmp_path, {"fsdp": 2}, "--records")
+    assert pool.record["partition"] == {"count": 2, "readers": 1}
+    for drawn, reference in zip(pool.record["draws"], alone.record["draws"], strict=True):
+        assert drawn["step"] == 1
+        assert not handed(drawn, 1)["response_mask"].any(), "the second share was meant to train on nothing"
+        together, rows = every_row(drawn), every_row(reference)
+        for name in ("input_ids", "response_mask", "behavior_log_probs"):
+            np.testing.assert_array_equal(together[name], rows[name])
+    launches_as_exact("a pool's update over a share that recorded nothing", pool, alone, wide, seeds=SEEDS)
 
 
 @pytest.mark.mesh(devices=2)
@@ -989,9 +1004,7 @@ def test_a_share_that_trains_nothing_holds_the_shared_prompts_parents_its_peer_p
     its rows share no prompt. It holds the parents' table at the documents' count the pool agrees
     (`agreed_records`), so the pool hands the step one tree, and the pool trains on the rows and moves the
     parameters one process does."""
-    pool, alone, wide = (Updated(tmp_path, {"fsdp": 2}, 2, "--truncate"),
-                         Updated(tmp_path, {"fsdp": 2}, 1, "--truncate"),
-                         Updated(tmp_path, {"fsdp": 2}, 1, "--truncate", "--float64"))
+    pool, alone, wide = scheduled_three(tmp_path, {"fsdp": 2}, "--truncate")
     assert pool.record["partition"] == {"count": 2, "readers": 1}
     for drawn, reference in zip(pool.record["draws"], alone.record["draws"], strict=True):
         assert drawn["step"] == 1
@@ -1011,18 +1024,20 @@ def test_the_readers_of_one_share_train_on_the_rows_its_first_reader_sampled(tmp
     batch, the batch one process samples, and the update is that process's.
     Both sampling, the shards held different rows and the step trained on
     them as one batch."""
-    (pool, [pooled]), (alone, [single]) = (scheduled(tmp_path, {"tensor": 2}, 2, "--vary"),
-                                           scheduled(tmp_path, {"tensor": 2}, 1, "--vary"))
-    drawn = pool["draws"][0]
-    assert pool["partition"] == {"count": 1, "readers": 2} and drawn["step"] == 1
-    first, second, reference = handed(drawn, 0), handed(drawn, 1), handed(alone["draws"][0], 0)
-    for name, value in first.items():
-        np.testing.assert_array_equal(second[name], value)
-    for name in ("input_ids", "response_mask", "behavior_log_probs"):
-        np.testing.assert_array_equal(first[name], reference[name])
-    np.testing.assert_allclose(first["old_log_probs"], reference["old_log_probs"], atol=TOLERANCE)
-    for name, value in single.items():
-        np.testing.assert_allclose(pooled[name], value, atol=TOLERANCE)
+    def first_reader(draw):
+        return handed(draw, 0)
+
+    pool, alone, wide = scheduled_three(tmp_path, {"tensor": 2}, "--vary", rows=first_reader)
+    assert pool.record["partition"] == {"count": 1, "readers": 2}
+    for drawn, reference in zip(pool.record["draws"], alone.record["draws"], strict=True):
+        assert drawn["step"] == 1
+        first, second, rows = handed(drawn, 0), handed(drawn, 1), handed(reference, 0)
+        for name, value in first.items():
+            np.testing.assert_array_equal(second[name], value)
+        for name in ("input_ids", "response_mask", "behavior_log_probs"):
+            np.testing.assert_array_equal(first[name], rows[name])
+    launches_as_exact("one share's readers' rescoring and update, its first reader's rows", pool, alone, wide,
+                      seeds=SEEDS)
 
 
 @pytest.mark.mesh(devices=2)

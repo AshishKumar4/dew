@@ -152,7 +152,8 @@ def main() -> None:
                 multihost_utils.process_allgather(leaf, tiled=True))
                 for path, leaf in jax.tree_util.tree_flatten_with_path(final.variables["params"])[0]})
             draws.append({"step": int(final.step), "shared": FORK_PARENTS_KEY in trained[0],
-                          "rows": {name: np.asarray(rows[name]).tolist() for name in PACKED}})
+                          "rows": {name: np.asarray(rows[name]).tolist() for name in PACKED},
+                          "dtypes": {name: np.asarray(rows[name]).dtype.name for name in PACKED}})
     if process == 0:
         np.savez(args.out.with_suffix(".npz"), **leaves)
         args.out.write_text(json.dumps({
