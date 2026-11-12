@@ -79,13 +79,12 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import (
     DECLARED_MIX,
-    FILE_SHARDS,
+    PLAN_VERSIONS,
     STRUCTURED,
     Manifest,
     StepIdentity,
     _changed,
     _semantic,
-    filled_version,
     identified,
     streams_parquet,
 )
@@ -273,11 +272,12 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     if unkeyed:
         return None, (f"steps ({', '.join(unkeyed)} bind to one run's facts or have no "
                       "identity='name@version', which no generation holds)",)
-    # Keyed as the fill was, by the shards it numbered its rows by (`filled_version`).
-    version = filled_version(fill)
-    changed = _changed(_semantic(dependency), _prefix_manifest(stored, prefix, read, version).semantic())
-    if changed:
-        return None, changed
+    # Keyed as its fill spelled its steps, by a plan version this Dew reads (`PLAN_VERSIONS`), the latest
+    # first: a generation published under the one before names its steps otherwise.
+    changes = [_changed(_semantic(dependency), _prefix_manifest(stored, prefix, read, version).semantic())
+               for version in reversed(PLAN_VERSIONS)]
+    if all(changes):
+        return None, changes[0]
     if not selections:
         return generation.source(), ()
     if any(isinstance(stage, MapWithIndex) for stage in prefix):
@@ -291,7 +291,7 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     placing: Read = ("streamed" if read == "streamed"
                      else "indexed" if placed.supports("indexed") else "memory")
     if (placing == "streamed" and any(isinstance(selection, RecordSlice) for selection in selections)
-            and not placed.manifest(version).index_ordered):
+            and not placed.manifest().index_ordered):
         raise ValueError(
             f"a records holdout numbers its inputs by index, and generation {generation.url} numbers them by "
             f"the shards a stream of {placed.describe()} read, which it doesn't state is the index order; "
@@ -689,8 +689,7 @@ def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read, version
 
 def _cache_key(source: Source, prefix: Sequence[Stage], read: Read, version: int) -> Manifest | None:
     """`_cache_manifest`, or None where `source` states no content of its own to key. A stream's fill
-    numbers its rows by its shards, which a Parquet store's are its files from `FILE_SHARDS` and its row
-    groups before (`filled_version`), so the two fill caches of their own."""
+    numbers its rows by its shards, which a Parquet store's are its files (`shards`)."""
     stated = source.fingerprint()
     if not identified(json_value(stated, "source")):
         return None
@@ -699,7 +698,7 @@ def _cache_key(source: Source, prefix: Sequence[Stage], read: Read, version: int
         (source,),
         tuple(_identity(stage, cache=True) for stage in _cache_steps(prefix)),
         fill={"read": read, "row_ids": "sharded" if read == "streamed" else "indexed",
-              **({"shards": "files"} if read == "streamed" and version >= FILE_SHARDS
+              **({"shards": "files"} if read == "streamed"
                  and streams_parquet(json_value(stated, "source")) else {})},
         version=version,
     )

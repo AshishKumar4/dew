@@ -19,7 +19,6 @@ import itertools
 import json
 import os
 import threading
-import typing
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import ClassVar, Literal, Protocol, runtime_checkable
@@ -139,16 +138,7 @@ from dew.data.pipeline import (
     with_children,
     with_stores,
 )
-from dew.data.plan import (
-    DECLARED_MIX,
-    PLAN_VERSIONS,
-    Plan,
-    StepIdentity,
-    fingerprint,
-    read_by,
-    spelled,
-    unplaced,
-)
+from dew.data.plan import PLAN_VERSIONS, Plan, StepIdentity, fingerprint, read_by, spelled, unplaced
 from dew.data.readers import Opener, _CanonicalPass, _Host, _PerShare, _Statistics, statistics_of
 from dew.data.sources.base import (
     Read,
@@ -160,8 +150,6 @@ from dew.data.sources.base import (
     materialized,
     tokenizer_contract,
 )
-from dew.data.sources.concatenate import Concatenate
-from dew.data.sources.tokens import TokenFiles
 from dew.data.steps.generic import Coordinated
 from dew.data.storage import Mirrored
 
@@ -376,16 +364,6 @@ def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int
     return found
 
 
-def _token_stores(source: Source) -> Iterator[TokenFiles]:
-    """The token stores `source` reads, through every view and a concatenation's parts."""
-    for each in beneath(source, typing.get_args(Rows.__value__)):
-        if isinstance(each, Concatenate):
-            for part in each.sources:
-                yield from _token_stores(part)
-        elif isinstance(each, TokenFiles):
-            yield each
-
-
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
     tokenizer_contract((f"corpus {_name(leaf)}", source.metadata())
                        for pipeline in pipelines for leaf, source in _leaves(pipeline))
@@ -519,8 +497,7 @@ members may be restored by key beneath them: a shuffle's window, a packer's rema
 expansion's tail holds rows of the mix that saved them."""
 
 
-def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]
-                      ) -> dict[str, tuple[JSON, tuple[TokenFiles, ...]]]:
+def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) -> dict[str, JSON]:
     """What each member of a streamed mix reads and makes, as one digest under its key
     (`_member_keys`): its order, sources, steps with their code and dependencies, the facts its
     order rests on and its caches; and under the empty key the same of the mixture's own stages
@@ -532,8 +509,7 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]
     Each member is read in `train`, the tree the plan's lowering describes (`build`), which a
     memory read made of the written pipeline and which holds no member that accepted no row; its
     caches are those of each of its corpora's stages as its pipeline wrote them (`_written`), the
-    ones a memory read already ran among them. Each member's manifest comes with the token stores it
-    reads (`Plan.earlier_members`)."""
+    ones a memory read already ran among them."""
     source = train.source
     if (not isinstance(source, Mixture) or build.global_order
             or not all(isinstance(stage, _KEYED_ABOVE) for stage in train.stages)):
@@ -550,22 +526,22 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]
     corpora = build.lowering.order["corpora"]
     if not isinstance(corpora, list):
         raise TypeError("a mixture's order holds its corpora's orders as a list")
-    members: dict[str, tuple[JSON, tuple[TokenFiles, ...]]] = {"": ({"steps": steps([
+    members: dict[str, JSON] = {"": {"steps": steps([
         *(_identity(stage) for stage in written(train.stages) if not isinstance(stage, (Workers, Prefetch))),
-        *(StepIdentity.of(step) for step in host)])}, ())}
+        *(StepIdentity.of(step) for step in host)])}}
     for index, (key, child) in enumerate(zip(_member_keys(_members(source.pipelines)), source.pipelines,
                                              strict=True)):
         sources = [read for _, read in _leaves(child)]
         identities = [*(_identity(stage) for read in sources for stage in _written(read, ())),
                       *(_identity(stage) for stage in written(tuple(_steps(child)))
                         if not isinstance(stage, (Workers, Prefetch)))]
-        members[key] = (json_value({
+        members[key] = json_value({
             "order": unplaced(spelled(corpora[index], build.version)),
             "sources": [read_of(read).fingerprint() for read in sources],
             "steps": steps(identities),
             "derived": dict(_derived(child, build.child(index))),
             "cache": list(_cache_references(child, build.read, build.version)),
-        }, "member manifest"), tuple(store for read in sources for store in _token_stores(read)))
+        }, "member manifest")
     return members
 
 
@@ -757,7 +733,7 @@ def _own_key(branch: Pipeline) -> int | None:
 def _keys_shuffles(build: _Build) -> bool:
     """Whether `build` shuffles its chain by the chain's own name (`_own_key`): from plan version 9, a named
     chain whose order shuffles at its root; one that shuffles nothing reads alike under any name."""
-    return build.version >= 9 and build.named is not None and any(
+    return build.named is not None and any(
         isinstance(stage, Shuffle) for stage in build.lowering.stages)
 
 
@@ -810,9 +786,6 @@ def compile(
     read_by(plan_version)
     # The objective's data and each chain's calls as the plan's version reads them (`ObjectiveData.at`,
     # `Pipeline.at`).
-    objective = None if objective is None else objective.at(plan_version)
-    train = train.at(plan_version)
-    validation = None if validation is None else validation.at(plan_version)
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _TRAINING_LOADING
@@ -964,7 +937,7 @@ def _staged(
         # Epochs of a read with a record count count it, read endlessly; of one with none, the source
         # examples a pass holds, its prepared rows as held, bounded to that many passes (`_bounded`).
         passes = None if _epoch_records(train, build) is not None else _pass_examples(train, read, build)
-        original, train = ((_endless(original, version), _endless(train, version)) if passes is None else
+        original, train = ((_endless(original), _endless(train)) if passes is None else
                            (_bounded(original, epochs * passes), _bounded(train, epochs * passes)))
         build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed,
                    version=version)
@@ -1016,7 +989,7 @@ def _pass_examples(train: Pipeline, read: Read, build: _Build) -> int | None:
         count = Proportions.of(_weights(source), source.seed).covering(known)
     elif read == "streamed" and not _in_memory(source):
         stated = [shard.rows for shard in
-                  source.manifest(build.version).sized(build.stream_loading.threads).shards]
+                  source.manifest().sized(build.stream_loading.threads).shards]
         held = [rows for rows in stated if rows is not None]
         if len(held) != len(stated):
             return None
@@ -1164,11 +1137,9 @@ def _compiled(
          **build.lowering.order},
         _derived(train, build),
         cache=_cache_references(original, read, build.version),
-        members={key: fingerprint(manifest) for key, (manifest, _) in members.items()},
-        earlier_members=members,
+        members={key: fingerprint(manifest) for key, manifest in members.items()},
         volatile=any(_volatile(stage) for stage in
                      (*_steps(original), *(stage for source in sources for stage in _written(source, ())))),
-        stores=tuple(store for source in sources for store in _token_stores(source)),
         version=build.version,
     )
     tuned = build.tuned(train, batches=batches)
@@ -1797,7 +1768,6 @@ def iterate(
     """A finite record pass through the same lowering, for publication and export, read by data plan
     `plan_version` (`compile`'s), automatic workers read in the process (`Loading.unsized`)."""
     read_by(plan_version)
-    pipeline = pipeline.at(plan_version)
     loading = loading.unsized()
     if any(
         isinstance(stage, (RandomMap, BatchStage, MapBatch, Workers, Repeat)) for stage in _steps(pipeline)
@@ -1963,14 +1933,13 @@ def fitted[Entry](
     record count, but states the source examples a pass holds
     (`Loader.pass_examples`), reads it bounded to that many passes, as
     `examples` bounds it (`Loader.epochs`), in the one compile (`_staged`)."""
-    objective = objective.at(plan_version)
     # Each chain's calls as the plan's version reads them, before anything is measured (`Pipeline.at`).
     if isinstance(dataset, Dataset):
-        dataset = dataset._chain().at(plan_version)
+        dataset = dataset._chain()
     if isinstance(validation, Dataset):
-        validation = validation._chain().at(plan_version)
+        validation = validation._chain()
     elif validation is not None:
-        validation = {name: entry._chain().at(plan_version) if isinstance(entry, Dataset) else entry
+        validation = {name: entry._chain() if isinstance(entry, Dataset) else entry
                       for name, entry in validation.items()}
     if not isinstance(dataset, (Dataset, Loader)):
         if examples is not None:
@@ -1992,7 +1961,7 @@ def fitted[Entry](
         chain = dataset._chain()
         # A run of epochs reads its chain as written, which staging reads endlessly or bounds to its
         # epochs' passes over its examples (`_staged`).
-        trained = chain if examples is not None or epochs is not None else _endless(chain, plan_version)
+        trained = chain if examples is not None or epochs is not None else _endless(chain)
         read = trained.mode or _preferred_read((trained,), provision=True)
         # A run of phases compiles each phase on its own (`_compile_phases`), so its measure is its own.
         measured = (None if not scored or (isinstance(trained.source, Phases) and examples is None) else
@@ -2018,18 +1987,17 @@ def fitted[Entry](
                     for name, entry in named.items()}
 
 
-def _endless(chain: Pipeline, version: int = PLAN_VERSIONS[-1]) -> Pipeline:
+def _endless(chain: Pipeline) -> Pipeline:
     """`chain` read endlessly: a repeat before its batch where it has none and its read can end. A
     chain of phases reads each phase through the chain's own stages, and where one of them already
     reads on (`_reads_on`), as Grain refuses to repeat an order without end, each other phase repeats
     at the place the chain's own repeat takes, its share of the chain's stages before the batch moved
     into it; a mixture whose members all read on is read as it is. A phase that batches inside itself and
-    states no repeat reads on with its repeat before its own batch (`_repeated_inside`), from plan version
-    `DECLARED_MIX`."""
+    states no repeat reads on with its repeat before its own batch (`_repeated_inside`)."""
     if any(isinstance(stage, Repeat) for stage in chain.stages) or _reads_on(chain):
         return chain
     source = chain.source
-    if isinstance(source, Phases) and version >= DECLARED_MIX:
+    if isinstance(source, Phases):
         chain = dataclasses.replace(chain, source=dataclasses.replace(
             source, pipelines=tuple(map(_repeated_inside, source.pipelines))))
         source = chain.source
@@ -2076,8 +2044,7 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
     is the chain as its run's widths measured it (`_held_measure`), which it reads as it stands."""
     # The objective's data and the chain's calls as the plan's version reads them, before it is measured
     # (`ObjectiveData.at`, `Pipeline.at`).
-    objective = None if objective is None else objective.at(plan_version)
-    chain = _held_batched(dataset._chain().at(plan_version), batch)
+    chain = _held_batched(dataset._chain(), batch)
     if measured is None:
         measured = _held_measure(chain, objective)
     elif not measured.branches[0].batched:
@@ -2141,8 +2108,6 @@ def validation(
     widths its steps bind to (`run_widths`), and `measured` the branch as they measured it, batched; it
     reads by data plan version `plan_version`, its run's (`compile`)."""
     read_by(plan_version)
-    objective = None if objective is None else objective.at(plan_version)
-    pipeline = pipeline.at(plan_version)
     read = read or _preferred_read((pipeline,), provision=provision)
 
     # One pass reads every record, in the chain's own batches or `batch`'s (`_held_batched`).
@@ -2175,13 +2140,12 @@ def publish(
     generation, unless one is already published under its key (with the plan
     of a terminal pack), which it returns: filled as a run of data plan
     `plan_version` reads it, whose shards a stream's fill numbers its rows by
-    (`dew.data.plan.filled_version`)."""
+    (`dew.data.sources.base.Source.manifest`)."""
     from dew.data.cache import Cache
     from dew.data.generation import Generation
     from dew.data.packing import PackingPlan, plan_name
 
     read_by(plan_version)
-    pipeline = pipeline.at(plan_version)
     if not isinstance(cache, Cache):
         raise TypeError("publish needs a Cache destination")
     if isinstance(pipeline.source, (Mixture, Phases)):

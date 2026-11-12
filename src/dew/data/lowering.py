@@ -145,7 +145,7 @@ from dew.data.pipeline import (
     member_record,
     members_held,
 )
-from dew.data.plan import DECLARED_MIX, IN_ORDER, PLAN_VERSIONS, Manifest
+from dew.data.plan import PLAN_VERSIONS, Manifest
 from dew.data.readers import WorkerMirrors, _FillShare
 from dew.data.shards import bounded as shards_bounded, bounded_places, cut, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
@@ -580,7 +580,7 @@ class _PerInput:
     """A run of record stages from an expansion over one input, by its index among the inputs (`index`), in a
     read's workers (`_Build.spreads`): `_chained`'s rows and markers, each random stage drawing for each row
     from its seed, the input's index and the row's place among the input's rows there, the same in any count
-    of workers (`IN_ORDER`). A marker of an input dropped before the run goes on as it is."""
+    of workers. A marker of an input dropped before the run goes on as it is."""
 
     stages: tuple[RecordStage, ...]
     seeds: tuple[int | None, ...]
@@ -1283,8 +1283,8 @@ class _Build:
     writes itself. None where the workers read the whole order after its batch, as a read that drops
     nothing is read."""
     version: int = PLAN_VERSIONS[-1]
-    """The data plan version it reads by (`dew.data.plan.PLAN_VERSIONS`): 9 a corpus's shuffles each by its
-    own key (`ordered`), 8 each by its seed alone."""
+    """The data plan version it reads by (`dew.data.plan.PLAN_VERSIONS`), which spells the steps its caches
+    are keyed by (`_fill`)."""
     named: int | None = None
     """The key of the chain this builds, read outside any mixture, where it was given a name: the key a
     mixture keys it by as its first member of that name (`dew.data.compile._own_key`), which its shuffles
@@ -1296,16 +1296,14 @@ class _Build:
 
     def spreads(self, rows: Rows) -> bool:
         """Whether its workers run its expansion and the record steps after it over each input (`_PerInput`),
-        handing on each input's rows in its order: a training read cut per share from `IN_ORDER`, over
-        indexed rows."""
-        return (not self.elastic and self.in_order and self.version >= IN_ORDER
-                and isinstance(rows, pygrain.MapDataset))
+        handing on each input's rows in its order: a training read cut per share, over indexed rows."""
+        return not self.elastic and self.in_order and isinstance(rows, pygrain.MapDataset)
 
     @property
     def in_order(self) -> bool:
         """Whether its loading workers read its inputs in their order (`_InputOrder`, `_StreamOrder`), so
         its rows and its position are those a read in none makes, whatever their count: an elastic read's, and
-        from `IN_ORDER` a training read cut per share of indexed inputs. A stream cut per share reads its
+        a training read cut per share of indexed inputs. A stream cut per share reads its
         shards in its workers' own, each worker's shards its own, as a stream is read through and never by
         index: in order, every worker would read the whole stream (`_StreamOrder`). So does a cache of
         steps that drop records, which its workers read as a stream of each input's outputs, its views'
@@ -1316,8 +1314,7 @@ class _Build:
         cached = (cache is not None and not self.lowering.one_to_one
                   and not _automatic_cache(self.lowering.stages[cache]))
         streams = self.read == "streamed" or cached
-        return self.elastic or (self.training and not self.global_order and self.version >= IN_ORDER
-                                and not streams)
+        return self.elastic or (self.training and not self.global_order and not streams)
 
     def child(self, index: int) -> _Build:
         """The build of the `index`th corpus a mixture or phases reads, by its own analysis, keyed
@@ -1433,7 +1430,7 @@ class _Build:
                 names=[_name(child) for child in source.pipelines],
                 labels=[_label(child) for child in source.pipelines],
             )
-        return KeyedMix(streams, source.weights, keys, source.seed, declared=self.version >= DECLARED_MIX)
+        return KeyedMix(streams, source.weights, keys, source.seed)
 
     def counted_members(self, pipeline: Pipeline) -> tuple[tuple[str, str, str], ...]:
         """The members of `pipeline`'s mixture, each's key (`_member_keys`), name and label, where a read
@@ -1545,7 +1542,7 @@ class _Build:
         cache, interleave = self.lowering.cache, self.lowering.interleave
         start = 0 if cache is None else cache + 1
         transparent = cache is not None and _transparent(pipeline, cache)
-        shards = source.manifest(self.version)
+        shards = source.manifest()
         if cache is not None:
             filled, manifest, prefix = _fill(pipeline, source, cache, self.read, self.version)
             shards = _positioned(shards, partition, self.stream_loading) if 0 <= last < cache else shards
@@ -1839,14 +1836,14 @@ class _Build:
         return rows
 
     def ordered(self, stage: Shuffle) -> Shuffle:
-        """`stage` as this build reads it: from plan version 9 a shuffle draws from its seed and its corpus's
-        own key, the one it goes by in the mixture that reads it (`corpus`'s last), or, read outside any,
-        its name's where it was given one (`named`), so corpora of one length shuffled by one seed read in
-        orders of their own, and a named corpus reads one order whichever others a mixture holds, however
-        deep, and alone, as a later phase continues it (row 3840); version 8, and an unnamed chain read
-        outside any mixture, by its seed alone."""
+        """`stage` as this build reads it: a shuffle draws from its seed and its corpus's own key, the one
+        it goes by in the mixture that reads it (`corpus`'s last), or, read outside any, its name's where it
+        was given one (`named`), so corpora of one length shuffled by one seed read in orders of their own,
+        and a named corpus reads one order whichever others a mixture holds, however deep, and alone, as a
+        later phase continues it (row 3840); an unnamed chain read outside any mixture, by its seed
+        alone."""
         key = self.corpus[-1] if self.corpus else self.named
-        if self.version < 9 or key is None:
+        if key is None:
             return stage
         keyed = hashlib.blake2b(repr((stage.seed, key)).encode(), digest_size=4).digest()
         return dataclasses.replace(stage, seed=int.from_bytes(keyed, "big"))
