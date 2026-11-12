@@ -614,7 +614,7 @@ class GpuTarget:
 # Streaming multiprocessors of each canonical device: T4 40, A100 108, A10 72, L4 58, H100 SXM 132,
 # RTX PRO 6000 Blackwell Server 188, from NVIDIA's architecture whitepapers and datasheets.
 # Boost clock (MHz) and memory bandwidth (GB/s) of each canonical device, from the same datasheets:
-# A100 SXM4 80GB 1410/2039, A10 1695/600, L4 2040/300, H100 SXM 1830/3350, RTX PRO 6000 Blackwell
+# A100 SXM4 40GB 1410/1555, A10 1695/600, L4 2040/300, H100 SXM 1830/3350, RTX PRO 6000 Blackwell
 # Server 2617/1597. The rates, latencies and L2 a family shares are `architecture`'s.
 # Opted-in shared memory per block, in KiB: Turing64, A100163, Ampere/Ada/RTX
 # Blackwell99, Hopper227. The SM reservation is already excluded:
@@ -651,8 +651,9 @@ TARGETS = {target.generation: target for target in (
     # its one-element loop's slope over 64 to 1024 iterations, 0.4% from the line).
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), multiprocessors=108, clock_hz=1410e6,
-              # The A100 40 GB's, the least an A100 holds.
-              memory_bandwidth=2039e9, memory=40 * 10 ** 9, triton_gemm_fusions=False, step_seconds=5.96e-6,
+              # The A100 40 GB's, the least an A100 holds and streams: 1215 MHz HBM2 over 5120 bits, 1555
+              # GB/s (the 80 GB part's 2039 priced the fleet's 40 GB A100s 1.31x too fast; their clocks.json).
+              memory_bandwidth=1555e9, memory=40 * 10 ** 9, triton_gemm_fusions=False, step_seconds=5.96e-6,
               # The Ampere Tuning Guide's "Increased L2 Capacity": A100's 40 MB.
               l2_bytes=40 * 2 ** 20,
               # In-kernel: a dependent lane reduction's 225.3 ns (FS-STEP-SECONDS1-a100, its two rounds 225.32
@@ -706,14 +707,21 @@ TARGETS = {target.generation: target for target in (
                         'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12, handoff=0.695e-6),
                         'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6),
                         'NVIDIA H200': Measured(2.81e-6, 4.617e12)}),
-    # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
-    # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
+    # Datasheet facts and a B200's measured steps and L2, no routes: what a compile-only sm100 device needs
+    # (`tests/kernel_compile.py`), its peaks the scoreboard's MFU; a B200 run states its own clock and
+    # bandwidth (`runtime_facts`). Its clock is the busy SM's under NVML, 1965 MHz at every sample (60), and
+    # its steps and L2 a B200's (2026-11-12: the step probes' two rounds, tools/device_facts.py).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
               dense_peaks={'NVIDIA B200': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=148,
               # HGX B200's 1,440 GB of HBM3e over its 8 GPUs.
               clock_hz=1965e6, memory_bandwidth=8e12, memory=180 * 10 ** 9,
-              # The Blackwell Tuning Guide's "Increased L2 Capacity" (1.4.2.2): GB200's GPU, 126 MB.
-              l2_bytes=126 * 2 ** 20,
+              # A B200's L2 as its driver states it (cudaDevAttrL2CacheSize, 126.5 MiB).
+              l2_bytes=132_644_864,
+              # A loop iteration on XLA's path, 5.41 us (a one-element loop's slope over 64 to 1024
+              # iterations, its second round 1.1% from the line; its first's 5.30 us 1.3%).
+              step_seconds=5.41e-6,
+              # In-kernel: a dependent lane reduction's 144.0 ns (its two rounds 144.05 and 144.04).
+              kernel_step_seconds=144.0e-9,
               # Qwen3.5-0.8B's step at 8 x 3072 tokens under 'full', its head tiled and unfused, compiled for
               # a B200 holds 22.9 GiB of temporaries, against 5.6 with the head fused: some of its weight
               # gradients run after the backward, which the derivation bounds from above by running all
