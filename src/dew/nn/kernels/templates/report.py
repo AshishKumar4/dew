@@ -1038,12 +1038,20 @@ def _written(opcode: str, operands: list[str]) -> set[int]:
     return set(range(int(target.group(1)), int(target.group(1)) + count))
 
 
+def _predicated(instruction: str) -> bool:
+    """Whether a SASS instruction runs under a predicate other than the always-true one (`@P0`, `@!P1`;
+    not `@PT`)."""
+    first = instruction.split(maxsplit=1)[0] if instruction.strip() else ""
+    return first.startswith("@") and first.lstrip("@!") != "PT"
+
+
 def _reused_register_a(instructions: list[str], labels: dict[str, int]) -> int:
     """The writes in a loop (a backward branch's body, walked over two trips) to the registers of a warpgroup
     MMA's register operand A whose group is still pending: PTX leaves an operand A read until a
     `wgmma.wait_group` retires its group (PTX ISA, "wgmma.mma_async"), so a write before it is undefined
     behaviour, the product reading whichever value its warp reached (row 5416: a prologue's next step
-    rewrote A under `wait_group 1`, its forward differing run to run on a GH200)."""
+    rewrote A under `wait_group 1`, its forward differing run to run on a GH200). A predicated wait
+    (`@P0 WARPGROUP.DEPBAR.LE`) retires nothing on the walk, which takes no predicate as known."""
     reused = 0
     for at, text in enumerate(instructions):
         head = labels.get(branch.group(1)) if (branch := _BRANCH.search(text)) else None
@@ -1061,7 +1069,7 @@ def _reused_register_a(instructions: list[str], labels: dict[str, int]) -> int:
                         issuing |= set(range(int(left.group(1)), int(left.group(1)) + REGISTER_A))
                     if "gsb0" in instruction:
                         committed, issuing = [*committed, issuing], set()
-                elif opcode == "WARPGROUP.DEPBAR.LE":
+                elif opcode == "WARPGROUP.DEPBAR.LE" and not _predicated(instruction):
                     pending = int(operands[-1], 0)
                     committed = committed[len(committed) - pending:] if pending else []
                 else:

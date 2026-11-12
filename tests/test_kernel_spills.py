@@ -793,6 +793,11 @@ def test_the_sass_rules_find_what_ptxas_left_of_a_kernel(listing, found):
     assert found in finding
     assert report.sass_findings_of(CONVERTING_LISTING) == ()
     assert report.sass_findings_of(REGISTER_A_LISTING.replace("gsb0, 0x1", "gsb0, 0x0")) == ()
+    # A retire only some trips take (a predicated wait) retires nothing the walk can count on.
+    conditional = REGISTER_A_LISTING.replace("WARPGROUP.DEPBAR.LE gsb0, 0x1",
+                                             "@P0 WARPGROUP.DEPBAR.LE gsb0, 0x0")
+    (finding,) = report.sass_findings_of(conditional)
+    assert "register operand A before its group retired" in finding
 
 
 def test_the_compile_gate_reads_machine_code_or_fails_a_kernel_it_could_not_read():
