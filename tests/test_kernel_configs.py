@@ -1149,6 +1149,32 @@ def test_a_blackwells_mx_product_runs_the_template_named_for_it():
     _assert_launches("sm100", "mx projection", _mx_projection, 2, "dew_gmm")
 
 
+def test_an_mx_products_tile_holds_its_block_scale_rings_in_tensor_memory_too():
+    """An MXFP8 projection's tile on a B200 is legal only where its accumulators and its block-scale rings'
+    tensor memory, live in one scope, fit the device's 512 columns (`stream_tensor_columns`, its rings'
+    physical columns in the layout they are allocated in): 128 x 256 at two 128-deep stages, its
+    accumulators' 512 columns beside its rings' 24 more, refused (B7: the fork's allocator raised at
+    lowering); the tile its launch derives, legal."""
+    from kernel_compile import lowered_for
+
+    product, specs = _mx_projection()
+    with generation.assumed("sm100"), tuning.seen() as seen:
+        lowered_for(product, specs, "sm100")
+    taken = [(op, config, ba) for (op, _), (config, ba) in zip(seen, seen.taken, strict=True)
+             if isinstance(op, grouped_matmul.MosaicMxGmm)]
+    assert taken
+    wide = mosaic_gpu.Tiles(128, 256, 128, 2, 1, warpgroups=1, family="tcgen05")
+    with generation.assumed("sm100"):
+        target = generation.gpu_target()
+        assert all(op.legal(ba, config, target) and not op.legal(ba, wide, target)
+                   for op, config, ba in taken)
+        # Its rings' tensor memory, as the layout they are allocated in takes it: a's 8 columns and b's two
+        # 128-row tiles' 16.
+        family = mosaic_gpu.family_of(wide, jnp.float8_e4m3fn)
+        op, _, ba = taken[0]
+        assert family.stream_tensor_columns(op._allocations(ba, wide, family).blocks, wide.stages) == 24
+
+
 def _nvfp4_block_projection():
     """An NVFP4 MoE projection, both operands E2M1 (`gemm.nvfp4_block_product`: 2048 deep, 768 wide, eight
     experts of whole 128-row blocks) through the template named."""

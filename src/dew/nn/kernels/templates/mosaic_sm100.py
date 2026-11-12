@@ -354,6 +354,12 @@ def scales_tiled(scales: jax.Array) -> jax.Array:
     return tiled.reshape(*lead, *scale_tiles(rows, columns))
 
 
+def _tmem_aligned(columns: int) -> int:
+    """`columns` of tensor memory as Pallas slices an allocation from a kernel's one base: whole multiples of
+    `TMEM_COL_ALIGNMENT` (jax._src.pallas.mosaic_gpu.core), the base the aligned sum, at most 512."""
+    return -(-columns // plgpu_core.TMEM_COL_ALIGNMENT) * plgpu_core.TMEM_COL_ALIGNMENT
+
+
 def scale_memory(tiles: tuple[int, ...], stages: int) -> tuple[int, int]:
     """The tensor memory a ring of `stages` slots of block-scale tiles `tiles` (`scale_tiles`' shape) is
     copied to: a row a lane, each slot's scales its own columns (`ScaleRing._scales`)."""
@@ -609,6 +615,16 @@ class Tcgen05Rings(Tcgen05Issuer, mosaic.RingFamily[Accumulator]):
         # Each turn holds every accumulator of a tile (`persist`); exactly summed, the turns hold a window's
         # partials and the tile's running sums take as many columns again.
         return (self.turns + summed) * columns * accumulators
+
+    def stream_tensor_columns(self, blocks: dict, stages: int) -> int:
+        # Each block-scale ring's tensor memory as `streams` allocates it (`scale_memory` in
+        # `SCALES_LAYOUT`): the physical columns that layout takes for its shape (Mosaic's
+        # `TMEMLayout.cols_in_shape`: its rows past 128 and its replication its own columns), aligned as
+        # Pallas slices each allocation from one base (`TMEM_COL_ALIGNMENT`).
+        layout = plgpu.TMEMLayout.SCALES_LAYOUT.to_mgpu()
+        return sum(_tmem_aligned(layout.cols_in_shape(scale_memory(shape, stages),
+                                                      jnp.dtype(dtype).itemsize * 8))
+                   for shape, dtype in blocks.values() if tuple(shape[-2:]) == SCALE_TILE)
 
     def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = (),
                 swizzles: dict[str, int] | None = None, copies: dict[str, int] | None = None,

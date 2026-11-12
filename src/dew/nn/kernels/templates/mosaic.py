@@ -979,6 +979,13 @@ class Issuer[Accumulator](abc.ABC):
         del columns, accumulators, summed
         return 0
 
+    def stream_tensor_columns(self, blocks: dict, stages: int) -> int:
+        """The tensor memory columns its streams of `blocks` (`streams`') take at `stages` beside its
+        accumulators (tcgen05's block-scale rings, each slot's scales copied there): none where no stream
+        keeps tensor memory."""
+        del blocks, stages
+        return 0
+
     def column_registers(self, columns: int, dtype) -> int:
         """The registers a consumer thread holds for a vector of `columns` entries of `dtype` in the
         accumulator's column layout (`column`), broadcast over its rows: its share as JAX lays the vector

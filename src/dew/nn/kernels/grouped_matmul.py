@@ -689,6 +689,15 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                         // resources.THREADS)
         second = held_second if ba.arguments.get('paired') is not None else 0
         plain += second
+        if ba.arguments.get('exact_sums') and family.sums_in_persist:
+            # A family promoting each window's partials into running sums in its accumulators' own home
+            # (tcgen05's tensor memory, `persist`'s `summed`) holds a chunk of a partial and the running sum's
+            # beside it a promote at a time (`_promoted`, each product's in turn), not two register
+            # accumulators: a 128 x 128 tile 2 x 64 words and the walk's control (B6, where two whole
+            # accumulators charged 272 refused it past 248).
+            chunk = -(-config.block_m * family.chunk_columns(columns) // config.warpgroups
+                      // resources.THREADS)
+            return max(2 * chunk + resources.CONTROL_REGISTERS, plain + max(phases))
         if ba.arguments.get('exact_sums'):
             # Each product's running sum, a second fp32 accumulator (`mosaic_gpu.tgmm`'s exact sums), is
             # carried as a loop value beside its step's product (`mosaic.Issuer.summed_apart`), awaited before
@@ -986,8 +995,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         family there (a layout of it, `bundles.layouts`), in its granularity (whole roles of rows for each
         consumer, exactly the family's accumulator rows where it fixes them, whole column units, one of
         its depths, at most its consumers, at most the programs its registers hold, a pair's tile on a family
-        whose products span one, `mosaic_gpu.pair_takes`), its accumulators held in the tensor memory a
-        family keeps them in (`mosaic.Issuer.tensor_columns`), with a ring of two
+        whose products span one, `mosaic_gpu.pair_takes`), its accumulators and its streams' tensor memory
+        held in the tensor memory a family keeps them in (`mosaic.Issuer.tensor_columns`,
+        `stream_tensor_columns`), with a ring of two
         stages at least (a walk keeping one step's products in flight holds its slot while the next step's
         loads fill another), its blocks dividing the call's extents, its cluster at most the family's
         (`mosaic.Family.cluster`), and a one-dimensional side operand's block, copied untiled, at most one
@@ -1000,10 +1010,17 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             return False
         # A family fixing its accumulator's rows takes a tile of exactly them a consumer, and one holding its
         # accumulators in tensor memory a tile whose accumulators it holds (a paired product's two).
+        # Its tensor memory is every allocation live in the kernel's one scope: the accumulators and its
+        # streams' (an MX product's block-scale rings, B7: a 128 x 256 MXFP8 tile's 512 columns of
+        # accumulators passed beside its rings' 24 more, which the allocator refused).
         accumulators = 1 if ba.arguments.get('paired') is None else 2
+        tensor = family.tensor_columns(mosaic_gpu.tile_columns(config, family), accumulators,
+                                       bool(ba.arguments.get('exact_sums')))
+        if tensor:
+            blocks = self._allocations(ba, config, family).blocks
+            tensor += family.stream_tensor_columns(blocks, config.stages)
         if (family.accumulator_rows not in (None, config.block_m // config.warpgroups)
-                or family.tensor_columns(mosaic_gpu.tile_columns(config, family), accumulators,
-                                         bool(ba.arguments.get('exact_sums'))) > (target.tmem_columns or 0)):
+                or tensor > (target.tmem_columns or 0)):
             return False
         if not self._granular(ba, config, family):
             return False

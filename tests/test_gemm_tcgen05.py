@@ -324,3 +324,17 @@ def test_a_b200s_products_lower_at_the_tiles_their_launch_derives():
         assert taken, name
         with generation.assumed("sm100"):
             assert all(op.legal(ba, config, generation.gpu_target()) for op, config, ba in taken), name
+
+
+def test_an_exactly_summed_tile_holds_the_registers_its_promotes_hold():
+    """A B200's exactly summed grouped product (bf16 operands, 128 rows a group, depth and width 128) holds
+    its 128 x 128 tile legal: its windows' partials and running sums stay in tensor memory, promoted a chunk
+    at a time (`Tcgen05Rings._promoted`), whose two chunks the register model charges, not two register
+    accumulators (B6, where 272 registers charged past the 248 budget refused the tile)."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    launch = grouped_matmul.MosaicGmm()
+    with generation.assumed("sm100"):
+        target = generation.gpu_target()
+        ba = launch.bind(bf16((512, 128)), bf16((4, 128, 128)), jax.ShapeDtypeStruct((4,), jnp.int32),
+                         out_dtype="float32", trans_rhs=False, interpret=False, exact_sums=True)
+        assert launch.legal(ba, mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=1, family="tcgen05"), target)
