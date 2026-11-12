@@ -406,8 +406,7 @@ def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
     the trainer's weights (`rollout/lag/mean` above 0, which each step's own generation never does), each
     weighted by the objective's behavior importance, a group's samples of a prompt reading its paged prompt
     once (`--rollout.served.page-size`), and the server ends with the run. The run records the
-    served settings and loads with them, and a record written before they existed loads as drawing each
-    step's own (ledger 2695)."""
+    served settings and loads with them."""
     import threading
 
     import rl_support
@@ -442,6 +441,7 @@ def test_a_grpo_run_draws_its_rollouts_ahead_from_dews_own_server(tmp_path):
         lags = [scalars["rollout/lag/mean"] for _, scalars in journal.scalars()
                 if "rollout/lag/mean" in scalars]
     assert max(lags) > 0
+    assert LMRunConfig.load(str(tmp_path / "served")).rollout == config.rollout
 
 
 def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
@@ -474,6 +474,8 @@ def test_a_recorded_grpo_run_trains_on_the_rollout_it_records(tmp_path):
                               "--rollout.method", "rloo", "--objective.reward-kl", "0.05"], default=default)
     state = config.run()
     assert int(state.step) == 1 and state.ema is not None
+    loaded = LMRunConfig.load(str(tmp_path / "grpo")).rollout
+    assert loaded is not None and loaded.method == "rloo"
     refused = LMRunConfig.cli(["--trainer.steps", "1", "--trainer.name", "dapo",
                                "--trainer.checkpoint-dir", str(tmp_path),
                                "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",

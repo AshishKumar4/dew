@@ -617,6 +617,7 @@ def test_a_run_from_before_pair_windows_reads_a_pair_a_row():
     earlier, stated = DPOObjective(model, 3), DPOObjective(model, 3, segments=1)
     earlier.bind_plan(PAIR_WINDOWS - 1)
     stated.bind_plan(PAIR_WINDOWS)
+    assert earlier.inputs == stated.inputs and earlier.trace_key() == stated.trace_key()
     batch = windows([PAIR, PAIR], 4, segments=1)
     params = stated.init(jax.random.key(0))
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=stated.init(jax.random.key(2)))
@@ -627,3 +628,6 @@ def test_a_run_from_before_pair_windows_reads_a_pair_a_row():
     found, expected = (jax.tree.leaves(scored(objective)) for objective in (earlier, stated))
     for one, other in zip(found, expected, strict=True):
         np.testing.assert_array_equal(one, other)
+    later = DPOObjective(model, 3)
+    later.bind_plan(PAIR_WINDOWS)
+    assert later.segments is None and later.trace_key() != stated.trace_key()

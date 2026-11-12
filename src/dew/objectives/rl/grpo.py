@@ -400,8 +400,7 @@ class GRPOObjective(TokenScorer):
             # The router positions that count are the response tokens the policy's forward reads: a token's
             # input (`[:, :-1]`) whose own target is trained, in a real chain.
             fields = {SEGMENTS_FIELD: terms.segments}
-            queries = (real_slots(fields, mask.shape)[:, :-1] & (mask[:, :-1] != 0)
-                       & (self.row_weights(batch, mask.shape[0]) > 0)[:, None])
+            queries = real_slots(fields, mask.shape)[:, :-1] & (mask[:, :-1] != 0)
             statistics, effects, router_metrics = self.balance.compose(
                 variables, objective, terms.routing or {}, batch, queries, fields)
             metrics.update(router_metrics)
