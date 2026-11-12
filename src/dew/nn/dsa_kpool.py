@@ -12,8 +12,10 @@ softmax average of its members' keys under learned gate scores plus a
 per-slot term. Each query attends every token of its top `index_topk //
 index_kpool` pools, plus the incomplete frontier pool with
 `index_kpool_always_select_tail`. Pools count from a row's first real key,
-so left padding pools like the unpadded tokens. The selection is detached,
-as the reference's `torch.no_grad` indices are.
+so left padding pools like the unpadded tokens, and in a row of packed
+documents from each document's own first, so a document pools, keeps its
+tail and selects as it does alone. The selection is detached, as the
+reference's `torch.no_grad` indices are.
 
 Decode caches the expanded keys and values and the packed indexer state
 `[k | gate_scores | valid]` per slot in MLA's fixed-capacity sparse cache; a
@@ -57,6 +59,26 @@ def _real_slots(valid, count: int):
     compact = jnp.arange(count)
     slots = order[:, jnp.minimum(compact, valid.shape[-1] - 1)]
     return jnp.where(compact[None] < real[:, None], slots, -1)
+
+
+def _document_pools(valid, segments, kpool: int, pools: int):
+    """`[B, pools, kpool]` token indices of a row of packed documents' pools: each document's real tokens in
+    their order cut into pools of `kpool` from its own first, the documents' pools one after another,
+    -1 past them and in a document's last pool past its tokens."""
+    batch, total = valid.shape
+    beyond = jnp.iinfo(jnp.int32).max
+    document = jnp.where(valid, jnp.asarray(segments, jnp.int32), beyond)
+    order = jnp.argsort(document, axis=-1, stable=True)
+    grouped = jnp.take_along_axis(document, order, axis=-1)
+    place = jnp.arange(total)
+    first = jax.lax.cummax(jnp.where((place == 0) | (grouped != jnp.roll(grouped, 1, axis=-1)), place, 0),
+                           axis=1)
+    rank = place - first
+    real = grouped != beyond
+    pool = jnp.where(real, jnp.cumsum(real & (rank % kpool == 0), axis=-1) - 1, pools)
+    rows = jnp.broadcast_to(jnp.arange(batch)[:, None], (batch, total))
+    return jnp.full((batch, pools, kpool), -1, jnp.int32).at[rows, pool, rank % kpool].set(
+        order.astype(jnp.int32), mode="drop")
 
 
 # wq_b, wk, k_norm and weights_proj carry the V3.2 indexer's declarations
@@ -120,16 +142,23 @@ class KPoolIndexer(IndexerFront, nn.Module):
             [keys, gate_scores.astype(keys.dtype), valid.astype(keys.dtype)[..., None]], axis=-1
         )
 
-    def _pools(self, packed):
+    def _pools(self, packed, segments=None, documents: int = 1):
         """The pools of a packed state, `[B, P]` of them: their keys
         `[B, P, head_dim]`, their token indices `[B, P, kpool]` (-1 on a slot
         outside the row) and whether every slot is valid
-        (`get_pooled_states`, modeling_glm5_next.py:899-967)."""
+        (`get_pooled_states`, modeling_glm5_next.py:899-967). A row of packed
+        documents (`segments`, at most `documents` of them) pools each
+        document's real tokens from its own first (`_document_pools`)."""
         keys, gate_scores, valid = jnp.split(packed, [self.head_dim, 2 * self.head_dim], axis=-1)
         valid = valid[..., 0] > 0
         batch, total = valid.shape
-        pools = -(-total // self.kpool)
-        indices = _real_slots(valid, pools * self.kpool)
+        if segments is None:
+            pools = -(-total // self.kpool)
+            indices = _real_slots(valid, pools * self.kpool)
+        else:
+            # A document's last pool may be part full, and so may the padding's (segment 0).
+            pools = -(-total // self.kpool) + documents + 1
+            indices = _document_pools(valid, segments, self.kpool, pools).reshape(batch, pools * self.kpool)
         safe = jnp.maximum(indices, 0)
         grouped_keys = jnp.take_along_axis(keys, safe[..., None], axis=1).reshape(
             batch, pools, self.kpool, self.head_dim)
@@ -146,25 +175,22 @@ class KPoolIndexer(IndexerFront, nn.Module):
         probabilities = jnp.nan_to_num(jax.nn.softmax(logits, axis=2)).astype(keys.dtype)
         return jnp.sum(probabilities * grouped_keys, axis=2), indices, pool_valid
 
-    def _tail(self, visible, valid):
+    def _tail(self, visible):
         """Each query's incomplete pool as token indices, `[B, S, kpool - 1]`,
         -1 where there is none (`append_visible_tail`,
-        modeling_glm5_next.py:974-1024): the `visible_count % kpool` real
-        tokens after the last complete pool the query sees, in the pools'
-        order (`_real_slots`)."""
-        batch, queries, total = visible.shape
-        slots = _real_slots(valid, total)
-        visible_count = jnp.sum(visible, axis=-1, dtype=jnp.int32)
-        tail_count = visible_count % self.kpool
-        offsets = jnp.arange(self.kpool - 1)
-        compact = (visible_count - tail_count)[..., None] + offsets
-        tail = jnp.take_along_axis(jnp.broadcast_to(slots[:, None], (batch, queries, total)),
-                                   jnp.minimum(compact, total - 1), axis=-1)
-        allowed = jnp.logical_and(offsets < tail_count[..., None], compact < total)
-        tail_visible = jnp.take_along_axis(visible, jnp.maximum(tail, 0), axis=-1)
-        return jnp.where(allowed & (tail >= 0) & tail_visible, tail, -1)
+        modeling_glm5_next.py:974-1024): the last `visible_count % kpool`
+        keys the query sees, in their order, the keys after the last complete
+        pool of its document, whose pools count from its first real key as
+        the query's visible keys do."""
+        total = visible.shape[-1]
+        rank = jnp.cumsum(visible, axis=-1, dtype=jnp.int32)
+        visible_count = rank[..., -1:]
+        held = visible & (rank > visible_count - visible_count % self.kpool)
+        # The held keys' indices in order, first among each query's (`top_k` of their negated indices).
+        first, _ = jax.lax.top_k(jnp.where(held, -jnp.arange(total), -total), self.kpool - 1)
+        return jnp.where(first > -total, -first, -1)
 
-    def select_indices(self, x, q_resid, packed, visible):
+    def select_indices(self, x, q_resid, packed, visible, segments=None, documents: int = 1):
         """Complete selected token indices `[B, S, N]`, -1 for an empty slot.
 
         `packed` is the state of every candidate (the cache on decode),
@@ -174,13 +200,14 @@ class KPoolIndexer(IndexerFront, nn.Module):
         choose the lower token index, because `jax.lax.top_k` is stable;
         torch's `topk` promises no tie order, so a selection a tie decides
         may differ from the reference's. A pool the query cannot see is
-        never chosen, whatever the tie rule.
+        never chosen, whatever the tie rule. A row of packed documents
+        (`segments`, at most `documents`) pools each document apart (`_pools`);
+        `visible` keeps each query to its own document's keys.
         """
         x, q_resid, packed = (jax.lax.stop_gradient(part) for part in (x, q_resid, packed))
         batch, length, _ = x.shape
         total = packed.shape[1]
-        valid = packed[..., -1] > 0
-        pool_keys, pool_indices, pool_valid = self._pools(packed)
+        pool_keys, pool_indices, pool_valid = self._pools(packed, segments, documents)
         scores = self.scored(self.queries(q_resid), pool_keys, x)
         # A pool is a candidate iff the query sees its last token
         # (modeling_glm5_next.py:832-839); its indices are clamped only so
@@ -196,7 +223,7 @@ class KPoolIndexer(IndexerFront, nn.Module):
         chosen_indices = pool_indices[jnp.arange(batch)[:, None, None], jnp.maximum(chosen, 0)]
         tokens = jnp.where(chosen[..., None] >= 0, chosen_indices, -1).reshape(batch, length, -1)
         if self.always_select_tail and self.kpool > 1:
-            tokens = jnp.concatenate([tokens, self._tail(visible, valid)], axis=-1)
+            tokens = jnp.concatenate([tokens, self._tail(visible)], axis=-1)
         return tokens
 
 
@@ -215,8 +242,9 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
     the whole query width.
 
     decode=True runs against a `max_seq_len`-slot cache of expanded keys,
-    values and packed indexer state, causality read off the slots. Packed
-    documents have no reference form and are refused. The latent norms are the
+    values and packed indexer state, causality read off the slots. A row of
+    packed documents pools, keeps its tails and selects within each document as
+    it does alone; a cached call holds one sequence a row. The latent norms are the
     model's RMSNorm at its epsilon (modeling_glm5_next.py:1103, 1116). The
     selection is a materialized mask, so outside decode 'auto' and 'cudnn' run
     xla.
@@ -258,10 +286,9 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
             dtype=self.dtype, precision=self.precision, name=INDEXER)
 
     def _check_call(self, call: MixerCall, batch: int, length: int) -> None:
-        if coordinates_of(call.metadata, batch, length).segments is not None:
-            raise ValueError(
-                "kpool_sparse_attention pools one row's consecutive keys, which a packed "
-                "row of documents has no reference form for; pass one document per row")
+        if call.decode and coordinates_of(call.metadata, batch, length).segments is not None:
+            raise ValueError("a cached kpool_sparse_attention call holds one sequence a row, whose cache "
+                             "slots are its positions; decode one document per row")
         valid = None if call.metadata is None else call.metadata.valid
         if valid is not None and valid.shape != (batch, length):
             raise ValueError(f"row validity must be {(batch, length)}, got {valid.shape}")
@@ -281,7 +308,9 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
         """Select pools, retaining the complete token list for opted-in draft reuse."""
         if not call.decode or (prediction_phase == "ordinary"
                                and not self.has_variable("cache", "selection_position")):
-            return self.indexer.select_indices(x, q_resid, index_keys, keep), None
+            laid = coordinates_of(call.metadata, *x.shape[:2])
+            return self.indexer.select_indices(x, q_resid, index_keys, keep, laid.segments,
+                                               laid.max_segments), None
         # SGLang 97c6978 index_topk_share.py:22-28,48-64 carries the complete token list;
         # a draft hit must not append the new query's tail.
         batch, length = x.shape[:2]
