@@ -26,9 +26,8 @@ LEAST_CUBLAS_BESIDE_TENSOR_MEMORY = (13, 2)
 """The least cuBLAS a GPU holding tensor memory runs Dew under: below it many cuBLAS kernels free their tensor
 memory twice, so a kernel beside one, as a Mosaic launch overlaps the kernel before it (programmatic dependent
 launch, its tensor memory allocated before its wait), can have its tensor memory taken or its allocation
-stranded: a silent wrong result or a hang (JAX's CUDA plugin warns of it at start; a B200 run under cuBLAS
-12.9.2 hung at its 97th step, ledger 5671). cuBLAS's major is its CUDA build's, so no cuda12 build runs on
-one."""
+stranded: a silent wrong result or a hang (JAX's CUDA plugin warns of it at start). cuBLAS's major is its
+CUDA build's, so no cuda12 build runs on one."""
 
 PACKAGE_INDEX = "https://pypi.dewml.dev/simple"
 """Dew's package index, the one place Dew's JAX build (pyproject.toml's jax
