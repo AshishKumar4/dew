@@ -569,24 +569,33 @@ def test_a_red_run_of_a_row_revokes_its_earlier_green_runs_by_any_set_token_or_t
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
 
 
-def test_each_red_names_itself_so_a_green_between_two_reds_stands_after_neither(
+def test_a_red_that_read_the_rows_state_before_another_red_still_revokes_the_green_between_them(
         ci, tmp_path, monkeypatch, cache_worker):
-    """Each red run of a row names itself the row's last red afresh, never a count another red may repeat at
-    once (two reds that read one count would both write the next): a green run recorded between two reds
-    follows the first, and after the second it stands no more (review, 2026-11-12)."""
+    """Two red runs of a row at once, the second having read the row's revocation state before the first wrote
+    it, and a green run recorded between their writes: after the second red the green stands no more. A red
+    begins a fresh epoch, whatever it read; a count the second red read stale would write the first's number
+    again and let the green stand (review, 2026-11-12)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     flaky_row(tmp_path)
+    answered = ci.r2.Store.get
 
-    def red() -> None:
-        monkeypatch.setenv("FAIL", "1")
-        assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict, policy="off")] == [1, 0, 0]
-        monkeypatch.delenv("FAIL")
+    def red(stale: bool = False) -> None:
+        def get(store, key: str, *args: object, **kwargs: object) -> bytes | None:
+            # As read before the other red's write: the row had no red then.
+            if stale and ("-reds/" in key or "-epochs/" in key):
+                return None
+            return answered(store, key, *args, **kwargs)
+
+        with monkeypatch.context() as patched:
+            patched.setattr(ci.r2.Store, "get", get)
+            patched.setenv("FAIL", "1")
+            assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict, policy="off")] == [1, 0, 0]
 
     armada_task(ci, monkeypatch, verdict)
     red()
     armada_task(ci, monkeypatch, verdict)
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
-    red()
+    red(stale=True)
     assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
 
 
