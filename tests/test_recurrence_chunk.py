@@ -21,6 +21,7 @@ from reference_error import (
     assert_fp32_reduction_bound,
     assert_rounds_where_the_reference_does,
     chain_roundings,
+    dot_precisions,
     widened,
     with_gradients,
 )
@@ -375,6 +376,23 @@ def test_documents_entering_memories_of_their_own_are_as_exact_as_each_alone(hoo
     entered twice sums both documents' gradients."""
     assert_forked_on_par('xla', hooks, functools.partial(entered_draw, hooks),
                          f'xla {hooks} a forked call\'s documents', seeds=80)
+
+
+@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[6], HOOKS[8]], ids=str)
+def test_the_portable_maths_products_state_ieee_float32_as_a_gpu_runs_them(hooks):
+    """The portable math's training step over fp32 operands, traced as an A100 runs it under the run's default
+    numerics: every fp32 product it states IEEE float32 (`recurrence_algebra.STATE_PRECISION`), the derived
+    scan's own among them (`scan._portable`), never JAX's configured precision, whose default an A100's
+    compiler ran as TF32 (M-JS-96: 1823 times the fp32 recurrence's distance from float64). The delta rule
+    with a decay a head and a key dimension, and a write gate without it."""
+    (operands,) = draw(hooks, packed=False, seed=0)
+    step = with_gradients(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK))
+    with generation.assumed('sm80'):
+        precisions = dot_precisions(step, operands, cotangents(operands, 0))
+    highest = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
+    narrowed = {(str(stated), shapes) for stated, dtype, shapes in precisions
+                if dtype == jnp.float32 and stated != highest}
+    assert precisions and not narrowed, narrowed
 
 
 def test_fla_refuses_a_forked_call_named_or_handed_to_it():

@@ -19,7 +19,9 @@ the commit that wrote them. A later main reads each back as a user's process wou
 
 Run it on CPU from a clean checkout of the main it records, then commit the files (and `upload` a pinned
 one): the corpus only grows, one directory per recorded main, so a later main is read against every
-earlier one.
+earlier one. A run is never recorded again: where the repo later changes an input a generation's runs read
+(a fixture's tokenizer), that generation keeps the input as its runs read it beside them (`inputs/`, at its
+path in the checkout), which tests/test_saved_runs.py reads them over (`checkout_of`).
 """
 
 import argparse
@@ -109,7 +111,7 @@ def main() -> None:
 
     import numpy as np
     from fetched_fixtures import save
-    from saved_run_kinds import SAVED_KINDS
+    from saved_run_kinds import SAVED_KINDS, trained_finite
 
     kinds = sorted(SAVED_KINDS) if args.kinds is None else args.kinds
     unknown = sorted(set(kinds) - set(SAVED_KINDS))
@@ -137,6 +139,8 @@ def main() -> None:
                 held = (ROOT / run.pretrained).resolve()
                 run = dataclasses.replace(run, pretrained=held.relative_to(ROOT).as_posix())
             state = run.prepare().train(kind)
+            # A run that trained to a loss not finite is no reference (`trained_finite`).
+            trained_finite(root / "runs" / kind)
             seen = evidence(run, state, root / "runs" / kind)
             packed = anonymous(root / "runs" / kind, kind, {str(root): ".", str(ROOT): "."})
             save(written / f"{kind}.npz", {"run": np.frombuffer(packed, np.uint8)},

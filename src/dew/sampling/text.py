@@ -46,6 +46,7 @@ from dew.batch import (
     valid_order,
     with_validity,
 )
+from dew.inputs.spec import Field
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import program
@@ -813,12 +814,15 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
 
 
 def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray], max_new_tokens: int,
-                 sampling: Sampling, n: int, *, capacity: int | None = None) -> np.ndarray:
+                 sampling: Sampling, n: int, *, capacity: int | None = None,
+                 spelling: Callable[[int], str] | None = None) -> np.ndarray:
     """Shared host validation; return the real slots (`real_slots`) without placing unused device inputs.
 
     `capacity` is the cache slots a row holds, which a prompt's real tokens
     and `max_new_tokens` must fit: a server's own capacity, or the model's
-    `max_seq_len` where None.
+    `max_seq_len` where None. Every request's ids pass here, a task's and a server's: a text id outside
+    the model's embedding table (`Field.bounded`, as a training batch is held) is refused, naming the id,
+    its token by `spelling` where a processor knows it, and the table's rows.
     """
     if isinstance(model, BlockDenoiser):
         raise Lacks("cache", f"{type(model).__name__}'s cache commits whole canvases (BlockDenoiser), not "
@@ -844,9 +848,9 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
     vocab = model.vocab_size if isinstance(model, Bounded) else None
     if np.any(ids < 0):
         raise ValueError("token ids must be non-negative")
+    # A media position's id is its tower's, never the table's.
     media = np.asarray(fields.get("image_indices", np.full(ids.shape, -1))) >= 0
-    if vocab is not None and np.any((ids >= vocab) & ~media):
-        raise ValueError("text token ids must be inside the vocabulary")
+    Field.indexing("tokens", (), model).bounded(np.where(media, 0, ids), spelling)
     if vocab is not None and (sampling.pad >= vocab or any(token >= vocab for token in sampling.stops)):
         raise ValueError("sampling token ids must be inside the vocabulary")
     return valid

@@ -109,9 +109,10 @@ def weighed(weights: Sequence[float], terms: Sequence[jax.Array]) -> jax.Array:
 @struct.dataclass
 class PassReports:
     """What a validation scored of each pass of a looped model, its passes in order, beside the run's own
-    report of its last pass (`Objective._validation_scores`): each pass's loss statistics, the run's loss
-    had it weighed that pass alone, and the artifacts its metrics read. A validation pass that scores
-    metrics reports each of them and the loss of each pass under `<split>/pass_<k>/`
+    report of its last pass (`Objective._validation_scores`, `Objective.evaluate`): each pass's loss
+    statistics, the run's loss had it weighed that pass alone (None where no loss was asked), and the
+    artifacts its metrics read. A validation that scores metrics reports each of them, and of each pass
+    under `<split>/pass_<k>/` beside the loss of each pass where it scores the loss
     (`dew.training.evaluation`); one of the loss alone reports the run's."""
 
-    passes: tuple[tuple[Ratio | Weighted, Artifacts], ...]
+    passes: tuple[tuple[Ratio | Weighted | None, Artifacts], ...]

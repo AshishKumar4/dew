@@ -2,7 +2,8 @@
 
 The corpus (tests/fixtures/saved_runs, written by tools/saved_runs_reference.py) holds, for each main that
 recorded it, a saved run of each run kind (`saved_run_kinds.SAVED_KINDS`): its run.json and its last
-checkpoint, a recording that is committed or pinned in the fetched store (`reference_error.recording`).
+checkpoint, a recording that is committed or pinned in the fetched store (`reference_error.recording`), and
+the inputs its runs read that the repo has since changed (`INPUTS`), read as they were (`checkout_of`).
 This main reads each as a user's process would: the record rebuilds its run (`RunConfig.load`), the
 checkpoint's inference declaration pins (`SavedRun.pinned`) where its objective declares a saved task,
 which loads it (`from_run`) and answers one request, and the run resumes from its checkpoint for one step
@@ -22,7 +23,7 @@ import jax
 import pytest
 from process_support import assert_exits_cleanly
 from reference_error import recording
-from saved_run_kinds import SAVED_KINDS, answered, computed
+from saved_run_kinds import SAVED_KINDS, answered, computed, trained_finite
 from saved_run_products import unpacked
 
 from dew.checkpoints import Checkpoints
@@ -106,6 +107,45 @@ def test_a_saved_run_names_no_owner_time_or_place_of_the_machine_that_wrote_it(r
                 assert found is not None and not ABSOLUTE.search(found.read()), member.name
 
 
+INPUTS = "inputs"
+"""A generation's directory of the inputs its runs read that the repo has since changed, each at its path
+in the checkout (the Gemma 3 fixture's tokenizer, which the repair of its mask token's row changed after
+8a7909b0f068 trained over it): what was saved with a run, as it read them, is part of its record."""
+
+
+def checkout_of(tmp_path: Path, recorded: str) -> Path:
+    """The checkout as the main `recorded` read its runs' sources: this one, where its generation keeps no
+    inputs of its own (`INPUTS`); else a mirror of it under `tmp_path`, every entry the checkout's own but
+    those inputs, each its generation's copy. A record names a source by its path in the repo, which a
+    run reads from the checkout's root."""
+    root = Path(__file__).resolve().parents[1]
+    kept = CORPUS / recorded / INPUTS
+    if not kept.is_dir():
+        return root
+    mirror = tmp_path / "checkout"
+    if mirror.is_dir():
+        return mirror
+
+    def opened(directory: Path, original: Path) -> None:
+        # A directory of the mirror whose every entry is the checkout's, to replace one at a time.
+        directory.mkdir()
+        for entry in original.iterdir():
+            (directory / entry.name).symlink_to(entry)
+
+    opened(mirror, root)
+    for given in sorted(path for path in kept.rglob("*") if path.is_file()):
+        place = given.relative_to(kept)
+        here, there = mirror, root
+        for part in place.parts[:-1]:
+            here, there = here / part, there / part
+            if here.is_symlink():
+                here.unlink()
+                opened(here, there)
+        (here / place.name).unlink(missing_ok=True)
+        (here / place.name).write_bytes(given.read_bytes())
+    return mirror
+
+
 def extracted(tmp_path: Path, recorded: str, kind: str) -> Path:
     """The run directory of `kind`'s saved run, unpacked under `tmp_path`."""
     with archived(recorded, kind) as packed:
@@ -114,7 +154,31 @@ def extracted(tmp_path: Path, recorded: str, kind: str) -> Path:
 
 
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
-def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind):
+def test_a_run_an_earlier_main_saved_trained_to_finite_losses(tmp_path, recorded, kind):
+    """Each run of the corpus logged finite losses and gradient norms at every step it logged them
+    (`saved_run_kinds.trained_finite`): a run trained to NaN is no reference, and every later main's reads
+    of it would compare NaN to NaN."""
+    trained_finite(extracted(tmp_path, recorded, kind))
+
+
+def test_a_run_that_logged_a_loss_not_finite_is_refused_as_a_reference(tmp_path):
+    """`trained_finite` refuses a run whose logged loss or gradient norm is NaN or infinite, at any step,
+    and one that logged none, which no reference can be; a run of finite ones reads back its steps'."""
+    for logged in ({1: {"train/loss": 1.4}, 2: {"train/loss": float("nan")}},
+                   {1: {"train/loss": 1.4, "train/grad_norm": float("inf")}}, {1: {"train/accuracy": 0.5}}):
+        run = tmp_path / f"run-{len(list(tmp_path.iterdir()))}"
+        with LocalTracker(run / "tracking") as tracker:
+            for step, scalars in logged.items():
+                tracker.log(scalars, step)
+        with pytest.raises(ValueError):
+            trained_finite(run)
+    with LocalTracker(tmp_path / "finite" / "tracking") as tracker:
+        tracker.log({"train/loss": 1.4, "train/grad_norm": 0.45, "train/accuracy": 0.3}, 1)
+    assert trained_finite(tmp_path / "finite") == {1: {"train/loss": 1.4, "train/grad_norm": 0.45}}
+
+
+@pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
+def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, monkeypatch, recorded, kind):
     """A kind's run saved at an earlier main rebuilds from its record, in the compute it recorded, and,
     where its objective declared a saved task then and the run recorded that declaration, pins its last
     checkpoint and loads as that task, which answers a request. A run whose objective declared none at its
@@ -122,6 +186,7 @@ def test_a_run_an_earlier_main_saved_loads_and_answers(tmp_path, recorded, kind)
     `dew.inference.models.SavedModel`), so pinning it is refused; resuming it saves a step that declares
     one (`test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint`)."""
     run = extracted(tmp_path, recorded, kind)
+    monkeypatch.chdir(checkout_of(tmp_path, recorded))
     recorded_run = RunConfig.load(str(run))
     seen = evidence(recorded, kind)
     task = objectives[recorded_run.objective.name].saved_task
@@ -192,7 +257,7 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     here = SAVED_KINDS[kind](tmp_path, drawn=False)
     # A source the repo holds is recorded by its path in the repo (a decision run's backbone), read from
     # the checkout's root as the run that wrote it read it.
-    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    monkeypatch.chdir(checkout_of(tmp_path, recorded))
     # A run on the examples clock paused before its bound (`Pause`) trains on to it, its progress the
     # examples it consumed; a run counted in steps trains one step more.
     clocked = seen is not None and recorded_run.trainer.examples is not None
@@ -246,7 +311,7 @@ def rebuilt(tmp_path: Path, monkeypatch, recorded: str, kind: str, **stated) -> 
     recorded_run = RunConfig.load(str(run))
     with Checkpoints(str(run)) as checkpoints:
         last = checkpoints.latest
-    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+    monkeypatch.chdir(checkout_of(tmp_path, recorded))
     clocked = recorded_run.trainer.examples is not None
     trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), stop=None,
                                   **({} if clocked else {"steps": last + 1}), resume="require",

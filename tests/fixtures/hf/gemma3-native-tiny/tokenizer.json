@@ -1832,12 +1832,12 @@
     },
     {
       "id": 203,
-      "content": "token203",
-      "single_word": true,
+      "content": "<mask>",
+      "single_word": false,
       "lstrip": false,
       "rstrip": false,
       "normalized": false,
-      "special": false
+      "special": true
     },
     {
       "id": 204,
@@ -2306,15 +2306,6 @@
       "rstrip": false,
       "normalized": false,
       "special": false
-    },
-    {
-      "id": 256,
-      "content": "<mask>",
-      "single_word": false,
-      "lstrip": false,
-      "rstrip": false,
-      "normalized": false,
-      "special": true
     }
   ],
   "normalizer": null,
@@ -2554,7 +2545,7 @@
       "<start_of_image>": 200,
       "<end_of_image>": 201,
       "<image_soft_token>": 202,
-      "token203": 203,
+      "<mask>": 203,
       "token204": 204,
       "token205": 205,
       "token206": 206,

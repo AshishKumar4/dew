@@ -36,7 +36,7 @@ from dew.artifacts import TokenScores
 from dew.batch import TEXT_KEY, Batch, Variables, flat_field, real_slots, thaw
 from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, Confident, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
-from dew.inputs import Field, InputSpec
+from dew.inputs import Field, InputSpec, OutsideTable
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import progressed
@@ -149,7 +149,11 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         self.block = block
         self.samples = samples
         self.decode = decode
-        self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
+        text = Field.indexing(TEXT_KEY, (seq_len,), model)
+        # The mask id is placed inside the compiled step, where no host check of a batch sees it.
+        if text.rows is not None and not text.admits(process.mask_id):
+            raise OutsideTable("the masking process's mask_id", process.mask_id, text.rows)
+        self.inputs = InputSpec(sample=text)
         self.ema = EMASpec.constant(ema_decay)
 
     @property

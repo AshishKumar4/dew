@@ -625,6 +625,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
             held, available = _next_batch(iterator, scored)
             if not available:
                 break
+            _bounded(objective, held)
             held, last, batch = _covered(mesh, held, last, scored)
             _admitted(objective, batch, seen)
             # This rank's own real rows, counted on the host; the pool's count
@@ -702,6 +703,13 @@ def _counted_tokens(objective: Objective[Loss, Effects], held: Batch, tokens: li
     return [tokens[0] + int(np.sum(np.where(real, scored, 0))), tokens[1] + rows_of(held) * per_row]
 
 
+def _bounded(objective: Objective[Loss, Effects], batch: Batch | None) -> None:
+    """Refuse a validation batch, on the host before it is placed, where its token ids fall outside its
+    model's table (`InputSpec.bounded`), as each training batch is."""
+    if batch is not None and objective.inputs is not None:
+        objective.inputs.bounded(batch)
+
+
 def _admitted(objective: Objective[Loss, Effects], batch: Batch, seen: set) -> None:
     """Check a batch of a shape the split has not shown (`seen`) against what the objective declares
     (`InputSpec.check`), as a training step checks its own (`Trainer.fit`)."""
@@ -735,6 +743,7 @@ def admit_split(objective: Objective[Loss, Effects], batches: Reader | Episodes,
         # The phases `_score_split` walks for its first batch, so every rank meets its peers.
         held, available = _next_batch(iterator, 0)
         if available:
+            _bounded(objective, held)
             _, _, batch = _covered(mesh, held, None, 0)
             _admitted(objective, batch, set())
     finally:
@@ -887,7 +896,7 @@ def _as_placed(leaf) -> np.ndarray:
     return host.astype(jax.dtypes.canonicalize_dtype(host.dtype), copy=False)
 
 
-def _pass_reports(produced) -> tuple[tuple[Ratio | Weighted, Artifacts], ...]:
+def _pass_reports(produced) -> tuple[tuple[Ratio | Weighted | None, Artifacts], ...]:
     """Each pass's `(loss statistics, artifacts)` an objective's report holds (`PassReports`), none where
     it reports its model's output alone."""
     return next((artifact.passes for artifact in _artifacts(produced) if isinstance(artifact, PassReports)),

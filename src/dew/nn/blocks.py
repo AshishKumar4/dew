@@ -3,7 +3,7 @@
 import functools
 from collections.abc import Callable
 from functools import partial
-from typing import overload
+from typing import TYPE_CHECKING, overload
 
 import jax
 import jax.numpy as jnp
@@ -25,6 +25,9 @@ from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .rope import sinusoid_frequencies, sinusoids
 from .sharding import LogicalAxes, constrain, explicit_spec, rows_taken, whole_spec
 
+if TYPE_CHECKING:
+    from dew.nn.wrapping import HeadedModel
+
 
 def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
     """The `kernel_init` keyword for a normal draw of `std`, as lm-engine
@@ -44,6 +47,31 @@ def _table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
     would scatter-add repeated tokens' cotangents in bf16. Under an Explicit
     axis splitting the ids, the rows are placed as the ids are (`rows_taken`)."""
     return rows_taken(table, ids).astype(dtype)
+
+
+def token_table(model: "nn.Module | HeadedModel") -> tuple[int, frozenset[int]] | None:
+    """The embedding table a model reads its tokens through, which a token field indexes
+    (`dew.inputs.spec.Field.indexing`): the rows its declared vocabulary
+    (`dew.nn.protocols.Bounded`) builds, found on the model, the backbone a head reads
+    (`dew.nn.wrapping.HeadedModel`) or the decoder a wrapper holds (`WrapsDecoder`), and the
+    placeholder ids a multimodal model replaces before its table reads them (`ReplacesTokens`), which
+    hold no row of their own; None for a model of no stated vocabulary."""
+    from dew.nn.protocols import Bounded, ReplacesTokens, WrapsDecoder
+    from dew.nn.wrapping import HeadedModel
+
+    replaced: set[int] = set()
+    while True:
+        if isinstance(model, ReplacesTokens):
+            replaced |= {*model.extra_placeholder_ids,
+                         *(() if model.image_token_id is None else (model.image_token_id,))}
+        if isinstance(model, Bounded) and isinstance(model.vocab_size, int):
+            return model.vocab_size, frozenset(replaced)
+        if isinstance(model, WrapsDecoder):
+            model = getattr(model, model.wraps)
+        elif isinstance(model, HeadedModel):
+            model = model.backbone
+        else:
+            return None
 
 
 def table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:

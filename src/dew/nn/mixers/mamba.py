@@ -48,7 +48,7 @@ from dew.nn.kernels import chunked_launch, recurrence_algebra, recurrence_chunk
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.norms import RMSNorm
-from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum
+from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general
 from dew.nn.residuals import Residual
 from dew.nn.sharding import rows_like, sequence_shards
 from dew.nn.ssm import affine_spans
@@ -103,7 +103,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         # The reference's `combine_fn` (modeling_mamba.py:231-234).
         decays, writes = jax.lax.associative_scan(affine_spans, (decay, write), axis=1)
         states = decays * h[:, None] + writes
-        read = float32_einsum('bcdn,bcn->bcd', states, C_c)
+        read = recurrence_algebra.portable_einsum('bcdn,bcn->bcd', states, C_c)
         return states[:, -1], read
 
     steps = tuple(chunks(t) for t in (x, dt, B, C, resets))
