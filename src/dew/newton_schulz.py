@@ -218,8 +218,8 @@ def newton_schulz(x: jax.Array, coeffs, steps: int, eps: float,
     preconditioning optax's: the Frobenius or spectral norm, or the AOL or Schatten-4 rescaling of the first
     step; `coeffs` one triple, `steps` times, or a schedule of them, known when the step is traced: each
     coefficient a constant of the program, rounded to the iteration's dtype as optax rounds it, which a
-    product's scaling and its added term fold into (`a X + B X` one product's epilogue; an array of them,
-    read at run time, left each scaling its own pass over the stack: row 5669's trace, 50 ms a step)."""
+    product's scaling and its added term may fold into (`a X + B X` one product's epilogue; with them an
+    array read at run time, the scalings ran as passes of their own, 50 ms of row 5669's step)."""
     rows, columns = x.shape[-2:]
     tall = rows > columns
     batch = tuple(range(x.ndim - 2))
