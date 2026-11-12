@@ -140,13 +140,16 @@ def _written(tree, layer, index):
 
 
 def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: Tree | None,
-                moments: Mapping[str, Tree], norms: Tree, x: jax.Array, per_layer: jax.Array | None,
+                moments: Mapping[str, Tree], norms: Tree, x: jax.Array, per_layer: object,
                 shared: Sequence[object]) -> jax.Array:
     """`layer(weights_i, x, per_layer_i, *shared)` over the run's layers in order, as a scan computes it,
     whose backward updates the run in place (`InBackward`): its new weights, masters and moments, and each
     layer's gradient's norm and finiteness (`NORMS`), are the cotangents of `weights`, `masters`,
     `moments` and `norms`. `per_layer` holds what each layer reads of its own (a scan's xs: each layer's
-    dropout key), `shared` what every layer reads (attention metadata), passed in, not closed over."""
+    dropout key, its read-only collections), `shared` what every layer reads (attention metadata), passed
+    in, not closed over. A floating array `shared` holds (a cross-attention's context, which a trainable
+    encoder computes) takes the sum of every layer's cotangent, as a scan's closed-over input does; the
+    others none."""
     current = plan()
     assert current is not None, "a run updates in its backward only inside a step's plan"
     current.handled.append(path)
@@ -154,6 +157,15 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
     # What every layer reads crosses the rule as its arrays; its other leaves (a static field of the
     # attention metadata) are the rule's own.
     arrays, shared_of = holes(tuple(shared), lambda leaf: isinstance(leaf, jax.Array | np.ndarray))
+    # Which of them the layers differentiate: the floating ones.
+    flows = tuple(bool(jnp.issubdtype(jnp.result_type(leaf), jnp.inexact)) for leaf in arrays)
+
+    def flowing(shared):
+        return tuple(leaf for leaf, flow in zip(shared, flows, strict=True) if flow)
+
+    def merged(shared, flowed):
+        given = iter(flowed)
+        return tuple(next(given) if flow else leaf for leaf, flow in zip(shared, flows, strict=True))
 
     def forward_layer(x, slices, shared):
         weights_i, per_layer_i = slices
@@ -168,8 +180,9 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
     def run_forward(weights, masters, moments, norms, x, per_layer, shared):
         def body(x, slices):
             weights_i, per_layer_i = slices
-            y, back = jax.vjp(lambda weights_i, x: layer(weights_i, x, per_layer_i, *shared_of(shared)),
-                              weights_i, x)
+            y, back = jax.vjp(lambda weights_i, x, flowed: layer(weights_i, x, per_layer_i,
+                                                                   *shared_of(merged(shared, flowed))),
+                              weights_i, x, flowing(shared))
             leaves, treedef = jax.tree_util.tree_flatten(back)
             # A residual that is the layer's weights, its own input or what every layer reads is read again
             # where it lies in the backward, not stacked a second time.
@@ -201,7 +214,7 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
         narrow = masters is not None
 
         def body(carry, index):
-            dx, moving, moments, sumsq, nonfinite = carry
+            dx, moving, moments, sumsq, nonfinite, dshared = carry
             weights_i = _sliced(weights if narrow else moving, index)
             given = {"weights": jax.tree.leaves(weights_i), "shared": shared_leaves,
                      "x": jax.tree.leaves(_sliced(inputs, index)),
@@ -209,7 +222,8 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
             stored = iter([leaf[index] for leaf in kept])
             back = jax.tree_util.tree_unflatten(treedef, [given[slot[0]][slot[1]] if slot is not None
                                                           else next(stored) for slot in slots])
-            gradient, dx = back(dx)
+            gradient, dx, dflowed = back(dx)
+            dshared = jax.tree.map(jnp.add, dshared, dflowed)
             held = _sliced(moving, index)
             held_moments = {name: _sliced(tree, index) for name, tree in moments.items()}
             moved, moved_moments = current.update(path, index, gradient, held, held_moments)
@@ -224,17 +238,19 @@ def scanned_run(path: tuple[str, ...], layer: Callable, weights: Tree, masters: 
             moments = {name: _written(tree, moved_moments[name], index) for name, tree in moments.items()}
             sumsq = sumsq.at[index].set(squares)
             nonfinite = nonfinite.at[index].set(bad)
-            return (dx, moving, moments, sumsq, nonfinite), None
+            return (dx, moving, moments, sumsq, nonfinite, dshared), None
 
         start = (cotangent, masters if narrow else weights, moments, jnp.zeros((count,), jnp.float32),
-                 jnp.zeros((count,), jnp.float32))
-        (dx, moved, moments, sumsq, nonfinite), _ = jax.lax.scan(body, start, jnp.arange(count), reverse=True)
+                 jnp.zeros((count,), jnp.float32), tuple(jnp.zeros_like(leaf) for leaf in flowing(shared)))
+        (dx, moved, moments, sumsq, nonfinite, dshared), _ = jax.lax.scan(body, start, jnp.arange(count),
+                                                                         reverse=True)
         written_norms = {"sumsq": sumsq.astype(norms["sumsq"].dtype),
                          "nonfinite": nonfinite.astype(norms["nonfinite"].dtype)}
         # The copies' cotangent is nothing the step reads (`Transaction.split_planned` takes the masters').
         weights_out = jax.tree.map(jnp.zeros_like, weights) if narrow else moved
         return (weights_out, moved if narrow else None, moments, written_norms, dx,
-                jax.tree.map(_zeros_like_input, per_layer), jax.tree.map(_zeros_like_input, shared))
+                jax.tree.map(_zeros_like_input, per_layer),
+                merged(tuple(_zeros_like_input(leaf) for leaf in shared), dshared))
 
     # A rule whose cotangents are the step's new state, Dew's choice, never the run's derivative
     # (`Surrogate`): the step reads them as its update (`InBackward`), its gate (`gated`) a value of the

@@ -157,18 +157,21 @@ batch."""
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize("optimizer", [ADAMW, GROUPED], ids=["adamw", "groups"])
-def test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time(optimizer):
+@pytest.mark.parametrize(("optimizer", "fields"),
+                         [(ADAMW, {}), (GROUPED, {}), (ADAMW, {"layer_scalar": "frozen"})],
+                         ids=["adamw", "groups", "frozen scalar"])
+def test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time(optimizer, fields):
     """Two steps of a decoder whose one stage scans its layers, each updating them in its backward
     (`Transaction.planned`: the step runs `in_backward.scanned_run`), leave its variables, optimizer state
     as a checkpoint holds them on par with the same steps a layer at a time, whose update reads the
     whole gradient (check 1, against one device's float64): the plan's update of a layer's slice of the
-    state is the whole update's (row 4857). That the plan engages is the step's memory
+    state is the whole update's (row 4857), a layer reading a read-only collection beside its weights (a
+    frozen layer scalar's) as the ordinary scan does. That the plan engages is the step's memory
     (`test_a_scanned_step_holds_no_more_than_a_layer_at_a_time`): a scanned step taking its whole gradient
     first holds more than a layer at a time does."""
     from test_stage_local import decoder as stage_decoder, draw, initials, stepped
 
-    scanned, plain = stage_decoder(scan_layers=True), stage_decoder()
+    scanned, plain = stage_decoder(scan_layers=True, **fields), stage_decoder(**fields)
     # No average beside them: an EMA two steps old is its draw's, whose rounding both arms share.
     initial = initials(plain, optimizer, ema=None)
     one_stage = MeshSpec(fsdp=2)
