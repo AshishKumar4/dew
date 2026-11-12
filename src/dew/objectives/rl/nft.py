@@ -165,7 +165,9 @@ class DiffusionNFTObjective(DiffusionObjective):
         if step.ema is None:
             raise ValueError("DiffusionNFT's old policy is its EMA slot, which this step does not carry")
         rows, trained = times.shape
-        r = self.optimality(advantages)
+        real = self.row_weights(batch, rows) > 0
+        samples = jnp.where(real.reshape(rows, *(1,) * (samples.ndim - 1)), samples, 0)
+        r = jnp.where(real, self.optimality(jnp.where(real, advantages, 0)), 0)
         # An inpainting model's masked-image inputs, as the rollout encoded them (`NFTRollout`).
         given = {**self.encoded_conditions(variables, batch), **batch.get("spatial", {})}
         live = self.denoiser(variables, given, None)
@@ -194,12 +196,17 @@ class DiffusionNFTObjective(DiffusionObjective):
             return None, (policy, drift)
 
         _, (policy, drift) = jax.lax.scan(at, None, (times.T, jnp.swapaxes(noise, 0, 1)))
-        per_row = jnp.mean(policy, axis=0) + self.kl * jnp.mean(drift, axis=0)
-        metrics = {"policy": jnp.mean(policy), "optimality": jnp.mean(r)}
+        policy_row = jnp.mean(policy, axis=0)
+        drift_row = jnp.mean(drift, axis=0)
+        per_row = policy_row + self.kl * drift_row
+        metrics = {
+            "policy": self.row_mean(policy_row, batch).mean()[0],
+            "optimality": self.row_mean(r, batch).mean()[0],
+        }
         if self.kl > 0:
-            metrics["velocity_kl"] = jnp.mean(drift)
+            metrics["velocity_kl"] = self.row_mean(drift_row, batch).mean()[0]
         if REWARDS_KEY in batch:
-            metrics["reward"] = jnp.asarray(batch[REWARDS_KEY], jnp.float32).mean()
+            metrics["reward"] = self.row_mean(jnp.asarray(batch[REWARDS_KEY], jnp.float32), batch).mean()[0]
         # A sample of a repeated source row (`VALID_ROWS`, `real_samples`) weighs nothing in the mean.
         return self.row_mean(per_row, batch), Aux(metrics)
 

@@ -317,15 +317,17 @@ class GRPOObjective(TokenScorer):
             policy = self.packed_log_probs(params, batch, progress=progress)
             qk, sown, inspected = None, None, None
         dtype = at_least_fp32(policy.dtype)
-        mask = jnp.asarray(batch[RESPONSE_MASK_KEY], dtype)
-        behavior = jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], dtype)
+        real = (self.row_weights(batch, shape[0]) > 0)[:, None]
+        mask = jnp.where(real, jnp.asarray(batch[RESPONSE_MASK_KEY], dtype), 0)
+        behavior = jnp.where(real, jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], dtype), 0)
         proximal = OLD_LOG_PROBS_KEY in batch
-        old = jnp.asarray(batch[OLD_LOG_PROBS_KEY], dtype) if proximal else behavior
+        old = jnp.where(real, jnp.asarray(batch[OLD_LOG_PROBS_KEY], dtype), 0) if proximal else behavior
+        advantages = jnp.where(real, jnp.asarray(batch[ADVANTAGES_KEY], dtype), 0)
+        segments = jnp.where(real, jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32), 0)
         weights = batch.get(SESSION_WEIGHTS_KEY)
-        return _Terms(policy, old, behavior,
-                      jnp.asarray(batch[ADVANTAGES_KEY], dtype), mask,
-                      jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32),
-                      None if weights is None else jnp.asarray(weights, dtype), proximal, qk, sown, inspected)
+        kept_weights = None if weights is None else jnp.where(real, jnp.asarray(weights, dtype), 0)
+        return _Terms(policy, old, behavior, advantages, mask, segments, kept_weights, proximal, qk, sown,
+                      inspected)
 
     traced = ("seq_len", "balance", "head_chunks", "head_tile", "head_fused", "aggregation_tokens",
               "kl_term", "reward_kl", "beta", "epsilon_low", "epsilon_high", "dual_clip",
