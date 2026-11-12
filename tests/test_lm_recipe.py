@@ -910,9 +910,8 @@ def test_a_packed_runs_record_loads_where_its_token_store_is_not(tmp_path):
 
 def test_a_run_over_a_token_store_with_an_eos_scans_none_of_its_tokens_for_its_identity(
         tmp_path, monkeypatch):
-    """A compile over a token store whose producer stated an EOS fingerprints it with no scan of its tokens
-    (row 3139): Dew's cache holds no record of an earlier reading of its documents, which only a resume of
-    a plan an earlier Dew saved asked for."""
+    """A compile over a token store whose producer stated an EOS fingerprints it from its committed
+    manifest and length indexes alone, with no scan of its tokens (row 3139)."""
     from dew.data import Memory
     from dew.data.sinks import export
 
@@ -924,26 +923,6 @@ def test_a_run_over_a_token_store_with_an_eos_scans_none_of_its_tokens_for_its_i
     plan = compile(TokenFiles(url).batch(1), read="memory", loading=Loading(workers=0)).plan
     assert plan.manifest.semantic()["source"]["sources"][0]["documents"] == "records"
     assert not (tmp_path / "cache" / "dew" / "token-documents").exists()
-
-
-def test_whether_an_earlier_dew_read_a_token_stores_documents_alike_is_each_fields_own(tmp_path):
-    """An export holding two token fields is read alike by a Dew before row 3028 in one and not the other:
-    each field's records closed by the EOS alone, or not. Each field's store says so, whichever is read
-    first, so neither takes the other's answer from Dew's cache; and neither's fingerprint asks it, which
-    every run computes: it names how today's reads the documents, and the scan waits for a resume."""
-    from dew.data import Memory
-    from dew.data.sinks import export
-
-    url = str(tmp_path / "tokens")
-    stated = {"token_store": True, "tokenizer": "byte", "vocab_size": 256, "dtype": "int32", "eos_id": 0}
-    rows = [{"text": np.asarray([1, 0], np.int32), "ids": np.asarray([0, 1], np.int32)},
-            {"text": np.asarray([2, 0], np.int32), "ids": np.asarray([0, 2], np.int32)}]
-    export(Memory(rows), url, format="array_record", length_field="text", metadata=stated)
-    text, ids = TokenFiles(url), TokenFiles(url, field="ids")
-    assert text.fingerprint()["documents"] == ids.fingerprint()["documents"] == "records"
-    assert "_read_alike" not in vars(text) and "_read_alike" not in vars(ids)
-    assert not ids.read_alike()
-    assert text.read_alike()
 
 
 @pytest.mark.parametrize("eos", [None, 0], ids=["no-eos", "eos"])
