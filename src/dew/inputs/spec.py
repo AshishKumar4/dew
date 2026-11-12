@@ -54,13 +54,17 @@ def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
 class OutsideTable(ValueError):
     """A token id outside the embedding table it indexes (`Field.bounded`, `Field.admits`), which reads no row
     of it: `holder`, what holds the id, the `token`, the table's `rows`, and the token's spelling where a
-    processor knows it."""
+    processor knows it. Its arguments are its `args`, so it crosses a process as itself (a pickle rebuilds
+    an exception from them), its message read off them."""
 
     def __init__(self, holder: str, token: int, rows: int, spelled: str | None = None):
-        self.holder, self.token, self.rows = holder, token, rows
-        named = "" if spelled is None else f" ({spelled!r})"
-        super().__init__(f"{holder} holds the id {token}{named}, outside the {rows} rows of the table it "
-                         "indexes: its tokens come from another vocabulary than the model's")
+        super().__init__(holder, token, rows, spelled)
+        self.holder, self.token, self.rows, self.spelled = holder, token, rows, spelled
+
+    def __str__(self) -> str:
+        named = "" if self.spelled is None else f" ({self.spelled!r})"
+        return (f"{self.holder} holds the id {self.token}{named}, outside the {self.rows} rows of the table "
+                "it indexes: its tokens come from another vocabulary than the model's")
 
 
 @dataclass(frozen=True)
