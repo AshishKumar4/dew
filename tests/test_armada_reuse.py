@@ -624,3 +624,39 @@ def test_a_lookup_whose_epoch_is_unread_or_gone_reuses_nothing(ci, tmp_path, mon
     for key in [key for key in stored if "-epochs/" in key]:
         del stored[key]
     assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+
+
+def test_a_red_runs_epoch_write_sent_again_after_a_later_one_never_puts_it_back(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """An epoch's write sent again after a later epoch replaced it (a retry of a write the Worker took but
+    whose answer was lost; a kept connection replaying its request) changes nothing, so the green run recorded
+    in the epoch between stays revoked by the red that began the later one (review, 2026-11-12)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    flaky_row(tmp_path)
+    sent: list[tuple] = []
+    sender = ci.SEND
+
+    def keeping(method: str, url: str, headers, body, timeout: float):
+        if method == "PUT" and "-epochs/" in url and "test_a" in url:
+            sent.append((method, url, dict(headers), body, timeout))
+        return sender(method, url, headers, body, timeout)
+
+    def red() -> None:
+        with monkeypatch.context() as patched:
+            patched.setenv("FAIL", "1")
+            rows = armada_task(ci, monkeypatch, verdict, policy="off")
+        assert [row["exitCode"] for row in rows] == [1, 0, 0]
+
+    armada_task(ci, monkeypatch, verdict)
+    with monkeypatch.context() as patched:
+        patched.setattr(ci, "SEND", keeping)
+        red()
+    first_red = sent[-1]
+    armada_task(ci, monkeypatch, verdict)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    red()
+    # The first red's epoch write, sent again as it was sent.
+    status, _, answer = sender(*first_red)
+    answer.close()
+    assert status in (204, 412)
+    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
