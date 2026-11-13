@@ -729,8 +729,9 @@ def _children(node: Chunk) -> list[Chunk]:
 
 CONSTRUCTORS = (
     Chunk.token, Chunk.entering, Chunk.prefix, Chunk.decay, Chunk.loop, Chunk.plain, Chunk.pair,
-    Chunk.outputs, Chunk.state, Chunk.gram, Chunk.spread, Chunk.applied, Chunk.rows, Chunk.times, Chunk.matmul,
-    Chunk.plus, Chunk.minus, Chunk.decayed, Chunk.written, Chunk.solve, Chunk.doubled, Chunk.substituted)
+    Chunk.outputs, Chunk.state, Chunk.gram, Chunk.spread, Chunk.applied, Chunk.rows, Chunk.times,
+    Chunk.matmul, Chunk.plus, Chunk.minus, Chunk.decayed, Chunk.written, Chunk.solve, Chunk.doubled,
+    Chunk.substituted)
 """Every constructor of the chunk's language, as `get_callable_args` matches a node."""
 
 

@@ -690,9 +690,14 @@ class Apart(NamedTuple):
     finite: bool = False
 
     @property
+    def above(self) -> int | None:
+        """Its floor where `x >= 2**floor`, above zero; None where it is not known so."""
+        return self.floor if self.sign > 0 else None
+
+    @property
     def positive(self) -> bool:
         """Whether `x >= 2**floor`: above zero."""
-        return self.floor is not None and self.sign > 0
+        return self.above is not None
 
 
 NOWHERE = Apart()
@@ -828,19 +833,21 @@ def _apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitu
         return _held_apart((operands[0] if kept else WHOLE)._replace(finite=proven), aval.dtype)
     if not operands:
         return NOWHERE
-    made = _float_apart(equation, operands, bounds)
+    made = _float_apart(equation, operands, bounds, aval.dtype)
     # Finite where its operands make it so and its own bound is within its dtype; a finite value is a number.
     finite = made.finite and _within(bound, aval.dtype)
     return _held_apart(made._replace(number=made.number or finite, finite=finite), aval.dtype)
 
 
-def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitude | None]) -> Apart:
-    """`_apart` of a float output before its dtype holds it (`_held_apart`), `finite` before its own bound
-    is read: whether its operands make it finite."""
+def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[Magnitude | None],
+                 dtype) -> Apart:
+    """`_apart` of a float output of `dtype` before its dtype holds it (`_held_apart`), `finite` before its
+    own bound is read: whether its operands make it finite."""
     name = symbol(equation.primitive)
     first, floors, signs = operands[0], [held.floor for held in operands], [held.sign for held in operands]
     numbers, finite = all(held.number for held in operands), all(held.finite for held in operands)
-    every = None if None in floors else floors
+    known = [floor for floor in floors if floor is not None]
+    every = known if len(known) == len(floors) else None
     if name in ("add", "sub"):
         sides = signs if name == "add" else [signs[0], -signs[1]]
         sign = sides[0] if len(set(sides)) == 1 else 0
@@ -864,7 +871,8 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
         return Apart(max(beyond) if beyond else None if every is None else min(every), sign, numbers, finite)
     if name == "select_n":
         cases = operands[1:]
-        return Apart(None if any(held.floor is None for held in cases) else min(held.floor for held in cases),
+        kept = [held.floor for held in cases if held.floor is not None]
+        return Apart(min(kept) if len(kept) == len(cases) else None,
                      cases[0].sign if len({held.sign for held in cases}) == 1 else 0,
                      all(held.number for held in cases), all(held.finite for held in cases))
     if name == "neg":
@@ -872,15 +880,15 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
     if name == "abs":
         return first._replace(sign=1)
     if name in ("square", "integer_pow"):
-        return _power_apart(equation, first, bounds[0])
+        return _power_apart(equation, first, bounds[0], dtype)
     if name in ("exp", "exp2"):
         floor = None
         if first.finite and bounds[0] is not None and bounds[0] <= 6:
             floor = -(math.floor(2 ** bounds[0] * (math.log2(math.e) if name == "exp" else 1.0)) + 2)
         return Apart(floor, 1, first.number, first.finite)
     if name == "sqrt":
-        real = first.number and first.sign > 0
-        return Apart(first.floor // 2 if first.positive else None, 1, real, real and first.finite)
+        real, above = first.number and first.sign > 0, first.above
+        return Apart(None if above is None else above // 2, 1, real, real and first.finite)
     if name == "rsqrt":
         real = first.number and first.sign > 0
         floor = (-bounds[0]) // 2 - 1 if real and first.finite and bounds[0] not in (None, NOTHING) else None
@@ -912,8 +920,8 @@ def _float_apart(equation: jcore.JaxprEqn, operands: list[Apart], bounds: list[M
     return NOWHERE
 
 
-def _power_apart(equation: jcore.JaxprEqn, operand: Apart, bound: Magnitude | None) -> Apart:
-    """A square's or an integer power's `Apart` before its dtype holds it (`_float_apart`)."""
+def _power_apart(equation: jcore.JaxprEqn, operand: Apart, bound: Magnitude | None, dtype) -> Apart:
+    """A square's or an integer power's `Apart`, of `dtype`, before its dtype holds it (`_float_apart`)."""
     power = 2 if symbol(equation.primitive) == "square" else equation.params["y"]
     if power == 0:
         # JAX lowers a zeroth power to ones.
@@ -926,10 +934,10 @@ def _power_apart(equation: jcore.JaxprEqn, operand: Apart, bound: Magnitude | No
                      operand.finite)
     # A negative power is the reciprocal of the positive one, which must be a float for its reciprocal to
     # be above zero; of a number it is a number (an infinity of a zero), finite of one held away from zero.
-    reach = int(jnp.finfo(equation.outvars[0].aval.dtype).maxexp)
-    floored = operand.finite and bound is not None and bound != NOTHING and -power * bound < reach
-    return Apart(power * bound if floored else None, sign, operand.number,
-                 operand.number and operand.floor is not None)
+    floor, reach = None, int(jnp.finfo(dtype).maxexp)
+    if operand.finite and bound is not None and bound != NOTHING and -power * bound < reach:
+        floor = power * bound
+    return Apart(floor, sign, operand.number, operand.number and operand.floor is not None)
 
 
 def _apart_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
@@ -950,11 +958,11 @@ def _apart_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
       most `2**(2**b max(|l|, |a|))`, and a power more;
     - an integer power of `y <= -1` of `|x| >= 2**l`: at most `2**(y l)`, where `2**(-y l)` is a float (the
       reciprocal of a power that underflows to zero is infinite)."""
-    name = symbol(equation.primitive)
-    dtype = equation.outvars[0].aval.dtype
-    if not jnp.issubdtype(dtype, jnp.floating):
+    name, aval = symbol(equation.primitive), equation.outvars[0].aval
+    if not isinstance(aval, ShapedArray) or not jnp.issubdtype(aval.dtype, jnp.floating):
         return None
     upper, held = operands[0], apart[0]
+    above = held.above
     if name == "div":
         floor = apart[1].floor
         if upper is None or not held.finite or floor is None:
@@ -965,22 +973,23 @@ def _apart_bound(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
             return None
         return upper if upper == NOTHING else -((-upper) // 2)
     if name == "rsqrt":
-        return -(held.floor // 2) + 1 if held.positive else None
+        return None if above is None else -(above // 2) + 1
     if name in ("log", "log2"):
-        if not held.positive or not held.finite or upper is None or upper == NOTHING:
+        if above is None or not held.finite or upper is None or upper == NOTHING:
             return None
-        return _log2(max(abs(held.floor), abs(upper), 1)) + 1
+        return _log2(max(abs(above), abs(upper), 1)) + 1
     if name == "pow":
         exponent = operands[1]
-        proven = held.positive and held.finite and apart[1].finite
-        if not proven or upper is None or upper == NOTHING or exponent is None or exponent > 6:
+        if above is None or not (held.finite and apart[1].finite) or upper is None or upper == NOTHING:
             return None
-        return math.ceil(2.0 ** max(exponent, -64) * max(abs(held.floor), abs(upper))) + 1
+        if exponent is None or exponent > 6:
+            return None
+        return math.ceil(2.0 ** max(exponent, -64) * max(abs(above), abs(upper))) + 1
     # An integer power of a negative exponent.
     power = equation.params["y"]
     if power == 0:
         return UNIT
-    if held.floor is None or -power * held.floor < int(jnp.finfo(dtype).minexp):
+    if held.floor is None or -power * held.floor < int(jnp.finfo(aval.dtype).minexp):
         return None
     return power * held.floor
 
