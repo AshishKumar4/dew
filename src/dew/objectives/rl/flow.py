@@ -197,7 +197,7 @@ class FlowGRPOObjective(DiffusionObjective):
         """
         latents, following, times, next_times = self._window(batch)
         old = jax.lax.stop_gradient(jnp.asarray(batch[OLD_LOG_PROBS_KEY], jnp.float32))
-        real = (self.row_weights(batch, times.shape[0]) > 0)[:, None]
+        real = self.real_rows(batch, times.shape[0])[:, None]
         raw_mask = jax.lax.stop_gradient(jnp.asarray(batch["transition_mask"], jnp.bool_))
         advantages = jax.lax.stop_gradient(jnp.asarray(batch[ADVANTAGES_KEY], jnp.float32))
         if old.shape != times.shape or raw_mask.shape != times.shape:
