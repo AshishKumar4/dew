@@ -111,7 +111,8 @@ def test_a_step_of_two_commits_reports_its_latest_sample_and_sums_its_telemetry(
         return jnp.float32(0.0), {}, jnp.ones((), bool), jnp.ones((), bool), committed
 
     parts = (part(1, [3.0, 1.0]), part(0, [0.0, 0.0]), part(1, [5.0, 0.0]), part(0, [0.0, 0.0]))
-    total = whole_step(parts)[-1]
+    # Its parts state no loss of their own (`Committed.own`), so the step reduces none.
+    total = whole_step(parts, reduce=lambda _: pytest.fail("no part states its own loss"))[-1]
     assert (float(total.norm), int(total.count), total.tokens.tolist()) == (2.0, 2, [2, 0])
     assert total.inspected.names == ("params/l2", "params/w/mean")
     assert total.inspected.values.tolist() == [5.0, 0.0]

@@ -269,7 +269,7 @@ class ControlPPOObjective(ReleasesModel, Objective[Ratio, Variables]):
         entropy = tanh_normal_entropy(location, scale, noise=noise)
         per_step = policy + value - self.entropy_cost * entropy
         terms = {"policy": policy, "value": value, "entropy": entropy}
-        metrics = {**metrics, **{name: self.row_mean(term, batch).mean()[0] for name, term in terms.items()}}
+        metrics = {**metrics, **{name: self.row_mean(term, batch) for name, term in terms.items()}}
         return self.row_mean(per_step, batch), Aux(metrics)
 
 

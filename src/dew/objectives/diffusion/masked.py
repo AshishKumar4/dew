@@ -222,10 +222,9 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         prediction = Ratio(self.row_mean(losses, batch, weights=weights).total,
                            self.row_mean(real.astype(at_least_fp32(losses.dtype)), batch).total)
         correct = predicted == tokens
-        accuracy, _ = self.accuracy(correct.astype(losses.dtype), batch, counted).mean()
-        reported = {
-            "masked_accuracy": accuracy,
-            "masked_fraction": jnp.sum(counted) / jnp.maximum(jnp.sum(real, dtype=losses.dtype), 1.0),
+        reported: dict[str, jax.Array | Ratio] = {
+            "masked_accuracy": self.accuracy(correct.astype(losses.dtype), batch, counted),
+            "masked_fraction": Ratio(jnp.sum(counted, dtype=losses.dtype), jnp.sum(real, dtype=losses.dtype)),
         }
         statistics: Ratio | RoutedStatistics = prediction
         effects = None

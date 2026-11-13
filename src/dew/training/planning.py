@@ -37,9 +37,9 @@ from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
 from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
-from dew.nn.kernels.options import compiler_options, program, program_digest
+from dew.nn.kernels.options import OuterProgram, compiler_options, owned_program, program_digest
 from dew.nn.kernels.templates import report
-from dew.objectives.base import RECORD, Objective
+from dew.objectives.base import RECORD, Objective, Pooled
 from dew.state import TrainState, apart, together
 from dew.telemetry.compiles import EVENTS, Compiles
 from dew.telemetry.instrumentation import compiled_memory
@@ -67,6 +67,7 @@ from dew.training.memory import (
     step_fits,
     temporaries_factor,
 )
+from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
 from dew.training.profiling import PGLE_CAPTURE
 
 if TYPE_CHECKING:
@@ -205,30 +206,75 @@ class SampledStep(NamedTuple):
     executable: jax.stages.Compiled
 
 
-@program
-def whole_step(outputs):
-    """A step's outputs from those of the microbatches it was read in: the
-    last one's loss, pooled over the window where it commits, and its
-    report, as each step of an accumulating run reports its own
-    microbatch's; finite and accepted where every microbatch was; and the
-    commits' counts, tokens and norms summed, its inspection the latest
-    part's that committed (`interval.latest`), as a run's interval keeps
-    the latest sampled commit: a step of two commits (a window a rejection
-    left part filled, then the closing part of a run's last batch) reports
-    its second's summaries, never the two added."""
+def whole_step_program[L, E](objective: Objective[L, E]) -> OuterProgram:
+    """`whole_step` over `objective`'s statistics (`Objective.reduce_loss`), the one program a split step
+    runs on its microbatches' outputs, compiled under its towers' options, which a run compiled ahead
+    compiles with its step (`dew.training.ahead`)."""
+    return owned_program(functools.partial(whole_step, reduce=objective.reduce_loss,
+                                           shown=frozenset(objective.shown)), *objective.towers())
+
+
+def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
+                  shown: frozenset[str] = frozenset()):
+    """A step's outputs from those of the microbatches it was read in: its loss as an unsplit step logs it,
+    whatever the split (docs/design/training.md, the logged loss): where its last microbatch commits, the
+    update's, pooled over the window; elsewhere its own batch's, its microbatches' own statistics pooled
+    (`Committed.own`) and reduced by `reduce` (`Objective.reduce_loss`); its metrics pooled by their own
+    statistics (`_pooled`), a metric the objective shows (`shown`, which a run selects by) refused where it
+    states none; finite and accepted where every microbatch was; and the commits' counts,
+    tokens and norms summed, its inspection the latest part's that committed (`interval.latest`), as a
+    run's interval keeps the latest sampled commit: a step of two commits (a window a rejection left part
+    filled, then the closing part of a run's last batch) reports its second's summaries, never the two
+    added. A pure function, which a step compiles as a program of its own (`dew.training.compiler`) or
+    traces within its own (`dew.training.ahead`)."""
     losses, metrics, finite, accepted, committed = zip(*outputs, strict=True)
-    # A recording step's evaluations are every microbatch's, in the order they ran (`RECORD`).
-    report = {name: jnp.concatenate([part[name] for part in metrics]) if name.startswith(RECORD) else value
-              for name, value in metrics[-1].items()}
+    report = {name: _pooled(name, [part[name] for part in metrics]) for name in metrics[-1]}
+    if len(metrics) > 1:
+        # A metric that states no pooling is one microbatch's, named so (`Aux.metrics`); a shown one, which
+        # a run selects its best and its plateau by under its name, is refused.
+        unpooled = sorted(name for name in shown & set(report) if not isinstance(report[name], Pooled))
+        if unpooled:
+            raise ValueError(f"the objective shows {', '.join(unpooled)}, which state no pooling over the "
+                             "microbatches a step is read in; state each as a Ratio or Moments "
+                             "(`Aux.metrics`), or read the step whole (split=1)")
+        report = {(name if name.startswith(RECORD) or name in (TRAINING_FLOPS, TOKENS)
+                   or isinstance(value, Pooled) else f"{name}/last_microbatch"): value
+                  for name, value in report.items()}
+    loss = losses[-1]
+    if committed[-1].own is not None:
+        owns = [part.own for part in committed]
+        # Pooled as a window pools them (`Transaction.prepare_attempt`): a loss stated as one scalar as the
+        # mean of its equal microbatches', statistics by their sums.
+        scalar = all(isinstance(part, jax.Array) and part.ndim == 0 for part in owns)
+        own = reduce(jax.tree.map(lambda *values: sum(values), *owns))[0]
+        own = own / len(owns) if scalar else own
+        loss = jnp.where(committed[-1].count > 0, loss, own.astype(loss.dtype))
     summed = jax.tree.map(lambda *values: sum(values),
-                          *(dataclasses.replace(part, inspected=None) for part in committed))
+                          *(dataclasses.replace(part, inspected=None, own=None) for part in committed))
     sample = None
     for part in committed:
         if part.inspected is not None:
             sample = (part.count, part.inspected) if sample is None else latest(
                 (part.count, part.inspected), sample)
-    return (losses[-1], report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)),
+    # A pooled statistic leaves the step as its value, the number a caller reads (`Aux.metrics`).
+    report = {name: value.mean()[0] if isinstance(value, Pooled) else value for name, value in report.items()}
+    return (loss, report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)),
             dataclasses.replace(summed, inspected=None if sample is None else sample[1]))
+
+
+def _pooled(name: str, values: list):
+    """A step's metric `name` from its microbatches' `values`: a recording step's evaluations every
+    microbatch's in the order they ran (`RECORD`); the model FLOPs and tokens counted, summed; a `Pooled`
+    statistic by its own pooling (`Pooled.pooled`); any other its last microbatch's (`Aux.metrics`)."""
+    if name.startswith(RECORD):
+        return jnp.concatenate(values)
+    if name == TOKENS:
+        return functools.reduce(_TokenCount.add, values)
+    if isinstance(values[-1], Pooled):
+        return Pooled.pooled(values)
+    if name == TRAINING_FLOPS:
+        return jax.tree.map(lambda *parts: sum(parts), *values)
+    return values[-1]
 
 
 TRACING_COLLECTIONS = 50_000

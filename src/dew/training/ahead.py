@@ -1007,13 +1007,14 @@ def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader:
     run checked (`Trainer.validate`), and the first batch of the stream of this process's share fit opens
     (`Trainer._stream_partition`, its ramp's stages beginning where updates do) from the position its
     checkpoint left a run resumed under `resume` at (`Checkpoints.position`), under the layout's rules,
-    as the run's resume reads it (`dew.training.startup.resume_admitted`, row 3917). A run its checkpoint
+    or started again where its plan changed and the run resumes its data relaxed, as the run's resume
+    reads it (`dew.training.startup.resume_admitted`, row 3917). A run its checkpoint
     completes has no step to take, and is refused. What a step compiled ahead (`AheadTarget.compiled`)
     and an offline view of a run (`dew.config.RunConfig.viewed`) start from."""
     from flax import linen as nn
 
     from dew.data.dataset import DataPartition
-    from dew.training._fit import first_batch
+    from dew.training._fit import data_resumed, first_batch
 
     trainer._declare_input(lambda: first_batch(loader, trainer._stream_partition()))
     trainer.reading(loader, examples=examples, steps=steps)
@@ -1023,11 +1024,16 @@ def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader:
     if resumed is not None and steps is not None and resumed >= steps:
         raise ValueError(f"the run is complete at step {resumed}, its last checkpoint written, so it has no "
                          "step to take")
-    # The shares fit reads by, its layout placing the rows, the saved one's among them.
+    # The shares fit reads by, its layout placing the rows, the saved one's among them, read on from or
+    # started again as the run's data resume decides (`Trainer.data_resume`, `data_resumed`).
     with nn.logical_axis_rules(trainer.layout.axis_rules):
-        position = None if checkpoints is None or resumed is None else checkpoints.position(
-            resumed, DataPartition.of(trainer.device_mesh))
-        return first_batch(loader, trainer._stream_partition(), position)
+        partition = trainer._stream_partition()
+        if checkpoints is None or resumed is None:
+            return first_batch(loader, partition)
+        saved = DataPartition.of(trainer.device_mesh)
+        position, _ = data_resumed(loader, partition, lambda: checkpoints.position(resumed, saved),
+                                   resume=trainer.data_resume, step=resumed)
+        return first_batch(loader, partition, position)
 
 
 class CompiledAhead(SystemExit):
@@ -1331,9 +1337,10 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
     evaluations' warming pass over its first state, compiled where the run's own code calls them over
     shapes (`collecting`), by digest: `started`'s last part."""
     from dew.distributed.placement import placed_shapes
+    from dew.objectives.base import Pooled
     from dew.state import apart, together
     from dew.training.interval import added_tokens, book_shapes, booked, bookkeep, copied, latest
-    from dew.training.planning import whole_step
+    from dew.training.planning import whole_step_program
 
     candidate, split = planned.candidate, planned.split
     placed = placed_shapes(start.abstract, start.shardings)
@@ -1346,8 +1353,9 @@ def _results_programs[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], start:
             trainer._window_of(dataclasses.replace(placed, compute=None), candidate, window)
         for step in steps:
             moving, loss, aux, finite, accepted, committed = shapes_of(step.out_info)
-            if split > 1:
-                loss, aux, finite, accepted, committed = whole_step(
+            # As the step runs it: its whole where it is split or states a statistic (`StepCompiler.runner`).
+            if split > 1 or any(isinstance(value, Pooled) for value in (aux or {}).values()):
+                loss, aux, finite, accepted, committed = whole_step_program(trainer.objective)(
                     [(loss, aux, finite, accepted, committed)] * split)
             book = book_shapes(loss)
             counted = bookkeep(*booked(book, book, loss, finite, committed, aux or {}))

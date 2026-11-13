@@ -17,7 +17,6 @@ from dew.data import Loading, Memory
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
-from dew.data.plan import PLAN_VERSIONS
 from dew.data.sinks import export
 from dew.data.sources import Files
 from dew.data.storage import Store
@@ -61,17 +60,15 @@ def ids(reader, count: int) -> list[int]:
             for value in (batch["id"] if "id" in batch else batch["text"])]
 
 
-@pytest.mark.parametrize("version", PLAN_VERSIONS[-2:])
 @pytest.mark.parametrize("order", ["in order", "shuffled"])
 @pytest.mark.parametrize("files", [1, 3])
 @pytest.mark.parametrize("kind", ["jsonl", "json", "text", "csv", "parquet", "arrow", "array_record"])
-def test_a_stream_restarted_midstream_reads_what_an_uninterrupted_one_reads(kind, files, order, version):
+def test_a_stream_restarted_midstream_reads_what_an_uninterrupted_one_reads(kind, files, order):
     """A stream of a `kind` store of `files` files, read in order or shuffled, saved after three batches
-    and restored in a stream of its own, reads the uninterrupted stream's next five batches, at each data
-    plan version this Dew reads by."""
-    root = Store(f"memory://stream-restarts/{kind}-{files}-{order.replace(' ', '-')}-{version}")
+    and restored in a stream of its own, reads the uninterrupted stream's next five batches."""
+    root = Store(f"memory://stream-restarts/{kind}-{files}-{order.replace(' ', '-')}")
     chain = Pipeline(Files(written(root, kind, files), format=kind))
     chain = (chain.shuffle(seed=7, window=8) if order == "shuffled" else chain).repeat().batch(2)
-    data = compile(chain, read="streamed", loading=READ, plan_version=version)
+    data = compile(chain, read="streamed", loading=READ)
     expected, _ = assert_resumes_where_it_stopped(lambda: data.train(DataPartition()), ids, 3, 5)
     assert len(expected) == 16

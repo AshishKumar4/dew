@@ -255,6 +255,15 @@ class Budgeted(Protocol):
     def stop_seconds(self) -> float | None: ...
 
 
+@runtime_checkable
+class ReadsInProcess(Protocol):
+    """A training stream that says whether it reads in the training process, its order its loading
+    workers' count's and that count none (`dew.data.readers._PerShare`, row 5852)."""
+
+    @property
+    def in_process(self) -> bool: ...
+
+
 class Forwarding:
     """Forwards a stream wrapper's stop signal, stop budget, close, identity and where it ends to its
     source.
@@ -1233,9 +1242,13 @@ class Unstacked(ValueError):
 def _stacked(value) -> bool:
     """Whether Grain stacks `value` into one array: numbers of any dtype JAX counts as one (bfloat16 and
     the float8s among them, which NumPy kinds as voids), booleans, strings and bytes, and mappings of
-    them; not lists, object arrays, structured records or other records."""
+    them, and a record a registered pytree holds of them (a laid row's `dew.batch.Coordinates`), which
+    Grain stacks leaf by leaf; not lists, object arrays, structured records or other records."""
     if isinstance(value, Mapping):
         return bool(value) and all(_stacked(field) for field in value.values())
+    if not isinstance(value, (list, tuple)) and not jax.tree_util.treedef_is_leaf(jax.tree.structure(value)):
+        leaves = jax.tree.leaves(value)
+        return bool(leaves) and all(_stacked(leaf) for leaf in leaves)
     if not isinstance(value, (np.ndarray, np.generic, jax.Array, int, float, complex, str, bytes)):
         return False
     dtype = np.asarray(value).dtype
@@ -1958,7 +1971,9 @@ class StepPhases(Forwarding):
                        "saved phases' position")
         phase = integer(saved["phase"], "the saved phase")
         ends = list(listed(saved["ends"], "saved phase ends", read=integer, what="a list of steps"))
-        identities = list(strings(saved["identities"], "saved phase identities"))
+        from dew.data.plan import saved_identity
+
+        identities = [saved_identity(held) for held in strings(saved["identities"], "saved phase identities")]
         if phase >= len(self._make) or ends != self._ends[:phase] or identities[:phase] != [
                 self._identity(index) for index in range(phase)]:
             raise _position.PlanChanged(

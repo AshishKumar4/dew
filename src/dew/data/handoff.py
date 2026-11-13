@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from typing import NamedTuple
 
 import grain.python as pygrain
+import jax
 import numpy as np
 from typing_extensions import TypeIs
 
@@ -235,8 +236,9 @@ class _Grouped:
     def column(self, values: list[Field]) -> np.ndarray | list[Field]:
         """One field's values across the group: stacked where they are arrays of one shape and type,
         else as they are."""
-        # What a batch stacks (`_stacked`), of one shape and type; the rest as it is.
-        if not all(_stacked(value) for value in values):
+        # What a batch stacks (`_stacked`), arrays of one shape and type; the rest as it is.
+        if not all(_stacked(value) and jax.tree_util.treedef_is_leaf(jax.tree.structure(value))
+                   for value in values):
             return values
         arrays = [np.asarray(value) for value in values]
         if any(array.shape != arrays[0].shape or array.dtype != arrays[0].dtype for array in arrays):

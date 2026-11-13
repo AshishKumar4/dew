@@ -15,7 +15,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew import _position
-from dew._records import JSON, integer, json_value, record
+from dew._records import JSON, json_value, record
 from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch
 from dew.data.dataset import (
     Closeable,
@@ -32,7 +32,7 @@ from dew.data.dataset import (
 )
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
-from dew.data.plan import COUNTERS, PLAN_VERSIONS, STRUCTURED, DataResume, Plan, PlanChanged
+from dew.data.plan import COUNTERS, DataResume, Plan, PlanChanged
 from dew.data.shared import SharedMapping
 from dew.data.storage import MIRRORED, Mirrored, PositionText, carried_mirrors
 
@@ -215,9 +215,6 @@ class _PublishedCounts:
         self.published = _Published(state, retired=retired)
 
 
-type Opener = Callable[[], pygrain.DatasetIterator[Batch]]
-"""What opens a reader's Grain iterator (`_PerShare`)."""
-
 
 class _PerShare(Forwarding):
     """Lazy Grain reader with owner-published positions and counters."""
@@ -234,6 +231,13 @@ class _PerShare(Forwarding):
         owns the iterator states it, as the global reader does."""
         return self._stop_seconds
 
+    @property
+    def in_process(self) -> bool:
+        """Whether it reads in the training process, its order its workers' count's and that count none
+        (its plan's topology, row 5852): a run states its workers (`.workers(n)`) or reads `.elastic()`."""
+        topology = self._plan.topology
+        return not topology.get("elastic") and topology.get("workers") == 0
+
     def __init__(
         self,
         open_reader: Callable[[], pygrain.DatasetIterator[Batch]],
@@ -243,12 +247,8 @@ class _PerShare(Forwarding):
         stop_seconds: float,
         endless: bool = True,
         replicated: bool = False,
-        saved_as: Callable[[int, int], tuple[Opener, Plan]] | None = None,
     ):
         self._open, self._plan = open_reader, plan
-        # The reader and plan of a position saved under another version this lowering reads by
-        # (`resumed_at`), in the workers it names.
-        self._saved_as = saved_as
         self._resume: DataResume = resume
         self._stop_seconds = stop_seconds
         self._endless = endless
@@ -319,16 +319,14 @@ class _PerShare(Forwarding):
                 "the saved position is an elastic read's, and this read is per share; resume it with "
                 ".elastic() on the chain")
         decoded = record(json.loads(state), "saved per-share position") if held is None else held
-        self.resumed_at(decoded)
         written = record(decoded.get(_position.PLAN), "saved data plan")
         self._plan.check(written, resume=self._resume)
         saved = record(decoded.get("iterator"), "saved Grain iterator")
         self.close()
         self._saved = saved
         self._statistics.publish(None)
-        if self._plan.version >= STRUCTURED:
-            rules = record(written.get("rules", {}), "saved data plan rules")
-            self._grain_restores(json_value(rules.get("grain"), "saved grain rule"))
+        rules = record(written.get("rules", {}), "saved data plan rules")
+        self._grain_restores(json_value(rules.get("grain"), "saved grain rule"))
 
     def _grain_restores(self, written: JSON) -> None:
         """Restore the saved iterator state now, through the iterators that own it, where a Grain of another
@@ -345,21 +343,6 @@ class _PerShare(Forwarding):
                               f"which this grain {GRAIN} does not read (docs/design/data.md, the rules): "
                               f"resume with grain=={written}, or go on from the run's weights as a new run "
                               "that reads its data afresh") from error
-
-    def resumed_at(self, decoded: Mapping[str, object]) -> None:
-        """Read on as the saved position `decoded` was read where it was saved under another plan version
-        this Dew reads (`dew.data.plan.PLAN_VERSIONS`), in the workers it names: this share's build at that
-        version (`saved_as`), which the run goes on under; a position of this read's own version, or of one
-        this Dew reads none of, which its check refuses, as it is."""
-        written = record(decoded.get(_position.PLAN), "saved data plan").get("version")
-        if (self._saved_as is None or written == self._plan.version or not isinstance(written, int)
-                or written not in PLAN_VERSIONS):
-            return
-        topology = record(record(decoded.get(_position.PLAN), "saved data plan").get("topology", {}),
-                          "saved data plan topology")
-        workers = integer(topology.get("workers", 0), "saved per-share workers")
-        self._open, self._plan = self._saved_as(written, workers)
-        self._plan_record = SharedMapping.of(self._plan.record())
 
     def identity(self) -> str:
         """What every share of the pool reads, which the pool agrees before it

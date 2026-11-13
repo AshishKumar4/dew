@@ -296,7 +296,8 @@ def test_the_sparse_phase_keeps_the_indexer_and_the_model_apart():
         assert seen[weight] > 0
         kl_grads = jax.jit(
             jax.grad(
-                lambda p, objective=objective: objective.loss(p, batch, step_at())[1].metrics["indexer_kl"]
+                lambda p, objective=objective:
+                    objective.loss(p, batch, step_at())[1].metrics["indexer_kl"]
             )
         )(params)["params"]
         for path, leaf in jax.tree_util.tree_leaves_with_path(kl_grads):
@@ -312,7 +313,8 @@ def test_the_sparse_phase_keeps_the_indexer_and_the_model_apart():
     def total(objective, reported):
         def run(params, text):
             value, aux = objective.scalar_loss(params, {"text": text}, step_at())
-            return value if not reported else aux.metrics["ce"] + 0.5 * aux.metrics["indexer_kl"]
+            kl = aux.metrics["indexer_kl"]
+            return value if not reported else aux.metrics["ce"] + 0.5 * kl
         return jax.jit(run)
 
     def draw(seed):
@@ -410,7 +412,8 @@ def test_packing_carried_by_the_model_inputs_scores_the_same_kl(phase, topk):
     _, by_columns = objective.scalar_loss(params, columns, step_at())
     _, by_inputs = objective.scalar_loss(params, carried, step_at())
 
-    assert float(by_inputs.metrics["indexer_kl"]) == float(by_columns.metrics["indexer_kl"])
+    assert (float(by_inputs.metrics["indexer_kl"])
+            == float(by_columns.metrics["indexer_kl"]))
 
 
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])

@@ -368,7 +368,7 @@ def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, 
     it: its objective built, then handed to `RunConfig.train` with its data, the chain it states uncompiled
     as the examples hand it (`run.data`), or the loader its build compiled (`given`), the run naming no data
     plan version, as one written in Python does. The train resolves it itself, the saved run's (`resumed`,
-    which `readied` asks of a chain; a loader reads by the version it was compiled at), so the resume
+    which `readied` asks whatever it is handed), so the resume
     compares alike and fits the one step past its checkpoint, and the record it writes names the version
     the saved run states (train 589's review: a run trained so read by this Dew's version and recorded
     none, so a saved run's resume was refused; train 627's: the chain's path was not the one proven). The

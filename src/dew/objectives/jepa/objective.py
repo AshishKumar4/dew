@@ -44,6 +44,7 @@ from dew.nn.sharding import explicit_spec, whole_spec
 from dew.objectives.base import (
     Aux,
     EMASpec,
+    Moments,
     Objective,
     ProgramModule,
     Ratio,
@@ -62,8 +63,9 @@ PREDICTOR = "predictor"
 LABEL_KEY = "label"
 
 
-def representation_health(z) -> dict[str, jax.Array]:
-    """Return two collapse measures for pooled embeddings `[B, D]`, as metrics.
+def representation_health(z) -> dict[str, Moments]:
+    """Return two collapse measures for pooled embeddings `[B, D]`, as metrics their batch's moments pool
+    (`Moments`), so a step read in several microbatches reports them as its whole batch would.
 
     `repr_std` is the per-dimension standard deviation across the batch. It
     goes to zero exactly when the encoder stops distinguishing inputs.
@@ -74,15 +76,10 @@ def representation_health(z) -> dict[str, jax.Array]:
     Both are computed in fp32, so a run's compute dtype does not set the
     noise floor of the drift, and bf16 and fp32 runs read off the same curves.
     """
-    batch_size, dim = z.shape
-    z = z.astype(jnp.float32)
-    centered = z - jnp.mean(z, axis=0, keepdims=True)
-    product = functools.partial(jnp.matmul, out_sharding=whole_spec(centered, 2))
-    cov = accumulated(product, centered.T, centered) / max(batch_size - 1, 1)
-    off_diagonal = cov * (1.0 - jnp.eye(dim, dtype=cov.dtype))
+    product = functools.partial(jnp.matmul, out_sharding=whole_spec(z, 2))
     return {
-        "repr_std": jnp.mean(jnp.std(z, axis=0)),
-        "repr_cov_offdiag": jnp.sqrt(jnp.sum(off_diagonal ** 2) / max(dim * (dim - 1), 1)),
+        "repr_std": Moments.of(z, "std"),
+        "repr_cov_offdiag": Moments.of(z, "offdiagonal", lambda a, b: accumulated(product, a, b)),
     }
 
 

@@ -27,9 +27,15 @@ def step_record(deltas: Mapping[str, list[str]], control: dict | None, rung: JSO
                 tree: Mapping[str, object] | None = None) -> dict:
     """What a persistent and a local save both record of a step: the leaves of each average it stores as
     their differences from their weights, by the average's name, its control state, its rung, its inference
-    artifact, its boxed axes and the implementation of each key its `tree` holds (`key_record`)."""
+    artifact, its boxed axes, the implementation of each key its `tree` holds (`key_record`), and, where it
+    holds a data position, the code and machine that wrote it (`running_environment`), which the position
+    itself holds none of (row 5862)."""
+    from dew.data.plan import running_environment
+
+    held = tree is not None and "position" in tree
     return {"deltas": dict(deltas), "control": copy.deepcopy(control or {}), "rung": rung,
-            "artifact": artifact, "boxed": boxed_record(boxed), "keys": key_record(tree)}
+            "artifact": artifact, "boxed": boxed_record(boxed), "keys": key_record(tree),
+            **({"environment": running_environment()} if held else {})}
 
 
 def key_record(tree: Mapping[str, object] | None) -> dict[str, str]:
