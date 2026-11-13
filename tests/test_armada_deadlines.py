@@ -272,6 +272,22 @@ def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci,
     assert "Fatal Python error: Aborted" in record and "test_any.py" in record
     assert "ended by signal 6" in record.split("== native stacks", 1)[1]
     assert not list(scratch.glob("dew-capture-*"))
+    # The row says its capture was armed and the stacks were read: what the land queue publishes a red that
+    # does not repeat on (bible §88).
+    assert (aborted["capture"], aborted["natives"]) == ("armed", "read")
+
+
+def test_a_red_whose_capture_could_not_be_armed_says_why(ci, tmp_path, monkeypatch):
+    """A red row whose task could not arm the native-stack capture says why on its row (`capture`), so the
+    land queue never takes it for a red whose signal would have been read (bible §88: a red that does not
+    repeat publishes only where CI keeps a native backtrace of any task a signal ends)."""
+    interpreter(tmp_path, "3.12")
+    monkeypatch.setattr(ci.natives, "built", lambda: (None, "no C compiler in the container"))
+    written(tmp_path, {"test_any.py": "def test_fails():\n    assert False\n"})
+    ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "unarmed.json", 30.0, cache="off")
+    [red] = json.loads((tmp_path / "unarmed.json").read_text())["rows"]
+    assert red["exitCode"] == 1 and "natives" not in red
+    assert red["capture"] == "no C compiler in the container"
 
 
 def test_a_worker_a_signal_ends_keeps_its_native_stacks_though_pytest_exits_red(ci, tmp_path):

@@ -175,13 +175,26 @@ class Capture:
         shutil.rmtree(self.where, ignore_errors=True)
         return read
 
+    def evidence(self, stacks: str) -> dict[str, str]:
+        """What a red row says of its capture (`stacks`, what it read): `capture`, "armed", or why it was not;
+        and where a signal ended a process of it, `natives`, "read" where every such process's stacks were
+        read, else "unread". The land queue publishes a red that does not repeat only on both (bible §88)."""
+        ended = stacks.count(" ended by signal ")
+        return {"capture": "armed" if self.variables else self.why or "not armed",
+                **({"natives": "unread" if UNREAD in stacks else "read"} if ended else {})}
 
-def read(pid: str, spy: Path, began: float) -> str:
+
+UNREAD = "no native stack was read"
+"""What the collector's header says of a signalled process none of whose stacks it read (`collect`)."""
+
+
+def read(pid: str, spy: Path, began: float) -> tuple[str, bool]:
     """Every thread's stack of the stopped process `pid`, read from outside it within the time its handler
     waits (`COLLECT_SECONDS` from `began`): Bloomberg's pystack's, beside `spy` in the test environment
     (pyproject.toml's test extra), which unwinds every OS thread, native and Python frames both, a thread with
     no Python state too (an XLA worker's abort); py-spy's (`spy`), whose native mode reads only the threads
-    Python knows (review, 2026-11-13), with what time is left where pystack read none."""
+    Python knows (review, 2026-11-13), with what time is left where pystack read none; and whether either read
+    them."""
     def left() -> float:
         return COLLECT_SECONDS - 5 - (time.monotonic() - began)
 
@@ -197,9 +210,9 @@ def read(pid: str, spy: Path, began: float) -> str:
             said.append(f"{command[:7]} read nothing: {error}")
             continue
         if done.returncode == 0 and done.stdout.strip():
-            return done.stdout
+            return done.stdout, True
         said.append(f"{command[:7]} read nothing: {done.stderr.strip()[-300:]}")
-    return "\n".join(said)
+    return "\n".join(said), False
 
 
 def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
@@ -214,11 +227,11 @@ def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
             if len(parts) != 2 or not all(part.isdigit() for part in parts):
                 continue
             pid, signum = parts
-            frames = read(pid, spy, began)
+            frames, held = read(pid, spy, began)
             with stacks.open("a") as out:
                 at = time.strftime("%H:%M:%SZ", time.gmtime())
-                out.write(f"== process {pid} ended by signal {signum} ({at}): its threads' native stacks\n"
-                          f"{frames}\n")
+                header = "its threads' native stacks" if held else UNREAD
+                out.write(f"== process {pid} ended by signal {signum} ({at}): {header}\n{frames}\n")
             (done / f"done.{pid}").touch()
 
 
