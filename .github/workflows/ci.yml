@@ -53,8 +53,9 @@ env:
   # and used 122, the other ran out its deadline on 125), and whose map over a commit runs on its .armada.json's CPU
   # pin, as the lint gates' does (armada d1db76c; 2026-11-10: unpinned maps landed on hosts the pin leaves out), and
   # whose judges' and later map tasks' jobs run a task's timeout and ten minutes past the run's deadline, so a judged
-  # run whose first wave ran long still judges (armada 080b5dd; train 795: its judges got 192 s and it went ungraded).
-  ARMADA: github:AshishKumar4/armada#080b5ddbe5176698013f0050c79cdc138b7366a6
+  # run whose first wave ran long still judges (armada 080b5dd; train 795: its judges got 192 s and it went ungraded),
+  # and which shows a local plan's stderr, where Dew's plan states its reuse (armada bc61de0).
+  ARMADA: github:AshishKumar4/armada#bc61de0a56e8864a04b89cd3bef6937c98e11f8e
 
 jobs:
   # A commit this workflow passed on another push, or one the land queue
@@ -126,8 +127,11 @@ jobs:
         # run's after every lane's, as its suite's.
         case "$GITHUB_REF_NAME" in main) priority=--priority=5 ;; *) priority= ;; esac
         if [ -n "$WHOLE" ]; then priority=--priority=-15; fi
+        # Any CPU the region gives: the suite's pin and AMD's 25/1, as a gate reads text and types and its verdict is
+        # one on any host (2026-11-13: small lint maps pinned alone ran out 8 minutes on 25/1 placements).
+        cpus=$(jq -r '[.task.cpu // empty] | flatten | map("\(.vendor)/\(.family)/\(.model)") + ["AuthenticAMD/25/1"] | unique | join(",")' .armada.json)
         grep -v '^#' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
-          $priority --label="lint-$GITHUB_REF_NAME" -- \
+          $priority --cpu="$cpus" --label="lint-$GITHUB_REF_NAME" -- \
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
           sh "$base" '{item}'
 
