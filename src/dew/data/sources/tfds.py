@@ -64,7 +64,7 @@ def _decoder_record(value: object) -> Mapping[str, object] | None:
         function, dtype = StepIdentity.of(value._fn), value._output_dtype
         bound = (value._args, value._kwargs)
         return {"class": kind, "function": function.semantic(),
-                "output_dtype": None if dtype is None else str(getattr(dtype, "name", dtype)),
+                "output_dtype": structured(dtype),
                 "args": structured(value._args), "kwargs": structured(value._kwargs),
                 "identity_required": True,
                 "identity": function.declared if by_content((value._fn, *bound)) else None}

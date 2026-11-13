@@ -2244,13 +2244,14 @@ def test_a_committed_export_of_no_rows_reads_as_empty_and_an_empty_directory_as_
     directory holding no export and no files is still refused as missing."""
     from dew.data import Files, Memory
     from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
     from dew.data.sinks import export
 
     none = Memory([{"x": np.int32(1)}]).filter(lambda row: int(row["x"]) < 0, identity="none@1")
     assert export(none, str(tmp_path / "empty"), format=format)["rows"] == 0
     empty = Files(str(tmp_path / "empty"))
     assert len(empty.records("indexed")) == len(empty.records("memory")) == 0
-    assert list(iterate(empty, read="streamed")) == []
+    assert list(iterate(Pipeline(empty), read="streamed")) == []
     (tmp_path / "bare").mkdir()
     with pytest.raises(FileNotFoundError):
         Files(str(tmp_path / "bare"), format=format).records("indexed")
