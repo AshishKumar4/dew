@@ -269,7 +269,7 @@ def _pooled(name: str, values: list):
     if name == TOKENS:
         return functools.reduce(_TokenCount.add, values)
     if isinstance(values[-1], Pooled):
-        return type(values[-1]).pooled(values)
+        return Pooled.pooled(values)
     if name == TRAINING_FLOPS:
         return jax.tree.map(lambda *parts: sum(parts), *values)
     return values[-1]

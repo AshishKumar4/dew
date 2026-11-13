@@ -1265,8 +1265,10 @@ def test_authoritative_zero_target_count_is_refused_before_division():
 def test_dependency_change_preserves_global_resume_only_when_derived_order_matches():
     manifest = Manifest({"name": "test"}, revision="before")
     plan = Plan("global", manifest, {"seed": 0}, {"accepted_ids": fingerprint([1, 3, 5])})
+    # Dew's revision is the checkpoint step's, not the position's (row 5862): nothing the position holds
+    # changed.
     changed = dataclasses.replace(plan, manifest=dataclasses.replace(manifest, revision="after"))
-    assert changed.check(plan.record()) == ("revision",)
+    assert changed.check(plan.record()) == ()
     changed = dataclasses.replace(changed, derived={"accepted_ids": fingerprint([1, 3, 7])})
     with pytest.raises(ValueError):
         changed.check(plan.record())

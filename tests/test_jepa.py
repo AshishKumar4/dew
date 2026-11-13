@@ -442,12 +442,13 @@ def test_representation_health_pooled_over_microbatches_is_the_whole_batchs():
     microbatches pools them (`Moments.pooled`), read as the whole batch's do, to float32's rounding."""
     from dew.objectives.base import Moments
 
-    (z,) = redundant_embeddings(0)
-    whole = representation_health(jnp.asarray(z))
-    halves = [representation_health(jnp.asarray(part)) for part in (z[:12], z[12:])]
-    for name in ("repr_std", "repr_cov_offdiag"):
-        pooled = Moments.pooled([half[name] for half in halves])
-        np.testing.assert_allclose(pooled.held(), whole[name].held(), rtol=1e-5)
+    def pooled(z):
+        halves = [representation_health(part) for part in (z[:12], z[12:])]
+        return jnp.stack([Moments.pooled([half[name] for half in halves]).mean()[0]
+                          for name in ("repr_std", "repr_cov_offdiag")])
+
+    assert_as_exact(jax.jit(pooled), as_given(lambda z: health_in(z, z.dtype)), redundant_embeddings,
+                    "pooled representation health", seeds=HEALTH_SEEDS)
 
 
 def test_representation_health_is_the_float64_statistics():

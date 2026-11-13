@@ -128,10 +128,14 @@ class Pooled:
     `dew.training.planning.whole_step`): `pooled` combines its parts as the whole batch would have made it,
     `mean` reads it on the device and `held` on the host."""
 
-    @classmethod
-    def pooled(cls, parts: Sequence[Self]) -> Self:
-        """`parts`, one a microbatch, as one: by default their leaves summed."""
-        return jax.tree.map(lambda *values: sum(values), *parts)
+    def joined(self, later: Self) -> Self:
+        """This part and a `later` microbatch's as one: by default their leaves summed."""
+        return jax.tree.map(lambda mine, theirs: mine + theirs, self, later)
+
+    @staticmethod
+    def pooled[P: Pooled](parts: Sequence[P]) -> P:
+        """`parts`, one a microbatch, as one, each joined to those before it (`joined`)."""
+        return functools.reduce(lambda whole, later: whole.joined(later), parts)
 
     def mean(self) -> tuple[jax.Array, jax.Array]:
         """Its value, and whether it has any mass."""
@@ -211,19 +215,15 @@ class Moments(Pooled):
         squares = jnp.sum(deviations ** 2, axis=0)
         return cls(jnp.asarray(rows.shape[0], jnp.float32), center, squares, products, statistic)
 
-    @classmethod
-    def pooled(cls, parts: Sequence[Self]) -> Self:
-        whole = parts[0]
-        for later in parts[1:]:
-            count = whole.count + later.count
-            share = jnp.where(count > 0, later.count / jnp.where(count > 0, count, 1), 0)
-            delta = later.center - whole.center
-            weight = whole.count * share
-            products = None if whole.products is None else (
-                whole.products + later.products + weight * jnp.outer(delta, delta))
-            squares = whole.squares + later.squares + weight * delta ** 2
-            whole = cls(count, whole.center + share * delta, squares, products, whole.statistic)
-        return whole
+    def joined(self, later: Self) -> Self:
+        count = self.count + later.count
+        share = jnp.where(count > 0, later.count / jnp.where(count > 0, count, 1), 0)
+        delta = later.center - self.center
+        weight = self.count * share
+        products = None if self.products is None or later.products is None else (
+            self.products + later.products + weight * jnp.outer(delta, delta))
+        squares = self.squares + later.squares + weight * delta ** 2
+        return type(self)(count, self.center + share * delta, squares, products, self.statistic)
 
     def mean(self) -> tuple[jax.Array, jax.Array]:
         active = self.count > 0
@@ -231,6 +231,8 @@ class Moments(Pooled):
         if self.statistic == "std":
             value = jnp.mean(jnp.sqrt(self.squares / count))
         else:
+            if self.products is None:
+                raise ValueError("off-diagonal moments hold their products")
             dim = self.center.shape[0]
             covariance = self.products / jnp.maximum(count - 1, 1)
             off = covariance * (1.0 - jnp.eye(dim, dtype=covariance.dtype))
