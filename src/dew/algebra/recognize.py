@@ -106,14 +106,10 @@ recognized once, the latest `fusion.DECISIONS_HELD` held."""
 
 def _keyed(jaxpr: jcore.Jaxpr, index: fusion.Index) -> Hashable:
     """`jaxpr`'s key (`_body_key`), built once a body however many family sets are asked of it (the
-    compile point asks attention's, then the norms')."""
-    if index not in _HELD_KEYS:
-        _HELD_KEYS[index] = _body_key(jaxpr, index)
-    return _HELD_KEYS[index]
-
-
-_HELD_KEYS: weakref.WeakKeyDictionary[fusion.Index, Hashable] = weakref.WeakKeyDictionary()
-"""Each body's key (`_keyed`), held while its index lives."""
+    compile point asks attention's, then the norms'), held on its index."""
+    if index.key is None:
+        index.key = _body_key(jaxpr, index)
+    return index.key
 
 
 def _body_key(jaxpr: jcore.Jaxpr, index: fusion.Index) -> Hashable:
@@ -436,11 +432,8 @@ def _reads(index: fusion.Index, places: Sequence[int], var: jcore.Var) -> bool:
 
 
 def _forward(index: fusion.Index, var: jcore.Var, reach: int = REACH) -> dict[jcore.Var, int]:
-    """The values `var` reaches within `reach` equations, with their distance, walked once a body."""
-    held = _HELD_WALKS.setdefault(index, {})
-    if ("forward", var, reach) not in held:
-        held["forward", var, reach] = _walked_forward(index, var, reach)
-    return held["forward", var, reach]
+    """The values `var` reaches within `reach` equations, with their distance (`_walked`)."""
+    return _walked(index, "forward", var, reach)
 
 
 def _walked_forward(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jcore.Var, int]:
@@ -458,17 +451,18 @@ def _walked_forward(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jco
     return found
 
 
-_HELD_WALKS: weakref.WeakKeyDictionary[fusion.Index, dict] = weakref.WeakKeyDictionary()
-"""Each body's walks from its values (`_backward`, `_forward`), held while its index lives: every candidate
-of an anchor walks from the same rows and results again."""
-
-
 def _backward(index: fusion.Index, var: jcore.Var, reach: int = REACH) -> dict[jcore.Var, int]:
-    """The values `var` is made from within `reach` equations, with their distance, walked once a body."""
-    held = _HELD_WALKS.setdefault(index, {})
-    if (var, reach) not in held:
-        held[var, reach] = _walked_back(index, var, reach)
-    return held[var, reach]
+    """The values `var` is made from within `reach` equations, with their distance (`_walked`)."""
+    return _walked(index, "backward", var, reach)
+
+
+def _walked(index: fusion.Index, direction: str, var: jcore.Var, reach: int) -> dict[jcore.Var, int]:
+    """A walk from `var` in `direction` within `reach` equations, walked once a body and held on its index:
+    every candidate of an anchor walks from the same rows and results again."""
+    if (direction, var, reach) not in index.walks:
+        walk = _walked_forward if direction == "forward" else _walked_back
+        index.walks[direction, var, reach] = walk(index, var, reach)
+    return index.walks[direction, var, reach]
 
 
 def _walked_back(index: fusion.Index, var: jcore.Var, reach: int) -> dict[jcore.Var, int]:
@@ -519,20 +513,16 @@ def _constant(index: fusion.Index, var: jcore.Var) -> bool:
     return var in _constants(index)
 
 
-_HELD_CONSTANTS: weakref.WeakKeyDictionary[fusion.Index, frozenset[jcore.Var]] = weakref.WeakKeyDictionary()
-"""Each body's constant values (`_constants`), held while its index lives."""
-
-
 def _constants(index: fusion.Index) -> frozenset[jcore.Var]:
     """The values of the body `index` reads made from its constants and literals alone, in one pass over its
-    equations in order."""
-    if index not in _HELD_CONSTANTS:
+    equations in order, found once a body and held on its index."""
+    if index.constants is None:
         found: set[jcore.Var] = set(index.consts)
         for equation in index.jaxpr.eqns:
             if all(isinstance(atom, jcore.Literal) or atom in found for atom in equation.invars):
                 found.update(equation.outvars)
-        _HELD_CONSTANTS[index] = frozenset(found)
-    return _HELD_CONSTANTS[index]
+        index.constants = frozenset(found)
+    return index.constants
 
 
 def _scalars(index: fusion.Index, places: Sequence[int],
