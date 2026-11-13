@@ -36,6 +36,7 @@ from dew.data.pipeline import (
     Shuffle,
     Slice,
     Stage,
+    children,
     consumed_forward,
 )
 from dew.data.sources.urls import Fetch
@@ -90,6 +91,22 @@ expansion (docs/design/data.md, the rules): it draws by the row's place among th
 read keys a draw (Grain's `random_map`), its workers handing on before it (`_handoff`), in any count of
 workers alike (row 5715). A position of a read before it, whose workers drew by each input and its row,
 records none, which a resume restarts relaxed across or refuses exactly."""
+
+
+def draws_after_expansion(pipeline: Pipeline) -> tuple[frozenset[bool], bool]:
+    """Whether a random step draws after an expansion on some way a record takes through `pipeline`, its
+    corpus's stages and then those of each chain that mixes or phases it: the ways' expansion states at its
+    end, and whether one drew past an expansion (the plan rule `expanded_draws`). Members' stages are their
+    own: an expansion in one member and a draw in another is no such way."""
+    below = [draws_after_expansion(child) for child in children(pipeline)]
+    states, drawn = (frozenset().union(*(ends for ends, _ in below)), any(found for _, found in below)) \
+        if below else (frozenset({False}), False)
+    for stage in pipeline.stages:
+        if isinstance(stage, FlatMap):
+            states = frozenset({True})
+        elif isinstance(stage, RandomMap) and True in states:
+            drawn = True
+    return states, drawn
 
 
 def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, elastic: bool = True,

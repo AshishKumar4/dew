@@ -84,6 +84,7 @@ from dew.data.handoff import (
     _threads,
     _Ungrouped,
     _Unspread,
+    draws_after_expansion,
     record_stage_of,
 )
 from dew.data.mixing import (
@@ -1207,22 +1208,6 @@ def _member_key(members: Sequence[str], index: int) -> int:
 
 
 @dataclasses.dataclass(frozen=True)
-def _draws_after_expansion(pipeline: Pipeline) -> tuple[frozenset[bool], bool]:
-    """Whether a random step draws after an expansion on some way a record takes through `pipeline`, its
-    corpus's stages and then those of each chain that mixes or phases it: the ways' expansion states at its
-    end, and whether one drew past an expansion (the plan rule `expanded_draws`). Members' stages are their
-    own: an expansion in one member and a draw in another is no such way."""
-    below = [_draws_after_expansion(child) for child in children(pipeline)]
-    states, drawn = (frozenset().union(*(ends for ends, _ in below)), any(found for _, found in below)) \
-        if below else (frozenset({False}), False)
-    for stage in pipeline.stages:
-        if isinstance(stage, FlatMap):
-            states = frozenset({True})
-        elif isinstance(stage, RandomMap) and True in states:
-            drawn = True
-    return states, drawn
-
-
 class _Build:
     read: Read
     loading: Loading
@@ -1285,7 +1270,7 @@ class _Build:
         mixed = any(isinstance(chain.source, Mixture) for chain in chains(pipeline))
         shuffled = any(isinstance(stage, Shuffle) for stage in _steps(pipeline))
         batched = any(isinstance(stage, Batched) for stage in _steps(pipeline))
-        drawn = self.in_order and _draws_after_expansion(pipeline)[1]
+        drawn = self.in_order and draws_after_expansion(pipeline)[1]
         return {"identity": IDENTITY, **({"shuffle": self.SHUFFLE} if shuffled else {}),
                 **({"mix": MIX} if mixed else {}), **({"dealing": DEALING} if self.in_order else {}),
                 **({"phases": self.DRAWN} if self.skipped else {}),

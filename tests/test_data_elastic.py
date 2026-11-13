@@ -556,23 +556,19 @@ def test_a_draw_after_an_expansion_is_one_readers_however_its_workers_spread_the
 
 
 def test_a_draw_in_one_member_after_another_members_expansion_records_no_draw_rule():
-    """A mixture whose one member expands its records and whose other draws records no rule for draws after
-    an expansion (train 792's F11): no record is drawn after it was expanded; one member expanding then
-    drawing records it."""
+    """A mixture whose one member expands its records and whose other draws holds no draw after an
+    expansion (train 792's F11), which the plan records as a rule where one does (`expanded_draws`): no
+    record is drawn after it was expanded; a member expanding then drawing, or the mixture drawing after a
+    member expanded, holds one."""
     from dew.data import mix
-
-    def rules(chain) -> dict:
-        reader = worker_reader(chain.batch(BATCH), 0, 1, 2)
-        try:
-            return dict(json.loads(reader.get_state())["dew_data_plan"]["rules"])
-        finally:
-            reader.close()
+    from dew.data.handoff import draws_after_expansion
 
     rows = tuple({"id": np.int64(index)} for index in range(24))
     expanding = Pipeline(Memory(rows)).flat_map(Pieces(3))
     drawing = Pipeline(Memory(rows)).random_map(Drawn())
-    assert "expanded_draws" not in rules(mix([expanding.repeat(), drawing.repeat()]))
-    assert "expanded_draws" in rules(mix([expanding.random_map(Drawn()).repeat(), drawing.repeat()]))
+    assert not draws_after_expansion(mix([expanding.repeat(), drawing.repeat()]))[1]
+    assert draws_after_expansion(mix([expanding.random_map(Drawn()).repeat(), drawing.repeat()]))[1]
+    assert draws_after_expansion(mix([expanding.repeat(), drawing.repeat()]).random_map(Drawn()))[1]
 
 
 def test_a_position_its_workers_drew_by_input_is_refused_naming_the_draw_rule():
