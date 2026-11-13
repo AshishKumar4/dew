@@ -130,8 +130,8 @@ class Supervised(Objective[Ratio]):
         if jnp.ndim(losses) == 0:
             raise ValueError("the loss returns one loss per example, not their mean; Supervised "
                              "takes the mean over the batch's rows itself")
-        metrics = {name: self.row_mean(metric(outputs, batch), batch).mean()[0]
-                   for name, metric in self.metrics.items()}
+        metrics: dict[str, jax.Array | Ratio] = {
+            name: self.row_mean(metric(outputs, batch), batch) for name, metric in self.metrics.items()}
         aux = Aux(metrics, variables=dict(updates) if held else None, qk_stats=qk, inspected=sown)
         return self.row_mean(losses, batch), aux, losses
 

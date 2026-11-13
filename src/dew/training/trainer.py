@@ -45,11 +45,12 @@ from dew.data.dataset import (
     Loader,
     PhasedStream,
     RampedStream,
+    ReadsInProcess,
     StepPhases,
     stream_identity,
 )
 from dew.data.pipeline import Dataset
-from dew.data.plan import DataResume, PlanChanged
+from dew.data.plan import DataResume, PlanChanged, environment_changes
 from dew.distributed.batches import (
     PREFETCH_DEPTH,
     DevicePrefetchIterator,
@@ -181,6 +182,8 @@ from dew.training.transaction import (
 )
 
 _log = logging.getLogger(__name__)
+_input_log = logging.getLogger("dew.training.input")
+"""Where a run says what its input costs its steps, once (`_written`)."""
 
 if TYPE_CHECKING:
     from dew.optim import OptimConfig
@@ -712,6 +715,10 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(f"the checkpoint at step {resume} in {checkpoints.directory} trained another "
                              f"computation ({', '.join(differs)}); resume it with the objective and model "
                              "it recorded, or train in another directory")
+        # The code and machine that wrote the step's data position, which decide none of its rows: warned of.
+        wrote = checkpoints.environment(resume)
+        if wrote is not None:
+            environment_changes(wrote)
         # A step an earlier Dew wrote records no key's implementation (`key_record`): its key data is the
         # run's own key's.
         key = state.key if jnp.issubdtype(state.key.dtype, jax.dtypes.prng_key) else (
@@ -1077,7 +1084,7 @@ class Trainer(Generic[Loss, Effects]):
             raise Preempted(run.preempted)
         # One stage's scan holds its runs stacked for its step alone: the state a run returns holds them on
         # their stored layers, as every reader by layer name reads them, at no device's cost but the copy.
-        return trained if self._staging.stages > 1 else self.stored(trained)
+        return trained if self._staging.stages > 1 else self._staging.stored(trained, consumed=True)
 
     def _fit_plan(
         self,
@@ -1404,6 +1411,7 @@ class Trainer(Generic[Loss, Effects]):
         if not complete and (pending or not plan.ended(current, interval.real_tokens, interval.consumed)):
             partition = self._stream_partition()
             run.source = plan.dataset.train(partition)
+            run.unworked = isinstance(run.source, ReadsInProcess) and run.source.in_process
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None and run.restarted is None else None)
             source = run.source
@@ -2097,6 +2105,12 @@ class Trainer(Generic[Loss, Effects]):
         scalars = {**logged_scalars(read, taken.counts, elapsed, self.device_mesh.devices.size,
                                     rollout=self.rollout is not None, update_flops=run.update_flops),
                    **run.startup.scalars()}
+        if run.unworked and elapsed > 0 and taken.counts.waited > elapsed / 2:
+            # Said once: a per-share stream read in the process starves the step.
+            run.unworked = False
+            _input_log.warning("the step waits on its input for more than half its time, read by a per-share "
+                               "stream in the training process: state its loading workers (.workers(n)), or "
+                               "read it .elastic(), whose order any count of workers keeps")
         self._display.interval(taken.step, scalars)
         if self.tracker is not None:
             self.tracker.log(scalars, taken.step)

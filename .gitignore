@@ -36,3 +36,6 @@ samples/
 build/
 # recorded fixtures over 1 MiB, fetched by tools/fetched_fixtures.py from their pins (*.fetched.json)
 /tests/fixtures/fetched/
+
+# run logs a test runner writes where it is started, never part of the tree
+/*.log

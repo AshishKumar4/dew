@@ -234,6 +234,8 @@ class Curves:
 def train(args: argparse.Namespace, run: Run, probe: RouterProbe | None) -> tuple[Any, Curves]:
     """Every step in the recorded order: timed from `timing_warmup` to the
     profiled tail, which is traced, with the probes' time taken out."""
+    from dew.objectives.base import held_metric
+
     losses, objectives, norms, extras = [], [], [], []
     window = TracedWindow(run.total, args.timing_warmup, args.profile_steps, trace_directory(args))
     state, loss = run.state, None
@@ -246,12 +248,12 @@ def train(args: argparse.Namespace, run: Run, probe: RouterProbe | None) -> tupl
         state, loss, metrics, _, _, committed = run.step(state, run.batch(step))
         # The step's loss is the whole objective, balance terms included;
         # the cross entropy the reference records as its loss is `ce`.
-        losses.append(metrics["ce"])
+        losses.append(held_metric(metrics["ce"]))
         objectives.append(loss)
         # The norm of the update it committed, none (NaN) where it committed none.
         norms.append(committed.norm / committed.count)
         if args.aux_loss_alpha is not None:
-            extras.append({"aux_loss": metrics["aux_loss"]})
+            extras.append({"aux_loss": held_metric(metrics["aux_loss"])})
     return state, Curves(losses, objectives, norms, extras, window.close(loss), window.timed_steps)
 
 

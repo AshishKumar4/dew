@@ -22,7 +22,7 @@ from dew.distributed.placement import Validation
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import Link, Schedule
-from dew.objectives.base import Objective
+from dew.objectives.base import Objective, Pooled
 from dew.state import TrainState, apart, occupied, together
 from dew.telemetry.instrumentation import StepFlops
 from dew.training._candidates import Stepping, candidate_for, lowered_for
@@ -49,7 +49,7 @@ from dew.training.planning import (
     held_objects,
     settled,
     splits,
-    whole_step,
+    whole_step_program,
 )
 from dew.training.profiling import pgle_runs
 from dew.training.rungs import keep_rung, plan_flops, recorded_rung
@@ -345,6 +345,8 @@ class StepCompiler[L, E]:
         # state another program's step returned, a cooldown's restored, a public caller's) is laid out for
         # this step's window first (`laid_out`).
         returned: list[jax.Array | None] = [None]
+        # A split step's whole from its microbatches' outputs, its loss as an unsplit step logs it.
+        whole = whole_step_program(self.objective)
 
         def run(current, batch, sampled: bool = False):
             # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
@@ -381,7 +383,10 @@ class StepCompiler[L, E]:
                     outputs.append(tuple(output))
                 stepped = together(moving, frozen)
                 returned[0] = stepped.window_size
-                return (stepped, *(outputs[0] if split == 1 else whole_step(outputs)))
+                # A step's metrics a caller reads as numbers: a split step's, or one stating a statistic
+                # (`Aux.pooled`), through its whole, which pools them and reads each as its value.
+                pooling = split > 1 or any(isinstance(value, Pooled) for value in outputs[0][1].values())
+                return (stepped, *(whole(outputs) if pooling else outputs[0]))
         return run
 
     def _planned(self, stepping: Stepping, state: TrainState, batch: Batch,

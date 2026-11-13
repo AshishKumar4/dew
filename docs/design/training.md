@@ -192,6 +192,13 @@ Every run logs canonical MFU (analytic model FLOPs on real tokens over wall time
 
 A run inspects what its training does where `TrainerConfig.inspection` names it (`dew.training.Inspection`): parameter paths by glob and the trees summarized at them (the parameters, the gradient the optimizer is handed, its update and the parameters' change), every how many windows of the run's accumulation steps (the update committing in each), and modules whose outputs a sampled step summarizes, named by class-name glob or by their path as the log names it (`layers_3/*`): a model applied in parts, a decision run's backbone and head or a PPO run's policy and critic, names each module by its path in the model's variables (`backbone/layers_3/attn`, `head/...`, `critic/...`), fixed by the model whatever a run watches, and a glob may name a part's module by that path or its path within the part, over a language model's real tokens, with the loss's cotangent at each watched output where `cotangents` asks and each summary's share of magnitudes a decade where `histogram` asks. The summaries are reduced inside the step over the global arrays and ride its commit, logged under `inspect/` off the step loop; a run that inspects nothing compiles its step unchanged, and one that does compiles a sampled step beside it, admitted by the same memory plan. A sampled step summarizes the very forward its loss trains, never a second one: an objective's model call opens what the step sows (`Step.sown`, the watched modules' `inspected` collection where `Step.watched` names them), a diffusion denoiser opens it through its calls (`Denoiser.opened`), and a guidance returns it through its own transforms as the `Guidance` protocol's `observed` prediction. `dew inspect run.json --set trainer.inspection=...` views one sampled update of a saved run offline, from its latest checkpoint or its start, over the batch its first step takes, and writes nothing (`RunConfig.inspected`, `dew.training.inspected`).
 
+A step's logged loss (`train/loss`) is the loss of the rows that step consumed, whatever the split it is
+read in: at a step whose update commits, the update's loss, its window of accumulated microbatches pooled;
+at any other, its own batch's, its microbatches pooled. Its logged metrics are its own batch's too: each
+states how it pools (`Aux.metrics`: a `Ratio` of its numerator and its mass, which the step's microbatches
+sum), so a run read in two microbatches a step logs the numbers it logs read whole. A metric that states no
+pooling is one microbatch's, logged at a split step as its last microbatch's under `<name>/last_microbatch`.
+
 ## 8. After training
 
 ```python
