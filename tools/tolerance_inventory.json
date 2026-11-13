@@ -54,7 +54,7 @@
    "lane": "Kernels"
   },
   "tests/test_audio.py": {
-   "comparisons": 8,
+   "comparisons": 7,
    "lane": "Models, Serving & RL"
   },
   "tests/test_audio_condition.py": {
