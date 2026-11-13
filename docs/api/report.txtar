@@ -1,7 +1,7 @@
 Dew's public surface (tools/api_report.py). A moved line is an API change: regenerate with
 `python tools/api_report.py --write` and say why in the commit.
 -- exports --
-class Aux(metrics: Mapping[str, jax.Array | Pooled], variables: Variables | None = None, qk_stats: Variables | None = None, effects: Effects | None = None, inspected: Variables | None = None, record: Evaluated | Recorded | None = None) -> None  [dew.objectives.base]
+class Aux(metrics: Mapping[str, jax.Array | Pooled], variables: Variables | None = None, qk_stats: Variables | None = None, effects: Effects | None = None, inspected: Variables | None = None, record: Evaluated | Recorded | None = None, pooled: Mapping[str, Pooled] = <factory>) -> None  [dew.objectives.base]
   .replace(self, **updates)
 class Best(metric: str | Metric | TrainingScalar | Summary | types.MethodType | Callable[[Mapping], float], top: int = 1, mode: Literal['min', 'max'] | None = None, threshold: float | None = None, weights_only: bool = False, split: str | None = None, *, _source: Source | None = None)  [dew.training.selection]
   .resolved(self, scored: Mapping[str, Sequence[Declared]]) -> Best
