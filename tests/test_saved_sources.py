@@ -111,7 +111,8 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     MLP, its positions a learned table) exports as its native release, and loads (`Pretrained.load(run)`,
     at the attention a run asks and twice the context, its learned table keeping its rows, as every
     task resizes a cache) as its model in Dew's own layout, its parameters the run's final ones, whose own
-    export refuses, stating why; asked no weights, it reads their shapes and dtypes alone; a second run
+    export refuses, stating why; asked no weights, it reads their shapes and dtypes alone; on the host, its
+    weights as host arrays read from storage, nothing transferred to a device on the way; a second run
     naming it (`--pretrained <run>`) starts from it and trains its step (row 4785: a token run's native
     release declared no task a run starts from)."""
     from flax import linen as nn
@@ -145,6 +146,12 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(shapes.variables))
     assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables["params"]) == jax.tree.map(
         lambda leaf: (leaf.shape, leaf.dtype), state.variables["params"])
+    # On the host, its weights read from storage as host arrays, no device holding them on the way (a
+    # load placed them on the accelerator and fetched them back).
+    with jax.transfer_guard_host_to_device("disallow_explicit"):
+        host = Pretrained.load(str(source), on_host=True)
+    assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(host.variables))
+    leaves_alike(host.variables["params"], state.variables["params"])
     run = dataclasses.replace(first, pretrained=str(source), source=SourceOptions(step="latest"),
                               model=ModelConfig("causal_transformer", {"dtype": "float32"}))
     second, _ = trained(run, tmp_path, "second", trainer={"checkpoint_final": True})

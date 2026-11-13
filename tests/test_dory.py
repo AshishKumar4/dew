@@ -27,7 +27,6 @@ from reference_error import (
     equations,
     indexed_recording,
     recording,
-    seeds_for,
     widened,
 )
 from residual_orders import model_axes
@@ -35,15 +34,7 @@ from tool_support import load as load_tool
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader, replayed
-from dew.decision import (
-    Choice,
-    DecisionInputs,
-    DecisionModel,
-    DecisionObjective,
-    Example,
-    JointLayout,
-    JointSchemaHead,
-)
+from dew.decision import Choice, DecisionModel, DecisionObjective, Example, JointLayout, JointSchemaHead
 from dew.inference import TextGeneration
 from dew.inference.serving import Server
 from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
@@ -637,6 +628,10 @@ def peft_merged(checkpoint: Path, adapter: Path) -> dict[str, np.ndarray]:
 
 MERGED_SEEDS = 8
 """The merged-adapter site's declared draws (`seeds_for`)."""
+PEFT_MERGED_SEEDS = 8
+"""The declared draws of the adapter held to PEFT's own merge, another reference than `MERGED_SEEDS`' and
+sized apart, the reference compared with itself: sized by `seeds_for` on armada's CPUs (2026-11-12,
+eg-sized2 at 0aed05577f7), where each run sized it again."""
 
 
 def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
@@ -696,10 +691,8 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     def adapted_logits(drawn):
         return adapted.model.apply(resumed, drawn)
 
-    seeds = seeds_for(peft_logits(torch.float32), draw, 'the adapter as PEFT merges it',
-                      truth_fn=peft_logits(torch.float64))
     assert_as_exact(adapted_logits, peft_logits(torch.float32), draw, 'the adapter as PEFT merges it',
-                    seeds=seeds, truth_fn=peft_logits(torch.float64))
+                    seeds=PEFT_MERGED_SEEDS, truth_fn=peft_logits(torch.float64))
     adapted.save(tmp_path / 'merged', variables=resumed)
     merged = Pretrained.load(tmp_path / 'merged', dtype='float32', attention_impl='xla')
     # Merging folds each adapter into its projection's weight, a rounding of its own: the merged
@@ -751,19 +744,15 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
     # The two tasks compile their own programs, placed as each one's weights are: their options' logits
     # are held by check 1, over drawn states, against the live task in float64.
     words = sorted({word for example in EXAMPLES for word in example.state.split()})
-    # Every drawn state's row padded to one width, the row of a state of every word, which no state of three
-    # of them exceeds: each arm compiles once, not once a state's length (row 5390: 128 draws' programs of
-    # each of three arms held at once passed the process's mappings).
-    width = max(len(row.tokens) for row in live.rows([(' '.join(words), {'team': INTENT})])[0])
     wide = {}
 
     def scored(task, seed):
-        """The options' logits of a state of three words drawn from the examples', as a call lays it out."""
+        """The options' logits of a state of three words drawn from the examples', as the task answers it:
+        its rows scored through its own programs (`Decide.logits`), a saved run's in the numerics form it
+        saved, -inf past the question's options (row 5206)."""
         state = ' '.join(np.random.default_rng([0xD07, int(seed)]).choice(words, 3))
-        inputs = DecisionInputs.collate(task.rows([(state, {'team': INTENT})])[0], task.specials.pad,
-                                        width=width)
-        logits = wide.setdefault(id(task), jax.jit(task.model.logits))(task.variables, inputs)
-        return np.asarray(logits)[np.asarray(inputs.options)]
+        logits = np.asarray(task.logits(task.rows([(state, {'team': INTENT})])[0])[0])
+        return logits[~np.isneginf(logits)]
 
     @as_given
     def truth(seed):

@@ -51,7 +51,7 @@ from dew.nn.derivatives import KernelGlue, contracted
 from dew.nn.host_memory import fetched, fetched_at, on_host, placed_like, stored_at
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, Choice, backend
-from dew.nn.kernels.selection import Kernel, Op, Requirement, select, selected
+from dew.nn.kernels.selection import Kernel, Op, Requirement, select
 from dew.nn.precision import at_least_fp32, float32_einsum
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import manual_map, sequence_shards
@@ -829,7 +829,7 @@ class KVStore:
             family = attention_mosaic_program.bundle(generation.gpu_target().generation, query.dtype)
             return family is not None
         case = PagedCase(heads=query.shape[2], kv_heads=pool.shape[0], head_dim=query.shape[3],
-                         value_dim=self._get(self.payloads[-1][0]).shape[-1], dtype=query.dtype,
+                         value_dim=self._value_width(), dtype=query.dtype,
                          pool=pool.dtype, page_size=self.layout.page_size, quantized=self.layout.quantized,
                          groups=self.layout.groups, head_shards=1, softcap=softcap, arithmetic=False,
                          named='auto', rows=query.shape[0], queries=query.shape[1], keys=self._slots())
@@ -846,7 +846,7 @@ class KVStore:
         from dew.nn.kernels.templates import attention as template, attention_decode
 
         initial = None if sinks is None else template.sinks(sinks, query.shape[0], query.shape[1],
-                                                             self._get(self.payloads[-1][0]).shape[-1])
+                                                             self._value_width())
         hooks = template.Hooks(None if softcap is None else template.Capped(softcap), initial=initial)
         interpret = generation.placed_platform() != "gpu"
         pools = [self._get(name) for name, _ in self.payloads]
@@ -882,18 +882,32 @@ class KVStore:
         """Every row's slots of `pool` `[heads, pages, page_size, ...]`, as `[rows, capacity, heads, ...]`."""
         return _gather_pages(pool, self._get(TABLE), self.layout.groups)
 
-    def case(self, query: jax.Array, *, value_dim: int, softcap: float | None, arithmetic: bool,
-             named: str, windowed: bool = False, sinks: bool = False) -> PagedCase:
-        """The `PagedCase` of a decode step's query `[rows, heads, head_dim]` over this pool, its values
-        `value_dim` wide, under the layer's `softcap`, its reference-only `arithmetic`
-        (`dew.nn.attention.reference_only`) and its `AttentionImpl`, `named`; a `windowed` step reads
-        each row from its window's first key; a layer with `sinks` has attention sinks."""
+    def case(self, query: jax.Array, *, softcap: float | None, arithmetic: bool, named: str,
+             windowed: bool = False, sinks: bool = False) -> PagedCase:
+        """The `PagedCase` of a decode step's query `[rows, heads, head_dim]` over this pool, its values as
+        wide as the pool stores them (`_value_width`), under the layer's `softcap`, its reference-only
+        `arithmetic` (`dew.nn.attention.reference_only`) and its `AttentionImpl`, `named`; a `windowed`
+        step reads each row from its window's first key; a layer with `sinks` has attention sinks."""
         return PagedCase(heads=query.shape[-2], kv_heads=self.kv_heads, head_dim=self.head_dim,
-                         value_dim=value_dim, dtype=jnp.dtype(query.dtype), pool=jnp.dtype(self.dtype),
+                         value_dim=self._value_width(), dtype=jnp.dtype(query.dtype),
+                         pool=jnp.dtype(self.dtype),
                          page_size=self.layout.page_size, quantized=self.layout.quantized,
                          groups=self.layout.groups, head_shards=_head_shards(query), softcap=softcap,
                          arithmetic=arithmetic, named=named, rows=query.shape[0], queries=1,
                          keys=self._slots(), windowed=windowed, sinks=sinks)
+
+    def paged_kernel(self, query: jax.Array, *, softcap: float | None, arithmetic: bool, named: str,
+                     windowed: bool = False, sinks: bool = False) -> str | None:
+        """The paged kernel the selector gives a decode step's query over this pool (`PAGED`, over its one
+        `case`), reported as the step's route, which `decode` runs; None where no paged kernel takes it and
+        the layer reads the gathered rows itself."""
+        kernel = select(PAGED, self.case(query, softcap=softcap, arithmetic=arithmetic, named=named,
+                                         windowed=windowed, sinks=sinks)).kernel
+        return None if kernel == 'gathered' else kernel
+
+    def _value_width(self) -> int:
+        """The width the pool stores each value at (the keys' where the values are the keys)."""
+        return self._get(self.payloads[-1][0]).shape[-1]
 
     def _slots(self) -> int:
         """The keys each row reads: its table's slots of pages, or a compact cache's capacity."""
@@ -901,15 +915,14 @@ class KVStore:
             return self._get(TABLE).shape[1] * self.layout.page_size
         return self._get(self.payloads[0][0]).shape[1]
 
-    def decode(self, query: jax.Array, lengths: jax.Array, softcap: float | None,
+    def decode(self, query: jax.Array, lengths: jax.Array, kernel: str, softcap: float | None,
                starts: jax.Array | None = None, sinks: jax.Array | None = None) -> jax.Array:
         """Attend one query per row `[rows, heads, head_dim]` to the first `lengths` slots of that row,
         from `starts` `[rows]` where given (a window's first slot, which the GPU's kernel reads), with
         `sinks` `[heads]` where the layer has them (the GPU's kernel applies them).
 
-        Decode runs the paged kernel the selector takes (`PAGED`: the device's, or the attention template's
-        decode where the GPU's refuses the pool), which raises `KernelRefused` where every paged kernel's
-        requirements turn the step down. The TPU kernel does not scale
+        Decode runs the paged `kernel` the step's selection gave it (`paged_kernel`: the device's, or the
+        attention template's decode where the GPU's refuses the pool). The TPU kernel does not scale
         the logits, so the query is multiplied by 1/sqrt(head_dim) first, the
         same scale every other attention path applies. A Mosaic kernel cannot
         be partitioned automatically, and neither can the GPU's Pallas kernel,
@@ -917,16 +930,6 @@ class KVStore:
         queries, lengths and page tables, and the key heads of the pool its
         query heads read, with every page, as the tables index the whole pool.
         """
-        case = self.case(query, value_dim=self.head_dim, softcap=softcap, arithmetic=False, named='auto',
-                         windowed=starts is not None, sinks=sinks is not None)
-        # The selector's paged kernel, reported as the step's route (the layer read it ahead, unreported,
-        # `CausalSelfAttention._decode_attention`): the layer reads this step through the pages where one
-        # takes it, the gathered rows elsewhere.
-        kernel = select(PAGED, case).kernel
-        if kernel == 'gathered':
-            # No paged kernel takes the step: the device's own raises its refusals.
-            selected(PAGED, case, 'triton' if backend() == "gpu" else 'tpu')
-
         def local(query, key, value, lengths, table, *extras):
             # The optional operands as `decode` gave them: the window's starts, the sinks, then the
             # template's values' bound (`BOUND`) and a quantized pool's scales.

@@ -1970,6 +1970,12 @@ layers Dew unrolls, stepped in 479.4 and 479.1 ms with it and 479.5 and
 479.2 without (2a6e1d3d9's parent), and it failed XLA's schedule check
 (`hlo_schedule.cc:463`) in a two-process GPU pool's step.
 
+On the same pair, 2026-11-12, a Qwen3.5-4B decision step (random weights, 12,288-token joint rows, full
+remat, one or two rows a device a microbatch, Muon and AdamW; IG-SCALING-2XH100, row 5568) took the
+scheduler and three all-gather thresholds: the scheduler hid half the exposed communication (77 to 40 ms of
+a 1,078 ms step), and 1 GiB, 128 MiB and 30 MiB stepped within 1% of each other in all 15 timed cells, 128
+MiB holding 39.4 GiB of peak at two rows against 1 GiB's 44.6.
+
 ```
 cd <dew checkout> && JAX_PLATFORMS=cuda XLA_FLAGS= XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 PYTHONPATH=src \
   python tools/reference_runs/dew_lm.py --model <Llama-3.1-8B config checkpoint> --data <2 x 4096 windows.npz> \

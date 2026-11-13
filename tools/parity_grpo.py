@@ -13,8 +13,8 @@ compared with, and once in float64, the exact values both are measured from,
 over the seeds check 1 draws (`tools/recorded_references.py`,
 tests/reference_error.py).
 
-Run with verl 0.9.0, Torch 2.14.0 CPU and JAX (the recorder plans its seeds
-on a JAX transcription):
+Run with verl 0.9.0, Torch 2.14.0 CPU and JAX (the recorder sizes its seeds
+by check 1's rule, tests/reference_error.py):
   uv venv venvs/rlref --python 3.12
   uv pip install --python venvs/rlref/bin/python torch==2.14.0 \\
       --index-url https://download.pytorch.org/whl/cpu
@@ -88,29 +88,9 @@ def evaluated(arrays: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], dic
             {"loss": np.asarray(exact_loss, np.float64), "grad": exact_gradient})
 
 
-def proxy(arrays):
-    """The same composition in JAX from Dew's own terms (`clipped_surrogate_terms`, its dual clip at verl's
-    3, and `sampled_kl`), which plans the seeds the recorder confirms on verl."""
-    import jax
-    import jax.numpy as jnp
-
-    from dew.rl.surrogate import clipped_surrogate_terms, sampled_kl
-
-    mask = arrays["response_mask"]
-
-    def loss(current):
-        policy, _ = clipped_surrogate_terms(current - arrays["old_log_probs"], arrays["advantages"], mask,
-                                            epsilon_low=0.2, epsilon_high=0.2, dual_clip=3.0)
-        kl = sampled_kl(arrays["ref_log_probs"] - current)
-        return (jnp.sum(policy * mask) + BETA * jnp.sum(kl * mask)) / jnp.sum(mask)
-
-    value, gradient = jax.value_and_grad(loss)(arrays["current_log_probs"])
-    return {"loss": value, "grad": gradient}
-
-
 if __name__ == "__main__":
     from recorded_references import record_reference
 
-    record_reference("grpo", rollout, evaluated, proxy, package="verl", repo="volcengine/verl",
+    record_reference("grpo", rollout, evaluated, package="verl", repo="volcengine/verl",
                      tool="tools/parity_grpo.py", out=FIXTURES / "rl" / "grpo.npz", description=__doc__,
                      beta=BETA)

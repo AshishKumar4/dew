@@ -1,4 +1,4 @@
-"""The one-draw rule (`assert_as_exact_as_the_reference`, `assert_no_less_exact`): a
+"""The one-draw rule (`assert_as_exact_as_the_reference`): a
 site's one recorded or drawn comparison, held by its distance from float64 and its rows against the
 reference's (`rows_over`), which G02 moves to check 1 site by site (`reference_error.assert_as_exact`). Its
 rows' sizes and errors, and the gate's findings, are reference_error's; its sites import it from here.
@@ -74,10 +74,3 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
         raise gate.GateFailure([gate.Finding(label, rule, measure, f"{label}: {message}")
                            for rule, measure, message in found],
                           f"{label}: " + "; ".join(message for _, _, message in found))
-
-
-def assert_no_less_exact(dew, reference, truth, label: str) -> None:
-    """An unchanged computation has no larger float64 distance than its source."""
-    mine, theirs = distance(dew, truth), distance(reference, truth)
-    assert within(mine, theirs), (
-        f"{label}: {mine:.3e} from float64 (rms), the unchanged source {theirs:.3e}")

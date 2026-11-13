@@ -8,13 +8,15 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Kernels and performance
 
-- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5727, 5730, 5731]
+- GEMM cells at parity: the template the default on every NVIDIA cell. [1295, 153, 2109, 5623, 5634, 5666, 5727, 5730, 5851]
 - Cached and block visibility on the template's spans. [1495, 245, 5392, 5437]
 - Performance measurements. [569, 285, 295, 1378]
 - One attention algebra: state, visibility, hooks. [1293]
 - One recurrence algebra, the template for every form and product, and port retirement. [1294, 2076, 3426, 3427, 1701, 5635, 5739]
 - The template beats FA2 and FA3, its resources the model's. [1299, 5284, 5285, 5293, 5368]
 - Inference through the templates. [3424, 3602]
+- Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5322, 5398, 5403, 5808, 5809, 5810, 5811, 5813, 5814, 5815, 5816, 5817, 5820, 5822, 5823, 5825, 5827, 5829, 5831, 5832, 5833, 5834, 5835, 5836, 5837, 5839, 5841, 5842, 5843, 5845, 5846, 5847, 5848]
+- The kernel challenge's lessons in the templates. [5271]
 - The shared-prefix fork as the GPU default, priced where it enters a recurrence. [5476, 5353, 5288]
 - Convolution repairs above their owner. [5665]
 - Low-precision and decode-size GEMMs. [483, 1464, 4518, 4519]
@@ -24,7 +26,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - Family toolkit: resources derived and checked against ptxas, one planner, one traversal. [2987]
 - MoE transport, role-aware low precision and observability. [4515]
 - Flax's dot_product_attention with force_fp32_for_softmax keeps the softmax's float32 probabilities into the PV product. [4860]
-- The kernel challenge's lessons in the templates. [5271]
 - Attention stability: check 1 on the accurate form, finiteness on the default, everywhere. [5278, 5327]
 - Derived resources: tiles, registers, residency and issued work. [5567]
 - Exact on every path, every edge and every derivative order. [2656]
@@ -43,6 +44,7 @@ This page is generated from the maintainers' findings ledger as each change land
 - Every nn and interop primitive, seam, contract and derivative has one owner. [3270, 5450, 5625]
 - Checkpoints.variables on a local. [5667]
 - Serving and RL measured where users run them. [5315, 5321, 5393, 5394, 5395]
+- D2 (audit3 interop-core): pipeline_assembly._bind_language_model binds supplied text-encoder params by reading fabricated zero views of every stored tensor. [5807]
 
 ## Training and parallelism
 
@@ -54,7 +56,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Data
 
-- The saved data plan as recorded rules, one last version, and the resume modes. [5497]
 - Metamorphic run flows: a run equals its saved, reloaded and restarted self. [4511]
 
 ## RL and serving
@@ -66,15 +67,16 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## Algebra
 
-- One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 1570, 1551, 1571, 705, 1572, 4735, 5234, 5235, 5239, 5381, 5705, 5706, 5707, 5708, 5732]
+- One assertion generation: every float site on check 1, the one-draw rules and floor judges deleted. [4813, 1305, 1569, 1551, 705, 5234, 5235, 5239, 5381, 5707]
 - Qwix's quantized convolution from its fork alone. [783]
 - Released checkpoints judged on GPUs. [1703, 1549]
 - Every model comparison on check 1. [2300, 3722, 5212]
-- RL batch-fill and microbatch-split invariants, rollout start/evaluation compilation and RL suite cost cuts. [5681, 5699]
-- algebra.md and the engine agree. [5709, 5711, 5712]
-- Reference comparisons held by derived bounds. [1719, 1543, 2094]
+- Reference comparisons held by derived bounds. [1719, 2094]
 - Bit-level synthesis in dew.algebra. [3733]
+- RL batch-fill and microbatch-split invariants, rollout start/evaluation compilation and RL suite cost cuts. [5681]
+- algebra.md and the engine agree. [5780]
 - The monograph's transformer pieces as configurations of the shared seams. [1404]
+- TFDS decoder identity, derived source preparation, cache close cancellation, conventional fields, prepared-dataset concatenation, and export/tokenizer contracts. [5778]
 
 ## Tutorials and docs
 
@@ -82,7 +84,6 @@ This page is generated from the maintainers' findings ledger as each change land
 
 ## CI and tooling
 
-- Carried JAX fixes upstream. [4689, 4690, 4693, 4698, 5322, 5398, 5403]
-- Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670, 5672]
+- Dew's CI, test cache and compile-ahead tests. [5377, 5491, 5670]
 - 1364's ruling (docs/design/testing.md:78, :115). [3179]
 - The JAX fork, releases and installs. [3569, 3739, 3376, 3378, 3379, 3380, 3382, 3384, 3385, 3388, 3390, 3391, 3397, 3403, 3404]

@@ -352,6 +352,16 @@ def released_past_budget():
 
 
 @pytest.fixture
+def unqualified(monkeypatch):
+    """A test of the gate itself, whose sites are its subjects and declare the counts it tests them at: no
+    qualification run sizes them (`check1_wire.QUALIFY`). Its file asks for it
+    (`pytestmark = pytest.mark.usefixtures("unqualified")`)."""
+    from check1_wire import QUALIFY
+
+    monkeypatch.delenv(QUALIFY, raising=False)
+
+
+@pytest.fixture
 def without_deterministic_ops(monkeypatch):
     """The cuda lane runs the whole suite under --xla_gpu_deterministic_ops,
     under which Dew's fused kernels take their ordered schedules (a

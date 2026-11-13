@@ -9,6 +9,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
+from .scatter import gather_positions
 from .visibility import visible
 
 
@@ -164,3 +165,96 @@ def _spanned(segment_ids) -> jax.Array:
     queries, keys = document_ids(segment_ids)
     end = jnp.where(queries == 0, 0, keys.shape[1]).astype(jnp.int32)
     return template.dense(template.KeySpans(jnp.zeros_like(end), end, queries, keys, keys.shape[1], "spans"))
+
+
+class DocumentWindows(NamedTuple):
+    """A packed row's compressed windows document by document (`document_windows`): each document's
+    complete windows of `rate` of its real tokens from its first, as the document alone pools them,
+    one entry after another, `S // rate` entries a row whatever its documents hold."""
+
+    sources: jax.Array
+    """`[B, T, rate]`: the row's index of each entry's tokens."""
+    first: jax.Array
+    """`[B, T]`: the entry is its document's first window, which overlaps no earlier one."""
+    live: jax.Array
+    """`[B, T]`: the entry is a document's complete window, not a slot past the row's last."""
+    document: jax.Array
+    """`[B, T]`: the entry's document."""
+    window: jax.Array
+    """`[B, T]`: the entry's index among its document's windows."""
+    query_document: jax.Array
+    """`[B, S]`: each token's document."""
+    query_rank: jax.Array
+    """`[B, S]`: each token's rank among its document's real tokens."""
+
+    def gathered(self, x):
+        """`x` `[B, S, F]` at each entry's tokens, `[B, T, rate, F]`."""
+        batch, entries, rate = self.sources.shape
+        return gather_positions(x, self.sources.reshape(batch, entries * rate)).reshape(
+            batch, entries, rate, x.shape[-1])
+
+    def origins(self, places):
+        """Each entry's rotary origin `[B, T]`: its window's first token's place (`Coordinates.places`),
+        where its document's queries that read it rotate."""
+        held = jnp.broadcast_to(jnp.asarray(places), self.query_rank.shape)
+        return jnp.take_along_axis(held, self.sources[:, :, 0], axis=1)
+
+    def visible(self, rate: int):
+        """Which entries each query may attend, `[B, S, T]`: its own document's whose window closed at
+        or before it, by its rank there, as `entries_visible` reads a document alone."""
+        closed = self.window[:, None, :] < (self.query_rank[:, :, None] + 1) // rate
+        return self.live[:, None, :] & (self.document[:, None, :] == self.query_document[:, :, None]) & closed
+
+
+def document_windows(segments, valid, rate: int) -> DocumentWindows:
+    """The compressed windows of a row of `segments` `[B, S]`, its real tokens where `valid` marks them,
+    each document's pooled from its own first real token on (`DocumentWindows`): the row's real tokens
+    in document order, each document's in its own, each window opening at a multiple of `rate` among
+    its document's and closed by a real token of it `rate - 1` later; a document's partial last window
+    pools nothing, as the stateless path drops a row's."""
+    segments = jnp.asarray(segments)
+    batch, length = segments.shape
+    real = jnp.ones(segments.shape, bool) if valid is None else jnp.asarray(valid, bool)
+    held = jnp.where(real, segments, jnp.iinfo(segments.dtype).max)
+    order = jnp.argsort(held, axis=1, stable=True)
+    held, kept = (jnp.take_along_axis(field, order, axis=1) for field in (held, real))
+    slots = jnp.arange(length)
+    previous = jnp.concatenate([jnp.full((batch, 1), -1, held.dtype), held[:, :-1]], axis=1)
+    rank = slots - jax.lax.cummax(jnp.where(kept & (held != previous), slots, 0), axis=1)
+    last = jnp.minimum(slots + rate - 1, length - 1)
+    closes = (slots + rate - 1 < length) & kept[:, last] & (held[:, last] == held)
+    opens = kept & (rank % rate == 0) & closes
+    # The row's openings in order, an entry each; slots past its last are no window (`live`).
+    picked = jnp.argsort(~opens, axis=1, stable=True)[:, :length // rate]
+    spans = jnp.minimum(picked[:, :, None] + jnp.arange(rate), length - 1)
+    sources = jnp.take_along_axis(order, spans.reshape(batch, -1), axis=1).reshape(spans.shape)
+    opened = jnp.take_along_axis(rank, picked, axis=1)
+    # Each token's rank back at its place in the row.
+    ranks = jnp.zeros_like(rank).at[jnp.arange(batch)[:, None], order].set(rank)
+    return DocumentWindows(sources, opened == 0, jnp.take_along_axis(opens, picked, axis=1),
+                           jnp.take_along_axis(held, picked, axis=1), opened // rate, segments, ranks)
+
+
+def document_means(values: jax.Array, segment_ids, valid) -> jax.Array:
+    """Each token's mean of `values` `[B, S, ...]` over its document's real tokens (`segment_ids`, those
+    `valid` marks), at least float32 wide: what a query that reads every key of its document alike reads,
+    as the document alone reads its row's."""
+    batch, length = values.shape[:2]
+    real = jnp.asarray(valid, bool)
+    held = jnp.where(real, jnp.asarray(segment_ids), jnp.iinfo(jnp.int32).max)
+    order = jnp.argsort(held, axis=1, stable=True)
+    held, kept = (jnp.take_along_axis(field, order, axis=1) for field in (held, real))
+    widened = values.astype(jnp.promote_types(values.dtype, jnp.float32))
+    ordered = jnp.take_along_axis(widened, order.reshape(batch, length, *(1,) * (values.ndim - 2)), axis=1)
+    weight = kept.reshape(batch, length, *(1,) * (values.ndim - 2))
+    place = jnp.arange(length)
+    begins = (place == 0) | (held != jnp.roll(held, 1, axis=1))
+    sums = within_documents(jnp.where(weight, ordered, 0), begins)
+    counts = within_documents(kept.astype(widened.dtype), begins)
+    # Each document's whole sum, at its last token, read back at each of its tokens.
+    ends = jnp.roll(begins, -1, axis=1).at[:, -1].set(True)
+    last = jax.lax.cummin(jnp.where(ends, place, length - 1), axis=1, reverse=True)
+    whole = jnp.take_along_axis(sums, last.reshape(batch, length, *(1,) * (values.ndim - 2)), axis=1)
+    count = jnp.take_along_axis(counts, last, axis=1).reshape(weight.shape)
+    means = whole / jnp.maximum(count, 1)
+    return jnp.zeros_like(means).at[jnp.arange(batch)[:, None], order].set(means)

@@ -1383,7 +1383,7 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
     """The committed tiny fixture `name`'s transformers logits recorded over check 1's seeds
     (`recorded_references.record_logits`): each seed's token grid (tests/interop_support.py `drawn_ids`),
     the reference's fp32 eager logits on the CPU and their float64 truth (the model in float64, its float32
-    pins widened), its count planned on Dew's own load of the fixture and confirmed on the reference.
+    pins widened), its count the reference's own.
     The ids are drawn again by the test, and the reference's evidence alone is kept with its truth's
     sketch (`record_case`'s summary), which the test's float64 run of Dew's model is held to, in
     recorded_logits.npz beside the fixture."""

@@ -61,6 +61,27 @@ def test_the_precision_seams_hold_every_order(edge):
                     plain_fn=lambda x: x.astype(jnp.bfloat16).astype(x.dtype))
 
 
+@pytest.mark.parametrize("edge", EDGES)
+def test_a_straight_through_rounding_holds_every_order(edge):
+    """`fake_quant.straight_through` (a declared surrogate): its value the rounded operand's bit for bit, a
+    negative zero kept, and every order finite wherever float64 is a normal float32 and the plain formula,
+    the rounding as JAX writes it, is."""
+    from dew.nn.fake_quant import straight_through
+
+    (x,) = normal_draw(2654, (5, 4), scale=EDGES[edge])
+    (direction,) = normal_draw(2655, x.shape, scale=EDGES[edge])
+    (cotangent,) = normal_draw(2656, x.shape)
+    rounded = x.at[0, 0].set(-0.0).astype(jnp.bfloat16)
+    value = np.asarray(straight_through(x, rounded))
+    np.testing.assert_array_equal(value, np.asarray(rounded.astype(x.dtype)))
+    assert np.signbit(value[0, 0])
+    np.testing.assert_array_equal(np.asarray(jax.grad(lambda x: straight_through(x, rounded).sum())(x)),
+                                  np.ones(x.shape, np.float32))
+    assert_contract(lambda x: straight_through(x, x.astype(jnp.bfloat16)), (x,), (direction,), cotangent,
+                    f"a straight-through rounding {edge}",
+                    plain_fn=lambda x: x.astype(jnp.bfloat16).astype(x.dtype))
+
+
 def plain_rms(x, epsilon: float = 1e-6):
     """x over its root mean square, the RMS norm as written."""
     return x / jnp.sqrt(jnp.mean(jnp.square(x), axis=-1, keepdims=True) + epsilon)

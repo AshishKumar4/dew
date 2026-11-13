@@ -1116,7 +1116,7 @@ class DreamerRollout:
         if not self.checkpointed_replay or isinstance(env, Simulator):
             return taken
         key = jax.random.key(0)
-        count = env.reset(key)[1].reward.shape[0]
+        count = jax.eval_shape(env.reset, key)[1].reward.shape[0]
         carry = jax.eval_shape(lambda key: self._begin(key, self.objective.memory(count)), key)
         example = self._step_example(carry.observation, count)
         # The replay the rollout was given, or the one its prefill fills.
@@ -1213,15 +1213,25 @@ class DreamerRollout:
 
     def _started(self, variables: Variables, key: jax.Array) -> _Live:
         """Every environment's first episode begun, and the replay: the one given, or a fresh one the
-        prefill fills."""
-        count = self.env.count if isinstance(self.env, Simulator) else self.env.reset(key)[1].reward.shape[0]
+        prefill fills. Over a JAX environment the reset and memory start run as one compiled program."""
         # The live state is donated to the steps that advance it, each buffer once, so each leaf gets a buffer
         # of its own: an environment's state may hold one array in two of its fields (Playground's do). Each
         # holds its dtype strongly, as a restored state's leaves do: a weakly typed one (a Python number a
         # reset folds in, the flight race's `ramp`) lowers the rollout to another program than a resumed
         # run's, which compiles again (ledger 3451).
-        carry = jax.tree.map(lambda leaf: jnp.array(leaf, dtype=leaf.dtype),
-                             self._begin(key, self.objective.memory(count)))
+        if isinstance(self.env, Simulator):
+            count = self.env.count
+            carry = jax.tree.map(lambda leaf: jnp.array(leaf, dtype=leaf.dtype),
+                                 self._begin(key, self.objective.memory(count)))
+        else:
+            count = jax.eval_shape(self.env.reset, key)[1].reward.shape[0]
+            stepped = Driven(self.env)
+
+            def begin_env(start_key: jax.Array) -> Carry:
+                return jax.tree.map(lambda leaf: jnp.array(leaf, dtype=leaf.dtype),
+                                    start(stepped, start_key, self.objective.memory(count)))
+
+            carry = self.objective.program("start", begin_env, holds=(stepped,))(key)
         returns = jnp.zeros(count)
         if self.replay is not None:
             return _Live(carry, self.replay, returns)

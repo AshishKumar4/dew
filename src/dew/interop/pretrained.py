@@ -373,7 +373,7 @@ class Pretrained:
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
                    layout: Layout | None = None, dtype: DTypeLike | None = None,
-                   param_dtype: DTypeLike | None = None) -> Self:
+                   param_dtype: DTypeLike | None = None, on_host: bool = False) -> Self:
         """Return the pinned checkpoint `run` (`SavedRun.pinned`), rebuilt from the run's own inference
         record, in the layout of the architecture the record names, computing in `dtype` and stored in
         `param_dtype` where given. A decoder no family's layout writes (`dew.interop.layouts.source_layout`)
@@ -391,8 +391,8 @@ class Pretrained:
 
         model_config = saved_model(run.record, dtype)
         model = model_config.build()
-        # Restored where `mesh` and `layout` place them, sharded as a run's own load is.
-        variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
+        # Restored where `mesh` and `layout` place them, sharded as a run's own load is, or into host arrays.
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype, on_host=on_host)
         # The run's task as its loader reads it (`saved_settings`): its policy, budget, pad and
         # end-of-sequence ids and process, which the export writes in the format its readers read.
         held = None if run.objective.settings is None else saved_settings(run.record, run.objective.settings)
@@ -1202,9 +1202,9 @@ def _placement(mesh: MeshSpec | Mesh | None, layout: Layout | None, *, on_host: 
     of a tree, a leaf at a time (`place`), by the layout as a model that places its own tree refines it
     (`_refined`), or none: refused beside `on_host`, which keeps the variables as host arrays, or a load
     without its weights, whose restore places them."""
-    if on_host and (mesh is not None or layout is not None):
-        raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
-                         "pass one")
+    from dew.checkpoints import host_or_placed
+
+    host_or_placed(on_host, mesh, layout)
     streaming = mesh is not None or layout is not None
     if streaming and not weights:
         raise ValueError("a source loaded without its weights has nothing to place; the restore that "

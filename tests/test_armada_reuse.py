@@ -578,7 +578,7 @@ def test_a_red_that_read_the_rows_state_before_another_red_still_revokes_the_gre
     again and let the green stand (review, 2026-11-12)."""
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     flaky_row(tmp_path)
-    sender = ci.SEND
+    sender = ci.records.SEND
 
     def red(stale: bool = False) -> None:
         read = []
@@ -592,7 +592,7 @@ def test_a_red_that_read_the_rows_state_before_another_red_still_revokes_the_gre
             return sender(method, url, headers, body, timeout)
 
         with monkeypatch.context() as patched:
-            patched.setattr(ci, "SEND", send)
+            patched.setattr(ci.records, "SEND", send)
             patched.setenv("FAIL", "1")
             rows = armada_task(ci, monkeypatch, verdict, policy="off")
         assert [row["exitCode"] for row in rows] == [1, 0, 0]
@@ -613,7 +613,7 @@ def test_a_lookup_whose_epoch_is_unread_or_gone_reuses_nothing(ci, tmp_path, mon
     assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
 
     # The Worker unavailable for the rows' epochs alone.
-    sender = ci.SEND
+    sender = ci.records.SEND
 
     def send(method: str, url: str, headers, body, timeout: float):
         if "-epochs/" in url:
@@ -621,7 +621,7 @@ def test_a_lookup_whose_epoch_is_unread_or_gone_reuses_nothing(ci, tmp_path, mon
         return sender(method, url, headers, body, timeout)
 
     with monkeypatch.context() as patched:
-        patched.setattr(ci, "SEND", send)
+        patched.setattr(ci.records, "SEND", send)
         assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
     # Its epochs gone (the bucket's expiry), every green run recorded in them stands no more: a green written
     # after a red it read nothing of, kept past that red's epoch, is never reused (review, 2026-11-12).
@@ -639,7 +639,7 @@ def test_a_red_runs_epoch_write_sent_again_after_a_later_one_never_puts_it_back(
     verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
     flaky_row(tmp_path)
     sent: list[tuple] = []
-    sender = ci.SEND
+    sender = ci.records.SEND
 
     def keeping(method: str, url: str, headers, body, timeout: float):
         if method == "PUT" and "-epochs/" in url and "test_a" in url:
@@ -654,7 +654,7 @@ def test_a_red_runs_epoch_write_sent_again_after_a_later_one_never_puts_it_back(
 
     armada_task(ci, monkeypatch, verdict)
     with monkeypatch.context() as patched:
-        patched.setattr(ci, "SEND", keeping)
+        patched.setattr(ci.records, "SEND", keeping)
         red()
     first_red = sent[-1]
     armada_task(ci, monkeypatch, verdict)

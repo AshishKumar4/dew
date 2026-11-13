@@ -20,7 +20,8 @@ def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, 
     may mean those runs predate the file's tests, and is a floor on its time: it runs split by its
     records, alone, not packed with the light files by the median it had before."""
     for name in ("test_census", "test_light", "test_other"):
-        (tmp_path / "tests" / f"{name}.py").write_text("")
+        (tmp_path / "tests" / f"{name}.py").write_text(
+            "def test_cell(): pass\ndef test_a(): pass\ndef test_b(): pass\n")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {**{f"tests/test_census.py::test_cell[{n}]": 30.0 for n in range(40)},
          "tests/test_light.py::test_a": 20.0, "tests/test_other.py::test_b": 20.0}))
@@ -70,7 +71,7 @@ def test_a_file_no_run_measured_at_a_cut_weighs_its_estimate_and_no_setup_paid_a
     for a suite of 100, armada sized the run by 6,500 s tasks that took a minute, and train 772's CI ran out
     its deadline on 20 of 688 containers)."""
     for name in ("test_measured", "test_unmeasured"):
-        (tmp_path / "tests" / f"{name}.py").write_text("")
+        (tmp_path / "tests" / f"{name}.py").write_text("def test_cell(): pass\n")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {**{f"tests/test_measured.py::test_cell[{n}]": 10.0 for n in range(10)},
          **{f"tests/test_unmeasured.py::test_cell[{n}]": 10.0 for n in range(100)}}))
@@ -81,6 +82,78 @@ def test_a_file_no_run_measured_at_a_cut_weighs_its_estimate_and_no_setup_paid_a
               if entry["python"] == "3.12" and entry["tests"] == "tests/test_unmeasured.py"]
     # A hundred tests of 16 s each as estimated, six to a group within the target.
     assert groups == [96.0] * 16 + [64.0]
+
+
+def test_a_file_armada_holds_only_rows_of_weighs_what_its_rows_took(ci, tmp_path):
+    """A file armada holds no file timing of, but whose rows it holds at a cut, weighs those rows' sum, as
+    its file timing would say, not its record scaled by the other files' ratio: armada keeps a plan's rows
+    from run to run and drops the file timings a run did not itself measure (ledger 5579: after one run that
+    reused most rows it held 1 file timing of 1,067, and 688 of 689 files were weighed by a guess)."""
+    for name in ("test_measured", "test_rows", "test_neither"):
+        (tmp_path / "tests" / f"{name}.py").write_text("def test_cell(): pass\n")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {**{f"tests/test_measured.py::test_cell[{n}]": 10.0 for n in range(10)},
+         **{f"tests/test_rows.py::test_cell[{n}]": 10.0 for n in range(20)},
+         **{f"tests/test_neither.py::test_cell[{n}]": 10.0 for n in range(5)}}))
+    timings = {"files": {"3.12:tests/test_measured.py": 160.0},
+               "rows": {"3.12:tests/test_measured.py": 160.0, "3.12:tests/test_rows.py#1/2": 120.0,
+                        "3.12:tests/test_rows.py#2/2": 130.0, "3.12:tests/test_rows.py#collect": 1.0}}
+    names = ["tests/test_measured.py", "tests/test_rows.py", "tests/test_neither.py"]
+    # The file neither times is its record scaled by how much slower armada ran the two measured (1.6, 1.25).
+    assert ci.weights(names, timings, "3.12") == {
+        "tests/test_measured.py": 160.0, "tests/test_rows.py": 250.0, "tests/test_neither.py": 80.0}
+
+
+def test_a_recorded_test_the_file_no_longer_defines_cuts_it_into_no_group(ci, tmp_path):
+    """A file whose record still names a function a lane renamed is planned by the tests it defines: the
+    stale entries weigh nothing and cut no group, so no task of it runs nothing (2026-11-12:
+    tests/test_recurrence.py's 37 tests ran as 133 tasks, 113 of them empty, by a record of 262 with 244 of a
+    renamed function's). A class's recorded tests stay while the class does, and one the record lacks still
+    spreads over the groups there are."""
+    (tmp_path / "tests/test_cut.py").write_text(
+        "import pytest\n\n@pytest.mark.parametrize('n', range(4))\ndef test_kept(n): pass\n\n"
+        "class TestHeld(Base): pass\n\ntest_made = make()\n\ndef test_new(): pass\n")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {**{f"tests/test_cut.py::test_renamed[{n}]": 100.0 for n in range(40)},
+         **{f"tests/test_cut.py::test_kept[{n}]": 100.0 for n in range(4)},
+         "tests/test_cut.py::TestHeld::test_inherited": 100.0, "tests/test_cut.py::test_made": 100.0}))
+    planned = [entry for entry in ci.plan(100.0, {}) if entry["python"] == "3.12"
+               and entry["tests"] == "tests/test_cut.py"]
+    assert [entry["weight"] for entry in planned] == [100.0] * 6
+    count = len(planned)
+    members = [ci.members("tests/test_cut.py", f"{group}/{count}") for group in range(1, count + 1)]
+    assert sorted(node.partition("::")[2] for group in members for node in group) == [
+        "TestHeld::test_inherited", "test_kept[0]", "test_kept[1]", "test_kept[2]", "test_kept[3]",
+        "test_made"]
+    assert all(members)
+
+
+def test_a_whole_verdict_whose_rows_are_not_its_files_collected_tests_is_named(
+        ci, tmp_path, monkeypatch, capsys):
+    """`ci.py partition VERDICT COLLECTED...`: a whole run's rows on the floor Python against what pytest
+    collects: green where each collected test is in one row (a split file's groups and a site's judge
+    together, a file CI runs apart left out), and exit 1 naming the file and the tests where one is in no row,
+    in two, or in a row and not collected."""
+    listed = tmp_path / "collected.txt"
+    listed.write_text("tests/test_a.py::test_one\ntests/test_a.py::test_two[x]\ntests/test_b.py::test_site\n"
+                      "tests/test_gen_api.py::test_apart\n\n3 tests collected in 1.0s\n")
+
+    def judged(rows: list[dict]) -> tuple[int, list[str]]:
+        (tmp_path / "verdict.json").write_text(json.dumps({"rows": rows}))
+        monkeypatch.setattr(sys, "argv", ["ci.py", "partition", str(tmp_path / "verdict.json"), str(listed)])
+        return ci.main(), capsys.readouterr().out.splitlines()[1:]
+
+    whole = [{"name": "3.12:tests/test_a.py#1/2", "tests": {"tests/test_a.py::test_one": 1.0}},
+             {"name": "3.12:tests/test_a.py#2/2", "tests": {"tests/test_a.py::test_two[x]": 1.0}},
+             {"name": "3.12:tests/test_b.py#test_site", "tests": {"tests/test_b.py::test_site": 9.0}},
+             {"name": "3.14:tests/test_a.py", "tests": {"tests/test_a.py::test_one": 1.0}},
+             {"name": "3.12-test_b-0123456789ab-draws-0-8"}]
+    assert judged(whole) == (0, [])
+    assert judged([whole[0], whole[0], *whole[2:], {"name": "3.12:tests/test_c.py", "tests": {
+        "tests/test_c.py::test_gone": 1.0}}]) == (1, [
+            "tests/test_a.py: 1 of its 2 tests collected and in no row: test_two[x]",
+            "tests/test_a.py: 1 of its 2 tests in two rows: test_one",
+            "tests/test_c.py: 1 of its 0 tests in a row and not collected: test_gone"])
 
 
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):

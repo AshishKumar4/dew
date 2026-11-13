@@ -180,8 +180,8 @@ def serve(checkout: str) -> None:
 
 def write_seeded(worker) -> None:
     """Each case's seeded draws with mamba_ssm's outputs and gradients and their float64 truth (`worker`,
-    `serve`'s `Session`), recorded as a summary (`record_case`), Dew's portable scan the sizing proxy and
-    its float64 path held to the oracle at every seed (`assert_computes_the_oracle`)."""
+    `serve`'s `Session`), recorded as a summary (`record_case`), Dew's portable scan's
+    float64 path held to the oracle at every seed (`assert_computes_the_oracle`)."""
     import jax
     import jax.numpy as jnp
     from recorded_references import held_to_the_oracle, provenance, record_case, save
@@ -210,10 +210,7 @@ def write_seeded(worker) -> None:
             held_to_the_oracle(exact_run, arrays, truth, roundings, "mamba_ssm")
             return reference, truth
 
-        stored.update(record_case(
-            case, draw, evaluate,
-            lambda arrays, dtype=narrow_dtype: selective_xla(arrays, dtype),
-            truth_proxy=exact_run, store_inputs=False, summary=True))
+        stored.update(record_case(case, draw, evaluate, store_inputs=False, summary=True))
         stored[f"{case}.dtype"] = np.asarray(str(narrow_dtype))
         stored[f"{case}.shape"] = np.asarray(shape, np.int32)
         stored[f"{case}.regime"] = np.asarray(regime)

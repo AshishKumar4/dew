@@ -5,7 +5,15 @@ import itertools
 
 import numpy as np
 import pytest
-from sampling_gate import FALSE_RED, LEVEL, SamplingFailure, assert_draws_as_declared, p_value, statistics
+from sampling_gate import (
+    FALSE_RED,
+    LEVEL,
+    SamplingFailure,
+    TooFewExpected,
+    assert_draws_as_declared,
+    p_value,
+    statistics,
+)
 from scipy import stats
 
 SHARES = (0.85, 0.05, 0.1)
@@ -28,13 +36,27 @@ def test_a_share_favoured_by_two_hundredths_fails():
         assert_draws_as_declared(drawn((0.83, 0.07, 0.1)), SHARES, "favoured", seeds=64)
 
 
+def test_a_rare_outcome_is_refused_at_too_few_draws_and_judged_as_itself_at_enough():
+    """A sampler that never draws its rarest declared outcome and draws the next rarest in its place, the
+    two at chances 0.04 and 0.02 of 100 draws a seed: at one seed, which expects 4 and 2 of them, the site
+    is refused (`TooFewExpected`); at 64 seeds, which expect 256 and 128, it fails. The two outcomes were
+    judged as one where either expected fewer than five, and that sampler, whose merged share is fair,
+    passed at any count that kept them merged."""
+    chances = (0.94, 0.02, 0.04)
+    moved = drawn((0.94, 0.06, 0.0), 100)
+    with pytest.raises(TooFewExpected):
+        assert_draws_as_declared(moved, chances, "a rare outcome at one seed", seeds=1)
+    with pytest.raises(SamplingFailure):
+        assert_draws_as_declared(moved, chances, "a rare outcome at 64 seeds", seeds=64)
+    assert_draws_as_declared(drawn(chances, 100), chances, "a fair sampler of a rare outcome", seeds=64)
+
+
 def test_a_site_too_small_to_judge_is_refused():
     """Eight records a seed over two seeds expect less than one of the rarest part: refused, not
     judged; and counts of another shape, a chance that is not positive or finite, and chances that do not
     sum to one (a declaration's typo, never repaired), are refused too."""
-    with pytest.raises(AssertionError) as raised:
+    with pytest.raises(TooFewExpected):
         assert_draws_as_declared(drawn(SHARES, 8), SHARES, "small", seeds=2)
-    assert raised.type is AssertionError
     with pytest.raises(ValueError):
         assert_draws_as_declared(lambda seed: np.array([1.5, 2, 3]), SHARES, "floats", seeds=1)
     with pytest.raises(ValueError):

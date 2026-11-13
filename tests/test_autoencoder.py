@@ -94,6 +94,20 @@ CLIP = (2, 3, 16, 16)
 """A drawn clip's batch, frames, height and width."""
 
 
+def test_a_kl_autoencoder_computes_at_the_dtype_it_is_asked_for():
+    """`StableDiffusionVAE(model, params, dtype=...)` runs its module at that dtype, its parameters as
+    given: a float32 `AutoencoderKL` asked for bfloat16 decodes as the same module built at bfloat16
+    does, bit for bit, where it ran in float32 and recorded bfloat16; with none it runs the module's own."""
+    model = AutoencoderKL(channels=(8, 16, 16), blocks_per_level=1, norm_groups=4, dtype=jnp.float32)
+    params = model.init(jax.random.PRNGKey(0), jnp.zeros((1, IMAGE_SIZE, IMAGE_SIZE, 3)))["params"]
+    latents = jax.random.normal(jax.random.PRNGKey(1), (2, IMAGE_SIZE // 4, IMAGE_SIZE // 4, 4))
+    asked = StableDiffusionVAE(model, params, dtype=jnp.bfloat16).decode_batch(params, latents)
+    built = model.clone(dtype=jnp.bfloat16).apply({"params": params}, latents, method="decode")
+    assert asked.dtype == jnp.bfloat16
+    np.testing.assert_array_equal(np.asarray(asked, np.float32), np.asarray(built, np.float32))
+    assert StableDiffusionVAE(model, params).decode_batch(params, latents).dtype == jnp.float32
+
+
 @functools.cache
 def sd3_tiny():
     return load_kl_vae(str(FIXTURES / "sd3-tiny"), jnp.float32, revision="bf16", subfolder=None)[0]

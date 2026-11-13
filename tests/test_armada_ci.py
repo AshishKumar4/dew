@@ -98,7 +98,8 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     daily run (DEW_WHOLE_SUITE) runs every file on both, with nothing only
     collected. Every row is named once, test_gen_api never."""
     for name in ("test_heavy", "test_light", "test_new", "test_measured", "test_gen_api", "test_config"):
-        (tmp_path / "tests" / f"{name}.py").write_text("")
+        (tmp_path / "tests" / f"{name}.py").write_text(
+            "".join(f"def test_{each}(): pass\n" for each in "abcde"))
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0,
          "tests/test_light.py::test_c": 30.0, "tests/test_measured.py::test_d": 25.0,
@@ -2064,15 +2065,18 @@ def run_options(tmp_path: Path, ref: str, policy: str, option: str, whole: bool 
     return [word for word in run if word.startswith(option)]
 
 
-def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priority(tmp_path):
-    """A push to base/kernels runs its suite at a lane's whole-suite priority, -10 as verdict.sh's, so it
-    never takes containers from a lane's precheck or targeted run (0), and a lane's branch at the default
-    (the maintainer, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger); a train's CI is the
-    queue's gates on the hub, which set its own (runbooks/hub.md)."""
+def test_a_base_push_runs_at_a_targeted_runs_priority_and_the_background_suite_below_every_lanes(tmp_path):
+    """A push to base/kernels runs its suite at a targeted run's priority, 0, with the suite's ordinary
+    deadline, so it is graded: at a lane's whole-suite priority (-10) with the background deadline it waited
+    behind every train, precheck and lane run and ran out its 6,000 s ungraded, every one of the eleven runs
+    that started from 2026-11-09 to 11-12, each about 115 tasks after reuse, all queued (the owner's rule,
+    2026-11-01: every push to base is graded, a red its committer's the same day). Trains keep their own
+    priority above it; a lane's branch runs at the default; a train's CI is the queue's gates on the hub,
+    which set its own (runbooks/hub.md)."""
     def priority(ref: str) -> list[str]:
         return run_options(tmp_path, ref, "off", "--priority")
 
-    assert priority("base/kernels") == ["--priority=-10"]
+    assert priority("base/kernels") == ["--priority=0"]
     assert priority("fix/lane") == []
     # Main's whole run (the schedule's, the queue's whole dispatch) is background work, below every lane's run
     # at a head (verdict.sh's -10), so no head waits behind it (Main, 2026-11-06); a push to main stays its
@@ -2084,8 +2088,8 @@ def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priorit
     calls = suite_step(tmp_path / "whole-deadlines", "main", "", "off", 2, whole=True)
     assert {word for call in calls for word in call if word.startswith(("--deadline", "--pool=48"))} == {
         "--deadline=6000", "--pool=48"}
-    # A base push, below lanes too and on the pool armada gives it, keeps the background deadline.
-    assert run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline") == ["--deadline=6000"]
+    # A base push, no background run now, on the pool armada gives it, has the suite's ordinary deadline.
+    assert run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline") == ["--deadline=2700"]
     assert run_options(tmp_path / "base-pool", "base/kernels", "on", "--pool") == []
 
 
