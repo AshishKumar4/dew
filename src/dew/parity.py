@@ -9,6 +9,7 @@ from the arms and the draws that record them.
 """
 
 import dataclasses
+import enum
 import functools
 import hashlib
 import itertools
@@ -388,10 +389,23 @@ def _examples_refuse(examples: list[np.ndarray], scalar: bool, tail: float = LOW
     return None
 
 
+class _Undecided(enum.Enum):
+    """Which of `_typical_status`' rules left a leaf undecided: its draws hold no paired ratio, its typical
+    draw's ratio does not pass, its draws' log ratios spread past QUALIFYING_SPREAD, their tail lies above
+    their median, or its stacked examples do not pass it (`_examples_refuse`: too few for their tail test at
+    their spread, or their own tail above their medians)."""
+
+    UNPAIRED = "unpaired"
+    TYPICAL = "typical"
+    SPREAD = "spread"
+    TAIL = "tail"
+    EXAMPLES = "examples"
+
+
 def _typical_status(mine: np.ndarray, theirs: np.ndarray,
                     tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL),
                     examples: list[np.ndarray] | None = None,
-                    scalar: bool = False) -> tuple[str, float, float, float, str]:
+                    scalar: bool = False) -> tuple[str, float, float, float, str, _Undecided | None]:
     """A leaf's verdict by its draws' paired ratios, asked only where its pooled ratio leaves it
     inconclusive: "pass" where the typical draw's ratio passes (the draws' geometric mean, its interval
     `_status`), the draws' log ratios spread no wider than QUALIFYING_SPREAD (where the tail test sees a
@@ -401,22 +415,25 @@ def _typical_status(mine: np.ndarray, theirs: np.ndarray,
     (`_example_medians`), and the examples' own tail about their draws' medians is asked too
     (`_within_draws`), so a fault on some of each draw's examples is refused. A pass certifies the typical
     draw's (or example's) ratio under PARITY and no fault the tail tests see at that spread; a `scalar` leaf
-    (one value an example) takes the known null's tail test (`_scalar_tail`)."""
+    (one value an example) takes the known null's tail test (`_scalar_tail`). The reason is given in words
+    and as the rule that refused (`_Undecided`), None for a pass."""
     ratios = _log_ratios(mine, theirs) if examples is None else _example_medians(examples)
     if ratios is None or not len(ratios):
-        return "inconclusive", float("nan"), float("nan"), float("nan"), "its draws hold no paired ratio"
+        return ("inconclusive", float("nan"), float("nan"), float("nan"), "its draws hold no paired ratio",
+                _Undecided.UNPAIRED)
     ratio, low, high = _geometric(ratios, tails)
     if _status(ratio, low, high) != "pass":
-        return "inconclusive", ratio, low, high, "the typical draw's ratio does not pass"
+        return "inconclusive", ratio, low, high, "the typical draw's ratio does not pass", _Undecided.TYPICAL
     if (spread := float(np.std(ratios))) > QUALIFYING_SPREAD:
         return ("inconclusive", ratio, low, high,
                 f"its draws' log ratios spread {spread:.2f}, past the {QUALIFYING_SPREAD} the tail test "
-                f"sees at")
+                f"sees at", _Undecided.SPREAD)
     if (tail := _tail_sign(ratios, tails[0])) < tails[0]:
-        return "inconclusive", ratio, low, high, f"its draws' tail lies above their median (p {tail:.1e})"
+        return ("inconclusive", ratio, low, high, f"its draws' tail lies above their median (p {tail:.1e})",
+                _Undecided.TAIL)
     if examples is not None and (reason := _examples_refuse(examples, scalar, tails[0])) is not None:
-        return "inconclusive", ratio, low, high, reason
-    return "pass", ratio, low, high, ""
+        return "inconclusive", ratio, low, high, reason, _Undecided.EXAMPLES
+    return "pass", ratio, low, high, "", None
 
 
 def _sized(mine: np.ndarray, theirs: np.ndarray, typical: bool = False,
@@ -645,17 +662,19 @@ NO_ZERO_ROWS: ZeroRows = (np.zeros(0, np.int64), np.zeros(0), np.zeros(0))
 
 RECORDED_KINDS = {
     "reference": "output", "truth": "output",
-    "mse": "seed", "worst": "seed", "finite": "seed", "sketch": "seed", "example_mse": "seed",
-    "example_worst": "seed", "scale": "seed",
+    "mse": "seed", "worst": "seed", "share": "seed", "finite": "seed", "sketch": "seed",
+    "example_mse": "seed", "example_worst": "seed", "scale": "seed",
     "zero_rows": "span", "zero_errors": "span", "zero_offsets": "offsets",
-    "shape": "whole", "dtype": "whole",
+    "shape": "whole", "dtype": "whole", "heavy": "whole",
 }
 """A recording's entries kept one a leaf, `<site>.<kind>.<leaf>` (a pilot's `<site>.pilot.<kind>.<leaf>`),
 each kind by how it is held: a full recording's outputs and truths over its seeds (`output`); a summarized
 one's evidence, one row a seed (`seed`: a `RecordedLeaf`'s summary, its truth's sketch, a stacked site's
 examples, a weighed site's rounding scales); its rows of float64 zero joined over the seeds (`span`), each
 seed's span of them between consecutive `offsets`; and what the whole recording holds once a leaf
-(`whole`). The one statement of the layout: the recorder writes and cuts by it
+(`whole`: its shape and dtype, and a weighed site's heavy elements, a mask). A summarized weighed site's
+reference's weighed evidence is a summary of its own under `<site>.weighed`, its leaves the weighed classes'
+(`classed_paths`). The one statement of the layout: the recorder writes and cuts by it
 (tools/recorded_references.py) and the gate reads by it (tests/reference_error.py). Every other entry
 (inputs, digests, counts, provenance) is the whole recording's."""
 
@@ -702,14 +721,17 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
     return leaf_summaries([reference], [truth])[0]
 
 
-def leaf_summaries(references, truths) -> list[RecordedLeaf]:
+def leaf_summaries(references, truths, terms=None) -> list[RecordedLeaf]:
     """Each reference leaf's `leaf_summary` against its truth, read at once (`_summaries`), each held to
-    its truth's shape first: a recording's record (tools/recorded_references.py)."""
+    its truth's shape first: a recording's record (tools/recorded_references.py). With `terms`, a leaf's
+    rows are sized by them as check 1 sizes a row by what it sums (`_LaidTruths.of`): a weighed arm's
+    residuals against their truth of zeros, every row of unit size (`Weighed.ones`)."""
     for reference, truth in zip(references, truths, strict=True):
         if np.shape(reference) != np.shape(truth):
             raise AssertionError(f"a leaf {np.shape(reference)} against a truth {np.shape(truth)}")
     # Every reference given, so every leaf has its summary (`_summaries`' None is a reference of None's).
-    return [summary for summary in _summaries(references, _LaidTruths.of(truths)) if summary is not None]
+    return [summary for summary in _summaries(references, _LaidTruths.of(truths, terms))
+            if summary is not None]
 
 
 def _missed(mse, missed):
@@ -999,7 +1021,13 @@ class _Draws:
         Dew on the same draws against the library arm (`assert_as_exact`'s `library_fn`), on the
         exception's `leaves` alone: seed by seed and leaf by leaf, the reference's evidence (its error,
         its worst row, its rows of float64 zero) is whichever of the two arms' error is the larger there,
-        and a value must be finite in both. Every other leaf is the reference's alone."""
+        and a value must be finite in both. Every other leaf is the reference's alone, its examples'
+        evidence with it (a site of stacked examples, `examples`). A covered leaf holds no examples'
+        evidence and is judged without it, by its pooled ratio, its draws' paired ratios and its worst row:
+        the example rules' nulls take Dew and one reference as an exchangeable pair on each example, which
+        neither an arm chosen seed by seed nor the larger of two arms' errors example by example is (the
+        first refuses equal arms by the paired rows, the second by the tails about a draw's median); a rule
+        for the pair of arms is ledger 5707's."""
         if library.names != self.names or len(library.mine) != len(self.mine):
             raise AssertionError("the library arm's draws are not the reference's")
         unknown = sorted(set(leaves) - set(self.names))
@@ -1013,13 +1041,18 @@ class _Draws:
         zero_rows = [[(theirs if chosen else mine)
                       for mine, theirs, chosen in zip(seed, other, picked, strict=True)]
                      for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
-        # A library arm's leaves are judged by their pooled ratio alone: their examples are not Dew's against
-        # one reference.
         # A picked cell's worst row is the library arm's, and so is its share.
         shares = self.held_shares().copy()
         shares[..., 1] = np.where(pick, library.held_shares()[..., 1], shares[..., 1])
+
+        def uncovered(field: str):
+            held = getattr(self, field)
+            return None if held is None else [[None if covered[leaf] else examples
+                                               for leaf, examples in enumerate(row)] for row in held]
+
         return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
-                      self.finite & (library.finite | ~covered), self.widths, shares=shares)
+                      self.finite & (library.finite | ~covered), self.widths,
+                      uncovered("examples"), uncovered("example_rows"), shares)
 
 
 def _shares(found: list[list], count: int) -> np.ndarray:
@@ -1410,6 +1443,10 @@ class Weighed:
     heavy: list | None = None
     """Each floating leaf's heavy elements (`_heavy`), a mask, None for a leaf of none: its residuals
     judged as a leaf of their own beside the light ones' (`classed`)."""
+    recorded: object = None
+    """A recorded reference's own weighed evidence at this draw, where its recording keeps no outputs to
+    weigh: its residuals' `RecordedLeaf` a leaf of the classed tree (`recorded_evidence`), read when the
+    recording was made, with its outputs and their truth in hand."""
 
     def classed(self, tree):
         """`tree`, of the truth's structure (its leaves by the truth's treedef, a structural None kept out),
@@ -1431,7 +1468,14 @@ class Weighed:
         of unit size (`ones`, the
         terms `_prepared` sizes rows by). Each leaf's shape is checked before any arithmetic. An element
         no rounding reaches (c = 0) is exact in the reference's program, and an arm not exact there fails,
-        by name, as does an element whose scale is not finite, which no error can be read against."""
+        by name, as does an element whose scale is not finite, which no error can be read against. An arm
+        that is a recording's evidence (its leaves `RecordedLeaf`) holds no element to weigh: its weighed
+        evidence is the recording's own for this draw (`recorded`), and one that holds none is refused."""
+        if any(isinstance(leaf, RecordedLeaf) for leaf in jax.tree.leaves(tree)):
+            if self.recorded is None:
+                raise AssertionError(f"{arm}: a recording of its evidence alone, which holds no weighed "
+                                     f"evidence of this draw; record the site's weighed check with it")
+            return self.recorded, self.classed(self.zeros)
         structure = jax.tree.structure(self.truth)
         paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(self.truth)]
         leaves = structure.flatten_up_to(jax.device_get(tree))
@@ -1503,6 +1547,9 @@ class Conditioning:
 
     scale_of: Callable
     heavy: list | None = None
+    recorded_of: Callable | None = None
+    """`recorded_of(inputs, seed)`, a recorded reference's weighed evidence at a draw by its leaf's path
+    (`recorded_evidence`), where its recording keeps no outputs: read into each draw's weighing (`of`)."""
 
     def digest(self) -> str:
         """The classes' digest (`heavy`, each mask's shape and values), which every map task of a sharded
@@ -1528,7 +1575,37 @@ class Conditioning:
         zeros = jax.tree.map(lambda leaf: np.zeros(np.shape(leaf)) if float_leaf(leaf) else leaf, truth)
         ones = jax.tree.map(lambda leaf: np.ones(np.shape(leaf)) if float_leaf(leaf) else None, truth)
         weighing = Weighed(truth, scale, zeros, ones, self.heavy)
-        return dataclasses.replace(weighing, ones=weighing.classed(ones))
+        weighing = dataclasses.replace(weighing, ones=weighing.classed(ones))
+        if self.recorded_of is None:
+            return weighing
+        # The recording's evidence laid as this draw's classed tree, each leaf found by its path.
+        classed, found = weighing.classed(zeros), self.recorded_of(inputs, seed)
+        paths = classed_paths(classed)
+        if not set(paths) <= set(found):
+            raise AssertionError(f"seed {seed}: the recording holds no weighed evidence of "
+                                 f"{sorted(set(paths) - set(found))}, classes of this draw's leaves")
+        return dataclasses.replace(
+            weighing, recorded=jax.tree.structure(classed).unflatten([found[path] for path in paths]))
+
+    def recorded_evidence(self, reference, truth, inputs, seed) -> tuple[dict, dict]:
+        """A reference's weighed evidence at a draw, as a recording keeps it where it keeps no outputs: by
+        each class leaf's path (`classed_paths`), its residuals' summary as check 1 reads a weighed arm's
+        (`Weighed.weighed`, its rows of unit size), and beside it the truth of zeros each is read against.
+        The recorder's one writer (tools/recorded_references.py), which `of` reads back (`recorded_of`)."""
+        weighing = self.of(truth, inputs, seed)
+        residuals, zeros = weighing.weighed(reference, "the reference")
+        paths, leaves = classed_paths(zeros), jax.tree.leaves(zeros)
+        summaries = leaf_summaries(jax.tree.leaves(residuals), leaves,
+                                   jax.tree.structure(zeros).flatten_up_to(weighing.ones))
+        return dict(zip(paths, summaries, strict=True)), dict(zip(paths, leaves, strict=True))
+
+
+def classed_paths(tree) -> list[str]:
+    """Each leaf of a weighed arm's classed tree (`Weighed.classed`) by its path, in the tree's leaf order:
+    a leaf's name, then where it is split its class and the count of that class's values a row
+    (`logits/heavy/3`); the names a recording keeps its weighed evidence by."""
+    return [jax.tree_util.keystr(path, simple=True, separator="/")
+            for path, _ in jax.tree_util.tree_leaves_with_path(tree)]
 
 
 def _compacted(leaf: np.ndarray, mask: np.ndarray) -> dict:

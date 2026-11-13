@@ -62,8 +62,15 @@ def runs_on(build: str, driver: str, sm: tuple[int, int], cuda: int | None = Non
     least, least_sm, least_cuda = next((major, s, version) for name, major, s, version in CUDA_BUILDS
                                        if name == build)
     supported = int(driver.split(".")[0]) >= least if cuda is None else cuda >= least_cuda
+    return supported and _builds_for(least_sm, least_cuda, sm)
+
+
+def _builds_for(least_sm: tuple[int, int], least_cuda: int, sm: tuple[int, int]) -> bool:
+    """Whether a CUDA build of least SM `least_sm` and CUDA version `least_cuda` builds for a GPU of `sm`:
+    one its SM meets, and for a GPU holding tensor memory (`TENSOR_MEMORY_SMS`) one whose cuBLAS is 13.2
+    or newer (`LEAST_CUBLAS_BESIDE_TENSOR_MEMORY`), its CUDA major's."""
     cublas = least_cuda // 1000 >= LEAST_CUBLAS_BESIDE_TENSOR_MEMORY[0] or sm[0] not in TENSOR_MEMORY_SMS
-    return supported and sm >= least_sm and cublas
+    return sm >= least_sm and cublas
 
 
 def newest_build(gpus: tuple[str, tuple[int, int]] | None, cuda: int | None = None) -> str | None:
@@ -73,6 +80,18 @@ def newest_build(gpus: tuple[str, tuple[int, int]] | None, cuda: int | None = No
     if gpus is None:
         return None
     return next((name for name, _, _, _ in CUDA_BUILDS if runs_on(name, *gpus, cuda)), None)
+
+
+def generation_builds(generation: str) -> tuple[str, ...]:
+    """JAX's CUDA builds a GPU of the CUDA `generation` (`sm90`, `sm100`) runs, newest first: each that builds
+    for its SM (`_builds_for`), a GPU holding tensor memory the cuda13 build alone. A step compiled for such a
+    GPU is compiled by one of them, as its kernels and spills are that toolchain's."""
+    found = re.fullmatch(r"sm_?(\d+)(\d)a?", generation)
+    if found is None:
+        raise ValueError(f"{generation!r} names no CUDA generation; name one as sm80 or sm100")
+    sm = (int(found.group(1)), int(found.group(2)))
+    return tuple(name for name, _, least_sm, least_cuda in CUDA_BUILDS
+                 if _builds_for(least_sm, least_cuda, sm))
 
 
 def dew_cache_dir() -> str:

@@ -82,6 +82,9 @@ SEEDS = {"v3 block": 16, "v3n block": 32, "v32 block": 8, "auto": 64, "decode": 
          "mla_v3 float8_e4m3fn latent decode": 8, "mla_v32 float8_e4m3fn latent decode": 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada: the most any of
 a site's cases took."""
+PREFIX_RUN_SEEDS = 32
+"""The prefix run's loss's declared seeds, the reference compared with itself: sized by `seeds_for` on
+armada's CPUs (2026-11-12, eg-sized2 at 0aed05577f7), where each run sized it again."""
 
 LENGTH = 28
 """The tokens of a drawn row: four times the fixtures' seven, so a draw's input gradient sums over
@@ -1048,7 +1051,6 @@ def test_a_prefix_run_trains_an_mla_decoder_that_reads_its_blocks_whole():
     under an explicit block-causal mask written apart from Dew (`block_causal`), from that mask's float64
     run (check 1), its in-block targets left out."""
     from block_support import block_causal
-    from reference_error import seeds_for
 
     from dew.batch import TEXT_KEY
     from dew.objectives.lm.objective import batch_text
@@ -1075,8 +1077,8 @@ def test_a_prefix_run_trains_an_mla_decoder_that_reads_its_blocks_whole():
         scores = objective.token_scores(params, batch_text({TEXT_KEY: tokens, "text_block_groups": blocks}))
         return scores.losses, scores.weights
 
-    seeds = seeds_for(masked(decoder), draw, "mla prefix run loss", truth_fn=masked(wide))
-    assert_as_exact(dew, masked(decoder), draw, "mla prefix run loss", seeds=seeds, truth_fn=masked(wide))
+    assert_as_exact(dew, masked(decoder), draw, "mla prefix run loss", seeds=PREFIX_RUN_SEEDS,
+                    truth_fn=masked(wide))
 
 
 def test_a_latent_attention_source_reads_its_blocks_whole_through_its_config_and_export(tmp_path):

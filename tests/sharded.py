@@ -31,7 +31,7 @@ from jax.sharding import NamedSharding, PartitionSpec
 from reference_error import as_given, assert_as_exact, without_ynn
 
 from dew.distributed.placement import parameter_axes
-from dew.telemetry.instrumentation import custom_call_kind, hlo_instructions
+from dew.telemetry.instrumentation import PALLAS, custom_call_kind, hlo_instructions
 from dew.telemetry.trace import collective
 
 
@@ -186,7 +186,8 @@ def _relays_out(instruction) -> bool:
 
 def boundary_copies(text: str) -> list[str]:
     """Each layout pass (`_relays_out`) in compiled HLO `text` that produces an operand of a kernel
-    call (a Pallas-Triton call or one of Dew's FFI handlers) or reads one of its results, through any
+    call (a Pallas call of any kind, Triton's, Mosaic GPU's or Mosaic TPU's, as the profiler classifies
+    them, `instrumentation.PALLAS`; or one of Dew's FFI handlers) or reads one of its results, through any
     views (`VIEWS`): XLA re-laying out an array at the kernel's edge. Read with the profiler's own
     HLO parser (`dew.telemetry.instrumentation.hlo_instructions`)."""
     instructions = hlo_instructions(text)
@@ -213,7 +214,7 @@ def boundary_copies(text: str) -> list[str]:
     found = []
     for name, instruction in instructions.items():
         if instruction.op != "custom-call" or not (
-                custom_call_kind(instruction.target) == "triton" or instruction.target.startswith("dew_")):
+                custom_call_kind(instruction.target) in PALLAS or instruction.target.startswith("dew_")):
             continue
         found += [f"{producer} -> {name}" for operand in instruction.operands
                   for producer in producers(operand)

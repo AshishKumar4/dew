@@ -49,18 +49,11 @@ def first_episode_rows(following: TimeStep,
     return {**rows, **{name: at_last(value) for name, value in (reached or {}).items()}}
 
 
-def flights(policy: Policy, env: Env | Simulator | DrivenSimulator, steps: int, *,
-            memory: Callable[[int], Memory] | None = None,
-            models: tuple[Held, ...] = ()) -> Callable[[Params, jax.Array], TimeStep]:
-    """A flier of `policy` in fresh environments of `env`, flown `steps` steps without restarting: called
-    with the policy's variables and a key, it answers the steps that followed each action `[steps, envs]`,
-    their observations the environment's own (a driver's, `Driven` or `DrivenSimulator`, taken off). A JAX
-    `Env` is flown in one program (`dew.rl.env.env_rollout`), one environment as a batch of one; a
-    host-stepped batch, a `Simulator` or a `DrivenSimulator`, from the host (`simulator_rollout`), its
-    ended episodes left ended or, driven, restarted, which a first episode's reading leaves out.
-    `memory(count)` is a recurrent policy's starting state over the `count` environments
-    (`DreamerV3Objective.memory`), and `models` the networks the policy runs, whose compiler options its
-    programs take (`dew.nn.kernels.options.owned_program`; an objective's `towers()`)."""
+def _uncompiled_flights(
+        policy: Policy, env: Env | Simulator | DrivenSimulator, steps: int, *,
+        memory: Callable[[int], Memory] | None = None,
+        models: tuple[Held, ...] = ()) -> tuple[Callable[[Params, jax.Array], TimeStep], bool]:
+    """`flights`' underlying function and whether `env` is a JAX `Env` whose flight compiles whole."""
     driven = isinstance(env, Driven | DrivenSimulator)
 
     def own(following: TimeStep) -> TimeStep:
@@ -78,7 +71,7 @@ def flights(policy: Policy, env: Env | Simulator | DrivenSimulator, steps: int, 
             taken = simulator_rollout(stepped, policy, variables, carry, steps, reset=False, models=models)[1]
             return own(taken.following)
 
-        return flown_host
+        return flown_host, False
     jax_env = env
     reward = jax.eval_shape(jax_env.reset, jax.random.key(0))[1].reward
     starting = None if memory is None else memory(reward.shape[0] if reward.ndim else 1)
@@ -89,7 +82,23 @@ def flights(policy: Policy, env: Env | Simulator | DrivenSimulator, steps: int, 
         following = taken.following
         return own(following if reward.ndim else jax.tree.map(lambda leaf: leaf[:, None], following))
 
-    return owned_program(flown, *models)
+    return flown, True
+
+
+def flights(policy: Policy, env: Env | Simulator | DrivenSimulator, steps: int, *,
+            memory: Callable[[int], Memory] | None = None,
+            models: tuple[Held, ...] = ()) -> Callable[[Params, jax.Array], TimeStep]:
+    """A flier of `policy` in fresh environments of `env`, flown `steps` steps without restarting: called
+    with the policy's variables and a key, it answers the steps that followed each action `[steps, envs]`,
+    their observations the environment's own (a driver's, `Driven` or `DrivenSimulator`, taken off). A JAX
+    `Env` is flown in one program (`dew.rl.env.env_rollout`), one environment as a batch of one; a
+    host-stepped batch, a `Simulator` or a `DrivenSimulator`, from the host (`simulator_rollout`), its
+    ended episodes left ended or, driven, restarted, which a first episode's reading leaves out.
+    `memory(count)` is a recurrent policy's starting state over the `count` environments
+    (`DreamerV3Objective.memory`), and `models` the networks the policy runs, whose compiler options its
+    programs take (`dew.nn.kernels.options.owned_program`; an objective's `towers()`)."""
+    flown, on_device = _uncompiled_flights(policy, env, steps, memory=memory, models=models)
+    return owned_program(flown, *models) if on_device else flown
 
 
 def episodes(policy: Policy, env: Env | Simulator | DrivenSimulator, steps: int, *,
@@ -100,7 +109,7 @@ def episodes(policy: Policy, env: Env | Simulator | DrivenSimulator, steps: int,
     and `steps`, and for each observation view in `reached` the mean of its value at each first episode's
     last step. `memory(count)` is a recurrent policy's starting state (`DreamerV3Objective.memory`), and
     `models` the networks whose compiler options its programs take."""
-    flown = flights(policy, env, steps, memory=memory, models=models)
+    flown, on_device = _uncompiled_flights(policy, env, steps, memory=memory, models=models)
 
     def means(variables: Params, key: jax.Array) -> dict[str, jax.Array]:
         following = flown(variables, key)
@@ -109,8 +118,8 @@ def episodes(policy: Policy, env: Env | Simulator | DrivenSimulator, steps: int,
         return {"return": jnp.mean(rows["return"]),
                 **{name: jnp.mean(rows[name].astype(jnp.float32)) for name in ("steps", *reached)}}
 
-    # A JAX Env's flight and its reading are one program; a host-stepped flight is read as it lands.
-    read = means if isinstance(env, Simulator | DrivenSimulator) else owned_program(means, *models)
+    # A JAX Env's flight and its reading fuse into one program; a host-stepped flight is read as it lands.
+    read = owned_program(means, *models) if on_device else means
 
     def score(variables: Params, key: jax.Array) -> dict[str, float]:
         return {name: float(value) for name, value in jax.device_get(read(variables, key)).items()}

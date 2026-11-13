@@ -10,26 +10,26 @@ call, small beside the activations, and their gradients unstack the same way.
 
 import dataclasses
 from collections.abc import Sequence
+from typing import TypeGuard
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
 
-from dew.nn.dense import _plain_dense, intercepted
-from dew.nn.precision import biased, float32_dot_general
+from dew.nn.dense import Dense, _biased, _plain_dense, _promoted, intercepted
+from dew.nn.precision import float32_dot_general
 
 from .kernels.generation import INHERENT, Choice, device_generation
-from .kernels.projections import dot_general
 from .kernels.selection import Kernel, Op, Requirement, select
 
 
 @dataclasses.dataclass(frozen=True)
 class JoinCase:
-    """The projections of one input as the join's selector reads them (`joins`): whether each is a plain
-    Dense (`dense`) on the join's dot_general (`dot_general`), whether they agree in width, bias, dtype,
-    precision and promotion (`uniform`), whether a wrapper intercepts their own calls (`intercepted`),
-    and whether each holds its own kernel (`held`)."""
+    """The projections of one input as the join's selector reads them (`joins`): whether each is a plain Dense
+    (`dense`) on the join's dot_general (`dot_general`), whether they agree in width, bias, dtype, precision,
+    promotion and product (`uniform`: the join takes the first's product for all), whether a wrapper
+    intercepts their own calls (`intercepted`), and whether each holds its own kernel (`held`)."""
 
     dense: bool
     dot_general: bool
@@ -52,7 +52,7 @@ JOIN_SUPPORTS: tuple[Requirement[JoinCase], ...] = (
                 "a projection takes a dot_general other than the join's (`float32_dot_general`)",
                 row=INHERENT, kind='handoff'),
     Requirement('uniform', lambda case: case.uniform,
-                "the projections differ in width, bias, dtype, precision or promotion", row=INHERENT,
+                "the projections differ in width, bias, dtype, precision, promotion or product", row=INHERENT,
                 kind='handoff'),
     Requirement('intercepted', lambda case: not case.intercepted,
                 "the model computes under a wrapper (an adapter, a quantization) that intercepts each "
@@ -74,7 +74,7 @@ def join_case(projections: Sequence[nn.Module]) -> JoinCase:
         dot_general=all(projection.dot_general in (None, float32_dot_general)
                         and projection.dot_general_cls is None for projection in projections),
         uniform=len({(projection.features, projection.use_bias, projection.dtype, projection.precision,
-                      projection.promote_dtype) for projection in projections}) == 1,
+                      projection.promote_dtype, projection.dot_general) for projection in projections}) == 1,
         intercepted=(any(projection.product_owned() for projection in projections) if dense
                      else intercepted()),
         held=all(projection.has_variable('params', 'kernel') for projection in projections))
@@ -113,37 +113,41 @@ JOINS = {choice: _join(choice) for choice in CHOICES}
 """The join's selector of each choice a layer joins projections for."""
 
 
-def joins(choice: Choice, projections: Sequence[nn.Module]) -> bool:
-    """Whether `projections` run as one GEMM (`joined_dense`), as the join's selector for `choice`
-    reports it (`JOINS`): where the join measured faster on the device and their calls take nothing the
-    join does not reproduce. Initialization creates each projection's parameters through
-    its own call."""
+def joins(projections: Sequence[nn.Module], choice: Choice) -> TypeGuard[Sequence[Dense]]:
+    """Whether `projections` run as one GEMM (`joined_dense`), as the join's selector for `choice` reports it
+    (`JOINS`): where the join measured faster on the device and their calls take nothing the join does not
+    reproduce, so each a bare `Dense` (the join's `dense` requirement), which the answer states of them for
+    `joined_dense` (a guard narrows its first argument). Initialization creates each projection's parameters
+    through its own call."""
     if projections[0].is_initializing():
         return False
     return select(JOINS[choice], join_case(projections)).kernel == 'joined'
 
 
-def joined_dense(x: jax.Array, projections: Sequence[nn.Module], *, axis: int) -> jax.Array:
+def joined_dense(x: jax.Array, projections: Sequence[Dense], *, axis: int) -> jax.Array:
     """`projections`' outputs of `x` from one GEMM, stacked on output axis `axis`: -2 gives
     `[..., n, features]`, -1 `[..., features, n]`. Each kernel and bias is read and cast as its
-    own call casts it; `joins` says when the result is theirs."""
+    own call casts it, and the product taken and biased by a Dense's own arithmetic (`dense._biased`: a
+    16-bit product with an fp32-stored bias rounded once with it, as each projection apart rounds its own);
+    `joins` says when the result is theirs."""
     if axis not in (-2, -1):
         raise ValueError(f"the projections stack on output axis -2 or -1, not {axis}")
-    promoted = [projection.promote_dtype(
-        x, meta.unbox(projection.get_variable('params', 'kernel')),
-        meta.unbox(projection.get_variable('params', 'bias')) if projection.use_bias else None,
-        dtype=projection.dtype) for projection in projections]
+    first = projections[0]
+    stored = [meta.unbox(projection.get_variable('params', 'bias')) if first.use_bias else None
+              for projection in projections]
+    promoted = [_promoted(projection, x, meta.unbox(projection.get_variable('params', 'kernel')), bias)
+                for projection, bias in zip(projections, stored, strict=True)]
     inputs = promoted[0][0]
-    # A kernel is [inputs, features]; the stacked axis sits beside its features as it will in the output.
+    # A kernel is [inputs, features]; the stacked axis sits beside its features as it will in the output,
+    # and the biases beside theirs, so the kernels side by side and the biases flattened alike pair each
+    # output column with its own bias.
     kernel = jnp.stack([kernel for _, kernel, _ in promoted], axis=axis + 3)
-    biases = (jnp.stack([bias for _, _, bias in promoted], axis=axis + 2) if projections[0].use_bias
-              else None)
+
+    def flat(biases: list) -> jax.Array | None:
+        return None if biases[0] is None else jnp.stack(biases, axis=axis + 2).reshape(-1)
+
     dimensions = (((inputs.ndim - 1,), (0,)), ((), ()))
-    # One matrix product of the kernels side by side, as a Dense takes its own (`projections.dot_general`).
-    y = dot_general(float32_dot_general)(inputs, kernel.reshape(kernel.shape[0], -1), dimensions,
-                                         precision=projections[0].precision)
-    y = y.reshape(*y.shape[:-1], *kernel.shape[1:])
-    if biases is None:
-        return y
-    # Taken and biased as each Dense takes and biases its own (`dew.nn.dense`).
-    return biased(y, biases)
+    # One matrix product of the kernels side by side, as a Dense takes its own (`dense._biased`).
+    y = _biased(first, inputs, kernel.reshape(kernel.shape[0], -1), dimensions,
+                flat([bias for _, _, bias in promoted]), lambda bias: bias, flat(stored))
+    return y.reshape(*y.shape[:-1], *kernel.shape[1:])

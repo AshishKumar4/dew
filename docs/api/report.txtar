@@ -40,7 +40,7 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .save_local(self, step: int, state: TrainState, saved: bytes | None, *, share: DataPartition | None = None, control: dict | None = None, rung: JSON = None, artifact: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None) -> None
   .source(self, step: int) -> str
   .stored(self, step: int | str | None = None) -> Variables
-  .variables(self, *, step: int | str | None = None, ema: bool | None = None, mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None, parameter_roots: tuple[tuple[str, ...], ...] = (('params',), ('frozen',)), unread: tuple[tuple[str, ...], ...] = ()) -> Variables
+  .variables(self, *, step: int | str | None = None, ema: bool | None = None, mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None, parameter_roots: tuple[tuple[str, ...], ...] = (('params',), ('frozen',)), unread: tuple[tuple[str, ...], ...] = (), on_host: bool = False) -> Variables
   .wait(self) -> None
   .would_keep(self, ranking: Ranking | Sequence[Ranking]) -> bool
 class Condition(encoder: ConditionEncoder, field: str = 'text', unconditional: str | float | Mapping[str, object] = '') -> None  [dew.inputs.spec]

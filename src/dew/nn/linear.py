@@ -1161,7 +1161,7 @@ class GatedDeltaNet(nn.Module):
 
         if not self.fused_in_proj:
             gates = (self.in_proj_b, self.in_proj_a)
-            if joins(Choice.DELTA_GATES, gates):
+            if joins(gates, Choice.DELTA_GATES):
                 b, a = jnp.moveaxis(constrain(joined_dense(x, gates, axis=-1), HEADS), -1, 0)
             else:
                 b, a = (projected(dense, HEADS[:3]) for dense in gates)

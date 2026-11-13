@@ -87,7 +87,14 @@ NAME = "cross_attention"
 
 CROSS_LENGTHS = "cross_lengths"
 """The cache variable of each row's real context tokens, `[rows]`."""
-CROSS_CACHE = frozenset({CROSS_KEY, CROSS_VALUE, CROSS_LENGTHS})
+CROSS_DOCUMENTS = "cross_documents"
+"""The cache variable of each kept context token's document, `[rows, context_length]`, numbered on as the
+row's documents continue (`_held`), 0 past its real tokens; 1 for every real token of a context that names
+no documents, the whole row's."""
+CROSS_LAST = "cross_last"
+"""The cache variable of each row's last document, `[rows]`, which a later call's first document continues;
+0 where the kept context names no documents, every token of the row reading all of it."""
+CROSS_CACHE = frozenset({CROSS_KEY, CROSS_VALUE, CROSS_LENGTHS, CROSS_DOCUMENTS, CROSS_LAST})
 
 
 def crossing(path) -> bool:
@@ -504,10 +511,12 @@ class GatedCrossAttention(nn.Module):
     @nn.compact
     def __call__(self, stream: jax.Array, context: CrossContext | None, *,
                  read: Callable[[jax.Array], jax.Array] | None = None, decode: bool = False,
-                 train: bool = False) -> jax.Array:
+                 train: bool = False, queries: jax.Array | None = None) -> jax.Array:
         """`stream` after the block. `stream` is the residual as the decoder
         carries it, its rows first, and `read` gives the `[B, S, emb_features]`
-        states a sublayer reads from it; None reads the stream itself."""
+        states a sublayer reads from it; None reads the stream itself. `queries`
+        are the call's tokens' documents (`CrossContext.queries_of`), by which a
+        cached call without its context reads the kept one's (`_held`)."""
         read = read or (lambda held: held)
         x = read(stream)
         if context is None and self.is_initializing():
@@ -518,23 +527,22 @@ class GatedCrossAttention(nn.Module):
             raise ValueError(f"this cross-attention reads {self.context_features}-wide context tokens, "
                              f"got {context.embeddings.shape[-1]}")
         if decode:
-            lengths = _held_lengths(self, x, context)
+            lengths, documents = _held(self, x, context, queries)
         elif context is None:
             return stream
         else:
-            lengths = context.lengths
+            lengths, documents = _read(context)
         attention = self.attention()
         nn.share_scope(self, attention)
         # A row without context reads its first slot, so its softmax stays finite: one over no keys
         # would be NaN, which the select below drops forward but not from the gradients.
         embeddings = None if context is None else context.embeddings
         # A context of several documents is read by each document's own tokens alone (`CrossContext`).
-        documents = ({} if context is None or context.segments is None
-                     else {"segment_ids": context.queries, "key_segment_ids": context.segments})
+        seen = {} if documents is None else {"segment_ids": documents.query, "key_segment_ids": documents.key}
         output = attention(self._normed(self.norms[0], x), embeddings,
                            key_value_seq_lengths=jnp.maximum(lengths, 1), cached=decode,
-                           cache_dtype=x.dtype if self.dtype is None else self.dtype, **documents)
-        present = _present(stream, context, lengths)
+                           cache_dtype=x.dtype if self.dtype is None else self.dtype, **seen)
+        present = _present(stream, documents, lengths)
         dropout = Dropout(rate=self.dropout_rate)
 
         def joined(stream: jax.Array, name: str, branch: jax.Array) -> jax.Array:
@@ -573,7 +581,7 @@ class SharedGatedCrossAttention(nn.Module):
     @nn.compact
     def __call__(self, stream: jax.Array, context: CrossContext | None, *, layer: LayerReads,
                  read: Callable[[jax.Array], jax.Array] | None = None, decode: bool = False,
-                 train: bool = False) -> jax.Array:
+                 train: bool = False, queries: jax.Array | None = None) -> jax.Array:
         """`stream` after the block, as `GatedCrossAttention`'s call, its layer's attention input and
         attention handed it (`layer`)."""
         read = read or (lambda held: held)
@@ -586,11 +594,11 @@ class SharedGatedCrossAttention(nn.Module):
             raise ValueError(f"a layer's own projections read {x.shape[-1]}-wide context tokens, the "
                              f"decoder's width, got {context.embeddings.shape[-1]}")
         if decode:
-            lengths = _held_lengths(self, x, context)
+            lengths, documents = _held(self, x, context, queries)
         elif context is None:
             return stream
         else:
-            lengths = context.lengths
+            lengths, documents = _read(context)
         attention = layer.attention
         query, gate = attention.context_query(layer.normed(x))
         embeddings = None if context is None else context.embeddings
@@ -603,33 +611,65 @@ class SharedGatedCrossAttention(nn.Module):
         else:
             assert embeddings is not None
             key, value = attention.context_keys(embeddings)
-        documents = ({} if context is None or context.segments is None
-                     else {"queries": context.queries, "segments": context.segments})
         branch = attention.attend_context(query, gate, key, value, lengths=lengths, progress=layer.progress,
-                                          **documents)
+                                          queries=None if documents is None else documents.query,
+                                          segments=None if documents is None else documents.key)
         branch = Dropout(rate=self.dropout_rate)(branch, deterministic=not train)
-        return _joined(self, "alpha_cross_attn", stream, branch, _present(stream, context, lengths),
+        return _joined(self, "alpha_cross_attn", stream, branch, _present(stream, documents, lengths),
                        ngpt=self.ngpt, precision=self.precision)
 
 
-def _held_lengths(module: nn.Module, x: jax.Array, context: CrossContext | None) -> jax.Array:
-    """Each row's real context tokens a cached call of a block reads: a call that carries a context
-    keeps them once the cache is allocated, as its attention keeps the keys and values
-    (`kept_context`); a call without one reads what the cache keeps."""
+def _read(context: CrossContext) -> tuple[jax.Array, CrossDocuments | None]:
+    """Each row's real context tokens an uncached call of a block reads and, where its context names
+    documents, each query's and each context token's (`CrossContext`)."""
+    if context.segments is None or context.queries is None:
+        return context.lengths, None
+    return context.lengths, CrossDocuments(context.queries, context.segments)
+
+
+def _held(module: nn.Module, x: jax.Array, context: CrossContext | None,
+          queries: jax.Array | None) -> tuple[jax.Array, CrossDocuments | None]:
+    """Each row's real context tokens a cached call of a block reads and each query's and each context
+    token's document (`CrossDocuments`; None for a call that carries a context naming none). A call that
+    carries a context reads it as an uncached one (`_read`) and, once the cache is allocated, keeps its
+    count, each token's document (`CROSS_DOCUMENTS`) and the row's last document (`CROSS_LAST`) beside its
+    keys and values (`kept_context`), numbered on from the row's as a decoder's cache numbers a call's
+    documents (`Append.documents`): its first document continues the row's last. A call without one reads
+    what the cache keeps, its tokens' documents `queries` (one document a row where None) numbered on the
+    same way and the row's last moved on with them, so a document that continues the row's last reads its
+    own context alone and a new one none, then and in every later call; under a kept context that names no
+    documents every token of the row reads all of it, as it did."""
     allocated = module.has_variable("cache", CROSS_LENGTHS)
-    lengths = module.variable("cache", CROSS_LENGTHS, jnp.zeros, x.shape[:1], jnp.int32)
-    if context is None:
-        return lengths.value
+    rows, width = x.shape[0], module.context_length
+    lengths = module.variable("cache", CROSS_LENGTHS, jnp.zeros, (rows,), jnp.int32)
+    kept = module.variable("cache", CROSS_DOCUMENTS, jnp.zeros, (rows, width), jnp.int32)
+    last = module.variable("cache", CROSS_LAST, jnp.zeros, (rows,), jnp.int32)
+    first = jnp.maximum(last.value, 1)[:, None]
+    if context is not None:
+        read, documents = _read(context)
+        if allocated:
+            tokens = jnp.arange(context.embeddings.shape[1])[None, :]
+            named = (tokens < context.lengths[:, None]).astype(jnp.int32) if documents is None else jnp.where(
+                documents.key > 0, first + documents.key - 1, 0)
+            lengths.value = read
+            kept.value = jnp.pad(named, ((0, 0), (0, width - named.shape[1])))
+            last.value = (jnp.zeros((rows,), jnp.int32) if documents is None
+                          else first[:, 0] + jnp.maximum(jnp.max(documents.query, axis=-1), 1) - 1)
+        return read, documents
+    own = jnp.ones(x.shape[:2], jnp.int32) if queries is None else jnp.asarray(queries, jnp.int32)
+    numbered = jnp.where(own > 0, first + own - 1, 0)
+    whole = last.value == 0
     if allocated:
-        lengths.value = context.lengths
-    return context.lengths
+        # The row's last document moves on with the call's, as the decoder's cache numbers them.
+        last.value = jnp.where(whole, 0, jnp.maximum(jnp.max(numbered, axis=-1), last.value))
+    return lengths.value, CrossDocuments(jnp.where(whole[:, None], 1, numbered), kept.value)
 
 
-def _present(stream: jax.Array, context: CrossContext | None, lengths: jax.Array) -> jax.Array:
-    """Where a block's read joins `stream`: each row with context tokens and, where the context holds
-    several documents, each token whose document holds some, as its row alone would skip the block."""
-    if context is not None and context.segments is not None and context.queries is not None:
-        held = holds_keys(CrossDocuments(context.queries, context.segments))
+def _present(stream: jax.Array, documents: CrossDocuments | None, lengths: jax.Array) -> jax.Array:
+    """Where a block's read joins `stream`: each row with context tokens and, where the read names
+    documents, each token whose document holds some, as its row alone would skip the block."""
+    if documents is not None:
+        held = holds_keys(documents)
         return held.reshape(held.shape[:2] + (1,) * (stream.ndim - 2))
     return (lengths > 0).reshape((-1,) + (1,) * (stream.ndim - 1))
 

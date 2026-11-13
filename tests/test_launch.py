@@ -5,6 +5,7 @@ programs on this machine, so what is checked is what a shell sees: the exit
 code, the output, and which processes are left alive.
 """
 
+import contextlib
 import errno
 import os
 import signal
@@ -74,6 +75,28 @@ WAITING_RANK = ("import os, pathlib, sys, time\n"
                 "pathlib.Path(sys.argv[1], 'rank' + os.environ['DEW_PROCESS_ID'])"
                 ".write_text(str(os.getpid()))\n"
                 "time.sleep(600)\n")
+
+
+def test_a_killed_launchers_ranks_end_with_it(tmp_path):
+    """A launcher killed outright (SIGKILL, the kernel's out-of-memory kill) runs no stop of its own: its
+    ranks, each in a session of its own and silent in a collective, end with it all the same, by the
+    lifeline each was started with, and no longer hold their accelerators with no launcher to stop them (the
+    audit of 2026-11-12, A1)."""
+    launch = launcher("--processes-per-host", "2", "--port", "1", "--", sys.executable, "-c", WAITING_RANK,
+                      str(tmp_path), env={**ENV, "JAX_PLATFORMS": "cpu"})
+    try:
+        ranks = started_ranks(tmp_path, 2)
+        launch.kill()
+        launch.wait(timeout=30)
+        deadline = time.monotonic() + 30
+        while any(alive(pid) for pid in ranks) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert [alive(pid) for pid in ranks] == [False, False]
+    finally:
+        launch.kill()
+        for pid in started_ranks(tmp_path, 2):
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
 
 
 @pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP, signal.SIGINT])
@@ -268,6 +291,22 @@ def test_a_rank_over_ssh_is_stopped_with_sigterm_and_its_connection_waits_for_it
     for rank in range(2):
         assert (tmp_path / f"signal{rank}").read_text() == "SIGTERM"
         assert (tmp_path / f"checkpoint{rank}").read_text() == "written"
+
+
+def test_hosts_named_with_their_ssh_logins_join_at_the_first_hosts_network_name(tmp_path):
+    """Hosts given as ssh destinations with a login (`alice@node-a`) are reached over ssh at those
+    destinations, and their ranks join the pool at the first host's network name alone: `alice@node-a:PORT`
+    is no address a rank can reach, so a pool named that way could not join (the audit of 2026-11-12, A4)."""
+    binaries = ssh_stand_in(tmp_path)
+    done = launched("--hosts", "alice@node-a,alice@node-b", "--processes-per-host", "1", "--port", "12345",
+                    "--dry-run", "--", "python", "train.py",
+                    env={**ENV, "JAX_PLATFORMS": "cpu", "PATH": f"{binaries}:{ENV['PATH']}"})
+    assert done.returncode == 0, done.stdout + done.stderr
+    ranks = [line for line in done.stdout.splitlines() if "train.py" in line]
+    assert len(ranks) == 2, done.stdout
+    assert all("JAX_COORDINATOR_ADDRESS=node-a:12345" in line for line in ranks), done.stdout
+    assert ["alice@node-a" in line.split() for line in ranks] == [True, False]
+    assert "alice@node-b" in ranks[1].split()
 
 
 def test_a_failing_rank_over_ssh_leaves_none_of_its_processes_on_its_host(tmp_path):
