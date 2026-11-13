@@ -81,22 +81,26 @@ class Encoding:
     def fewest_tokens(self, row: "FittedRow") -> int:
         """The fewest tokens a draw of this encoding lays `row` out to: a drawn order keeps a row's length,
         as `Fit` sizes it (`Fit._longest`), and a draw the layout refuses lays it out as Fit admitted it.
-        A "none of the above" beside a choice's options lengthens a row of several questions, which its
-        layout lays out untrimmed, and in place of its right option may shorten its question, each
-        question's drawn on its own: the admitted length less what each such option in place takes away.
-        A row of one question, whose layout may trim its options together, is one of its three layouts."""
+        A row of one question, whose layout may trim its options together, is one of its three layouts. A
+        row of several questions lays them out untrimmed and its state in the room they leave, so its
+        length grows with theirs: its shortest draw puts a "none of the above" in place of the right
+        option of every question that option shortens (beside its options, it lengthens a question), each
+        drawn on its own, a question's own length read with no state to refill the room it frees."""
         if not self.none_of_the_above:
             return row.length
         fewest = self.none_of_the_above_options
 
-        def laid(drop: bool, names: Collection[str] | None = None) -> int:
-            return _with_none(self.layout, self.tokenizer, self.specials, row, fewest, drop, names)[0]
+        def laid(drop: bool, names: Collection[str] | None = None, held: "FittedRow" = row) -> int:
+            return _with_none(self.layout, self.tokenizer, self.specials, held, fewest, drop, names)[0]
 
         if len(row.names) == 1:
             return min(row.length, laid(drop=False), laid(drop=True))
-        drawn = [name for name in row.names if name in row.example.answers
-                 and draws_none(row.example.questions[name], fewest)]
-        return row.length + sum(min(0, laid(drop=True, names={name}) - row.length) for name in drawn)
+        bare = dataclasses.replace(row, tokens=row.tokens[:0])
+        alone = laid(drop=True, names=(), held=bare)
+        shorter = {name for name in row.names if name in row.example.answers
+                   and draws_none(row.example.questions[name], fewest)
+                   and laid(drop=True, names={name}, held=bare) < alone}
+        return min(row.length, laid(drop=True, names=shorter))
 
     def _rows(self, example: Example, asked: Mapping[str, Question], rng: np.random.Generator | None,
               tokens: np.ndarray | None) -> list[Encoded]:
