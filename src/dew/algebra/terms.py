@@ -403,8 +403,8 @@ def parameter_key(value) -> Hashable:
     if isinstance(value, enum.Enum):
         return "enum", _named(type(value)), value.name
     if isinstance(value, (np.ndarray, jax.Array)) and not isinstance(value, jax_core.Tracer):
-        array = np.asarray(jax.random.key_data(value) if jnp.issubdtype(value.dtype, jax.dtypes.prng_key)
-                           else value)
+        # The key type's printed form, which a key kept in another process can read.
+        _, array = held_bits(value)
         return ("array", str(value.dtype), array.shape, str(array.dtype),
                 hashlib.sha256(np.ascontiguousarray(array).tobytes()).hexdigest())
     if isinstance(value, jax.sharding.Mesh):
@@ -574,7 +574,8 @@ def _region[Node: (Term, Skeleton)](closed: jcore.Jaxpr, ranges: Ranges,
 
     def apart_of(atom) -> Apart:
         if isinstance(atom, jcore.Literal):
-            return _held_apart(_constant_apart(atom.val), np.asarray(atom.val).dtype)
+            return _held_apart(_constant_apart(atom.val), atom.val.dtype if typed_key(atom.val)
+                               else np.asarray(atom.val).dtype)
         return apart.get(atom, NOWHERE)
 
     # Each value a broadcast made, by its source and the axes it laid the source's along, so a broadcast of
@@ -733,7 +734,9 @@ def _held_apart(apart: Apart, dtype) -> Apart:
 
 def _constant_apart(value) -> Apart:
     """A real constant's `Apart`: whether it holds no NaN and no infinity, its sign where its elements share
-    one, and a float's least magnitude's power where no element is zero."""
+    one, and a float's least magnitude's power where no element is zero; none of a key's."""
+    if typed_key(value):
+        return NOWHERE
     array = np.asarray(value)
     real = jnp.issubdtype(array.dtype, jnp.floating) or jnp.issubdtype(array.dtype, jnp.integer)
     if not real or not array.size:
@@ -1010,7 +1013,8 @@ def _bounded(equation: jcore.JaxprEqn, operands: list[Magnitude | None],
     and for a bitwise operation (int32's `not(-2**31)` is `2**31 - 1`); a float as the real arithmetic
     bounds it (`_real_bound`)."""
     aval = equation.outvars[0].aval
-    if not isinstance(aval, ShapedArray):
+    # An extended dtype's value (a typed key a selection or a layout moves) is no number.
+    if not isinstance(aval, ShapedArray) or jnp.issubdtype(aval.dtype, jax.dtypes.extended):
         return None
     dtype = np.dtype(aval.dtype)
     if dtype == np.bool_:
@@ -1160,6 +1164,8 @@ def _log2(value: float) -> int:
 def _magnitude(value) -> Magnitude | None:
     """A constant's magnitude, its elements' largest (a complex one's modulus); None for one of no number (a
     key's). A number of any dtype, ml_dtypes' (bfloat16, float8) among them, which numpy's type tree omits."""
+    if typed_key(value):
+        return None
     array = np.asarray(value)
     if not (jnp.issubdtype(array.dtype, jnp.number) or array.dtype == bool):
         return None
@@ -1181,7 +1187,9 @@ def _typed(dtypes: dict, magnitudes: dict, term: Term | Skeleton, atom, magnitud
     """`term`'s dtype (`atom`'s) and its magnitude, the first where one term names two values."""
     named = key(term)
     if isinstance(atom.aval, ShapedArray):
-        dtypes.setdefault(named, np.dtype(atom.aval.dtype))
+        # An extended dtype (a typed key's) is JAX's own, which NumPy holds no type of.
+        dtype = atom.aval.dtype
+        dtypes.setdefault(named, dtype if jnp.issubdtype(dtype, jax.dtypes.extended) else np.dtype(dtype))
     magnitudes.setdefault(named, magnitude)
 
 
@@ -1268,8 +1276,24 @@ def literal_key(atom: jcore.Literal) -> Hashable:
     """A literal's identity in a region: its dtype, shape and bits, so two literals are one term where they
     are the same constant, and never where they round apart. Its weak type is no part of it: an equation's
     types are settled where it is traced, so a weak and a strong literal of one dtype compute alike."""
-    value = np.asarray(atom.val)
-    return str(value.dtype), value.shape, value.tobytes()
+    dtype, array = held_bits(atom.val)
+    return dtype, array.shape, array.tobytes()
+
+
+def typed_key(value) -> bool:
+    """Whether `value` holds typed PRNG keys (`jax.random.key`), whose bits NumPy cannot read."""
+    dtype = getattr(value, "dtype", None)
+    return dtype is not None and jnp.issubdtype(dtype, jax.dtypes.prng_key)
+
+
+def held_bits(value) -> tuple[Hashable, np.ndarray]:
+    """A constant's dtype and the array of the bits it holds: a typed PRNG key's are its key data
+    (`jax.random.key_data`), its dtype the key type itself, which is its implementation (two implementations
+    may print one tag); any other value's its own, its dtype by name."""
+    if typed_key(value):
+        return value.dtype, np.asarray(jax.random.key_data(value))
+    array = np.asarray(value)
+    return str(array.dtype), array
 
 
 def _shape(atom) -> tuple[int, ...]:
