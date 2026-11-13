@@ -44,8 +44,8 @@ import lint_scopes as scopes
 DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Top level", ["dew", "dew.batch", "dew.mesh"]),
     ("Training", ["dew.training", "dew.training.budget", "dew.training.cooldown", "dew.state", "dew.optim",
-                  "dew.laprop", "dew.newton_schulz", "dew.gauss_newton", "dew.training.quantization",
-                  "dew.training.runtime", "dew.clusters",
+                  "dew.optim_schedules", "dew.laprop", "dew.newton_schulz", "dew.gauss_newton",
+                  "dew.training.quantization", "dew.training.runtime", "dew.clusters",
                   "dew.distributed.placement", "dew.distributed.batches", "dew.averaging"]),
     ("Objectives", ["dew.objectives", "dew.objectives.base", "dew.objectives.lm", "dew.objectives.diffusion",
                     "dew.objectives.routing",
