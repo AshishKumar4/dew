@@ -38,6 +38,7 @@ from dew.data.dataset import (
     Ends,
     Loader,
     PhasedStream,
+    Position,
     RampedStream,
     StepPhases,
     row_field,
@@ -955,27 +956,35 @@ def _opened_at(loader: Loader, partition: DataPartition, position: bytes | None)
 
 def data_resumed(loader: Loader, partition: DataPartition, position: Callable[[], bytes | None],
                  *, resume: DataResume, step: int) -> tuple[bytes | None, tuple[str, ...]]:
-    """Where a resume's data reads on from, as the run's mode `resume` says (`Trainer.data_resume`, which a
-    loader compiled already resumes by too: `dew.data.compile.fitted`), and what differs between its saved
-    plan and the run's: the saved `position` (read here, its share's), and none, where its plan makes the
-    same rows; else, resumed relaxed, the position its stream starts at afresh, and the names of what
-    differs (`PlanChanged.differs`), every process alike (`agreed_same`): the beginning of its order, or,
-    for a stream read in stages, the stage the run's progress stands in (`step`, the run's, or the records
-    and phases its saved position states) opened at its own start, every boundary kept where the run's
-    progress places it (`StepPhases.restarted`, `PhasedStream.restarted`, `RampedStream.restarted`). A run
-    bounded in examples keeps its bound on its own count (`FitPlan.finished`). Refused, naming what
-    differs, where it resumes exactly, or where the stream keeps no position; a position no plan check
-    refuses (a damaged one) refuses either way. The one decision a run makes of its data's resume, before
-    anything is written over the run it resumes (`dew.training.startup.resume_admitted`) and where it
-    opens its data (`Trainer._starting`)."""
+    """`resumed_on` the training stream `loader` opens for `partition`'s share, closed after: a run's data
+    resume decided before anything is written over the run it resumes (`dew.training.startup
+    .resume_admitted`)."""
+    stream = loader.train(partition)
+    try:
+        return resumed_on(stream, position, resume=resume, step=step)
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+
+
+def resumed_on(stream: Iterator[Batch], position: Callable[[], bytes | None], *, resume: DataResume,
+               step: int) -> tuple[bytes | None, tuple[str, ...]]:
+    """Where a resume's data reads on from in `stream`, a training stream, as the run's mode `resume` says
+    (`Trainer.data_resume`, which a loader compiled already resumes by too: `dew.data.compile.fitted`), and
+    what differs between its saved plan and the run's, every process alike (`agreed_same`): the saved
+    `position` (read here, its share's), and none, where the stream restores it, its plan making the same
+    rows; else, resumed relaxed, the position it starts at afresh (`restarted`) and the names of what
+    differs (`PlanChanged.differs`). Refused, naming what differs, where it resumes exactly; a position no
+    plan check refuses (a damaged one) refuses either way."""
     held: list[bytes | None] = [None]
+    fresh = stream.get_state() if isinstance(stream, Checkpointable) else None
 
     def found() -> list[str]:
         # A failure here (an exact refusal, a damaged position) is the pool's (`agreed_same`).
         try:
             held[0] = position()
             if held[0] is not None:
-                admitted(loader, partition, held[0])
+                restore_position(_positioned(stream), held[0])
             return []
         except PlanChanged as changed:
             if resume == "exact":
@@ -985,26 +994,54 @@ def data_resumed(loader: Loader, partition: DataPartition, position: Callable[[]
     differs = agreed_same("data resume", found)
     if not differs:
         return held[0], ()
-    stream = loader.train(partition)
-    try:
-        def refused(why: str) -> PlanChanged:
-            return PlanChanged(tuple(differs), f"the saved data position's plan differs from this run's in "
-                               f"{', '.join(differs)}, and the run's stream {why}, so its data cannot start "
-                               "again: resume it exactly with the data that wrote it, or start a new run "
-                               "from its weights")
+    return restarted(stream, fresh, held[0], step, tuple(differs)), tuple(differs)
 
-        if isinstance(stream, StepPhases | RampedStream):
-            start = stream.restarted(step)
-        elif isinstance(stream, PhasedStream):
-            start = stream.restarted(step, held[0])
-        elif isinstance(stream, Checkpointable):
-            start = stream.get_state()
-        else:
-            raise refused("keeps no position to start from")
-    finally:
-        if isinstance(stream, Closeable):
-            stream.close()
-    return start if isinstance(start, bytes) else json.dumps(start).encode(), tuple(differs)
+
+def restored_or_restarted(stream: Checkpointable, saved: bytes, *, resume: DataResume, step: int
+                          ) -> tuple[str, ...]:
+    """`stream` restored to `saved`, the run's training stream on the worker that reads it, which opens it
+    once and restores it there (`Trainer._prefetched`); or, resumed relaxed where its plan differs, started
+    afresh (`restarted`): what differs, none where it restored. Each process decides it alike, from one
+    saved plan and its own."""
+    fresh = stream.get_state()
+    try:
+        restore_position(stream, saved)
+        return ()
+    except PlanChanged as changed:
+        if resume == "exact":
+            raise
+        differs = tuple(changed.differs)
+    restore_position(stream, restarted(stream, fresh, saved, step, differs))
+    return differs
+
+
+def restarted(stream: object, fresh: Position | None, saved: bytes | None, step: int,
+              differs: tuple[str, ...]) -> bytes:
+    """Where `stream` starts again where its saved plan differs in `differs`: the beginning of its order
+    (`fresh`, its state as it opened), or, for a stream read in stages, the stage the run's progress stands
+    in (`step`, the run's, or the records and phases its `saved` position states) opened at its own start,
+    every boundary kept where the run's progress places it (`StepPhases.restarted`,
+    `PhasedStream.restarted`, `RampedStream.restarted`). A run bounded in examples keeps its bound on its
+    own count (`FitPlan.finished`). Refused where the stream keeps no position."""
+    if isinstance(stream, StepPhases | RampedStream):
+        start = stream.restarted(step)
+    elif isinstance(stream, PhasedStream):
+        start = stream.restarted(step, saved)
+    elif fresh is not None:
+        start = fresh
+    else:
+        raise PlanChanged(differs, f"the saved data position's plan differs from this run's in "
+                          f"{', '.join(differs)}, and the run's stream keeps no position to start from, so "
+                          "its data cannot start again: resume it exactly with the data that wrote it, or "
+                          "start a new run from its weights")
+    return start if isinstance(start, bytes) else json.dumps(start).encode()
+
+
+def _positioned(stream: Iterator[Batch]) -> Checkpointable:
+    """`stream`, which a resume restores: refused where it keeps no position."""
+    if not isinstance(stream, Checkpointable):
+        raise TypeError("the training stream keeps no position a resume reads its batch from")
+    return stream
 
 
 def admitted(loader: Loader, partition: DataPartition, position: bytes) -> None:

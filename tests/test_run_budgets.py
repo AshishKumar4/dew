@@ -1331,14 +1331,18 @@ def test_a_batched_step_that_makes_no_rows_of_a_group_refuses_it_and_carries_its
     loader = compile(chain, read="streamed", examples=len(docs) if bounded else None)
     stream = loader.train(DataPartition())
     try:
-        batches = list(stream)
+        # An unbounded training read repeats its corpus: its first two batches, within its first pass.
+        batches = list(stream if bounded else itertools.islice(stream, 2))
     finally:
         if isinstance(stream, Closeable):
             stream.close()
     assert not any(1 in np.asarray(batch["text"]) for batch in batches)
     refused = {name: value for name, value in loader.statistics().items()
                if name.endswith("/empty_expansion")}
-    assert list(refused.values()) == [1], refused
+    # Once a pass of the corpus: once where the read ends with it, at least once in an endless one's start,
+    # which a reader reads ahead of.
+    (count,) = refused.values()
+    assert count == 1 if bounded else count >= 1, refused
     if bounded:
         assert sum(int(np.sum(batch[EXAMPLES_CONSUMED])) for batch in batches) == len(docs)
 
