@@ -1158,36 +1158,44 @@ class _Program[T: (Tiles, BackwardTiles)]:
 
         return *self._sliced(at(spans.lo, block), at(spans.hi, block)), whole
 
-    def _positions(self, first, spans: _Spans, row) -> list[tuple[jax.Array, ...]]:
-        """The positions a query block from `first` holds rows of, in a call whose intervals each hold
-        `per_span` queries (`KeySpans.per_span`): each one's index, its interval `[start, end)` (batch row
-        `row`'s, read once) and whether the block holds its rows; as many as the block can hold,
-        statically."""
+    def _positions(self, first, spans: _Spans, row, step, carry):
+        """`carry` through `step(carry, position, start, end, holds)` over the positions a query block from
+        `first` holds rows of, in a call whose intervals each hold `per_span` queries (`KeySpans.per_span`):
+        each one's index, its interval `[start, end)` (batch row `row`'s) and whether the block holds its
+        rows; as many as the block can hold. A loop, its bounds read a position at a time: read at once,
+        unrolled, their addresses and values held into the walk (a decode prefill's 64-row block held 33
+        positions', ptxas holding its sm89 launch at 248 registers where its walk alone needs 160, row
+        5760)."""
         positions = spans.start.shape[1]
         held = min(positions, self.tiles.block_q // self.per_span + 1)
         at = lax.div(first, self.per_span)
-        found = []
-        for offset in range(held):
+
+        def body(offset, carry):
             position = at + offset
             # A position past the call's holds no row: read its last one's, unused.
             index = jnp.minimum(position, positions - 1)
             holds = (position < positions) & (position * self.per_span < first + self.tiles.block_q)
-            found.append((position, self._entry(spans.start, index, row=row),
-                          self._entry(spans.end, index, row=row), holds))
-        return found
+            return step(carry, position, self._entry(spans.start, index, row=row),
+                        self._entry(spans.end, index, row=row), holds)
+
+        return lax.fori_loop(0, held, body, carry)
 
     def _positions_reach(self, first, spans: _Spans, row):
         """`reach`'s for a call whose intervals each hold `per_span` queries: the key tiles from the first any
         of its rows' intervals starts in to the last any ends in, none seen whole where the block holds a
         padding row (a decode step's few rows of a tile), else those every one of its intervals covers."""
         block_k, big = self.tiles.block_k, jnp.iinfo(jnp.int32).max
-        lo, hi, full_lo, full_hi = jnp.int32(big), jnp.int32(0), jnp.int32(0), jnp.int32(big)
-        for _, start, end, holds in self._positions(first, spans, row):
+
+        def step(carry, _, start, end, holds):
+            lo, hi, full_lo, full_hi = carry
             seen = holds & (end > start)
-            lo = jnp.where(seen, jnp.minimum(lo, lax.div(start, block_k)), lo)
-            hi = jnp.where(seen, jnp.maximum(hi, pl.cdiv(end, block_k)), hi)
-            full_lo = jnp.where(holds, jnp.maximum(full_lo, pl.cdiv(start, block_k)), full_lo)
-            full_hi = jnp.where(holds, jnp.minimum(full_hi, lax.div(end, block_k)), full_hi)
+            return (jnp.where(seen, jnp.minimum(lo, lax.div(start, block_k)), lo),
+                    jnp.where(seen, jnp.maximum(hi, pl.cdiv(end, block_k)), hi),
+                    jnp.where(holds, jnp.maximum(full_lo, pl.cdiv(start, block_k)), full_lo),
+                    jnp.where(holds, jnp.minimum(full_hi, lax.div(end, block_k)), full_hi))
+
+        lo, hi, full_lo, full_hi = self._positions(
+            first, spans, row, step, (jnp.int32(big), jnp.int32(0), jnp.int32(0), jnp.int32(big)))
         lo = jnp.minimum(lo, hi)
         if self.padded(first) is not False:
             full_hi = jnp.where(self.padded(first), full_lo, full_hi)
@@ -1205,10 +1213,13 @@ class _Program[T: (Tiles, BackwardTiles)]:
         if spans.lo is not None:
             return _query_bounds(family, spans, row, first, count)
         place = lax.div(first + family.iota((count,), 0), self.per_span)
-        start = end = place * 0
-        for position, low, high, holds in self._positions(first, spans, row):
+
+        def step(carry, position, low, high, holds):
+            start, end = carry
             mine = (place == position) & holds
-            start, end = jnp.where(mine, low, start), jnp.where(mine, high, end)
+            return jnp.where(mine, low, start), jnp.where(mine, high, end)
+
+        start, end = self._positions(first, spans, row, step, (place * 0, place * 0))
         return ((family.as_row(start), family.as_row(end)),), None
 
     def _entry(self, ref, index, *, row):
