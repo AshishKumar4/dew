@@ -199,9 +199,14 @@ def bare_search(objective):
     def asked(split, narrow, footprint=None, *, derived=True, lowering=True):
         raise Asked(search.remat_rung())
 
-    search = FitSearch(lower=asked, options=lambda candidate: None, objective=objective,
-                       mesh=MeshSpec().build(jax.devices()[:1]), xla_defaults=False, narrow=False, base=None,
-                       resumed=None, capacity=LIMIT)
+    from model_support import memory_limited_to
+
+    from dew.training.ahead import compile_only_gpus
+
+    # A GPU whose stated memory limits its allocator to `LIMIT`, so the search judges its derivations.
+    mesh = MeshSpec().build(compile_only_gpus("sm90", 1, memory_limited_to(LIMIT)))
+    search = FitSearch(lower=asked, options=lambda candidate: None, objective=objective, mesh=mesh,
+                       xla_defaults=False, narrow=False, base=None, resumed=None)
     return search
 
 
@@ -630,6 +635,8 @@ def gated(layers: str, generation: str, remat: str, capacity: int, records, prec
     """A gate case's step compiled ahead for one compile-only GPU of `generation` stating `capacity`
     bytes at JAX's matmul `precision`, its rungs recorded under `records`: every compile its plan made,
     refused or not."""
+    from model_support import memory_limited_to
+
     from dew.registry import models
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
@@ -638,12 +645,12 @@ def gated(layers: str, generation: str, remat: str, capacity: int, records, prec
                          remat=None if remat == "none" else REMAT_POLICIES[remat], **GATE_LAYERS[layers])
     # The split left to the plan, so the derivation judges each split it reads.
     trainer = Trainer(LMObjective(model, seq_len=128), optax.adamw(1e-3), key=jax.random.key(0),
-                      mesh=MeshSpec().build(compile_only_gpus(generation, 1)))
+                      mesh=MeshSpec().build(compile_only_gpus(generation, 1, memory_limited_to(capacity))))
     tokens = ((np.arange(4 * 129).reshape(4, 129) * 7) % 128).astype(np.int32)
     with pytest.MonkeyPatch.context() as patch, jax.default_matmul_precision(precision):
         patch.setenv("DEW_RUNG_RECORDS", str(records))
         try:
-            compile_ahead(trainer, {"text": tokens}, capacity=capacity)
+            compile_ahead(trainer, {"text": tokens})
         except PlanRefused as refused:
             return [probe.record() for probe in refused.probes]
     return list(trainer.plan["probes"])

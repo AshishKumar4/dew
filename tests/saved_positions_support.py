@@ -1,6 +1,10 @@
-"""The chains whose positions main saved before phases shared corpora (`tools/positions_saved_by_main.py`,
-`tests/fixtures/positions`), each step declaring its identity, so an edit elsewhere in the tests leaves the
-positions resumable: phases on their own streams, and a bounded mixture laid out and shuffled."""
+"""The chains whose positions a main saved under the plan version before this Dew's
+(`tools/positions_saved_by_main.py`, `tests/fixtures/positions`), each step declaring its identity or defined
+here, so an edit elsewhere in the tests leaves the positions resumable: phases on their own streams, a
+bounded mixture laid out and shuffled, a shuffled chain through a configured step taken to a bound, streamed
+and read into memory, and a seeded mix of two named corpora."""
+
+import dataclasses
 
 import numpy as np
 from test_chain_compile import Tokens
@@ -48,6 +52,36 @@ def bounded_mixture(layout: str):
     return compile(laid.read(read).batch(2), read=read, examples=2 * len(LENGTHS))
 
 
-SAVED = {"step_phases": (step_phases, 2), "bounded_mixture_strided": (lambda: bounded_mixture("strided"), 2),
-         "bounded_mixture_held": (lambda: bounded_mixture("held"), 3)}
+@dataclasses.dataclass(frozen=True)
+class Scaled:
+    """A configured record step: each id times `factor`."""
+
+    factor: int
+
+    def __call__(self, row):
+        return {**row, "id": row["id"] * self.factor}
+
+
+def taken(count: int = 20, factor: int = 2, read: str = "streamed"):
+    """40 ids shuffled through a configured step (`Scaled`), taken to `count` records, in batches of two."""
+    rows = Memory({"id": np.arange(1, 41, dtype=np.int32)}, shard_rows=4)
+    chain = Pipeline(rows).shuffle(seed=3, window=8).map(Scaled(factor)).repeat().take(count).batch(2)
+    return compile(chain, read=read, loading=READ)
+
+
+def named(name: str, tag: int) -> Pipeline:
+    """A corpus of 16 ids named `name`, each the `tag`th corpus's, read on without end."""
+    return Pipeline(Memory({"id": np.arange(tag * 100, tag * 100 + 16, dtype=np.int32)}, shard_rows=4),
+                    name=name).repeat()
+
+
+def mixture():
+    """Two named corpora mixed by a seed, streamed."""
+    return compile(mix([named("a", 1), named("b", 2)], seed=4).batch(2), read="streamed", loading=READ)
+
+
+SAVED = {"step_phases": (step_phases, 2), "step_phases_later": (step_phases, 5),
+         "bounded_mixture_strided": (lambda: bounded_mixture("strided"), 2),
+         "bounded_mixture_held": (lambda: bounded_mixture("held"), 3), "taken": (taken, 3),
+         "taken_in_memory": (lambda: taken(read="memory"), 3), "mixture": (mixture, 3)}
 """Each saved position's loader and the steps read before it was saved."""

@@ -72,6 +72,7 @@ from dew.data.dataset import (
 )
 from dew.data.elastic_order import _InputOrder, _StreamOrder
 from dew.data.handoff import (
+    EXPANDED_DRAWS,
     RecordStage,
     _Barren,
     _carried,
@@ -83,19 +84,19 @@ from dew.data.handoff import (
     _threads,
     _Ungrouped,
     _Unspread,
+    draws_after_expansion,
     record_stage_of,
 )
 from dew.data.mixing import (
     Accepted,
-    Carried,
     Chunked,
     CorpusCounts,
     KeyedMix,
-    ProportionalSelection,
     Proportions,
     TokenDeficit,
+    _weights,
+    mixed_indexed,
     rewound,
-    token_weights,
 )
 from dew.data.ordering import Skipping, place_of
 from dew.data.packing import packed_documents
@@ -110,6 +111,8 @@ from dew.data.pipeline import (
     Batched,
     BatchedGroups,
     BatchStage,
+    Combined,
+    Concatenated,
     Documents,
     Expansion,
     Filter,
@@ -122,7 +125,6 @@ from dew.data.pipeline import (
     Mixture,
     Native,
     Pack,
-    Phases,
     Pipeline,
     Prefetch,
     RandomMap,
@@ -147,9 +149,9 @@ from dew.data.pipeline import (
     member_record,
     members_held,
 )
-from dew.data.plan import PLAN_VERSIONS, STRUCTURED, Manifest
+from dew.data.plan import Manifest
 from dew.data.readers import WorkerMirrors, _FillShare
-from dew.data.shards import bounded as shards_bounded, bounded_places, cut, streamed
+from dew.data.shards import _Sequential, bounded as shards_bounded, bounded_places, cut, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
@@ -360,7 +362,7 @@ def _counts_own_rows(pipeline: Pipeline) -> bool:
     """Whether a per-share read counts `pipeline`'s rows as they leave it: a corpus does, and a
     mixture does only where a Grain step of its own may drop rows, which no count of its own
     follows; else its rows are its corpora's, each counted."""
-    if not isinstance(pipeline.source, (Mixture, Phases)):
+    if not isinstance(pipeline.source, Combined):
         return True
     return any(isinstance(stage, Native) for stage in pipeline.stages)
 
@@ -371,7 +373,7 @@ def _counts_rows(pipeline: Pipeline, at: int) -> bool:
     counted before it (`FlatMap.examples`, `CorpusCounts.rows`), a memory read's as it held them where it
     ran the step (`_written`)."""
     source, stages = pipeline.source, pipeline.stages[:at]
-    ran = stages if isinstance(source, (Mixture, Phases)) else _written(source, stages)
+    ran = stages if isinstance(source, Combined) else _written(source, stages)
     return not any(isinstance(stage, FlatMap) and stage.examples for stage in ran)
 
 
@@ -451,7 +453,7 @@ def _consumes(pipeline: Pipeline) -> bool:
     as it held its rows (`_written`), so every row after it holds a count. A phase whose mix other phases
     read on counts its draws too (`_Build.counting`)."""
     source = pipeline.source
-    stages = pipeline.stages if isinstance(source, (Mixture, Phases)) else _written(source, pipeline.stages)
+    stages = pipeline.stages if isinstance(source, Combined) else _written(source, pipeline.stages)
     return examples_bound(stages) is not None
 
 
@@ -462,7 +464,7 @@ def _completes(pipeline: Pipeline, at: int, counting: bool) -> bool:
     example's every window (`dew.data.completion`)."""
     source = pipeline.source
     before = pipeline.stages[:at]
-    laid = before if isinstance(source, (Mixture, Phases)) else _written(source, before)
+    laid = before if isinstance(source, Combined) else _written(source, before)
     return counting and cuts(laid)
 
 
@@ -692,13 +694,12 @@ def _filled(stage: Artifact) -> Cache:
     return stage.cache
 
 
-def _fill(pipeline: Pipeline, source: Source, at: int, read: Read,
-          version: int) -> tuple[Cache, Manifest, _Prefix]:
-    """The cache stage at `at`, its fill's key at plan `version`, and the record steps that fill it."""
+def _fill(pipeline: Pipeline, source: Source, at: int, read: Read) -> tuple[Cache, Manifest, _Prefix]:
+    """The cache stage at `at`, its fill's key, and the record steps that fill it."""
     artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
     if not isinstance(artifact, Artifact):
         raise ValueError(f"stage {at} of {_name(pipeline)} is not a cache")
-    return _filled(artifact), _cache_manifest(source, prefix, read, version), _Prefix(_cache_steps(prefix))
+    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(_cache_steps(prefix))
 
 
 def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[int, int, int]]:
@@ -1225,9 +1226,6 @@ class _Build:
     and runs the rest. A mixture's corpora each read in a share of them, or in the workers a corpus
     writes itself. None where the workers read the whole order after its batch, as a read that drops
     nothing is read."""
-    version: int = PLAN_VERSIONS[-1]
-    """The data plan version it reads by (`dew.data.plan.PLAN_VERSIONS`), which spells the steps its caches
-    are keyed by (`_fill`)."""
     named: int | None = None
     """The key of the chain this builds, read outside any mixture, where it was given a name: the key a
     mixture keys it by as its first member of that name (`dew.data.compile._own_key`), which its shuffles
@@ -1257,8 +1255,9 @@ class _Build:
         (`dew.data.plan.IDENTITY`), a shuffle's key (`SHUFFLE`), a mix's schedule (`dew.data.mixing.MIX`),
         where its loading workers read its inputs in their order, how they are dealt
         (`dew.data.elastic_order.DEALING`), how a phase continues a corpus an earlier phase read out of
-        order (`DRAWN`) and how a batched step's empty groups are refused
-        (`dew.data.pipeline.BatchedGroups.REFUSALS`); only those the read uses. A plan records them
+        order (`DRAWN`), how a batched step's empty groups are refused
+        (`dew.data.pipeline.BatchedGroups.REFUSALS`) and how a random step after an expansion draws
+        (`dew.data.handoff.EXPANDED_DRAWS`); only those the read uses. A plan records them
         (`dew.data.plan.Plan.rules`) and a resume compares them."""
         from dew.data.elastic_order import DEALING
         from dew.data.mixing import MIX
@@ -1267,10 +1266,12 @@ class _Build:
         mixed = any(isinstance(chain.source, Mixture) for chain in chains(pipeline))
         shuffled = any(isinstance(stage, Shuffle) for stage in _steps(pipeline))
         batched = any(isinstance(stage, Batched) for stage in _steps(pipeline))
+        drawn = self.in_order and draws_after_expansion(pipeline)[1]
         return {"identity": IDENTITY, **({"shuffle": self.SHUFFLE} if shuffled else {}),
                 **({"mix": MIX} if mixed else {}), **({"dealing": DEALING} if self.in_order else {}),
                 **({"phases": self.DRAWN} if self.skipped else {}),
-                **({"batched": BatchedGroups.REFUSALS} if batched else {})}
+                **({"batched": BatchedGroups.REFUSALS} if batched else {}),
+                **({"expanded_draws": EXPANDED_DRAWS} if drawn else {})}
 
     def counting(self, pipeline: Pipeline) -> bool:
         """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
@@ -1305,8 +1306,8 @@ class _Build:
         return self.elastic or (self.training and not self.global_order and not streams)
 
     def child(self, index: int) -> _Build:
-        """The build of the `index`th corpus a mixture or phases reads, by its own analysis, keyed
-        by the name it goes by there (`_member_key`)."""
+        """The build of the `index`th corpus a mixture, phases or a concatenation reads, by its own
+        analysis, keyed by the name it goes by there (`_member_key`)."""
         members = strings(self.lowering.order["members"], "mixture members")
         pool = (None if self.pool is None
                 else Workers(_shared_pool(self.pool.count, len(members), index), self.pool.buffer))
@@ -1354,7 +1355,7 @@ class _Build:
         source = pipeline.source
         if build.pool is None or build.in_order:
             return {}
-        if not isinstance(source, (Mixture, Phases)):
+        if not isinstance(source, Combined):
             return {"/".join(str(key) for key in build.corpus): build.pool.count}
         return {key: count for index, child in enumerate(source.pipelines)
                 for key, count in build.child(index).pools(child).items()}
@@ -1376,20 +1377,46 @@ class _Build:
         key = (self.seed, *self.corpus, drawn, *share)
         return int(np.random.SeedSequence(key).generate_state(1, np.uint32)[0])
 
+    def members(self, pipeline: Pipeline, partition: DataPartition) -> tuple[list[_Build], list[Rows]]:
+        """The build and the rows of each chain `pipeline` mixes or joins, each by its own analysis
+        (`child`). They share its read budget, each reading with its share of the threads and the
+        read-ahead: a mix of hundreds of corpora holds what a read of one does, and a corpus whose share
+        is no thread reads on the thread that draws from it."""
+        nested = children(pipeline)
+        builds = [self.child(index) for index in range(len(nested))]
+        builds = [dataclasses.replace(build, loading=dataclasses.replace(
+            build.loading, threads=build.loading.threads // len(nested),
+            read_buffer=build.loading.read_buffer // len(nested))) for build in builds]
+        return builds, [build.records(child, partition) for build, child in zip(builds, nested, strict=True)]
+
+    def concatenated(self, pipeline: Pipeline, partition: DataPartition) -> Rows:
+        """The rows of the chains `pipeline` joins (`Concatenated`), one member after another: each as its
+        own build reads it once through (`dew.data.analysis._once`), joined by index where every member's
+        rows are indexed (Grain's concatenation) and read in turn on the reading thread where one is a
+        stream (`dew.data.shards._Sequential`, whose position is the member it reads and that member's).
+        The join is the read's root: a training read cut per share repeats it unless the pipeline does,
+        as it repeats a store's share (`shared`)."""
+        builds, parents = self.members(pipeline, partition)
+        indexed = [parent for parent in parents if isinstance(parent, pygrain.MapDataset)]
+        if len(indexed) == len(parents):
+            rows: Rows = pygrain.MapDataset.concatenate(indexed)
+        else:
+            streams = [_as_iter(parent, build.loading) for parent, build in zip(parents, builds, strict=True)]
+            rows = _Sequential(pygrain.MapDataset.range(len(streams)), streams.__getitem__, self.loading)
+        if self.training and not self.global_order and not self.lowering.repeated:
+            rows = _repeated(rows, None, _name(pipeline), self.loading)
+        return rows
+
+    def combined(self, pipeline: Pipeline, partition: DataPartition) -> Rows:
+        """The rows of the chains `pipeline` combines: joined (`concatenated`) or mixed (`mixed`)."""
+        joined = isinstance(pipeline.source, Concatenated)
+        return self.concatenated(pipeline, partition) if joined else self.mixed(pipeline, partition)
+
     def mixed(self, pipeline: Pipeline, partition: DataPartition) -> Rows:
         source = pipeline.source
         if not isinstance(source, Mixture):
             raise ValueError("phases need the global phased lowering")
-        # The mix's corpora share its read budget, each reading with its share of the threads and the
-        # read-ahead: a mix of hundreds of corpora holds what a read of one does, and a corpus whose
-        # share is no thread reads on the thread that draws from it.
-        members = len(source.pipelines)
-        builds = [self.child(index) for index in range(members)]
-        builds = [dataclasses.replace(build, loading=dataclasses.replace(
-            build.loading, threads=build.loading.threads // members,
-            read_buffer=build.loading.read_buffer // members)) for build in builds]
-        parents = [build.records(child, partition)
-                   for build, child in zip(builds, source.pipelines, strict=True)]
+        builds, parents = self.members(pipeline, partition)
         # A run bounded in examples counts each member's where its rows are delivered: each row says the
         # member it was drawn from (`MEMBER`, `counted_members`).
         keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
@@ -1479,7 +1506,7 @@ class _Build:
             present = _Present.of(records) if _in_memory(keyed) else None
             positions = None if present is None else present.positions
         stored = _cache_inputs(keyed, records)
-        filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read, self.version)
+        filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read)
         # Read by input, as the source's own rows are: its missing inputs skipped, as the uncached
         # root skips them, and written by the fill; one record for each input reads by index and in
         # the uncached chain's order, the rest as a stream of each input's outputs.
@@ -1534,7 +1561,7 @@ class _Build:
         transparent = cache is not None and _transparent(pipeline, cache)
         shards = source.manifest()
         if cache is not None:
-            filled, manifest, prefix = _fill(pipeline, source, cache, self.read, self.version)
+            filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
             shards = _positioned(shards, partition, self.stream_loading) if 0 <= last < cache else shards
             reader = filled.streamed(shards.reader, manifest, transform=prefix, threads=prefix.threads,
                                      source=source, transparent=transparent)
@@ -1643,13 +1670,13 @@ class _Build:
         # each record they drop as a marker, which the reading process drops after them.
         pool = self.owning(pipeline).pool
         pooled = (pool is not None and (pool.count > 0 or self.in_order)
-                  and not isinstance(source, (Mixture, Phases)))
+                  and not isinstance(source, Combined))
         # A Grain step of the caller's reads its rows as Grain gives them, without a marker.
         native = next((isinstance(stage, Native) for stage in pipeline.stages
                        if not isinstance(stage, (Shuffle, Slice, Limit, Repeat))), False)
         share: Share = None
-        if isinstance(source, (Mixture, Phases)):
-            rows, consumed = self.owning(pipeline).mixed(pipeline, partition), 0
+        if isinstance(source, Combined):
+            rows, consumed = self.owning(pipeline).combined(pipeline, partition), 0
         elif self.read == "streamed":
             rows, consumed, share = self.sharded(pipeline, source, partition, last, marked=pooled)
         else:
@@ -1898,15 +1925,10 @@ class _Build:
             rows = stage.function(given.seed(self.stage_seed(pipeline, at, partition)))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
-            refusing = self.version >= STRUCTURED
-            rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage, refusing=refusing))
-            # A group it makes no rows of is refused and counted here, its examples carried to the next row;
-            # a plan of 13 carried them uncounted, as its positions hold.
-            if refusing:
-                rows = Accepted(rows, _name(pipeline), _label(pipeline), rows=False,
-                                members=self.counted_members(pipeline))
-            elif self.counting(pipeline):
-                rows = Carried(rows)
+            rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage))
+            # A group it makes no rows of is refused and counted here, its examples carried to the next row.
+            rows = Accepted(rows, _name(pipeline), _label(pipeline), rows=False,
+                            members=self.counted_members(pipeline))
         else:
             return self.layout_stage(rows, stage, pipeline, at)
         return rows
@@ -1922,10 +1944,11 @@ class _Build:
                            members=bool(self.counted_members(pipeline)), drawn=bool(self.stamped))
             rows = self.targeted(ruled, stage.fields[0], pipeline, at + 1)
         elif isinstance(stage, Artifact):
-            if not isinstance(rows, pygrain.MapDataset) or isinstance(pipeline.source, (Mixture, Phases)):
-                raise ValueError("a cache belongs on each corpus's indexed rows, before mix and interleave")
+            if not isinstance(rows, pygrain.MapDataset) or isinstance(pipeline.source, Combined):
+                raise ValueError("a cache belongs on each corpus's indexed rows, before mix, concat and "
+                                 "interleave")
             prefix = pipeline.stages[: pipeline.stages.index(stage)]
-            manifest = _cache_manifest(pipeline.source, prefix, self.read, self.version)
+            manifest = _cache_manifest(pipeline.source, prefix, self.read)
             rows = _filled(stage).mapped(rows, manifest)
         elif not isinstance(stage, Interleave):
             raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} has no lowering here")
@@ -2378,29 +2401,6 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
             with _closing(rows) as read:
                 spans = _TokenSplit(read, split).spans
             yield spans
-
-
-def mixed_indexed(members: Sequence[pygrain.MapDataset], mixture: Mixture) -> pygrain.MapDataset:
-    """`members`, `mixture`'s indexed corpora, drawn from as its weights and seed say
-    (`ProportionalSelection`): its read's mix, and its twin of draws' (`dew.data.compile`)."""
-    selection = ProportionalSelection([len(member) for member in members], _weights(mixture), mixture.seed)
-    return pygrain.MapDataset.select_from_datasets(members, selection)
-
-
-def _weights(mixture: Mixture) -> Sequence[float]:
-    """A mixture's weights, as shares of its corpora's stated valid target
-    tokens when it mixes by tokens, from the rows and valid targets each
-    corpus states as it is read."""
-    if mixture.tokens is None:
-        return mixture.weights
-    leaves = [child.source for child in mixture.pipelines if not isinstance(child.source, (Mixture, Phases))]
-    facts = [source.metadata() for source in leaves]
-    return token_weights(
-        [_name(child) for child in mixture.pipelines],
-        mixture.weights,
-        [integer(stated["rows"], "rows") for stated in facts],
-        [integer(stated["valid_targets"], "valid_targets") for stated in facts],
-    )
 
 
 def _workers(pipeline: Pipeline, loading: Loading) -> int:

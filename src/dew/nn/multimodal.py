@@ -366,6 +366,15 @@ class MultimodalTransformer(DecoderWrapper):
         return frozenset({*self.extra_placeholder_ids,
                           *(() if self.image_token_id is None else (self.image_token_id,))})
 
+    @property
+    def replaces_media(self) -> bool:
+        """Whether `_fused` gives each slot a call's media fill its towers' embedding in place of its id's
+        (`dew.nn.protocols.ReplacesTokens`): every family's but one whose decoder hashes n-grams of the ids
+        media fill (`Engram.media_stops` False, Qwen4-Exp's), which keeps that id and reads it from a token
+        map of its table's rows, as its table would."""
+        engram = self.language_model.engram
+        return engram is None or engram.media_stops
+
     def _fused(self, tokens, image_indices=None, audio_indices=None, conditioning=None,
                train: bool = False) -> Fusion:
         """Decoder token identities and their embeddings with media slots filled,

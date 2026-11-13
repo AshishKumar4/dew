@@ -81,6 +81,7 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.progress import END, Progress, progressed
 from dew.nn.protocols import (
     EXITS,
+    BankedStacks,
     Bounded,
     CountedLogits,
     CountedLogitsTraining,
@@ -837,7 +838,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         return np.sum(scored, axis=-1, dtype=np.int64)
 
     def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
-        return self.model.bank_sites(store)
+        # A model that declares no stacks (`BankedStacks`: a user's, an NNX module's) has none to bank.
+        return self.model.bank_sites(store) if isinstance(self.model, BankedStacks) else ()
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))

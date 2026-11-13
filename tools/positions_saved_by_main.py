@@ -1,6 +1,6 @@
-"""Positions saved before phases shared corpora (row 5497's fixtures): run at the sha that saves them, from
-the repository's root, with `tests/saved_positions_support.py` beside it, writing each loader's position
-after its steps (`SAVED`) into the directory it is given."""
+"""Positions a main saves under the plan version before this Dew's (tests/fixtures/positions): run at the sha
+that saves them, from the repository's root, with `tests/saved_positions_support.py` beside it, writing each
+loader's position after its steps (`SAVED`) into the directory it is given."""
 
 import itertools
 import sys

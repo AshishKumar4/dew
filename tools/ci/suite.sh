@@ -16,7 +16,8 @@
 #   ARMADA_URL, ARMADA_TOKEN   for a red gang's logs, which the map's summary does not hold
 #   LABEL            the jobs' label
 #   PRIORITY         the jobs' armada priority (none: armada's default)
-#   DEW_TEST_CACHE   the test cache's policy (tools/armada/ci.py policy; `off` runs every file)
+#   DEW_TEST_CACHE   the test cache's policy (tools/armada/ci.py policy; `off` runs every file, `cold` every file
+#                    no record holds, as cold)
 #   DEW_WHOLE_SUITE  1 for the whole suite: the whole_suite cells, every file on the newest Python, and the release
 #                    checks after it (tools/armada/session.py `selected`, ci.py `plan`, `release-plan`)
 #   GANGLESS         1 to run no gangs (a base/kernels push and a base/<producer> promote: main's trains run them)
@@ -61,10 +62,10 @@ if [ -z "${PROVEN:-}" ] && [ -z "${GANGLESS:-}" ]; then
   gangs=$!
 fi
 # Its own deadline sits above what every file takes on its containers when no row is cached: 2700 s; a cold suite
-# (the cache's policy off: a lock, JAX's build or the recorder changed) compiles everything anew, 5400 s (train
-# 254's cold suite left 780 tasks unstarted at 2,698 s); a background run takes a bounded share, 6000 s.
+# (the cache's policy off or cold: a lock, JAX's build or the recorder changed) compiles everything anew, 5400 s
+# (train 254's cold suite left 780 tasks unstarted at 2,698 s); a background run takes a bounded share, 6000 s.
 if [ -n "${BACKGROUND:-}" ]; then bound="--deadline=6000"
-elif [ "${DEW_TEST_CACHE:-}" = off ]; then bound="--deadline=5400"
+elif [ "${DEW_TEST_CACHE:-on}" != on ]; then bound="--deadline=5400"
 else bound="--deadline=2700"; fi
 [ -z "${POOL:-}" ] || bound="$bound --pool=$POOL"
 # A commit PROVEN runs no suite again, whatever its stored verdict or the cache's policy; the whole suite reads no

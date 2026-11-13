@@ -20,11 +20,10 @@ What lands:
 
 - tests/fixtures/linear_attention/gated_delta_net.npz: random operands of
   the gated delta rule over 70 tokens (two chunks of 64, the second padded)
-  with `torch_chunk_gated_delta_rule` and `torch_recurrent_gated_delta_rule`
-  run on them, from a zero state and from a random initial state; a
-  depthwise causal conv input, its taps and `F.conv1d`'s output; and one
-  `Qwen3_5GatedDeltaNet` layer's weights under their checkpoint names, its
-  input and its output. config.json beside it holds the geometry the layer
+  and an initial state, a depthwise causal conv input and its taps, whose
+  shapes the tests draw operands of anew and run transformers on live; and
+  one `Qwen3_5GatedDeltaNet` layer's weights under their checkpoint names and
+  an input of its width. config.json beside it holds the geometry the layer
   was built with, so the test repeats no numbers of its own.
 - tests/fixtures/hf/qwen35-tiny/: a random-weight hybrid checkpoint in the
   HF layout (three linear-attention layers, one gated full-attention layer,
@@ -47,11 +46,7 @@ import torch
 import torch.nn.functional as F
 from huggingface_hub import hf_hub_download
 from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
-from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5TextRotaryEmbedding,
-    torch_chunk_gated_delta_rule,
-    torch_recurrent_gated_delta_rule,
-)
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5TextRotaryEmbedding
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 HF = FIXTURES / "hf"
@@ -66,21 +61,21 @@ PROBE = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src" / "dew" /
 # a partial rotary of a quarter of the head (the released factor), the
 # doubled gated q_proj, and a conv with a real history. The multimodal
 # fixture's text decoder is this one too (tools/hf_reference.py).
-CONFIG: dict = dict(
-    vocab_size=256, hidden_size=64, intermediate_size=128,
-    num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
-    head_dim=32, hidden_act="silu", max_position_embeddings=64,
-    rms_norm_eps=1e-6, tie_word_embeddings=True,
-    linear_conv_kernel_dim=4, linear_key_head_dim=12, linear_value_head_dim=16,
-    linear_num_key_heads=2, linear_num_value_heads=4,
-    layer_types=["linear_attention"] * 3 + ["full_attention"],
+CONFIG: dict = {
+    "vocab_size": 256, "hidden_size": 64, "intermediate_size": 128,
+    "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2,
+    "head_dim": 32, "hidden_act": "silu", "max_position_embeddings": 64,
+    "rms_norm_eps": 1e-6, "tie_word_embeddings": True,
+    "linear_conv_kernel_dim": 4, "linear_key_head_dim": 12, "linear_value_head_dim": 16,
+    "linear_num_key_heads": 2, "linear_num_value_heads": 4,
+    "layer_types": ["linear_attention"] * 3 + ["full_attention"],
     # A quarter of head_dim 32 rotates: 8 dims, 4 frequency pairs, which the
     # three mRoPE sections split as 2 + 1 + 1 (the released [11, 11, 10]
     # splits the 32 pairs of a 64-dim rope the same way).
-    rope_parameters={"rope_type": "default", "rope_theta": 1000000.0,
-                     "partial_rotary_factor": 0.25,
-                     "mrope_interleaved": True, "mrope_section": [2, 1, 1]},
-)
+    "rope_parameters": {"rope_type": "default", "rope_theta": 1000000.0,
+                        "partial_rotary_factor": 0.25,
+                        "mrope_interleaved": True, "mrope_section": [2, 1, 1]},
+}
 
 # The rule fixture: two chunks of 64 with the second one padded, three heads
 # so a head index mistake shows, and key and value dims apart.
@@ -123,7 +118,7 @@ def scatter_weights(model: torch.nn.Module) -> None:
 
 
 def rule_fixture(generator: torch.Generator) -> dict:
-    """The two forms of the rule on random operands, from zero and from a state.
+    """The rule's random operands and a state to start from.
 
     The reference normalises q and k inside the rule
     (use_qk_l2norm_in_kernel=True, as Qwen3_5GatedDeltaNet calls it), so the
@@ -137,42 +132,26 @@ def rule_fixture(generator: torch.Generator) -> dict:
     g = -F.softplus(torch.randn(shape, generator=generator))
     beta = torch.sigmoid(torch.randn(shape, generator=generator))
     state = 0.5 * torch.randn((RULE_BATCH, RULE_HEADS, KEY_DIM, VALUE_DIM), generator=generator)
-    arrays = {"rule.query": query, "rule.key": key, "rule.value": value,
-              "rule.g": g, "rule.beta": beta, "rule.initial_state": state}
-    for name, form in (("chunk", torch_chunk_gated_delta_rule),
-                       ("recurrent", torch_recurrent_gated_delta_rule)):
-        for carried, initial in (("", None), ("_carried", state)):
-            with torch.no_grad():
-                out, final = form(query, key, value, g, beta, initial_state=initial,
-                                  output_final_state=True, use_qk_l2norm_in_kernel=True)
-            arrays[f"{name}{carried}.output"] = out
-            arrays[f"{name}{carried}.state"] = final
-    return arrays
+    return {"rule.query": query, "rule.key": key, "rule.value": value,
+            "rule.g": g, "rule.beta": beta, "rule.initial_state": state}
 
 
 def conv_fixture(generator: torch.Generator) -> dict:
-    """F.conv1d as the reference calls it: depthwise, padded K - 1 to the
-    left and cut to the sequence length, then silu."""
+    """A depthwise causal conv's input and taps, as F.conv1d takes them."""
     x = torch.randn((CONV_BATCH, CONV_FEATURES, CONV_LENGTH), generator=generator)
     weight = 0.3 * torch.randn((CONV_FEATURES, 1, CONV_KERNEL), generator=generator)
-    with torch.no_grad():
-        out = F.silu(F.conv1d(x, weight, padding=CONV_KERNEL - 1,
-                              groups=CONV_FEATURES)[..., :CONV_LENGTH])
-    return {"conv.input": x, "conv.weight": weight, "conv.output": out}
+    return {"conv.input": x, "conv.weight": weight}
 
 
 def layer_fixture(model: Qwen3_5ForCausalLM, generator: torch.Generator) -> dict:
-    """One Qwen3_5GatedDeltaNet with the tiny model's first-layer weights."""
+    """One Qwen3_5GatedDeltaNet's weights, the tiny model's first layer's, and an input of its width."""
     layer = model.model.layers[0].linear_attn
     # torch types a submodule attribute as Tensor | Module; this one is the
     # Qwen3_5GatedDeltaNet of a linear_attention layer.
     assert isinstance(layer, torch.nn.Module)
     hidden = torch.randn((RULE_BATCH, LAYER_LENGTH, CONFIG["hidden_size"]), generator=generator)
-    with torch.no_grad():
-        out = layer(hidden, attention_mask=None)
-    arrays = {f"layer.{name}": tensor for name, tensor in layer.state_dict().items()}
-    arrays.update({"layer.hidden": hidden, "layer.output": out})
-    return arrays
+    weights = {f"layer.{name}": tensor for name, tensor in layer.state_dict().items()}
+    return {**weights, "layer.hidden": hidden}
 
 
 def real_config() -> dict:
@@ -202,8 +181,7 @@ def write_linear(model: Qwen3_5ForCausalLM) -> None:
         "hidden_size", "rms_norm_eps", "linear_conv_kernel_dim", "linear_key_head_dim",
         "linear_value_head_dim", "linear_num_key_heads", "linear_num_value_heads")}
     (LINEAR / "config.json").write_text(json.dumps(geometry, indent=2) + "\n")
-    print(f"{LINEAR}: {len(arrays)} arrays, layer output "
-          f"{tuple(arrays['layer.output'].shape)}")
+    print(f"{LINEAR}: {len(arrays)} arrays, layer input {tuple(arrays['layer.hidden'].shape)}")
 
 
 def write_tiny(model: Qwen3_5ForCausalLM) -> None:

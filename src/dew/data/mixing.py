@@ -26,7 +26,9 @@ from dew.data.pipeline import (
     CONSUMED,
     DRAWN,
     REFUSED,
+    Combined,
     Drawn,
+    Mixture,
     Owed,
     Record,
     Rejected,
@@ -438,46 +440,6 @@ class _AcceptedIterator(_CountedIterator[Batch]):
                 counts.restore(record(record(members[key], "member counter")["counts"], "member counts"))
         held = counted.get("rejections")
         self._predicate.restored(None if held is None else integer(held, "rejected rows"))
-
-
-class Carried(pygrain.IterDataset[Batch]):
-    """`parent`'s rows, each marker's source examples (`Rejected.consumed`) carried on to the next row and
-    the markers dropped, counting nothing: the carrier after a batched map's group it makes no rows of
-    (`dew.data.pipeline.BatchedGroups`) where a plan of 13 reads, whose positions hold it. The examples it
-    owes are checkpointed with its parent's position; those the stream ends owing are its end's
-    (`dew.training._fit.drained`)."""
-
-    def __init__(self, parent: pygrain.IterDataset[Batch | Rejected]):
-        super().__init__(parent)
-        self._records = parent
-
-    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        return _CarriedIterator(iter(self._records))
-
-
-class _CarriedIterator(pygrain.DatasetIterator[Batch]):
-    def __init__(self, parent: pygrain.DatasetIterator):
-        super().__init__(parent)
-        self._read, self._owed = parent, Owed()
-
-    def __next__(self) -> Batch:
-        while True:
-            element = next(self._read)
-            if isinstance(element, Rejected):
-                self._owed.owe(element.consumed, element.drawn)
-                continue
-            return self._owed.paid(element)
-
-    def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._read.get_state(), "owed": self._owed.examples, **self._owed.saved_draws()}
-
-    def set_state(self, state: Mapping[str, object]) -> None:
-        self._read.set_state(record(state["parent"], "carried parent"))
-        self._owed = Owed.restored(integer(state["owed"], "examples owed"),
-                                   json_value(state.get("drawn"), "draws owed"))
-
-    def close(self) -> None:
-        self._read.close()
 
 
 class Accepted(pygrain.IterDataset[Batch]):
@@ -1388,3 +1350,28 @@ def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
     if counts.name not in counted:
         counted[counts.name] = CorpusCounts(counts.name, counts.label, rows=counts.rows)
     counted[counts.name].add(counts)
+
+
+def mixed_indexed(members: Sequence[pygrain.MapDataset], mixture: Mixture) -> pygrain.MapDataset:
+    """`members`, `mixture`'s indexed corpora, drawn from as its weights and seed say
+    (`ProportionalSelection`): its read's mix, and its twin of draws' (`dew.data.compile`)."""
+    selection = ProportionalSelection([len(member) for member in members], _weights(mixture), mixture.seed)
+    return pygrain.MapDataset.select_from_datasets(members, selection)
+
+
+def _weights(mixture: Mixture) -> Sequence[float]:
+    """A mixture's weights, as shares of its corpora's stated valid target
+    tokens when it mixes by tokens, from the rows and valid targets each
+    corpus states as it is read."""
+    if mixture.tokens is None:
+        return mixture.weights
+    from dew.data.analysis import _name
+
+    leaves = [child.source for child in mixture.pipelines if not isinstance(child.source, Combined)]
+    facts = [source.metadata() for source in leaves]
+    return token_weights(
+        [_name(child) for child in mixture.pipelines],
+        mixture.weights,
+        [integer(stated["rows"], "rows") for stated in facts],
+        [integer(stated["valid_targets"], "valid_targets") for stated in facts],
+    )

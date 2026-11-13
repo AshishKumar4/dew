@@ -562,8 +562,7 @@ class Trainer(Generic[Loss, Effects]):
         return dataclasses.replace(placed, accumulation=pending)
 
     @ruled
-    def validate(self, batch: Batch | None = None, *, steps: int | None = None,
-                 capacity: int | None = None) -> Validation:
+    def validate(self, batch: Batch | None = None, *, steps: int | None = None) -> Validation:
         """What `fit` checks of the state before it places it (`Layout.validate`), read without
         placing anything, so a run is checked on a CPU host before a costly launch.
 
@@ -572,8 +571,8 @@ class Trainer(Generic[Loss, Effects]):
         of the splits its plan may take whose devices hold it, the trainer's own where it fixes one
         (`splits`). It leaves out the narrow copies a step may read (`TrainState.compute`), which the plan
         drops first where the step does not fit with them. An `OptimConfig` is built over `steps`, as
-        `fit(steps=...)` builds it. `capacity` is the bytes each device has, for a mesh whose devices report
-        none: a CPU mesh of `--xla_force_host_platform_device_count` devices standing in for GPUs.
+        `fit(steps=...)` builds it. A trainer on compile-only GPUs (`dew.training.ahead.compile_only_gpus`)
+        checks it against the memory stated for them, on a host that holds none.
 
         Raises what `fit` raises before placing the state: `LayoutRefused` for a state over a device's memory
         or a layout that replicates too much of the model, and ValueError for rules that name an axis the
@@ -582,11 +581,10 @@ class Trainer(Generic[Loss, Effects]):
         self.scheduled(None if steps is None else steps // self.accumulation)
         state = jax.eval_shape(self._staged_start)
         if batch is None:
-            return self._validated(state, capacity)[1]
-        return self._fitting(state, marked(DataPartition(), self._counted_batch)(batch), capacity)
+            return self._validated(state)[1]
+        return self._fitting(state, marked(DataPartition(), self._counted_batch)(batch))
 
-    def _validated(self, state: TrainState, capacity: int | None = None
-                   ) -> tuple[Placement[TrainState], Validation]:
+    def _validated(self, state: TrainState) -> tuple[Placement[TrainState], Validation]:
         """`state`'s placement and what `Layout.validate` reads of the state it places, as the
         layout placed it, once every refusal before a placement passed: a float the devices
         cannot hold, a layout that replicates too much and a state over a device's memory."""
@@ -606,18 +604,17 @@ class Trainer(Generic[Loss, Effects]):
         with self._declared():
             self._staging.check(self.layout, variables, placement, self.device_mesh)
         self.validation = self._validation(placed_shapes(dataclasses.replace(state, variables=variables),
-                                                         dataclasses.replace(shardings, variables=placement)),
-                                           capacity)
+                                                         dataclasses.replace(shardings, variables=placement)))
         _log.info("the state holds %.2f GiB on its fullest device between steps",
                   max(self.validation.device_bytes.values()) / 2 ** 30)
         return shardings, self.validation
 
-    def _validation(self, placed: TrainState, capacity: int | None = None) -> Validation:
+    def _validation(self, placed: TrainState) -> Validation:
         """`Layout.validate` of `placed`, read in every axis the modules box, which every process
         agrees, each reading its own devices' memory."""
         with self._staging.held(boxed(self._boxed_axes())):
             return agreed("state placement", functools.partial(
-                self.layout.validate, self.device_mesh, placed, capacity=capacity))
+                self.layout.validate, self.device_mesh, placed))
 
     @ruled
     def place(self) -> tuple[TrainState, Placement[TrainState], bytes | None]:
@@ -915,8 +912,7 @@ class Trainer(Generic[Loss, Effects]):
         self._shape = dataclasses.replace(self._shape, split=self._given_split)
 
     @ruled
-    def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None, *,
-                capacity: int | None = None) -> CompiledStep:
+    def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep:
         """Compile a transaction over the state and one already-produced global batch
         (`StepCompiler.compile`).
 
@@ -924,23 +920,20 @@ class Trainer(Generic[Loss, Effects]):
         copy of parameters and optimizer state. Keep no reference to the old state after stepping.
         Orbax copies a checkpoint to host before `save` returns, provided `Checkpoints` names neither
         prioritized keys nor a concurrent transfer limit. The loader's batch is not donated. The plan takes
-        the fewest microbatches at least recomputation; a device that states no memory, a compile-only
-        GPU's, holds `capacity` bytes, as a step compiled ahead states them. Built at the pass count of the
-        phase its batch was read in (`PhasePasses.scoped`).
+        the fewest microbatches at least recomputation, a compile-only GPU holding the memory stated for it.
+        Built at the pass count of the phase its batch was read in (`PhasePasses.scoped`).
         """
         with self.phase_passes.scoped(self, self._compiler):
-            compiled = self._took(self._compiler.compile(self._stepping(), state, batch, trials,
-                                                         capacity=capacity))
+            compiled = self._took(self._compiler.compile(self._stepping(), state, batch, trials))
         assert compiled.step is not None
         return compiled.step
 
     @ruled
-    def _compiled_plan(self, state: TrainState, batch: Batch, trials: Trials | None, capacity: int | None,
+    def _compiled_plan(self, state: TrainState, batch: Batch, trials: Trials | None,
                        frontier: bool = False) -> Planned:
         """The plan the run's step compiles at (`StepCompiler.plan`), taken as `compile` takes its compile;
         the caller reads its lowering before releasing it or serializing its executable (`compile_ahead`)."""
-        planned, compiled = self._compiler.plan(self._stepping(), state, batch, trials,
-                                                capacity, frontier)
+        planned, compiled = self._compiler.plan(self._stepping(), state, batch, trials, frontier)
         self._took(compiled)
         return planned
 
@@ -1479,8 +1472,7 @@ class Trainer(Generic[Loss, Effects]):
             averaged=self.objective.ema is not None and not self.objective.ema_is_reference))
         return state, shardings, False
 
-    def _whole_validated(self, state: TrainState, batch: Batch, split: int, capacity: int | None
-                         ) -> Validation:
+    def _whole_validated(self, state: TrainState, batch: Batch, split: int) -> Validation:
         """`Layout.validate` of the whole state the run's steps keep between them reading `batch`'s
         shapes (a marked batch, as the stream gives it) in `split` microbatches: `state` with the
         accumulation its window pools. The narrow copies are left out: the plan's first rung drops
@@ -1488,16 +1480,16 @@ class Trainer(Generic[Loss, Effects]):
         micro = microbatch_shapes(split_fields(batch)[0], split)
         with self._traced_on(self.device_mesh) as schedule:
             _, _, whole, _ = prepared_for(self._stepping(), state, micro, schedule, split, narrow=False)
-        return self._validated(whole, capacity)[1]
+        return self._validated(whole)[1]
 
-    def _fitting(self, state: TrainState, batch: Batch, capacity: int | None = None) -> Validation:
+    def _fitting(self, state: TrainState, batch: Batch) -> Validation:
         """The report of the whole state the run's steps keep reading `batch` (`_whole_validated`) in
         the first of the splits its plan may take (`splits`) whose devices hold it, refused, before
         anything is placed, where none does: the plan picks among them once the state is placed."""
         refusals = []
         for split in splits(self._shape.rows, batch, self.device_mesh, self.microbatches, self._shape.split):
             try:
-                return self._whole_validated(state, batch, split, capacity)
+                return self._whole_validated(state, batch, split)
             except LayoutRefused as refused:
                 refusals.append(refused)
         raise refusals[-1]

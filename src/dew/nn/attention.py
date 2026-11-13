@@ -30,6 +30,7 @@ from .attention_kernels import (
     DECODE,
     TPU_BACKEND,
     AttentionCase,
+    cudnn_packs,
     decodes,
     flash_target,
     reverse_only,
@@ -61,6 +62,8 @@ from .documents import (
     cross_document_mask,
     document_ids,
     document_offsets,
+    own_runs,
+    packed_runs,
     query_order,
     with_documents,
 )
@@ -145,7 +148,7 @@ def widen_value_heads(query, value):
 
 
 def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
-                    key_value_seq_lengths=None):
+                    key_value_seq_lengths=None, segment_ids=None, max_segments: int | None = None):
     """Run jax's cudnn flash attention over any sequence length.
 
     cudnn has no backward pass for an odd query or key length (77 CLIP text
@@ -153,8 +156,15 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
     padded query row is sliced off and the padded key hidden by the kernel's
     key_value_seq_lengths, which never reach past the real keys.
     tests/test_kernels.py pins the equality with the xla path. On a mesh it
-    runs per shard (`on_attention_shards`).
+    runs per shard (`on_attention_shards`). Packed rows, a call's own
+    `segment_ids` `[B, S]` with at most `max_segments` documents a row and
+    nothing else hiding keys (`attention_kernels.cudnn_packs`), run as cuDNN's packed sequences
+    (`packed_runs`: each document, and each row's padding after them, a
+    sequence), as FlashAttention runs them, the padded row in none.
     """
+    if segment_ids is not None:
+        assert max_segments is not None, "cuDNN packs a call's documents bounded alone (`cudnn_packs`)"
+        return _cudnn_packed(query, key, value, causal, sliding_window, segment_ids, max_segments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
     # jax's cudnn call takes a mask or bias only at the full [.., Q, K]
     # (check_layout in jax/_src/cudnn/fused_attention_stablehlo.py), so a
@@ -183,6 +193,34 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                     mask=(None if mask is None else four_dimensional(mask), SCORES),
                     key_value_seq_lengths=(kv_lengths, ("activation_batch",)))
     return out[:, :q_len] if q_pad else out
+
+
+def _cudnn_packed(query, key, value, causal: bool, sliding_window, segment_ids, max_segments: int):
+    """`cudnn_attention` of packed rows (`packed_runs`) through jax's cuDNN attention's packed layout (its
+    ragged offsets, `fused_attention_stablehlo.dot_product_attention`), at jax.nn's scale and masks: a
+    sequence's padding ends it, causality and a window behind the query within it."""
+    from jax._src.cudnn import fused_attention_stablehlo as cudnn
+
+    length = query.shape[-3]
+    offsets, lengths = packed_runs(segment_ids, max_segments + 1)
+    pad = length % 2
+    if pad:
+        query, key, value = (pad_rows(x, pad) for x in (query, key, value))
+    # A window behind the query alone reaches cuDNN (`attention_kernels.CUDNN_SUPPORTS`).
+    behind = None if sliding_window is None else window_sides(causal, sliding_window)[0] + 1
+
+    def local(query, key, value, offsets, lengths):
+        out = cudnn.dot_product_attention(
+            query, key, value, None, None, lengths, lengths, offsets, offsets,
+            scale=1.0 / math.sqrt(query.shape[-1]),
+            mask_type=cudnn.MaskType.PADDING_CAUSAL if causal else cudnn.MaskType.PADDING,
+            sliding_window_length=behind)
+        assert isinstance(out, jax.Array), "its FP8 path alone returns the amaxes beside the output"
+        return out
+
+    out = on_attention_shards(local, query, key, value, offsets=(offsets, ("activation_batch", None)),
+                              lengths=(lengths, ("activation_batch", None)))
+    return out[:, :length] if pad else out
 
 
 def _jax_nn(query, key, value, bias=None, mask=None, key_value_seq_lengths=None, *, causal: bool,
@@ -230,10 +268,9 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
         flat = (query.reshape(rows * length, *query.shape[2:]),
                 *(x.reshape(-1, *x.shape[2:]) for x in (key, value)))
         if key_segment_ids is None:
-            # A call's own documents are its runs, whatever their ids.
-            changes = segment_ids[:, 1:] != segment_ids[:, :-1]
-            begins = jnp.concatenate([jnp.ones((rows, 1), bool), changes], axis=1)
-            offsets, own_keys = cu_seqlens(begins, rows * (max_segments + 1)), {}
+            # A call's own documents are its runs, whatever their ids (`own_runs`).
+            begins, firsts = own_runs(segment_ids, max_segments + 1)
+            offsets, own_keys = cu_seqlens(begins, rows * (max_segments + 1), firsts=firsts), {}
         else:
             # Another sequence's documents pair with the queries' by id, sequence i each side's
             # document i. FA3 takes a positive bound on the keys' lengths, which an empty key array
@@ -306,9 +343,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     """
     if sinks is not None and sinks.shape != (query.shape[2],):
         raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
-    rule = attention_quantized.owner()
-    quantized = rule is not None and not attention_quantized.whole(rule)
-    if quantized and (not attention_quantized.takes(rule) or sinks is not None or dropout_rate):
+    quantized = _quantized(sinks is not None, bool(dropout_rate))
+    if quantized == 'reference':
         raise ValueError("the template computes a quantized model's attention under an int8 rule of Qwix's "
                          "dynamic absmax, no sinks and no dropout; the reference path computes the rest")
 
@@ -775,11 +811,8 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
         value = widen_value_heads(query, value)
 
     if implementation == 'cudnn':
-        def fused(query, key, value):
-            return cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
-                                   key_value_seq_lengths)
-
-        out = fused(query, key, value)
+        out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window, key_value_seq_lengths,
+                              segment_ids, max_segments)
     elif implementation == 'triton':
         out = triton_attention(query, key, value, causal)
     elif implementation == 'flash':
@@ -1028,8 +1061,8 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     """Run one whole-sequence attention call on the kernel `attention_kernel` resolved.
 
     `masked` is `mask` with the key `lengths` and `starts` in it. Splash takes sinks, a
-    softcap and packed segment ids itself, flash takes the ids as its packed sequences given
-    `max_segments`, and the template reads the ids (`CrossDocuments` included) as its spans;
+    softcap and packed segment ids itself, flash and cudnn take a call's own ids as their packed sequences
+    given `max_segments`, and the template reads the ids (`CrossDocuments` included) as its spans;
     elsewhere segment ids become the document mask, and sinks and a softcap run
     `reference_attention`, since `jax.nn.dot_product_attention` has neither. The rest goes to
     `_fused_attention`. Key lengths reach
@@ -1053,7 +1086,10 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     # its last keys (`CrossDocuments`), which splash does not; elsewhere the mask carries them.
     aligned = isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
     packed = (implementation == 'template' or (implementation == 'tpu' and not aligned)
-              or (implementation == 'flash' and max_segments is not None))
+              or (implementation == 'flash' and max_segments is not None)
+              or (implementation == 'cudnn' and segment_ids is not None and cudnn_packs(
+                  not isinstance(segment_ids, CrossDocuments), max_segments is not None,
+                  any(x is not None for x in (mask, bias, lengths, starts)))))
     if segment_ids is not None and not packed:
         if aligned:
             inside = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
@@ -1062,8 +1098,10 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
         else:
             mask = with_documents(mask, segment_ids)
             masked = with_documents(masked, segment_ids)
-        # cuDNN takes the documents as their mask, an additive bias (`kernel_for_materialized_mask`):
-        # a cache's aligned ones as it took a cache's mask, a call's own where cuDNN is named.
+        # cuDNN takes the documents it runs no packed sequences of as their mask, an additive bias
+        # (`kernel_for_materialized_mask`): a cache's aligned ones as it took a cache's mask, a call's own
+        # unbounded ones where cuDNN is named.
+        segment_ids = None
     if implementation == 'reference' or (implementation == 'xla' and (
             sinks is not None or softcap is not None or dropout_seed is not None)):
         mask = combined_attention_mask(query.shape[-3], key.shape[-3], causal, sliding_window, masked)
@@ -1135,6 +1173,16 @@ def _xla_kernel_narrows(query) -> bool:
         query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not bf16_dot_runs())
 
 
+def _quantized(sinks: bool, dropout: bool) -> str | None:
+    """`AttentionCase.quantized`'s kernel for a call with `sinks` or `dropout`: the template's quantized
+    attention where a quantized model's rule owning its products takes it, the reference path where it does
+    not; None where no rule owns them or it quantizes no activation."""
+    rule = attention_quantized.owner()
+    if rule is None or attention_quantized.whole(rule):
+        return None
+    return 'template' if attention_quantized.takes(rule) and not (sinks or dropout) else 'reference'
+
+
 def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_softmax=True, softcap=None,
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,
                    max_segments=None, key_value_seq_lengths=None, key_value_seq_starts=None,
@@ -1168,7 +1216,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
-        splash_mask=False, shards=sequence_shards(), dropout=dropout, form=generation.numerics().forms)
+        splash_mask=False, shards=sequence_shards(), dropout=dropout, form=generation.numerics().forms,
+        quantized=_quantized(sinks is not None, dropout))
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
     # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
     # read the case (`TPU_SUPPORTS`).

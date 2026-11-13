@@ -12,6 +12,7 @@ from collections.abc import Mapping, Sequence
 from typing import NamedTuple
 
 import grain.python as pygrain
+import jax
 import numpy as np
 from typing_extensions import TypeIs
 
@@ -36,6 +37,7 @@ from dew.data.pipeline import (
     Shuffle,
     Slice,
     Stage,
+    children,
     consumed_forward,
 )
 from dew.data.sources.urls import Fetch
@@ -82,6 +84,30 @@ def _carried(pipeline: Pipeline, consumed: int, *, marked: bool, windows: bool =
                   and (windows or not (isinstance(stage, Shuffle) and stage.window is not None))):
             return at
     return len(pipeline.stages)
+
+
+EXPANDED_DRAWS = "row-place"
+"""The `expanded_draws` rule a plan of a read in its inputs' order records where a random step follows an
+expansion (docs/design/data.md, the rules): it draws by the row's place among the rows handed on, as every
+read keys a draw (Grain's `random_map`), its workers handing on before it (`_handoff`), in any count of
+workers alike (row 5715). A position of a read before it, whose workers drew by each input and its row,
+records none, which a resume restarts relaxed across or refuses exactly."""
+
+
+def draws_after_expansion(pipeline: Pipeline) -> tuple[frozenset[bool], bool]:
+    """Whether a random step draws after an expansion on some way a record takes through `pipeline`, its
+    corpus's stages and then those of each chain that mixes or phases it: the ways' expansion states at its
+    end, and whether one drew past an expansion (the plan rule `expanded_draws`). Members' stages are their
+    own: an expansion in one member and a draw in another is no such way."""
+    below = [draws_after_expansion(child) for child in children(pipeline)]
+    states, drawn = (frozenset().union(*(ends for ends, _ in below)), any(found for _, found in below)) \
+        if below else (frozenset({False}), False)
+    for stage in pipeline.stages:
+        if isinstance(stage, FlatMap):
+            states = frozenset({True})
+        elif isinstance(stage, RandomMap) and True in states:
+            drawn = True
+    return states, drawn
 
 
 def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, elastic: bool = True,
@@ -210,8 +236,9 @@ class _Grouped:
     def column(self, values: list[Field]) -> np.ndarray | list[Field]:
         """One field's values across the group: stacked where they are arrays of one shape and type,
         else as they are."""
-        # What a batch stacks (`_stacked`), of one shape and type; the rest as it is.
-        if not all(_stacked(value) for value in values):
+        # What a batch stacks (`_stacked`), arrays of one shape and type; the rest as it is.
+        if not all(_stacked(value) and jax.tree_util.treedef_is_leaf(jax.tree.structure(value))
+                   for value in values):
             return values
         arrays = [np.asarray(value) for value in values]
         if any(array.shape != arrays[0].shape or array.dtype != arrays[0].dtype for array in arrays):

@@ -71,6 +71,40 @@ def test_a_distillations_source_banks_its_student_and_reads_its_teacher_whole():
               objective.student_variables(variables))
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_host_owned_states_banked_teacher_gathers_a_layer_as_its_tree_did():
+    """The bytes a device gathers for a distillation's largest layer (`gathered_layer_bytes`) once a host
+    layout banks its teacher's frozen trees into its kept state (`banked_frozen`, below the teacher's root):
+    the teacher's bank read back onto its layers (`stored_layers`), its layer the same bytes as before the
+    bank, not its three layers' together."""
+    from flax import linen as nn
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.distillation import DistillationObjective
+    from dew.objectives.lm import LMObjective
+    from dew.training.execution import banked_frozen
+    from dew.training.memory import gathered_layer_bytes
+
+    def decoder(layers):
+        return CausalTransformer(vocab_size=16, emb_features=8, num_layers=layers, num_heads=2,
+                                 mlp_features=16, max_seq_len=8, scan_layers=True)
+
+    objective = DistillationObjective(LMObjective(decoder(2), 8, ema_decay=None),
+                                      LMObjective(decoder(3), 8, ema_decay=None))
+    mesh = Mesh(jax.devices()[:2], ("fsdp",))
+
+    def split(leaf, lead=0):
+        # Each leaf's first dimension past `lead` over fsdp, where it divides.
+        spec = (None,) * lead + (("fsdp",) if leaf.ndim > lead and leaf.shape[lead] % 2 == 0 else ())
+        return jax.device_put(leaf, NamedSharding(mesh, P(*spec)))
+
+    placed = jax.tree.map(split, nn.unbox(objective.init(jax.random.key(0))))
+    banked = banked_frozen(objective, placed, lambda rows, path: split(jnp.stack(rows), lead=1))
+    whole = gathered_layer_bytes(objective, placed)
+    assert whole is not None and gathered_layer_bytes(objective, banked) == whole
+
+
 @dataclass(frozen=True)
 class DeclaredOwners:
     sites: tuple[DecoderBank, ...]

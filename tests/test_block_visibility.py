@@ -392,6 +392,26 @@ def test_whole_blocks_read_as_their_block_causal_reading(case):
     np.testing.assert_equal(whole, blocked)
 
 
+def test_rows_of_one_document_each_read_whole_blocks_by_their_documents():
+    """Rows of one document each with their padding after it (`Coordinates.max_segments` 1, right-padded),
+    each document one whole block (`AttentionMetadata.whole_blocks`), take the non-causal call by their
+    documents as packed rows do: reading whole blocks drops the call's causality, so the documents it
+    would leave to causality stay (`_one_document_a_row`). The real tokens' states are bitwise those of
+    the same rows read as packed documents."""
+    kinds = {"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}}
+    decoder = model(**kinds).clone(attention_impl="xla")
+    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
+    params = decoder.init(jax.random.key(1), ids)
+    segments, blocks = jnp.asarray(PADDED, jnp.int32), jnp.asarray(np.where(PADDED, 0, -1), jnp.int32)
+
+    def states(documents):
+        laid = coordinates(ids.shape, segments=segments, max_segments=documents, right_padded=True)
+        return np.asarray(decoder.apply(params, ids, coordinates=laid, block_groups=blocks, whole_blocks=True,
+                                        method=CausalTransformer.hidden_states))[PADDED]
+
+    np.testing.assert_array_equal(states(1), states(2))
+
+
 def test_whole_blocks_route_as_the_non_causal_call_by_documents():
     """A block layer reading whole blocks (`AttentionMetadata.whole_blocks`) computes bitwise what a
     non-causal decoder computes over the documents, and its call routes as that decoder's does on an

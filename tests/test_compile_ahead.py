@@ -11,7 +11,6 @@ import dataclasses
 import functools
 import itertools
 import json
-import logging
 import os
 import shutil
 import subprocess
@@ -27,9 +26,10 @@ import pytest
 from lane_environment import without_flags
 from jax.extend import custom_call_targets, xla
 from kernel_compile import gate_generations
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, memory_limited_to
 from token_support import token_rows
 
+from dew._devices import allocator_limit, device_limit
 from dew._records import listed, record
 from dew.nn.kernels.generation import capability
 from dew.nn.sharding import Link
@@ -44,12 +44,24 @@ TINY_SHARD = 256
 
 
 def this_gpus(count: int = 1) -> tuple:
-    """`count` compile-only GPUs of this GPU's own target, its generation and its multiprocessors (an H100
-    PCIe's 114, not the canonical H100's 132), whose programs this GPU's loader takes (`BuildTarget.held`)."""
+    """`count` compile-only GPUs of this GPU's own target, its generation, its multiprocessors (an H100
+    PCIe's 114, not the canonical H100's 132) and the memory whose allocator's limit is its own, whose
+    programs this GPU's loader takes (`BuildTarget.held`)."""
     from dew.training.ahead import BuildTarget, compile_only_gpus
 
     own = BuildTarget.of(jax.devices()[:1])
-    return compile_only_gpus(own.generation, count, multiprocessors=own.multiprocessors)
+    assert own.memory is not None
+    return compile_only_gpus(own.generation, count, memory_limited_to(own.memory),
+                             multiprocessors=own.multiprocessors)
+
+
+def gpus(generation: str, count: int = 1, limit: int = 2**36) -> tuple:
+    """`count` compile-only GPUs of `generation` whose stated memory gives their allocator `limit` bytes
+    (`memory_limited_to`), 64 GiB unless a test asks less: XLA's own scheduling reads the memory a target
+    states, which a GPU's of that size leaves to the step's own needs."""
+    from dew.training.ahead import compile_only_gpus
+
+    return compile_only_gpus(generation, count, memory_limited_to(limit))
 
 
 def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1, remat=None,
@@ -451,7 +463,7 @@ def test_a_run_resumed_mid_window_compiles_its_step_ahead_building_no_window_of_
     resumes holds its window, so it builds none ahead, and its count of microbatches, a shape there, is
     never read (row 4752's review: it was read as a number and compiling ahead raised TypeError)."""
     from dew.checkpoints import Checkpoints
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     def accumulating(**mesh):
         model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
@@ -464,8 +476,7 @@ def test_a_run_resumed_mid_window_compiles_its_step_ahead_building_no_window_of_
     run.fit(batch, steps=1, checkpoint_every=1)
     run.checkpoints.wait()
     assert run.checkpoints.accumulation_template(1) is not None
-    ahead = compile_ahead(accumulating(mesh=MeshSpec().build(compile_only_gpus("sm90", 1))), batch,
-                          capacity=2**30)
+    ahead = compile_ahead(accumulating(mesh=MeshSpec().build(gpus("sm90"))), batch)
     assert ahead.starts
 
 
@@ -474,14 +485,14 @@ def test_a_bfloat16_decoders_step_compiles_ahead_for_an_a100():
     compile point keys each body's recognition by its equations' parameters, the custom VJP's rules its
     recognized bodies hold among them, which JAX holds unhashable (row 4783's head: "unhashable type:
     'Unhashable'")."""
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2,
                          dtype="bfloat16")
     trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                      mesh=MeshSpec().build(compile_only_gpus("sm80", 1)),
+                      mesh=MeshSpec().build(gpus("sm80")),
                       layout=Layout(min_shard=TINY_SHARD))
-    assert compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30).starts
+    assert compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1)).starts
 
 
 def test_a_step_compiled_ahead_over_phases_of_other_batches_takes_a_split_that_cuts_each():
@@ -493,12 +504,12 @@ def test_a_step_compiled_ahead_over_phases_of_other_batches_takes_a_split_that_c
     from dew.data.compile import compile
     from dew.data.pipeline import Pipeline
     from dew.mesh import LayoutRefused
-    from dew.training.ahead import compile_ahead, compile_only_gpus, first_step_batch
+    from dew.training.ahead import compile_ahead, first_step_batch
 
     corpus = Pipeline(Memory(token_rows(VOCAB, 64, SEQ_LEN + 1))).repeat()
     loader = compile(phases((corpus.batch(12), 2), (corpus.batch(8), None)), read="memory")
     for split, refused in ((2, False), (3, True)):
-        trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=split)
+        trainer = fine_tune(MeshSpec().build(gpus("sm90")), split=split)
         with pytest.raises(LayoutRefused) if refused else contextlib.nullcontext():
             compile_ahead(trainer, first_step_batch(trainer, loader, 4))
 
@@ -507,15 +518,12 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     """A compile-only GPU with stated memory takes the run's own fit search, whose one fitting
     program is the saved executable, not another compile outside the report. The report records
     that compile's time and memory, and planning creates no device state or runner to execute."""
-    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+    from dew.training.ahead import AheadOfTime, compile_ahead
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
-    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)))
-    original_state_mesh = trainer.state_mesh
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=2**30)))
     with Compiles("step") as compiles:
-        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=2**30)
-    assert tuple(trainer.device_mesh.devices.flat) == compile_only_gpus("sm90", 1, 2**30)
-    assert trainer.state_mesh is trainer.device_mesh and trainer.state_mesh is not original_state_mesh
+        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
     assert compiles.count == 1
     # Its fresh state's build and placement compiled beside the step, for a run handed it to compile none of
     # it on its GPU (`AheadOfTime.starts`).
@@ -524,10 +532,11 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     (probe,) = listed(plan["probes"], "probes", read=record, what="probes")
     assert probe["fits"] is True and probe["temp"] == ahead.temp_bytes
     assert probe["argument"] == ahead.argument_bytes
-    assert ahead.capacity == 2**30
+    # The plan was made against the allocator's limit the GPU's stated memory gives (`allocator_limit`).
+    assert ahead.capacity == ahead.built.memory == 2**30
     from dew.training.memory import device_memory
 
-    stated = device_memory(trainer.device_mesh.devices.flat[0], ahead.capacity, ahead.argument_bytes)
+    stated = device_memory(trainer.device_mesh.devices.flat[0], ahead.argument_bytes)
     assert stated["pool_bytes"] == ahead.capacity
     assert stated["largest_free_block_bytes"] == ahead.capacity - ahead.argument_bytes
     seconds = probe["compile_seconds"]
@@ -548,19 +557,18 @@ def admitted(tmp_path_factory):
     """`fine_tune`'s step compiled ahead on GPUs of `NEEDING_MICROBATCHES`, its plan kept beside the
     compilation cache as every search keeps its own (`DEW_RUNG_RECORDS`): the records' directory, the
     trainer and its `AheadOfTime`, admitted once for the module."""
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     records = tmp_path_factory.mktemp("rungs")
     with pytest.MonkeyPatch.context() as patch:
         # The module's own data and Hub caches, as each test's (`own_settings`), its rung records `records`.
         lane_environment.per_test_settings(patch, tmp_path_factory.mktemp)
         patch.setenv("DEW_RUNG_RECORDS", str(records))
-        trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None)
-        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=NEEDING_MICROBATCHES)
+        trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=NEEDING_MICROBATCHES)), split=None)
+        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
     return records, trainer, ahead
 
 
-@pytest.mark.shared_setup("admitted")
 def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_over_its_own_gpus(tmp_path):
     """A host's GPUs, serialized as their topology (`get_attached_topology(...).serialize()`, here of
     compile-only H100s at a stated 40 GiB) and read back elsewhere (`host_gpus`), are the GPUs XLA compiles
@@ -588,8 +596,35 @@ def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_o
     assert [device.device_kind for device in read] == [device.device_kind for device in host]
     assert key(read) == key(host)
     assert key(read) != key(compile_only_gpus("sm90", 2))
+    # The topology states its GPUs' memory, which the devices read back carry as the ones serialized do.
+    assert [device_limit(device) for device in read] == [allocator_limit(40 * 2**30)] * 2
 
 
+@pytest.mark.parametrize("host, memory", [("a100-sxm4-40gb", 42_406_903_808), ("gh200", 101_468_602_368)])
+def test_a_hosts_serialized_topology_states_its_gpus_memory_and_their_allocators_limit(monkeypatch, host,
+                                                                                         memory):
+    """A topology a GPU host serialized of its own GPUs (`get_attached_topology("cuda").serialize()`, an
+    A100 SXM4 40 GB's and a GH200's, kept as the hosts wrote them, in base64) states each GPU's memory, its
+    total as XLA reads it for its target (`topology_memory`); at Dew's share of a GPU the allocator's limit
+    derived from it (`allocator_limit`) is at most XLA's 2 MiB rounding under the one the GPU states: the
+    GH200's run stated 96,395,591,680 (M-IG-6), a compile ahead that states its memory loads there."""
+    from pathlib import Path
+
+    from dew.training.ahead import topology_memory
+
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.95")
+    import base64
+
+    # Kept as base64 text: the bytes the host's `serialize()` wrote.
+    written = Path(__file__).parent / "fixtures" / "topologies" / f"{host}.b64"
+    serialized = base64.b64decode(written.read_text())
+    assert topology_memory(serialized) == memory
+    if host == "gh200":
+        assert 0 <= 96_395_591_680 - allocator_limit(memory) < 2 * 2**20
+    assert topology_memory(b"") is None
+
+
+@pytest.mark.shared_setup("admitted")
 def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admitted):
     """A step compiled ahead on GPUs whose memory its plan needs several microbatches for searches for its
     plan, at several microbatches, and saves it, the run left at its plan, its rung its last probe's."""
@@ -610,13 +645,12 @@ def test_compiling_ahead_with_its_frontier_lists_each_rung_above_its_plan_at_few
     takes. A rung at as many microbatches as one below it is none of them. The run is left at its plan. Its
     search starts at the plan admitted before it (`admitted`), kept beside the compilation cache, as a run
     after another starts at its recorded plan: that plan's compile alone, the frontier read above it."""
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     records, _, earlier = admitted
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(records))
-    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None)
-    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=NEEDING_MICROBATCHES,
-                          frontier=True)
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=NEEDING_MICROBATCHES)), split=None)
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
     probes = listed(plan["probes"], "probes", read=record, what="probes")
     # A sibling that offloads what the ladder's top recomputes sits at that top's split (row 1932).
@@ -651,12 +685,12 @@ def test_a_frontier_at_the_ladders_top_lists_its_offloaded_sibling_at_its_last_f
     (a sweep at 83bc7370bc: from 600 kB to 700 kB the sibling fits at no plan's split on a device with no
     host memory of its own, and past 850 kB the plan takes one)."""
     from dew.nn.backbones.decoder_block import REMAT_POLICIES, remat_record
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
     from dew.training.memory import head_fused_of, head_tile_of, recompute_record
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
-    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=None, remat="full")
-    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=capacity, frontier=True)
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=capacity)), split=None, remat="full")
+    ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
     plan = record(ahead.plan, "plan")
     frontier = listed(plan["frontier"], "frontier", read=record, what="frontier")
     full, offloaded = (remat_record(REMAT_POLICIES[name]) for name in ("full", "minimal_offloaded"))
@@ -705,44 +739,58 @@ def test_a_program_compiled_for_gpus_none_attached_skips_the_autotuning_nothing_
     objective = fine_tune(deviceless, split=None).objective
     search = FitSearch(lower=None, options=lambda candidate: compiler_options(*objective.towers()) or None,
                        objective=objective, mesh=deviceless, xla_defaults=False, narrow=False, base=None,
-                       resumed=None, capacity=2**30)
+                       resumed=None)
     assert search.compiled_options(None) == search.required == (compiler_options(*objective.towers()) or None)
     assert dataclasses.replace(search, xla_defaults=True).compiled_options(None) == search.required
     monkeypatch.setenv("XLA_FLAGS", f"{os.environ['XLA_FLAGS']} --xla_gpu_autotune_level=2")
     assert targeted(lowered(deviceless), None) is None
 
 
-def test_compiling_ahead_with_its_frontier_on_gpus_of_no_stated_memory_is_refused(tmp_path, monkeypatch):
-    """A frontier asked of compile-only GPUs that state no memory is refused before anything compiles
-    (row 3107): their memory unknown, every rung would fit there, a frontier of the whole ladder."""
+@pytest.mark.parametrize("frontier", [False, True])
+def test_compiling_ahead_on_gpus_of_no_stated_memory_is_refused_before_anything_traces(tmp_path, monkeypatch,
+                                                                                       frontier):
+    """A step compiled ahead for compile-only GPUs that state no memory, which every plan for them is made
+    against, is refused before anything traces or compiles, its frontier or not (row 3107; PF03: it
+    planned by compiling every rung, fourteen minutes of probes on a B200's step), naming the two ways to
+    state it once: each GPU's memory, or a host's own serialized topology."""
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "rungs"))
     trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)))
-    with Compiles("step") as compiles, pytest.raises(ValueError):
-        compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=True)
+    with Compiles(None) as compiles, pytest.raises(ValueError):
+        compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), frontier=frontier)
     assert compiles.count == 0
 
 
-def test_a_run_compiled_ahead_on_gpus_given_no_capacity_hears_they_state_no_memory(tmp_path, monkeypatch,
-                                                                                    caplog):
-    """A run that sets its remat, compiled ahead on GPUs given no capacity, whose memory nothing states,
-    has no rung judged ("unstated", one answer for the walk and the footprint, `memory.judged`; rows 3667,
-    3668), compiles at its own rung alone, and hears once that its devices state no memory, not that its
-    layout cannot be judged ("unknown")."""
-    from dew.nn.backbones.decoder_block import REMAT_POLICIES
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+def test_a_configured_run_compiling_ahead_for_gpus_of_no_stated_memory_is_refused_before_it_reads(tmp_path):
+    """A configured run compiling ahead for GPUs whose memory it does not state (no `capacity-gib`, no
+    host topology) is refused before its first batch is read or its step planned (`stated_limit`), as a
+    step compiled ahead for them is (`compile_ahead`): no step compiles and nothing is written."""
+    from run_kinds import lm
 
-    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
-    # Its split left to the plan, so the derivation reads every split.
-    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), remat=REMAT_POLICIES["full"],
-                        split=None)
-    with caplog.at_level(logging.WARNING, logger="dew"), Compiles("step") as compiles:
-        ahead = compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1))
-    plan = record(ahead.plan, "plan")
-    derived = listed(plan["derived"], "derived", read=record, what="derived rungs")
-    assert compiles.count == 1 and [entry["label"] for entry in derived] == ["unstated"]
-    assert len([entry for entry in caplog.records if entry.name == "dew.training.planning"]) == 1
+    from dew.config.lm import LMRunConfig
+    from dew.training.ahead import stated_limit
+
+    run = LMRunConfig.cli(["--trainer.name", "ahead", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+                           "--trainer.steps", "2", "--trainer.compile-ahead.generation", "sm80",
+                           "--trainer.compile-ahead.devices", "1",
+                           "--trainer.compile-ahead.path", str(tmp_path / "step.dew-aot")],
+                          default=lm(tmp_path, drawn=False))
+    with Compiles("step") as compiles, pytest.raises(ValueError):
+        run.run()
+    assert compiles.count == 0 and not (tmp_path / "step.dew-aot").exists()
+    assert stated_limit(gpus("sm80", limit=2**34)) == 2**34
+
+
+def test_a_build_of_compile_only_gpus_holds_their_stated_memory_and_refuses_a_device_holding_less():
+    """A build of compile-only GPUs (`BuildTarget.of`) holds the allocator's limit their stated memory gives
+    (`device_limit`), as a build of attached GPUs holds theirs: a device of a lower limit is refused naming
+    both, one of a higher limit takes it."""
+    from dew.training.ahead import BuildTarget
+
+    small, large = BuildTarget.of(gpus("sm90", limit=2**34)), BuildTarget.of(gpus("sm90", limit=2**35))
+    assert (small.memory, large.memory) == (2**34, 2**35)
+    assert large.differences(small) and not small.differences(large)
 
 
 def test_an_ahead_plan_that_fits_no_device_reports_every_refused_program(tmp_path, monkeypatch):
@@ -751,17 +799,24 @@ def test_an_ahead_plan_that_fits_no_device_reports_every_refused_program(tmp_pat
     step starts at its ladder's last remat rung and its split is pinned, so the refusal comes after the
     few rungs left rather than after every policy's compile."""
     from dew.nn.backbones.decoder_block import REMAT_POLICIES
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
     from dew.training.planning import PlanRefused
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
-    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), remat=REMAT_POLICIES["full"])
+    # GPUs that hold the state and the batch between steps, and not a step's temporaries beside them.
+    rows = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    held = max(fine_tune(MeshSpec().build(gpus("sm90")), remat=REMAT_POLICIES["full"]).validate(
+        rows).device_bytes.values())
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=held)), remat=REMAT_POLICIES["full"])
     with pytest.raises(PlanRefused) as refused:
-        compile_ahead(trainer, token_rows(VOCAB, BATCH, SEQ_LEN + 1), capacity=1024)
+        compile_ahead(trainer, rows)
     probes = refused.value.probes
     assert probes and all(not probe.fits for probe in probes)
     assert all(probe.compile_seconds > 0 for probe in probes)
     assert any(probe.headroom is not None and probe.headroom < 0 for probe in probes)
+    # The allocator its closest's headroom read, stated beside it: the GPU's limit.
+    (allocator,) = refused.value.allocators
+    assert allocator["bytes_limit"] == held
 
 
 def test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once(tmp_path, monkeypatch):
@@ -771,18 +826,18 @@ def test_a_compile_only_gpu_holds_the_accumulator_a_step_builds_once(tmp_path, m
     prefetched next to the step (the 2113 review: the sum was counted among the arguments and again
     beside them, so an offline plan could refuse a step that fits)."""
     from dew.distributed.batches import batch_shardings, prefetched_bytes
-    from dew.training.ahead import compile_ahead, compile_only_gpus, step_batch
+    from dew.training.ahead import compile_ahead, step_batch
     from dew.training.memory import temporaries_factor
 
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path))
     capacity = 2**30
-    trainer = fine_tune(MeshSpec().build(compile_only_gpus("sm90", 1)), split=2)
+    trainer = fine_tune(MeshSpec().build(gpus("sm90", limit=capacity)), split=2)
     rows = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    ahead = compile_ahead(trainer, rows, capacity=capacity)
+    ahead = compile_ahead(trainer, rows)
     (probe,) = listed(record(ahead.plan, "plan")["probes"], "probes", read=record, what="probes")
     batch = step_batch(trainer, rows)
     prefetched = prefetched_bytes(batch, batch_shardings(trainer.device_mesh, batch))
-    temporaries = ahead.temp_bytes * temporaries_factor(trainer.device_mesh, capacity)
+    temporaries = ahead.temp_bytes * temporaries_factor(trainer.device_mesh)
     assert probe["fits"] is True
     assert probe["headroom"] == (capacity - ahead.argument_bytes - (ahead.output_bytes - ahead.alias_bytes)
                                  - prefetched - temporaries)
@@ -796,10 +851,10 @@ def test_a_step_compiled_ahead_for_eight_gpus_reads_and_writes_what_the_run_on_e
     the same trainer's step reads and writes on eight CPU devices, under each layout: its share of
     the state, whole or split, and of the batch. XLA states what it costs and every byte count of its
     memory, and its peak holds its arguments, its outputs that alias none, and its temporaries."""
-    from dew.training.ahead import compile_ahead, compile_only_gpus, step_batch
+    from dew.training.ahead import compile_ahead, step_batch
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    absent = fine_tune(spec.build(compile_only_gpus("sm90", 8)))
+    absent = fine_tune(spec.build(gpus("sm90", 8)))
     ahead = compile_ahead(absent, batch)
     run = fine_tune(spec.build())
     state, _, _ = run.place()
@@ -824,9 +879,9 @@ def test_a_step_compiled_ahead_saves_and_loads_whole_and_runs_only_on_its_own_gp
     program that never starts (row 3606)."""
     import pickle
 
-    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+    from dew.training.ahead import AheadOfTime, compile_ahead
 
-    ahead = compile_ahead(fine_tune(MeshSpec(fsdp=2).build(compile_only_gpus("sm80", 2))),
+    ahead = compile_ahead(fine_tune(MeshSpec(fsdp=2).build(gpus("sm80", 2))),
                           token_rows(VOCAB, BATCH, SEQ_LEN + 1))
     ahead.save(tmp_path / "step.dew-aot")
     loaded = AheadOfTime.load(tmp_path / "step.dew-aot")
@@ -864,8 +919,8 @@ mixer = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, lin
 model = CausalTransformer(vocab_size=64, emb_features=128, num_layers=1, num_heads=2, head_dim=64,
                           mlp_features=256, max_seq_len=128, dtype="bfloat16", mixer=mixer)
 trainer = Trainer(LMObjective(model, 128), optax.adam(1e-3), key=jax.random.key(0),
-                  mesh=MeshSpec().build(compile_only_gpus("sm80", 1)), layout=Layout(min_shard=256))
-compile_ahead(trainer, token_rows(64, 2, 129), capacity=2**34)
+                  mesh=MeshSpec().build(compile_only_gpus("sm80", 1, 2**35)), layout=Layout(min_shard=256))
+compile_ahead(trainer, token_rows(64, 2, 129))
 """
 """A bf16 gated-delta decoder's step compiled ahead for a compile-only A100, in a process of its own: its
 checkout is its argument."""
@@ -910,11 +965,11 @@ model = models.build(
         "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 64,
         "linear_value_head_dim": 64, "linear_conv_kernel_dim": 4}}}},
     mixture={"experts": 4, "top_k": 2, "layers": (1,)})
-mesh = MeshSpec(fsdp=2).build(compile_only_gpus(sys.argv[2], 2))
+mesh = MeshSpec(fsdp=2).build(compile_only_gpus(sys.argv[2], 2, 2**36))
 trainer = Trainer(LMObjective(model, 512), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
                   layout=Layout(min_shard=256))
 with routes() as taken:
-    ahead = compile_ahead(trainer, token_rows(1024, 8, 513), capacity=2**35)
+    ahead = compile_ahead(trainer, token_rows(1024, 8, 513))
 print(json.dumps({"kernels": sorted({(route.choice, route.kernel) for route in taken})}))
 """
 """A hybrid MoE decoder whose step runs every template, compiled ahead for two compile-only GPUs of a
@@ -985,12 +1040,12 @@ def test_a_step_compiled_ahead_with_no_gpu_attached_runs_the_attention_its_gpu_r
     where named), lowered here, where a kernel this host could not lower would refuse the step
     (`selection.Unlowerable`; row 4616: every compile ahead's attention once ran as XLA's, and each GPU job
     compiled its own step at run time)."""
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2,
                          attention_impl=implementation)
     trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                      mesh=MeshSpec().build(compile_only_gpus(generation, 1)),
+                      mesh=MeshSpec().build(gpus(generation)),
                       layout=Layout(min_shard=TINY_SHARD))
     from dew.nn.kernels.generation import routes
 
@@ -1074,12 +1129,12 @@ def test_a_step_compiled_ahead_is_one_program_and_a_run_of_another_refuses_it(tm
     refuses it before it trains, and refuses it again on its next fit, rather than compiling its own
     (row 1915)."""
     from dew.nn.kernels.generation import assumed
-    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+    from dew.training.ahead import AheadOfTime, compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
 
     def ahead(width=None):
-        return compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus("sm80", 1)), width=width), batch)
+        return compile_ahead(fine_tune(MeshSpec().build(gpus("sm80")), width=width), batch)
 
     first, again, wide = ahead(), ahead(), ahead(width=48)
     assert first.program == again.program != wide.program
@@ -1115,7 +1170,7 @@ def test_a_configured_run_compiles_its_step_ahead_for_gpus_it_lacks_and_trains_n
     assert ended.value.code == 0
     saved = AheadOfTime.load(path)
     assert (saved.generation, saved.devices) == ("sm80", 1) and saved.peak_bytes > 0
-    assert saved.capacity == 2**30 and saved.plan is not None
+    assert saved.capacity == allocator_limit(2**30) and saved.plan is not None
     assert not runs.exists()
 
 
@@ -1185,7 +1240,7 @@ def test_a_configured_run_compiles_ahead_for_the_multiprocessors_it_states_and_l
     again = compiled("--trainer.compile-ahead.multiprocessors", "114")
     canonical = compiled()
     assert (pcie.built.multiprocessors, pcie.target.multiprocessors) == (114, 114)
-    assert pcie.built.memory == pcie.target.memory == int(0.0007 * 2**30)
+    assert pcie.built.memory == pcie.target.memory == allocator_limit(int(0.0007 * 2**30))
     assert pcie.sampled is not None and again.built == pcie.built
     assert canonical.built.multiprocessors == gpu_target("sm90").multiprocessors
     held = dataclasses.replace(gpu_target("sm90"), device_kind="NVIDIA H100 PCIe", multiprocessors=114)
@@ -1339,7 +1394,7 @@ def test_a_decision_runs_step_compiled_ahead_is_the_program_its_run_lowers_as_fi
     path = tmp_path / "ahead.dew-aot"
     stated = ["--trainer.checkpoint-dir", str(tmp_path / "runs"), *CLOCKED]
     target = ["--trainer.compile-ahead.generation", "sm90", "--trainer.compile-ahead.devices", "8",
-              "--trainer.compile-ahead.path", str(path)]
+              "--trainer.compile-ahead.path", str(path), "--trainer.compile-ahead.capacity-gib", "80"]
     ahead = DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *target],
                                   default=decision(tmp_path, drawn=False))
     with pytest.raises(CompiledAhead):
@@ -1368,8 +1423,10 @@ def a_clocked_run_with_a_cooldown_trains_from_its_step_compiled_ahead_compiling_
     stated = ["--trainer.checkpoint-dir", str(runs), *CLOCKED]
     # This GPU's own target, its multiprocessors as it counts them (an H100 PCIe's 114).
     own = BuildTarget.of(jax.devices()[:1])
+    assert own.memory is not None
     ahead = ["--trainer.compile-ahead.generation", own.generation,
              "--trainer.compile-ahead.multiprocessors", str(own.multiprocessors),
+             "--trainer.compile-ahead.capacity-gib", str(memory_limited_to(own.memory) / 2**30),
              "--trainer.compile-ahead.devices", "1", "--trainer.compile-ahead.path", str(path)]
     compiling = DecisionRunConfig.cli(["--trainer.name", "ahead", *stated, *ahead], default=default)
     with pytest.raises(CompiledAhead):
@@ -1399,13 +1456,13 @@ def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_param
     resident copy of the parameters, a second gradient buffer or a narrow copy kept beside the sum,
     each two bytes a parameter or more, exceeds that: row 1661's 14 GB on a 4B run surfaced only on a
     GPU, and this finds its kind on a CPU host."""
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     model = models.build("causal_transformer", vocab_size=VOCAB, **WIDE_MLP, num_kv_heads=2, dtype=dtype)
 
     def ahead(accumulation: int, rows: int):
         trainer = Trainer(LMObjective(model, SEQ_LEN), OptimConfig(optimizer="adamw", learning_rate=1e-3),
-                          key=jax.random.key(0), mesh=MeshSpec().build(compile_only_gpus(generation, 1)),
+                          key=jax.random.key(0), mesh=MeshSpec().build(gpus(generation)),
                           layout=Layout(min_shard=TINY_SHARD), split=1, accumulation=accumulation)
         trainer.validate(steps=8)
         return compile_ahead(trainer, token_rows(VOCAB, rows, SEQ_LEN + 1))
@@ -1419,9 +1476,14 @@ def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_param
     assert 0 < activations < gradient / 2
     # The window's arguments: its gradient sum, and at most a token row a microbatch it holds to replay.
     assert window.argument_bytes - one.argument_bytes <= gradient + held
-    assert window.temp_bytes - one.temp_bytes <= activations
-    # Its whole peak, outputs that alias no argument among it.
-    assert window.peak_bytes - one.peak_bytes <= gradient + held + activations
+    # Its temporaries beside the committing step's: fewer than the smallest buffer the cell catches, a narrow
+    # copy's two bytes a parameter. XLA schedules for a target of stated memory, which may hold a
+    # microbatch's working set a little longer, so they are not held to one microbatch's activations.
+    narrow = 2 * sum(leaf.size for leaf in jax.tree.leaves(shapes))
+    assert window.temp_bytes - one.temp_bytes < narrow
+    # Its whole peak, outputs that alias no argument among it: the sum and the rows beside the committing
+    # step's, and less than a narrow copy more.
+    assert window.peak_bytes - one.peak_bytes < gradient + held + narrow
 
 
 def a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path):
@@ -1503,10 +1565,10 @@ def test_a_watched_runs_step_compiled_ahead_carries_its_sampled_step():
     compiled ahead for it carries both (`AheadOfTime.sampled`), each its own program, so the run handed it
     compiles neither on its target (train 332's review)."""
     from dew.training import Inspection
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    devices = compile_only_gpus("sm90", 1)
+    devices = gpus("sm90")
     watched = compile_ahead(fine_tune(MeshSpec().build(devices), inspection=Inspection(every=1)), batch)
     plain = compile_ahead(fine_tune(MeshSpec().build(devices)), batch)
     assert watched.sampled is not None and plain.sampled is None
@@ -1563,14 +1625,14 @@ def test_a_run_naming_its_input_alone_compiles_its_step_ahead(tmp_path):
 
     from dew.data.dataset import Loader
     from dew.objectives.supervised import Supervised
-    from dew.training.ahead import AheadTarget, compile_only_gpus
+    from dew.training.ahead import AheadTarget
 
     data = Loader(train=lambda partition: iter([{"x": np.ones((BATCH, 8), np.float32),
                                                   "y": np.zeros((BATCH, 4), np.float32)}] * 4),
                   val=None, batch=BATCH, records=None)
     trainer = Trainer(Supervised(nn.Dense(4), lambda outputs, batch: (outputs - batch["y"]) ** 2, inputs="x"),
                       optax.sgd(0.1), key=jax.random.key(0),
-                      mesh=MeshSpec().build(compile_only_gpus("sm90", 1)))
+                      mesh=MeshSpec().build(gpus("sm90")))
     ended = AheadTarget("sm90", 1, str(tmp_path / "step.dew-aot")).compiled(trainer, data, steps=1)
     assert ended.ahead.devices == 1 and trainer.objective.inputs is not None
 
@@ -1597,10 +1659,10 @@ def test_a_step_compiled_ahead_records_the_links_its_program_was_decided_by():
     process holds to measure, spreads no projection over it and records that link
     (`AheadOfTime.links`); the same step over a link that spreads one is another program, which a run
     on GPUs that measure such a link would lower in its place (row 2229)."""
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    target = MeshSpec(tensor=2).build(compile_only_gpus("sm90", 2))
+    target = MeshSpec(tensor=2).build(gpus("sm90", 2))
     saved = compile_ahead(latent(target), batch)
     assert saved.links["tensor"].bytes_per_second is None
     assert compile_ahead(latent(target, links=FAST), batch).program != saved.program
@@ -1611,10 +1673,10 @@ def test_a_stated_link_is_the_one_a_step_compiled_ahead_records_and_a_handed_run
     that link whole, bandwidth and peak, and is the program a stated link spreads by; a run
     handed it that states another traces with the step's, and says so once (train 300's review: the
     step recorded the bandwidth alone, so a run stating the same link traced with its own peak)."""
-    from dew.training.ahead import compile_ahead, compile_only_gpus
+    from dew.training.ahead import compile_ahead
 
     batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
-    target = MeshSpec(tensor=2).build(compile_only_gpus("sm90", 2))
+    target = MeshSpec(tensor=2).build(gpus("sm90", 2))
     stated = compile_ahead(latent(target, links=FAST), batch)
     (recorded,) = stated.links.values()
     assert (recorded.bytes_per_second, recorded.flops_per_second, recorded.spread) == (1e18, 1e9, True)

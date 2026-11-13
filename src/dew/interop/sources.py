@@ -27,6 +27,7 @@ import numpy as np
 from dew import _records
 from dew._cache import hub_answer, hub_commit, hub_storage, recorded_hub_answer
 from dew.interop import pickles
+from dew.interop.codecs import CT_PARTS
 from dew.interop.safetensors_io import (
     LazyTensors,
     header_specs,
@@ -439,14 +440,35 @@ def _hub_header(name: str, revision: str, file: str) -> dict[str, tuple[list[int
                           _records.text(_records.record(entry, tensor_name)["dtype"], "dtype"))
             for tensor_name, entry in header.items() if tensor_name != "__metadata__"}
 
-def _hub_sidecar(name: str, revision: str, file: str, tensor_name: str) -> tuple[list[int], str, str]:
-    """One tiny metadata sidecar tensor's shape, dtype tag and hex bytes, read by its range over HTTP
-    through a stream with no read-ahead (`stored_tensor`), no byte of another tensor fetched."""
-    from huggingface_hub import HfFileSystem
+SIDECAR_BYTES = 65536
+"""The largest stored tensor `hub_tensor` records as the Hub answered it: a metadata sidecar (a compressed
+weight's shape, an autoencoder's latent statistics), which an offline load reads back; a larger one is read
+from the Hub each time."""
 
-    with HfFileSystem().open(f"{name}@{revision}/{file}", "rb", cache_type="none") as stream:
-        shape, tag, raw = stored_tensor(stream, tensor_name)
-    return shape, tag, raw.hex()
+
+def hub_tensor(path: str, tensor_name: str, filename: str, question: tuple[str, ...], *,
+               offset: int = 0) -> np.ndarray:
+    """One stored tensor of the safetensors at `offset` of the Hub file `path` (`repo@revision/file`), read
+    by its byte range through a stream with no read-ahead (`stored_tensor`), no byte of another tensor
+    fetched, as it reads (`stored_array`; `filename` names it in a refusal): recorded under `question` where
+    it is no larger than `SIDECAR_BYTES`, so an offline load reads it back, and refused offline where it
+    was never read online. Every load without its weights reads a stored tensor from the Hub through it: a
+    file's (`StoredWeights.sidecar`) and a DDUF archive's (`dew.interop.dduf`)."""
+    from huggingface_hub import HfFileSystem, constants
+
+    if constants.HF_HUB_OFFLINE:
+        recorded = recorded_hub_answer(question)
+        if recorded is None:
+            raise FileNotFoundError(f"{path}: its {tensor_name} was never read online; load it online once, "
+                                    "or with its weights")
+        shape, tag, raw = recorded.value
+    else:
+        with HfFileSystem().open(path, "rb", cache_type="none") as stream:
+            shape, tag, held = stored_tensor(stream, tensor_name, offset=offset)
+        raw = held.hex()
+        if len(held) <= SIDECAR_BYTES:
+            hub_answer(question, lambda: (shape, tag, raw))
+    return stored_array(tensor_name, shape, tag, bytes.fromhex(raw), filename)
 
 
 
@@ -485,8 +507,9 @@ def stored_tensors(source: SourceReference, root: Path, *, folder: str = "") -> 
     """`source`'s weight tensors at the snapshot `root` (`snapshot(weights=False)`) as their shapes and
     dtypes alone, read from their safetensors headers (`StoredWeights.specs`, a Hub source's over HTTP
     and cached), what a load without its weights translates: each tensor an `Unread` array, its shape
-    and dtype, no value fetched or read, save a 2-element `.weight_shape` metadata sidecar read by byte
-    slice alone (`StoredWeights.sidecar`). None for a checkpoint of PyTorch pickles alone."""
+    and dtype, no value fetched or read, save a compressed weight's 2-element shape sidecar
+    (`codecs.CT_PARTS`'s) read by byte slice alone (`StoredWeights.sidecar`). None for a checkpoint of
+    PyTorch pickles alone."""
     stored = StoredWeights(source.name, root, source.subfolder or "")
     if not stored.files(folder):
         return None
@@ -499,7 +522,7 @@ def stored_tensors(source: SourceReference, root: Path, *, folder: str = "") -> 
         {name: spec for name, (_, spec) in held.items()},
         lambda name: (
             stored.sidecar(held[name][0], name)
-            if name.endswith(".weight_shape") and held[name][1].shape == (2,)
+            if name.endswith(CT_PARTS["shape"]) and held[name][1].shape == (2,)
             else Unread(held[name][1].shape, held[name][1].dtype)
         ),
     )
@@ -591,12 +614,8 @@ class StoredWeights:
         if local_path.is_file():
             with open(local_path, "rb") as stream:
                 return read_safetensors_slice(stream, name, os.fspath(local_path))
-        shape, tag, hex_bytes = hub_answer(
-            ("safetensors sidecar", self.name_or_dir, self.directory.name, file, name),
-            functools.partial(_hub_sidecar, self.name_or_dir, self.directory.name, file, name),
-        ).value
-        spec = stored_spec(name, shape, tag, file)
-        return np.frombuffer(bytes.fromhex(hex_bytes), dtype=spec.dtype).reshape(spec.shape).copy()
+        return hub_tensor(f"{self.name_or_dir}@{self.directory.name}/{file}", name, file,
+                          ("safetensors sidecar", self.name_or_dir, self.directory.name, file, name))
 
 @dataclass(frozen=True)
 class LoadName:

@@ -27,7 +27,7 @@ import numpy as np
 from dew._records import JSON, boolean, integer, json_value, numbers, record
 from dew.batch import Batch
 from dew.data.dataset import Loading
-from dew.data.pipeline import Dataset, Mixture, Phases, Piped, Pipeline, Stage
+from dew.data.pipeline import Combined, Concatenated, Dataset, Mixture, Phases, Piped, Pipeline, Stage
 from dew.data.sources.base import READS, Read, Source
 from dew.registry import (
     Annotation,
@@ -401,6 +401,13 @@ class _MixRecord:
 
 
 @dataclasses.dataclass(frozen=True)
+class _ConcatRecord:
+    """A concatenation's record: its members' chains in the order it joins them."""
+
+    concat: Sequence[JSON] = dataclasses.field(metadata=_reads(_entries))
+
+
+@dataclasses.dataclass(frozen=True)
 class _PhasesRecord:
     """Phases' record: their chains and the steps or tokens each ends at, under the one clock they keep,
     read where the record names it (`_read_source`)."""
@@ -410,7 +417,7 @@ class _PhasesRecord:
     until_tokens: JSON = dataclasses.field(default=None, metadata=_reads(_kept, omitted=True))
 
 
-def _laid_out(laid: _ChainRecord | _MixRecord | _PhasesRecord) -> dict[str, JSON]:
+def _laid_out(laid: _ChainRecord | _MixRecord | _ConcatRecord | _PhasesRecord) -> dict[str, JSON]:
     """`laid` as its record holds it: each of its fields in their declared order, one its layout omits
     at its default left out there."""
     return {field.name: json_value(getattr(laid, field.name), field.name)
@@ -418,7 +425,7 @@ def _laid_out(laid: _ChainRecord | _MixRecord | _PhasesRecord) -> dict[str, JSON
             if not (field.metadata[_OMITTED] and getattr(laid, field.name) == field.default)}
 
 
-def _read_laid[Laid: (_ChainRecord, _MixRecord, _PhasesRecord)](
+def _read_laid[Laid: (_ChainRecord, _MixRecord, _ConcatRecord, _PhasesRecord)](
         layout: type[Laid], written: Mapping[str, object], what: str) -> Laid:
     """The record `written` as `layout` lays it out (`_laid_out`): each field read as it declares, a field
     it leaves out its default where it has one."""
@@ -513,12 +520,14 @@ def _makes(entry: Piped, made: Pipeline, pipeline: Pipeline) -> bool:
             and _same(made.stages, pipeline.stages[:entry.end], "call") is None)
 
 
-def _source(source: Source | Mixture | Phases) -> dict[str, JSON]:
+def _source(source: Source | Combined) -> dict[str, JSON]:
     if isinstance(source, Mixture):
         tokens = (None if source.tokens is None
                   else _typed(source.tokens, declared_type(Mixture, "tokens"), "a mixture's token count"))
         return _laid_out(_MixRecord([_chain(child) for child in source.pipelines], list(source.weights),
                                     tokens, source.seed))
+    if isinstance(source, Concatenated):
+        return _laid_out(_ConcatRecord([_chain(child) for child in source.pipelines]))
     if isinstance(source, Phases):
         ends: list[JSON] = list(source.ends)
         return _laid_out(_PhasesRecord([_chain(child) for child in source.pipelines],
@@ -662,7 +671,7 @@ def _function(written: object) -> types.FunctionType:
     return function
 
 
-def _read_source(written: Mapping[str, object]) -> Source | Mixture | Phases:
+def _read_source(written: Mapping[str, object]) -> Source | Combined:
     if "mix" in written:
         mix = _read_laid(_MixRecord, written, "mix")
         counting = _annotated(declared_type(Mixture, "tokens"))
@@ -671,6 +680,9 @@ def _read_source(written: Mapping[str, object]) -> Source | Mixture | Phases:
             raise ValueError("a mixture's token count reads back as no function")
         return Mixture(tuple(_read_chain(record(child, "corpus")) for child in mix.mix), tuple(mix.weights),
                        counted, mix.seed)
+    if "concat" in written:
+        joined = _read_laid(_ConcatRecord, written, "concat")
+        return Concatenated(tuple(_read_chain(record(child, "member")) for child in joined.concat))
     if "phases" in written:
         phases = _read_laid(_PhasesRecord, written, "phases")
         # The one clock the record names: its tokens' where it names them, its steps' otherwise.

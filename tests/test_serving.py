@@ -20,7 +20,7 @@ from arm_arithmetic import float64_held
 from flax import linen as nn
 from jax.experimental import checkify
 from model_support import Digits, decoder, serving_task as task
-from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings
+from reference_error import as_given, assert_as_exact
 from serving_support import (
     Served,
     assert_same_draws,
@@ -322,30 +322,46 @@ def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
         np.testing.assert_array_equal(original, saved)
 
 
+PACKED_SEEDS = {"kv_shared": 8, "k_eq_v": 8, "output_gate": 8}
+"""Each case's declared draws of the packed layout against the plain one (check 1), sized by `seeds_for` on
+armada."""
+
+
 @pytest.mark.parametrize("case", ["kv_shared", "k_eq_v", "output_gate"])
 def test_inference_projection_layout_preserves_special_attention_logits(case):
+    """The inference layout of a decoder's projections (`inference_projections`, its projections packed)
+    over a decoder that shares its last layer's keys and values, reads its values from its keys, or gates
+    its attention's output: every logit on par with the plain layout's from the plain model in float64
+    (check 1, two layouts of one model's weights), the logits whole and each a leaf of its own, over drawn
+    weights and tokens."""
+    from model_support import float64_twin
+
     from dew.inference.projections import inference_projections
 
-    with jax.enable_x64():
-        model = CausalTransformer(
-            vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=1,
-            head_dim=8, mlp_features=32, max_seq_len=64, dtype=jnp.float64,
-            precision=jax.lax.Precision.HIGHEST, attention_impl="reference",
-            kv_shared_layers=(1,) if case == "kv_shared" else None,
-            attention_k_eq_v=case == "k_eq_v", v_norm=case == "k_eq_v",
-            output_gate=case == "output_gate")
-        tokens = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
-        variables = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
-                                 nn.unbox(model.init(jax.random.key(13), tokens)))
-        packed = inference_projections(model, variables)
-        expected = jax.jit(model.apply)(variables, tokens)
-        actual = jax.jit(model.apply)(packed, tokens)
-        # One function in float64 over two layouts of its weights, whose products sum in other orders:
-        # within the packed program's float64 rounding of the plain one.
-        roundings = chain_roundings(jax.make_jaxpr(model.apply)(packed, tokens))
-        assert_computes_the_oracle(np.asarray(actual), np.asarray(expected), f"{case} packed projections",
-                                   roundings=roundings)
-        np.testing.assert_array_equal(jnp.argmax(actual, axis=-1), jnp.argmax(expected, axis=-1))
+    model = CausalTransformer(
+        vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=1, head_dim=8,
+        mlp_features=32, max_seq_len=64, attention_impl="reference",
+        kv_shared_layers=(1,) if case == "kv_shared" else None, attention_k_eq_v=case == "k_eq_v",
+        v_norm=case == "k_eq_v", output_gate=case == "output_gate")
+    init = jax.jit(lambda key, tokens: nn.unbox(model.init(key, tokens)))
+
+    def draw(seed):
+        """A seed's weights, their inference layout, packed once as a server packs them, and tokens."""
+        tokens = jax.random.randint(jax.random.fold_in(jax.random.key(5), seed), (2, 8), 0, VOCAB)
+        variables = init(jax.random.fold_in(jax.random.key(13), seed), tokens)
+        return variables, inference_projections(model, variables), tokens
+
+    def logits(module, variables, tokens):
+        """The logits, whole and each logit a leaf of its own, so no other logit's rounding error buys
+        budget for one wrong logit's."""
+        out = module.apply(variables, tokens)
+        return {"logits": out, "each": tuple(out.reshape(-1))}
+
+    wide = float64_twin(model)
+    assert_as_exact(lambda variables, packed, tokens: logits(model, packed, tokens),
+                    lambda variables, packed, tokens: logits(model, variables, tokens), draw,
+                    f"{case} packed projections", seeds=PACKED_SEEDS[case],
+                    truth_fn=lambda variables, packed, tokens: logits(wide, variables, tokens))
 
 
 @pytest.mark.parametrize("decode_steps", [1, 4])

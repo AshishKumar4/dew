@@ -30,7 +30,6 @@ from dew.interop.safetensors_io import stored_spec
 
 _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt", ".pth")
 _CHUNK = 1 << 24
-_SIDECAR_CACHE_LIMIT = 65536
 Entries = Mapping[str, tuple[int, int]]
 """A DDUF archive's entries, each its data's offset in the archive and its length."""
 
@@ -154,22 +153,9 @@ def metadata(
         key = f"{digest}-metadata"
 
         def remote_tensor(file: str, tensor_name: str) -> np.ndarray:
-            def fetched() -> tuple[list[int], str, str]:
-                with HfFileSystem().open(ref, "rb", cache_type="none") as stream:
-                    shape, tag, raw = sources.stored_tensor(stream, tensor_name, offset=entries[file][0])
-                return shape, tag, raw.hex()
-
-            spec = specs[file][tensor_name]
-            if int(np.prod(spec.shape)) * spec.dtype.itemsize > _SIDECAR_CACHE_LIMIT:
-                shape, tag, raw = fetched()
-            else:
-                # A small tensor (a sidecar) is kept as the Hub answered it, for an offline load to read.
-                question = ("dduf sidecar", source.name, root.name, selected, file, tensor_name)
-                if constants.HF_HUB_OFFLINE and recorded_hub_answer(question) is None:
-                    raise FileNotFoundError(f"{source.name} at {root.name}: {file}:{tensor_name} was never "
-                                            "read online")
-                shape, tag, raw = hub_answer(question, fetched).value
-            return sources.stored_array(tensor_name, shape, tag, bytes.fromhex(raw), file)
+            return sources.hub_tensor(ref, tensor_name, file,
+                                      ("dduf sidecar", source.name, root.name, selected, file, tensor_name),
+                                      offset=entries[file][0])
 
         reader = remote_tensor
 

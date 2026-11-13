@@ -6,6 +6,7 @@ import itertools
 from collections import Counter
 from dataclasses import replace
 
+import jax
 import numpy as np
 from reader_support import assert_resumes_where_it_stopped
 from test_decision_objective import INTENT, LAYOUT, SPECIALS, TOKENIZER, tiny_backbone
@@ -54,7 +55,7 @@ def rows(batches) -> list[tuple[int, ...]]:
     """Each real window's rows of `batches`, in window order, each its own tokens."""
     read = []
     for batch in batches:
-        batch = {name: np.asarray(value) for name, value in batch.items()}
+        batch = jax.tree.map(np.asarray, dict(batch))
         real = batch.get(VALID_ROWS, np.ones(len(batch["tokens"]), bool))
         read += [tuple(alone(batch, window, segment)["tokens"][0].tolist())
                  for window, segment in rows_of(batch) if real[window]]
