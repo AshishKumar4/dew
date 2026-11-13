@@ -333,6 +333,17 @@ width its backward takes, a causal or windowed call square or over another seque
 aligns as FlashAttention aligns them), no arbitrary mask, block groups, key lengths, bias, softcap or sinks,
 no deterministic ops, and a wheel holding code for the target."""
 
+def _cudnn_packs(case: AttentionCase) -> bool:
+    """Whether cuDNN runs `case`'s documents as its packed sequences (`attention.cudnn_packs`, the call's
+    view of the same): its own documents, bounded (`Coordinates.max_segments`), with no mask, bias, key
+    lengths or key starts beside them, on a GPU of sm90 or later (jax's `check_is_flash_attention`: "Packed
+    layout requires a GPU with at least Hopper architecture")."""
+    named = capability(device_generation())
+    return (case.documents == 'own' and case.max_segments is not None
+            and not (case.mask or case.bias or case.lengths or case.starts)
+            and named is not None and named >= (9, 0))
+
+
 CUDNN_SUPPORTS = (
     _ON_GPU,
     _Need('capability', lambda case: bf16_dot_runs(), "cuDNN takes bf16 and fp16 from sm80",
@@ -347,10 +358,12 @@ CUDNN_SUPPORTS = (
     _Need('sinks', lambda case: not case.sinks, "the call has attention sinks", row=INHERENT),
     _Need('bidirectional_window', lambda case: case.window is None or case.causal or case.aligned,
                 "cuDNN keeps a window behind the query only", row=INHERENT),
-    _Need('documents', lambda case: case.documents is None or case.aligned,
-                "cuDNN takes no segment ids, a call's packed documents only as their mask, a dense bias "
-                "that costs more than the xla kernel's mask (`_attention_kernel` builds it where cuDNN is "
-                "named)", row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
+    _Need('documents', lambda case: case.documents is None or case.aligned or _cudnn_packs(case),
+                "cuDNN takes packed documents as its packed sequences only where they are a call's own, "
+                "bounded, beside nothing else hiding keys, on sm90 or later (`attention.cudnn_packs`); "
+                "otherwise only as their mask, a dense bias that costs more than the xla kernel's mask "
+                "(`_attention_kernel` builds it where cuDNN is named)",
+                row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),
     _Need('mask', lambda case: not case.mask,
                 "cuDNN takes an arbitrary mask as a dense bias, which costs more than the xla kernel's "
                 "mask; a window's band and a forward-only cache call over several queries, which it is "
@@ -578,7 +591,8 @@ on a GPU or a TPU runs it by default, where its cell's declared old route does n
 class Timed:
     """The calls a kind of call's declared receipts timed (`DECLARED`): its queries and keys alike from
     `shortest` to `longest` tokens, at the head `widths` and the query heads a key head serves (`groups`),
-    `causal` or full (any of each where None), and windowed where `windows`, else no window."""
+    `causal` or full (any of each where None), windowed where `windows`, else no window, and with a call's
+    own packed documents where `documents`, else none."""
 
     shortest: int
     longest: int
@@ -586,6 +600,7 @@ class Timed:
     groups: tuple[int, ...] | None = None
     causal: bool | None = None
     windows: bool = True
+    documents: bool = True
 
     def holds(self, case: AttentionCase) -> bool:
         """Whether `case` lies within these calls."""
@@ -593,14 +608,14 @@ class Timed:
                 and (self.widths is None or case.head_dim in self.widths)
                 and (self.groups is None or case.heads // case.kv_heads in self.groups)
                 and (self.causal is None or case.causal == self.causal)
-                and (self.windows or case.window is None))
+                and (self.windows or case.window is None) and (self.documents or case.documents is None))
 
 
 MEASURED: dict[tuple[str | None, CallKind], Timed] = {
     **{(family, CallKind.of(jnp.bfloat16)): Timed(0, 32768) for family in ('mma.sync', 'wgmma')},
     **{(family, CallKind.of(jnp.float32)): Timed(0, 1024) for family in ('mma.sync', 'wgmma')},
     ('tcgen05', CallKind.of(jnp.bfloat16)): Timed(256, 32768, (64, 128, 256), (4,), causal=True,
-                                                  windows=False),
+                                                  windows=False, documents=False),
 }
 """The shapes each instruction family's DECLARED receipts hold for a kind of call; a call outside them is a
 cell none declares (`AttentionCase.cell`). On tcgen05 a 16-bit call's: from 256 to 32768 tokens at widths
