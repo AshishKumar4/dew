@@ -8,14 +8,17 @@ from .kl import AutoencoderKL
 class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
     """Encodes and decodes images with a frozen native `AutoencoderKL` and its latent normalization."""
 
-    def __init__(self, model: AutoencoderKL, params, dtype=jnp.bfloat16, latent_shift=None,
-                 latent_scale=None):
-        """The autoencoder around `params` as given: `dtype` sets the computation dtype and never casts
-        them, and `latent_shift` and `latent_scale` default to 0.0 and 0.18215 (SD1's). A release's, its
-        config's shift and scale with it, is `dew.interop.autoencoders.pretrained.load_autoencoder`'s."""
-        self.dtype = dtype
+    def __init__(self, model: AutoencoderKL, params, dtype=None, latent_shift=None, latent_scale=None):
+        """The autoencoder around `params` as given: `dtype` sets the computation dtype, `model` run at it
+        (its own where None), and never casts them, and `latent_shift` and `latent_scale` default to 0.0
+        and 0.18215 (SD1's). A release's, its config's shift and scale with it, is
+        `dew.interop.autoencoders.pretrained.load_autoencoder`'s."""
         if params is None:
             raise ValueError("A native autoencoder requires explicit parameters")
+        # The module itself where it already computes at the asked dtype: a program keys on it.
+        if dtype is not None and jnp.dtype(dtype) != jnp.dtype(model.dtype):
+            model = model.clone(dtype=dtype)
+        self.dtype = model.dtype
         super().__init__(model, params)
         shift = 0.0 if latent_shift is None else latent_shift
         scale = 0.18215 if latent_scale is None else latent_scale

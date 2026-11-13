@@ -55,7 +55,6 @@ from dew.nn.attention import reference_attention
 from dew.nn.attention_masks import causal_attention_mask, visibility_mask
 from dew.nn.cross_attention import context_mask
 from dew.nn.dense import Dense, DenseGeneral
-from dew.nn.documents import document_mask
 from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.flops import cross_attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places
@@ -859,8 +858,11 @@ class DeepseekV4Attention(FakeQuantizing):
             allowed = causal_attention_mask(
                 slots, keys.shape[1], self.sliding_window,
                 key_valid=cached_validity(self, keys.shape[1]))[:, 0]
-            if segment_ids is not None:
-                allowed = allowed & document_mask(segment_ids)
+            # Each token reads its own document's cached keys alone, as the cache numbers them
+            # (`Append.documents`: a call's first document continues its row's last).
+            kept = append.documents(segment_ids)
+            own = jnp.take_along_axis(kept, jnp.maximum(slots, 0), axis=1)
+            allowed = allowed & (own[:, :, None] == kept[:, None, :])
 
         if self.compressor is not None:
             # An entry is visible by its window's tokens' order among the row's real tokens, which the
