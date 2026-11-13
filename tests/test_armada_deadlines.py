@@ -290,6 +290,18 @@ def test_a_red_whose_capture_could_not_be_armed_says_why(ci, tmp_path, monkeypat
     assert red["capture"] == "no C compiler in the container"
 
 
+def test_native_stacks_count_as_read_only_where_every_signalled_process_was_read(ci):
+    """Two processes a signal ended, one read and the other not (the collector ended while it read it: no record
+    of it beyond its word that it was signalled), are `unread`: the land queue never takes a run whose
+    signal-ended process left no native stacks for one that kept them (review, 2026-11-13)."""
+    capture = object.__new__(ci.natives.Capture)
+    capture.variables, capture.why, capture.signalled = {"LD_PRELOAD": "x"}, "", 2
+    one = f"== process 7 ended by signal 6 (00:00:00Z): {ci.natives.HELD}\nframes\n"
+    assert capture.evidence(one) == {"capture": "armed", "natives": "unread"}
+    capture.signalled = 1
+    assert capture.evidence(one) == {"capture": "armed", "natives": "read"}
+
+
 def test_a_worker_a_signal_ends_keeps_its_native_stacks_though_pytest_exits_red(ci, tmp_path):
     """A process a test starts (a worker, here in another directory) that a signal ends keeps its native
     stacks with the run's whole output, though pytest itself exits red rather than by the signal (review,

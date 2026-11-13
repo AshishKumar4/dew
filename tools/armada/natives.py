@@ -135,6 +135,7 @@ class Capture:
         self.stacks_file = self.where / "stacks.txt"
         self.variables: dict[str, str] = {}
         self.collector: subprocess.Popen | None = None
+        self.signalled = 0
         library, self.why = built()
         spy = spy.resolve()
         if library is None:
@@ -172,6 +173,8 @@ class Capture:
                 self.collector.kill()
         read = self.stacks_file.read_text(errors="replace") if self.stacks_file.is_file() else (
             f"no native stacks were captured: {self.why}\n" if self.why else "")
+        # Each process that told the collector a signal ended it, read or not (`collect`'s `seen.<pid>`).
+        self.signalled = len(list(self.done.glob("seen.*"))) if self.done.is_dir() else 0
         shutil.rmtree(self.where, ignore_errors=True)
         return read
 
@@ -179,13 +182,16 @@ class Capture:
         """What a red row says of its capture (`stacks`, what it read): `capture`, "armed", or why it was not;
         and where a signal ended a process of it, `natives`, "read" where every such process's stacks were
         read, else "unread". The land queue publishes a red that does not repeat only on both (bible §88)."""
-        ended = stacks.count(" ended by signal ")
+        held = stacks.count(f"): {HELD}\n")
+        ended = max(self.signalled, stacks.count(" ended by signal "))
         return {"capture": "armed" if self.variables else self.why or "not armed",
-                **({"natives": "unread" if UNREAD in stacks else "read"} if ended else {})}
+                **({"natives": "read" if held == ended else "unread"} if ended else {})}
 
 
 UNREAD = "no native stack was read"
 """What the collector's header says of a signalled process none of whose stacks it read (`collect`)."""
+HELD = "its threads' native stacks"
+"""What it says of one whose stacks it read."""
 
 
 def read(pid: str, spy: Path, began: float) -> tuple[str, bool]:
@@ -227,10 +233,12 @@ def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
             if len(parts) != 2 or not all(part.isdigit() for part in parts):
                 continue
             pid, signum = parts
+            # Seen before it is read: one the collector is ended while reading counts as unread (review).
+            (done / f"seen.{pid}").touch()
             frames, held = read(pid, spy, began)
             with stacks.open("a") as out:
                 at = time.strftime("%H:%M:%SZ", time.gmtime())
-                header = "its threads' native stacks" if held else UNREAD
+                header = HELD if held else UNREAD
                 out.write(f"== process {pid} ended by signal {signum} ({at}): {header}\n{frames}\n")
             (done / f"done.{pid}").touch()
 
