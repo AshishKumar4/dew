@@ -52,12 +52,14 @@ from dew.training.memory import (
     climbed,
     compiled_if_it_fits,
     derived_headroom,
+    device_memory,
     head_fused_of,
     head_tile_of,
     headed_more,
     judged,
     local_devices,
     offloads,
+    placeable,
     pooled_headroom,
     recompute_more,
     recompute_record,
@@ -458,11 +460,21 @@ def unplanned(probes: Sequence[Probe]) -> str:
 
 class PlanRefused(RuntimeError):
     """No candidate fits. `probes` holds every program the search compiled, including refusals, so
-    an offline gate reads failed admission evidence as objects rather than parsing the message."""
+    an offline gate reads failed admission evidence as objects rather than parsing the message, and
+    `allocators` what each local device's allocator stated as the search refused (`device_memory`): its
+    limit, its bytes in use, its largest free block and its pool, which the closest's headroom read."""
 
-    def __init__(self, probes: Sequence[Probe]):
-        self.probes = tuple(probes)
-        super().__init__(unplanned(self.probes))
+    def __init__(self, probes: Sequence[Probe], allocators: Sequence[Mapping[str, int]] = ()):
+        self.probes, self.allocators = tuple(probes), tuple(allocators)
+        gib = 1024 ** 3
+        read = [memory for memory in self.allocators if 'bytes_limit' in memory and 'bytes_in_use' in memory]
+        said = ""
+        if read:
+            tightest = min(read, key=placeable)
+            names = ('bytes_limit', 'bytes_in_use', 'largest_free_block_bytes', 'pool_bytes')
+            said = " Its tightest device's allocator: " + ", ".join(
+                f"{name} {tightest[name] / gib:.2f} GiB" for name in names if name in tightest) + "."
+        super().__init__(unplanned(self.probes) + said)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -777,9 +789,6 @@ class FitSearch[LossT, EffectsT]:
     """A step compiled ahead (`dew.training.ahead`), run in place of the search's first compile where it
     is that program (`AheadOfTime.taken`), lowered as its own compile lowered it (`handed`: within its
     refusals, for its GPU, `fits_here`)."""
-    capacity: int | None = None
-    """The bytes a device that states none holds (`step_headroom`): a compile-only GPU's, as a step
-    compiled ahead for it states them (`AheadTarget.capacity`)."""
     derive: Callable[[int, bool], Candidate] | None = None
     """The step at a split, at the objective's rung and `narrow`, traced and not lowered, for its derived
     footprint (`dew.training.footprint`), which picks the search's first rung (`derived_start`); None
@@ -822,7 +831,7 @@ class FitSearch[LossT, EffectsT]:
     program's whole pass in seconds (`report.passes`), none the registry held before it searched."""
 
     def __post_init__(self):
-        self.factor = temporaries_factor(self.mesh, self.capacity)
+        self.factor = temporaries_factor(self.mesh)
         self.started = self.remat_rung()
         record = recompute_record(self.objective)
         # Whether any module the run trains sets its own remat, which it compiles at alone.
@@ -862,7 +871,8 @@ class FitSearch[LossT, EffectsT]:
         passes: list[JSON] = list(report.passes()[passed:])
         self.kernels = {"spills": spills, "refused": refused, "rewrites": rewrites, "passes": passes}
         if split is None or self.fitted is None:
-            raise PlanRefused(self.probes) from (self.refusals[-1] if self.refusals else None)
+            allocators = [device_memory(device) for device in local_devices(self.mesh)]
+            raise PlanRefused(self.probes, allocators) from (self.refusals[-1] if self.refusals else None)
         return self.found(split), tuple(self.probes)
 
     def above(self, candidates: Sequence[int], split: int) -> tuple[Probe, ...]:
@@ -960,7 +970,7 @@ class FitSearch[LossT, EffectsT]:
                                  "label": "unstated", "terms": None})
             if self.remat_set:
                 _log.warning("the run sets remat %s, and its devices state no memory to judge its footprint "
-                             "against (a CPU, or a compile-only GPU given no capacity), so the derivation "
+                             "against (a CPU), so the derivation "
                              "picks no plan and the compiles decide it", self.remat_rung())
             return "unstated", narrow
         # The last rung traced short, from whose footprint the rungs after it are bounded without a trace
@@ -1026,7 +1036,7 @@ class FitSearch[LossT, EffectsT]:
 
         bounded = dataclasses.replace(footprint, resident=resident, held=footprint.held - copies,
                                       peak=most + copies, peak_lower=least)
-        return derived_headroom(bounded, devices, self.capacity, last.built - copies)
+        return derived_headroom(bounded, devices, last.built - copies)
 
     def judged(self, split: int, narrow: bool) -> int | None:
         """The derived headroom of the step at `split` and `narrow` at the objective's rung, traced once a
@@ -1067,7 +1077,7 @@ class FitSearch[LossT, EffectsT]:
     def headroom_bounds(self, candidate: Candidate) -> tuple[int, int] | None:
         """The least and most headroom `candidate`'s derived footprint leaves the pool (`derived_headroom`,
         the same on every process), None where it has none or no device states memory."""
-        return derived_headroom(candidate.footprint, local_devices(self.mesh), self.capacity, candidate.built)
+        return derived_headroom(candidate.footprint, local_devices(self.mesh), candidate.built)
 
     def lowering(self, split: int) -> Candidate:
         """The step at `split` at the objective's rung and the search's `narrow`, lowered: from the
@@ -1194,10 +1204,9 @@ class FitSearch[LossT, EffectsT]:
         return self.derive is not None
 
     def judging(self) -> bool:
-        """Whether every process's devices judge a derived footprint (`memory.judged`) at the search's
-        capacity, each process answering alike: where one does not, every rung is unknown and no footprint
-        is traced."""
-        local = all(judged(device, self.capacity) for device in local_devices(self.mesh))
+        """Whether every process's devices judge a derived footprint (`memory.judged`), each process
+        answering alike: where one does not, every rung is unknown and no footprint is traced."""
+        local = all(judged(device) for device in local_devices(self.mesh))
         return all(from_every_process(local))
 
     def current(self) -> dict[str, JSON]:
@@ -1272,7 +1281,7 @@ class FitSearch[LossT, EffectsT]:
                     self.footprints.clear()
                     self.derivations.clear()
                     candidate = self.footprinted(split, candidate)
-            fit, headroom = step_fits(executable, self.mesh, candidate.held, self.capacity, candidate.built)
+            fit, headroom = step_fits(executable, self.mesh, candidate.held, candidate.built)
             self.sampled = None
             if fit and candidate.sampled is not None and ahead is not None and ahead.sampled is not None:
                 # The sampled step compiled ahead with the step, lowered as its compile lowered it (`handed`),
@@ -1299,7 +1308,7 @@ class FitSearch[LossT, EffectsT]:
                     self.derivations.clear()
                 self.sampled = (None if compiled is None
                                 else SampledStep(program_digest(lowered[-1]), compiled))
-                fit, headroom = step_fits(compiled, self.mesh, candidate.held, self.capacity, candidate.built)
+                fit, headroom = step_fits(compiled, self.mesh, candidate.held, candidate.built)
         seconds = time.perf_counter() - began
         probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
         foreseen = _judged_headroom(self.headroom_bounds(candidate))

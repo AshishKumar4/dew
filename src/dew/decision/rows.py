@@ -5,7 +5,7 @@ fields a row carries (`TRAINING_FIELDS`); `DecisionObjective.data` assembles the
 import collections
 import dataclasses
 import hashlib
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TypeGuard
 
@@ -77,6 +77,30 @@ class Encoding:
     consistency term's rows; every row then carries them, an example of none with none in each."""
     none_of_the_above_options: int = field(default=0, repr=False, metadata={ADDED: True})
     """The fewest options a choice holds to draw a "none of the above" (`draws_none`); 0, every choice."""
+
+    def fewest_tokens(self, row: "FittedRow") -> int:
+        """The fewest tokens a draw of this encoding lays `row` out to: a drawn order keeps a row's length,
+        as `Fit` sizes it (`Fit._longest`), and a draw the layout refuses lays it out as Fit admitted it.
+        A row of one question, whose layout may trim its options together, is one of its three layouts. A
+        row of several questions lays them out untrimmed and its state in the room they leave, so its
+        length grows with theirs: its shortest draw puts a "none of the above" in place of the right
+        option of every question that option shortens (beside its options, it lengthens a question), each
+        drawn on its own, a question's own length read with no state to refill the room it frees."""
+        if not self.none_of_the_above:
+            return row.length
+        fewest = self.none_of_the_above_options
+
+        def laid(drop: bool, names: Collection[str] | None = None, held: "FittedRow" = row) -> int:
+            return _with_none(self.layout, self.tokenizer, self.specials, held, fewest, drop, names)[0]
+
+        if len(row.names) == 1:
+            return min(row.length, laid(drop=False), laid(drop=True))
+        bare = dataclasses.replace(row, tokens=row.tokens[:0])
+        alone = laid(drop=True, names=(), held=bare)
+        shorter = {name for name in row.names if name in row.example.answers
+                   and draws_none(row.example.questions[name], fewest)
+                   and laid(drop=True, names={name}, held=bare) < alone}
+        return min(row.length, laid(drop=True, names=shorter))
 
     def _rows(self, example: Example, asked: Mapping[str, Question], rng: np.random.Generator | None,
               tokens: np.ndarray | None) -> list[Encoded]:
@@ -505,21 +529,9 @@ class Fit(pygrain.MapTransform):
         its row does; an example's context does not change."""
         if not self.none_of_the_above:
             return row.length, row.context
-        example = row.example
-        labels = example.labels()
-
-        fewest = self.none_of_the_above_options
-
-        def laid_out(drop: bool) -> tuple[int, int]:
-            asked = {name: (_none_of_the_above(question, labels[name], drop=drop)[0]
-                            if name in example.answers and draws_none(question, fewest) else question)
-                     for name in row.names for question in (example.questions[name],)}
-            laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked,
-                                    tokens=row.tokens.tolist(), request=example.questions)
-            schemas = sum(len(each.context or ()) for each in laid if each.spans_in_context)
-            return sum(len(each.tokens) for each in laid), schemas or row.context
-
-        sizes = [(row.length, row.context), laid_out(drop=False), laid_out(drop=True)]
+        sizes = [(row.length, row.context),
+                 *(_with_none(self.layout, self.tokenizer, self.specials, row, self.none_of_the_above_options,
+                              drop) for drop in (False, True))]
         return max(tokens for tokens, _ in sizes), max(context for _, context in sizes)
 
     def _unit(self, grouped: GroupedExamples) -> Batch | Rejected:
@@ -558,6 +570,24 @@ class Fit(pygrain.MapTransform):
                 "_dew_truncated": any(row.truncated for _, row in rows),
                 "_dew_cut": _cuts(row for _, row in rows), "_dew_declined": _declined(row for _, row in rows),
                 "_dew_bounds": {"slots": {"questions": questions, "options": options}}}
+
+
+def _with_none(layout: Layout, tokenizer: Tokenizer, specials: Specials, row: FittedRow, fewest: int,
+               drop: bool, names: Collection[str] | None = None) -> tuple[int, int]:
+    """The tokens and context tokens `row` lays out to with a "none of the above" (`Encoding`) beside each
+    of its answered choices' options that draws one (`draws_none`, `fewest`), or in place of its right
+    option where `drop`: each such question of `names` where given, of the row's every one otherwise. A
+    schema read as the row's context lengthens as its row does; an example's context does not change."""
+    example = row.example
+    labels = example.labels()
+    asked = {name: (_none_of_the_above(question, labels[name], drop=drop)[0]
+                    if name in example.answers and draws_none(question, fewest)
+                    and (names is None or name in names) else question)
+             for name in row.names for question in (example.questions[name],)}
+    laid = layout.rows(tokenizer, specials, example.state, asked, tokens=row.tokens.tolist(),
+                       request=example.questions)
+    schemas = sum(len(each.context or ()) for each in laid if each.spans_in_context)
+    return sum(len(each.tokens) for each in laid), schemas or row.context
 
 
 @dataclass(frozen=True)
@@ -634,6 +664,16 @@ class LayoutRows(pygrain.RandomMapTransform):
             return _encoded_unit(self.encoding, element["decision_unit"], rng)
         fitted = _fitted(element)
         return self.encoding(fitted.example, fitted.names, rng, fitted.tokens, admitted=fitted.cuts)
+
+    def shortest(self, record: Batch, field: str) -> int:
+        """The fewest `field` tokens any draw of this read lays `record` out to (`dew.data.pipeline.
+        Shortest`, which a memory read bounds its windows' documents by): a row's (`Encoding.fewest_tokens`),
+        a unit's its rows' together, which the packer places whole."""
+        if field != "tokens":
+            raise ValueError(f"a decision row's draws lay out its tokens, not {field!r}")
+        if "decision_unit" in record:
+            return sum(self.encoding.fewest_tokens(row) for _, row in record["decision_unit"].rows)
+        return self.encoding.fewest_tokens(_fitted(record))
 
 
 @dataclass(frozen=True)
@@ -897,6 +937,13 @@ class PackedRows(pygrain.MapTransform):
             laid["context"] = element["context"]
             laid["context_segments"] = contexts
             laid["context_lengths"] = np.int32(np.count_nonzero(contexts))
+        if "row" not in element:
+            # Its rows are the packer's documents as it wrote them: the read's coordinates step lays them out
+            # (`dew.data.steps.generic.Coordinated`, `tokens_coordinates`), declaring the most a window
+            # holds, which the read measured, and refusing a window past it. A unit of rows packs as one
+            # document, so a grouped window's rows keep the objective's own bound.
+            laid["tokens_segment_ids"] = units
+            laid["tokens_positions"] = np.asarray(element["tokens_positions"])
         if self.option_slots is not None:
             laid["option_slots"], laid["slotted"] = compacted(options, self.option_slots)
         return laid

@@ -3,6 +3,8 @@
 (`<file>#G/N@users`), and its record's place on a device class, in the cache Worker's key alphabet (no colon,
 no hash)."""
 
+from collections.abc import Mapping
+
 
 def row(python: str, name: str, split: str) -> str:
     return f"{python}:{name}" + (f"#{split}" if split else "")
@@ -13,6 +15,24 @@ def parsed_row(row_name: str) -> tuple[str, str, str]:
     python, rest = row_name.split(":", 1)
     name, _, split = rest.partition("#")
     return python, name, split
+
+
+GROUPED: list = [None, {}]
+"""The rows `grouped_rows` last grouped, and their groups: a plan asks of one run's timings for every file."""
+
+
+def grouped_rows(measured: Mapping[str, float]) -> dict[tuple[str, str], dict[str, float]]:
+    """Armada's row timings `measured` by their Python and file, each row's seconds under its group; a map
+    task's seconds are kept under its task's name, no row's. Grouped once for the rows it was last asked
+    of."""
+    if GROUPED[0] is not measured:
+        found: dict[tuple[str, str], dict[str, float]] = {}
+        for row_name, seconds in measured.items():
+            if ":" in row_name:
+                python, name, group = parsed_row(row_name)
+                found.setdefault((python, name), {})[group] = seconds
+        GROUPED[:] = [measured, found]
+    return GROUPED[1]
 
 
 VARIED = "@"
@@ -52,3 +72,16 @@ def place_variant(group: str) -> str:
     """The process variant a record's group (`key_parts`) is of (`row_place`: `whole-as-<variant>`,
     `<index>-of-<count>-as-<variant>`); none, the lane's own process's."""
     return group.partition("-as-")[2]
+
+
+def release_plan(verdict: dict, python: str) -> list[dict]:
+    """The release checks of a whole suite's `verdict` (`armada verdict <sha> --json`), a task each
+    requirement: the files whose rows name checks under it (`release_env`, as pytest resolved each test's
+    mark before any selection: executed.py), which the run's own tasks set aside, as the suite's environment
+    lacks it (ci.py's `selected`), each run on `python` (the oldest tested). ci.py's `release` runs them."""
+    checks: dict[str, set[str]] = {}
+    for found in verdict["rows"]:
+        for requirement in found.get("release_env", {}):
+            checks.setdefault(requirement, set()).add(parsed_row(found["name"])[1])
+    return [{"release": requirement, "python": python, "tests": " ".join(sorted(names))}
+            for requirement, names in sorted(checks.items())]

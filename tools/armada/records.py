@@ -162,6 +162,25 @@ def begun(python: str, row_name: str, held: str, common: str, token: str, after:
     return UNREAD
 
 
+MISSED = {"unread": "its records were not read", "shared": "no green run on these shared inputs",
+          "none": "no record of its last run", "blind": "its last run recorded no inputs",
+          "red": "a red run since its green one", "inputs": "an executed input changed",
+          "kept": "its green run was not kept"}
+"""Why a lookup did not reuse a row (ci.py's `green_record`, `reusable`), in the words a plan states it."""
+
+
+def missed(found: dict | None, key: str | None, current: str | None) -> str:
+    """Why the last run `found` of a row whose inputs hash to `key` now (None where it recorded none) was not
+    reused in epoch `current`, in `MISSED`'s words: no record, none of its inputs, a red run since its green
+    one (a red record, or an epoch a red run began after it), a changed executed input, or its green run not
+    kept."""
+    if found is None or found["depends"] is None:
+        return MISSED["none" if found is None else "blind"]
+    if found["key"] is None or (key == found["key"] and not standing(found, current)):
+        return MISSED["red"]
+    return MISSED["inputs"] if key != found["key"] else MISSED["kept"]
+
+
 def standing(found: dict, current: str | None) -> bool:
     """Whether green record `found` was recorded in `current`, its row's epoch (`epoch`), which exists."""
     return current is not None and found.get("epoch") == current

@@ -28,7 +28,7 @@ def task_arguments(running: argparse.ArgumentParser, pythons: Sequence[str], dea
     running.add_argument("--out", type=Path, required=True)
     running.add_argument(
         "--cache", required=True,
-        help="the plan's DEW_TEST_CACHE (`policy`): on, or off")
+        help="the plan's DEW_TEST_CACHE (`policy`): on, cold (looked up, run cold), or off")
     running.add_argument("--whole", choices=("0", "1"), default="0",
                          help="the plan's DEW_WHOLE_SUITE: 1 on the whole suite's run, which runs its cells")
     running.add_argument("--census", choices=("0", "1"), default="0",

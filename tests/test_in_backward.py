@@ -182,8 +182,9 @@ def test_a_scanned_step_holds_no_more_than_a_layer_at_a_time(generation, dtype):
     the backward's too."""
     held = []
     for scan in (False, True):
+        gpu = compile_only_gpus(generation, 1, 80 * 2**30)
         run = Trainer(LMObjective(decoder(scan=scan, dtype=dtype, num_layers=8), SEQ), ADAMW,
-                      key=jax.random.key(0), mesh=MeshSpec().build(compile_only_gpus(generation, 1)),
+                      key=jax.random.key(0), mesh=MeshSpec().build(gpu),
                       layout=Layout(min_shard=TINY_SHARD), split=1, accumulation=1, checkpoints=None,
                       tracker=None)
         run.validate(steps=8)

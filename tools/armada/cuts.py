@@ -7,7 +7,7 @@ tests a task cuts a file by are session.py's (`session.groups`), which ci.py han
 
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 CUT = re.compile(r"(\d+)/(\d+)")
 """A row's group that is one of a file's cut: `G/N`; a collection's, a site's judge's or a GPU lane's process
@@ -34,7 +34,7 @@ def split(session, tests: list[float], seconds: float, target: float, cut: int =
         return [seconds / count] * count
     setup = max(seconds - sum(tests), 0.0) / cut
     heaviest = max(sum(tests[run.start:run.stop]) for run in session.groups(tests, cut)) if cut > 1 else None
-    if heaviest is not None and heaviest + setup <= KEPT * target:
+    if heaviest is not None and heaviest + setup <= session.KEPT * target:
         count = cut
     else:
         room = max(target - setup, target / 2)
@@ -42,7 +42,6 @@ def split(session, tests: list[float], seconds: float, target: float, cut: int =
     return [sum(tests[run.start:run.stop]) + setup for run in session.groups(tests, count) if run]
 
 
-KEPT = 1.5
 """How far past the target a split file's heaviest group may run before the file is cut again."""
 
 
@@ -64,18 +63,102 @@ def measured_cut(groups: Mapping[str, float]) -> tuple[float, int] | None:
 
 
 def weighed(session, tests: list[float], seconds: float, target: float,
-            measured: tuple[float, int] | None) -> list[float]:
-    """The weights of the groups the plan runs a file as, from its recorded `tests`: cut from the seconds
-    and the cut its rows were `measured` at (`measured_cut`, `split`). Where no run measured it at a cut,
-    from the `seconds` it is estimated at (ci.py's `weights`: its record times how much slower armada ran
-    the files measured both ways, or a median that mixes the cuts of the runs it remembers), spread over its
-    tests as one group that paid nothing besides: an estimate's excess over the record is no one group's
-    setup, and taken for one, every group the file was then cut into paid it again (2026-11-12: with one
-    file's timing left to scale by, every other file weighed 1.6 times its record and the 0.6 was its setup,
-    so tests/test_model_protocols.py's 10,537 s of tests were planned as 195 groups of 6,500 s, 354 task-
-    hours; armada sized the run by its longest tasks, gave the sites' 874 map tasks 20 of its 688
-    containers, and train 772's CI ran out its deadline)."""
+            measured: tuple[float, int] | None, stored: Sequence[float] = ()) -> list[float]:
+    """The weights of the groups the plan runs a file as, from its recorded `tests`: cut from the seconds and
+    the cut its rows were `measured` at (`measured_cut`, `split`). Where no run measured it at a cut, from the
+    `seconds` it is estimated at (ci.py's `weights`: its record times how much slower armada ran the files
+    measured both ways, or a median that mixes the cuts of the runs it remembers), spread over its tests as
+    one group that paid nothing besides: an estimate's excess over the record is no one group's setup, and
+    taken for one, every group the file was then cut into paid it again (2026-11-12: with one file's timing
+    left to scale by, every other file weighed 1.6 times its record and the 0.6 was its setup, so
+    tests/test_model_protocols.py's 10,537 s of tests were planned as 195 groups of 6,500 s, 354 task-hours;
+    armada sized the run by its longest tasks, gave the sites' 874 map tasks 20 of its 688 containers, and
+    train 772's CI ran out its deadline). A file with a stored cut (`stored`: each of its groups' recorded
+    seconds, session.CUTS) runs as that cut, each group its tests plus the setup each paid, while every
+    group's tests stay within `session.held_seconds` (`session.planned`'s test, whatever target a plan is
+    asked for, so its tasks cut it alike: review): the durations fold alone keeps or replaces a cut
+    (`refolded`), so a group's name means the same tests from run to run and its record is found again (Main,
+    2026-11-13); one outgrown is cut afresh, so a group past its deadline, which no green run would fold away,
+    is not run as it is again (train 793's review)."""
+    if stored and max(stored) <= session.held_seconds():
+        setup = max((measured[0] if measured is not None else seconds) - sum(stored), 0.0) / len(stored)
+        return [weight + setup for weight in stored]
     if measured is not None:
         return split(session, tests, measured[0], target, measured[1])
     total = sum(tests)
     return split(session, [each * seconds / total for each in tests] if total > 0 else tests, seconds, target)
+
+
+def ran(rows: Mapping[str, list[dict]]) -> dict[str, list[float]]:
+    """How main's CI ran each test file, from its rows by file (ci.py's `verdict_rows`): each group's seconds
+    in order (one, its whole row's, where it ran whole) where every row is green and every group of its count
+    is there; none where a row is red or a group is missing."""
+    runs: dict[str, list[float]] = {}
+    for name, held in rows.items():
+        if any(row["exitCode"] != 0 for row in held):
+            continue
+        groups = {row["name"].partition("#")[2]: row["seconds"] for row in held}
+        if set(groups) == {""}:
+            runs[name] = [groups[""]]
+            continue
+        found = {CUT.fullmatch(group) for group in groups}
+        counts = {int(each[2]) for each in found if each}
+        if None not in found and len(counts) == 1 and len(groups) == (count := counts.pop()):
+            runs[name] = [groups[f"{group}/{count}"] for group in range(1, count + 1)]
+    return runs
+
+
+def refolded(session, stored: Mapping[str, list[str]], runs: Mapping[str, list[float]], target: float,
+             before: Mapping[str, dict[str, float]],
+             after: Mapping[str, dict[str, float]]) -> dict[str, list[str]]:
+    """The stored cuts (session.CUTS) after main's CI ran each file as `runs` says (`ran`), every group within
+    `KEPT` of `target`, setup and all: a file it ran as its stored cut keeps it; one it ran as another cut
+    stores that cut, made from the record it was cut by (`before`: each file's own tests, node id to seconds).
+    A group past that cuts the file anew from the folded record (`after`), as `split` cuts a file it has no
+    cut for. Each group's first test is its boundary; a file run whole within its bound, or cut into a group
+    that holds none of its recorded tests, stores none; a file it did not run keeps its own. The fold is the
+    one place a cut changes (Main, 2026-11-13: a group's name means the same tests from run to run, so its
+    record is found again)."""
+    kept = dict(stored)
+    for name, seconds in runs.items():
+        bounds = stored.get(name)
+        if max(seconds) <= session.KEPT * target:
+            if bounds is not None and len(bounds) + 1 == len(seconds):
+                continue
+            own, count = before.get(name, {}), len(seconds)
+        else:
+            own = after.get(name, {})
+            units = session.unit_seconds(list(own), list(own.values()))
+            count = len(split(session, units, sum(seconds), target, len(seconds))) if own else 1
+        kept.pop(name, None)
+        if count > 1 and own:
+            groups = session.cut(list(own), list(own.values()), count)
+            if all(groups):
+                kept[name] = [group[0] for group in groups[1:]]
+    return kept
+
+
+def stale(session, own: dict[str, float], observed: dict[str, float], seconds: float, cut: int,
+          target: float) -> bool:
+    """Whether a file's record `own` no longer cuts it as it runs: its tests differ from those its rows
+    `observed` (one added, removed or renamed); a file within `target` (it took `seconds`), or one with no
+    tests to cut, is recorded past it, so the plan would split what runs whole; or, for a file past it (as
+    `cut` groups), the groups the plan cuts from the record (`split`) run a group past `session.KEPT` of
+    the target as its tests ran, setup included, and those it would cut from what they took run their
+    heaviest shorter. A cut that fits is kept whatever its tests' times drift, as the plan keeps it, and so
+    is one whose heaviest group no cut shortens (a test heavier than the budget, which runs alone either
+    way): a fold rewrites a file only where its plan changes for the better."""
+    if own.keys() != observed.keys():
+        return True
+    if seconds <= target or not own:
+        return sum(own.values()) > target
+    nodes = sorted(own)
+    recorded = session.unit_seconds(nodes, [own[node] for node in nodes])
+    ran = session.unit_seconds(nodes, [observed[node] for node in nodes])
+    setup = max(seconds - sum(ran), 0.0) / cut
+
+    def heaviest(weights: list[float]) -> float:
+        count = len(split(session, weights, seconds, target, cut))
+        return max(sum(ran[run.start:run.stop]) + setup for run in session.groups(weights, count) if run)
+
+    return heaviest(recorded) > session.KEPT * target and heaviest(ran) < heaviest(recorded)

@@ -92,7 +92,7 @@ SEEDS = {'decode': 16, 'kernels': 16, 'window kernels': 8, 'softcap': 32, 'route
          'metadata': 128, 'packed kernels': 16, 'bf16 head': 8, 'strict head': 8, 'norm gradient': 8,
          'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'gpu kernels': 16,
          'right padded': 16, 'rotary': 8, 'old record': 512,
-         'learned hybrid decode': 8, 'layouts': 8}
+         'learned hybrid decode': 8, 'layouts': 8, 'one document a row': 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, and the GPU
 sites on an A100): the most any of a site's cases took."""
 
@@ -1538,6 +1538,49 @@ def test_right_padded_rows_attend_causally_with_no_mask(rng, causal):
 
     assert_as_exact(states(model, right_padded=True), states(model), drawn(model), f"{causal} right padded",
                     seeds=SEEDS['right padded'], truth_fn=states(model.clone(dtype=jnp.float64)))
+
+
+def test_rows_of_one_document_each_attend_as_unpacked_rows():
+    """Rows of one document each with their padding after it (`Coordinates.max_segments` 1, right-padded)
+    reach the attention kernel as unpacked rows do, causal with no documents (`_one_document_a_row`): on a
+    B200 (traced on this CPU) each call takes the unpacked call's route, where the documents asked cuDNN
+    for its packed form, an S-squared backward workspace (row 5916). Their real tokens' states are on par
+    (check 1) with the same rows' read as packed documents, both from the packed call's in float64."""
+    from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import Unlowerable
+
+    model = tiny()
+    segments = (jnp.arange(SEQ)[None, :] < jnp.asarray([[7], [SEQ]])).astype(jnp.int32)
+    real = segments != 0
+
+    def laid(documents):
+        return coordinates(segments.shape, segments=segments, max_segments=documents, right_padded=True)
+
+    def states(model, documents):
+        return jax.jit(lambda params, ids: jnp.where(real[..., None], model.apply(
+            params, ids, coordinates=laid(documents), method=CausalTransformer.hidden_states), 0))
+
+    assert_as_exact(states(model, 1), states(model, 2), drawn(model), "one document a row",
+                    seeds=SEEDS['one document a row'], truth_fn=states(model.clone(dtype=jnp.float64), 2))
+    # A B200 call of a shape its cuDNN cell timed (`MEASURED`): 16-bit, 8 query heads over 2 of 64, 256
+    # tokens.
+    narrow = tiny(num_heads=8, num_kv_heads=2, head_dim=64, max_seq_len=256, dtype=jnp.bfloat16)
+    rows = (jnp.arange(256)[None, :] < jnp.asarray([[70], [256]])).astype(jnp.int32)
+    ids = jnp.zeros(rows.shape, jnp.int32)
+    params = jax.eval_shape(narrow.init, jax.random.key(0), ids)
+
+    def routes(given):
+        """The attention kernels the call takes, each with what refused its preferred one; on a host
+        that loads none of the kernel's library, the kernel it cannot lower (`Unlowerable`)."""
+        try:
+            with generation.assumed("sm100"), generation.routes() as found:
+                jax.jit(lambda params: narrow.apply(params, ids, coordinates=given)).trace(params)
+        except Unlowerable as refused:
+            return refused.kernel
+        return [(route.kernel, route.refusal) for route in found
+                if route.choice == generation.Choice.ATTENTION]
+
+    assert routes(coordinates(rows.shape, segments=rows, max_segments=1, right_padded=True)) == routes(None)
 
 
 def _rotate_half_reference(x, freqs_cos, freqs_sin, scale=None):

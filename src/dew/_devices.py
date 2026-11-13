@@ -237,20 +237,59 @@ def fraction_name() -> str:
     return next((name for name in FRACTIONS if name in os.environ), FRACTIONS[1])
 
 
-def pool_bound(*, cuda: bool) -> float | None:
-    """The share of each GPU XLA's pool takes as this run names it, which Dew may size it below and never
-    above (`dew.communicators`): its fraction where it names one (`fraction_name`); Dew's own where it
-    names nothing (`preallocate_gpu_pool`); JAX's where it names preallocation or the allocator without
-    one. None where the pool holds no fixed share: a process off CUDA, a pool that grows
-    (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) or another allocator than XLA's own BFC pool."""
-    allocator = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default").lower()
-    growing = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "true").lower() in ("false", "0")
-    if not cuda or growing or allocator not in ("default", "bfc"):
-        return None
+def pool_share() -> float:
+    """The share of each GPU XLA's allocator is limited to as this run names it, the limit a GPU's
+    `bytes_limit` states (its memory times this, `CreateBFCAllocator`'s memory fraction): its fraction
+    where it names one (`fraction_name`); Dew's own where it names nothing, as a prepared training process
+    takes it (`preallocate_gpu_pool`); JAX's where it names preallocation or the allocator without one. A
+    compile for absent GPUs reads it for the prepared run that loads its program (`allocator_limit`): one
+    loaded where Dew did not prepare the process (a notebook's, at JAX's 75%) holds less, and its loader
+    refuses the program naming both limits (`dew.training.ahead.BuildTarget.differences`)."""
     named = os.environ.get(fraction_name())
     if named is not None:
         return float(named)
     return JAX_SHARE if any(name in os.environ for name in POOL_NAMES) else DEW_SHARE
+
+
+COMPILE_ONLY_MEMORY: dict = {}
+"""Each compile-only GPU's memory, its total bytes, as its topology states it to XLA (`device_memory_size`,
+written by `dew.training.ahead.compile_only_gpus`, read from a host's own by `host_gpus`): the one
+statement every admission of a program compiled for it reads (`allocator_limit`)."""
+
+
+def allocator_limit(memory: int) -> int:
+    """The bytes XLA's allocator is limited to on a GPU of `memory` bytes, as the run that loads a program
+    states it (`bytes_limit`): its memory times the pool's share (`pool_share`), as a double truncated
+    (`CreateBFCAllocator`, xla/pjrt/gpu/gpu_helpers.cc), the one rule a compile for absent GPUs and the
+    GPU's own allocator read alike. The GPU's own rounds it up to 2 MiB besides (`RoundUpGpuMemoryLimit`,
+    there), so a plan held to this limit is held to at most 2 MiB less than the GPU's, and loads there:
+    a GH200 of 101,468,602,368 bytes at Dew's share derives 96,395,172,249 against the 96,395,591,680 it
+    states (M-IG-6, measured)."""
+    return int(memory * pool_share())
+
+
+def device_limit(device) -> int | None:
+    """The bytes an allocation on `device` fails against: its allocator's limit as it states it
+    (`Device.memory_stats`' `bytes_limit`) where it is this process's own, a compile-only GPU's derived
+    from its stated memory (`COMPILE_ONLY_MEMORY`), None where neither states one (a CPU)."""
+    import jax
+
+    if device in jax.local_devices():
+        return (device.memory_stats() or {}).get("bytes_limit")
+    memory = COMPILE_ONLY_MEMORY.get(device)
+    return None if memory is None else allocator_limit(memory)
+
+
+def pool_bound(*, cuda: bool) -> float | None:
+    """The share of each GPU XLA's pool takes as this run names it (`pool_share`), which Dew may size it
+    below and never above (`dew.communicators`). None where the pool holds no fixed share: a process off
+    CUDA, a pool that grows (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) or another allocator than XLA's own
+    BFC pool."""
+    allocator = os.environ.get("XLA_PYTHON_CLIENT_ALLOCATOR", "default").lower()
+    growing = os.environ.get("XLA_PYTHON_CLIENT_PREALLOCATE", "true").lower() in ("false", "0")
+    if not cuda or growing or allocator not in ("default", "bfc"):
+        return None
+    return pool_share()
 
 
 def preallocate_gpu_pool() -> None:

@@ -451,6 +451,43 @@ def set_quantizers(model_module, *, enabled: bool):
     model_module.act_quant, model_module.fp4_act_quant = act_quant, fp4_act_quant
 
 
+@contextlib.contextmanager
+def followed_quantizers(model_module, decided: dict[str, np.ndarray]):
+    """model.py's quantizers rounding where another run rounded: each call's output the next blocks of its
+    kind from `decided` (that run's outputs per kind, joined in call order, `Record.joined`'s "out"), its
+    gradient straight through as the stand-ins' (`kernel._fake_quant`), and each call recorded in every
+    active record (`_probed`): the float64 computation that rounds where that run rounded
+    (docs/design/testing.md, a quantized computation's truth). A run that leaves a decision untaken, or
+    takes one past them, is another computation than the one it follows, and is refused."""
+    kernels = sys.modules["kernel"]
+    taken = dict.fromkeys(BLOCKS, 0)
+
+    def take(site: str, x: torch.Tensor, inplace: bool):
+        rows, start = x.numel() // BLOCKS[site], taken[site]
+        if start + rows > len(decided[site]):
+            raise ValueError(f"the following run rounds {site} blocks past the run it follows")
+        taken[site] = start + rows
+        value = torch.from_numpy(decided[site][start:start + rows]).to(x.dtype).reshape(x.shape)
+        return _probed(site, x, lambda: kernels._fake_quant(x, value, inplace))
+
+    def act_quant(x, block_size=128, scale_fmt=None, scale_dtype=torch.float32, inplace=False):
+        return take("window", x, inplace)
+
+    def fp4_act_quant(x, block_size=32, inplace=False, scale_dtype=torch.float8_e8m0fnu):
+        return take("entries" if scale_dtype == torch.float8_e4m3fn else "index", x, inplace)
+
+    held = model_module.act_quant, model_module.fp4_act_quant
+    model_module.act_quant, model_module.fp4_act_quant = act_quant, fp4_act_quant
+    try:
+        yield
+    finally:
+        model_module.act_quant, model_module.fp4_act_quant = held
+    left = {site: len(decided[site]) - count for site, count in taken.items()
+            if count != len(decided[site])}
+    if left:
+        raise ValueError(f"the following run leaves the decisions of the run it follows untaken: {left}")
+
+
 def install_selection_probe():
     """Wrap torch.Tensor.topk to record every selection: its scored rows, its
     sorted picks and their margins."""
@@ -999,22 +1036,147 @@ def clearing_rows(net, vocabulary: int, seed: int) -> np.ndarray:
             return ids.numpy().astype(np.int32)
 
 
+def clearing_quantized_rows(model_module, net, vocabulary: int, seed: int) -> np.ndarray:
+    """The `seed`-th drawn rows `[2, LENGTH]` (a stream of their own, redrawn until it does) whose every
+    top-k of the release's forward, its quantizers on, clears the gate's `MARGIN`
+    (tests/selection_margins.py): rows a float32 port selects over as the release does, its roundings
+    each held to their own (`quantized_forward_evaluated`)."""
+    from selection_margins import MARGIN
+
+    generator = torch.Generator().manual_seed(0x5154 + seed)
+    while True:
+        ids = torch.randint(3, vocabulary - 1, (2, LENGTH), generator=generator)
+        recorded = Record()
+        RECORDS[:] = [recorded]
+        set_quantizers(model_module, enabled=True)
+        try:
+            with torch.no_grad():
+                reset(net)
+                forward(net, ids)
+        finally:
+            set_quantizers(model_module, enabled=False)
+            RECORDS.clear()
+        margins = [call["margin"] for call in recorded.calls.get("selection", [])]
+        if all(bool((margin > MARGIN).all()) for margin in margins):
+            return ids.numpy().astype(np.int32)
+
+
+CACHED_LEAVES = ("prompt_logits", "decode_logits", "draft_logits", "draft_confidence")
+"""The cached run's outputs check 1 holds (`cached`): its draft ids are its draft logits' argmax, which the
+rows' margins hold apart (`clearing_cached_rows`)."""
+
+
+def clearing_cached_rows(net, vocabulary: int, seed: int) -> np.ndarray:
+    """The `seed`-th drawn rows `[2, LENGTH]` (a stream of their own, redrawn until it does) whose cached run
+    (`cached`) decides alike in a float32 port: every top-k clears twice the gate's `MARGIN`
+    (tests/selection_margins.py), and so does every argmax the run feeds on, its top two apart by that of
+    the row's largest finite logit: the main model's at the prompt's last position and at each step, which
+    DSpark drafts from, and each draft's at every position but its last, whose token the next position's
+    logits read (model.py:1149-1153). Twice, so a port's own run, whose decisions' inputs sit within
+    float32 rounding of the release's, clears MARGIN as its test holds it to (`cached_rows`): over 160 rows
+    cleared at MARGIN alone, Dew's run of one cleared 8.95e-6."""
+    from selection_margins import MARGIN
+
+    generator = torch.Generator().manual_seed(0x4348 + seed)
+    while True:
+        ids = torch.randint(3, vocabulary - 1, (2, LENGTH), generator=generator)
+        recorded = Record()
+        RECORDS[:] = [recorded]
+        with torch.no_grad():
+            outputs = cached(net, ids)
+        RECORDS.clear()
+        fed = [outputs["prompt_logits"][:, -1], outputs["decode_logits"], outputs["draft_logits"][:, :, :-1]]
+        margins = [call["margin"] for call in recorded.calls.get("selection", [])] + [
+            selection_margins(torch.from_numpy(logits).reshape(-1, logits.shape[-1]).float(), 1)["margin"]
+            for logits in fed]
+        if all(bool((margin > 2 * MARGIN).all()) for margin in margins):
+            return ids.numpy().astype(np.int32)
+
+
+def cached_evaluated(model_module, net, wide):
+    """A recorded cached run's evaluation (`record_case`): the release's prefill, teacher-forced steps and
+    DSpark's drafts after each (`cached`), their logits and confidence (`CACHED_LEAVES`), in float32 and in
+    float64."""
+    def evaluate(inputs):
+        ids = torch.from_numpy(inputs["input_ids"].astype(np.int64))
+        with torch.no_grad():
+            narrow = cached(net, ids)
+            with widened(model_module):
+                truth = cached(wide, ids)
+        return ({name: narrow[name].astype(np.float64) for name in CACHED_LEAVES},
+                {name: truth[name] for name in CACHED_LEAVES})
+    return evaluate
+
+
+def _inputs(rounded: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Each kind's quantizer inputs as a leaf of its own, `rounded/<kind>`, the name a port's test gives it
+    (tests/quantized_arms.py)."""
+    return {f"rounded/{site}": value for site, value in rounded.items()}
+
+
+def _rounded(record: Record, name: str, dtype=None) -> dict[str, np.ndarray]:
+    """A record's quantizer calls' `name` blocks per kind, joined in call order, at their width or
+    `dtype`'s."""
+    joined = {site: record.joined(site, name).numpy() for site in BLOCKS}
+    return joined if dtype is None else {site: value.astype(dtype) for site, value in joined.items()}
+
+
+def quantized_forward_evaluated(model_module, net, wide):
+    """A recorded quantization-aware forward's evaluation (`record_case`): the release's logits, its
+    quantizers on, and every quantizer input (`rounded`), in float32 and in float64, its float64 run
+    following the float32 run's roundings (`followed_quantizers`), whose outputs it returns third."""
+    def evaluate(inputs):
+        ids = torch.from_numpy(inputs["input_ids"].astype(np.int64))
+        narrow_record, wide_record = Record(), Record()
+        RECORDS[:] = [narrow_record]
+        set_quantizers(model_module, enabled=True)
+        try:
+            with torch.no_grad():
+                reset(net)
+                logits = forward(net, ids)[1]
+        finally:
+            set_quantizers(model_module, enabled=False)
+            RECORDS.clear()
+        decided = _rounded(narrow_record, "out")
+        with widened(model_module), torch.no_grad():
+            RECORDS[:] = [wide_record]
+            try:
+                with followed_quantizers(model_module, decided):
+                    reset(wide)
+                    truth = forward(wide, ids)[1]
+            finally:
+                RECORDS.clear()
+        narrow = {"logits": logits.double().numpy(), **_inputs(_rounded(narrow_record, "in", np.float64))}
+        return narrow, {"logits": truth.numpy(), **_inputs(_rounded(wide_record, "in"))}, decided
+    return evaluate
+
+
+def drawn_once(clearing):
+    """A recording's draw of rows (`record_case`), `clearing(index)`'s each drawn once, and the rows it drew
+    by index, which recording_rows.npz keeps."""
+    rows: dict[int, np.ndarray] = {}
+
+    def draw(index: int) -> dict[str, np.ndarray]:
+        if index not in rows:
+            rows[index] = clearing(index)
+        return {"input_ids": rows[index]}
+    return draw, rows
+
+
 def write_recording(seed: int):
     """recording.npz beside the fixture: the release's plain logits in fp32 and fp64 over drawn rows its
     selections clear (`clearing_rows`), every position's and a cached walk's past its prompt, summarized
     over seeds for check 1, and the rows each seed drew (recording_rows.npz)
     (`recorded_references.record_case`), the reference the suite's variants of a row (an interior gap,
-    shifted positions, a shifted cached walk) are held to (tests/test_deepseek_v41.py)."""
+    shifted positions, a shifted cached walk) are held to (tests/test_deepseek_v41.py); over rows drawn
+    apart (`clearing_quantized_rows`) the quantization-aware forward's logits and every quantizer input
+    (`quantized_forward_evaluated`), its decisions recorded, which its truth followed; and over rows drawn
+    apart again (`clearing_cached_rows`) the cached run and DSpark's drafts (`cached_evaluated`)."""
     from recorded_references import provenance, record_case, save
 
     model_module, args, net, wide = released(seed)
 
-    rows: dict[int, np.ndarray] = {}
-
-    def draw(index: int) -> dict[str, np.ndarray]:
-        if index not in rows:
-            rows[index] = clearing_rows(net, args.vocab_size, index)
-        return {"input_ids": rows[index]}
+    draw, rows = drawn_once(lambda index: clearing_rows(net, args.vocab_size, index))
 
     def evaluated(start: int):
         """Each row's logits from position `start` on, in fp32 and in fp64."""
@@ -1032,6 +1194,19 @@ def write_recording(seed: int):
     # Every position's, and those a cached walk computes after its prompt's prefill.
     arrays = {**record_case("deepseek v41 plain rows", draw, evaluated(0), summary=True),
               **record_case("deepseek v41 plain walk", draw, evaluated(PROMPT - 1), summary=True)}
+
+    # The quantization-aware forward's, over rows drawn apart (`clearing_quantized_rows`), held by its
+    # float64 run following its own roundings (docs/design/testing.md).
+    quantized_draw, quantized = drawn_once(
+        lambda index: clearing_quantized_rows(model_module, net, args.vocab_size, index))
+    arrays.update(record_case("deepseek v41 quantized forward", quantized_draw,
+                              quantized_forward_evaluated(model_module, net, wide), summary=True,
+                              followed=True))
+
+    # The cached run and DSpark's drafts, over rows its every selection and fed argmax clears.
+    cached_draw, walking = drawn_once(lambda index: clearing_cached_rows(net, args.vocab_size, index))
+    arrays.update(record_case("deepseek v41 plain cached", cached_draw,
+                              cached_evaluated(model_module, net, wide), summary=True))
     written = save(FIXTURE / "recording.npz", {**arrays, "provenance": provenance(
         "deepseek-ai/DeepSeek-V4.1-Flash", DEEPSEEK_V41_REVISION, "cpu",
         "PYTHONPATH=src:.:tests:tools <release python> tools/deepseek_v41_reference.py --record",
@@ -1039,7 +1214,9 @@ def write_recording(seed: int):
         license="mit")
     # The rows each seed drew, which the test reads its inputs from (`recorded_rows`): its own draw would
     # rerun the release's selections to clear them.
-    np.savez(FIXTURE / "recording_rows.npz", rows=np.stack([rows[index] for index in range(len(rows))]))
+    np.savez(FIXTURE / "recording_rows.npz", rows=np.stack([rows[index] for index in range(len(rows))]),
+             quantized_rows=np.stack([quantized[index] for index in range(len(quantized))]),
+             cached_rows=np.stack([walking[index] for index in range(len(walking))]))
     print(f"{written}: {sorted(arrays)}; {len(rows)} rows")
 
 

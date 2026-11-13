@@ -19,6 +19,20 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `compile(..., resume=)` takes `"relaxed"` where it took `"non-exact"`, and a plan's refusal is a
   `dew.data.plan.PlanChanged` naming what differs (`differs`).
 
+- A plan the devices refuse (`PlanRefused`) states what each local device's allocator read as it refused
+  (`PlanRefused.allocators`, the tightest in its message: its limit, its bytes in use, its largest free
+  block and its pool), so a refusal at a phase's boundary names what holds the device.
+
+- A compile-only GPU states its memory once: `compile_only_gpus(generation, count, memory)` takes each GPU's
+  memory, its total as the GPU states it, which XLA compiles for and every admission of a program compiled
+  for it reads as the allocator's limit derived from it (`dew._devices.allocator_limit`, the run's pool
+  share, as the GPU's own allocator states it); a host's own serialized topology (`host_gpus`) states its
+  GPUs' memory itself. `compile_ahead` no longer takes `capacity`, and refuses before anything traces GPUs
+  that state no memory, where it planned by compiling; `Trainer.validate` and `Layout.validate` no longer
+  take `capacity`: a run is checked for GPUs on a host that holds none over compile-only GPUs of stated
+  memory. `AheadTarget.capacity_gib` is that memory, and `AheadOfTime.capacity` the limit the plan held to.
+
+
 - Dew requires its JAX build 0.12.0.1.post85 (Python alone; the CUDA and PJRT plugins stay post81's): the
   GPU interpreter checks a barrier wait that names its phase at its waits alone, so consumers that take
   alternate tiles of one ring over several rotations, warps among them, are checked rather than refused.
