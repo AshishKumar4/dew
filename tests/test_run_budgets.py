@@ -1331,7 +1331,8 @@ def test_a_batched_step_that_makes_no_rows_of_a_group_refuses_it_and_carries_its
     loader = compile(chain, read="streamed", examples=len(docs) if bounded else None)
     stream = loader.train(DataPartition())
     try:
-        batches = list(stream)
+        # An unbounded training read repeats its corpus: its first two batches, within its first pass.
+        batches = list(stream if bounded else itertools.islice(stream, 2))
     finally:
         if isinstance(stream, Closeable):
             stream.close()
