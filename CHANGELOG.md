@@ -33,6 +33,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   memory. `AheadTarget.capacity_gib` is that memory, and `AheadOfTime.capacity` the limit the plan held to.
 
 
+- Dew requires its JAX build 0.12.0.1.post86 (Python alone; the CUDA and PJRT plugins stay post81's): a Mosaic
+  GPU kernel's identity reads its operations, not its source locations, so a kernel traced alone and again in a
+  step's gradient compiles once; cuDNN's attention gates read the capability of the GPU a program is traced
+  for, so compiling ahead for a compile-only GPU takes head dims past 128; the Mosaic GPU pipeline takes a
+  prefetch of a step's first values under the step before's last products; the TPU pipeline carries a value
+  across its steps.
 - Dew requires its JAX build 0.12.0.1.post85 (Python alone; the CUDA and PJRT plugins stay post81's): the
   GPU interpreter checks a barrier wait that names its phase at its waits alone, so consumers that take
   alternate tiles of one ring over several rotations, warps among them, are checked rather than refused.
