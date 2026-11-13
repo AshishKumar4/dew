@@ -15,6 +15,7 @@ from .hf import from_hf
 from .hub import Hub
 from .iterator import from_iter
 from .memory import DataFrame, Memory
+from .provisioning import provisioner
 from .pytorch import from_torch
 from .tfds import TFDS
 from .tokens import _SPLIT as _ONE_SPLIT, TokenFiles
@@ -55,8 +56,9 @@ def source(
     if split not in (None, _ONE_SPLIT) and isinstance(resolved, TokenFiles):
         raise ValueError(f"{resolved.describe()} is a token export, which holds one split; split={split!r} "
                          "is an export of its own, its TokenFiles(url)")
-    if provision and isinstance(resolved, (Files, Hub, TFDS, TokenFiles)):
-        resolved.provision()
+    # The store beneath it that prepares an indexed read it cannot take yet, a concatenation's each.
+    if provision and (preparer := provisioner(resolved, "indexed")) is not None:
+        preparer.provision()
     return resolved
 
 

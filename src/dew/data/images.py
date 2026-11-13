@@ -16,7 +16,7 @@ from numpy.typing import ArrayLike
 
 from dew._records import ADDED, record
 from dew.batch import Batch
-from dew.data.facts import resized, shaped, unshaped
+from dew.data.facts import IMAGE_FIELDS, conventional, resized, shaped, unshaped
 from dew.data.image_augmentation import AUGMENTATION_KEYS, JITTER
 from dew.data.image_codec import as_rgb, decode_image
 from dew.data.pipeline import DeviceStep, Rejected
@@ -81,7 +81,8 @@ def _payload(image: bytes | Mapping[str, object] | ArrayLike) -> bytes | ArrayLi
 
 @dataclasses.dataclass(frozen=True)
 class DecodeImage(grain.MapTransform):
-    """The image in `field` as RGB uint8 pixels under `to`, including prepared ArrayRecord
+    """The image in `field` as RGB uint8 pixels under `to`, the default `jpg` reading the record's
+    conventional field (`dew.data.facts.conventional`: jpg, png or image), including prepared ArrayRecord
     pixels, labels and captions; bytes that are no image are counted and dropped. With
     `rejects=False`, use `map` and fail on bad bytes. `at_least` bounds a reduced JPEG decode."""
 
@@ -95,7 +96,9 @@ class DecodeImage(grain.MapTransform):
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """RGB pixels under `to`, each image its own height and width, in place of the bytes in `field`."""
-        return shaped(unshaped(facts, self.field), self.to, [None, None, 3])
+        fields = record(facts.get("fields", {}), "fields")
+        pixels = unshaped(facts, conventional(fields, self.field, IMAGE_FIELDS))
+        return shaped(pixels, self.to, [None, None, 3])
 
     def __post_init__(self) -> None:
         import_opencv()
@@ -106,34 +109,39 @@ class DecodeImage(grain.MapTransform):
             object.__setattr__(self, name, value)
 
     def map(self, element: Batch | bytes) -> Batch | Rejected:
-        field = self.field
-        if isinstance(element, bytes):
-            from dew.data.sources.codec import unpack_dict_of_byte_arrays
-
-            decoded = unpack_dict_of_byte_arrays(element)
-            field = field if field in decoded else "image" if "shape" in decoded else "jpg"
-            element = {key: value for key, value in decoded.items()
-                       if key not in ("shape", "label", "caption", "txt")}
-            # The prepared format's integers are little-endian int32 on every host.
-            if "shape" in decoded:
-                height, width = np.frombuffer(decoded["shape"], "<i4")
-                element[field] = np.frombuffer(decoded[field], np.uint8).reshape(int(height), int(width), 3)
-            if "label" in decoded:
-                element["label"] = np.int32(np.frombuffer(decoded["label"], "<i4")[0])
-            element["caption"] = decoded.get("caption", decoded.get("txt", b"")).decode()
-        image = _payload(element[field])
-        if isinstance(image, bytes):
-            try:
-                image = decode_image(image, at_least=self.at_least)
-            except ValueError:
-                if not self.rejects:
-                    raise
-                return Rejected("undecodable")
-        else:
-            image = as_rgb(np.asarray(image))
+        try:
+            # A prepared ArrayRecord payload is undecodable alike where it is malformed (row 5758).
+            field, row = self._prepared(element) if isinstance(element, bytes) else (
+                conventional(element, self.field, IMAGE_FIELDS), element)
+            image = _payload(row[field])
+            pixels = decode_image(image, at_least=self.at_least) if isinstance(image, bytes) \
+                else as_rgb(np.asarray(image))
+        except (KeyError, ValueError, UnicodeDecodeError):
+            if not self.rejects:
+                raise
+            return Rejected("undecodable")
         # The pixels replace the bytes they came from.
-        kept = {key: value for key, value in element.items() if key != field}
-        return {**kept, self.to: image}
+        return {**{key: value for key, value in row.items() if key != field}, self.to: pixels}
+
+    def _prepared(self, payload: bytes) -> tuple[str, Batch]:
+        """A prepared ArrayRecord image's field and row: its pixels under `image` shaped by its `shape`
+        (little-endian int32 on every host), its label and caption beside them; a malformed one refused."""
+        from dew.data.sources.codec import unpack_dict_of_byte_arrays
+
+        decoded = unpack_dict_of_byte_arrays(payload)
+        field = (self.field if self.field in decoded else "image" if "shape" in decoded
+                 else conventional(decoded, self.field, IMAGE_FIELDS))
+        row: Batch = {key: value for key, value in decoded.items()
+                      if key not in ("shape", "label", "caption", "txt")}
+        if "shape" in decoded:
+            height, width = np.frombuffer(decoded["shape"], "<i4", count=2)
+            if height <= 0 or width <= 0:
+                raise ValueError(f"a prepared image of {height}x{width} pixels")
+            row[field] = np.frombuffer(decoded[field], np.uint8).reshape(int(height), int(width), 3)
+        if "label" in decoded:
+            row["label"] = np.int32(np.frombuffer(decoded["label"], "<i4", count=1)[0])
+        row["caption"] = decoded.get("caption", decoded.get("txt", b"")).decode()
+        return field, row
 
 
 @dataclasses.dataclass(frozen=True)

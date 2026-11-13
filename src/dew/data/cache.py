@@ -12,7 +12,7 @@ import time
 import uuid
 import weakref
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor, wait
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -23,6 +23,7 @@ import grain.python as grain
 import numpy as np
 
 from dew._builds import dew_cache_dir
+from dew._records import integer
 from dew.data.concurrent import Concurrently
 from dew.data.dataset import Loading, Ranges
 from dew.data.declared import Declared
@@ -413,6 +414,7 @@ class _Writer:
         self.pool = ThreadPoolExecutor(cache.upload_workers, thread_name_prefix="dew-cache-upload")
         self.lock = threading.Condition(threading.RLock())
         self.futures: list[Future] = []
+        self.shard_bytes_spooled: list[int] = []
         self.segments: list[dict] = []
         self.index = sqlite3.connect(Path(self.directory.name) / "inputs.sqlite", check_same_thread=False)
         self.index.execute(
@@ -577,6 +579,7 @@ class _Writer:
         upload = self.pool.submit(self._upload, number, path, entries, actual)
         upload.add_done_callback(self._ended)
         self.futures.append(upload)
+        self.shard_bytes_spooled.append(actual)
 
     def _reserve_shard(self, actual: int, provisional: int, path: Path) -> bool:
         if actual > self.cache.spool_limit:
@@ -682,6 +685,9 @@ class _Writer:
         leaves the fill filling, unless the cache blocks on a full spool."""
         try:
             work()
+        except CancelledError:
+            with self.lock:
+                self._stopped()
         except OSError as error:
             if self.cache.on_full == "block":
                 raise
@@ -768,21 +774,26 @@ class _Writer:
             self.pending.clear()
             self.spool_bytes -= self.pending_bytes
             self.pending_bytes = 0
-        tasks = [*self.futures, *([self.seal_future] if self.seal_future is not None else [])]
-        # The uploads in flight and a seal a fill already began run to their end, publishing what they
-        # publish (a fill read whole seals and publishes its generation), or fail, none left running past
-        # its writer: a silent read fails by its transport's bound (`dew.data.storage.IDLE_SECONDS`), and a
-        # body a peer stops reading waits on it (row 5402). No upload starts after these.
-        wait(tasks)
-        failed = sum(1 for task in tasks if not task.cancelled() and task.exception() is not None)
+            cancelled = 0
+            if self.seal_future is not None and self.seal_future.cancel():
+                self.seal_future = None
+            for upload, spooled in zip(self.futures, self.shard_bytes_spooled, strict=True):
+                if upload.cancel():
+                    cancelled += 1
+                    self.spool_bytes -= spooled
+            active = [
+                *(task for task in self.futures if not task.cancelled()),
+                *([self.seal_future] if self.seal_future is not None else []),
+            ]
+        wait(active)
+        failed = sum(1 for task in active if not task.cancelled() and task.exception() is not None)
         with self.lock:
-            self.abandoned += pending + failed
+            self.abandoned += pending + cancelled + failed
         self.pool.shutdown(wait=True, cancel_futures=True)
         self.index.close()
         self._reported()
         self._release()
         self._completed()
-
 
 class _Mapped(grain.MapDataset[CachedValue]):
     """An indexed cache read, with no fill for a volatile prefix."""
@@ -1024,14 +1035,9 @@ class _CachedIterator(grain.DatasetIterator):
             self.parent.set_state(state)
             self.ordinal = None
             return
-        ordinal = state.get("ordinal")
+        ordinal = integer(state.get("ordinal"), "cached shard ordinal")
         parent = state.get("parent")
-        if (
-            isinstance(ordinal, bool)
-            or not isinstance(ordinal, int)
-            or ordinal < 0
-            or not isinstance(parent, Mapping)
-        ):
+        if ordinal < 0 or not isinstance(parent, Mapping):
             raise ValueError("invalid cached shard iterator state")
         self.parent.set_state(parent)
         self.ordinal = ordinal

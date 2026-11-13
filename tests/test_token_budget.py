@@ -49,6 +49,23 @@ def test_a_token_budget_reads_its_rows_on_every_share_as_one_global_batch():
         resumed.close()
 
 
+@pytest.mark.parametrize("laid", ["step", "windows"])
+@pytest.mark.parametrize(("tokens", "rows"), [(8, 1), (16, 2), (32, 4)])
+def test_a_budgeted_chain_states_the_rows_its_batches_hold(laid, tokens, rows):
+    """The batch a budgeted chain states (`facts`) is the rows each batch it compiles to holds, whether a
+    record step or a window stage lays its 8-token rows out: 1, 2 and 4 rows under 8, 16 and 32 tokens."""
+    documents = Memory(tuple({"text": np.arange(index, index + 9, dtype=np.int32)} for index in range(48)))
+    rows_of_eight = (Pipeline(documents).map(FixedTokens(8, extra=1)) if laid == "step"
+                     else Pipeline(documents).windows(8))
+    chain = rows_of_eight.repeat().batch(tokens=tokens)
+    reader = compile(chain, read="memory", seed=7, loading=READ).train(DataPartition())
+    try:
+        batch = next(reader)["text"]
+    finally:
+        reader.close()
+    assert chain.facts()["batch"] == len(batch) == rows
+
+
 def test_a_token_budget_of_part_rows_is_refused():
     """A budget of whole 8-token rows compiles; one of 36 tokens is refused."""
     compile(windows(32), read="memory", loading=READ)
