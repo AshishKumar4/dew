@@ -250,9 +250,9 @@ def test_a_task_says_each_red_row_last_where_armada_keeps_its_tail(ci, tmp_path,
 
 
 def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci, tmp_path):
-    """A pytest an abort ends (a native library's, here os.abort) keeps its whole output and its processes' native
-    stacks among the task's artifacts, named on its red row, so the cause is read from what it left (row 5801:
-    train 788's abort left faulthandler's Python stacks and no native frame; owner, 2026-11-13)."""
+    """A pytest an abort ends (a native library's, here os.abort) keeps its whole output and its processes'
+    native stacks among the task's artifacts, named on its red row, so the cause is read from what it left (row
+    5801: train 788's abort left faulthandler's Python stacks and no native frame; owner, 2026-11-13)."""
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_any.py": "import os\n\n\ndef test_aborts():\n    print('before the abort')\n"
                                       "    os.abort()\n"})
