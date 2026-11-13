@@ -417,8 +417,11 @@ class AlignedDocuments:
         chunks = -(-sizes // chunk)
         opened = (jnp.cumsum(chunks, axis=1) - chunks) * chunk
         total = -(-length // chunk) + documents
-        slots = jnp.arange(length, dtype=jnp.int32)[None, :]
-        document = jnp.clip(jnp.sum(slots[:, :, None] >= firsts[:, None, :], axis=-1) - 1, 0, documents - 1)
+        positions = jnp.arange(length, dtype=jnp.int32)
+        slots = positions[None, :]
+        # Each slot's document: the last whose first slot is at or before it, its row's firsts sorted.
+        found = jax.vmap(lambda row: jnp.searchsorted(row, positions, side="right"))(firsts)
+        document = jnp.clip(found - 1, 0, documents - 1)
         aligned = (jnp.take_along_axis(opened, document, axis=1)
                    + slots - jnp.take_along_axis(firsts, document, axis=1))
         lines = jnp.arange(rows)[:, None]

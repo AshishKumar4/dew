@@ -12,8 +12,9 @@ their products through `portable` and read a chunk's memory through `remembered`
 across the mesh axis. Packed documents restart the decays at each document's first position (varlen).
 
 The algebra declares its products and issues none (the design's layering): every product goes through the
-caller's `issue(name, left, right)`, the mainloop's, by its name in `PRODUCTS`, which says what it multiplies;
-the portable math's issuer is XLA's (`portable`), a kernel's its own dot."""
+caller's `issue(name, left, right)`, the mainloop's, by its name, which its launch's issuer dispatches to the
+buffers it stages that product's operands in; the portable math's issuer is XLA's (`portable`), a kernel's its
+own dot."""
 
 import functools
 import math
@@ -39,44 +40,8 @@ from dew.nn.precision import (
 )
 
 Issue = Callable[[str, "Operand", "Operand"], jax.Array]
-"""A mainloop's product: `issue(name, left, right)` is `left @ right` over the last two axes, the product
-`PRODUCTS[name]` declares, in the mainloop's own dot."""
-
-PRODUCTS = {
-    "intra": "the write-gated keys against the keys, `kb k^T`, under a decay a head (`intra`)",
-    "scores": "the queries against the keys, `q k^T`, under a decay a head (`readout`)",
-    "merge": "two diagonal blocks' inverses joined across the block below them (`factor`)",
-    "apply_w": "the inverse against the decayed write-gated keys, `L (kb exp(gc))` (`apply`)",
-    "apply_u": "the inverse against the write-gated values, `L (vb)` (`apply`)",
-    "corrected": "the write's keys against the memory entering, `W S` (`carry`)",
-    "write": "the decayed keys against the corrected values, `(k last)^T v_new` (`carry`)",
-    "memory": "the decayed queries against the memory entered, `(q exp(gc)) S` (`readout`)",
-    "local": "the chunk's scores against its corrected values, `A_qk v_new` (`readout`)",
-    "compose": "a transition against another's, `T2 T1` and `T2 W1` (`compose`)",
-    "local_t": "the keys against the queries, `k q^T`, the scores' transpose (`local_gradient`)",
-    "local_dv": "the scores' transpose against the output's gradient, `A^T do` (`local_gradient`)",
-    "reads": "the queries' transpose against the decayed output gradient, `q^T (do exp(gc))`",
-    "values_dv": "the keys against the leaving memory's gradient, `k dS` (`reverse_carried`)",
-    "weights_dv": "the weights' transpose against the values' gradient, `w^T dv` (`reverse_carried`)",
-    "values_ds": "the output's gradient against the corrected values, `do v^T` (`scores_gradient`)",
-    "memory_dq": "the output's gradient against the entered memory's transpose, `do S^T`",
-    "memory_dk": "the corrected values against the leaving memory's gradient, `v dS^T`",
-    "memory_dw": "the values' gradient against the entered memory's transpose, `dv S^T`",
-    "memory_trace": "the entered memory against the leaving one's gradient's transpose, `S dS^T`, whose "
-                    "diagonal sums `sum(S dS)` a key row each (a mainloop's `memory_gradients` launch)",
-    "scores_dq": "the scores' gradient against the keys, `ds k`, and its transpose against the queries",
-    "inverse_t": "the inverse's transpose against a gradient, `L^T dX` (`system_gradient`)",
-    "inverse_dx": "the weights' gradient against the weighted keys' transpose, `dw (k b exp(gc))^T`",
-    "inverse_du": "the corrected values' gradient against the gated values' transpose, `du (v b)^T`",
-    "inverse_l": "the inverse's gradient through the inverse, `L^T dX L^T`",
-    "keys_dl": "the system's gradient against the keys, `dL k`, and the keys against themselves, `k k^T`",
-    "keys_dlt": "the system's gradient, its rows scaled by the write gates, transposed against the keys",
-    "summed": "a decay's range terms against a triangle or the identity, each token's sum (`summed_pairs`)",
-}
-"""The algebra's products by name. A decay a key dimension weighs each term of `intra`'s and `scores`'
-contractions (`paired`), which a mainloop issues as a product of the factored operands within the range its
-decay's bound keeps exact, or as the weighed sum."""
-
+"""A mainloop's product: `issue(name, left, right)` is `left @ right` over the last two axes, in the
+mainloop's own dot, `name` the product its launch's issuer stages it as."""
 
 STATE_PRECISION = exact_float32(None)
 """The precision the portable math's products take: a chunk's products carry the recurrent state, whose
