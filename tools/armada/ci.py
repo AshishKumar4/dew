@@ -366,6 +366,7 @@ class Reading:
     parts: dict[str, bytes] = dataclasses.field(default_factory=dict)
     modules: dict[str, dict[str, bytes] | bytes] = dataclasses.field(default_factory=dict)
     durations: dict[str, dict[str, float]] | None = None
+    stored: dict[str, list[str]] | None = None
     cuts: dict[tuple[str, int], list[list[str]]] = dataclasses.field(default_factory=dict)
     lock: threading.Lock = dataclasses.field(default_factory=threading.Lock)
 
@@ -375,10 +376,11 @@ class Reading:
         # Under the lock: the plan's threads share a reading (train 679: a half-parted record cut empty).
         with self.lock:
             if self.durations is None:
-                self.durations = parted_record(session.cut_record())
+                self.durations, self.stored = parted_record(session.cut_record()), session.stored_cuts()
             if (name, count) not in self.cuts:
                 own = own_tests(name, self.durations.get(name, {}))
-                self.cuts[(name, count)] = session.cut(list(own), list(own.values()), count)
+                self.cuts[(name, count)] = session.planned(name, list(own), list(own.values()), count,
+                                                           self.stored)
             return self.cuts[(name, count)]
 
     def named(self, name: str) -> list[str]:
@@ -705,6 +707,14 @@ def recorded_tests() -> dict[str, list[float]]:
     """Each file's tests' times recorded (`own_tests`), one shared setup's one weight (`session.units`)."""
     found = {name: own_tests(name, tests) for name, tests in parted_record().items()}
     return {name: session.unit_seconds(list(own), list(own.values())) for name, own in found.items() if own}
+
+
+def stored_weights() -> dict[str, list[float]]:
+    """Each split file's stored cut (`session.CUTS`) as its groups' recorded seconds (`own_tests`), which the
+    plan keeps while they hold (`cuts.weighed`)."""
+    stored, parted = session.stored_cuts(), parted_record()
+    return {name: [sum(own[node] for node in group) for group in session.cut_by(list(own), bounds)]
+            for name, bounds in stored.items() if (own := own_tests(name, parted.get(name, {})))}
 
 
 def parted_record(path: Path = session.DURATIONS) -> dict[str, dict[str, float]]:
@@ -1145,6 +1155,7 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
     for name in every:
         session.shared_setups(name)
     recorded = recorded_tests()
+    stored = stored_weights()
     entries = []
     for python in PYTHONS:
         # Every file on every Python daily; on a pushed run, its cache's policy on or off, the newest takes
@@ -1159,7 +1170,7 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
                 cut = cuts.weighed(session, recorded.get(name, []), seconds, target,
-                                   measured_cut(timings, python, name))
+                                   measured_cut(timings, python, name), stored.get(name, ()))
                 groups[name] = [(f"{group}/{len(cut)}" if len(cut) > 1 else "", weight)
                                 for group, weight in enumerate(cut, start=1)]
         # Each check-1 site its file's marks shard is a row of its own, its judge's.
@@ -1532,7 +1543,7 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
     # (`watched`): each is the input of every file the task runs; and every file of the checkout as it stood
     # then, so a file the run wrote is told from one it read alone (`watched.changed`, `record`).
     before = watched.stamps(os.getcwd(), followed.HIDDEN_INPUTS)
-    opens = watched.Opens(os.getcwd(), frozenset({str(session.DURATIONS)}))
+    opens = watched.Opens(os.getcwd(), frozenset({str(session.DURATIONS), str(session.CUTS)}))
     done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               env=dict(environment))
 
@@ -2189,6 +2200,23 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     return 0
 
 
+def verdict_rows(verdict: dict) -> dict[str, list[dict]]:
+    """Main's CI `verdict`'s rows by test file, as its floor Python ran each file's groups or whole: no
+    collection's, site's or variant's row, and none of a file the checkout no longer has or has changed since
+    the verdict's commit, whose rows observed tests it may no longer hold (`folded`, `cuts.ran`)."""
+    changed = set(subprocess.run(["git", "diff", "--name-only", verdict["sha"], "--", "tests"], check=True,
+                                 capture_output=True, text=True).stdout.split())
+    rows: dict[str, list[dict]] = {}
+    for row_ in verdict["rows"]:
+        if ":" not in row_["name"]:
+            continue
+        python, name, split_ = parsed_row(row_["name"])
+        if (python == PYTHONS[0] and split_ != COLLECT and not session.SITE.fullmatch(split_)
+                and VARIED not in split_ and Path(name).is_file() and name not in changed):
+            rows.setdefault(name, []).append(row_)
+    return rows
+
+
 def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, float]:
     """The durations `record` with main's CI `verdict` (`armada verdict <sha> --json`) folded in, one test
     file at a time, each whole, as its floor Python's rows ran it. A file whose rows are all green and
@@ -2207,16 +2235,7 @@ def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, 
     by the record (`site_entries`), and a judge armada did not run is a row of its task's name. A
     whole_suite cell a row set aside (its `whole_suite` names it, its `tests` do not: a train's batch)
     keeps its entry too."""
-    changed = set(subprocess.run(["git", "diff", "--name-only", verdict["sha"], "--", "tests"], check=True,
-                                 capture_output=True, text=True).stdout.split())
-    rows: dict[str, list[dict]] = {}
-    for row_ in verdict["rows"]:
-        if ":" not in row_["name"]:
-            continue
-        python, name, split_ = parsed_row(row_["name"])
-        if (python == PYTHONS[0] and split_ != COLLECT and not session.SITE.fullmatch(split_)
-                and VARIED not in split_ and Path(name).is_file() and name not in changed):
-            rows.setdefault(name, []).append(row_)
+    rows = verdict_rows(verdict)
     kept = {node: seconds for node, seconds in record.items() if Path(node.split("::")[0]).is_file()}
     for name, held in rows.items():
         splits = {parsed_row(row_["name"])[2] for row_ in held}
@@ -2405,10 +2424,17 @@ def main() -> int:
         return 1 if wrong or not nodes else 0
     if args.operation == "durations":
         target = json.loads(Path(".armada.json").read_text())["target"]
-        before = durations_record()
-        recorded = folded(before, json.loads(args.verdict.read_text()), target)
+        before, verdict = durations_record(), json.loads(args.verdict.read_text())
+        # The record main's CI cut its files by, read before its times change it (`cuts.refolded`).
+        cut_by = {name: own_tests(name, tests) for name, tests in parted_record().items()}
+        recorded = folded(before, verdict, target)
         if recorded != before:
             session.DURATIONS.write_text(json.dumps(recorded, indent=0) + "\n")
+        after = {name: own_tests(name, tests) for name, tests in parted_record().items()}
+        runs = cuts.ran(verdict_rows(verdict))
+        stored = cuts.refolded(session, session.stored_cuts(), runs, target, cut_by, after)
+        if stored != session.stored_cuts():
+            session.CUTS.write_text(json.dumps(stored, indent=0, sort_keys=True) + "\n")
         changed = sorted({node.split("::")[0] for node in before.keys() ^ recorded.keys()}
                          | {node.split("::")[0] for node in before.keys() & recorded.keys()
                             if before[node] != recorded[node]})

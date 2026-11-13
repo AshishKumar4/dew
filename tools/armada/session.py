@@ -7,13 +7,23 @@ and a change to it reruns nothing. The standard library alone: the plan imports 
 installed."""
 
 import ast
+import bisect
 import functools
+import json
 import os
 import re
 from collections.abc import Container, Iterator, Mapping
 from pathlib import Path
 
 DURATIONS = Path("tests/test_durations.json")
+CUTS = Path("tests/test_cuts.json")
+"""Each split test file's cut as main's CI last ran it, kept while the file's groups hold (`stored_cuts`): the
+node id each group after the first begins at, so a group's name means the same tests from run to run whatever
+their times do, and its record is found again (2026-11-13: 43% of the plan's rows had no record, a split
+file's groups renamed whenever its times moved; Main). Written by the durations fold alone (ci.py
+`durations`), a record the land queue owns as it owns `DURATIONS`; a second file rather than a key of that
+one, whose readers all read node ids to seconds (split.py, ci.py, the queue's merge of a head's new times, a
+GPU tier's record of the same shape)."""
 
 
 SELECTION = ("-m", "not network")
@@ -303,6 +313,32 @@ def cut(nodes: list[str], seconds: list[float], count: int) -> list[list[str]]:
     held = units(nodes)
     runs = groups([sum(seconds[index] for index in unit) for unit in held], count)
     return [[nodes[index] for unit in held[run.start:run.stop] for index in unit] for run in runs]
+
+
+def stored_cuts() -> dict[str, list[str]]:
+    """The stored cuts (`CUTS`): each split file's group boundaries, none where the checkout has no record."""
+    return json.loads(CUTS.read_text()) if CUTS.is_file() else {}
+
+
+def cut_by(nodes: list[str], bounds: list[str]) -> list[list[str]]:
+    """`nodes` (node-id order) as the `len(bounds) + 1` groups a stored cut names: each of `units` in the
+    group whose interval of node ids, [bounds[k - 1], bounds[k]), holds its first test, so a test added later
+    falls in the interval it sorts into and no test leaves its group while the cut stands."""
+    held: list[list[str]] = [[] for _ in range(len(bounds) + 1)]
+    for unit in units(nodes):
+        held[bisect.bisect_right(bounds, nodes[unit[0]])].extend(nodes[index] for index in unit)
+    return [sorted(members) for members in held]
+
+
+def planned(name: str, nodes: list[str], seconds: list[float], count: int,
+            stored: Mapping[str, list[str]] | None = None) -> list[list[str]]:
+    """Test file `name`'s recorded `nodes` as the plan's `count` groups: its stored cut where it has `count`
+    groups and the groups are cut by the durations record (`cut_record`; a GPU tier cuts by its own seconds),
+    else cut by their `seconds` (`cut`). `stored` is `stored_cuts()` where a caller has read it once."""
+    bounds = (stored_cuts() if stored is None else stored).get(name) if cut_record() == DURATIONS else None
+    if bounds is not None and len(bounds) + 1 == count:
+        return cut_by(nodes, bounds)
+    return cut(nodes, seconds, count)
 
 
 @functools.cache
