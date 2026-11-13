@@ -68,7 +68,7 @@ def intra_own(q, k, hi, lo, beta, taken, call: Call, *, scale: float, products: 
     scored = "scores" in products
     keys = key_block(call, functools.partial(_own_held, call, outputs=len(products)),
                      functools.partial(_own_staged, call, products=products),
-                     functools.partial(_own_streamed, call, queries=scored))
+                     functools.partial(_own_streamed, call, queries=scored), contracted=True)
     steps = width // keys
 
     def program(at, q_ref, k_ref, hi_ref, lo_ref, beta_ref, taken_ref, *sums, streams, staging, landing):

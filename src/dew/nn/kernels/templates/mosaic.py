@@ -1012,6 +1012,13 @@ class Issuer[Accumulator](abc.ABC):
         (`NARROWEST_SWIZZLE_BYTES`), 16 bf16 columns, which both families' products read (wgmma's N in
         eights, mma.sync's n of 8 twice through ldmatrix). A template splitting its columns finer than its
         stores' `column_unit` to fill the multiprocessors (the recurrence's value blocks) steps by it."""
+        return self.narrowest_depth(dtype)
+
+    def narrowest_depth(self, dtype) -> int:
+        """The fewest columns of `dtype` a staged block takes where a product contracts over them (its
+        depth): a row of the narrowest swizzle (`NARROWEST_SWIZZLE_BYTES`), 16 bf16 columns, every family's
+        products' depth (wgmma's and tcgen05's K of 16, mma.sync's k of 16). A family whose products split
+        their N columns between lane groups (tcgen05's `narrowest_columns`) splits no depth."""
         return swizzling.swizzle_columns(dtype, swizzling.NARROWEST_SWIZZLE_BYTES)
 
     @property

@@ -1132,31 +1132,41 @@ def fitting_block(call: Call, held: Callable[[int], Held], staged: Callable[[int
 
 
 def key_block(call: Call, held: Callable[[int], Held], staged: Callable[[int], tuple],
-              streamed: Callable[[int], dict] | None = None) -> int:
+              streamed: Callable[[int], dict] | None = None, *, contracted: bool = False) -> int:
     """A launch's key block under a decay a key dimension, whose prefix halves, decays and gated keys it
     holds a block at a time in fp32: from the widest of the family's depths for 16-bit operands
-    (`Family.depths`) down to the narrowest columns a staged operand takes (`Family.narrowest_columns`), the
-    widest that fits a thread's registers (`fitting_block`); where the launch walks its key blocks and
+    (`Family.depths`) down to the narrowest columns a staged operand takes (`_key_blocks`: its depth's where
+    the launch's products contract over the key block or it issues none, `contracted`), the widest that fits
+    a thread's registers (`fitting_block`); where the launch walks its key blocks and
     streams a block at a time (`streamed(block)`, its walked streams there), the block a multiprocessor holds
     most programs of (`_planned_launch`, at its register model and its shared memory), the widest of those.
     Its walks wait on their products' latency: the intra launch's 248 registers a thread and 143 KB held an
     H100 at one program a multiprocessor, its schedulers without a warp to issue 64% of its cycles
     (kda-ncu2-h100-bc481d7de)."""
-    family = call.family
-    widest, unit = family.depths(jnp.bfloat16)[0], family.narrowest_columns(jnp.bfloat16)
     if streamed is None:
-        return fitting_block(call, held, staged, widest, unit)
+        return fitting_block(call, held, staged, call.family.depths(jnp.bfloat16)[0],
+                             _key_unit(call, contracted=contracted))
     resident = functools.partial(_resident, call, held, staged, streamed)
     # Where no block holds a program, the narrowest, as `fitting_block` falls back: the widest, which the
     # register-unchecked gate compiled, spilled 2784 bytes where the narrowest's need was the question
     # (row 5298, jsf-sm100-redgreen).
-    return max(_key_blocks(call), key=lambda block: (resident(block), block if resident(block) else -block))
+    return max(_key_blocks(call, contracted=contracted),
+               key=lambda block: (resident(block), block if resident(block) else -block))
 
 
-def _key_blocks(call: Call) -> list[int]:
-    """The key blocks a walk under a decay a key dimension may take (`key_block`), each dividing the keys."""
+def _key_unit(call: Call, *, contracted: bool) -> int:
+    """The narrowest key block a launch takes: a product's depth where its products contract over the key
+    block or it issues none (`Family.narrowest_depth`), else the narrowest columns a staged operand takes
+    (`Family.narrowest_columns`: tcgen05's 32, a 64-row product's N split between two lane groups). Kimi
+    delta attention's intra walk at tcgen05's 32 held one program a multiprocessor at 240 registers, its
+    scores and system two launches, where at 16 an H100's merged walk holds two (180 registers)."""
     family = call.family
-    widest, unit = family.depths(jnp.bfloat16)[0], family.narrowest_columns(jnp.bfloat16)
+    return family.narrowest_depth(jnp.bfloat16) if contracted else family.narrowest_columns(jnp.bfloat16)
+
+
+def _key_blocks(call: Call, *, contracted: bool) -> list[int]:
+    """The key blocks a walk under a decay a key dimension may take (`key_block`), each dividing the keys."""
+    widest, unit = call.family.depths(jnp.bfloat16)[0], _key_unit(call, contracted=contracted)
     return [block for block in whole_blocks(widest, unit) if call.width % block == 0]
 
 
@@ -1299,7 +1309,7 @@ def _intra_merges(call: Call) -> bool:
     resident = functools.partial(_resident, call, functools.partial(_intra_held, call, outputs=2),
                                  functools.partial(_intra_staged, call, products=("scores", "system")),
                                  functools.partial(_intra_streamed, call, queries=True))
-    return any(resident(block) for block in _key_blocks(call))
+    return any(resident(block) for block in _key_blocks(call, contracted=True))
 
 
 def _intra_prefix(call: Call, scanned, decays: jax.Array, keys: int) -> tuple:
@@ -1394,7 +1404,7 @@ def _intra_walk(q, k, g, beta, taken, call: Call, *, scale: float, products: tup
     outputs = len(products)
     keys = key_block(call, functools.partial(_intra_held, call, outputs=outputs),
                      functools.partial(_intra_staged, call, products=products),
-                     functools.partial(_intra_streamed, call, queries=scored))
+                     functools.partial(_intra_streamed, call, queries=scored), contracted=True)
     steps = width // keys
 
     def program(at, q_ref, k_ref, g_ref, beta_ref, taken_ref, *outs, streams, staging, landing):
