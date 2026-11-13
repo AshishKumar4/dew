@@ -441,19 +441,6 @@ def _semantic(recorded: Mapping[str, object]) -> dict[str, JSON]:
     }
 
 
-def _environment(recorded: Mapping[str, object]) -> dict[str, JSON]:
-    """The code and machine that ran a manifest's steps, from its record:
-    Dew's revision and lock, the interpreter, the platform and each external
-    module's bytes, for the steps a memory read ran and then the plan's own.
-    A step states a change to what it computes in its configuration or
-    declared identity; its modules' bytes change with any edit to their
-    files, as Dew's revision does with any edit to Dew. A function outside
-    Dew states none, so its modules' bytes are what it computes, which an
-    exact resume holds (`Plan.check`)."""
-    steps = (*_identities(recorded["ran"]), *_identities(recorded["steps"]))
-    return {**{name: json_value(recorded[name], name) for name in _ENVIRONMENT},
-            "modules": [step["modules"] for step in steps]}
-
 
 def _saved_code(saved: Mapping[str, object], steps: Sequence[StepIdentity]) -> list[list[JSON] | None]:
     """A saved position's undeclared code by step (`Manifest.code`): its own `code`, or, a position of the
@@ -469,6 +456,16 @@ def _saved_code(saved: Mapping[str, object], steps: Sequence[StepIdentity]) -> l
     return [[before[place] for place in step.code]
             if isinstance(before, list) and len(before) == len(step.modules) else None
             for step, before in zip(steps, modules, strict=False)]
+
+
+def environment_changes(wrote: Mapping[str, object]) -> tuple[str, ...]:
+    """The fields of the code and machine that wrote a data position (`running_environment`'s, as a
+    checkpoint step or a position of the previous format records them) that this process does not repeat,
+    warned of once: none decides the rows a run reads on to (row 5862)."""
+    changes = _changed(wrote, running_environment())
+    if changes:
+        _log.warning("data environment changed under an unchanged plan: %s", ", ".join(changes))
+    return changes
 
 
 def running_environment() -> dict[str, JSON]:
@@ -569,9 +566,6 @@ class Manifest:
 
     def semantic(self, version: int | None = None) -> dict[str, JSON]:
         return _semantic(self.record(version))
-
-    def environment(self) -> dict[str, JSON]:
-        return _environment(self.record())
 
     def code(self) -> list[list[JSON]]:
         """What decides a step's rows that its identity does not state: each step's module digests at its
@@ -846,9 +840,10 @@ class Plan:
         """Refuse a saved plan whose rows this plan does not make again: another
         version, order, derived order fact, per-share topology or semantic
         manifest (`Manifest.semantic`), or, resumed exactly, a step outside Dew
-        whose code changed and that declares no identity. A changed environment
-        (`Manifest.environment`) is returned and warned of, and refused for a
-        per-share plan."""
+        whose code changed and that declares no identity (`Manifest.code`). The code and machine that wrote
+        a position are the checkpoint step's (`running_environment`), warned of where they changed
+        (`environment_changes`); a position of the previous format, which held them, has its changes
+        returned and warned of (row 5862)."""
         current = self.record()
         if current["version"] != saved.get("version"):
             written = saved.get("version")
@@ -955,10 +950,8 @@ class Plan:
             # A position of the previous format holds the environment it ran under, which a run's checkpoint
             # step holds now (`running_environment`): warned of where it changed, as the step's is.
             earlier = record(saved["environment"], "saved data environment")
-            changes = _changed({name: value for name, value in earlier.items() if name != "modules"},
-                               running_environment())
-            if changes:
-                _log.warning("data environment changed under an unchanged plan: %s", ", ".join(changes))
+            changes = environment_changes(
+                {name: value for name, value in earlier.items() if name != "modules"})
         if self.volatile:
             _log.warning("resuming volatile data; fetched outcomes may differ")
         if edited:

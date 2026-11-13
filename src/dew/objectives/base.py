@@ -123,8 +123,27 @@ def own_objective(name: str, held: Hashable, objective: Hashable) -> None:
                          "passes")
 
 
+class Pooled:
+    """A statistic a step pools over the microbatches it is read in before reading it (`Aux.metrics`,
+    `dew.training.planning.whole_step`): `pooled` combines its parts as the whole batch would have made it,
+    `mean` reads it on the device and `held` on the host."""
+
+    @classmethod
+    def pooled(cls, parts: Sequence[Self]) -> Self:
+        """`parts`, one a microbatch, as one: by default their leaves summed."""
+        return jax.tree.map(lambda *values: sum(values), *parts)
+
+    def mean(self) -> tuple[jax.Array, jax.Array]:
+        """Its value, and whether it has any mass."""
+        raise NotImplementedError
+
+    def held(self) -> float:
+        """Its value read on the host from the parts a step returned."""
+        raise NotImplementedError
+
+
 @struct.dataclass
-class Ratio:
+class Ratio(Pooled):
     """A loss numerator and its denominator, kept apart until the loss is reduced.
 
     Both parts sum across microbatches and devices, and only then does `mean`
@@ -167,9 +186,65 @@ class Exponentiated(Ratio):
         return math.exp(super().held()) if float(np.asarray(self.mass)) > 0 else 0.0
 
 
-def held_metric(value: jax.Array | np.ndarray | Ratio | float) -> float:
-    """A step's metric (`Aux.metrics`) read on the host: a `Ratio`'s mean, anything else as a number."""
-    return value.held() if isinstance(value, Ratio) else float(value)
+@struct.dataclass
+class Moments(Pooled):
+    """A batch's first and second moments over its rows, by feature: their `count`, `center` (the mean),
+    `squares` (the summed squared deviations from it) and `products` (their summed outer products, None
+    where `statistic` reads none), pooled over microbatches by Chan's parallel update, as the whole batch's
+    would be; read as `statistic`: `"std"`, the features' mean population standard deviation, or
+    `"offdiagonal"`, the RMS of the sample covariance's off-diagonal entries."""
+
+    count: jax.Array
+    center: jax.Array
+    squares: jax.Array
+    products: jax.Array | None
+    statistic: str = struct.field(pytree_node=False)
+
+    @classmethod
+    def of(cls, rows: jax.Array, statistic: str, product: Callable | None = None) -> Self:
+        """The moments of `rows` `[B, D]` in fp32, their co-moment by `product` (a matmul) where `statistic`
+        reads it."""
+        rows = rows.astype(jnp.float32)
+        center = jnp.mean(rows, axis=0)
+        deviations = rows - center
+        products = None if statistic == "std" else (product or jnp.matmul)(deviations.T, deviations)
+        squares = jnp.sum(deviations ** 2, axis=0)
+        return cls(jnp.asarray(rows.shape[0], jnp.float32), center, squares, products, statistic)
+
+    @classmethod
+    def pooled(cls, parts: Sequence[Self]) -> Self:
+        whole = parts[0]
+        for later in parts[1:]:
+            count = whole.count + later.count
+            share = jnp.where(count > 0, later.count / jnp.where(count > 0, count, 1), 0)
+            delta = later.center - whole.center
+            weight = whole.count * share
+            products = None if whole.products is None else (
+                whole.products + later.products + weight * jnp.outer(delta, delta))
+            squares = whole.squares + later.squares + weight * delta ** 2
+            whole = cls(count, whole.center + share * delta, squares, products, whole.statistic)
+        return whole
+
+    def mean(self) -> tuple[jax.Array, jax.Array]:
+        active = self.count > 0
+        count = jnp.where(active, self.count, 1)
+        if self.statistic == "std":
+            value = jnp.mean(jnp.sqrt(self.squares / count))
+        else:
+            dim = self.center.shape[0]
+            covariance = self.products / jnp.maximum(count - 1, 1)
+            off = covariance * (1.0 - jnp.eye(dim, dtype=covariance.dtype))
+            value = jnp.sqrt(jnp.sum(off ** 2) / max(dim * (dim - 1), 1))
+        return jnp.where(active, value, 0), active
+
+    def held(self) -> float:
+        return float(np.asarray(self.mean()[0]))
+
+
+def held_metric(value: jax.Array | np.ndarray | Pooled | float) -> float:
+    """A step's metric (`Aux.metrics`) read on the host: a `Pooled` statistic's value, anything else as a
+    number."""
+    return value.held() if isinstance(value, Pooled) else float(value)
 
 
 @struct.dataclass
@@ -525,11 +600,13 @@ class Aux(Generic[Effects]):
     collections. `effects` are additive observations that the optimizer
     applies once per committed update, not once per microbatch.
     """
-    metrics: Mapping[str, jax.Array | Ratio]
-    """The step's metrics, each the loss's own report. A `Ratio` (its numerator and its mass; an
-    `Exponentiated` one, its exponential) pools over the microbatches a step is read in by its sums, so the
-    step logs it as the step read whole would (docs/design/training.md, the logged metrics); an array is
-    one microbatch's, which a step read in several logs as its last's, under `<name>/last_microbatch`."""
+    metrics: Mapping[str, jax.Array | Pooled]
+    """The step's metrics, each the loss's own report. A `Pooled` one (a `Ratio`, its numerator and its
+    mass; an `Exponentiated` one, its exponential; a batch's `Moments`) pools over the microbatches a step
+    is read in, so the step logs it as the step read whole would (docs/design/training.md, the logged
+    metrics); an array is one microbatch's, which a step read in several logs as its last's, under
+    `<name>/last_microbatch`, and a metric the objective shows (`Objective.shown`), which a run selects
+    by, is refused as an array where a step is read in several."""
     variables: Variables | None = None
     """Whole nonparameter collections from one accepted microbatch, such as BatchNorm statistics.
 

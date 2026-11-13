@@ -51,6 +51,7 @@ from dew.objectives.base import (
     Loss,
     Metric,
     Objective,
+    Pooled,
     Ratio,
     Shown,
     Step,
@@ -315,7 +316,7 @@ class Evaluation:
             step: int | jax.Array = 0, averaged: Variables | None = None,
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
             schedule_step: int | jax.Array | np.ndarray | None = None, loss: bool = False,
-            training: Mapping[str, jax.Array | Ratio] | None = None, warm: bool = False,
+            training: Mapping[str, jax.Array | Pooled] | None = None, warm: bool = False,
             updates: int | jax.Array | None = None,
             scored_to: str | os.PathLike[str] | None = None) -> Evaluation:
         """Evaluate `variables` on the batches every process can read, without an optimizer or a tracker.
@@ -405,7 +406,7 @@ class Evaluation:
     def _episodes(cls, episodes: Episodes, variables: Variables, *, key: jax.Array, step: int | jax.Array,
                   schedule_step: int | jax.Array | np.ndarray | None, updates: int | jax.Array | None,
                   split: str,
-                  warm: bool, metrics: Sequence[Metric], training: Mapping[str, jax.Array | Ratio] | None
+                  warm: bool, metrics: Sequence[Metric], training: Mapping[str, jax.Array | Pooled] | None
                   ) -> Evaluation:
         """`run`'s evaluation of a split scored by its episodes: its metrics checked and agreed as a data
         split's are (`_agree_configuration`), each one reading the flight's scores (`Flown`), its clocks,
@@ -542,7 +543,7 @@ def _agree_configuration(
 
 
 def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array | np.ndarray | None,
-           averaged: Variables | None, training: Mapping[str, jax.Array | Ratio] | None = None,
+           averaged: Variables | None, training: Mapping[str, jax.Array | Pooled] | None = None,
            updates: int | jax.Array | None = None) -> tuple[int, Step, tuple[int, ...], dict[str, float]]:
     """Draw the event's clocks and RNG, and the identity every rank reports.
 
@@ -1216,7 +1217,7 @@ class Evaluator[L, E]:
             yield
 
     def evaluation(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState],
-                   links: Mapping[str, Link], training: Mapping[str, jax.Array | Ratio],
+                   links: Mapping[str, Link], training: Mapping[str, jax.Array | Pooled],
                    names: Sequence[str] | None = None, *, warm: bool = False,
                    joined: Mapping[str, float] | None = None, examples: int | None = None,
                    cooled: bool = False) -> Evaluation:
@@ -1250,7 +1251,7 @@ class Evaluator[L, E]:
 
     def evaluate(self, state: TrainState, shardings: Placement[TrainState], links: Mapping[str, Link],
                  reader: Split | None, metrics: Sequence[Metric], preview: bool, *, loss: bool = False,
-                 split: str = "val", training: Mapping[str, jax.Array | Ratio] | None = None,
+                 split: str = "val", training: Mapping[str, jax.Array | Pooled] | None = None,
                  warm: bool = False,
                  scored_to: str | None = None, examples: int | None = None,
                  cooled: bool = False) -> Evaluation:

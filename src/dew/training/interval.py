@@ -28,7 +28,7 @@ from dew.batch import CONSUMED_COUNT, Batch, ConsumedCount
 from dew.data.dataset import rows_of
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Ratio, held_metric
+from dew.objectives.base import Pooled, held_metric
 from dew.optim_schedules import learning_rate
 from dew.state import TrainState
 from dew.telemetry.instrumentation import (
@@ -455,7 +455,7 @@ class Reading(NamedTuple):
     statistics, already on the host."""
 
     loss: Number
-    aux: Mapping[str, Number | Ratio]
+    aux: Mapping[str, Number | Pooled]
     accepted: Number
     streak: Number | None
     rate: Number | None

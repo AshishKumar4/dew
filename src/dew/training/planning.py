@@ -39,7 +39,7 @@ from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import OuterProgram, compiler_options, owned_program, program_digest
 from dew.nn.kernels.templates import report
-from dew.objectives.base import RECORD, Objective, Ratio
+from dew.objectives.base import RECORD, Objective, Pooled
 from dew.state import TrainState, apart, together
 from dew.telemetry.compiles import EVENTS, Compiles
 from dew.telemetry.instrumentation import compiled_memory
@@ -210,15 +210,18 @@ def whole_step_program[L, E](objective: Objective[L, E]) -> OuterProgram:
     """`whole_step` over `objective`'s statistics (`Objective.reduce_loss`), the one program a split step
     runs on its microbatches' outputs, compiled under its towers' options, which a run compiled ahead
     compiles with its step (`dew.training.ahead`)."""
-    return owned_program(functools.partial(whole_step, reduce=objective.reduce_loss), *objective.towers())
+    return owned_program(functools.partial(whole_step, reduce=objective.reduce_loss,
+                                           shown=frozenset(objective.shown)), *objective.towers())
 
 
-def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]]):
+def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
+                  shown: frozenset[str] = frozenset()):
     """A step's outputs from those of the microbatches it was read in: its loss as an unsplit step logs it,
     whatever the split (docs/design/training.md, the logged loss): where its last microbatch commits, the
     update's, pooled over the window; elsewhere its own batch's, its microbatches' own statistics pooled
     (`Committed.own`) and reduced by `reduce` (`Objective.reduce_loss`); its metrics pooled by their own
-    statistics (`_pooled`); finite and accepted where every microbatch was; and the commits' counts,
+    statistics (`_pooled`), a metric the objective shows (`shown`, which a run selects by) refused where it
+    states none; finite and accepted where every microbatch was; and the commits' counts,
     tokens and norms summed, its inspection the latest part's that committed (`interval.latest`), as a
     run's interval keeps the latest sampled commit: a step of two commits (a window a rejection left part
     filled, then the closing part of a run's last batch) reports its second's summaries, never the two
@@ -227,9 +230,15 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]]):
     losses, metrics, finite, accepted, committed = zip(*outputs, strict=True)
     report = {name: _pooled(name, [part[name] for part in metrics]) for name in metrics[-1]}
     if len(metrics) > 1:
-        # A metric that states no pooling is one microbatch's, named so (`Aux.metrics`).
+        # A metric that states no pooling is one microbatch's, named so (`Aux.metrics`); a shown one, which
+        # a run selects its best and its plateau by under its name, is refused.
+        unpooled = sorted(name for name in shown & set(report) if not isinstance(report[name], Pooled))
+        if unpooled:
+            raise ValueError(f"the objective shows {', '.join(unpooled)}, which state no pooling over the "
+                             "microbatches a step is read in; state each as a Ratio or Moments "
+                             "(`Aux.metrics`), or read the step whole (split=1)")
         report = {(name if name.startswith(RECORD) or name in (TRAINING_FLOPS, TOKENS)
-                   or isinstance(value, Ratio) else f"{name}/last_microbatch"): value
+                   or isinstance(value, Pooled) else f"{name}/last_microbatch"): value
                   for name, value in report.items()}
     loss = losses[-1]
     if committed[-1].own is not None:
@@ -253,13 +262,15 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]]):
 
 def _pooled(name: str, values: list):
     """A step's metric `name` from its microbatches' `values`: a recording step's evaluations every
-    microbatch's in the order they ran (`RECORD`); the model FLOPs and tokens counted, summed; a `Ratio`
-    by its parts' sums; any other its last microbatch's (`Aux.metrics`)."""
+    microbatch's in the order they ran (`RECORD`); the model FLOPs and tokens counted, summed; a `Pooled`
+    statistic by its own pooling (`Pooled.pooled`); any other its last microbatch's (`Aux.metrics`)."""
     if name.startswith(RECORD):
         return jnp.concatenate(values)
     if name == TOKENS:
         return functools.reduce(_TokenCount.add, values)
-    if name == TRAINING_FLOPS or isinstance(values[-1], Ratio):
+    if isinstance(values[-1], Pooled):
+        return type(values[-1]).pooled(values)
+    if name == TRAINING_FLOPS:
         return jax.tree.map(lambda *parts: sum(parts), *values)
     return values[-1]
 
