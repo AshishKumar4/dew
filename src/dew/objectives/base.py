@@ -128,12 +128,12 @@ class Pooled:
     `dew.training.planning.whole_step`): `pooled` combines its parts as the whole batch would have made it,
     `mean` reads it on the device and `held` on the host."""
 
-    def joined(self, later: Self) -> Self:
-        """This part and a `later` microbatch's as one: by default their leaves summed."""
+    def joined(self, later: Pooled) -> Pooled:
+        """This part and a `later` microbatch's of its own kind as one: by default their leaves summed."""
         return jax.tree.map(lambda mine, theirs: mine + theirs, self, later)
 
     @staticmethod
-    def pooled[P: Pooled](parts: Sequence[P]) -> P:
+    def pooled(parts: Sequence[Pooled]) -> Pooled:
         """`parts`, one a microbatch, as one, each joined to those before it (`joined`)."""
         return functools.reduce(lambda whole, later: whole.joined(later), parts)
 
@@ -215,7 +215,9 @@ class Moments(Pooled):
         squares = jnp.sum(deviations ** 2, axis=0)
         return cls(jnp.asarray(rows.shape[0], jnp.float32), center, squares, products, statistic)
 
-    def joined(self, later: Self) -> Self:
+    def joined(self, later: Pooled) -> Moments:
+        if not isinstance(later, Moments):
+            raise TypeError(f"moments join moments, not a {type(later).__name__}")
         count = self.count + later.count
         share = jnp.where(count > 0, later.count / jnp.where(count > 0, count, 1), 0)
         delta = later.center - self.center
@@ -223,7 +225,7 @@ class Moments(Pooled):
         products = None if self.products is None or later.products is None else (
             self.products + later.products + weight * jnp.outer(delta, delta))
         squares = self.squares + later.squares + weight * delta ** 2
-        return type(self)(count, self.center + share * delta, squares, products, self.statistic)
+        return Moments(count, self.center + share * delta, squares, products, self.statistic)
 
     def mean(self) -> tuple[jax.Array, jax.Array]:
         active = self.count > 0
