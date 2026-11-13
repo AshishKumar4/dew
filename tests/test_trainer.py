@@ -19,6 +19,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -237,6 +238,37 @@ def test_a_steps_logged_metrics_are_its_rows_whatever_its_split():
     whole, split = logged(1), logged(2)
     for name in names:
         assert_fp32_reduction_bound(split[name], whole[name], np.abs(whole[name]), terms=LM_ROWS * LM_CONTEXT)
+
+
+@dataclasses.dataclass(frozen=True)
+class Slow:
+    """A record step that takes `seconds` a record."""
+
+    seconds: float
+
+    def __call__(self, row):
+        time.sleep(self.seconds)
+        return row
+
+
+@pytest.mark.parametrize("workers", [None, 2], ids=["in-process", "stated-workers"])
+def test_a_per_share_stream_that_starves_the_step_in_process_is_said_once(caplog, workers):
+    """A per-share stream read in the training process (its automatic count none, as its order is its
+    workers' count's, row 5852) whose records take longer than the step: the run says once that its input
+    starves the step, naming `.workers(n)` and `.elastic()`; a stream that states its workers is not said
+    to."""
+    import logging
+
+    from dew.data.compile import compile
+
+    rows = np.random.default_rng(0).normal(size=(64, FEATURES)).astype(np.float32)
+    chain = Pipeline(Memory({"x": rows, "y": 2 * rows[:, :2]}, shard_rows=8)).map(Slow(0.01)).repeat()
+    chain = chain if workers is None else chain.workers(workers)
+    loader = compile(chain.batch(BATCH), read="streamed")
+    with caplog.at_level(logging.WARNING, logger="dew.training.input"):
+        make_trainer().fit(loader, steps=6, log_every=1)
+    said = [record for record in caplog.records if record.name == "dew.training.input"]
+    assert len(said) == (1 if workers is None else 0)
 
 
 def test_a_run_given_steps_and_tokens_is_refused_as_a_budget_named_twice():

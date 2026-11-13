@@ -183,6 +183,8 @@ from dew.training.transaction import (
 )
 
 _log = logging.getLogger(__name__)
+_input_log = logging.getLogger("dew.training.input")
+"""Where a run says what its input costs its steps, once (`_written`)."""
 
 if TYPE_CHECKING:
     from dew.optim import OptimConfig
@@ -198,6 +200,15 @@ Effects = DefaultTypeVar("Effects", default=None)
 
 _DEFAULT_MESH = MeshSpec()
 _DEFAULT_LAYOUT = Layout()
+
+
+def _unworked(dataset: Loader) -> bool:
+    """Whether a per-share stream reads `dataset` in the training process: an automatic count sizes it no
+    workers, as its order is its workers' count's (row 5852), which a run states (`.workers(n)`) or reads
+    elastically."""
+    plan = dataset.plan
+    return (plan is not None and plan.lowering == "per-share" and not plan.topology.get("elastic")
+            and plan.topology.get("workers") == 0)
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -1378,6 +1389,7 @@ class Trainer(Generic[Loss, Effects]):
         if not complete and (pending or not plan.ended(current, interval.real_tokens, interval.consumed)):
             partition = self._stream_partition()
             run.source = plan.dataset.train(partition)
+            run.unworked = _unworked(plan.dataset)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None and run.restarted is None else None)
             source = run.source
@@ -2070,6 +2082,12 @@ class Trainer(Generic[Loss, Effects]):
         read, elapsed = reading
         scalars = {**logged_scalars(read, taken.counts, elapsed, self.device_mesh.devices.size,
                                     rollout=self.rollout is not None), **run.startup.scalars()}
+        if run.unworked and elapsed > 0 and taken.counts.waited > elapsed / 2:
+            # Said once: a per-share stream read in the process starves the step.
+            run.unworked = False
+            _input_log.warning("the step waits on its input for more than half its time, read by a per-share "
+                               "stream in the training process: state its loading workers (.workers(n)), or "
+                               "read it .elastic(), whose order any count of workers keeps")
         self._display.interval(taken.step, scalars)
         if self.tracker is not None:
             self.tracker.log(scalars, taken.step)
