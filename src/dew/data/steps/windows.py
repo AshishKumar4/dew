@@ -102,7 +102,7 @@ class WindowSource(View[TokenFiles]):
     def lengths(self) -> np.ndarray | None:
         return None
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         return _indexed_manifest(self, self.describe(), 1024)
 
 

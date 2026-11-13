@@ -648,14 +648,24 @@ def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
     # eleven options and more is written as the 0.5 both answer with.
     agent = json.loads((tmp_path / "rl_agent_config.json").read_text())
     published = json.loads((TINY / "rl_agent_config.json").read_text())
-    # What Laya's agent reads it by: every key it requires, an option layout of its own (row 4599).
+    # What Laya's agent reads it by: every key it requires, an option layout of its own (row 4599), and
+    # the encoder its release named, not the directory this task's tokenizer was read from (row 4788).
     assert set(LAYA_REQUIRED) <= set(agent) and agent["option_layout"] == "sequential"
+    assert agent["encoder"] == published["encoder"]
     assert agent["temperature"] == published["temperature"]
     assert agent["head_layers"] == published["head_layers"]
     assert agent["temperature_by_options"] == {**published["temperature_by_options"], "choice:11+": 0.5}
     again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=decide.name)
     for request in CASES.values():
         assert again.systemone(request) == decide.systemone(request)
+
+
+def test_a_laya_release_names_no_encoder_where_its_task_holds_only_a_local_tokenizer(decide, tmp_path):
+    """A task whose release named no encoder, its tokenizer read from a directory on this machine, writes
+    Laya's config without an encoder rather than that directory's path, which a pushed release would
+    publish (row 4788): Laya's agent refuses such a config (`LAYA_REQUIRED`) where it would read a path."""
+    replace(decide, named_encoder=None).save_pretrained(tmp_path)
+    assert "encoder" not in json.loads((tmp_path / "rl_agent_config.json").read_text())
 
 
 def test_a_laya_tasks_release_bundle_saves_and_exports_the_tasks_release(decide, tmp_path):

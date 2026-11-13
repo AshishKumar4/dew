@@ -252,8 +252,12 @@ with mmap.mmap(-1, size, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS) as pages, 
     for offset in range(0, size, mmap.PAGESIZE):
         pages[offset] = 1
     after = resident_memory()
+ended = resident_memory()["Anonymous"] - peak.before["Anonymous"]
+# An array of the freed block's size, which the allocator serves from it: its bytes, which no new page holds.
+with resident_peak() as allocated:
+    again = np.ones(64 * 2**20, np.uint8)
 print(json.dumps({"before": before, "after": after, "size": size, "rise": peak.rise("Anonymous"),
-                  "ended": resident_memory()["Anonymous"] - peak.before["Anonymous"]}))
+                  "ended": ended, "allocated": allocated.rise("Allocated")}))
 """
 
 
@@ -263,7 +267,10 @@ def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation
     writer ran on (where the kernel's running counters lagged by a batch a CPU), even in a process whose
     allocator holds a freed block of that size resident, which an array of that size would be served from
     without a new page; and a region's peak (`resident_peak`) holds the pages it holds as it ends, which
-    the reading after they are unmapped no longer does."""
+    the reading after they are unmapped no longer does. Over the bytes the allocator holds allocated
+    (`allocated_memory`), a region's peak rises by such an array, served from the freed block, by all of
+    it (rows 5266, 5562: a tree held home after an identical one was freed rose by under a fiftieth of
+    itself in resident pages)."""
     import json
     import subprocess
     import sys
@@ -275,6 +282,7 @@ def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation
     assert after["Anonymous"] >= before["Anonymous"] + size
     assert after["Rss"] >= after["Anonymous"]
     assert measured["rise"] >= size > measured["ended"]
+    assert measured["allocated"] >= size
 
 
 @pytest.mark.gpu(reason="CUPTI times a GPU's kernels")

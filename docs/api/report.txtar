@@ -31,7 +31,7 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .profile_steps(self) -> list[int]
   .python_run(self, reasons: Sequence[str]) -> None
   .resolve(self, step: int | str | None) -> int | None
-  .restore(self, template=None, step: int | str | None = None, *, share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ())
+  .restore(self, template=None, step: int | str | None = None, *, share: DataPartition | None = None)
   .restore_profiles(self, step: int) -> tuple[Variables, ...]
   .resumed(self, resume: Resume = 'auto') -> int | None
   .rollout_state(self, step: int, template: Mapping[str, object]) -> dict | None
@@ -40,7 +40,7 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .save_local(self, step: int, state: TrainState, saved: bytes | None, *, share: DataPartition | None = None, control: dict | None = None, rung: JSON = None, artifact: JSON = None, boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None, rollout: Mapping[str, object] | None = None) -> None
   .source(self, step: int) -> str
   .stored(self, step: int | str | None = None) -> Variables
-  .variables(self, *, step: int | str | None = None, ema: bool | None = None, mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None, parameter_roots: tuple[tuple[str, ...], ...] = (('params',), ('frozen',)), unread: tuple[tuple[str, ...], ...] = ()) -> Variables
+  .variables(self, *, step: int | str | None = None, ema: bool | None = None, mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None, parameter_roots: tuple[tuple[str, ...], ...] = (('params',), ('frozen',)), unread: tuple[tuple[str, ...], ...] = (), on_host: bool = False) -> Variables
   .wait(self) -> None
   .would_keep(self, ranking: Ranking | Sequence[Ranking]) -> bool
 class Condition(encoder: ConditionEncoder, field: str = 'text', unconditional: str | float | Mapping[str, object] = '') -> None  [dew.inputs.spec]
@@ -138,7 +138,6 @@ class Objective()  [dew.objectives.base]
   .bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]
   .batch_statistics(self, variables: Variables, part_at: Callable[[jax.Array], tuple[Batch, Step]], split: int) -> tuple[jax.Array, ...] | None
   .bind_model(self, source: Model | Source[Model], *, variables: Variables | None | Omitted = <Omitted.OMITTED: 'omitted'>, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Model
-  .bind_plan(self, version: int) -> None
   .bind_widths(self, widths: Mapping[str, object]) -> None
   .build_task(self, variables: Variables, *, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
@@ -181,7 +180,6 @@ class Objective()  [dew.objectives.base]
   .scalars: property -> TrainingScalars[Loss, Effects]
   .scored_tokens(self, batch: Batch) -> np.ndarray
   .scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, jax.Array] | None
-  .served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]
   .stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]
   .substitute(self, modules: Sequence[nn.Module]) -> None
   .substituted(self, modules: Sequence[nn.Module]) -> Self
@@ -241,7 +239,6 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]
   .batch_statistics(self, variables: Variables, part_at: Callable[[jax.Array], tuple[Batch, Step]], split: int) -> tuple[jax.Array, ...] | None
   .bind_model(self, source: Model | Source[Model], *, variables: Variables | None | Omitted = <Omitted.OMITTED: 'omitted'>, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Model
-  .bind_plan(self, version: int) -> None
   .bind_widths(self, widths: Mapping[str, object]) -> None
   .build_task(self, variables: Variables, *, processor: Processor | None | Omitted = <Omitted.OMITTED: 'omitted'>) -> Task | SavedTask
   .complete_variables(self, key: jax.Array, tree: Variables) -> Variables
@@ -284,7 +281,6 @@ class Supervised(model: nn.Module | Source[nn.Module], loss: Criterion, metrics:
   .scalars: property -> TrainingScalars[Loss, Effects]
   .scored_tokens(self, batch: Batch) -> np.ndarray
   .scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, jax.Array]
-  .served_groups(self, variables: Variables) -> tuple[ProjectionGroup, ...]
   .stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]
   .substitute(self, modules: Sequence[nn.Module]) -> None
   .substituted(self, modules: Sequence[nn.Module]) -> Self

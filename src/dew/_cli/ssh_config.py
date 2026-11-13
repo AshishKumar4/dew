@@ -12,6 +12,8 @@ import os
 from collections.abc import Sequence
 from pathlib import Path
 
+from filelock import FileLock
+
 from dew._files import replacing
 
 
@@ -58,21 +60,28 @@ def _without(text: str, name: str) -> str:
 
 def write(name: str, entry: str) -> None:
     """Put `entry` in place of the TPU's block, or at the end."""
-    target = path()
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    current = target.read_text() if target.is_file() else ""
-    kept = _without(current, name)
-    if kept and not kept.endswith("\n"):
-        kept += "\n"
-    with replacing(target) as written:
-        written.write_text(kept + entry)
-        os.chmod(written, 0o600)
+    _replaced(name, entry)
 
 
 def forget(name: str) -> None:
     """Remove the TPU's block, when the file has one."""
+    _replaced(name, None)
+
+
+def _replaced(name: str, entry: str | None) -> None:
+    """The file with the TPU's block replaced by `entry`, or removed (None; the file left as it is where
+    it holds none), read, changed and published under one lock beside it: two commands for different
+    TPUs each read the file and replaced the whole of it with what they had read, the last one erasing
+    the other's entry."""
     target = path()
-    if target.is_file():
-        current = target.read_text()
-        if _without(current, name) != current:
-            write(name, "")
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with FileLock(str(target) + ".dew.lock"):
+        current = target.read_text() if target.is_file() else ""
+        kept = _without(current, name)
+        if entry is None and kept == current:
+            return
+        if kept and not kept.endswith("\n"):
+            kept += "\n"
+        with replacing(target) as written:
+            written.write_text(kept + (entry or ""))
+            os.chmod(written, 0o600)

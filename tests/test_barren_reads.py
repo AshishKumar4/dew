@@ -2,7 +2,6 @@
 record it drops as a marker, which the reading process drops, so a worker whose own inputs are
 all dropped never holds up the others' (row 883)."""
 
-import functools
 import json
 from dataclasses import dataclass
 
@@ -16,7 +15,6 @@ from dew.data import Loading, Memory, Rejected, mix
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
-from dew.data.plan import FILE_SHARDS, IN_ORDER
 from dew.data.sources.grain import from_grain
 
 WORKERS = Loading(workers=3, threads=1, read_buffer=1, worker_buffer=1)
@@ -236,12 +234,10 @@ def _kept(name: str) -> Pipeline:
     return rows.filter_map(KeepsEven()).repeat()
 
 
-def test_a_mixture_edit_that_moves_a_kept_corpus_to_other_workers_is_refused():
-    """Under plan version 10, whose workers each read every count-th input of their corpus, a mixture of
-    two corpora read by three loading workers, the first in two and the second in one: a position saved
-    there and restored where the second corpus leads, in two, is refused, and one restored where a third
-    corpus joins in none, the first two as they were, reads on. From version 11 a corpus's workers read
-    its inputs in their order, so its position names none of them, and the moved mixture reads on."""
+def test_a_mixture_edit_that_moves_a_kept_corpus_to_other_workers_reads_on():
+    """A mixture of two corpora read by three loading workers, each corpus's workers reading its inputs in
+    their order, so its position names none of them: a position saved there and restored where the second
+    corpus leads reads on."""
     loading = Loading(workers=3, threads=1, read_buffer=1, worker_buffer=1)
     current = compile(mix([_kept("a"), _kept("b")]).batch(1), read="indexed", loading=loading)
     reader = current.train(DataPartition())
@@ -257,51 +253,18 @@ def test_a_mixture_edit_that_moves_a_kept_corpus_to_other_workers_is_refused():
         next(resumed)
     finally:
         resumed.close()
-    earlier = functools.partial(compile, plan_version=FILE_SHARDS)
-    saved_from = earlier(mix([_kept("a"), _kept("b")]).batch(1), read="indexed", loading=loading)
-    reader = saved_from.train(DataPartition())
-    try:
-        next(reader)
-        saved = reader.get_state()
-    finally:
-        reader.close()
-    moved = earlier(mix([_kept("b"), _kept("c")]).batch(1), read="indexed", loading=loading)
-    moved = moved.train(DataPartition())
-    try:
-        with pytest.raises(ValueError):
-            moved.set_state(saved)
-    finally:
-        moved.close()
-    joined = earlier(mix([_kept("a"), _kept("b"), _kept("c")]).batch(1), read="indexed",
-                     loading=Loading(workers=2, threads=1, read_buffer=1, worker_buffer=1))
-    two = earlier(mix([_kept("a"), _kept("b")]).batch(1), read="indexed",
-                  loading=Loading(workers=2, threads=1, read_buffer=1, worker_buffer=1))
-    before = two.train(DataPartition())
-    try:
-        next(before)
-        state = before.get_state()
-    finally:
-        before.close()
-    resumed = joined.train(DataPartition())
-    resumed.set_state(state)
-    assert set(_ids(resumed, 4)) <= set(range(0, 12, 2))
 
 
-@pytest.mark.parametrize("version", [FILE_SHARDS, IN_ORDER])
-def test_a_nested_mixture_reads_in_the_workers_it_writes(version):
-    """A mixture written to read in three workers, inside another, with the loading's own workers
-    none: under plan version 10 its two corpora read in two and one of them, the other corpus in the
-    reading process, which its position records; from 11 they read their inputs in their order in any
-    count of workers, and its position names none (`IN_ORDER`). Each reads the kept records."""
+def test_a_nested_mixture_reads_in_the_workers_it_writes():
+    """A mixture written to read in three workers, inside another, with the loading's own workers none:
+    its corpora read their inputs in their order in any count of workers, and its position names none.
+    Each reads the kept records."""
     inner = mix([_kept("a"), _kept("b")]).workers(3)
     loading = Loading(workers=0, threads=1, read_buffer=1)
-    data = compile(mix([inner, _kept("c")]).batch(1), read="indexed", loading=loading, plan_version=version)
+    data = compile(mix([inner, _kept("c")]).batch(1), read="indexed", loading=loading)
     reader = data.train(DataPartition())
-    # The position a run saves records the workers each corpus read in.
+    # The position a run saves records no workers of a corpus.
     plan = record(json.loads(reader.get_state())["dew_data_plan"], "saved plan")
     topology = record(plan["topology"], "topology")
     assert set(_ids(reader, 8)) <= set(range(0, 12, 2))
-    if version == FILE_SHARDS:
-        assert sorted(record(topology["pools"], "pools").values()) == [0, 1, 2]
-    else:
-        assert "pools" not in topology and "workers" not in topology
+    assert "pools" not in topology and "workers" not in topology

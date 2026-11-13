@@ -492,7 +492,7 @@ def test_a_16_mixed_dits_first_muon_step_stays_finite():
 
 
 def test_a_schedule_that_marks_no_rate_is_its_own_shape():
-    """A ScheduleBase subclass implementing `values(steps)` alone, with fields of its own and
+    """A ScheduleBase subclass implementing `values(horizons)` alone, with fields of its own and
     none marked a rate, builds under OptimConfig and steps at the values it gives: it holds no rate
     fields as operands (`rates`), so its values are constants of its program."""
 
@@ -500,7 +500,7 @@ def test_a_schedule_that_marks_no_rate_is_its_own_shape():
     class Halving(ScheduleBase):
         start: float = 0.4
 
-        def values(self, steps):
+        def values(self, horizons):
             return lambda count: self.start * 0.5 ** count
 
     assert Halving().rates() == {}
@@ -1683,6 +1683,50 @@ def test_a_resumed_rate_reaches_a_solver_inside_an_injected_wrapper(name):
         assert learning_rate(state) is not None
         np.testing.assert_array_equal(learning_rate(state), learning_rate(want))
     np.testing.assert_array_equal(state.hyperparams["gain"], 2.0)
+
+
+def test_stated_horizons_reach_a_solver_inside_an_injected_wrapper_and_its_reported_rate():
+    """A stated build's solver (`build(stated=True)`) holds no step horizons in a fresh state, which a run
+    sets (`with_horizons`) where a run's own injected wrapper holds the solver too: the wrapped solver then
+    makes the updates the solver built for the run's steps makes, bit for bit, and reports its rate from the
+    first, before any update takes it."""
+    from dew.optim import with_horizons
+
+    config = OptimConfig(optimizer="adam", learning_rate=dataclasses.replace(
+        SCHEDULES["cosine"], peak_value=1e-2, init_value=1e-4, end_value=1e-3), clip_grads=0)
+    stated = optax.inject_hyperparams(lambda gain: optax.chain(config.build(10, stated=True),
+                                                               optax.scale(gain)))(gain=2.0)
+    built = optax.inject_hyperparams(lambda gain: optax.chain(config.build(10), optax.scale(gain)))(gain=2.0)
+    params, grads = {"w": jnp.ones(3)}, {"w": jnp.ones(3)}
+    rates = {group: rate for group, (rate, _) in config.grouped_rates().items()}
+    state = with_horizons(stated.init(params), config.horizons(10), rates, 10)
+    want = built.init(params)
+    np.testing.assert_array_equal(learning_rate(state), learning_rate(want))
+    for _ in range(3):
+        updates, state = stated.update(grads, state, params)
+        expected, want = built.update(grads, want, params)
+        np.testing.assert_array_equal(updates["w"], expected["w"])
+        np.testing.assert_array_equal(learning_rate(state), learning_rate(want))
+
+
+def test_a_clocked_state_supplied_to_a_run_of_steps_takes_its_optimizers_horizons():
+    """A state a run on the examples clock holds (its schedule over the run's progress), reclocked into an
+    optimizer given built for a run of steps, whose horizons no config of a trainer sets (`reclocked` over
+    `schedule_states`, as `Trainer.fit` reads a supplied state): its schedule's state takes that
+    optimizer's own horizons, so it steps and reports the rates that optimizer's fresh state does."""
+    from dew.optim import reclocked, schedule_states
+
+    config = OptimConfig(optimizer="adam", learning_rate=dataclasses.replace(
+        SCHEDULES["cosine"], peak_value=1e-2, init_value=1e-4, end_value=1e-3, warmup_steps=2), clip_grads=0)
+    params, grads = {"w": jnp.ones(3)}, {"w": jnp.ones(3)}
+    built = config.build(10)
+    state, want = reclocked(config.build(10, clocked=True).init(params), schedule_states(built, params)), \
+        built.init(params)
+    for _ in range(4):
+        updates, state = built.update(grads, state, params)
+        expected, want = built.update(grads, want, params)
+        np.testing.assert_array_equal(updates["w"], expected["w"])
+        np.testing.assert_array_equal(learning_rate(state), learning_rate(want))
 
 
 ADAMW_SEEDS = 8

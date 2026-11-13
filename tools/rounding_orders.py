@@ -53,23 +53,41 @@ def main(fixture: Path, out: Path, count: int, seed: int, group: int) -> None:
 def symmetric(fixture: Path, drawn: Path) -> None:
     """Hold the float64 truth of the second and the last residual order drawn under `drawn` (each order's
     numerics.npz, which its reference's recorder writes there: `kimi_k3_reference.py truth DIR`) to the
-    fixture's own, within float64 rounding over the computation's longest chain of reductions (each layer's
-    hidden and token sums, then the head's): the orders are a symmetry of the reference's computation, not
-    only of Dew's."""
+    fixture's own at every float64 leaf it holds (its loss, its logits over a decode's steps and those after
+    an update), wherever the fixture's truth holds a value: everywhere, but a leaf over the rows' tokens at
+    their padded places, where its recorder writes NaN and an order's is NaN too; a truth of no value
+    anywhere else is refused. Within
+    float64 rounding over the computation's longest chain of reductions (each layer's hidden and token sums
+    over the longest row it reads, the head's, then the loss's over the vocabulary and its targets): the
+    orders are a symmetry of the reference's computation, not only of Dew's."""
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
     from reference_error import assert_computes_the_oracle
 
     text = json.loads((fixture / "config.json").read_text())
     text = text.get("text_config", text)
     with np.load(fixture / "numerics.npz") as exact, np.load(fixture / "reference.npz") as stored:
+        truths = {key: exact[key] for key in exact.files if exact[key].dtype == np.float64}
         valid = stored["attention_mask"].astype(bool)
-        roundings = text["num_hidden_layers"] * (text["hidden_size"] + valid.shape[1]) + text["hidden_size"]
-        count = len(np.load(drawn / "orders.npy"))
-        for k in (1, count - 1):
-            with np.load(drawn / str(k) / "numerics.npz") as arrays:
-                for key in ("logits_f64", "updated_logits_f64"):
-                    assert_computes_the_oracle(arrays[key][valid], exact[key][valid],
-                                               f"{fixture.name} order {k} {key}", roundings=roundings)
+        targets, longest = valid.size, max(valid.shape[1], stored["generated"].shape[1])
+    held = {}
+    for key, truth in truths.items():
+        held[key] = ~np.isnan(truth)
+        padded = ~valid.reshape(valid.shape + (1,) * (truth.ndim - valid.ndim))
+        if not held[key].all() and not (truth.shape[:valid.ndim] == valid.shape
+                                        and np.array_equal(~held[key], np.broadcast_to(padded, truth.shape))):
+            raise AssertionError(f"{fixture.name} {key}: the fixture's truth holds no value at places that "
+                                 f"are no padded token's")
+    roundings = (text["num_hidden_layers"] * (text["hidden_size"] + longest) + text["hidden_size"]
+                 + text["vocab_size"] + targets)
+    count = len(np.load(drawn / "orders.npy"))
+    for k in (1, count - 1):
+        with np.load(drawn / str(k) / "numerics.npz") as arrays:
+            for key, truth in truths.items():
+                if not np.array_equal(~np.isnan(arrays[key]), held[key]):
+                    raise AssertionError(f"{fixture.name} order {k} {key}: its truth holds values at other "
+                                         f"places than the fixture's")
+                assert_computes_the_oracle(arrays[key][held[key]], truth[held[key]],
+                                           f"{fixture.name} order {k} {key}", roundings=roundings)
     print(fixture.name, "orders 1 and", count - 1, "hold the float64 truth")
 
 

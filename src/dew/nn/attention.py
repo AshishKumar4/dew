@@ -32,6 +32,7 @@ from .attention_kernels import (
     AttentionCase,
     decodes,
     flash_target,
+    reverse_only,
     template_infers,
 )
 from .attention_masks import (
@@ -287,14 +288,17 @@ def triton_attention(query, key, value, causal: bool):
 
 def template_attention(query, key, value, causal: bool, sliding_window, *, sinks, softcap, segment_ids,
                        lengths, starts, block_groups=None, image_groups=None, key_valid=None, key_runs=None,
-                       places=None, dropout_rate=0.0, dropout_seed=None, dropout_places=None, bias=None):
+                       places=None, query_slots=None, dropout_rate=0.0, dropout_seed=None,
+                       dropout_places=None, bias=None, fill: float | None = None):
     """The attention template's route (`attention_route.attend`) over the call's visibility as spans
     (`key_spans`): its causality, window, documents (`segment_ids`, or `CrossDocuments` aligned to their last
     keys), key lengths and starts, block and image groups, and key validity and counted places, with
     probability dropout at `dropout_rate` drawn from `dropout_seed`. A softcap is a score hook, a `bias` a
     score hook added after it (`template.Biased`): one term a key `[B or 1, H or 1, 1, K]` (ALiBi's, over the
     keys' logical places) a key parameter, a dense `[B or 1, H or 1, Q, K]` one a tile parameter, read a
-    tile at a time and its gradient the tiles' pulled cotangents; sinks are the softmax's initial state. On
+    tile at a time and its gradient the tiles' pulled cotangents; sinks are the softmax's initial state. A
+    `fill` (`mask_fill`) is every hidden key's logit, a score hook after the rest (`template.Filled`), the
+    call walking every key. On
     a mesh it runs per shard (`on_attention_shards`), as the decode kernel does: the key heads repeat until
     the tensor axes split them, the sinks split with their heads, and the ids, lengths, starts, groups,
     validity and places with
@@ -310,12 +314,11 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
 
     def local(query, key, value, sinks=None, segment_ids=None, lengths=None, starts=None,
               block_groups=None, image_groups=None, key_valid=None, key_runs=None, places=None,
-              global_rows=None, global_heads=None, seed=None, bias=None):
+              query_slots=None, global_rows=None, global_heads=None, seed=None, bias=None):
         batch, queries, keys = query.shape[0], query.shape[1], key.shape[1]
         spans = key_spans(queries, keys, causal, sliding_window, segment_ids, lengths, starts,
                           block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
-                          key_runs=key_runs,
-                          places=places, rows=batch)
+                          key_runs=key_runs, places=places, query_slots=query_slots, rows=batch)
         drop = None
         if seed is not None and dropout_places is not None:
             # A sequence exchange's slice draws at the call's global places (`template.DropPlaces`).
@@ -330,8 +333,12 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
             params = (template.Param(bias[:, :, 0], template.Kind.KEY),)
         else:
             params = (template.Param(bias, template.Kind.TILE),)
+        score_mod = capped if bias is None else template.Biased(capped)
+        if fill is not None:
+            score_mod, params = template.Filled.over(spans, fill, score_mod, params)
+            spans = template.spans(queries, keys, batch)
         hooks = template.Hooks(
-            score_mod=capped if bias is None else template.Biased(capped),
+            score_mod=score_mod,
             score_params=params,
             initial=None if sinks is None else template.sinks(sinks, batch, queries, value.shape[-1]),
             drop=drop)
@@ -352,7 +359,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                       image_groups=(image_groups, ("activation_batch", None)),
                       key_valid=(key_valid, ("activation_batch", None)),
                       key_runs=(key_runs, ("activation_batch", None, None, None)),
-                      places=(places, ("activation_batch", None)), seed=(dropout_seed, (None,)),
+                      places=(places, ("activation_batch", None)),
+                      query_slots=(query_slots, ("activation_batch", None)), seed=(dropout_seed, (None,)),
                       bias=(None if bias is None else jnp.broadcast_to(
                           bias, (*jnp.shape(bias)[:3], key.shape[1])), _bias_axes(bias)))
 
@@ -556,8 +564,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                                  key_value_seq_lengths=None, dropout_rate=0.0,
                                  dropout_rng=None, deterministic=True, key_segment_ids=None,
                                  key_value_seq_starts=None, block_groups=None, image_groups=None,
-                                 key_valid=None, key_runs=None, places=None, scale_logits=False,
-                                 mask_fill: float | None = None):
+                                 key_valid=None, key_runs=None, places=None, query_slots=None,
+                                 scale_logits=False, mask_fill: float | None = None):
     """Attend over [B, S, H, D] queries, keys and values: [B, S, H, Dv] out.
 
     `implementation` names the kernel (`AttentionImpl`, dispatched by
@@ -604,9 +612,11 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     outside any: under causality a block's query also sees its block whole,
     an image's its later keys within the window (`template.spans`).
     `key_valid` `[B, K]` marks the real keys, `key_runs` `[B, Q, R, 2]` each
-    query's key intervals, whose union it may see, and `places` `[B, S]` the places a
-    window counts (`counted_places`). The template reads these as its spans
-    (`key_spans`); every other path takes the mask they mean (`visibility_mask`).
+    query's key intervals, whose union it may see, `places` `[B, S]` the places a
+    window counts (`counted_places`), and `query_slots` `[B, S]` a cached call's queries'
+    own keys (the slots its cache stores them at, -1 for padding), whose blocks they read
+    whole. The template reads these as its spans (`key_spans`); every other path takes
+    the mask they mean (`visibility_mask`).
 
     A mesh sequence axis above one runs `sequence_parallel_attention`. Active dropout draws each weight
     from `dropout_rng` on the route the selector takes for it (`reference`, or `template` where named),
@@ -631,13 +641,14 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         if segment_ids is None:
             raise ValueError("key_segment_ids are the keys' documents beside the queries' segment_ids")
         segment_ids = CrossDocuments(segment_ids, key_segment_ids)
-    if not causal:
+    if not causal and key_runs is None:
+        # A call that sees every key sees its groups'; one over runs reads its blocks whole past its window.
         block_groups = image_groups = None
     if sliding_window is None:
         places = None
     if shards > 1:
         spanned = {"block_groups": block_groups, "image_groups": image_groups, "key_valid": key_valid,
-                   "key_runs": key_runs, "places": places}
+                   "key_runs": key_runs, "places": places, "query_slots": query_slots}
         causal, sliding_window, mask, key_value_seq_lengths, materialized = _sequence_sharded(
             query.shape[-3], key.shape[-3], causal=causal, sliding_window=sliding_window, mask=mask,
             segment_ids=segment_ids, lengths=key_value_seq_lengths, starts=key_value_seq_starts,
@@ -663,7 +674,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
                      max_segments=max_segments, key_value_seq_lengths=key_value_seq_lengths,
                      key_value_seq_starts=key_value_seq_starts, block_groups=block_groups,
                      image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
-                     dropout_rate=dropout_rate if dropping else 0.0, dropout_seed=words)
+                     query_slots=query_slots, dropout_rate=dropout_rate if dropping else 0.0,
+                     dropout_seed=words)
     return checkpoint_name(out, Residual.ATTENTION_OUTPUT)
 
 
@@ -673,18 +685,19 @@ def _read_nothing(out: jax.Array, live: jax.Array | None) -> jax.Array:
     return out if live is None else jnp.where(live, out, jnp.zeros((), out.dtype))
 
 
-def _filled(ran: Callable[[], jax.Array], portable: Callable[[], jax.Array], fill: float, live, query, key,
+def _filled(ran: Callable[[], jax.Array], filled: Callable[[], jax.Array], fill: float, live, query, key,
             value, *, bias, sinks, softcap, precision, dropping: bool) -> jax.Array:
     """A call's output where every key a row may not see has the logit `fill` (`mask_fill`), exactly the
-    portable path's (`portable()`, `reference_attention`'s `where(mask, logits, fill)`): the fused kernel
-    (`ran()`) weighs a masked key nothing, which the fill weighs too wherever it lies past fp32's exp from
-    the row's logits (`_fill_weighs`: none of the call's logits comes within 105 of it), so its rows that
-    see a key are the portable path's, and a row that sees none (`live`, `visible_rows`) reads every value
-    alike under a finite fill (`_unread`: each key's logit the fill, beside a head's sink) and NaN under
-    -inf, beside sinks 0, whose denominator the sink holds (the value's gradient NaN with it, every key's,
-    as the portable path's NaN weights give it). Where the fill may weigh a masked key of a row that sees
-    one (a fill above some logit, or within 105 below it), or a dropping call has a row that sees none (its
-    draw weighs the uniform weights' keys), the call runs the portable path, decided as it runs."""
+    portable path's (`reference_attention`'s `where(mask, logits, fill)`): the fused kernel (`ran()`)
+    weighs a masked key nothing, which the fill weighs too wherever it lies past fp32's exp from the row's
+    logits (`_fill_weighs`: none of the call's logits comes within 105 of it), so its rows that see a key
+    are the portable path's, and a row that sees none (`live`, `visible_rows`) reads every value alike
+    under a finite fill (`_unread`: each key's logit the fill, beside a head's sink) and NaN under -inf,
+    beside sinks 0, whose denominator the sink holds (the value's gradient NaN with it, every key's, as the
+    portable path's NaN weights give it). Where the fill may weigh a masked key of a row that sees one (a
+    fill above some logit, or within 105 below it), or a dropping call has a row that sees none (its draw
+    weighs the uniform weights' keys), the call runs `filled()`, a kernel that weighs the fill itself (the
+    template's score hook, `template.Filled`, else the portable path), decided as it runs."""
     if fill == -jnp.inf:
         if sinks is not None or live is None:
             return _read_nothing(ran(), live)
@@ -700,7 +713,7 @@ def _filled(ran: Callable[[], jax.Array], portable: Callable[[], jax.Array], fil
         return out if live is None else jnp.where(
             live, out, _unread(value.astype(out.dtype), query.shape[-2], fill, sinks, precision))
 
-    return jax.lax.cond(weighs, portable, fused)
+    return jax.lax.cond(weighs, filled, fused)
 
 
 def _fill_weighs(fill: float, query, key, bias, softcap) -> jax.Array:
@@ -745,8 +758,8 @@ def _unread(value, heads: int, fill: float, sinks, precision) -> jax.Array:
 def _fused_attention(query, key, value, bias, mask, causal, sliding_window, implementation, *,
                      softcap, sinks, segment_ids, key_value_seq_lengths, max_segments=None,
                      key_value_seq_starts=None, block_groups=None, image_groups=None, key_valid=None,
-                     key_runs=None,
-                     places=None, dropout_rate=0.0, dropout_seed=None, dropout_places=None):
+                     key_runs=None, places=None, query_slots=None, dropout_rate=0.0, dropout_seed=None,
+                     dropout_places=None, mask_fill=None):
     """Run the kernel `implementation` names, at the query's head width: the executor of what the
     attention selector chose (`resolve_implementation`, `_attention_kernel`), which held the call to
     the kernel's requirements (`attention_kernels.ATTENTION`) before it reaches here.
@@ -755,7 +768,7 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
     template takes its own value width. `key_value_seq_lengths` reaches cudnn, xla and the template as
     lengths and 'tpu' as the mask it means; `key_value_seq_starts` reaches the template and the decode
     kernel alone, and the groups, key validity and places the template alone (`_attention_kernel` folds them
-    into the mask elsewhere).
+    into the mask elsewhere), as `mask_fill`, every hidden key's logit (`template_attention`'s `fill`).
     """
     v_head_dim = value.shape[-1]
     if v_head_dim != query.shape[-1] and implementation != 'template':
@@ -840,8 +853,9 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
                                  segment_ids=segment_ids, lengths=key_value_seq_lengths,
                                  starts=key_value_seq_starts, block_groups=block_groups,
                                  image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
-                                 places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
-                                 dropout_places=dropout_places, bias=bias)
+                                 places=places, query_slots=query_slots, dropout_rate=dropout_rate,
+                                 dropout_seed=dropout_seed, dropout_places=dropout_places, bias=bias,
+                                 fill=mask_fill)
     else:  # 'tpu'
         if key_value_seq_lengths is not None:
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
@@ -852,12 +866,6 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
 
 
 FORWARD_MODE = contextvars.ContextVar("forward_mode_attention", default=False)
-
-REVERSE_ONLY = ('cudnn', 'triton', 'flash', 'tpu', 'template')
-"""The kernels that define their reverse-mode derivative alone (`jax.custom_vjp`), its backward traced after
-the call: forward mode takes theirs from the reference path (`forward_differentiable`), and a call's stated
-precision is held over that backward (`at_precision`). The others are JAX's own products (xla) or state
-their own (decode), which their tangents and transposes keep."""
 
 
 @contextlib.contextmanager
@@ -882,9 +890,9 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
                      causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
                      softcap=None, segment_ids=None, max_segments=None, key_value_seq_lengths=None,
                      key_value_seq_starts=None, block_groups=None, image_groups=None, key_valid=None,
-                     key_runs=None,
-                     places=None, dropout_rate=0.0, dropout_seed=None, dropout_places=None,
-                     wide_logits: bool = False, scale_logits: bool = False, mask_fill: float | None = None):
+                     key_runs=None, places=None, query_slots=None, dropout_rate=0.0, dropout_seed=None,
+                     dropout_places=None, wide_logits: bool = False, scale_logits: bool = False,
+                     mask_fill: float | None = None):
     """Dispatch one whole-sequence attention call to the kernel it names,
     differentiable in forward mode under `forward_mode_attention`.
 
@@ -917,29 +925,28 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     starts = None if key_value_seq_starts is None else jnp.asarray(key_value_seq_starts, jnp.int32)
     masked = mask if lengths is None else with_key_lengths(mask, lengths, key.shape[-3])
     masked = with_key_starts(masked, starts, key.shape[-3])
-    resolved = resolve_implementation(
-        implementation, query, key, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
-        causal=causal, sliding_window=sliding_window, mask=mask, bias=bias,
-        segment_ids=segment_ids, max_segments=max_segments, key_value_seq_lengths=lengths,
-        key_value_seq_starts=starts, block_groups=block_groups, image_groups=image_groups,
-        key_valid=key_valid, key_runs=key_runs, places=places, dropout=dropout_seed is not None,
-        dropout_places=dropout_places, wide_logits=wide_logits).kernel
+    facts = {"dtype": dtype, "precision": precision, "force_fp32_for_softmax": force_fp32_for_softmax,
+             "softcap": softcap, "sinks": sinks, "causal": causal, "sliding_window": sliding_window,
+             "mask": mask, "bias": bias, "segment_ids": segment_ids, "max_segments": max_segments,
+             "key_value_seq_lengths": lengths, "key_value_seq_starts": starts, "block_groups": block_groups,
+             "image_groups": image_groups, "key_valid": key_valid, "key_runs": key_runs, "places": places,
+             "query_slots": query_slots, "dropout": dropout_seed is not None, "wide_logits": wide_logits}
+    resolved = resolve_implementation(implementation, query, key, **facts).kernel
     call = functools.partial(
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
         segment_ids=segment_ids, max_segments=max_segments, lengths=lengths, starts=starts,
         block_groups=block_groups, image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
-        places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed, dropout_places=dropout_places,
-        wide_logits=wide_logits, scale_logits=scale_logits)
+        places=places, query_slots=query_slots, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
+        dropout_places=dropout_places, wide_logits=wide_logits, scale_logits=scale_logits)
     live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths,
                         starts, block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
-                        key_runs=key_runs,
-                        places=places)
+                        key_runs=key_runs, places=places, query_slots=query_slots)
 
-    def ran() -> jax.Array:
-        """The call on the kernel it resolved to, a row that sees no key whatever it gives."""
-        if resolved == 'inference':
+    def ran(kernel: str = resolved, fill: float | None = None) -> jax.Array:
+        """The call on `kernel`, the one it resolved to by default, every key it hides at the logit `fill`
+        (the reference's and the template's) where given, else a row that sees no key whatever it gives."""
+        if kernel == 'inference':
             # A call no derivative is taken of on the template where it measured faster, a differentiated
             # one's forward and derivatives xla's (`attention_kernels.template_infers`).
             def on(implementation):
@@ -950,27 +957,26 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
             primal = 'template' if template_infers(query.dtype, query.shape[-1], causal) else 'xla'
             return forward_differentiable(on(primal), on('xla'), query, key, value, bias, sinks,
                                           primal_alone=True)
-        if not FORWARD_MODE.get() or resolved not in REVERSE_ONLY:
-            return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
 
         def fused(query, key, value, bias, sinks):
-            return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
+            return call(query, key, value, bias=bias, sinks=sinks, implementation=kernel, mask_fill=fill)
+
+        if not FORWARD_MODE.get() or not reverse_only(kernel):
+            return fused(query, key, value, bias, sinks)
 
         def reference(query, key, value, bias, sinks):
-            return call(query, key, value, bias=bias, sinks=sinks, implementation='reference')
+            return call(query, key, value, bias=bias, sinks=sinks, implementation='reference', mask_fill=fill)
 
         return forward_differentiable(fused, reference, query, key, value, bias, sinks)
 
     if mask_fill is None:
         return _read_nothing(ran(), live)
-
-    def portable() -> jax.Array:
-        return call(query, key, value, bias=bias, sinks=sinks, implementation='reference',
-                    mask_fill=mask_fill)
-
     if resolved == 'reference':
-        return portable()
-    return _filled(ran, portable, mask_fill, live, query, key, value, bias=bias, sinks=sinks, softcap=softcap,
+        return ran(fill=mask_fill)
+    # The template weighs the fill itself where it takes the call (`template.Filled`), else the reference.
+    templated = ATTENTION.kernel('template').refused(attention_case(query, key, named='template', **facts))
+    filled = functools.partial(ran, 'reference' if templated else 'template', mask_fill)
+    return _filled(ran, filled, mask_fill, live, query, key, value, bias=bias, sinks=sinks, softcap=softcap,
                    precision=precision, dropping=dropout_seed is not None)
 
 
@@ -1016,9 +1022,9 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
 def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, precision,
                       force_fp32_for_softmax, causal, sliding_window, mask, masked, softcap,
                       segment_ids, max_segments, lengths, starts, block_groups=None, image_groups=None,
-                      key_valid=None, key_runs=None, places=None, dropout_rate=0.0, dropout_seed=None,
-                      dropout_places=None, wide_logits: bool = False, scale_logits: bool = False,
-                      mask_fill: float | None = None):
+                      key_valid=None, key_runs=None, places=None, query_slots=None, dropout_rate=0.0,
+                      dropout_seed=None, dropout_places=None, wide_logits: bool = False,
+                      scale_logits: bool = False, mask_fill: float | None = None):
     """Run one whole-sequence attention call on the kernel `attention_kernel` resolved.
 
     `masked` is `mask` with the key `lengths` and `starts` in it. Splash takes sinks, a
@@ -1031,17 +1037,18 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     splash cannot describe, so 'auto' never picks 'tpu' for them. Key starts reach the decode
     kernel and the template as they are and every other path as the mask they mean. Block and image
     groups, key validity and counted places reach the template alone; every other path takes the call's
-    spans as the mask they mean (`visibility_mask`). A `mask_fill` reaches the reference alone; the fused
-    kernels weigh a masked key nothing (`_filled`).
+    spans as the mask they mean (`visibility_mask`). A `mask_fill` reaches the reference and the template,
+    which weighs it by a score hook (`template.Filled`); the other kernels weigh a masked key nothing
+    (`_filled`).
     """
-    spanned = (block_groups, image_groups, key_valid, key_runs, places)
+    spanned = (block_groups, image_groups, key_valid, key_runs, places, query_slots)
     if any(x is not None for x in spanned) and implementation != 'template':
         mask = masked = visibility_mask(query.shape[-3], key.shape[-3], causal, sliding_window, mask,
                                         segment_ids, lengths, starts, block_groups=block_groups,
                                         image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
-                                        places=places)
+                                        places=places, query_slots=query_slots)
         causal, sliding_window, segment_ids, lengths, starts = False, None, None, None, None
-        block_groups = image_groups = key_valid = key_runs = places = None
+        block_groups = image_groups = key_valid = key_runs = places = query_slots = None
     # Another sequence's documents under causality or a window align each document's queries with
     # its last keys (`CrossDocuments`), which splash does not; elsewhere the mask carries them.
     aligned = isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
@@ -1080,16 +1087,16 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                                 segment_ids=segment_ids, max_segments=max_segments,
                                 key_value_seq_lengths=lengths, key_value_seq_starts=starts,
                                 block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
-                                key_runs=key_runs,
-                                places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed,
-                                dropout_places=dropout_places)
+                                key_runs=key_runs, places=places, query_slots=query_slots,
+                                dropout_rate=dropout_rate, dropout_seed=dropout_seed,
+                                dropout_places=dropout_places, mask_fill=mask_fill)
     # A kernel whose products take no precision of their own (jax.nn's xla attention, Pallas dots: the
     # template's portable mainloop, splash and its flash fallback) multiplies at the call's stated
     # precision: a reverse-only kernel's backward, traced after the call, held at it too (`at_precision`),
     # and JAX's own products by the forward's scope alone, which their tangents and transposes keep, so
     # forward mode differentiates them as written. A stated default is a floor the run's configured
     # precision meets, and a kernel that states its own keeps it.
-    if implementation in REVERSE_ONLY and not asks_default_precision(precision):
+    if reverse_only(implementation) and not asks_default_precision(precision):
         return at_precision(precision)(fused)(query, key, value, bias, sinks)
     with configured_precision(precision):
         return fused(query, key, value, bias, sinks)
@@ -1132,12 +1139,15 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,
                    max_segments=None, key_value_seq_lengths=None, key_value_seq_starts=None,
                    block_groups=None, image_groups=None, key_valid=None, key_runs=None, places=None,
-                   dropout: bool = False, dropout_places: template.DropPlaces | None = None,
-                   wide_logits: bool = False, named: str = 'auto') -> AttentionCase:
+                   query_slots=None, dropout: bool = False, wide_logits: bool = False,
+                   named: str = 'auto') -> AttentionCase:
     """The `AttentionCase` of a call `scaled_dot_product_attention` takes under the `named`
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
+    # Groups a call reads under causality, or past the window of its runs (`scaled_dot_product_attention`).
+    grouped = ((bool(causal) or key_runs is not None)
+               and (block_groups is not None or image_groups is not None))
     case = AttentionCase(
         queries=q_len, keys=kv_len, rows=math.prod(query.shape[:-3]), heads=query.shape[-2],
         kv_heads=key.shape[-2],
@@ -1146,9 +1156,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         documents=None if segment_ids is None else 'cross' if cross else 'own',
         aligned=cross and (causal or sliding_window is not None), max_segments=max_segments,
         lengths=key_value_seq_lengths is not None, starts=key_value_seq_starts is not None,
-        blocks=bool(causal) and (block_groups is not None or image_groups is not None),
-        spans_only=((bool(causal) and (block_groups is not None or image_groups is not None))
-                    or key_valid is not None or key_runs is not None
+        blocks=grouped,
+        spans_only=(grouped or key_valid is not None or key_runs is not None or query_slots is not None
                     or (places is not None and sliding_window is not None)),
         mask=mask is not None, bias=bias is not None,
         bias_hook=(bias is not None and jnp.ndim(bias) == 4 and jnp.shape(bias)[-2] in (1, query.shape[1])
@@ -1159,10 +1168,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
-        splash_mask=False, shards=sequence_shards(), dropout=dropout,
-        drop_placed=dropout_places is not None and (dropout_places.queries is not None
-                                                    or dropout_places.keys is not None),
-        form=generation.numerics().forms)
+        splash_mask=False, shards=sequence_shards(), dropout=dropout, form=generation.numerics().forms)
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
     # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
     # read the case (`TPU_SUPPORTS`).
@@ -1176,9 +1182,8 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
                            force_fp32_for_softmax=True, softcap=None, sinks=None, causal=False,
                            sliding_window=None, mask=None, bias=None, segment_ids=None, max_segments=None,
                            key_value_seq_lengths=None, key_value_seq_starts=None, block_groups=None,
-                           image_groups=None, key_valid=None, key_runs=None, places=None,
-                           dropout: bool = False, dropout_places: template.DropPlaces | None = None,
-                           wide_logits: bool = False) -> Route:
+                           image_groups=None, key_valid=None, key_runs=None, places=None, query_slots=None,
+                           dropout: bool = False, wide_logits: bool = False) -> Route:
     """The route an `AttentionImpl` takes for this call (`Route.kernel`, `Route.forced` what forced it),
     as the attention selector
     reports it (`select`, over `attention_case`): 'auto' takes the kernel the target's row measured
@@ -1196,7 +1201,7 @@ def resolve_implementation(implementation: AttentionImpl, query, key, *, dtype=N
                           key_value_seq_lengths=key_value_seq_lengths,
                           key_value_seq_starts=key_value_seq_starts, block_groups=block_groups,
                           image_groups=image_groups, key_valid=key_valid, key_runs=key_runs, places=places,
-                          dropout=dropout, dropout_places=dropout_places, wide_logits=wide_logits,
+                          query_slots=query_slots, dropout=dropout, wide_logits=wide_logits,
                           named=implementation)
     if not (decodes(case) and implementation in ('auto', 'cudnn', 'xla')):
         return select(ATTENTION, case, None if implementation == 'auto' else implementation)

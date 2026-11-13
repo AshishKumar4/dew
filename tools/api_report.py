@@ -236,6 +236,7 @@ def config() -> list[str]:
     module of each run kind the registry names (`dew.registry.runs`), wherever it lives, and every dataclass
     of Dew a run kind's fields reach (`reaches`), each once under its qualified name."""
     import dew.config
+    from dew._records import annotations_of
     from dew.registry import runs
 
     kinds = {runs.paths[name].partition(":")[0] for name in runs.paths}
@@ -250,7 +251,7 @@ def config() -> list[str]:
         cls = pending.pop()
         if cls not in reached:
             reached.add(cls)
-            hints = typing.get_type_hints(cls, include_extras=True)
+            hints = annotations_of(cls, include_extras=True)
             pending.extend(found for field in dataclasses.fields(cls) for found in reaches(hints[field.name]))
     lines = []
     for cls in sorted(listed | reached, key=lambda cls: (cls.__module__, cls.__qualname__)):
@@ -280,8 +281,10 @@ def arguments(cls) -> list[str]:
     """A command's arguments as it declares them to tyro, which spells them (a field `name` the flag
     `--name`, underscores as hyphens, unless it is `Positional` or `arg` names it): each field's name, its
     type with its aliases resolved (`Zone` is `str | None`), its default, and what tyro is told of it."""
+    from dew._records import annotations_of
+
     try:
-        hints = typing.get_type_hints(cls, include_extras=True)
+        hints = annotations_of(cls, include_extras=True)
     except (NameError, TypeError):
         hints = {}
     lines = []

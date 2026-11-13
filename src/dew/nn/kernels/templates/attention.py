@@ -754,6 +754,50 @@ class Biased(tuning.FieldHook):
         return capped + bias
 
 
+@dataclasses.dataclass(frozen=True)
+class Filled(tuning.FieldHook):
+    """A masked logit as a score hook (`dew.nn.attention`'s `mask_fill`): `score_mod`'s logits (the scaled
+    logits where None), its parameters the hook's first `inner`, at each key the query's spans show it
+    (`within`), and the logit `fill` at every other, which the softmax weighs as the portable path's
+    `where(mask, logits, fill)` does, so a call under it walks every key. Its own parameters, after the inner
+    hook's, are the spans' bounds (`KeySpans.start` and `end`, each of its `runs` intervals' a `Kind.QUERY`
+    one, starts first) and, where it packs `documents`, the queries' ids (`Kind.QUERY`) and the keys'
+    (`Kind.KEY`), integers as the spans hold them, which take no derivative: equal for equal facts and inner
+    hooks (`tuning.FieldHook`)."""
+
+    fill: float
+    runs: int
+    documents: bool
+    score_mod: Callable | None = None
+    inner: int = 0
+
+    def __call__(self, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array,
+                 *params: jax.Array) -> jax.Array:
+        inner, own = params[:self.inner], params[self.inner:]
+        starts, ends, ids = own[:self.runs], own[self.runs:2 * self.runs], own[2 * self.runs:]
+        if self.score_mod is not None:
+            logits = self.score_mod(logits, q_pos, k_pos, *inner)
+        seen = functools.reduce(operator.or_, (within(k_pos, start, end)
+                                               for start, end in zip(starts, ends, strict=True)))
+        if self.documents:
+            seen = seen & (ids[0] == ids[1])
+        return jnp.where(seen, logits, self.fill)
+
+    @classmethod
+    def over(cls, spans: KeySpans, fill: float, score_mod: Callable | None,
+             params: tuple[Param, ...]) -> tuple["Filled", tuple[Param, ...]]:
+        """The hook over `spans` beside `score_mod` and its `params`, and the parameters the two read: the
+        inner hook's, then each run's start, each run's end, and the documents' ids where `spans` packs
+        them."""
+        spans = spans.per_query()
+        start, end = ((bound[..., None] if bound.ndim == 2 else bound) for bound in (spans.start, spans.end))
+        own = [Param(bound[:, None, :, run], Kind.QUERY) for bound in (start, end)
+               for run in range(bound.shape[-1])]
+        ids = [] if spans.query_ids is None or spans.key_ids is None else [
+            Param(spans.query_ids[:, None, :], Kind.QUERY), Param(spans.key_ids[:, None, :], Kind.KEY)]
+        return cls(fill, start.shape[-1], bool(ids), score_mod, len(params)), (*params, *own, *ids)
+
+
 DROP_DOMAIN = 0x6A09E667
 """The keep draw's domain tag: the fraction bits of sqrt(2), so the draw's first word is one no other
 `fmix32` user mixes first, and its stream never coincides with theirs."""

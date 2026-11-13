@@ -312,7 +312,8 @@ class Writer(nn.Module):
 
 class Decoder(nn.Module):
     """One attention module's paged store of `capacity` slots a row: its keys and values written at their
-    slots, then one query a row decoded over the first `lengths` slots of that row (`KVStore.decode`)."""
+    slots, then one query a row decoded over the first `lengths` slots of that row (`KVStore.decode`), through
+    the paged kernel the store's selection gives the step (`KVStore.paged_kernel`)."""
 
     layout: KVCache
     capacity: int
@@ -325,7 +326,8 @@ class Decoder(nn.Module):
             self.variable("cache", "written", lambda: True)
             return None
         store.write(key, value, positions)
-        return store.decode(query, lengths, None)
+        kernel = store.paged_kernel(query, softcap=None, arithmetic=False, named="auto")
+        return store.decode(query, lengths, kernel, None)
 
 
 

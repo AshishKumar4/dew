@@ -140,7 +140,7 @@ class Signals:
 @dataclasses.dataclass(frozen=True)
 class Signal:
     """An opened signal (`Signals.opened`): each turn arrived at once, by a load, a product's commit or a
-    role's threads, and waited for at its turn's parity by every role that waits on it, at every turn."""
+    role's threads, and waited for at its turn's phase by every role that waits on it, at every turn."""
     shape: Signals
     barriers: state_types.AbstractRef
 
@@ -162,7 +162,7 @@ class Signal:
         plgpu.barrier_arrive(self.barriers.at[turn.slot])
 
     def wait(self, turn: rings.Turn) -> None:
-        plgpu.barrier_wait(self.barriers.at[turn.slot], parity=turn.parity)
+        plgpu.barrier_wait(self.barriers.at[turn.slot], phase=turn.rotation)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -229,7 +229,7 @@ class Tensor:
     def freed(self, turn: rings.Turn) -> None:
         """The product warp waits for the turn's accumulator: given back by the turn `count` before."""
         pl.when(turn.counter >= self.shape.count)(lambda: plgpu.barrier_wait(
-            self.read_done.at[turn.slot], parity=turn.freed))
+            self.read_done.at[turn.slot], phase=turn.rotation - 1))
 
     def acquire(self, turn: rings.Turn):
         """The product warp's turn: the turn's accumulator, once `freed`."""
@@ -247,7 +247,7 @@ class Tensor:
 
     def ready(self, turn: rings.Turn) -> None:
         """A reading role's turn: its products done, once, however many parts it reads (`slot`)."""
-        plgpu.barrier_wait(self.done.at[turn.slot], parity=turn.parity)
+        plgpu.barrier_wait(self.done.at[turn.slot], phase=turn.rotation)
 
     def running_columns(self, first, count: int):
         """Columns `first` to `first + count` of the tile's running sums (`Accumulators.running`)."""
@@ -310,7 +310,7 @@ class PairedRing(CommittedRing):
             raise ValueError(f"a pair's step is the pair's block (`rings.Paired` indices), not {view}")
         slot = rings.opaque(turn.slot)
         pl.when(turn.counter >= self.stages)(lambda: plgpu.barrier_wait(
-            self.consumed.at[slot], parity=turn.freed))
+            self.consumed.at[slot], phase=turn.rotation - 1))
         plgpu.copy_gmem_to_smem(view.ref, self.smem.at[slot], self.full.at[slot],
                                 **self.topology.copied(view.along))
 

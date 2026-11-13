@@ -92,6 +92,27 @@ def test_a_group_whose_leader_was_reaped_is_signalled_only_where_its_owner_start
         owned.stdout.close()
 
 
+def test_a_groups_lifeline_ends_when_the_last_process_its_leader_left_ends():
+    """A started group whose leader exits before a process it left, the leader reaped, is still its lifeline's
+    while that process runs; when that process ends by itself the lifeline ends too, holding the group's id no
+    longer: it watched only its owner from the leader's end on, so it outlived the group and killed, at its
+    owner's end, whatever group the id then named (the audit of 2026-11-12, N2)."""
+    before = lifelines()
+    owned = start([sys.executable, "-c", leader_with_child("")], stdout=subprocess.PIPE, text=True)
+    try:
+        held = child_of(owned)
+        owned.wait()
+        assert running(held) and lifelines() == before + 1
+        os.kill(held, signal.SIGKILL)
+        deadline = time.monotonic() + 10
+        while lifelines() > before and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert lifelines() == before
+        assert stop(owned) == []
+    finally:
+        owned.stdout.close()
+
+
 def test_a_group_whose_owner_is_killed_before_its_lifeline_knows_it_ends_with_its_owner(tmp_path):
     """An owner killed between its group's start and its lifeline's reading the group's id (the window an
     owner busy elsewhere, its other thread holding the interpreter, keeps open while its command already

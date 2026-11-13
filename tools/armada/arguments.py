@@ -109,6 +109,11 @@ def parser(pythons: Sequence[str], deadline: float) -> argparse.ArgumentParser:
         operations.add_parser("release-plan", help="a whole suite verdict's release checks, a task each"),
         operations.add_parser("release", help="one requirement's release checks; exit 1 on a red row"),
         pythons)
+    whole = operations.add_parser(
+        "partition", help="whether a whole verdict's rows ran each collected test once; exit 1 where not")
+    whole.add_argument("verdict", type=Path, help="armada verdict <sha> --json")
+    whole.add_argument("collected", type=Path, nargs="+",
+                       help="pytest --collect-only -q of the commit's test files under CI's selection")
     recording = operations.add_parser("durations")
     recording.add_argument("verdict", type=Path, help="main's CI verdict: armada verdict <sha> --json")
     return parser

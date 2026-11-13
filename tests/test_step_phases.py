@@ -17,7 +17,7 @@ from test_chain_compile import Tokens
 from test_data_mixtures import READ, assert_same, checkpointed_trainer, parameters
 
 from dew.batch import PHASE, VALID_ROWS, Phase
-from dew.data import Memory, phases
+from dew.data import Memory, mix, phases
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.mesh import LayoutRefused
@@ -42,6 +42,20 @@ def chain(*ends):
     return phases((source(1), ends[0]), (source(2), None))
 
 
+def resumes_as_read(loader, whole, stops) -> None:
+    """A read of `loader` stopped at each of `stops`, saved and resumed, reads `whole` (an unstopped read's
+    steps) on from where it stopped."""
+    for stop in stops:
+        head, stopped = read(loader, stop)
+        saved = stopped.get_state()
+        stopped.close()
+        resumed = loader.train(DataPartition())
+        resumed.set_state(saved)
+        rest, resumed = read(loader, len(whole) - stop, resumed)
+        resumed.close()
+        assert head + rest == whole, stop
+
+
 def read(loader, steps: int, stream=None):
     """`steps` batches of `loader`'s training read, each its real rows' ids and its phase; and the stream."""
     stream = stream if stream is not None else loader.train(DataPartition())
@@ -63,15 +77,7 @@ def test_phases_over_reads_cut_per_share_each_read_their_own_rows_and_resume_as_
     stream.close()
     assert [phase for _, phase in whole] == [Phase(0)] * 3 + [Phase(1)] * 4
     assert all(ids and {row // 1000 for row in ids} == {phase.index + 1} for ids, phase in whole)
-    for stop in range(1, 7):
-        head, stopped = read(loader, stop)
-        saved = stopped.get_state()
-        stopped.close()
-        resumed = loader.train(DataPartition())
-        resumed.set_state(saved)
-        rest, resumed = read(loader, 7 - stop, resumed)
-        resumed.close()
-        assert head + rest == whole, stop
+    resumes_as_read(loader, whole, range(1, 7))
 
 
 def test_a_resume_into_phases_that_moved_an_end_the_run_passed_is_refused():
@@ -86,15 +92,145 @@ def test_a_resume_into_phases_that_moved_an_end_the_run_passed_is_refused():
     moved.close()
 
 
-def test_phases_read_each_on_its_own_stream_refuse_a_corpus_two_of_them_read():
-    """Phases read each on its own stream open each corpus at its first record, so a corpus two of them read
-    would be read again from its start: refused, as reading one global order is what continues it, whatever
-    each phase names it."""
+def member(tag: int, endless: bool = False, rows: int = 48):
+    """A corpus of `rows` rows whose ids say they are the `tag`th source's, in id order, of uneven lengths,
+    some dropped as too long: a mix's member, which its mix reads again from its start where it runs out,
+    or `endless` itself."""
+    held = [{"id": np.int32(1000 * tag + index), "length": np.int32(3 + index % 11)} for index in range(rows)]
+    chain = Memory(held).map(Tokens()).filter(fits, reason="too_long")
+    return chain.repeat() if endless else chain
+
+
+SHARED_ROWS = 192
+
+SHARED = member(1, rows=SHARED_ROWS)
+"""The corpus phases share: its ids in its order, those that fit (`KEPT`)."""
+
+KEPT = [1000 + index for index in range(SHARED_ROWS) if (3 + index % 11) % 5 != 0]
+
+
+def first_pass(batches, records: int):
+    """`batches`' steps until they trained more than `records` of `SHARED`, short of its mix reading it a
+    second time: what a read trains of it across its phases' boundaries, each record once."""
+    kept, seen = [], 0
+    for ids, phase in batches:
+        seen += sum(row // 1000 == 1 for row in ids)
+        if seen > records:
+            break
+        kept.append((ids, phase))
+    return kept
+
+
+def shared_phases(elastic: bool = False):
+    """Two phases on the step clock sharing `SHARED`, each its own mix: the first with another corpus, its
+    draws shuffled within windows of six after the mix and batched by 128 tokens, to step 3; the second
+    with a third corpus at other weights, unshuffled and batched by 64 tokens, on; each
+    read elastically where asked (`Pipeline.elastic`)."""
+    first = mix([SHARED, member(2, endless=True)], weights=(0.5, 0.5)).shuffle(1, streamed=6)
+    second = mix([SHARED, member(3, endless=True)], weights=(0.25, 0.75))
+    if elastic:
+        first, second = first.elastic(), second.elastic()
+    return phases((first.batch(tokens=128), 3), (second.batch(tokens=64), None))
+
+
+def shared_ids(batches) -> tuple[list[int], list[int]]:
+    """The ids of `SHARED` each phase of `batches` trains, in order."""
+    by_phase: tuple[list[int], list[int]] = ([], [])
+    for ids, phase in batches:
+        by_phase[phase.index].extend(row for row in ids if row // 1000 == 1)
+    return by_phase
+
+
+@pytest.mark.parametrize("read_as", ["indexed", "streamed"])
+def test_phases_that_share_a_corpus_train_each_of_its_records_once_across_their_boundary(read_as):
+    """Two phases on their own streams sharing a corpus, the first shuffling its draws after its mix and the
+    second batching them otherwise: the second continues the corpus where the run left it, so each of its
+    records is trained once, none lost, the ones the first phase's shuffle still held trained by the
+    second, until its mix reads it again; and a read stopped at any step, in either phase or at their
+    boundary, resumed reads what the read never stopped reads."""
+    loader = compile(shared_phases(), read=read_as, loading=READ)
+    whole, stream = read(loader, 24)
+    stream.close()
+    first, second = shared_ids(first_pass(whole, len(KEPT)))
+    assert first and second and not set(first) & set(second)
+    trained = sorted(first + second)
+    assert len(trained) == len(set(trained)) and trained == KEPT[:len(trained)]
+    assert first != sorted(first), "the first phase's shuffle reorders the draws it trains"
+    resumes_as_read(loader, whole, (2, 3, 4, 6))
+
+
+def test_three_phases_sharing_a_corpus_through_a_short_shuffled_middle_train_each_record_once():
+    """Three phases sharing a corpus, the first two shuffling their draws after their mixes and the middle one
+    a single step, which ends before it draws past every pull the first trained ahead: the third continues
+    from those too, so each record is trained once, none lost; one of the first's members is itself a mix,
+    which draws nothing the run carries; and a read stopped in the middle or the last phase, resumed, reads
+    what the read never stopped reads."""
+    nested = mix([member(4, endless=True), member(5, endless=True)])
+    first = mix([SHARED, nested], weights=(0.5, 0.5)).shuffle(1, streamed=6).batch(tokens=128)
+    middle = mix([SHARED, member(2, endless=True)], weights=(0.5, 0.5)).shuffle(2, streamed=4)
+    middle = middle.batch(tokens=64)
+    last = mix([SHARED, member(3, endless=True)], weights=(0.25, 0.75)).batch(tokens=64)
+    loader = compile(phases((first, 3), (middle, 4), (last, None)), read="indexed", loading=READ)
+    whole, stream = read(loader, 24)
+    stream.close()
+    passed = first_pass(whole, len(KEPT))
+    trained = [row for ids, _ in passed for row in ids if row // 1000 == 1]
+    assert {phase.index for _, phase in passed} == {0, 1, 2}
+    assert len(trained) == len(set(trained)) and sorted(trained) == KEPT[:len(trained)]
+    resumes_as_read(loader, whole, (3, 4, 5))
+
+
+def test_phases_that_share_a_corpus_continue_it_on_every_share_of_their_reads():
+    """Two shares of phases sharing a corpus each continue their own cut of it: on each, every record of
+    the corpus the share reads is trained once across the boundary, and no share trains another's."""
+    loader = compile(shared_phases(), read="indexed", loading=READ)
+    held: list[list[int]] = []
+    for index in range(2):
+        batches, stream = read(loader, 16, loader.train(DataPartition(index, 2)))
+        stream.close()
+        # Short of the share's own cut of the corpus read again.
+        first, second = shared_ids(first_pass(batches, len(KEPT) // 2 - 4))
+        assert not set(first) & set(second)
+        held.append(first + second)
+    assert not set(held[0]) & set(held[1])
+    assert all(len(ids) == len(set(ids)) for ids in held)
+
+
+@pytest.mark.parametrize("resumed", [1, 4])
+def test_elastic_phases_that_share_a_corpus_resume_inside_the_second_on_another_share_count(resumed):
+    """Elastic phases sharing a corpus, saved by two shares inside the second phase, resume on another count
+    of shares: between them they read the next steps' rows one reader reads, the shared corpus continued
+    where the run left it, as every reader of an elastic read names its draws alike."""
+    loader = compile(shared_phases(elastic=True), read="indexed", loading=READ)
+    whole = [ids for ids, _ in read(loader, 7, loader.train(DataPartition()))[0]]
+    shares = [loader.train(DataPartition(index, 2)) for index in range(2)]
+    for share in shares:
+        list(itertools.islice(share, 5))
+    (state,) = {share.get_state() for share in shares}
+    again = [loader.train(DataPartition(index, resumed)) for index in range(resumed)]
+    for share in again:
+        share.set_state(state)
+    for step in (5, 6):
+        held = sorted(itertools.chain.from_iterable(_ids(next(share)) for share in again))
+        assert held == sorted(whole[step])
+
+
+def test_phases_that_share_a_corpus_otherwise_than_as_one_member_each_are_refused():
+    """A phase that reads a corpus another reads other than as a member of its own mix, whose position no key
+    names, phases that read it through other steps before their mixes, where the one's draws are no draws of
+    the other's, and phases that read it under other keys, which draw and shuffle it otherwise, are refused,
+    as the run could not continue the corpus where it left it."""
     with pytest.raises(ValueError):
         compile(phases((source(1), 3), (source(1), None)), read="indexed", loading=READ)
+    other = mix([SHARED.map(lambda row: row), member(3, endless=True)]).batch(tokens=64)
     with pytest.raises(ValueError):
-        compile(phases((source(1).named("early"), 3), (source(1).named("late"), None)), read="indexed",
-                loading=READ)
+        compile(phases((mix([SHARED, member(2, endless=True)]).batch(tokens=128), 3), (other, None)),
+                read="indexed", loading=READ)
+    # Moved to another place among the unnamed, it is drawn and shuffled under another key.
+    moved = mix([member(3, endless=True), SHARED]).batch(tokens=64)
+    with pytest.raises(ValueError):
+        compile(phases((mix([SHARED, member(2, endless=True)]).batch(tokens=128), 3), (moved, None)),
+                read="indexed", loading=READ)
 
 
 @pytest.mark.parametrize(("repeats", "ends"), [(None, "never"), (1, "apart")])
@@ -235,3 +371,49 @@ def test_phases_of_elastic_reads_resume_on_another_share_count(saved, resumed):
     for step in range(2):
         held = itertools.chain.from_iterable(_ids(next(share)) for share in again)
         assert sorted(held) == sorted(whole[step])
+
+
+SAVED_BY_MAIN = Path(__file__).with_name("fixtures") / "positions" / "main-d74347b5a"
+"""Positions main saved at d74347b5a, before phases shared corpora, of the chains
+`saved_positions_support` builds (`tools/positions_saved_by_main.py`): phases on their own streams inside the
+first, and a bounded mixture's read while its layout or its held shuffle holds counts."""
+
+
+@pytest.mark.parametrize("saved", ["step_phases", "bounded_mixture_strided", "bounded_mixture_held"])
+def test_a_position_saved_before_phases_shared_corpora_resumes_as_it_was_read(saved):
+    """A position main saved before draws were stamped and carried (no corpus carried or trained in a
+    phases' position, no draws owed by a counter or held by a layout's documents or a held shuffle's units)
+    resumes, and reads what a read of the same chain stopped where it stopped reads after it."""
+    from saved_positions_support import SAVED
+
+    loader, steps = SAVED[saved]
+    streams = [loader().train(DataPartition()) for _ in range(2)]
+    list(itertools.islice(streams[0], steps))
+    streams[1].set_state((SAVED_BY_MAIN / f"{saved}.position").read_bytes())
+    # The rest of each read, the stopped one's and the restored one's, batch by batch, eight steps on.
+    after = [[_ids(batch) for batch in itertools.islice(stream, 8)] for stream in streams]
+    for stream in streams:
+        stream.close()
+    assert after[1] == after[0] and after[0]
+
+
+def test_phases_sharing_a_corpus_saved_under_13_resume_by_13_and_are_refused_by_14():
+    """Phases that share a corpus, read under plan 13, read each phase's corpora from their start (13's
+    `phases` rule), and resume so where the run compiles them at 13, as a run config's resume does; a read
+    compiled at this Dew's, which continues the corpus from the draws the run trained, refuses the position,
+    naming the rule (docs/design/data.md, the rules)."""
+    loader = compile(shared_phases(), read="indexed", loading=READ, plan_version=13)
+    whole, stream = read(loader, 8)
+    stream.close()
+    first, second = shared_ids(first_pass(whole, len(KEPT)))
+    assert set(first) & set(second), "13's second phase reads the shared corpus again from its start"
+    resumes_as_read(loader, whole, (2, 4))
+    _, stopped = read(loader, 4)
+    saved = stopped.get_state()
+    stopped.close()
+    refusing = compile(shared_phases(), read="indexed", loading=READ).train(DataPartition())
+    try:
+        with pytest.raises(ValueError):
+            refusing.set_state(saved)
+    finally:
+        refusing.close()

@@ -102,6 +102,48 @@ def test_a_run_updating_in_its_backward_moves_as_the_whole_steps_update_would():
                     truth_fn=jax.jit(whole_step(wide, widened(layered))))
 
 
+SHARED_SEEDS = 64
+"""Check 1's declared seeds for a shared input's gradient through a run updating in its backward."""
+
+
+def test_what_every_layer_of_a_run_updating_in_its_backward_reads_takes_its_layers_gradient():
+    """A floating array every layer of a run updating in its backward reads beside its residual (a
+    cross-attention's context, which a trainable encoder computes upstream) takes the sum of the layers'
+    cotangents, the gradient an ordinary scan of the same layers gives it, on par (check 1, truth float64):
+    the run's rule gave it none, so whatever computed it never trained (audit3 nn-core P1)."""
+    from dew.nn import in_backward
+
+    def kept(path, index, gradient, weights, moments):
+        # The update is no part of what this holds: the weights stay as they are.
+        return weights, {}
+
+    def layer(weights, x, key, context):
+        return jnp.tanh(x @ weights["kernel"] + context)
+
+    def through_run(kernel, x, context):
+        norms = {"sumsq": jnp.zeros((3,), kernel.dtype), "nonfinite": jnp.zeros((3,), kernel.dtype)}
+        with in_backward.planned(in_backward.InBackward(update=kept, moments=())):
+            y = in_backward.scanned_run(("layers_0_2",), layer, {"kernel": kernel}, None, {}, norms, x, None,
+                                        (context,))
+        return jnp.sum(y ** 2)
+
+    def through_scan(kernel, x, context):
+        y, _ = jax.lax.scan(lambda x, w: (layer({"kernel": w}, x, None, context), None), x, kernel)
+        return jnp.sum(y ** 2)
+
+    def draw(seed):
+        kernel, x, context = (jax.random.normal(key, shape) * scale for key, shape, scale in zip(
+            jax.random.split(jax.random.key(seed), 3), ((3, 4, 4), (2, 4), (2, 4)), (0.5, 1.0, 0.3),
+            strict=True))
+        return kernel, x, context
+
+    def gradient(loss):
+        return jax.jit(lambda kernel, x, context: jax.grad(loss, argnums=2)(kernel, x, context))
+
+    assert_as_exact(gradient(through_run), gradient(through_scan), draw, "a shared input's gradient",
+                    seeds=SHARED_SEEDS)
+
+
 EIGHT_BIT = OptimConfig(optimizer="adamw", learning_rate=1e-2, weight_decay=0.1, state_dtype="int8")
 """Adamw keeping its moments in 8 bits (`OptimConfig.state_dtype`), codes and their blocks' scales no
 backward writes as a float cotangent: its step takes the whole gradient first."""
@@ -157,18 +199,21 @@ batch."""
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize("optimizer", [ADAMW, GROUPED], ids=["adamw", "groups"])
-def test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time(optimizer):
+@pytest.mark.parametrize(("optimizer", "fields"),
+                         [(ADAMW, {}), (GROUPED, {}), (ADAMW, {"layer_scalar": "frozen"})],
+                         ids=["adamw", "groups", "frozen scalar"])
+def test_a_scanned_step_updating_in_its_backward_trains_as_a_layer_at_a_time(optimizer, fields):
     """Two steps of a decoder whose one stage scans its layers, each updating them in its backward
     (`Transaction.planned`: the step runs `in_backward.scanned_run`), leave its variables, optimizer state
     as a checkpoint holds them on par with the same steps a layer at a time, whose update reads the
     whole gradient (check 1, against one device's float64): the plan's update of a layer's slice of the
-    state is the whole update's (row 4857). That the plan engages is the step's memory
+    state is the whole update's (row 4857), a layer reading a read-only collection beside its weights (a
+    frozen layer scalar's) as the ordinary scan does. That the plan engages is the step's memory
     (`test_a_scanned_step_holds_no_more_than_a_layer_at_a_time`): a scanned step taking its whole gradient
     first holds more than a layer at a time does."""
     from test_stage_local import decoder as stage_decoder, draw, initials, stepped
 
-    scanned, plain = stage_decoder(scan_layers=True), stage_decoder()
+    scanned, plain = stage_decoder(scan_layers=True, **fields), stage_decoder(**fields)
     # No average beside them: an EMA two steps old is its draw's, whose rounding both arms share.
     initial = initials(plain, optimizer, ema=None)
     one_stage = MeshSpec(fsdp=2)

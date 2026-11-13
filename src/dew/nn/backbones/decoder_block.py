@@ -46,6 +46,7 @@ from ..inputs import (
     FEEDFORWARD_ROUTES,
     MIXER_ROUTES,
     AttentionMetadata,
+    CrossContext,
     LayerInputs,
     MixerCall,
     PredictionPhase,
@@ -1013,7 +1014,8 @@ class DecoderBlock(nn.Module):
         state = self._enter(x, train, attention_metadata, decode)
         if self.cross is not None:
             held = AttentionMetadata() if attention_metadata is None else attention_metadata
-            state = self._crossed(state, held.context, decode, train, held.progress)
+            state = self._crossed(state, held.context, decode, train, held.progress,
+                                  CrossContext.queries_of(held.coordinates))
         state, read, site = self._read(state, "attention")
         if not (self.wiring.pre_norms and self.attention_norm):
             normed = read
@@ -1068,10 +1070,12 @@ class DecoderBlock(nn.Module):
         return self._leave(state, train, per_layer_input)
 
     def _crossed(self, state: _BlockState, context, decode: bool, train: bool,
-                 progress: jax.Array | None) -> _BlockState:
+                 progress: jax.Array | None, queries: jax.Array | None) -> _BlockState:
         """The state after the cross-attention block joins it: the plain stream (AltUp's active
         copy among them, nGPT's unit one), mHC's streams through their mean, or the depth
-        state's partial block through the mixture the attention reads."""
+        state's partial block through the mixture the attention reads. `queries` are the call's
+        tokens' documents (`CrossContext.queries_of`), which a cached call without its context reads the
+        kept one's documents by."""
         # A block that reads through the layer's own attention is handed it, with the layer's attention
         # input from the states a sublayer reads (`LayerReads`).
         layer = {}
@@ -1080,7 +1084,7 @@ class DecoderBlock(nn.Module):
                 raise ValueError(f"this layer's mixer ({type(self.self_attn).__name__}) has no attention of "
                                  "its own for its cross-attention block to read a context through")
             layer = {"layer": LayerReads(self._attention_input, self.self_attn, progress)}
-        joined = functools.partial(self.cross_attention, decode=decode, train=train, **layer)
+        joined = functools.partial(self.cross_attention, decode=decode, train=train, queries=queries, **layer)
 
         def cross(*arguments, **options):
             # Its attention's projections are a mixer's, its feed-forward's a feed-forward's.

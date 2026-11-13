@@ -171,7 +171,7 @@ def test_a_warmup_may_be_a_share_of_the_run(schedule):
     cosine's own 100-step horizon 5 where the run states none."""
     shared, written = schedule("5%"), schedule(10)
     for step in (0, 3, 9, 10, 11, 50, 99):
-        assert float(shared.values(200)(step)) == float(written.values(200)(step))
+        assert float(shared.schedule(200)(step)) == float(written.schedule(200)(step))
     assert shared.warmup(200) == 10
     if isinstance(shared, Cosine):
         assert shared.warmup(None) == 5
@@ -180,7 +180,7 @@ def test_a_warmup_may_be_a_share_of_the_run(schedule):
 @pytest.mark.parametrize("warmup", ["0%", "101%", "5", "five%"])
 def test_a_warmup_that_is_neither_steps_nor_a_share_is_refused(warmup):
     with pytest.raises(ValueError):
-        Cosine(1.0, warmup_steps=warmup, decay_steps=100).values(200)
+        Cosine(1.0, warmup_steps=warmup, decay_steps=100).schedule(200)
 
 
 
@@ -189,11 +189,11 @@ def test_a_one_cycle_rise_may_be_a_share_of_the_run():
     step, and its warmup is the steps to its peak, torch's 0.3 * 100 - 1."""
     shared, written = OneCycle(1.0, warmup_fraction="30%"), OneCycle(1.0, warmup_fraction=0.3)
     for step in (0, 10, 28, 29, 30, 60, 99):
-        assert float(shared.values(100)(step)) == float(written.values(100)(step))
+        assert float(shared.schedule(100)(step)) == float(written.schedule(100)(step))
     assert shared.warmup(100) == written.warmup(100) == 29
     assert OptimConfig(learning_rate=shared).warmups(100) == {"learning_rate": 29}
     with pytest.raises(ValueError):
-        OneCycle(1.0, warmup_fraction="30").values(100)
+        OneCycle(1.0, warmup_fraction="30").schedule(100)
 
 
 def test_a_config_records_the_warmups_of_the_schedules_its_optimizer_runs():

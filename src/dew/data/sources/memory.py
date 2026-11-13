@@ -136,7 +136,7 @@ class Memory(Dataset):
             return _Columns(self.values)
         return self.values
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         return _indexed_manifest(self, "memory", self.shard_rows)
 
     def metadata(self) -> Mapping[str, object]:

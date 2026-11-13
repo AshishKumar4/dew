@@ -18,15 +18,12 @@ jax.distributed.initialize() would pin the process to its own devices.
 from __future__ import annotations
 
 import contextlib
-import ctypes
 import functools
 import gc
 import hashlib
-import threading
 from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import ClassVar
 
 from flax import linen as nn
 from process_support import serve_mode, worker_parser
@@ -68,48 +65,23 @@ SAMPLED = 0.005
 """Seconds between the counts `allocated_growth` takes inside its block."""
 
 
-class _Mallinfo2(ctypes.Structure):
-    """glibc's `struct mallinfo2` (malloc.h), its fields in bytes."""
-    _fields_: ClassVar[list[tuple[str, type]]] = [(name, ctypes.c_size_t) for name in (
-        "arena", "ordblks", "smblks", "hblks", "hblkhd", "usmblks", "fsmblks", "uordblks", "fordblks",
-        "keepcost")]
-
-
-def allocated() -> int:
-    """The bytes glibc's allocator holds allocated, in every arena and every mapped chunk (`mallinfo2`'s
-    `uordblks` and `hblkhd`): NumPy's arrays and XLA CPU's buffers, a tensor read home among them, live
-    however their pages were come by."""
-    mallinfo2 = ctypes.CDLL(None).mallinfo2
-    mallinfo2.restype = _Mallinfo2
-    info = mallinfo2()
-    return info.uordblks + info.hblkhd
-
-
 @contextlib.contextmanager
 def allocated_growth(into: list[int]) -> Iterator[None]:
-    """How far the bytes this process holds allocated (`allocated`) rise above where they start within the
-    block, appended to `into`: the most of its counts every `SAMPLED` seconds on a thread of its own and as
-    it ends, after a collection. What a block holds home past a sample's interval is counted: a whole tree
-    read home before it is written, which the export's bound is about. Resident pages, the measure before
-    it, did not count what the allocator served from pages freed earlier in the process: a tree held home
-    after an identical one was freed rose by under a fiftieth of itself, and after the exports before it
-    by under half (rows 5266, 5562)."""
+    """How far the bytes this process holds allocated (`dew.telemetry.benchmark.allocated_memory`) rise
+    above where they start within the block, appended to `into` however it ends: the most of its counts
+    every `SAMPLED` seconds and as it ends (`resident_peak`), after a collection. What a
+    block holds home past a sample's interval is counted: a whole tree read home before it is written,
+    which the export's bound is about."""
+    from dew.telemetry.benchmark import resident_peak
+
     gc.collect()
-    began = allocated()
-    most, stop = [began], threading.Event()
-
-    def sampled() -> None:
-        while not stop.wait(SAMPLED):
-            most[0] = max(most[0], allocated())
-
-    sampler = threading.Thread(target=sampled, daemon=True)
-    sampler.start()
+    peak = None
     try:
-        yield
+        with resident_peak(SAMPLED) as peak:
+            yield
     finally:
-        stop.set()
-        sampler.join()
-        into.append(max(most[0], allocated()) - began)
+        if peak is not None:
+            into.append(peak.rise("Allocated"))
 
 
 def exported(args) -> dict:

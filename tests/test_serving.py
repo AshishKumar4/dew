@@ -20,8 +20,14 @@ from arm_arithmetic import float64_held
 from flax import linen as nn
 from jax.experimental import checkify
 from model_support import Digits, decoder, serving_task as task
-from reference_error import as_given, assert_as_exact
-from serving_support import Served, assert_served_as_exact
+from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings
+from serving_support import (
+    Served,
+    assert_same_draws,
+    assert_same_generation,
+    assert_served_as_exact,
+    assert_served_to_the_bit,
+)
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
 from tool_policy import ToolPolicy
@@ -50,19 +56,15 @@ BUDGETS = [5, 9, 3, 12, 7]
 MESH_SEEDS = 16
 """The mesh server's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` (2026-10-21,
 on armada: 16 for each of the three meshes)."""
+MIXED_STEP_SEEDS, ADAPTER_SET_SEEDS, ADAPTED_LAYERS_SEEDS = 256, 256, 8
+"""The declared seeds of the mixed step's two sites, the served adapter set's two and the adapter set over
+different layers', each sized paired by `seeds_for` on armada's CPUs (2026-11-12, eg-serving-sized at
+eff3f59346b), where each run sized them again (46 to 114 s a site)."""
 
 
 
 
 
-def assert_same_generation(served, alone):
-    """The served row is the lone row: tokens, length, termination and both likelihoods."""
-    served, alone = served.host(), alone.host()
-    np.testing.assert_array_equal(served.tokens, alone.tokens)
-    np.testing.assert_array_equal(served.lengths, alone.lengths)
-    np.testing.assert_array_equal(served.terminated, alone.terminated)
-    np.testing.assert_allclose(served.behavior_log_probs, alone.behavior_log_probs, atol=2e-6, rtol=2e-6)
-    np.testing.assert_allclose(served.raw_log_probs, alone.raw_log_probs, atol=2e-6, rtol=2e-6)
 
 
 def test_a_server_draws_at_its_tasks_progress_and_at_each_version_it_loads():
@@ -85,10 +87,10 @@ def test_a_server_draws_at_its_tasks_progress_and_at_each_version_it_loads():
 
     server = Server.from_task(at(5), slots=2, capacity=128)
     for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
-        assert_same_generation(actual, at(5)(prompt, 5, key=3))
+        assert_same_draws(actual, at(5)(prompt, 5, key=3))
     server.reload(params, Progress(jnp.asarray(1, jnp.int32)))
     for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
-        assert_same_generation(actual, at(1)(prompt, 5, key=3))
+        assert_same_draws(actual, at(1)(prompt, 5, key=3))
     assert not np.array_equal(at(5)(PROMPTS[0], 5, key=3).host().raw_log_probs,
                               at(1)(PROMPTS[0], 5, key=3).host().raw_log_probs)
     with pytest.raises(ValueError):
@@ -263,7 +265,7 @@ def test_a_server_over_loaded_weights_places_them_once():
         server.step()
         server.step()
     server.run()
-    assert_same_generation(ticket.result(), bound(prompt[None], 8, key=0))
+    assert_same_draws(ticket.result(), bound(prompt[None], 8, key=0))
 
 
 @pytest.mark.mesh(devices=2)
@@ -309,7 +311,7 @@ def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
                for old, new in zip(before, served, strict=True))
     other = TextGeneration(bound.model, trained, bound.processor, sampling=bound.sampling)
     for prompt, actual in zip(("12", "34"), served, strict=True):
-        assert_same_generation(actual, other(prompt, 5, key=3))
+        assert_same_draws(actual, other(prompt, 5, key=3))
     fresh = Server.from_task(other, slots=2, capacity=128)
     for actual, expected in zip(served, fresh(["12", "34"], 5, key=3), strict=True):
         assert_same_generation(actual, expected)
@@ -338,10 +340,11 @@ def test_inference_projection_layout_preserves_special_attention_logits(case):
         packed = inference_projections(model, variables)
         expected = jax.jit(model.apply)(variables, tokens)
         actual = jax.jit(model.apply)(packed, tokens)
-        # Both run in float64; 64 epsilon covers the tiny decoder's few
-        # reassociated dot sums, well inside the existing FP32 parity bound.
-        eps = 64 * np.finfo(np.float64).eps
-        np.testing.assert_allclose(actual, expected, atol=eps, rtol=eps)
+        # One function in float64 over two layouts of its weights, whose products sum in other orders:
+        # within the packed program's float64 rounding of the plain one.
+        roundings = chain_roundings(jax.make_jaxpr(model.apply)(packed, tokens))
+        assert_computes_the_oracle(np.asarray(actual), np.asarray(expected), f"{case} packed projections",
+                                   roundings=roundings)
         np.testing.assert_array_equal(jnp.argmax(actual, axis=-1), jnp.argmax(expected, axis=-1))
 
 
@@ -362,7 +365,7 @@ def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone
     served = [ticket.result() for ticket in tickets]
     assert [generation.text for generation in served] == [generation.text for generation in alone]
     for mine, theirs in zip(served, alone, strict=True):
-        assert_same_generation(mine, theirs)
+        assert_same_draws(mine, theirs)
     assert all(ticket.admitted is not None and ticket.finished is not None for ticket in tickets)
 
 
@@ -404,7 +407,7 @@ def test_host_task_and_server_preserve_nonzero_lora_branches():
     assert not np.array_equal(expected.host().raw_log_probs, bound("12", 6, key=3).host().raw_log_probs)
     assert_same_generation(unplaced("12", 6, key=3), expected)
     served = Server.from_task(unplaced, slots=2, capacity=128)
-    assert_same_generation(served(["12"], 6, key=3)[0], expected)
+    assert_same_draws(served(["12"], 6, key=3)[0], expected)
 
 
 def test_reload_normalizes_source_precision_before_concatenating_projections():
@@ -425,7 +428,7 @@ def test_reload_normalizes_source_precision_before_concatenating_projections():
     normalized = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), incoming)
     other = TextGeneration(bound.model, jax.tree.map(jnp.asarray, normalized), bound.processor,
                            sampling=bound.sampling)
-    assert_same_generation(server(["12"], 5, key=3)[0], other("12", 5, key=3))
+    assert_same_draws(server(["12"], 5, key=3)[0], other("12", 5, key=3))
 
 
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
@@ -440,7 +443,7 @@ def test_quantized_weights_serve_the_same_greedy_text_as_the_task(dtype):
     alone = [bound(prompt, 4, key=3) for prompt in prompts]
     assert [result.text for result in served] == [result.text for result in alone]
     for result, expected in zip(served, alone, strict=True):
-        assert_same_generation(result, expected)
+        assert_same_draws(result, expected)
 
 
 def test_a_sampled_request_keeps_its_own_draws():
@@ -454,7 +457,7 @@ def test_a_sampled_request_keeps_its_own_draws():
                for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     server.run()
     for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True)):
-        assert_same_generation(tickets[index].result(), bound(prompt, budget, key=index))
+        assert_same_draws(tickets[index].result(), bound(prompt, budget, key=index))
     batched = bound(PROMPTS, 6, key=3)
     served = server(PROMPTS, 6, key=3)
     assert tuple(generation.text[0] for generation in served) == batched.text
@@ -552,7 +555,7 @@ def test_submission_keeps_device_keys_on_device_until_admission():
     with guarded(allow=("host_to_device",)):
         ticket = server.submit(prompt, 5, key=key)
     server.run()
-    assert_same_generation(ticket.result(), bound(prompt[None], 5, key=key))
+    assert_same_draws(ticket.result(), bound(prompt[None], 5, key=key))
 
 
 def test_a_request_keyed_by_another_prng_implementation_is_refused_before_it_queues():
@@ -566,7 +569,7 @@ def test_a_request_keyed_by_another_prng_implementation_is_refused_before_it_que
         server.submit(prompt, 5, key=jax.random.key(7, impl="rbg"))
     ticket = server.submit(prompt, 5, key=3)
     server.run()
-    assert_same_generation(ticket.result(), bound(prompt[None], 5, key=3))
+    assert_same_draws(ticket.result(), bound(prompt[None], 5, key=3))
 
 
 @pytest.mark.parametrize("seed", [7, 2**31, -1, 2**40 + 3])
@@ -582,7 +585,7 @@ def test_a_request_with_an_integer_seed_launches_nothing_until_admission(seed):
     with guarded():
         ticket = server.submit(prompt, 5, key=seed)
     server.run()
-    assert_same_generation(ticket.result(), bound(prompt[None], 5, key=seed))
+    assert_same_draws(ticket.result(), bound(prompt[None], 5, key=seed))
 
 
 def test_repeated_requests_reuse_their_programs_and_read_back_only_results():
@@ -620,27 +623,6 @@ def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_ste
         second = served(rounds[1])
     for mine, theirs in zip(second, first, strict=True):
         np.testing.assert_array_equal(mine.host().tokens, theirs.host().tokens)
-
-
-def test_a_servers_step_runs_one_executable_for_each_admission_size():
-    """A server's step (`dew.inference.serving_kernel.dispatched`) asks its program for the executable a
-    call takes once for each size of admission, and runs it with the dynamic arguments alone after: no
-    later step builds the program's dispatch key over the weights and cache (train 329's review: about 1
-    ms a step)."""
-    from dew.inference.serving_kernel import dispatched
-
-    asked: list[int | None] = []
-
-    class Program:
-        def executable(self, model, params, pad_id, placement, steps, resident, carried, admission, *rest):
-            asked.append(None if admission is None else len(admission["slots"]))
-            return lambda *dynamic: dynamic[3]
-
-    step = dispatched(Program())
-    sizes = [None, {"slots": np.zeros(2)}, None, {"slots": np.zeros(2)}, {"slots": np.zeros(4)}, None]
-    ran = [step("model", {}, 0, "placement", 1, "resident", "carried", admission, (), (), None, "progress")
-           for admission in sizes]
-    assert asked == [None, 2, 4] and ran == sizes
 
 
 @pytest.mark.parametrize("decode_steps", [1, 4])
@@ -780,7 +762,7 @@ def test_a_prompt_past_the_bucket_under_the_capacity_is_served_as_the_task_serve
     server = Server.from_task(bound, slots=2, capacity=384)
     ticket = server.submit(prompt, 50, key=0)
     server.run()
-    assert_same_generation(ticket.result(), bound(prompt, 50, key=0))
+    assert_same_draws(ticket.result(), bound(prompt, 50, key=0))
 
 
 @pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
@@ -803,7 +785,7 @@ def test_a_multimodal_model_serves_over_its_language_models_cache(options):
     for ticket, lone, prompt, budget in zip(tickets, [*alone, alone[2]], [*PROMPTS, PROMPTS[2]],
                                             [*BUDGETS, BUDGETS[2]], strict=True):
         served = ticket.result()
-        assert_same_generation(served, lone)
+        assert_same_draws(served, lone)
         ids = np.asarray([Digits().encode(prompt)], np.int32)
         # A generation's tokens are the prompt and its continuation.
         walked = greedy_walk(model, params, ids, budget)
@@ -871,7 +853,7 @@ def test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages(options, sta
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     _, tickets = served_alongside(bound, **options)
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
-        assert_same_generation(ticket.result(), lone)
+        assert_same_draws(ticket.result(), lone)
 
 
 HYBRID_SHARED = {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=4, pages=40), "prefix_cache": True}
@@ -896,27 +878,24 @@ users' are (ledger 1698) leave their scores' paired ratio unresolved within 512 
 wide and 16 draws a request resolve at 256 (armada, rows/1698-serving-hybrid)."""
 NARROW_HYBRID, NARROW_HYBRID_TAILED = HybridSite(seeds=256), HybridSite(seeds=512)
 """The sites at 256 words, 16 wide and 8 draws, sized paired by `seeds_for` on armada (11-03, at
-0fccb01d79): every-page's and restores-past-admission's resolve at 256, evicted's and
-one-entry-booked-twice's at 512."""
+0fccb01d79): every-page's and restores-past-admission's resolve at 256, one-entry-booked-twice's at 512,
+as evicted's did, which the every-page site's server now holds to the bit."""
+
+
+EVERY_PAGE = {"prefix_state_every": 1}
+"""A state kept at every page of a shared prefix."""
+FROM_THE_HOST = {"slots": 1, "kv_cache": KVCache(page_size=4, pages=6), "host_pages": 8, "prefix_states": 4}
+"""One slot over a pool of six pages with a host tier of eight and a store of four states."""
 
 
 @pytest.mark.parametrize("requests, options, hits, rounds, site", [
     ((Served(12), Served(12), Served(12, flipped=(9,)), Served(12, flipped=(1,)), Served(12),
       Served(12, flipped=(6,))), {}, (0, 8, 16, 16, 24, 24), None, WIDE_HYBRID),
     ((Served(12), Served(12), Served(12, flipped=(9,))), {"chunk": 3}, (0, 8, 16), None, WIDE_HYBRID),
-    ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4), None, NARROW_HYBRID),
+    ((Served(12), Served(12, flipped=(6,))), EVERY_PAGE, (0, 4), None, NARROW_HYBRID),
     ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2), NARROW_HYBRID),
-    ((Served(12), Served(12, flipped=(0,)), Served(12)),
-     {"slots": 1, "kv_cache": KVCache(page_size=4, pages=6), "host_pages": 8, "prefix_states": 4},
-     (0, 0, 8), None, NARROW_HYBRID),
-    ((Served(9), Served(12, flipped=(0,)), Served(12, flipped=(0, 1)), Served(9)),
-     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 1,
-      "prefix_states": 4}, (0, 0, 0, 0), None, NARROW_HYBRID),
-    ((Served(9), Served(9, flipped=(0,)), Served(9)),
-     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 6,
-      "prefix_states": 1}, (0, 0, 8), None, NARROW_HYBRID)],
-    ids=["by-default", "in-pieces", "every-page", "restores-past-admission", "from-the-host",
-         "from-one-host-slot", "a-state-from-the-host"])
+    ((Served(12), Served(12, flipped=(0,)), Served(12)), FROM_THE_HOST, (0, 0, 8), None, NARROW_HYBRID)],
+    ids=["by-default", "in-pieces", "every-page", "restores-past-admission", "from-the-host"])
 @pytest.mark.check1_shards(seeds=256, per_task=64)
 def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds,
                                                                              site):
@@ -926,18 +905,50 @@ def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(req
     assert_reads_a_shared_prefix(requests, options, hits, rounds, site)
 
 
-@pytest.mark.parametrize("requests, options, hits, rounds, site", [
-    ((Served(12), Served(12, flipped=(1,)), Served(12)), {"prefix_states": 1}, (0, 0, 0), None,
-     NARROW_HYBRID_TAILED),
-    ((Served(12), Served(12, flipped=(1,)), Served(12), Served(12, flipped=(1,))), {"prefix_states": 1},
-     (0, 8), (2, 2), NARROW_HYBRID_TAILED)],
-    ids=["evicted", "one-entry-booked-twice"])
 @pytest.mark.check1_shards(seeds=512, per_task=128)
-def test_a_hybrid_stack_reads_a_shared_prefix_from_a_store_of_one_entry(requests, options, hits, rounds,
-                                                                        site):
-    """`assert_reads_a_shared_prefix`'s sites of 512 seeds, a store of one entry's, which CI draws in map
-    tasks of 128."""
-    assert_reads_a_shared_prefix(requests, options, hits, rounds, site)
+def test_a_hybrid_stack_reads_a_shared_prefix_from_a_store_of_one_entry_booked_twice():
+    """`assert_reads_a_shared_prefix`'s site of 512 seeds, which CI draws in map tasks of 128: two prompts
+    admitted together into a store of one entry keep one state, the later booking's, which the next round's
+    repeat of it reads; the other's row, with no entry to keep its state in, prefills in one piece, another
+    sum than a row cut at its deepest page, so this site is no other's program and is sized itself."""
+    assert_reads_a_shared_prefix((Served(12), Served(12, flipped=(1,)), Served(12), Served(12, flipped=(1,))),
+                                 {"prefix_states": 1}, (0, 8), (2, 2), NARROW_HYBRID_TAILED)
+
+
+@pytest.mark.parametrize("requests, options, hits, sized, draws", [
+    ((Served(12), Served(12, flipped=(1,)), Served(12)), {"prefix_states": 1}, (0, 0, 0), EVERY_PAGE, 512),
+    ((Served(9), Served(12, flipped=(0,)), Served(12, flipped=(0, 1)), Served(9)),
+     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 1,
+      "prefix_states": 4}, (0, 0, 0, 0), FROM_THE_HOST, 256),
+    ((Served(9), Served(9, flipped=(0,)), Served(9)),
+     {"slots": 1, "admission": 1, "kv_cache": KVCache(page_size=4, pages=8), "host_pages": 6,
+      "prefix_states": 1}, (0, 0, 8), FROM_THE_HOST, 256)],
+    ids=["evicted", "from-one-host-slot", "a-state-from-the-host"])
+def test_a_hybrid_stack_keeps_or_loses_a_prefixs_state_to_the_bit_of_a_sized_sites_server(
+        requests, options, hits, sized, draws):
+    """What a server keeps of a shared prefix changes none of a row's bits. A store of one entry evicts the
+    first prompt's state for the next one's, so its repeat reads nothing and computes its row again; a tier
+    of one host slot keeps one of a prompt's two reclaimed pages, where the store holds the state after the
+    deepest page only, so the repeat reads nothing back; a store of one entry sends a prompt's state to
+    the host tier when another prompt's takes the entry, and its repeat reads it back with its pages. Each
+    serves, over the draws its own sized site drew (`draws`), what the sized site's server of the same
+    step serves the same requests (`sized`: `assert_reads_a_shared_prefix`'s every-page and from-the-host
+    sites), every field to the bit, with its own shared prefix tokens (`hits`): that site's check 1
+    holds its likelihoods.
+
+    The bits agree by the engine's construction, under two conditions these sites meet. Wherever the store
+    has an entry to keep a state in, a prompt's prefill is cut at its deepest shareable page, so a row that
+    finds no state runs the same first piece that made the state another row restores, and the rest from
+    the same bits. And the piece computed again runs among as many rows as the first did: every site here
+    seats one request a round, where a GPU's products choose their algorithm by their row count, so a
+    site that computes a row again inside a fuller step is no site of this kind."""
+    site = NARROW_HYBRID
+    model = hybrid_model(vocab_size=site.vocab, width=site.width)
+    task = TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
+                          sampling=Sampling(temperature=0, pad_token_id=0))
+    assert_served_to_the_bit(task, requests, f"hybrid shared prefix {hits}",
+                             serving={**HYBRID_SHARED, **options}, sized={**HYBRID_SHARED, **sized},
+                             hits=hits, draws=draws, budget=site.budget)
 
 
 def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
@@ -948,19 +959,15 @@ def assert_reads_a_shared_prefix(requests, options, hits, rounds, site):
     two entries): a repeat reads both full pages, as does a prompt agreeing with it past its deepest
     boundary; one agreeing nowhere reads none, its state taking the other entry, so the first prompt's
     is still kept and its repeat reads its pages again; one agreeing only through its first page reads
-    none, as no state is kept there. Where a state is kept every page, that one reads its first page; a
-    store of one entry evicts the first prompt's state for the next one's and its reuse with it. Two
+    none, as no state is kept there. Where a state is kept every page, that one reads its first page. Two
     prompts admitted together into a store of one entry keep one state, the later booking's, which the
     next round's repeat of it reads; two repeats seated together each restore their state, past the
     one prompt piece a call admits. A pool of six pages with a host tier spills the first prompt's pages
     while another prompt runs, its state kept in a store of four entries, and its repeat reads its pages
-    back (a pool without the tier reads none: its other prompt takes the pages); in a pool of eight pages
-    two other prompts reclaim a prompt's two shared pages, and a tier of one host slot keeps one of them
-    alone, where the store holds the state after the deepest page only, so the repeat reads nothing back;
-    a store of one entry sends a prompt's state to the host tier when another prompt's takes the entry,
-    and its repeat reads it back with its pages (`dew.inference.pages.States`; a tier holds as many states
-    as its host pages' bytes, one in six pages' here). Each request draws what it draws alone and scores
-    it as a full forward does (check 1)."""
+    back (a pool without the tier reads none: its other prompt takes the pages; `dew.inference.pages.States`).
+    A store's or a tier's other fates of a state (evicted, half its pages kept, sent to the host) are
+    `test_a_hybrid_stack_keeps_or_loses_a_prefixs_state_to_the_bit_of_a_sized_sites_server`'s. Each
+    request draws what it draws alone and scores it as a full forward does (check 1)."""
     # A vocabulary of 256 at least and eight draws a request, so each request's scores spread enough to
     # measure: at 64, fp32 sums as users' are (ledger 2468) leave the ratio unresolved within 512 seeds.
     model = hybrid_model(vocab_size=site.vocab, width=site.width)
@@ -1077,7 +1084,7 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     server, tickets = served_alongside(bound, **options)
     assert server.mixed_refusal is None
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
-        assert_same_generation(ticket.result(), lone)
+        assert_same_draws(ticket.result(), lone)
     assert server.prefix_hits == shared_page(options)
 
 
@@ -1097,7 +1104,80 @@ def test_a_decoder_reading_each_tokens_place_or_id_serves_in_the_mixed_step(fiel
     serving = {"slots": 3, "capacity": 64}
     assert Server.from_task(bound, **serving).mixed_refusal is None
     assert_served_as_exact(bound, (Served(7), Served(5), Served(9)), f"mixed step over {fields}",
-                           serving=serving)
+                           serving=serving, seeds=(MIXED_STEP_SEEDS,) * 2)
+
+
+def measured_decoder(**fields) -> CausalTransformer:
+    """The mixed step's decoder: 256 words, 32 wide and two layers, whose scores spread enough to measure."""
+    return CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=64,
+                             max_seq_len=64, dtype="float32", **fields)
+
+
+GREEDY = Sampling(temperature=0, pad_token_id=0)
+"""A greedy draw that stops at its budget alone."""
+
+
+def measured_task(model: CausalTransformer, sampling: Sampling = GREEDY, **controls) -> TextGeneration:
+    """A task over `model`'s drawn weights that stops at its budget alone, greedy unless `sampling` says."""
+    return TextGeneration(model, nn.unbox(model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))),
+                          sampling=sampling, **controls)
+
+
+ARITHMETIC = {
+    "sampled": (lambda: measured_task(measured_decoder(), Sampling(temperature=0.8, top_k=5, pad_token_id=0)),
+                {"slots": 3, "capacity": 64}, (Served(7), Served(5), Served(9)), 3),
+    "several-steps-over-pages": (
+        lambda: measured_task(measured_decoder()),
+        {"slots": 3, "capacity": 64, "kv_cache": KVCache(page_size=16, pages=12), "decode_steps": 3},
+        (Served(7), Served(5), Served(9)), 8),
+    "a-parallel-hybrid": (
+        lambda: measured_task(parallel_hybrid_model(vocab_size=256)),
+        {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=4, pages=40)},
+        (Served(12), Served(9), Served(12, flipped=(6,))), 8),
+    "speculative-blocks": (
+        lambda: measured_task(measured_decoder(num_nextn_predict_layers=1), strategy=Speculative(block=3)),
+        {"slots": 3, "capacity": 64}, (Served(7), Served(5), Served(9)), 8),
+}
+"""The cells of a server's arithmetic no other sized site holds (`assert_served_as_exact`), by name: the task,
+the serving options, the requests and the tokens each draws. A served likelihood is the server's own
+program's, so the scenarios of this file hold their draws to the lone task's exactly
+(`assert_same_draws`) and these cells, with the sized sites around them, hold the likelihoods over the
+dimensions that change the server's sums: the cache's layout (dense here and in the mixed step's site,
+pages of 16 here, pages of 4 in the hybrid sites), a prefill whole or in pieces (the hybrid in-pieces
+site), a prefix read or not (the hybrid sites), one decode step a call or several, a greedy draw or a
+sampled one (whose behavior likelihood is held too), a row of attention alone or with a layered or a
+parallel recurrent state, requests alone or mixed mid-flight, speculative blocks, and the meshes
+(`test_a_server_on_a_mesh_draws_what_each_request_draws_alone`, the prefill mesh's site below). The weights'
+form (packed, quantized, adapted, reloaded) is none of them: served and lone run the same weights. One
+dimension no site holds yet: a quantized cache (`KVCache.quantized`), which changes every step's attention
+operands and which no test serves through; its reference must apply the cache's rounding, which the served
+check's full forward does not (ledger 5681)."""
+ARITHMETIC_SEEDS = {"sampled": 256, "several-steps-over-pages": 64, "a-parallel-hybrid": 128,
+                    "speculative-blocks": 64}
+PREFILL_MESH_SEEDS = 64
+"""Each cell's declared seeds and the prefill mesh's, sized paired by `seeds_for` on armada's CPUs
+(2026-11-12, eg-serving-cells at 6d599746e47)."""
+
+
+@pytest.mark.parametrize("cell", list(ARITHMETIC))
+def test_a_server_scores_its_draws_as_a_full_forward_over_its_arithmetic(cell):
+    """Each cell of `ARITHMETIC`: every request draws what the lone task draws, and its likelihoods are on
+    par with a full forward's from the float64 twin (check 1)."""
+    bound, serving, requests, budget = ARITHMETIC[cell]
+    assert_served_as_exact(bound(), requests, f"served arithmetic: {cell}", serving=serving, budget=budget,
+                           seeds=(ARITHMETIC_SEEDS[cell],) * 2)
+
+
+@pytest.mark.distributed
+def test_a_server_that_prefills_on_a_mesh_of_its_own_scores_its_draws_as_a_full_forward():
+    """Disaggregated serving's arithmetic: prompts prefilled on two devices of their own, their rows' state
+    moved to the decoding device, draw what the lone task draws and score it on par with a full forward's
+    from the float64 twin (check 1)."""
+    prefilling = MeshSpec(fsdp=2).build(jax.devices()[1:3])
+    assert_served_as_exact(measured_task(measured_decoder()), (Served(7), Served(5), Served(9)),
+                           "served arithmetic: a prefill mesh",
+                           serving={"slots": 3, "capacity": 64, "prefill_mesh": prefilling}, budget=8,
+                           seeds=(PREFILL_MESH_SEEDS,) * 2)
 
 
 def test_a_host_tier_reads_back_a_prefix_whose_upload_reclaims_the_last_device_pages():
@@ -1176,7 +1256,7 @@ def test_prompts_seated_together_share_the_pages_the_first_writes_in_that_step(c
     assert all(ticket.running() or ticket.done() for ticket in tickets) and cancelled.cancelled()
     server.run()
     for ticket, lone in zip(tickets, alone, strict=True):
-        assert_same_generation(ticket.result(), lone)
+        assert_same_draws(ticket.result(), lone)
 
 
 @pytest.mark.parametrize("host_pages, hits, offloaded",
@@ -1204,7 +1284,7 @@ def test_a_host_tier_keeps_prefix_pages_the_pool_reclaims(host_pages, hits, offl
         drawn.append(ticket.result())
     assert server.prefix_hits == hits
     for generation, lone in zip(drawn, alone, strict=True):
-        assert_same_generation(generation, lone)
+        assert_same_draws(generation, lone)
 
 
 def test_a_banked_servers_host_tier_reads_back_the_prefix_pages_its_pool_reclaimed():
@@ -1225,7 +1305,7 @@ def test_a_banked_servers_host_tier_reads_back_the_prefix_pages_its_pool_reclaim
         drawn.append(ticket.result())
     assert "layers_0_3" in server.cache and server.prefix_hits == 8
     for generation, lone in zip(drawn, alone, strict=True):
-        assert_same_generation(generation, lone)
+        assert_same_draws(generation, lone)
 
 
 def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alone():
@@ -1246,7 +1326,7 @@ def test_samples_of_one_prompt_prefill_it_once_and_each_draws_what_it_draws_alon
     assert server.prefix_hits == 3 * 16
     assert tickets[0].admitted == tickets[1].admitted == tickets[3].admitted < tickets[4].admitted
     for ticket, lone in zip(tickets, alone, strict=True):
-        assert_same_generation(ticket.result(), lone)
+        assert_same_draws(ticket.result(), lone)
 
 
 @pytest.mark.parametrize(("kind", "budget"), [("attention", 9), ("hybrid", 9), ("attention", 7)],
@@ -1271,7 +1351,7 @@ def test_a_finished_requests_history_is_read_by_a_prompt_that_continues_it(kind,
     continued = [*prompt, *drawn, 8, 9]
     before = server.prefix_hits
     second = server([continued], 6, key=1)[0]
-    assert_same_generation(second, bound([continued], 6, key=1))
+    assert_same_draws(second, bound([continued], 6, key=1))
     assert server.prefix_hits - before == len(history) // 4 * 4
 
 
@@ -1291,7 +1371,7 @@ def test_a_paged_server_serves_layers_that_read_their_keys_places(fields, prefix
     server, tickets = served_alongside(bound, kv_cache=KVCache(page_size=4, pages=40),
                                        prefix_cache=prefix_cache)
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
-        assert_same_generation(ticket.result(), lone)
+        assert_same_draws(ticket.result(), lone)
     assert server.prefix_hits == (4 if prefix_cache else 0)
 
 
@@ -1310,7 +1390,7 @@ def test_a_server_runs_a_model_with_prediction_depths_without_them(options):
     server, tickets = served_alongside(bound, **options)
     assert server.mixed_refusal is None
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
-        assert_same_generation(ticket.result(), lone)
+        assert_same_draws(ticket.result(), lone)
     held = jax.tree_util.tree_flatten_with_path(server.cache)[0]
     assert not [path for path, _ in held if "mtp" in jax.tree_util.keystr(path).lower()]
 
@@ -1336,7 +1416,7 @@ def test_a_server_drafts_speculative_blocks_as_a_lone_call_does(temperature, dec
         server = Server.from_task(bound, slots=4, capacity=128, admission=2, decode_steps=decode_steps)
     server, tickets = served_by(server)
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
-        assert_same_generation(ticket.result(), lone)
+        assert_same_draws(ticket.result(), lone)
     for options in ({"kv_cache": KVCache(page_size=16, pages=12)}, {"chunk": 3}):
         with pytest.raises(ValueError):
             Server.from_task(bound, slots=2, capacity=128, **options)
@@ -1432,7 +1512,7 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
     from pathlib import Path
 
     from arm_arithmetic import widened
-    from reference_error import as_given, assert_as_exact, seeds_for
+    from reference_error import as_given, assert_as_exact
 
     from dew.interop.pretrained import Pretrained
     from dew.lora import AdapterSet, LoRA
@@ -1500,11 +1580,8 @@ def test_a_server_over_an_adapter_set_draws_each_request_under_its_own_adapter(t
 
         return drawn_alone
 
-    label = "served adapter set"
-    count = seeds_for(by_itself("float32"), draw, label, truth_fn=by_itself("float64"),
-                      dew_fn=through_the_server)
-    assert_as_exact(through_the_server, by_itself("float32"), draw, label, seeds=count,
-                    truth_fn=by_itself("float64"))
+    assert_as_exact(through_the_server, by_itself("float32"), draw, "served adapter set",
+                    seeds=ADAPTER_SET_SEEDS, truth_fn=by_itself("float64"))
 
 
 def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own():
@@ -1517,7 +1594,7 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
     from pathlib import Path
 
     from arm_arithmetic import widened
-    from reference_error import as_given, assert_as_exact, seeds_for
+    from reference_error import as_given, assert_as_exact
 
     from dew.interop.pretrained import Pretrained
     from dew.lora import AdapterSet
@@ -1554,9 +1631,8 @@ def test_an_adapter_set_whose_adapters_adapt_different_layers_runs_each_rows_own
 
         return logits
 
-    label = "adapter set over different layers"
-    count = seeds_for(alone("float32"), draw, label, truth_fn=alone("float64"), dew_fn=served)
-    assert_as_exact(served, alone("float32"), draw, label, seeds=count, truth_fn=alone("float64"))
+    assert_as_exact(served, alone("float32"), draw, "adapter set over different layers",
+                    seeds=ADAPTED_LAYERS_SEEDS, truth_fn=alone("float64"))
 
 
 def test_a_row_of_an_adapter_sets_base_computes_the_base_bit_for_bit():
@@ -1738,7 +1814,7 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode
     assert_sharded(served.variables["params"], server.mesh)
     assert server.groups == jax.device_count()
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
-        assert_same_generation(ticket.result(), row)
+        assert_same_draws(ticket.result(), row)
 
 
 def banked_task(sampling: Sampling, *, layers: int = 4, devices: int = 1) -> TextGeneration:
@@ -1770,7 +1846,7 @@ def test_a_server_over_a_banked_store_keeps_its_cache_banked_and_draws_what_the_
     server, tickets = served_alongside(bound, **options)
     assert "layers_0_3" in server.cache and not any(f"layers_{index}" in server.cache for index in range(4))
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
-        assert_same_generation(ticket.result(), row)
+        assert_same_draws(ticket.result(), row)
 
 
 
@@ -1788,7 +1864,7 @@ def test_a_banked_server_over_row_groups_seats_its_paged_prompts_in_every_layer_
                                        kv_cache=KVCache(page_size=16, pages=12))
     assert server.groups == 2 and server.mixed_refusal is not None and "layers_0_3" in server.cache
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
-        assert_same_generation(ticket.result(), row)
+        assert_same_draws(ticket.result(), row)
 
 
 @pytest.mark.mesh(devices=4)
@@ -1806,7 +1882,7 @@ def test_a_banked_server_that_prefills_on_a_mesh_of_its_own_moves_its_rows_past_
     server, tickets = served_by(server)
     assert "layers_0_2" in server.cache
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
-        assert_same_generation(ticket.result(), row)
+        assert_same_draws(ticket.result(), row)
 
 
 @pytest.mark.distributed
@@ -1848,12 +1924,12 @@ def test_a_server_that_prefills_on_a_mesh_of_its_own_draws_what_one_mesh_draws(d
     server = Server.from_task(served, slots=4, capacity=128, admission=2, prefill_mesh=prefilling)
     server, tickets = served_by(server)
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
-        assert_same_generation(ticket.result(), row)
+        assert_same_draws(ticket.result(), row)
     moved = jax.tree.map(lambda leaf: leaf * 0.5, bound.variables)
     server.reload(moved)
     ticket = server.submit(PROMPTS[0], BUDGETS[0], key=0)
     server.run()
-    assert_same_generation(ticket.result(), dataclasses.replace(bound, variables=moved)(
+    assert_same_draws(ticket.result(), dataclasses.replace(bound, variables=moved)(
         PROMPTS[0], BUDGETS[0], key=0))
 
 
@@ -1873,7 +1949,7 @@ def test_a_server_on_an_expert_and_stage_mesh_exchanges_its_experts_and_runs_its
     with jax.set_mesh(spec.build()):
         _, tickets = served_alongside(served, slots=8, admission=8)
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
-        assert_same_generation(ticket.result(), row)
+        assert_same_draws(ticket.result(), row)
 
 
 class UserDecoder(nn.Module):
@@ -1952,14 +2028,14 @@ def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
         inference_projections(plain.model, plain.variables)["params"]["decoder"]["layers_0"]["self_attn"])
     served = TextGeneration(answering.model, packed, bound.processor, sampling=bound.sampling)
     for index, prompt in enumerate(PROMPTS[:3]):
-        assert_same_generation(served(prompt, 5, key=index), bound(prompt, 5, key=index))
+        assert_same_draws(served(prompt, 5, key=index), bound(prompt, 5, key=index))
     server = Server.from_task(served, slots=2, capacity=128)
     trained = jax.tree.map(lambda leaf: leaf * 1.5, answering.variables)
     server.reload(trained)
     retrained = wrapped(UserDecoder, bound.model, jax.tree.map(lambda leaf: leaf * 1.5, bound.variables),
                         bound.sampling, bound.processor)
     for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
-        assert_same_generation(actual, retrained(prompt, 5, key=3))
+        assert_same_draws(actual, retrained(prompt, 5, key=3))
 
 
 def test_a_tree_split_for_training_packs_as_its_whole_tree_and_splits_back_as_it_was():
@@ -1990,7 +2066,7 @@ def test_a_tree_split_for_training_packs_as_its_whole_tree_and_splits_back_as_it
     server.reload(whole)
     alone = TextGeneration(model, whole, RunProcessor(Digits()), sampling=sampling)
     for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
-        assert_same_generation(actual, alone(prompt, 5, key=3))
+        assert_same_draws(actual, alone(prompt, 5, key=3))
 
 
 def test_a_projection_quantized_apart_from_its_group_is_served_unpacked():
@@ -2009,7 +2085,7 @@ def test_a_projection_quantized_apart_from_its_group_is_served_unpacked():
     alone = TextGeneration(quantized, bound.variables, bound.processor, sampling=bound.sampling)
     server = Server.from_task(alone, slots=2, capacity=128)
     for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
-        assert_same_generation(actual, alone(prompt, 5, key=3))
+        assert_same_draws(actual, alone(prompt, 5, key=3))
 
 
 @pytest.mark.parametrize("finished", [True, False], ids=["prefilled", "prefilling"])
@@ -2034,7 +2110,7 @@ def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote(finished):
     ticket = server.submit("1234567", 8, key=0)
     server.run()
     assert server.prefix_hits == hits
-    assert_same_generation(ticket.result(), bound.bind(other)("1234567", 8, key=0))
+    assert_same_draws(ticket.result(), bound.bind(other)("1234567", 8, key=0))
 
 
 @pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=4, pages=3), "prefix_cache": True}],
@@ -2060,7 +2136,7 @@ def test_a_request_cancelled_while_it_waits_leaves_its_peers_running(options):
     server.run()
     assert tickets[1].cancelled()
     for index in (0, 2):
-        assert_same_generation(tickets[index].result(), bound(PROMPTS[index], 5, key=index))
+        assert_same_draws(tickets[index].result(), bound(PROMPTS[index], 5, key=index))
 
 
 def test_a_request_past_the_servers_own_capacity_is_refused_at_submit():
@@ -2078,7 +2154,7 @@ def test_a_request_past_the_servers_own_capacity_is_refused_at_submit():
         server.submit("1" * 64, 1, key=0)
     ticket = server.submit("12", 62, key=0)
     server.run()
-    assert_same_generation(ticket.result(), plain("12", 62, key=0))
+    assert_same_draws(ticket.result(), plain("12", 62, key=0))
 
 
 def test_a_text_prompt_through_the_hf_processor_serves_what_the_task_draws():
@@ -2121,7 +2197,7 @@ def test_a_served_request_without_a_budget_takes_what_the_tasks_max_length_leave
     server.run()
     alone = bound("123", key=0)
     assert int(np.asarray(alone.lengths)[0]) == 5
-    assert_same_generation(ticket.result(), alone)
+    assert_same_draws(ticket.result(), alone)
     batch = bound(["12", "1234"], key=0).host()
     served = server(["12", "1234"], key=0)
     assert np.asarray(batch.lengths).tolist() == [int(np.asarray(row.lengths)[0]) for row in served] == [4, 4]

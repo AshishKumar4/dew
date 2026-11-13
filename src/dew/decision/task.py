@@ -357,6 +357,9 @@ class Decide(SavedRunTask, InItsForm):
     """The run checkpoint the weights came from, when they came from a run."""
     processor: Processor | None = None
     """The backbone's own processor, which prepares a request's images for it."""
+    named_encoder: str | None = field(default=None, compare=False)
+    """The encoder the release it was read from names for its readers (`PretrainedDecision.named_encoder`),
+    which a release of it names again; None for a task read from none."""
     derives_sharing: bool = field(default=True, repr=False, compare=False)
     """Whether the task states how a request's questions share a state where its layout states none
     (`QuestionLayout.shared_for`), as a task built in code does; one read from a release or a run lays its
@@ -439,7 +442,8 @@ class Decide(SavedRunTask, InItsForm):
         # A release lays its rows out as it states them, sharing a state only where it says so.
         return cls(model, variables, bundle.layout, bundle.decision_tokenizer, bundle.specials,
                    bundle.calibration, name=name or str(bundle.origin or bundle.source),
-                   processor=bundle.processor, precision=bundle.numerics, derives_sharing=False)
+                   processor=bundle.processor, precision=bundle.numerics, derives_sharing=False,
+                   named_encoder=bundle.named_encoder)
 
     @classmethod
     def _recorded(cls, directory: str, record: Mapping[str, object], backbone, variables: Variables,
@@ -463,7 +467,7 @@ class Decide(SavedRunTask, InItsForm):
         # Its passes pad to the options the run trained at, so a server compiles their programs up front.
         budget = Budget(options=settings.options)
         # Its rows laid out as the run recorded them: a layout that states no sharing, from a run saved
-        # before rows shared a state (`dew.data.plan.SHARED_STATE`), a question a row as it trained. One
+        # before rows shared a state (data plan version 9), a question a row as it trained. One
         # that states its sharing, saved under such a plan, trained its rows in streams
         # (`QuestionLayout.streamed`, which the plan's version states and no record holds) and is laid
         # here as documents continuing the shared part: the same tokens at the same positions, each
@@ -508,32 +512,35 @@ class Decide(SavedRunTask, InItsForm):
 
     @classmethod
     def source_of(cls, run: SavedRun, *, mesh: "MeshSpec | Mesh | None", layout: "Placement | None",
-                  dtype: DTypeLike | None, param_dtype: DTypeLike | None) -> "PretrainedDecision":
+                  dtype: DTypeLike | None, param_dtype: DTypeLike | None,
+                  on_host: bool) -> "PretrainedDecision":
         """`run`, a step its native release holds, as the source a decision run that names it starts from
         (`ReleasedTask.source_of`): the bundle of its task (`PretrainedDecision.of`), its head, layout,
         calibration and weights the run's, under the numerics its step trained in (`SavedRun.formed`)."""
         from dew.decision.sources import PretrainedDecision
 
-        task = cls.from_saved(run, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype)
+        task = cls.from_saved(run, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
+                              on_host=on_host)
         return PretrainedDecision.of(run.formed(task))
 
     @classmethod
     def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
                    layout: "Placement | None" = None, dtype: DTypeLike | None = None,
-                   param_dtype: DTypeLike | None = None) -> Self:
+                   param_dtype: DTypeLike | None = None, on_host: bool = False) -> Self:
         """Load the `DecisionObjective` run `run` (its checkpoint pinned, `SavedRun.pinned`) as a task;
         `from_run` loads one from its directory.
 
         The task is rebuilt from the run's record over the checkpoint's weights, and includes any
         calibration `save` wrote into the run. `ema` selects the averaged weights, and None uses them
-        when the run kept them. `mesh` and `layout` place the weights as the trainer does, `dtype`
-        overrides the compute dtype and `param_dtype` the storage dtype. The image processor reloads
+        when the run kept them. `mesh` and `layout` place the weights as the trainer does, or `on_host`
+        reads them into host arrays; `dtype` overrides the compute dtype and `param_dtype` the storage
+        dtype. The image processor reloads
         from its recorded source independently of the tokenizer that lays out the task's text.
         """
         from dew.inference.tasks import saved_model
 
         directory, record, step = run.directory, run.record, run.step
-        variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype, on_host=on_host)
         averaged = run.averaged(ema)
         backbone = saved_model(record, dtype).build()
         task = cls._recorded(directory, record, backbone, variables, Weights(step, averaged), dtype)

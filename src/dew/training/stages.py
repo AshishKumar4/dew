@@ -69,7 +69,6 @@ if TYPE_CHECKING:
     from dew.data.dataset import DataPartition
     from dew.distributed.placement import Layout
     from dew.nn.backbones.decoder_stack import DecoderBank, RowCut, RowStack
-    from dew.nn.protocols import ProjectionGroup
     from dew.nn.sharding import Schedule
     from dew.state import TrainState
 
@@ -327,23 +326,18 @@ class StageLocal:
 
     @overload
     def restore(self, checkpoints: Checkpoints, template: TrainState, step: int | str | None,
-                share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ()
-                ) -> tuple[TrainState, bytes | None]: ...
+                share: DataPartition | None = None) -> tuple[TrainState, bytes | None]: ...
 
     @overload
     def restore(self, checkpoints: Checkpoints, template: Mapping[str, object], step: int | str | None,
-                share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ()
-                ) -> tuple[Mapping[str, object], bytes | None]: ...
+                share: DataPartition | None = None) -> tuple[Mapping[str, object], bytes | None]: ...
 
     def restore(self, checkpoints: Checkpoints, template: TrainState | Mapping[str, object],
-                step: int | str | None, share: DataPartition | None = None,
-                served: Sequence[ProjectionGroup] = ()
+                step: int | str | None, share: DataPartition | None = None
                 ) -> tuple[TrainState | Mapping[str, object], bytes | None]:
         """`checkpoints.restore` of `template`, a state or some of its fields, each stacked run's
-        layers read onto their own stage's devices (`checkpointed`) and stacked there (`restored`);
-        `served` as the checkpoints read it."""
-        restored, position = checkpoints.restore(self.state(template, self.checkpointed), step, share=share,
-                                                 served=served)
+        layers read onto their own stage's devices (`checkpointed`) and stacked there (`restored`)."""
+        restored, position = checkpoints.restore(self.state(template, self.checkpointed), step, share=share)
         return self.state(restored, self.restored), position
 
     def stored(self, state: TrainState) -> TrainState:

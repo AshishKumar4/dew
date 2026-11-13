@@ -88,7 +88,8 @@ def supported(case: dict[str, str]) -> bool:
 
 class _Paged(nn.Module):
     """A paged store of `CAPACITY` slots a row: its keys and values written, then one query a row decoded over
-    the first `lengths` slots of its row (`KVStore.decode`) under the layer's `softcap` and `sinks`."""
+    the first `lengths` slots of its row (`KVStore.decode`) under the layer's `softcap` and `sinks`, through
+    the paged kernel the selector gives the step's case (`PAGED`), as a layer selects it."""
 
     softcap: float | None
 
@@ -100,7 +101,9 @@ class _Paged(nn.Module):
             self.variable("cache", "written", lambda: True)
             return None
         store.write(key, value, jnp.broadcast_to(jnp.arange(CAPACITY), (rows, CAPACITY)))
-        return store.decode(query, lengths, self.softcap, sinks=sinks)
+        kernel = store.paged_kernel(query, softcap=self.softcap, arithmetic=False, named="auto",
+                                    sinks=sinks is not None)
+        return store.decode(query, lengths, kernel, self.softcap, sinks=sinks)
 
 
 def _step(case: dict[str, str], *, reference: bool):

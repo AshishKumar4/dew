@@ -106,8 +106,18 @@ def test_runs_that_agree_average_to_their_own_weights_and_a_runs_average_is_read
     """Three runs of the same weights average to those weights exactly; runs that keep an average
     (EMA) average it where `ema` is None, as their loaders read them, and their live weights where it
     is False, the record saying which. A run over two pipeline stages keeps its EMA stacked by stage
-    beside its weights and checkpoints every layer of both."""
+    beside its weights and checkpoints every layer of both. Its average reads onto the host as onto a
+    device."""
     run = trained(tmp_path / "run", 2, adapted=False, ema_decay=0.5, mesh=mesh)
+    from dew.inference.tasks import SavedRun
+
+    # Its average read onto the host (its byte planes decoded over the live weights) as the placed read
+    # gives it.
+    saved = SavedRun.pinned(run)
+    for leaf, own in zip(jax.tree.leaves(saved.variables(ema=True, on_host=True)),
+                         jax.tree.leaves(saved.variables(ema=True)), strict=True):
+        assert isinstance(leaf, np.ndarray)
+        np.testing.assert_array_equal(leaf, np.asarray(own))
     copies = [run, *(shutil.copytree(run, str(tmp_path / f"copy{index}")) for index in range(2))]
     for ema in (None, False):
         average = averaged(copies, ema=ema)

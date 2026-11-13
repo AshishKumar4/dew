@@ -238,6 +238,10 @@ def test_a_collection_saved_with_x64_on_restores_with_it_off(tmp_path):
     np.testing.assert_array_equal(held, table)
     variables = Checkpoints(str(tmp_path / "run")).variables(ema=False)
     np.testing.assert_array_equal(np.asarray(variables["constants"]["table"]), table.astype(np.float32))
+    # Read onto the host, the collection stored apart from the step reads as the placed read gives it.
+    host = Checkpoints(str(tmp_path / "run")).variables(ema=False, on_host=True)
+    assert isinstance(host["constants"]["table"], np.ndarray)
+    np.testing.assert_array_equal(host["constants"]["table"], table.astype(np.float32))
 
 
 RETYPED = """

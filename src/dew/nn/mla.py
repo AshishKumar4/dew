@@ -30,7 +30,7 @@ from dew.nn.attention import AttentionImpl, kernel_for_materialized_mask, scaled
 from dew.nn.attention_masks import causal_attention_mask, chunk_mask, max_attention_logits, visibility_mask
 from dew.nn.cross_attention import sow_context_logits, with_context_logits
 from dew.nn.dense import Dense
-from dew.nn.documents import document_mask
+from dew.nn.documents import document_mask, document_means
 from dew.nn.flops import MissingFlopsCount, attention_flops, cross_attention_flops, projection_flops
 from dew.nn.inputs import (
     PLAIN_CALL,
@@ -787,8 +787,11 @@ class MultiHeadLatentAttention(LinearProducts):
             implementation = kernel_for_materialized_mask(
                 implementation, query, key, dtype=self.dtype, precision=self.precision,
                 force_fp32_for_softmax=self.force_fp32_for_softmax)
+        # An unselected query of a packed document reads that document's keys alike (`_attend`).
+        documents = None if unselected is None or segment_ids is None else (segment_ids, row_valid)
         return self._attend(query, key, value, gating, mask, implementation, causal=causal, bias=bias,
-                            unselected=unselected, force_fp32_for_softmax=self.force_fp32_for_softmax)
+                            unselected=unselected, documents=documents,
+                            force_fp32_for_softmax=self.force_fp32_for_softmax)
 
     def _dense_visibility(self, metadata, positions, places, segment_ids, valid, causal: bool, batch: int,
                           length: int) -> tuple[jax.Array | None, bool]:
@@ -960,12 +963,14 @@ class MultiHeadLatentAttention(LinearProducts):
                                  self.attention_chunk)
 
     def _attend(self, query, key, value, gating, mask, implementation, *, causal: bool = False, bias=None,
-                unselected=None, force_fp32_for_softmax: bool = True):
+                unselected=None, documents=None, force_fp32_for_softmax: bool = True):
         """The attention over `key` and `value` and its output projection, sowing the per-head
         maxima QK-Clip reads where a caller opened the collection. A query `unselected` marks reads
         every key alike, the mean of the values, as a selection that chose nothing does in the
-        reference, and `force_fp32_for_softmax` is a k-pool attention's own policy; a latent
-        attention's kind refuses any but the default (`latent_refusals`)."""
+        reference: in a row of packed `documents` (its segment ids and validity), its own document's
+        keys (`dew.nn.documents.document_means`), as the document alone reads its row's. And
+        `force_fp32_for_softmax` is a k-pool attention's own policy; a latent attention's kind refuses
+        any but the default (`latent_refusals`)."""
         # The per-head maxima the QK-Clip reads, with the nope width the
         # clip needs to split the latent projections: computed only when a
         # caller opened the collection. Under a sparse selection the mask
@@ -981,8 +986,8 @@ class MultiHeadLatentAttention(LinearProducts):
             force_fp32_for_softmax=force_fp32_for_softmax,
             implementation=implementation, causal=causal, mask=mask, bias=bias)
         if unselected is not None:
-            wide = value.astype(at_least_fp32(value.dtype))
-            uniform = jnp.mean(wide, axis=1, keepdims=True).astype(attention.dtype)
+            uniform = (jnp.mean(value.astype(at_least_fp32(value.dtype)), axis=1, keepdims=True)
+                       if documents is None else document_means(value, *documents)).astype(attention.dtype)
             attention = jnp.where(unselected, uniform, attention)
         return self._output(attention, gating)
 

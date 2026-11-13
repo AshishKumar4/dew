@@ -166,14 +166,15 @@ def test_the_reverse_step_draws_from_mdlms_categorical():
     times the share revealed, the mask with the share that stays. `Unmask`
     draws the reveal and the token separately; over 20000 steps, each masked
     position's outcomes follow MDLM's categorical, held by the sampling gate
-    with a row a masked position (32 positions, 12 categories each). Visible
-    positions keep their tokens."""
+    with a row a masked position (32 positions, 12 categories each), every
+    one of which expects 46 draws or more under the step's own head
+    (`reverse_head`). Visible positions keep their tokens."""
     process = MDLM(mask_id=MASK)()
     row = jnp.asarray(REFERENCE["reverse_row"], jnp.int32)
     t = jnp.full((row.shape[0],), float(REFERENCE["reverse_t"]), jnp.float32)
     s = jnp.full((row.shape[0],), float(REFERENCE["reverse_s"]), jnp.float32)
     variables = {"params": {"hidden": jnp.asarray(REFERENCE["hidden"]),
-                            "head": jnp.asarray(REFERENCE["head"])}}
+                            "head": jnp.asarray(REFERENCE["reverse_head"])}}
     denoise = DiscreteDenoiser(process, Fixed(), variables)
     denoised, log_probs = denoise(row, t)
     masked = np.asarray(row == MASK)
