@@ -365,10 +365,20 @@ def snapshot(name_or_dir: str, revision: str | None, *,
     """
     if os.path.isdir(name_or_dir):
         return Path(name_or_dir)
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import constants, snapshot_download
+    from huggingface_hub.errors import LocalEntryNotFoundError
 
-    directory = Path(snapshot_download(name_or_dir, revision=revision,
-                                       allow_patterns=METADATA_PATTERNS))
+    try:
+        directory = Path(snapshot_download(name_or_dir, revision=revision,
+                                           allow_patterns=METADATA_PATTERNS))
+    except LocalEntryNotFoundError:
+        if not constants.HF_HUB_OFFLINE:
+            raise
+        # Offline, a commit none of whose files is metadata (a repo of one DDUF archive) has no snapshot
+        # folder in the Hub cache, which huggingface_hub makes only around a file it fetches: its folder
+        # is the one of the commit the revision named online (`hub_commit`), as the online call returned
+        # it, and holds what the cache holds of it.
+        directory = hub_storage(name_or_dir) / "snapshots" / hub_commit(name_or_dir, revision).value
     if weights is False:
         return directory
     files = repo_files(name_or_dir, directory)
