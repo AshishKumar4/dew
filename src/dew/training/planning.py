@@ -256,6 +256,8 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]],
         if part.inspected is not None:
             sample = (part.count, part.inspected) if sample is None else latest(
                 (part.count, part.inspected), sample)
+    # A pooled statistic leaves the step as its value, the number a caller reads (`Aux.metrics`).
+    report = {name: value.mean()[0] if isinstance(value, Pooled) else value for name, value in report.items()}
     return (loss, report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)),
             dataclasses.replace(summed, inspected=None if sample is None else sample[1]))
 

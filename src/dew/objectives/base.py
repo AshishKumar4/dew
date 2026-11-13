@@ -609,7 +609,7 @@ class Aux(Generic[Effects]):
     collections. `effects` are additive observations that the optimizer
     applies once per committed update, not once per microbatch.
     """
-    metrics: Mapping[str, jax.Array]
+    metrics: Mapping[str, jax.Array | Pooled]
     """The step's metrics, each the loss's own report, a number however it was stated: a metric stated as a
     `Pooled` statistic (a `Ratio`, its numerator and its mass; an `Exponentiated` one, its exponential; a
     batch's `Moments`) reads here as its value, and its statistic is kept in `pooled`, which the trainer

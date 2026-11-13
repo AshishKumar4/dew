@@ -22,7 +22,7 @@ from dew.distributed.placement import Validation
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import Link, Schedule
-from dew.objectives.base import Objective
+from dew.objectives.base import Objective, Pooled
 from dew.state import TrainState, apart, occupied, together
 from dew.telemetry.instrumentation import StepFlops
 from dew.training._candidates import Stepping, candidate_for, lowered_for
@@ -382,7 +382,10 @@ class StepCompiler[L, E]:
                     outputs.append(tuple(output))
                 stepped = together(moving, frozen)
                 returned[0] = stepped.window_size
-                return (stepped, *(outputs[0] if split == 1 else whole(outputs)))
+                # A step's metrics a caller reads as numbers: a split step's, or one stating a statistic
+                # (`Aux.pooled`), through its whole, which pools them and reads each as its value.
+                pooling = split > 1 or any(isinstance(value, Pooled) for value in outputs[0][1].values())
+                return (stepped, *(whole(outputs) if pooling else outputs[0]))
         return run
 
     def _planned(self, stepping: Stepping, state: TrainState, batch: Batch,
