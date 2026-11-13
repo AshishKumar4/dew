@@ -63,18 +63,15 @@ from dew.optim import (
     ParamGroup,
     Power,
     PowerTail,
-    ScheduleBase,
     clips_qk,
     laprop,
-    learning_rate,
     muon_partition,
     muon_weight_dimension_numbers,
-    rates_of,
     scale_by_qk_clip,
     stepped,
     weight_decay_mask,
-    with_rates,
 )
+from dew.optim_schedules import ScheduleBase, learning_rate, rates_of, with_rates
 from dew.training import MeshSpec
 from tools.muonclip_reference import clip_qk_kernel, clip_scale
 
@@ -266,8 +263,8 @@ def test_muons_state_is_optaxs_tree_and_steps_its_moments_bit_for_bit():
 
 
 def iteration_products(update, *arguments) -> list:
-    """The precision, operand dtype and shapes of each of the Newton-Schulz products `update` traces
-    (`dot_precisions`): X X^T and A A, each over a stack of matrices' batch."""
+    """The precision and operand dtype of each of the Newton-Schulz products `update` traces
+    (`dot_precisions`): X Xᴴ, A A and B X, each over a stack of matrices' batch."""
     return [(precision, dtype) for precision, dtype, shapes in dot_precisions(update, *arguments)
             if all(len(shape) == 3 for shape in shapes)]
 
@@ -370,7 +367,7 @@ def test_muons_bfloat16_newton_schulz_is_as_exact_as_jordans():
                "tall": optax.contrib.MuonDimensionNumbers((1,), (2,))}
 
     def dew(wide, tall):
-        done = orthogonalized({"wide": wide, "tall": tall}, numbers, jnp.asarray(NEWTON_SCHULZ), 5, 1e-8)
+        done = orthogonalized({"wide": wide, "tall": tall}, numbers, NEWTON_SCHULZ, 5, 1e-8)
         return [done["wide"], done["tall"]]
 
     def jordan(wide, tall):
@@ -702,11 +699,7 @@ def test_a_matrix_declared_with_no_axis_named_is_orthogonalized_as_one_matrix():
 
     params = {'params': {'layers_0': {'altup': {'prediction_coefs': {'kernel': jnp.zeros((16, 4))}}}}}
     path = ('params', 'layers_0', 'altup', 'prediction_coefs', 'kernel')
-    updates, grads = group_updates(params)
-    reference = optax.contrib.muon(LR)
-    one = {'kernel': node(grads, path)}
-    expected, _ = reference.update(one, reference.init(one), one)
-    np.testing.assert_array_equal(np.asarray(node(updates, path)), np.asarray(expected['kernel']))
+    assert_updates_as(muon_solver(), optax.contrib.muon(LR), params, [path], "an undeclared AltUp matrix")
 
 
 def test_the_router_gate_takes_the_adamw_update():
@@ -1690,7 +1683,7 @@ def test_stated_horizons_reach_a_solver_inside_an_injected_wrapper_and_its_repor
     sets (`with_horizons`) where a run's own injected wrapper holds the solver too: the wrapped solver then
     makes the updates the solver built for the run's steps makes, bit for bit, and reports its rate from the
     first, before any update takes it."""
-    from dew.optim import with_horizons
+    from dew.optim_schedules import with_horizons
 
     config = OptimConfig(optimizer="adam", learning_rate=dataclasses.replace(
         SCHEDULES["cosine"], peak_value=1e-2, init_value=1e-4, end_value=1e-3), clip_grads=0)
@@ -1698,7 +1691,7 @@ def test_stated_horizons_reach_a_solver_inside_an_injected_wrapper_and_its_repor
                                                                optax.scale(gain)))(gain=2.0)
     built = optax.inject_hyperparams(lambda gain: optax.chain(config.build(10), optax.scale(gain)))(gain=2.0)
     params, grads = {"w": jnp.ones(3)}, {"w": jnp.ones(3)}
-    rates = dict(config.grouped_rates())
+    rates = {group: rate for group, (rate, _) in config.grouped_rates().items()}
     state = with_horizons(stated.init(params), config.horizons(10), rates, 10)
     want = built.init(params)
     np.testing.assert_array_equal(learning_rate(state), learning_rate(want))
@@ -1714,7 +1707,7 @@ def test_a_clocked_state_supplied_to_a_run_of_steps_takes_its_optimizers_horizon
     optimizer given built for a run of steps, whose horizons no config of a trainer sets (`reclocked` over
     `schedule_states`, as `Trainer.fit` reads a supplied state): its schedule's state takes that
     optimizer's own horizons, so it steps and reports the rates that optimizer's fresh state does."""
-    from dew.optim import reclocked, schedule_states
+    from dew.optim_schedules import reclocked, schedule_states
 
     config = OptimConfig(optimizer="adam", learning_rate=dataclasses.replace(
         SCHEDULES["cosine"], peak_value=1e-2, init_value=1e-4, end_value=1e-3, warmup_steps=2), clip_grads=0)
@@ -1804,7 +1797,8 @@ def test_adams_first_moment_keeps_a_complex_gradients_both_components(state_dtyp
     does, where a real store would drop it (row 1870, AT-05); the real leaf's moment is real, and so is
     the rate the tree steps at: no step casts a complex value to a real one."""
     from dew._moments import QuantizedMoments
-    from dew.optim import OptimConfig, learning_rate
+    from dew.optim import OptimConfig
+    from dew.optim_schedules import learning_rate
 
     shape = (16, 256)
     params = {"w": jnp.full(shape, 0.5 + 0.5j, jnp.complex64), "v": jnp.full(shape, 0.5, jnp.float32)}

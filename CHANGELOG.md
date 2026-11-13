@@ -7,6 +7,16 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- `dew.optim_schedules` holds a solver's learning rate as operands of its state: `ScheduleBase`, `RateState`
+  and `ProgressState`, `scheduled_solver`, `rates_of`, `with_rates`, `with_horizons`, `learning_rate`,
+  `held_rates`, `scaled_rates`, `settable_rates`, `schedule_states`, `reclocked` and `stepped_rate` are
+  imported from there, where `dew.optim` held them; the schedule kinds (`Cosine`, `Linear`, `Power`,
+  `OneCycle`, `Exponential`) and `OptimConfig` stay in `dew.optim`.
+
+- Dew requires its JAX build 0.12.0.1.post84 (Python alone; the CUDA and PJRT plugins stay post81's): the
+  toolkit's ring waits name their phase, so the interpreter checks two consumers that take alternate tiles
+  of one ring; a tcgen05 pair's step block over a partial depth lowers; the lowering cache keys a program
+  4 to 5 seconds sooner on a 32-layer step.
 - Dew requires its JAX build 0.12.0.1.post83 (Python alone; the CUDA and PJRT plugins stay post81's): a
   Pallas interpreter's thread map runs its threads on a CPU client of its own, so an interpreted kernel
   inside a host callback no longer deadlocks when the calling computation's client has a full device queue.
@@ -25,6 +35,16 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   and refuses 8 to 12, naming both ways on: resume with the Dew that wrote it, or go on from its weights as
   a new run that reads its data afresh. `Objective.bind_plan`, `dew.data.pipeline.earlier`, `Pipeline.at`
   and `ObjectiveData.earlier` are gone, and `Source.manifest` takes no version.
+
+- A schedule's step horizons (its warmup's and decay's lengths in steps) are operands of its solver's state
+  (`RateState.horizons`) where a run builds it stated (`OptimConfig.build(stated=True)`), so a rehearsed run
+  and the run itself step one program over the persistent compile cache whatever their lengths. A schedule
+  states them through the new `ScheduleBase.horizons(steps)` hook, and `ScheduleBase.values` takes them
+  as `values(horizons, rates)` where it took `values(steps, rates)`: a subclass that read the run's length
+  in `values` overrides `horizons` to state the lengths it reads, or reads `{}`.
+
+- Dew requires optax 0.2.8 or later (was 0.2.6): Muon's Newton-Schulz is optax's own iteration, its layout,
+  shape scalings and preconditionings (AOL, Schatten) included, which 0.2.8 first ships.
 
 - A run's fit plan judges a head that keeps its whole logits by their fp32 bytes before it traces the step's
   gradient (`Objective.whole_head_table` names the head's table), and bounds the rung after a traced one

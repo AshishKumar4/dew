@@ -1,7 +1,7 @@
 """The pieces of a learning-rate schedule as functions of a step count: a warmup's ramp, a cosine, a power
 law, a linear decay, joined as Optax joins them (`optax.join_schedules`), each of whose step counts may be a
-Python number or an operand, a solver's step horizons (`dew.optim.RateState.horizons`), so the program that
-reads them depends on no run's length. `dew.optim`'s schedules are built from them."""
+Python number or an operand, a solver's step horizons (`dew.optim_schedules.RateState.horizons`), so the
+program that reads them depends on no run's length. `dew.optim`'s schedules are built from them."""
 
 from collections.abc import Callable
 
@@ -10,7 +10,8 @@ import jax.numpy as jnp
 import optax
 
 type Horizon = jax.Array | int | float
-"""A step count a schedule reads: a Python number, or an operand (`dew.optim.RateState.horizons`)."""
+"""A step count a schedule reads: a Python number, or an operand
+(`dew.optim_schedules.RateState.horizons`)."""
 
 
 def power_schedule(peak: jax.typing.ArrayLike, warmup_steps: Horizon, a: jax.typing.ArrayLike,

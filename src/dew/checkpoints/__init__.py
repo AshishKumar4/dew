@@ -538,7 +538,7 @@ def _refuse_lacking(lacking: set[str], where: str, unread: Set[str] = frozenset(
 
 RETIRED_RATE = ("learning_rate_scale", "learning_rate_shape")
 """The hyperparameters Dew's optimizer injected before it held a schedule's own rate fields
-(`dew.optim.RateState`): a rate's scale and its schedule's shape, two scalars side by side in an
+(`dew.optim_schedules.RateState`): a rate's scale and its schedule's shape, two scalars side by side in an
 injected state's hyperparameters, which a resume refuses by name rather than as a mismatched tree."""
 
 
@@ -577,8 +577,9 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
         raise ValueError(
             "the checkpoint's optimizer state holds its rate as a scale times a schedule's shape "
             f"({' and '.join(RETIRED_RATE)}), which Dew's optimizer no longer forms: it holds the "
-            "schedule's own rate fields (dew.optim.RateState), so a run cannot resume it. Resume it "
-            "with the Dew that wrote it, or start a fresh run from its weights in a directory of its own.")
+            "schedule's own rate fields (dew.optim_schedules.RateState), so a run cannot resume it. "
+            "Resume it with the Dew that wrote it, or start a fresh run from its weights in a directory of "
+            "its own.")
     from dew.state import CHECKPOINTED, OPTIONAL
     missing = set(CHECKPOINTED).difference(stored, OPTIONAL)
     if missing:

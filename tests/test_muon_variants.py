@@ -13,7 +13,14 @@ from reference_error import as_given, assert_as_exact
 from test_optim import UPDATE_SEEDS, assert_updates_as, muon_solver, stacked_draw
 from torch_layout import node
 
-from dew.newton_schulz import NEWTON_SCHULZ, POLAR_EXPRESS_TABLE, orthogonalized, polar_express
+from dew.newton_schulz import (
+    NEWTON_SCHULZ,
+    POLAR_EXPRESS_TABLE,
+    ns_operands,
+    orthogonalized,
+    orthogonalized_leaf,
+    polar_express,
+)
 
 QUERY = ('params', 'layers_0', 'self_attn', 'q_proj', 'kernel')
 """The decoder's first query projection, `[embed 32, heads 2 * head_dim 16]`."""
@@ -137,7 +144,7 @@ def test_polar_express_orthogonalizes_as_its_paper_does(steps):
     def dew(wide, tall):
         # The stacks in the tree's own order, "tall" before "wide".
         return jax.tree.leaves(orthogonalized({"wide": wide, "tall": tall}, numbers,
-                                              jnp.asarray(polar_express(steps)), steps, 1e-7))
+                                              polar_express(steps), steps, 1e-7))
 
     def paper(dtype):
         @as_given
@@ -247,3 +254,69 @@ def test_a_flat_attentions_projections_are_the_matrices_muon_steps():
         stepped = optax.apply_updates(params, updates)
         for before, after in zip(jax.tree.leaves(params), jax.tree.leaves(stepped), strict=True):
             assert np.all(np.isfinite(np.asarray(after))) and not np.array_equal(after, before)
+
+
+def shaped_draw(seed):
+    """A wide stack of three 24 x 40 matrices, a tall one of two 40 x 24, a square one of two 32 x 32 and
+    one 2-D 24 x 40 matrix, drawn at `seed`."""
+    keys = jax.random.split(jax.random.key(seed), 4)
+    shapes = ((3, 24, 40), (2, 40, 24), (2, 32, 32), (24, 40))
+    return tuple(np.asarray(jax.random.normal(key, shape)) for key, shape in zip(keys, shapes, strict=True))
+
+
+@pytest.mark.parametrize("preconditioning", ["frobenius", "spectral", "aol", "schatten"])
+@pytest.mark.parametrize("group", [None, 1], ids=["joined", "one-at-a-time"])
+def test_muons_newton_schulz_on_the_stored_layout_is_as_exact_as_optaxs(preconditioning, group):
+    """Dew's orthogonalization of wide, tall, square and 2-D updates, on the matrices as they are stored
+    (`newton_schulz`: a tall matrix's Gram product and polynomial taken from its shorter side, where optax
+    transposes it), its stacks of one shape joined or each its own (`ns_group`), on par from float64 with
+    optax's
+    own iteration (`orthogonalized_leaf`) of each matrix at `preconditioning`, in the dtype Dew's numerics
+    iterate in (check 1)."""
+    stacked = optax.contrib.MuonDimensionNumbers((1,), (2,))
+    numbers = (stacked, stacked, stacked, optax.contrib.MuonDimensionNumbers(0, 1))
+
+    def dew(*stacks):
+        return list(orthogonalized(stacks, numbers, NEWTON_SCHULZ, 5, 1e-8, preconditioning, group=group))
+
+    def optax_arm(*stacks):
+        # optax iterates in the update's own dtype: here in the one Dew's numerics iterate in (`ns_operands`).
+        def one(stack, shape):
+            given = jnp.asarray(stack)
+            work = ns_operands(given.dtype, preconditioning)
+            return orthogonalized_leaf(given.astype(work), 5, shape, coeffs=NEWTON_SCHULZ,
+                                       preconditioning=preconditioning).astype(given.dtype)
+        return [one(stack, shape) for stack, shape in zip(stacks, numbers, strict=True)]
+
+    def truth(*stacks):
+        return [orthogonalized_leaf(jnp.asarray(stack), 5, shape, coeffs=NEWTON_SCHULZ,
+                                    preconditioning=preconditioning)
+                for stack, shape in zip(stacks, numbers, strict=True)]
+
+    assert_as_exact(dew, optax_arm, shaped_draw, f"Muon's Newton-Schulz at {preconditioning}",
+                    seeds=UPDATE_SEEDS, truth_fn=truth)
+
+
+@pytest.mark.parametrize("group", [None, 1], ids=["joined", "one-at-a-time"])
+@pytest.mark.parametrize("per_head", [None, HEADS])
+def test_muons_reported_update_work_is_its_compiled_updates_matrix_work(per_head, group):
+    """The work a Muon run reports beside the model's (`OptimConfig.update_flops`, `train/update_flops`) is
+    the matrix work its update runs: the compiled update over the decoder's parameters, whole or each head's
+    block alone (`per_head`), multiplies exactly that many FLOPs, its AdamW group none."""
+    from optim_support import decoder_draw, drawn_axes
+
+    from dew.optim import OptimConfig
+    from dew.telemetry.instrumentation import hlo_flops
+
+    params = decoder_params()
+    opts = {**({} if per_head is None else {"per_head": per_head}),
+            **({} if group is None else {"ns_group": group})}
+    config = OptimConfig(optimizer="muon", learning_rate=LR, optimizer_opts=opts)
+    solver = config.build(10)
+    _, grads = drawn_tree(params, 0)
+    with drawn_axes(decoder_draw()):
+        compiled = jax.jit(solver.update).lower(grads, solver.init(params), params).compile()
+        reported = config.update_flops(params)
+    counted = hlo_flops(compiled)
+    assert counted is not None and reported is not None and reported > 0
+    assert counted.hardware == reported
