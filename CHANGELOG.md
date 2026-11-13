@@ -88,6 +88,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - `DreamerRollout` compiles its JAX environment reset once (`saved_shapes` reading shapes via
   `jax.eval_shape`), and `dew.rl.evaluation` fuses `episodes` into a single compiled program.
 
+- `BatchNormLocal` normalizes partial trailing virtual groups over their valid rows, `DiffusionRunConfig`
+  forwards all `SourceOptions` to `load_diffusion_source` (refusing unsupported `dex`, `scan_layers` and
+  `packed_experts` before fetching weights), `fused_head_loss` selects zero-weight excluded targets away
+  before multiplying, `twohot_bins` spaces even bin counts without duplicating zero, `DiscreteDenoiser`
+  traces blockwise steps once, and `ControlRollout` and `DreamerRollout` fuse collection
+  summaries/permutations and dynamic-length rollout loops.
+
 - A paged `Server` keeps a prefix cache by default (`prefix_cache=None` derives it on wherever the layout pages,
   the rows sample a token a step on the server's own mesh and the model computes a split prompt as a whole
   one); a request draws what it draws without it. Pass `prefix_cache=False` to keep pages private. A

@@ -1227,6 +1227,9 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
                           text: bool = True, text_only: bool = False,
                           prediction_depths: int | None = None,
                           modeling_overrides: Mapping[str, object] | None = None,
+                          dex: DifferentialExtension | None = None,
+                          scan_layers: bool = False,
+                          packed_experts: bool = False,
                           step: int | str | None = None,
                           ema: bool | None = None) -> PretrainedPipeline | RunPipeline:
     """A published diffusion pipeline, to train from its own weights, or a saved Dew diffusion run
@@ -1250,19 +1253,24 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     (`TextToImage.prepare(conditions=...)`), and a prompt, training or
     `save`, which read the text encoder, are refused.
 
-    `text_only`, `prediction_depths` and `modeling_overrides` read as
-    `Pretrained.load`'s do: a pipeline has no wrapper's language model for
-    `text_only` to take, its components hold no prediction depths, so any
-    count keeps them all, and none reads overrides, which are refused.
-
+    `text_only`, `prediction_depths`, `modeling_overrides`, `dex`,
+    `scan_layers` and `packed_experts` read as `Pretrained.load`'s do: a
+    pipeline has no wrapper's language model for `text_only` to take, its
+    components hold no prediction depths, so any count keeps them all, and
+    overrides, DEX, layer scanning and packed expert banks are refused.
     A saved run is no published pipeline: Dew writes no diffusers layout of one, so it loads as the parts
     and policy of the task its run built (`pipeline_of_run`), which a `DiffusionObjective` trains as it
     trains a pipeline. A step or EMA choice beside a pipeline is refused, as it selects nothing.
     """
-    run = pinned_run(checkpoint, step=step, ema=ema)
     _unread_overrides(modeling_overrides, "a diffusion pipeline")
+    _unpacked(packed_experts, "a diffusion pipeline")
+    if dex is not None:
+        raise TypeError("a diffusion pipeline takes no differential extension")
+    if scan_layers:
+        raise TypeError("scan_layers scans a decoder's layers; a diffusion pipeline has none")
     if text_only:
         _no_language_model(checkpoint, "diffusion pipeline")
+    run = pinned_run(checkpoint, step=step, ema=ema)
     if run is not None:
         stored = None if param_dtype == AUTO else param_dtype
         return pipeline_of_run(run, checkpoint, dtype=dtype, param_dtype=stored, revision=revision,

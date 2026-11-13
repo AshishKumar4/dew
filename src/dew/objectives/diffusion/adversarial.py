@@ -93,12 +93,24 @@ class BatchNormLocal(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array, batch: Batch) -> jax.Array:
+        from dew.batch import VALID_ROWS
+
         rows, height, width, channels = x.shape
-        groups = math.ceil(rows / self.virtual_batch)
-        grouped = x.reshape(groups, -1, height * width, channels)
+        size = min(self.virtual_batch, rows)
+        groups = math.ceil(rows / size)
+        padded_rows = groups * size
+        pad = padded_rows - rows
+        if pad:
+            padded_x = jnp.pad(x, ((0, pad), (0, 0), (0, 0), (0, 0)))
+            padded_real = jnp.pad(Objective.real_rows(batch, rows), ((0, pad),), constant_values=False)
+            moment_batch: Batch = {VALID_ROWS: padded_real}
+        else:
+            padded_x, moment_batch = x, batch
+        grouped = padded_x.reshape(groups, size, height * width, channels)
         mean, var = (jnp.expand_dims(moment, (1, 2))
-                     for moment in Objective.row_moments(grouped, batch, (1, 2), rows=(0, 1)))
-        normalized = ((grouped - mean) / jnp.sqrt(var + self.eps)).reshape(x.shape)
+                     for moment in Objective.row_moments(grouped, moment_batch, (1, 2), rows=(0, 1)))
+        normalized = ((grouped - mean) / jnp.sqrt(var + self.eps)).reshape(
+            padded_rows, height, width, channels)[:rows]
         weight = self.param("weight", nn.initializers.ones, (channels,))
         bias = self.param("bias", nn.initializers.zeros, (channels,))
         return normalized * weight + bias

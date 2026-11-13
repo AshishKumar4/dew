@@ -1813,3 +1813,27 @@ def test_a_tiled_heads_forward_derivative_holds_where_its_tiles_maxima_tie():
 
         moved, truth = (jax.jvp(fn, (bias,), (direction,))[1] for fn in (log_z, whole))
     assert_computes_the_oracle(moved, truth, "the tied tiles' log partition's tangent", roundings=4)
+
+
+@pytest.mark.parametrize("z_loss", [0.0, 1e-2])
+def test_fused_head_loss_ignores_zero_weight_excluded_targets_across_value_grad_and_jvp(z_loss):
+    """An excluded target (`excluded=1`, whose per-token loss is `+inf`) with weight `0` contributes `0`
+    rather than `0 * inf = NaN` to `fused_head_loss`'s total, reverse gradients and forward tangent, while
+    a nonzero-weight excluded target keeps `+inf`."""
+    hidden = jnp.zeros((2, 4), jnp.float32)
+    matrix = jnp.zeros((4, 2), jnp.float32)
+    targets = jnp.asarray([0, 1], jnp.int32)
+    weights = jnp.asarray([1.0, 0.0], jnp.float32)
+
+    def total_fn(h, m, w):
+        table = OutputTable(m, vocab_major=False, precision=jax.lax.Precision.HIGHEST)
+        return fused_head_loss(h, table, targets, w, z_loss=z_loss, tile=(1, 2), predict=False, excluded=1)[0]
+
+    val, (g_h, g_m) = jax.value_and_grad(lambda h, m: total_fn(h, m, weights), argnums=(0, 1))(hidden, matrix)
+    assert float(val) == 0.0
+    np.testing.assert_array_equal(np.asarray(g_h), np.zeros_like(hidden))
+    np.testing.assert_array_equal(np.asarray(g_m), np.zeros_like(matrix))
+    _, tangent = jax.jvp(lambda h, m: total_fn(h, m, weights), (hidden, matrix),
+                         (jnp.ones_like(hidden), jnp.ones_like(matrix)))
+    assert float(tangent) == 0.0
+    assert np.isposinf(float(total_fn(hidden, matrix, jnp.asarray([1.0, 1.0], jnp.float32))))
