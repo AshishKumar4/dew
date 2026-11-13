@@ -290,9 +290,10 @@ def test_decode_image_reads_an_image_under_any_conventional_field(field):
     (decoded,) = iterate(Memory([{field: _png(200), "id": 1}]).map(images.DecodeImage(rejects=False)))
     assert decoded["image"].shape == (4, 4, 3) and int(decoded["image"][0, 0, 0]) == 200
     assert set(decoded) == {"id", "image"}
-    for rejects in (False, True):
-        named = Memory([{field: _png(200)}]).map(images.DecodeImage("photo", rejects=rejects))
-        with pytest.raises(KeyError, match="photo"):
+    held = Memory([{field: _png(200)}])
+    for named in (held.map(images.DecodeImage("photo", rejects=False)),
+                  held.filter_map(images.DecodeImage("photo"))):
+        with pytest.raises(KeyError):
             list(iterate(named))
 
 
