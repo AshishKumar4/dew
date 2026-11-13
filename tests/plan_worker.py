@@ -10,7 +10,8 @@ def agreement(args) -> dict:
     (`Device.memory_stats`): the room its derivation says the step needs at four microbatches, read off
     a plan made there at a whole limit's room, and then the splits the search compiles and the plan it
     makes where process 0's device leaves that room to the byte and each other process's a byte less per
-    rank."""
+    rank than the least its derivation says it might need: a CPU's footprint is an interval (row 5448),
+    which a device short of its upper bound alone leaves undecided."""
     import jax
     import optax
 
@@ -38,8 +39,9 @@ def agreement(args) -> dict:
 
     leaving(limit)
     (judged,) = [entry for entry in planned(4)["derived"] if entry["split"] == 4]
-    need = limit - judged["headroom"]
-    leaving(need - args.process_id)
+    least, most = judged.get("headroom_bounds", (judged["headroom"],) * 2)
+    need = limit - least
+    leaving(need if args.process_id == 0 else limit - most - args.process_id)
     plan = planned(None)
     return {"need": need, "asked": [probe["split"] for probe in plan["probes"]], "split": plan["split"],
             "derived": {str(entry["split"]): entry["headroom"] for entry in plan["derived"]}}
