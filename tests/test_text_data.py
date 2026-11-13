@@ -924,6 +924,34 @@ def test_a_tokenizer_whose_model_type_transformers_dispatches_without_remote_cod
     assert load_tokenizer(str(released), local_files_only=True).encode(text) == expected
 
 
+def test_token_exports_under_one_name_are_read_together_only_where_its_files_are_the_same(tmp_path):
+    """A token export commits the identity its tokenizer resolved to, each file's digest among it, so two
+    exports under one tokenizer name are read together only where their ids mean the same: a local
+    tokenizer two of whose tokens exchange ids between exports, its size and EOS as they were, is refused,
+    and a second export by the unchanged files is read with the first."""
+    from dew.data import Memory, concat
+    from dew.data.text import export_tokens
+
+    released = tmp_path / "tokenizer"
+    released.mkdir()
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(Path(__file__).parent / "fixtures" / "hf" / "dory-tiny" / name, released / name)
+
+    def exported(name: str) -> TokenFiles:
+        export_tokens(Memory([{"text": "a b a"}, {"text": "b a"}]), str(tmp_path / name), str(released),
+                      eos=False)
+        return TokenFiles(str(tmp_path / name))
+
+    first, again = exported("first"), exported("again")
+    assert concat([first, again]).facts()["tokenizer"] == str(released)
+    stated = json.loads((released / "tokenizer.json").read_text())
+    vocabulary = stated["model"]["vocab"]
+    vocabulary["a"], vocabulary["b"] = vocabulary["b"], vocabulary["a"]
+    (released / "tokenizer.json").write_text(json.dumps(stated))
+    with pytest.raises(ValueError):
+        concat([first, exported("exchanged")]).facts()
+
+
 def test_hosts_that_mount_one_corpus_at_different_paths_read_one_order(tmp_path):
     """Each host of a pool reads its own copy of a token corpus, mounted where it was put: the
     copies' readers agree on what they read, and a copy that holds other tokens does not."""

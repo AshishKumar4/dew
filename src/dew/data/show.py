@@ -14,6 +14,7 @@ from dew.batch import Batch
 from dew.data.pipeline import (
     Batched,
     BatchStage,
+    Concatenated,
     Configured,
     DeviceStep,
     Filter,
@@ -41,7 +42,7 @@ def shown(chain: Pipeline, rows: Iterable[Batch | bytes]) -> None:
 
 
 def _chain_lines(chain: Pipeline, depth: int = 0) -> list[str]:
-    """The lines `show` prints of `chain`: its store, or the corpora a mix or phases read, each
+    """The lines `show` prints of `chain`: its store, or the corpora a mix, a concat or phases read, each
     with its own chain indented below, then each stage in order, one a line."""
     indent = "  " * depth
     source = chain.source
@@ -49,6 +50,10 @@ def _chain_lines(chain: Pipeline, depth: int = 0) -> list[str]:
         lines = [f"{indent}mix" if source.tokens is None else f"{indent}mix(by='tokens')"]
         for weight, child in zip(source.weights, source.pipelines, strict=True):
             lines += [f"{indent}  weight {weight:g}:", *_chain_lines(child._chain(), depth + 2)]
+    elif isinstance(source, Concatenated):
+        lines = [f"{indent}concat"]
+        for child in source.pipelines:
+            lines += _chain_lines(child._chain(), depth + 1)
     elif isinstance(source, Phases):
         lines = [f"{indent}phases" if source.clock == "steps" else f"{indent}schedule"]
         unit = "step" if source.clock == "steps" else "committed tokens"

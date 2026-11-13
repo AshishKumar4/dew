@@ -26,7 +26,9 @@ from dew.data.pipeline import (
     CONSUMED,
     DRAWN,
     REFUSED,
+    Combined,
     Drawn,
+    Mixture,
     Owed,
     Record,
     Rejected,
@@ -1388,3 +1390,28 @@ def _added(counted: dict[str, CorpusCounts], counts: CorpusCounts) -> None:
     if counts.name not in counted:
         counted[counts.name] = CorpusCounts(counts.name, counts.label, rows=counts.rows)
     counted[counts.name].add(counts)
+
+
+def mixed_indexed(members: Sequence[pygrain.MapDataset], mixture: Mixture) -> pygrain.MapDataset:
+    """`members`, `mixture`'s indexed corpora, drawn from as its weights and seed say
+    (`ProportionalSelection`): its read's mix, and its twin of draws' (`dew.data.compile`)."""
+    selection = ProportionalSelection([len(member) for member in members], _weights(mixture), mixture.seed)
+    return pygrain.MapDataset.select_from_datasets(members, selection)
+
+
+def _weights(mixture: Mixture) -> Sequence[float]:
+    """A mixture's weights, as shares of its corpora's stated valid target
+    tokens when it mixes by tokens, from the rows and valid targets each
+    corpus states as it is read."""
+    if mixture.tokens is None:
+        return mixture.weights
+    from dew.data.analysis import _name
+
+    leaves = [child.source for child in mixture.pipelines if not isinstance(child.source, Combined)]
+    facts = [source.metadata() for source in leaves]
+    return token_weights(
+        [_name(child) for child in mixture.pipelines],
+        mixture.weights,
+        [integer(stated["rows"], "rows") for stated in facts],
+        [integer(stated["valid_targets"], "valid_targets") for stated in facts],
+    )
