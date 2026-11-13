@@ -120,7 +120,6 @@ from dew.training._fit import (
     clocked,
     consumption_counted,
     counted_step,
-    data_resumed,
     declarations,
     first_batch,
     fit_policies,
@@ -128,6 +127,7 @@ from dew.training._fit import (
     pooled_first,
     read_batch,
     restored,
+    resumed_on,
     stage_reached,
     unrecorded_parts,
     validation_read,
@@ -1302,15 +1302,8 @@ class Trainer(Generic[Loss, Effects]):
             run.stop_control = checkpoints.control(checkpoints.latest)
         if checkpoints is None or start.resume is None:
             return 0, None, lambda: self._placed(start, positioned=False)[:2], start.abstract
-        position, differs = data_resumed(
-            dataset, self._stream_partition(),
-            functools.partial(checkpoints.position, start.resume, DataPartition.of(self.device_mesh)),
-            resume=self.data_resume, step=start.resume)
-        if differs:
-            run.restarted = differs
-            _log.warning("the saved data position's plan differs from this run's in %s, so its data starts "
-                         "again from the beginning of its order while its state resumes "
-                         "(data_resume='relaxed'; 'exact' refuses it)", ", ".join(differs))
+        # Where its data reads on from is decided on the stream the run opens (`_opened`, `resumed_on`).
+        position = functools.partial(checkpoints.position, start.resume, DataPartition.of(self.device_mesh))
         return start.resume, position, lambda: self._placed(start, positioned=False)[:2], start.abstract
 
     def _stream_partition(self) -> DataPartition:
@@ -1368,6 +1361,14 @@ class Trainer(Generic[Loss, Effects]):
         if not complete and (pending or not plan.ended(current, interval.real_tokens, interval.consumed)):
             partition = self._stream_partition()
             run.source = plan.dataset.train(partition)
+            if callable(position):
+                # The saved position, or where the stream starts again, decided on the stream it opened.
+                position, differs = resumed_on(run.source, position, resume=self.data_resume, step=current)
+                if differs:
+                    run.restarted = differs
+                    _log.warning("the saved data position's plan differs from this run's in %s, so its data "
+                                 "starts again from the beginning of its order while its state resumes "
+                                 "(data_resume='relaxed'; 'exact' refuses it)", ", ".join(differs))
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
             source = run.source
