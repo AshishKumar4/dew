@@ -428,10 +428,10 @@ def test_pack_quantized_compressed_tensors_loads_shapes_without_downloading_weig
 
 def test_a_hub_autoencoder_resolves_its_release_once(tmp_path: Path) -> None:
     """A published DC-AE loaded from a Hub (on the loopback) by `load_autoencoder` asks the Hub's API no
-    more than fetching its snapshot with its weights does (`sources.snapshot`): the release its dispatch
-    resolved is the one its loader reads, its weights fetched at the commit its config was read at (audit3
-    families F4; its config read once, tests/test_dc_ae.py). Its parameters are the ones a load of the same
-    directory holds, and it loads again with the Hub gone from what the first load fetched."""
+    more than fetching its snapshot with its weights does (`sources.snapshot`): its dispatch and its loader
+    resolve its release no more than that fetch does (audit3 families F4; its config read once,
+    tests/test_dc_ae.py). Its parameters have the shapes and dtypes a load of the same directory gives,
+    and it loads again with the Hub gone from what the first load fetched."""
     from local_hub import LocalHub
 
     from dew.interop.autoencoders.pretrained import load_autoencoder
