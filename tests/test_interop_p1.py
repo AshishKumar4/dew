@@ -183,7 +183,6 @@ def test_single_file_loads_without_weights_across_storage_dtypes_and_borrowed_sh
     sd_tensors, sd_meta = read_file(SINGLE_FILE / "sd.safetensors")
     kw = {"dtype": "float32", "attention_impl": "xla"}
     pos_key = "cond_stage_model.transformer.text_model.embeddings.position_ids"
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg_sf"))
     for stored in (np.int64, np.uint16):
         sf_repo = tmp_path / f"sf_repo_{np.dtype(stored).name}"
         shutil.copytree(SINGLE_FILE / "configs", sf_repo)
@@ -191,9 +190,11 @@ def test_single_file_loads_without_weights_across_storage_dtypes_and_borrowed_sh
         write_file({**{k: np.asarray(v) for k, v in sd_tensors.items()}, pos_key: pos_ids},
                    sf_repo / "sd.safetensors", sd_meta)
         expected_sf = Pretrained.load(sf_repo, single_file="sd.safetensors", on_host=True, **kw)
+        # The load without weights in a cache of its own, which no conversion with weights wrote.
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / f"xdg_sf_{np.dtype(stored).name}"))
         local_sf = Pretrained.load(sf_repo, single_file="sd.safetensors", weights=False, **kw)
         assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(local_sf.variables))
-        sf_cache_root = tmp_path / "xdg_sf" / "dew" / "single_file"
+        sf_cache_root = tmp_path / f"xdg_sf_{np.dtype(stored).name}" / "dew" / "single_file"
         assert not [p for p in sf_cache_root.rglob("*") if p.suffix == ".safetensors"]
         assert _shapes_and_dtypes(local_sf.variables) == _shapes_and_dtypes(expected_sf.variables)
 
