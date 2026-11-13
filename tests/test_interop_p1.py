@@ -67,9 +67,12 @@ def _payloads(path: Path) -> list[tuple[str, int, int]]:
 
 
 def _weightless(hub, repo: str, files: dict[str, Path], declared: tuple[str, ...] = ()) -> None:
-    """No byte of a stored tensor's payload left the Hub for `repo` but the `declared` metadata tensors'
-    (a sidecar, a latent's statistics): every weight file it served, it served by ranges (`Served.asked`),
-    each clear of every other tensor's payload."""
+    """No weight file left the Hub for `repo` whole, and none of a tensor's payload but the `declared`
+    metadata tensors' (a sidecar, a latent's statistics) beyond a safetensors file's header read: each
+    range it served (`Served.asked`) clear of every other tensor's payload, save one from a safetensors
+    file's first byte, which huggingface_hub's public header read (`HfApi.parse_safetensors_file_metadata`)
+    asks in one range of its own size. A DDUF archive's every range is clear: its headers and metadata
+    entries are read by their exact ranges."""
     for served in hub.served:
         if served.repo != repo or served.file is None or served.sent == 0:
             continue
@@ -78,6 +81,8 @@ def _weightless(hub, repo: str, files: dict[str, Path], declared: tuple[str, ...
         if payloads:
             assert served.asked is not None, served
             begin, end = served.asked
+            if begin == 0 and served.file.endswith(".safetensors"):
+                continue
             assert not any(begin < stop and start < end for start, stop in payloads), served
 
 
