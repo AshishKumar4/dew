@@ -384,6 +384,56 @@ def test_a_declaration_derives_once_whatever_routes_block_its_traces_record_into
     assert len(report.rewrites()) == before
 
 
+REGISTERED_BETWEEN = """
+import json
+import sys
+
+sys.path[:0] = ["tests"]
+import jax.numpy as jnp
+import test_algebra_derive as held
+from egglog import eq, i64, rule, union, var
+
+from dew.algebra import SATURATION, derive, rules
+from dew.algebra.terms import Term
+from dew.nn.kernels.templates import report
+
+forms = derive.derive(held.declared(held.attention), accurate=False, saturation=SATURATION)
+tiles = held.shaped(held.tile_of(held.operands(*held.draw(0)), 0))
+forms.init(tiles)
+first = len(report.rewrites())
+forms.init(tiles)
+again = len(report.rewrites())
+value, root, inner, outer = var("value", Term), var("root", Term), var("inner", i64), var("outer", i64)
+once = rule(eq(value.unary("abs", inner).unary("abs", outer)).to(root)).then(
+    union(root).with_(value.unary("abs", inner)))
+family = rules.RuleFamily("a magnitude's magnitude", (once,), (lambda x: jnp.abs(jnp.abs(x)), jnp.abs, None))
+rules.register(rules.Rules.declared("registered between", "exact", (family,), "a test's"))
+forms.init(tiles)
+found = report.rewrites()
+print(json.dumps({"first": first, "again": again, "after": len(found), "admitted": list(found[-1].admitted)}))
+"""
+"""A process that derives a declaration's forms at a shape twice, registers a rule set, and asks for them
+again."""
+
+
+def test_a_rule_set_registered_after_a_derivation_derives_the_forms_afresh():
+    """A reduction's forms are kept by what their derivation reads, the rule sets its numerics admit among
+    them (they saturate in its e-graph): asked again at the same shapes they are the ones kept, and after a
+    set is registered they are derived afresh under it, their report naming it. They were kept by their
+    mesh, target, numerics and shapes alone, so a set registered later never reached a shape derived
+    before it."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    done = subprocess.run([sys.executable, "-c", REGISTERED_BETWEEN], capture_output=True, text=True,
+                          check=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    found = json.loads(done.stdout.strip().splitlines()[-1])
+    assert found["again"] == found["first"] and found["after"] == found["first"] + 1, found
+    assert "registered between" in found["admitted"]
+
+
 def test_sums_no_maximum_scales_walk_as_plain_sums():
     """A declaration whose walked sums read no walked maximum derives plain sums: on par with the function."""
     forms = derive.derive(declared(unshifted), accurate=False, saturation=SATURATION)

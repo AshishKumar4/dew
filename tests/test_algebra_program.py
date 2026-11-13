@@ -947,6 +947,53 @@ def test_a_rule_set_registered_after_a_rewrite_reaches_the_programs_rewritten_af
     assert min(found["after"]) > 0.1
 
 
+EXACT_ON_UNBOUNDED = """
+import json
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from egglog import eq, i64, rule, union, var
+
+from dew import algebra
+from dew.algebra import rules
+from dew.algebra.terms import Term
+
+
+def twice(x):
+    return jnp.abs(jnp.abs(x))
+
+
+x = jnp.asarray(np.random.default_rng(0).standard_normal((5, 38)), jnp.float32)
+closed = jax.make_jaxpr(twice)(x)
+
+
+def magnitudes():
+    return sum(equation.primitive.name == "abs" for equation in algebra.rewritten_program(closed).jaxpr.eqns)
+
+
+before = magnitudes()
+value, root, inner, outer = var("value", Term), var("root", Term), var("inner", i64), var("outer", i64)
+once = rule(eq(value.unary("abs", inner).unary("abs", outer)).to(root)).then(
+    union(root).with_(value.unary("abs", inner)))
+family = rules.RuleFamily("a magnitude's magnitude", (once,), (twice, jnp.abs, None))
+rules.register(rules.Rules.declared("registered exact", "exact", (family,), "a test's"))
+print(json.dumps({"before": before, "after": magnitudes()}))
+"""
+"""A process that rewrites a program of a magnitude's magnitude over an operand nothing bounds, registers an
+exact set that reads it as the magnitude, and rewrites it again."""
+
+
+def test_a_registered_exact_rule_rewrites_a_window_of_values_nothing_bounds():
+    """An exact rule reads no bound, so it fires in a window whose values have none: a registered exact set
+    that reads `abs(abs(x))` as `abs(x)` leaves one magnitude of the two over an input the program states no
+    range of. The pass left every such window as traced, whatever sets were admitted, because no reordering
+    rule could fire in it (`rules.reorderable`)."""
+    done = subprocess.run([sys.executable, "-c", EXACT_ON_UNBOUNDED], capture_output=True, text=True,
+                          check=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    assert json.loads(done.stdout.strip().splitlines()[-1]) == {"before": 2, "after": 1}
+
+
 def test_a_value_is_priced_at_the_bytes_its_dtype_holds():
     """A region's values are priced at their own element size (`cost.work`): a program reading bfloat16
     operands reads half the device bytes one reading float32 operands of the same shape does, and its product

@@ -49,7 +49,13 @@ class Saturation:
 
     def limits(self, region: terms.Region) -> tuple[int, int]:
         """The nodes and iterations `region` may take."""
-        return self.growth * max(1, region.equations), self.depth * max(1, region.depth)
+        return self.sized(region.equations, region.depth)
+
+    def sized(self, equations: int, depth: int) -> tuple[int, int]:
+        """The nodes and iterations an input of `equations` equations whose longest chain is `depth` may
+        take: a region's (`limits`), and a derivation's whose input is no region, sized by the rows its
+        e-graph holds as registered (a scan's token programs' terms, its chunk's root term and leaves)."""
+        return self.growth * max(1, equations), self.depth * max(1, depth)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -57,7 +63,8 @@ class AlgebraReport:
     """What one region's rewrite did: the equations it read, the sets admitted and the matches each fired,
     its limits, its iterations and nodes, whether a limit stopped it, the region's price before and after in
     seconds (`cost.model`; None for a region no rule may fire in, `rules.reorderable`, whose terms are never
-    built and so never priced), the seconds this program's rewrite of it took, the roots whose cheaper form
+    built and so never priced, and a scan's own derivations price no form before theirs, `reported`), the
+    seconds this program's rewrite of it took, the roots whose cheaper form
     the program took (`spliced`, `_splices`: a picked form that does not land, a value another window's form
     made or a form of another type, is none), and whether an earlier window of its structure derived its
     forms (`reused`, `_derived`: its seconds a lookup's)."""
@@ -286,7 +293,7 @@ def _deriving(accurate: bool, saturation: Saturation) -> Hashable:
     (`rules.admitted`, by name), so a target assumed, a precision set or a set registered later derives
     afresh."""
     return (accurate, saturation, cost.target(), str(jax.config.jax_default_matmul_precision),
-            tuple(sets.name for sets in rules.admitted(accurate)))
+            rules.admitted_names(accurate))
 
 
 def _derived(window: jcore.Jaxpr, accurate: bool, saturation: Saturation,
@@ -418,7 +425,8 @@ def _windows(jaxpr: jcore.Jaxpr) -> list[tuple[jcore.Jaxpr, list[jcore.Var]]]:
 def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> Rewrite:
     """`closed`'s roots' forms, its bodies already rewritten, chosen together from its terms saturated under
     the admitted rule sets where they are cheaper than the region as traced (`cost.cheaper`), and the report
-    of the rewrite. A region no reordering may touch (`rules.reorderable`) builds no e-graph. The saturated
+    of the rewrite. A region no admitted set may change (`rules.firing`: one no reordering may touch, where
+    no exact set past the saturation aids is admitted) builds no e-graph. The saturated
     graph's forms are extracted first; only where one differs from its root is the region as traced
     extracted too, from the graph as it stood (egglog's `push`, `pop`): a region whose forms are its roots'
     (commutativity's alone) takes one extraction."""
@@ -426,7 +434,8 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
     admitted = rules.admitted(accurate)
     # A window's structure decides first, its egglog terms built only where a rule may fire.
     skeleton = terms.region(closed, forms=terms.Skeleton)
-    if not rules.reorderable(skeleton):
+    firing = rules.firing(admitted, skeleton)
+    if not firing:
         fired = dict.fromkeys((sets.name for sets in admitted), 0)
         report = AlgebraReport(skeleton.equations, tuple(fired), fired, saturation.limits(skeleton),
                                iterations=0, nodes=0, limited=False, before=None, after=None,
@@ -436,7 +445,7 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
     priced = cost.model(region, cost.fused(cost.target()))
     graph, bundle, roots = graphed(region)
     graph.push()
-    saturated = saturate(graph, region, admitted, saturation)
+    saturated = saturate(graph, region, firing, saturation)
     nodes = node_count(graph)
     forms, after = extracted(graph, bundle, priced)
     changed = any(terms.key(form) != terms.key(root) for root, form in zip(roots, forms, strict=True))
@@ -446,9 +455,10 @@ def _region(closed: jcore.Jaxpr, *, accurate: bool, saturation: Saturation) -> R
         _, before = extract.cheapest(graph, bundle, priced)
     picked = ({terms.key(root): form for root, form in zip(roots, forms, strict=True)}
               if changed and cost.cheaper(after, before) else {})
-    report = AlgebraReport(region.equations, tuple(saturated.fired), saturated.fired, saturated.limits,
-                           saturated.iterations, nodes, saturated.limited, before.value, after.value,
-                           time.perf_counter() - began)
+    # Every admitted set is reported, one that could not fire here (`rules.firing`) at no match.
+    fired = {**dict.fromkeys((sets.name for sets in admitted), 0), **saturated.fired}
+    report = AlgebraReport(region.equations, tuple(fired), fired, saturated.limits, saturated.iterations,
+                           nodes, saturated.limited, before.value, after.value, time.perf_counter() - began)
     return Rewrite(region, picked, report)
 
 
@@ -597,6 +607,31 @@ def saturate(graph: EGraph, region: terms.Region, admitted: tuple[rules.Rules, .
             break
     graph.run(facts)
     return Saturated(fired, (nodes, steps), iterations, limited)
+
+
+def run_within(graph: EGraph, ruleset, limits: tuple[int, int], name: str) -> Saturated:
+    """`graph` run under one `ruleset`, reported as `name`, to its fixpoint or `limits` (nodes, iterations;
+    `Saturation.sized`), an iteration at a time with the count read between them, as `saturate` reads it:
+    its matches, the iterations it ran and whether a limit stopped it."""
+    nodes, steps = limits
+    iterations, matches = 0, 0
+    while iterations < steps and node_count(graph) <= nodes:
+        ran = graph.run(ruleset)
+        iterations += 1
+        matches += sum(ran.num_matches_per_rule.values())
+        if not ran.updated:
+            return Saturated({name: matches}, limits, iterations, limited=False)
+    return Saturated({name: matches}, limits, iterations, limited=True)
+
+
+def reported(graph: EGraph, sized: int, saturated: Saturated, began: float,
+             after: float | None = None) -> AlgebraReport:
+    """A derivation's own saturation (`run_within`: a scan's token programs', its chunk's) as the report a
+    region's rewrite makes, recorded with the kernels' (`kernel_report.record_rewrite`): its size as
+    registered, its limits, its iterations and rows, whether a limit stopped it, and its form's price."""
+    return AlgebraReport(sized, tuple(saturated.fired), saturated.fired, saturated.limits,
+                         saturated.iterations, node_count(graph), saturated.limited, None, after,
+                         time.perf_counter() - began)
 
 
 def extracted[Price: Linear](graph: EGraph, bundle: terms.Term, model: DagCostModel[Price], *,

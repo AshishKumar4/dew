@@ -534,10 +534,14 @@ def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
     exactly to float64, each float64 result rounded once back to float32, as `accumulated` takes a
     product's sums: XLA's CPU compiler runs a reduction with a combine of its own as one loop over the
     row, rounding at each step. A process without the setting, or operands not float32, take the plain
-    reduction on every platform, chosen by the platform a program is lowered for (`platform_dependent`)."""
+    reduction on every platform, chosen by the platform a program is lowered for (`platform_dependent`).
+    The widened path is a protected span of its own (`_protected`), whatever span its caller is in: a
+    rewrite that moved its casts or reordered its sum would undo the widening. The plain reduction is the
+    caller's math, rewritten as any other."""
     if not wide_cpu_arithmetic() or not any(operand.dtype == jnp.float32 for operand in operands):
         return tuple(reduction(*operands))
 
+    @_protected
     def wide(*operands):
         with jax.enable_x64(new_val=True):
             reduced = reduction(*(operand.astype(jnp.float64) if operand.dtype == jnp.float32 else operand

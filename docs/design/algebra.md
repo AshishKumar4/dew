@@ -69,9 +69,8 @@ checked-in output yet. The text stays as the design to resume.
   transpose rules bracket the span's tangent and cotangent too, so a span keeps its marker through autodiff. A
   marker carries its kind as an object, never a name string:
   - `Protected`: the error-free transforms of `dew.nn.precision` (`two_sum`, `two_product`, `compensated_add`,
-    `compensated_difference`; `compensated_sum` and `widened_reduction` with their site's declaration, row 4026:
-    today `widened_reduction` marks nothing of its own, its one caller running it inside a derivative declared
-    `Protected`, so a caller outside one would keep no protection, an open gap)
+    `compensated_difference`; `compensated_sum` with its site's declaration, row 4026; `widened_reduction`'s
+    widened path, a span of its own whatever its caller's)
     and the numerics bodies of custom derivatives (§1.3). A protected span is a boundary no region crosses. At compile time it is one opaque leaf. At dev time
     the generator may propose another form for it, which extraction admits only when its error estimate meets the
     span's own (§1.5), and which lands only as reviewed generated code.
@@ -365,7 +364,11 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
   - the templates' schedules, the toolkit and the families;
   - custom derivatives that implement kernels, and numerics and surrogate bodies except as §1.3 allows;
   - the planner's contract and the precision policy's meaning;
-  - JAX, jaxlib and XLA, used through public interfaces only.
+  - JAX, jaxlib and XLA, unchanged: the pass reads a fact a library states from the library, through its
+    designed interfaces where it has one, and where it has none composes it from the library's own methods,
+    public or private (`program`'s static arguments by JAX's own inference, `nn.programs`' precision presets by
+    JAX's own conversion), never from a list of Dew's that restates it; a fact or hook that fits the fork goes
+    there at its source.
 - **XLA keeps** fusion and code generation; it does not reassociate floating-point math by default, so chosen forms
   reach it intact.
 
@@ -751,6 +754,12 @@ class Saturation:
   benchmark_step's cpu-smoke steps) reached either of 64 and 4, the largest using under a quarter of each,
   and none priced lower at four times both (`SATURATION`'s receipt). At dev time they are measured on the
   declarations when the generator resumes. They are re-measured when a set changes.
+- A scan's two derivations stop at the same limits (`Saturation.sized`, `program.run_within`): the token
+  programs' affine form and the chunk's forms each saturate within `growth` times the rows their e-graph holds
+  as registered and `depth` times their longest chain. Measured over the shipped scans' declarations (the scan,
+  join, recurrence and Kimi Linear tests' 164 derivations, as this sizing landed): the fullest graph reached 613
+  rows of its 1,536 (40%), the longest run 9 iterations of its 24 (38%), and none stopped. A token program a limit stops before its affine form is refused, the refusal
+  naming the limits; a chunk graph a limit stops is extracted as it stands, each form in it the chunk's own.
 - A region a limit stops keeps the cheapest form found so far (as extraction prices the forms it holds,
   §6.5), and the report says so; one that reaches its
   fixpoint first was not stopped by a limit.

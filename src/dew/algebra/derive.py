@@ -648,7 +648,8 @@ class _Forms:
 
 def context() -> tuple:
     """What a derivation reads where it runs beside its declaration and shapes, the key of every derivation a
-    declaration holds (`derive`'s forms, `scan.derive_scan`'s carry splits): forms traced under one abstract
+    declaration holds (`derive`'s forms, beside the rule sets its numerics admit, `rules.admitted_names`;
+    `scan.derive_scan`'s carry splits): forms traced under one abstract
     mesh hold its avals in their literals (a sharded step's bound under a local one's mesh refused to lower),
     and are priced for one target (`cost.target`), under one run's numerics and one matmul precision, with
     the extractor oracle on or off (`Passes.checked`). Not the whole trace context, whose identity-keyed
@@ -683,8 +684,10 @@ def derive(declaration: Reduction, *, accurate: bool, saturation: program.Satura
         return made
 
     def forms(shapes: Mapping) -> _Forms:
-        return derived_at(context(), tuple((name, tuple(shapes[name][0]), np.dtype(shapes[name][1]))
-                                           for name in names))
+        # The engine's sets saturate beside the derivation's own (`_derived`), so a set registered after a
+        # shape's forms were derived derives them afresh, as a program's windows do (`program._deriving`).
+        return derived_at((context(), rules.admitted_names(accurate)),
+                          tuple((name, tuple(shapes[name][0]), np.dtype(shapes[name][1])) for name in names))
 
     def shaped(values):
         return {name: (value.shape, value.dtype) for name, value in values.items()}

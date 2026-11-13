@@ -732,6 +732,22 @@ def admitted(accurate: bool, *, dev: bool = False) -> tuple[Rules, ...]:
                  if (dev or not rules.dev) and (dev or not accurate or rules.rounding == "exact"))
 
 
+def admitted_names(accurate: bool) -> tuple[str, ...]:
+    """The admitted sets by name, in their order: what a derivation kept keys on beside its program, so a set
+    registered later derives afresh (the program pass's windows, a reduction's forms)."""
+    return tuple(sets.name for sets in admitted(accurate))
+
+
+def firing(sets: tuple[Rules, ...], region: terms.Region) -> tuple[Rules, ...]:
+    """The sets of `sets` that may change `region`: every one where a reordering rule may fire
+    (`reorderable`); else the `exact` ones, whose rewrites read no bound, and none where those are saturation
+    aids alone, which change no program by themselves (`Rules.aid`)."""
+    if reorderable(region):
+        return sets
+    exact = tuple(held for held in sets if held.rounding == "exact")
+    return () if all(held.aid for held in exact) else exact
+
+
 def instances() -> Mapping[str, Instance]:
     """Every registered rule written as JAX, by its set's name and its own (`Rules.instances`): the
     qualification inventory its accuracy test holds each right side to its left side over."""

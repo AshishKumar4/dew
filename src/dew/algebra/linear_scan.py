@@ -46,6 +46,7 @@ import dataclasses
 import functools
 import math
 import operator
+import time
 from collections.abc import Callable, Iterator
 
 import jax
@@ -75,9 +76,10 @@ from egglog import (
 )
 from jax.extend import core as jcore
 
-from dew.algebra import cost, extract, terms
+from dew.algebra import cost, extract, program, terms
 from dew.algebra.cost import Work
 from dew.algebra.forms import Program, Refused, aval
+from dew.nn.kernels.templates import report as kernel_report
 
 
 class Token(Expr):
@@ -245,27 +247,45 @@ class Parts:
     values_read: bool = False
 
 
-def parts(update: Program, readout: Program) -> Parts:
+def _chain(traced: Program) -> int:
+    """The longest chain of `traced`'s equations, each reading the one before it."""
+    levels: dict = {}
+    for equation in traced.jaxpr.eqns:
+        level = 1 + max((levels.get(atom, 0) for atom in equation.invars if isinstance(atom, jcore.Var)),
+                        default=0)
+        levels.update(dict.fromkeys(equation.outvars, level))
+    return max(levels.values(), default=0)
+
+
+def parts(update: Program, readout: Program, saturation: program.Saturation) -> Parts:
     """The token's update and readout (each a traced program whose first input is the state) as an affine
-    map of the state (`Parts`, the module's account); refused where either reaches no affine form, or reads
-    the state through an equation whose algebra no constructor states."""
+    map of the state (`Parts`, the module's account), their e-graph saturated within `saturation`'s limits
+    for its size as registered (its rows before a rule runs, the two programs' terms) and their longer
+    chain, the saturation reported with the kernels' rewrites (`program.reported`); refused where either
+    reaches no affine form (the refusal says so where a limit stopped the saturation first), or reads the
+    state through an equation whose algebra no constructor states."""
     atoms: list = []
     made, read = _translated(update, atoms), _translated(readout, atoms)
-    graph = EGraph()
+    began, graph = time.perf_counter(), EGraph()
     graph.register(made, read)
-    graph.run(_token_rules().saturate())
+    sized = program.node_count(graph)
+    limits = saturation.sized(sized, max(_chain(update), _chain(readout)))
+    saturated = program.run_within(graph, _token_rules(), limits, "a scan's token")
+    kernel_report.record_rewrite(program.reported(graph, sized, saturated, began))
+    stopped = (f" (its saturation stopped at its limits, {limits[0]} nodes and {limits[1]} iterations, short "
+               f"of its fixpoint)" if saturated.limited else "")
     made, read = graph.extract(form_of(made)), graph.extract(form_of(read))
     corrected = get_callable_args(made, Affine.corrected)
     args = corrected if corrected is not None else get_callable_args(made, Affine.decayed)
     if args is None:
         raise Refused("the update is not a decayed state, exp(z) a scalar's or each key's, plus a rank-one "
-                      "input and corrections of the decayed state along the input's vector")
+                      f"input and corrections of the decayed state along the input's vector{stopped}")
     readout_args = get_callable_args(read, Affine.readout)
     values_read = readout_args is None
     found = get_callable_args(read, Affine.applied) if values_read else readout_args
     if found is None:
         raise Refused("the readout is not the state contracted with a vector over its keys or its values "
-                      "plus a part free of it")
+                      f"plus a part free of it{stopped}")
     base2, per_key, exponent, left, right, *correction = args
     return Parts(update, readout, tuple(atoms), bool(terms.integer(base2)),
                  bool(terms.integer(per_key)), exponent, left, right,
@@ -429,9 +449,14 @@ class Chunk(Expr):
     """The state entering the chunk."""
 
     @classmethod
-    def decay(cls, part: StringLike) -> Chunk: ...
+    def prefix(cls) -> Chunk: ...
+    """The tokens' exponents' compensated prefix, which every decay is an exponential of (`scan._decays`):
+    one pass, shared by the decays a form reads."""
+
+    @classmethod
+    def decay(cls, part: StringLike, prefix: Chunk) -> Chunk: ...
     """The chunk's decays (`scan._Decays`): "entering" `gamma`, "to_last" `exp(G_last - G_t)`, "whole"
-    `gamma_last`, "between" each pair's."""
+    `gamma_last`, "between" each pair's, each an exponential of the shared `prefix` (`decayed_by`)."""
 
     @classmethod
     def loop(cls, values: Chunk) -> Chunk: ...
@@ -452,9 +477,10 @@ class Chunk(Expr):
     def state(self) -> Chunk: ...
 
     @classmethod
-    def gram(cls, left: Chunk, right: Chunk, strict: i64Like) -> Chunk: ...
+    def gram(cls, left: Chunk, right: Chunk, strict: i64Like, between: Chunk) -> Chunk: ...
     """Each pair's decayed contraction `sum_k left_ik right_jk between_ijk`, `j < i` where `strict`, else
-    `j <= i` (`scan._paired`)."""
+    `j <= i` (`scan._paired`). The decay it reads is its operand (`decay("between")`), as every node's that
+    reads one is: a form's price holds each decay's exponentials once, shared by the nodes that read it."""
 
     @method(cost=1)
     def rows(self, scale: Chunk) -> Chunk: ...
@@ -474,21 +500,24 @@ class Chunk(Expr):
     def minus(self, other: Chunk) -> Chunk: ...
 
     @classmethod
-    def spread(cls, readers: Chunk, values: Chunk, keys: Chunk) -> Chunk: ...
+    def spread(cls, readers: Chunk, values: Chunk, keys: Chunk, between: Chunk) -> Chunk: ...
     """`sum_{j <= i} (readers_i . values_j) keys_jk between_ijk`: each token's earlier writes, their values
-    read by its reader along the state's values, decayed to it along the keys (`scan._spread`)."""
+    read by its reader along the state's values, decayed to it along the keys by `between`
+    (`decay("between")`; `scan._spread`)."""
 
     @classmethod
     def applied(cls, state: Chunk, readers: Chunk) -> Chunk: ...
     """`readers state^T`: each token's reader contracted with the state along its values."""
 
     @classmethod
-    def decayed(cls, state: Chunk) -> Chunk: ...
-    """The entering state decayed across the whole chunk, `gamma_last * h` along its keys."""
+    def decayed(cls, state: Chunk, whole: Chunk) -> Chunk: ...
+    """The entering state decayed across the whole chunk, `gamma_last * h` along its keys, `gamma_last`
+    its operand `whole` (`decay("whole")`)."""
 
     @classmethod
-    def written(cls, keys: Chunk, values: Chunk) -> Chunk: ...
-    """`sum_t (keys_t * exp(G_last - G_t)) values_t^T`."""
+    def written(cls, keys: Chunk, values: Chunk, to_last: Chunk) -> Chunk: ...
+    """`sum_t (keys_t * exp(G_last - G_t)) values_t^T`, the decays to the chunk's last token its operand
+    `to_last` (`decay("to_last")`)."""
 
     @classmethod
     def solve(cls, lower: Chunk, given: Chunk) -> Chunk: ...
@@ -503,6 +532,11 @@ class Chunk(Expr):
     """`(I + lower)^-1 given` by forward substitution, a row a step."""
 
 
+def decayed_by(part: str) -> Chunk:
+    """The chunk's decay `part` (`Chunk.decay`), of the chunk's one prefix."""
+    return Chunk.decay(part, Chunk.prefix())
+
+
 def _identities(corrects: bool, scalar: bool, values_read: bool = False):
     """The identities of the module's account, `wy` where tokens correct the state. A `scalar` decay's
     memory is read and then decayed, `(Q h) exp(G)`, as the template's output (`recurrence_algebra.
@@ -514,7 +548,7 @@ def _identities(corrects: bool, scalar: bool, values_read: bool = False):
     values = Chunk.token("U")
     given, other, lower, left, right = vars_("given other lower left right", Chunk)
     h = Chunk.entering()
-    entering = Chunk.decay("entering")
+    entering, between = decayed_by("entering"), decayed_by("between")
     queries = Chunk.token("Q")
     if values_read:
         memory = Chunk.applied(h, queries).times(entering)
@@ -522,16 +556,17 @@ def _identities(corrects: bool, scalar: bool, values_read: bool = False):
         memory = queries.matmul(h).times(entering) if scalar else queries.times(entering).matmul(h)
     found = []
     if corrects:
-        system = Chunk.gram(Chunk.token("C"), Chunk.token("B"), 1).rows(Chunk.token("s"))
+        system = Chunk.gram(Chunk.token("C"), Chunk.token("B"), 1, between).rows(Chunk.token("s"))
         corrected = Chunk.solve(system, values.minus(
-            Chunk.token("C").times(Chunk.decay("entering")).rows(Chunk.token("s")).matmul(h)))
+            Chunk.token("C").times(entering).rows(Chunk.token("s")).matmul(h)))
         found.append(rewrite(Chunk.loop(values)).to(Chunk.plain(corrected)))
-    local = (Chunk.spread(queries, given, Chunk.token("B")) if values_read
-             else Chunk.gram(queries, Chunk.token("B"), 0).matmul(given))
+    local = (Chunk.spread(queries, given, Chunk.token("B"), between) if values_read
+             else Chunk.gram(queries, Chunk.token("B"), 0, between).matmul(given))
     found += [
         rewrite(Chunk.plain(given)).to(Chunk.pair(
             memory.plus(local).plus(Chunk.token("R")),
-            Chunk.decayed(h).plus(Chunk.written(Chunk.token("B"), given)))),
+            Chunk.decayed(h, decayed_by("whole")).plus(
+                Chunk.written(Chunk.token("B"), given, decayed_by("to_last"))))),
         rewrite(Chunk.pair(left, right).outputs()).to(left),
         rewrite(Chunk.pair(left, right).state()).to(right),
         rewrite(Chunk.solve(lower, given)).to(given.plus(Chunk.doubled(lower).matmul(given))),
@@ -575,7 +610,7 @@ def columns_of(value: Chunk) -> i64: ...
 
 def _shapes(extents: Extents):
     """Each value's shape (`rows_of`, `columns_of`) from its operands', as the e-graph grows."""
-    a, b, t = vars_("a b t", Chunk)
+    a, b, t, d, e = vars_("a b t d e", Chunk)
     r, c = vars_("r c", i64)
     tokens, keys, values = i64(extents.tokens), i64(extents.keys), i64(extents.values)
 
@@ -590,9 +625,9 @@ def _shapes(extents: Extents):
         for made in (a.rows(b), a.times(b), a.plus(b), a.minus(b), Chunk.solve(b, a),
                      Chunk.substituted(b, a))]
     found += [fixed(made, tokens, tokens)
-              for made in (Chunk.gram(a, b, 0), Chunk.gram(a, b, 1), Chunk.doubled(a))]
-    found += [fixed(made, keys, values) for made in (Chunk.decayed(a), Chunk.written(a, b), a.state())]
-    found += [fixed(made, tokens, keys) for made in (Chunk.spread(a, b, t), Chunk.applied(a, b))]
+              for made in (Chunk.gram(a, b, 0, d), Chunk.gram(a, b, 1, d), Chunk.doubled(a))]
+    found += [fixed(made, keys, values) for made in (Chunk.decayed(a, d), Chunk.written(a, b, d), a.state())]
+    found += [fixed(made, tokens, keys) for made in (Chunk.spread(a, b, e, d), Chunk.applied(a, b))]
     found.append(fixed(a.outputs(), tokens, keys if extents.values_read else values))
     return ruleset(*found, name="chunk_shapes")
 
@@ -603,25 +638,30 @@ def _leaves(extents: Extents) -> list:
     read, out = (v, k) if extents.values_read else (k, v)
     shapes = {Chunk.token("B"): (c, k), Chunk.token("C"): (c, k), Chunk.token("Q"): (c, read),
               Chunk.token("U"): (c, v), Chunk.token("R"): (c, out), Chunk.token("s"): (c, 1),
-              Chunk.entering(): (k, v), Chunk.decay("entering"): (c, d), Chunk.decay("to_last"): (c, d),
-              Chunk.decay("whole"): (d, 1), Chunk.decay("between"): (c, c)}
+              Chunk.entering(): (k, v), Chunk.prefix(): (c, d), decayed_by("entering"): (c, d),
+              decayed_by("to_last"): (c, d), decayed_by("whole"): (d, 1), decayed_by("between"): (c, c)}
     return [fact for value, (rows, columns) in shapes.items()
             for fact in (set_(rows_of(value)).to(i64(rows)), set_(columns_of(value)).to(i64(columns)))]
 
 
 def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precision: jax.lax.PrecisionLike,
-           checked: bool = False) -> Form:
+           saturation: program.Saturation, checked: bool = False) -> Form:
     """The chunk's cheapest form (the module's account) under `schedule`, its products at `precision`: the
-    e-graph saturated under the identities, extracted by each node's work (`_work`; a solve, which no node
-    computes until an identity rewrites it, costs past every form), and the extracted form priced exactly,
-    its shared nodes once and its critical path along its chains (`_priced`)."""
-    graph = EGraph()
+    e-graph saturated under the identities within `saturation`'s limits for its size as registered (its rows
+    before a rule runs: the root term and its leaves' shapes) and the root's chain (a graph a limit stops
+    holds the forms reached, each the chunk's own, and its report says it stopped, `program.reported`),
+    extracted by each node's work (`_work`; a solve, which
+    no node computes until an identity rewrites it, costs past every form), and the extracted form priced
+    exactly, its shared nodes once and its critical path along its chains (`_priced`)."""
+    began, graph = time.perf_counter(), EGraph()
     values = Chunk.token("U")
     loop = Chunk.loop(values) if corrects else Chunk.plain(values)
     root = Chunk.pair(loop.outputs(), loop.state())
     graph.register(root, *_leaves(extents))
-    graph.run((_identities(corrects, extents.decay_keys == 1, extents.values_read)
-               | _shapes(extents)).saturate())
+    sized = program.node_count(graph)
+    saturated = program.run_within(
+        graph, _identities(corrects, extents.decay_keys == 1, extents.values_read) | _shapes(extents),
+        saturation.sized(sized, _depth(root)), "a scan's chunk")
 
     def marginal(egraph: EGraph, node) -> cost.Seconds:
         if get_callable_args(node, Chunk.solve) is not None:
@@ -635,8 +675,9 @@ def derive(extents: Extents, *, corrects: bool, schedule: cost.Schedule, precisi
     parts = get_callable_args(extracted, Chunk.pair)
     outputs, state = parts if parts is not None else (extracted.outputs(), extracted.state())
     shape_of = functools.partial(_shape_of, graph)
-    priced = _priced((outputs, state), extents, shape_of, precision)
-    return Form(outputs, state, cost.Seconds(priced, schedule))
+    price = cost.Seconds(_priced((outputs, state), extents, shape_of, precision), schedule)
+    kernel_report.record_rewrite(program.reported(graph, sized, saturated, began, price.value))
+    return Form(outputs, state, price)
 
 
 def _shape_of(graph: EGraph, value: Chunk) -> tuple[int, int]:
@@ -656,6 +697,11 @@ def _priced(roots: tuple[Chunk, ...], extents: Extents, shape_of, precision: jax
         spans[terms.key(node)] = own.span + max((spans[terms.key(child)] for child in _children(node)),
                                                 default=0.0)
     return dataclasses.replace(work, span=max(spans[terms.key(root)] for root in roots))
+
+
+def _depth(node: Chunk) -> int:
+    """The longest chain of nodes from `node` down to a leaf."""
+    return 1 + max(map(_depth, _children(node)), default=0)
 
 
 def _nodes(roots: tuple[Chunk, ...]) -> Iterator[Chunk]:
@@ -681,10 +727,10 @@ def _children(node: Chunk) -> list[Chunk]:
     return []
 
 
-CONSTRUCTORS = (Chunk.token, Chunk.entering, Chunk.decay, Chunk.loop, Chunk.plain, Chunk.pair, Chunk.outputs,
-                Chunk.state, Chunk.gram, Chunk.spread, Chunk.applied, Chunk.rows, Chunk.times, Chunk.matmul,
-                Chunk.plus, Chunk.minus, Chunk.decayed, Chunk.written, Chunk.solve, Chunk.doubled,
-                Chunk.substituted)
+CONSTRUCTORS = (
+    Chunk.token, Chunk.entering, Chunk.prefix, Chunk.decay, Chunk.loop, Chunk.plain, Chunk.pair,
+    Chunk.outputs, Chunk.state, Chunk.gram, Chunk.spread, Chunk.applied, Chunk.rows, Chunk.times, Chunk.matmul,
+    Chunk.plus, Chunk.minus, Chunk.decayed, Chunk.written, Chunk.solve, Chunk.doubled, Chunk.substituted)
 """Every constructor of the chunk's language, as `get_callable_args` matches a node."""
 
 
@@ -703,11 +749,14 @@ def _work(node: Chunk, extents: Extents, shape_of, precision: jax.lax.PrecisionL
         # the update that reads it (two launches a token on XLA's path).
         per_token = k * v * (6.0 if corrected else 3.0) + 2.0 * k * v
         return Work(operations=c * per_token, exponentials=c * d, span=2.0 * c)
+    if get_callable_args(node, Chunk.prefix) is not None:
+        # The compensated prefix (`scan._decays`): one pass over the tokens' exponents, one kernel.
+        return Work(operations=12.0 * c * d, kernels=1.0)
     if (args := get_callable_args(node, Chunk.decay)) is not None:
-        # The compensated prefix (`scan._decays`), its pairs' exponentials.
+        # Its pairs' exponentials of the prefix's differences, fused with the prefix's pass.
         part = terms.text(args[0])
         elements = {"entering": c * d, "to_last": c * d, "whole": d, "between": c * c * d}[part]
-        return Work(operations=12.0 * c * d + elements, exponentials=elements, kernels=1.0)
+        return Work(operations=elements, exponentials=elements)
     if (args := get_callable_args(node, Chunk.gram)) is not None:
         if d == 1:
             return product(c, k, c) + Work(operations=2.0 * c * c)

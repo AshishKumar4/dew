@@ -311,6 +311,29 @@ def test_a_portable_recurrence_product_sums_in_float64():
     assert np.asarray(jax.jit(lambda lhs, rhs: portable("product", lhs, rhs))(lhs, rhs)).tolist() == [[1.0]]
 
 
+def test_a_widened_reductions_wide_path_is_a_protected_span_of_its_own(monkeypatch):
+    """A reduction widened under the test setting (`widened_reduction`) called from plain math, outside any
+    protected span, holds its float64 path in one protected call (`dew.nn.derivatives.Protected`), which the
+    algebra pass keeps as traced; it computes the float64 sum rounded once, and differentiates. Its one
+    caller ran it inside a derivative declared protected, and the helper marked nothing of its own."""
+    from dew.nn.derivatives import Protected, marked_call_p
+    from dew.nn.precision import widened_reduction
+
+    monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    rows = np.random.default_rng(0).standard_normal((4, 64)).astype(np.float32)
+
+    def summed(x):
+        return widened_reduction(lambda x: (jnp.sum(x, -1),), x)[0]
+
+    closed = jax.make_jaxpr(lambda x: summed(x))(rows)
+    assert [equation.params["kind"] for equation in equations(closed)
+            if equation.primitive is marked_call_p] == [Protected()]
+    with jax.enable_x64(new_val=True):
+        wide = np.asarray(jnp.sum(jnp.asarray(rows, jnp.float64), -1).astype(jnp.float32))
+    np.testing.assert_array_equal(jax.jit(lambda x: summed(x))(rows), wide)
+    np.testing.assert_array_equal(jax.grad(lambda x: summed(x).sum())(rows), np.ones_like(rows))
+
+
 @pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
 def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     """Each site of the wide CPU arithmetic, a float32 product and a bias's spread and a row's logsumexp
