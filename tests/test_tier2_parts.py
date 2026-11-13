@@ -943,6 +943,65 @@ def test_an_lfm2_of_convolutions_alone_assembles():
     assert fields["layer_types"] == ("conv",) * 4 and (fields["num_heads"], fields["num_kv_heads"]) == (4, 2)
 
 
+def test_a_probe_builds_no_meta_model_twice(tmp_path, monkeypatch):
+    """Tier 2's probe of a type transformers builds and no family reads (an Olmo2 wider than the probe's
+    sizes, whose layers the probe cuts to two) builds transformers' model on torch's meta device once a
+    config (`verify_mapping`): its kinds told from the probe's fields and from their cut, the cut's model
+    the one whose parameters it counts, where it built the cut again for the count; the type's own sizes
+    once more, which it assembles from parts. Its float64 reference, which computes, is no meta model. Dew's cache is the
+    test's own, so no verification recorded before answers in the probe's place."""
+    from collections import Counter
+
+    from interop_support import tiny_config
+    from transformers import Olmo2ForCausalLM
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    built, construct = [], Olmo2ForCausalLM.__init__
+
+    def counted(self, config, *args, **kwargs):
+        if torch.get_default_device().type == "meta":
+            built.append((config.hidden_size, config.vocab_size, config.num_hidden_layers))
+        construct(self, config, *args, **kwargs)
+
+    monkeypatch.setattr(Olmo2ForCausalLM, "__init__", counted)
+    config = tiny_config("olmo2", hidden_size=128, head_dim=32, intermediate_size=256, vocab_size=512)
+    assert isinstance(verify_mapping(config.to_dict()), VerifiedMapping)
+    assert max(Counter(built).values()) == 1, built
+
+
+_ASSEMBLED = """
+import json
+import sys
+
+import torch
+from transformers import LlamaConfig, LlamaForCausalLM
+
+from dew.interop import parts
+
+with torch.device("meta"):
+    model = LlamaForCausalLM(LlamaConfig(**json.loads(sys.argv[1])))
+parts.assemble(model)
+print(json.dumps(sorted(sys.modules)))
+"""
+"""A Llama of the sizes `argv[1]` states assembled from parts, and every module the process then holds."""
+
+
+def test_assembling_a_model_imports_the_modeling_code_its_matching_reaches_alone():
+    """`parts.assemble` resolves a known part's class only where its matching reaches it (`identify`, each
+    role's candidates in `KNOWN`'s order), so a Llama, whose tree asks no routed experts, leaves the modeling
+    code of Qwen3-MoE, whose parts only those roles list, unimported, where the first match imported every
+    known part's module. In a process of its own, as an import is the process's."""
+    import subprocess
+    import sys
+
+    done = subprocess.run([sys.executable, "-c", _ASSEMBLED, json.dumps(TINY)], capture_output=True,
+                          text=True, check=False)
+    assert done.returncode == 0, done.stderr[-4000:]
+    held = set(json.loads(done.stdout.splitlines()[-1]))
+    assert "transformers.models.llama.modeling_llama" in held
+    assert "transformers.models.qwen3_moe.modeling_qwen3_moe" not in held
+
+
 def _aliased(first, second):
     def compute(x):
         return x if first is second else -x
