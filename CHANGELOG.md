@@ -7,6 +7,18 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A resume treats its data relaxed by default (`TrainerConfig.data_resume`, `--set trainer.data_resume=exact`):
+  the run's parameters, optimizer state, step, schedule and random state resume as saved, and its data reads
+  on at its saved position where the saved plan makes the same rows; where the plan differs (a rule, a
+  fact, the order, the sources or steps, the topology, or a plan version this Dew does not read), the data
+  starts again from the beginning of its order, the log naming each part that differs and the run's
+  records holding it (`DataRestarted`); data read in stages (phases, schedules, a batch ramp) starts again
+  at the stage the run's progress stands in, that stage's own start, its boundaries where the run's progress
+  places them, and a run bounded in examples ends at its own count. `exact` refuses any difference, as every
+  resume did before.
+  `compile(..., resume=)` takes `"relaxed"` where it took `"non-exact"`, and a plan's refusal is a
+  `dew.data.plan.PlanChanged` naming what differs (`differs`).
+
 - A plan the devices refuse (`PlanRefused`) states what each local device's allocator read as it refused
   (`PlanRefused.allocators`, the tightest in its message: its limit, its bytes in use, its largest free
   block and its pool), so a refusal at a phase's boundary names what holds the device.
