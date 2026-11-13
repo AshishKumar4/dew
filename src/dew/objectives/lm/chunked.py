@@ -627,14 +627,12 @@ def _softmax_cotangent(logits, first, excluded, peaks, masses, rests, labels, d_
     # A target at the excluded column scores a constant +inf, which no logit moves.
     selected = _without(jax.nn.one_hot(labels - first, logits.shape[-1], dtype=bool), first,
                         excluded, value=False)
-    safe_masses = jnp.where(masses != 0, masses, 1)
     coefficient = d_partition if picked else d_first + d_partition
-    share = exponentials * (coefficient / safe_masses)[:, None]
-    entry = label_entry(exponentials / safe_masses[:, None], (rests / safe_masses)[:, None])
-    target = (exponentials * ((d_first + d_partition) / safe_masses)[:, None] - d_first[:, None] * entry
-              if picked else exponentials * (d_partition / safe_masses)[:, None] + d_first[:, None] * entry)
-    active = (d_first != 0) | (d_partition != 0)
-    return jnp.where(active[:, None], jnp.where(selected, target, share), 0)
+    share = exponentials * (coefficient / masses)[:, None]
+    entry = label_entry(exponentials / masses[:, None], (rests / masses)[:, None])
+    target = (exponentials * ((d_first + d_partition) / masses)[:, None] - d_first[:, None] * entry if picked
+              else exponentials * (d_partition / masses)[:, None] + d_first[:, None] * entry)
+    return jnp.where(selected, target, share)
 
 
 def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, predict, temperature,
