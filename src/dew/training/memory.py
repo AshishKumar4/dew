@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import re
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
@@ -71,6 +72,21 @@ def gathered_layer_bytes(objective, variables: Variables) -> int | None:
     Qwen3.5-4B's 1 GiB combined about 4.7 layers' 215 MiB each in its forward and held 5 GiB more at its
     peak than 128 MiB did, in the same time (IG-SCALING-2XH100), and a Llama-3.1-8B's 128 MiB split its 0.44
     GB layers and lost 2.6% (docs/performance.md)."""
+    leaves, structure = jax.tree.flatten(variables)
+    key = (structure, tuple((leaf.shape, jnp.dtype(leaf.dtype), splits_parameter(leaf)) for leaf in leaves))
+    # Once a run: each plan's options read it (`step_compiler_options`), its sizing a trace of its own.
+    held = _GATHERED.setdefault(objective, {})
+    if key not in held:
+        held[key] = _largest_layer_bytes(objective, variables)
+    return held[key]
+
+
+_GATHERED: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+"""By objective, `gathered_layer_bytes` by its variables' structure, shapes, dtypes and splits."""
+
+
+def _largest_layer_bytes(objective, variables: Variables) -> int | None:
+    """`gathered_layer_bytes` sized afresh."""
     def layered(tree):
         # A bank's rows are read where they lie (`StoredRow`): their shapes and dtypes are what is sized.
         return jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype) if isinstance(leaf, StoredRow)

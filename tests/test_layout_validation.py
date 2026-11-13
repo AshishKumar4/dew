@@ -23,6 +23,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from kernel_compile import compile_only_gpus
 from model_support import TINY_DECODER
 from sharded import collective_axes
+from steady_state import steady_state
 from test_parallelism import BoxedReadout
 from token_support import repeated_token_batch, token_rows
 
@@ -240,6 +241,9 @@ def test_a_gpu_step_over_fsdp_combines_its_parameter_gathers_a_layer_at_a_time()
                    if collective(instruction.op) == "all-gather" and not instruction.op.endswith("-start"))
 
     assert largest_gather(placed) <= -(-layer // 2 ** 20) * 2 ** 20 < largest_gather(None)
+    # Each plan's options read the run's layer sizing once: a later plan's trace nothing.
+    with assumed("sm90"), jax.set_mesh(mesh), steady_state():
+        step_compiler_options(objective, BATCH * SEQ_LEN, frozen=False, devices=mesh.size, variables=placed)
 
 
 @pytest.mark.mesh(devices=8)
