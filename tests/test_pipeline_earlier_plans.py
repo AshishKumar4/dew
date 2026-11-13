@@ -49,17 +49,17 @@ def _read(loader, skipped: int, batches: int) -> list[list[int]]:
 
 
 @pytest.mark.parametrize("read", ["streamed", "memory"])
-def test_a_position_saved_under_14_resumes_through_a_grown_take(read):
+def test_a_position_saved_under_14_resumes_where_it_stopped(read):
     """A position main saved under plan 14, which described its order's stages in place, per share or in
     a global order, resumes in this Dew's read onto the rows a read of the same chain stopped where it stopped
-    reads next, through a take grown since, which reads on past the old bound; a configured step whose
-    configuration changed is refused, its rows not the saved run's."""
+    reads next, a stream's through a take grown since too, which reads on past the old bound; a configured
+    step whose configuration changed is refused, its rows not the saved run's."""
     from saved_positions_support import taken
 
     name = "taken" if read == "streamed" else "taken_in_memory"
     saved = (SAVED_BY_MAIN / f"{name}.position").read_bytes()
     after = _read(taken(read=read), 3, 4)
-    for count in (20, 30):
+    for count in (20, 30) if read == "streamed" else (20,):
         resumed = taken(count, read=read).train(DataPartition())
         try:
             resumed.set_state(saved)

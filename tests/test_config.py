@@ -125,8 +125,9 @@ def test_a_run_trained_on_a_compiled_loader_records_this_dews_version(tmp_path):
 
 
 def test_a_run_naming_a_version_this_dew_reads_none_of_is_refused_with_a_compiled_loader(tmp_path):
-    """A run that names a data plan version this Dew reads none of is refused before it trains, handed a
-    loader compiled already as a chain is (train 593's review)."""
+    """A run resumed exactly that names a data plan version this Dew reads none of is refused before it
+    trains, handed a loader compiled already as a chain is (train 593's review); relaxed, it reads by this
+    Dew's (`RunConfig.resumed`)."""
     import numpy as np
     from affine_run import FEATURES
 
@@ -137,7 +138,7 @@ def test_a_run_naming_a_version_this_dew_reads_none_of_is_refused_with_a_compile
     chain = Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat()
     loader = compile(chain)
     config = TrainerConfig(name="named", checkpoint_dir=str(tmp_path / "runs"), steps=1, eval_every=None,
-                           checkpoint_every=None)
+                           checkpoint_every=None, data_resume="exact")
     with pytest.raises(ValueError):
         RunConfig(trainer=config, data_plan_version=13).train(Regression(), loader, name="named")
 
