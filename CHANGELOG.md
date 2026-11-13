@@ -50,17 +50,19 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   `compile(..., resume=)` takes `"relaxed"` where it took `"non-exact"`, and a plan's refusal is a
   `dew.data.plan.PlanChanged` naming what differs (`differs`).
 
-- Data plan version 14, the last global one: a plan describes each step by its structure (its class and
-  fields, a callable by its own identity, an array by its fingerprint, a mapping in its order) and records,
-  by name, the rules its read takes its next rows by (`identity`, `shuffle`, `mix`, `dealing`, `grain`,
-  `phases`) and the shards a stream reads, each one value beside the code that implements it
-  (docs/design/data.md, the rules). A resume compares them and refuses a differing one by its name; a Grain
-  upgrade refuses only a position whose iterator state its iterators cannot restore. Phases that share a
-  corpus continue it from the draws the run trained. This Dew reads plans of 13 exactly (a run's resume
-  compiles its data at 13, and a per-share position of 13 resumes in a read compiled at 14 as 13 read it)
-  and refuses 8 to 12, naming both ways on: resume with the Dew that wrote it, or go on from its weights as
-  a new run that reads its data afresh. `Objective.bind_plan`, `dew.data.pipeline.earlier`, `Pipeline.at`
-  and `ObjectiveData.earlier` are gone, and `Source.manifest` takes no version.
+- Data plan version 15: a plan describes each step by its structure (its class and fields, a callable by
+  its own identity, an array by its fingerprint, a mapping in its order) once, in its manifest, its order
+  holding each stage by the place of the step that describes it, and records, by name, the rules its read
+  takes its next rows by (`identity`, `shuffle`, `mix`, `dealing`, `grain`, `phases`) and the shards a
+  stream reads, each one value beside the code that implements it (docs/design/data.md, the rules). A resume
+  compares them and refuses a differing one by its name; a Grain upgrade refuses only a position whose
+  iterator state its iterators cannot restore. Phases that share a corpus continue it from the draws the run
+  trained. This Dew reads plans of 14, which described each stage of its order again in place, exactly, as
+  its own, and refuses 8 to 13, naming both ways on: resume with the Dew that wrote it, or go on from its
+  weights as a new run that reads its data afresh; a relaxed resume of one starts its data again.
+  `Objective.bind_plan`, `dew.data.pipeline.earlier`, `Pipeline.at` and `ObjectiveData.earlier` are gone,
+  `Source.manifest` takes no version, and a run handed a compiled loader records the version the run it
+  resumes saved, or this Dew's.
 
 - A schedule's step horizons (its warmup's and decay's lengths in steps) are operands of its solver's state
   (`RateState.horizons`) where a run builds it stated (`OptimConfig.build(stated=True)`), so a rehearsed run

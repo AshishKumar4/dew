@@ -440,34 +440,6 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         self._predicate.restored(None if held is None else integer(held, "rejected rows"))
 
 
-class Carried(pygrain.IterDataset[Batch]):
-    """`parent`'s rows, each marker's source examples (`Rejected.consumed`) carried on to the next row and
-    the markers dropped, counting nothing: the carrier after a batched map's group it makes no rows of
-    (`dew.data.pipeline.BatchedGroups`) where a plan of 13 reads, whose positions hold it. The examples it
-    owes are checkpointed with its parent's position; those the stream ends owing are its end's
-    (`dew.training._fit.drained`)."""
-
-    def __init__(self, parent: pygrain.IterDataset[Batch | Rejected]):
-        super().__init__(parent)
-        self._records = parent
-
-    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
-        return _CarriedIterator(iter(self._records))
-
-
-class _CarriedIterator(pygrain.DatasetIterator[Batch]):
-    def __init__(self, parent: pygrain.DatasetIterator):
-        super().__init__(parent)
-        self._read, self._owed = parent, Owed()
-
-    def __next__(self) -> Batch:
-        while True:
-            element = next(self._read)
-            if isinstance(element, Rejected):
-                self._owed.owe(element.consumed, element.drawn)
-                continue
-            return self._owed.paid(element)
-
     def get_state(self) -> Mapping[str, object]:
         return {"parent": self._read.get_state(), "owed": self._owed.examples, **self._owed.saved_draws()}
 

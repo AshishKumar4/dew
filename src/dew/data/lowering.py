@@ -87,7 +87,6 @@ from dew.data.handoff import (
 )
 from dew.data.mixing import (
     Accepted,
-    Carried,
     Chunked,
     CorpusCounts,
     KeyedMix,
@@ -147,7 +146,7 @@ from dew.data.pipeline import (
     member_record,
     members_held,
 )
-from dew.data.plan import PLAN_VERSIONS, STRUCTURED, Manifest
+from dew.data.plan import Manifest
 from dew.data.readers import WorkerMirrors, _FillShare
 from dew.data.shards import bounded as shards_bounded, bounded_places, cut, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
@@ -692,13 +691,12 @@ def _filled(stage: Artifact) -> Cache:
     return stage.cache
 
 
-def _fill(pipeline: Pipeline, source: Source, at: int, read: Read,
-          version: int) -> tuple[Cache, Manifest, _Prefix]:
-    """The cache stage at `at`, its fill's key at plan `version`, and the record steps that fill it."""
+def _fill(pipeline: Pipeline, source: Source, at: int, read: Read) -> tuple[Cache, Manifest, _Prefix]:
+    """The cache stage at `at`, its fill's key, and the record steps that fill it."""
     artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
     if not isinstance(artifact, Artifact):
         raise ValueError(f"stage {at} of {_name(pipeline)} is not a cache")
-    return _filled(artifact), _cache_manifest(source, prefix, read, version), _Prefix(_cache_steps(prefix))
+    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(_cache_steps(prefix))
 
 
 def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[int, int, int]]:
@@ -1225,9 +1223,6 @@ class _Build:
     and runs the rest. A mixture's corpora each read in a share of them, or in the workers a corpus
     writes itself. None where the workers read the whole order after its batch, as a read that drops
     nothing is read."""
-    version: int = PLAN_VERSIONS[-1]
-    """The data plan version it reads by (`dew.data.plan.PLAN_VERSIONS`), which spells the steps its caches
-    are keyed by (`_fill`)."""
     named: int | None = None
     """The key of the chain this builds, read outside any mixture, where it was given a name: the key a
     mixture keys it by as its first member of that name (`dew.data.compile._own_key`), which its shuffles
@@ -1479,7 +1474,7 @@ class _Build:
             present = _Present.of(records) if _in_memory(keyed) else None
             positions = None if present is None else present.positions
         stored = _cache_inputs(keyed, records)
-        filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read, self.version)
+        filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read)
         # Read by input, as the source's own rows are: its missing inputs skipped, as the uncached
         # root skips them, and written by the fill; one record for each input reads by index and in
         # the uncached chain's order, the rest as a stream of each input's outputs.
@@ -1534,7 +1529,7 @@ class _Build:
         transparent = cache is not None and _transparent(pipeline, cache)
         shards = source.manifest()
         if cache is not None:
-            filled, manifest, prefix = _fill(pipeline, source, cache, self.read, self.version)
+            filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
             shards = _positioned(shards, partition, self.stream_loading) if 0 <= last < cache else shards
             reader = filled.streamed(shards.reader, manifest, transform=prefix, threads=prefix.threads,
                                      source=source, transparent=transparent)
@@ -1898,15 +1893,10 @@ class _Build:
             rows = stage.function(given.seed(self.stage_seed(pipeline, at, partition)))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
-            refusing = self.version >= STRUCTURED
-            rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage, refusing=refusing))
-            # A group it makes no rows of is refused and counted here, its examples carried to the next row;
-            # a plan of 13 carried them uncounted, as its positions hold.
-            if refusing:
-                rows = Accepted(rows, _name(pipeline), _label(pipeline), rows=False,
-                                members=self.counted_members(pipeline))
-            elif self.counting(pipeline):
-                rows = Carried(rows)
+            rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage))
+            # A group it makes no rows of is refused and counted here, its examples carried to the next row.
+            rows = Accepted(rows, _name(pipeline), _label(pipeline), rows=False,
+                            members=self.counted_members(pipeline))
         else:
             return self.layout_stage(rows, stage, pipeline, at)
         return rows
@@ -1925,7 +1915,7 @@ class _Build:
             if not isinstance(rows, pygrain.MapDataset) or isinstance(pipeline.source, (Mixture, Phases)):
                 raise ValueError("a cache belongs on each corpus's indexed rows, before mix and interleave")
             prefix = pipeline.stages[: pipeline.stages.index(stage)]
-            manifest = _cache_manifest(pipeline.source, prefix, self.read, self.version)
+            manifest = _cache_manifest(pipeline.source, prefix, self.read)
             rows = _filled(stage).mapped(rows, manifest)
         elif not isinstance(stage, Interleave):
             raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} has no lowering here")

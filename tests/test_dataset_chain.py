@@ -18,7 +18,7 @@ from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.pipeline import Configured, ObjectiveData, Pipeline, Rejected
-from dew.data.plan import PLAN_VERSIONS, Manifest
+from dew.data.plan import Manifest
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
@@ -317,7 +317,7 @@ def fetched_generation(chain, directory):
     source = prepared.source
     cache = Cache((directory / "fetched").as_uri())
     fetch = FetchLike()
-    manifest = _cache_manifest(source, prepared.stages, "indexed", PLAN_VERSIONS[-1])
+    manifest = _cache_manifest(source, prepared.stages, "indexed")
     stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest,
                           transform=lambda index, row: (fetch(row),))
     try:

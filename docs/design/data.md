@@ -496,15 +496,14 @@ A streamed file source exposes physical shards with immutable identities. The ma
 
 Indexes, accepted counts, lengths and packing plans come from producer metadata or an explicit preparation job. Memory mode may compute them from its resident records. Training startup may scan a source when `fit` provisions its missing index, which it does where the source can build one, and otherwise reports the read mode it cannot have; a compile with provisioning off suggests `dew data provision` or `provision=True`. A read nothing can prepare is refused as such before any read; one a preparation provides is refused naming the artifact, the bytes preparing it reads where its store states them, and the command to provision it. Length grouping reads lightweight length metadata; global packing at scale reads a published sharded plan. Heavy transforms run once per consumed record.
 
-The saved plan includes its format version, lowering, source snapshots, stage identities, order, mixture weights and accounting rule, packing policy, derived-order fingerprints, cache generations, volatility and relevant topology. It holds what decides the rows and nothing of the checkout or the machine: a step outside Dew that declares no identity is held by its code's bytes, which an exact resume compares; Dew's revision, its lock, the interpreter and the platform are recorded by the checkpoint step beside the position, and a resume warns where they changed. Two runs of one command on one checkout save the same position bytes. The plan's format is version 14, which reads the version before it, 13, exactly; a run saved under an earlier one is refused, naming both ways on: the Dew that wrote it resumes it, or a new run goes on from its weights and reads its data afresh. A run records the version it reads by (`RunConfig.data_plan_version`), and a resume reads by the saved run's. What decides which rows come next is recorded as rules (below), so a change to one is a new value of that rule, not a new version. Resume checks the plan before opening readers. A global record count can survive an environment change only if its semantic plan and derived order are unchanged; the change is recorded. Per-share replay also needs the same environment.
+The saved plan includes its format version, lowering, source snapshots, stage identities, order, mixture weights and accounting rule, packing policy, derived-order fingerprints, cache generations, volatility and relevant topology. It holds what decides the rows and nothing of the checkout or the machine: a step outside Dew that declares no identity is held by its code's bytes, which an exact resume compares; Dew's revision, its lock, the interpreter and the platform are recorded by the checkpoint step beside the position, and a resume warns where they changed. Two runs of one command on one checkout save the same position bytes. Each step's configuration is described once, in the plan's manifest, and its order holds each of its stages by the place of the step that describes it. The plan's format is version 15, which reads the version before it, 14, exactly: 14 described each stage of its order again in place, and is read as 15 once its order's stages are found among its manifest's steps. A run saved under an earlier one is refused, naming both ways on: the Dew that wrote it resumes it, or a new run goes on from its weights and reads its data afresh; a relaxed resume starts its data again. A run records the version it was saved under (`RunConfig.data_plan_version`). What decides which rows come next is recorded as rules (below), so a change to one is a new value of that rule, not a new version. Resume checks the plan before opening readers. A global record count can survive an environment change only if its semantic plan and derived order are unchanged; the change is recorded. Per-share replay also needs the same environment.
 
 #### The rules
 
-From version 14 a plan records, by name, the rules its read takes its next rows by, only those it uses. Each
+A plan records, by name, the rules its read takes its next rows by, only those it uses. Each
 rule's value is an identifier stated once, beside the code that implements it, and read by both the plan's
 writer and a resume's comparison; a behaviour change of a rule is a new value there. A resume whose saved
-value of a rule differs from this Dew's is refused, the refusal naming the rule and both values, unless
-this Dew still reads that value (the version before, 13, below).
+value of a rule differs from this Dew's is refused, the refusal naming the rule and both values.
 
 | Rule | Value | Owner | What it decides |
 |---|---|---|---|
@@ -527,10 +526,6 @@ are no prefix of each corpus's draws: the earlier phase's order is traced once m
 repeats), and the later phase starts past the first place it did not train and draws past those after it
 that it did. Each record is then trained once across the boundary, none lost. The trace costs one lookup a
 record the earlier phase read, once as the later phase is compiled or, on the token clock, opened.
-
-A plan of 13 records no rules, and reads by 13's: steps named by their printing. No Dew of 13 read phases
-on their own streams that share a corpus, which a plan of 13 refuses. A run's resume compiles its data at
-the version it saved (its record's `data_plan_version`).
 
 #### Resuming data: relaxed or exact
 

@@ -92,9 +92,9 @@ def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_names_eigh
 
     config = RunConfig(data=TokenFiles("tokens/train").pipe(presets.token_windows, seq_len=8, batch=2),
                        trainer=TrainerConfig(steps=1))
-    assert config.data_plan_version is None and config.resumed().data_plan_version == PLAN_VERSIONS[-1] == 14
+    assert config.data_plan_version is None and config.resumed().data_plan_version == PLAN_VERSIONS[-1] == 15
     saved = config.resumed().record()
-    assert RunConfig.read(saved).data_plan_version == 14
+    assert RunConfig.read(saved).data_plan_version == 15
     earlier = {**saved, "fields": {name: value for name, value in saved["fields"].items()
                                    if name != "data_plan_version"}}
     directory = tmp_path / "planned"
@@ -103,11 +103,10 @@ def test_a_run_records_the_data_plan_it_reads_by_and_one_saved_before_names_eigh
     assert RunConfig.load(str(directory)).data_plan_version == 8
 
 
-def test_a_run_trained_on_a_compiled_loader_records_the_version_the_loader_reads_by(tmp_path):
-    """A run handed a loader already compiled (`RunConfig.train` of a `Loader`) reads the order the loader
-    was compiled in, so its record names the loader's data plan version, which rebuilding the run reads by,
-    not this Dew's (train 589's review: a loader compiled at 8 trained under a record naming 9): one compiled
-    at the version before this Dew's, which it reads too."""
+def test_a_run_trained_on_a_compiled_loader_records_this_dews_version(tmp_path):
+    """A run handed a loader already compiled (`RunConfig.train` of a `Loader`), one compiled for a run of
+    the version before this Dew's, records this Dew's data plan version, which every version it reads reads
+    by (`dew.data.plan.read_by`), so rebuilding the run reads the order the loader read."""
     import numpy as np
     from affine_run import FEATURES
 
@@ -119,17 +118,15 @@ def test_a_run_trained_on_a_compiled_loader_records_the_version_the_loader_reads
     earlier = PLAN_VERSIONS[0]
     loader = compile(Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat(),
                      plan_version=earlier)
-    assert loader.plan.version == earlier != PLAN_VERSIONS[-1]
     config = TrainerConfig(name="loaded", checkpoint_dir=str(tmp_path / "runs"), steps=1, eval_every=None,
                            checkpoint_every=None)
     RunConfig(trainer=config).train(Regression(), loader, name="loaded")
-    assert RunConfig.load(str(tmp_path / "runs" / "loaded")).data_plan_version == earlier
+    assert RunConfig.load(str(tmp_path / "runs" / "loaded")).data_plan_version == PLAN_VERSIONS[-1] != earlier
 
 
-def test_a_run_naming_another_version_than_its_compiled_loader_is_refused(tmp_path):
-    """A run that names its data plan version and is handed a loader compiled at another would train the
-    loader's order under a record naming its own, so it is refused, naming both, before it trains (train
-    593's review)."""
+def test_a_run_naming_a_version_this_dew_reads_none_of_is_refused_with_a_compiled_loader(tmp_path):
+    """A run that names a data plan version this Dew reads none of is refused before it trains, handed a
+    loader compiled already as a chain is (train 593's review)."""
     import numpy as np
     from affine_run import FEATURES
 
@@ -138,7 +135,7 @@ def test_a_run_naming_another_version_than_its_compiled_loader_is_refused(tmp_pa
 
     rows = np.random.default_rng(0).normal(size=(16, FEATURES)).astype(np.float32)
     chain = Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat()
-    loader = compile(chain, plan_version=14)
+    loader = compile(chain)
     config = TrainerConfig(name="named", checkpoint_dir=str(tmp_path / "runs"), steps=1, eval_every=None,
                            checkpoint_every=None)
     with pytest.raises(ValueError):
