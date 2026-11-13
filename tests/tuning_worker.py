@@ -32,7 +32,7 @@ def mode_settle(args) -> list:
         return [step()(*operands(count)) for count in rows]
 
     with generation.assumed("sm80"):
-        tuned, _ = tuning.tune(lambda: jax.make_jaxpr(program)())
+        tuned = tuning.tune(lambda: jax.make_jaxpr(program)())
     return launched(tuned)
 
 

@@ -343,8 +343,10 @@ def test_a_meeting_and_a_new_stage_drop_each_groups_part_filled_window():
     def stacked(*values):
         return jnp.asarray(values)
 
+    # The groups' windows hold none and one microbatch, at microsteps 6 and 5 of windows of 2.
     window = Accumulation(gradient=None, mass=stacked(2.0, 1.0), statistics=(stacked(3.0, 5.0),),
-                          effects=(), qk_stats=(), batches=None, variables=None, attempts=None, tokens=None)
+                          effects=(), qk_stats=(), batches=None, variables=None, attempts=None, tokens=None,
+                          fill=stacked(0, 1))
     inner = Replicas(microstep=stacked(6, 5), updates=stacked(3, 2),
                      variables={"params": {"w": jnp.ones((2, 3))}}, opt_state=(), ema=None, scale=None,
                      accumulation=window, deferred=None)
@@ -353,10 +355,11 @@ def test_a_meeting_and_a_new_stage_drop_each_groups_part_filled_window():
                        key=jax.random.key(0), scale=None, window_size=jnp.asarray(2), inner=inner)
     diloco = DiLoCo(every=1, rate=1.0, momentum=0.0)
     met = diloco.synced(dataclasses.replace(state, opt_state=diloco.outer.init(state.variables["params"])))
-    for after in (met, dropped(state, 2)):
+    for after in (met, dropped(state)):
         assert after.inner.microstep.tolist() == [6, 4] and int(after.microstep) == 6
         assert after.inner.accumulation.mass.tolist() == [0.0, 0.0]
         assert after.inner.accumulation.statistics[0].tolist() == [0.0, 0.0]
+        assert after.inner.accumulation.fill.tolist() == [0, 0]
 
 
 @pytest.mark.mesh(devices=2)

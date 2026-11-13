@@ -17,7 +17,6 @@ itself alone (`dew.nn.protocols.ForkedCalls`) and draws nothing at random; a cal
 from __future__ import annotations
 
 import dataclasses
-import itertools
 from collections.abc import Mapping, Sequence
 
 import jax
@@ -26,7 +25,7 @@ import numpy as np
 from flax import struct
 
 from dew.batch import BLOCKS_FIELD, Coordinates, Forks, coordinates
-from dew.data.tokens import common_prefix, first_fit
+from dew.data.tokens import FirstFit, common_prefix
 
 
 @struct.dataclass
@@ -200,9 +199,12 @@ def _keyed(rows: Sequence[Sequence[int]], positions: Sequence[Sequence[int]] | N
 def _planned(lengths: Sequence[int], width: int, keys: Sequence[Sequence[bytes]] | None,
              documents: int | None) -> list[list[tuple[int, list[int]]]]:
     """Rows of `lengths` planned into windows (`_windows`): grouped by their keys' common prefixes where
-    `keys` is given (`_groups`), else each a group of its own, at most `documents` a window."""
-    groups = _groups(keys, width) if keys is not None else [[at] for at in range(len(lengths))]
-    return _windows(groups, lengths, keys, width, None if keys is not None else documents)
+    `keys` is given (`_groups`), else each a group of its own, at most `documents` documents a window
+    (`laid_documents`, as `_Layout.write` lays them): a group sharing a prefix lays more documents than
+    its rows apart do, so the bound holds it to its rows apart where it would pass it."""
+    groups = (_groups(keys, lengths, width, documents) if keys is not None
+              else [[at] for at in range(len(lengths))])
+    return _windows(groups, lengths, keys, width, documents)
 
 
 def token_keys(row: np.ndarray, places: np.ndarray, extra: Sequence[np.ndarray], blocks=None) -> list[bytes]:
@@ -222,10 +224,12 @@ def token_keys(row: np.ndarray, places: np.ndarray, extra: Sequence[np.ndarray],
             for key, block in zip(keys, blocks.tolist(), strict=True)]
 
 
-def _groups(keys: Sequence[Sequence[bytes]], width: int) -> list[list[int]]:
+def _groups(keys: Sequence[Sequence[bytes]], lengths: Sequence[int], width: int,
+            documents: int | None) -> list[list[int]]:
     """The rows cut into groups, each laid over one copy of its common prefix: sorted, then each run of
     sorted rows a group where that lays out fewest tokens in all (a group's tokens its prefix and each row's
-    rest, within one window of `width`), a run grown only while its rows share a token."""
+    rest, within one window of `width`, its documents within `documents`, `laid_documents`), a run grown
+    only while its rows share a token."""
     order = sorted(range(len(keys)), key=lambda number: tuple(keys[number]))
     shared = [common_prefix(keys[order[at]], keys[order[at + 1]]) for at in range(len(order) - 1)]
     sizes = [len(keys[number]) for number in order]
@@ -238,7 +242,9 @@ def _groups(keys: Sequence[Sequence[bytes]], width: int) -> list[list[int]]:
                 prefix = min(prefix, shared[begin])
             total += sizes[begin]
             laid = prefix + total - (end - begin) * prefix
-            if laid > width or (begin < end - 1 and prefix == 0):
+            # Grown by a row, a run's prefix only shortens, so its tokens and documents only grow.
+            if laid > width or (begin < end - 1 and prefix == 0) or (documents is not None and laid_documents(
+                    prefix, [lengths[number] for number in order[begin:end]]) > documents):
                 break
             if best[begin][0] + laid < best[end][0]:
                 best[end] = (best[begin][0] + laid, begin)
@@ -259,23 +265,36 @@ def _prefix(group: Sequence[int], lengths: Sequence[int], keys: Sequence[Sequenc
     return prefix
 
 
+def laid_documents(prefix: int, sizes: Sequence[int]) -> int:
+    """The documents a group of rows of `sizes` tokens lays over a shared `prefix` (`over_prefix`, as
+    `_Layout.write` lays them): the prefix, where it holds any, and each row's rest past it."""
+    return (prefix > 0) + sum(size > prefix for size in sizes)
+
+
 def _documents(window: Sequence[tuple[int, Sequence[int]]], laid: Sequence[np.ndarray]) -> int:
-    """The documents a window of groups lays out: each prefix, and each row's rest past it."""
-    return sum((prefix > 0) + sum(len(laid[row]) > prefix for row in group) for prefix, group in window)
+    """The documents a window of groups lays out (`laid_documents`)."""
+    return sum(laid_documents(prefix, [len(laid[row]) for row in group]) for prefix, group in window)
 
 
 def _windows(groups: Sequence[list[int]], lengths: Sequence[int], keys: Sequence[Sequence[bytes]] | None,
              width: int, documents: int | None = None) -> list[list[tuple[int, list[int]]]]:
-    """`groups` of rows of `lengths` packed first-fit, longest first, into windows of `width`, at most
-    `documents` groups a window where given: each window its groups in order, each as its prefix's length
-    (`_prefix`, by `keys`) and its rows."""
+    """`groups` of rows of `lengths` packed first-fit, longest first, into windows of `width` slots and
+    at most `documents` documents where given (`laid_documents`): each window its groups in order, each as
+    its prefix's length (`_prefix`, by `keys`) and its rows."""
     planned = [(_prefix(group, lengths, keys), group) for group in groups]
     sizes = np.asarray([prefix + sum(lengths[number] - prefix for number in group)
                         for prefix, group in planned], np.int64)
+    counts = [laid_documents(prefix, [lengths[number] for number in group]) for prefix, group in planned]
     order = np.argsort(-sizes, kind="stable")
-    grouped, starts = first_fit(sizes[order], width, max(len(order), 1), documents)
-    return [[planned[order[at]] for at in grouped[start:stop]]
-            for start, stop in itertools.pairwise(starts)]
+    # Every window open at once (a bin a group), each group in the first with room for it.
+    placement = FirstFit((width,) if documents is None else (width, documents), max(len(order), 1))
+    windows: list[list[tuple[int, list[int]]]] = [[] for _ in range(len(order))]
+    for at in order.tolist():
+        size = (int(sizes[at]),) if documents is None else (int(sizes[at]), counts[at])
+        chosen = placement.place(size)
+        assert chosen is not None, "a bin a group: one is always free"
+        windows[chosen].append(planned[at])
+    return [window for window in windows if window]
 
 
 def over_prefix(prefix: int, sizes: Sequence[int]) -> list[tuple[int, int, int, int]]:

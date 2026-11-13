@@ -541,7 +541,7 @@ def _refuse_lacking(lacking: set[str], where: str, unread: Set[str] = frozenset(
 
 RETIRED_RATE = ("learning_rate_scale", "learning_rate_shape")
 """The hyperparameters Dew's optimizer injected before it held a schedule's own rate fields
-(`dew.optim.RateState`): a rate's scale and its schedule's shape, two scalars side by side in an
+(`dew.optim_schedules.RateState`): a rate's scale and its schedule's shape, two scalars side by side in an
 injected state's hyperparameters, which a resume refuses by name rather than as a mismatched tree."""
 
 
@@ -580,8 +580,9 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
         raise ValueError(
             "the checkpoint's optimizer state holds its rate as a scale times a schedule's shape "
             f"({' and '.join(RETIRED_RATE)}), which Dew's optimizer no longer forms: it holds the "
-            "schedule's own rate fields (dew.optim.RateState), so a run cannot resume it. Resume it "
-            "with the Dew that wrote it, or start a fresh run from its weights in a directory of its own.")
+            "schedule's own rate fields (dew.optim_schedules.RateState), so a run cannot resume it. "
+            "Resume it with the Dew that wrote it, or start a fresh run from its weights in a directory of "
+            "its own.")
     from dew.state import CHECKPOINTED, OPTIONAL
     missing = set(CHECKPOINTED).difference(stored, OPTIONAL)
     if missing:
@@ -653,9 +654,50 @@ def _filled(template, restored: dict, step: int):
     # A field no checkpoint holds (the narrow copies) starts over: the
     # template's are of its own parameters, not the restored ones. An optional one the checkpoint
     # holds none of is None (`OPTIONAL`).
-    return template.replace(**restored, **{field.name: field.default for field in dataclasses.fields(template)
-                                           if field.name not in CHECKPOINTED},
-                            **{name: None for name in OPTIONAL if name not in restored})
+    started = {field.name: field.default for field in dataclasses.fields(template)
+               if field.name not in CHECKPOINTED}
+    state = template.replace(**restored, **started,
+                             **{name: None for name in OPTIONAL if name not in restored})
+    window = state.window
+    if window is None or window.fill is not None:
+        return state
+    return state.with_window(dataclasses.replace(window, fill=_held_occupancy(state, template.window.fill)))
+
+
+def _held_occupancy(state, placed: jax.ShapeDtypeStruct) -> jax.Array:
+    """The occupancy of `state`'s window as the previous format saved it, which kept none
+    (`_occupancy_unsaved`), placed as `placed` says: its windows began where the clock was a multiple of
+    their size, each group's under DiLoCo, but where a commit had emptied it (`transaction.cleared`, every
+    count it holds zero: no microbatch's statistics, mass, tokens or attempt), as a shortened commit closing
+    a run's last window left it at any clock, which the format saved whole."""
+    window = state.window
+    clock = state.microstep if state.inner is None else state.inner.microstep
+    held = jax.tree.leaves((window.statistics, window.mass, window.tokens, window.attempts))
+    # Each group's window its own: a leaf's first axis is the groups' under DiLoCo.
+    kept = 1 if state.inner is not None else 0
+    holds = jnp.zeros(clock.shape, bool)
+    for leaf in held:
+        holds = holds | jnp.any(leaf != 0, axis=tuple(range(kept, leaf.ndim)))
+    fill = jnp.where(holds, clock % state.window_size, 0).astype(jnp.int32)
+    return fill if placed.sharding is None else jax.device_put(fill, placed.sharding)
+
+
+_WINDOWS = (("accumulation",), ("inner", "accumulation"))
+"""Where a step's state tree holds its window: the run's own, or under DiLoCo its groups'."""
+
+
+def _occupancy_unsaved(template, metadata):
+    """A restore's `template`, a train state's, without the occupancy (`Accumulation.fill`) of a window the
+    checkpoint saved in the previous format, which kept none: every branch of the restore reads that tree,
+    and `_filled` derives the occupancy (`_held_occupancy`). Any other template as it is."""
+    from dew.state import TrainState
+
+    if not isinstance(template, TrainState) or template.window is None:
+        return template
+    stored = next((_at(metadata, path) for path in _WINDOWS if _at(metadata, path) is not None), None)
+    if stored is None or "fill" in stored:
+        return template
+    return template.with_window(dataclasses.replace(template.window, fill=None))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1732,6 +1774,13 @@ class Checkpoints:
             state_tree['position'] = gather_positions(saved, share)
         return state_tree
 
+    def environment(self, step: int) -> Mapping[str, object] | None:
+        """The code and machine that wrote `step`'s data position (`dew.data.plan.running_environment`), or
+        None for a step that holds none, or one written before steps recorded it."""
+        snapshot = self._step_metadata(step, local=step == self._local_latest())
+        held = (snapshot.custom_metadata or {}).get("environment")
+        return None if held is None else record(held, "a step's environment")
+
     def rung(self, step: int) -> JSON:
         """Return the rung of `fit`'s ladder that the state at `step` trained on.
 
@@ -1901,6 +1950,10 @@ class Checkpoints:
             arrays["batch_statistics"] = tuple(arrays["batch_statistics"])
         if arrays.get("replayed_statistics") is not None:
             arrays["replayed_statistics"] = tuple(arrays["replayed_statistics"])
+        if "fill" not in arrays:
+            # The previous format kept no occupancy, which `_filled` derives from the clock, at its shape.
+            clock = metadata["microstep"] if metadata.get("inner") is None else metadata["inner"]["microstep"]
+            arrays["fill"] = jax.ShapeDtypeStruct(clock.shape, jnp.int32)
         return Accumulation(**arrays)
 
     def position(self, step: int, share: DataPartition) -> bytes | None:
@@ -1989,20 +2042,12 @@ class Checkpoints:
         metadata = _item_metadata(snapshot)
         stored = metadata.keys()
         _check_template(template, metadata, stored, mapping=mapping)
+        placed = template
+        template = _occupancy_unsaved(template, metadata)
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None
         if template is None:
-            untyped = _host_read(from_local=from_local)
-            restored = self._restored(step, None, jax.tree.map(lambda _: untyped, dict(metadata)),
-                                      local=from_local, partial=False)
-            if from_local:
-                restored = jax.tree.map(np.asarray, restored)
-            restored = dict(restored)
-            for path, deltas in _ema_deltas(snapshot).items():
-                weights = _by_path(_at(restored, _averaged(path)))
-                restored = _with(restored, path, jax.tree_util.tree_map_with_path(
-                    lambda keys, leaf, deltas=deltas, weights=weights: _from_delta_planes(leaf, weights[keys])
-                    if keys in deltas else leaf, _at(restored, path)))
+            restored = self._host_restored(step, snapshot, metadata, local=from_local)
         elif from_local and self._lost(step):
             restored, held = self._lost_shards(step, template, frozen, snapshot, metadata, where)
         else:
@@ -2059,8 +2104,22 @@ class Checkpoints:
         restored = self._with_frozen(dict(restored), frozen, held)
         table = None if mapping else restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
-        restored = _filled(template, restored, step)
+        restored = _filled(placed, restored, step)
         return restored, saved
+
+    def _host_restored(self, step: int, snapshot, metadata, *, local: bool) -> dict:
+        """Every leaf `step` holds as a host array (`restore` with no template), each EMA stored as its
+        planes' differences from the weights read back into the average it holds (`_from_delta_planes`)."""
+        untyped = _host_read(from_local=local)
+        restored = self._restored(step, None, jax.tree.map(lambda _: untyped, dict(metadata)), local=local,
+                                  partial=False)
+        restored = dict(jax.tree.map(np.asarray, restored) if local else restored)
+        for path, deltas in _ema_deltas(snapshot).items():
+            weights = _by_path(_at(restored, _averaged(path)))
+            restored = _with(restored, path, jax.tree_util.tree_map_with_path(
+                lambda keys, leaf, deltas=deltas, weights=weights: _from_delta_planes(leaf, weights[keys])
+                if keys in deltas else leaf, _at(restored, path)))
+        return restored
 
     def _averages(self, step: int, metadata, restored, path: TreePath, targets: dict, deltas: dict, *,
                   local: bool) -> Variables:

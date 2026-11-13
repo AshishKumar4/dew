@@ -222,7 +222,7 @@ def test_a_step_lowered_afresh_past_spilled_kernels_traces_the_footprint_of_the_
     def lower(split, narrow, footprint=None, *, derived=True, lowering=True):
         asked.append({"footprint": footprint, "derived": derived, "lowering": lowering})
         traced = kept if derived and footprint is None else footprint
-        return Candidate({}, None, {}, None, None, 0, 0, None, "[]", KernelReport((), ()), traced)
+        return Candidate({}, None, {}, None, None, 0, 0, None, KernelReport((), ()), traced)
 
     search = bare_search(deep(split=None).objective)
     search.lower = lower

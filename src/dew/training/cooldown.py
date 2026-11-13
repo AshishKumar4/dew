@@ -136,7 +136,7 @@ def decay(shape: str, update: int, updates: int) -> float:
 def check_branches(branching: bool, suites: Mapping[str, object], *, settable: bool) -> None:
     """Refuse cooldown branches, where the run is `branching`, that it could not score or decay: one
     with no validation suite to score them, and an optimizer whose state holds no learning rate a
-    branch can scale (`settable`, `dew.optim.settable_rates`)."""
+    branch can scale (`settable`, `dew.optim_schedules.settable_rates`)."""
     if not branching:
         return
     if not suites:

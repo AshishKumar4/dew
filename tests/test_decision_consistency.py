@@ -179,10 +179,10 @@ def test_a_looped_backbones_exit_gate_trains_under_ouros_exit_objective_over_eac
     # The expectation under each question's exit distribution lies between its passes' least and most
     # losses, and is no one pass's: the gate drawn off its zeros weighs them apart.
     stacked = np.stack(charges)
-    expected = float(aux.metrics["exit_ce"])
+    expected = float(aux.metrics["exit_ce"].mean()[0])
     assert scored_mean(stacked.min(axis=0)) <= expected <= scored_mean(stacked.max(axis=0))
     assert all(expected != scored_mean(charge) for charge in charges)
-    assert float(aux.metrics["exit_entropy"]) > 0
+    assert float(aux.metrics["exit_entropy"].mean()[0]) > 0
 
     def gate_gradient(objective):
         gradient = jax.grad(lambda params: objective.reduce_loss(objective.loss(
@@ -555,7 +555,7 @@ def test_an_input_lm_term_is_the_backbones_own_next_token_loss_over_the_rows_bes
     label, _ = stats.terms[0].mean()
     value, _ = weighted.reduce_loss(stats)
     assert np.array_equal(np.asarray(value), np.asarray(label + 0.25 * term.mean()[0]))
-    assert np.array_equal(np.asarray(aux.metrics["input_ce"]), np.asarray(term.mean()[0]))
+    assert np.array_equal(np.asarray(aux.metrics["input_ce"].mean()[0]), np.asarray(term.mean()[0]))
     language = LMObjective(backbone.clone(causal=True), tokens.shape[1] - 1, head_tile="tiled")
     text = {"text": jnp.asarray(tokens), "text_coordinates": coordinates(segments=segments)}
     scored, _ = language.loss(part(variables, "backbone"), text, step)

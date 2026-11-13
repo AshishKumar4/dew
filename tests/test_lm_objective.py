@@ -345,7 +345,7 @@ def test_a_padded_target_the_head_gives_no_mass_adds_nothing_to_the_loss_or_its_
         scalar = jax.value_and_grad(objective.scalar_loss, has_aux=True)
         (loss, aux), gradient = scalar(held, batch, step_at())
         scores = objective.evaluate(held, batch, step_at())
-        return loss, aux.metrics["ce"], gradient, Perplexity()(scores, batch)
+        return loss, aux.metrics["ce"].mean()[0], gradient, Perplexity()(scores, batch)
 
     masked, finite = scored(-jnp.inf), scored(-1e30)
     assert np.isfinite(float(finite[0]))
@@ -363,12 +363,12 @@ def test_aux_reports_perplexity_and_token_accuracy():
     assert set(aux.metrics) == {"ce", "perplexity", "token_accuracy"}
     assert aux.variables is None
     # The cross entropy is the loss, and the perplexity its exponential, each the value itself.
-    np.testing.assert_array_equal(aux.metrics["ce"], loss)
-    np.testing.assert_array_equal(aux.metrics["perplexity"], jnp.exp(loss))
+    np.testing.assert_array_equal(aux.metrics["ce"].mean()[0], loss)
+    np.testing.assert_array_equal(aux.metrics["perplexity"].mean()[0], jnp.exp(loss))
 
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
     right = np.argmax(np.asarray(logits), axis=-1) == np.asarray(batch[TEXT_KEY][:, 1:])
-    np.testing.assert_array_equal(aux.metrics["token_accuracy"], counted_share(right))
+    np.testing.assert_array_equal(aux.metrics["token_accuracy"].mean()[0], counted_share(right))
 
 
 def test_dropout_runs_on_the_step_key():
@@ -397,7 +397,7 @@ def test_padded_tokens_are_left_out_of_the_accuracy_too():
     _, aux = objective.scalar_loss(params, batch, step_at())
 
     logits = np.asarray(objective.model.apply(params, batch[TEXT_KEY][:, :-1]))
-    np.testing.assert_array_equal(aux.metrics["token_accuracy"],
+    np.testing.assert_array_equal(aux.metrics["token_accuracy"].mean()[0],
                                   counted_share(np.argmax(logits, axis=-1) == targets, targets != 0))
 
 
@@ -930,7 +930,7 @@ def test_loss_role_counts_only_assistant_targets():
     _, aux = objective.scalar_loss(params, {TEXT_KEY: tokens, ROLES_KEY: roles}, step_at())
     logits = np.asarray(objective.model.apply(params, tokens[:, :-1]))
     right = np.argmax(logits, axis=-1) == np.asarray(tokens[:, 1:])
-    np.testing.assert_array_equal(aux.metrics["token_accuracy"], counted_share(right, kept))
+    np.testing.assert_array_equal(aux.metrics["token_accuracy"].mean()[0], counted_share(right, kept))
 
 
 def test_a_roles_column_is_ignored_without_loss_role():
@@ -985,7 +985,7 @@ def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
 
     def objective(tokens):
         loss, aux = with_z.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
-        return {"loss": jnp.atleast_1d(loss), "z term": jnp.atleast_1d(aux.metrics["z_loss"])}
+        return {"loss": jnp.atleast_1d(loss), "z term": jnp.atleast_1d(aux.metrics["z_loss"].mean()[0])}
 
     def oracle(dtype):
         """The oracle on the model's logits in `dtype`, its float32 run on the float32 ones."""
@@ -1011,7 +1011,7 @@ def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
 
     # The term leaves the cross entropy the plain objective's, which is the padded targets' own
     # (`test_padded_targets_are_left_out_of_the_average`), and adds to the loss.
-    np.testing.assert_array_equal(aux.metrics["ce"], plain_aux.metrics["ce"])
+    np.testing.assert_array_equal(aux.metrics["ce"].mean()[0], plain_aux.metrics["ce"].mean()[0])
     assert "z_loss" not in plain_aux.metrics
     assert loss != without, "the term made no difference to check"
 

@@ -291,18 +291,19 @@ def test_the_sparse_phase_keeps_the_indexer_and_the_model_apart():
         objective = LMObjective(
             deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse", weight=weight))
         _, aux, grads = gradient(objective)
-        assert float(aux.metrics["ce"]) == float(ce)
+        assert float(aux.metrics["ce"].mean()[0]) == float(ce)
         seen[weight] = split_norms(grads)[0]
         assert seen[weight] > 0
         kl_grads = jax.jit(
             jax.grad(
-                lambda p, objective=objective: objective.loss(p, batch, step_at())[1].metrics["indexer_kl"]
+                lambda p, objective=objective:
+                    objective.loss(p, batch, step_at())[1].metrics["indexer_kl"].mean()[0]
             )
         )(params)["params"]
         for path, leaf in jax.tree_util.tree_leaves_with_path(kl_grads):
             if not is_indexer(path):
                 assert bool(jnp.all(leaf == 0)), jax.tree_util.keystr(path)
-        assert float(aux.metrics["indexer_kl"]) > 0
+        assert float(aux.metrics["indexer_kl"].mean()[0]) > 0
     assert seen[2.0] == 4 * seen[0.5]
 
     objective = LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse", weight=0.5))
@@ -312,7 +313,8 @@ def test_the_sparse_phase_keeps_the_indexer_and_the_model_apart():
     def total(objective, reported):
         def run(params, text):
             value, aux = objective.scalar_loss(params, {"text": text}, step_at())
-            return value if not reported else aux.metrics["ce"] + 0.5 * aux.metrics["indexer_kl"]
+            kl = aux.metrics["indexer_kl"].mean()[0]
+            return value if not reported else aux.metrics["ce"].mean()[0] + 0.5 * kl
         return jax.jit(run)
 
     def draw(seed):
@@ -369,7 +371,7 @@ def test_a_packed_batch_scores_the_kl_of_its_documents_alone():
 
         def kl(objective, at, params=params):
             return jax.jit(lambda *batches: objective.scalar_loss(params, batches[at], step_at())[1]
-                           .metrics["indexer_kl"])
+                           .metrics["indexer_kl"].mean()[0])
 
         assert np.isfinite(float(kl(objective, 0)(*draw(0))))
         assert_as_exact(kl(objective, 0), kl(objective, 1), draw, f"{phase} documents alone",
@@ -410,7 +412,8 @@ def test_packing_carried_by_the_model_inputs_scores_the_same_kl(phase, topk):
     _, by_columns = objective.scalar_loss(params, columns, step_at())
     _, by_inputs = objective.scalar_loss(params, carried, step_at())
 
-    assert float(by_inputs.metrics["indexer_kl"]) == float(by_columns.metrics["indexer_kl"])
+    assert (float(by_inputs.metrics["indexer_kl"].mean()[0])
+            == float(by_columns.metrics["indexer_kl"].mean()[0]))
 
 
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])
@@ -430,8 +433,8 @@ def test_padding_the_model_inputs_mask_leaves_out_counts_no_query(phase, topk):
     _, masked_by_segments = objective.scalar_loss(params, by_segments, step_at())
     _, masked_by_inputs = objective.scalar_loss(params, by_mask, step_at())
 
-    assert (float(masked_by_inputs.metrics["indexer_kl"])
-            == float(masked_by_segments.metrics["indexer_kl"]))
+    assert (float(masked_by_inputs.metrics["indexer_kl"].mean()[0])
+            == float(masked_by_segments.metrics["indexer_kl"].mean()[0]))
 
 
 def test_the_warmup_starts_a_fresh_indexer_beside_a_dense_checkpoint():
@@ -551,6 +554,6 @@ def test_the_warmup_trains_through_the_trainer():
     (before, aux), grads = jax.value_and_grad(
         lambda params: trainer.objective.scalar_loss(params, token_batch(), step_at()),
         has_aux=True)(initial.variables)
-    assert float(before) == float(aux.metrics["indexer_kl"])
+    assert float(before) == float(aux.metrics["indexer_kl"].mean()[0])
     assert float(optax.tree.norm(grads[FROZEN])) == 0
     assert float(optax.tree.norm(grads["params"])) > 0
