@@ -2218,8 +2218,10 @@ def test_a_concatenation_of_unindexed_files_is_provisioned_by_its_stores(tmp_pat
 
 
 @pytest.mark.parametrize("rows", [[{"x": 1}, {"x": 2, "y": 3}],
-                                  [{"meta": {"a": 1}}, {"meta": {"a": 2, "b": 4}}]],
-                         ids=["a-later-field", "a-nested-field"])
+                                  [{"meta": {"a": 1}}, {"meta": {"a": 2, "b": 4}}],
+                                  [{"items": np.array([{"a": 1}], dtype=object)},
+                                   {"items": np.array([{"a": 2, "b": 3}], dtype=object)}]],
+                         ids=["a-later-field", "a-nested-field", "a-field-in-an-array"])
 def test_an_arrow_export_refuses_a_field_its_schema_would_drop_and_commits_nothing(tmp_path, rows):
     """A Parquet export typed by its first chunk, one row a chunk, refuses a later row's field, or a nested
     struct's, that its schema has none of (the audit's DC2), and commits no export, where Arrow dropped the

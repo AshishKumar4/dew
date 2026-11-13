@@ -183,8 +183,9 @@ def _kept(value: Value, kind: pa.DataType, path: str) -> None:
                 _kept(entry, known[name], at)
         case str() | bytes() | bytearray():
             return
-        case Sequence() if pa.types.is_list(kind) or pa.types.is_large_list(kind) \
+        case Sequence() | np.ndarray() if pa.types.is_list(kind) or pa.types.is_large_list(kind) \
                 or pa.types.is_fixed_size_list(kind):
+            # An array is a list column as Arrow converts it, an object array's entries its structs.
             for entry in value:
                 _kept(entry, kind.value_type, f"{path}[]")
 

@@ -317,71 +317,68 @@ def structured(value) -> JSON:
     identity records apart), another configured object by what it computes, a container entry by entry (a
     mapping's in its order), an array by its fingerprint, a callable by its own identity (`StepIdentity`), a
     scalar as JSON holds it, and anything else by its text, without addresses."""
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        kind = type(value)
-        described: dict[str, JSON] = {"class": f"{kind.__module__}.{kind.__qualname__}"}
-        for field in dataclasses.fields(value):
-            held = getattr(value, field.name)
-            if field.repr or (field.metadata.get(ADDED) and held != field.default):
-                described[field.name] = structured(held)
-        return described
-    if isinstance(value, _Dependencies):
-        return json_value(value.dependencies(), type(value).__qualname__)
-    match value:
-        case None | bool() | int() | str():
-            return value
-        case float():
-            return value if np.isfinite(value) else {"float": value.hex()}
-        case Enum():
-            return {"enum": f"{type(value).__module__}.{type(value).__qualname__}", "name": value.name}
-        case list() | tuple():
-            return [structured(entry) for entry in value]
-        case Mapping():
-            # In its order, which a reader of it may take (a chat template's labels, rendered in turn).
-            return {"mapping": [[name if isinstance(name, str) else repr(name), structured(entry)]
-                                for name, entry in value.items()]}
-        case np.ndarray() | jax.Array():
-            return {"array": content_fingerprint(np.asarray(value)).hex()}
-        case np.generic():
-            return structured(value.item())
-        case np.dtype():
-            return {"dtype": str(value)}
-    if isinstance(value, type):
-        return {"class": f"{value.__module__}.{value.__qualname__}"}
-    if inspect.ismethod(value):
-        # A bound method computes what its object's configuration says.
-        return {"method": callable_name(value), "of": structured(value.__self__)}
-    if inspect.isfunction(value):
-        return {"function": StepIdentity.of(value).semantic()}
-    if inspect.isbuiltin(value):
-        return {"function": f"{value.__module__}.{value.__qualname__}"}
-    return {"text": re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))}
+    return _described(value)[0]
 
 
 def by_content(value) -> bool:
-    """Whether `structured` describes `value` by what it computes, which a later run's equal description
-    shows it computes again: a dataclass whose recorded fields are, a configured object (`dependencies`), a
-    scalar, a container whose entries are, an array, a type, a bound method of such an object, a builtin, or
-    a function whose identity a cache keys (`StepIdentity.keyable`: declared, `identity='name@version'`);
-    not an object it can describe only by its text, which two that compute otherwise can share."""
+    """Whether `structured`'s description of `value` is its alone, so an equal description shows a later
+    run reads the same value (row 5754): every part described by content and no two values of one
+    description, not a part described by its text, a function that declares no identity a cache keys
+    (`StepIdentity.keyable`), a list (described as a tuple is), a mapping keyed by other than text, or a
+    NumPy scalar (described as its Python value is)."""
+    return _described(value)[1]
+
+
+def _described(value) -> tuple[JSON, bool]:
+    """`structured`'s description of `value` and whether it is `value`'s alone (`by_content`): one walk."""
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return all(by_content(getattr(value, field.name))
-                   for field in dataclasses.fields(value) if field.repr)
+        kind = type(value)
+        described: dict[str, JSON] = {"class": f"{kind.__module__}.{kind.__qualname__}"}
+        alone = True
+        for field in dataclasses.fields(value):
+            held = getattr(value, field.name)
+            if field.repr or (field.metadata.get(ADDED) and held != field.default):
+                described[field.name], own = _described(held)
+                alone = alone and own
+        return described, alone
     if isinstance(value, _Dependencies):
-        return True
+        return json_value(value.dependencies(), type(value).__qualname__), True
     match value:
-        case None | bool() | int() | str() | float() | Enum() | np.ndarray() | jax.Array() | np.generic() \
-                | np.dtype() | type():
-            return True
+        case None | bool() | int() | str():
+            return value, True
+        case float():
+            return (value if np.isfinite(value) else {"float": value.hex()}), True
+        case Enum():
+            return {"enum": f"{type(value).__module__}.{type(value).__qualname__}", "name": value.name}, True
         case list() | tuple():
-            return all(by_content(entry) for entry in value)
+            entries = [_described(entry) for entry in value]
+            alone = isinstance(value, tuple) and all(own for _, own in entries)
+            return [entry for entry, _ in entries], alone
         case Mapping():
-            return all(by_content(key) and by_content(entry) for key, entry in value.items())
+            # In its order, which a reader of it may take (a chat template's labels, rendered in turn).
+            entries = [(name, _described(entry)) for name, entry in value.items()]
+            return ({"mapping": [[name if isinstance(name, str) else repr(name), entry]
+                                 for name, (entry, _) in entries]},
+                    all(isinstance(name, str) and own for name, (_, own) in entries))
+        case np.ndarray() | jax.Array():
+            return {"array": content_fingerprint(np.asarray(value)).hex()}, True
+        case np.generic():
+            return _described(value.item())[0], False
+        case np.dtype():
+            return {"dtype": str(value)}, True
+    if isinstance(value, type):
+        return {"class": f"{value.__module__}.{value.__qualname__}"}, True
     if inspect.ismethod(value):
-        return by_content(value.__self__)
+        # A bound method computes what its object's configuration says.
+        of, alone = _described(value.__self__)
+        return {"method": callable_name(value), "of": of}, alone
     if inspect.isfunction(value):
-        return StepIdentity.of(value).keyable(function=True, external=not value.__module__.startswith("dew."))
-    return inspect.isbuiltin(value)
+        identity = StepIdentity.of(value)
+        return {"function": identity.semantic()}, identity.keyable(
+            function=True, external=not value.__module__.startswith("dew."))
+    if inspect.isbuiltin(value):
+        return {"function": f"{value.__module__}.{value.__qualname__}"}, True
+    return {"text": re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))}, False
 
 
 def _printed_config(step: DataclassInstance, config: str, dependent: bool) -> str:

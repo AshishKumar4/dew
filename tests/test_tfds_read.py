@@ -156,8 +156,9 @@ inverted = tfds.decode.make_decoder()(_inverted)
 def test_a_cache_keys_a_tfds_decoders_function_and_arguments(tmp_path):
     """Decoders made by `tfds.decode.make_decoder` over one function, its arguments apart, cached under
     one root: each reads its own pixels (row 5754), where they shared one source fingerprint and the second
-    read the first's cache; a decoder whose function declares no identity keys no cache, and a plan over it
-    is no exact one, which a resume cannot tell it reads again."""
+    read the first's cache; a decoder whose function declares no identity, or bound to an argument its
+    record cannot tell from another (a list, recorded as a tuple is), keys no cache, and a plan over it is
+    no exact one, which a resume cannot tell it reads again."""
     root = str(tmp_path / "cache")
 
     def pixels(decoder) -> list[int]:
@@ -167,7 +168,8 @@ def test_a_cache_keys_a_tfds_decoders_function_and_arguments(tmp_path):
     one, five = pixels(offset(delta=1)), pixels(offset(delta=5))
     assert len(one) == 4 and [value - 4 for value in five] == one
     unnamed = TFDS("dew_images", path=str(FIXTURE), split="test", decoders={"image": inverted()})
-    with pytest.raises(ValueError):
-        pixels(inverted())
+    for unkeyed in (inverted(), offset(delta=[1])):
+        with pytest.raises(ValueError):
+            pixels(unkeyed)
     loader = compile(unnamed.batch(2), read="indexed", loading=Loading(workers=0, cache=False), steps=1)
     assert not loader.plan.manifest.exact
