@@ -965,7 +965,9 @@ The templates compute by their derived forms where the declarations state the wa
 derived one replaced is deleted with it, check 1 holding the derived forms to XLA's reference:
 
 - The attention forward. Every mainloop's step, merge and finish take the declaration's forms, with the sums
-  in the mainloop's own accumulator and every product through its own issuer. The declaration covers
+  in the mainloop's own accumulator and every product through its own issuer. (Today a finish of a state
+  already normalized, a merge of finished states (`finished_merged`), takes its sums as its output by hand,
+  `finish`'s `normalized`.) The declaration covers
   natural and base-2 exponents, keys-first tiles, initial states and score hooks; its products sum in fp32.
   A dropping call's step keeps the template's: the declaration narrows a dropped weight unnormalized, past
   fp16's largest at a rate near 1, where the template's scaled parts keep it. A walk's merge and finish name
@@ -998,8 +1000,9 @@ derived one replaced is deleted with it, check 1 holding the derived forms to XL
 
 The template's own forms, kept by hand rather than derived, run on every mainloop, the portable plain-JAX
 one among them, in three places:
-- the accurate forms (the compensated exponent, the largest weight held to 1, raw logits, the anchor test,
-  the keyed sums);
+- the accurate forms' anchor split and keyed sums (the accurate exponential, its rescale, the largest weight
+  held to 1 and raw logits' scale the declaration states, `declaration`'s `natural` and `raw`, which the
+  derivation evaluates as written, its step, merge and output derived around them);
 - compensated running sums and the scaled walk's sums at each row's power of two (`SCALED_WALK`);
 - representations the template keeps: the compensated prefix, the inverse by doubling, the launch structure.
 Those are rounding and representation choices the fast class does not make. The replacement rule holds:
