@@ -17,8 +17,10 @@
 #   --pip           use pip instead of uv
 #
 # The CUDA build is the newest of cuda_builds below, each build:least driver:least SM, generated from
-# dew._builds.CUDA_BUILDS, that the driver and every GPU's SM run. Dew needs Python python_min or
-# newer.
+# dew._builds.CUDA_BUILDS, that the driver and every GPU's SM run; on a GPU that holds tensor memory (an SM
+# major of tensor_memory_sms: a B200, a B300), only a build of CUDA tensor_memory_cuda or newer, as an older
+# build's cuBLAS frees a kernel's tensor memory twice beside Dew's own kernels (dew._builds). Dew needs Python
+# python_min or newer.
 set -eu
 
 # BEGIN install facts (site/scripts/gen_install.py)
@@ -26,6 +28,8 @@ python_min=3.12
 package_index=https://pypi.dewml.dev/simple
 pip_least='pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
 cuda_builds='cuda13:580:7.5 cuda12:525:5.2'
+tensor_memory_sms='10 11'
+tensor_memory_cuda=13
 # END install facts
 # BEGIN uv bootstrap (site/scripts/gen_install.py)
 uv_least=0.13.4
@@ -116,13 +120,18 @@ if [ -n "$gpus" ]; then
 	# The oldest build, the last entry, and its least driver.
 	oldest=${cuda_builds##* } least=${cuda_builds##* } least=${least#*:} least=${least%%:*}
 	runs=cpu why="SM $sm is older than JAX's CUDA builds support" name=${oldest%%:*}
-	if [ "$major" -lt "$least" ]; then why="CUDA ${name#cuda} needs driver $least or newer; update the driver to use the GPU"
+	# Whether the GPUs hold tensor memory, which only a build of CUDA tensor_memory_cuda or newer runs beside.
+	case " $tensor_memory_sms " in *" ${sm%%.*} "*) holds=1 ;; *) holds= ;; esac
+	if [ "$major" -lt "$least" ] && [ -z "$holds" ]; then why="CUDA ${name#cuda} needs driver $least or newer; update the driver to use the GPU"
 	elif [ -z "$sm" ]; then why="nvidia-smi did not report its compute capability; choose with --cuda, one of$(majors)"
 	else
 		for entry in $cuda_builds; do
-			least=${entry#*:} least=${least%%:*}
-			if [ "$major" -ge "$least" ] && at_least "${entry##*:}"; then runs=${entry%%:*}; break; fi
+			name=${entry%%:*} least=${entry#*:} least=${least%%:*}
+			if [ -n "$holds" ] && [ "${name#cuda}" -lt "$tensor_memory_cuda" ]; then continue; fi
+			if [ "$major" -ge "$least" ] && at_least "${entry##*:}"; then runs=$name; break; fi
+			[ -z "$holds" ] || needs="JAX's $name build, NVIDIA driver $least or newer"
 		done
+		[ -z "$holds" ] || [ "$runs" != cpu ] || why="this GPU needs $needs; update the driver to use the GPU"
 	fi
 	if [ "$runs" = cpu ]; then hardware="$gpu, driver $driver: no GPU build, as $why"
 	else hardware="$gpu, driver $driver, runs CUDA ${runs#cuda}"
@@ -137,6 +146,12 @@ else
 	runs=cpu hardware="no GPU or TPU, so the CPU build"
 fi
 [ -n "$build" ] || build=$runs
+# A build named with --cuda is taken whatever the driver says, but not below what the GPUs' tensor memory needs.
+case $build in cuda*)
+	if [ -n "${holds:-}" ] && [ "${build#cuda}" -lt "$tensor_memory_cuda" ]; then
+		die "this GPU holds tensor memory, which JAX's $build build's cuBLAS frees twice beside Dew's kernels (a hang or a wrong result): it needs the cuda$tensor_memory_cuda build or newer, --cuda $tensor_memory_cuda"
+	fi ;;
+esac
 
 # The Python environment.
 conda=

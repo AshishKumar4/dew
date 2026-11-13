@@ -226,6 +226,24 @@ def test_a_resumed_diloco_run_restores_each_replica_and_ends_where_an_unbroken_o
 
 
 @pytest.mark.mesh(devices=2)
+def test_a_diloco_run_resumes_at_the_split_its_replicas_pool(tmp_path):
+    """Each replica pools a window of the split its run was saved at, which no other split reads: a resume
+    that states another is refused, one that leaves it open plans at it, however the planner would choose
+    (row 5558)."""
+    def run(split=None):
+        return trainer(2, diloco=DiLoCo(every=2, rate=OUTER_RATE, momentum=MOMENTUM), path=tmp_path / "run",
+                       split=split)
+
+    with jax.enable_x64(new_val=True):
+        run(2).fit(dataset(), steps=2, checkpoint_every=1, log_every=1)
+        with pytest.raises(ValueError):
+            run(4).fit(dataset(), steps=3, checkpoint_every=1, log_every=1)
+        resumed = run()
+        assert int(resumed.fit(dataset(), steps=3, checkpoint_every=1, log_every=1).step) == 3
+        assert resumed.plan["split"] == 2
+
+
+@pytest.mark.mesh(devices=2)
 def test_a_diloco_mesh_holds_each_replicas_rows_and_inner_copy_on_its_own_devices():
     """A mesh of two DiLoCo replicas splits a batch's rows over them, holds each replica's inner copy on
     its own devices alone, and splits the outer parameters over the replicas where a dimension divides,

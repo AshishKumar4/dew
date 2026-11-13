@@ -15,7 +15,7 @@ from dew.batch import Batch
 from dew.data.dataset import Closeable, Records
 from dew.data.pipeline import Dataset
 
-from .base import Read, Shard, ShardManifest, source_record
+from .base import Read, Shard, ShardManifest, _single_indexed_manifest, source_record
 from .codec import Value
 from .iterator import _StreamIterator
 
@@ -96,16 +96,14 @@ class HF(Dataset):
 
         if not isinstance(self.dataset, Arrow):
             raise ValueError(f"{self.describe()} is an IterableDataset, read only as a stream")
-        return arrow_rows(self.dataset)
+        rows = arrow_rows(self.dataset)
+        return tuple(rows[index] for index in range(len(rows))) if read == "memory" else rows
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         from datasets import Dataset as Arrow
 
         if isinstance(self.dataset, Arrow):
-            rows = len(self.dataset)
-            # One shard, the Arrow dataset's records in their index order.
-            return ShardManifest((Shard(self.describe(), self.describe(), 0, rows, rows),), self._read_shard,
-                                 index_ordered=True)
+            return _single_indexed_manifest(self, self.describe())
         return ShardManifest(self._shards(self.dataset.n_shards), self._read_shard, self._shards)
 
     def _shards(self, count: int) -> tuple[Shard, ...]:
@@ -114,11 +112,9 @@ class HF(Dataset):
                      for index in range(count))
 
     def _read_shard(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
-        from datasets import Dataset as Arrow
+        from datasets import IterableDataset
 
-        if isinstance(self.dataset, Arrow):
-            return arrow_rows(self.dataset).to_iter_dataset(options)
-        if not isinstance(shard, _HFShard):
+        if not isinstance(shard, _HFShard) or not isinstance(self.dataset, IterableDataset):
             raise ValueError("a Hugging Face stream needs its own shard descriptor")
         return _Streamed(_undecoded(self.dataset), shard)
 

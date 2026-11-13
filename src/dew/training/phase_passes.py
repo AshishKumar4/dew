@@ -11,7 +11,7 @@ hands on.
 from __future__ import annotations
 
 import contextlib
-from collections.abc import Hashable, Iterator, Sequence
+from collections.abc import Collection, Hashable, Iterator, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -90,6 +90,15 @@ class PhasePasses[L, E]:
             raise ValueError(f"a batch of the run's phase {phase} meets phase_passes of {len(self.counts)} "
                              "phase(s): one count a phase")
         return self.counts[phase]
+
+    def begins(self, compiled: Collection[Hashable]) -> bool:
+        """Whether the step being compiled (`current`) begins a phase whose count no step of `compiled`
+        (keys of `key`) ran, past the run's first: a step planned afresh, at its own count's split, where
+        the run is at an update's end (`Trainer._unpooled`)."""
+        if self.current is None or not compiled:
+            return False
+        return all(not isinstance(held, tuple) or len(held) != 2 or held[1] != self.current
+                   for held in compiled)
 
     def at(self, batch: Batch) -> int | None:
         """The count of the phase `batch` was read in (`count`), taken as the step being compiled's

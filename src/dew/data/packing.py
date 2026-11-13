@@ -446,7 +446,7 @@ class PackedSource(View[Source]):
     def lengths(self) -> np.ndarray | None:
         return None
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         return _indexed_manifest(self, self.plan.location, 1024)
 
 

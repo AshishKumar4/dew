@@ -19,6 +19,7 @@ in a run's metrics, never its identity.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import itertools
 import logging
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
@@ -144,6 +145,12 @@ class ShardManifest:
     counted: Callable[[int], tuple[int, ...]] | None = None
     fixed_parts: bool = False
 
+    @property
+    def digest(self) -> str:
+        """The shards' ids in their order as one digest: what a stream reads in turn, which a plan records
+        as its `shards` rule's fact (`dew.data.compile._derived`) and a resume compares."""
+        return hashlib.sha256("\n".join(shard.id for shard in self.shards).encode()).hexdigest()[:16]
+
     def parts(self) -> tuple[Shard, ...]:
         """The store's finer shards its subdivision always cuts (`fixed_parts`), as a read by more readers
         than its shards cuts them; none where it cuts by count, or cuts none."""
@@ -213,10 +220,8 @@ class Source(Protocol):
         """The records by index, for a memory or an indexed read."""
         ...
 
-    def manifest(self, version: int) -> ShardManifest:
-        """The shards and their reader, for a streamed read of data plan `version`
-        (`dew.data.plan.PLAN_VERSIONS`), which decides a store's shards where
-        versions shard it otherwise (a Parquet store's, `dew.data.plan.FILE_SHARDS`)."""
+    def manifest(self) -> ShardManifest:
+        """The shards and their reader, for a streamed read."""
         ...
 
     def metadata(self) -> Mapping[str, object]:
@@ -310,8 +315,8 @@ class View[S: Source]:
     def records(self, read: Read) -> Records:
         return self.source.records(read)
 
-    def manifest(self, version: int) -> ShardManifest:
-        return self.source.manifest(version)
+    def manifest(self) -> ShardManifest:
+        return self.source.manifest()
 
     def lengths(self) -> np.ndarray | None:
         return self.source.lengths()
@@ -374,6 +379,36 @@ def _indexed_manifest(source: Source, uri: str, rows: int,
             for start in range(0, count, rows)
         ),
         _IndexedSlice(source) if reader is None else reader,
+        index_ordered=True,
+    )
+
+
+def _single_indexed_manifest(source: Source, uri: str) -> ShardManifest:
+    """One whole-store shard `(0..count)` for a single-reader stream, preserving the single-shard
+    positions earlier runs saved, with row-wise `subdivide` when readers × workers exceed one."""
+    count = len(source.records("indexed"))
+
+    def subdivide(required: int) -> tuple[Shard, ...]:
+        parts = min(required, count)
+        if parts < required:
+            return ()
+        step, remainder = divmod(count, parts)
+        bounds = [index * step + min(index, remainder) for index in range(parts + 1)]
+        return tuple(
+            Shard(
+                f"{uri}:{bounds[index]}:{bounds[index + 1]}",
+                uri,
+                bounds[index],
+                bounds[index + 1],
+                bounds[index + 1] - bounds[index],
+            )
+            for index in range(parts)
+        )
+
+    return ShardManifest(
+        (Shard(uri, uri, 0, count, count),),
+        _IndexedSlice(source),
+        subdivide=subdivide,
         index_ordered=True,
     )
 

@@ -32,8 +32,9 @@ dependencies = [
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
     "jax>=0.12.0.1.post85,<0.12.1",
-    # optax.contrib.MuonDimensionNumbers, which dew.newton_schulz types, is 0.2.6's.
-    "optax>=0.2.6",
+    # optax 0.2.8's Muon: the preconditionings Dew's Muon iterates by (`preconditioning`, its AOL and Schatten
+    # first steps, whose clamp dew.newton_schulz reads) and the iteration, layout and shape scalings it calls.
+    "optax>=0.2.8",
     "orbax-checkpoint>=0.12.4",
     "numpy>=2.0",
     "pillow>=10.1",

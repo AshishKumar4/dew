@@ -52,16 +52,20 @@ def preempting(at: int, **observed) -> Preempting:
     return Preempting(at_step=at, **observed)
 
 
-def finite(value) -> bool:
-    """Whether every floating or complex entry of `value` is finite, as a bit-for-bit comparison needs first:
-    NaN equals NaN to an array comparison that matches NaNs, and an infinity equals itself, so two runs or
-    two requests gone to NaN or overflow would pass as one. Integers, booleans and text hold none."""
-    values = np.asarray(value)
-    return values.dtype.kind not in "fc" or bool(np.all(np.isfinite(values)))
+def finite(tree) -> bool:
+    """Whether every floating or complex entry of `tree`'s leaves (a value, or a tree of them) is finite, as
+    a bit-for-bit comparison needs first: NaN equals NaN to an array comparison that matches NaNs, and an
+    infinity equals itself, so two runs or two requests gone to NaN or overflow would pass as one.
+    Integers, booleans and text hold none."""
+    return all(np.asarray(leaf).dtype.kind not in "fc" or bool(np.all(np.isfinite(np.asarray(leaf))))
+               for leaf in jax.tree.leaves(tree))
 
 
 def bits(state) -> list[np.ndarray]:
-    """Every leaf of a run's state on the host, a key as its raw bits, for a bit-for-bit comparison."""
-    return [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
+    """Every leaf of a run's state on the host, a key as its raw bits, for a bit-for-bit comparison, each
+    finite first (`finite`): two runs gone to NaN compare alike bit for bit."""
+    held = [np.asarray(jax.random.key_data(leaf) if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
             for leaf in jax.tree.leaves(state)]
+    assert finite(held), "a leaf of the run's state is not finite"
+    return held
 

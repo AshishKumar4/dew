@@ -9,12 +9,12 @@ from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 import grain.python as grain
 
 from dew.batch import Batch
-from dew.data.dataset import Loading, Ranges
+from dew.data.dataset import Closeable, Loading, Ranges
 from dew.data.declared import Declared, Unmirrored, mirrored
 from dew.data.once import locked_cached_property
 from dew.data.storage import Store, local, on_gcs
@@ -248,26 +248,33 @@ class ArrayRecords:
         """Grain's reader of the shards, made once however many read threads first ask for it at once: each
         made apart would check, pin and open every shard again (row 803: 83 readers made for a cache's 6
         shards on 16 threads, its replay 3.8 times slower than on one)."""
-        paths = []
-        for url, declared in zip(self.urls, self.declared, strict=True):
-            if declared is not None:
-                # ArrayRecord's reader opens paths alone, so a declared shard is read from a checked file
-                # on this host: its own, or its copy in Dew's mirror, a GCS one's too, held while it reads.
-                path, held = declared.leased()
-                self._pins.append(held)
-                paths.append(path)
-                continue
-            fs, path = Store(url, self.storage_options).resolve()
-            if local(fs):
-                paths.append(path)
-            elif on_gcs(fs):
-                paths.append("gs://" + path)
-            else:
-                pin = mirrored(Store(url, self.storage_options))
-                self._pins.append(pin)
-                paths.append(pin.name)
-        return grain.ArrayRecordDataSource(paths)
-
+        paths: list[str] = []
+        pins: list[BinaryIO] = []
+        try:
+            for url, declared in zip(self.urls, self.declared, strict=True):
+                if declared is not None:
+                    # ArrayRecord's reader opens paths alone, so a declared shard is read from a checked
+                    # file on this host: its own, or its copy in Dew's mirror, held while it reads.
+                    path, held = declared.leased()
+                    pins.append(held)
+                    paths.append(path)
+                    continue
+                fs, path = Store(url, self.storage_options).resolve()
+                if local(fs):
+                    paths.append(path)
+                elif on_gcs(fs):
+                    paths.append("gs://" + path)
+                else:
+                    pin = mirrored(Store(url, self.storage_options))
+                    pins.append(pin)
+                    paths.append(pin.name)
+            opened = grain.ArrayRecordDataSource(paths)
+        except BaseException:
+            for pin in pins:
+                pin.close()
+            raise
+        self._pins.extend(pins)
+        return opened
     def __len__(self) -> int:
         if not self.urls:
             return 0
@@ -300,7 +307,9 @@ class ArrayRecords:
 
     def close(self) -> None:
         self._shards.close()
-        self.__dict__.pop("reader", None)
+        reader = ArrayRecords.reader.taken(self)
+        if isinstance(reader, Closeable):
+            reader.close()
         for pin in self._pins:
             pin.close()
         self._pins.clear()

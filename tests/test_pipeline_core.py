@@ -26,7 +26,7 @@ from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
 from dew.data.dataset import DataPartition, Loading
 from dew.data.mixing import TokenDeficit, token_weights
-from dew.data.pipeline import Configured, Pipeline, Rejected, mix
+from dew.data.pipeline import Configured, Pack, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources import Files, Memory
 
@@ -2162,7 +2162,7 @@ def test_the_saved_order_names_the_stages_a_memory_read_ran_as_an_indexed_read_d
     documents = [{"text": np.arange(size, dtype=np.int32)} for size in (8, 1, 8)]
     packed = Pipeline(Memory(documents)).pack(8, bins=1).shuffle(0, window=2).repeat().batch(1)
     orders = [compile(packed, read=read, loading=READ).plan.order["stages"] for read in ("memory", "indexed")]
-    assert orders[0] == orders[1] and orders[0][0].startswith("Pack(")
+    assert orders[0] == orders[1] and isinstance(orders[0][0], Pack)
 
 
 def test_an_indexed_pack_over_a_token_store_reads_its_planned_global_windows(tmp_path):

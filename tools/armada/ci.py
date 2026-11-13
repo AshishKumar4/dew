@@ -21,7 +21,7 @@ test alone. Each group also pays the file's setup (its module's fixtures,
 imports and compiles), which is what armada measured the file at beyond its
 tests' times in tests/test_durations.json, at the cut its rows were last timed
 at and shared among that cut's groups (`measured_cut`), so the file takes the
-fewest groups whose heaviest, setup included, holds to `target` (`split`). A file weighs armada's
+fewest groups whose heaviest, setup included, holds to `target` (`cuts.split`). A file weighs armada's
 median of its last green runs, or its tests' sum in tests/test_durations.json where that is more
 (those runs may predate the file's current tests), else that sum scaled to armada, else the mean.
 Each entry names its rows, one a file (or a file's group), so armada grades a task that leaves
@@ -136,6 +136,7 @@ import sys
 import threading
 import time
 import tomllib
+import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
@@ -174,6 +175,7 @@ grading = _loaded(HERE / "grading.py")
 host = _loaded(HERE / "host.py")
 stalls = _loaded(HERE / "stalls.py")
 costs = _loaded(HERE / "costs.py")
+cuts = _loaded(HERE / "cuts.py")
 command_line = _loaded(HERE / "arguments.py")
 rows = _loaded(HERE / "rows.py")
 row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
@@ -398,7 +400,7 @@ class Reading:
         if module not in self.modules:
             self.modules[module] = units(module)
         found = self.modules[module]
-        return found.get(executed, b"missing") if isinstance(found, dict) else found
+        return found.get(executed, digests.MISSING) if isinstance(found, dict) else found
 
 
 def cache_key(common: str, name: str, split: str, depends: list[str],
@@ -504,6 +506,153 @@ def green_key(python: str, row_name: str, held: str, key: str) -> str:
     return f"{CACHE_PREFIX}-green/{python}/{row_place(row_name, held)}/{key}"
 
 
+SETS_KEPT = 8
+"""How many of a row's green runs' distinct executed sets its list keeps (`sets_key`), the most recently used
+first. A row's key hashes the inputs its run executed (`cache_key`), and runs of other trees, which trains,
+base/kernels' CI and lanes' runs make all day, execute other sets: in the records on 2026-11-12, every one of
+40 green runs sampled per row had a set of its own, and a row kept a median of 57 green runs over the bucket's
+14 days (about 4 a day) and at most 732 (about 52 a day). Eight hold the median row's last two days and the
+busiest row's last four hours, a tree's own set reused since staying first (`remembered`); each candidate
+costs a lookup only where its units are this tree's (`matchable`)."""
+
+
+def sets_key(python: str, row_name: str, held: str) -> str:
+    """Where row `row_name`'s list on class `held` of its green runs' executed sets is (`remembered`,
+    `green_record`): their digests (`set_digest`), as ccache's direct mode keeps a source's manifests; each
+    set's inputs are kept once by its digest (`set_key`), as a set runs to thousands of inputs and files one
+    process ran share theirs."""
+    return f"{CACHE_PREFIX}-sets/{python}/{row_place(row_name, held)}"
+
+
+def set_key(digest: str) -> str:
+    """Where the executed set of digest `digest` is kept, its inputs in order (`executed_set`)."""
+    return f"{CACHE_PREFIX}-set/{digest}"
+
+
+def epoch_key(python: str, row_name: str, held: str, common: str) -> str:
+    """Where row `row_name`'s epoch on class `held` on shared inputs `common` is named (`epoch`)."""
+    return f"{CACHE_PREFIX}-epochs/{python}/{common[:16]}/{row_place(row_name, held)}"
+
+
+class Unread(Exception):
+    """The Worker gave no answer for a row's epoch: no green run of it stands, none is recorded as one."""
+
+
+UNREAD = "unread"
+"""What a green run records as its epoch where none could be read or begun: no epoch's name, so it never
+stands (`standing`)."""
+
+
+def epoch(python: str, row_name: str, held: str, common: str, token: str) -> tuple[str | None, str | None]:
+    """The name of row `row_name`'s epoch on class `held` on these shared inputs (`epoch_key`) and its ETag,
+    the Worker's version of it; (None, None) where it has none; `Unread` where the Worker did not answer. A
+    red run begins a new epoch, a fresh name each, and a green run records the epoch it ran in, beginning one
+    where there is none (`begun`); a green run is reused only within its epoch (`standing`). So a red run,
+    whatever set it executed and whatever tree it ran on, revokes every green run recorded before it: no
+    lookup by another executed set, no plan's kept token and no set published again brings one back (review,
+    2026-11-12: a flaky red's set differs from its green's, so its own key revoked nothing). A name is never
+    reused, and no green run stands where a row has no epoch, so neither a green written after a red it read
+    nothing of nor an epoch the bucket's expiry took lets an earlier green run stand again: each costs a miss.
+    """
+    try:
+        with store(token).request("GET", epoch_key(python, row_name, held, common)) as reply:
+            if reply.body is None:
+                return None, None
+            tag = {name.lower(): value for name, value in reply.headers.items()}.get("etag")
+            return json.loads(reply.body.whole()).get("epoch"), tag
+    except (r2.R2Error, ValueError) as error:
+        raise Unread(f"the epoch of {row_name} on {held} was not read: {error}") from error
+
+
+def begun(python: str, row_name: str, held: str, common: str, token: str, after: str | None = None,
+          fresh_only: bool = False) -> str:
+    """A new epoch of row `row_name` on class `held` on these shared inputs, its fresh name written over the
+    epoch of ETag `after` (`epoch`; none: only where the row has none), and its name; `UNREAD` where the
+    Worker did not take it. Written only on that condition (If-Match, If-None-Match), so a write sent again
+    later, by a retry or by a connection that replays its request, never puts back an epoch a later one
+    replaced (review, 2026-11-12). A red run (`fresh_only` false) whose condition another write beat reads the
+    epoch again and begins the next after it, as it must revoke whatever stands; a green one gives up
+    (`UNREAD`): an epoch it did not read may be a red's."""
+    for attempt in range(RECORD_TRIES * 2):
+        if attempt:
+            time.sleep(min(2 ** attempt, 8) / 4)
+        name = uuid.uuid4().hex
+        condition = {"If-Match": after} if after is not None else {"If-None-Match": "*"}
+        try:
+            with store(token).request("PUT", epoch_key(python, row_name, held, common), headers=condition,
+                                      body=json.dumps({"epoch": name}).encode()):
+                return name
+        except r2.Conflict:
+            if fresh_only:
+                return UNREAD
+            try:
+                after = epoch(python, row_name, held, common, token)[1]
+            except Unread:
+                return UNREAD
+        except (r2.R2Error, ValueError) as error:
+            print(f"the test cache did not take a new epoch of {row_name}: {error}", file=sys.stderr)
+            if not isinstance(error, r2.Unavailable):
+                return UNREAD
+    return UNREAD
+
+
+def standing(found: dict, current: str | None) -> bool:
+    """Whether green record `found` was recorded in `current`, its row's epoch (`epoch`), which exists."""
+    return current is not None and found.get("epoch") == current
+
+
+@functools.lru_cache(maxsize=1024)
+def executed_set(digest: str, token: str) -> tuple[str, ...] | None:
+    """The inputs of the executed set of digest `digest` (`set_key`), read once a process however many rows
+    name it (a plan's threads share them); None where the Worker holds none, or one whose inputs hash
+    otherwise."""
+    found = recorded(set_key(digest), token)
+    held = tuple(found.get("depends", ())) if isinstance(found, dict) else ()
+    return held if held and set_digest(held) == digest else None
+
+
+def set_digest(depends: Sequence[str]) -> str:
+    """The digest of an executed set, its inputs in order."""
+    return hashlib.sha256(json.dumps(sorted(depends)).encode()).hexdigest()
+
+
+def matchable(depends: Sequence[str], reading: Reading) -> bool:
+    """Whether an executed set can be this checkout's: a set naming a unit a module here lacks
+    (`digests.MISSING`) was run by a tree that held it, so no key of it can be this one's, and no green run is
+    looked up for it."""
+    return not any(followed.CODE in path and path.partition(followed.CODE)[2] not in ("", followed.WHOLE)
+                   and reading.part(path) == digests.MISSING for path in depends)
+
+
+SETS_WRITTEN: set[str] = set()
+"""The executed sets this process has written (`remembered`), each once however many rows name it."""
+
+
+def remembered(python: str, row_name: str, held: str, depends: Sequence[str], token: str,
+               ran: bool = False) -> None:
+    """Row `row_name`'s executed set `depends` made the first of its list on class `held` (`sets_key`), the
+    least recently used leaving past `SETS_KEPT`: by every green run that records it (`ran`), and by every
+    task that reuses a green run by it, so a burst of other trees' runs evicts no set a tree still reuses. A
+    write lost to another at once loses a set from the list, never adds a wrong one: a miss, a run, never a
+    wrong reuse. A green run writes its set's inputs again (once a process), so they outlive every green
+    record that names them under the bucket's expiry, which counts from each object's last write (review,
+    2026-11-12)."""
+    digest = set_digest(depends)
+    # The set's inputs first, so a list never names a set the Worker lacks.
+    if ran and digest not in SETS_WRITTEN:
+        if not written(set_key(digest), token, json.dumps({"depends": sorted(depends)}).encode()):
+            return
+        SETS_WRITTEN.add(digest)
+    held_sets = (recorded(sets_key(python, row_name, held), token) or {}).get("sets", [])
+    if held_sets[:1] == [digest]:
+        return
+    if digest not in held_sets and digest not in SETS_WRITTEN and not written(
+            set_key(digest), token, json.dumps({"depends": sorted(depends)}).encode()):
+        return
+    kept = [digest, *(each for each in held_sets if each != digest)][:SETS_KEPT]
+    written(sets_key(python, row_name, held), token, json.dumps({"sets": kept}).encode())
+
+
 def recorded(key: str, token: str) -> dict | None:
     """The record at `key`, read (`record_of`), or None where there is none or the Worker did not give it."""
     found = record_of(key, token)
@@ -559,9 +708,9 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tupl
         for each in held:
             found = green_record(python, name, group, common, token, [each], reading)
             # Kept only where its green run is kept by its key, as the task reads it.
-            if found is not None and recorded(green_key(python, row(python, name, group), each, found["key"]),
-                                              token) is not None:
-                return f"{each}:{found['key']}"
+            if found is not None and recorded(
+                    green_key(python, row(python, name, group), each, found[0]["key"]), token) is not None:
+                return f"{each}:{found[0]['key']}"
         return None
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
@@ -644,22 +793,49 @@ def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[st
 
 
 def green_record(python: str, name: str, split: str, common: str, token: str,
-                 classes: list[str], reading: Reading | None = None) -> dict | None:
+                 classes: list[str], reading: Reading | None = None) -> tuple[dict, str] | None:
     """The record of test file `name`'s row (in `split`'s group) that ran green on exactly these inputs on one
-    of `classes`, the first found; else None. The plan (`reusable`) and a task (`reused`) read it alike, from
-    one reading of the inputs (`Reading`)."""
+    of `classes`, the first found, with its class; else None. The plan (`reusable`) and a task (`reused`) read
+    it alike, from one reading of the inputs (`Reading`). A row's key hashes the inputs its run executed, so
+    these inputs are keyed with each executed set a green run of the row recorded: the last run's on these
+    shared inputs first, then each set of the row's list (`sets_key`), most recently used first. A hit is
+    sound: its key equals a green run's only where every input that run executed, its units among them, holds
+    here what it held then, so this tree's run would execute the same set; a set naming a unit this tree lacks
+    is skipped unread (`matchable`). Keyed by the last run's set alone, a row run green on main was found by
+    no plan once a run of another tree came after it (2026-11-12: train 781's CI kept 2 of 4,180 tasks; a
+    reach of a comment's change planned 7,161 rows)."""
+    reading = Reading() if reading is None else reading
+    place = row(python, name, split)
     for each in classes:
-        found = recorded(record_key(python, row(python, name, split), each, common), token)
-        if found is None or found["depends"] is None:
+        tried: set[str] = set()
+        try:
+            current = epoch(python, place, each, common, token)[0]
+        except Unread:
             continue
-        # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of exactly
-        # these, kept by that key (`green_key`) whatever ran since.
-        key = cache_key(common, name, split, found["depends"], reading)
-        if found["key"] is not None and found["key"] == key:
-            return found
-        kept = recorded(green_key(python, row(python, name, split), each, key), token)
-        if kept is not None and kept["key"] == key:
-            return kept
+        if current is None:
+            continue
+        found = recorded(record_key(python, place, each, common), token)
+        if found is not None and found["depends"] is not None:
+            # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of
+            # exactly these, kept by that key (`green_key`) whatever ran since.
+            key = cache_key(common, name, split, found["depends"], reading)
+            if found["key"] is not None and found["key"] == key and standing(found, current):
+                return found, each
+            kept = recorded(green_key(python, place, each, key), token)
+            if kept is not None and kept["key"] == key and standing(kept, current):
+                return kept, each
+            tried.add(set_digest(found["depends"]))
+        for digest in (recorded(sets_key(python, place, each), token) or {}).get("sets", []):
+            if digest in tried:
+                continue
+            tried.add(digest)
+            depends = executed_set(digest, token)
+            if depends is None or not matchable(depends, reading):
+                continue
+            key = cache_key(common, name, split, list(depends), reading)
+            kept = recorded(green_key(python, place, each, key), token)
+            if kept is not None and kept["key"] == key and standing(kept, current):
+                return kept, each
     return None
 
 
@@ -681,12 +857,23 @@ def reused(python: str, name: str, split: str, common: str, network: bool = Fals
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
+    place = row(python, name, split)
     if kept is not None:
-        found = recorded(green_key(python, row(python, name, split), *kept), token)
-        if found is not None and found["key"] == kept[1] and fresh(found, name, common, reading):
+        found = recorded(green_key(python, place, *kept), token)
+        try:
+            current = epoch(python, place, kept[0], common, token)[0]
+        except Unread:
+            found = None
+        if found is not None and found["key"] == kept[1] and fresh(found, name, common, reading) and standing(
+                found, current):
+            remembered(python, place, kept[0], found["depends"], token)
             return found["row"]
-    found = green_record(python, name, split, common, token, reused_classes(network), reading)
-    return None if found is None else found["row"]
+    hit = green_record(python, name, split, common, token, reused_classes(network), reading)
+    if hit is None:
+        return None
+    # Its executed set the first of its row's list: a set reused stays while other trees' runs come and go.
+    remembered(python, place, hit[1], hit[0]["depends"], token)
+    return hit[0]["row"]
 
 
 def fresh(recorded: dict, name: str, common: str, reading: Reading | None = None) -> bool:
@@ -756,63 +943,13 @@ def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[s
             else recorded[name] * slower if name in recorded else None for name in files}
 
 
-def split(tests: list[float], seconds: float, target: float, cut: int = 1) -> list[float]:
-    """The weights of the groups a file that took `seconds` as `cut` groups runs as. Of those
-    seconds, what its recorded `tests`' times leave is what each group paid besides its tests (its
-    module's fixtures, imports and compiles, which a test's least recorded time does not hold), so
-    each group weighs its tests plus that setup. The file is cut (`session.groups`) into the fewest runs
-    whose tests fit what the setup leaves of `target`, at least half of it, so a file whose setup
-    is most of a group is not cut into slivers that each pay it again; a heavier test runs alone.
-    Counting the setup once a group, rather than scaling every test by the file's total, keeps a
-    file from being cut finer each run for the setup its last cut added. A file keeps the cut it
-    ran as while that cut's heaviest group, setup included, stays within `KEPT` of `target`:
-    a group's compiled programs are cached under its cut (tests/remote_cache.py), so a new cut
-    compiles every group from nothing, and the setup that measures moves the next cut again
-    (armada dew-20261020144644-dceff433: a new cut fetched no programs, and 14 of its 20 split
-    files would have been cut again). A file with no recorded time runs as equal counts of its
-    tests."""
-    if sum(tests) <= 0:
-        count = math.ceil(seconds / target)
-        return [seconds / count] * count
-    setup = max(seconds - sum(tests), 0.0) / cut
-    heaviest = max(sum(tests[run.start:run.stop]) for run in session.groups(tests, cut)) if cut > 1 else None
-    if heaviest is not None and heaviest + setup <= KEPT * target:
-        count = cut
-    else:
-        room = max(target - setup, target / 2)
-        count = len(session.starts(session.milliseconds(tests), round(room * 1000)))
-    return [sum(tests[run.start:run.stop]) + setup for run in session.groups(tests, count) if run]
-
-
-KEPT = 1.5
-"""How far past the target a split file's heaviest group may run before the file is cut again."""
-
-
 def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | None:
-    """What `name` took under `python` at the cut its rows in `timings` name, and that cut's count:
-    its groups' rows summed where every group of a count has its row (the most groups if several
-    counts do), else its whole row, else None. A row's median is measured at the cut its name
-    holds, unlike the file's median, which mixes the cuts of the runs it remembers."""
-    whole, counts = None, {}
-    for row_name, seconds in timings.get("rows", {}).items():
-        # A map task's seconds are kept under its task's name, no row's; a site's judge is no group of the cut
-        # (`sites`).
-        if ":" not in row_name:
-            continue
-        python_, name_, split_ = parsed_row(row_name)
-        # Nor is a GPU lane's process variant (`varied`): no armada plan cuts by one.
-        if ((python_, name_) != (python, name) or split_ == COLLECT or session.SITE.fullmatch(split_)
-                or VARIED in split_):
-            continue
-        if not split_:
-            whole = seconds
-            continue
-        index, count = (int(part) for part in split_.split("/"))
-        counts.setdefault(count, {})[index] = seconds
-    complete = [count for count, held in counts.items() if len(held) == count]
-    if complete:
-        return sum(counts[max(complete)].values()), max(complete)
-    return None if whole is None else (whole, 1)
+    """What `name` took under `python` at the cut its rows in `timings` name, and that cut's count
+    (`cuts.measured_cut`, over its rows by their groups); a map task's seconds are kept under its task's name,
+    no row's."""
+    return cuts.measured_cut({group: seconds for row_name, seconds in timings.get("rows", {}).items()
+                              if ":" in row_name for python_, name_, group in [parsed_row(row_name)]
+                              if (python_, name_) == (python, name)})
 
 
 APART = re.compile(r"\bpytest\.mark\.torchax\b")
@@ -1184,8 +1321,8 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
         groups: dict[str, list[tuple[str, float]]] = {}
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
-                at = costs.measured_as(recorded.get(name, []), seconds, measured_cut(timings, python, name))
-                cut = split(at[0], at[1], target, at[2])
+                cut = cuts.weighed(session, recorded.get(name, []), seconds, target,
+                                   measured_cut(timings, python, name))
                 groups[name] = [(f"{group}/{len(cut)}" if len(cut) > 1 else "", weight)
                                 for group, weight in enumerate(cut, start=1)]
         # Each check-1 site its file's marks shard is a row of its own, its judge's.
@@ -1863,9 +2000,23 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
         # plan, which cuts by the record alone, may cut the file otherwise (`session.cut`).
         key = (cache_key(common, name, parsed_row(row_["name"])[2], ran["depends"])
                if green and name not in unkeyed else None)
+        # A red run begins the row's next epoch first, so every green run recorded before it stands no
+        # more (`epoch`); a green one keeps the epoch it ran in, begun where the row has none, or none where
+        # neither was read or written.
+        try:
+            current, tag = epoch(python, row_["name"], held, common, token)
+        except Unread:
+            current, tag = UNREAD, None
+        if row_["exitCode"] != 0:
+            if current == UNREAD or begun(python, row_["name"], held, common, token, after=tag) == UNREAD:
+                continue
+            current = None
+        elif current is None:
+            current = begun(python, row_["name"], held, common, token, fresh_only=True)
         body = json.dumps({"key": key,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
-                           "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"]}).encode()
+                           "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"],
+                           "epoch": current}).encode()
         # The record under these inputs, which `reused` reads, and the last run's, which the GPU tier and
         # lane read, only once the first is written, so it is never newer.
         if written(record_key(python, row_["name"], held, common), token, body):
@@ -1876,6 +2027,8 @@ def record(python: str, rows: list[dict], log: Path, common: str, network: bool 
                 common, name, parsed_row(row_["name"])[2], ran["depends"])
             if ran_on is not None:
                 written(green_key(python, row_["name"], held, ran_on), token, body)
+            if key is not None:
+                remembered(python, row_["name"], held, ran["depends"], token, ran=True)
 
 
 def written(key: str, token: str, body: bytes) -> bool:
@@ -2282,12 +2435,11 @@ def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut
     """Whether a file's record `own` no longer cuts it as it runs: its tests differ from those its rows
     `observed` (one added, removed or renamed); a file within `target` (it took `seconds`), or one with no
     tests to cut, is recorded past it, so the plan would split what runs whole; or, for a file past it (as
-    `cut` groups), the groups the
-    plan cuts from the record (`split`) run a group past `KEPT` of the target as its tests ran, setup
-    included, and those it would cut from what they took run their heaviest shorter. A cut that fits is
-    kept whatever its tests' times drift, as the plan keeps it, and so is one whose heaviest group no cut
-    shortens (a test heavier than the budget, which runs alone either way): a fold rewrites a file only
-    where its plan changes for the better."""
+    `cut` groups), the groups the plan cuts from the record (`cuts.split`) run a group past `cuts.KEPT` of
+    the target as its tests ran, setup included, and those it would cut from what they took run their
+    heaviest shorter. A cut that fits is kept whatever its tests' times drift, as the plan keeps it, and so
+    is one whose heaviest group no cut shortens (a test heavier than the budget, which runs alone either
+    way): a fold rewrites a file only where its plan changes for the better."""
     if own.keys() != observed.keys():
         return True
     if seconds <= target or not own:
@@ -2298,10 +2450,10 @@ def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut
     setup = max(seconds - sum(ran), 0.0) / cut
 
     def heaviest(weights: list[float]) -> float:
-        count = len(split(weights, seconds, target, cut))
+        count = len(cuts.split(session, weights, seconds, target, cut))
         return max(sum(ran[run.start:run.stop]) + setup for run in session.groups(weights, count) if run)
 
-    return heaviest(recorded) > KEPT * target and heaviest(ran) < heaviest(recorded)
+    return heaviest(recorded) > cuts.KEPT * target and heaviest(ran) < heaviest(recorded)
 
 
 ARTIFACTS = "/armada/task/artifacts"

@@ -18,7 +18,7 @@ from dew.data import Loading, presets
 from dew.data.compile import compile, held, iterate
 from dew.data.dataset import Loader
 from dew.data.pipeline import Dataset, Pipeline
-from dew.data.plan import PLAN_VERSIONS, earlier_plan
+from dew.data.plan import PLAN_VERSIONS
 from dew.data.sources.tokens import TokenFiles
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective
@@ -908,121 +908,10 @@ def test_a_packed_runs_record_loads_where_its_token_store_is_not(tmp_path):
     assert int(config.run().step) == 1
 
 
-@pytest.mark.parametrize(("documents", "eos", "resumes"), [
-    ([[1, 2, 3, 4, 5]], None, True),
-    ([[1, 2, 0], [3, 0], [4, 5, 0]], 0, True),
-    ([[1, 0, 2], [3, 4, 5]], 0, False),
-    ([[1, 2], [3, 4]], None, False),
-], ids=["one-record", "eos-closed", "eos-within", "records-without-eos"])
-def test_a_plan_an_earlier_dew_saved_over_a_token_store_resumes_where_it_read_the_same_documents(
-        tmp_path, documents, eos, resumes):
-    """A Dew before row 3028 read a token store's documents by its EOS, or, stating none, its whole stream
-    as one, stating no lengths then, and named the store without saying how it reads them (`documents`).
-    Where it read the documents today's reads, the producer's records (one record with no EOS, or records
-    each closed by the EOS alone), a plan it saved resumes, read as today's names the store
-    (`earlier_plan`); where it read others (an EOS within a record, records without an EOS one stream to
-    it), however many, the plan, which counted those others, is refused."""
-    from dew.data import Memory
-    from dew.data.sinks import export
-
-    url = str(tmp_path / "tokens")
-    stated = {"token_store": True, "tokenizer": "byte", "vocab_size": 256, "dtype": "int32", "eos_id": eos}
-    export(Memory([{"text": np.asarray(document, np.int32)} for document in documents]), url,
-           format="array_record", length_field="text", metadata=stated)
-    # The store read whole, and its windows, whose fingerprint extends the store's with their own keys.
-    for read in (TokenFiles(url).batch(1), TokenFiles(url).pipe(presets.token_windows, seq_len=2, batch=1)):
-        plan = compile(read, read="memory", loading=Loading(workers=0)).plan
-        saved = json.loads(json.dumps(plan.record()))
-        (fingerprint,) = saved["manifest"]["source"]["sources"]
-        assert fingerprint.pop("documents") == "records"
-        # The lengths that Dew stated: none without an EOS; with one, its documents', today's where alike.
-        if "0/lengths" in saved["derived"] and (eos is None or not resumes):
-            saved["derived"].pop("0/lengths")
-        assert plan.check(plan.record()) == ()
-        # As a reader's `set_state` reads it: translated once (`earlier_plan`), then checked.
-        if resumes:
-            assert plan.check(earlier_plan(saved, plan)) == ()
-        else:
-            with pytest.raises(ValueError):
-                plan.check(earlier_plan(saved, plan))
-
-
-def _bare(value, alike=lambda fingerprint: True):
-    """`value` with each token store's `documents` dropped where `alike` holds of its fingerprint."""
-    if isinstance(value, list):
-        return [_bare(part, alike) for part in value]
-    if not isinstance(value, dict):
-        return value
-    if value.get("store") == "tokens" and alike(value):
-        value = {name: part for name, part in value.items() if name != "documents"}
-    return {name: _bare(part, alike) for name, part in value.items()}
-
-
-@pytest.mark.parametrize(("stores", "form", "resumes"), [
-    ([([[1, 2, 0], [3, 0]], 0), ([[4, 5, 0], [6, 0]], 0)], "before", True),
-    ([([[1, 0, 2], [3, 0]], 0), ([[4, 5, 0], [6, 0]], 0)], "before", False),
-    ([([[1, 2, 3]], None), ([[4, 5, 6, 7]], None)], "before", True),
-    ([([[1, 0, 2], [3, 0]], 0), ([[4, 5, 0], [6, 0]], 0)], "named", True),
-], ids=["eos-closed", "eos-within", "one-record", "named-where-other"])
-def test_a_mix_an_earlier_dew_saved_over_token_stores_resumes_where_it_read_their_documents_alike(
-        tmp_path, stores, form, resumes):
-    """A mix an earlier Dew saved keeps each member by a digest of what it reads: before row 3028 its token
-    stores named without `documents` and a store without an EOS stating no lengths; then for a while each
-    store named with `documents` only where that Dew had read others of it. A member that read its stores'
-    documents as today's reads them resumes as today's names it (`earlier_plan`); one whose store the
-    earlier Dew read otherwise, or whose sources changed, is refused."""
-    from dew.data import Memory, mix
-    from dew.data.plan import fingerprint
-    from dew.data.sinks import export
-
-    urls = []
-    for index, (written, eos) in enumerate(stores):
-        stated = {"token_store": True, "tokenizer": "byte", "vocab_size": 256, "dtype": "int32",
-                  "eos_id": eos}
-        urls.append(str(tmp_path / f"store-{index}"))
-        export(Memory([{"text": np.asarray(document, np.int32)} for document in written]), urls[-1],
-               format="array_record", length_field="text", metadata=stated)
-    plan = compile(mix([TokenFiles(url) for url in urls]).batch(1), read="streamed",
-                   loading=Loading(workers=0)).plan
-    assert set(plan.members) > {""}, "a streamed mix keeps its members by key"
-    record_now = json.loads(json.dumps(plan.record()))
-    within = {json.dumps(_bare(TokenFiles(url).fingerprint()), sort_keys=True)
-              for url, (written, eos) in zip(urls, stores, strict=True)
-              if eos is not None and any(eos in document[:-1] for document in written)}
-
-    def alike(store):
-        return json.dumps(_bare(store), sort_keys=True) not in within
-
-    def earlier_member(manifest):
-        if form == "named":
-            return _bare(manifest, alike)
-        bare = _bare(manifest)
-        unstated = {f"{index}/lengths" for index, source in enumerate(bare["sources"])
-                    if source["metadata"]["eos_id"] is None}
-        return {**bare, "derived": {name: value for name, value in bare["derived"].items()
-                                    if name not in unstated}}
-
-    members = {key: fingerprint(earlier_member(json.loads(json.dumps(manifest))) if key else manifest)
-               for key, (manifest, _) in plan.earlier_members.items()}
-    earlier = {**record_now, "members": members,
-               "manifest": _bare(record_now["manifest"], alike if form == "named" else lambda store: True)}
-    assert earlier["members"] != record_now["members"]
-    if resumes:
-        assert plan.check(earlier_plan(earlier, plan)) == ()
-        changed = {**earlier, "members": {**members, next(key for key in members if key):
-                                          fingerprint({"another": "member"})}}
-        with pytest.raises(ValueError):
-            plan.check(earlier_plan(changed, plan))
-    else:
-        with pytest.raises(ValueError):
-            plan.check(earlier_plan(earlier, plan))
-
-
 def test_a_run_over_a_token_store_with_an_eos_scans_none_of_its_tokens_for_its_identity(
         tmp_path, monkeypatch):
-    """A compile over a token store whose producer stated an EOS fingerprints it with no scan of its tokens
-    (row 3139): Dew's cache holds no record of an earlier reading of its documents, which only a resume of
-    a plan an earlier Dew saved asks for (`earlier_plan`)."""
+    """A compile over a token store whose producer stated an EOS fingerprints it from its committed
+    manifest and length indexes alone, with no scan of its tokens (row 3139)."""
     from dew.data import Memory
     from dew.data.sinks import export
 
@@ -1034,26 +923,6 @@ def test_a_run_over_a_token_store_with_an_eos_scans_none_of_its_tokens_for_its_i
     plan = compile(TokenFiles(url).batch(1), read="memory", loading=Loading(workers=0)).plan
     assert plan.manifest.semantic()["source"]["sources"][0]["documents"] == "records"
     assert not (tmp_path / "cache" / "dew" / "token-documents").exists()
-
-
-def test_whether_an_earlier_dew_read_a_token_stores_documents_alike_is_each_fields_own(tmp_path):
-    """An export holding two token fields is read alike by a Dew before row 3028 in one and not the other:
-    each field's records closed by the EOS alone, or not. Each field's store says so, whichever is read
-    first, so neither takes the other's answer from Dew's cache; and neither's fingerprint asks it, which
-    every run computes: it names how today's reads the documents, and the scan waits for a resume."""
-    from dew.data import Memory
-    from dew.data.sinks import export
-
-    url = str(tmp_path / "tokens")
-    stated = {"token_store": True, "tokenizer": "byte", "vocab_size": 256, "dtype": "int32", "eos_id": 0}
-    rows = [{"text": np.asarray([1, 0], np.int32), "ids": np.asarray([0, 1], np.int32)},
-            {"text": np.asarray([2, 0], np.int32), "ids": np.asarray([0, 2], np.int32)}]
-    export(Memory(rows), url, format="array_record", length_field="text", metadata=stated)
-    text, ids = TokenFiles(url), TokenFiles(url, field="ids")
-    assert text.fingerprint()["documents"] == ids.fingerprint()["documents"] == "records"
-    assert "_read_alike" not in vars(text) and "_read_alike" not in vars(ids)
-    assert not ids.read_alike()
-    assert text.read_alike()
 
 
 @pytest.mark.parametrize("eos", [None, 0], ids=["no-eos", "eos"])

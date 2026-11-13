@@ -111,7 +111,7 @@ class Torch(Dataset):
         indexed = TorchRecords(self.dataset, self.fields)
         return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         """The map-style records as a stream of consecutive index ranges (`_indexed_manifest`), as a
         memory source streams."""
         return _indexed_manifest(self, self.describe(), 1024)

@@ -46,7 +46,8 @@ from dew.distributed.batches import DevicePrefetchIterator, Signature, restore_p
 from dew.distributed.placement import MeshSpec, Placement
 from dew.held_updates import waiting
 from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
-from dew.optim import OptimConfig, reclocked
+from dew.optim import OptimConfig
+from dew.optim_schedules import reclocked
 from dew.state import TrainState
 from dew.telemetry.profile import Profiler, region
 from dew.training.budget import Pause, Plateau, every_step, recorded
@@ -350,6 +351,8 @@ class FitRun:
     last_local_saved: int | None = None
     stopped: bool = False
     training: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
+    update_flops: float | None = None
+    """One update's optimizer work beyond the model's (`OptimConfig.update_flops`), which its logs report."""
     source: Iterator[Batch] | None = None
     train: DevicePrefetchIterator | None = None
     partition: DataPartition | None = None
@@ -615,21 +618,26 @@ def restored(state: TrainState, resume: int, examples: int | None) -> TrainState
     """`state`, restored from step `resume`'s checkpoint, as the run reads on from it. A run on the
     examples clock (`examples`) refuses a checkpoint of a run on another clock, which kept no examples
     consumed (`TrainState.consumed`) for its schedule to read on from. A checkpoint that kept no tokens
-    waiting for an update its optimizer holds back (`TrainState.deferred`), as one written before they
-    waited, holds none: each call's tokens were committed with it."""
+    waiting for an update its optimizer holds back (`TrainState.deferred`), as an earlier Dew wrote it
+    before they waited, is refused."""
     if examples is not None and state.consumed is None:
         raise ValueError(
             f"step {resume}'s checkpoint is of a run counted in steps or tokens, which kept no examples "
             "consumed, and this run reads its schedule off them: resume it on the clock it was written "
             "on, or start a fresh run from its weights")
-    return dataclasses.replace(state, deferred=waiting(state.opt_state)) if state.deferred is None else state
+    if state.deferred is None and waiting(state.opt_state) is not None:
+        raise ValueError(
+            f"step {resume}'s checkpoint keeps no tokens waiting for the update its optimizer holds back, as "
+            "an earlier Dew wrote it: resume it with the Dew that wrote it, or start a fresh run from its "
+            "weights")
+    return state
 
 
 def afresh(initial: TrainState, made: optax.OptState, examples: int | None) -> TrainState:
     """A state supplied to a fit, which reads its data afresh: its clock of examples at none consumed
     where the run is on that clock (`examples`), none on another, and its schedules in the form the run's
-    own optimizer makes (`made`, its init's shapes; `dew.optim.reclocked`), a DiLoCo run's in each group's
-    inner state, its outer optimizer's as it is."""
+    own optimizer makes (`made`, its init's shapes; `dew.optim_schedules.reclocked`), a DiLoCo run's in each
+    group's inner state, its outer optimizer's as it is."""
     consumed = None if examples is None else jnp.zeros((), jnp.int32)
     if initial.inner is not None:
         return dataclasses.replace(initial, consumed=consumed, inner=regrouped(

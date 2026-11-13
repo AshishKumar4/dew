@@ -4,7 +4,6 @@ import dataclasses
 import functools
 from pathlib import Path
 
-import jax
 import numpy as np
 import pytest
 from test_text_presets import same_batches
@@ -45,39 +44,6 @@ def held_batches(loader) -> list:
             close()
 
 
-def test_a_chain_compiled_under_an_earlier_plan_lays_its_pairs_a_row_in_each_split():
-    """The preferences preset called with no `segments`, then split, compiled under a data plan from
-    before pairs packed into windows (`dew.data.plan.PAIR_WINDOWS`): each split reads the batches the same
-    chain reads with `segments=1` stated, a pair a row, its own records and no other's, in training and
-    held out (`Pipeline.at`, the preset's `earlier`). The call is made again where it stands in the chain
-    as it is now, over each split's own source: made on the chain as it stood when it was called, both
-    splits read every record. A call that states its `segments` reads as it states under either plan,
-    and under this Dew's plan the unstated call packs its pairs into windows."""
-    from dew.data.plan import IN_ORDER
-
-    # Twelve pairs, each its own ids, so a split that read another's records reads other batches.
-    pairs = Memory([{"chosen": [*[1, 2, 3, 4][: 2 + index % 3], index % 7],
-                     "rejected": [1, 2, 5][: 2 + index % 2],
-                     "chosen_mask": [*[0, 0, 1, 1][: 2 + index % 3], 1],
-                     "rejected_mask": [0, 0, 1][: 2 + index % 2]}
-                    for index in range(12)])
-
-    def loader(version=None, **stated):
-        train, held = pairs.pipe(presets.preferences, seq_len=6, batch=2, **stated).holdout(records=4)
-        options = {} if version is None else {"plan_version": version}
-        return compile(train, validation=held, read="indexed", loading=LOADING, **options)
-
-    rows = loader(segments=1)
-    for read in (loader(IN_ORDER), loader(IN_ORDER, segments=1)):
-        same_batches(rows, read, 4)
-        for expected, held in zip(held_batches(rows), held_batches(read), strict=True):
-            assert expected.keys() == held.keys()
-            jax.tree.map(np.testing.assert_array_equal, held, expected)
-    assert sum(len(batch["input_ids"]) for batch in held_batches(rows)) == 4
-    first = [next(iter(each.train(DataPartition())))["input_ids"] for each in (rows, loader())]
-    assert [np.ndim(ids) for ids in first] == [3, 2]
-
-
 @dataclasses.dataclass
 class Raised:
     """A callable chains are piped through that is no function and does not hash (a dataclass compares
@@ -101,10 +67,7 @@ def all_but_one(dataset):
 def test_a_chain_piped_through_many_calls_and_an_unhashable_callable_compiles():
     """A chain piped thirty times through a callable object that does not hash compiles, and reads each
     record through every call; so does one piped thirty times through a call that makes another store
-    of its input, which reads the records thirty such calls leave. Every compile reads its chain's calls
-    at its plan's version (`Pipeline.at`), each chain once and by no hash of a callable (a read that
-    followed each call's input chain again visited two to the thirtieth of them, and one keyed by the
-    callable raised TypeError before any reader opened)."""
+    of its input, which reads the records thirty such calls leave."""
     chain = Memory([{"id": np.int32(index)} for index in range(8)])
     for _ in range(30):
         chain = chain.pipe(Raised(1))

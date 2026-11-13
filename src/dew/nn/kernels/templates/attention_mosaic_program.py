@@ -424,12 +424,6 @@ def _padded(queries: int, keys: int, config: Tiles | BackwardTiles) -> tuple[int
     return whole(max(queries, 1), block), whole(max(keys, 1), block)
 
 
-DROPPING = Refusal('dropout_places',
-                  "the Mosaic mainloop draws dropout at its own places; a sequence exchange slice draws at "
-                  "its global places, a table gather a tile (`DropPlaces`)")
-"""Why this mainloop refuses a dropping call that draws at a slice's global places (`refused`)."""
-
-
 def launch_scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int, *, reduces: bool = True,
                  products: tuple | None = None) -> resources.Scope:
     """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s, and those it scopes after its
@@ -510,8 +504,6 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
     if hooks.rounds is not None and (backward or hooks.drop is not None or hooks.initial is not None):
         return ROUNDED
-    if hooks.drop is not None and (hooks.drop.queries is not None or hooks.drop.keys is not None):
-        return DROPPING
     if hooks.drop is not None and not algebra.drops_in_place(dtype, hooks.drop.bound):
         # Dropped weights past the dtype's largest take scaled parts (`algebra.dropped_parts`), which the
         # mainloop's sums in place do not take back (`mosaic.unscaled_part`).
@@ -874,7 +866,23 @@ def _hooked_of(hooks: Hooks, call: PaddedCall, unit: int) -> _Hooked:
         initial = call.rows(state.m, -jnp.inf), call.rows(state.total), _columns(acc, unit)
     output = tuple(_columns(value, unit) if param.kind == Kind.OUTPUT else value
                    for value, param in zip(call.output_params, hooks.output_params, strict=True))
-    return _Hooked(call.score_params, output, initial, hooks.drop)
+    return _Hooked(call.score_params, output, initial,
+                   placed_draws(hooks.drop, call.query.shape[1], call.key_rows))
+
+
+def placed_draws(drop: Dropout | None, queries: int, keys: int) -> Dropout | None:
+    """`drop` with its global places (`DropPlaces`, a sequence exchange's slice) at a launch's padded
+    `queries` and `keys`, both, a slice holding one whole its local places, so a program reads either's a
+    tile at a time beside its spans (`_coords`), every launch of a call's, its forward's and its backward's;
+    `drop` as it is where it draws at its local places."""
+    if drop is None or (drop.queries is None and drop.keys is None):
+        return drop
+
+    def padded(places: jax.Array | None, count: int) -> jax.Array:
+        places = jnp.arange(count, dtype=jnp.int32) if places is None else places.astype(jnp.int32)
+        return jnp.pad(places, (0, count - places.shape[0]))
+
+    return dataclasses.replace(drop, queries=padded(drop.queries, queries), keys=padded(drop.keys, keys))
 
 
 def _param(family: mosaic.Family, ref, kind: Kind, row, head, first, like, k_first=None, *,
@@ -1334,17 +1342,25 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
         k_pos = key_start + key_offsets
     else:
         k_pos = places(k_first, key_axis) if keys_read else k_first + family.iota(shape, key_axis)
-    if spans is None:
-        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first, tile_keys=tile_keys,
-                              key_start=key_start, key_offsets=key_offsets)
     keys = pl.ds(k_first, shape[key_axis])
     of_keys = family.rows_of if keys_first else family.columns_of
+    drop_at = None
+    if draw is not None and draw.queries is not None and draw.keys is not None:
+        # A draw at a slice's global places (`_placed_draws`): its queries' and keys' a tile's vectors, which
+        # the draw then reads in place of its tables (`algebra.drawn`).
+        of_queries = family.columns_of if keys_first else family.rows_of
+        drop_at = of_queries(draw.queries.at[pl.ds(first, shape[query_axis])]), of_keys(draw.keys.at[keys])
+        draw = dataclasses.replace(draw, queries=None, keys=None)
+    if spans is None:
+        return algebra.Coords(q_pos, k_pos, drop=draw, keys_first=keys_first, tile_keys=tile_keys,
+                              key_start=key_start, key_offsets=key_offsets, drop_at=drop_at)
     bounds, query_ids = held if held is not None else _query_bounds(family, spans, row, first,
                                                                     shape[query_axis], keys_first=keys_first)
     ids = None
     if query_ids is not None and spans.key_ids is not None:
         ids = query_ids, of_keys(spans.key_ids.at[row, keys])
-    return algebra.Coords(q_pos, k_pos, bounds, ids, draw, keys_first=keys_first, tile_keys=tile_keys)
+    return algebra.Coords(q_pos, k_pos, bounds, ids, draw, keys_first=keys_first, tile_keys=tile_keys,
+                          drop_at=drop_at)
 
 
 def _query_bounds(family: mosaic.Family, spans: _Spans, row, first, count: int, *, keys_first: bool = False

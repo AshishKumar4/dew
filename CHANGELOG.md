@@ -10,6 +10,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - Dew requires its JAX build 0.12.0.1.post85 (Python alone; the CUDA and PJRT plugins stay post81's): the
   GPU interpreter checks a barrier wait that names its phase at its waits alone, so consumers that take
   alternate tiles of one ring over several rotations, warps among them, are checked rather than refused.
+- `dew.optim_schedules` holds a solver's learning rate as operands of its state: `ScheduleBase`, `RateState`
+  and `ProgressState`, `scheduled_solver`, `rates_of`, `with_rates`, `with_horizons`, `learning_rate`,
+  `held_rates`, `scaled_rates`, `settable_rates`, `schedule_states`, `reclocked` and `stepped_rate` are
+  imported from there, where `dew.optim` held them; the schedule kinds (`Cosine`, `Linear`, `Power`,
+  `OneCycle`, `Exponential`) and `OptimConfig` stay in `dew.optim`.
+
 - Dew requires its JAX build 0.12.0.1.post84 (Python alone; the CUDA and PJRT plugins stay post81's): the
   toolkit's ring waits name their phase, so the interpreter checks two consumers that take alternate tiles
   of one ring; a tcgen05 pair's step block over a partial depth lowers; the lowering cache keys a program
@@ -21,6 +27,28 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   Mosaic GPU kernel over operands on a concrete mesh lowers a reshard of a literal, so a bf16 template
   decode on an Ampere or Ada GPU whose operands sit on a `NamedSharding` lowers, where it failed with
   "Shaped arrays must be represented by ir.Values, got: 0".
+- Data plan version 14, the last global one: a plan describes each step by its structure (its class and
+  fields, a callable by its own identity, an array by its fingerprint, a mapping in its order) and records,
+  by name, the rules its read takes its next rows by (`identity`, `shuffle`, `mix`, `dealing`, `grain`,
+  `phases`) and the shards a stream reads, each one value beside the code that implements it
+  (docs/design/data.md, the rules). A resume compares them and refuses a differing one by its name; a Grain
+  upgrade refuses only a position whose iterator state its iterators cannot restore. Phases that share a
+  corpus continue it from the draws the run trained. This Dew reads plans of 13 exactly (a run's resume
+  compiles its data at 13, and a per-share position of 13 resumes in a read compiled at 14 as 13 read it)
+  and refuses 8 to 12, naming both ways on: resume with the Dew that wrote it, or go on from its weights as
+  a new run that reads its data afresh. `Objective.bind_plan`, `dew.data.pipeline.earlier`, `Pipeline.at`
+  and `ObjectiveData.earlier` are gone, and `Source.manifest` takes no version.
+
+- A schedule's step horizons (its warmup's and decay's lengths in steps) are operands of its solver's state
+  (`RateState.horizons`) where a run builds it stated (`OptimConfig.build(stated=True)`), so a rehearsed run
+  and the run itself step one program over the persistent compile cache whatever their lengths. A schedule
+  states them through the new `ScheduleBase.horizons(steps)` hook, and `ScheduleBase.values` takes them
+  as `values(horizons, rates)` where it took `values(steps, rates)`: a subclass that read the run's length
+  in `values` overrides `horizons` to state the lengths it reads, or reads `{}`.
+
+- Dew requires optax 0.2.8 or later (was 0.2.6): Muon's Newton-Schulz is optax's own iteration, its layout,
+  shape scalings and preconditionings (AOL, Schatten) included, which 0.2.8 first ships.
+
 - A run's fit plan judges a head that keeps its whole logits by their fp32 bytes before it traces the step's
   gradient (`Objective.whole_head_table` names the head's table), and bounds the rung after a traced one
   from that trace, so a step whose whole logits leave no room is planned from one gradient trace and

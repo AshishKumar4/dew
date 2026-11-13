@@ -110,21 +110,3 @@ def timed(task: str, records: Sequence[Drawn], units: int) -> dict[str, float]:
         if rates:
             found[costed(task, word)] = statistics.median(rates)
     return found
-
-
-def measured_as(tests: Sequence[float], seconds: float,
-                measured: tuple[float, int] | None) -> tuple[list[float], float, int]:
-    """What ci.py's `split` cuts a file from: its recorded `tests`, with the seconds and the cut its rows
-    were `measured` at (ci.py's `measured_cut`), whose excess over the record is what each of that cut's
-    groups paid besides its tests. Where no run measured it at a cut, its tests scaled to the `seconds` it is
-    estimated at (ci.py's `weights`: its record times how much slower armada ran the files measured both
-    ways, or a median that mixes the cuts of the runs it remembers), as one group that paid nothing besides:
-    an estimate's excess over the record is no one group's setup, and taken for one, every group the file was
-    then cut into paid it again (2026-11-12: with one file's timing left to scale by, every other file weighed
-    1.6 times its record and the 0.6 was its setup, so tests/test_model_protocols.py's 10,537 s of tests were
-    planned as 195 groups of 6,500 s, 354 task-hours; armada sized the run by its longest tasks, gave the
-    sites' 874 map tasks 20 of its 688 containers, and train 772's CI ran out its deadline)."""
-    if measured is not None:
-        return list(tests), *measured
-    total = sum(tests)
-    return [each * seconds / total for each in tests] if total > 0 else list(tests), seconds, 1

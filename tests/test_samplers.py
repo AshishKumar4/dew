@@ -22,6 +22,7 @@ import pytest
 from diffusion_support import SourceOracle, relative_gap, walk
 from flax import linen as nn
 from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
+from sampling_gate import assert_draws_as_declared
 from tool_support import run_from
 
 from dew.diffusion import (
@@ -197,20 +198,34 @@ def masked_process():
     return DiscreteProcess(LogLinear(), mask_id=len(TOKEN_PROBS)), TokenOracle()
 
 
-def assert_token_frequencies(samples, tol=0.03):
-    counts = np.bincount(np.asarray(samples).ravel(), minlength=len(TOKEN_PROBS) + 1)
-    assert counts[-1] == 0, "a sample kept the mask"
-    np.testing.assert_allclose(counts[:-1] / counts.sum(), TOKEN_PROBS, atol=tol)
+TOKEN_SEEDS = 4
+"""The walks the masked case's frequencies pool, each 256 samples of 16 independent positions."""
+
+
+def assert_token_frequencies(walked):
+    """Each of `walked(seed)`'s positions, a full reveal holding no mask, drawn at TOKEN_PROBS as a fair
+    sampler would (the sampling gate, over TOKEN_SEEDS walks)."""
+    def counts(seed: int) -> np.ndarray:
+        held = np.bincount(np.asarray(walked(seed)).ravel(), minlength=len(TOKEN_PROBS) + 1)
+        assert held[-1] == 0, "a sample kept the mask"
+        return held[:-1]
+
+    assert_draws_as_declared(counts, TOKEN_PROBS, "the masked walk's tokens", seeds=TOKEN_SEEDS)
+
+
+def assert_gaussian_walk(walked):
+    """`walked`'s samples at the generator's default seed, the oracle's Gaussian (`assert_gaussian_stats`)."""
+    assert_gaussian_stats(walked(2))
 
 
 IMAGE = (8, 8, 3)
 PROCESS_CASES = {
-    "vp": (vp_process, IMAGE, assert_gaussian_stats),
-    "linear": (linear_process, IMAGE, assert_gaussian_stats),
-    "endpoint": (endpoint_process, IMAGE, assert_gaussian_stats),
-    "karras": (karras_process, IMAGE, assert_gaussian_stats),
-    "ve_endpoint": (ve_endpoint_process, IMAGE, assert_gaussian_stats),
-    "flow": (flow_process, IMAGE, assert_gaussian_stats),
+    "vp": (vp_process, IMAGE, assert_gaussian_walk),
+    "linear": (linear_process, IMAGE, assert_gaussian_walk),
+    "endpoint": (endpoint_process, IMAGE, assert_gaussian_walk),
+    "karras": (karras_process, IMAGE, assert_gaussian_walk),
+    "ve_endpoint": (ve_endpoint_process, IMAGE, assert_gaussian_walk),
+    "flow": (flow_process, IMAGE, assert_gaussian_walk),
     "masked": (masked_process, (16,), assert_token_frequencies),
 }
 """Each process family over an oracle of known data: the process and its
@@ -275,7 +290,8 @@ threshold every masked position reveals from its first draw, which samples the o
 
 def assert_reaches_its_data(case, solver, steps=100):
     build, shape, reaches = PROCESS_CASES[case]
-    reaches(generate(*build(), solver, steps, shape=shape))
+    process, model = build()
+    reaches(lambda seed: generate(process, model, solver, steps, shape=shape, seed=seed))
 
 
 @pytest.mark.parametrize("name", sorted(solvers))

@@ -190,31 +190,31 @@ def test_the_served_weights_are_restored_in_the_dtype_they_serve_in(example):
 
 
 def test_a_saved_run_records_its_widths_and_a_server_of_it_compiles_its_passes_up_front(decide, tmp_path):
-    """A fit records the most questions a row and options a question its data holds, as its layout steps
-    bound them (`Loader.widths`, `DecisionObjective.bind_widths`), with its checkpoint, over data that
-    states none ahead; the task loaded from the run pads each pass to them (`Budget`), so a scoring server
+    """A fit records the most options a question its data holds, as its layout steps bound them
+    (`Loader.widths`, `DecisionObjective.bind_widths`), with its checkpoint, over data that states none
+    ahead; the task loaded from the run pads each pass's questions to them (`Budget`), so a scoring server
     over it compiles its passes' programs up front (ledger 2074). A record written before runs recorded
-    widths loads with none, and its server compiles none ahead."""
+    them, or by one that recorded a count of questions beside them, loads with none, and its server
+    compiles none ahead."""
     asked = Example("the card was charged twice", {"q": Choice("Which team?", ["cards", "loans", "fraud"])},
                     {"q": "cards"})
     laid = decide.layout.rows(decide.tokenizer, decide.specials, asked.state, asked.questions)
-    widths = (max(len(row.questions) for row in laid), max(len(question.options) for row in laid
-                                                           for question in row.questions))
+    options = max(len(question.options) for row in laid for question in row.questions)
     objective = DecisionObjective(decide)
-    assert objective.widths is None
+    assert objective.options is None
     checkpoints = Checkpoints(str(tmp_path / "today"), keep=1)
     state = Trainer(objective, optax.sgd(0.0), key=0, checkpoints=checkpoints).fit(
         decision_rows([asked] * 8, 8, objective=objective.data()), steps=1, checkpoint_every=1, log_every=100)
     checkpoints.wait()
     record = objective.inference_record()
-    assert isinstance(record, dict) and (record["questions"], record["options"]) == widths
-    earlier = {name: value for name, value in record.items() if name not in ("questions", "options")}
+    assert isinstance(record, dict) and record["options"] == options and "questions" not in record
+    earlier = {**{name: value for name, value in record.items() if name != "options"}, "questions": 1}
     with Checkpoints(str(tmp_path / "earlier")) as written:
         written.save(1, state, artifact=earlier)
         written.wait()
     today, before = (Decide.from_run(str(tmp_path / name)) for name in ("today", "earlier"))
     # A pass's question slots are its windows' (`Decide.pass_shapes`): its options pad to the run's.
-    assert today.budget.options == widths[1] and before.budget.options is None
+    assert today.budget.options == options and before.budget.options is None
     server = ScoringServer.from_task(*today.scoring())
     assert server.programs and server.programs == today.pass_shapes
     assert not ScoringServer.from_task(*before.scoring()).programs
@@ -423,7 +423,10 @@ def test_a_scoring_server_reports_the_share_of_each_pass_shapes_tokens_its_rows_
     server.run()
     for future in futures:
         future.result()
-    held = [row for body in CASES.values() for row in task.admit(body).rows if row.media is None]
+    # The rows each request lays out, by a task of its own: admitting them again on the served task would
+    # count them again.
+    laid, _ = decide.scoring()
+    held = [row for body in CASES.values() for row in laid.admit(body).rows if row.media is None]
     shapes = task.passes.shapes
     assert shapes and sum(passes.real for passes in shapes.values()) == sum(
         len(row.encoded.tokens) for row in held)
@@ -434,7 +437,7 @@ def test_a_scoring_server_reports_the_share_of_each_pass_shapes_tokens_its_rows_
     metrics = server.metrics()
     # The server reports the task's passes and what it admitted and refused (`WireScoring.metrics`).
     assert metrics == {**task.passes.metrics(), **task.counts.metrics("served")}
-    assert metrics["data/rows/served"] == task.counts.accepted > 0
+    assert metrics["data/rows/served"] == task.counts.accepted == len(CASES)
     assert metrics["served/real_token_share"] == sum(passes.real for passes in shapes.values()) / computed
     assert 0 < metrics["served/real_token_share"] < 1
     assert {name for name in metrics if name.endswith("/passes")} == {

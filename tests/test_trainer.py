@@ -1155,8 +1155,9 @@ def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
 def test_a_checkpoint_of_the_retired_rate_scale_and_shape_is_refused(tmp_path):
     """Before 1.0 a configured rate was held as a scale times a schedule's shape, under
     `learning_rate_scale` and `learning_rate_shape` in the optimizer's state, where Dew now holds the
-    schedule's own fields (`dew.optim.RateState`). Resuming such a checkpoint is refused (ValueError),
-    even by a run whose state has the same tree, rather than stepping at a rate it no longer forms."""
+    schedule's own fields (`dew.optim_schedules.RateState`). Resuming such a checkpoint is refused
+    (ValueError), even by a run whose state has the same tree, rather than stepping at a rate it no longer
+    forms."""
     def factory(learning_rate_scale, learning_rate_shape):
         return optax.sgd(learning_rate_scale * learning_rate_shape)
 
@@ -1927,62 +1928,6 @@ class Counted(Objective):
         return loss, Aux({}, variables={"stats": {"seen": variables["stats"]["seen"] + 1}})
 
 
-class FrozenCounted(Counted):
-    """`Counted`, its collection written back in a Flax `FrozenDict`, as Flax's `apply` writes one
-    under `flax_return_frozendict`."""
-
-    def loss(self, variables, batch, step):
-        loss = jnp.sum(variables["params"]["w"] ** 2)
-        return loss, Aux({}, variables=frozen_dict({"stats": {"seen": variables["stats"]["seen"] + 1}}))
-
-
-class ListedCounted(Counted):
-    """`Counted`, its count held in a list, which the loss writes back as a Flax `FrozenDict`."""
-
-    def fresh_variables(self, key, held):
-        return {"params": {"w": jnp.ones((2,))}, "stats": {"seen": [{"count": jnp.zeros(())}]}}
-
-    def loss(self, variables, batch, step):
-        loss = jnp.sum(variables["params"]["w"] ** 2)
-        count = variables["stats"]["seen"][0]["count"] + 1
-        return loss, Aux({}, variables={"stats": {"seen": [frozen_dict({"count": count})]}})
-
-
-class FrozenListedCounted(Counted):
-    """`ListedCounted`, its count starting in a Flax `FrozenDict` in its list, which the loss writes back
-    as a dict."""
-
-    def fresh_variables(self, key, held):
-        return {"params": {"w": jnp.ones((2,))}, "stats": {"seen": [frozen_dict({"count": jnp.zeros(())})]}}
-
-    def loss(self, variables, batch, step):
-        loss = jnp.sum(variables["params"]["w"] ** 2)
-        count = variables["stats"]["seen"][0]["count"] + 1
-        return loss, Aux({}, variables={"stats": {"seen": [{"count": count}]}})
-
-
-def seen(stats) -> float:
-    """How many steps a `Counted` collection counted, held as `Counted` or `ListedCounted` holds it."""
-    held = stats["seen"]
-    return float(held[0]["count"] if isinstance(held, list) else held)
-
-
-@pytest.mark.parametrize("objective", [Counted, FrozenCounted, ListedCounted, FrozenListedCounted],
-                         ids=["dict", "frozen", "listed", "frozen-listed"])
-def test_aux_variables_are_written_back_into_the_state_and_checkpointed(tmp_path, objective):
-    """A collection the loss writes back replaces the state's, in the state's dicts whichever Flax
-    container it comes in, under a mapping or a list."""
-    trainer = make_trainer(tmp_path, objective=objective(), optimizer=optax.adamw(1e-2, weight_decay=1.0))
-    state = trainer.fit(dataset(), steps=3, log_every=1)
-    nodes = jax.tree.leaves(state.variables, is_leaf=lambda node: isinstance(node, FrozenDict))
-    assert not any(isinstance(node, FrozenDict) for node in nodes)
-    assert seen(state.variables["stats"]) == 3.0
-    assert set(state.opt_state[0].mu) == {"w"}
-
-    restored, _ = trainer.checkpoints.restore()
-    assert seen(restored["variables"]["stats"]) == 3.0
-
-
 class ListedParameters(Objective):
     """Parameters held in a list, as a stack of layers can be."""
 
@@ -2036,10 +1981,11 @@ def test_a_tree_of_any_kind_of_mapping_is_held_as_dicts_where_it_enters(tmp_path
     """A tree a run is handed holds its collections in any kind of mapping (a dict, a Flax
     `FrozenDict`, an `OrderedDict`), under a list or a tuple too: where the objective's init returns
     it, where a supplied state holds it and where the loss writes it back, the state holds it as
-    dicts, so every step's tree has one structure and the run counts every step."""
+    dicts, so every step's tree has one structure and the run counts every step; the collection is no
+    parameter the optimizer holds moments of, and its checkpoint restores its count."""
     objective = Kinded(kind if entry == "init" else "dict", kind if entry == "write-back" else "dict",
                        container)
-    trainer = make_trainer(tmp_path, objective=objective, optimizer=optax.sgd(1e-2))
+    trainer = make_trainer(tmp_path, objective=objective, optimizer=optax.adamw(1e-2, weight_decay=1.0))
     supplied = None
     if entry == "supplied":
         initial = trainer.initial_state()
@@ -2050,6 +1996,10 @@ def test_a_tree_of_any_kind_of_mapping_is_held_as_dicts_where_it_enters(tmp_path
         state, is_leaf=lambda node: isinstance(node, Mapping) and type(node) is not dict)
         if isinstance(node, Mapping)]
     assert not others and float(counted(state.variables["stats"])) == 3.0
+    assert set(state.opt_state[0].mu) == {"w"}
+    trainer.checkpoints.wait()
+    restored, _ = trainer.checkpoints.restore()
+    assert float(counted(restored["variables"]["stats"])) == 3.0
 
 
 @jax.tree_util.register_pytree_node_class
@@ -2111,17 +2061,6 @@ def test_a_supplied_state_whose_parameters_and_moments_hold_a_frozen_dict_in_a_l
     state = trainer.fit(dataset(), steps=2, log_every=1, state=supplied)
     nodes = jax.tree.leaves(state, is_leaf=lambda node: isinstance(node, FrozenDict))
     assert int(state.step) == 2 and not any(isinstance(node, FrozenDict) for node in nodes)
-
-
-def test_a_supplied_state_holding_a_frozen_dict_in_a_list_trains_as_its_dicts_do(tmp_path):
-    """A state handed to fit holds its trees as dicts of its own, a Flax `FrozenDict` in a list
-    included, so the collection its loss writes back keeps the state's structure."""
-    trainer = make_trainer(tmp_path, objective=ListedCounted(), optimizer=optax.adamw(1e-2, weight_decay=1.0))
-    initial = trainer.initial_state()
-    stats = {"seen": [frozen_dict({"count": initial.variables["stats"]["seen"][0]["count"]})]}
-    state = trainer.fit(dataset(), steps=3, log_every=1,
-                        state=dataclasses.replace(initial, variables={**initial.variables, "stats": stats}))
-    assert seen(state.variables["stats"]) == 3.0
 
 
 # --------------------------------------------------------------------------

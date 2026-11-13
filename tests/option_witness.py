@@ -34,6 +34,7 @@ from run_kinds import (
 
 from dew import registry
 from dew._cli.main import main
+from dew._records import annotations_of
 from dew.config import RunConfig
 from dew.decision.layout import QuestionSegment, Reads, built_in
 from dew.registry import objectives
@@ -130,7 +131,7 @@ def alternatives(annotation, base=None) -> list[object]:
             # The saved value with one field changed, each field's alternatives in turn: the fields of
             # its own class, a subclass's beside the annotation's.
             saved = type(base)
-            hints = typing.get_type_hints(saved)
+            hints = annotations_of(saved)
             changed = []
             for name in (field.name for field in dataclasses.fields(saved) if field.init):
                 for value in alternatives(hints[name], getattr(base, name)):
@@ -139,7 +140,7 @@ def alternatives(annotation, base=None) -> list[object]:
                     except (TypeError, ValueError):
                         continue
             return [base, *(value for value in changed if value != base)]
-        hints = typing.get_type_hints(annotation)
+        hints = annotations_of(annotation)
         fields = [field.name for field in dataclasses.fields(annotation) if field.init]
         declared = {name: alternatives(hints[name]) for name in fields}
         declared = {name: values for name, values in declared.items() if len(values) > 1}
@@ -243,7 +244,7 @@ def reach(run: RunConfig, objective: str, name: str, annotation, argument: bool 
     named = bare(annotation) in (int, float, str, bool)
 
     def paths(config, prefix: str):
-        hints = typing.get_type_hints(type(config), include_extras=True)
+        hints = annotations_of(type(config), include_extras=True)
         for field in dataclasses.fields(config):
             value, hint = getattr(config, field.name), hints[field.name]
             if field.name == name if named else holds(bare(hint), bare(annotation)):
@@ -273,7 +274,7 @@ class Option:
 def unwitnessed(kind: type, options) -> list[str]:
     """The fields of `kind` of Dew's types (`dews`) that declare fewer than two alternatives, so no option
     of `options` witnesses them, none declared derived from the run nor a record, its writer's."""
-    hints = typing.get_type_hints(kind)
+    hints = annotations_of(kind)
     return [field.name for field in dataclasses.fields(kind) if field.name not in options
             and dews(hints[field.name]) and "derived" not in field.metadata and not record(hints[field.name])]
 
@@ -284,7 +285,7 @@ def options_of(run: RunConfig, objective: str, kind: type, base, prefix: str = "
     (`ObjectiveConfig.build`); where its saved value is a dataclass the run builds from fields of its own
     (a decision run's layout from its budgets, `_budgeted`), its options are that value's fields', each
     reached as the run sets it. A field of Dew's types that no alternative witnesses fails."""
-    hints = typing.get_type_hints(kind)
+    hints = annotations_of(kind)
     fields = {field.name: field for field in dataclasses.fields(kind)}
     declared = witnessed(kind, base)
     missing = unwitnessed(kind, declared)
@@ -354,7 +355,7 @@ of its own (`dew.inference.models.ModelSettings`)."""
 def witnessed(settings: type, base=None) -> dict[str, list[object]]:
     """Each field of `settings` its record holds that declares alternatives (`alternatives`), with them:
     about `base`'s value of it, the settings a run saved, where given."""
-    hints = typing.get_type_hints(settings)
+    hints = annotations_of(settings)
     # A field its class's record holds none of (`metadata={"record": False}`) is no option a saved task
     # is built with: no save states it (a question layout's reading under an earlier data plan).
     declared = {field.name: alternatives(hints[field.name], getattr(base, field.name, None))
@@ -536,7 +537,7 @@ def witnessed_on(builder, objective: str, settings: type, root: Path, elsewhere:
               for name, option in options.items()
               if (found := option.found) is not None and name not in elsewhere}
     reachable = {name: option.found for name, option in options.items() if option.found is not None}
-    hints = typing.get_type_hints(type(run), include_extras=True)
+    hints = annotations_of(type(run), include_extras=True)
 
     def flags(assigned: dict[str, object]) -> dict[str, str]:
         """The `--set`s of each option `assigned`, and of what its reader takes it only beside (`BESIDE`)."""

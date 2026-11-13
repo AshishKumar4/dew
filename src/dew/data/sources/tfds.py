@@ -425,7 +425,7 @@ class TFDS(Dataset):
             indexed = indexed.map(_Texts(texts))
         return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         return _indexed_manifest(self, str(self.builder.data_path), self.shard_rows)
 
     def stated(self) -> Mapping[str, object]:

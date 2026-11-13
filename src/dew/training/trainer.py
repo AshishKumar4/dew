@@ -15,6 +15,7 @@ import dataclasses
 import datetime
 import functools
 import logging
+import math
 import os
 import sys
 import time
@@ -77,13 +78,14 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import (
-    STACKED_OPTIMIZERS,
-    declaring,
+from dew.optim import STACKED_OPTIMIZERS, declaring, with_bounds
+from dew.optim_schedules import (
+    ScheduleBase,
     held_rates,
     scaled_rates,
+    schedule_states,
     settable_rates,
-    with_bounds,
+    with_horizons,
     with_rates,
 )
 from dew.registry import Unrecordable
@@ -123,7 +125,7 @@ from dew.training._fit import (
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau
 from dew.training.cadence import Counted
-from dew.training.compiler import Compiled, CompiledStep, StepCompiler
+from dew.training.compiler import Compiled, CompiledStep, StepCompiler, laid_out
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -294,6 +296,9 @@ class Trainer(Generic[Loss, Effects]):
         # How the run's batches are cut and counted (`RunShape`): the microbatches a step's batch is read in
         # start 1 where `whole`, else as stated, until a pooling state's window or the first plan decides.
         self._shape = RunShape(split=1 if whole is not None else split)
+        # The split the run was given, which a phase planned afresh at an update's end plans under
+        # (`_compiled_for`); None where the planner chooses.
+        self._given_split = self._shape.split
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -636,7 +641,24 @@ class Trainer(Generic[Loss, Effects]):
         places the state (`Checkpoints.position`), and restores the state alone. A run handed a step
         compiled ahead builds it with the programs compiled with the step (`_taking`)."""
         with self._taking():
-            return self._placing(start, positioned=positioned)
+            state, shardings, position = self._placing(start, positioned=positioned)
+        return self._stated(state), shardings, position
+
+    def _stated(self, state: TrainState) -> TrainState:
+        """`state` with its scheduled solvers' step horizons this run's (`OptimConfig.horizons`), which a
+        configured run's optimizer holds as operands it sets on every state it steps (`stated`,
+        `dew.optim_schedules.with_horizons`): its step and its start are one program at any length of run, a
+        rehearsal's or a restart's served from the persistent cache. A restore's template (`_placing`)
+        holds them made, so a checkpoint saved without them restores. A trainer given an Optax
+        transformation keeps its own."""
+        config = self._config
+        if config is None:
+            return state
+        steps = self._shape.updates
+        horizons = config.horizons(steps, clocked=self._shape.examples is not None)
+        schedules = {group: rate for group, (rate, _) in config.grouped_rates().items()
+                     if isinstance(rate, ScheduleBase)}
+        return rates_set(state, lambda held: with_horizons(held, horizons, schedules, steps))
 
     def _placing(self, start: Start, *, positioned: bool
                  ) -> tuple[TrainState, Placement[TrainState], bytes | None]:
@@ -656,10 +678,8 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, abstract.variables,
                 lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype)))
         share = DataPartition.of(self.device_mesh) if positioned else None
-        # The groups a checkpoint may hold packed, named on the stored layers it holds (`row_shapes`).
-        served = self.objective.served_groups(self._staging.row_shapes(abstract.variables))
-        state, position = self._staging.restore(checkpoints, placed_shapes(abstract, shardings), resume,
-                                               share, served=served)
+        state, position = self._staging.restore(checkpoints, self._stated(placed_shapes(abstract, shardings)),
+                                               resume, share)
         state = restored(state, resume, self._shape.examples)
         _rollout_resumed(self.rollout, checkpoints, resume, state.key.sharding)
         if (config := self._config) is not None:
@@ -1079,7 +1099,7 @@ class Trainer(Generic[Loss, Effects]):
         transformation keeps it."""
         if self._config is None:
             return
-        built = self._config.build(updates, clocked=self._shape.examples is not None)
+        built = self._config.build(updates, clocked=self._shape.examples is not None, stated=True)
         self._shape = dataclasses.replace(self._shape, updates=updates)
         self._optimizer = declaring(self.objective.optimizer(built), self._boxed_axes)
 
@@ -1102,6 +1122,13 @@ class Trainer(Generic[Loss, Effects]):
                                                   resumed=initial is None and interval.last_saved is not None)
         if complete:
             return state
+        # The update's work beyond the model's, of an optimizer the objective steps its params with whole: one
+        # that phases it apart (`Objective.optimizer`, a consistency distillation's two networks) states none.
+        if self._config is not None and type(self.objective).optimizer is Objective.optimizer:
+            spread = math.prod(size for axis, size in self.device_mesh.shape.items() if axis != STAGE_AXIS)
+            # Read under the axes the modules boxed, a stage-local run's stacked by stage, as `_groups` reads.
+            with self._staging.held(boxed(self._boxed_axes())):
+                run.update_flops = self._config.update_flops(state.variables["params"], devices=spread)
         compiled: dict[Hashable, tuple[CompiledStep, StepFlops | None]] = run.compiled
         seen = 0
         run.notice = PreemptionNotice()
@@ -1258,8 +1285,9 @@ class Trainer(Generic[Loss, Effects]):
             initial = owned_dicts(self._staging.received(self.objective, dataclasses.replace(
                 initial, variables=dict(initial.variables))))
             with self._staging.held(boxed(self._boxed_axes())):
-                initial = afresh(initial, jax.eval_shape(self.optimizer.init, initial.variables["params"]),
-                                 self._shape.examples)
+                initial = self._stated(afresh(initial, schedule_states(self.optimizer,
+                                                                       initial.variables["params"]),
+                                              self._shape.examples))
             supplied, shardings = self._staging.supplied(initial, lambda staged: self._validated(staged)[0])
             return int(supplied.step), None, lambda: (supplied, shardings), None
         start = self._started(resume)
@@ -1853,9 +1881,18 @@ class Trainer(Generic[Loss, Effects]):
         run's step, else at the state's.
         """
         state = self._staged(state, run.current)
+        signature = self.phase_passes.key(batch_signature(batch))
+        if signature not in compiled and self.phase_passes.begins(compiled) and (
+                state.window is None or int(state.microstep) % int(state.window_size) == 0):
+            # A phase of other passes begins at an update's end: its step is planned afresh, at the split
+            # the run was given or the planner's for its own passes, over the state as a fresh state holds
+            # it, no window laid out; one that begins inside an update keeps the run's, the one its open
+            # window is laid out for.
+            self._shape = dataclasses.replace(self._shape, split=self._given_split)
+            if state.inner is None:
+                state = laid_out(state, self.accumulation)
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.
         trials = Trials(state, batch)
-        signature = self.phase_passes.key(batch_signature(batch))
         if signature not in compiled:
             self._read_taken(run)
             # A process whose reader changed a field or a shape would compile
@@ -1969,7 +2006,8 @@ class Trainer(Generic[Loss, Effects]):
             return
         read, elapsed = reading
         scalars = {**logged_scalars(read, taken.counts, elapsed, self.device_mesh.devices.size,
-                                    rollout=self.rollout is not None), **run.startup.scalars()}
+                                    rollout=self.rollout is not None, update_flops=run.update_flops),
+                   **run.startup.scalars()}
         self._display.interval(taken.step, scalars)
         if self.tracker is not None:
             self.tracker.log(scalars, taken.step)

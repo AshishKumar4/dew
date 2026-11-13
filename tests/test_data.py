@@ -312,7 +312,7 @@ def test_automatic_workers_read_each_run_length_as_a_read_in_none_does_within_th
 def test_a_read_cut_per_share_reads_one_order_in_any_count_of_workers():
     """A training read cut per share, its steps run in its loading workers before an expansion that makes
     its rows a stream, reads the batches it reads in no workers in one, two, four and the count automatic
-    loading resolves to (`IN_ORDER`, `_Build.in_order`): each worker reads whole groups of consecutive inputs
+    loading resolves to (`_Build.in_order`): each worker reads whole groups of consecutive inputs
     by index and they are handed on in turn. A position saved in any count resumes in any other on the
     batches the uninterrupted read goes on to (row 4862)."""
     chain = (Pipeline(Memory(_Indexed(40))).shuffle(5).repeat().random_map(_Jittered())
@@ -392,14 +392,12 @@ class _Tokens:
 
 
 @pytest.mark.parametrize("chain", ["chunked", "expanded twice"])
-def test_a_read_in_order_counts_its_rows_and_examples_as_the_earlier_read(chain):
-    """A read cut per share in its inputs' order (`IN_ORDER`), in no workers and in two, counts what a
-    version 10 read counts of the same batches: a cut into chunks its records' chunks
-    (`data/chunks_per_record`), which the reading process keeps, and an objective's expansion after
-    another the source examples it makes rows of (`FlatMap.examples`), each where it stands (review of
-    row 4862)."""
+def test_a_read_in_order_counts_its_rows_and_examples_alike_in_any_count_of_workers(chain):
+    """A read cut per share in its inputs' order (`_Build.in_order`), in no workers and in two, counts the
+    same of the same batches: a cut into chunks its records' chunks (`data/chunks_per_record`), which the
+    reading process keeps, and an objective's expansion after another the source examples it makes rows
+    of (`FlatMap.examples`), each where it stands (review of row 4862)."""
     from dew.data.pipeline import FlatMap
-    from dew.data.plan import FILE_SHARDS
     from dew.data.text import Chunks
 
     source = Pipeline(Memory(_Indexed(30)), name="docs").shuffle(5).repeat()
@@ -408,10 +406,9 @@ def test_a_read_in_order_counts_its_rows_and_examples_as_the_earlier_read(chain)
     else:
         built = source.flat_map(_Spread())._then(FlatMap(_Spread(), examples=True)).batch(4)
 
-    def counted(workers, version):
-        pinned = {} if version is None else {"plan_version": version}
+    def counted(workers):
         loading = Loading(workers=workers, host=TWO_CPUS)
-        loader = compile(built, seed=5, steps=10**6, loading=loading, **pinned)
+        loader = compile(built, seed=5, steps=10**6, loading=loading)
         reader = loader.train(DataPartition())
         try:
             listed(reader, 6)
@@ -420,42 +417,8 @@ def test_a_read_in_order_counts_its_rows_and_examples_as_the_earlier_read(chain)
         finally:
             reader.close()
 
-    earlier = counted(0, FILE_SHARDS)
-    assert earlier
-    for workers in (0, 2):
-        assert counted(workers, None) == earlier
-
-
-@pytest.mark.parametrize("workers", [0, 2])
-def test_a_position_saved_under_plan_version_10_resumes_as_10_read_it(workers):
-    """A per-share read saved under plan version 10, in no workers or in two, which each read every
-    second input, resumes under this Dew's version (`IN_ORDER`) as 10 read it, in the workers its position
-    names (`_PerShare.resumed_at`): on the batches 10's read goes on to, bit for bit, and its positions name
-    10 still."""
-    from dew.data.plan import FILE_SHARDS, IN_ORDER, PLAN_VERSIONS
-
-    chain = (Pipeline(Memory(_Indexed(40))).shuffle(5).repeat().random_map(_Jittered())
-             .flat_map(_Spread()).batch(4))
-    earlier = compile(chain, seed=5, loading=Loading(workers=workers), plan_version=FILE_SHARDS)
-    now = compile(chain, seed=5)
-    assert earlier.plan.version == FILE_SHARDS and now.plan.version == PLAN_VERSIONS[-1] >= IN_ORDER
-    reader = earlier.train(DataPartition())
-    try:
-        whole = listed(reader, 12)
-    finally:
-        reader.close()
-    reader = earlier.train(DataPartition())
-    try:
-        head, saved = listed(reader, 5), reader.get_state()
-    finally:
-        reader.close()
-    resumed = now.train(DataPartition())
-    try:
-        resumed.set_state(saved)
-        assert head + listed(resumed, 7) == whole
-        assert json.loads(resumed.get_state())["dew_data_plan"]["version"] == FILE_SHARDS
-    finally:
-        resumed.close()
+    alone = counted(0)
+    assert alone and counted(2) == alone
 
 
 @pytest.mark.parametrize("workers", [0, pytest.param(1, marks=pytest.mark.slow),
@@ -1088,7 +1051,7 @@ class _Lazy:
     def lengths(self):
         return None
 
-    def manifest(self, version):
+    def manifest(self):
         raise ValueError("a lazy source is indexed")
 
 
@@ -1275,45 +1238,51 @@ def test_from_grain_scores_a_validation_pass_that_ends():
     assert _indices(data.val(DataPartition()), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
 
 
-def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path):
-    """The seam is only worth having if the trainer treats it as any other
-    dataset: a run over it checkpoints its iterator position, and a resume
-    reads the batches after the checkpoint rather than replaying them."""
+@pytest.mark.parametrize("source", ["grain", "records in memory"])
+def test_a_run_over_a_data_source_checkpoints_and_resumes_where_it_stopped(tmp_path, source):
+    """The seams to a caller's Grain dataset and to records in memory are only worth having if the trainer
+    treats each as any other dataset: a run over it checkpoints its iterator position, and a resume reads
+    the batches after the checkpoint rather than replaying them, ending where an uninterrupted run ends:
+    its weights, its optimizer's moments, and the step and data position its last checkpoint holds."""
     import optax
     from flax import linen as nn
 
     from dew.objectives.base import Aux, Objective
     from dew.training import Checkpoints, Layout, Trainer
 
+    # The simulated mesh is eight devices wide, so a step is eight records.
+    width, outputs, steps, data, target = {
+        "grain": (3, 2, 4, lambda: compile(Pipeline(Memory(_grain_points())).repeat().batch(8),
+                                           read="indexed", **WORKERS), lambda batch: batch["y"]),
+        "records in memory": (2, 1, 5, lambda: _records(_columns(16), 8),
+                              lambda batch: batch["index"][:, None].astype(jnp.float32)),
+    }[source]
+
     class Regression(Objective):
-        """Squared error of an affine map against twice its input."""
+        """Squared error of an affine map against the source's target."""
 
         def __init__(self):
-            self.model = nn.Dense(2)
+            self.model = nn.Dense(outputs)
 
         def fresh_variables(self, key, held):
-            return self.model.init(key, jnp.zeros((1, 3)))
+            return self.model.init(key, jnp.zeros((1, width)))
 
         def loss(self, variables, batch, step):
-            return jnp.mean((self.model.apply(variables, batch["x"]) - batch["y"]) ** 2), Aux({})
+            return jnp.mean((self.model.apply(variables, batch["x"]) - target(batch)) ** 2), Aux({})
 
-    def run(steps, directory=None):
-        trainer = Trainer(
-            Regression(), optax.sgd(0.1), key=jax.random.key(0),
-            layout=Layout(min_shard=1, tolerance=1.0),
-            checkpoints=None if directory is None else Checkpoints(str(directory)))
-        # The simulated mesh is eight devices wide, so a step is eight records.
-        return trainer.fit(compile(Pipeline(Memory(_grain_points())).repeat().batch(8), read="indexed",
-            **WORKERS),
-                           steps=steps, log_every=1,
-                           checkpoint_every=None if directory is None else 2)
+    def run(steps, directory):
+        trainer = Trainer(Regression(), optax.sgd(0.01, momentum=0.9), key=jax.random.key(0),
+                          layout=Layout(min_shard=1, tolerance=1.0), checkpoints=Checkpoints(str(directory)))
+        state = trainer.fit(data(), steps=steps, log_every=1, checkpoint_every=2)
+        trainer.checkpoints.wait()
+        held, _, position = trainer.place()
+        return state, (int(held.step), None if position is None else position.decode())
 
     run(2, tmp_path / "run")
-    resumed = run(4, tmp_path / "run")
-    whole = run(4)
-
-    for expected, actual in zip(jax.tree.leaves(whole.variables),
-                                jax.tree.leaves(resumed.variables), strict=True):
+    (resumed, resumed_end), (whole, whole_end) = run(steps, tmp_path / "run"), run(steps, tmp_path / "whole")
+    assert resumed_end == whole_end and resumed_end[1] is not None
+    for expected, actual in zip(jax.tree.leaves((whole.variables, whole.opt_state)),
+                                jax.tree.leaves((resumed.variables, resumed.opt_state)), strict=True):
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
@@ -1511,44 +1480,6 @@ def test_an_epoch_of_records_too_few_for_one_batch_is_one_step():
     assert data.epoch_steps(1) == 1
 
 
-def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(tmp_path):
-    """The in-memory route exists so a first run can checkpoint. A resumed run
-    reads the records after the checkpoint and ends where an uninterrupted
-    run ends."""
-    import optax
-    from flax import linen as nn
-
-    from dew.objectives.base import Aux, Objective
-    from dew.training import Checkpoints, Layout, Trainer
-
-    class Regression(Objective):
-        def __init__(self):
-            self.model = nn.Dense(1)
-
-        def fresh_variables(self, key, held):
-            return self.model.init(key, jnp.zeros((1, 2)))
-
-        def loss(self, variables, batch, step):
-            target = batch["index"][:, None].astype(jnp.float32)
-            return jnp.mean((self.model.apply(variables, batch["x"]) - target) ** 2), Aux({})
-
-    def run(steps, directory=None):
-        trainer = Trainer(
-            Regression(), optax.sgd(0.01), key=jax.random.key(0),
-            layout=Layout(min_shard=1, tolerance=1.0),
-            checkpoints=None if directory is None else Checkpoints(str(directory)))
-        return trainer.fit(_records(_columns(16), 8), steps=steps, log_every=1,
-                           checkpoint_every=None if directory is None else 2)
-
-    run(2, tmp_path / "run")
-    resumed = run(5, tmp_path / "run")
-    whole = run(5)
-
-    for expected, actual in zip(jax.tree.leaves(whole.variables),
-                                jax.tree.leaves(resumed.variables), strict=True):
-        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
-
-
 def test_a_batch_encoders_reader_is_part_of_the_plan_a_resume_checks():
     """A batch encoder names the reader it runs in the run's plan: a run resumed with the same reader
     reads on as it did, and one given another reader, the same words handed back by another
@@ -1583,15 +1514,19 @@ def test_a_batch_encoders_reader_is_part_of_the_plan_a_resume_checks():
 
 
 def test_a_batch_encoders_reader_that_binds_what_it_reads_states_what_it_computes():
-    """A reader one function makes bound to its words (a partial) computes what its binding says,
-    which its function's name, the one a plan held of it, does not: the same function over other words
-    would resume as it, so an encoder of one is refused until it declares what it computes, and then
-    encodes by it."""
+    """A reader one function makes bound to its words (a partial) computes what its binding says, which
+    its function's name, the one a plan held of it, does not: the same function over other words would
+    resume as it. An encoder of one encodes by it and trains as any step does, a step of no stable
+    identity, which an exact resume or a cache refuses; declared, it is exact, and two declared apart are
+    two steps."""
+    from dew.data.plan import StepIdentity
+
     reader = functools.partial(_words_of, words=("a", "b"))
     for encoder in (EncodeCaptions, EncodeFields):
-        with pytest.raises(ValueError):
-            encoder(reader)
-    encoded = EncodeCaptions(reader, declared="words@ab")({"caption": ["x", "y", "z"]})
+        assert not StepIdentity.of(encoder(reader)).exact
+        ab, cd = encoder(reader, declared="words@ab"), encoder(reader, declared="words@cd")
+        assert StepIdentity.of(ab).exact and StepIdentity.of(ab).semantic() != StepIdentity.of(cd).semantic()
+    encoded = EncodeCaptions(reader)({"caption": ["x", "y", "z"]})
     np.testing.assert_array_equal(encoded["words"], ["a", "b", "a"])
 
 

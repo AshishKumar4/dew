@@ -9,7 +9,8 @@ import numpy as np
 import pytest
 from reference_error import assert_computes_the_oracle, chain_roundings
 
-from dew.optim import Cosine, Exponential, Linear, OneCycle, Power, PowerTail, ProgressState, RateState, _Rate
+from dew.optim import Cosine, Exponential, Linear, OneCycle, Power, PowerTail
+from dew.optim_schedules import ProgressState, RateState, _Rate
 
 STEPS = 40
 """The updates of the lockstep run: each consumes one fortieth of its bound."""
@@ -94,3 +95,52 @@ def test_a_schedule_whose_every_horizon_is_its_own_reads_its_updates_in_a_clocke
             state = rate.update(state)
     stepped_values, roundings = stepped(schedule)
     assert_computes_the_oracle(np.asarray(values), stepped_values, "update-horizoned", roundings=roundings)
+
+
+def test_a_schedules_step_horizons_are_operands_so_its_step_is_one_program_at_any_horizon():
+    """A schedule's step horizons (`ScheduleBase.horizons`) reach its values as operands
+    (`RateState.horizons`): one program, traced once, steps it at any run's length, warmup share or tail
+    start, each horizon read (the two runs' rates part at a count where their schedules do)."""
+    def one_program(first, second, steps: tuple[int, int], count: int) -> None:
+        traced = []
+
+        def value(held, at):
+            traced.append(at)
+            return first.schedule(steps[0], horizons=held)(at)
+
+        stepped = jax.jit(value)
+        rates = [float(stepped({name: np.asarray(given) for name, given in schedule.horizons(length).items()},
+                               np.int32(count)))
+                 for schedule, length in ((first, steps[0]), (second, steps[1]))]
+        assert len(traced) == 1 and rates[0] != rates[1], rates
+
+    one_program(Cosine(1.0, warmup_steps="10%"), Cosine(1.0, warmup_steps="10%"), (40, 400), 20)
+    tails = [Power(1.0, a=0.5, warmup_steps=4, tail=PowerTail(start=start, steps=80)) for start in (10, 30)]
+    one_program(*tails, (100, 100), 20)
+
+
+def test_reclocking_into_an_optimizer_built_for_its_steps_keeps_that_optimizers_horizons():
+    """A clocked run's state (`ProgressState`) reclocked into an optimizer built for a run of steps
+    (`OptimConfig.build`, its horizons in its own state) steps that optimizer's schedule (`reclocked`)."""
+    from dew.optim import OptimConfig
+    from dew.optim_schedules import reclocked
+
+    params = {"w": np.zeros(3, np.float32)}
+    config = OptimConfig(optimizer="adam", learning_rate=Cosine(1.0, warmup_steps=4))
+    clocked = config.build(40, clocked=True).init(params)
+    made = config.build(40).init(params)
+    held = reclocked(clocked, made)
+    (rate,) = [node for node in jax.tree.leaves(held, is_leaf=lambda node: isinstance(node, RateState))
+               if isinstance(node, RateState)]
+    (wanted,) = [node for node in jax.tree.leaves(made, is_leaf=lambda node: isinstance(node, RateState))
+                 if isinstance(node, RateState)]
+    assert {name: int(value) for name, value in rate.horizons.items()} == {
+        name: int(value) for name, value in wanted.horizons.items()} == {"warmup": 4, "decay_steps": 40}
+
+
+def test_a_one_cycles_shortest_fall_ends_at_its_end_value():
+    """A one-cycle schedule whose fall is shorter than a step still ends at its end value at the run's last
+    step, as Optax's arithmetic does, however short a positive fall."""
+    with jax.enable_x64(new_val=True):
+        schedule = OneCycle(peak_value=1.0, init_value=0.5, end_value=0.25, warmup_fraction=0.9999999999)
+        assert float(schedule.schedule(2)(1)) == 0.25
