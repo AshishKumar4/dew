@@ -886,9 +886,9 @@ def resource_operands(name: str, dtype, rows: int, length: int) -> list[jax.Shap
 @lowers('sm90')
 def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     """The 27B gated delta net's forward launched twice in one program on an H100, at its derived tiles and
-    at a variant: a kernel's name compiled under both launches (`report.launching`) is gated on each
-    launch's evidence, the variant's shared memory its own; a gate that read a kernel by its name alone kept
-    one launch's and dropped the other's."""
+    at a variant's, each the forward's own (`_ran`): a kernel's name compiled under both launches
+    (`report.launching`) is gated on each launch's evidence, the variant's shared memory its own; a gate that
+    read a kernel by its name alone kept one launch's and dropped the other's."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels
 
@@ -898,7 +898,7 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
     args = resource_operands('qwen3.5-27b-gdn', jnp.bfloat16, 1, 256)
     bound = template.MOSAIC.bind(*args, None, max_segments=None, bound=1.0)
     with generation.assumed(facts):
-        derived, variant = template.MOSAIC.variants(bound)[:2]
+        derived, variant = (_ran(tiles, training=False) for tiles in template.MOSAIC.variants(bound)[:2])
 
     def call():
         def fn(*operands):
@@ -924,10 +924,10 @@ def test_the_resource_gate_reads_each_launch_of_one_kernel_apart():
 @lowers('sm90')
 def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
     """The 27B gated delta net's forward over 4089 tokens and over 4096 in one program on an H100, each at its
-    derived tiles under its own launch (`report.launching`): the mainloop pads both lengths to the same
-    chunks, so its launches' statics meet, and each launch's kernels still carry its own launch's digest
-    (`tuning.lowered_once` keys a trace on the launch tracing it). They shared one trace and the second's
-    kernels were named for the first, a spill of one refused as the other (row 2941)."""
+    derived forward's tiles (`_ran`) under its own launch (`report.launching`): the mainloop pads both
+    lengths to the same chunks, so its launches' statics meet, and each launch's kernels still carry its own
+    launch's digest (`tuning.lowered_once` keys a trace on the launch tracing it). They shared one trace and
+    the second's kernels were named for the first, a spill of one refused as the other (row 2941)."""
     from dew.nn.kernels.lowered import kernel_calls
 
     target = 'sm90'
@@ -938,7 +938,7 @@ def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
     with generation.assumed(facts):
         launches = {length: (bound := template.MOSAIC.bind(*operands[length], None, max_segments=None,
                                                            bound=1.0),
-                             template.MOSAIC.variants(bound)[0])
+                             _ran(template.MOSAIC.variants(bound)[0], training=False))
                     for length in lengths}
 
     def both(*flat):
@@ -1497,10 +1497,10 @@ a forked call on each family's bundle."""
 def forked_case(target: str, name: str, training: bool) -> tuple:
     """`name`'s 16-bit call over a forked call's three documents a row, entering a table of a given memory
     and two stored slots (`chunked_launch.Forked`), the gated delta net's with an entry write, at the
-    template's derived tiles on `target`, its forward or training pass as a gate case (`KernelCase`): its
-    operands laid from the chunks' edges and its table as the walks take it (`template.forked_laid`). Returns
-    the case (None where the template derives no tiles), the bound call, its tiles and the same call
-    unforked, bound."""
+    template's derived tiles on `target` (a forward alone at its own, `_ran`), its forward or training pass
+    as a gate case (`KernelCase`): its operands laid from the chunks' edges and its table as the walks take it
+    (`template.forked_laid`). Returns the case (None where the template derives no tiles), the bound call, its
+    derived tiles and the same call unforked, bound."""
     from fla_gdn_support import KernelCase
 
     facts = generation.gpu_target(target)
@@ -1536,12 +1536,12 @@ def forked_case(target: str, name: str, training: bool) -> tuple:
             if training:
                 return mainloop_backward.gradients(q, k, v, g, beta, None, *rest, tiles=tiles, family=family,
                                                    forked=forked, skip=fused, **formed)
-            return chunk_forward.forward(q, k, v, g, beta, None, tiles=tiles, family=family, forked=forked,
-                                         skip=fused, **formed)
+            return chunk_forward.forward(q, k, v, g, beta, None, tiles=_ran(tiles, training=False),
+                                         family=family, forked=forked, skip=fused, **formed)
 
         return fn, (*laid, *tabled, *cotangents, *skip)
 
-    label = f"{name} bfloat16 {'training' if training else 'forward'} forked {tiles}"
+    label = f"{name} bfloat16 {'training' if training else 'forward'} forked {_ran(tiles, training=training)}"
     return KernelCase(label, call), bound, tiles, unforked
 
 
