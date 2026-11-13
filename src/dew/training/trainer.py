@@ -78,15 +78,13 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import (
-    STACKED_OPTIMIZERS,
+from dew.optim import STACKED_OPTIMIZERS, declaring, with_bounds
+from dew.optim_schedules import (
     ScheduleBase,
-    declaring,
     held_rates,
     scaled_rates,
     schedule_states,
     settable_rates,
-    with_bounds,
     with_horizons,
     with_rates,
 )
@@ -649,7 +647,7 @@ class Trainer(Generic[Loss, Effects]):
     def _stated(self, state: TrainState) -> TrainState:
         """`state` with its scheduled solvers' step horizons this run's (`OptimConfig.horizons`), which a
         configured run's optimizer holds as operands it sets on every state it steps (`stated`,
-        `dew.optim.with_horizons`): its step and its start are one program at any length of run, a
+        `dew.optim_schedules.with_horizons`): its step and its start are one program at any length of run, a
         rehearsal's or a restart's served from the persistent cache. A restore's template (`_placing`)
         holds them made, so a checkpoint saved without them restores. A trainer given an Optax
         transformation keeps its own."""

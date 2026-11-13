@@ -63,18 +63,15 @@ from dew.optim import (
     ParamGroup,
     Power,
     PowerTail,
-    ScheduleBase,
     clips_qk,
     laprop,
-    learning_rate,
     muon_partition,
     muon_weight_dimension_numbers,
-    rates_of,
     scale_by_qk_clip,
     stepped,
     weight_decay_mask,
-    with_rates,
 )
+from dew.optim_schedules import ScheduleBase, learning_rate, rates_of, with_rates
 from dew.training import MeshSpec
 from tools.muonclip_reference import clip_qk_kernel, clip_scale
 
@@ -1686,7 +1683,7 @@ def test_stated_horizons_reach_a_solver_inside_an_injected_wrapper_and_its_repor
     sets (`with_horizons`) where a run's own injected wrapper holds the solver too: the wrapped solver then
     makes the updates the solver built for the run's steps makes, bit for bit, and reports its rate from the
     first, before any update takes it."""
-    from dew.optim import with_horizons
+    from dew.optim_schedules import with_horizons
 
     config = OptimConfig(optimizer="adam", learning_rate=dataclasses.replace(
         SCHEDULES["cosine"], peak_value=1e-2, init_value=1e-4, end_value=1e-3), clip_grads=0)
@@ -1710,7 +1707,7 @@ def test_a_clocked_state_supplied_to_a_run_of_steps_takes_its_optimizers_horizon
     optimizer given built for a run of steps, whose horizons no config of a trainer sets (`reclocked` over
     `schedule_states`, as `Trainer.fit` reads a supplied state): its schedule's state takes that
     optimizer's own horizons, so it steps and reports the rates that optimizer's fresh state does."""
-    from dew.optim import reclocked, schedule_states
+    from dew.optim_schedules import reclocked, schedule_states
 
     config = OptimConfig(optimizer="adam", learning_rate=dataclasses.replace(
         SCHEDULES["cosine"], peak_value=1e-2, init_value=1e-4, end_value=1e-3, warmup_steps=2), clip_grads=0)
@@ -1800,7 +1797,8 @@ def test_adams_first_moment_keeps_a_complex_gradients_both_components(state_dtyp
     does, where a real store would drop it (row 1870, AT-05); the real leaf's moment is real, and so is
     the rate the tree steps at: no step casts a complex value to a real one."""
     from dew._moments import QuantizedMoments
-    from dew.optim import OptimConfig, learning_rate
+    from dew.optim import OptimConfig
+    from dew.optim_schedules import learning_rate
 
     shape = (16, 256)
     params = {"w": jnp.full(shape, 0.5 + 0.5j, jnp.complex64), "v": jnp.full(shape, 0.5, jnp.float32)}

@@ -9,7 +9,8 @@ import numpy as np
 import pytest
 from reference_error import assert_computes_the_oracle, chain_roundings
 
-from dew.optim import Cosine, Exponential, Linear, OneCycle, Power, PowerTail, ProgressState, RateState, _Rate
+from dew.optim import Cosine, Exponential, Linear, OneCycle, Power, PowerTail
+from dew.optim_schedules import ProgressState, RateState, _Rate
 
 STEPS = 40
 """The updates of the lockstep run: each consumes one fortieth of its bound."""
@@ -121,7 +122,8 @@ def test_a_schedules_step_horizons_are_operands_so_its_step_is_one_program_at_an
 def test_reclocking_into_an_optimizer_built_for_its_steps_keeps_that_optimizers_horizons():
     """A clocked run's state (`ProgressState`) reclocked into an optimizer built for a run of steps
     (`OptimConfig.build`, its horizons in its own state) steps that optimizer's schedule (`reclocked`)."""
-    from dew.optim import OptimConfig, reclocked
+    from dew.optim import OptimConfig
+    from dew.optim_schedules import reclocked
 
     params = {"w": np.zeros(3, np.float32)}
     config = OptimConfig(optimizer="adam", learning_rate=Cosine(1.0, warmup_steps=4))

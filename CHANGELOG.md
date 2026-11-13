@@ -7,6 +7,12 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- `dew.optim_schedules` holds a solver's learning rate as operands of its state: `ScheduleBase`, `RateState`
+  and `ProgressState`, `scheduled_solver`, `rates_of`, `with_rates`, `with_horizons`, `learning_rate`,
+  `held_rates`, `scaled_rates`, `settable_rates`, `schedule_states`, `reclocked` and `stepped_rate` are
+  imported from there, where `dew.optim` held them; the schedule kinds (`Cosine`, `Linear`, `Power`,
+  `OneCycle`, `Exponential`) and `OptimConfig` stay in `dew.optim`.
+
 - Dew requires its JAX build 0.12.0.1.post83 (Python alone; the CUDA and PJRT plugins stay post81's): a
   Pallas interpreter's thread map runs its threads on a CPU client of its own, so an interpreted kernel
   inside a host callback no longer deadlocks when the calling computation's client has a full device queue.

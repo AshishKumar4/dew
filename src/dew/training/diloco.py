@@ -191,7 +191,7 @@ def dropped(state: TrainState, size: int) -> TrainState:
 
 
 def rated(state: TrainState) -> optax.OptState:
-    """The optimizer state whose learning rates a run reads and sets (`dew.optim.learning_rate`,
+    """The optimizer state whose learning rates a run reads and sets (`dew.optim_schedules.learning_rate`,
     `held_rates`, `with_rates`): its own, or under DiLoCo the groups' inner one, its rates stacked, every
     group's alike, which those read at the first group's and set at every group's."""
     return state.opt_state if state.inner is None else state.inner.opt_state
