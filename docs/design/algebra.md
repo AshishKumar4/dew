@@ -316,11 +316,12 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
 
   The rule's left side is the reference arm, the left side at float64 the truth, and the right side the
   candidate; `assert_certified` is added where a bound applies. Each rule's check 1 site names the rule.
-  (Today a registered set's rewrite is qualified numerically by one instance, whatever its layouts and
-  directions, `rules.instances`; each rule of the registered sets and of the carried set is proven an
-  identity over the reals, its stated magnitudes at least the true ones, rule by rule
-  (tests/test_algebra_rules_sound.py); and the decoupled set's rules, a derivation's own, are held through
-  the forms they derive (tests/algebra_laws.py), not rule by rule.)
+  Each rule of the registered sets and of the carried set, every layout and direction a rule of its own, is
+  held to check 1 at the first instantiation its conditions admit over shapes taken largest first, its two
+  sides computed from the rule as egglog holds it, and is proven an identity over the reals, its stated magnitudes at least the true ones
+  (tests/test_algebra_rules_sound.py). A registered rewrite's adversarial families and its check 2 are its
+  family's instance's (`rules.instances`), one a family. (Today the decoupled set's rules, a derivation's
+  own, are held through the forms they derive (tests/algebra_laws.py), not rule by rule.)
 - **Each program site the pass changes,** in one of two ways:
   - at a site the gate compiles itself: `assert_as_exact(rewritten(fn), fn, draw, label, seeds=...)`, its truth
     `fn` on the inputs widened to float64;
