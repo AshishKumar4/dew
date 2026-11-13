@@ -1550,13 +1550,31 @@ def evidence_name(python: str, tests: list[str], group: str) -> str:
     return f"{python}-{hashlib.sha256(graded.encode()).hexdigest()[:16]}"
 
 
-def stall_evidence(python: str, tests: list[str], group: str, dump: str, began: float) -> str:
-    """A run past its deadline kept whole among the task's artifacts (`stalls.kept`), its path there: its red
-    rows' evidence (armada's `artifacts`). `began` is the run's monotonic start."""
+def watched_pytest(command: list[str], environment: dict[str, str], deadline: float, grace: float, pid: Path,
+                   python: str, name: str, began: float
+                   ) -> tuple[int, str, bool, str, set[str], set[str], str | None]:
+    """pytest run as a task runs it (`ran_pytest`), with the task environment's py-spy reading a stalled run's
+    stacks (`stalls.dumped`) and a collector outside it reading those of any process of it a signal ends
+    (`natives.Capture`): its exit, output, whether it expired, a stall's stacks, the files it opened and
+    wrote, and the evidence it left among the task's artifacts, named `name`: a stall's record, or a red run's
+    whole output with the native stacks where a signal ended it or a process of it (a worker its test
+    started), as one record (`stalls.kept`)."""
+    spy = Path(f".venv-{python}/bin/py-spy")
+    capture = natives.Capture(spy, dict(environment))
+    try:
+        returncode, output, expired, dump, opened, wrote = ran_pytest(
+            command, {**environment, **capture.variables}, deadline, grace, pid, spy)
+    finally:
+        stacks = capture.stacks()
     root = armada_dir("ARMADA_ARTIFACTS", ARTIFACTS)
-    kept = stalls.kept(root, evidence_name(python, tests, group), dump,
-                       time.time() - (time.monotonic() - began))
-    return str(kept.relative_to(root))
+    if expired:
+        kept = stalls.kept(root, name, dump, time.time() - (time.monotonic() - began))
+    elif returncode != 0 and (returncode < 0 or "ended by signal" in stacks):
+        kept = stalls.kept(root, f"signalled-{name}", f"{output}\n== native stacks\n{stacks}",
+                           time.time() - (time.monotonic() - began))
+    else:
+        return returncode, output, expired, dump, opened, wrote, None
+    return returncode, output, expired, dump, opened, wrote, str(kept.relative_to(root))
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
@@ -1606,23 +1624,8 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                               **({progress.SET_ASIDE: str(aside)} if resumes else {})})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
-    # The task environment's py-spy (the test extra), which reads a stalled pytest's stacks (`stalls.dumped`)
-    # and, from a collector outside it, those of a process of its a signal ends (`natives.Capture`).
-    spy = Path(f".venv-{python}/bin/py-spy")
-    capture = natives.Capture(spy, dict(environment))
-    try:
-        returncode, output, expired, dump, opened, wrote = ran_pytest(
-            command, {**environment, **capture.variables}, deadline, grace, pid, spy)
-    finally:
-        stacks = capture.stacks()
-    stall = stall_evidence(python, tests, group, dump, began) if expired else None
-    # A red run that a signal ended, or a process of it (a worker its test started): its whole output and the
-    # native stacks kept as one record, as a stall's is (`stalls.kept`).
-    if not expired and returncode != 0 and (returncode < 0 or "ended by signal" in stacks):
-        root = armada_dir("ARMADA_ARTIFACTS", ARTIFACTS)
-        kept = stalls.kept(root, f"signalled-{evidence_name(python, tests, group)}",
-                           f"{output}\n== native stacks\n{stacks}", time.time() - (time.monotonic() - began))
-        stall = str(kept.relative_to(root))
+    returncode, output, expired, dump, opened, wrote, stall = watched_pytest(
+        command, environment, deadline, grace, pid, python, evidence_name(python, tests, group), began)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
