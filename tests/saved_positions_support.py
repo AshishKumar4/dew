@@ -80,7 +80,7 @@ def mixture():
     return compile(mix([named("a", 1), named("b", 2)], seed=4).batch(2), read="streamed", loading=READ)
 
 
-SAVED = {"step_phases": (step_phases, 2), "bounded_mixture_strided": (lambda: bounded_mixture("strided"), 2),
+SAVED = {"step_phases": (step_phases, 2), "step_phases_later": (step_phases, 5), "bounded_mixture_strided": (lambda: bounded_mixture("strided"), 2),
          "bounded_mixture_held": (lambda: bounded_mixture("held"), 3), "taken": (taken, 3),
          "taken_in_memory": (lambda: taken(read="memory"), 3), "mixture": (mixture, 3)}
 """Each saved position's loader and the steps read before it was saved."""

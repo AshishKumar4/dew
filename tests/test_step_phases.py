@@ -403,11 +403,13 @@ SAVED_BY_MAIN = Path(__file__).with_name("fixtures") / "positions" / "main-0c8cf
 read while its layout or its held shuffle holds counts."""
 
 
-@pytest.mark.parametrize("saved", ["step_phases", "bounded_mixture_strided", "bounded_mixture_held"])
+@pytest.mark.parametrize("saved", ["step_phases", "step_phases_later", "bounded_mixture_strided",
+                                   "bounded_mixture_held"])
 def test_a_position_main_saved_under_plan_14_resumes_as_it_was_read(saved):
     """A position main saved under plan 14, which described its order's stages in place, of phases on their
-    own streams or of a bounded mixture read while its layout or its held shuffle holds counts, resumes, and
-    reads what a read of the same chain stopped where it stopped reads after it."""
+    own streams, in the first or past it (its finished phase named by its plan's identity, which held 14's
+    version, `saved_identity`), or of a bounded mixture read while its layout or its held shuffle holds
+    counts, resumes, and reads what a read of the same chain stopped where it stopped reads after it."""
     from saved_positions_support import SAVED
 
     loader, steps = SAVED[saved]
