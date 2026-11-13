@@ -326,7 +326,10 @@ def test_rows_given_already_placed_are_bounded_where_they_lie():
 
 def _refused_in_a_process(token: int) -> None:
     """A token bound checked in a process of its own, as a data worker's would be."""
-    Field("text", (SEQ_LEN + 1,), rows=ROWS).bounded(np.full(SEQ_LEN + 1, token, np.int32))
+    from dew.nn.blocks import TokenTable
+
+    Field("text", (SEQ_LEN + 1,), table=TokenTable(ROWS, frozenset(), media=False)).bounded(
+        np.full(SEQ_LEN + 1, token, np.int32))
 
 
 def test_a_token_refusal_crosses_a_process_as_itself():
