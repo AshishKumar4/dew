@@ -126,8 +126,11 @@ jobs:
         # run's after every lane's, as its suite's.
         case "$GITHUB_REF_NAME" in main) priority=--priority=5 ;; *) priority= ;; esac
         if [ -n "$WHOLE" ]; then priority=--priority=-15; fi
+        # Any CPU the region gives: the suite's pin and AMD's 25/1, as a gate reads text and types and its verdict is
+        # one on any host (2026-11-13: small lint maps pinned alone ran out 8 minutes on 25/1 placements).
+        cpus=$(jq -r '[.task.cpu // empty] | flatten | map("\(.vendor)/\(.family)/\(.model)") + ["AuthenticAMD/25/1"] | unique | join(",")' .armada.json)
         grep -v '^#' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
-          $priority --label="lint-$GITHUB_REF_NAME" -- \
+          $priority --cpu="$cpus" --label="lint-$GITHUB_REF_NAME" -- \
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
           sh "$base" '{item}'
 
