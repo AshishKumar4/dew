@@ -27,7 +27,7 @@ from dew.batch import Batch, Variables
 from dew.nn.blocks import IMAGENET_MEAN, IMAGENET_STD, torch_bicubic_resize
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
-from dew.nn.norms import l2_normalized
+from dew.nn.norms import cosine
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Objective
 
@@ -182,9 +182,7 @@ class Alignment:
                              f"match the encoder's {targets.shape[1]} patches")
         projected = self.module(targets.shape[-1]).apply(projector, hidden)
         assert isinstance(projected, jax.Array)
-        projected = projected.astype(at_least_fp32(projected.dtype))
-        return -Objective.row_mean(jnp.sum(l2_normalized(projected) * l2_normalized(targets), axis=-1),
-                                   batch).mean()[0]
+        return -Objective.row_mean(cosine(projected, targets), batch).mean()[0]
 
     def captures(self, module: nn.Module, method: str) -> bool:
         """Return whether `capture_intermediates` should keep this call: True for `layer`'s output."""
