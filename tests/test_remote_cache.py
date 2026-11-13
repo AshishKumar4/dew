@@ -492,6 +492,28 @@ def test_a_bundle_keeps_what_its_run_loaded_or_compiled_and_drops_the_chunks_it_
     assert programs(tmp_path / "again") == {"jit_a-1": b"a" * 600}
 
 
+def test_a_bundle_that_runs_again_after_another_keeps_what_it_loaded_in_each_stint(cache_worker, tmp_path):
+    """A file's bundle closed, another's run, then the first's again (A, B, A): a fetched program the first
+    loads only in its second stint stays in its bundle with the one it loaded in its first (review,
+    2026-11-13: a closed bundle ignored its later loads, and the next run compiled a program this one used).
+    """
+    url, stored, _ = cache_worker
+    stored["/jax/cpu/bundles/tests/a.py"] = remote_cache.packed([("jit_x-1", b"x"), ("jit_y-1", b"y")])
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
+    cache.opened("tests/a.py")
+    loaded(tmp_path, "jit_x-1")
+    cache.closed("tests/a.py")
+    cache.opened("tests/b.py")
+    compiled(tmp_path, "jit_b-1")
+    cache.closed("tests/b.py")
+    cache.opened("tests/a.py")
+    loaded(tmp_path, "jit_y-1")
+    cache.closed("tests/a.py")
+    cache.drain()
+    kept = {key for key, _ in remote_cache.unpacked(stored["/jax/cpu/bundles/tests/a.py"])}
+    assert kept == {"jit_x-1", "jit_y-1"}
+
+
 def test_a_url_that_is_no_address_leaves_the_local_cache_as_it_is(tmp_path):
     """A URL that does not parse (an unclosed IPv6 bracket) or names no port is refused with a warning
     when the cache is installed, as one that is no http(s) address is: the run compiles with JAX's own
@@ -547,8 +569,9 @@ def test_a_tasks_switches_of_bundle_list_the_cache_directory_once_and_each_keeps
                                                                                           tmp_path):
     """A task's files switch bundles without listing JAX's cache directory each time (watched.py's `Writes`
     reports what arrives in it): one listing as the first bundle opens, however many programs the directory
-    holds, and each file's bundle holds the programs its own tests compiled, none restored or compiled under
-    another (row 3496: a 140-file task's 281 listings of 602,483 restored programs took 727 s of 1,074 s)."""
+    holds, and each file's bundle holds the programs its own tests compiled, none compiled under another nor
+    restored and left unloaded (row 3496: a 140-file task's 281 listings of 602,483 restored programs took 727
+    s of 1,074 s)."""
     import os
     import sys
 
@@ -575,9 +598,10 @@ def test_a_tasks_switches_of_bundle_list_the_cache_directory_once_and_each_keeps
     finally:
         watching[0] = False
     assert len(listed) == 1
+    # Each bundle holds what its tests compiled; the restored program its tests never loaded is dropped.
     for index, file in enumerate(files):
         held = {key for key, _ in remote_cache.unpacked(stored[f"/jax/cpu/bundles/{file}"])}
-        assert held == ({f"jit_{index}-1", "jit_restored-1"} if index == 0 else {f"jit_{index}-1"}), file
+        assert held == {f"jit_{index}-1"}, file
 
 
 def past_the_bound(cache_worker, tmp_path: Path, monkeypatch, file: str) -> remote_cache.RemoteCache:

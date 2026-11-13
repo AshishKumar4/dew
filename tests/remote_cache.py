@@ -225,6 +225,11 @@ class RemoteCache:
                     self.file = file
                     if self.seen is None:
                         self.seen = self._programs()
+                elif file in self.sealed:
+                    self._moved_on()
+                # A bundle written back and now running again (A, B, A) counts what it opens from here on: the
+                # opens since its close, its own reads among them, went to it while sealed (review).
+                self.sealed.discard(file)
                 if file in self.held:
                     return
                 self.held[file] = set()
