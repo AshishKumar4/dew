@@ -948,8 +948,8 @@ def test_a_probe_builds_no_meta_model_twice(tmp_path, monkeypatch):
     sizes, whose layers the probe cuts to two) builds transformers' model on torch's meta device once a
     config (`verify_mapping`): its kinds told from the probe's fields and from their cut, the cut's model
     the one whose parameters it counts, where it built the cut again for the count; the type's own sizes
-    once more, which it assembles from parts. Its float64 reference, which computes, is no meta model. Dew's cache is the
-    test's own, so no verification recorded before answers in the probe's place."""
+    once more, which it assembles from parts. Its float64 reference, which computes, is no meta model.
+    Dew's cache is the test's own, so no verification recorded before answers in the probe's place."""
     from collections import Counter
 
     from interop_support import tiny_config
