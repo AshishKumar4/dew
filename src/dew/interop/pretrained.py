@@ -428,10 +428,8 @@ class Pretrained:
                                                export_adapter=_unwritten(stated), tokenizer=tokenizer)
                 else:
                     # Resolved once: the bundle is written in the layout just found.
-                    source = PretrainedDecoder.from_model(decoder.with_cross_attention(None), variables,
-                                                          tokenizer=tokenizer, generation_config=generation,
-                                                          layout=stated)
-                    bundle = replace(source, model=decoder)
+                    bundle = PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
+                                                          generation_config=generation, layout=stated)
             bundle = replace(bundle, processor=processor)
             if isinstance(held, MaskedSettings):
                 # A masked run's model is a decoder: no wrapper denoises.
@@ -908,20 +906,29 @@ class PretrainedDecoder(Pretrained):
         Gemma 4 writes frozen or trainable layer-scalar values into HF buffers; reloading that layout
         reproduces the computation, but not which scalars were trainable.
 
+        A model that reads a context through cross-attention (`CrossAttending`) is its source's
+        extension, which no family writes: the bundle is laid out as the model without it, and carries
+        the model, so a run starting from it reads it and its export refuses it (`Pretrained.export`).
+
         `tokenizer` is the vocabulary the weights were trained with, as an object or
         by name. `save` writes its files next to the weights, so the directory that
         `Pretrained.load` reads back includes its processor. `generation_config` is
         what generation_config.json records; None uses the native defaults with
-        the exported model's cache mode. `layout` is the model's layout where the caller has resolved it
-        already (`Pretrained.from_saved`), so it is resolved once.
+        the exported model's cache mode. `layout` is the layout of the model without its
+        cross-attention where the caller has resolved it already (`Pretrained.from_saved`), so it is
+        resolved once.
         """
         from dew.interop.layouts import source_layout
+        from dew.nn.protocols import CrossAttending
 
-        resolved = source_layout(model) if layout is None else layout
+        crossing = isinstance(model, CrossAttending) and model.cross_attention is not None
+        laid = model.with_cross_attention(None) if crossing else model
+        resolved = source_layout(laid) if layout is None else layout
         if isinstance(resolved, Unwritable):
             raise decoder_parts.ExportRefused(
                 f"{type(model).__name__} has no Hugging Face layout Dew writes: {resolved.reason}")
-        return cls._of_layout(model, variables, resolved, tokenizer, generation_config)
+        bundle = cls._of_layout(laid, variables, resolved, tokenizer, generation_config)
+        return replace(bundle, model=model) if crossing else bundle
 
     @classmethod
     def _of_layout(cls, model: nn.Module, variables: Variables, layout: SourceLayout,
