@@ -1145,6 +1145,22 @@ def test_a_b200s_declared_cell_holds_only_its_receipts_head_layouts(heads, kv_he
     assert (cell in attention_kernels.DECLARED) == declared
 
 
+@pytest.mark.parametrize(("causal", "window", "declared"), [
+    (True, None, True), (False, None, False), (True, 1024, False)], ids=["causal", "full", "windowed"])
+def test_a_b200s_declared_cell_holds_only_its_receipts_masks(causal, window, declared):
+    """A bf16 call of 4096 tokens, 128 wide, 32 query heads over 8, on a B200, whose cell names cuDNN for the
+    calls its receipts timed (`attention_kernels.MEASURED`: causal, unwindowed): a causal call is in that
+    cell; a full one or a windowed one is a cell none declares, which takes the template."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+
+    query = jax.ShapeDtypeStruct((1, 4096, 32, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 4096, 8, 128), jnp.bfloat16)
+    with generation.assumed("sm100"):
+        cell = attention_case(query, key, causal=causal, sliding_window=window).cell
+    assert (cell in attention_kernels.DECLARED) == declared
+
+
 @pytest.mark.parametrize(("groups", "limits", "least"), [
     ("0::/outer/inner\n", {"sys/fs/cgroup/memory.max": "max", "sys/fs/cgroup/outer/memory.max": "2147483648",
                            "sys/fs/cgroup/outer/inner/memory.max": "4294967296"}, 2147483648),
