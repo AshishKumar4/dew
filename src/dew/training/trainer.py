@@ -45,6 +45,7 @@ from dew.data.dataset import (
     Loader,
     PhasedStream,
     RampedStream,
+    ReadsInProcess,
     StepPhases,
     stream_identity,
 )
@@ -200,15 +201,6 @@ Effects = DefaultTypeVar("Effects", default=None)
 
 _DEFAULT_MESH = MeshSpec()
 _DEFAULT_LAYOUT = Layout()
-
-
-def _unworked(dataset: Loader) -> bool:
-    """Whether a per-share stream reads `dataset` in the training process: an automatic count sizes it no
-    workers, as its order is its workers' count's (row 5852), which a run states (`.workers(n)`) or reads
-    elastically."""
-    plan = dataset.plan
-    return (plan is not None and plan.lowering == "per-share" and not plan.topology.get("elastic")
-            and plan.topology.get("workers") == 0)
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -1396,7 +1388,7 @@ class Trainer(Generic[Loss, Effects]):
         if not complete and (pending or not plan.ended(current, interval.real_tokens, interval.consumed)):
             partition = self._stream_partition()
             run.source = plan.dataset.train(partition)
-            run.unworked = _unworked(plan.dataset)
+            run.unworked = isinstance(run.source, ReadsInProcess) and run.source.in_process
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None and run.restarted is None else None)
             source = run.source

@@ -255,6 +255,15 @@ class Budgeted(Protocol):
     def stop_seconds(self) -> float | None: ...
 
 
+@runtime_checkable
+class ReadsInProcess(Protocol):
+    """A training stream that says whether it reads in the training process, its order its loading
+    workers' count's and that count none (`dew.data.readers._PerShare`, row 5852)."""
+
+    @property
+    def in_process(self) -> bool: ...
+
+
 class Forwarding:
     """Forwards a stream wrapper's stop signal, stop budget, close, identity and where it ends to its
     source.
