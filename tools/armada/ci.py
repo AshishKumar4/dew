@@ -170,6 +170,7 @@ r2 = records.r2
 watched = _loaded(HERE / "watched.py")
 followed = _loaded(HERE / "followed.py")
 progress = _loaded(HERE / "progress.py")
+natives = _loaded(HERE / "natives.py")
 digests = _loaded(HERE / "digests.py")
 grading = _loaded(HERE / "grading.py")
 host = _loaded(HERE / "host.py")
@@ -1542,13 +1543,19 @@ def ran_pytest(command: list[str], environment: Mapping[str, str], deadline: flo
     return done.returncode, "".join(lines), expired, dump, None if left else closed, wrote
 
 
+def evidence_name(python: str, tests: list[str], group: str) -> str:
+    """The name a run's evidence is kept under among the task's artifacts: the rows it grades, so a task's
+    several runs (a GPU lane's) each keep their own."""
+    graded = "\n".join(row(python, name, group) for name in tests)
+    return f"{python}-{hashlib.sha256(graded.encode()).hexdigest()[:16]}"
+
+
 def stall_evidence(python: str, tests: list[str], group: str, dump: str, began: float) -> str:
     """A run past its deadline kept whole among the task's artifacts (`stalls.kept`), its path there: its red
-    rows' evidence (armada's `artifacts`), named by the rows it grades, so a task's several runs (a GPU
-    lane's) each keep their own. `began` is the run's monotonic start."""
+    rows' evidence (armada's `artifacts`). `began` is the run's monotonic start."""
     root = armada_dir("ARMADA_ARTIFACTS", ARTIFACTS)
-    graded = hashlib.sha256("\n".join(row(python, name, group) for name in tests).encode()).hexdigest()[:16]
-    kept = stalls.kept(root, f"{python}-{graded}", dump, time.time() - (time.monotonic() - began))
+    kept = stalls.kept(root, evidence_name(python, tests, group), dump,
+                       time.time() - (time.monotonic() - began))
     return str(kept.relative_to(root))
 
 
@@ -1599,10 +1606,18 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
                                               **({progress.SET_ASIDE: str(aside)} if resumes else {})})
     if network:
         environment = {key: value for key, value in environment.items() if key not in session.CLOSED_HUB}
-    # The task environment's py-spy (the test extra), which reads a stalled pytest's stacks (`stalls.dumped`).
-    returncode, output, expired, dump, opened, wrote = ran_pytest(command, environment, deadline, grace, pid,
-                                                                  Path(f".venv-{python}/bin/py-spy"))
+    # The task environment's py-spy (the test extra), which reads a stalled pytest's stacks (`stalls.dumped`)
+    # and a signal-ended one's native stacks (`natives`).
+    spy, stacks = Path(f".venv-{python}/bin/py-spy"), out.with_name(f"{out.name}.native")
+    capture, uncaptured = natives.armed(spy, stacks, dict(environment))
+    returncode, output, expired, dump, opened, wrote = ran_pytest(command, {**environment, **capture},
+                                                                  deadline, grace, pid, spy)
     stall = stall_evidence(python, tests, group, dump, began) if expired else None
+    # A pytest a signal ended: its whole output and its processes' native stacks kept (`natives.kept`).
+    if returncode < 0 and not expired:
+        said = f"\nnative stacks not captured: {uncaptured}\n" if uncaptured else ""
+        stall = natives.kept(armada_dir("ARMADA_ARTIFACTS", ARTIFACTS), evidence_name(python, tests, group),
+                             output + said, stacks)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     # How collection found each file: a file with no row is green only where every test it holds was set aside
     # by the selection, as pytest reported it (executed.py); a run that wrote no report greens nothing.
