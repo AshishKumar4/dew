@@ -332,8 +332,9 @@ class DevicePrefetchIterator:
     iterator, so it must be thread-safe and must not block.
 
     `source_state`, when given, is a saved position the worker restores before
-    its first read; if the source is not checkpointable, the first `next`
-    raises TypeError. After each batch the iterator returns, `source_state`
+    its first read, by `restore` (a resume's `restored_or_restarted`, which may
+    start it afresh where its plan changed); if the source is not
+    checkpointable, the first `next` raises TypeError. After each batch the iterator returns, `source_state`
     holds the source's position after that batch.
 
     `prepare`, when supplied, transforms the source's host batch before
@@ -355,11 +356,13 @@ class DevicePrefetchIterator:
 
     def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = PREFETCH_DEPTH,
                  source_state: bytes | None = None, *, prepare: Callable[[Batch], Batch] | None = None,
-                 reads: Mapping[Signature, tuple[bool, ...]] | None = None):
+                 reads: Mapping[Signature, tuple[bool, ...]] | None = None,
+                 restore: Callable[[Checkpointable, bytes], None] = restore_position):
         if depth <= 0:
             raise ValueError("prefetch depth must be positive")
         self._iterator: Iterator | None = iter(iterator)
         self._source_name = type(self._iterator).__name__
+        self._restore = restore
         self._mesh: Mesh | None = mesh
         # The placed batches waiting for the consumer, at most `depth`; `_ready` wakes whoever waits on
         # them, on an enqueue, a dequeue, a stop and the worker's end, so neither side polls.
@@ -460,7 +463,7 @@ class DevicePrefetchIterator:
             if not self._stop.is_set() and self.source_state is not None:
                 if source is None:
                     raise TypeError(f"{self._source_name} cannot resume from a saved position")
-                restore_position(source, self.source_state)
+                self._restore(source, self.source_state)
             while not self._stop.is_set():
                 with region("data.read"):
                     batch = next(iterator)

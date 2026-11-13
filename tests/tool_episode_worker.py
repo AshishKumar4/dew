@@ -66,7 +66,9 @@ def main() -> None:
     except BaseException as error:
         if mode == "ok":
             raise
-        failed, failure = f"{type(error).__name__}: {error}", type(error).__name__
+        from process_support import refusal
+
+        failed, failure = f"{type(error).__name__}: {error}", refusal(error)
     if mode == "ok":
         assert state is not None
         parameters = collective_host(state.variables, phase="episode pool test parameters")
