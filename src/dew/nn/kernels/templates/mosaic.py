@@ -208,55 +208,6 @@ def stacked_read(refs, groups: tuple[tuple[int, ...], ...]) -> list[jax.Array]:
 
 
 @dataclasses.dataclass(frozen=True)
-class Outbox:
-    """A stage each of a program's consumers writes its share of a step's sum into, which the program's
-    producer adds into global memory (TMA's reduction) and frees (FlashAttention 3's dQ store warp: the add's
-    waits off the consumers' walk): a consumer `claim`s its stage once the producer has read its last share,
-    at its step's start, and `put`s its share when formed (a claim beside the put, ptxas sank the wait below
-    the share's products and held them across it, 352 bytes spilled and C7512 serializing the walk's
-    products where at the step's start the walk spills none, a shared dQ at width 128); the producer
-    `take`s a step once every share is staged, adds each into its view and frees the stage once the adds
-    have read it (`streamed`'s `adds`), having freed it once before its first (`opened`). Allocated with
-    `outbox`."""
-
-    smem: jax.Ref
-    full: jax.Ref
-    empty: jax.Ref
-
-    def opened(self) -> None:
-        """The producer's every stage freed before its first step, so a consumer's first put waits as its
-        others do, with no branch of its own."""
-        for share in range(self.smem.shape[0]):
-            plgpu.barrier_arrive(self.empty.at[share])
-
-    def claim(self, share: int) -> None:
-        """Consumer share `share`'s stage, once the producer has read its last."""
-        plgpu.barrier_wait(self.empty.at[share])
-
-    def put(self, share: int, value: jax.Array) -> None:
-        """Consumer share `share`'s `value` staged in its claimed stage (`claim`)."""
-        self.smem.at[share][...] = value
-        plgpu.commit_smem()
-        plgpu.barrier_arrive(self.full.at[share])
-
-    def take(self, views: tuple) -> None:
-        """The producer's add of each staged share into its view of `views`, the stage freed once read."""
-        for share, view in enumerate(views):
-            plgpu.barrier_wait(self.full.at[share])
-            plgpu.copy_smem_to_gmem(self.smem.at[share], view, reduction_op="add")
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-        for share in range(len(views)):
-            plgpu.barrier_arrive(self.empty.at[share])
-
-
-def outbox(shape: tuple, dtype, shares: int) -> list:
-    """An `Outbox`'s allocations for `pl.run_scoped`: a stage of `shape` in `dtype` a share, and its staged
-    and freed barriers, one a share."""
-    return [plgpu.SMEM((shares, *shape), dtype), plgpu.Barrier(num_barriers=shares),
-            plgpu.Barrier(num_barriers=shares)]
-
-
-@dataclasses.dataclass(frozen=True)
 class Exchange:
     """A shared-memory block each of a program's consumers stages its share of and every consumer then
     reads whole, a step at a time (FlashAttention 3's P and dS between its two MMA warpgroups at width 256):
@@ -1610,9 +1561,9 @@ class Transport[Allocated, Opened](abc.ABC):
         self.scheduled(1, consumer, lambda: self.stream(streams, walk.views, 0, walk.steps), floor=floor)
 
     @abc.abstractmethod
-    def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:
-        """The producer's loads of steps `lo` to `hi` from `views` (`opened`'s), where the family has one,
-        and with `adds` each step's sum the consumers stage added (`streamed`)."""
+    def stream(self, streams, views: dict, lo, hi) -> None:
+        """The producer's loads of steps `lo` to `hi` from `views` (`opened`'s), where the family has one
+        (`streamed`)."""
 
     @abc.abstractmethod
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
@@ -2057,13 +2008,13 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             ring_.initialized()
         return rings
 
-    def stream(self, streams, views: dict, lo, hi, *, adds: tuple | None = None) -> None:
+    def stream(self, streams, views: dict, lo, hi) -> None:
         rings = tuple(streams.values())
 
         def tiles(index):
             return tuple(ring.viewed(views[name], index) for name, ring in zip(streams, rings, strict=True))
 
-        streamed(rings, tiles, lo, hi, adds=adds)
+        streamed(rings, tiles, lo, hi)
 
     def output_staging(self, outputs: tuple, consumers: int) -> list:
         # Each consumer's share of each output in two chunk buffers, not the whole tile (`output_staging`).

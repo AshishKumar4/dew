@@ -40,7 +40,6 @@ from dew.nn.kernels.templates import (
     attention_triton,
     bundles,
     mosaic_sm90,
-    resources,
 )
 
 pytestmark = pytest.mark.kernel
@@ -80,24 +79,19 @@ _INTERPRETED = contextvars.ContextVar("interpreted_on", default="sm90")
 FED = {"dkv_family": "wgmma.fed", "dkv_consumers": 2}
 """The dK/dV launch on an H100's layout whose consumers feed their rings, its two consumers splitting each
 slot's queries (`attention_mosaic_program.split_queries`), as the derivation takes it."""
-RAISED_FORMS = ("fused-shared-dq", "fused-producer-dq")
-"""The backward's forms whose consumers hold more registers than a warpgroup's even share, legal only where
-the GPU's compile honors their raise (`resources.RAISES_HONORED`)."""
-BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys",
-                  *(RAISED_FORMS if resources.RAISES_HONORED else ()), "accurate")
-"""The backward's forms (`_backward_form`): the fast in two launches and in one each way, the raised ones
-where raises hold (`RAISED_FORMS`), and the accurate."""
-WGMMA_FORMS = ("fused", "fused-keys-first", "fused-shared-keys", *RAISED_FORMS)
+BACKWARD_FORMS = ("default", "fused", "fused-keys-first", "fused-shared-keys", "accurate")
+"""The backward's forms (`_backward_form`): the fast in two launches and in one each way, and the
+accurate."""
+WGMMA_FORMS = ("fused", "fused-keys-first", "fused-shared-keys")
 """The backward's forms on an H100's layouts alone: its one launch, whose tile of the call forms an A100's
 registers hold at no extent (64 x 64 holds 258 a thread, 32 x 128 in two column halves 258, et-a100bwd2),
-and `FED`'s fed consumers, its shared keys and dQ, which an A100's mma.sync, one warpgroup, takes none of."""
+and `FED`'s fed consumers and its shared keys, which an A100's mma.sync, one warpgroup, takes none of."""
 HOOKED_FORMS = ("default", "accurate")
 """The forms every hooked call takes: its fast form's one launch takes a hook of no parameters, an initial
 state or a draw alone."""
 
 
-FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128, "fused-shared-dq": 128,
-               "fused-producer-dq": 128}
+FORM_WIDTHS = {"fused-keys-first": 64, "fused-shared-keys": 128}
 """The head width a backward form takes where the checks' own (128, a call form's 64) is not one it holds:
 the keys-first one launch holds width 64 alone (its dK, dV and dQ tiles past a consumer's registers at
 128), the shared keys' consumers 128 and wider (each its share of the columns whole swizzled rows)."""
@@ -110,9 +104,7 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     `accurate-halves` (a width split's, `BackwardTiles.columns`); or the fast form's one launch (`fused`),
     queries first on the dQ launch's layout, or keys first on `FED`'s (`fused-keys-first`), each consumer
     64 of a slot's 128 queries, or queries first over keys its two consumers share on `FED`'s layout
-    (`fused-shared-keys`), or keys first on the dQ launch's layout, each of its two consumers its own keys,
-    their score cotangents exchanged for a shared dQ (`fused-shared-dq`, FlashAttention 3's width 128), its
-    producer adding it (`fused-producer-dq`); or the fast form at its derivation's tiles (`derived`)."""
+    (`fused-shared-keys`); or the fast form at its derivation's tiles (`derived`)."""
     family = INTERPRETED_ON[_INTERPRETED.get()]
     if family != WGMMA:
         # An A100's forms: its own layout's two launches, the accurate and the derived.
@@ -129,10 +121,6 @@ def _backward_form(form: str) -> tuple[bool, attention_mosaic.BackwardTiles | No
     if form == "fused-shared-keys":
         return False, attention_mosaic.BackwardTiles(64, 64, 2, 2, fused=True, family=FED["dkv_family"],
                                                      shared_keys=True)
-    if form in ("fused-shared-dq", "fused-producer-dq"):
-        return False, attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, dkv_family="wgmma",
-                                                     dkv_consumers=2, shared_dq=True, staged_logits=True,
-                                                     producer_dq=form == "fused-producer-dq", family=WGMMA)
     if form == "fused-keys-first":
         return False, attention_mosaic.BackwardTiles(128, 64, 2, 1, fused=True, family=WGMMA, **FED)
     if form == "accurate":

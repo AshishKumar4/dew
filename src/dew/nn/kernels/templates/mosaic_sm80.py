@@ -597,8 +597,8 @@ class CpAsync(mosaic.Family[Pipeline, Streams, jax.Array]):
             raise ValueError("a pipelined family's streams take their views where they open (its walk loads)")
         return Streams(allocated, views)
 
-    def stream(self, streams, views, lo, hi, *, adds: tuple | None = None) -> None:
-        del streams, views, lo, hi, adds
+    def stream(self, streams, views, lo, hi) -> None:
+        del streams, views, lo, hi
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,

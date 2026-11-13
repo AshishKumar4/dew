@@ -322,9 +322,9 @@ class VmemRings(mosaic.Family[dict, Streams, jax.Array]):
             raise ValueError("a TPU ring's streams take their views where they open (its walk copies)")
         return Streams(allocated, views)
 
-    def stream(self, streams, views, lo, hi, *, adds: tuple | None = None) -> None:
+    def stream(self, streams, views, lo, hi) -> None:
         # No producer role: the walk issues its own copies.
-        del streams, views, lo, hi, adds
+        del streams, views, lo, hi
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, issue: Callable, finish: Callable,
                 *, consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0,

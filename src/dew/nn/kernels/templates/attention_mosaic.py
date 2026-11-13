@@ -1020,8 +1020,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         # The one launch adds each tile's dQ under the first pass's D: the fast form's, a call's of equal
         # head widths, its dK/dV program queries first on the dQ launch's layout or keys first on
         # one whose consumers share a key block (`split_queries`), each consumer's share of a slot's queries
-        # a warpgroup MMA's rows (dQ's product's M), or keys first each consumer its own keys over the whole
-        # slot where they share dQ (`BackwardTiles.shared_dq`). A score hook's and an initial state's only
+        # a warpgroup MMA's rows (dQ's product's M). A score hook's and an initial state's only
         # queries first (at width 256 its consumers sharing a key block, `attention_mosaic_coop`), and a
         # hook of no parameters, whose gradients no launch writes (Gemma 2's softcap, FlashAttention 3's);
         # the state's (gpt-oss's sinks) the first pass's D and the keys' share of the weights give
@@ -1053,9 +1052,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return False
         keys_first = config.dkv_apart
         if config.fused and (ba.arguments["query"].shape[-1] != ba.arguments["value"].shape[-1] or (
-                keys_first and not ((split_queries(dkv_family)
-                                     and (config.block_q // config.dkv.consumers) % dkv_family.rows == 0)
-                                    or (config.shared_dq and config.block_q % dkv_family.rows == 0)))
+                keys_first and not (split_queries(dkv_family)
+                                    and (config.block_q // config.dkv.consumers) % dkv_family.rows == 0))
                 or (config.staged_logits and not keys_first)):
             return False
         dtype = ba.arguments["query"].dtype
@@ -1080,17 +1078,6 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             # A score hook's tiles at a role's rows (`derived`'s fewer rows a consumer): a hooked call's tiles
             # of fewer fail to lower.
             return False
-        if config.producer_dq and not config.shared_dq:
-            # The producer adds a shared dQ's staged shares alone (`mosaic.Outbox`).
-            return False
-        if config.shared_dq:
-            # Keys first, each consumer its own keys (no layout whose consumers feed their rings), each its
-            # share of dQ's columns whole swizzled rows (`_fused_adds`).
-            dkv = config.dkv
-            share = _width(ba.arguments["query"].shape[-1], family, dtype) // dkv.consumers
-            return (config.fused and not config.queries_first and dkv.consumers > 1 and config.columns == 1
-                    and not split_queries(bundle_of(dkv, dtype))
-                    and share % family.column_unit(dtype) == 0)
         if config.shared_keys:
             # Every consumer's share of the keys whole rows of a swizzle the exchange stages them at
             # (`swizzling.swizzle_for`), its share of the columns whole swizzled rows
