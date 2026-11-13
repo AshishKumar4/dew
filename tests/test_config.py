@@ -115,7 +115,7 @@ def test_a_run_naming_the_version_before_this_dews_records_this_dews(tmp_path):
     from dew.data.plan import PLAN_VERSIONS
 
     rows = np.random.default_rng(0).normal(size=(16, FEATURES)).astype(np.float32)
-    loader = compile(Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat())
+    loader = compile(Memory([{"x": row, "y": 2 * row[:2]} for row in rows]).batch(8).repeat(), resume="exact")
     config = TrainerConfig(name="loaded", checkpoint_dir=str(tmp_path / "runs"), steps=1, eval_every=None,
                            checkpoint_every=None, data_resume="exact")
     RunConfig(trainer=config, data_plan_version=PLAN_VERSIONS[0]).train(Regression(), loader, name="loaded")
