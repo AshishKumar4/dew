@@ -72,6 +72,7 @@ from dew.data.dataset import (
 )
 from dew.data.elastic_order import _InputOrder, _StreamOrder
 from dew.data.handoff import (
+    EXPANDED_DRAWS,
     RecordStage,
     _Barren,
     _carried,
@@ -1257,8 +1258,9 @@ class _Build:
         (`dew.data.plan.IDENTITY`), a shuffle's key (`SHUFFLE`), a mix's schedule (`dew.data.mixing.MIX`),
         where its loading workers read its inputs in their order, how they are dealt
         (`dew.data.elastic_order.DEALING`), how a phase continues a corpus an earlier phase read out of
-        order (`DRAWN`) and how a batched step's empty groups are refused
-        (`dew.data.pipeline.BatchedGroups.REFUSALS`); only those the read uses. A plan records them
+        order (`DRAWN`), how a batched step's empty groups are refused
+        (`dew.data.pipeline.BatchedGroups.REFUSALS`) and how a random step after an expansion draws
+        (`dew.data.handoff.EXPANDED_DRAWS`); only those the read uses. A plan records them
         (`dew.data.plan.Plan.rules`) and a resume compares them."""
         from dew.data.elastic_order import DEALING
         from dew.data.mixing import MIX
@@ -1267,10 +1269,15 @@ class _Build:
         mixed = any(isinstance(chain.source, Mixture) for chain in chains(pipeline))
         shuffled = any(isinstance(stage, Shuffle) for stage in _steps(pipeline))
         batched = any(isinstance(stage, Batched) for stage in _steps(pipeline))
+        steps = list(_steps(pipeline))
+        expanded = next((index for index, stage in enumerate(steps) if isinstance(stage, FlatMap)), None)
+        drawn = (self.in_order and expanded is not None
+                 and any(isinstance(stage, RandomMap) for stage in steps[expanded + 1:]))
         return {"identity": IDENTITY, **({"shuffle": self.SHUFFLE} if shuffled else {}),
                 **({"mix": MIX} if mixed else {}), **({"dealing": DEALING} if self.in_order else {}),
                 **({"phases": self.DRAWN} if self.skipped else {}),
-                **({"batched": BatchedGroups.REFUSALS} if batched else {})}
+                **({"batched": BatchedGroups.REFUSALS} if batched else {}),
+                **({"expanded_draws": EXPANDED_DRAWS} if drawn else {})}
 
     def counting(self, pipeline: Pipeline) -> bool:
         """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in

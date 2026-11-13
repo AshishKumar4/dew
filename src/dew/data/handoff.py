@@ -84,6 +84,14 @@ def _carried(pipeline: Pipeline, consumed: int, *, marked: bool, windows: bool =
     return len(pipeline.stages)
 
 
+EXPANDED_DRAWS = "row-place"
+"""The `expanded_draws` rule a plan of a read in its inputs' order records where a random step follows an
+expansion (docs/design/data.md, the rules): it draws by the row's place among the rows handed on, as every
+read keys a draw (Grain's `random_map`), its workers handing on before it (`_handoff`), in any count of
+workers alike (row 5715). A position of a read before it, whose workers drew by each input and its row,
+records none, which a resume restarts relaxed across or refuses exactly."""
+
+
 def _handoff(stages: Sequence[Stage], start: int, *, marked: bool, elastic: bool = True,
              spread: bool = False) -> int:
     """Where an elastic read's workers hand its rows on (`elastic_order._InputOrder`), at the latest:
