@@ -306,6 +306,11 @@ class Store:
         with self.request("PUT", key, body=body):
             pass
 
+    def delete(self, key: str) -> None:
+        """The object at `key` deleted, where there is one."""
+        with self.request("DELETE", key):
+            pass
+
     def keys(self, prefix: str) -> Iterator[str]:
         """The keys under `prefix`, without it, a page at a time."""
         cursor = None

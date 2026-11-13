@@ -7,21 +7,26 @@ DEW_XLA_CACHE_URL and DEW_XLA_CACHE_TOKEN set (.armada.json), `install` keeps ea
 programs in that file's bundle on the dew-xla-cache Worker (deployed from the private dew-ops
 repository), through JAX's own cache directory: one GET as the file is collected writes its last
 run's programs into the directory, and one PUT after it ran, where it compiled any program the
-bundle lacked, sends the programs compiled under it and those fetched for it. Bundles are kept
+bundle lacked or did not use, sends the programs compiled under it and those of the fetched ones it opened.
+Bundles are kept
 under jaxlib's version, the backend, the Python minor and the device's kind, beside
 JAX's own key of each program and its flags.
 
 JAX keeps a program as one file, `<key>-cache`, in `jax_compilation_cache_dir`, and with no
 `jax_compilation_cache_max_size` (Dew sets none) it neither evicts nor stamps them
 (jax/_src/lru_cache.py in jax 0.11.2), so the files a directory gains while a file's tests run are
-the programs they compiled, which a watch of the directory reports as they arrive
-(tools/armada/watched.py's `Writes`), so no switch of bundle lists it. A bundle past the Worker's bound
+the programs they compiled, which a watch of the directory reports as they arrive, and the programs JAX
+loads are the files opened in it (tools/armada/watched.py's `Writes`), so no switch of bundle lists it. A
+bundle keeps what its run compiled or loaded and nothing else, its chunks past those dropped from the Worker:
+a bundle that kept every program it ever fetched only grew, recut groups borrowing their siblings' programs
+and writing them under their own cut, to its cap (train 796, 2026-11-13: a four-test group of
+test_attention_mosaic_compile.py fetched 6,283 programs, 3.1 GB, and two such groups on one container filled
+its 20 GB disk). A bundle past the Worker's bound
 (`MAX_BYTES`) is kept in chunks of it (`chunk`), each a body of its own, so a file keeps every program
 it compiled: one bundle at the bound dropped the rest, which every run compiled afresh, and a bundle at
 it was never sent again (2026-11-08: the A100 tier's parts compiled 1,767 programs afresh, 922 s,
-their bundles read at 100.0 MB). The programs they only read
-are not seen, so a program another file's bundle brought in joins this file's bundle only where it
-is compiled under it. Each pytest
+their bundles read at 100.0 MB). A program another file's bundle brought in joins this file's bundle only
+where it is compiled under it, since its open is seen where the directory gained it, not for whom. Each pytest
 worker that keeps a bundle has a directory of its own (conftest), so the files a worker's bundle
 gains are its own whole writes, never another worker's half-written one.
 
@@ -126,6 +131,14 @@ class RemoteCache:
         bundle's switch lists no directory of hundreds of thousands of programs (row 3496)."""
         self.written: dict[str, list[str]] = {}
         """The programs compiled while each bundle's tests ran, in the order they appeared."""
+        self.used: dict[str, set[str]] = {}
+        """The programs opened while each bundle's tests ran: JAX's loads of the fetched ones it took."""
+        self.blind: set[str] = set()
+        """The bundles while whose tests ran the watch lost events: what they opened is not known, so each
+        keeps every program it fetched."""
+        self.sealed: set[str] = set()
+        """The bundles written back (`closed`): opens after it, its own reads among them, are no use of
+        theirs."""
         self.fetched: dict[str, list[str]] = {}
         """The programs each bundle's GET brought, in the bundle's order."""
         self.held: dict[str, set[str]] = {}
@@ -140,8 +153,8 @@ class RemoteCache:
         """The bundles whose fetched programs did not all reach the directory: never written back, so a
         partial restore does not replace a whole bundle."""
         # Daemon threads, which the interpreter does not wait for at exit; `drain` bounds the wait.
-        self.uploads: queue.Queue[tuple[str, bytes]] = queue.Queue()
-        """Each body to send, by its key on the Worker (a chunk's, `chunk`)."""
+        self.uploads: queue.Queue[tuple[str, bytes | None]] = queue.Queue()
+        """Each body to send, by its key on the Worker (a chunk's, `chunk`); None, a chunk to delete."""
         self.uploader = threading.Thread(target=self._uploading, daemon=True, name="xla-cache")
         self.uploader.start()
         self.programs_fetched = self.uploaded = 0
@@ -184,15 +197,20 @@ class RemoteCache:
         """The programs the directory gained since the current bundle's run began or last moved on,
         written to its account (under `state`): those that arrived in it (`writes`), the directory listed
         again only where the watch's queue overflowed meanwhile."""
-        arrived = self.writes.gained()
+        gained = self.writes.gained()
         if self.file is None or self.seen is None:
             return
-        if arrived is None:
+        if gained is None:
             programs = self._programs()
             fresh, self.seen = programs - self.seen, programs
+            self.blind.add(self.file)
         else:
+            arrived, opened = gained
             fresh = {name.removesuffix(SUFFIX) for name in arrived if name.endswith(SUFFIX)} - self.seen
             self.seen |= fresh
+            if self.file not in self.sealed:
+                self.used.setdefault(self.file, set()).update(
+                    name.removesuffix(SUFFIX) for name in opened if name.endswith(SUFFIX))
         written = self.written.setdefault(self.file, [])
         written += sorted(fresh - set(written))
 
@@ -286,11 +304,13 @@ class RemoteCache:
         return seeded(self.directory, key, value)
 
     def closed(self, file: str) -> None:
-        """Bundle `file` written back, where its tests compiled a program it lacked: the programs fetched
-        for it, in its bundle's order, then those compiled under it, in chunks of at most `MAX_BYTES`
+        """Bundle `file` written back, where its tests compiled a program it lacked or left one it holds
+        unused: the programs fetched for it that its run opened (every one, where the watch lost what it
+        opened), in its bundle's order, then those compiled under it, in chunks of at most `MAX_BYTES`
         (`CHUNKS` of them), a program past the bound going without; each chunk sent whose programs differ
-        from what the Worker holds there, so a bundle that grew sends its last chunks alone; nothing sent
-        where none of those it lacked fits."""
+        from what the Worker holds there, so a bundle that grew sends its last chunks alone, and each chunk it
+        no longer fills deleted; nothing sent where its run used none, or where what it keeps is what the
+        Worker holds."""
         if not self.available or file in self.unrestored:
             return
         try:
@@ -298,10 +318,13 @@ class RemoteCache:
                 if file == self.file:
                     self._moved_on()
                 written = list(self.written.get(file, []))
-                fetched = list(self.fetched.get(file, []))
-                # Its own bundle's fetched programs are held already; a recut group's, borrowed from
-                # its file's other cuts (`_siblings`), are not, and are written under its own cut once.
-                if not {*written, *fetched} - self.held.get(file, set()) - self.queued.get(file, set()):
+                used = self.used.get(file, set())
+                fetched = [key for key in self.fetched.get(file, []) if file in self.blind or key in used]
+                self.sealed.add(file)
+                # What it keeps: the fetched programs its run loaded (a recut group's, borrowed from its
+                # file's other cuts, `_siblings`, written under its own cut once), and those it compiled.
+                wanted = {*written, *fetched}
+                if not wanted or wanted == self.queued.get(file) or wanted == self.held.get(file):
                     return
             chunks: list[list[tuple[str, bytes]]] = [[]]
             size = 0
@@ -324,9 +347,9 @@ class RemoteCache:
             self._failed(error)
             return
         with self.state:
-            self.queued[file] = {*written, *fetched}
+            self.queued[file] = wanted
             kept = {key for entries in chunks for key, _ in entries}
-            if not kept - self.held.get(file, set()):
+            if not kept or kept == self.held.get(file, set()):
                 return  # nothing new fits: the Worker's bundle stays as it is
             self.held[file] = kept
             held = self.chunked.get(file, [])
@@ -335,12 +358,18 @@ class RemoteCache:
             self.chunked[file] = [[key for key, _ in entries] for entries in chunks]
         for index in changed:
             self.uploads.put((self._chunk(file, index), packed(chunks[index])))
+        # The chunks it held past those it now fills, deleted, so the next fetch ends where this bundle does.
+        for index in range(len(chunks), len(held)):
+            self.uploads.put((self._chunk(file, index), None))
 
     def _uploading(self) -> None:
         while True:
             key, bundle = self.uploads.get()
             try:
-                if not self.given_up:  # checked as each request is made: a queued bundle goes unsent
+                if not self.given_up and bundle is None:  # a chunk the bundle no longer fills
+                    self.store.delete(key)
+                    self._answered()
+                elif not self.given_up:  # checked as each request is made: a queued bundle goes unsent
                     self.store.put(key, bundle)
                     self._answered()
                     with self.lock:
@@ -354,8 +383,10 @@ class RemoteCache:
     def summary(self) -> str:
         """What the remote did for this process, which a task's log ends with: a slow task whose
         compilations missed it says so."""
+        used = sum(len(set(self.fetched.get(file, [])) & self.used.get(file, set())) for file in self.fetched)
         return (f"shared XLA cache: {self.programs_fetched} programs fetched "
-                f"({self.bytes_fetched / 1e6:.1f} MB read), {self.uploaded} bundles uploaded "
+                f"({self.bytes_fetched / 1e6:.1f} MB read), {used} of those listed loaded, "
+                f"{self.uploaded} bundles uploaded "
                 f"({self.bytes_uploaded / 1e6:.1f} MB)"
                 + ("" if self.available else ", given up as unreachable"))
 

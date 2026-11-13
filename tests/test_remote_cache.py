@@ -21,6 +21,12 @@ def compiled(directory: Path, key: str, value: bytes = b"executable") -> None:
     (directory / f"{key}{remote_cache.SUFFIX}").write_bytes(value)
 
 
+def loaded(directory: Path, *keys: str) -> None:
+    """Programs `keys` loaded from JAX's cache `directory`, as JAX reads a program it finds there."""
+    for key in keys:
+        (directory / f"{key}{remote_cache.SUFFIX}").read_bytes()
+
+
 def programs(directory: Path) -> dict[str, bytes]:
     return {path.name.removesuffix(remote_cache.SUFFIX): path.read_bytes()
             for path in directory.glob(f"*{remote_cache.SUFFIX}")}
@@ -428,6 +434,7 @@ def test_a_recut_group_restores_what_its_overlapping_groups_held(cache_worker, t
     group = remote_cache.bundle("tests/split.py::test_x", "1/3", None)
     recut.opened(group)
     assert set(programs(new)) == {"jit_front-1"}
+    loaded(new, "jit_front-1")
     recut.closed(group)
     recut.drain()
     assert [key for key, _ in remote_cache.unpacked(stored["/jax/cpu/bundles/tests/split.py/1-of-3"])] == [
@@ -460,32 +467,29 @@ print(value, int(compilation_cache_counts().get("train/cache_misses", 0)))
     assert run_child(script, str(tmp_path / "cache"), url) == ["18.0", "0"]
 
 
-def test_a_program_fetched_and_not_used_again_stays_in_its_bundle(cache_worker, tmp_path):
-    """A process that fetches a file's bundle and compiles only a new program writes back the new one
-    with the fetched ones: a test that ran in one partition and not in this one keeps its programs."""
+def test_a_bundle_keeps_what_its_run_loaded_or_compiled_and_drops_the_chunks_it_no_longer_fills(
+        cache_worker, tmp_path, monkeypatch):
+    """A file's next run that loads one of its bundle's programs and leaves the other unused writes back the
+    one it loaded, and deletes the chunk it no longer fills, so the next fetch reads that one alone: a bundle
+    that kept every program it ever fetched only grew to its cap (train 796, 2026-11-13: a four-test group
+    fetched 6,283 programs, 3.1 GB, and two such groups filled their container's disk). A run that used none
+    of them and compiled nothing leaves the bundle as it is."""
     url, stored, _ = cache_worker
-    script = """
-import sys
-import jax
-import remote_cache
-from dew._cache import enable_compilation_cache
-enable_compilation_cache(sys.argv[1])
-remote = remote_cache.install(sys.argv[2], "token")
-remote.opened("tests/test_kept.py")
-if sys.argv[3] == "first":
-    jax.jit(lambda x: (x * 3.0).sum())(jax.numpy.arange(4.0))
-else:
-    jax.jit(lambda x: (x - 7.0).max())(jax.numpy.arange(5.0))
-remote.closed("tests/test_kept.py")
-remote.drain()
-print(remote.uploaded)
-"""
-    assert run_child(script, str(tmp_path / "first"), url, "first") == ["1"]
-    [key] = [key for key in stored if key.endswith("/bundles/tests/test_kept.py")]
-    first = dict(remote_cache.unpacked(stored[key]))
-    assert run_child(script, str(tmp_path / "second"), url, "second") == ["1"]
-    second = dict(remote_cache.unpacked(stored[key]))
-    assert set(first) < set(second) and all(second[name] == first[name] for name in first)
+    past_the_bound(cache_worker, tmp_path, monkeypatch, "tests/shrinks.py").drain()
+    bundle, rest = "/jax/cpu/bundles/tests/shrinks.py", "/jax/cpu/bundles/tests/shrinks.py/=1"
+    assert rest in stored
+    idle = remote_cache.RemoteCache(tmp_path / "idle", url, "token", "jax/cpu")
+    idle.opened("tests/shrinks.py")
+    idle.drain()
+    assert rest in stored
+    after = remote_cache.RemoteCache(tmp_path / "next", url, "token", "jax/cpu")
+    after.opened("tests/shrinks.py")
+    loaded(tmp_path / "next", "jit_a-1")
+    after.drain()
+    assert [key for key, _ in remote_cache.unpacked(stored[bundle])] == ["jit_a-1"] and rest not in stored
+    again = remote_cache.RemoteCache(tmp_path / "again", url, "token", "jax/cpu")
+    again.opened("tests/shrinks.py")
+    assert programs(tmp_path / "again") == {"jit_a-1": b"a" * 600}
 
 
 def test_a_url_that_is_no_address_leaves_the_local_cache_as_it_is(tmp_path):
@@ -615,6 +619,7 @@ def test_a_bundle_that_grows_sends_the_chunks_it_changed_alone(cache_worker, tmp
     seen.clear()
     after = remote_cache.RemoteCache(tmp_path / "next", url, "token", "jax/cpu")
     after.opened("tests/grows.py")
+    loaded(tmp_path / "next", "jit_a-1", "jit_b-1")
     compiled(tmp_path / "next", "jit_c-1", b"c" * 100)
     after.drain()
     rest = "/jax/cpu/bundles/tests/grows.py/=1"
@@ -637,6 +642,7 @@ def test_a_bundle_fetched_ahead_is_restored_with_no_request_and_grows_as_one_fet
     seen.clear()
     cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/gpu")
     cache.opened("tests/ahead.py")
+    loaded(tmp_path, "jit_a-1", "jit_b-1")
     cache.closed("tests/ahead.py")
     assert [path for path in seen if "/bundles/" in path] == []
     assert programs(tmp_path) == {"jit_a-1": b"a" * 600, "jit_b-1": b"b" * 600}
@@ -662,6 +668,7 @@ def test_a_recut_group_fetched_ahead_restores_its_overlapping_groups_programs_wi
     cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/gpu")
     cache.opened(group)
     assert [path for path in seen if "/bundles/" in path] == [] and set(programs(tmp_path)) == {"jit_front-1"}
+    loaded(tmp_path, "jit_front-1")
     cache.closed(group)
     cache.drain()
     assert [key for key, _ in remote_cache.unpacked(stored["/jax/gpu/bundles/tests/split.py/1-of-3"])] == [
