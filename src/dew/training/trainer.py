@@ -49,7 +49,7 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.data.pipeline import Dataset
-from dew.data.plan import DataResume, PlanChanged
+from dew.data.plan import DataResume, PlanChanged, running_environment
 from dew.distributed.batches import (
     PREFETCH_DEPTH,
     DevicePrefetchIterator,
@@ -722,6 +722,13 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(f"the checkpoint at step {resume} in {checkpoints.directory} trained another "
                              f"computation ({', '.join(differs)}); resume it with the objective and model "
                              "it recorded, or train in another directory")
+        # The code and machine that wrote the step's data position, which decide none of its rows: warned of.
+        wrote = checkpoints.environment(resume)
+        if wrote is not None:
+            now = running_environment()
+            changed = sorted(name for name in {*wrote, *now} if wrote.get(name) != now.get(name))
+            if changed:
+                _log.warning("data environment changed under an unchanged plan: %s", ", ".join(changed))
         # A step an earlier Dew wrote records no key's implementation (`key_record`): its key data is the
         # run's own key's.
         key = state.key if jnp.issubdtype(state.key.dtype, jax.dtypes.prng_key) else (

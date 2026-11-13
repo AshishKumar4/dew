@@ -1709,6 +1709,12 @@ class Checkpoints:
             state_tree['position'] = gather_positions(saved, share)
         return state_tree
 
+    def environment(self, step: int) -> Mapping[str, JSON] | None:
+        """The code and machine that wrote `step`'s data position (`dew.data.plan.running_environment`), or
+        None for a step that holds none, or one written before steps recorded it."""
+        held = (self._step_metadata(step).custom_metadata or {}).get("environment")
+        return None if held is None else record(held, "a step's environment")
+
     def rung(self, step: int) -> JSON:
         """Return the rung of `fit`'s ladder that the state at `step` trained on.
 

@@ -456,6 +456,32 @@ def _environment(recorded: Mapping[str, object]) -> dict[str, JSON]:
 
 
 @functools.cache
+def _saved_code(saved: Mapping[str, object], steps: Sequence[StepIdentity]) -> list[list[JSON] | None]:
+    """A saved position's undeclared code by step (`Manifest.code`): its own `code`, or, a position of the
+    previous format, its environment's module digests at each of `steps`' code places, where it held as
+    many modules as the step does now (None, nothing to compare, where it did not)."""
+    if "code" in saved:
+        return [listed(entry, "saved step code", read=json_value, what="module digests")
+                for entry in listed(saved["code"], "saved data code", read=json_value,
+                                    what="each step's code")]
+    environment = record(saved.get("environment", {}), "saved data environment")
+    modules = listed(environment.get("modules", []), "saved data modules", read=json_value,
+                     what="each step's module digests")
+    return [[before[place] for place in step.code]
+            if isinstance(before, list) and len(before) == len(step.modules) else None
+            for step, before in zip(steps, modules, strict=False)]
+
+
+def running_environment() -> dict[str, JSON]:
+    """The code and machine this process runs (`Manifest`'s environment fields): Dew's revision and whether
+    its checkout is clean, its lock, the interpreter and the platform. A checkpoint step records it beside
+    its data position (`dew.checkpoints`), which holds what decides the rows alone, and a resume warns where
+    it changed (row 5862)."""
+    (revision, clean), lock = checkout_now(), _locked()
+    return {"revision": revision, "lock": lock, "python": platform.python_version(),
+            "platform": platform.platform(), "clean": clean}
+
+
 def _locked() -> str:
     """The fingerprint of the checkout's lock files and installed distributions, read once a process:
     it parses every installed distribution's metadata, most of a second, which no compilation
@@ -546,6 +572,13 @@ class Manifest:
 
     def environment(self) -> dict[str, JSON]:
         return _environment(self.record())
+
+    def code(self) -> list[list[JSON]]:
+        """What decides a step's rows that its identity does not state: each step's module digests at its
+        own code's places (`StepIdentity.code`), a function outside Dew that declares no identity being what
+        its code computes, a step that declares one none; the steps a memory read ran, then the plan's
+        (row 5862)."""
+        return [[step.modules[place] for place in step.code] for step in (*self.ran, *self.steps)]
 
     @property
     def canonical(self) -> bytes:
@@ -766,7 +799,7 @@ class Plan:
             "version": self.version,
             "lowering": self.lowering,
             "manifest": self.manifest.semantic(self.version),
-            "environment": self.manifest.environment(),
+            "code": json_value(self.manifest.code(), "code"),
             "order": self.spelled_order(),
             "derived": json_value(self.derived, "derived"),
             "topology": json_value(self.topology, "topology"),
@@ -798,7 +831,7 @@ class Plan:
         the manifest's parts each apart, and a list's entries, such as each
         source's content and each step's identity, one by one."""
         recorded = self.record()
-        for name in ("order", "environment", "manifest"):
+        for name in ("order", "code", "manifest"):
             del recorded[name]
         recorded["topology"] = json_value(
             {name: value for name, value in self.topology.items() if name != "share"}, "topology"
@@ -902,25 +935,14 @@ class Plan:
                 f"saved data plan {', '.join(changed)} changed, so the records the saved position counts "
                 "are not this run's; resume with the sources, steps and tokenizers that wrote it"
             )
-        environment = self.manifest.environment()
-        saved_environment = record(saved.get("environment"), "saved data environment")
-        if edited is not None:
-            environment = {name: value for name, value in environment.items() if name != "modules"}
-            saved_environment = {name: value for name, value in saved_environment.items()
-                                 if name != "modules"}
-        # The plan's steps state what they compute (`Manifest.semantic`), so a resume of an unchanged plan
-        # and topology reads on under another Dew, a global order's or a share's, the change reported.
-        changes = _changed(saved_environment, environment)
         if resume != "relaxed" and edited is None:
             # A function outside Dew that declares no identity, a step's or the factory's that configured
             # it, is what its code computes: its module's bytes changed, it may make other rows from the
             # same records (row 3938).
-            saved_modules = listed(saved_environment.get("modules", []), "saved data modules",
-                                   read=json_value, what="each step's module digests")
-            rewritten = [step.name for step, before in zip(
-                (*self.manifest.ran, *self.manifest.steps), saved_modules, strict=False)
-                if isinstance(before, list) and len(before) == len(step.modules)
-                and any(before[place] != step.modules[place] for place in step.code)]
+            saved_code = _saved_code(saved, (*self.manifest.ran, *self.manifest.steps))
+            rewritten = [step.name for step, before, now in zip(
+                (*self.manifest.ran, *self.manifest.steps), saved_code, self.manifest.code(), strict=False)
+                if before is not None and before != now]
             if rewritten:
                 raise PlanChanged(
                     tuple(f"code.{name}" for name in rewritten),
@@ -928,8 +950,14 @@ class Plan:
                     "and it declares no identity saying it computes the same; declare one "
                     "(identity='name@version') to resume exactly, or resume relaxed "
                     "(`data_resume='relaxed'`)")
-        if changes:
-            _log.warning("data environment changed under an unchanged plan: %s", ", ".join(changes))
+        if "environment" in saved:
+            # A position of the previous format holds the environment it ran under, which a run's checkpoint
+            # step holds now (`running_environment`): warned of where it changed, as the step's is.
+            earlier = record(saved["environment"], "saved data environment")
+            changes = _changed({name: value for name, value in earlier.items() if name != "modules"},
+                               running_environment())
+            if changes:
+                _log.warning("data environment changed under an unchanged plan: %s", ", ".join(changes))
         if self.volatile:
             _log.warning("resuming volatile data; fetched outcomes may differ")
         if edited:
