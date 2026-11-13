@@ -362,6 +362,10 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
         at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), ci.device_class(), inputs)
         stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [], "peak": 4 * 2 ** 30,
                                  "shares": int(name == "tests/test_spawner.py"), "pools": 0}).encode()
+    # Their first green runs gone, as the bucket's expiry takes them, so the lane runs them again by these
+    # measures rather than reusing those runs of exactly these inputs (a row keeps each green run's set).
+    for at in [at for at in stored if "-sets/" in at or "-green/" in at]:
+        del stored[at]
     assert ci.gpu_lane("3.12", every, out, cache="on", processes=4, deadline=600.0) == 0
     rows = json.loads(out.read_text())["rows"]
     assert [row["exitCode"] for row in rows] == [int(name == "tests/test_red.py") for name in every]
