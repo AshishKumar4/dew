@@ -32,6 +32,7 @@ from dew.training.footprint import Footprint
 from dew.training.memory import (
     climb_to,
     head_tile_of,
+    layer_gathers,
     local_devices,
     memory_record,
     rung_record,
@@ -414,9 +415,11 @@ class StepCompiler[L, E]:
         if self.rung() != before:
             _log.warning("taking the saved plan, from the ahead step or %s", record_path)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
+        # The plan's one sizing of its largest layer, which every candidate's options read.
+        gathered = layer_gathers(self.objective, state.variables, mesh.devices.size)
         search = FitSearch(
             lower, lambda candidate: step_options(
-                self.objective, candidate.micro, candidate.prepared.variables, mesh),
+                self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
             else self._base_rung[1], resumed, ahead=self.ahead, capacity=capacity,
             derive=None if recorded is not None else functools.partial(lower, lowering=False, floored=True),
@@ -462,7 +465,9 @@ class StepCompiler[L, E]:
         cpu = settings.state_mesh
         sites = stack_sites(self.objective, state.variables)
         execution = HostExecution(self.objective, settings.layout, settings.device_mesh, cpu, sites,
-                                  device=stepping.shape.device)
+                                  device=stepping.shape.device,
+                                  gathered=layer_gathers(self.objective, state.variables,
+                                                         settings.device_mesh.devices.size))
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with stepping.traced_on(cpu) as schedule:
             _, shapes = stepping.loss_shape(state, cpu_batch, settings.accumulation)
