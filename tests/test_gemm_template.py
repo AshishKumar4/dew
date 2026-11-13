@@ -709,7 +709,7 @@ def test_a_swapped_dense_product_lowers_for_cuda(generation_name, transpose_rhs)
 @pytest.mark.parametrize("rows", [1, 8, 32])
 def test_an_amperes_decode_product_splits_its_depth_over_the_wave(rows, transpose_rhs):
     """An A100 decode step's dense product over a 2048 x 2048 matrix (row 483's input gradient), the matrix
-    lying either way, derives a swapped tile of at most `SWAPPED_ROWS` rows whose depth splits until its
+    lying either way, derives a legal tile, swapped or not as its walk prices, whose depth splits until its
     programs fill most of the wave (`pricing.split_count` pricing the matrix's stream): its steps priced
     at their MMA alone, it walked 12 programs on 108 multiprocessors at 2.8-3.0x XLA's time (M-NS-12)."""
     launch = grouped_matmul.MosaicGmm()
@@ -720,9 +720,10 @@ def test_an_amperes_decode_product_splits_its_depth_over_the_wave(rows, transpos
     with generation.assumed("sm80"):
         target = generation.gpu_target()
         tile = launch.derived(bound, target)
-        assert tile is not None and tile.swapped and launch.legal(bound, tile, target), tile
-    assert tile.block_m <= grouped_matmul.SWAPPED_ROWS, tile
-    programs = 2048 // tile.block_m * -(-rows // tile.block_n) * tile.splits
+        assert tile is not None and launch.legal(bound, tile, target), tile
+    # Its output tiles: swapped, the matrix's rows by the call's; else the call's rows by the matrix's.
+    rows_of, columns_of = (2048, rows) if tile.swapped else (rows, 2048)
+    programs = -(-rows_of // tile.block_m) * -(-columns_of // tile.block_n) * tile.splits
     assert programs >= target.multiprocessors // 2, (tile, programs)
 
 
@@ -1062,6 +1063,25 @@ def test_a_parts_units_are_priced_at_the_clock_it_holds_under_load():
                if rate is not None)
     assert unmeasured.loaded_clock_hz == unmeasured.clock_hz
     assert cost.rates(b200, device=True)[-1] == cost.rates(unmeasured, device=True)[-1]
+
+
+def test_a_decoded_operand_moves_its_stage_its_decoders_reads_and_each_decoded_copy():
+    """A step's shared traffic (`pricing.step_shared_bytes`) counts each part of a decoded operand's passage
+    (row 5874: the NVFP4 decode's two forms priced against each other): a decode into registers moves its
+    packed bytes twice, staged and read by its decoders, and the products read none of it; a decode into a
+    stage each consumer keeps its own moves one more read of the packed stage and one more decoded stage than
+    one its consumers share."""
+    tiles = mosaic_gpu.Tiles(128, 128, 256, 3, 1, warpgroups=2, family="wgmma")
+    family = pricing.family_of(tiles, jnp.bfloat16)
+    packed, stage = 0.5 + 1 / 16, 2
+    left, right = tiles.block_m * tiles.block_k, tiles.block_n * tiles.block_k
+
+    def moved(itemsizes, decoded):
+        return pricing.step_shared_bytes(tiles, family, itemsizes, decoded)
+
+    assert moved((packed, 2), ((0, 1), None)) - moved((0, 2), ((0, 1), None)) == left * 2 * packed
+    assert (moved((2, packed), (None, (stage, 2))) - moved((2, packed), (None, (stage, 1)))
+            == right * (packed + stage))
 
 
 def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiprocessors_a_target_states():

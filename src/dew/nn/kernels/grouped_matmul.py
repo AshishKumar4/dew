@@ -1292,30 +1292,50 @@ class MosaicGmm(_Mosaic):
 
 
     def derived(self, ba, target) -> mosaic_gpu.Tiles | None:
-        # A dense product of fewer rows than a role's (a decode step's) runs swapped: its matrix takes the
+        # A dense product of fewer rows than a role's (a decode step's) may run swapped: its matrix takes the
         # MMA's rows and its rows the columns, whose unit is narrower, so its tile multiplies no padding rows
         # (CUTLASS's and cuBLAS's swap of A and B; megabake's 4 x 2048 x 2048 product went from 10.0 to
-        # 4.7 us swapped, cuBLAS's time, row 1762). It is derived as the swapped call's own tile.
+        # 4.7 us swapped, cuBLAS's time, row 1762), derived as the swapped call's own tile, and taken where
+        # its walk prices below the unswapped tile's (row 5874: an NVFP4 decode's swap won on wide outputs
+        # and lost 25-31% on square and narrow ones, M-EM-26-gh200).
+        plain = self._decode_split(ba, super().derived(ba, target), target)
         swapped = self._swapped(ba, target)
-        if swapped is None:
-            return self._decode_split(ba, super().derived(ba, target), target)
-        tile = self._derived(swapped, target, admits=lambda tile: (self._left_fits(ba, tile)
-                                                                    and tile.block_m <= SWAPPED_ROWS))
+        tile = None if swapped is None else self._derived(swapped, target, admits=lambda tile: (
+            self._left_fits(ba, tile) and tile.block_m <= SWAPPED_ROWS))
         if tile is None:
-            return None
+            return plain
         # Its few output tiles leave a wave's programs idle: its depth splits where the busiest program then
         # walks shorter, its fp32 partials' passes and their sum's launch counted (`pricing.split_count`,
         # the kernel gradient's rule; rows 1762 and 483), every run in the one launch (`mosaic_gpu.gmm`).
-        weight, padded = swapped.arguments['tokens'], swapped.arguments['kernel']
-        itemsizes = (weight.dtype.itemsize, padded.dtype.itemsize)
+        tile = dataclasses.replace(tile, swapped=True)
         splits = 1 if ba.arguments['exact_sums'] else pricing.split_count(
-            tile, groups=1, rows=weight.shape[1], depth=weight.shape[0], width=padded.shape[1],
-            itemsizes=itemsizes, multiprocessors=_multiprocessors(target),
-            step_seconds=pricing.step_seconds(tile, target, itemsizes),
-            bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
-        swapped_tile = dataclasses.replace(tile, swapped=True)
-        split = dataclasses.replace(swapped_tile, splits=splits)
-        return split if splits > 1 and self.legal(ba, split, target) else swapped_tile
+            dataclasses.replace(tile, swapped=False), **self._contraction(ba, tile, target))
+        split = dataclasses.replace(tile, splits=splits)
+        tile = split if splits > 1 and self.legal(ba, split, target) else tile
+        walked = {each: pricing.walk_seconds(each, self._contraction(ba, each, target))
+                  for each in (tile, plain) if each is not None}
+        return plain if plain is not None and walked[plain] <= walked[tile] else tile
+
+    def _contraction(self, ba, tile: mosaic_gpu.Tiles, target) -> dict:
+        """A decode-sized dense call's walk at `tile` (`pricing.decode_contraction`): swapped, its matrix
+        the rows (`_swapped`), its operands' bytes and decoded forms the launch's (`_operand_bytes`)."""
+        _, depth, width = self._generated_extents(ba)
+        assert depth is not None, "a product's steps run over its depth"
+        rows = ba.arguments['tokens'].shape[0]
+        swapped = self._swapped(ba, target) if tile.swapped else None
+        return pricing.decode_contraction(
+            tile, target, rows=rows, groups=ba.arguments['sizes'].shape[0], depth=depth, width=width,
+            columns=None if swapped is None else swapped.arguments['kernel'].shape[1],
+            # A decode step's partials hold its rows, a TMA descriptor's whole 8s of them.
+            held=-(-rows // mosaic_gpu.TMA_ROWS) * mosaic_gpu.TMA_ROWS,
+            operands=self._operand_bytes(ba, tile), multiprocessors=_multiprocessors(target))
+
+    def _operand_bytes(self, ba, tile: mosaic_gpu.Tiles) -> tuple[tuple[float, float], tuple]:
+        """The bytes an element of the products' left and right operands moves from device memory at `tile`
+        (swapped, the matrix the left) and each one's decode (`pricing.step_shared_bytes`): none."""
+        tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
+        rows, matrix = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(kernel.dtype).itemsize
+        return ((matrix, rows) if tile.swapped else (rows, matrix)), (None, None)
 
     def _decode_split(self, ba, tile: mosaic_gpu.Tiles | None, target) -> mosaic_gpu.Tiles | None:
         """`tile`, a call's of decode-sized groups (each group's rows within one row tile: a MoE decode
@@ -1330,21 +1350,9 @@ class MosaicGmm(_Mosaic):
         if (tile is None or ba.arguments['exact_sums'] or ba.arguments.get('paired') is not None
                 or hooks.prologue is not None or hooks.epilogue is not None):
             return tile
-        tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
-        groups = ba.arguments['sizes'].shape[0]
-        if tokens.shape[0] > groups * tile.block_m:
+        if ba.arguments['tokens'].shape[0] > ba.arguments['sizes'].shape[0] * tile.block_m:
             return tile
-        _, depth, width = self._generated_extents(ba)
-        assert depth is not None, "a product's steps run over its depth"
-        # A decode step's rows bound its active experts, each one row tile, and its partials hold its rows.
-        active = min(groups, tokens.shape[0])
-        itemsizes = (tokens.dtype.itemsize, kernel.dtype.itemsize)
-        splits = pricing.split_count(
-            tile, groups=active, rows=depth * active, depth=tile.block_m, width=width,
-            partial_rows=-(-tokens.shape[0] // mosaic_gpu.TMA_ROWS) * mosaic_gpu.TMA_ROWS,
-            itemsizes=itemsizes, multiprocessors=_multiprocessors(target),
-            step_seconds=pricing.step_seconds(tile, target, itemsizes),
-            bandwidth=target.memory_rate, launch_seconds=target.launch_seconds)
+        splits = pricing.split_count(tile, **self._contraction(ba, tile, target))
         split = dataclasses.replace(tile, splits=splits)
         return split if splits > 1 and self.legal(ba, split, target) else tile
 
@@ -1562,6 +1570,19 @@ class MosaicPackedGmm(MosaicGmm):
                 and super().candidate(ba, config, target))
 
     SWAPPED_OPTIONS: ClassVar[dict] = {'packed_rows': True}
+
+    def _operand_bytes(self, ba, tile: mosaic_gpu.Tiles) -> tuple[tuple[float, float], tuple]:
+        # Its matrix moves its words and block scales (`formats.NvFp4`): decoded into the stage the products
+        # read (`gmm`'s `scales`, its decoded dtype's: one its consumers share or each one's own,
+        # `packed.decoding`), or swapped, in registers into them, each consumer its rows (`packed_rows`).
+        tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
+        stored = sum(leaf.size * jnp.dtype(leaf.dtype).itemsize
+                     for leaf in (kernel.words, kernel.scales)) / math.prod(kernel.shape)
+        rows, stage = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(kernel.dtype).itemsize
+        if tile.swapped:
+            return (stored, rows), ((0, 1), None)
+        copies = 1 if packed.shared_decode(tile, interpret=False) else tile.warpgroups
+        return (rows, stored), (None, (stage, copies))
 
     def _swaps_on(self, family: mosaic.Family, dtype) -> bool:
         # Swapped, its matrix's stages decode in registers into the products' left operand
