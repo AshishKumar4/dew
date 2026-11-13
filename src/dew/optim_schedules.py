@@ -330,8 +330,8 @@ def scheduled_solver(make: Callable[..., optax.GradientTransformation], rate: fl
 def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     """Return the learning rate stored in `opt_state`, if the optimizer stores one.
 
-    An OptimConfig's solver holds the rate it stepped at last (`dew.optim.scheduled_solver`), and an
-    Optax optimizer can inject `learning_rate` itself (`optax.inject_hyperparams`); an injected
+    An OptimConfig's solver holds the rate it stepped at last (`scheduled_solver`), and an Optax
+    optimizer can inject `learning_rate` itself (`optax.inject_hyperparams`); an injected
     wrapper of other hyperparameters is read through to the optimizer it holds. The result is None
     when the optimizer closes over the rate, or when parameter groups hold several rates.
     """
