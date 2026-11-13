@@ -593,7 +593,8 @@ def test_a_stage_local_runs_largest_layer_gathers_what_the_replicated_pipelines_
     found = []
     for stage_local in (True, False):
         run = trainer(decoder(), optax.adam(1e-3), STAGED, 8, stage_local=stage_local)
-        found.append(gathered_layer_bytes(run.objective, run.initial_state().variables))
+        state, _, _ = run.place()
+        found.append(gathered_layer_bytes(run.objective, state.variables))
     assert found[0] is not None and found[0] == found[1], found
 
 
