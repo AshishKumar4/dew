@@ -47,7 +47,15 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from capability_modules import Denoiser, FamilyText, NNXDenoiser, NNXLanguageModel, NNXTokens, TokenModel
+from capability_modules import (
+    Denoiser,
+    FamilyText,
+    NNXDenoiser,
+    NNXLanguageModel,
+    NNXTokens,
+    TokenModel,
+    TupleOutputModel,
+)
 from decision_support import decision_rows
 from flax.nnx import bridge
 from recording import RecordingTracker, finite
@@ -409,6 +417,7 @@ UNREGISTERED: tuple[Family, ...] = (
     Family("user+denoiser", None, PIXEL_DENOISER | {INTERVAL}, 0, user(Denoiser), IMAGE),
     Family("nnx+denoiser", None, PIXEL_DENOISER, 0, user(bridge.ToLinen, nnx_class=NNXDenoiser, args=(3,)),
            IMAGE),
+    Family("user+tuple", None, frozenset(), 256, user(TupleOutputModel, vocab_size=256)),
 )
 
 ALL: tuple[Family, ...] = (*(family for variants in FAMILIES.values() for family in variants), *UNREGISTERED)
@@ -979,15 +988,17 @@ def supervised(family: Family, directory: Path) -> None:
 
 
 def refuse_supervised(family: Family) -> None:
-    supervised_over(family)
+    objective = supervised_over(family)
+    variables = objective.init(jax.random.key(0))
+    batch = {"text": token_batch(SEQ) % family.vocab}
+    objective.loss(variables, batch, Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(1), ema=None))
 
 
 CALLED = frozenset({"causal_transformer", "causal_transformer+modernbert", "multimodal_transformer+gemma3",
-                    "user+causal", "torch+gpt_neox", "nnx+causal", "simple_dit", "user+denoiser"})
-"""The families `supervised` covers: models whose call maps tokens to their
-logits, as a decoder, an encoder, a media wrapper, a user's module, a torch
-model and an NNX one, and denoisers, whose call also needs a time it cannot
-give; its loss is the user's own, so `lm` covers the rest."""
+                    "user+causal", "torch+gpt_neox", "nnx+causal", "user+tuple"})
+"""The families `supervised` covers: models whose call reads the sample alone, mapping tokens to their
+logits (a decoder, an encoder, a media wrapper, a user's module, a torch model and an NNX one) or to a
+multi-output tuple whose unindexed `CrossEntropy` is refused (`Lacks('logits')`)."""
 
 DISTILLED = frozenset({"simple_dit", "unet", "flux_transformer", "user+denoiser"})
 """The denoisers the few-step and distillation rows cover: a transformer whose
@@ -1085,7 +1096,7 @@ METHODS: tuple[Method, ...] = (
            refuse_guidance_distillation, trains=("guidance_distillation",),
            within=lambda family: family.name in DISTILLED),
     Method("jepa", frozenset({ENCODES}), frozenset(), jepa, trains=("jepa",)),
-    Method("supervised", frozenset({LOGITS, DENOISES}), frozenset({LOGITS}), supervised, refuse_supervised,
+    Method("supervised", frozenset(), frozenset({LOGITS}), supervised, refuse_supervised,
            trains=("supervised",), within=lambda family: family.name in CALLED),
     Method("block_diffusion", frozenset({LOGITS, CAUSAL}), frozenset({CANVAS}), block_diffusion,
            refuse_block_diffusion, trains=("block_diffusion",),
@@ -1103,6 +1114,14 @@ def cells(supported: bool) -> list:
             for method in METHODS for family in ALL
             if method.reads <= family.facts and method.within(family)
             and (method.needs <= family.facts) is supported and (supported or method.refuse is not None)]
+
+
+assert {method.name for method in METHODS} == {
+    param.values[0].name for param in cells(supported=True)
+}, "every method row must generate at least one supported cell"
+assert {method.name for method in METHODS if method.refuse is not None} <= {
+    param.values[0].name for param in cells(supported=False)
+}, "every method with a refusal check must generate at least one refused cell"
 
 
 @pytest.fixture(autouse=True)
@@ -1133,3 +1152,20 @@ def test_a_refused_cell_names_what_the_family_lacks(method, family):
     assert refused.value.capability in method.needs - family.facts
     carried = pickle.loads(pickle.dumps(refused.value))
     assert (carried.capability, carried.args) == (refused.value.capability, refused.value.args)
+
+
+@pytest.mark.parametrize("name", ["simple_dit", "user+denoiser"])
+def test_supervised_refuses_denoisers_requiring_time_beside_the_sample(name):
+    """`Supervised` calls its model on the sample alone, so a denoiser that initializes and predicts
+    finitely when given its image sample and timestep `t` fails with `TypeError` under `Supervised`."""
+    family = BY_NAME[name]
+    inputs = family.inputs()
+    sample = jnp.zeros((1, *inputs.sample.shape), jnp.float32)
+    timestep = jnp.zeros((1,), jnp.float32)
+    held = loaded(family)
+    ok_vars = held.variables or held.model.init(jax.random.key(0), sample, timestep)
+    ok_out = held.model.apply(ok_vars, sample, timestep)
+    assert ok_out.shape == sample.shape and bool(jnp.all(jnp.isfinite(ok_out)))
+    objective = Supervised(held.given, CrossEntropy(labels="target"), inputs=InputSpec(inputs.sample))
+    with pytest.raises(TypeError):
+        objective.init(jax.random.key(0))

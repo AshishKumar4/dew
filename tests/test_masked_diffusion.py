@@ -20,7 +20,7 @@ import optax
 import pytest
 from flax import linen as nn
 from model_support import flat_tree
-from reference_error import as_given, assert_as_exact, widened
+from reference_error import assert_as_exact, widened
 
 from dew.batch import coordinates
 from dew.checkpoints import Checkpoints
@@ -508,10 +508,12 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
         lambda leaf: leaf.dtype, reference.variables)
     expected_logits = jax.jit(lambda tokens: reference.model.apply(reference.variables, tokens))
     actual_logits = jax.jit(lambda tokens: converted.model.apply(converted.variables, tokens))
+    wide_model = reference.model.clone(dtype=jnp.float64)
+    wide_variables = widened(reference.variables)
     assert_as_exact(actual_logits, expected_logits,
                     lambda seed: (np.asarray([(np.arange(8) + seed) % model.vocab_size], np.int32),),
                     'converted masked decoder logits', seeds=8,
-                    truth_fn=as_given(lambda tokens: np.asarray(expected_logits(tokens), np.float64)))
+                    truth_fn=lambda tokens: wide_model.apply(wide_variables, tokens))
 
     source.save(tmp_path / "published", variables=resumed.variables)
     reloaded = Pretrained.load(tmp_path / "published", dtype="bfloat16", attention_impl="xla")

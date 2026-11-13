@@ -110,58 +110,35 @@ def gradient(model, variables, tokens, cotangent, **apply) -> dict:
 dtypes = pytest.mark.parametrize("dtype", DTYPES)
 
 
-@dtypes
-@pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
-def test_logits_are_the_forwards(name, dtype):
-    source, read = loaded(name, dtype), reads(name, dtype)
-    same(read.logits, source.model.apply(source.variables, read.tokens))
-
-
 @pytest.mark.parametrize("name", PATHS)
-def test_the_head_over_the_hidden_states_is_the_logits(name, dtype="float32"):
-    source, read = loaded(name, dtype), reads(name, dtype)
-    same(source.model.apply(source.variables, read.hidden, method="logits_from_hidden"), read.logits)
-
-
-@pytest.mark.parametrize("name", PATHS)
-def test_the_head_a_loss_contracts_is_the_logits(name, dtype="float32"):
-    """The table's product, bias and softcap included, at the table's
-    precision; or, where the model gives no table, the exact head."""
-    source, read = loaded(name, dtype), reads(name, dtype)
-    same(source.model.apply(source.variables, read.hidden, method="logits_from_hidden")
-         if read.table is None else contracted(read.hidden, read.table, source.variables), read.logits)
-
-
-@pytest.mark.parametrize("name", PATHS)
-def test_the_reads_write_no_cache_and_leave_an_allocated_one_alone(name, dtype="float32"):
-    """With every collection mutable, neither read writes a `cache`. With a
-    causal model's decode cache allocated beside the parameters (a
-    bidirectional model has none), both leave it as it was and compute what
-    they computed without it. (A mutable `qk` collection has the attention
-    layers sow their statistics, which moves some families' logits by a
-    rounding, so the reads are compared under the same collections.)"""
-    source, read = loaded(name, dtype), reads(name, dtype)
+def test_a_token_models_reads_cache_invariance_and_gradients_match_its_forward(name):
+    """A token model's `logits`, `logits_from_hidden` and `output_table` contraction agree bit for bit
+    with its forward (at both checkpoint dtypes for decoders), neither `logits` nor `hidden_states`
+    writes a `cache` or alters an allocated decode cache, and a decoder's gradients through `logits`
+    match its forward's."""
+    source, read = loaded(name, "float32"), reads(name, "float32")
     model, variables = source.model, source.variables
+    if name in DECODERS:
+        same(read.logits, model.apply(variables, read.tokens))
+        bf16, bf16_read = loaded(name, "bfloat16"), reads(name, "bfloat16")
+        same(bf16_read.logits, bf16.model.apply(bf16.variables, bf16_read.tokens))
+        cotangent = _cotangent(read.logits)
+        same(gradient(model, variables, read.tokens, cotangent, method="logits"),
+             gradient(model, variables, read.tokens, cotangent))
+    same(model.apply(variables, read.hidden, method="logits_from_hidden"), read.logits)
+    same(model.apply(variables, read.hidden, method="logits_from_hidden")
+         if read.table is None else contracted(read.hidden, read.table, variables), read.logits)
+
     cache = (model.apply(variables, ROWS, method="init_cache", mutable=["cache"])[1]["cache"]
              if model.causal else None)
     for method in ("logits", "hidden_states"):
         without, written = model.apply(variables, read.tokens, method=method, mutable=True)
         assert "cache" not in written, method
         if cache is not None:
-            beside, written = model.apply({**variables, "cache": cache}, read.tokens, method=method,
-                                          mutable=True)
-            same(written["cache"], cache)
+            beside, written_c = model.apply({**variables, "cache": cache}, read.tokens,
+                                            method=method, mutable=True)
+            same(written_c["cache"], cache)
             same(beside, without)
-
-
-@pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
-def test_gradients_through_the_logits_are_the_forwards(name, dtype="float32"):
-    source, read = loaded(name, dtype), reads(name, dtype)
-    model, variables = source.model, source.variables
-    cotangent = _cotangent(read.logits)
-    same(gradient(model, variables, read.tokens, cotangent, method="logits"),
-         gradient(model, variables, read.tokens, cotangent))
-
 
 # DiffusionGemma: the clean read is the causal encoder over the shared tree.
 
@@ -534,12 +511,11 @@ def _packed(variables, groups) -> dict:
 
 
 @pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
-def test_packed_projections_serve_the_models_draws(name):
-    """Every group a decoder declares packs: the packed variables still declare the same groups, and a
-    causal decoder's greedy decode over them draws the tokens the model's own variables draw, bit for
-    bit. The greedy decodes run as the check of their scores runs its arms (`summed_as_run`), whose
-    programs they share, over the rows the checkpoint is read over (ledger 3868); the scores themselves
-    are `test_packed_projections_score_as_the_model_does`'."""
+def test_packed_projections_score_as_the_model_does(name):
+    """Every group a decoder declares packs while preserving its declared group widths; a causal decoder's
+    greedy decode over packed variables draws the exact tokens its own variables draw (`summed_as_run`),
+    and its packed logits and cached decode hold check 1 from float64 over drawn prompts and forced
+    continuations."""
     source, rows = loaded(name), tokens(name)
     model, variables = source.model, source.variables
     groups = model.inference_projection_groups(variables)
@@ -549,37 +525,22 @@ def test_packed_projections_serve_the_models_draws(name):
                    for member, width in zip(group.members, group.widths, strict=True))
     packed = _packed(variables, groups)
     assert model.inference_projection_groups(packed) == groups
-    if not model.causal:
-        return
-    own = _programs(name, "model", (("decode", True),))
-    with summed_as_run():
-        _, drawn, _ = _greedy(own, variables, rows)
-        _, packed_drawn, _ = _greedy(own, packed, rows)
-    same(packed_drawn, drawn)
-
-
-@pytest.mark.parametrize("name", [name for name in PATHS if name in DECODERS])
-def test_packed_projections_score_as_the_model_does(name):
-    """A decoder's packed projections (`_packed`) give the logits and the cached decode its own
-    variables give. One wider product can round apart from three (falcon-tiny's logits moved by
-    1.2e-7, Kimi K2's by 7.2e-7, qwen3-next-tiny's by 1.8e-5 on another CPU), so the scores are judged
-    by check 1 from float64 over drawn prompts and forced continuations, not by their bits. A
-    bidirectional decoder packs as a causal one does and serves no decode step, so its logits alone are
-    judged."""
-    source = loaded(name)
-    model, variables = source.model, source.variables
-    packed = _packed(variables, model.inference_projection_groups(variables))
     label = f"{name} packed"
     if not model.causal:
-        def logits(model, variables):
-            return lambda tokens, forced: model.apply(variables, tokens, method="logits")
+        def logits(net, held):
+            return lambda tok, forced: net.apply(held, tok, method="logits")
 
         assert_as_exact(logits(model, packed), logits(model, variables), _continued(model), label,
                         seeds=CACHED_SEEDS, truth_fn=logits(float64_twin(model), widened(variables)))
         return
     call = (("decode", True),)
+    own = _programs(name, "model", call)
+    with summed_as_run():
+        _, drawn, _ = _greedy(own, variables, rows)
+        _, packed_drawn, _ = _greedy(own, packed, rows)
+    same(packed_drawn, drawn)
     reference, truth = _reference(name, call)
-    assert_as_exact(_scored(_programs(name, "model", call), packed), reference, _continued(model), label,
+    assert_as_exact(_scored(own, packed), reference, _continued(model), label,
                     seeds=CACHED_SEEDS, truth_fn=truth)
 
 

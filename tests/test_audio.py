@@ -195,29 +195,73 @@ def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_ref
                     truth_fn=blocks_in(torch.float64))
 
 
-def encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(audio):
-    """Frame subsampling must leave no strided slice on a dot's operand chain.
+AUDIO_JIT_SEEDS = 8
+"""Check 1's declared seeds for the in-jit length-derived audio mask encoder on CPU and GPU."""
 
-    XLA's Triton GEMM fusion propagates a dot's tiling into its operands and
-    mishandles a strided slice, aborting the process with
-    `triton_tiling_propagation.cc: Check failed: src_fragment_it !=
-    src_fragments_order.end()` as soon as anything fusible produces the
-    sliced tensor. Deriving the mask from clip lengths inside the same jit
-    puts such a producer above every frame subsample, which the encoder's
-    former `mask[:, ::stride]` did not survive. Run with JAX_PLATFORMS=cuda.
-    """
-    path, _, variables, model, _, _ = audio
+
+def encoder_compiles_on_gpu_with_the_mask_built_in_the_same_jit(audio):
+    """Frame subsampling must leave no strided slice on a dot's operand chain, and its computed features
+    hold check 1 against Transformers' float32 audio encoder from its float64 twin over drawn features."""
+    import torch
+    from safetensors.torch import load_file as load_torch
+    from transformers.models.gemma3n.modeling_gemma3n import Gemma3nAudioEncoder
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel
+
+    from _dew_torch.precision import float64_twin, widened
+    from tools.audio_reference import audio_config as reference_config
+
+    path, config, variables, model, _, _ = audio
     data = np.load(path / "reference.npz")
+    is_3n = isinstance(config, Gemma3nAudio)
+    kind = "gemma3n" if is_3n else "gemma4"
 
     @jax.jit
     def encode(variables, features, lengths):
         return model.apply(variables, features,
                            jnp.arange(features.shape[1])[None, :] < lengths[:, None])
 
-    encoded = encode(variables, jnp.asarray(data["input_features"]),
-                     jnp.asarray(data["input_features_mask"].sum(1, dtype=np.int32)))
+    lengths = jnp.asarray(data["input_features_mask"].sum(1, dtype=np.int32))
+    encoded = encode(variables, jnp.asarray(data["input_features"]), lengths)
     np.testing.assert_array_equal(encoded.mask, data["valid"])
-    np.testing.assert_allclose(encoded.features, data["encoded"], rtol=0, atol=1e-4)
+
+    ref_cfg = reference_config(kind)
+    if not is_3n:
+        ref_cfg._attn_implementation = "sdpa"
+    cls = Gemma3nAudioEncoder if is_3n else Gemma4AudioModel
+    narrow = cls(ref_cfg).eval()
+    narrow.load_state_dict(load_torch(str(path / "encoder.safetensors")))
+    wide = float64_twin(narrow, lambda: cls(ref_cfg).eval())
+    raw_mask = torch.from_numpy(np.asarray(data["input_features_mask"]))
+    torch_mask = ~raw_mask if is_3n else raw_mask
+    fixture_features = np.asarray(data["input_features"], np.float32)
+    shape = fixture_features.shape
+
+    # Each arm reads a draw and the fixture's own features, the fixture's output a leaf judged beside the
+    # draw's by the same check.
+    @jax.jit
+    def ours(drawn):
+        return (encode(variables, drawn, lengths).features,
+                encode(variables, jnp.asarray(fixture_features), lengths).features)
+
+    def ref_arm(tower, dtype, ctx):
+        def one(features):
+            with ctx(), torch.no_grad():
+                out = tower(torch.from_numpy(np.asarray(features)).to(dtype), torch_mask).last_hidden_state
+            return out.double().numpy() if dtype == torch.float64 else out.float().numpy()
+
+        @as_given
+        def run(drawn):
+            return one(drawn), one(fixture_features)
+
+        return run
+
+    def draw(seed: int):
+        return (np.random.default_rng([0xA11, seed]).standard_normal(shape).astype(np.float32),)
+
+    narrow_fn = ref_arm(narrow, torch.float32, contextlib.nullcontext)
+    wide_fn = ref_arm(wide, torch.float64, widened)
+    assert_as_exact(ours, narrow_fn, draw, f"{kind} in-jit audio mask encoder", seeds=AUDIO_JIT_SEEDS,
+                    truth_fn=wide_fn)
 
 
 def test_audio_input_gradients_and_sgd_step_match_reference(audio):

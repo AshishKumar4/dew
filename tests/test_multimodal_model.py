@@ -45,6 +45,7 @@ from dew.nn.inputs import ModelInputs
 from dew.nn.mixers.attention import AttentionMixer
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.parity import Inconclusive
 from dew.registry import ModelConfig
 from dew.sampling.text import Sampling
 from dew.training import Layout, MeshSpec, Trainer
@@ -737,11 +738,12 @@ def test_a_drawn_sites_slip_fails_its_check(arms, slipped):
     site = f"multimodal-{family}" + (f"-{kind}" if kind else "")
     recording, draw, dew, leaves = pipeline_arms(arms)
     slip = computing(family, slipped=slipped, text=kind == "text")
-    with pytest.raises(GateFailure):
+    with pytest.raises(GateFailure) as caught:
         # The slip is the narrow arm's alone: the truth stays the recorded one's (`dew`'s float64 run).
         assert_arms_as_recorded(
             (recording, draw, lambda dtype, inputs: (dew if dtype == jnp.float64 else slip)(dtype, inputs),
              leaves), site, SEEDS[arms], f"{arms} slipped {slipped}", weighed=arms in WEIGHED)
+    assert not isinstance(caught.value, Inconclusive)
 
 
 def _float32_values_in_float64(loaded, inputs) -> int:

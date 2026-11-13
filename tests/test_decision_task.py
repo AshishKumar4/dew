@@ -102,14 +102,17 @@ def assert_same_rounded_answers(found: dict, expected: dict, case: str) -> None:
     by fp32 rounding: the same choices, and every reported number within one
     unit of its fourth decimal, the rounding both apply."""
     assert found["usage"]["input_tokens"] == expected["usage"]["input_tokens"]
+    assert set(found["answers"]) == set(expected["answers"]), case
     for name, answer in found["answers"].items():
         reference = expected["answers"][name]
         assert answer["type"] == reference["type"]
         if answer["type"] == "choice":
             assert answer["choice"] == reference["choice"]
         for field in ("noul", "score", "confidence"):
-            if field in reference and field in answer:
+            assert (field in answer) == (field in reference), (case, name, field)
+            if field in reference:
                 assert abs(answer[field] - reference[field]) <= 1e-4, (case, name, field)
+        assert set(answer.get("probabilities", {})) == set(reference.get("probabilities", {})), (case, name)
         for option, value in answer.get("probabilities", {}).items():
             assert abs(value - reference["probabilities"][option]) <= 1e-4, (case, name, option)
 
