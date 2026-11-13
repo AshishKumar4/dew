@@ -7,6 +7,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Dew requires its JAX build 0.12.0.1.post85 (Python alone; the CUDA and PJRT plugins stay post81's): the
+  GPU interpreter checks a barrier wait that names its phase at its waits alone, so consumers that take
+  alternate tiles of one ring over several rotations, warps among them, are checked rather than refused.
 - Dew requires its JAX build 0.12.0.1.post84 (Python alone; the CUDA and PJRT plugins stay post81's): the
   toolkit's ring waits name their phase, so the interpreter checks two consumers that take alternate tiles
   of one ring; a tcgen05 pair's step block over a partial depth lowers; the lowering cache keys a program
