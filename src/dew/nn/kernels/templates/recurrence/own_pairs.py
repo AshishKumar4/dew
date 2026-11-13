@@ -191,9 +191,10 @@ def key_pairs_own(q, k, hi, lo, beta, d_scores, d_system, taken, call: Call, *, 
     chunk, width, family = call.chunk, call.width, call.family
     given, gates, square = call.given, call.gates, fp32_operand(call)
     # The block a multiprocessor holds most programs of, at its registers and its shared memory: by its
-    # registers alone, an sm86's 99 KB held none of its 32-key block's 106 KB (row 5282).
+    # registers alone, an sm86's 99 KB held none of its 32-key block's 106 KB (row 5282). It issues no
+    # products, so a product's depth steps it (`key_block`'s `contracted`), as the forward's.
     keys = key_block(call, functools.partial(_key_own_held, call), functools.partial(_key_own_staged, call),
-                     functools.partial(_key_own_streamed, call))
+                     functools.partial(_key_own_streamed, call), contracted=True)
     steps = width // keys
 
     def program(at, q_ref, k_ref, hi_ref, lo_ref, beta_ref, ds_ref, da_ref, taken_ref, dq_ref, dk_ref, dg_ref,
