@@ -138,6 +138,7 @@ import threading
 import time
 import tomllib
 import xml.etree.ElementTree as ET
+from collections import Counter
 from collections.abc import Container, Mapping, Sequence
 from pathlib import Path
 
@@ -526,10 +527,12 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tupl
     # The plan's one reading of the checkout, which every row's key reads its inputs from.
     reading = Reading()
 
+    misses: dict[tuple[str, str], list[str]] = {}
     def hit(each_row: tuple[str, str]) -> str | None:
         name, group = each_row
         for each in held:
-            found = green_record(python, name, group, common, token, [each], reading)
+            found = green_record(python, name, group, common, token, [each], reading,
+                                 misses.setdefault(each_row, []))
             # Kept only where its green run is kept by its key, as the task reads it.
             if found is not None and recorded(
                     green_key(python, row(python, name, group), each, found[0]["key"]), token) is not None:
@@ -537,7 +540,11 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str) -> dict[tupl
         return None
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        return {each: found for each, found in zip(rows, pool.map(hit, rows), strict=True) if found}
+        found = {each: kept for each, kept in zip(rows, pool.map(hit, rows), strict=True) if kept}
+    # Why each other row was not kept, by its first class's word (`green_record`), as a train's log states it.
+    missed = dict(Counter((misses.get(e) or ["no class"])[0] for e in rows if e not in found).most_common())
+    print(f"plan: {python}: kept {len(found)} of {len(rows)} rows; not kept: {missed}", file=sys.stderr)
+    return found
 
 
 def eager_sites(python: str, sites: Sequence[tuple[str, str]]) -> set[tuple[str, str]]:
@@ -615,8 +622,8 @@ def kept_of(tests: list[str]) -> tuple[list[str], dict[tuple[str, str], tuple[st
     return names, kept
 
 
-def green_record(python: str, name: str, split: str, common: str, token: str,
-                 classes: list[str], reading: Reading | None = None) -> tuple[dict, str] | None:
+def green_record(python: str, name: str, split: str, common: str, token: str, classes: list[str],
+                 reading: Reading | None = None, why: list[str] | None = None) -> tuple[dict, str] | None:
     """The record of test file `name`'s row (in `split`'s group) that ran green on exactly these inputs on one
     of `classes`, the first found, with its class; else None. The plan (`reusable`) and a task (`reused`) read
     it alike, from one reading of the inputs (`Reading`). A row's key hashes the inputs its run executed, so
@@ -626,18 +633,23 @@ def green_record(python: str, name: str, split: str, common: str, token: str,
     here what it held then, so this tree's run would execute the same set; a set naming a unit this tree lacks
     is skipped unread (`matchable`). Keyed by the last run's set alone, a row run green on main was found by
     no plan once a run of another tree came after it (2026-11-12: train 781's CI kept 2 of 4,180 tasks; a
-    reach of a comment's change planned 7,161 rows)."""
+    reach of a comment's change planned 7,161 rows). A miss says why in `why`, a class at a time (`MISSED`).
+    """
     reading = Reading() if reading is None else reading
+    why = [] if why is None else why
     place = row(python, name, split)
     for each in classes:
         tried: set[str] = set()
         try:
             current = epoch(python, place, each, common, token)[0]
         except Unread:
+            why.append("unread")
             continue
         if current is None:
+            why.append("no green epoch")
             continue
         found = recorded(record_key(python, place, each, common), token)
+        why.append("an executed input changed" if found is not None else "no record on these shared inputs")
         if found is not None and found["depends"] is not None:
             # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of
             # exactly these, kept by that key (`green_key`) whatever ran since.
