@@ -407,6 +407,9 @@ class FitRun:
     """The cooldown branch the run is to run at its current step before it reads on, resolved
     (`dew.training.cooldown.Pending`): one its checkpoints kept unfinished, as the pool agreed it, or
     one due at its last step, which runs after the step's final save (`Trainer._wind_down`)."""
+    warmed: JSON = None
+    """The rung the evaluations' programs were last warmed at (`StepCompiler.rung`, `Trainer._warmed`): a
+    step compiled at another shape or phase leaves them as they were unless it moved the run's objective."""
 
     def open_window(self, profile: ProfileWindow | None, profiler: Profiler | None, seen: int,
                     compiled: bool) -> None:

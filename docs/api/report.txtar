@@ -1013,11 +1013,12 @@ dew.telemetry.profile.CaptureOptions
 dew.training.ahead.AheadTarget
   generation: str
   devices: int
-  path: str
+  path: str | None = None
   capacity_gib: float | None = None
   frontier: bool = False
   multiprocessors: int | None = None
   topology: str | None = None
+  phases: tuple[int, ...] = ()
 dew.training.budget.Pause
   fraction: float
 dew.training.budget.Plateau
