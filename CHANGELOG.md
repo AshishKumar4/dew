@@ -57,8 +57,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   as `values(horizons, rates)` where it took `values(steps, rates)`: a subclass that read the run's length
   in `values` overrides `horizons` to state the lengths it reads, or reads `{}`.
 
-- Dew requires optax 0.2.8 or later (was 0.2.6): Muon's Newton-Schulz is optax's own iteration, its layout,
-  shape scalings and preconditionings (AOL, Schatten) included, which 0.2.8 first ships.
+- Dew requires optax 0.2.8 or later (was 0.2.6): Muon iterates Newton-Schulz in Dew's own form, on the matrices
+  as they are stored (no transposes), held to optax's iteration as its oracle; its layout, shape scalings,
+  coefficient presets and preconditionings (AOL, Schatten), which 0.2.8 first ships, are optax's.
 
 - A run resumes from what the current Dew and the one before it wrote, and refuses an earlier format by
   name with the ways on: a step that holds a decision run's projections packed (`q`, `k` and `v` in one
