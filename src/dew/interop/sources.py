@@ -16,10 +16,10 @@ import functools
 import json
 import logging
 import os
-from collections.abc import Callable, Collection
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import IO, TYPE_CHECKING
 
 import jax
 import numpy as np
@@ -27,6 +27,7 @@ import numpy as np
 from dew import _records
 from dew._cache import hub_answer, hub_commit, hub_storage, recorded_hub_answer
 from dew.interop import pickles
+from dew.interop.codecs import CT_PARTS
 from dew.interop.safetensors_io import (
     LazyTensors,
     header_specs,
@@ -36,7 +37,7 @@ from dew.interop.safetensors_io import (
     stored_spec,
     weight_files,
 )
-from dew.interop.unread import Unread, unread
+from dew.interop.unread import Stored, Unread, unread
 
 if TYPE_CHECKING:
     from transformers import PreTrainedModel
@@ -147,6 +148,41 @@ class SourceReference:
 
         return self.file(root, filename) if file_exists(self.name, selected, revision=root.name) else None
 
+    def stored_file(
+        self, root: Path, filename: str, *, optional: bool = False
+    ) -> Mapping[str, Stored] | None:
+        """One tensor file's shapes and dtypes alone (`Unread`), without downloading or mapping its
+        payload, or converted where it is a PyTorch pickle."""
+        selected = (Path(self.subfolder or "") / filename).as_posix()
+        if Path(selected).suffix == ".safetensors":
+            local_path = root / selected
+            if os.path.lexists(local_path) or os.path.isdir(self.name):
+                if not os.path.lexists(local_path):
+                    if optional:
+                        return None
+                    return tensor_file(self.file(root, filename))
+                return unread(header_specs(local_path))
+            from huggingface_hub import constants, file_exists
+
+            question = ("safetensors header", self.name, root.name, selected)
+            if (
+                optional
+                and not (constants.HF_HUB_OFFLINE and recorded_hub_answer(question) is not None)
+                and not file_exists(self.name, selected, revision=root.name)
+            ):
+                return None
+            if constants.HF_HUB_OFFLINE and recorded_hub_answer(question) is None:
+                raise FileNotFoundError(
+                    f"{self.name} at {root.name}: {selected}'s header was never read online"
+                )
+            header = hub_answer(
+                question, functools.partial(_hub_header, self.name, root.name, selected)
+            ).value
+            return unread({
+                name: stored_spec(name, shape, tag, selected) for name, (shape, tag) in header.items()
+            })
+        path = self.optional_file(root, filename) if optional else self.file(root, filename)
+        return None if path is None else tensor_file(path)
     def weights(self, root: Path, components: tuple[str, ...] = ("",)) -> Path:
         """The pinned root with exactly the requested component weights present."""
         requested = tuple((Path(self.subfolder or "") / part).as_posix() for part in components)
@@ -330,10 +366,23 @@ def snapshot(name_or_dir: str, revision: str | None, *,
     """
     if os.path.isdir(name_or_dir):
         return Path(name_or_dir)
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import constants, snapshot_download
+    from huggingface_hub.errors import IncompleteSnapshotError, LocalEntryNotFoundError
 
-    directory = Path(snapshot_download(name_or_dir, revision=revision,
-                                       allow_patterns=METADATA_PATTERNS))
+    try:
+        directory = Path(snapshot_download(name_or_dir, revision=revision,
+                                           allow_patterns=METADATA_PATTERNS))
+    except LocalEntryNotFoundError as missing:
+        # Offline, a commit none of whose files is metadata (a repo of one DDUF archive) has no snapshot
+        # folder in the Hub cache, which huggingface_hub makes only around a file it fetches: its folder
+        # is the one of the commit the revision named online (`hub_commit`), as the online call returned
+        # it. A folder the cache holds, or one it knows lacks a file (`IncompleteSnapshotError`), is
+        # huggingface_hub's to answer for.
+        if not constants.HF_HUB_OFFLINE or isinstance(missing, IncompleteSnapshotError):
+            raise
+        directory = hub_storage(name_or_dir) / "snapshots" / hub_commit(name_or_dir, revision).value
+        if directory.exists():
+            raise
     if weights is False:
         return directory
     files = repo_files(name_or_dir, directory)
@@ -380,30 +429,103 @@ def _hub_files(name: str, revision: str) -> list[str]:
 
 
 def _hub_header(name: str, revision: str, file: str) -> dict[str, tuple[list[int], str]]:
-    """Each tensor of a Hub file's safetensors header, its shape and dtype tag, read over HTTP."""
-    from huggingface_hub import HfApi
+    """Each tensor of a Hub file's safetensors header, its shape and dtype tag, read over HTTP by the
+    header's exact range (`safetensors_header`) through a stream with no read-ahead: no byte of a tensor
+    fetched, where `HfApi.parse_safetensors_file_metadata` asks the file's first 100,001 bytes."""
+    from huggingface_hub import HfFileSystem
 
-    header = HfApi().parse_safetensors_file_metadata(name, file, revision=revision)
-    return {tensor_name: (list(tensor.shape), tensor.dtype) for tensor_name, tensor in header.tensors.items()}
+    with HfFileSystem().open(f"{name}@{revision}/{file}", "rb", cache_type="none") as stream:
+        header, _ = safetensors_header(stream)
+    return {tensor_name: (list(_records.integers(_records.record(entry, tensor_name)["shape"], "shape")),
+                          _records.text(_records.record(entry, tensor_name)["dtype"], "dtype"))
+            for tensor_name, entry in header.items() if tensor_name != "__metadata__"}
+
+SIDECAR_BYTES = 65536
+"""The largest stored tensor `hub_tensor` records as the Hub answered it: a metadata sidecar (a compressed
+weight's shape, an autoencoder's latent statistics), which an offline load reads back; a larger one is read
+from the Hub each time."""
 
 
-def stored_tensors(source: SourceReference, root: Path) -> LazyTensors[Unread] | None:
+def hub_tensor(path: str, tensor_name: str, filename: str, question: tuple[str, ...], *,
+               offset: int = 0) -> np.ndarray:
+    """One stored tensor of the safetensors at `offset` of the Hub file `path` (`repo@revision/file`), read
+    by its byte range through a stream with no read-ahead (`stored_tensor`), no byte of another tensor
+    fetched, as it reads (`stored_array`; `filename` names it in a refusal): recorded under `question` where
+    it is no larger than `SIDECAR_BYTES`, so an offline load reads it back, and refused offline where it
+    was never read online. Every load without its weights reads a stored tensor from the Hub through it: a
+    file's (`StoredWeights.sidecar`) and a DDUF archive's (`dew.interop.dduf`)."""
+    from huggingface_hub import HfFileSystem, constants
+
+    if constants.HF_HUB_OFFLINE:
+        recorded = recorded_hub_answer(question)
+        if recorded is None:
+            raise FileNotFoundError(f"{path}: its {tensor_name} was never read online; load it online once, "
+                                    "or with its weights")
+        shape, tag, raw = recorded.value
+    else:
+        with HfFileSystem().open(path, "rb", cache_type="none") as stream:
+            shape, tag, held = stored_tensor(stream, tensor_name, offset=offset)
+        raw = held.hex()
+        if len(held) <= SIDECAR_BYTES:
+            hub_answer(question, lambda: (shape, tag, raw))
+    return stored_array(tensor_name, shape, tag, bytes.fromhex(raw), filename)
+
+
+
+def safetensors_header(stream: IO[bytes], *, offset: int = 0) -> tuple[Mapping[str, object], int]:
+    """The header of the safetensors file a seekable `stream` holds at `offset`, and the offset its
+    tensors' data starts at: its first 8 bytes and the header they size read, nothing past them."""
+    stream.seek(offset)
+    header_len = int.from_bytes(stream.read(8), "little")
+    return _records.record(json.loads(stream.read(header_len)), "safetensors header"), offset + 8 + header_len
+
+
+def stored_tensor(stream: IO[bytes], tensor_name: str, *, offset: int = 0) -> tuple[list[int], str, bytes]:
+    """One tensor of the safetensors file a seekable `stream` holds at `offset`, as stored: its header's
+    shape and dtype tag, and its bytes alone, read by their range."""
+    header, start = safetensors_header(stream, offset=offset)
+    entry = _records.record(header[tensor_name], tensor_name)
+    bounds = _records.integers(entry["data_offsets"], "data_offsets")
+    stream.seek(start + bounds[0])
+    raw = stream.read(bounds[1] - bounds[0])
+    return list(_records.integers(entry["shape"], "shape")), _records.text(entry["dtype"], "dtype"), raw
+
+
+def stored_array(tensor_name: str, shape: Sequence[int], tag: str, raw: bytes, filename: str) -> np.ndarray:
+    """A stored tensor's bytes (`stored_tensor`) as the array it reads as (`stored_spec`)."""
+    spec = stored_spec(tensor_name, shape, tag, filename)
+    return np.frombuffer(raw, dtype=spec.dtype).reshape(spec.shape).copy()
+
+
+def read_safetensors_slice(
+    stream: IO[bytes], tensor_name: str, filename: str, *, offset: int = 0
+) -> np.ndarray:
+    """Read one small metadata tensor by byte slice from a seekable safetensors `stream` at `offset`."""
+    return stored_array(tensor_name, *stored_tensor(stream, tensor_name, offset=offset), filename)
+
+def stored_tensors(source: SourceReference, root: Path, *, folder: str = "") -> LazyTensors[Stored] | None:
     """`source`'s weight tensors at the snapshot `root` (`snapshot(weights=False)`) as their shapes and
     dtypes alone, read from their safetensors headers (`StoredWeights.specs`, a Hub source's over HTTP
     and cached), what a load without its weights translates: each tensor an `Unread` array, its shape
-    and dtype, no value fetched or read. None for a checkpoint of PyTorch pickles alone, whose shapes
-    no header states, which a load reads whole. Raises FileNotFoundError where a header cannot be read
-    (offline, never read online)."""
+    and dtype, no value fetched or read, save a compressed weight's 2-element shape sidecar
+    (`codecs.CT_PARTS`'s) read by byte slice alone (`StoredWeights.sidecar`). None for a checkpoint of
+    PyTorch pickles alone."""
     stored = StoredWeights(source.name, root, source.subfolder or "")
-    if not stored.files(""):
+    if not stored.files(folder):
         return None
-    held = stored.specs("")
+    held = stored.specs(folder)
     if held is None:
         raise FileNotFoundError(f"{source.name} at {root.name}: its weights' headers were never read "
                                 "online, and offline they are read from the files alone; load it online "
                                 "once, or with its weights")
-    return unread({name: spec for name, (_, spec) in held.items()})
-
+    return LazyTensors(
+        {name: spec for name, (_, spec) in held.items()},
+        lambda name: (
+            stored.sidecar(held[name][0], name)
+            if name.endswith(CT_PARTS["shape"]) and held[name][1].shape == (2,)
+            else Unread(held[name][1].shape, held[name][1].dtype)
+        ),
+    )
 
 @dataclass(frozen=True)
 class StoredWeights:
@@ -415,12 +537,20 @@ class StoredWeights:
     name_or_dir: str
     directory: Path
     subfolder: str = ""
+    entries: Mapping[str, Mapping[str, jax.ShapeDtypeStruct]] | None = None
+    tensor_reader: Callable[[str, str], np.ndarray] | None = None
 
     def files(self, folder: str) -> tuple[str, ...]:
         """The repo-relative files that hold `folder`'s weights (`weight_files`): a directory's
-        own, or the commit's, as the Hub lists them (`_hub_files`), recorded so an offline run
-        reads the same listing (`repo_files`)."""
-        if os.path.isdir(self.name_or_dir):
+        own, an archive's (`entries`), or the commit's, as the Hub lists them (`_hub_files`),
+        recorded so an offline run reads the same listing (`repo_files`)."""
+        if self.entries is not None:
+            listing = set(self.entries) | {
+                path.relative_to(self.directory).as_posix()
+                for path in self.directory.rglob("*")
+                if path.is_file()
+            }
+        elif os.path.isdir(self.name_or_dir):
             listing = {path.relative_to(self.directory).as_posix() for path in self.directory.rglob("*")
                        if path.is_file()}
         else:
@@ -445,7 +575,9 @@ class StoredWeights:
         owner: dict[str, str] = {}
         for file in self.files(folder):
             question = ("safetensors header", self.name_or_dir, self.directory.name, file)
-            if (self.directory / file).is_file():
+            if self.entries is not None and file in self.entries:
+                specs = dict(self.entries[file])
+            elif (self.directory / file).is_file():
                 specs = header_specs(self.directory / file)
             elif os.path.isdir(self.name_or_dir) or (constants.HF_HUB_OFFLINE
                                                      and recorded_hub_answer(question) is None):
@@ -466,9 +598,24 @@ class StoredWeights:
         def read(file: str) -> dict[str, np.ndarray]:
             return read_file(repo_file(self.name_or_dir, self.directory, file))[0]
 
-        return LazyTensors({name: spec for name, (_, spec) in held.items()},
-                           lambda name: read(held[name][0])[name])
+        def load_tensor(name: str) -> np.ndarray:
+            file = held[name][0]
+            if self.tensor_reader is not None and self.entries is not None and file in self.entries:
+                return self.tensor_reader(file, name)
+            return read(file)[name]
 
+        return LazyTensors({name: spec for name, (_, spec) in held.items()}, load_tensor)
+
+    def sidecar(self, file: str, name: str) -> np.ndarray:
+        """Read one small metadata tensor by byte slice without mapping or downloading the shard's weights."""
+        if self.tensor_reader is not None and self.entries is not None and file in self.entries:
+            return self.tensor_reader(file, name)
+        local_path = self.directory / file
+        if local_path.is_file():
+            with open(local_path, "rb") as stream:
+                return read_safetensors_slice(stream, name, os.fspath(local_path))
+        return hub_tensor(f"{self.name_or_dir}@{self.directory.name}/{file}", name, file,
+                          ("safetensors sidecar", self.name_or_dir, self.directory.name, file, name))
 
 @dataclass(frozen=True)
 class LoadName:

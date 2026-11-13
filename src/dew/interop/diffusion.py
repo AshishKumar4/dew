@@ -6,7 +6,7 @@ scheduler implementation is imported by this module.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -18,7 +18,9 @@ from dew import _records
 from dew._records import JSON
 from dew.interop import weights
 from dew.interop.config_records import NativeFields, native_fields
-from dew.interop.safetensors_io import read_weights
+from dew.interop.safetensors_io import LazyTensors, read_weights
+from dew.interop.sources import StoredWeights
+from dew.interop.unread import Stored, Unread, held as held_stored, unread as unread_map, valued
 from dew.interop.weights import ParamTree, checkpoint_dtype, indexed_path, insert, source_alias
 from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.flux2 import Flux2Transformer
@@ -239,7 +241,7 @@ def _unet_path(name: str, rank: int) -> tuple[str, ...]:
     return tuple(path)
 
 
-def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondition, *,
+def translate_unet_weights(tensors: Mapping[str, Stored], model: UNet2DCondition, *,
                            param_dtype: str = "float32", lazy: bool = False
                            ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
     """Map UNet tensors into a parameter tree and the layouts that invert it.
@@ -252,13 +254,13 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
     parameters: LazyTree = {}
     owners: dict[tuple[str, ...], str] = {}
     for name, tensor in tensors.items():
-        path = _unet_path(name, tensor.ndim)
+        stored = held_stored(tensor)
+        path = _unet_path(name, stored.ndim)
         source_alias(tensors, owners, path, name)
-        stored = np.asarray(tensor)
         dtype = checkpoint_dtype(stored.dtype, param_dtype)
         kernel = path[-1] == "kernel"
         attention = "Attention1" in path or "Attention2" in path
-        if lazy and not (kernel and stored.ndim == 4):
+        if lazy and not (kernel and stored.ndim == 4) and valued(stored):
             value = SourceLeaf((stored,), dtype, transposed=kernel)
         else:
             value = stored.astype(dtype, copy=False)
@@ -272,7 +274,8 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
             value = value.reshape(shape)
         if owners[path] == name:
             insert(parameters, path, value, name)
-    return parameters, unet_layouts({name: tensor.shape for name, tensor in tensors.items()}, model)
+    shapes = {name: held_stored(tensor).shape for name, tensor in tensors.items()}
+    return parameters, unet_layouts(shapes, model)
 
 
 def _unet_stage(model: UNet2DCondition, path: tuple[str, ...]) -> UNetStage:
@@ -718,9 +721,9 @@ def flux_path(name: str, rank: int) -> tuple[str, ...]:
     raise ValueError(f"unknown tensor name {name!r}")
 
 
-def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32",
+def translate_sd3_weights(tensors: Mapping[str, Stored], *, param_dtype: str = "float32",
                           lazy: bool = False
-                          ) -> tuple[LazyTree, ParamTree, tuple[WeightLayout, ...]]:
+                          ) -> tuple[LazyTree, dict[str, Stored], tuple[WeightLayout, ...]]:
     """Map SD3 tensors into a parameter tree, its buffers and the inverting layouts.
 
     The source's position embedding is a persistent sin/cos-initialized
@@ -733,12 +736,17 @@ def translate_sd3_weights(tensors: Mapping[str, np.ndarray], *, param_dtype: str
     position = tensors.get("pos_embed.pos_embed")
     if position is None:
         raise ValueError("An SD3 transformer stores its position embedding buffer")
-    array = np.asarray(position, np.float32)
-    if array.ndim != 3 or array.shape[0] != 1:
-        raise ValueError(f"The position buffer must be [1, tokens, width], got {array.shape}")
-    buffers: ParamTree = {"pos_embed": np.ascontiguousarray(array)}
-    return parameters, buffers, sd3_layouts({name: tensor.shape for name, tensor in tensors.items()})
-
+    held_pos = held_stored(position)
+    if held_pos.ndim != 3 or held_pos.shape[0] != 1:
+        raise ValueError(f"The position buffer must be [1, tokens, width], got {held_pos.shape}")
+    pos_buf = (
+        np.ascontiguousarray(held_pos.astype(np.float32))
+        if valued(held_pos)
+        else held_pos.astype(np.float32)
+    )
+    return parameters, {"pos_embed": pos_buf}, sd3_layouts(
+        {name: held_stored(tensor).shape for name, tensor in tensors.items()}
+    )
 
 def sd3_layouts(shapes: Mapping[str, tuple[int, ...]]) -> tuple[WeightLayout, ...]:
     """The layouts `translate_sd3_weights` returns, from the stored tensors' shapes
@@ -826,7 +834,7 @@ def qwen_image_path(name: str, rank: int) -> tuple[str, ...]:
     raise ValueError(f"unknown tensor name {name!r}")
 
 
-def read_transformer(tensors: Mapping[str, np.ndarray],
+def read_transformer(tensors: Mapping[str, Stored],
                      path_of: Callable[[str, int], tuple[str, ...] | None], *,
                      param_dtype: str = "float32", lazy: bool = False
                      ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
@@ -846,11 +854,37 @@ def transformer_layouts(shapes: Mapping[str, tuple[int, ...]],
                                   ("params",))
 
 
-def component_tensors(directory: Path, component: str) -> dict[str, np.ndarray]:
+def component_tensors(
+    directory: Path,
+    component: str,
+    *,
+    stored: StoredWeights | None = None,
+    weights_loaded: bool = True,
+    metadata: Collection[str] = (),
+) -> Mapping[str, Stored]:
     """Read one published component's weights: the shards its index names or
-    its one weights file, never a precision variant beside them."""
-    return read_weights(directory / component)
-
+    its one weights file, or its `Unread` header specs (plus any small `metadata`
+    tensors read by byte slice) when `weights_loaded` is False."""
+    if weights_loaded or stored is None:
+        return read_weights(directory / component)
+    if not stored.files(component):
+        return read_weights(directory / component)
+    specs = stored.specs(component)
+    if specs is None:
+        raise FileNotFoundError(
+            f"{stored.name_or_dir} at {stored.directory.name}: {component}'s headers were never read online"
+        )
+    if not metadata:
+        return unread_map({name: spec for name, (_, spec) in specs.items()})
+    meta_names = frozenset(metadata)
+    return LazyTensors(
+        {name: spec for name, (_, spec) in specs.items()},
+        lambda name: (
+            stored.sidecar(specs[name][0], name)
+            if name in meta_names
+            else Unread(specs[name][1].shape, specs[name][1].dtype)
+        ),
+    )
 
 def flax_component_parameters(component: str, tensors: Mapping[str, np.ndarray]) -> ParamTree:
     """Map canonical tensor names into the storage tree a Flax checkpoint declares.
@@ -946,6 +980,7 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
     they read no shards; Diffusers' PyTorch classes read the safetensors beside it, and their
     `from_flax` conversion, which reads the msgpack, takes a folder without them
     (modeling_utils.py:1109-1113, 0.34.0)."""
+    from dew.interop.autoencoders.pretrained import written_metadata
     from dew.interop.decoder_parts import layout_tensors
     from dew.interop.safetensors_io import LazyTensors, save_sharded, tensor_specs
     written = {path for layout in source.weight_layouts for path in layout.paths}
@@ -981,8 +1016,10 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
     for layout in source.weight_layouts:
         component, _, name = layout.name.partition("/")
         layouts.setdefault(component, {})[name] = layout
+    # The autoencoder's metadata tensors as its source stores them, which its registration reads at load.
+    vae_stats = {f"vae/{name}": value for name, value in written_metadata(source.autoencoder).items()}
     retained: dict[str, dict[str, str]] = {}
-    specifications = tensor_specs(source.retained_tensors)
+    specifications = {**tensor_specs(source.retained_tensors), **tensor_specs(vae_stats)}
     for source_name in specifications:
         component, _, name = source_name.partition("/")
         if name not in layouts.get(component, {}):
@@ -991,8 +1028,14 @@ def save_source(source, values, destination: Path, max_shard_size: int | str) ->
         # Each tensor is built as the shard that holds it is written, so the host
         # holds one shard of the export (`save_sharded`).
         names = retained.get(component, {})
-        carried = LazyTensors({name: specifications[original] for name, original in names.items()},
-                              lambda name, names=names: source.retained_tensors[names[name]])
+        carried = LazyTensors(
+            {name: specifications[original] for name, original in names.items()},
+            lambda name, names=names: (
+                vae_stats[names[name]]
+                if names[name] in vae_stats
+                else source.retained_tensors[names[name]]
+            ),
+        )
         tensors = layout_tensors(layouts.get(component, {}), values, retained=carried)
         declared = Declared.read(index, component, component_configs.get(component, {}))
         save_sharded(tensors, destination / component, max_shard_size, stem=declared.stem)
