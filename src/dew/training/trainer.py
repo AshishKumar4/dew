@@ -1058,7 +1058,7 @@ class Trainer(Generic[Loss, Effects]):
             raise Preempted(run.preempted)
         # One stage's scan holds its runs stacked for its step alone: the state a run returns holds them on
         # their stored layers, as every reader by layer name reads them, at no device's cost but the copy.
-        return trained if self._staging.stages > 1 else self.stored(trained)
+        return trained if self._staging.stages > 1 else self._staging.stored(trained, consumed=True)
 
     def _fit_plan(
         self,
