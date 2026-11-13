@@ -68,6 +68,8 @@ class ActorCritic(nn.Module):
     spread: float = 1.0
 
     def setup(self) -> None:
+        if self.spread <= 0:
+            raise ValueError("ActorCritic spread must be positive")
         self.policy_net = _MLP(tuple(self.policy_layers), 2 * self.action_size)
         self.value_net = _MLP(tuple(self.value_layers), 1)
 
@@ -121,6 +123,7 @@ class ControlPPOObjective(ReleasesModel, Objective[Ratio, Variables]):
     `reward_scaling` multiplies each reward, `value_cost` weighs the value loss and `entropy_cost`
     the entropy bonus. Brax's `ppo.train` defaults, but the discount, Playground's DM Control one."""
 
+    resumable: ClassVar[tuple[str, ...]] = ("entropy_cost",)
     shown: Mapping[str, Shown] = {"loss": Shown(), "episode_return": Shown(better="higher")}
 
     def __init__(self, model: ActorCritic, observation_size: int, *, discount: float = 0.995,
@@ -293,8 +296,17 @@ def _summary(steps: Transition, returns: jax.Array):
              "log_prob": extras["log_prob"], "reward": steps.following.reward,
              "terminated": steps.following.terminated, "truncated": steps.following.truncated,
              "following": steps.following.observation}
-    ended_returns = jnp.sum(jnp.where(ended, totals, 0)) / jnp.maximum(jnp.sum(ended), 1)
-    return returns, jax.tree.map(sequences, batch), ended_returns, jnp.sum(ended)
+    count = jnp.sum(ended)
+    ended_mean = jnp.where(count > 0, jnp.sum(jnp.where(ended, totals, 0)) / jnp.maximum(count, 1), jnp.nan)
+    return returns, jax.tree.map(sequences, batch), ended_mean
+
+
+def _summary_and_order(steps: Transition, returns: jax.Array, key: jax.Array, *, epochs: int):
+    next_returns, gathered, ended_mean = _summary(steps, returns)
+    sequences = gathered["reward"].shape[0]
+    order = jax.vmap(lambda subkey: jax.random.permutation(subkey, sequences))(
+        jax.random.split(key, epochs)).reshape(-1).astype(jnp.int32)
+    return next_returns, gathered, ended_mean, order
 
 
 class Saved(TypedDict):
@@ -342,7 +354,7 @@ class ControlRollout:
 
     @property
     def metrics(self) -> Mapping[str, float]:
-        return {"episode_return": self._ended}
+        return {"episode_return": float(self._ended)}
 
     @contextlib.contextmanager
     def branch(self, name: str) -> Iterator[None]:
@@ -379,16 +391,26 @@ class ControlRollout:
             return None
         key = jax.random.key(0)
         carry = jax.eval_shape(functools.partial(rollout_start, env), key)
+        step_out = jax.eval_shape(env.reset, key)[1]
         count = len(jax.tree.leaves(carry.observation)[0])
-
-        def collected(variables, carry):
-            _, steps = self._unrolled(env, variables, carry)
-            return _summary(steps, jnp.zeros(count, jnp.float32))[1]
-
-        gathered = jax.eval_shape(collected, jax.eval_shape(self.objective.init, key), carry)
-        order = jax.ShapeDtypeStruct((self.epochs * len(gathered["reward"]),), np.int32)
+        sequences = self.unrolls * count
+        step_shape = (sequences, self.unroll_length)
+        obs_shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct((*step_shape, *leaf.shape[1:]),
+                                                                    leaf.dtype), carry.observation)
+        acted_extras = jax.eval_shape(
+            lambda v, c: self.objective.act(v, c.observation, key, c.memory)[1],
+            jax.eval_shape(self.objective.init, key), carry)
+        gathered = {"observation": obs_shapes,
+                    "raw_action": jax.ShapeDtypeStruct((*step_shape, env.action_size),
+                                                       acted_extras["raw_action"].dtype),
+                    "log_prob": jax.ShapeDtypeStruct(step_shape, acted_extras["log_prob"].dtype),
+                    "reward": jax.ShapeDtypeStruct(step_shape, step_out.reward.dtype),
+                    "terminated": jax.ShapeDtypeStruct(step_shape, step_out.terminated.dtype),
+                    "truncated": jax.ShapeDtypeStruct(step_shape, step_out.truncated.dtype),
+                    "following": obs_shapes}
+        order = jax.ShapeDtypeStruct((self.epochs * sequences,), np.int32)
         return {"carry": carry, "returns": jax.ShapeDtypeStruct((count,), jnp.float32), "collected": gathered,
-                "order": order, "ended": jax.ShapeDtypeStruct((), jnp.float32),
+                "order": order, "ended": jax.ShapeDtypeStruct((), np.float32),
                 "served": jax.ShapeDtypeStruct((), jnp.int32)}
 
     def restored(self, tree: Saved) -> None:
@@ -396,26 +418,45 @@ class ControlRollout:
         it served reads them off the updates at its next call, as the run that saved it did."""
         self._carry, self._returns = tree["carry"], tree["returns"]
         self._collected = jax.tree.map(np.asarray, dict(tree["collected"]))
-        self._order, self._ended = np.asarray(tree["order"]), float(tree["ended"])
+        self._order, self._ended = np.asarray(tree["order"], np.int32), float(tree["ended"])
         self._served = int(tree["served"]) if "served" in tree else None
 
-    def _collector(self) -> Callable[[Variables, Carry], tuple[Carry, Transition]]:
-        """The collection for the rollout's environment as it is now: a run may change it between
-        collections (a curriculum), its collection made again; episodes under way carry on. Over a JAX
-        environment it is the objective's program (`Objective.program`), which runs the policy's modules."""
+    def _collect(self, variables: Variables, carry: Carry, returns: jax.Array, key: jax.Array):
+        """Collect `unrolls` sequences in `self.env`, summarize GAE trajectories and draw epoch permutations
+        in one compiled program over a JAX `Env` (or host-stepped over a `Simulator`), staying on device."""
         env = self.env
         if isinstance(env, Simulator):
-            return functools.partial(self._simulated, env)
-        return self.objective.program("collection", functools.partial(self._unrolled, env), holds=(env,))
+            carry, steps = self._simulated(env, variables, carry)
+            order_key = jax.device_put(key, returns.sharding) if key.sharding != returns.sharding else key
+            returns, gathered, ended, order = program(
+                _summary_and_order, static_argnames=("epochs",))(
+                steps, returns, order_key, epochs=self.epochs)
+            return carry, returns, gathered, ended, order
 
-    def _started(self, key: jax.Array) -> Carry:
-        """Fresh episodes of the rollout's environment (`rollout_start`): over a JAX environment one
-        program, compiled whole as its collection is (`_collector`), rather than its reset's every
-        operation dispatched alone."""
+        def collect_env(params: Variables, cur_carry: Carry, cur_returns: jax.Array, order_key: jax.Array, *,
+                        epochs: int):
+            next_carry, steps = self._unrolled(env, params, cur_carry)
+            next_returns, gathered, ended, order = _summary_and_order(
+                steps, cur_returns, order_key, epochs=epochs)
+            return next_carry, next_returns, gathered, ended, order
+
+        return self.objective.program(
+            "collection", collect_env, holds=(env,), static_argnames=("epochs",))(
+            variables, carry, returns, key, epochs=self.epochs)
+
+    def _started(self, key: jax.Array) -> tuple[Carry, jax.Array]:
+        """Fresh episodes and zeroed running returns: over a JAX environment one compiled program so both
+        `carry` and `returns` share the caller's sharding from the first collection."""
         env = self.env
         if isinstance(env, Simulator):
-            return rollout_start(env, key)
-        return self.objective.program("start", functools.partial(rollout_start, env), holds=(env,))(key)
+            carry = rollout_start(env, key)
+            return carry, jnp.zeros(len(jax.tree.leaves(carry.observation)[0]), jnp.float32)
+
+        def start_env(start_key: jax.Array) -> tuple[Carry, jax.Array]:
+            carry = rollout_start(env, start_key)
+            return carry, jnp.zeros(len(jax.tree.leaves(carry.observation)[0]), jnp.float32)
+
+        return self.objective.program("start", start_env, holds=(env,))(key)
 
     def _unrolled(self, env: Env, params: Variables, carry: Carry) -> tuple[Carry, Transition]:
         """The carry after `unrolls` rollouts of the live policy in `env` and their steps
@@ -443,23 +484,20 @@ class ControlRollout:
         served = (int(state.updates) % passes or passes) if self._served is None else self._served
         carry, returns = self._carry, self._returns
         if carry is None or returns is None:
-            carry = self._started(key)
-            returns = jnp.zeros(len(jax.tree.leaves(carry.observation)[0]), jnp.float32)
+            carry, returns = self._started(key)
         collected, order = self._collected, self._order
         if served >= passes or collected is None or order is None:
-            carry, steps = self._collector()(state.variables, carry)
-            returns, gathered, ended, count = program(_summary)(steps, returns)
-            collected = jax.device_get(gathered)
-            self._ended = float(ended) if int(count) else float("nan")
-            sequences = len(collected["reward"])
+            carry, returns, dev_collected, dev_ended, dev_order = self._collect(
+                state.variables, carry, returns, key)
+            collected, ended_val, order = jax.device_get((dev_collected, dev_ended, dev_order))
+            self._ended = float(ended_val)
+            sequences = collected["reward"].shape[0]
             if sequences % self.minibatches:
                 raise ValueError(f"{sequences} sequences do not split into {self.minibatches} minibatches")
-            rng = np.random.default_rng(np.asarray(jax.random.key_data(key)).ravel())
-            order = np.concatenate([rng.permutation(sequences) for _ in range(self.epochs)]).astype(np.int32)
             served = 0
         self._carry, self._returns, self._collected, self._order = carry, returns, collected, order
         self._served = served + 1
-        size = len(collected["reward"]) // self.minibatches
+        size = collected["reward"].shape[0] // self.minibatches
         rows = order[served * size:(served + 1) * size]
         return jax.tree.map(lambda values: values[rows], collected)
 
@@ -469,7 +507,8 @@ def episode_return(objective: ControlPPOObjective, env: Env | Simulator, params:
     """The mean undiscounted return of the first episode of each of `env`'s environments, an `Env` or a
     `Simulator`, over `steps` steps of the policy, its deterministic action where `greedy`: the whole
     episode where `steps` is an episode's length (`dew.rl.evaluation.episodes`)."""
-    return episodes(objective.greedy if greedy else objective.act, env, steps)(params, key)["return"]
+    return episodes(objective.greedy if greedy else objective.act, env, steps,
+                    models=objective.towers())(params, key)["return"]
 
 
 __all__ = ["ActorCritic", "ControlPPOObjective", "ControlRollout", "Saved", "episode_return",

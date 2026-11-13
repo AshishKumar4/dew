@@ -795,3 +795,25 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
         drawn,
         pipeline.bind(restored.variables)(prompts, steps=2, guidance=None, solver=Euler(),
                                           key=7).host().images)
+
+
+def test_diffusion_run_source_refuses_unsupported_source_transformations_before_weights(pipelines, tmp_path):
+    """`DiffusionRunConfig` forwards `SourceOptions`'s `dex`, `scan_layers` and `packed_experts` to
+    `load_diffusion_source`, which refuses each unsupported nondefault transformation before reading or
+    downloading weight files."""
+    from dew.config.trainer import SourceOptions
+    from dew.nn.dex import DifferentialExtension
+
+    metadata = tmp_path / "metadata_only"
+    shutil.copytree(pipelines / "sd3" / "pipeline", metadata, ignore=shutil.ignore_patterns("*.safetensors"))
+    base = DiffusionRunConfig(pretrained=str(metadata), preset=None, model=precision(),
+                              data=images_of("tfds://oxford_flowers102", 16), val_metrics=(),
+                              objective=ObjectiveConfig("diffusion",
+                                                        {"solver": Euler(), "guidance": None, "steps": 2,
+                                                         "unconditional_prob": 0.0, "ema_decay": None}))
+    with pytest.raises(TypeError):
+        dataclasses.replace(base, source=SourceOptions(scan_layers=True)).build()
+    with pytest.raises(TypeError):
+        dataclasses.replace(base, source=SourceOptions(dex=DifferentialExtension())).build()
+    with pytest.raises(ValueError):
+        dataclasses.replace(base, source=SourceOptions(packed_experts=True)).build()
