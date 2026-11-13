@@ -50,7 +50,7 @@ def pytest_collection_modifyitems(config, items):
         record = session.own(session.standing(name, of_file), sites)
         planned = session.planned(name, list(record), list(record.values()), count)
         collected = [node for node in nodes if node.split("::")[0] == name]
-        groups = session.kept(collected, planned, mean)
+        groups = session.kept(collected, planned, mean, session.stored_bounds(name, count))
         # Every collected test in exactly one group: each task cuts the file whole and alike, so the groups
         # together run each test once, and a cut that would not is no task's to run.
         if sorted(node for members in groups for node in members) != collected:

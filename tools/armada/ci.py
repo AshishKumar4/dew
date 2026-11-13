@@ -337,7 +337,7 @@ def shared(python: str) -> str:
     # (`digests.built`, fetched_fixtures' `manifest`, `digests.contents`), whose names are.
     for root in ("tests", "src"):
         for path in sorted(Path(root).rglob("*")):
-            if (path.is_file() and path.suffix != ".py" and not digests.built(path)
+            if (path.is_file() and path.suffix != ".py" and not digests.built(path) and path != session.CUTS
                     and digests.FIXTURES not in path.parents
                     and not digests.fetched.manifest(path).is_file()):
                 digest.update(b"fixture:" + str(path).encode())

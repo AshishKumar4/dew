@@ -74,13 +74,13 @@ def weighed(session, tests: list[float], seconds: float, target: float,
     left to scale by, every other file weighed 1.6 times its record and the 0.6 was its setup, so
     tests/test_model_protocols.py's 10,537 s of tests were planned as 195 groups of 6,500 s, 354 task-hours;
     armada sized the run by its longest tasks, gave the sites' 874 map tasks 20 of its 688 containers, and
-    train 772's CI ran out its deadline). A file's stored cut (`stored`: each of its groups' recorded seconds,
-    session.CUTS) stands while its heaviest group, the setup each group paid added, stays within `KEPT` of
-    `target`, so its groups keep their names and their records (Main, 2026-11-13)."""
+    train 772's CI ran out its deadline). A file with a stored cut (`stored`: each of its groups' recorded
+    seconds, session.CUTS) runs as that cut, each group its tests plus the setup each paid: the durations fold
+    alone keeps or replaces a cut (`refolded`), so a group's name means the same tests from run to run and its
+    record is found again (Main, 2026-11-13)."""
     if stored:
         setup = max((measured[0] if measured is not None else seconds) - sum(stored), 0.0) / len(stored)
-        if max(stored) + setup <= KEPT * target:
-            return [weight + setup for weight in stored]
+        return [weight + setup for weight in stored]
     if measured is not None:
         return split(session, tests, measured[0], target, measured[1])
     total = sum(tests)

@@ -330,15 +330,20 @@ def cut_by(nodes: list[str], bounds: list[str]) -> list[list[str]]:
     return [sorted(members) for members in held]
 
 
+def stored_bounds(name: str, count: int, stored: Mapping[str, list[str]] | None = None) -> list[str] | None:
+    """Test file `name`'s stored cut (`CUTS`) where it holds `count` groups and the groups are cut by the
+    durations record (`cut_record`; a GPU tier cuts by its own seconds), else None. `stored` is
+    `stored_cuts()` where a caller has read it once."""
+    bounds = (stored_cuts() if stored is None else stored).get(name) if cut_record() == DURATIONS else None
+    return bounds if bounds is not None and len(bounds) + 1 == count else None
+
+
 def planned(name: str, nodes: list[str], seconds: list[float], count: int,
             stored: Mapping[str, list[str]] | None = None) -> list[list[str]]:
-    """Test file `name`'s recorded `nodes` as the plan's `count` groups: its stored cut where it has `count`
-    groups and the groups are cut by the durations record (`cut_record`; a GPU tier cuts by its own seconds),
-    else cut by their `seconds` (`cut`). `stored` is `stored_cuts()` where a caller has read it once."""
-    bounds = (stored_cuts() if stored is None else stored).get(name) if cut_record() == DURATIONS else None
-    if bounds is not None and len(bounds) + 1 == count:
-        return cut_by(nodes, bounds)
-    return cut(nodes, seconds, count)
+    """Test file `name`'s recorded `nodes` as the plan's `count` groups: its stored cut where it holds them
+    (`stored_bounds`), else cut by their `seconds` (`cut`)."""
+    bounds = stored_bounds(name, count, stored)
+    return cut_by(nodes, bounds) if bounds is not None else cut(nodes, seconds, count)
 
 
 @functools.cache
@@ -393,22 +398,27 @@ def cut_record() -> Path:
     return Path(weights) if weights else DURATIONS
 
 
-def kept(nodes: list[str], planned: list[list[str]], mean: float) -> list[list[str]]:
-    """`nodes`, a task's collected tests of one split file in node-id order, as the plan's groups
-    `planned` (the file's recorded tests cut, `cut`): each test the record names in its planned group, so no
-    group runs a recorded test its plan did not weigh (2026-11-11: two new parameters moved test_recurrence's
-    963 s test into a group planned at 77 s); a test the record lacks that shares a setup with a recorded
-    one (`units`) in that one's group; and the rest, `mean` seconds each, cut into as many runs of
-    consecutive tests as there are groups (`groups`), the kth run joining the kth group, so a new
-    parametrization spreads across the groups from its first run, never into one group past its deadline
-    (2026-11-03: test_attention_mosaic's ~190 new ids, weighed nothing, packed into one). A group of a file
-    whose record misses a test it collects is run, never reused (ci.py's `record`)."""
+def kept(nodes: list[str], planned: list[list[str]], mean: float,
+         bounds: list[str] | None = None) -> list[list[str]]:
+    """`nodes`, a task's collected tests of one split file in node-id order, as the plan's groups `planned`
+    (the file's recorded tests cut, `cut`): each test the record names in its planned group, so no group runs
+    a recorded test its plan did not weigh (2026-11-11: two new parameters moved test_recurrence's 963 s test
+    into a group planned at 77 s); a test the record lacks that shares a setup with a recorded one (`units`)
+    in that one's group; and the rest, `mean` seconds each, cut into as many runs of consecutive tests as
+    there are groups (`groups`), the kth run joining the kth group, so a new parametrization spreads across
+    the groups from its first run, never into one group past its deadline (2026-11-03: test_attention_mosaic's
+    ~190 new ids, weighed nothing, packed into one). A group of a file whose record misses a test it collects
+    is run, never reused (ci.py's `record`). Under a stored cut (`bounds`, `stored_bounds`) a new test joins
+    the group whose interval it sorts into, where it stays once recorded, so the file's other groups keep
+    their records (Main, 2026-11-13)."""
     group_of = {node: index for index, members in enumerate(planned) for node in members}
     held: list[list[str]] = [[] for _ in planned]
     new: list[list[str]] = []
     for unit in units(nodes):
         placed = next((group_of[nodes[index]] for index in unit if nodes[index] in group_of), None)
-        if placed is None:
+        if placed is None and bounds is not None:
+            held[bisect.bisect_right(bounds, nodes[unit[0]])].extend(nodes[index] for index in unit)
+        elif placed is None:
             new.append([nodes[index] for index in unit])
         else:
             held[placed].extend(nodes[index] for index in unit)
