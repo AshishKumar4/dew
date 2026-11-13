@@ -986,60 +986,54 @@ def test_a_fold_that_moves_a_test_between_groups_runs_each_test_once_in_its_new_
     assert sorted((tmp_path / "runs").read_text()) == ["0", "1", "2"]
 
 
-def test_a_fold_that_retimes_a_split_file_and_records_its_new_test_keeps_its_other_groups_records(
+def test_a_split_file_keeps_its_stored_cut_and_its_groups_records_whatever_armada_measured(
         ci, tmp_path, monkeypatch, cache_worker):
-    """A split file runs as the cut main's CI last ran (tests/test_cuts.json, kept by the durations fold): a
-    head's new test joins the group whose interval of node ids it sorts into, and a fold that records it and
-    retimes every test of the file, every group within its bound, keeps the cut, so the group the new test did
-    not join keeps its tests and its green record and runs none of them again (Main, 2026-11-13: 43% of the
-    plan's rows had no record, a split file's groups renamed whenever its record or times moved, no input
-    changed)."""
+    """A split file runs as the cut main's CI last ran it (tests/test_cuts.json, which the durations fold
+    alone keeps or replaces), whatever armada's timings would cut it into: its groups keep their names and
+    their tests, so each finds its green record and runs nothing (Main, 2026-11-13: 43% of the plan's rows had
+    no record, a split file cut into 175 groups by one run's timings and 172 by the next's, no input changed).
+    A fold whose groups fit keeps the cut; a whole run drops it."""
     (tmp_path / ".armada.json").write_text(json.dumps({"target": 300, "environment": {}}))
-    nodes = [f"tests/test_steady.py::test_{index}" for index in range(4)]
-
-    def define(count: int) -> None:
-        (tmp_path / "tests/test_steady.py").write_text(
-            "from pathlib import Path\n"
-            + "".join(f"def test_{index}():\n    with Path('runs').open('a') as runs: runs.write('{index}')\n"
-                      for index in range(count)))
-
-    define(3)
-    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict(zip(nodes[:3], [300.0, 100.0, 100.0],
+    nodes = [f"tests/test_steady.py::test_{index}" for index in range(3)]
+    (tmp_path / "tests/test_steady.py").write_text(
+        "from pathlib import Path\n"
+        + "".join(f"def test_{index}():\n    with Path('runs').open('a') as runs: runs.write('{index}')\n"
+                  for index in range(3)))
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(dict(zip(nodes, [300.0, 100.0, 100.0],
                                                                            strict=True))))
     (tmp_path / "tests/test_cuts.json").write_text(json.dumps({"tests/test_steady.py": [nodes[1]]}))
     verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
     base = commit(tmp_path, "base")
+    groups = {"3.12:tests/test_steady.py#1/2": nodes[:1], "3.12:tests/test_steady.py#2/2": nodes[1:]}
 
-    def run() -> dict[str, list[str]]:
-        rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+    def run(timings: dict | None = None) -> dict[str, list[str]]:
+        rows = armada_task(ci, monkeypatch, verdict, ci.policy(base), timings=timings)
         assert all(row["exitCode"] == 0 for row in rows)
         return {row["name"]: sorted(row["tests"]) for row in rows}
 
-    assert run() == {"3.12:tests/test_steady.py#1/2": nodes[:1], "3.12:tests/test_steady.py#2/2": nodes[1:3]}
-    # A head adds test_3: it joins the second group, the interval it sorts into.
-    define(4)
-    head = commit(tmp_path, "a new test")
-    groups = {"3.12:tests/test_steady.py#1/2": nodes[:1], "3.12:tests/test_steady.py#2/2": nodes[1:]}
-    (tmp_path / "runs").write_text("")
     assert run() == groups
-    # Main's CI timed every test anew and the fold records the new one: by its times the file would cut as
-    # [0, 1] and [2, 3]; its groups, 150 s and 300 s, stay within half again of the target.
+    # Armada last measured the file as three groups, each within the target: cut by those timings, the plan
+    # would run it as three groups that no record names.
+    measured = {"rows": {f"3.12:tests/test_steady.py#{group}/3": seconds
+                         for group, seconds in ((1, 300.0), (2, 100.0), (3, 100.0))}}
+    (tmp_path / "runs").write_text("")
+    assert run(measured) == groups
+    assert (tmp_path / "runs").read_text() == ""
+    # Main's CI ran the stored cut green within its bounds: the fold keeps it; run whole, it drops it.
     main_ci = tmp_path / ".verdict/main.json"
-    main_ci.write_text(json.dumps({"sha": head, "part": "all", "rows": [
-        {"name": "3.12:tests/test_steady.py#1/2", "exitCode": 0, "seconds": 150.0,
-         "tests": {nodes[0]: 150.0}},
-        {"name": "3.12:tests/test_steady.py#2/2", "exitCode": 0, "seconds": 300.0,
-         "tests": {nodes[1]: 100.0, nodes[2]: 100.0, nodes[3]: 100.0}}]}))
+    main_ci.write_text(json.dumps({"sha": base, "part": "all", "rows": [
+        {"name": "3.12:tests/test_steady.py#1/2", "exitCode": 0, "seconds": 310.0,
+         "tests": {nodes[0]: 310.0}},
+        {"name": "3.12:tests/test_steady.py#2/2", "exitCode": 0, "seconds": 190.0,
+         "tests": {nodes[1]: 95.0, nodes[2]: 95.0}}]}))
     monkeypatch.setattr(sys, "argv", ["ci.py", "durations", str(main_ci)])
     assert ci.main() == 0
-    assert json.loads((tmp_path / "tests/test_durations.json").read_text()) == dict(
-        zip(nodes, [150.0, 100.0, 100.0, 100.0], strict=True))
     assert json.loads((tmp_path / "tests/test_cuts.json").read_text()) == {"tests/test_steady.py": [nodes[1]]}
-    commit(tmp_path, "main's CI folded")
-    (tmp_path / "runs").write_text("")
-    assert run() == groups
-    # The first group is found and runs nothing; the second, whose record lacked its new test, runs again.
-    assert sorted((tmp_path / "runs").read_text()) == ["1", "2", "3"]
+    main_ci.write_text(json.dumps({"sha": base, "part": "all", "rows": [
+        {"name": "3.12:tests/test_steady.py", "exitCode": 0, "seconds": 500.0,
+         "tests": {nodes[0]: 300.0, nodes[1]: 100.0, nodes[2]: 100.0}}]}))
+    assert ci.main() == 0
+    assert json.loads((tmp_path / "tests/test_cuts.json").read_text()) == {}
 
 
 def test_a_split_files_tests_of_one_shared_setup_run_in_one_group_as_the_plan_cuts_them(
