@@ -214,11 +214,11 @@ def test_a_training_reads_draws_lay_a_row_out_to_no_fewer_tokens_than_it_states(
     from dew.decision.rows import ConfigureLayout, QuestionRows
 
     rate = 0.9 if joint else 0.5
-    team = Choice("Which team?", {"billing": "b" * 40, "technical": "t" * 40})
-    urgency = Choice("How urgent?", {"low": "l" * 40, "high": "h" * 40})
-    examples = ([Example("x" * length, {"team": team, "urgency": urgency},
-                         {"team": "billing" if length % 2 else "technical", "urgency": "high"})
-                 for length in range(1100, 1600, 20)] if joint else EXAMPLES)
+    # Right options far longer than a "none of the above" in their place, the others short.
+    team = Choice("Which team?", {"billing": "b" * 150, "technical": "t"})
+    urgency = Choice("How urgent?", {"low": "l", "high": "h" * 150})
+    examples = ([Example("x" * length, {"team": team, "urgency": urgency}, {"team": "billing", "urgency": "high"})
+                 for length in range(0, 1200, 20)] if joint else EXAMPLES)
     layout = JointLayout(max_len=1536) if joint else LAYOUT
     heads = {"head": JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)}
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
