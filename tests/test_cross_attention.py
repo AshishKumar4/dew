@@ -40,13 +40,14 @@ from dew.nn.cross_attention import (
     CROSS_LENGTHS,
     CrossAttention,
     GatedCrossAttention,
+    SharedCrossAttention,
     crossing,
     encode_context,
     gated_join,
 )
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
-from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext, ModelInputs
+from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, CrossContext, ModelInputs
 from dew.nn.kv_cache import KVCache
 from dew.nn.mlp import GatedMLP
 from dew.nn.ngpt import NGPT
@@ -346,6 +347,51 @@ def test_a_cached_context_decodes_as_the_full_forward():
     """The context a prefill carries stays in the cache, and each later step attends over it without
     it: the steps' logits on par with the full forward's from the float64 forward (check 1)."""
     assert_a_cached_context_decodes_as_the_full_forward(MODEL, "cached context")
+
+
+@pytest.mark.parametrize("cross", [CROSS, SharedCrossAttention(layer_ids=(0, 2), context_length=6)],
+                         ids=["own attention", "the layer's attention"])
+def test_a_cached_document_reads_its_own_context_without_it(cross):
+    """A packed row's prefill, documents 1 and 2 two tokens each over a context of two tokens, one each
+    (`CONTEXT_SEGMENTS` [1, 2]), into a cache, then calls without the context: a step continuing document
+    2, a call continuing it and starting document 3, and a step continuing document 3. Document 2's later
+    tokens read its own context alone and document 3's none, in every call: their logits are the same, bit
+    for bit, whatever document 1's tokens and its context token (and, for document 3, document 2's), as
+    the cache keeps each context token's document and the row's last document beside the keys and values
+    and moves the last on with each call, for both blocks. The kept keys alone, every later call read both
+    documents' context. A row whose context names no documents is read whole by every later token."""
+    model = MODEL.clone(cross_attention=cross)
+    variables, ids, context, _ = model_draw(model)(1)
+    packed = coordinates(segments=jnp.asarray([[1, 1, 2, 2]] * B, jnp.int32),
+                         positions=jnp.asarray([[0, 1, 0, 1]] * B, jnp.int32), max_segments=2)
+    later = [(slice(4, 5), [1], [2]), (slice(5, 7), [1, 2], [3, 0]), (slice(7, 8), [1], [1])]
+    _, made = model.apply(variables, B, method=CausalTransformer.init_cache, mutable=["cache"])
+
+    def decoded(ids, context, *, named: bool) -> np.ndarray:
+        given = {CONTEXT: context[:, :2], CONTEXT_LENGTHS: jnp.full((B,), 2, jnp.int32)}
+        given |= {CONTEXT_SEGMENTS: jnp.asarray([[1, 2]] * B, jnp.int32)} if named else {}
+        _, held = model.apply({**variables, **made}, ids[:, :4], decode=True, mutable=["cache"],
+                              coordinates=packed, conditioning=given)
+        found = []
+        for tokens, documents, positions in later:
+            on = coordinates(segments=jnp.asarray([documents] * B, jnp.int32),
+                             positions=jnp.asarray([positions] * B, jnp.int32), max_segments=2)
+            out, held = model.apply({**variables, **held}, ids[:, tokens], decode=True, mutable=["cache"],
+                                    coordinates=on)
+            found.append(np.asarray(out))
+        return np.concatenate(found, axis=1)
+
+    first = ids.copy()
+    first[:, :2] = (ids[:, :2] + 1) % VOCAB
+    second = context.copy()
+    second[:, 0] = -context[:, 0]
+    both = second.copy()
+    both[:, 1] = -context[:, 1]
+    found = decoded(ids, context, named=True)
+    np.testing.assert_array_equal(found, decoded(first, second, named=True))
+    # Document 3's tokens, the call's second and the last step, read no context.
+    np.testing.assert_array_equal(found[:, 2:], decoded(ids, both, named=True)[:, 2:])
+    assert not np.array_equal(decoded(ids, context, named=False), decoded(ids, second, named=False))
 
 
 def test_a_scanned_stack_runs_its_blocks_as_the_plain_one():

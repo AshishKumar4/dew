@@ -75,10 +75,7 @@ def call_metadata(model: CausalTransformer, tokens, decode: bool, image_groups, 
         if coordinates is None or coordinates.segments is None:
             raise ValueError("a context of several documents is read by packed rows, which name "
                              "their tokens' documents (segment_ids or coordinates)")
-        # Over forks, each token reads its tree's context, a row's documents continuing one another.
-        queries = (coordinates.segments if coordinates.forks is None
-                   else coordinates.forks.trees(coordinates.segments))
-        context = dataclasses.replace(context, queries=queries)
+        context = dataclasses.replace(context, queries=CrossContext.queries_of(coordinates))
     # A block router's blocks are numbered once for every routed layer.
     block = None if model.mixture is None else model.mixture.routing_block
     blocks = None if block is None else numbered_blocks(
