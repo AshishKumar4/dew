@@ -7,6 +7,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- On a GPU holding tensor memory (a B200, B300 or other SM 10.x/11.x part), a run refuses to start under a
+  cuBLAS below 13.2 (`UnsafeCublas`), whose kernels free their tensor memory twice beside another kernel's
+  (JAX's CUDA plugin warns of it at start), and the installer takes the cuda13 build there or none,
+  refusing `--cuda 12`.
+
 - A run's fit plan judges a head that keeps its whole logits by their fp32 bytes before it traces the step's
   gradient (`Objective.whole_head_table` names the head's table), and bounds the rung after a traced one
   from that trace, so a step whose whole logits leave no room is planned from one gradient trace and
