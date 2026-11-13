@@ -19,6 +19,7 @@ import collections
 import contextlib
 import dataclasses
 import functools
+import itertools
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import NamedTuple
@@ -38,7 +39,15 @@ from dew.data.dataset import rows_of
 from dew.distributed.placement import placed_bytes
 from dew.mesh import DATA_AXIS, FSDP_AXIS, row_axes
 from dew.nn.kernels.generation import _compute_capability, gpu_target
-from dew.nn.programs import bodies, computed, loop_programs, reduction, scan_body, scatter
+from dew.nn.programs import (
+    bodies,
+    computed,
+    live as live_equations,
+    loop_programs,
+    reduction,
+    scan_body,
+    scatter,
+)
 from dew.objectives.base import Objective
 from dew.state import TrainState
 from dew.training.compiled_program import (
@@ -70,9 +79,9 @@ class Footprint:
     anything. These are not additional temporary bytes: the state's existing allocations already
     count against allocator headroom, and newly built copies and accumulators are in `held`."""
     peak: int | None = None
-    """The most bytes its loss's gradient program holds at once at one microbatch, in its traced order
-    (`peak_bytes`): the residuals still live, the backward's cotangents and the gradient as it is
-    built. None where `residuals` is."""
+    """The gradient program's peak at one microbatch (`peak_bytes`): its residuals, cotangents and
+    gradients. A CPU upper bound also holds operands whose matrix gradients may run after the backward;
+    `peak_lower` states its interval. None where `residuals` is."""
     exact: bool = True
     """Whether `peak` is the program's as XLA's rules make it, else a bound from below
     (`bounded_below`): a step whose derived headroom is then an upper bound refuses on it soundly and
@@ -90,6 +99,9 @@ class Footprint:
     asked (`derived_terms`), from which the step's peak at its head's tile is bounded without a trace of it
     (`dew.training.planning.FitSearch.walked`); None for a step whose head keeps no whole logits, or where
     no peak is derived. No term the footprint records."""
+    peak_lower: int | None = None
+    """A CPU peak's lower bound, beside its upper bound `peak`: the same walk without possible library
+    arrays and with gradients consumed in traced order. None where the existing single-bound rules apply."""
 
     @property
     def temporaries(self) -> int | None:
@@ -100,11 +112,18 @@ class Footprint:
             return self.peak
         return max(self.peak, self.gradients + self.staged)
 
+    @property
+    def lower_temporaries(self) -> int | None:
+        """The least temporaries the derivation admits, including a staged commit's gradient and fields."""
+        lower = self.peak if self.peak_lower is None else self.peak_lower
+        return lower if lower is None or not self.staged else max(lower, self.gradients + self.staged)
+
     def record(self) -> dict[str, JSON]:
         """The terms traced, not an admission decision: XLA's fit check remains authoritative."""
         return {"residuals": self.residuals, "gradients": self.gradients, "held": self.held,
                 "resident": dict(self.resident), "peak": self.peak, "peak_exact": self.exact,
-                "staged": self.staged, "consumed": self.consumed}
+                "staged": self.staged, "consumed": self.consumed,
+                **({} if self.peak_lower is None else {"peak_lower": self.peak_lower})}
 
 
 class HeadTerms(NamedTuple):
@@ -131,10 +150,11 @@ class HeadTerms(NamedTuple):
 
 class Peak(NamedTuple):
     """A gradient program's derived peak (`gradient_peak`): its bytes, and whether they are the
-    program's own or a bound from below (`bounded_below`)."""
+    program's own or a bound from below (`bounded_below`); a CPU's upper bound and `lower` beside it."""
 
     bytes: int
     exact: bool
+    lower: int | None = None
 
 
 def device_bytes(tree) -> int:
@@ -187,6 +207,29 @@ LOOPS = (jax.lax.scan_p, jax.lax.while_p)
 POINTER_BYTES = 8
 """The bytes of a pointer, which XLA's tuple of a program's results holds one of for each result."""
 
+YNN_MIN_ELEMENTS = 4096
+"""The least elements of an operation or an operand YNNPACK prefers over an elementwise loop
+(`IsInstructionPreferredByYnn`, xla/backends/cpu/ynn_support.cc), layout operations accepted separately."""
+
+YNN_UNARY = frozenset({jax.lax.abs_p, jax.lax.ceil_p, jax.lax.convert_element_type_p, jax.lax.cos_p,
+    jax.lax.erf_p, jax.lax.exp_p, jax.lax.expm1_p, jax.lax.floor_p, jax.lax.log_p, jax.lax.log1p_p,
+    jax.lax.logistic_p, jax.lax.neg_p, jax.lax.round_p, jax.lax.rsqrt_p, jax.lax.sign_p, jax.lax.sin_p,
+    jax.lax.sqrt_p, jax.lax.tanh_p, jax.lax.tan_p, jax.lax.integer_pow_p, jax.lax.square_p})
+"""`GetYnnUnaryOpMap` (xla/backends/cpu/ynn_support.cc), with powers JAX lowers to multiply and divide."""
+
+YNN_BINARY = frozenset({jax.lax.add_p, primitives.add_jaxvals_p, jax.lax.div_p, jax.lax.max_p,
+    jax.lax.min_p, jax.lax.mul_p, jax.lax.pow_p, jax.lax.sub_p})
+"""`GetYnnBinaryOpMap` (xla/backends/cpu/ynn_support.cc), with JAX's cotangent sum lowered to add."""
+
+YNN_ELEMENT_TYPES = frozenset({"float64", "float32", "bfloat16", "int8", "uint8"})
+"""The elementwise types of `IsElementwiseOpSupportedByYnn` (xla/backends/cpu/ynn_support.cc)."""
+
+YNN_ARRAY_TYPES = YNN_ELEMENT_TYPES | frozenset({"int4", "uint4", "float16", "int32"})
+"""The array types of `YnnType` (xla/backends/cpu/runtime/ynnpack/ynn_interop.cc)."""
+
+YNN_MAX_RANK = 8
+"""`YNN_MAX_TENSOR_RANK`, ynnpack/include/ynnpack.h, checked by `IsLayoutSupportedByYnn`."""
+
 PRODUCTS = (jax.lax.dot_general_p, jax.lax.conv_general_dilated_p, primitives.ragged_dot_general_p)
 """The products a weight's gradient is made by, past which a value is a cotangent the backward reads on
 (`sunk`)."""
@@ -196,6 +239,136 @@ def _folds(primitive: jcore.Primitive) -> bool:
     place of an extremum, or one over windows."""
     return primitive in WINDOWS or (reduction(primitive)
                                     and primitive not in (jax.lax.argmax_p, jax.lax.argmin_p))
+
+
+def _ynn_eligible(equation: jcore.JaxprEqn) -> bool:
+    """Whether a default CPU reduction library fusion can include `equation`, with row-major arrays:
+    `YnnMatcher::IsOpSupported` (xla/backends/cpu/transforms/ynn_matcher.h) and its checks in
+    xla/backends/cpu/ynn_support.cc. This is independent of LLVM's cheap-to-recompute operations."""
+    values = [*equation.invars, *equation.outvars]
+    if len(equation.outvars) != 1:
+        return False
+    types = []
+    for value in values:
+        aval = value.aval
+        if not isinstance(aval, ShapedArray) or len(aval.shape) > YNN_MAX_RANK:
+            return False
+        types.append(str(aval.dtype))
+    if any(dtype not in YNN_ARRAY_TYPES for dtype in types):
+        return False
+    primitive = equation.primitive
+    output_type = types[-1]
+    if primitive is jax.lax.iota_p:
+        return not equation.invars and output_type in ("float32", "int32")
+    # The matcher accepts layout operations before applying the element-count preference.
+    if bitcast(equation) or primitive in (
+            jax.lax.transpose_p, jax.lax.copy_p, jax.lax.broadcast_in_dim_p, primitives.name_p):
+        if len(equation.invars) != 1 or types[0] != output_type:
+            return False
+        if primitive is jax.lax.broadcast_in_dim_p:
+            axes = equation.params["broadcast_dimensions"]
+            return all(left < right for left, right in itertools.pairwise(axes))
+        return True
+    if primitive is jax.lax.pad_p:
+        return (len(equation.invars) == 2 and all(dtype == output_type for dtype in types)
+                and all(interior == 0 and (size != 1 or (low == 0 and high == 0))
+                        for size, (low, high, interior) in zip(
+                            dimensions(equation.invars[0]), equation.params["padding_config"], strict=True)))
+    if not any(math.prod(dimensions(value)) >= YNN_MIN_ELEMENTS for value in values):
+        return False
+    if primitive in YNN_UNARY or primitive in YNN_BINARY:
+        return (len(equation.invars) == (1 if primitive in YNN_UNARY else 2)
+                and all(dtype in YNN_ELEMENT_TYPES for dtype in types)
+                and (primitive is not jax.lax.round_p or equation.params["rounding_method"]
+                     == jax.lax.RoundingMethod.TO_NEAREST_EVEN))
+    reducers = {jax.lax.reduce_sum_p: jax.lax.add_p, jax.lax.reduce_max_p: jax.lax.max_p,
+                jax.lax.reduce_min_p: jax.lax.min_p, jax.lax.reduce_window_sum_p: jax.lax.add_p,
+                jax.lax.reduce_window_max_p: jax.lax.max_p, jax.lax.reduce_window_min_p: jax.lax.min_p}
+    reducer = reducers.get(primitive)
+    if primitive in (jax.lax.reduce_p, jax.lax.reduce_window_p):
+        inner = bodies(equation)
+        if len(equation.invars) != 2 or len(inner) != 1 or len(inner[0].eqns) != 1:
+            return False
+        operation = inner[0].eqns[0]
+        if (operation.primitive not in (jax.lax.add_p, jax.lax.max_p, jax.lax.min_p)
+                or set(operation.invars) != set(inner[0].invars)
+                or operation.outvars != inner[0].outvars or types[1] != output_type):
+            return False
+        reducer = operation.primitive
+    if reducer is None:
+        return False
+    if primitive in WINDOWS:
+        sizes = equation.params["window_dimensions"]
+        strides = equation.params.get("window_strides", (1,) * len(sizes))
+        axes = sum(size > 1 or stride > 1 for size, stride in zip(sizes, strides, strict=True))
+        if (not axes or len(dimensions(equation.outvars[0])) + axes > YNN_MAX_RANK
+                or any(size > 1 and stride != size for size, stride in zip(sizes, strides, strict=True))
+                or any(value != 1 for key in ("base_dilation", "window_dilation")
+                       for value in equation.params.get(key, (1,) * len(sizes)))):
+            return False
+    elif not equation.params.get("axes", equation.params.get("dimensions", ())):
+        return False
+    if reducer is jax.lax.add_p:
+        return (types[0], output_type) in {
+            ("float64", "float64"), ("float32", "float32"), ("float16", "float32"),
+            ("bfloat16", "float32"), ("int8", "int32"), ("uint8", "int32")}
+    return types[0] == output_type and output_type in (
+        "float64", "float32", "float16", "bfloat16", "int8", "uint8")
+
+
+def _cpu_dot_inputs(equation: jcore.JaxprEqn) -> frozenset[int]:
+    """Operands a scalar/vector dot can loop-fuse: the opposite operand is a vector below 16 KiB
+    (`CpuInstructionFusion::ShouldFuse`, xla/service/cpu/cpu_instruction_fusion.cc). Other dots stay
+    individual library products. Sizes here are physical, not a head projection's counted bytes."""
+    if (equation.primitive is not jax.lax.dot_general_p or len(equation.invars) != 2
+            or len(equation.outvars) != 1 or len(dimensions(equation.outvars[0])) > 1):
+        return frozenset()
+    return frozenset(index for index in (0, 1)
+                     if len(dimensions(other := equation.invars[1 - index])) == 1
+                     and isinstance(other.aval, ShapedArray)
+                     and math.prod(dimensions(other)) * np.dtype(other.aval.dtype).itemsize < 16 * 1024)
+
+
+def _cpu_output_dot(equation: jcore.JaxprEqn) -> bool:
+    """The real, non-batched scalar/vector dots an add may output-fuse (`CanBeOutputFused`,
+    xla/service/cpu/cpu_instruction_fusion.cc); the caller checks the one-use condition."""
+    return (equation.primitive is jax.lax.dot_general_p and len(equation.outvars) == 1
+            and isinstance(equation.outvars[0].aval, ShapedArray)
+            and len(dimensions(equation.outvars[0])) <= 1
+            and not np.issubdtype(equation.outvars[0].aval.dtype, np.complexfloating)
+            and not any(equation.params["dimension_numbers"][1]))
+
+
+def _cpu_reduction_scratch(equation: jcore.JaxprEqn) -> int:
+    """Possible tree-reduction partials, held beside the input of a non-library reduction. CPU's
+    AlgebraicSimplifier strength-reduces vector-vector dots to multiply/reduce; TreeReductionRewriter
+    splits dimensions into windows of 32 (xla/service/cpu/cpu_compiler.cc,
+    xla/hlo/transforms/simplifiers/tree_reduction_rewriter.{h,cc}). Count all possible levels as an upper
+    bound; the lower walk need not materialize these partials."""
+    if len(equation.outvars) != 1:
+        return 0
+    if (equation.primitive is jax.lax.dot_general_p and len(equation.invars) == 2
+            and all(len(dimensions(value)) == 1 for value in equation.invars)
+            and not dimensions(equation.outvars[0])):
+        shape, axes = list(dimensions(equation.invars[0])), (0,)
+    elif (reduction(equation.primitive) and equation.primitive not in WINDOWS
+          and not _ynn_eligible(equation)):
+        shape = list(dimensions(equation.invars[0]))
+        axes = equation.params.get("axes", equation.params.get("dimensions", ()))
+    else:
+        return 0
+    aval = equation.outvars[0].aval
+    if not isinstance(aval, ShapedArray):
+        return 0
+    size = np.dtype(aval.dtype).itemsize
+    if jnp.issubdtype(aval.dtype, jnp.floating):
+        size = max(4, size)  # FloatNormalization can promote unsupported low-precision accumulation.
+    partials = 0
+    while any(shape[axis] > 32 for axis in axes):
+        shape = [math.ceil(length / 32) if axis in axes else length
+                 for axis, length in enumerate(shape)]
+        partials += math.prod(shape) * size
+    return partials
 
 
 WINDOWS = (jax.lax.reduce_window_p, jax.lax.reduce_window_sum_p, jax.lax.reduce_window_max_p,
@@ -312,8 +485,20 @@ def _peak(lowered: jcore.Jaxpr, count: int, platform: str, workspace: Workspace,
     gradient = lowered.replace(outvars=lowered.outvars[:count])
     # Hoisted last: a constant the gradient returns runs ahead of the work however its weight gradients run.
     ordered = hoisted(sunk(gradient) if deferred else gradient)
-    return Peak(peak_bytes(ordered, platform, workspace, consumed=consumed, counted=counted),
-                not bounded_below(gradient, platform))
+    upper = peak_bytes(ordered, platform, workspace, consumed=consumed, counted=counted)
+    lower = None
+    if platform == "cpu":
+        # CPU scheduling can leave matrix gradients until their shared backward operands' last reads.
+        # Holding those operands to the end bounds that retention without predicting its schedule.
+        upper = max(upper, peak_bytes(hoisted(sunk(gradient)), platform, workspace, consumed=consumed,
+                                      counted=counted))
+        if counted is None:
+            minimal = gradient.replace(eqns=live_equations(gradient.eqns, gradient.outvars))
+            lower = peak_bytes(hoisted(minimal), platform, workspace, consumed=consumed, lower=True)
+            assert lower <= upper
+        # A shape-filtered head projection can change which alias of one storage it counts. It is an
+        # upper decomposition, not a lower-bound proof for a different head policy.
+    return Peak(upper, not bounded_below(gradient, platform), lower)
 
 
 def hoisted(program: jcore.Jaxpr) -> jcore.Jaxpr:
@@ -410,7 +595,8 @@ def bounded_below(program: jcore.Jaxpr, platform: str) -> bool:
 
 def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
                slicing: Slicing | None = None, carried: frozenset = frozenset(), *,
-               consumed: bool = False, counted: Callable[[jcore.Var], bool] | None = None) -> int:
+               consumed: bool = False, counted: Callable[[jcore.Var], bool] | None = None,
+               lower: bool = False) -> int:
     """The most bytes `program` holds at once beside its inputs, its equations run in their traced
     order. A value XLA keeps a buffer of (`Frontier`) is held from the equation that computes it to the
     last that reads it, an output to the end. An equation that takes its operands from memory
@@ -426,10 +612,12 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     program (not a loop's body) holds besides each copy of an input its products read laid out for them
     from the first such product to the last (`laid_copies`), and on a GPU each product the operands it
     may be made beside (`siblings`), and the tuple of its results; on a CPU, as a bound wherever XLA may
-    fuse or make apart, the arrays its fusions read apart (`laid_inputs`), what its products read made once
-    or copied (`cpu_layouts`), and its input copies from its start. No schedule XLA picks is modelled: a
-    compile confirms."""
-    frontier = Frontier(program, platform, returned=True, counted=counted)
+    fuse or make apart, the arrays its library fusions read apart (`laid_inputs`), what its products read
+    made once or copied (`cpu_layouts`), and its input copies from its start. No schedule XLA picks is
+    modelled here: `_peak` also walks deferred gradients for a CPU upper bound. With `lower`, the CPU's
+    possible library arrays and product copies are omitted, leaving the definite traced terms."""
+    frontier = Frontier(program, platform, returned=not (platform == "cpu" and lower and consumed),
+                        counted=counted, lower=lower)
     last = {kept: index for index, equation in enumerate(program.eqns)
             for kept in frontier.reading(equation.invars)}
     # The copies of the step's inputs its products read laid out for them (`laid_copies`), each held
@@ -437,11 +625,10 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     # (`siblings`): the step's own program's, whose parameters' layouts are fixed, not a loop's body's.
     entry = slicing is None and not carried
     beside, spans, spanned = siblings(frontier, program) if entry and platform == "gpu" else ({}, [], {})
-    begun: dict = {}
-    if platform == "cpu":
-        beside, spans, spanned, begun = cpu_layouts(frontier, program)
+    if platform == "cpu" and not lower:
+        beside, spans, spanned = cpu_layouts(frontier, program)
     laid = laid_copies(frontier, program) if entry else []
-    if platform == "cpu":
+    if platform == "cpu" and not lower:
         # A copy of an input reads nothing XLA must wait on: a CPU's schedule makes it at the program's
         # start (row 5290), so a bound holds it from there.
         laid = [(0, ended, size) for _, ended, size in laid]
@@ -458,7 +645,7 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
     # The step's results are one tuple, a pointer to each, which XLA holds the whole program
     # (`ShapeUtil::ByteSizeOf` of a tuple).
     live = POINTER_BYTES * len(program.outvars) if entry and len(program.outvars) > 1 else 0
-    held, most = set(), live
+    held, prepared, most = set(), set(), live
     for index, equation in enumerate(program.eqns):
         live += sum(size for first, _, size in copies if first == index)
         made = [out for out in equation.outvars
@@ -468,28 +655,39 @@ def peak_bytes(program: jcore.Jaxpr, platform: str, workspace: Workspace,
         taken = in_place(frontier, equation, held, last, index)
         if made or not frontier.fusing(equation):
             inner = max((peak_bytes(body, platform, workspace, Slicing.entering(equation, body),
-                                    returned_carry(equation, body), counted=counted)
+                                    returned_carry(equation, body), counted=counted, lower=lower)
                          for body in bodies(equation)), default=0)
             # An operand made beside an earlier product's is held from there (`siblings`), not made here.
             made_for = unfused(frontier, equation) - spanned.get(index, set())
             operands = sum(map(frontier.share, made_for)) + beside.get(index, 0)
-            if platform == "cpu":
-                # The arrays the fusions making its operands read apart (`laid_inputs`), a shared one's
-                # where it is made, before its first reader.
-                starting = {value for value in spanned.get(index, set()) if begun[value] == index}
-                # A reduction's fusion runs on YNNPACK's kernels as a product's does; an elementwise
-                # one is XLA's own loop, which reads its broadcasts and transposes in place.
+            reused = set()
+            if platform == "cpu" and lower:
+                for value in made_for:
+                    producer = frontier.producers.get(value)
+                    if producer is None:
+                        continue
+                    base = _lower_reused_storage(frontier, producer, held, last, index)
+                    if (base is not None and base not in reused and base not in frontier.reading(
+                            read for read in equation.invars if read is not value)):
+                        reused.add(base)
+                        operands -= frontier.share(value)
+            if platform == "cpu" and not lower:
+                # A shared operand's chain runs before its first product, beside its other live buffers.
+                starting = spanned.get(index, set()) - prepared
+                prepared.update(starting)
                 reduced = made if _folds(equation.primitive) else []
                 operands += sum(map(frontier.share, laid_inputs(frontier, [*reduced, *made_for, *starting])))
             products = 0 if not cublas_product(equation) else (
                 workspace.sliced if sliced.fused(equation) else workspace.each)
+            if platform == "cpu" and not lower:
+                products += _cpu_reduction_scratch(equation)
             # A loop's results (its stacked outputs, its carry) are held beside each turn's own; a call's
             # results are what its body returns.
             running = (looped(frontier, last, index, equation, made, carried) + inner
                        if equation.primitive in LOOPS else max(inner, made_bytes) - taken)
             # The fusions that make its operands run before it, each buffer they alone read freed with them
             # (`freed`): the most is theirs, or its own past them.
-            freed = sum(map(frontier.share, dying(frontier, equation, made_for, held, last, index)))
+            freed = sum(map(frontier.share, dying(frontier, equation, made_for, held, last, index) - reused))
             most = max(most, live + operands, live - freed + running + operands + products)
         held.update(made)
         live += made_bytes
@@ -555,7 +753,7 @@ def laid_copies(frontier: Frontier, program: jcore.Jaxpr) -> list[tuple[int, int
 
 
 def cpu_layouts(frontier: Frontier, program: jcore.Jaxpr) -> tuple[
-        dict[int, int], list[tuple[int, int, int]], dict[int, set], dict[jcore.Var, int]]:
+        dict[int, int], list[tuple[int, int, int]], dict[int, set]]:
     """What a CPU's products hold beside the operands they read made for them (`unfused`): XLA's CPU
     products (YNNPACK's and Eigen's) read every operand from memory in the order they take it, so a
     fused value two products read is made once, held from the first to the last (a span, `(first, last,
@@ -563,8 +761,7 @@ def cpu_layouts(frontier: Frontier, program: jcore.Jaxpr) -> tuple[
     read by its keys' and its queries' gradients); and each value XLA keeps a buffer of (`Frontier`), or
     so made once, that a product reads in an order it does not take (`product_order`) is copied for that
     product (bytes, by product: an attention's probabilities read by its values' gradient laid out
-    otherwise). Row 5290: 64 x 128 tokens, 8 heads over 2, compiled 1.375 times the derivation without.
-    Last, each shared value's first reader, where it is made."""
+    otherwise). Row 5290: 64 x 128 tokens, 8 heads over 2, compiled 1.375 times the derivation without."""
     products = [(index, equation) for index, equation in enumerate(program.eqns)
                 if equation.primitive is jax.lax.dot_general_p]
     reads: dict = {}
@@ -590,37 +787,49 @@ def cpu_layouts(frontier: Frontier, program: jcore.Jaxpr) -> tuple[
             if kept and product_order(operand, contracting, batch) is not None:
                 copied[index] = copied.get(index, 0) + frontier.share(operand)
     return (copied, [(readers[0], readers[-1], frontier.share(value)) for value, readers in shared.items()],
-            spanned, {value: readers[value in constant] for value, readers in shared.items()})
+            spanned)
 
 
 def laid_inputs(frontier: Frontier, values: Sequence[jcore.Var]) -> set[jcore.Var]:
-    """The values of the fused chains that make `values` that a CPU's fusion reads as arrays of their
-    own: XLA's CPU fusions over YNNPACK's elementwise kernels read their inputs as dense arrays in their
-    own order and type, so each broadcast that widens a value, and each transpose or conversion of a
-    buffer, in a chain is made apart, beside the chain, as the chain runs (an attention's softmax
-    denominator broadcast over its scores, its probabilities' cotangent turned to float32 and transposed
-    for its scores' cotangent: 2 x 2048 tokens, 4 heads over 1, in bfloat16, row 5290)."""
-    found, pending, seen = set(), list(values), set()
+    """The arrays a CPU's library fusions read apart while making `values`: the chains a reduction may
+    fuse into (`Frontier.reducing`), whose broadcasts, layout changes and conversions YNNPACK may read
+    from dense arrays. A transpose followed by a conversion is one array in the outer operation's type
+    and order. An input YNNPACK cannot fuse, such as a select, holds its result alone. Elementwise loop
+    fusions index their broadcasts and transposes in place (`ElementalIrEmitter::MakeElementGenerator`,
+    xla/service/elemental_ir_emitter.cc), reading an upstream library fusion's result from its own array."""
+    found, pending, seen = set(), [(value, value in frontier.reducing) for value in values], set()
     while pending:
-        value = pending.pop()
-        if value in seen or not computed(value):
+        value, library = pending.pop()
+        if (value, library) in seen or not computed(value):
             continue
-        seen.add(value)
+        seen.add((value, library))
         equation = frontier.producers.get(value)
-        if equation is None or not frontier.fusing(equation):
+        if equation is None:
             # A product or a loop reads its operands from memory: no fusion of the chain runs past it.
             continue
         reads = [read for read in equation.invars if computed(read)]
+        if not library:
+            if value in frontier.reducing:
+                found.add(value)
+            elif frontier.fusing(equation):
+                pending.extend((read, False) for read in reads
+                               if read not in frontier.inputs and not frontier.buffered(read))
+            continue
+        if not _ynn_eligible(equation):
+            found.add(value)
+            continue
         primitive = equation.primitive
         # Every broadcast that widens a value, of constants too (a mask's iota, a cotangent of ones): XLA
         # may fold it into the fusion or make it apart, and a bound counts it apart.
         widened = (primitive is jax.lax.broadcast_in_dim_p
                    and math.prod(dimensions(value)) > math.prod(dimensions(equation.invars[0])))
         relaid = primitive in (jax.lax.transpose_p, jax.lax.convert_element_type_p) and any(
-            read in frontier.inputs or frontier.buffered(read) for read in reads)
+            frontier.stored(read) for read in reads)
         if widened or relaid:
             found.add(value)
-        pending.extend(read for read in reads if read not in frontier.inputs and not frontier.buffered(read))
+        if not relaid:
+            pending.extend((read, True) for read in reads
+                           if read not in frontier.inputs and not frontier.buffered(read))
     return {value for value in found if value not in values}
 
 
@@ -743,6 +952,31 @@ def dying(frontier: Frontier, equation: jcore.JaxprEqn, made_for: set[jcore.Var]
             if buffer in held and last.get(buffer) == index and buffer not in direct}
 
 
+def _lower_reused_storage(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapping,
+                          index: int) -> jcore.Var | None:
+    """A last-read temporary a lower-walk pointwise loop may overwrite, resolving its operand's views
+    (`HloDataflowAnalysis::CanShareOperandBufferWithUser`, elementwise case). The same storage remains
+    live when such a loop makes an operand for a following product."""
+    if (not frontier.lower or frontier.platform != "cpu" or not equation.primitive.elementwise
+            or len(equation.outvars) != 1 or equation.effects):
+        return None
+    output = equation.outvars[0]
+    for operand in equation.invars:
+        if not computed(operand):
+            continue
+        storage = frontier.reading([operand])
+        if len(storage) != 1:
+            continue
+        (base,) = storage
+        if (base in held and last.get(base) == index
+                and isinstance(operand.aval, ShapedArray) and isinstance(output.aval, ShapedArray)
+                and dimensions(operand) == dimensions(output) and operand.aval.dtype == output.aval.dtype
+                and device_share(base) == device_share(output)
+                and base not in frontier.reading(value for value in equation.invars if value is not operand)):
+            return base
+    return None
+
+
 def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapping, index: int) -> int:
     """The bytes of the buffer `equation`, the program's `index`th, writes its result in: a scatter's
     base's, or a product's bias's (`biased`), the one buffer the program holds (`held`) that it is or views
@@ -750,8 +984,11 @@ def in_place(frontier: Frontier, equation: jcore.JaxprEqn, held: set, last: Mapp
     and it is its result's size, as XLA shares a scatter's first operand's buffer with its result
     (`HloDataflowAnalysis::CanShareOperandBufferWithUser`, xla/hlo/analysis/hlo_dataflow_analysis.cc) and
     a GEMM's bias's that nothing else reads, before it or after (`FuseMatrixBiasAdd`'s `can_overwrite_bias`,
-    xla/backends/gpu/transforms/gemm_rewriter.cc); none for any other equation."""
+    xla/backends/gpu/transforms/gemm_rewriter.cc). The CPU lower walk also permits a last-read
+    elementwise operand's storage to supply its result."""
     primitive = equation.primitive
+    if (reused := _lower_reused_storage(frontier, equation, held, last, index)) is not None:
+        return frontier.share(reused)
     if scatter(primitive) and equation.invars:
         at = 0
     elif primitive is jax.lax.dot_general_p and len(equation.invars) == 3:
@@ -855,9 +1092,10 @@ class Frontier:
     `counted` names alone (`share`), every value's where None."""
 
     def __init__(self, program: jcore.Jaxpr, platform: str, *, returned: bool,
-                 counted: Callable[[jcore.Var], bool] | None = None):
+                 counted: Callable[[jcore.Var], bool] | None = None, lower: bool = False):
         self.platform = platform
         self.counted = counted
+        self.lower = lower
         self.producers = {out: equation for equation in program.eqns for out in equation.outvars}
         self.inputs = {*program.invars, *program.constvars}
         self.outputs = {out for out in program.outvars if computed(out)} if returned else set()
@@ -874,6 +1112,92 @@ class Frontier:
                          if equation.primitive is jax.lax.optimization_barrier_p
                          for out, operand in zip(equation.outvars, equation.invars, strict=True)}
         self.barred = {operand for operand in self.forwards.values() if computed(operand)}
+        # YNNPACK grows a reduction through its own supported consumers, including transcendentals,
+        # independently of LLVM's cheap-to-recompute classification (`_ynn_eligible`).
+        self.reducing: set[jcore.Var] = set()
+        self.absorbed: set[jcore.Var] = set()
+        self.looping: set[jcore.Var] = set()
+        if platform == "cpu":
+            for equation in program.eqns:
+                if _ynn_eligible(equation) and (_folds(equation.primitive)
+                        or any(value in self.reducing for value in equation.invars if computed(value))):
+                    self.reducing.update(out for out in equation.outvars if computed(out))
+            if lower:
+                # Positionwise primitives include JAX's polynomial, which lowers to a loop's
+                # multiply/add chain. Shared intermediates can stay inside one loop when every path
+                # reaches the same result (`CanFuseOnAllPaths`, xla/service/instruction_fusion.cc).
+                # Non-library reductions are loop consumers too (`CanBeLoopFused`,
+                # xla/service/cpu/cpu_instruction_fusion.cc).
+                looping = {id(equation) for equation in program.eqns if not equation.effects
+                           and (equation.primitive in ELEMENTWISE or equation.primitive.elementwise
+                                or equation.primitive.positionwise or equation.primitive.rearranges
+                                or (reduction(equation.primitive) and equation.primitive not in WINDOWS
+                                    and not _ynn_eligible(equation))
+                                or _cpu_dot_inputs(equation))}
+                self.looping.update(out for equation in program.eqns if id(equation) in looping
+                                    for out in equation.outvars if computed(out))
+                roots: dict[jcore.Var, int] = {}
+
+                def root(value):
+                    if value not in roots:
+                        roots[value] = 1 << len(roots)
+                    return roots[value]
+
+                reached = {value: root(value) for value in program.outvars if computed(value)}
+                for consumer in reversed(program.eqns):
+                    terminal = 0
+                    for out in consumer.outvars:
+                        if computed(out):
+                            terminal |= reached.get(out, 0)
+                    produced = max((math.prod(dimensions(out)) for out in consumer.outvars), default=0)
+                    for number, value in enumerate(consumer.invars):
+                        if not computed(value):
+                            continue
+                        producer = self.producers.get(value)
+                        reused = (producer is not None and producer.primitive in ELEMENTWISE
+                                  and not recomputed(producer, "cpu")
+                                  and math.prod(dimensions(value)) < produced)
+                        permitted = (id(consumer) in looping and
+                                     (consumer.primitive is not jax.lax.dot_general_p
+                                      or number in _cpu_dot_inputs(consumer)))
+                        ends = root(value) if not permitted or reused else terminal
+                        reached[value] = reached.get(value, 0) | ends
+                self.absorbed.update(value for value in self.looping
+                                     if value not in self.outputs and (ends := reached.get(value, 0))
+                                     and ends & (ends - 1) == 0 and ends != roots.get(value)
+                                     and self.producers[value].primitive not in PRODUCTS)
+                for consumer in program.eqns:
+                    if consumer.primitive not in (jax.lax.add_p, primitives.add_jaxvals_p):
+                        continue
+                    for value in consumer.invars:
+                        if (computed(value) and value not in self.outputs and self.readers[value] == 1
+                                and consumer.invars.count(value) == 1
+                                and (producer := self.producers.get(value)) is not None
+                                and _cpu_output_dot(producer)):
+                            self.absorbed.add(value)
+                # A single-consumer producer eligible for the same library region needs no separate
+                # allocation (`LibraryRewriter::AddFusionCandidates`, `GrowFusion`). The lower walk
+                # permits that fusion, including reductions and costly elementwise operations.
+                pending = [self.producers[value] for value in self.reducing]
+                seen: set[int] = set()
+                while pending:
+                    consumer = pending.pop()
+                    if id(consumer) in seen:
+                        continue
+                    seen.add(id(consumer))
+                    for value in consumer.invars:
+                        if not computed(value) or value in self.outputs or self.readers[value] != 1:
+                            continue
+                        producer = self.producers.get(value)
+                        if producer is not None and _ynn_eligible(producer):
+                            self.absorbed.add(value)
+                            pending.append(producer)
+                if not returned:
+                    # A leaf-local update can consume an elementwise gradient in the loop that writes
+                    # its donated parameter, without a separate gradient array.
+                    self.absorbed.update(value for value in program.outvars if computed(value)
+                                         and self.producers.get(value) is not None
+                                         and value in self.looping)
 
     def share(self, value: jcore.Var) -> int:
         """`device_share` of `value` where the frontier counts it (`counted`), else none."""
@@ -894,6 +1218,9 @@ class Frontier:
         if equation is None or not equation.invars or not computed(equation.invars[0]):
             return False
         operand = equation.invars[0]
+        if self.lower and self.platform == "cpu" and equation.primitive in (
+                primitives.name_p, primitives.sharding_constraint_p):
+            return self.stored(operand)
         if bitcast(equation):
             return operand in self.inputs or not self.fused(operand) or self.view(operand)
         # XLA lays a value out once, so a transpose is its storage only where it is its one reader.
@@ -915,7 +1242,16 @@ class Frontier:
         if value in self.barred:
             # A barrier's operand holds a buffer unless it is another's storage.
             return self.view(value)
+        if value in self.absorbed:
+            return True
         equation = self.producers.get(value)
+        if (self.lower and self.platform == "cpu" and equation is not None
+                and equation.primitive in (primitives.name_p, primitives.sharding_constraint_p)):
+            return True
+        if (self.lower and self.platform == "cpu" and value in self.looping
+                and equation is not None and equation.primitive not in (*ELEMENTWISE, *PRODUCTS)):
+            # An unfamiliar positionwise lowering is not proof that its intermediate is stored.
+            return value not in self.outputs or self.view(value)
         if value in self.forwards:
             return self.stored(self.forwards[value])
         if equation is None or not recomputed(equation, self.platform):
@@ -942,6 +1278,9 @@ class Frontier:
         Qwen3.5-4B's tied embedding's gradient, a scatter-add into zeros, was derived holding the zeros
         beside it, 2.37 GiB over XLA's 4.76 at its step's peak under 'full' (row 4089)."""
         primitive = equation.primitive
+        if self.lower and self.platform == "cpu" and any(
+                out in self.looping or out in self.absorbed for out in equation.outvars):
+            return True
         return (recomputed(equation, self.platform) or primitive is jax.lax.reduce_p or primitive in WINDOWS
                 or reduction(primitive) or scatter(primitive))
 
@@ -1186,4 +1525,5 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                 workspace=gemm_workspace(target), lowering=lowering, consumed=reads, deferred=late,
                 table=objective.whole_head_table(variables))
     return Footprint(residuals, device_bytes(prepared.variables["params"]), held, resident_bytes(prepared),
-                     None if peak is None else peak.bytes, peak is None or peak.exact, staged, reads, head)
+                     None if peak is None else peak.bytes, peak is None or peak.exact, staged, reads, head,
+                     None if peak is None else peak.lower)
