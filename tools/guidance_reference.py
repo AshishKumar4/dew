@@ -149,10 +149,7 @@ def apg_draw(seed: int) -> dict[str, np.ndarray]:
 
 def apg_seeds(destination: Path) -> None:
     """Every APG case over the seeds check 1 draws (`record_case`): each seed's initial state, the
-    published guider's float32 walk from it and its float64 one, the count planned on Dew's own walk
-    (tests/diffusion_support.py's `apg_walked`)."""
-    sys.path.insert(0, str(FIXTURE.parents[1]))
-    from diffusion_support import apg_walked
+    published guider's float32 walk from it and its float64 one."""
     from recorded_references import provenance, record_case, save
 
     published = guider()
@@ -163,10 +160,7 @@ def apg_seeds(destination: Path) -> None:
             return ({"walked": apg_walk(published, case, x).numpy()},
                     {"walked": apg_walk(published, case, x.double()).numpy()})
 
-        def walked(inputs, case=case):
-            return {"walked": apg_walked(case, LABEL, inputs["x_T"])}
-
-        arrays.update(record_case(name, apg_draw, evaluate, walked))
+        arrays.update(record_case(name, apg_draw, evaluate))
     save(destination, {**arrays, "provenance": provenance(
         "diffusers", DIFFUSERS, "cpu", f"python tools/guidance_reference.py apg-seeds {destination}",
         torch=torch.__version__)}, reference=f"huggingface/diffusers {DIFFUSERS}", license="Apache-2.0")

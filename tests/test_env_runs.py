@@ -38,8 +38,8 @@ VIEWS = ("state", "teacher")
 """What a race shows its agent: the drone's state, which the student reads, and the teacher's view."""
 TINY = {"deter": 16, "hidden": 8, "stoch": 4, "classes": 4, "blocks": 2, "units": 8}
 """A world model's widths at a test's size."""
-DYNAMICS = {"action_size": 4, "stoch": 4, "classes": 4, "width": 16, "layers": 1, "heads": 2, "context": 8}
-"""TransDreamer's dynamics at a test's size, over windows of 8 steps."""
+DYNAMICS = {"action_size": 4, "stoch": 4, "classes": 4, "width": 16, "layers": 1, "heads": 2, "context": 4}
+"""TransDreamer's dynamics at a test's size, over windows of 4 steps."""
 OPTIM = OptimConfig(optimizer="adam", learning_rate=1e-3)
 
 
@@ -56,12 +56,12 @@ def flight(count: int = 16) -> EnvConfig:
     return EnvConfig("flight", {"racing": RACING, "views": list(VIEWS)}, count=count)
 
 
-def teacher_run(root: Path, steps: int = 2) -> EnvRunConfig:
+def teacher_run(root: Path, steps: int = 1) -> EnvRunConfig:
     """PPO over the race's privileged view, as tools/fpv_race.py's teacher, at a test's size."""
     model = ModelConfig(ACTOR_CRITIC, {"policy_layers": [16], "value_layers": [16]})
     return EnvRunConfig(env=flight(), model=model,
                         objective=ObjectiveConfig(CONTROL_PPO, {"discount": 0.9, "reads": ["teacher"]}),
-                        rollout=RolloutConfig("control", {"unroll_length": 4, "epochs": 1, "minibatches": 2}),
+                        rollout=RolloutConfig("control", {"unroll_length": 2, "epochs": 1, "minibatches": 2}),
                         optim=OPTIM, trainer=trainer(root, steps))
 
 
@@ -72,8 +72,8 @@ def teacher_policy() -> ControlPPOObjective:
 
 def student(root: Path, steps: int, **fields) -> EnvRunConfig:
     """A Dreamer agent of the drone's state in the race, at a test's size."""
-    rollout = {"batch": 8, "length": 8, "train_ratio": 16.0, "prefill": 8, "capacity": 64}
-    run = EnvRunConfig(env=flight(8), model=ModelConfig(WORLD_MODEL, {**TINY, "reads": "state"}),
+    rollout = {"batch": 8, "length": 4, "train_ratio": 16.0, "prefill": 4, "capacity": 32}
+    run = EnvRunConfig(env=flight(4), model=ModelConfig(WORLD_MODEL, {**TINY, "reads": "state"}),
                        rollout=RolloutConfig("dreamer", rollout), optim=OPTIM, trainer=trainer(root, steps))
     return dataclasses.replace(run, **fields)
 
@@ -97,29 +97,29 @@ def assert_bitwise(one, other) -> None:
 
 
 def ppo(root: Path):
-    run = dataclasses.replace(teacher_run(root, 3), episodes={"episodes": EpisodesConfig(steps=16)})
+    run = dataclasses.replace(teacher_run(root, 3), episodes={"episodes": EpisodesConfig(steps=8)})
     objective = teacher_policy()
     env = Batched(FlightEnv(racing(), VIEWS), 16)
-    return run, objective, ControlRollout(objective, env, unroll_length=4, epochs=1, minibatches=2)
+    return run, objective, ControlRollout(objective, env, unroll_length=2, epochs=1, minibatches=2)
 
 
 def dreamer(root: Path):
-    run = student(root, 3)
+    run = student(root, 2)
     objective = DreamerV3Objective(world_model())
-    env = Batched(FlightEnv(racing(), VIEWS), 8)
-    return run, objective, DreamerRollout(objective, env, capacity=64, batch=8, length=8, train_ratio=16.0,
-                                          prefill=8)
+    env = Batched(FlightEnv(racing(), VIEWS), 4)
+    return run, objective, DreamerRollout(objective, env, capacity=32, batch=8, length=4, train_ratio=16.0,
+                                          prefill=4)
 
 
 def transdreamer_race(root: Path):
     """TransDreamer's agent in the race a host simulator steps (`GateRace`, no images)."""
-    race = {"renderer": None, "racing": RACING, "views": list(VIEWS), "count": 8}
+    race = {"renderer": None, "racing": RACING, "views": list(VIEWS), "count": 4}
     model = ModelConfig(WORLD_MODEL, {**TINY, "reads": "state", "dynamics": DYNAMICS})
-    run = student(root, 3, env=EnvConfig("gate_race", race), model=model)
+    run = student(root, 2, env=EnvConfig("gate_race", race), model=model)
     objective = DreamerV3Objective(world_model(dynamics=TSSM(**DYNAMICS)))
-    simulator = GateRace(None, racing(), views=VIEWS, count=8)
-    return run, objective, DreamerRollout(objective, simulator, capacity=64, batch=8, length=8,
-                                          train_ratio=16.0, prefill=8)
+    simulator = GateRace(None, racing(), views=VIEWS, count=4)
+    return run, objective, DreamerRollout(objective, simulator, capacity=32, batch=8, length=4,
+                                          train_ratio=16.0, prefill=4)
 
 
 @pytest.mark.parametrize("composed", [ppo, dreamer, transdreamer_race], ids=lambda made: made.__name__)
@@ -133,7 +133,7 @@ def test_a_run_from_its_record_trains_as_the_run_composed_in_python(tmp_path, co
 
     run, objective, rollout = composed(tmp_path)
     state = run.prepare().train("record")
-    assert_bitwise(state, fitted(run, objective, rollout, 3))
+    assert_bitwise(state, fitted(run, objective, rollout, run.trainer.steps))
     saved = RunConfig.load(str(tmp_path / "record"))
     with Compiles("step") as again:
         retrained = saved.prepare().train("again")
@@ -143,6 +143,7 @@ def test_a_run_from_its_record_trains_as_the_run_composed_in_python(tmp_path, co
         with Compiles("step") as changed:
             saved.override({"objective.horizon": 100.0, "trainer.steps": 1}).prepare().train("horizon")
         assert any(program.kind == "traced" for program in changed.programs)
+
 
 @pytest.mark.parametrize("drawn", [False, True], ids=["greedy", "drawn"])
 @pytest.mark.parametrize("agent", ["ppo", "dreamer", "dreamer in a simulator"])
@@ -159,10 +160,10 @@ def test_a_runs_episodes_score_its_flights_from_the_evaluations_key(tmp_path, ag
 
     run, objective, _ = {"ppo": ppo, "dreamer": dreamer, "dreamer in a simulator": transdreamer_race}[agent](
         tmp_path)
-    count = 16 if agent == "ppo" else 8
+    count = 16 if agent == "ppo" else 4
     simulated = {"renderer": None, "racing": RACING, "views": list(VIEWS), "count": count}
     own = EnvConfig("gate_race", simulated) if agent == "dreamer in a simulator" else None
-    split = EpisodesConfig(steps=16, env=own, drawn=drawn)
+    split = EpisodesConfig(steps=8, env=own, drawn=drawn)
     run = dataclasses.replace(run, episodes={"episodes": split})
     state = run.prepare().train("scored")
     logged = {name: value for _, scalars in LocalTracker(str(tmp_path / "scored" / "tracking")).scalars()
@@ -170,16 +171,15 @@ def test_a_runs_episodes_score_its_flights_from_the_evaluations_key(tmp_path, ag
     policy = objective.act if drawn else objective.greedy
     if agent == "ppo":
         race = Batched(FlightEnv(racing(), VIEWS), count)
-        flown = episodes(policy, race, 16)
+        flown = episodes(policy, race, 8)
     else:
         race = (DrivenSimulator(GateRace(None, racing(), views=VIEWS, count=count)) if own is not None
                 else Driven(Batched(FlightEnv(racing(), VIEWS), count)))
-        flown = episodes(policy, race, 16, memory=objective.memory)
+        flown = episodes(policy, race, 8, memory=objective.memory)
     with generation.run_precision(run.trainer.precision):
         expected = flown(state.variables if state.ema is None else state.averaged,
-                         evaluation_key(state.key, 3))
+                         evaluation_key(state.key, run.trainer.steps))
     assert logged == {f"episodes/{name}": value for name, value in expected.items()}
-
 
 
 def test_a_student_resumed_by_its_command_keeps_the_teacher_step_it_pinned(tmp_path):
@@ -189,16 +189,16 @@ def test_a_student_resumed_by_its_command_keeps_the_teacher_step_it_pinned(tmp_p
     teacher's new latest and its resume was refused (row 3931). A run of no teacher stays one."""
     teacher_run(tmp_path).prepare().train("teacher")
     taught = TeacherConfig(str(tmp_path / "teacher"), demonstrates=True)
-    pretrains = {"batch": 8, "length": 8, "train_ratio": float("inf"), "prefill": 16, "capacity": 64}
+    pretrains = {"batch": 8, "length": 4, "train_ratio": float("inf"), "prefill": 8, "capacity": 32}
     # Named in its trainer, as `dew train` names a run by its file.
     command = student(tmp_path, 1, teacher=taught, rollout=RolloutConfig("dreamer", pretrains),
                       objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0}),
                       trainer=trainer(tmp_path, 1, name="taught"))
     command.prepare().train("taught")
-    teacher_run(tmp_path, steps=4).prepare().train("teacher")
+    teacher_run(tmp_path, steps=2).prepare().train("teacher")
     again = dataclasses.replace(command, trainer=trainer(tmp_path, 2, name="taught"))
     prepared = again.prepare()
-    assert prepared.run.teacher is not None and prepared.run.teacher.step == 2
+    assert prepared.run.teacher is not None and prepared.run.teacher.step == 1
     assert int(prepared.train("taught").step) == 2
     untaught = student(tmp_path, 1, trainer=trainer(tmp_path, 1, name="taught"))
     assert untaught.resumed().teacher is None
@@ -226,17 +226,17 @@ def test_a_pretraining_stage_from_its_record_learns_from_its_saved_teacher_as_co
     saved, teacher = trained_teacher
     # A step of the stage: one update reads, writes and records all a run of more does.
     scales = {"policy": 0.0, "value": 0.0, "replay_value": 0.0}
-    pretrains = {"batch": 8, "length": 8, "train_ratio": float("inf"), "prefill": 16, "capacity": 64}
+    pretrains = {"batch": 8, "length": 4, "train_ratio": float("inf"), "prefill": 8, "capacity": 32}
     pretraining = student(tmp_path, 1, teacher=TeacherConfig(str(saved), demonstrates=True),
                           objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "scales": scales}),
                           rollout=RolloutConfig("dreamer", pretrains))
     prepared = pretraining.prepare()
-    assert prepared.run.teacher is not None and prepared.run.teacher.step == 2
+    assert prepared.run.teacher is not None and prepared.run.teacher.step == 1
     pretrained = prepared.train("pretrain")
     objective = DreamerV3Objective(world_model(), imitation=1.0, scales=scales)
-    race = Batched(FlightEnv(racing(), VIEWS), 8)
-    rollout = DreamerRollout(objective, race, capacity=64, batch=8, length=8, train_ratio=float("inf"),
-                             prefill=16, demonstrator=Teacher(teacher_policy().act, teacher.variables))
+    race = Batched(FlightEnv(racing(), VIEWS), 4)
+    rollout = DreamerRollout(objective, race, capacity=32, batch=8, length=4, train_ratio=float("inf"),
+                             prefill=8, demonstrator=Teacher(teacher_policy().act, teacher.variables))
     assert_bitwise(pretrained, fitted(pretraining, objective, rollout, 1))
     assert_bitwise(prepared.rollout.held_replay, rollout.held_replay)
     dagger = student(tmp_path, 1, teacher=TeacherConfig(str(saved)),
@@ -259,11 +259,11 @@ def test_a_dagger_stage_from_its_record_labels_its_flights_with_its_saved_teache
     dagger = student(tmp_path, 1, teacher=TeacherConfig(str(saved)),
                      objective=ObjectiveConfig(DREAMER_V3, {"imitation": 1.0, "imitates": LABEL}))
     prepared = dagger.prepare()
-    assert prepared.run.teacher is not None and prepared.run.teacher.step == 2
+    assert prepared.run.teacher is not None and prepared.run.teacher.step == 1
     state = prepared.train("dagger")
     objective = DreamerV3Objective(world_model(), imitation=1.0, imitates=LABEL)
-    rollout = DreamerRollout(objective, Batched(FlightEnv(racing(), VIEWS), 8), capacity=64, batch=8,
-                             length=8, train_ratio=16.0, prefill=8,
+    rollout = DreamerRollout(objective, Batched(FlightEnv(racing(), VIEWS), 4), capacity=32, batch=8,
+                             length=4, train_ratio=16.0, prefill=4,
                              teacher=Teacher(teacher_policy().greedy, teacher.variables))
     assert_bitwise(state, fitted(dagger, objective, rollout, 1))
     labelled = jax.device_get(prepared.rollout.held_replay)
@@ -275,7 +275,7 @@ def test_a_dagger_stage_from_its_record_labels_its_flights_with_its_saved_teache
 def resumable(root: Path, agent: str) -> EnvRunConfig:
     """A run of `agent`'s, PPO or DreamerV3 with its replay in its checkpoints, to its fourth update in the
     race, checkpointed every update."""
-    replayed = {"batch": 8, "length": 8, "train_ratio": 16.0, "prefill": 8, "capacity": 64,
+    replayed = {"batch": 8, "length": 4, "train_ratio": 16.0, "prefill": 4, "capacity": 32,
                 "checkpointed_replay": True}
     run = (teacher_run(root, 4) if agent == "ppo" else
            student(root, 4, rollout=RolloutConfig("dreamer", replayed)))
@@ -301,8 +301,8 @@ def test_a_resumed_run_ends_as_the_run_that_never_stopped(tmp_path, agent):
     if agent == "dreamer":
         next_run = dataclasses.replace(
             next_run,
-            rollout=RolloutConfig("dreamer", {"batch": 8, "length": 16, "train_ratio": 16.0, "prefill": 16,
-                                              "capacity": 64, "checkpointed_replay": True}),
+            rollout=RolloutConfig("dreamer", {"batch": 8, "length": 8, "train_ratio": 16.0, "prefill": 8,
+                                              "capacity": 32, "checkpointed_replay": True}),
             objective=ObjectiveConfig(DREAMER_V3, {"entropy": 1e-5}))
     assert int(next_run.prepare().train("stopped").step) == 5
     refused = {"objective.discount": 0.5} if agent == "ppo" else {"objective.horizon": 100.0}

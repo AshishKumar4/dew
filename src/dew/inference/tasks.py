@@ -91,7 +91,9 @@ if TYPE_CHECKING:
     from dew.registry import ModelConfig
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
-Request = str | Sequence[str] | Rows
+Conversation = Sequence[Mapping[str, object]]
+"""One conversation's messages, each a mapping of its role and content, as a chat template reads them."""
+Request = str | Sequence[str] | Conversation | Rows
 
 SHAPE_BUCKETS = tuple(1 << exponent for exponent in range(21))
 """The shapes a text request is rounded up to: powers of two.
@@ -137,6 +139,8 @@ class Processor(Protocol):
 
     def spelling(self, ids: Sequence[int]) -> str: ...
 
+    def chat(self, messages: Conversation) -> ModelInputs: ...
+
     @property
     def bos_id(self) -> int | None: ...
 
@@ -145,8 +149,17 @@ def prepared_inputs(processor: Processor | None, request: Request, *, images: Me
     """Turn a request into `ModelInputs`, tokenizing text through `processor`.
 
     Token rows pass through with their ids and row order unchanged; only text
-    reaches the processor.
+    and a conversation reach the processor, a conversation rendered by its
+    chat template and continued from the assistant's turn (`Processor.chat`).
     """
+    if (isinstance(request, Sequence) and not isinstance(request, str) and request
+            and all(isinstance(message, Mapping) for message in request)):
+        if processor is None:
+            raise ValueError("a conversation is rendered by its processor's chat template: pass processor= "
+                             "where the task is built, or request ModelInputs or token rows")
+        if images is not None:
+            raise ValueError("a conversation carries its images in its messages' content parts")
+        return processor.chat([message for message in request if isinstance(message, Mapping)])
     if isinstance(request, str):
         text = [request]
     elif isinstance(request, Sequence) and request and all(isinstance(entry, str) for entry in request):
@@ -166,7 +179,7 @@ def prepared_inputs(processor: Processor | None, request: Request, *, images: Me
     if isinstance(request, ModelInputs):
         return ModelInputs.from_value(request)
     if isinstance(request, Sequence):
-        rows = [row for row in request if not isinstance(row, str)]
+        rows = [row for row in request if not isinstance(row, (str, Mapping))]
         if len(rows) != len(request):
             raise ValueError("a request cannot mix text prompts and numeric token rows")
         # ModelInputs reads the rows by `dew.batch.token_id`'s law.
@@ -415,7 +428,8 @@ class SavedRun:
 
     def variables(self, *, ema: bool | None, mesh: MeshSpec | Mesh | None = None,
                   layout: Layout | None = None, param_dtype: DTypeLike | None = None,
-                  parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS) -> Variables:
+                  parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS,
+                  on_host: bool = False) -> Variables:
         """The model's variables at this step, as every run loader reads them: an objective whose
         average is its frozen reference gives the trained weights whatever `ema` asks
         (`Objective.ema_is_reference`), and one that nests the model beside other networks gives the
@@ -432,7 +446,7 @@ class SavedRun:
             variables = checkpoints.variables(
                 step=self.step, ema=False if objective.ema_is_reference else ema, mesh=mesh, layout=layout,
                 param_dtype=param_dtype, parameter_roots=parameter_roots,
-                unread=tuple(strings(path, UNREAD) for path in unread))
+                unread=tuple(strings(path, UNREAD) for path in unread), on_host=on_host)
         return objective.model_tree(variables)
 
 
@@ -858,6 +872,20 @@ class RunProcessor:
 
     def decode(self, tokens: jax.typing.ArrayLike) -> list[str]:
         return [self.tokenizer.decode(row) for row in np.asarray(tokens)]
+
+    def chat(self, messages: Conversation) -> ModelInputs:
+        """`messages` rendered by the run's Hugging Face tokenizer's chat template with the assistant's turn
+        opened (`dew.data.chat.render_prompt`, as a run's prompts are), one row; a tokenizer of no template
+        (a byte one) refused."""
+        from dew.data.chat import Conversation as Turns, render_prompt
+        from dew.data.text import HFTokenizer
+
+        if not isinstance(self.tokenizer, HFTokenizer):
+            raise ValueError(f"a {type(self.tokenizer).__name__} has no chat template to render a "
+                             "conversation by: request its text")
+        ids = render_prompt(self.tokenizer.tokenizer, Turns.parse(list(messages)), "conversation")
+        tokens, fields = pad_token_rows([ids])
+        return ModelInputs(jnp.asarray(tokens), jax.tree.map(jnp.asarray, fields))
 
     def encode(self, text: str, *, specials: bool) -> list[int]:
         """`text`'s ids from the run's tokenizer, with the special tokens it adds around a sequence

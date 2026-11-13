@@ -142,7 +142,10 @@ def dew_run(server, prompts: np.ndarray, output: int):
 
 
 def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directory: Path):
-    """Untraced Python costs and a warmed decode-only Dew/XProf capture."""
+    """Untraced Python costs and a warmed decode-only Dew/XProf capture. The host's wall over the steps and
+    its profile are where a step's Python cost shows: one that built its program's dispatch key over the
+    weights and cache again each step (`dew.inference.serving_kernel.dispatched` runs an executable it
+    asked for once a size of admission) costs about 1 ms a step here (train 329's review)."""
     import jax
     from trace_window import DECODE_CATEGORIES, decode_category, kernel_totals
 
@@ -232,9 +235,11 @@ def dew_points(args):
         prompts = prompts_for(slots, count, args.prompt, args.vocab_limit)
         warm = prompts_for(slots, slots, args.prompt, args.vocab_limit, warm=True)
         began = time.perf_counter()
+        # No prefix reuse, as the engines run without it (vLLM's enable_prefix_caching=False): the timed
+        # repeats replay the warm pass's prompts, which a paged cache's default prefix reuse would serve.
         server = Server.from_task(task, slots=slots, capacity=capacity,
                                   admission=args.admission or None, decode_steps=args.decode_steps,
-                                  kv_cache=layout)
+                                  kv_cache=layout, prefix_cache=False)
         print(f"slots {slots}: built in {time.perf_counter() - began:.2f}s", flush=True)
         dew_run(server, warm, args.output)
         # Each power-of-two admission width is its own program (`admission_share`).

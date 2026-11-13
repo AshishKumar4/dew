@@ -46,6 +46,21 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 - Dew requires optax 0.2.8 or later (was 0.2.6): Muon's Newton-Schulz is optax's own iteration, its layout,
   shape scalings and preconditionings (AOL, Schatten) included, which 0.2.8 first ships.
 
+- A run resumes from what the current Dew and the one before it wrote, and refuses an earlier format by
+  name with the ways on: a step that holds a decision run's projections packed (`q`, `k` and `v` in one
+  array, as an earlier Dew stored them) where the run holds them apart, and a step that holds its whole
+  train state as one item. `Checkpoints.restore(served=)` and `Objective.served_groups` are gone with the
+  packed form's resume, and `Checkpoints.restore_profiles` refuses a step that holds its post-hoc EMA
+  profiles in its optimizer's one-item state (read them with the Dew that wrote it). Such a step's weights
+  still load (`Checkpoints.variables`, `Pretrained.from_saved`): start a fresh run from them, or resume it
+  with the Dew that wrote it.
+
+
+- On a GPU holding tensor memory (a B200, B300 or other SM 10.x/11.x part), a run refuses to start under a
+  cuBLAS below 13.2 (`UnsafeCublas`), whose kernels free their tensor memory twice beside another kernel's
+  (JAX's CUDA plugin warns of it at start), and the installer takes the cuda13 build there or none,
+  refusing `--cuda 12`.
+
 - A run's fit plan judges a head that keeps its whole logits by their fp32 bytes before it traces the step's
   gradient (`Objective.whole_head_table` names the head's table), and bounds the rung after a traced one
   from that trace, so a step whose whole logits leave no room is planned from one gradient trace and
@@ -67,6 +82,9 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   posterior and imagination noise from `Step`'s per-example update streams, and compute minibatch-wide
   advantage moments and return percentiles once across a split step's microbatches
   (`Objective.batch_statistics`, `Step.batch_statistics`, `Objective.real_rows`).
+
+- `DreamerRollout` compiles its JAX environment reset once (`saved_shapes` reading shapes via
+  `jax.eval_shape`), and `dew.rl.evaluation` fuses `episodes` into a single compiled program.
 
 - A paged `Server` keeps a prefix cache by default (`prefix_cache=None` derives it on wherever the layout pages,
   the rows sample a token a step on the server's own mesh and the model computes a split prompt as a whole
