@@ -151,7 +151,8 @@ class Capture:
         # Armed only once the collector reads its pipe: a dying process finds no reader before then, and dies
         # unread (a process aborting at once raced a collector still starting).
         ready = time.monotonic() + 10
-        while not (self.done / "ready").exists() and time.monotonic() < ready and self.collector.poll() is None:
+        while (not (self.done / "ready").exists() and time.monotonic() < ready
+               and self.collector.poll() is None):
             time.sleep(0.02)
         if not (self.done / "ready").exists():
             self.why = "the collector did not start"
