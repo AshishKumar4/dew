@@ -1286,7 +1286,8 @@ def _floor(pipeline: Pipeline, at: int, pack: Pack) -> int | None:
     field = pack.fields[0]
     floors = []
     for row in source.held:
-        if not isinstance(row, Mapping) or field not in row:
+        # A stating step makes the field from what it reads (an encoding, its tokens); else the row holds it.
+        if not isinstance(row, Mapping) or (stating is None and field not in row):
             return None
         floors.append(len(row[field]) if stating is None else stating.shortest(row, field))
     return max(1, min(floors))
