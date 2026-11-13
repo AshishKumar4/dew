@@ -229,7 +229,7 @@ Each form is priced in time from the device facts Dew already owns, never from f
 
 A region's seconds are computed once, from its composed terms over the chosen DAG (§6.5): bytes over bandwidth,
 FLOPs over the dtype's rate, each kernel XLA's fusion makes of it (a reduction's
-and a product's, each a fusion's root) at the part's measured fixed latency (its launch and first byte; a part no measurement holds pays none, and
+and a product's, each a fusion's root, as `cost.fused` restates XLA's fusion today: §6.5, row 5897) at the part's measured fixed latency (its launch and first byte; a part no measurement holds pays none, and
 its kernels are counted as work no rate prices, §6.5), so a
 chain of dependent reductions pays a kernel's latency a link, and the span of a loop XLA lowers at its
 iteration's latency (§6.5), combined as `templates.cost` combines a launch's. Row
@@ -269,7 +269,7 @@ fitted to them, and a rule set ships only with measured receipts.
   - a recurrence's state update.
 
   The hand-written algebra modules are the reference a generated form is held to. It need not equal them. It
-  replaces one when it meets both of the bible's bars (§4).
+  replaces one when it meets both bars §4 states.
 - **Stable numeric forms and surrogate bodies (dev time):** §1.3 and §1.5.
 - **Fusion:** a search over algebraic forms, fusion boundaries and template compositions for a region of a step
   (a norm, a projection and an activation, for example), built from the toolkit's composed primitives and its work
@@ -306,7 +306,7 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
 - check 1 is `assert_as_exact` as it applies `src/dew/parity.py` today: each tensor's pooled RMS distance
   to the float64 truth against the reference's at `PARITY`, its worst row at `ROW_FACTOR`, and narrow rows at
   `NARROW_FACTORS`. This doc names those constants and never restates them, so it cannot drift from the gate.
-- check 2 (bible §7, "never wrong"): where a rewritten operation has a certified bound (`tests/certified.py`),
+- check 2 (testing.md's, "never wrong"): where a rewritten operation has a certified bound (`tests/certified.py`),
   every element holds within it, at each rule's site and wherever the gate already runs check 2 for a program
   site.
 
@@ -345,8 +345,8 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
   transform's residual (`compensated_add`'s low word) is what a rewritten program computes. A test a
   transform would repeat the marker's with another body. A `Surrogate` test requires its backward to stay
   the declared rule, not autodiff's.
-- **Generated modules:** each ships its gate sites and its stability suite (bible §6); `generate --check` holds the
-  checked-in output to the generator's.
+- **Generated modules:** each ships its gate sites and its stability suite (testing.md's fast and accurate
+  forms); `generate --check` holds the checked-in output to the generator's.
 - **Determinism:** one jaxpr in gives a bytewise-identical rewritten program out, compared as its lowered
   StableHLO, across fresh processes with different `PYTHONHASHSEED`s, checked on the multi-process CPU lane. Multi-controller JAX needs every
   process to compile the same program, and one process repeating itself cannot catch an ordering that follows
@@ -364,14 +364,17 @@ All accuracy checks are the [accuracy gate](testing.md)'s, with no tolerance of 
 
 - **It replaces** custom derivatives that exist only to restructure algebra where its rules reach their form
   under the dominance rule (nGPT's join and normed hidden do not, §1.3), and hand-derived template algebra and numeric forms wherever a generated form meets both bars:
-  - bible §4: at least as efficient on every scoreboard row and GPU type the route serves, at the derived default,
-    in operator rows and the `benchmark_step` step;
-  - bible §6: the template's stability suite on both forms, and check 1 and check 2 against the float64 truth.
+  - efficiency (CONTRIBUTING.md's two measures, compared as kernel-templates.md §1 defines): at least as efficient
+    on every scoreboard row and GPU type the route serves, at the derived default, in operator rows and the
+    `benchmark_step` step;
+  - accuracy (testing.md's numerical accuracy): the template's stability suite on both forms, and check 1 and
+    check 2 against the float64 truth.
 - **It leaves:**
   - the templates' schedules, the toolkit and the families;
   - custom derivatives that implement kernels, and numerics and surrogate bodies except as §1.3 allows;
   - the planner's contract and the precision policy's meaning;
-  - JAX, jaxlib and XLA, unchanged: the pass reads a fact a library states from the library (bible §5):
+  - JAX, jaxlib and XLA, unchanged: the pass reads a fact a library states from the library (CONTRIBUTING.md's
+    Code: a fact from its one source):
     `program`'s static arguments by JAX's own inference, `nn.programs`' precision presets by JAX's own
     conversion.
 - **XLA keeps** fusion and code generation; it does not reassociate floating-point math by default, so chosen forms
@@ -572,9 +575,9 @@ product from its operand's shape add (a scale lifted out of a product, the carri
 distributions and factorings); a product of a mode with no stated rounding states neither, nor that it is
 plain or a matrix product, so no rule factors it or makes another in its mode.
 
-The dominance rule decides which reorderings fire. Its contract is bible §6: no infinity where the reference is
-finite. A reordering is admitted only when every new intermediate it makes has a number bound under the
-program's reach, the narrowest float's largest power of two, taken exactly (`math.frexp`: float64's `log2` of
+The dominance rule decides which reorderings fire. Its contract is the default form's (testing.md's fast and
+accurate forms): no infinity where the reference is finite. A reordering is admitted only when every new intermediate it makes has a number
+bound under the program's reach, the narrowest float's largest power of two, taken exactly (`math.frexp`: float64's `log2` of
 its largest rounds to 1024) (`rules.reach`; `rules.dominated`): a number bound
 under the float's largest is a finite value's wherever the program's values are. A value no number bounds
 admits nothing (but a positive scale out of a maximum or a minimum, which makes no new intermediate a bound
@@ -707,17 +710,15 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
   process prices with the same numbers. A fact no owner holds is
   added to `GpuTarget` or its `Architecture`, never to the engine. Prices are checked against measured profiles,
   never fitted to them; a form whose price and profile disagree is a finding against the cost model.
-- One cost vocabulary, two schedules. Every price is told in one vocabulary, the toolkit's `templates.cost.Work`:
-  an operation's work by unit (tensor-core FLOPs by mode, the 16-bit mode's, TF32's and FP8's, `fp8_flops`;
-  CUDA-core fp32 operations, a product at `Precision.HIGHEST` among them; SFU exponentials; conversions) and its bytes by
-  level (device memory, shared memory). The algebra's terms price through it (`cost.work`: a product's FLOPs in
+- One cost vocabulary, two schedules. Every price is told in one vocabulary, the toolkit's `templates.cost.Work`,
+  whose units kernel-templates.md §6 states. The algebra's terms price through it (`cost.work`: a product's FLOPs in
   its mode, from its operands' dtypes and its precision as the product declaration reads them, a dot
   algorithm's passes counted, and its operand bytes; a reduction's operations; a special function's
   exponentials, a conversion's conversions, any other elementwise node's operations, a layout change nothing;
-  a leaf's bytes, read once). A template kernel's issued work is read from its body into the same record
-  (docs/design/kernel-templates.md §6; today stated by hand, row 5895). No per-operation price
-  exists anywhere else. Today one does: a bit form's own price (`bits.BitForm.price`, its instructions' ALU and
-  FMA issues, §7) stands beside `Work`, which holds no integer or packed pipe yet (row 5386).
+  a leaf's bytes, read once). Today `cost.work` states that by hand, a primitive at a time; the per-primitive
+  rules that are to read a kernel's body are to read each term as its equation too (row 5901). A template
+  kernel's issued work is read from its body into the same record (docs/design/kernel-templates.md §6; today
+  stated by hand, row 5895). The one other per-operation price, a bit form's own, is kernel-templates.md §6's gap (row 5386).
 - A schedule turns summed work into seconds over `GpuTarget`'s facts, the one source of device facts, each
   unit's rate from them (`templates.cost.rates`); a unit a target states no rate of (a TPU's vector and
   transcendental units, which no primary source states) is priced by none, and a form is cheaper only where it
@@ -737,13 +738,13 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
 - Either schedule's time is the work-span model's (Brent's): the larger of a form's work at its units'
   rates and its span, its critical path's dependent steps, at one step's latency. On XLA's path a step is
   an iteration of a loop XLA lowers, its launches and its predicate (`GpuTarget.step_seconds`, each GPU's
-  measured as the slope of a loop's time over its iterations: an A100's 5.96 µs, an H100's 4.93 µs, an RTX
-  PRO 6000's 3.68 µs); a token loop's tokens and a substitution's rows are a step each. On the template's
-  path a step is a dependent reduction inside a program, measured as one (`GpuTarget.kernel_step_seconds`:
-  a Pallas program's 128-lane reduction read by the next, an A100's 225.3 ns, an H100's 142.7 ns, an RTX PRO
-  6000's 137.7 ns). The algebra's terms state no span of their own, extraction composing a span as its largest
-  node's (`extract.Level`), so a derived tile form's span is the derivation's to state. A whole launch's step,
-  its tile's load and products where its ring does not hide them, is the launch model's (row 4123).
+  measured as the slope of a loop's time over its iterations, its receipt beside it); a token loop's tokens
+  and a substitution's rows are a step each. On the template's path a step is a dependent reduction inside a
+  program, measured as one (`GpuTarget.kernel_step_seconds`: a Pallas program's 128-lane reduction read by the
+  next, its receipt beside it). The algebra's terms state no span of their own, extraction composing a span as
+  its largest node's (`extract.Level`), so a derived tile form's span is the derivation's to state. A whole
+  launch's step, its tile's load and products where its ring does not hide them, is the launch model's (row
+  4123).
 - Every rule is the pass's own, applied wherever its cost model prices the rewrite cheaper (today: wherever a
   window opens at one of its heads, within the window's saturation limits and its greedy extraction, §6.6,
   §6.7), with no
@@ -764,12 +765,8 @@ def extracted(graph, root, model): ...          # the exact extractor (a MILP), 
 - Extraction for a template's interface (`derive`) prices candidates through the tile walk; the compile-time
   pass and the derived scan's carry split price them through XLA's fusion. Each shared term is priced once either way.
 - The tile walk reads no registers or rings when pricing a candidate: both are properties of a whole chosen DAG
-  at a tile size the derivation does not yet know. The template's register model (`MosaicForward.registers`,
-  `_hook_live`) sizes its tiles to the form chosen, and its compile gate refuses a spill (the model proposing
-  and ptxas certifying is kernel-templates.md §7's, pending row 5896). (Today the gate
-  refuses a template launch's spill by relowering it at another config; where no config is left it logs that
-  and keeps the program before it, spill and all, recorded as a miss, and a kernel no template derived is
-  recorded, never refused: `report.settled`.)
+  at a tile size the derivation does not yet know. The template's derivation sizes its tiles to the form
+  chosen, its registers as kernel-templates.md §7 holds them.
 
 ### 6.6 Saturation
 
@@ -1082,9 +1079,8 @@ def derive_scan(declaration: Scan, *, saturation: Saturation, splits_held: int =
 - `step` takes the walk's tile as the template forms it: logits scaled, coordinates, and the mask and score
   hook applied. Places and tile layouts are the schedule's, not the algebra's.
 - The hand-written forms (`attention_algebra`, `recurrence_algebra`) are adapted to the same coarse interface.
-- A generated form replaces the hand-written one when it meets both bars of §4: bible §4's efficiency on every
-  scoreboard row and GPU type the route serves, and bible §6's stability suite and accuracy gate against the
-  float64 truth. Its internals need not decompose into the hand-written functions. The replacement deletes
+- A generated form replaces the hand-written one when it meets both bars of §4, its efficiency and its
+  accuracy. Its internals need not decompose into the hand-written functions. The replacement deletes
   what it replaces in the same change: no switch keeps a hand form beside its derived one.
 - The rule sets derivation needs beside §6.4's:
   - `decoupled`: dependent reductions split with correction terms; a running maximum chosen by `range`;
@@ -1238,7 +1234,8 @@ about it is an estimate.
   (SHF on the ALU, or IMAD.HI and IMAD.SHL, a multiply by a power of two, on the FMA pipe), a rotation (SHF's
   funnel shift, the ALU's alone), and LOP3 masking the XOR of one or two values (the mask an immediate). Every
   architecture from sm75 to sm120 issues them alike.
-- **Price** (`BitForm.price`): the busiest pipe's issues, then the instruction count. Nsight Compute's Kernel
+- **Price** (`BitForm.price`), the search's objective among a decode's forms: the busiest pipe's issues, then
+  the instruction count. A consumer is to price the form it takes through `Work` (§7.4). Nsight Compute's Kernel
   Profiling Guide (its pipelines) puts logic, shifts and every integer instruction but IMAD and IMUL on the
   ALU, and IMAD and IMUL on the FMA pipe; the CUDA C++ Best Practices Guide 13 (Table 5) gives a shift, a
   bitwise operation and an integer multiply-add 64 results a clock per multiprocessor on every compute
@@ -1334,9 +1331,7 @@ Agreed with the GEMM template's owner (2026-11-03):
   checkpoint), the decoder's live registers per thread (which `resources.py` prices before a tile is admitted)
   and its issues by pipe (`BitForm.issues`). (Today the packed matrix, `formats.NvFp4`, stores its words in
   the checked-in form's layout beside its scales, and no encoder or version with them.) `Work` holds no
-  integer pipe yet: the consumer's head adds the
-  ALU's and the FMA pipe's integer issues to it, each 64 results a clock per multiprocessor (§7.2), so
-  `cost.py` prices a form's mix beside the tile's other work. Its tests prove the form again.
+  integer pipe yet (kernel-templates.md §6, row 5386). Its tests prove the form again.
 - The decoder is emitted inline at a matrix-operand hook the GEMM template adds (row 3621): `BitForm.ptx(i)`
   writes output register `i` as one PTX block over the stored word (`$1`) into the register (`$0`), each step
   as its pipe's instruction (`shr`, `shl` and `shf` on the ALU, `mul.lo` and `mul.hi` by a power of two on the
