@@ -207,29 +207,32 @@ def test_a_training_reads_draws_lay_a_row_out_to_no_fewer_tokens_than_it_states(
     """A training read draws each row's layout (`LayoutRows`: a choice's options in a fresh order, a "none
     of the above" beside its options or in place of its right one), and states the fewest tokens any draw
     lays a row out to (`LayoutRows.shortest`), which bounds the documents a memory read's windows hold: no
-    draw is shorter, and the draws reach it, over rows of one question and joint rows of several, each of
-    whose questions draws on its own."""
+    draw is shorter, and the draws reach it. Over rows of one question, and joint rows of two whose right
+    options are long and whose states run past the window by less than, and more than, what one of them
+    gives back: the state refills the room one replaced option frees, but not what both free."""
     from dew.decision import JointLayout, JointSchemaHead
     from dew.decision.rows import ConfigureLayout, QuestionRows
 
-    urgency = Choice("How urgent?", {"low": "it can wait a week", "high": "now"})
-    examples = [Example(example.state, {"team": INTENT, "urgency": urgency},
-                        {"team": example.answers["team"], "urgency": "high" if index % 2 else "low"})
-                for index, example in enumerate(EXAMPLES)] if joint else EXAMPLES
+    rate = 0.9 if joint else 0.5
+    team = Choice("Which team?", {"billing": "b" * 40, "technical": "t" * 40})
+    urgency = Choice("How urgent?", {"low": "l" * 40, "high": "h" * 40})
+    examples = ([Example("x" * length, {"team": team, "urgency": urgency},
+                         {"team": "billing" if length % 2 else "technical", "urgency": "high"})
+                 for length in range(1100, 1600, 20)] if joint else EXAMPLES)
     layout = JointLayout(max_len=1536) if joint else LAYOUT
     heads = {"head": JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)}
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
-                                  specials=SPECIALS, layout=layout, none_of_the_above=0.5,
+                                  specials=SPECIALS, layout=layout, none_of_the_above=rate,
                                   **(heads if joint else {}))
     fit, *_ = objective.data().train
-    drawing = ConfigureLayout(layout, TOKENIZER, SPECIALS, shuffle=True, none_of_the_above=0.5, train=True)(
+    drawing = ConfigureLayout(layout, TOKENIZER, SPECIALS, shuffle=True, none_of_the_above=rate, train=True)(
         {"slots": {"questions": 2 if joint else 1, "options": 3}})
     for example in examples:
         for row in QuestionRows().flat_map(fit.map({"example": example})):
             floor = drawing.shortest(row, "tokens")
             drawn = [len(drawing.random_map(row, np.random.default_rng([7, seed]))["tokens"])
                      for seed in range(64)]
-            assert min(drawn) == floor, (example.state, sorted(set(drawn)), floor)
+            assert min(drawn) == floor, (len(example.state), sorted(set(drawn)), floor)
 
 
 DOCUMENTS_SEEDS = 8
