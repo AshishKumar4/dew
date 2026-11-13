@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import json
 import shutil
 import sys
@@ -105,37 +106,84 @@ def updated(model, variables, ids, rate):
     return value, forward(unquantized(model), stepped(variables, gradient, rate), ids)
 
 
-def cached_run(model, variables, ids, prompt):
-    """Prefill `prompt` tokens, then one token per step: the prompt's logits,
-    each step's logits, and DSpark's draft ids, logits and confidence after
-    each step over the context each call recorded. Every call is compiled
-    once per shape."""
-    rows = ids.shape[0]
-    cache = model.apply(variables, rows, method=model.init_cache, mutable=["cache"])[1]
-    drafts = model.apply(variables, rows, method=model.init_draft_cache, mutable=["cache"])[1]
+_DRIVERS: dict[tuple[int, bool], tuple] = {}
+"""`cached_run`'s compiled calls by the model's identity and whether they capture, each held with its
+model."""
+
+
+def _driver(model, capture: bool):
+    """`cached_run`'s prefill-or-step and draft for `model`, compiled once per shape across every run of it,
+    the variables an argument of each; with `capture`, each runs capturing its selections
+    (tests/selection_margins.py `capturing`) and returns them."""
+    held = _DRIVERS.get((id(model), capture))
+    if held is not None and held[0] is model:
+        return held[1:]
+    if capture:
+        from selection_margins import capturing
+
+        apply = functools.partial(capturing, model)
+    else:
+        apply = model.apply
+
+    def captured(collections):
+        """A call's collections beyond its cache and inputs: what it captured."""
+        return {name: value for name, value in collections.items()
+                if name not in ("cache", "prediction_inputs")}
 
     @jax.jit
-    def step(cache, tokens):
-        (_, logits), updated = model.apply(
+    def step(variables, cache, tokens):
+        (_, logits), updated = apply(
             {**variables, **cache}, tokens, decode=True, method=model.states_and_logits,
             mutable=["cache", "prediction_inputs"])
         context = model.apply(variables, updated["prediction_inputs"], method=model.draft_context)
-        return logits, {"cache": updated["cache"]}, context
+        return logits, {"cache": updated["cache"]}, context, captured(updated)
 
     @jax.jit
-    def draft(drafts, context, tokens):
-        return model.apply({**variables, **drafts}, context, tokens, method=model.draft, mutable=["cache"])
+    def draft(variables, drafts, context, tokens):
+        out, updated = apply({**variables, **drafts}, context, tokens, method=model.draft,
+                             mutable=["cache"])
+        return out, {"cache": updated["cache"]}, captured(updated)
 
-    prompt_logits, cache, context = step(cache, ids[:, :prompt])
-    _, drafts = draft(drafts, context, None)
+    _DRIVERS[id(model), capture] = (model, step, draft)
+    return step, draft
+
+
+def cached_run(model, variables, ids, prompt, captured: list | None = None):
+    """Prefill `prompt` tokens, then one token per step: the prompt's logits,
+    each step's logits, and DSpark's draft ids, logits and confidence after
+    each step over the context each call recorded. Every call is compiled
+    once per shape for every run of `model` (`_driver`).
+
+    After the prefill the drafter takes the prompt's context and drafts
+    nothing, as the release's `forward_spec` does at position 0: its
+    DSparkAttention writes the context's keys and values into its window
+    cache and returns before the block (model.py:1043-1050), the block's
+    attention having no compressor (`compress_ratio == 0`), and
+    `forward_spec` returns None (model.py:1280-1281).
+
+    With `captured`, every call runs capturing its selections
+    (tests/selection_margins.py `capturing`), the trunk's and each DSpark
+    stage's, and each call's captured collections are appended to it."""
+    rows = ids.shape[0]
+    step, draft = _driver(model, captured is not None)
+    cache = model.apply(variables, rows, method=model.init_cache, mutable=["cache"])[1]
+    drafts = model.apply(variables, rows, method=model.init_draft_cache, mutable=["cache"])[1]
+    prompt_logits, cache, context, seen = step(variables, cache, ids[:, :prompt])
+    # The drafter takes the prompt's context and drafts nothing: it selects nothing either.
+    _, drafts, _ = draft(variables, drafts, context, None)
+    calls = [seen]
     steps, drafted = [], []
     for position in range(prompt, ids.shape[1]):
-        logits, cache, context = step(cache, ids[:, position:position + 1])
-        steps.append(np.asarray(logits[:, 0]))
-        out, drafts = draft(drafts, context, jnp.argmax(logits[:, -1], -1))
-        drafted.append([np.asarray(value) for value in out])
-    return (np.asarray(prompt_logits), np.stack(steps, 1),
-            *(np.stack(value, 1) for value in zip(*drafted, strict=True)))
+        logits, cache, context, seen = step(variables, cache, ids[:, position:position + 1])
+        steps.append(logits[:, 0])
+        out, drafts, drew = draft(variables, drafts, context, jnp.argmax(logits[:, -1], -1))
+        drafted.append(out)
+        calls += [seen, drew]
+    if captured is not None:
+        captured.extend(calls)
+    # Arrays as JAX holds them, so a caller's trace of the whole run (a truth's rounding count) reads it.
+    return (prompt_logits, jnp.stack(steps, 1),
+            *(jnp.stack(value, 1) for value in zip(*drafted, strict=True)))
 
 
 @dataclasses.dataclass

@@ -21,12 +21,13 @@ from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding
 
 from dew import communicators
-from dew._devices import gpu_free_bytes, xla_flag
+from dew._devices import COMPILE_ONLY_MEMORY, allocator_limit, gpu_free_bytes, xla_flag
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
 from dew.distributed.placement import parameter_axes
 from dew.mesh import batch_axes, mesh_axes
+from dew.nn.backbones.layer_names import StoredRow, group_layers, stored_layers
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.kernels.templates import report
@@ -51,17 +52,77 @@ COLLECTIVES = {
 }
 """NVIDIA JAX-Toolbox's collective options for a GPU step over several devices: the scheduler overlaps
 each collective with compute, and the collectives combine into few large ones. Measured in
-docs/performance.md, "Collectives over several GPUs"."""
+docs/performance.md, "Collectives over several GPUs". A step that gathers its layers' parameters combines
+its all-gathers up to one layer's instead (`gathered_layer_bytes`)."""
+
+GATHER_THRESHOLD = 'xla_gpu_all_gather_combine_threshold_bytes'
+"""The bytes XLA combines a step's all-gathers up to (`COLLECTIVES`, `step_compiler_options`)."""
+
+def gathered_layer_bytes(objective, variables: Variables) -> int | None:
+    """The bytes a device gathers for the largest layer's split parameters (`splits_parameter`), every
+    collection's (a frozen split's too), each gathered whole in the dtype it is stored in: what a layer's
+    gathers move at most, whatever narrower dtype its step converts a shard to first (a bf16 step over fp32
+    parameters gathers half), so no layer's gathers are split, and at most two of a bf16 step's are held
+    ahead. A layer is a stack module's `layers_N`, every run the objective's networks store stacked (a
+    stage-local or periodic run, a host-owned state's bank of its frozen trees, a distillation teacher's
+    among them) read back onto its layers first (`stored_layers`, the networks' own views, as their exports
+    read them); None where no layer's leaf is split. A step whose all-gathers
+    combine up to one layer's gathers each layer at once (`step_compiler_options`): on 2 x H100 at fsdp 2,
+    Qwen3.5-4B's 1 GiB combined about 4.7 layers' 215 MiB each in its forward and held 5 GiB more at its
+    peak than 128 MiB did, in the same time (IG-SCALING-2XH100), and a Llama-3.1-8B's 128 MiB split its 0.44
+    GB layers and lost 2.6% (docs/performance.md)."""
+    def layered(tree):
+        # A bank's rows are read where they lie (`StoredRow`): their shapes and dtypes are what is sized.
+        return jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype) if isinstance(leaf, StoredRow)
+                            else leaf, stored_layers(objective, tree, banks=True))
+
+    # Two trees cut alike: the leaves' own dtypes, and a mark of which a parameter axis splits.
+    sized = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), variables)
+    marks = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(
+        leaf.shape, jnp.int8 if splits_parameter(leaf) else jnp.uint8), variables)
+    sized, marks = jax.eval_shape(lambda sized, marks: (layered(sized), layered(marks)), sized, marks)
+    layers: dict[tuple[str, ...], int] = {}
+    for (path, leaf), mark in zip(jax.tree_util.tree_flatten_with_path(sized)[0], jax.tree.leaves(marks),
+                                  strict=True):
+        names = [str(key.key) for key in path[1:] if isinstance(key, jax.tree_util.DictKey)]
+        found = [index for index, name in enumerate(names) if group_layers(name) is not None]
+        if found and mark.dtype == jnp.int8:
+            layer = tuple(names[:found[-1] + 1])
+            layers[layer] = layers.get(layer, 0) + leaf.size * jnp.dtype(leaf.dtype).itemsize
+    return max(layers.values(), default=None)
 
 
-def step_compiler_options(objective, tokens: float, frozen: bool,
-                          devices: int) -> jax.stages.CompilerOptions | None:
+def splits_parameter(leaf) -> bool:
+    """Whether a parameter axis splits `leaf`, a placed array (`parameter_axes`): a step gathers it whole
+    for its use."""
+    sharding = leaf.sharding
+    return isinstance(sharding, NamedSharding) and any(
+        sharding.mesh.shape[axis] > 1 for assignment in sharding.spec
+        for axis in parameter_axes(mesh_axes(assignment)))
+
+
+def layer_gathers(objective, variables: Variables, devices: int) -> int | None:
+    """The bytes a step over `devices` combines its all-gathers up to (`gathered_layer_bytes`) where it
+    takes the collective options (`collects`), None elsewhere: a fact of the run's plan, which its compiles'
+    options read (`step_compiler_options`)."""
+    return gathered_layer_bytes(objective, variables) if collects(devices) else None
+
+
+def collects(devices: int) -> bool:
+    """Whether a step over `devices` takes the collective options (`COLLECTIVES`): a GPU's over several."""
+    return backend() == 'gpu' and devices > 1
+
+
+def step_compiler_options(objective, tokens: float, frozen: bool, devices: int, *,
+                          gathered: int | None = None) -> jax.stages.CompilerOptions | None:
     """Return the XLA options for this objective's training step on this device.
 
     Each option applies unless the run set that flag itself. `tokens` is the
     number of tokens one device steps (`device_tokens`), `frozen` says
     whether the step trains next to frozen weights, and `devices` is how
-    many the step spans: over several GPUs it takes `COLLECTIVES`.
+    many the step spans: over several GPUs it takes `COLLECTIVES`, its
+    all-gathers combined up to the `gathered` bytes of its largest layer in
+    whole MiB where it gathers its layers (`layer_gathers`, the plan's).
 
     On a GPU, dots that share an input (q, k and v; gate and up) run separately.
     XLA's dot merger would run them as one GEMM over their weights, concatenated
@@ -93,8 +154,10 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     """
     generation = device_generation()
     options: dict[str, Option] = {}
-    if backend() == 'gpu' and devices > 1:
+    if collects(devices):
         options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
+        if gathered and xla_flag(GATHER_THRESHOLD) is None:
+            options[GATHER_THRESHOLD] = -(-gathered // 2 ** 20) * 2 ** 20
     small = tokens <= 128
     if (backend() == 'gpu' and xla_flag('xla_gpu_dot_merger_threshold_mb') is None
             and not (frozen and small)):
@@ -168,22 +231,21 @@ def split_share(params: Variables) -> float:
     total = split = 0
     for leaf in jax.tree.leaves(params):
         total += leaf.nbytes
-        sharding = leaf.sharding
-        if isinstance(sharding, NamedSharding) and any(
-                sharding.mesh.shape[axis] > 1 for assignment in sharding.spec
-                for axis in parameter_axes(mesh_axes(assignment))):
+        if splits_parameter(leaf):
             split += leaf.nbytes
     return split / total if total else 0.0
 
 
 def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: Batch, variables: Variables,
-                                  mesh: Mesh) -> jax.stages.CompilerOptions | None:
+                                  mesh: Mesh, gathered: int | None = None
+                                  ) -> jax.stages.CompilerOptions | None:
     """The options a step over microbatches of `micro` on `mesh` compiles with
     (`step_compiler_options`): by the tokens one device steps of a microbatch split over the
-    mesh's batch axes, and whether `variables` hold frozen weights it trains beside."""
+    mesh's batch axes, whether `variables` hold frozen weights it trains beside, and the plan's
+    `gathered` bytes (`layer_gathers`)."""
     shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
     return step_compiler_options(objective, device_tokens(objective, micro, shards), FROZEN in variables,
-                                 mesh.devices.size)
+                                 mesh.devices.size, gathered=gathered)
 
 
 def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch: Batch, shards: int) -> float:
@@ -260,13 +322,13 @@ def rung_record[LossT, EffectsT](objective: Objective[LossT, EffectsT], xla_defa
 
 
 def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0,
-                  capacity: int | None = None, built: int = 0) -> int | None:
+                  built: int = 0) -> int | None:
     """Return the bytes the tightest of `devices` has to spare once the step's memory is placed.
 
     The step's temporaries and new outputs are placed next to `held` more bytes
     that the loop keeps outside the step. The result is None if the executable or
-    a device reports no memory, a device stated `capacity` bytes reading as one
-    that holds them (`compile_only_gpus`' devices state none). The arguments (the state and the batch) are
+    a device reports no memory, a compile-only GPU reading as its stated memory holds them
+    (`device_memory`). The arguments (the state and the batch) are
     already resident and counted as in use, and the donated state's buffers are
     reused for the outputs that alias them; on a stated device, `built` bytes of them, which `held`
     counts as the step's first call builds them, are not yet.
@@ -278,7 +340,7 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
     stats = compiled_memory(executable)
     if stats is None:
         return None
-    return admitted(devices, capacity, stats.argument - built, stats.output - stats.alias + held, stats.temp)
+    return admitted(devices, stats.argument - built, stats.output - stats.alias + held, stats.temp)
 
 
 MEMORY_STATS = ('bytes_limit', 'bytes_in_use', 'pool_bytes', 'largest_free_block_bytes', 'peak_bytes_in_use')
@@ -296,7 +358,7 @@ def peak_memory_gib() -> float | None:
     return max(peaks) / 1024 ** 3 if peaks else None
 
 
-def derived_headroom(footprint: Footprint | None, devices: Sequence, capacity: int | None = None,
+def derived_headroom(footprint: Footprint | None, devices: Sequence,
                      built: int = 0) -> tuple[int, int] | None:
     """The least and most bytes the step would leave free, pooled over processes: its upper and lower
     temporary bounds admitted beside its resident and held bytes by the same allocator rule as a
@@ -310,7 +372,7 @@ def derived_headroom(footprint: Footprint | None, devices: Sequence, capacity: i
         lower = footprint.lower_temporaries
         assert lower is not None
         resident = sum(footprint.resident.values()) - built
-        memory = [device_memory(device, capacity, resident) for device in devices]
+        memory = [device_memory(device, resident) for device in devices]
         least = _admitted(devices, memory, footprint.held, upper)
         most = least if lower == upper else _admitted(devices, memory, footprint.held, lower)
         if least is not None and most is not None:
@@ -319,14 +381,13 @@ def derived_headroom(footprint: Footprint | None, devices: Sequence, capacity: i
     return None if not pooled else (min(value[0] for value in pooled), min(value[1] for value in pooled))
 
 
-def admitted(devices: Sequence, capacity: int | None, resident: int, beside: int,
-             temporaries: int) -> int | None:
+def admitted(devices: Sequence, resident: int, beside: int, temporaries: int) -> int | None:
     """The allocator's admission of a step, compiled (`step_headroom`) or derived (`derived_headroom`): the
     bytes the tightest of `devices` has to spare once the step's `temporaries`, in one block, twice where
     its allocator strands them (`stranding`), are placed beside `beside` more bytes, with `resident` bytes
-    in use already; None where a device states no memory. A device that states none, one compiled for and
-    absent (`compile_only_gpus`), holds the `capacity` it is stated to, `resident` in it as it would be."""
-    memory = [device_memory(device, capacity, resident) for device in devices]
+    in use already; None where a device states no memory. A compile-only GPU's stated memory holds
+    `resident` as it would (`device_memory`)."""
+    memory = [device_memory(device, resident) for device in devices]
     return _admitted(devices, memory, beside, temporaries)
 
 
@@ -345,12 +406,12 @@ def stated(memory: Sequence[Mapping[str, int]]) -> bool:
     return all('bytes_limit' in m and 'bytes_in_use' in m for m in memory)
 
 
-def judged(device, capacity: int | None = None) -> bool:
+def judged(device) -> bool:
     """Whether a step's footprint derived for `device` is judged against its memory (`derived_headroom`):
     where it states its memory (`device_memory`), which a CPU does not, and a device with none attached (a
-    compile-only GPU, `dew.training.ahead.compile_only_gpus`) only at the `capacity` a plan states for it.
-    The plan's walk and the footprint's trace read this one answer (`FitSearch.walked`)."""
-    return stated([device_memory(device, capacity)])
+    compile-only GPU, `dew.training.ahead.compile_only_gpus`) where its memory was stated. The plan's walk
+    and the footprint's trace read this one answer (`FitSearch.walked`)."""
+    return stated([device_memory(device)])
 
 
 def stranding(device, memory: Mapping[str, int]) -> int:
@@ -359,16 +420,20 @@ def stranding(device, memory: Mapping[str, int]) -> int:
     return 2 if strands_temporaries(device.platform, memory) else 1
 
 
-def device_memory(device, capacity: int | None = None, arguments: int = 0) -> Mapping[str, int]:
+def device_memory(device, arguments: int = 0) -> Mapping[str, int]:
     """What `device`'s allocator states (`Device.memory_stats`), empty where it states nothing: a CPU's,
-    or a compile-only GPU's (`dew.training.ahead.compile_only_gpus`), none of this process's own, which
-    holds no memory to read. A stated capacity models a fresh BFC pool with `arguments` resident:
-    its free block and temporary-stranding policy are read exactly as for that allocator."""
+    or a compile-only GPU's whose memory no one stated. A compile-only GPU's stated memory
+    (`COMPILE_ONLY_MEMORY`) models a fresh BFC pool at its allocator's limit (`allocator_limit`), with
+    `arguments` resident: its free block and temporary-stranding policy are read exactly as for that
+    allocator."""
     if device in jax.local_devices():
         return device.memory_stats() or {}
-    return {} if capacity is None else {
-        'bytes_limit': capacity, 'bytes_in_use': arguments, 'pool_bytes': capacity,
-        'largest_free_block_bytes': capacity - arguments}
+    memory = COMPILE_ONLY_MEMORY.get(device)
+    if memory is None:
+        return {}
+    limit = allocator_limit(memory)
+    return {'bytes_limit': limit, 'bytes_in_use': arguments, 'pool_bytes': limit,
+            'largest_free_block_bytes': limit - arguments}
 
 
 def local_devices(mesh: Mesh) -> list:
@@ -499,11 +564,11 @@ def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
     return memory['pool_bytes'] >= memory['bytes_limit'] and partitioning.lower() not in ('false', '0')
 
 
-def temporaries_factor(mesh: Mesh, capacity: int | None = None) -> int:
+def temporaries_factor(mesh: Mesh) -> int:
     """How many times its temporaries a step needs room for on this process's tightest device of
     `mesh` (`strands_temporaries`): 2 where an allocator can strand them, else 1."""
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    return max(stranding(device, memory) if (memory := device_memory(device, capacity)) else 1
+    return max(stranding(device, memory) if (memory := device_memory(device)) else 1
                for device in local)
 
 
@@ -524,7 +589,7 @@ def fits_everywhere(headroom: int | None) -> bool:
 
 
 def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0,
-              capacity: int | None = None, built: int = 0) -> tuple[bool, int | None]:
+              built: int = 0) -> tuple[bool, int | None]:
     """Whether the compiled step fits in the free memory of every device of `mesh`,
     and this process's headroom (`step_headroom`), None where it reads none.
 
@@ -534,8 +599,7 @@ def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0,
     the agreement.
     """
     local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
-    headroom = None if executable is None else step_headroom(executable, local, held=held,
-                                                             capacity=capacity, built=built)
+    headroom = None if executable is None else step_headroom(executable, local, held=held, built=built)
     return fits_everywhere(-1 if executable is None else headroom), headroom
 
 

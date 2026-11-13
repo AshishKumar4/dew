@@ -98,7 +98,8 @@ nonce, refused = float(sys.argv[1]), sys.argv[3] == "refused"
 with report.refusals():
     if refused:
         report.refuse(pickle_load(sys.argv[2]))
-    ahead = compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1)), nonce), BATCH)
+    # An H100's 80 GiB, which a step is compiled ahead against (`compile_only_gpus`' memory).
+    ahead = compile_ahead(experts(MeshSpec().build(compile_only_gpus("sm90", 1, 80 * 2**30)), nonce), BATCH)
     ahead.save(sys.argv[2] + (".again" if refused else ""))
     print(json.dumps({"program": ahead.program, "refusals": len(ahead.refusals),
                       "stepped": [miss.stepped for miss in report.misses()],

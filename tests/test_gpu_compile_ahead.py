@@ -91,8 +91,8 @@ from dew.data import Memory
 from dew.training import Inspection, MeshSpec
 from dew.training.ahead import compile_ahead, compile_only_gpus
 
-generation, path, multiprocessors = sys.argv[1], sys.argv[2], int(sys.argv[3])
-target = MeshSpec().build(compile_only_gpus(generation, 1, multiprocessors=multiprocessors))
+generation, path, multiprocessors, memory = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+target = MeshSpec().build(compile_only_gpus(generation, 1, memory, multiprocessors=multiprocessors))
 trainer = fine_tune(target, xla=True, split=2, inspection=Inspection(every=2))
 batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
 validation = {"val": Memory(token_rows(VOCAB, 2 * BATCH, SEQ_LEN + 1, seed=1)).batch(BATCH)}
@@ -100,8 +100,8 @@ fit = {"steps": 6, "log_every": 5, "eval_every": 3, "validation": validation}
 compile_ahead(trainer, batch, fit=fit).save(path)
 """
 """A step of two microbatches, sampled every second step, compiled ahead for the GPU argv[1] names, with
-argv[3] multiprocessors, with the programs of its fit's evaluations, and saved at argv[2], in a process
-that sees no GPU."""
+argv[3] multiprocessors and argv[4] bytes of memory, with the programs of its fit's evaluations, and saved
+at argv[2], in a process that sees no GPU."""
 QUIET = """
 import sys
 
@@ -190,8 +190,10 @@ def test_a_run_compiled_ahead_for_this_gpu_compiles_nothing_on_it_and_is_refused
     for name, text in (("quiet_build.py", QUIET_BUILD), ("quiet.py", QUIET), ("refused.py", TRAIN_REFUSED)):
         (tmp_path / name).write_text(text)
     environment = environment_of(tmp_path)
+    # Its memory stated as the GPU's allocator limit: a plan for no more than the GPU holds, which it loads.
+    assert own.memory is not None
     build = [sys.executable, str(tmp_path / "quiet_build.py"), own.generation, str(tmp_path / "step.dew-aot"),
-             str(own.multiprocessors)]
+             str(own.multiprocessors), str(own.memory)]
     subprocess.run(build, env={**environment, "CUDA_VISIBLE_DEVICES": "", "JAX_PLATFORMS": "cpu"}, check=True)
     subprocess.run([sys.executable, str(tmp_path / "quiet.py"), str(tmp_path / "step.dew-aot")],
                    env=environment, check=True)

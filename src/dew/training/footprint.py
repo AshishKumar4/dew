@@ -1476,7 +1476,7 @@ def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: T
 def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
                                           micro: Batch, window: int, prepared: TrainState,
                                           held: int, target, split: int, consumed: Callable[[], bool],
-                                          staged: int, capacity: int | None = None) -> Footprint:
+                                          staged: int) -> Footprint:
     """What a step over microbatches of `micro`'s shapes, its state `prepared` as placed, takes of a
     device like `target` beside that state (`Footprint`): its loss's residuals and its gradient
     program's peak at one microbatch, as that device's compiler keeps them and its GEMMs' workspace
@@ -1490,10 +1490,10 @@ def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
     run's axes each of one device, at that device's share of the microbatch (each leaf's shard,
     `shard_shape`), its parameters whole as those layouts gather them. A layout that splits more than the
     rows (stages, tensor, sequence) derives no residuals, which its compile judges, nor does a step for a
-    device whose memory nothing judges at `capacity` (`judged`: a CPU, a compile-only GPU no capacity is
-    given), whose walk reads no rung ('unstated', `FitSearch.walked`)."""
+    device whose memory nothing judges (`judged`: a CPU, a compile-only GPU whose memory no one stated),
+    whose walk reads no rung ('unstated', `FitSearch.walked`)."""
     mesh = jax.sharding.get_abstract_mesh()
-    if row_shards(micro) is None or not judged(target, capacity):
+    if row_shards(micro) is None or not judged(target):
         residuals = peak = reads = head = None
     else:
         loss, (variables, *rest) = traced_loss(objective, prepared, window, split)

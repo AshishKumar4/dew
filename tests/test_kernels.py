@@ -116,6 +116,31 @@ def flash_through_dews_attention_refuses_rows_it_would_misread(without_determini
                          keep=kept(32, 32, causal=True, segment_ids=packed.get("segment_ids")))
 
 
+@pytest.mark.parametrize("width, lengths", [(64, [[20, 12, 0], [9, 23, 0]]),
+                                            (256, [[33, 31, 1], [65, 0, 0]])])
+def cudnn_runs_a_calls_packed_documents_on_par(width, lengths, without_deterministic_ops):
+    """cuDNN runs a call's own packed documents as its packed sequences (`attention.cudnn_packs`), each
+    document and its row's padding a sequence: its output and gradients on par with the xla kernel's over
+    the documents' mask (check 1), at FlashAttention's widths and Qwen3.5's 256, there over rows of 65
+    tokens, which it pads even, one of them a single document."""
+    from dew.nn.attention_kernels import capability
+
+    named = capability(kernels.device_generation())
+    if named is None or named < (9, 0):
+        pytest.skip("cuDNN's packed sequences run from sm90")
+    tokens = sum(lengths[0])
+    own = {"segment_ids": jnp.asarray(documents(lengths)), "max_segments": 2}
+
+    def attend(implementation):
+        return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
+                                                            causal=True, **own)
+
+    draw = normal_drawn(37, (2, tokens, 4, width), (2, tokens, 1, width), (2, tokens, 1, width),
+                        (2, tokens, 4, width), dtype=jnp.bfloat16)
+    attention_on_par(attend('cudnn'), attend('xla'), draw, f"cudnn packed d{width}",
+                     keep=kept(tokens, tokens, causal=True, segment_ids=own["segment_ids"]))
+
+
 SHARDED_SEEDS = 8
 """The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
 `seeds_for`: the fewest for which one device compared with itself resolves the factor."""

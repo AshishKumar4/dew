@@ -22,7 +22,7 @@ from dew.distributed.placement import Validation
 from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import Link, Schedule
-from dew.objectives.base import Objective
+from dew.objectives.base import Objective, Pooled
 from dew.state import TrainState, apart, occupied, together
 from dew.telemetry.instrumentation import StepFlops
 from dew.training._candidates import Stepping, candidate_for, lowered_for
@@ -32,6 +32,7 @@ from dew.training.footprint import Footprint
 from dew.training.memory import (
     climb_to,
     head_tile_of,
+    layer_gathers,
     local_devices,
     memory_record,
     rung_record,
@@ -48,7 +49,7 @@ from dew.training.planning import (
     held_objects,
     settled,
     splits,
-    whole_step,
+    whole_step_program,
 )
 from dew.training.profiling import pgle_runs
 from dew.training.rungs import keep_rung, plan_flops, recorded_rung
@@ -259,7 +260,7 @@ class StepCompiler[L, E]:
         return links
 
     def compile(self, stepping: Stepping, state: TrainState, batch: Batch,
-                trials: Trials | None = None, *, capacity: int | None = None) -> Compiled:
+                trials: Trials | None = None) -> Compiled:
         """Compile a transaction over the state and one already-produced global batch (`Trainer.compile`),
         the step and what its compile found (`Compiled`).
 
@@ -272,8 +273,8 @@ class StepCompiler[L, E]:
         is on (`jax_enable_pgle`), the plan admitted runs its first runs on a trial, `trials`' or, where
         none are given, a copy of the state beside it, refused where the devices hold no room for it
         (`Trials.profiled`), and its program compiles again guided by their profile (`Planned.guided`),
-        the executable it replaces released with its program (`Planned.released`). A device that states
-        no memory, a compile-only GPU's, holds `capacity` bytes, as a step compiled ahead states them.
+        the executable it replaces released with its program (`Planned.released`). A compile-only GPU holds
+        the memory stated for it (`dew.training.memory.device_memory`).
         """
         settings = stepping.settings
         if (target := settings.lower_for) is not None:
@@ -307,12 +308,12 @@ class StepCompiler[L, E]:
                 raise ValueError("a step compiled ahead or inspected runs where the devices hold the state; "
                                  "this layout keeps the variables on the host")
             return Compiled(stepping.shape.split, step=self._compile_host(stepping, state, batch))
-        planned, compiled = self.plan(stepping, state, batch, trials, capacity)
+        planned, compiled = self.plan(stepping, state, batch, trials)
         return dataclasses.replace(compiled, step=self.runner(stepping, planned.released(),
                                                               settings.device_mesh))
 
     def plan(self, stepping: Stepping, state: TrainState, batch: Batch,
-             trials: Trials | None, capacity: int | None, frontier: bool = False) -> tuple[Planned, Compiled]:
+             trials: Trials | None, frontier: bool = False) -> tuple[Planned, Compiled]:
         """The shared device-step planner: the plan it admitted and what its compile found (`Compiled`, its
         step none: the caller reads its lowering before releasing it, `compile`, or serializing its
         executable, `compile_ahead`), with `frontier` the rungs above it (`FitSearch.above`)."""
@@ -323,7 +324,7 @@ class StepCompiler[L, E]:
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with stepping.traced_on(mesh, links) as schedule, held_objects():
             planned, flops, plan, validation = self._planned(stepping, state, batch, mesh, schedule,
-                                                             resumed, trials, capacity, frontier)
+                                                             resumed, trials, frontier)
             split, candidate = planned.split, planned.candidate
             self._shape_rungs[batch_layout(batch)] = self.rung()
             memory = memory_record(planned.executable, local_devices(mesh), candidate.held, fits=True)
@@ -344,6 +345,8 @@ class StepCompiler[L, E]:
         # state another program's step returned, a cooldown's restored, a public caller's) is laid out for
         # this step's window first (`laid_out`).
         returned: list[jax.Array | None] = [None]
+        # A split step's whole from its microbatches' outputs, its loss as an unsplit step logs it.
+        whole = whole_step_program(self.objective)
 
         def run(current, batch, sampled: bool = False):
             # A sampled step summarizes what the run inspects (`Planned.sampled`); every other, the plan's.
@@ -380,18 +383,21 @@ class StepCompiler[L, E]:
                     outputs.append(tuple(output))
                 stepped = together(moving, frozen)
                 returned[0] = stepped.window_size
-                return (stepped, *(outputs[0] if split == 1 else whole_step(outputs)))
+                # A step's metrics a caller reads as numbers: a split step's, or one stating a statistic
+                # (`Aux.pooled`), through its whole, which pools them and reads each as its value.
+                pooling = split > 1 or any(isinstance(value, Pooled) for value in outputs[0][1].values())
+                return (stepped, *(whole(outputs) if pooling else outputs[0]))
         return run
 
     def _planned(self, stepping: Stepping, state: TrainState, batch: Batch,
-                 mesh: Mesh, schedule: Schedule, resumed: JSON, trials: Trials | None, capacity: int | None,
+                 mesh: Mesh, schedule: Schedule, resumed: JSON, trials: Trials | None,
                  frontier: bool) -> tuple[Planned, StepFlops | None, JSON, Validation]:
         """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the first that
         fits, guided under AutoPGLE (`Planned.guided`), with `plan` its record and the objective at its rung,
         a microbatch's FLOPs (`plan_flops`) and the state it holds between steps, as the layout validates
         it. A plan recorded beside the compilation cache
-        (`recorded_rung`) is the first candidate, kept untimed; `resumed` is a checkpoint's rung; `capacity`
-        the bytes a device that states none holds (`FitSearch.capacity`); `frontier` asks the rungs above."""
+        (`recorded_rung`) is the first candidate, kept untimed; `resumed` is a checkpoint's rung; `frontier`
+        asks the rungs above."""
         settings = stepping.settings
         replicated = NamedSharding(mesh, P())
         placement = batch_shardings(mesh, batch)
@@ -401,11 +407,11 @@ class StepCompiler[L, E]:
                   lowering: bool = True, floored: bool = False) -> Candidate:
             return candidate_for(stepping, state, batch, schedule, placement, replicated, split,
                                  narrow, lowering=lowering,
-                                 capacity=capacity, footprint=footprint, derived=derived, floored=floored)
+                                 footprint=footprint, derived=derived, floored=floored)
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
-                                                   mesh, settings.step, capacity)
+                                                   mesh, settings.step)
         if self.ahead is not None and self.ahead.plan is not None:
             recorded = self.ahead.plan
         before = self.rung()
@@ -414,11 +420,13 @@ class StepCompiler[L, E]:
         if self.rung() != before:
             _log.warning("taking the saved plan, from the ahead step or %s", record_path)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
+        # The plan's one sizing of its largest layer, which every candidate's options read.
+        gathered = layer_gathers(self.objective, state.variables, mesh.devices.size)
         search = FitSearch(
             lower, lambda candidate: step_options(
-                self.objective, candidate.micro, candidate.prepared.variables, mesh),
+                self.objective, candidate.micro, candidate.prepared.variables, mesh, gathered),
             self.objective, mesh, self._xla_defaults, self._narrow, None if self._base_rung is None
-            else self._base_rung[1], resumed, ahead=self.ahead, capacity=capacity,
+            else self._base_rung[1], resumed, ahead=self.ahead,
             derive=None if recorded is not None else functools.partial(lower, lowering=False, floored=True),
             split_stated=stepping.shape.split is not None)
         planned, probes = search.admitted(
@@ -462,7 +470,9 @@ class StepCompiler[L, E]:
         cpu = settings.state_mesh
         sites = stack_sites(self.objective, state.variables)
         execution = HostExecution(self.objective, settings.layout, settings.device_mesh, cpu, sites,
-                                  device=stepping.shape.device)
+                                  device=stepping.shape.device,
+                                  gathered=layer_gathers(self.objective, state.variables,
+                                                         settings.device_mesh.devices.size))
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with stepping.traced_on(cpu) as schedule:
             _, shapes = stepping.loss_shape(state, cpu_batch, settings.accumulation)

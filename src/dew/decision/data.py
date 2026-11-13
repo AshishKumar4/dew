@@ -485,7 +485,12 @@ def decisions(dataset: Dataset, *, options: Sequence[str] = (), text: str = "tex
     context, or rows that hold their examples already. Its stages
     before this one, a holdout's selection among them, stand; a decision chain is a store's rows, and
     a mixture of them mixes decision chains (`mixture`). Raises ValueError for a mixture or phases
-    under it."""
+    under it.
+
+    A decision chain batched by tokens or filtered reads per share: a run launched as several processes
+    reads different rows from one process, and one process driving several GPUs reads one GPU's. Read it
+    `.elastic()` to keep its rows at any process count, at about 125 ms of host work a step on each process
+    (docs/design/data.md, the lowerings)."""
     from dew.data.sources.base import Source
 
     chain = dataset._chain()

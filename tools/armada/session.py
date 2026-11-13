@@ -7,13 +7,23 @@ and a change to it reruns nothing. The standard library alone: the plan imports 
 installed."""
 
 import ast
+import bisect
 import functools
+import json
 import os
 import re
 from collections.abc import Container, Iterator, Mapping
 from pathlib import Path
 
 DURATIONS = Path("tests/test_durations.json")
+CUTS = Path("tests/test_cuts.json")
+"""Each split test file's cut as main's CI last ran it, kept while the file's groups hold (`stored_cuts`): the
+node id each group after the first begins at, so a group's name means the same tests from run to run whatever
+their times do, and its record is found again (2026-11-13: 43% of the plan's rows had no record, a split
+file's groups renamed whenever its times moved; Main). Written by the durations fold alone (ci.py
+`durations`), a record the land queue owns as it owns `DURATIONS`; a second file rather than a key of that
+one, whose readers all read node ids to seconds (split.py, ci.py, the queue's merge of a head's new times, a
+GPU tier's record of the same shape)."""
 
 
 SELECTION = ("-m", "not network")
@@ -305,6 +315,53 @@ def cut(nodes: list[str], seconds: list[float], count: int) -> list[list[str]]:
     return [[nodes[index] for unit in held[run.start:run.stop] for index in unit] for run in runs]
 
 
+def stored_cuts() -> dict[str, list[str]]:
+    """The stored cuts (`CUTS`): each split file's group boundaries, none where the checkout has no record."""
+    return json.loads(CUTS.read_text()) if CUTS.is_file() else {}
+
+
+def cut_by(nodes: list[str], bounds: list[str]) -> list[list[str]]:
+    """`nodes` (node-id order) as the `len(bounds) + 1` groups a stored cut names: each of `units` in the
+    group whose interval of node ids, [bounds[k - 1], bounds[k]), holds its first test, so a test added later
+    falls in the interval it sorts into and no test leaves its group while the cut stands."""
+    held: list[list[str]] = [[] for _ in range(len(bounds) + 1)]
+    for unit in units(nodes):
+        held[bisect.bisect_right(bounds, nodes[unit[0]])].extend(nodes[index] for index in unit)
+    return [sorted(members) for members in held]
+
+
+def stored_bounds(name: str, count: int, stored: Mapping[str, list[str]] | None = None) -> list[str] | None:
+    """Test file `name`'s stored cut (`CUTS`) where it holds `count` groups and the groups are cut by the
+    durations record (`cut_record`; a GPU tier cuts by its own seconds), else None. `stored` is
+    `stored_cuts()` where a caller has read it once."""
+    bounds = (stored_cuts() if stored is None else stored).get(name) if cut_record() == DURATIONS else None
+    return bounds if bounds is not None and len(bounds) + 1 == count else None
+
+
+KEPT = 1.5
+"""How far past the plan's target a group's tests may weigh before its file is cut afresh: a stored cut is
+kept while each group's recorded tests stay within it (`planned`, cuts.py's `weighed`), and a cut the file
+ran as while its heaviest group, setup included, does (cuts.py's `split`, `refolded`)."""
+
+
+def held_seconds() -> float:
+    """The most a stored cut's group may weigh by its recorded tests (`KEPT` of .armada.json's target)."""
+    return KEPT * json.loads(Path(".armada.json").read_text())["target"]
+
+
+def planned(name: str, nodes: list[str], seconds: list[float], count: int,
+            stored: Mapping[str, list[str]] | None = None) -> list[list[str]]:
+    """Test file `name`'s recorded `nodes` as the plan's `count` groups: its stored cut where it holds them
+    (`stored_bounds`) and each group's recorded `seconds` stay within `held_seconds`, else cut by their
+    `seconds` (`cut`), as cuts.py's `weighed` weighs it."""
+    bounds = stored_bounds(name, count, stored)
+    if bounds is not None:
+        groups, weight = cut_by(nodes, bounds), dict(zip(nodes, seconds, strict=True))
+        if max(sum(weight[node] for node in group) for group in groups) <= held_seconds():
+            return groups
+    return cut(nodes, seconds, count)
+
+
 @functools.cache
 def bound(text: str) -> frozenset[str]:
     """The names a test file's source `text` binds at its top level (a function's, a class's, an assignment's,
@@ -358,15 +415,16 @@ def cut_record() -> Path:
 
 
 def kept(nodes: list[str], planned: list[list[str]], mean: float) -> list[list[str]]:
-    """`nodes`, a task's collected tests of one split file in node-id order, as the plan's groups
-    `planned` (the file's recorded tests cut, `cut`): each test the record names in its planned group, so no
-    group runs a recorded test its plan did not weigh (2026-11-11: two new parameters moved test_recurrence's
-    963 s test into a group planned at 77 s); a test the record lacks that shares a setup with a recorded
-    one (`units`) in that one's group; and the rest, `mean` seconds each, cut into as many runs of
-    consecutive tests as there are groups (`groups`), the kth run joining the kth group, so a new
-    parametrization spreads across the groups from its first run, never into one group past its deadline
-    (2026-11-03: test_attention_mosaic's ~190 new ids, weighed nothing, packed into one). A group of a file
-    whose record misses a test it collects is run, never reused (ci.py's `record`)."""
+    """`nodes`, a task's collected tests of one split file in node-id order, as the plan's groups `planned`
+    (the file's recorded tests cut, `cut`): each test the record names in its planned group, so no group runs
+    a recorded test its plan did not weigh (2026-11-11: two new parameters moved test_recurrence's 963 s test
+    into a group planned at 77 s); a test the record lacks that shares a setup with a recorded one (`units`)
+    in that one's group; and the rest, `mean` seconds each, cut into as many runs of consecutive tests as
+    there are groups (`groups`), the kth run joining the kth group, so a new parametrization spreads across
+    the groups from its first run, never into one group past its deadline (2026-11-03: test_attention_mosaic's
+    ~190 new ids, weighed nothing, packed into one). A group of a file whose record misses a test it collects
+    is run, never reused (ci.py's `record`): under a stored cut too, which places it by its interval once
+    recorded (`cut_by`), so a new parametrization is never packed into one group (train 793's review)."""
     group_of = {node: index for index, members in enumerate(planned) for node in members}
     held: list[list[str]] = [[] for _ in planned]
     new: list[list[str]] = []

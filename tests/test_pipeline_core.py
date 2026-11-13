@@ -1265,8 +1265,10 @@ def test_authoritative_zero_target_count_is_refused_before_division():
 def test_dependency_change_preserves_global_resume_only_when_derived_order_matches():
     manifest = Manifest({"name": "test"}, revision="before")
     plan = Plan("global", manifest, {"seed": 0}, {"accepted_ids": fingerprint([1, 3, 5])})
+    # Dew's revision is the checkpoint step's, not the position's (row 5862): nothing the position holds
+    # changed.
     changed = dataclasses.replace(plan, manifest=dataclasses.replace(manifest, revision="after"))
-    assert changed.check(plan.record()) == ("revision",)
+    assert changed.check(plan.record()) == ()
     changed = dataclasses.replace(changed, derived={"accepted_ids": fingerprint([1, 3, 7])})
     with pytest.raises(ValueError):
         changed.check(plan.record())
@@ -1370,10 +1372,11 @@ class Given:
 @pytest.mark.parametrize("read", ["indexed", "memory"])
 def test_an_edit_to_a_configured_factorys_module_alone_is_environment(tmp_path, monkeypatch, read):
     """A configured step's factory comes from a module of its own. An edit to
-    that file that leaves the factory alone changes only the environment, so
-    an exact resume reads on, where the plan names the step and where a
-    memory read's rows name the steps that made them; the same factory
-    configured otherwise, to make the same step, is refused."""
+    that file that leaves the factory alone changes nothing the position
+    holds (the code and machine are the checkpoint step's, row 5862), so an
+    exact resume reads on with no change named, where the plan names the
+    step and where a memory read's rows name the steps that made them; the
+    same factory configured otherwise, to make the same step, is refused."""
     shifted = tmp_path / f"shifted_{uuid4().hex}.py"
     shifted.write_text(SHIFTED)
     factory = GIVEN.format(shifted=shifted.stem)
@@ -1398,7 +1401,7 @@ def test_an_edit_to_a_configured_factorys_module_alone_is_environment(tmp_path, 
     edited = reader(1)
     try:
         edited.set_state(state)
-        assert edited.manifest_changes == ("modules",)
+        assert edited.manifest_changes == ()
         assert listed(edited, 2) == expected
     finally:
         edited.close()

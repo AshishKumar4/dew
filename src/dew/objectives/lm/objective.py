@@ -81,6 +81,7 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.progress import END, Progress, progressed
 from dew.nn.protocols import (
     EXITS,
+    BankedStacks,
     Bounded,
     CountedLogits,
     CountedLogitsTraining,
@@ -105,6 +106,7 @@ from dew.objectives.base import (
     OMITTED,
     Aux,
     EMASpec,
+    Exponentiated,
     Omitted,
     Prediction,
     Ratio,
@@ -836,7 +838,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         return np.sum(scored, axis=-1, dtype=np.int64)
 
     def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
-        return self.model.bank_sites(store)
+        # A model that declares no stacks (`BankedStacks`: a user's, an NNX module's) has none to bank.
+        return self.model.bank_sites(store) if isinstance(self.model, BankedStacks) else ()
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
@@ -1635,7 +1638,7 @@ class LMObjective(TokenScorer):
                 collections=collections, packing=_inputs(prepared).kwargs(),
                 progress=self.progress(step))
         statistics, kl = self._warmup_statistics(gathered[INDEXER_COLLECTION], prepared, batch)
-        reported = {"indexer_kl": kl}
+        reported: dict[str, jax.Array | Ratio] = {"indexer_kl": kl}
         qk, inspected = step.observed(gathered)
         if step.qk_stats:
             peak = _global_qk_max(qk)
@@ -1643,12 +1646,12 @@ class LMObjective(TokenScorer):
                 reported["qk/max_logit"] = peak
         return statistics, Aux(reported, qk_stats=qk, inspected=inspected)
 
-    def _warmup_statistics(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[Ratio, jax.Array]:
+    def _warmup_statistics(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[Ratio, Ratio]:
         """The warm-up's loss, the indexer's weighted KL over the queries it
         counted, and the KL per query it reports."""
         assert self.indexer is not None
         total, mass = self._indexer_term(sown, prepared, batch)
-        return Ratio(self.indexer.weight * total, mass), total / jnp.where(mass > 0, mass, 1)
+        return Ratio(self.indexer.weight * total, mass), Ratio(total, mass)
 
     def fuses_head(self) -> bool:
         """The training loss takes a tiled head's gradient in its forward (`token_scores`' `z_loss`),
@@ -1748,10 +1751,10 @@ class LMObjective(TokenScorer):
         units = shares(losses, weights)
         mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
         prediction = Ratio(self.row_mean(losses, batch, weights=weights).total, mass)
-        ce, _ = prediction.mean()
-        reported = {"ce": ce, "perplexity": jnp.exp(ce)}
+        reported: dict[str, jax.Array | Ratio] = {
+            "ce": prediction, "perplexity": Exponentiated(prediction.total, prediction.mass)}
         if correct is not None:
-            reported["token_accuracy"], _ = self.accuracy(correct, batch, weights).mean()
+            reported["token_accuracy"] = self.accuracy(correct, batch, weights)
         if passes is not None and self.exit_entropy is None:
             # Each pass's cross entropy at its weight in the last pass's place, over the same counted targets.
             term = weighed(self._weights_over(self.model), passes[0])
@@ -1763,15 +1766,14 @@ class LMObjective(TokenScorer):
             term, expected, entropy = exit_objective(pass_losses, gates, self.exit_entropy, width)
             units = shares(term, weights)
             prediction = Ratio(self.row_mean(term, batch, weights=weights).total, mass)
-            reported["exit_ce"], _ = Ratio(self.row_mean(expected, batch, weights=weights).total, mass).mean()
-            reported["exit_entropy"], _ = Ratio(self.row_mean(entropy, batch, weights=weights).total,
-                                                mass).mean()
+            reported["exit_ce"] = Ratio(self.row_mean(expected, batch, weights=weights).total, mass)
+            reported["exit_entropy"] = Ratio(self.row_mean(entropy, batch, weights=weights).total, mass)
         if self.z_loss:
             # PaLM's auxiliary over the same counted targets as the cross
             # entropy, so one Ratio carries both.
             z_total = self.z_loss * self.row_mean(jnp.square(log_z), batch, weights=weights).total
             units = units + self.z_loss * shares(jnp.square(log_z), weights)
-            reported["z_loss"] = z_total / jnp.where(mass > 0, mass, 1)
+            reported["z_loss"] = Ratio(z_total, mass)
             prediction = Ratio(prediction.total + z_total, mass)
         if sums is not None:
             # The head's sum carries the gradient; the per-token terms above report.
@@ -1784,7 +1786,7 @@ class LMObjective(TokenScorer):
                 for depth_losses, depth_weights, depth_sum in depths]))
             units = units + self.mtp_weight / len(depths) * sum(
                 shares(depth_losses, depth_weights) for depth_losses, depth_weights, _ in depths)
-            reported["mtp_ce"], _ = Ratio(mtp_total, mass).mean()
+            reported["mtp_ce"] = Ratio(mtp_total, mass)
             prediction = Ratio(prediction.total + self.mtp_weight * mtp_total, mass)
         if self.indexer is not None:
             # The KL shares the cross entropy's denominator, as the depths
@@ -1797,7 +1799,7 @@ class LMObjective(TokenScorer):
             kl_queries = self._query_weights(prepared, width)
             units = units + self.indexer.weight / len(counted) * sum(
                 shares(kl, kl_queries[:, :kl.shape[1]]) for kl in counted)
-            reported["indexer_kl"] = total / jnp.where(queries > 0, queries, 1)
+            reported["indexer_kl"] = Ratio(total, queries)
             prediction = Ratio(prediction.total + self.indexer.weight * total, mass)
         statistics: Ratio | RoutedStatistics = prediction
         effects = None

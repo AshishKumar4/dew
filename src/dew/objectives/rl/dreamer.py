@@ -76,6 +76,7 @@ from dew.rl.env import (
     Transition,
     Tree,
     env_rollout,
+    env_step,
     start,
     view,
     views,
@@ -1003,7 +1004,12 @@ def _kept(replay: ReplayBuffer, returns: jax.Array,
         return total, (total, observed["last"])
 
     returns, (totals, ended) = jax.lax.scan(tally, returns, observed)
-    return replay, returns, jnp.sum(jnp.where(ended, totals, 0)), jnp.sum(ended)
+    return replay, returns, jnp.sum(jnp.where(ended, totals, 0)), jnp.sum(ended, dtype=jnp.int32)
+
+
+_NONE_ENDED = np.int32(0)
+"""No episode ended yet: the count `_kept` sums its ended episodes in, which a loop over its steps starts
+at."""
 
 
 @dataclass
@@ -1198,18 +1204,13 @@ class DreamerRollout:
 
         def body(_, state: tuple[_Live, jax.Array, jax.Array]):
             cur, total, count = state
-            next_key, act_key, _ = jax.random.split(cur.carry.key, 3)
-            action, extras, memory = policy(variables, cur.carry.observation, act_key, cur.carry.memory)
-            env_state, following = env.step(cur.carry.state, action)
-            one = jax.tree.map(lambda leaf: leaf[None],
-                               Transition(cur.carry.observation, action, extras, following))
-            replay, returns, step_total, step_count = _kept(cur.replay, cur.returns, one)
-            next_carry = Carry(env_state, following.observation, next_key, memory)
-            return _Live(next_carry, replay, returns), total + step_total, count + step_count
+            # A driven environment restarts its own episodes (`Driven`).
+            carry, recorded = env_step(env, policy, variables, cur.carry, reset=False)
+            replay, returns, step_total, step_count = _kept(
+                cur.replay, cur.returns, jax.tree.map(lambda leaf: leaf[None], recorded))
+            return _Live(carry, replay, returns), total + step_total, count + step_count
 
-        count_zero = jnp.zeros_like(jnp.sum(jnp.zeros((1,), bool)))
-        init = (live, jnp.zeros((), live.returns.dtype), count_zero)
-        return jax.lax.fori_loop(0, steps, body, init)
+        return jax.lax.fori_loop(0, steps, body, (live, jnp.zeros((), live.returns.dtype), _NONE_ENDED))
 
     def _simulated(self, simulator: DrivenSimulator, variables: Variables, live: _Live, *, steps: int,
                    random: bool) -> tuple[_Live, jax.Array, jax.Array]:

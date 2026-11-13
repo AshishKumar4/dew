@@ -4,11 +4,12 @@
 
 with tools/armada on the path, as `ci.py task --split=G/N` runs it. Every
 container collects the same tests and cuts them as the plan cut the file's
-recorded ones (`session.cut`, in node-id order, each weighing its time in
-tests/test_durations.json, those marked with one shared setup one weight,
-`session.SHARED_SETUP`, into N runs of consecutive tests whose heaviest is as
-light as N runs can be; a recorded test the file no longer defines is no part of
-it, `session.standing`), each recorded test kept in its planned group and a test
+recorded ones (`session.planned`: by the cut main's CI last ran it as,
+tests/test_cuts.json, while it holds N groups; else `session.cut`, in node-id
+order, each weighing its time in tests/test_durations.json, those marked with
+one shared setup one weight, `session.SHARED_SETUP`, into N runs of consecutive
+tests whose heaviest is as light as N runs can be; a recorded test the file no
+longer defines is no part of it, `session.standing`), each recorded test kept in its planned group and a test
 the record lacks spread across them (`session.kept`). This keeps the Gth group
 and deselects the rest, after CI's own selection (`session.SELECTION`), and writes each file
 the record does not wholly name to DEW_UNRECORDED, whose group's row is kept
@@ -47,7 +48,7 @@ def pytest_collection_modifyitems(config, items):
         sites = session.declared_marks(name, path.read_text()) if path.is_file() else {}
         of_file = {node: seconds for node, seconds in sorted(recorded.items()) if node.split("::")[0] == name}
         record = session.own(session.standing(name, of_file), sites)
-        planned = session.cut(list(record), list(record.values()), count)
+        planned = session.planned(name, list(record), list(record.values()), count)
         collected = [node for node in nodes if node.split("::")[0] == name]
         groups = session.kept(collected, planned, mean)
         # Every collected test in exactly one group: each task cuts the file whole and alike, so the groups

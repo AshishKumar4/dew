@@ -1,7 +1,7 @@
 Dew's public surface (tools/api_report.py). A moved line is an API change: regenerate with
 `python tools/api_report.py --write` and say why in the commit.
 -- exports --
-class Aux(metrics: dict[str, jax.Array], variables: Variables | None = None, qk_stats: Variables | None = None, effects: Effects | None = None, inspected: Variables | None = None, record: Evaluated | Recorded | None = None) -> None  [dew.objectives.base]
+class Aux(metrics: Mapping[str, jax.Array | Pooled], variables: Variables | None = None, qk_stats: Variables | None = None, effects: Effects | None = None, inspected: Variables | None = None, record: Evaluated | Recorded | None = None, pooled: Mapping[str, Pooled] = <factory>) -> None  [dew.objectives.base]
   .replace(self, **updates)
 class Best(metric: str | Metric | TrainingScalar | Summary | types.MethodType | Callable[[Mapping], float], top: int = 1, mode: Literal['min', 'max'] | None = None, threshold: float | None = None, weights_only: bool = False, split: str | None = None, *, _source: Source | None = None)  [dew.training.selection]
   .resolved(self, scored: Mapping[str, Sequence[Declared]]) -> Best
@@ -19,6 +19,7 @@ class Checkpoints(directory: str, *, keep: int | Keep = 2, local_directory: str 
   .control(self, step: int) -> dict
   .cooldown(self, step: int) -> Mapping[str, object] | None
   .cooling(self, pending: Mapping[str, object] | None) -> None
+  .environment(self, step: int) -> Mapping[str, object] | None
   .kept(self) -> list[Kept]
   .latest: property -> int | None
   .local_path: property -> str
@@ -86,7 +87,7 @@ class EMASpec(decay: optax.Schedule, select: PathFilter = <function everything>,
 class EvalSuite(data: Split, metrics: Sequence[Metric] = (), every: int | str | Counted | None = None) -> None  [dew.training.evaluation]
 class Evaluation(step: int, split: str, scores: dict[str, float], coordinated_batches: int, records: int, event_key: tuple[int, ...], elapsed_seconds: float, previews: tuple[Artifact, ...], examples: int | None = None, real_token_share: float | None = None) -> None  [dew.training.evaluation]
   .branched(self) -> Evaluation
-  .run(cls, objective: Objective[Loss, Effects], variables: Variables, batches: Reader | Dataset | Episodes | None, *, key: int | jax.Array, metrics: Sequence[Metric] = (), step: int | jax.Array = 0, averaged: Variables | None = None, preview: bool = False, mesh: Mesh | None = None, split: str = 'val', schedule_step: int | jax.Array | np.ndarray | None = None, loss: bool = False, training: Mapping[str, jax.Array] | None = None, warm: bool = False, updates: int | jax.Array | None = None, scored_to: str | os.PathLike[str] | None = None) -> Evaluation  [classmethod]
+  .run(cls, objective: Objective[Loss, Effects], variables: Variables, batches: Reader | Dataset | Episodes | None, *, key: int | jax.Array, metrics: Sequence[Metric] = (), step: int | jax.Array = 0, averaged: Variables | None = None, preview: bool = False, mesh: Mesh | None = None, split: str = 'val', schedule_step: int | jax.Array | np.ndarray | None = None, loss: bool = False, training: Mapping[str, jax.Array | Pooled] | None = None, warm: bool = False, updates: int | jax.Array | None = None, scored_to: str | os.PathLike[str] | None = None) -> Evaluation  [classmethod]
   .scalars: property -> dict[str, float]
 class Field(key: str, shape: tuple[int, ...], variable_axes: tuple[int, ...] = (), table: TokenTable | None = None) -> None  [dew.inputs.spec]
   .admits(self, token: int) -> bool
@@ -111,7 +112,7 @@ class Layout(rules: LogicalAxisRules | Mapping[str, MeshAxes] = (('vocab', ('fsd
   .check(self, params: Variables, shardings: Placement[Variables], mesh: Mesh) -> None
   .offloaded(self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]
   .shardings(self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]
-  .validate(self, mesh: Mesh, state, *, capacity: int | None = None) -> Validation
+  .validate(self, mesh: Mesh, state) -> Validation
 class LocalTracker(directory: str | Path, *, plots: bool = False)  [dew.training.tracker]
   .artifact(self, value: Reported, step: int) -> None
   .close(self) -> None
@@ -320,7 +321,7 @@ class TrainState(step: jax.Array, microstep: jax.Array, updates: jax.Array, vari
   .window: property -> Accumulation | None
   .with_window(self, window: Accumulation | None) -> TrainState
 class Trainer(objective: Objective[Loss, Effects], optimizer: optax.GradientTransformation | OptimConfig, *, key: int | jax.Array, mesh: MeshSpec | Mesh = MeshSpec(fsdp=1, expert=1, tensor=1, sequence=1, stage=1, replicas=1, diloco=1, explicit=()), layout: Layout = Layout(rules=(('vocab', ('fsdp', 'tensor')), ('mlp', 'tensor'), ('mlp', 'fsdp'), ('modulation', 'fsdp'), ('attention', 'tensor'), ('attention', 'fsdp'), ('linear', 'fsdp'), ('embed', 'fsdp'), ('head_dim', 'fsdp'), ('heads', ('fsdp', 'tensor')), ('kv', ('fsdp', 'tensor')), ('index', 'fsdp'), ('kvlora', 'fsdp'), ('qlora', 'fsdp'), ('output', 'fsdp'), ('exp', 'expert'), ('heads', 'tensor'), ('kv', 'tensor'), ('activation_batch', ('data', 'expert', 'fsdp')), ('activation_length', 'sequence'), ('activation_spread', ('sequence', 'tensor')), ('activation_spread', 'sequence'), ('activation_heads', 'tensor'), ('activation_kv', 'tensor'), ('activation_mlp', 'tensor'), ('activation_vocab', 'tensor'), ('pages', ('data', 'expert', 'fsdp')), ('activation_batch', ('data', 'expert')), ('activation_batch', 'data')), min_shard=65536, tolerance=0.02, host=(), host_parameters=(), frozen_whole=False, stage_local=True, data_axes=()), microbatches: int | None = None, accumulation: int = 1, split: int | None = None, dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False, checkpoints: Checkpoints | None = None, tracker: Tracker | None = None, step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None, rollout: Rollout | None = None, profile: ProfileWindow | None = None, lower_for: str | None = None, ahead: AheadOfTime | None = None, tune_kernels: bool = False, record: bool = False, links: Mapping[str, Link] | None = None, inspection: Inspection | None = None, param_dtype: str | None = None, diloco: DiLoCo | None = None, phase_passes: Sequence[int] | None = None, data_resume: DataResume = 'relaxed')  [dew.training.trainer]
-  .compile(self, state: TrainState, batch: Batch, trials: Trials | None = None, *, capacity: int | None = None) -> CompiledStep
+  .compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep
   .device_mesh: cached property -> Mesh
   .executable: property -> jax.stages.Compiled | None
   .fit(self, dataset: Dataset | Loader | Handed, *, state: TrainState | None = None, resume: Resume = 'auto', **asked: Unpack[FitArguments]) -> TrainState
@@ -340,7 +341,7 @@ class Trainer(objective: Objective[Loss, Effects], optimizer: optax.GradientTran
   .state_mesh: cached property -> Mesh
   .step_flops: property -> StepFlops | None
   .stored(self, state: TrainState) -> TrainState
-  .validate(self, batch: Batch | None = None, *, steps: int | None = None, capacity: int | None = None) -> Validation
+  .validate(self, batch: Batch | None = None, *, steps: int | None = None) -> Validation
 class VideoGrid(videos: jax.Array, captions: tuple[str, ...] = ()) -> None  [dew.artifacts]
   .replace(self, **updates)
 class WandbTracker(project: str, name: str | None = None, *, entity: str | None = None, config: Mapping[str, object] | None = None, offline: bool = False, id: str | None = None, shared: bool = False, primary: bool = True, label: str = 'train')  [dew.training.tracker]

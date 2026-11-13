@@ -29,6 +29,7 @@ import numpy as np
 import pytest
 from fla_sites import LEAVES, the_template_is_as_exact_as_fla
 from generation_support import COMPILES_ON_CPU
+from map_judge import sharded
 from reference_error import FEWEST_SEEDS, assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import REFUSED, refuses_its_gradient, taken, template_call
@@ -74,6 +75,10 @@ def bf16(operands: Chunk, hooks) -> Chunk:
     names = ('query', 'key', 'value', 'beta') if hooks.delta else ('query', 'key', 'value')
     return dataclasses.replace(operands, **{name: getattr(operands, name).astype(jnp.bfloat16)
                                             for name in names})
+
+
+FINITE_SEEDS = 2
+"""The first draws a site holds finite wherever the float64 truth is (`assert_finite`), before its check 1."""
 
 
 def assert_finite(fn, truth, operands, regime: str) -> None:
@@ -133,21 +138,26 @@ def runs(fn, hooks, operands: Chunk, drawn, product: str) -> bool:
     return True
 
 
+def documents(starts) -> int | None:
+    """The most documents a row of `starts` `[B, T]` holds (every row's first token begins one), None where
+    the call packs none."""
+    if starts is None:
+        return None
+    return int(np.max(np.sum(np.asarray(starts)[:, 1:], axis=1))) + 1
+
+
 def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime, product, forms):
     """Each form's 16-bit forward through the template, or its forward and gradient, under `forms`
     (`forms_of`), finite wherever the float64 recurrence's are on the regime's first draws, and on par with
     its reference arm's from float64 over the site's declared seeds (check 1); a form or gradient it refuses
     is checked refused and skipped."""
     hooks = SITES[name]
-    mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks)
-    reference, exact = reference_arm(hooks, forms), functools.partial(token_by_token, hooks)
     if product == 'forward':
-        dew, truth, seeds = mosaic, exact, SEEDS[name, regime]
+        seeds = SEEDS[name, regime]
 
         def draws(seed):
             return (bf16(stressed(hooks, regime, seed)[0], hooks),)
     else:
-        dew, reference, truth = (with_gradients(restarting(fn, regime)) for fn in (mosaic, reference, exact))
         seeds = GRADIENT_SEEDS[name, regime]
 
         def draws(seed):
@@ -155,10 +165,32 @@ def the_template_stays_finite_and_on_par_where_chunked_forms_break(name, regime,
             return bf16(operands, hooks), (out.astype(jnp.bfloat16), final)
 
     operands = restarting(lambda given: given, regime)(draws(0)[0])
+    # The documents a row holds, a constant of the regime's draws, which a packed call's coordinates bound
+    # (`Coordinates.max_segments`) as every model layer passes it: unbounded, the template lays a row's every
+    # token as a document's possible first (`chunk_forward._layout`), 145 chunks and 142 sequences for resets
+    # on chunk edges' 140 tokens where their 18 documents take 23 and 20; interpreted, that regime's six
+    # cases took 691 s of a five-draw map task, 519 bounded (row 5906).
+    bound = documents(operands.starts)
+    mosaic = functools.partial(chunk_on, 'mosaic_gpu', hooks, max_segments=bound)
+    reference = functools.partial(reference_arm(hooks, forms), max_segments=bound)
+    exact = functools.partial(token_by_token, hooks)
+    if product == 'forward':
+        dew, truth = mosaic, exact
+    else:
+        dew, reference, truth = (with_gradients(restarting(fn, regime)) for fn in (mosaic, reference, exact))
     with under(forms):
         if not runs(dew, hooks, operands, draws(0), product):
             pytest.skip(f"the template refuses {name}'s {product}: a refusal, not numerical coverage")
         label = f'the template, {name} under {regime}, its {product}'
+
+        def finite(start: int, stop: int) -> None:
+            for seed in range(start, stop):
+                assert_finite(dew, truth, draws(seed), regime)
+
+        # Its first draws held finite once a site: by the map task that draws them, the judge pooling its
+        # word (`sharded`), where every map task and the judge held them again, each a compile and two runs
+        # of every case's arms, Kimi delta attention's about 8 s a run interpreted (row 5906).
+        sharded(f'{label}, finite', finite, FINITE_SEEDS, upto=FINITE_SEEDS)
         if fla_recorded(hooks):
             the_template_is_as_exact_as_fla(mosaic, f"stability/{name}/{regime}/{product}",
                                             ('out', 'final') if product == 'forward' else LEAVES, label)

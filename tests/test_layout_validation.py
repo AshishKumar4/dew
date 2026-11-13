@@ -21,7 +21,7 @@ import pytest
 from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from kernel_compile import compile_only_gpus
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, memory_limited_to
 from sharded import collective_axes
 from test_parallelism import BoxedReadout
 from token_support import repeated_token_batch, token_rows
@@ -126,10 +126,6 @@ def test_a_validated_fine_tune_is_placed_and_held_as_its_report_said(case):
     assert set(report.collectives) == {axis for axis, size in run.device_mesh.shape.items() if size > 1}
 
 
-GPU_BYTES = 40 * 2**30
-"""A compile-only GPU's capacity, which reports none: the smallest the generations here come in, an
-A100's 40 GB."""
-
 PLACEMENT = ("all-gather", "all-reduce", "reduce-scatter")
 """The collectives a placement implies (`Layout.validate`'s), beside those a model chooses itself (an
 attention's or an expert dispatch's exchange) and a pipeline's hand-offs."""
@@ -152,6 +148,21 @@ GPU_STEPS = {
 }
 
 
+def adam_step(objective, optimizer):
+    """A fine-tune's step over its variables and a batch: the objective's loss, its gradient and the
+    optimizer's update applied to the parameters."""
+    def step(variables, batch):
+        def loss(params):
+            at = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
+            return objective.scalar_loss({**variables, "params": params}, batch, at)[0]
+
+        params = variables["params"]
+        updates, _ = optimizer.update(jax.grad(loss)(params), optimizer.init(params), params)
+        return optax.apply_updates(params, updates)
+
+    return step
+
+
 @pytest.mark.parametrize("case", list(GPU_STEPS))
 def test_a_gpu_step_runs_the_collectives_its_layout_plans(case):
     """A fine-tune's step (its forward, backward and Adam update over the placed state, under the
@@ -168,18 +179,11 @@ def test_a_gpu_step_runs_the_collectives_its_layout_plans(case):
     variables = jax.eval_shape(lambda: nn.unbox(model.init(jax.random.key(0), ids)))
     shardings = layout.shardings(mesh, variables)
     placed = placed_shapes(variables, shardings)
-    report = layout.validate(mesh, placed, capacity=GPU_BYTES)
+    report = layout.validate(mesh, placed)
     rows = NamedSharding(mesh, P(report.batch_axes))
     batch = {"text": jax.ShapeDtypeStruct((BATCH, SEQ_LEN + 1), jnp.int32, sharding=rows)}
 
-    def step(variables, batch):
-        def loss(params):
-            at = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
-            return objective.scalar_loss({**variables, "params": params}, batch, at)[0]
-
-        params = variables["params"]
-        updates, _ = optimizer.update(jax.grad(loss)(params), optimizer.init(params), params)
-        return optax.apply_updates(params, updates)
+    step = adam_step(objective, optimizer)
 
     with assumed(generation), jax.set_mesh(mesh), nn.logical_axis_rules(layout.axis_rules):
         options = step_compiler_options(objective, BATCH * SEQ_LEN, frozen=False, devices=mesh.size)
@@ -195,6 +199,54 @@ def test_a_gpu_step_runs_the_collectives_its_layout_plans(case):
             report.collectives[axis]), axis
 
 
+def holding(spec: MeshSpec, limit: int):
+    """`spec` built over eight compile-only H100s whose stated memory limits each's allocator to `limit`
+    bytes (`compile_only_gpus`, `memory_limited_to`): GPUs a run is checked for on a host that holds none."""
+    return spec.build(compile_only_gpus("sm90", 8, memory_limited_to(limit)))
+
+
+def test_a_gpu_step_over_fsdp_combines_its_parameter_gathers_a_layer_at_a_time():
+    """A step over fsdp 2 on compile-only H100s, three decoder layers of 3.5M parameters computed in bf16
+    over fp32 ones, under the step's options (`step_compiler_options`, its gathers combined up to its
+    largest layer's parameters as stored, `gathered_layer_bytes`): no all-gather of the compiled step moves
+    more than that layer's bytes (a whole MiB over them), where the 1 GiB of the collective options alone
+    combines them past it (IG-SCALING-2XH100: 4.7 of Qwen3.5-4B's layers a gather, 5 GiB more held)."""
+    from dew.telemetry.instrumentation import hlo_instructions
+    from dew.telemetry.trace import collective
+    from dew.training.memory import layer_gathers
+
+    mesh = MeshSpec(fsdp=2).build(compile_only_gpus("sm90", 2, 40 * 2**30))
+    layout = Layout(min_shard=TINY_SHARD)
+    model = models.build("causal_transformer", vocab_size=VOCAB, emb_features=512, num_layers=3, num_heads=8,
+                         mlp_features=2048, max_seq_len=SEQ_LEN, dtype=jnp.bfloat16)
+    objective, optimizer = LMObjective(model, SEQ_LEN), optax.adam(1e-3)
+    ids = jnp.ones((1, SEQ_LEN), jnp.int32)
+    variables = jax.eval_shape(lambda: nn.unbox(model.init(jax.random.key(0), ids)))
+    shardings = layout.shardings(mesh, variables)
+    placed = placed_shapes(variables, shardings)
+    rows = NamedSharding(mesh, P(layout.validate(mesh, placed).batch_axes))
+    batch = {"text": jax.ShapeDtypeStruct((BATCH, SEQ_LEN + 1), jnp.int32, sharding=rows)}
+
+    step = adam_step(objective, optimizer)
+
+    with assumed("sm90"):
+        layer = layer_gathers(objective, placed, mesh.size)
+    assert layer is not None
+
+    def largest_gather(gathered):
+        with assumed("sm90"), jax.set_mesh(mesh), nn.logical_axis_rules(layout.axis_rules):
+            options = step_compiler_options(objective, BATCH * SEQ_LEN, frozen=False, devices=mesh.size,
+                                            gathered=gathered)
+            compiled = jax.jit(step, out_shardings=shardings["params"]).trace(placed, batch).lower().compile(
+                compiler_options=options)
+        # The executable's own module: its text, printed from a step whose memory is stated, carries
+        # attributes (an all-reduce's output_to_operand_aliasing) XLA's text parser refuses.
+        return max(sum(instruction.buffers) for instruction in hlo_instructions(compiled).values()
+                   if collective(instruction.op) == "all-gather" and not instruction.op.endswith("-start"))
+
+    assert largest_gather(layer) <= -(-layer // 2 ** 20) * 2 ** 20 < largest_gather(None)
+
+
 @pytest.mark.mesh(devices=8)
 def test_a_fine_tune_over_a_devices_capacity_is_refused_before_anything_is_placed():
     """A configured optimizer's run, read as `fit` builds it over its steps. Between what a device
@@ -205,10 +257,12 @@ def test_a_fine_tune_over_a_devices_capacity_is_refused_before_anything_is_place
     alone = max(run.validate(steps=8).device_bytes.values())
     whole = max(run.validate(step_batch(), steps=8).device_bytes.values())
     assert alone < whole
-    run.validate(steps=8, capacity=whole - 1)
-    run.validate(step_batch(), steps=8, capacity=whole)
+    optimizer = OptimConfig(optimizer="adam", learning_rate=1e-3)
+    short = fine_tune(holding(mesh(), whole - 1), layout, accumulation, optimizer)
+    short.validate(steps=8)
     with pytest.raises(LayoutRefused):
-        run.validate(step_batch(), steps=8, capacity=whole - 1)
+        short.validate(step_batch(), steps=8)
+    fine_tune(holding(mesh(), whole), layout, accumulation, optimizer).validate(step_batch(), steps=8)
 
 
 INITIALIZED: list[bool] = []
@@ -224,16 +278,6 @@ class Watched(LMObjective):
         return nn.unbox(super().init(key, variables))
 
 
-def capped(limit: int) -> type[Trainer]:
-    """A trainer class on devices of `limit` bytes each, as a GPU's allocator states its limit."""
-
-    class Capped(Trainer):
-        def _validation(self, placed, capacity=None):
-            return super()._validation(placed, limit)
-
-    return Capped
-
-
 @pytest.mark.mesh(devices=8)
 def test_a_fit_whose_whole_state_overflows_its_devices_is_refused_before_it_initializes_any():
     """`fit` reads its first batch before it places the state, and checks against it the whole state
@@ -243,9 +287,8 @@ def test_a_fit_whose_whole_state_overflows_its_devices_is_refused_before_it_init
     mesh, layout, accumulation = CASES["fsdp_tensor_accumulating"]
     whole = max(fine_tune(mesh(), layout, accumulation).validate(step_batch()).device_bytes.values())
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
-    run = capped(whole - 1)(Watched(model, SEQ_LEN, ema_decay=0.999), optax.adam(1e-3),
-                            key=jax.random.key(0), mesh=mesh(), layout=layout, accumulation=accumulation,
-                            split=1)
+    run = Trainer(Watched(model, SEQ_LEN, ema_decay=0.999), optax.adam(1e-3), key=jax.random.key(0),
+                  mesh=holding(mesh(), whole - 1), layout=layout, accumulation=accumulation, split=1)
     INITIALIZED.clear()
     with pytest.raises(LayoutRefused):
         run.fit(Loader(train=lambda partition: repeated_token_batch(VOCAB, BATCH, SEQ_LEN + 1), val=None,
@@ -263,17 +306,18 @@ def test_the_check_before_placing_reads_a_run_in_the_splits_its_plan_may_take():
     `fit` checks)."""
     mesh, layout, _ = CASES["fsdp_tensor_accumulating"]
 
-    def peak(split: int | None, capacity: int | None = None) -> int:
+    def peak(split: int | None, limit: int | None = None) -> int:
         model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
         trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=0.999), optax.adam(1e-3),
-                          key=jax.random.key(0), mesh=mesh(), layout=layout, split=split)
-        return max(trainer.validate(step_batch(), capacity=capacity).device_bytes.values())
+                          key=jax.random.key(0), mesh=mesh() if limit is None else holding(mesh(), limit),
+                          layout=layout, split=split)
+        return max(trainer.validate(step_batch()).device_bytes.values())
 
     whole = peak(1)
     assert peak(2) > whole
-    assert peak(None, capacity=whole) == whole
+    assert peak(None, limit=whole) == whole
     with pytest.raises(LayoutRefused):
-        peak(2, capacity=whole)
+        peak(2, limit=whole)
 
 
 @pytest.mark.mesh(devices=8)

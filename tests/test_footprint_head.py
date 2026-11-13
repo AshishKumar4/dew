@@ -14,7 +14,7 @@ import optax
 from affine_run import Features
 from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, memory_limited_to
 from token_support import token_rows
 
 from dew._records import listed, record
@@ -214,9 +214,10 @@ def test_a_diloco_groups_step_is_planned_by_its_own_optimizer_state():
 
     trainer = Trainer(Features(), optax.adam(0.1), key=jax.random.key(0), diloco=DiLoCo(every=2),
                       layout=Layout(min_shard=1, tolerance=1.0),
-                      mesh=MeshSpec(diloco=1).build(compile_only_gpus("sm90", 1)))
+                      mesh=MeshSpec(diloco=1).build(
+                          compile_only_gpus("sm90", 1, memory_limited_to(1 << 30))))
     rows = {"x": np.ones((8, 3), np.float32), "y": np.zeros((8, 2), np.float32)}
-    ahead = compile_ahead(trainer, rows, capacity=1 << 30)
+    ahead = compile_ahead(trainer, rows)
     # The peak the plan derived read each gradient consumed where it is made: Adam over the group's own
     # in-device moments (rows 3806, 4019).
     assert [(probe["derived"]["peak"] is not None, probe["derived"]["consumed"])
@@ -359,9 +360,10 @@ def test_a_whole_head_step_is_derived_at_most_what_xla_compiles_it_to(tmp_path, 
     model = models.build("causal_transformer", vocab_size=vocab, **{**TINY_DECODER, "max_seq_len": seq_len},
                          dtype=jnp.bfloat16, num_kv_heads=2)
     trainer = Trainer(LMObjective(model, seq_len), optax.adam(1e-3), key=jax.random.key(0),
-                      mesh=MeshSpec().build(compile_only_gpus("sm90", 1)), layout=Layout(min_shard=256))
+                      mesh=MeshSpec().build(compile_only_gpus("sm90", 1, memory_limited_to(80 << 30))),
+                      layout=Layout(min_shard=256))
     # The suite's lane multiplies at its highest precision, which keeps a head's logits in float32.
     with jax.default_matmul_precision("default"):
-        ahead = compile_ahead(trainer, token_rows(vocab, 2, seq_len + 1), capacity=80 << 30)
+        ahead = compile_ahead(trainer, token_rows(vocab, 2, seq_len + 1))
     (probe,) = listed(record(ahead.plan, "plan")["probes"], "probes", read=record, what="probes")
     assert 0.9 * probe["temp"] <= probe["derived"]["peak"] <= probe["temp"]

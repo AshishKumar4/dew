@@ -143,7 +143,9 @@ def test_a_held_optimizers_inputs_each_draw_once_however_the_trainer_reads_them(
     rows = Loader(train=lambda partition: Counting(wide), val=None, batch=wide, records=None)
     make_trainer(objective=Drawing(), optimizer=held_optimizer("multi_steps"), tracker=tracker,
                  accumulation=2, split=split).fit(rows, steps=8, log_every=1)
-    draws = [scalars["train/draw"] for _, scalars in tracker.scalars if "train/draw" in scalars]
+    # The draw states no pooling, so a step read in two parts logs its last part's, named so (`Aux.metrics`).
+    name = "train/draw" if split == 1 else "train/draw/last_microbatch"
+    draws = [scalars[name] for _, scalars in tracker.scalars if name in scalars]
     assert len(draws) == 8 and all(draws[index] == draws[index + 1] for index in range(0, 8, 2))
     assert len(set(draws)) == 4
 
