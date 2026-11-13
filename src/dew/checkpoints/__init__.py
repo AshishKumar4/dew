@@ -1712,7 +1712,8 @@ class Checkpoints:
     def environment(self, step: int) -> Mapping[str, object] | None:
         """The code and machine that wrote `step`'s data position (`dew.data.plan.running_environment`), or
         None for a step that holds none, or one written before steps recorded it."""
-        held = (self._step_metadata(step).custom_metadata or {}).get("environment")
+        snapshot = self._step_metadata(step, local=step == self._local_latest())
+        held = (snapshot.custom_metadata or {}).get("environment")
         return None if held is None else record(held, "a step's environment")
 
     def rung(self, step: int) -> JSON:
