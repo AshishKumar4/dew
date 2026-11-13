@@ -108,7 +108,7 @@ def selected(command: list[str], network: bool, whole: bool = False, release: bo
     policy: a policy-off train runs every file, never a whole-suite cell (the maintainer, 2026-10-28: train
     250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline). The release checks run in
     their own tasks alone (`release`), every one whatever else marks it, under a requirement the suite's
-    environment lacks (ci.py's `release_plan`), and on no other run, the network lane's among them. A site
+    environment lacks (rows.py's `release_plan`), and on no other run, the network lane's among them. A site
     marked one of `SHARDS` runs in its own tasks alone (`site`: its map tasks and its judge, ci.py's
     `site_entries`), and every other run sets it aside. This module is every row's key's (ci.py's `SHARED`),
     so a change to what a run selects re-keys every row (row 2558)."""

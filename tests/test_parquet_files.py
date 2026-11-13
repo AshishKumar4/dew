@@ -319,8 +319,8 @@ def test_a_parquet_store_reads_each_footer_once_however_many_reads_count_its_row
 
 @pytest.mark.parametrize("version", [5, PLAN_VERSIONS[-1] + 1], ids=["before", "after"])
 def test_a_read_by_a_plan_version_this_dew_reads_by_none_of_is_refused(version):
-    """Every read builds by its data plan version (`dew.data.compile._build`): a pass, a publication and an
-    export at one this Dew reads by none of is refused, as a run's compile is, where one past the latest
+    """Every read asks its data plan version (`dew.data.plan.read_by`): a pass, a publication and an
+    export at one this Dew reads none of is refused, as a run's compile is, where one past the latest
     read as one it reads (train 654's review, row 4583); a publication of it is refused where a version it
     reads already published the store's generation too, which it would have returned."""
     from uuid import uuid4

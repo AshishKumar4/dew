@@ -19,7 +19,7 @@ from dew._devices import deterministic_ops_requested
 from .kernels import decode_attention, generation
 from .kernels.generation import INHERENT, Choice, bf16_dot_runs, capability, device_generation, gpu_placed
 from .kernels.selection import Kernel, Op, Requirement
-from .kernels.templates import attention_quantized, attention_route
+from .kernels.templates import attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
 from .precision import wide_cpu_arithmetic
 
@@ -203,6 +203,20 @@ class AttentionCase:
     template does not take it."""
     rows: int = 1
     """The call's rows, every leading axis of the query's `[B, T, N, D]` (a batch, its chunks)."""
+    quantized: str | None = None
+    """Where a quantized model's rule owns the call's products and quantizes them
+    (`attention_quantized.owner`; an adapter's or an input quantizer's interception owns its projections
+    alone, never attention's products; a rule quantizing no activation leaves them whole,
+    `attention_quantized.whole`), the kernel computing the rule's arithmetic: 'template', its quantized
+    attention rounding the weights at each row's largest where it takes the rule and the call
+    (`attention_quantized.takes`; row 4858: no sinks, no draw), else 'reference', which forms each product
+    whole before Qwix quantizes it. A kernel forming its products inside a launch the rule never sees (a
+    vendor's or a Pallas kernel: flash, triton, cuDNN, splash, the decode kernel) refuses such a call, a
+    declared cell's and a call's own order's included (`_WHOLE_PRODUCTS`): their receipts timed kernels of
+    whole products (the complexity audit's A1: a B200's cuDNN cell returned 0.5 where the rule gives about
+    0.4961). jax.nn's xla attention forms its products through dot_general, which the rule quantizes as it
+    does the reference path's, so it takes them where a call or a run names it. None where no rule owns
+    them."""
 
     @property
     def cell(self) -> tuple[str | None, "CallKind"]:
@@ -272,6 +286,9 @@ def _flash_built(case: AttentionCase) -> bool:
 _ARITHMETIC = _Need('arithmetic', lambda case: not case.arithmetic,
                           "the call asks for arithmetic only the reference path computes "
                           "(`reference_only`)", row=INHERENT)
+_WHOLE_PRODUCTS = _Need('quantized', lambda case: case.quantized is None,
+                        "a quantized model's rule owns the call's products, which this kernel forms whole "
+                        "inside its launch, past the rule (`AttentionCase.quantized`)", row=INHERENT)
 _ON_GPU = _Need('backend', _on_gpu, "it runs on a GPU", row=INHERENT)
 _FAST = _Need('form', lambda case: case.form == "fast", "no accurate form", row=INHERENT)
 _FAST_HANDOFF = _Need('form', lambda case: case.form == "fast", "no accurate form", row=INHERENT,
@@ -279,6 +296,7 @@ _FAST_HANDOFF = _Need('form', lambda case: case.form == "fast", "no accurate for
 
 FLASH_SUPPORTS = (
     _FAST,
+    _WHOLE_PRODUCTS,
     _ON_GPU,
     _Need('document_bound', lambda case: case.documents is None or case.max_segments is not None,
                 "the call packs documents with no bound on a row's (`Coordinates.max_segments`), which its "
@@ -346,6 +364,7 @@ def cudnn_packs(own: bool, bounded: bool, hidden: bool) -> bool:
 
 
 CUDNN_SUPPORTS = (
+    _WHOLE_PRODUCTS,
     _ON_GPU,
     _Need('capability', lambda case: bf16_dot_runs(), "cuDNN takes bf16 and fp16 from sm80",
                 row=INHERENT),
@@ -394,6 +413,7 @@ runs at the query's head width, values included (`widen_value_heads`)."""
 
 TRITON_SUPPORTS = (
     _FAST,
+    _WHOLE_PRODUCTS,
     _ON_GPU,
     _Need('capability', lambda case: bf16_dot_runs(), "tokamax's Triton kernel needs sm80",
                 row=INHERENT),
@@ -442,6 +462,7 @@ descriptor (`AttentionCase.splash_mask`), the one fact that costs host-side work
 
 TPU_SUPPORTS = (
     _FAST,
+    _WHOLE_PRODUCTS,
     # Elsewhere it runs interpreted, where 'tpu' is named.
     TPU_BACKEND,
     _Need('bias', lambda case: not case.bias, "splash takes no bias", row=INHERENT, kind='measured'),
@@ -562,6 +583,9 @@ def _dense_peak_of(rows: int, queries: int, heads: int, keys: int, kv_heads: int
 
 
 TEMPLATE_SUPPORTS = (
+    _Need('quantized', lambda case: case.quantized in (None, 'template'),
+          "a quantized model's rule owns the call's products in a form the template's quantized attention "
+          "does not compute (`AttentionCase.quantized`)", row=INHERENT),
     _Need('dtype', lambda case: case.dtype in TEMPLATE_DTYPES and case.key_dtype == case.dtype,
           lambda case: f"the query is {case.dtype} and the keys are {case.key_dtype}, where the template "
                        "takes one dtype of fp32, bf16 and fp16 on its operands", row=INHERENT),
@@ -668,13 +692,13 @@ DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] =
                      "(M-ET-16, W18-gh200-1)"),
     ('tcgen05', CallKind.of(jnp.bfloat16)): (
         CUDNN, "cuDNN's fused attention measured faster than the template on a B200 at every shape timed: "
-                 "lab-b200-20261113-grid2 (CUPTI, the template's round 0 against cuDNN's five), causal bf16 "
+                 "ET-GRID2-b200 (CUPTI, the template's round 0 against cuDNN's five), causal bf16 "
                  "forwards and training steps at 128 to 32768 tokens, widths 64, 128 and 256, heads 8/2, "
                  "16/4 and 32/8: cuDNN faster at all 105 cells, by 1.85 times or more from 256 tokens (the "
                  "template's training 9.15 times at 1 x 32768 8/2 d128). Three cells are no timed win: "
                  "the training at 1 x 32768 32/8 d128, 16/4 d256 and 32/8 d256, template: did not complete, "
                  "row 5671 (it wedged at the first), cuDNN the one measured route that runs there, re-timed "
-                 "once the stall is fixed. Earlier, five rounds each (lab-b200-20261113-cudnn-rows "
+                 "once the stall is fixed. Earlier, five rounds each (ET-CUDNNROWS-b200 "
                  "against -rung, -att4b and -20261112-fix): "
                  "Qwen 3.5-4B's full attention, 16 query heads over 4 of 256, causal bf16, at 1 x 12288 its "
                  "forward 0.838 against 5.015 ms and a training step's attention 4.504 against 28.60 (the "
@@ -683,14 +707,14 @@ DECLARED: dict[tuple[str | None, CallKind], tuple[Kernel[AttentionCase], str]] =
                  "Qwen3-8B's, 32 over 8 of 128, 2 x 4096, 0.284 against 0.911 and 1.136 against 7.626, and "
                  "1 x 16384 its forward 1.411 against 4.212. A call of packed documents runs cuDNN's "
                  "packed sequences (`attention._cudnn_packed`), faster than the template at every cell "
-                 "timed: lab-b200-20261113-packed, Qwen3.5-4B's decision call, 16/4 d256 causal bf16, 12288 "
+                 "timed: ET-PACKED-b200, Qwen3.5-4B's decision call, 16/4 d256 causal bf16, 12288 "
                  "tokens a row (CUPTI, four rounds or five), one document a row its training 5.071 against "
                  "30.033 ms at one row and 19.222 against 116.469 at four, its forward 1.197 against 5.613 "
                  "and 3.115 against 19.837; twelve documents a row its training 1.510 against 4.841 and "
                  "5.133 against 16.909, its forward 0.249 against 1.035 and 0.724 against 3.338; its "
                  "backward's workspace B·H·S²·4 bytes, 9.59 GiB a row's call (temp 38.35 GiB at four rows, "
                  "plain cuDNN's 2.26), the whole 4B step's peak 95.3 GiB against the template's 61.4 at four "
-                 "rows (lab-b200-20261113-step85); rows 4839 and 5368 retire it"),
+                 "rows (LF-STEP85-b200); rows 4839 and 5368 retire it"),
     ('mma.sync', CallKind.of(jnp.bfloat16)): (
         FLASH, "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
                  "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
@@ -742,19 +766,12 @@ def _attention_preferred(case: AttentionCase) -> str:
     runs as any call there does, jax.nn's xla attention over the dense mask they mean (`visibility_mask`)
     where its scores fit, else the template (a forked decision row's call took the template's plain-JAX
     mainloop, and a run recorded fast its accurate route, once its forks' runs reached the call). A call
-    whose products a quantized model's rule owns (`attention_quantized.owner`; an adapter's or an input
-    quantizer's interception owns its projections alone, never the attention's products) and quantizes runs
-    the template's quantized attention where it takes the rule and the call (`attention_quantized.takes`),
-    else the reference path, which forms each product whole before Qwix quantizes it; a rule quantizing no
-    activation leaves them whole (`attention_quantized.whole`)."""
+    whose products a quantized model's rule owns runs the kernel that computes the rule's arithmetic
+    (`AttentionCase.quantized`), which every kernel forming its products whole refuses, a declared cell's
+    included."""
     backend = generation.backend()
-    if (rule := attention_quantized.owner()) is not None and not attention_quantized.whole(rule):
-        # A quantized model's rule owns the call's products, quantizing the weights by each row's largest:
-        # the template's anchored walk rounds them at that maximum where it takes the rule and the call
-        # (`attention_quantized`, row 4858: no sinks, no draw), else the reference path forms them.
-        if attention_quantized.takes(rule) and not (case.sinks or case.dropout):
-            return 'template'
-        return 'reference'
+    if case.quantized is not None:
+        return case.quantized
     if case.spans_only and backend in ('gpu', 'tpu'):
         return 'template'
     if (backend == 'gpu' and case.dense_bias and case.form == "fast"
@@ -834,7 +851,11 @@ a dense bias's preference names it."""
 def _decode_preferred(case: AttentionCase) -> str:
     """The kernel a decode call runs: on a GPU the hand-written decode kernel (`decode_attention`; the
     template's decode does not yet match it, rows 4042 to 4045), which hands a call it does not take to the
-    next kernel by legality, a declared cell's old route first (`DECODE_DECLARED`); xla elsewhere."""
+    next kernel by legality, a declared cell's old route first (`DECODE_DECLARED`); xla elsewhere; the
+    kernel computing a quantized model's rule where the rule owns the call's products, as attention's
+    (`AttentionCase.quantized`)."""
+    if case.quantized is not None:
+        return case.quantized
     return 'decode' if generation.backend() == 'gpu' else 'xla'
 
 
@@ -863,7 +884,7 @@ to 65 against 35.6, ET-DFP32-h100-pcie)."""
 
 
 DECODE = Op[AttentionCase](Choice.DECODE, (
-    Kernel[AttentionCase]('decode', decode_attention.SUPPORTS),
+    Kernel[AttentionCase]('decode', (_WHOLE_PRODUCTS, *decode_attention.SUPPORTS)),
     Kernel[AttentionCase]('cudnn', (*CUDNN_SUPPORTS, decode_attention.PRODUCTS), reverse_only=True),
     DECODE_XLA,
     Kernel[AttentionCase]('reference', (), generic=True),

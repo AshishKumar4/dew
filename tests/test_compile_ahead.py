@@ -569,7 +569,6 @@ def admitted(tmp_path_factory):
     return records, trainer, ahead
 
 
-@pytest.mark.shared_setup("admitted")
 def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_over_its_own_gpus(tmp_path):
     """A host's GPUs, serialized as their topology (`get_attached_topology(...).serialize()`, here of
     compile-only H100s at a stated 40 GiB) and read back elsewhere (`host_gpus`), are the GPUs XLA compiles
@@ -625,6 +624,7 @@ def test_a_hosts_serialized_topology_states_its_gpus_memory_and_their_allocators
     assert topology_memory(b"") is None
 
 
+@pytest.mark.shared_setup("admitted")
 def test_compiling_ahead_on_gpus_its_plan_needs_microbatches_for_admits_it(admitted):
     """A step compiled ahead on GPUs whose memory its plan needs several microbatches for searches for its
     plan, at several microbatches, and saves it, the run left at its plan, its rung its last probe's."""

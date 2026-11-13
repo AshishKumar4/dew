@@ -62,6 +62,7 @@ from .documents import (
     cross_document_mask,
     document_ids,
     document_offsets,
+    own_runs,
     packed_runs,
     query_order,
     with_documents,
@@ -267,10 +268,9 @@ def flash_attention(query, key, value, causal: bool, sliding_window=None, sinks=
         flat = (query.reshape(rows * length, *query.shape[2:]),
                 *(x.reshape(-1, *x.shape[2:]) for x in (key, value)))
         if key_segment_ids is None:
-            # A call's own documents are its runs, whatever their ids.
-            changes = segment_ids[:, 1:] != segment_ids[:, :-1]
-            begins = jnp.concatenate([jnp.ones((rows, 1), bool), changes], axis=1)
-            offsets, own_keys = cu_seqlens(begins, rows * (max_segments + 1)), {}
+            # A call's own documents are its runs, whatever their ids (`own_runs`).
+            begins, firsts = own_runs(segment_ids, max_segments + 1)
+            offsets, own_keys = cu_seqlens(begins, rows * (max_segments + 1), firsts=firsts), {}
         else:
             # Another sequence's documents pair with the queries' by id, sequence i each side's
             # document i. FA3 takes a positive bound on the keys' lengths, which an empty key array
@@ -343,9 +343,8 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
     """
     if sinks is not None and sinks.shape != (query.shape[2],):
         raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
-    rule = attention_quantized.owner()
-    quantized = rule is not None and not attention_quantized.whole(rule)
-    if quantized and (not attention_quantized.takes(rule) or sinks is not None or dropout_rate):
+    quantized = quantized_rule(sinks is not None, bool(dropout_rate))
+    if quantized == 'reference':
         raise ValueError("the template computes a quantized model's attention under an int8 rule of Qwix's "
                          "dynamic absmax, no sinks and no dropout; the reference path computes the rest")
 
@@ -1174,6 +1173,16 @@ def _xla_kernel_narrows(query) -> bool:
         query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not bf16_dot_runs())
 
 
+def quantized_rule(sinks: bool, dropout: bool = False) -> str | None:
+    """`AttentionCase.quantized`'s kernel for a call with `sinks` or `dropout`: the template's quantized
+    attention where a quantized model's rule owning its products takes it, the reference path where it does
+    not; None where no rule owns them or it quantizes no activation."""
+    rule = attention_quantized.owner()
+    if rule is None or attention_quantized.whole(rule):
+        return None
+    return 'template' if attention_quantized.takes(rule) and not (sinks or dropout) else 'reference'
+
+
 def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_softmax=True, softcap=None,
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,
                    max_segments=None, key_value_seq_lengths=None, key_value_seq_starts=None,
@@ -1207,7 +1216,8 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax, wide_logits),
         narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
-        splash_mask=False, shards=sequence_shards(), dropout=dropout, form=generation.numerics().forms)
+        splash_mask=False, shards=sequence_shards(), dropout=dropout, form=generation.numerics().forms,
+        quantized=quantized_rule(sinks is not None, dropout))
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
     # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
     # read the case (`TPU_SUPPORTS`).

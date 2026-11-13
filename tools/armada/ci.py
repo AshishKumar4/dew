@@ -538,11 +538,13 @@ def reusable(python: str, rows: list[tuple[str, str]], common: str,
             if found is not None and recorded(
                     green_key(python, row(python, name, group), each, found[0]["key"]), token) is not None:
                 return f"{each}:{found[0]['key']}"
+            if found is not None:
+                misses[each_row].insert(0, records.MISSED["kept"])
         return None
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
         found = {each: kept for each, kept in zip(rows, pool.map(hit, rows), strict=True) if kept}
-    missed.update(Counter((misses.get(e) or ["no class"])[0] for e in rows if e not in found))
+    missed.update(Counter(misses[e][0] for e in rows if e not in found))
     return found
 
 
@@ -632,8 +634,8 @@ def green_record(python: str, name: str, split: str, common: str, token: str, cl
     here what it held then, so this tree's run would execute the same set; a set naming a unit this tree lacks
     is skipped unread (`matchable`). Keyed by the last run's set alone, a row run green on main was found by
     no plan once a run of another tree came after it (2026-11-12: train 781's CI kept 2 of 4,180 tasks; a
-    reach of a comment's change planned 7,161 rows). A miss says why in `why`, a class at a time (`MISSED`).
-    """
+    reach of a comment's change planned 7,161 rows). A miss says why in `why`, a class at a time (records.py's
+    `MISSED`)."""
     reading = Reading() if reading is None else reading
     place = row(python, name, split)
     for each in classes:
@@ -641,17 +643,18 @@ def green_record(python: str, name: str, split: str, common: str, token: str, cl
         try:
             current = epoch(python, place, each, common, token)[0]
         except Unread:
-            why.append("unread")
+            why.append(records.MISSED["unread"])
             continue
         if current is None:
-            why.append("no green run on these shared inputs")
+            why.append(records.MISSED["shared"])
             continue
         found = recorded(record_key(python, place, each, common), token)
-        why.append("an executed input changed" if found is not None else "no record of its last run")
-        if found is not None and found["depends"] is not None:
-            # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of
-            # exactly these, kept by that key (`green_key`) whatever ran since.
-            key = cache_key(common, name, split, found["depends"], reading)
+        # The last run's inputs hashed once: its own key where fresh (`fresh`), else the green run of exactly
+        # these, kept by that key (`green_key`) whatever ran since; why it was not, the class's word.
+        recorded_set = None if found is None else found["depends"]
+        key = None if recorded_set is None else cache_key(common, name, split, recorded_set, reading)
+        why.append(records.missed(found, key, current))
+        if key is not None:
             if found["key"] is not None and found["key"] == key and standing(found, current):
                 return found, each
             kept = recorded(green_key(python, place, each, key), token)
@@ -1256,27 +1259,14 @@ def collect_entries(names: list[str], timings: dict, target: float) -> list[dict
 MARKED = ("whole_suite", "release_env")
 """The marks a file's row names its tests by, as pytest resolved them (executed.py): its whole_suite
 cells, which `slow` reports as the whole suite's alone, and its release checks, which `release_plan`
-plans."""
+plans (rows.py)."""
 RELEASE = "release:"
 """A release check's row, beside its file's own: `row`'s group, its requirement after it."""
 
 
-def release_plan(verdict: dict) -> list[dict]:
-    """The release checks of a whole suite's `verdict` (`armada verdict <sha> --json`), a task each
-    requirement: the files whose rows name checks under it (`release_env`, as pytest resolved each test's
-    mark before any selection: executed.py), which the run's own tasks set aside, as the suite's environment
-    lacks it (`selected`). Its run's second job runs them (.github/workflows/ci.yml, `release`)."""
-    checks: dict[str, set[str]] = {}
-    for found in verdict["rows"]:
-        for requirement in found.get("release_env", {}):
-            checks.setdefault(requirement, set()).add(parsed_row(found["name"])[1])
-    return [{"release": requirement, "python": PYTHONS[0], "tests": " ".join(sorted(names))}
-            for requirement, names in sorted(checks.items())]
-
-
 def release(python: str, tests: list[str], requirement: str, out: Path) -> int:
-    """`requirement`'s release checks in `tests` (`release_plan`), as a whole suite's second job runs each:
-    its rows in `out`, each red one named, exit 1 on any."""
+    """`requirement`'s release checks in `tests` (rows.py's `release_plan`), as a whole suite's second job
+    runs each: its rows in `out`, each red one named, exit 1 on any."""
     task(python, tests, "", out, session.DEADLINE, "off", release=requirement)
     red = [found["name"] for found in json.loads(out.read_text())["rows"] if found["exitCode"]]
     for name in red:
@@ -2380,9 +2370,9 @@ def flagged(verdict: Path, new: Path | None) -> int:
 
 
 def releasing(args: argparse.Namespace) -> int:
-    """`release-plan`'s tasks printed, or `release`'s checks run (`release_plan`, `release`)."""
+    """`release-plan`'s tasks printed, or `release`'s checks run (rows.py's `release_plan`, `release`)."""
     if args.operation == "release-plan":
-        print(json.dumps(release_plan(json.loads(args.verdict.read_text()))))
+        print(json.dumps(rows.release_plan(json.loads(args.verdict.read_text()), PYTHONS[0])))
         return 0
     return release(args.python, args.tests.split(), args.requirement, args.out)
 

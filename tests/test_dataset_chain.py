@@ -30,7 +30,7 @@ from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.pipeline import Configured, ObjectiveData, Pipeline, Rejected
-from dew.data.plan import PLAN_VERSIONS, Manifest
+from dew.data.plan import Manifest
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
@@ -329,7 +329,7 @@ def fetched_generation(chain, directory):
     source = prepared.source
     cache = Cache((directory / "fetched").as_uri())
     fetch = FetchLike()
-    manifest = _cache_manifest(source, prepared.stages, "indexed", PLAN_VERSIONS[-1])
+    manifest = _cache_manifest(source, prepared.stages, "indexed")
     stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest,
                           transform=lambda index, row: (fetch(row),))
     try:
@@ -1722,12 +1722,3 @@ def test_a_concat_states_its_datasets_facts_with_their_counts_added():
     facts = concat(counted).facts()
     assert (facts["rows"], facts["language"]) == (10, "en")
     assert "rows" not in concat([counted[0], Memory(rows("c", 2)).map(Scaled(2))]).facts()
-
-
-def test_a_concat_of_datasets_with_steps_is_read_by_no_plan_of_13():
-    """A concatenation of datasets with steps is an order no plan of 13 recorded: this Dew's plan reads
-    it, and a run that asks for 13 is refused before anything is read."""
-    chain = joined().batch(1)
-    assert compile(chain, read="indexed", loading=READ, plan_version=PLAN_VERSIONS[-1]).plan is not None
-    with pytest.raises(ValueError):
-        compile(chain, read="indexed", loading=READ, plan_version=PLAN_VERSIONS[0])
