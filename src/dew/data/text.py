@@ -146,7 +146,7 @@ def load_tokenizer(name: str, *, revision: str | None = None, local_files_only: 
             renamed = cls if cls is not None else RENAMED_TOKENIZERS.get(str(stated.get("tokenizer_class")))
             loaded = (AutoTokenizer.from_pretrained(
                 name, revision=revision, local_files_only=local_files_only,
-                config=_untyped_config(name, revision, local_files_only)) if renamed is None
+                config=_dispatch_config(name, revision, local_files_only)) if renamed is None
                 else getattr(transformers, renamed).from_pretrained(name, revision=revision,
                                                                     local_files_only=local_files_only))
             # from_pretrained's annotation names classes transformers binds
@@ -157,28 +157,38 @@ def load_tokenizer(name: str, *, revision: str | None = None, local_files_only: 
     return held
 
 
-_DISPATCH_FIELDS = ("model_type", "model_name", "tokenizer_class")
-"""The model config's fields AutoTokenizer dispatches on, beside its `_name_or_path`
-(tokenization_auto.py:779-809 and 931, transformers 5.16.1)."""
+def _dispatch_config(name: str, revision: str | None, local_files_only: bool) -> PreTrainedConfig | None:
+    """The model config AutoTokenizer dispatches by (its `config`) where transformers registers no class
+    for the model's type; None where it does or the repo holds no config, for AutoTokenizer to load its own.
 
-
-def _untyped_config(name: str, revision: str | None, local_files_only: bool) -> PreTrainedConfig | None:
-    """AutoTokenizer's model config where transformers registers no class for the model's type;
-    None where it does or the repo has no config, for AutoTokenizer to build its own.
-
-    An unregistered type reaches AutoTokenizer as an untyped PreTrainedConfig of every field the
-    file holds, which transformers validates against its own vocabulary: Dory's 'mlp' layer types
-    fail `validate_layer_type`, though no tokenizer reads them. This config holds the fields
-    AutoTokenizer dispatches on, read as `PreTrainedConfig.get_config_dict` resolves the file, so
-    an unregistered type transformers still dispatches (InternLM2's) dispatches as before."""
+    AutoTokenizer loads a model config on every load, and for a type AutoConfig registers no class for it
+    falls back to an untyped PreTrainedConfig of every field the file holds
+    (tokenization_auto.py:783-789, transformers 5.16.1 and 5.17.0), whose `validate_layer_type`
+    (configuration_utils.py:526) refuses layer kinds outside transformers' own list: Dory's 'mlp', which
+    no tokenizer reads. This is that config, every field as `PreTrainedConfig.get_config_dict` resolves the
+    file and the name as AutoConfig records it, of a class whose layer kinds are the model's own
+    (`_unregistered`); ledger 5778 holds it until that fallback validates no model's layers."""
     from transformers import PreTrainedConfig
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    stated, _ = PreTrainedConfig.get_config_dict(name, revision=revision, local_files_only=local_files_only)
+    stated, unread = PreTrainedConfig.get_config_dict(
+        name, revision=revision, local_files_only=local_files_only, name_or_path=name)
     if not stated or stated.get("model_type") in CONFIG_MAPPING:
         return None
-    return PreTrainedConfig.from_dict(
-        {"_name_or_path": name, **{field: stated[field] for field in _DISPATCH_FIELDS if field in stated}})
+    return _unregistered().from_dict(stated, **unread)
+
+
+@functools.cache
+def _unregistered() -> type[PreTrainedConfig]:
+    """The config class of a model type transformers registers none for, its layer kinds its own to
+    name: the override transformers' configs of other layer kinds make (its ResNet's, its Nemotron-H's)."""
+    from transformers import PreTrainedConfig
+
+    class Unregistered(PreTrainedConfig):
+        def validate_layer_type(self) -> None:
+            """The layer kinds are the model's own, which its own code validates."""
+
+    return Unregistered
 
 
 @runtime_checkable
@@ -821,10 +831,10 @@ def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "t
                   plan_version: int | None = None) -> Mapping[str, object]:
     """`dataset`'s documents in `field` tokenized by `tokenizer` and written to `url` as a committed
     token store (ArrayRecord shards, each record a document's ids under "text", its manifest naming
-    the tokenizer, vocabulary and EOS), which `dew.data.sources.TokenFiles(url)` reads back and
-    `presets.lm(ds, None, ...)` packs. Each document is ended by the tokenizer's EOS with `eos`, read by
-    data plan `plan_version` (`dew.data.plan.PLAN_VERSIONS`; this Dew's where None). Returns the
-    store's manifest."""
+    the tokenizer, its resolved identity, vocabulary and EOS), which `dew.data.sources.TokenFiles(url)`
+    reads back and `presets.lm(ds, None, ...)` packs. Each document is ended by the tokenizer's EOS with
+    `eos`, read by data plan `plan_version` (`dew.data.plan.PLAN_VERSIONS`; this Dew's where None).
+    Returns the store's manifest."""
     from dew.data.compile import iterate
     from dew.data.plan import PLAN_VERSIONS
     from dew.data.sinks import export
@@ -834,8 +844,12 @@ def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "t
     step = Tokenize(tokenizer, field, eos)
     documents = dataset.map(step)
     vocabulary = step.vocabulary
+    # The tokenizer's identity as it resolved for this export (a hub name's commit and every file's digest,
+    # a directory's files' digests), which stores read together state alike (`tokenizer_contract`): a name
+    # alone is two tokenizers once its files change.
     metadata = {"token_store": True, "tokenizer": tokenizer, "vocab_size": vocabulary.vocab_size,
-                "dtype": "int32", "eos_id": vocabulary.eos_id if eos else None}
+                "dtype": "int32", "eos_id": vocabulary.eos_id if eos else None,
+                "tokenizer_revision": vocabulary.dependencies()}
     version = PLAN_VERSIONS[-1] if plan_version is None else plan_version
     return export(iterate(documents, read=read, provision=provision, plan_version=version), url,
                   format="array_record", rows_per_shard=rows_per_shard, metadata=metadata,

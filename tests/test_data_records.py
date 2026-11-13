@@ -481,3 +481,13 @@ def test_a_concatenation_of_stores_in_memory_is_recorded_and_read_back():
 
     chain = _lm(concat([_documents(0), _documents(8)]).shuffle(0).repeat())
     assert _batches(_read_back(chain)) == _batches(chain)
+
+
+def test_a_concatenation_of_datasets_with_steps_is_recorded_and_read_back():
+    """Two datasets with steps of their own joined, each shuffled by itself: the record holds each
+    member's chain, and the chain read back from it reads the batches the one written reads."""
+    from dew.data import concat
+
+    members = [_documents(0).map(Tagged(1)).shuffle(0), _documents(8).map(Tagged(2)).shuffle(1).take(4)]
+    chain = _lm(concat(members).repeat())
+    assert _batches(_read_back(chain)) == _batches(chain)
