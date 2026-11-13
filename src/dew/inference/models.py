@@ -148,21 +148,17 @@ class ReleasedRun(SavedRun):
     def of(cls, directory: str | Path, trust: Sequence[str] = ()) -> Self:
         """The run step the release in `directory` holds, the packages `trust` names that its record imports
         imported first (`dew.registry.import_trusted`), as a run's are (`SavedRun.at`); a directory that
-        holds none is refused. A model's release written before it stated its run (its objective, model,
-        settings and numerics) reads as the declaration its run would have recorded, at step 0."""
+        holds none is refused."""
         from dew.config.release import Release
         from dew.inference.tasks import earlier_shapes
         from dew.registry import import_trusted
 
         release = Release.load(directory)
         task = None if release is None else release.task
-        if task is None or ("run" not in task and "objective" not in task):
+        if task is None or "run" not in task:
             raise ValueError(f"{directory} holds no native release: its release record states no run "
                              "(`dew export` of a run writes one)")
-        record = (named_fields(task["run"], "run") if "run" in task else
-                  {"objective": task["objective"], "model": task["model"],
-                   **named_fields(task.get("settings", {}), "settings"),
-                   **({} if task.get("numerics") is None else {"precision": task["numerics"]})})
+        record = named_fields(task["run"], "run")
         import_trusted(record, trust)
         held = cls.declared(str(directory), earlier_shapes(record), integer(task.get("step", 0), "step"))
         return replace(held, average=task.get("averaged") is True,
