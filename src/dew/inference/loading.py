@@ -145,9 +145,7 @@ def released_model(root: epath.Path) -> bool:
     from dew.config.release import Release
 
     release = Release.load(str(root))
-    # A model's release written before it stated its run names its objective (`ReleasedRun.of`).
-    return release is not None and release.task is not None and ("run" in release.task
-                                                                 or "objective" in release.task)
+    return release is not None and release.task is not None and "run" in release.task
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
