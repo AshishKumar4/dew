@@ -440,7 +440,8 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
     """A decision run over a mixture records its chain (row 3874): read back from its run.json
     (`RunConfig.load`), it resumes its checkpoint and trains on (row 3882). Its command run again with the
     mixture's order changed is refused that position by its plan, naming the record route first, as the
-    run it resumes recorded its chain (`PlanOrderChanged.routes`, row 3881), and the saved schedule's route
+    run it resumes recorded its chain (`PlanOrderChanged.routes`, row 3881), where it resumes its data
+    exactly (`data_resume="exact"`; relaxed, its default, restarts the data), and the saved schedule's route
     as a decision run reads its mixture, not the data layer's mix (row 3976), before it writes its own
     record: the one it resumes is left byte for byte as it was, and resumes."""
     from run_kinds import trained
@@ -457,7 +458,8 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
     saved = directory / "run.json"
     record, written = saved.read_bytes(), saved.stat()
     with pytest.raises(PlanOrderChanged) as refused:
-        trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 3})
+        trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed",
+                trainer={"name": "mixed", "steps": 3, "data_resume": "exact"})
     routes = refused.value.routes
     assert len(routes) == 3 and (routes[0], routes[-1]) == (RECORD, REBUILD) and SCHEDULE not in routes
     assert routes[1] == DecisionRunConfig.UNSEEDED
@@ -473,8 +475,8 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
 @pytest.mark.mesh(devices=8)
 def test_a_changed_command_names_no_record_route_where_the_record_would_not_rebuild_its_chains(tmp_path):
     """A decision run whose record would not rebuild its chains, its validation built in Python, is
-    refused its changed mixture order without the record route, which would refuse it again
-    (`_read_chain`), where it records its data alone (row 3913)."""
+    refused its changed mixture order, resuming its data exactly, without the record route, which would
+    refuse it again (`_read_chain`), where it records its data alone (row 3913)."""
     from run_kinds import trained
 
     from dew.data.plan import RECORD, PlanOrderChanged
@@ -487,7 +489,8 @@ def test_a_changed_command_names_no_record_route_where_the_record_would_not_rebu
     unrebuilt["fields"]["validation"] = {"unrecorded": "built in Python"}
     saved.write_text(json.dumps(unrebuilt))
     with pytest.raises(PlanOrderChanged) as refused:
-        trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 2})
+        trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed",
+                trainer={"name": "mixed", "steps": 2, "data_resume": "exact"})
     assert RECORD not in refused.value.routes
 
 
