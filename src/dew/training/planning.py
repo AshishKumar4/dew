@@ -39,7 +39,7 @@ from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import OuterProgram, compiler_options, owned_program, program_digest
 from dew.nn.kernels.templates import report
-from dew.objectives.base import RECORD, Objective, Ratio
+from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.compiles import EVENTS, Compiles
 from dew.telemetry.instrumentation import compiled_memory
@@ -205,14 +205,14 @@ class SampledStep(NamedTuple):
     executable: jax.stages.Compiled
 
 
-def whole_step_program(objective: Objective) -> OuterProgram:
+def whole_step_program[L, E](objective: Objective[L, E]) -> OuterProgram:
     """`whole_step` over `objective`'s statistics (`Objective.reduce_loss`), the one program a split step
     runs on its microbatches' outputs, compiled under its towers' options, which a run compiled ahead
     compiles with its step (`dew.training.ahead`)."""
     return owned_program(functools.partial(whole_step, reduce=objective.reduce_loss), *objective.towers())
 
 
-def whole_step(outputs, reduce: Callable[[Ratio | jax.Array | float], tuple[jax.Array, jax.Array]]):
+def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]]):
     """A step's outputs from those of the microbatches it was read in: its loss as an unsplit step logs it,
     whatever the split (docs/design/training.md, the logged loss): where its last microbatch commits, the
     update's, pooled over the window; elsewhere its own batch's, its microbatches' own statistics pooled

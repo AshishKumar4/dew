@@ -195,14 +195,19 @@ def test_a_steps_logged_loss_is_its_rows_whatever_its_split(split):
     read in two microbatches a step, or in the split its plan chooses, it logs every step's loss as the run
     read whole logs it, its commit steps' the update's and its others' their own batch's (docs/design/
     training.md, the logged loss), where a split step once logged its last microbatch's alone."""
+    from reference_error import assert_fp32_reduction_bound
+
     def logged(**kwargs) -> list[float]:
         tracker = RecordingTracker()
-        make_trainer(tracker=tracker, accumulation=2, **kwargs).fit(dataset(), steps=6, log_every=1)
+        trainer = make_trainer(tracker=tracker, accumulation=2, **kwargs)
+        trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+        trainer.fit(dataset(), steps=6, log_every=1)
         return [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
 
-    whole = logged(split=1)
+    whole = np.asarray(logged(split=1))
     assert len(whole) == 6
-    np.testing.assert_allclose(logged(split=split), whole, rtol=1e-6)
+    # Each step's loss, a mean of BATCH squared errors, pooled in another order: one fp32 reduction apart.
+    assert_fp32_reduction_bound(logged(split=split), whole, np.abs(whole), terms=BATCH)
 
 
 def test_a_run_given_steps_and_tokens_is_refused_as_a_budget_named_twice():
