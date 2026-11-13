@@ -48,6 +48,8 @@ import logging
 import os
 import pickle
 import platform
+import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
@@ -87,6 +89,7 @@ if TYPE_CHECKING:
     from jaxlib._jax import Traceback
 
     from dew.checkpoints import Resume
+    from dew.config import RunConfig
     from dew.data.compile import Handed
     from dew.data.dataset import DataPartition, Loader
     from dew.data.pipeline import Dataset
@@ -916,7 +919,9 @@ class AheadTarget:
 
     generation: str
     devices: int
-    path: str
+    path: str | None = None
+    """Where the step is saved (`AheadOfTime.save`); none where `phases` names the steps, which the
+    run's persistent compilation cache keeps."""
     capacity_gib: float | None = None
     frontier: bool = False
     """Whether the report lists each rung above the plan that fits at fewer microbatches than every plan
@@ -928,7 +933,13 @@ class AheadTarget:
     topology: str | None = None
     """A host's own serialized GPU topology (`host_gpus`), which states the GPUs it compiles for whole:
     their memory and multiprocessors, so it sets neither `capacity_gib` nor `multiprocessors`. A dew-ops
-    prepare is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads."""
+    prepare is handed its node's ($DEW_NODE_TOPOLOGY), so its compiles key the cache the node's run reads.
+    With it, `capacity_gib` states the bytes the run's plan is admitted to on each GPU (the pool XLA's
+    allocator holds there), which the topology's own memory does not."""
+    phases: tuple[int, ...] = ()
+    """The run's data phases whose steps are compiled in place of the first's, each over a batch of its own
+    (`phase_batch`), into the run's persistent compilation cache, where that phase's first compile in the
+    run finds them (`LaterPhases`): none, the first step's alone."""
 
     @property
     def capacity(self) -> int | None:
@@ -940,9 +951,8 @@ class AheadTarget:
         `topology` (`host_gpus`), the TPU topology's, which must hold `devices`, or `devices` GPUs of the
         generation at the stated capacity."""
         if self.topology is not None:
-            if self.capacity_gib is not None or self.multiprocessors is not None:
-                raise ValueError("a host's topology states its GPUs' memory and multiprocessors; set no "
-                                 "capacity or multiprocessors with it")
+            if self.multiprocessors is not None:
+                raise ValueError("a host's topology states its GPUs' multiprocessors; set none with it")
             return host_gpus(self.generation, self.topology, self.devices)
         if ":" not in self.generation:
             return compile_only_gpus(self.generation, self.devices, self.capacity, self.multiprocessors)
@@ -968,9 +978,23 @@ class AheadTarget:
         if trainer.rollout is not None:
             raise ValueError("compile_ahead lowers the step over the loader's batches; this run's step reads "
                              "its rollout's, which it makes only as it trains")
-        ahead = _compiled_ahead(trainer, first_step_batch(trainer, loader, steps, examples, resume),
-                                self.capacity, frontier=self.frontier, plan=plan,
-                                topology=None if self.topology is None else Path(self.topology).read_bytes())
+        batch = first_step_batch(trainer, loader, steps, examples, resume)
+        topology = None if self.topology is None else Path(self.topology).read_bytes()
+        if self.phases:
+            # Each later phase's step, into the persistent cache its run reads, its evaluations the first's,
+            # each planned afresh at the split the run was given, as its run plans it at its boundary.
+            last: AheadOfTime | None = None
+            for phase in self.phases:
+                trainer._planned_afresh()
+                last = _compiled_ahead(trainer, phase_batch(trainer, batch, phase), self.capacity,
+                                       frontier=False, plan=None, topology=topology)
+                _log.info("the step of data phase %d compiled ahead in %.1f s", phase, last.planned_seconds)
+            assert last is not None, "a target of phases names one"
+            return CompiledAhead(None, last)
+        if self.path is None:
+            raise ValueError("a step compiled ahead is saved where its target's path says; name one")
+        ahead = _compiled_ahead(trainer, batch, self.capacity, frontier=self.frontier, plan=plan,
+                                topology=topology)
         ahead.save(self.path)
         return CompiledAhead(self.path, ahead)
 
@@ -1008,19 +1032,144 @@ def first_step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], loader:
 
 class CompiledAhead(SystemExit):
     """Raised by a configured run under `compile_ahead` once its first step is compiled and saved
-    (`AheadTarget.compiled`). Compiling was the whole run, so uncaught it ends the program with status 0
-    and no traceback, the step's cost logged; `ahead` is the step and `path` where it was saved."""
+    (`AheadTarget.compiled`), or its later phases' steps compiled into its cache (`AheadTarget.phases`).
+    Compiling was the whole run, so uncaught it ends the program with status 0 and no traceback, the
+    step's cost logged; `ahead` is the step (the last phase's) and `path` where it was saved, if it was."""
 
-    def __init__(self, path: str, ahead: AheadOfTime):
+    def __init__(self, path: str | None, ahead: AheadOfTime):
         super().__init__(0)
         self.path, self.ahead = path, ahead
         _log.info("the step compiled ahead for %s %s GPUs holds %s bytes a device at its peak; saved to "
-                  "%s", ahead.devices, ahead.generation, ahead.peak_bytes, path)
+                  "%s", ahead.devices, ahead.generation, ahead.peak_bytes, path or "the compilation cache")
         if ahead.plan is not None:
             probes = record(ahead.plan, "plan")["probes"]
             assert isinstance(probes, list)
             _log.info("planned on them in %.1f s, %d programs compiled, the plan %s", ahead.planned_seconds,
                       len(probes), json.dumps(ahead.plan))
+
+
+def phase_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch, phase: int) -> Batch:
+    """`batch`, the run's first (`first_step_batch`), as its data phase `phase` delivers one: marked read in
+    it (`dew.batch.PHASE`), so its step is built at that phase's pass count (`PhasePasses`), and holding that
+    phase's rows (`RunShape.rows`, a phase each), each row field's rows the first's taken in turn: the
+    shapes and fields that phase's step compiles over, read from no reader. Its other fields, widths and
+    dtypes are the first phase's, as one recipe's phases hold them; a phase whose reader delivers others
+    lowers another program at its boundary, which compiles there as it would have."""
+    from dew.batch import PHASE, Phase
+
+    rows = trainer._shape.rows
+    held = next(len(leaf) for name, leaf in batch.items() if name != PHASE and np.ndim(leaf))
+    wanted = held if not rows or len(rows) == 1 else rows[phase]
+
+    def resized(leaf):
+        return np.resize(leaf, (wanted, *np.shape(leaf)[1:])) if np.ndim(leaf) and len(leaf) == held else leaf
+
+    return {**{name: jax.tree.map(resized, leaf) for name, leaf in batch.items() if name != PHASE},
+            PHASE: Phase(phase)}
+
+
+def later_phases[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch) -> tuple[int, ...]:
+    """The data phases after the one `batch`, the run's first step's as its loop read it (its work counted
+    and its rows marked, `step_batch`'s but for its host fields), was read in whose steps are other
+    programs than its and each other's, each by its first phase: a phase's step is the trainer's own key of
+    the batch it delivers (`phase_batch`, `PhasePasses.key` at its pass count); none for a run of no
+    phases. Its work is counted once, as its loop counted it: counted again, its telemetry columns were
+    refused as reserved, before a 4B run's first step (M-MC-3gB)."""
+    from dew.batch import PHASE
+    from dew.distributed.batches import batch_signature, split_fields
+
+    counts = trainer.phase_passes.counts
+    if PHASE not in batch or not counts:
+        return ()
+
+    def program(phase: int) -> Hashable:
+        return batch_signature(split_fields(phase_batch(trainer, batch, phase))[0]), counts[phase]
+
+    first = batch[PHASE].index
+    firsts: dict[Hashable, int] = {program(first): first}
+    for phase in range(first + 1, len(counts)):
+        firsts.setdefault(program(phase), phase)
+    return tuple(sorted(set(firsts.values()) - {first}))
+
+
+@dataclasses.dataclass
+class LaterPhases:
+    """A configured run, its record (`run`, `dew.config.RunConfig`) trained again by `dew train` once its
+    first step is dispatched, with its target its later data phases' steps (`AheadTarget.phases`) and its
+    links the run's own: a process of its own compiles them into the persistent compilation cache the run
+    reads, on this host's CPU over its own GPUs' topology (`host_gpus`), none of them drawn, so each
+    phase's first compile in the run reads its backend's program from the cache instead of compiling it
+    while the GPUs idle at the phase's boundary (row 5556: 241, 309 and 386 s at a 4B decision run's). Its
+    plan is admitted to the pool XLA's allocator holds on each GPU (`device_memory`), the state a fresh
+    run's, as the run's at an update's end, which is where a phase begins; a phase whose run plans another
+    program at its boundary compiles that as it did. The process is a group of its own whose lifeline
+    ends it however the run ends (`dew._cleanup.start`); one still running as the run ends is stopped, and
+    one whose compile failed has its log said: the run's boundary compiles its phase as it would have,
+    nothing retried. A run the record cannot rebuild (`RunConfig.unrecorded`), a pool of several
+    processes, a run with no persistent cache or one on another platform starts none. `trust` names the
+    packages the run's record may import (`dew train --trust`)."""
+
+    run: RunConfig
+    trust: tuple[str, ...] = ()
+    process: subprocess.Popen | None = None
+    # The directory of the process's record, topology and log, made as it starts, removed once it ends.
+    held: tempfile.TemporaryDirectory | None = None
+
+    def started[LossT, EffectsT](self, trainer: Trainer[LossT, EffectsT], batch: Batch) -> None:
+        """The process compiling the later phases of `trainer`'s run, started where they hold steps of other
+        programs than the step of `batch`, its first (`later_phases`)."""
+        from dew._cleanup import start
+        from dew.training.memory import device_memory
+
+        devices = jax.local_devices()
+        directory = jax.config.jax_compilation_cache_dir
+        if jax.process_count() > 1 or directory is None or {device.platform for device in devices} != {"gpu"}:
+            return
+        if trainer.host_master or trainer.rollout is not None or trainer.tune_kernels or pgle_runs():
+            # What a step compiled ahead refuses (`compile_ahead`): its phases compile in the run.
+            return
+        phases = later_phases(trainer, batch)
+        if not phases:
+            return
+        self.held = tempfile.TemporaryDirectory(prefix="dew-later-phases-", dir=directory)
+        held = Path(self.held.name)
+        (held / "topology").write_bytes(topologies.get_attached_topology("cuda").serialize())
+        capacity = min(device_memory(device)["bytes_limit"] for device in devices)
+        target = AheadTarget(gpu_target(devices[0].device_kind).generation, len(devices),
+                             topology=str(held / "topology"), phases=phases, capacity_gib=capacity / 2**30)
+        command = self.command(self.recorded(target, trainer._compiler.links(trainer.device_mesh), held))
+        with (held / "log").open("w") as written:
+            self.process = start(command, stdout=written, stderr=subprocess.STDOUT,
+                                 env={**os.environ, "JAX_PLATFORMS": "cpu"})
+        _log.info("compiling the steps of data phases %s ahead in process %d", list(phases), self.process.pid)
+
+    def recorded(self, target: AheadTarget, links: Mapping[str, Link], directory: Path) -> str:
+        """The run's record (`RunConfig.save`) in `directory`, its target `target` and its links `links`, the
+        ones the run traced with, measured or stated, so its run lowers the run's program: where the record
+        is written."""
+        stated = dataclasses.replace(self.run.trainer, compile_ahead=target, links=dict(links))
+        return dataclasses.replace(self.run, trainer=stated).save(str(directory))
+
+    def command(self, record: str) -> tuple[str, ...]:
+        """`dew train` of `record` (the CLI's own module, `dew._cli.main`), trusting the packages the
+        run's record may import."""
+        return (sys.executable, "-m", "dew._cli.main", "train", record,
+                *(word for name in self.trust for word in ("--trust", name)))
+
+    def stopped(self) -> None:
+        """The process stopped where it still runs as the run ends, its log said where it failed, and its
+        directory removed."""
+        from dew._cleanup import stop
+
+        if self.process is not None:
+            failed = self.process.poll()
+            if failed and self.held is not None:
+                _log.warning("compiling the later phases ahead failed (exit %d): %s", failed,
+                             (Path(self.held.name) / "log").read_text()[-4000:])
+            stop(self.process)
+        if self.held is not None:
+            self.held.cleanup()
+        self.process = self.held = None
 
 
 def step_batch[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Batch,
@@ -1101,7 +1250,8 @@ def _compiled_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: B
         raise ValueError("a frontier lists the rungs that fit the GPUs' memory, which compile-only GPUs "
                          "do not state; name it (--trainer.compile-ahead.capacity-gib, compile_ahead's "
                          "capacity)")
-    if capacity is not None:
+    if capacity is not None and not set(devices) <= _HOSTS_GPUS:
+        # A host's own GPUs state their memory to XLA; the capacity is its plan's admission alone.
         mesh = trainer.device_mesh
         devices = compile_only_gpus(generation, len(devices), capacity,
                                     None if stated is None else stated.multiprocessors)
