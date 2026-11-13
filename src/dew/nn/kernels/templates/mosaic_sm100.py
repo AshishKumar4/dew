@@ -341,6 +341,13 @@ def scale_tiles(rows: int, scales: int) -> tuple[int, int, int, int]:
     return (rows // SCALE_ROWS, scales // SCALES_A_ROW, *SCALE_TILE)
 
 
+def scales_tileable(scales) -> bool:
+    """Whether block scales `[..., rows, scales]` lay out in whole tiles (`scales_tiled`): whole 128s of rows
+    (`SCALE_ROWS`) and whole fours of scales a row (`SCALES_A_ROW`)."""
+    *_, rows, columns = scales.shape
+    return rows % SCALE_ROWS == 0 and columns % SCALES_A_ROW == 0
+
+
 def scales_tiled(scales: jax.Array) -> jax.Array:
     """Block scales `[..., rows, scales]` laid out in their tiles (`scale_tiles`): row `i`'s scale `j` at
     `[i // 128, j // 4, i % 32, (i // 32) % 4 * 4 + j % 4]`, as `async_copy_scales_to_tmem` documents their

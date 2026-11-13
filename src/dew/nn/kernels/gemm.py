@@ -578,14 +578,15 @@ BLOCKWISE_ROW = 'ledger 4518'
 
 
 @dataclasses.dataclass(frozen=True)
-class BlockwiseCase:
-    """A blockwise-scaled FP8 product as its selector reads it (`BLOCKWISE_FP8`): the tile the template's
-    launch plans for it on the target (`mosaic_gpu.gmm`'s `step_scales`), None where it plans none."""
+class ScaledCase:
+    """A scaled product as its selector reads it (`BLOCKWISE_FP8`, `MXFP8`, `NVFP4_BLOCK_OP`): the tile the
+    template's launch plans for it on the target (`mosaic_gpu.gmm`'s `step_scales` or `mx_scales`), None
+    where it plans none."""
 
     tile: mosaic_gpu.Tiles | None
 
 
-BLOCKWISE_FP8: selection.Op[BlockwiseCase] = selection.Op(generation.Choice.BLOCKWISE_FP8, (
+BLOCKWISE_FP8: selection.Op[ScaledCase] = selection.Op(generation.Choice.BLOCKWISE_FP8, (
     selection.Kernel('mosaic', (
         selection.Requirement(
             'planned', lambda case: case.tile is not None, "the template plans no step-scaled tile here: an "
@@ -621,7 +622,7 @@ def blockwise_fp8_product(lhs: jax.Array, kernel: jax.Array, group_sizes: jax.Ar
     tile = (_planned(launch, launch.bind(*_abstract(lhs, kernel, sizes), **call.keywords,
                                          scales=_abstract(row_scales, column_scales)))
             if per == 1 or per % SCALE_DEPTH == 0 else None)
-    if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic':
+    if selection.select(BLOCKWISE_FP8, ScaledCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
         summed = call(lhs, kernel, sizes, scales=(row_scales, column_scales))
     else:
@@ -651,7 +652,7 @@ def blockwise_fp8_kernel_gradient(lhs_t: jax.Array, rhs_t: jax.Array, group_bloc
                              exact_sums=True, step_scales=(row_scales, column_scales))
     tile = _planned(launch, launch.bind(*_abstract(*call.args), **{
         **call.keywords, 'step_scales': _abstract(row_scales, column_scales)}))
-    if selection.select(BLOCKWISE_FP8, BlockwiseCase(tile)).kernel == 'mosaic':
+    if selection.select(BLOCKWISE_FP8, ScaledCase(tile)).kernel == 'mosaic':
         assert tile is not None, "the selector names the template where it plans a tile"
         summed = call()
     else:
@@ -698,15 +699,7 @@ MXFP8_ROW = 'ledger 4519'
 """The MX product on Blackwell's block-scaled tensor cores (K51)."""
 
 
-@dataclasses.dataclass(frozen=True)
-class MxCase:
-    """An MX product as its selector reads it (`MXFP8`): the tile the template's launch plans for it on the
-    target (`grouped_matmul.MosaicMxGmm`), None where it plans none."""
-
-    tile: mosaic_gpu.Tiles | None
-
-
-def _block_scaled_op(choice: generation.Choice, product: str) -> selection.Op[MxCase]:
+def _block_scaled_op(choice: generation.Choice, product: str) -> selection.Op[ScaledCase]:
     """A block-scaled product's selector (`_block_scaled`): the template's products scaling each block in
     the instruction where named (`generation.chosen(<choice>='mosaic')`) and planned, past the measured
     requirement no receipt has met yet; else the decoded operands' product in XLA. `product` names the
@@ -753,21 +746,27 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     launch = grouped_matmul.MosaicMxGmm()
     tables = (() if gather is None else (gather,))
-    # Gathered rows' block scales are the same table's rows of the rows' scales, laid out for the products.
-    scales = (mosaic_sm100.scales_tiled(lhs.scales if gather is None else lhs.scales[gather]),
-              mosaic_sm100.scales_tiled(matrices.scales))
+    # Gathered rows' block scales are the same table's rows of the rows' scales, laid out for the products:
+    # planned from their tiles' shapes, laid out only where the template runs, so a call whose scales no tile
+    # holds (rows short of 128, a depth of fewer than four blocks) takes the decoded product.
+    rows_scales = lhs.scales if gather is None else lhs.scales[gather]
+
+    def tiled():
+        return mosaic_sm100.scales_tiled(rows_scales), mosaic_sm100.scales_tiled(matrices.scales)
+
     call = functools.partial(launch, lhs.codes, matrices.codes, sizes, (), (), None, None, *tables,
-                             out_dtype='float32', trans_rhs=True, interpret=interpret, scales=scales)
-    tile = _planned(launch, launch.bind(*_abstract(*call.args[:3]), (), (), None, None,
-                                        *_abstract(*tables), **{**call.keywords,
-                                                                'scales': _abstract(*scales)}))
-    if selection.select(op, MxCase(tile)).kernel != 'mosaic':
+                             out_dtype='float32', trans_rhs=True, interpret=interpret)
+    tileable = all(mosaic_sm100.scales_tileable(each) for each in (rows_scales, matrices.scales))
+    tile = None if not tileable else _planned(launch, launch.bind(
+        *_abstract(*call.args[:3]), (), (), None, None, *_abstract(*tables),
+        **{**call.keywords, 'scales': jax.eval_shape(tiled)}))
+    if selection.select(op, ScaledCase(tile)).kernel != 'mosaic':
         values = lhs.decoded() if gather is None else lhs.decoded()[gather]
         return xla_products.xla_ragged_dot(values, jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
                                              precision=jax.lax.Precision.DEFAULT,
                                              preferred_element_type=jnp.float32)
     assert tile is not None, "the selector names the template where it plans a tile"
-    return call()
+    return call(scales=tiled())
 
 
 NVFP4_BLOCK_OP = _block_scaled_op(generation.Choice.NVFP4_BLOCK, "an NVFP4 product")

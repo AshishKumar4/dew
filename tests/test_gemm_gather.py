@@ -7,6 +7,7 @@ import functools
 
 import jax
 import jax.numpy as jnp
+import mx_matrix
 import numpy as np
 import pytest
 from generation_support import cublas_compiled
@@ -405,3 +406,45 @@ def test_a_kernel_gradient_no_launch_reads_through_its_tables_runs_a_launch_on_i
     names = {equation.primitive.name for equation in equations(graph, platform="cuda")}
     assert "ragged_dot_general" not in names, names
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
+
+
+@pytest.mark.parametrize("named", [None, "xla"])
+def test_a_block_scaled_product_no_tile_holds_takes_the_decoded_product(named):
+    """A block-scaled product whose block scales no tile holds (MXFP8 rows `[128, 32]`: one scale a row,
+    short of the tiles' four) is selected before its scales are laid out for the template
+    (`mosaic_sm100.scales_tileable`): on a CPU as an sm100, or named XLA's, it runs the decoded operands'
+    product, on par with the MXFP8 values' product in fp32 (check 1), from float64, where laying its scales
+    out first failed to reshape."""
+    blocks = jnp.asarray([1], jnp.int32)
+    sizes = 128 * blocks
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(128, 32)), jnp.float32),
+                jnp.asarray(rng.normal(size=(1, 64, 32)), jnp.float32))
+
+    def blocked(x, w):
+        chosen = generation.chosen(mxfp8=named) if named else generation.chosen()
+        with generation.assumed("sm100"), chosen:
+            return gemm.mxfp8_product(formats.MxFp8.quantized(x), formats.MxFp8.quantized(w), blocks,
+                                      out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    assert_as_exact(blocked, jax.jit(mx_matrix.values_product(mx_matrix.mx_values, sizes)), draw,
+                    "an MXFP8 product no tile holds", seeds=SEEDS,
+                    truth_fn=mx_matrix.values_product(mx_matrix.mx_values, sizes, jnp.float64))
+
+
+def test_a_stored_nvfp4_matrix_no_tile_holds_takes_the_decoded_product():
+    """`nvfp4_quantized_product` of a stored NVFP4 matrix `[256, 64]` (64 columns, short of a tile's 128)
+    beside rows quantized as they are used, on a CPU as an sm100: bitwise the NVFP4 block product of its
+    rows, padded, and the matrix as one group in XLA, where laying its scales out for the template first
+    failed to reshape."""
+    rng = np.random.default_rng(5)
+    x = jnp.asarray(rng.normal(size=(5, 256)), jnp.float32)
+    matrix = formats.NvFp4.quantized(jnp.asarray(rng.normal(size=(256, 64)), jnp.float32))
+    with generation.assumed("sm100"):
+        out = gemm.nvfp4_quantized_product(x, matrix, out_dtype=jnp.float32, interpret_on_cpu=True)
+    expected = gemm.nvfp4_block_product(formats.NvFp4Block.quantized(jnp.pad(x, ((0, 123), (0, 0)))),
+                                        formats.NvFp4Block.of(matrix), jnp.asarray([1], jnp.int32),
+                                        out_dtype=jnp.float32)[:5]
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(expected))
