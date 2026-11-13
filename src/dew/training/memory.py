@@ -102,15 +102,16 @@ def splits_parameter(leaf) -> bool:
 
 
 def step_compiler_options(objective, tokens: float, frozen: bool, devices: int, *,
-                          gathered: int | None = None) -> jax.stages.CompilerOptions | None:
+                          variables: Variables | None = None) -> jax.stages.CompilerOptions | None:
     """Return the XLA options for this objective's training step on this device.
 
     Each option applies unless the run set that flag itself. `tokens` is the
     number of tokens one device steps (`device_tokens`), `frozen` says
     whether the step trains next to frozen weights, and `devices` is how
     many the step spans: over several GPUs it takes `COLLECTIVES`, its
-    all-gathers combined up to the `gathered` bytes of its largest layer
-    (`gathered_layer_bytes`) in whole MiB where it gathers its layers.
+    all-gathers combined up to the bytes a device gathers for the largest
+    layer of its `variables` (`gathered_layer_bytes`) in whole MiB where it
+    gathers its layers.
 
     On a GPU, dots that share an input (q, k and v; gate and up) run separately.
     XLA's dot merger would run them as one GEMM over their weights, concatenated
@@ -144,6 +145,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool, devices: int, 
     options: dict[str, Option] = {}
     if backend() == 'gpu' and devices > 1:
         options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
+        gathered = None if variables is None else gathered_layer_bytes(objective, variables)
         if gathered and xla_flag(GATHER_THRESHOLD) is None:
             options[GATHER_THRESHOLD] = -(-gathered // 2 ** 20) * 2 ** 20
     small = tokens <= 128
@@ -231,7 +233,7 @@ def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: 
     mesh's batch axes, and whether `variables` hold frozen weights it trains beside."""
     shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
     return step_compiler_options(objective, device_tokens(objective, micro, shards), FROZEN in variables,
-                                 mesh.devices.size, gathered=gathered_layer_bytes(objective, variables))
+                                 mesh.devices.size, variables=variables)
 
 
 def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch: Batch, shards: int) -> float:

@@ -46,7 +46,7 @@ from dew.nn.inputs import ModelInputs
 from dew.nn.inspection import INSPECTED, QK, observed_maxima
 from dew.nn.precision import at_least_fp32, weighted_total
 from dew.nn.progress import progressed
-from dew.nn.protocols import BlockDenoiser, CacheCapacity, Lacks, LayerScalars
+from dew.nn.protocols import BankedStacks, BlockDenoiser, CacheCapacity, Lacks, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.nn.visibility import same_group
 from dew.objectives.base import (
@@ -266,8 +266,10 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
                              processor=recorded_processor(self.processor))
 
     def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
-        """The shared text stack, as the training model declares it over `store`."""
-        return self.training_model.bank_sites(store)
+        """The shared text stack, as the training model declares it over `store`; none where it declares
+        no stacks (`BankedStacks`)."""
+        model = self.training_model
+        return model.bank_sites(store) if isinstance(model, BankedStacks) else ()
 
     def held_variables(self) -> Variables | None:
         """The SFT source this objective starts from, its split kept, read as

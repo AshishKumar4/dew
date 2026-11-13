@@ -54,7 +54,7 @@ from dew.mesh import batch_axes
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.backbones.layer_names import layer_index
 from dew.nn.kernels.options import Option, program
-from dew.training.memory import device_tokens, gathered_layer_bytes, step_compiler_options
+from dew.training.memory import device_tokens, step_compiler_options
 from dew.training.transaction import Realization, placed_as_rows
 
 if TYPE_CHECKING:
@@ -269,7 +269,7 @@ class HostExecution:
         shards = math.prod(self.accelerator.shape[axis] for axis in batch_axes(self.accelerator))
         options = step_compiler_options(self.objective, device_tokens(self.objective, batch, shards),
                                         FROZEN in variables, self.accelerator.devices.size,
-                                        gathered=gathered_layer_bytes(self.objective, variables))
+                                        variables=variables)
         return dict(options or {})
 
     def snapshot(self, variables):
