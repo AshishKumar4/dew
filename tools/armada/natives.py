@@ -180,16 +180,28 @@ class Capture:
         return f"no native stacks were captured: {self.why}\n" if self.why else ""
 
 
-def read(pid: str, spy: Path) -> str:
-    """Every thread's stack of the stopped process `pid`, read from outside it: pystack's (`PYSTACK`), each OS
-    thread's native and Python frames; py-spy's (`spy`) where pystack read none."""
+def read(pid: str, spy: Path, warm: subprocess.Popen, began: float) -> str:
+    """Every thread's stack of the stopped process `pid`, read from outside it within the time its handler
+    waits (`COLLECT_SECONDS` from `began`): pystack's (`PYSTACK`), each OS thread's native and Python frames,
+    once its fetch (`warm`) has ended, so a first crash's read waits on the download rather than racing it
+    (review, 2026-11-13); py-spy's (`spy`), which reads Python's threads alone, with what time is left where
+    pystack read none."""
+    def left() -> float:
+        return COLLECT_SECONDS - 5 - (time.monotonic() - began)
+
     said = []
+    try:
+        warm.wait(timeout=max(left() - 10, 1))
+    except subprocess.TimeoutExpired:
+        said.append("pystack was not fetched in time")
     for command in ([*PYSTACK, "remote", "--native-all", pid], [str(spy), "dump", "--native", "--pid", pid]):
+        if left() < 1:
+            said.append(f"no time left to read with {command[0]}")
+            break
         try:
-            done = subprocess.run(command, capture_output=True, text=True, timeout=COLLECT_SECONDS // 2 - 2,
-                                  check=False)
+            done = subprocess.run(command, capture_output=True, text=True, timeout=left(), check=False)
         except (subprocess.TimeoutExpired, OSError) as error:
-            said.append(f"{command[0]} read nothing: {error}")
+            said.append(f"{command[:7]} read nothing: {error}")
             continue
         if done.returncode == 0 and done.stdout.strip():
             return done.stdout
@@ -199,18 +211,19 @@ def read(pid: str, spy: Path) -> str:
 
 def collect(pipe: Path, done: Path, stacks: Path, spy: Path) -> None:
     """The collector: each process that writes `<pid> <signal>` to `pipe` as a signal ends it (`SHIM`) gets
-    py-spy's dump of its every thread, native and Python frames, appended to `stacks`, then `done/done.<pid>`,
-    its word that it may die. Opened for reading and writing, so the pipe never reads its end between writers.
-    """
+    every thread's stack read (`read`), appended to `stacks`, then `done/done.<pid>`, its word that it may
+    die. Opened for reading and writing, so the pipe never reads its end between writers; pystack fetched as
+    it starts, so a crash rarely waits on it."""
+    warm = subprocess.Popen([*PYSTACK, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     with open(os.open(pipe, os.O_RDWR), encoding="ascii", errors="replace") as said:
         (done / "ready").touch()
-        subprocess.Popen([*PYSTACK, "--help"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         for line in said:
+            began = time.monotonic()
             parts = line.split()
             if len(parts) != 2 or not all(part.isdigit() for part in parts):
                 continue
             pid, signum = parts
-            frames = read(pid, spy)
+            frames = read(pid, spy, warm, began)
             with stacks.open("a") as out:
                 at = time.strftime("%H:%M:%SZ", time.gmtime())
                 out.write(f"== process {pid} ended by signal {signum} ({at}): its threads' native stacks\n"
