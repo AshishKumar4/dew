@@ -333,15 +333,16 @@ width its backward takes, a causal or windowed call square or over another seque
 aligns as FlashAttention aligns them), no arbitrary mask, block groups, key lengths, bias, softcap or sinks,
 no deterministic ops, and a wheel holding code for the target."""
 
-def _cudnn_packs(case: AttentionCase) -> bool:
-    """Whether cuDNN runs `case`'s documents as its packed sequences (`attention.cudnn_packs`, the call's
-    view of the same): its own documents, bounded (`Coordinates.max_segments`), with no mask, bias, key
-    lengths or key starts beside them, on a GPU of sm90 or later (jax's `check_is_flash_attention`: "Packed
-    layout requires a GPU with at least Hopper architecture")."""
+def cudnn_packs(own: bool, bounded: bool, hidden: bool) -> bool:
+    """Whether cuDNN runs a call's packed documents as its packed sequences (`attention._cudnn_packed`): a
+    call's `own` documents, `bounded` (`Coordinates.max_segments`), with nothing else hiding keys beside them
+    (`hidden`: a mask, a bias, key lengths or key starts, which its sequences' padding would drop), on a GPU
+    of sm90 or later (jax's `check_is_flash_attention`: "Packed layout requires a GPU with at least Hopper
+    architecture"). The case's need (`CUDNN_SUPPORTS`' `documents`) and the dispatch (`_attention_kernel`)
+    each ask it, so a named cuDNN, which passes the measured need, runs the mask the need would have
+    priced."""
     named = capability(device_generation())
-    return (case.documents == 'own' and case.max_segments is not None
-            and not (case.mask or case.bias or case.lengths or case.starts)
-            and named is not None and named >= (9, 0))
+    return own and bounded and not hidden and named is not None and named >= (9, 0)
 
 
 CUDNN_SUPPORTS = (
@@ -358,9 +359,11 @@ CUDNN_SUPPORTS = (
     _Need('sinks', lambda case: not case.sinks, "the call has attention sinks", row=INHERENT),
     _Need('bidirectional_window', lambda case: case.window is None or case.causal or case.aligned,
                 "cuDNN keeps a window behind the query only", row=INHERENT),
-    _Need('documents', lambda case: case.documents is None or case.aligned or _cudnn_packs(case),
+    _Need('documents', lambda case: case.documents is None or case.aligned or cudnn_packs(
+                case.documents == 'own', case.max_segments is not None,
+                case.mask or case.bias or case.lengths or case.starts),
                 "cuDNN takes packed documents as its packed sequences only where they are a call's own, "
-                "bounded, beside nothing else hiding keys, on sm90 or later (`attention.cudnn_packs`); "
+                "bounded, beside nothing else hiding keys, on sm90 or later (`cudnn_packs`); "
                 "otherwise only as their mask, a dense bias that costs more than the xla kernel's mask "
                 "(`_attention_kernel` builds it where cuDNN is named)",
                 row='measured: cuDNN dense-mask bias (docs/performance.md)', kind='measured'),

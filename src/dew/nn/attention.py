@@ -30,6 +30,7 @@ from .attention_kernels import (
     DECODE,
     TPU_BACKEND,
     AttentionCase,
+    cudnn_packs,
     decodes,
     flash_target,
     reverse_only,
@@ -156,7 +157,7 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
     tests/test_kernels.py pins the equality with the xla path. On a mesh it
     runs per shard (`on_attention_shards`). Packed rows, a call's own
     `segment_ids` `[B, S]` with at most `max_segments` documents a row and
-    nothing else hiding keys (`cudnn_packs`), run as cuDNN's packed sequences
+    nothing else hiding keys (`attention_kernels.cudnn_packs`), run as cuDNN's packed sequences
     (`packed_runs`: each document, and each row's padding after them, a
     sequence), as FlashAttention runs them, the padded row in none.
     """
@@ -190,17 +191,6 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                     mask=(None if mask is None else four_dimensional(mask), SCORES),
                     key_value_seq_lengths=(kv_lengths, ("activation_batch",)))
     return out[:, :q_len] if q_pad else out
-
-
-def cudnn_packs(segment_ids, max_segments: int | None, mask=None, bias=None, lengths=None,
-                starts=None) -> bool:
-    """Whether cuDNN runs a call's packed documents as its packed sequences (`_cudnn_packed`): a call's own
-    `segment_ids`, bounded by `max_segments`, with no mask, bias, key lengths or key starts beside them,
-    which its sequences' padding would drop (`attention_kernels.CUDNN_SUPPORTS`' `documents`, the case's
-    view of the same)."""
-    others = (mask, bias, lengths, starts)
-    return (segment_ids is not None and max_segments is not None
-            and not isinstance(segment_ids, CrossDocuments) and all(x is None for x in others))
 
 
 def _cudnn_packed(query, key, value, causal: bool, sliding_window, segment_ids, max_segments: int):
@@ -1095,8 +1085,9 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
     aligned = isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
     packed = (implementation == 'template' or (implementation == 'tpu' and not aligned)
               or (implementation == 'flash' and max_segments is not None)
-              or (implementation == 'cudnn' and cudnn_packs(segment_ids, max_segments, mask, bias, lengths,
-                                                            starts)))
+              or (implementation == 'cudnn' and segment_ids is not None and cudnn_packs(
+                  not isinstance(segment_ids, CrossDocuments), max_segments is not None,
+                  any(x is not None for x in (mask, bias, lengths, starts)))))
     if segment_ids is not None and not packed:
         if aligned:
             inside = cross_document_mask(segment_ids, causal=causal, sliding_window=sliding_window)
