@@ -288,5 +288,5 @@ class Driven:
 
 
 __all__ = ["Batched", "Carry", "Driven", "Env", "EnvState", "Memory", "Observation", "Params", "Policy",
-           "TimeLimit", "TimeStep", "Transition", "Tree", "chosen", "driven_step", "env_rollout", "start",
-           "view", "views"]
+           "TimeLimit", "TimeStep", "Transition", "Tree", "chosen", "driven_step", "env_rollout", "env_step",
+           "start", "view", "views"]
