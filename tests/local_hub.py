@@ -121,10 +121,8 @@ def _chunks(path: Path, start: int = 0, stop: int | None = None):
 
 def _sha1(path: Path) -> str:
     """A file's SHA-1, read a chunk at a time: its oid and ETag as the Hub states them."""
-    digest = hashlib.sha1()
-    for chunk in _chunks(path):
-        digest.update(chunk)
-    return digest.hexdigest()
+    with path.open("rb") as file:
+        return hashlib.file_digest(file, "sha1").hexdigest()
 
 
 def _hashed(files: Mapping[str, Path], parent: str = "") -> str:
