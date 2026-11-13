@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from dew.batch import Variables
 from dew.interop.components import bind_component
@@ -22,7 +23,8 @@ if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
 
 LATENT_STATISTICS = ("bn.running_mean", "bn.running_var")
-"""The batch norm's running mean and variance read as latent-normalization metadata."""
+"""The batch norm's running mean and variance read as latent-normalization metadata, in that order
+(`load_flux2_vae`, `latent_statistics`)."""
 
 STATISTICS = (*LATENT_STATISTICS, "bn.num_batches_tracked")
 """The batch norm's buffers: its statistics become the latent normalization,
@@ -52,7 +54,7 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
         raise ValueError(f"FLUX.2's pipeline folds 2x2 latent blocks, not {config.get('patch_size')}")
     model = autoencoder_kl_from_diffusers(config, compute)
     loaded = read_weights(directory) if tensors is None else tensors
-    mean, variance = loaded["bn.running_mean"], loaded["bn.running_var"]
+    mean, variance = (loaded[name] for name in LATENT_STATISTICS)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
     return bind_component(
@@ -63,3 +65,12 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
                                        epsilon=config.get("batch_norm_eps", 1e-4)),
         prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, shapes=shapes,
         inputs=(frame,), tensors=loaded)
+
+
+def latent_statistics(autoencoder: Flux2Autoencoder) -> dict[str, np.ndarray]:
+    """The batch norm's running statistics `load_flux2_vae` read into `autoencoder`'s latent normalization,
+    under the names its source stores them by (`LATENT_STATISTICS`): what an export writes back beside its
+    weights (`Registration.stored_metadata`)."""
+    record = autoencoder.normalization.record
+    return dict(zip(LATENT_STATISTICS, (np.asarray(record[key], np.float32) for key in ("mean", "variance")),
+                    strict=True))
