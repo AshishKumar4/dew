@@ -1471,13 +1471,19 @@ def _weighted_values(v, a, beta, taken, call: Call):
                          landing={"values": held.landing(chunk, vb)})(v, a, beta, taken)
 
 
-def table_held(held: Held, call: Call, table: Table | None, bv: int) -> Held:
+def table_held(held: Held, call: Call, table: Table | None, bv: int, *, across: bool = False) -> Held:
     """`held` (a walk's `Held`) with its table's phase where it walks a forked call's (`Taking`, `Returning`):
     beside the memory carried, a key slice of the memory it takes up and of the entry write it adds, or of
-    the gradient a stored slot gathered and its sum, the walk taking them a slice at a time."""
+    the gradient a stored slot gathered and its sum, the walk taking them a slice at a time; `across`, the
+    slices live across the step as well, as ptxas holds them through a walk forming the output too (`_scan`:
+    at a B200's 248 registers Nemotron-H 4B's SSD spilled 16 bytes at a model of 244 and a write gate 60 to
+    80 at 237 under the cuda13 build's ptxas, row 5761)."""
     if table is None:
         return held
-    return dataclasses.replace(held, phases=(*held.phases, [f32(call.block, bv)] * 2))
+    slices = [f32(call.block, bv)] * 2
+    if across:
+        return dataclasses.replace(held, carried=[*held.carried, *slices])
+    return dataclasses.replace(held, phases=(*held.phases, slices))
 
 
 def sequence_walk(call: Call, memory: Operand, name: str, entering: tuple, walked: tuple, step,
@@ -1963,10 +1969,7 @@ def _scan(q, k, a, v, hi, lo, beta, h0, sequences, taken, call: Call, tiles: Til
     assert delta == call.delta, "the delta rule's walk corrects its values from the chunks' inverses"
     values = keys = call.given
     skipped = int(skip is not None)
-    # Its producer's floor (`stated_producer`): 80, its loads spilling at 24 to 64 (52 bytes on a B200's
-    # 27B GDN and Nemotron-H 4B SSD forwards), 16 at 72, none at 80 (rows 5357 and 5355, armada
-    # 20261110172539-d12d4eb1 and 20261110172902-73ad9c43).
-    producer = stated_producer(call, 80)
+    producer = _scan_producer(call)
 
     def program(at, q_ref, k_ref, a_ref, v_ref, hi_ref, lo_ref, beta_ref, h0_ref, seq_ref, taken_ref, *refs,
                 streams, staging, landing):
@@ -2072,30 +2075,56 @@ def _scan_corrected(call: Call, slots, tile, bv: int, state, prefix: tuple, beta
     return algebra.corrected(written, None, state, held.dtype, issue)
 
 
+def _scan_producer(call: Call) -> int | None:
+    """`_scan`'s producer's floor (`stated_producer`): 80, its loads spilling at 24 to 64 (52 bytes on a
+    B200's 27B GDN and Nemotron-H 4B SSD forwards), 16 at 72, none at 80 (rows 5357 and 5355, armada
+    20261110172539-d12d4eb1 and 20261110172902-73ad9c43)."""
+    return stated_producer(call, 80)
+
+
+def scan_holds(call: Call, tiles: Tiles, out_dtype, table: Table | None) -> bool:
+    """Whether `_scan`'s consumer threads at `tiles` hold their registers (its model, `_scan_planned`'s,
+    within `Family.registers` at its roles beside its producer's floor, `_scan_producer`), its output landing
+    in `out_dtype`: a forked call's forward walks its states and output in one launch only where it does
+    (`chunk_forward.prepared`), else in two."""
+    staging, landing, _, held = _scan_planned(call, tiles, out_dtype, table)
+    return held.registers(call.family, addressed(staging, landing)) <= call.family.registers(
+        tiles.walkers, producer=_scan_producer(call))
+
+
+def _scan_planned(call: Call, tiles: Tiles, out_dtype, table: Table | None) -> tuple:
+    """`_scan`'s launch's staging tiles, landings (a stored slot's, `table_landing`), what follows its final
+    memories, and its register model (`_scan_held`, `table_held` its slices held across the step), which
+    its registers are stated from: `(staging, landing, after, held)`."""
+    chunk, bv = call.chunk, tiles.block_v
+    held, keys, delta = dataclasses.replace(call.held, rows=call.rows), call.given, call.delta
+    staging = (_write_staging(call, bv), column_sums_scratch(call), *staging_tiles(held, (chunk, chunk)),
+               *staging_tiles(call.memories, (call.block, bv)), *staging_tiles(held, (chunk, bv)),
+               # The delta rule's corrected values' operand for the inverse's product.
+               *(staging_tiles(held, (chunk, bv)) if delta else ()))
+    final_landing, after = final_memory_landing(call, bv)
+    landing = {"out": ((chunk, bv), out_dtype), **final_landing,
+               **table_landing(call, table is not None and table.held > 0, bv)}
+    return staging, landing, after, table_held(_scan_held(call, keys, keys, bv), call, table, bv, across=True)
+
+
 def _scan_launched(program, call: Call, tiles: Tiles, out_dtype, *, sequences: int, batch: int,
                    table: Table | None, producer: int | None):
-    """`_scan`'s `program` launched (`launch_kernel`): its streams (the inverse under the delta rule, the
-    queries, keys and a role's values a chunk), the entering memories' once-streams, its staging tiles and
-    landings (a stored slot's, `table_landing`), its work over the laid sequences' mean of chunks, its
-    outputs (the output, the final memories, and a forked call's stored slots where its `table` holds any)
-    and its register model (`_scan_held`, `table_held`)."""
+    """`_scan`'s `program` launched (`launch_kernel`): its plan (`_scan_planned`), its work over the laid
+    sequences' mean of chunks, and its outputs (the output, the final memories, and a forked call's stored
+    slots where its `table` holds any)."""
     chunk = call.chunk
     width, bv, walkers = call.width, tiles.block_v, tiles.walkers
     steps, rows = call.chunks / sequences, batch * call.heads * width
     walked_width = bv * walkers
     held, keys, delta = dataclasses.replace(call.held, rows=call.rows), call.given, call.delta
+    staging, landing, after, modelled = _scan_planned(call, tiles, out_dtype, table)
     initial = Operand(rows, 1, jnp.dtype(jnp.float32))
     blocks = stream_blocks(**({"lower": ((chunk, chunk), held)} if delta else {}),
                            queries=((chunk, width), keys), keys=((chunk, width), keys),
                            values=((chunk, walked_width), keys))
     initials = stream_blocks(**{f"initial{i}": ((call.block, walked_width), initial)
                                 for i in range(width // call.block)})
-    staging = (_write_staging(call, bv), column_sums_scratch(call), *staging_tiles(held, (chunk, chunk)),
-               *staging_tiles(call.memories, (call.block, bv)), *staging_tiles(held, (chunk, bv)),
-               # The delta rule's corrected values' operand for the inverse's product.
-               *(staging_tiles(held, (chunk, bv)) if delta else ()))
-    final_landing, after = final_memory_landing(call, bv)
-    landing = {"out": ((chunk, bv), out_dtype), **final_landing}
     # A chunk's products: the memory's write and, under the delta rule, its prediction and the inverse's
     # correction; the scores once a role; the memory's and the local product's.
     corrections = (2 * chunk * width + 2 * chunk * chunk) * walked_width if delta else 0
@@ -2104,15 +2133,13 @@ def _scan_launched(program, call: Call, tiles: Tiles, out_dtype, *, sequences: i
     out_type = (jax.ShapeDtypeStruct((call.rows, call.heads * call.value_width), out_dtype),
                 jax.ShapeDtypeStruct((rows, call.value_width), jnp.float32),
                 *table_stored(call, table, batch))
-    landing |= table_landing(call, table is not None and table.held > 0, bv)
     return launch_kernel(program, call, out_type=out_type,
                          grid=(call.value_width // walked_width, sequences, call.heads),
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
                          ringed=True,
                          live=sequence_live(8),
                          work=work,
-                         consumers=walkers, staging=staging,
-                         held=table_held(_scan_held(call, keys, keys, bv), call, table, bv),
+                         consumers=walkers, staging=staging, held=modelled,
                          once=initials, landing=landing, after=after, reduces=held.parts > 1,
                          producer=producer)
 

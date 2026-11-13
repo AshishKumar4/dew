@@ -31,6 +31,7 @@ from dew.nn.kernels.templates.recurrence.mainloop import (
     family_of,
     padded_widths,
     per_key_refusal,
+    scan_holds,
 )
 from dew.nn.kernels.templates.recurrence.output import output_launch
 from dew.nn.kernels.templates.recurrence.table import Table
@@ -145,11 +146,12 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts=None
 def walks_once(dtype, *, per_key: bool, family: mosaic.Family | None, keeps: bool) -> bool:
     """Whether a forward of `dtype` runs its states and output in one walk (`_scan`), no memory kept for a
     backward to take: one keeping nothing (`keeps`) under a decay a head, where its `family`'s products read
-    their operands from shared memory (warpgroup MMA's) and a 16-bit call's operands are one part. Where
-    they read registers (mma.sync's), the walk's two phases' operand fragments held its thread past its
-    registers at every tile (an sm87's and an A100's), as the output launch's two phases at once did
-    (`output._output_held`); an fp32 call's parts spilled it at an H100's widest (132 bytes at two roles of 16
-    columns, jsf-scan4 at d54ec6b02)."""
+    their operands from shared memory (warpgroup MMA's) and a 16-bit call's operands are one part; a forked
+    call's only where the walk holds its table's slices at its tiles too (`prepared`). Where they read
+    registers (mma.sync's), the
+    walk's two phases' operand fragments held its thread past its registers at every tile (an sm87's and an
+    A100's), as the output launch's two phases at once did (`output._output_held`); an fp32 call's parts
+    spilled it at an H100's widest (132 bytes at two roles of 16 columns, jsf-scan4 at d54ec6b02)."""
     return (not keeps and not per_key and jnp.dtype(dtype).itemsize == 2 and family is not None
             and not family.operands_in_registers)
 
@@ -172,10 +174,11 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, firsts
                        keeps=keeps)
     run = prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
                    tiles=tiles, family=family, interpret=interpret, keeps=keeps, firsts=firsts,
-                   rounded=rounded, ranged=ranged, states=not scans, forked=forked)
+                   rounded=rounded, ranged=ranged, scans=scans, forked=forked,
+                   out_dtype=jnp.float32 if wide else None)
     call, tiles = run.call, run.tiles
     out_dtype = jnp.float32 if wide else run.dtype
-    if scans:
+    if run.scans:
         o, final = _scan(run.q, run.keys, run.a, run.v, run.hi, run.lo, run.beta, run.h0, run.sequences,
                          run.taken, call, tiles, scale=run.scale, out_dtype=out_dtype, skip=skip,
                          table=run.table)
@@ -225,6 +228,8 @@ class _Run:
     h0: jax.Array | None = None
     """Each row's entering memory `[B * HV * Dk, Dv]` fp32, as the states launch takes it."""
     table: Table | None = None
+    scans: bool = False
+    """Whether the forward walks its states and output in one launch (`_scan`; `prepared`'s choice)."""
     """A forked call's table, as its walks take it (`tabled`)."""
     stored: jax.Array | None = None
     """A forked call's stored slots, the finals its storing documents left `[B * held * HV * Dk, Dv]` fp32
@@ -251,14 +256,20 @@ def _paired(q, k, decays, beta, taken, call, *, scale: float, solves: bool) -> t
 def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
              firsts=None,
              inverse=None, kept=None, keeps: bool = True,
-             rounded: bool = False, ranged: bool = False, states: bool = True, forked=None) -> _Run:
+             rounded: bool = False, ranged: bool = False, scans: bool = False, forked=None,
+             out_dtype=None) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
     `kept` values, `(w, h, corrected, stored)`, are (`kept_forward`'s; its final memory then None), or but the
-    states launch's where not `states` (a walk forming the output too, `_scan`, runs it; its memories,
-    corrected values and final memory then None). The solve stores its inverse where the call `keeps` it
-    (`_solved`). A forked call's documents laid from chunks' edges (`chunked_launch.AlignedDocuments`) give
-    `forked` (`tabled`): its walks take up each document's memory from its table (`table.Table`)."""
+    states launch's where `scans` asks for a walk forming the output too (`_scan`, which runs it; its
+    memories, corrected values and final memory then None), a forked call's where that walk holds its table's
+    slices at its tiles too (`mainloop.scan_holds`), else its states and output launches apart: at a B200's
+    248 registers the walk beside a table spilled Nemotron-H 4B's SSD 16 bytes and a write gate 60 to 80 at
+    every ring's depth under the cuda13 build's ptxas, which an H100's write gate holds (row 5761), its output
+    landing in `out_dtype` (the operands' where None); `_Run.scans` says which. The solve stores its inverse
+    where the call `keeps` it (`_solved`). A forked call's documents laid from chunks' edges
+    (`chunked_launch.AlignedDocuments`) give `forked` (`tabled`): its walks take up each document's memory
+    from its table (`table.Table`)."""
     family = family_of(jnp.result_type(q, k, v)) if family is None else family
     if family is None:
         raise NotImplementedError(f"the mainloop has no bundle for the "
@@ -300,6 +311,8 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     held = given if delta or rounded else Operand(rows, product.EXACT_PARTS, jnp.dtype(jnp.float32))
     call = Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                 interpret, generation.gpu_target(), tiles.chunk, ranged=ranged)
+    table = None if forked is None else tabled(forked, width, columns)
+    scans = scans and (table is None or scan_holds(call, tiles, out_dtype or dtype, table))
     beta = laid(beta).reshape(rows, heads).T
     q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
     a, w, u, keys, scores, system = None, None, v, k, None, []
@@ -329,7 +342,7 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
         u = _weighted_values(v, a, beta, taken, call)
     elif per_key:
         (keys,) = _weighted(k, v, None, hi, lo, beta, taken, call)
-    elif delta and inverse is None and not states:
+    elif delta and inverse is None and scans:
         # A walk correcting its values itself (`_scan`) takes the inverse alone.
         (a,) = _solved(k, v, hi, lo, beta, taken, call, applies=False)
     elif delta and inverse is None:
@@ -347,12 +360,12 @@ def prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles,
     h0 = h0.reshape(-1, columns)
     run = _Run(call, tiles, dtype, scale, key_width, value_width, batch, q, k, v, hi, lo, beta, a,
                w, keys, scores, None, None, None, taken, sequences, laid, unlaid, u=u, h0=h0,
-               table=None if forked is None else tabled(forked, width, columns))
+               table=table, scans=scans)
     if kept is not None:
         # The forward's saved states, with the delta rule's weights or without them (`w` None).
         (w, h, corrected, stored) = kept
         return dataclasses.replace(run, w=w, h=h, corrected=corrected, stored=stored)
-    if not states:
+    if scans:
         return run
     h, corrected, final, stored = _states(keys, w, u, hi, lo, beta, h0, sequences, taken, call, tiles,
                                           run.table)
