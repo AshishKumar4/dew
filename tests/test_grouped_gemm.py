@@ -25,7 +25,7 @@ from native_certificates import (
 from op_certificates import BFLOAT16, FLOAT16, FLOAT32
 from reference_error import assert_as_exact, equations, with_gradients
 
-from dew.nn.kernels import gemm, generation, grouped_matmul, tuning
+from dew.nn.kernels import gemm, generation, grouped_matmul, selection, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 from dew.nn.moe import expert_projection
 
@@ -514,8 +514,8 @@ def test_a_paired_products_input_gradient_adds_its_parts_on_the_launch_its_plain
                for d, m in zip(cotangents, (first, second), strict=True))
     for generation_name in ("sm90", "sm80"):
         with generation.assumed(generation_name):
-            assert gemm._keeps_launch(cotangents[1], second, sizes, prior, jnp.bfloat16, (jnp.bfloat16,),
-                                      options), generation_name
+            assert gemm._keeps_launch(cotangents[1], second, sizes, gemm._added, (prior,), (jnp.bfloat16,),
+                                      (jnp.bfloat16,), options), generation_name
         with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic"):
             [d_tokens] = jax.vjp(paired, tokens)[1](cotangents)
         np.testing.assert_array_equal(np.asarray(d_tokens), np.asarray(wide.astype(jnp.bfloat16)),
@@ -1153,3 +1153,55 @@ def test_a_blackwells_projection_and_its_gradients_hold_check_1(sizes, out):
         # Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.
         assert_as_exact(on_the_template, jax.jit(with_gradients(on_xla())), draw, f"sm100 {sizes} into {out}",
                         seeds=SEEDS, truth_fn=with_gradients(on_xla(jnp.float64)))
+
+
+TIMED = [
+    ("sm90", "forward", (2560, 9216), "mosaic"), ("sm90", "forward", (9216, 2560), "xla"),
+    ("sm90", "forward", (2560, 1024), "mosaic"), ("sm90", "forward", (2560, 64), "xla"),
+    ("sm90", "input_gradient", (2560, 9216), "mosaic"), ("sm90", "input_gradient", (9216, 2560), "mosaic"),
+    ("sm90", "input_gradient", (2560, 1024), "mosaic"), ("sm90", "input_gradient", (2560, 64), "mosaic"),
+    ("sm90", "kernel_gradient", (2560, 9216), "xla"), ("sm90", "kernel_gradient", (9216, 2560), "mosaic"),
+    ("sm90", "kernel_gradient", (2560, 1024), "mosaic"), ("sm90", "kernel_gradient", (2560, 64), "mosaic"),
+    ("sm90", "forward", (2560, 3072), "xla"), ("sm90", "kernel_gradient", (3072, 2560), "xla"),
+    ("sm100", "forward", (2560, 64), "xla"), ("sm100", "forward", (2560, 9216), "mosaic"),
+    ("sm100", "input_gradient", (2560, 9216), "xla"), ("sm100", "input_gradient", (2560, 64), "mosaic"),
+    ("sm100", "kernel_gradient", (2560, 9216), "xla"), ("sm100", "kernel_gradient", (9216, 2560), "mosaic"),
+    ("sm100", "kernel_gradient", (2560, 1024), "xla"), ("sm100", "kernel_gradient", (2560, 64), "mosaic"),
+    ("sm100", "kernel_gradient", (3072, 2560), "mosaic"),
+]
+"""Each dense product the receipts timed (M-EM-36-gh200 on Hopper, em35d and lab-b200-20261113-grid on a
+B200: Qwen3.5-4B's up, down, key and gates matrices `[in, out]` at 24,576 tokens) beside the route its receipt
+timed fastest, and an untimed matrix (`[2560, 3072]`, `[3072, 2560]`), which keeps its kind's default
+(Hopper's XLA cells, the B200's template)."""
+
+
+def _named(value) -> str:
+    """A parameter's id: a matrix's extents joined by x, any other value as it prints."""
+    return "x".join(map(str, value)) if isinstance(value, tuple) else str(value)
+
+
+@pytest.mark.parametrize(("generation_name", "made", "matrix", "kernel"), TIMED, ids=_named)
+def test_a_timed_dense_product_takes_the_route_its_receipt_timed_fastest(generation_name, made, matrix,
+                                                                          kernel):
+    """A dense product of a matrix its family's receipts timed is a cell of its own (`grouped_matmul.Kind`'s
+    `matrix`, `MEASURED`), which the route its receipt timed fastest holds (`DECLARED`): the template where it
+    won, XLA's dot where it lost; a matrix no receipt timed takes its kind's cell, as before (owner, ops
+    361caffc)."""
+    from dew.nn.kernels.templates.product import declared
+
+    rows, (width_in, width_out) = 24576, matrix
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
+    product = declared(jnp.bfloat16, None, outputs=(jnp.bfloat16,))
+    with generation.assumed(generation_name):
+        if made == "kernel_gradient":
+            call = grouped_matmul.tgmm_call(bf16((rows, width_in)), bf16((rows, width_out)), sizes,
+                                            out_dtype=jnp.bfloat16, interpret=False, dense=True)
+        else:
+            transposed = made == "input_gradient"
+            tokens = bf16((rows, width_out if transposed else width_in))
+            call = grouped_matmul.gmm_call(tokens, bf16((1, width_in, width_out)), sizes,
+                                           out_dtype=jnp.bfloat16, trans_rhs=transposed, interpret=False,
+                                           dense=True)
+        case = grouped_matmul.grouped_case(*call, product=product, whole=True)
+        assert selection.selected(grouped_matmul.GROUPED, case).name == kernel, case.kind

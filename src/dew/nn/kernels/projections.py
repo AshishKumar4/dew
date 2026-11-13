@@ -284,7 +284,7 @@ def dot_general(xla):
     low-precision recipe where its role takes the matrix product (`recipe_projection`), else through the
     template's dense product (`gemm` of one group) where the call is a matrix product (`lhs`'s last axis
     against a matrix's first, no batch axes, both of one dtype) and a launch takes any of its products: the
-    forward, the input gradient or the kernel gradient (`_launched`). A call no launch takes is `xla`'s own
+    forward, the input gradient or the kernel gradient (`launched`). A call no launch takes is `xla`'s own
     program, differentiated by JAX, each of its products' routes reported with the reason no launch takes
     it (a declared cell's old route, a mesh axis splitting the operands, a CPU), so a layer runs as it ran
     before wherever the template declares XLA faster; every other product is `xla`'s."""
@@ -299,7 +299,7 @@ def dot_general(xla):
                  and tuple(map(tuple, batch)) == ((), ()))
         if plain:
             rows = lhs.reshape(-1, lhs.shape[-1])
-            if _launched(rows, rhs, out_dtype, precision):
+            if launched(rows, rhs, out_dtype, precision):
                 product = gemm(rows, rhs, out_dtype=out_dtype, precision=precision)
                 return product.reshape(*lhs.shape[:-1], rhs.shape[1])
         return xla(lhs, rhs, dimension_numbers, precision=precision,
@@ -337,19 +337,25 @@ def _recipe_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers, out_dtype
                        *(rhs.shape[axis] for axis in free_rhs))
 
 
-def _launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: PrecisionLike) -> bool:
+def launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: PrecisionLike) -> bool:
     """Whether a launch takes any of the dense product `rows @ matrix`'s products on the call's target
     (`grouped_matmul.GROUPED`): its forward, its input gradient or its kernel gradient, as `gemm` and
     its reverse mode make them, each read without its report (`selection.selected`). Where none does, the
     forward's route is reported, as XLA runs it. Decided once a key (`_decided`), its routes reported again
     at every call: a model's projections ask the same question at every layer's trace (row 3213: a warm
     start spent 10.9 of its 75.6 seconds selecting)."""
-    product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
+    rows_type, matrix_type = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in (rows, matrix))
     whole = seen_whole(rows) and seen_whole(matrix)
-    taken, found = _decided(jax.ShapeDtypeStruct(rows.shape, rows.dtype),
-                            jax.ShapeDtypeStruct(matrix.shape, matrix.dtype), jnp.dtype(out_dtype), product,
-                            whole, generation.gpu_target(), _cache.KERNEL_CHOICES.value,
-                            _cache.KERNEL_PINS.value)
+    return launches(rows_type, matrix_type, out_dtype, precision, whole=whole)
+
+
+def launches(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype, precision: PrecisionLike, *,
+             whole: bool) -> bool:
+    """`launched` of a product's operands by their shapes and dtypes, where they are seen `whole`
+    (`seen_whole`): a product formed later in the call (a fused MLP's down product, `dew.nn.gated_mlp`)."""
+    product = declared(rows.dtype, precision, outputs=(out_dtype,), operands=(rows.dtype, matrix.dtype))
+    taken, found = _decided(rows, matrix, jnp.dtype(out_dtype), product, whole, generation.gpu_target(),
+                            _cache.KERNEL_CHOICES.value, _cache.KERNEL_PINS.value)
     for route in found:
         generation.route(route.choice, kernel=route.kernel, preferred=route.preferred, refusal=route.refusal,
                          forced=route.forced)
@@ -360,10 +366,10 @@ def _launched(rows: jax.Array, matrix: jax.Array, out_dtype, precision: Precisio
 def _decided(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype: jnp.dtype, product,
              whole: bool, target: generation.GpuTarget, choices: tuple, pins: tuple
              ) -> tuple[bool, tuple[generation.Route, ...]]:
-    """`_launched`'s decision and the routes it found, once a key, the most recent keys kept: the operands'
+    """`launched`'s decision and the routes it found, once a key, the most recent keys kept: the operands'
     shapes and dtypes, the product, whether each is seen whole, and the target and the kernels a block names
     or pins, which the decision reads from its context, so they key it alone. Its routes are collected apart
-    (`generation.routes`' `alone`), `_launched` reporting them at every call."""
+    (`generation.routes`' `alone`), `launched` reporting them at every call."""
     del target, choices, pins
     with generation.routes(alone=True) as found:
         taken = _launched_once(rows, matrix, out_dtype, product, whole)
@@ -372,7 +378,7 @@ def _decided(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype
 
 def _launched_once(rows: jax.ShapeDtypeStruct, matrix: jax.ShapeDtypeStruct, out_dtype, product,
                    whole: bool) -> bool:
-    """`_launched`'s decision, its routes reported."""
+    """`launched`'s decision, its routes reported."""
     width = matrix.shape[1]
     abstract = functools.partial(jax.ShapeDtypeStruct, dtype=rows.dtype)
     matrices, sizes = abstract((1, *matrix.shape)), jax.ShapeDtypeStruct((1,), jnp.int32)

@@ -846,19 +846,20 @@ def test_each_dense_launch_lowers_once_however_many_layers_call_it():
 
 def test_a_dense_projections_launch_is_decided_once_and_reported_at_every_call():
     """`projections.dot_general`'s question, whether a launch takes a dense projection's products
-    (`projections._launched`), is answered alike at every trace (row 3213 decides it once a key): two traces
+    (`projections.launched`), is answered alike at every trace (row 3213 decides it once a key): two traces
     of one projection report the same routes and the same answer, and a block naming a kernel is its own key,
-    its answer the named kernel's."""
+    its answer the named kernel's. On an A100, where every dense product's cell declares XLA's dot
+    (`grouped_matmul.DECLARED`), the answer is no and its routes are reported."""
     rows, matrix = jnp.zeros((640, 384), jnp.bfloat16), jnp.zeros((384, 640), jnp.bfloat16)
-    with generation.assumed("sm90"):
+    with generation.assumed("sm80"):
         reported, answers = [], []
         for _ in range(2):
             with generation.routes() as found:
-                answers.append(projections._launched(rows, matrix, jnp.bfloat16, None))
+                answers.append(projections.launched(rows, matrix, jnp.bfloat16, None))
             reported.append([(route.choice, route.kernel, route.refusal) for route in found])
         assert reported[0] == reported[1] and reported[0] and answers[0] == answers[1], reported
         with generation.chosen(grouped_matmul="mosaic"):
-            assert projections._launched(rows, matrix, jnp.bfloat16, None)
+            assert projections.launched(rows, matrix, jnp.bfloat16, None)
 def test_two_launches_whose_padded_shapes_meet_name_their_own_kernels():
     """A GEMM at 4089 rows and one at 4096, which its Mosaic mainloop pads alike, lowered for an H100 in one
     program: each launch's kernel carries its own launch's digest (`report.named`), as a spill refuses the
@@ -1041,6 +1042,24 @@ def test_a_step_is_priced_at_the_longer_of_its_products_and_its_shared_traffic()
     walk = mosaic_gpu.split_walk(pair, groups=1, rows=24576, depth=9216, width=2560, itemsizes=(2, 2),
                                  multiprocessors=148, step_seconds=1.0, bandwidth=1.0, launch_seconds=None)
     assert walk.output * pair.block_m * 2 * pair.block_n == 9216 * 2560
+
+
+def test_a_parts_units_are_priced_at_the_clock_it_holds_under_load():
+    """A multiprocessor's units (the tensor cores, the CUDA cores, the special-function units, shared memory)
+    are priced at the clock its part holds under a step's tensor-core load (`Measured.loaded_clock`): a
+    B200's measured 1.549 GHz, so each is slower than at its 1.965 GHz boost, the clock's own units exactly as
+    a part stating 1.549 GHz, and a device's memory, which that clock does not drive, streams as fast; a
+    part no one measured keeps the clock it states."""
+    b200 = generation.gpu_target("sm100")
+    unmeasured = dataclasses.replace(b200, measured={})
+    restated = dataclasses.replace(unmeasured, clock_hz=1.549e9)
+    loaded, stated = cost.rates(b200, device=False), cost.rates(unmeasured, device=False)
+    # The CUDA cores, the special-function units and shared memory: the clock's alone.
+    assert loaded[3:6] == cost.rates(restated, device=False)[3:6]
+    assert all(rate < boosted for rate, boosted in zip(loaded[:6], stated[:6], strict=True)
+               if rate is not None)
+    assert unmeasured.loaded_clock_hz == unmeasured.clock_hz
+    assert cost.rates(b200, device=True)[-1] == cost.rates(unmeasured, device=True)[-1]
 
 
 def test_a_kernel_gradients_tail_is_priced_in_its_parts_steps_whatever_multiprocessors_a_target_states():

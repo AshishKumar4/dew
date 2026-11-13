@@ -129,3 +129,22 @@ def unaligned_widths_run_on_the_template(depth: int, width: int, *, interpret: b
                 got = np.asarray(jax.jit(call)(), np.float32)
             assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {"mosaic"}, name
             np.testing.assert_array_equal(got, expected, err_msg=name)
+
+
+def test_a_dense_products_partial_depth_lowers_with_its_matrix_prefetched():
+    """A dense product whose depth no step divides (16 rows of 96 by 64 columns, a 64-deep step: its last
+    step partial, `mosaic_gpu.partial_runs`) lowers for an H100 on the template, its matrix's whole steps
+    prefetched into L2 before its launch's wait (`_prefetched`) and its partial last step read bounded: a
+    prefetch of every step's block read past the matrix's depth (row 3601's prefetch, which the compile-ahead
+    step's 96-wide projections reached once the template became Hopper's dense default)."""
+    from kernel_compile import lowered_for
+
+    from dew.nn.kernels.lowered import kernel_calls
+
+    def product(x, w):
+        return gemm.gemm(x, w, None, out_dtype=jnp.float32)
+
+    with generation.chosen(grouped_matmul="mosaic"):
+        lowered = lowered_for(product, (jax.ShapeDtypeStruct((16, 96), jnp.bfloat16),
+                                        jax.ShapeDtypeStruct((96, 64), jnp.bfloat16)), "sm90")
+    assert [call.kind for call in kernel_calls(lowered)] == ["mosaic_gpu"]

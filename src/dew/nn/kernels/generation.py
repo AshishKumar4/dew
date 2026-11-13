@@ -405,12 +405,15 @@ class Measured:
     the plateau a long transfer reaches, below what the memory clock and bus give; `launch`, the seconds a
     kernel launch adds to a program that runs kernels one after another; and `handoff`, a GPU-scope semaphore
     signal another program of the same launch waits on, where the part's ring families fix tiles up across
-    programs (the balanced tail's partials). None where not measured."""
+    programs (the balanced tail's partials); `loaded_clock`, the multiprocessors' clock in Hz while a
+    training step's large products load the tensor cores, below the boost clock the driver states where the
+    part's power limit holds it there. None where not measured."""
 
-    fixed: float
-    bytes_per_second: float
+    fixed: float | None = None
+    bytes_per_second: float | None = None
     launch: float | None = None
     handoff: float | None = None
+    loaded_clock: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -550,8 +553,18 @@ class GpuTarget:
     def memory_rate(self) -> float | None:
         """Device-memory bytes a second a long transfer streams at: the part's measured plateau (`part`),
         else its clocks' bandwidth (`memory_bandwidth`)."""
-        part = self.part
-        return self.memory_bandwidth if part is None else part.bytes_per_second
+        return self._measured('bytes_per_second', self.memory_bandwidth)
+
+    @property
+    def loaded_clock_hz(self) -> float | None:
+        """The multiprocessors' clock under a training step's tensor-core load: the part's measured one
+        (`Measured.loaded_clock`), else the clock it states (`clock_hz`)."""
+        return self._measured('loaded_clock', self.clock_hz)
+
+    def _measured(self, fact: str, stated: float | None) -> float | None:
+        """The part's measured `fact` (`Measured`'s field), else the `stated` one."""
+        measured = None if self.part is None else getattr(self.part, fact)
+        return stated if measured is None else measured
 
     @property
     def fixed_seconds(self) -> float | None:
@@ -705,7 +718,12 @@ TARGETS = {target.generation: target for target in (
               # its hand-off 0.695 us in both; its launch fit no line (negative slopes).
               measured={'NVIDIA H100 80GB HBM3': Measured(1.87e-6, 3.190e12, launch=1.02e-6, handoff=0.78e-6),
                         'NVIDIA H100 PCIe': Measured(2.11e-6, 1.980e12, handoff=0.695e-6),
-                        'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6),
+                        # Its multiprocessors' clock under the 4B's large products: 1.496 GHz, the
+                        # time-weighted mean of sm__cycles_elapsed.avg.per_second over 18 GEMM launches under
+                        # ncu (1.476 to 1.522; the template's, cuBLASLt's and a pair's alike; M-EM-36-gh200),
+                        # against its 1.98 GHz clock locked.
+                        'NVIDIA GH200 480GB': Measured(2.51e-6, 3.812e12, launch=0.86e-6, handoff=0.71e-6,
+                                                       loaded_clock=1.496e9),
                         'NVIDIA H200': Measured(2.81e-6, 4.617e12)}),
     # Datasheet facts and a B200's measured steps and L2, no routes: what a compile-only sm100 device needs
     # (`tests/kernel_compile.py`), its peaks the scoreboard's MFU; a B200 run states its own clock and
@@ -722,6 +740,12 @@ TARGETS = {target.generation: target for target in (
               step_seconds=5.41e-6,
               # In-kernel: a dependent lane reduction's 144.0 ns (its two rounds 144.05 and 144.04).
               kernel_step_seconds=144.0e-9,
+              # Its multiprocessors' clock under a step's large products: 1.549 GHz, the time-weighted mean of
+              # sm__cycles_elapsed.avg.per_second over the 15 GEMM launches of 0.1 ms or more in the 4B's
+              # one-row Muon step under ncu (1.520 to 1.600; the driver's software power capping counter
+              # running at the default 1,000 W limit; lab-b200-20261112-bundle2/ncu-muon-raw.csv), where
+              # its idle-sampled 1965 MHz above stands.
+              measured={'NVIDIA B200': Measured(loaded_clock=1.549e9)},
               # Qwen3.5-0.8B's step at 8 x 3072 tokens under 'full', its head tiled and unfused, compiled for
               # a B200 holds 22.9 GiB of temporaries, against 5.6 with the head fused: some of its weight
               # gradients run after the backward, which the derivation bounds from above by running all
@@ -1154,8 +1178,9 @@ def route(choice: Choice, *, kernel: str, preferred: str | None = None, refusal:
 
 
 def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *, kind: TangentKind,
-                   live_cotangents: bool = False, primal: Callable | None = None,
-                   nested: bool = True) -> Callable:
+                   live_cotangents: bool = False, zero_cotangents: bool = False,
+                   primal: Callable | None = None, nested: bool = True,
+                   unread: tuple[int, ...] = ()) -> Callable:
     """A fused kernel as one function of its operands, differentiated at every order through
     `portable`, the same arithmetic in XLA, while every level of it runs the kernels.
     `forward(*operands)` gives the kernel's output and what its backward reads (`saved`, a tree of
@@ -1177,7 +1202,13 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
 
     With `live_cotangents`, `backward(saved, operands, cotangent, live)` gives the cotangents of the
     operands at the indices `live` alone, those a reverse pass differentiates, so a frozen operand's
-    cotangent is never formed. `primal(*operands)` gives the output where no derivative is taken (a kernel
+    cotangent is never formed. With `zero_cotangents`, an output no reverse pass reaches (its cotangent a
+    symbolic zero) reaches `backward` as None, so a kernel forms nothing for it (an output another product
+    reads in place of its derivative, `gemm`'s `applied`); a higher order's pullback reads zeros there. The
+    operands at `unread` positions, which no derivative reads (`portable` and `backward` alike: a value only
+    the forward multiplies, `gemm`'s `applied`), are no residual of the derivative: it holds each as an empty
+    array of its dtype, so a remat policy that saves the other operands recomputes nothing to form it.
+    `primal(*operands)` gives the output where no derivative is taken (a kernel
     that saves nothing), `forward`'s where None. Without `nested`, a derivative's level runs `forward` as
     it is on its operands held still (`stop_gradient`), not as a custom JVP of its own: a value it names
     (`checkpoint_name`) is a residual a remat policy can keep, and no order differentiates the kernels'
@@ -1185,6 +1216,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     operands': run as it was, a jvp of a gradient through a named kernel reached Mosaic GPU's call, which
     no JAX rule differentiates, row 2655)."""
     import jax
+    import jax.numpy as jnp
     from jax.custom_derivatives import SymbolicZero, zero_from_primal
 
     from dew.nn.derivatives import contracted, declared_tangent
@@ -1209,7 +1241,8 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         _, doperands, dcotangent = tangents
 
         def pullback(operands, cotangent):
-            whole = jax.vjp(portable, *operands)[1](cotangent)
+            outputs, pull = jax.vjp(portable, *operands)
+            whole = pull(_instantiated(cotangent, outputs))
             # `live` indexes the operands' leaves, as the reverse pass's `backward` takes them.
             return whole if live is None else tuple(jax.tree.leaves(whole)[index] for index in live)
 
@@ -1246,10 +1279,21 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
         # tangent, every reverse pass traced the portable math's forward mode for its type alone (a gated
         # delta net layer's training step's trace on an H100's lowering, row 3142).
         typed = jax.tree.map(lambda leaf: jax.typeof(leaf).to_tangent_aval(), output)
-        return output, linear_map(tangent, transposed, (primals, saved), moving, out_aval=typed)
+        held = tuple(jnp.zeros((0,), operand.dtype) if index in unread and operand is not None else operand
+                     for index, operand in enumerate(primals))
+        return output, linear_map(tangent, transposed, (held, saved), moving, out_aval=typed,
+                                  zero_cotangents=zero_cotangents)
 
     def bounding(*operands):
         return forward(*operands)[0] if primal is None else primal(*operands)
+
+    def _instantiated(cotangent, outputs):
+        """`cotangent` with zeros where no reverse pass reached an output (None), each of its output's full
+        type (its sharding and manual axes, `zeros_like` of the output as `portable` traced it)."""
+        if not zero_cotangents:
+            return cotangent
+        return jax.tree.map(lambda each, output: jnp.zeros_like(output) if each is None else each,
+                            cotangent, outputs, is_leaf=lambda each: each is None)
 
     return contracted("test_an_embedding_lookup_holds_every_order")(
         declared_tangent(kind, bounding, bounded_jvp, symbolic_zeros=True))
@@ -1266,14 +1310,16 @@ def unbroadcast(cotangent, shape: tuple[int, ...]):
     return pulled(cotangent)[0]
 
 
-def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None):
+def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_aval=None,
+               zero_cotangents: bool = False):
     """`apply(residuals, moving)`, linear in `moving`, whose transpose is `pullback(residuals, cotangent)`
     (the cotangents of `moving`, a tree like it): one `jax.experimental.hijax.HiPrim`, so reverse mode
     runs `pullback` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
     or `jax.linear_transpose` transposes, and under `jax.vmap` too, where the map is one of `apply` and
     `pullback` mapped over the batch. Its tangent is the map of the moving tangents plus `apply`'s own
     derivative in `residuals` (a higher order's). `out_aval`, where given, is the output's type (a tree of
-    avals like it), which `apply` is then traced for only where forward mode runs it."""
+    avals like it), which `apply` is then traced for only where forward mode runs it. With `zero_cotangents`,
+    a leaf of the cotangent that is a symbolic zero reaches `pullback` as None, not zeros."""
     import jax
 
     # The output's type as `apply` traces it, its sharding included: a shape and dtype alone
@@ -1283,7 +1329,7 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving, *, out_av
         traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
         out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
     in_avals = jax.tree.map(jax.typeof, (residuals, moving))
-    return _linear_primitive()(apply, pullback, in_avals, out_aval)(residuals, moving)
+    return _linear_primitive()(apply, pullback, in_avals, out_aval, zero_cotangents)(residuals, moving)
 
 
 @functools.cache
@@ -1313,11 +1359,13 @@ def _linear_primitive() -> type:
     class Linear(hijax.HiPrim):
         apply: Callable
         pullback: Callable
-        """`linear_map`'s two functions, `params` that `HiPrim` makes attributes."""
+        zero_cotangents: bool
+        """`linear_map`'s two functions and whether its pullback takes None for a zero cotangent, `params`
+        that `HiPrim` makes attributes."""
 
-        def __init__(self, apply, pullback, in_avals, out_aval):
+        def __init__(self, apply, pullback, in_avals, out_aval, zero_cotangents=False):
             self.in_avals, self.out_aval = in_avals, out_aval
-            self.params = {"apply": apply, "pullback": pullback}
+            self.params = {"apply": apply, "pullback": pullback, "zero_cotangents": zero_cotangents}
             super().__init__()
 
         def expand(self, *args):
@@ -1328,7 +1376,9 @@ def _linear_primitive() -> type:
             residuals, moving = maybe_accums
             if all_zero(out_ct):
                 return
-            pulled = self.pullback(residuals, instantiated(out_ct))
+            held = (jax.tree.map(lambda leaf: None if zero(leaf) else leaf, out_ct, is_leaf=zero)
+                    if self.zero_cotangents else instantiated(out_ct))
+            pulled = self.pullback(residuals, held)
             accums = jax.tree.leaves(moving, is_leaf=lambda leaf: isinstance(leaf, hijax.GradAccum))
             for accum, value in zip(accums, jax.tree.leaves(pulled), strict=True):
                 if isinstance(accum, hijax.GradAccum):
@@ -1368,7 +1418,8 @@ def _linear_primitive() -> type:
                     unbatched(leaf) if axis is None else jnp.moveaxis(leaf, 0, axis)
                     for leaf, axis in zip(leaves, axes, strict=True)])
 
-            return linear_map(applied, pulled, *args), jax.tree.map(lambda _: 0, self.out_aval)
+            return (linear_map(applied, pulled, *args, zero_cotangents=self.zero_cotangents),
+                    jax.tree.map(lambda _: 0, self.out_aval))
 
     return Linear
 

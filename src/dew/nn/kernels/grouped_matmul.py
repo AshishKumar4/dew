@@ -2154,19 +2154,24 @@ class Made(enum.Enum):
 
 class Kind(NamedTuple):
     """The kind of call a grouped product is (`GroupedCase.kind`), which with the device's instruction family
-    is its cell (`DECLARED`): dense (one matrix, every row) or grouped, what it makes, and the operands no
+    is its cell (`DECLARED`): dense (one matrix, every row) or grouped, what it makes, the operands no
     receipt of a 16-bit call times: FP8 ones (XLA's dot of them sums narrower than the FP8 contract holds,
-    row 1625), rows gathered through a table or stored through one (no old route reads them)."""
+    row 1625), rows gathered through a table or stored through one (no old route reads them); and, for a
+    dense product whose matrix a receipt timed on its family (`MEASURED`), that matrix's `[in, out]` extents,
+    a cell of its own, which the receipt's winner for it holds (None for every other product, the kind's
+    cell)."""
 
     dense: bool
     made: Made
     fp8: bool = False
     gathered: bool = False
     scattered: bool = False
+    matrix: tuple[int, int] | None = None
 
     def __str__(self) -> str:
         parts = ('fp8',) * self.fp8 + ('gathered',) * self.gathered + ('scattered',) * self.scattered
-        return ' '.join(('dense' if self.dense else 'grouped', self.made.value, *parts))
+        timed = () if self.matrix is None else ('x'.join(map(str, self.matrix)),)
+        return ' '.join(('dense' if self.dense else 'grouped', self.made.value, *parts, *timed))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2290,6 +2295,24 @@ CUTLASS = _launch_kernel(CutlassGmm.name, DECLARED_ONLY)
 """CUTLASS's launches, on their declared cells alone (`DECLARED_ONLY`)."""
 XLA = selection.Kernel[GroupedCase]('xla', (), generic=True)
 
+FOUR_B = ((2560, 9216), (9216, 2560), (2560, 1024), (2560, 64))
+"""Qwen3.5-4B's dense projections' matrices `[in, out]`: its MLP's up and down, its attention's key, its
+gated delta net's gates, which M-EM-36-gh200 and em35d timed at 24,576 tokens, each product of each."""
+
+MEASURED: dict[tuple[str | None, Made], frozenset[tuple[int, int]]] = {
+    (family, made): frozenset(FOUR_B) for family in ('wgmma', 'tcgen05')
+    for made in (Made.FORWARD, Made.INPUT_GRADIENT, Made.KERNEL_GRADIENT)}
+"""The dense matrices each instruction family's receipts timed, by what the product makes: a product of one is
+a cell of its own (`Kind.matrix`), which its receipt's winner holds; every other product its kind's."""
+
+M_EM_36 = ("M-EM-36-gh200 (a GH200, base/kernels df82480cb5c, CUPTI medians of 5 rounds, cuBLASLt autotuned "
+           "at run, 24,576 tokens)")
+EM35D = ("em35d (a B200, base/kernels ce6eff7f0be, CUPTI medians of 5 rounds, cuBLASLt autotuned at run, "
+         "24,576 tokens)")
+B200_GRID = ("lab-b200-20261113-grid (a B200, base/kernels 5ac163abbec, medians of 5 rounds' same-round "
+             "ratios, cuBLASLt autotuned at run, 24,576 tokens; its down kernel gradient the template's, "
+             "0.833x)")
+
 DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str]] = {
     ('mma.sync', Kind(dense=True, made=Made.FORWARD)):
         (XLA, "DENSE1 (A100, a55c8ffb2, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
@@ -2313,11 +2336,47 @@ DECLARED: dict[tuple[str | None, Kind], tuple[selection.Kernel[GroupedCase], str
         (XLA, "DENSE1 (H100): Mosaic 1.048x, Triton 1.738x XLA's dot"),
     ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT)):
         (XLA, "DENSE1 (H100): Mosaic 1.049x, Triton 1.149x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 9216))): (
+        MOSAIC, f"{M_EM_36}: the template 0.866x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(9216, 2560))): (
+        XLA, f"{M_EM_36}: the template 1.01x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 1024))): (
+        MOSAIC, f"{M_EM_36}: the template 0.96x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64))): (
+        XLA, f"{M_EM_36}: the template 1.294x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216))): (
+        MOSAIC, f"{M_EM_36}: the template 0.943x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(9216, 2560))): (
+        MOSAIC, f"{M_EM_36}: the template 0.912x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 1024))): (
+        MOSAIC, f"{M_EM_36}: the template 0.949x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 64))): (
+        MOSAIC, f"{M_EM_36}: the template 0.93x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216))): (
+        XLA, f"{M_EM_36}: the template 1.095x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(9216, 2560))): (
+        MOSAIC, f"{M_EM_36}: the template 0.975x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024))): (
+        MOSAIC, f"{M_EM_36}: the template 0.973x XLA's dot"),
+    ('wgmma', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 64))): (
+        MOSAIC, f"{M_EM_36}: the template 0.376x XLA's dot"),
+    ('tcgen05', Kind(dense=True, made=Made.FORWARD, matrix=(2560, 64))): (
+        XLA, f"{B200_GRID}: the template 1.216x XLA's dot (em35d 1.225x)"),
+    ('tcgen05', Kind(dense=True, made=Made.INPUT_GRADIENT, matrix=(2560, 9216))): (
+        XLA, f"{EM35D}: the template 1.009x XLA's dot"),
+    ('tcgen05', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 9216))): (
+        XLA, f"{B200_GRID}: the template 1.355x XLA's dot (em35d 1.303x)"),
+    ('tcgen05', Kind(dense=True, made=Made.KERNEL_GRADIENT, matrix=(2560, 1024))): (
+        XLA, f"{B200_GRID}: the template 1.148x XLA's dot (em35d 1.326x)"),
 }
-"""The grouped GEMM's declared cells (`selection.Op.declared`), where an old route measured faster than the
-template, each with its receipt (owner, bible da64ae5): (instruction family, kind of call) to (the old
-route's kernel, the receipt). The template is the default on every other cell; a cell leaves the list once the
-template measures at least as fast on it (geomean over the receipt's rows). Nothing is ranked at runtime. A
+"""The grouped GEMM's declared cells (`selection.Op.declared`), where a route measured faster than the
+template's default on a generation, each with its receipt (owner, bible da64ae5; "whatever is the
+best/fastest remains the route until our templates catch up", ops 361caffc): (instruction family, kind of
+call) to (that route's kernel, the receipt). A product of a matrix a receipt timed (`MEASURED`) is a cell of
+its own, which that receipt's winner holds: the template's where it won (on Hopper, over its kind's XLA
+cell), XLA's where it lost (on Blackwell, where the template is the kind's default); one timed whose cell is
+undeclared takes the template. A cell leaves the list once the template measures at least as fast on it.
+Nothing is ranked at runtime. A
 call the template cannot run (its legality) takes the next route in `GROUPED`'s order, which is no cell of
 this list."""
 
@@ -2352,14 +2411,26 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     tabled = 4 if launches is _TGMMS else 7
     gathered = len(arguments) > tabled and arguments[tabled] is not None
     scattered = launches is not _TGMMS and len(arguments) > 8 and arguments[8] is not None
-    kind = Kind(bool(options['dense']), made, fp8=fp8, gathered=gathered, scattered=scattered)
     call = base.call(launches, *arguments, **options)
+    matrix = _matrix_of(launches, arguments) if options['dense'] else None
+    timed = matrix in MEASURED.get((generation.family(call.target.generation), made), ())
+    kind = Kind(bool(options['dense']), made, fp8=fp8, gathered=gathered, scattered=scattered,
+                matrix=matrix if timed else None)
     cuda = generation.capability(call.target.generation)
     floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
     placed = generation.tpu(call.target) or floor
     paired = any(bound.arguments.get('paired') is not None for _, bound in call.bound.values())
     rows = _rows_of(launches, arguments)
     return GroupedCase(placed, whole, product, rows, call, kind, paired=paired)
+
+
+def _matrix_of(launches, arguments) -> tuple[int, int]:
+    """A dense product's matrix as it lies (`Kind.matrix`): a forward's kernel `[1, in, out]`, its input
+    gradient's the same matrix read transposed, its kernel gradient's output (its rows' width by its
+    cotangent's), one tuple for a projection's three products."""
+    if launches is _TGMMS:
+        return arguments[0].shape[1], arguments[1].shape[1]
+    return tuple(arguments[1].shape[1:])
 
 
 def _rows_of(launches, arguments) -> int:

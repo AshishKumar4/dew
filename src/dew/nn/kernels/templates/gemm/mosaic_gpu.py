@@ -915,7 +915,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                            resident=tiles.programs, scalars=0 if dense else 1,
                            cost=unit_cost.estimate(2 * m * n * k * len(matrices), *operands,
                                                    *prologue_operands, *epilogue_operands, *out_type),
-                           **_prefetched(tiles, grid, pl.cdiv(k, block_k), transpose_rhs, interpret,
+                           **_prefetched(tiles, grid, k // block_k, transpose_rhs, interpret,
                                          dense=dense, parts=(tail, scales, mx_scales, gather)))
     return kernel(*(operands if dense else (table, *operands)), *prologue_operands, *epilogue_operands,
                   *_workspace(tail, (multiprocessors, 2, consumers, *part), interpret))
@@ -936,11 +936,12 @@ def _prefetched(tiles: Tiles, grid: tuple, steps: int, transpose_rhs: bool, inte
     """Dew: a dense `gmm`'s matrix prefetched into L2 before its launch's wait for the one before it
     (`bodies.dependent`'s `prefetched`, `bodies.waits`): each program's first tile's matrix blocks of its
     first stages, so its first loads hit L2 rather than wait on memory under the previous launch's tail
-    (M-FS-12: a decode GEMM's prologue exposed 3-5%; row 3601). A plain dense product's alone (no tail,
-    scales or gathered rows: `parts` all None), whose first tile a program's index states (its persistent
-    walk's first, `persistent.tiled`); a grouped one's needs its routing, written before the wait. A
-    prefetch reads nothing into the program, so a matrix the launch before it still writes is prefetched
-    early, never read stale."""
+    (M-FS-12: a decode GEMM's prologue exposed 3-5%; row 3601), of its `steps` whose block lies whole in the
+    matrix (a partial last step's, `partial_runs`, would read past its depth). A plain dense product's alone
+    (no tail, scales or gathered rows: `parts` all None), whose first tile a program's index states (its
+    persistent walk's first, `persistent.tiled`); a grouped one's needs its routing, written before the
+    wait. A prefetch reads nothing into the program, so a matrix the launch before it still writes is
+    prefetched early, never read stale."""
     plain = dense and all(part is None for part in parts)
     if not (plain and tiles.splits == 1 and tiles.cluster == 1
             and bodies.waits(interpret)):
