@@ -697,21 +697,27 @@ def _block_scaled(lhs, matrices, group_blocks: jax.Array, op: selection.Op, inte
     sizes = (group_blocks * SCALE_DEPTH).astype(jnp.int32)
     launch = grouped_matmul.MosaicMxGmm()
     tables = (() if gather is None else (gather,))
-    # Gathered rows' block scales are the same table's rows of the rows' scales, laid out for the products.
-    scales = (mosaic_sm100.scales_tiled(lhs.scales if gather is None else lhs.scales[gather]),
-              mosaic_sm100.scales_tiled(matrices.scales))
+    # Gathered rows' block scales are the same table's rows of the rows' scales, laid out for the products:
+    # planned from their tiles' shapes, laid out only where the template runs, so a call whose scales no tile
+    # holds (rows short of 128, a depth of fewer than four blocks) takes the decoded product.
+    rows_scales = lhs.scales if gather is None else lhs.scales[gather]
+
+    def tiled():
+        return mosaic_sm100.scales_tiled(rows_scales), mosaic_sm100.scales_tiled(matrices.scales)
+
     call = functools.partial(launch, lhs.codes, matrices.codes, sizes, (), (), None, None, *tables,
-                             out_dtype='float32', trans_rhs=True, interpret=interpret, scales=scales)
-    tile = _planned(launch, launch.bind(*_abstract(*call.args[:3]), (), (), None, None,
-                                        *_abstract(*tables), **{**call.keywords,
-                                                                'scales': _abstract(*scales)}))
+                             out_dtype='float32', trans_rhs=True, interpret=interpret)
+    tileable = all(mosaic_sm100.scales_tileable(each) for each in (rows_scales, matrices.scales))
+    tile = None if not tileable else _planned(launch, launch.bind(
+        *_abstract(*call.args[:3]), (), (), None, None, *_abstract(*tables),
+        **{**call.keywords, 'scales': jax.eval_shape(tiled)}))
     if selection.select(op, MxCase(tile)).kernel != 'mosaic':
         values = lhs.decoded() if gather is None else lhs.decoded()[gather]
         return grouped_matmul.xla_ragged_dot(values, jnp.swapaxes(matrices.decoded(), 1, 2), sizes,
                                              precision=jax.lax.Precision.DEFAULT,
                                              preferred_element_type=jnp.float32)
     assert tile is not None, "the selector names the template where it plans a tile"
-    return call()
+    return call(scales=tiled())
 
 
 NVFP4_BLOCK_OP: selection.Op[MxCase] = selection.Op(generation.Choice.NVFP4_BLOCK, (
