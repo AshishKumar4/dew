@@ -98,7 +98,7 @@ def orthogonalized(updates: optax.Updates, numbers, coeffs, steps: int, eps: flo
     where None (`spread_stacks`), and padded so no device idles on a remainder: on a GH200 a 4B decision
     step's update ran its 222 TFLOP of products as 31 joined stacks at 0.74 of peak and as 317 stacks one at
     a time (`group=1`) at 0.58, 82 ms a step slower, where the joined copies held 11.3 GB more at the step's
-    peak (row 5669). A plan sets `group` from the room it has. On a mesh
+    peak (row 5669); a run states its `group` (`OptimConfig`'s `ns_group`), which no plan sets. On a mesh
     with Explicit axes the spreading runs with them Auto (`jax.sharding.auto_axes`), where a constraint may
     name them and a split stack slices, each update leaving where it came; on one device, or none in
     context, each stack iterates whole. A tree of head `widths` (`head_widths`) splits an update's output
