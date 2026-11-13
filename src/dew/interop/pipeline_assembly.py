@@ -43,7 +43,7 @@ from dew.interop.decoder_bindings import decoder_layouts
 from dew.interop.safetensors_io import LazyTensors
 from dew.interop.sources import StoredWeights
 from dew.interop.streaming import LazyTree, WeightLayout
-from dew.interop.unread import Stored
+from dew.interop.unread import Stored, unread as unread_specs
 from dew.interop.weights import AUTO, ParamTree, source_alias
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -937,8 +937,9 @@ def _bind_language_model[C: ConditionEncoder](
         return conditioner({"text_encoder": variables}), bound, retained
     if stored is None or (held := stored.specs("text_encoder")) is None:
         return conditioner(params), (), {}
-    _, bound, unread = read({name: np.broadcast_to(np.zeros((), spec.dtype), spec.shape)
-                             for name, (_, spec) in held.items()}, lazy=True)
+    # The stored tensors as their specs alone (`Unread`), which a tie or an alias the read checks compares
+    # by shape: no value of the encoder's is read where the supplied variables hold its weights.
+    _, bound, unread = read(unread_specs({name: spec for name, (_, spec) in held.items()}), lazy=True)
     source = stored.tensors({name: held[name] for name in unread})
     return conditioner(params), bound, LazyTensors(
         {f"text_encoder/{name}": source.specs[name] for name in unread},
