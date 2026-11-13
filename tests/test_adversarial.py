@@ -265,3 +265,78 @@ def test_a_lora_student_distills_beside_its_whole_teacher():
     for got, want in zip(jax.tree.leaves(state.variables[FROZEN]), jax.tree.leaves(held), strict=True):
         np.testing.assert_array_equal(np.asarray(got), want)
     assert np.any(np.asarray(state.variables["params"]["output"]["final_proj"]["lora_B"]) != 0)
+
+
+PARTIAL_BN_SEEDS = 8
+"""Check 1's declared seeds for `BatchNormLocal` over row counts not divisible by `virtual_batch=8`."""
+
+
+@pytest.mark.parametrize("rows", [9, 11, 13, 15])
+def test_batch_norm_local_normalizes_partial_trailing_virtual_groups_over_valid_rows(rows):
+    """`BatchNormLocal` and `Head` handle row counts not divisible by `virtual_batch=8`: the first 8 rows
+    normalize as an isolated 8-row group and the trailing `rows - 8` rows normalize over their own valid
+    members alone (held by check 1 from float64), ignoring `VALID_ROWS=False` filler rows and preserving
+    affine channel weights."""
+    from dew.batch import VALID_ROWS
+    from dew.objectives.diffusion.adversarial import BatchNormLocal
+
+    weight = jnp.asarray([1.5, -0.5, 2.0, 0.75], jnp.float32)
+    bias = jnp.asarray([0.25, -1.0, 0.5, 0.125], jnp.float32)
+    norm = BatchNormLocal(virtual_batch=8)
+    params = {"params": {"weight": weight, "bias": bias}}
+    with jax.enable_x64(new_val=True):
+        wide_params = {"params": {"weight": jnp.asarray([1.5, -0.5, 2.0, 0.75], jnp.float64),
+                                  "bias": jnp.asarray([0.25, -1.0, 0.5, 0.125], jnp.float64)}}
+
+    def split_groups(net_params, x):
+        return jnp.concatenate([norm.apply(net_params, x[:8], {}),
+                                norm.apply(net_params, x[8:], {})], axis=0)
+
+    @as_given
+    def wide_truth(x_np):
+        with jax.enable_x64(new_val=True):
+            x64 = jnp.asarray(x_np, jnp.float64)
+            return np.asarray(split_groups(wide_params, x64), np.float64)
+
+    def draw(seed: int):
+        rng = np.random.default_rng([0xB4, rows, seed])
+        return (rng.standard_normal((rows, 2, 3, 4)).astype(np.float32),)
+
+    assert_as_exact(jax.jit(lambda x: norm.apply(params, x, {})),
+                    jax.jit(lambda x: split_groups(params, x)),
+                    draw, f"BatchNormLocal {rows} rows", seeds=PARTIAL_BN_SEEDS, truth_fn=wide_truth)
+
+    if rows >= 11:
+        valid = np.ones(rows, bool)
+        valid[9] = False
+        kept_idx = np.asarray([*range(9), *range(10, rows)], np.int32)
+
+        def draw_masked(seed: int):
+            rng = np.random.default_rng([0xB5, rows, seed])
+            clean = rng.standard_normal((rows, 2, 3, 4)).astype(np.float32)
+            corrupted = clean.copy()
+            corrupted[9] = 1e6
+            return clean, corrupted
+
+        @as_given
+        def wide_masked_truth(clean, _corrupted):
+            with jax.enable_x64(new_val=True):
+                x64 = jnp.asarray(clean, jnp.float64)
+                tail64 = jnp.concatenate([x64[8:9], x64[10:]], axis=0)
+                return np.asarray(jnp.concatenate([norm.apply(wide_params, x64[:8], {}),
+                                                   norm.apply(wide_params, tail64, {})], axis=0), np.float64)
+
+        assert_as_exact(
+            jax.jit(lambda _c, corr: norm.apply(params, corr, {VALID_ROWS: valid})[kept_idx]),
+            jax.jit(lambda clean, _corr: jnp.concatenate(
+                [norm.apply(params, clean[:8], {}),
+                 norm.apply(params, jnp.concatenate([clean[8:9], clean[10:]], axis=0), {})], axis=0)),
+            draw_masked, f"BatchNormLocal {rows} rows masked", seeds=PARTIAL_BN_SEEDS,
+            truth_fn=wide_masked_truth)
+
+    x0 = jnp.asarray(draw(0)[0])
+    head = Head(cmap_dim=8, kernel_size=(1, 3))
+    cond = jnp.ones((rows, 4), jnp.float32)
+    head_vars = head.init(jax.random.key(0), x0, cond, update=False, batch={})
+    logits = head.apply(head_vars, x0, cond, update=False, batch={})
+    assert logits.shape == (rows, 2, 3) and bool(jnp.all(jnp.isfinite(logits)))

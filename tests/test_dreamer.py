@@ -947,3 +947,59 @@ def test_dreamer_filled_and_split_step_updates_as_the_real_windows_whole(dynamic
 
     assert_as_exact(split_arm, whole_arm, draw, f"DreamerV3 filled and split update ({dynamics_kind})",
                     seeds=DREAMER_SPLIT_SEEDS, truth_fn=float64_replay(whole_update, compiled=True))
+
+
+def test_even_twohot_bins_space_supports_evenly_and_dreamer_validates_bounds_and_compiles_once():
+    """Even `twohot_bins` counts >= 4 mirror evenly spaced negative coordinates without duplicating zero;
+    `DreamerV3Objective` and `DreamerRollout` validate silent-wrong bounds, `episodes_return` supports
+    `greedy=True`, and dynamic-length `_stepped` compiles zero extra rollout programs when `due` varies."""
+    from dew.objectives.rl.dreamer import demonstration_replay, episodes_return
+    from dew.rl.distributions import symexp, twohot_bins, twohot_loss, twohot_mean
+    from dew.telemetry.compiles import Compiles
+    from dew.training import Trainer
+
+    for count, limit, coords in ((2, 3.0, (-3.0, 3.0)),
+                                 (4, 3.0, (-3.0, -1.0, 1.0, 3.0)),
+                                 (6, 5.0, (-5.0, -3.0, -1.0, 1.0, 3.0, 5.0))):
+        bins = twohot_bins(count, limit=limit)
+        expected = np.asarray([float(symexp(jnp.float32(c))) for c in coords], np.float32)
+        np.testing.assert_array_equal(np.asarray(bins), expected)
+        np.testing.assert_array_equal(np.asarray(bins), -np.asarray(bins)[::-1])
+        assert bool(np.all(np.diff(np.asarray(bins)) > 0))
+    four_obj = DreamerV3Objective(WorldModel(1, 2, bins=4, deter=16, hidden=8, stoch=4, classes=4, units=8),
+                                  imagination=2)
+    vars_four = four_obj.init(jax.random.key(0))
+    peaked_logits = jnp.asarray([[50.0, -50.0, -50.0, -50.0],
+                                 [-50.0, 0.0, 0.0, -50.0],
+                                 [-50.0, -50.0, -50.0, 50.0]], jnp.float32)
+    decoded = twohot_mean(peaked_logits, four_obj.bins)
+    expected_means = np.asarray([float(four_obj.bins[0]), 0.0, float(four_obj.bins[3])], np.float32)
+    np.testing.assert_array_equal(np.asarray(decoded), expected_means)
+    assert bool(jnp.all(jnp.isfinite(twohot_loss(peaked_logits, decoded, four_obj.bins))))
+    for bad_kwargs in ({"slow_decay": 1.5}, {"return_rate": 0.0}):
+        with pytest.raises(ValueError):
+            DreamerV3Objective(tiny(), **bad_kwargs)
+    env = Batched(TimeLimit(Target(), episode_length=20), 4)
+    short_replay = demonstration_replay([{"observation": np.zeros((3, 1), np.float32),
+                                          "action": np.zeros((3, 1), np.float32),
+                                          "reward": np.zeros(3, np.float32)}])
+    with pytest.raises(ValueError):
+        DreamerRollout(DreamerV3Objective(tiny()), env, replay=short_replay, batch=4, length=8)
+    greedy_ret = episodes_return(four_obj, Batched(TimeLimit(Target(2), episode_length=6), 2), vars_four,
+                                 jax.random.key(3), 6, greedy=True)
+    assert np.isfinite(greedy_ret)
+
+    # Non-multiple prefill (12 = 8 + 4) and alternating due (4*8 / 24 = 1.333 -> 1 or 2 steps/env):
+    # dynamic `fori_loop` compiles 1 prefill rollout and 1 live rollout across updates.
+    rollout = DreamerRollout(four_obj, Batched(TimeLimit(Target(2), episode_length=20), 4), capacity=64,
+                             batch=4, length=8, train_ratio=24.0, prefill=12)
+    trainer = Trainer(four_obj, optax.adam(1e-3), key=jax.random.key(0), rollout=rollout,
+                      checkpoints=None, tracker=None)
+    state = trainer.initial_state()
+    rollout(state, {}, jax.random.key(1), objective=four_obj)
+    rollout(state.replace(updates=jnp.int32(1)), {}, jax.random.key(2), objective=four_obj)
+    with Compiles(None) as midrun:
+        for u in range(2, 6):
+            rollout(state.replace(updates=jnp.int32(u)), {}, jax.random.fold_in(jax.random.key(3), u),
+                    objective=four_obj)
+    assert midrun.count == 0

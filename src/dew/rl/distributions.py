@@ -37,7 +37,7 @@ def twohot_bins(count: int = 255, limit: float = 20.0) -> jax.Array:
     if count % 2 == 1:
         half = symexp(jnp.linspace(-limit, 0, (count - 1) // 2 + 1, dtype=jnp.float32))
         return jnp.concatenate([half, -half[:-1][::-1]])
-    half = symexp(jnp.linspace(-limit, 0, count // 2, dtype=jnp.float32))
+    half = symexp(jnp.linspace(-limit, -limit / (count - 1), count // 2, dtype=jnp.float32))
     return jnp.concatenate([half, -half[::-1]])
 
 

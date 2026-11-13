@@ -7,6 +7,26 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A resume treats its data relaxed by default (`TrainerConfig.data_resume`, `--set trainer.data_resume=exact`):
+  the run's parameters, optimizer state, step, schedule and random state resume as saved, and its data reads
+  on at its saved position where the saved plan makes the same rows; where the plan differs (a rule, a
+  fact, the order, the sources or steps, the topology, or a plan version this Dew does not read), the data
+  starts again from the beginning of its order, the log naming each part that differs and the run's
+  records holding it (`DataRestarted`); data read in stages (phases, schedules, a batch ramp) starts again
+  at the stage the run's progress stands in, that stage's own start, its boundaries where the run's progress
+  places them, and a run bounded in examples ends at its own count. `exact` refuses any difference, as every
+  resume did before.
+  `compile(..., resume=)` takes `"relaxed"` where it took `"non-exact"`, and a plan's refusal is a
+  `dew.data.plan.PlanChanged` naming what differs (`differs`).
+
+- Dew requires its JAX build 0.12.0.1.post85 (Python alone; the CUDA and PJRT plugins stay post81's): the
+  GPU interpreter checks a barrier wait that names its phase at its waits alone, so consumers that take
+  alternate tiles of one ring over several rotations, warps among them, are checked rather than refused.
+- `dew.optim_schedules` holds a solver's learning rate as operands of its state: `ScheduleBase`, `RateState`
+  and `ProgressState`, `scheduled_solver`, `rates_of`, `with_rates`, `with_horizons`, `learning_rate`,
+  `held_rates`, `scaled_rates`, `settable_rates`, `schedule_states`, `reclocked` and `stepped_rate` are
+  imported from there, where `dew.optim` held them; the schedule kinds (`Cosine`, `Linear`, `Power`,
+  `OneCycle`, `Exponential`) and `OptimConfig` stay in `dew.optim`.
 - Dew requires its JAX build 0.12.0.1.post84 (Python alone; the CUDA and PJRT plugins stay post81's): the
   toolkit's ring waits name their phase, so the interpreter checks two consumers that take alternate tiles
   of one ring; a tcgen05 pair's step block over a partial depth lowers; the lowering cache keys a program
@@ -42,6 +62,17 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   a new run that reads its data afresh. `Objective.bind_plan`, `dew.data.pipeline.earlier`, `Pipeline.at`
   and `ObjectiveData.earlier` are gone, and `Source.manifest` takes no version.
 
+- A schedule's step horizons (its warmup's and decay's lengths in steps) are operands of its solver's state
+  (`RateState.horizons`) where a run builds it stated (`OptimConfig.build(stated=True)`), so a rehearsed run
+  and the run itself step one program over the persistent compile cache whatever their lengths. A schedule
+  states them through the new `ScheduleBase.horizons(steps)` hook, and `ScheduleBase.values` takes them
+  as `values(horizons, rates)` where it took `values(steps, rates)`: a subclass that read the run's length
+  in `values` overrides `horizons` to state the lengths it reads, or reads `{}`.
+
+- Dew requires optax 0.2.8 or later (was 0.2.6): Muon iterates Newton-Schulz in Dew's own form, on the matrices
+  as they are stored (no transposes), held to optax's iteration as its oracle; its layout, shape scalings,
+  coefficient presets and preconditionings (AOL, Schatten), which 0.2.8 first ships, are optax's.
+
 - A run resumes from what the current Dew and the one before it wrote, and refuses an earlier format by
   name with the ways on: a step that holds a decision run's projections packed (`q`, `k` and `v` in one
   array, as an earlier Dew stored them) where the run holds them apart, and a step that holds its whole
@@ -51,12 +82,6 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   still load (`Checkpoints.variables`, `Pretrained.from_saved`): start a fresh run from them, or resume it
   with the Dew that wrote it.
 
-- A schedule's step horizons (its warmup's and decay's lengths in steps) are operands of its solver's state
-  (`RateState.horizons`) where a run builds it stated (`OptimConfig.build(stated=True)`), so a rehearsed run
-  and the run itself step one program over the persistent compile cache whatever their lengths. A schedule
-  states them through the new `ScheduleBase.horizons(steps)` hook, and `ScheduleBase.values` takes them
-  as `values(horizons, rates)` where it took `values(steps, rates)`: a subclass that read the run's length
-  in `values` overrides `horizons` to state the lengths it reads, or reads `{}`.
 
 - On a GPU holding tensor memory (a B200, B300 or other SM 10.x/11.x part), a run refuses to start under a
   cuBLAS below 13.2 (`UnsafeCublas`), whose kernels free their tensor memory twice beside another kernel's
@@ -87,6 +112,13 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 - `DreamerRollout` compiles its JAX environment reset once (`saved_shapes` reading shapes via
   `jax.eval_shape`), and `dew.rl.evaluation` fuses `episodes` into a single compiled program.
+
+- `BatchNormLocal` normalizes partial trailing virtual groups over their valid rows, `DiffusionRunConfig`
+  forwards all `SourceOptions` to `load_diffusion_source` (refusing unsupported `dex`, `scan_layers` and
+  `packed_experts` before fetching weights), `fused_head_loss` selects zero-weight excluded targets away
+  before multiplying, `twohot_bins` spaces even bin counts without duplicating zero, `DiscreteDenoiser`
+  traces blockwise steps once, and `ControlRollout` and `DreamerRollout` fuse collection
+  summaries/permutations and dynamic-length rollout loops.
 
 - A paged `Server` keeps a prefix cache by default (`prefix_cache=None` derives it on wherever the layout pages,
   the rows sample a token a step on the server's own mesh and the model computes a split prompt as a whole
