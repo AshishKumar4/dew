@@ -7,6 +7,15 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- A run resumes from what the current Dew and the one before it wrote, and refuses an earlier format by
+  name with the ways on: a step that holds a decision run's projections packed (`q`, `k` and `v` in one
+  array, as an earlier Dew stored them) where the run holds them apart, and a step that holds its whole
+  train state as one item. `Checkpoints.restore(served=)` and `Objective.served_groups` are gone with the
+  packed form's resume, and `Checkpoints.restore_profiles` refuses a step that holds its post-hoc EMA
+  profiles in its optimizer's one-item state (read them with the Dew that wrote it). Such a step's weights
+  still load (`Checkpoints.variables`, `Pretrained.from_saved`): start a fresh run from them, or resume it
+  with the Dew that wrote it.
+
 - A schedule's step horizons (its warmup's and decay's lengths in steps) are operands of its solver's state
   (`RateState.horizons`) where a run builds it stated (`OptimConfig.build(stated=True)`), so a rehearsed run
   and the run itself step one program over the persistent compile cache whatever their lengths. A schedule
