@@ -11,12 +11,10 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
-from dew._coordination import collective_host
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import CLOSES_WINDOW, Batch
 from dew.distributed.batches import batch_layout, batch_shardings
@@ -25,7 +23,7 @@ from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import Link, Schedule
 from dew.objectives.base import Objective
-from dew.state import TrainState, apart, occupancy, together
+from dew.state import TrainState, apart, occupied, together
 from dew.telemetry.instrumentation import StepFlops
 from dew.training._candidates import Stepping, candidate_for, lowered_for
 from dew.training._lowering import Lowered, routed
@@ -73,7 +71,7 @@ def laid_out(state: TrainState, window: int) -> TrainState:
     size = int(state.window_size)
     if size == window:
         return state
-    if int(jnp.max(occupancy(state.window))):
+    if occupied(state.window):
         raise ValueError(f"the state pools an open window of {size} microbatches, and the step it is handed "
                          f"to reads {window} an update: a step of another split begins at an update's end")
     # Counted on the host and placed as the counts were: an operation on the device arrays would compile a
@@ -287,7 +285,7 @@ class StepCompiler[L, E]:
         # A state pools its window's microbatches where it holds one part filled: the window, laid out for
         # its split, binds it. Read on the host: a reduction on the devices compiles a program of the
         # occupancy's placement, a restored one's another than a fresh one's, which a resume compiles anew.
-        pools = bool(np.max(collective_host(occupancy(state.window), phase="accumulation occupancy")))
+        pools = bool(occupied(state.window))
         held = state.window is not None or split > 1
         # DiLoCo's replicas, once they have stepped, each count their microbatches in their split's windows,
         # which no other split reads: it binds the split, a stated other refused.
