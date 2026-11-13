@@ -562,3 +562,41 @@ def test_a_clipped_run_stores_its_stepped_kernels_times_the_clip():
 
     assert_as_exact(trained, paper(model), draw, "a clipped run's stepped kernels", seeds=CLIPPED_STEP_SEEDS,
                     truth_fn=paper(model.clone(dtype=jnp.float64)))
+
+
+class Matrix(Objective[Ratio, None]):
+    """A least-squares fit of a 4 x 8 matrix, its rows split over a mesh's fsdp axis (`embed`'s)."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": nn.LogicallyPartitioned(jnp.arange(32, dtype=jnp.float32).reshape(4, 8) / 32,
+                                                        ("embed", None))}}
+
+    def loss(self, variables, batch, step):
+        errors = (variables["params"]["w"].sum() - batch["y"]) ** 2
+        return Ratio(jnp.sum(errors), jnp.asarray(errors.size, jnp.float32)), Aux({})
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_local_step_one_process_wrote_reads_onto_the_host_and_onto_any_mesh(tmp_path):
+    """A local step one process wrote holds every shard in its own directory, so its variables read onto
+    the host (`variables(on_host=True)`: host arrays, restored onto the process's CPU device) and placed with
+    no mesh named (the default mesh over every device, not the two it was written on), each as the step
+    holds them, bit for bit, where both were refused for its placement (row 5667). A pool's local step,
+    each process holding its own shards, still reads onto the placement it was written with alone."""
+    from dew.training import MeshSpec
+
+    persistent, local = str(tmp_path / "persistent"), str(tmp_path / "local")
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    train = Trainer(Matrix(), optax.sgd(.1), key=jax.random.PRNGKey(3), mesh=mesh,
+                    checkpoints=Checkpoints(persistent, local_directory=local, local_every=1))
+    initial = train.initial_state()
+    data = {"y": jnp.ones(2 * jax.device_count(), jnp.float32)}
+    state, *_ = train.compile(initial, data)(initial, data)
+    written = np.asarray(state.variables["params"]["w"])
+    train.checkpoints.save_local(1, state, b"1", share=DataPartition())
+    train.checkpoints.wait()
+    host = Checkpoints(persistent, local_directory=local, local_every=1).variables(ema=False, on_host=True)
+    assert isinstance(host["params"]["w"], np.ndarray)
+    np.testing.assert_array_equal(host["params"]["w"], written)
+    placed = Checkpoints(persistent, local_directory=local, local_every=1).variables(ema=False)
+    np.testing.assert_array_equal(np.asarray(placed["params"]["w"]), written)
