@@ -29,7 +29,7 @@ from kernel_compile import gate_generations
 from model_support import TINY_DECODER, memory_limited_to
 from token_support import token_rows
 
-from dew._devices import allocator_limit, device_limit
+from dew._devices import allocator_limit, device_memory
 from dew._records import listed, record
 from dew.nn.kernels.generation import capability
 from dew.nn.sharding import Link
@@ -534,8 +534,6 @@ def test_compiling_ahead_plans_once_and_saves_the_selected_program(tmp_path, mon
     assert probe["argument"] == ahead.argument_bytes
     # The plan was made against the allocator's limit the GPU's stated memory gives (`allocator_limit`).
     assert ahead.capacity == ahead.built.memory == 2**30
-    from dew.training.memory import device_memory
-
     stated = device_memory(trainer.device_mesh.devices.flat[0], ahead.argument_bytes)
     assert stated["pool_bytes"] == ahead.capacity
     assert stated["largest_free_block_bytes"] == ahead.capacity - ahead.argument_bytes
@@ -598,7 +596,7 @@ def test_a_program_compiled_over_a_hosts_serialized_topology_keys_the_cache_as_o
     assert key(read) == key(host)
     assert key(read) != key(compile_only_gpus("sm90", 2))
     # The topology states its GPUs' memory, which the devices read back carry as the ones serialized do.
-    assert [device_limit(device) for device in read] == [allocator_limit(40 * 2**30)] * 2
+    assert [device_memory(device)["bytes_limit"] for device in read] == [allocator_limit(40 * 2**30)] * 2
 
 
 @pytest.mark.parametrize("host, memory", [("a100-sxm4-40gb", 42_406_903_808), ("gh200", 101_468_602_368)])
@@ -784,7 +782,7 @@ def test_a_configured_run_compiling_ahead_for_gpus_of_no_stated_memory_is_refuse
 
 def test_a_build_of_compile_only_gpus_holds_their_stated_memory_and_refuses_a_device_holding_less():
     """A build of compile-only GPUs (`BuildTarget.of`) holds the allocator's limit their stated memory gives
-    (`device_limit`), as a build of attached GPUs holds theirs: a device of a lower limit is refused naming
+    (`device_memory`), as a build of attached GPUs holds theirs: a device of a lower limit is refused naming
     both, one of a higher limit takes it."""
     from dew.training.ahead import BuildTarget
 

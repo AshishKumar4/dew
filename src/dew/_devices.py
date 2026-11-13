@@ -253,8 +253,9 @@ def pool_share() -> float:
 
 COMPILE_ONLY_MEMORY: dict = {}
 """Each compile-only GPU's memory, its total bytes, as its topology states it to XLA (`device_memory_size`,
-written by `dew.training.ahead.compile_only_gpus`, read from a host's own by `host_gpus`): the one
-statement every admission of a program compiled for it reads (`allocator_limit`)."""
+written by `dew.training.ahead.compile_only_gpus`, read from a host's own by `host_gpus`), and each CPU
+device's standing in for a GPU (`dew.training.ahead.stand_in_gpus`): the one statement every admission
+and layout check on the device reads (`device_memory`, `allocator_limit`)."""
 
 
 def allocator_limit(memory: int) -> int:
@@ -268,16 +269,20 @@ def allocator_limit(memory: int) -> int:
     return int(memory * pool_share())
 
 
-def device_limit(device) -> int | None:
-    """The bytes an allocation on `device` fails against: its allocator's limit as it states it
-    (`Device.memory_stats`' `bytes_limit`) where it is this process's own, a compile-only GPU's derived
-    from its stated memory (`COMPILE_ONLY_MEMORY`), None where neither states one (a CPU)."""
+def device_memory(device, arguments: int = 0) -> Mapping[str, int]:
+    """What `device`'s allocator states, in bytes (`Device.memory_stats`' keys). A device whose memory is
+    stated (`COMPILE_ONLY_MEMORY`: a compile-only GPU's, or a CPU device's standing in for a GPU) states a
+    fresh BFC pool at its allocator's limit (`allocator_limit`) with `arguments` resident: its free block
+    and temporary-stranding policy are read exactly as for that allocator. An attached device states its
+    own, empty where it states nothing (a CPU's), as does a compile-only GPU whose memory no one stated."""
     import jax
 
-    if device in jax.local_devices():
-        return (device.memory_stats() or {}).get("bytes_limit")
     memory = COMPILE_ONLY_MEMORY.get(device)
-    return None if memory is None else allocator_limit(memory)
+    if memory is None:
+        return (device.memory_stats() or {}) if device in jax.local_devices() else {}
+    limit = allocator_limit(memory)
+    return {"bytes_limit": limit, "bytes_in_use": arguments, "pool_bytes": limit,
+            "largest_free_block_bytes": limit - arguments}
 
 
 def pool_bound(*, cuda: bool) -> float | None:

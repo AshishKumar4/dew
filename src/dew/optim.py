@@ -62,7 +62,6 @@ from dew.newton_schulz import (
     newton_schulz_flops,
     orthogonalized,
     polar_express,
-    spread_matrices,
 )
 from dew.nn.inspection import QK
 from dew.nn.precision import at_least_fp32
@@ -388,12 +387,10 @@ def _scale_by_shape(consistent_rms: float | None, per_head: Mapping[str, int] | 
     return optax.GradientTransformation(lambda params: optax.EmptyState(), update_fn)
 
 
-def muon_update_flops(params, steps: int, per_head: Mapping[str, int] | None = None, *, devices: int = 1,
-                      group: int | None = None) -> float:
+def muon_update_flops(params, steps: int, per_head: Mapping[str, int] | None = None) -> float:
     """Muon's Newton-Schulz FLOPs an update over `params` (`newton_schulz_flops`): each parameter it takes
     (`muon_weight_dimension_numbers`) as the stack of matrices it orthogonalizes, a head's alone where
-    `per_head` names its width (`head_widths`), joined `group` at a time and padded for its `devices` as the
-    iteration runs them (`spread_matrices`), at `steps` iterations."""
+    `per_head` names its width (`head_widths`), at `steps` iterations."""
     numbers = jax.tree.leaves(muon_weight_dimension_numbers(params), is_leaf=muon_leaf)
     widths = jax.tree.leaves(head_widths(params, per_head), is_leaf=lambda node: node is None)
     stacks = [jax.eval_shape(lambda held, shape=shape, width=width: headed(as_matrices(held, shape)[0],
@@ -401,7 +398,7 @@ def muon_update_flops(params, steps: int, per_head: Mapping[str, int] | None = N
               for leaf, shape, width in zip(jax.tree.leaves(params), numbers, widths, strict=True)
               if shape is not None]
     return sum(newton_schulz_flops(matrices, rows, columns, steps)
-               for matrices, rows, columns in spread_matrices(stacks, devices, group))
+               for matrices, rows, columns in (stack.shape for stack in stacks))
 
 
 def head_widths(updates, per_head: Mapping[str, int] | None):
