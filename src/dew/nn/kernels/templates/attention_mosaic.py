@@ -510,7 +510,10 @@ class MosaicForward(_Mainloop[Tiles]):
         wgmma's, row 4042), that takes the call and derives a config: a config legal with its natural
         rewalk's tiles (`_relaunched`), so a tile whose rewalk no tile holds gives way to a smaller (a 48-row
         training walk's scaled op on an A100 at width 32, legal at 48 x 64 and its rewalk not, derived none
-        where 32 x 64 holds both, et-why48)."""
+        where 32 x 64 holds both, et-why48). A config is legal as it launches, its rewalk's tiles named
+        (`_launchable`), so a compile's refusal of it (`report.refused`, keyed by the config the launch
+        traced) steps its derivation: read at its own tiles alone, the refusal reached nothing and a B200's
+        spilling 4B forward compiled twice, the same program (PF03)."""
         query = ba.arguments["query"]
         for family in layouts(target.generation, query.dtype, query.shape[1]):
             if self.refusal(ba, family) is not None:
@@ -520,15 +523,24 @@ class MosaicForward(_Mainloop[Tiles]):
                     return Tiles(rows, walked, 2, consumers, family=family.name, columns=columns)
 
                 def fits(config: Tiles) -> bool:
-                    return (self._launch_legal(ba, config, target)
-                            and self._relaunched(ba, config, target) is not None)
+                    return self._launchable(ba, config, target) is not None
 
                 config = _derived(family, query.dtype, query.shape[1], _keys(ba), tiles, fits,
                                   overlapped=True, walks=walked_extents,
                                   least_walked=functools.partial(_least_keys, family))
                 if config is not None:
-                    return self._relaunched(ba, config, target)
+                    return self._launchable(ba, config, target)
         return None
+
+    def _launchable(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget
+                    ) -> Tiles | None:
+        """`config` as it launches, its natural rewalk's tiles named (`_relaunched`), where that is legal
+        (`legal`: a compile's refusal of the launch among its rules, keyed by this config); None where it is
+        not or no tile holds the rewalk."""
+        if not self._launch_legal(ba, config, target):
+            return None
+        launched = self._relaunched(ba, config, target)
+        return launched if launched is not None and self.legal(ba, launched, target) else None
 
     def streaming(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> Tiles:
         """`config` for a call whose walk the device's memory bounds (`streams`), its key tile the least its
@@ -554,18 +566,20 @@ class MosaicForward(_Mainloop[Tiles]):
         # together (`resident`): a larger tile holding fewer of them keeps no more in flight (an A100's
         # 16-row d64 decode at 256-key tiles staged 146 KB, one program a multiprocessor, 1.17x the hand
         # kernel's five resident programs of 20 KB, M-DD-7 W34).
-        dividing = [candidate for candidate in (dataclasses.replace(config, block_k=extent) for extent in
-                                                reversed(walked_extents(family, query.dtype, config.block_k)))
-                    if self.keys % candidate.block_k == 0 and self._launch_legal(ba, candidate, target)]
+        dividing = [launched for launched in (
+                        self._launchable(ba, dataclasses.replace(config, block_k=extent), target)
+                        for extent in reversed(walked_extents(family, query.dtype, config.block_k))
+                        if self.keys % extent == 0)
+                    if launched is not None]
         for candidate in dividing:
             held = self.resident(ba, candidate, target)
             if held * self._staged_keys(ba, candidate) >= in_flight:
-                return self._relaunched(ba, candidate, target) or config
+                return candidate
         # Where none keeps the stream in flight, the largest dividing tile before a derived one that does not
         # divide the keys: a GH200's bounded decode at 192-key tiles over 32768 padded its cache, 84.5 of its
         # 134 us a step at width 128 (M-ET-70), where its 128-key walk alone is 49.5.
         if self.keys % config.block_k and dividing:
-            return self._relaunched(ba, dividing[-1], target) or dividing[-1]
+            return dividing[-1]
         return config
 
     def streamed(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:

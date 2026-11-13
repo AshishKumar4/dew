@@ -560,16 +560,21 @@ def reads_binaries(lowered: jax.stages.Lowered) -> bool:
 
 
 def kept(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None = None, *,
-         relower: Callable[[], jax.stages.Lowered], first: Attempt | None = None) -> jax.stages.Compiled:
+         relower: Callable[[], jax.stages.Lowered], first: Attempt | None = None,
+         read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None) -> jax.stages.Compiled:
     """`lowered` compiled and kept (`settled`), its first compile `first` or one in this thread."""
-    return settled(lowered, options, relower, attempted(lowered, options) if first is None else first)
+    return settled(lowered, options, relower, attempted(lowered, options) if first is None else first,
+                   read=read)
 
 
 def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
-            relower: Callable[[], jax.stages.Lowered], first: Attempt) -> jax.stages.Compiled:
+            relower: Callable[[], jax.stages.Lowered], first: Attempt, *,
+            read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None
+            ) -> jax.stages.Compiled:
     """The program kept of `lowered`'s first compile (`first`), read through its kernels' binaries
-    (`binaries`): where a kernel of a template's launch spills, that launch's config is refused (`refused`),
-    the miss recorded (`misses`, logged), and the program `relower`ed and compiled, again for as long as a
+    (`read`, `binaries` where None): where a kernel of a template's launch spills, that launch's config is
+    refused (`refused`), the miss recorded (`misses`, logged), and the program `relower`ed and compiled,
+    again for as long as a
     launch spills at a config not yet refused; `relower` traces afresh, so each refused launch's derivation
     takes the next config by its own rule, through every composition its device has (`bundles.groups`), and
     a launch whose every legal config spilled derives none, its call taking the next route (it leaves the
@@ -581,7 +586,9 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
     after them. Refusals commit only as a replacement compiles,
     so a later process derives the program kept here. A program loaded from the persistent compilation
     cache carries its kernels' binaries as one compiled here does. A program whose block XLA refuses steps
-    its asking Triton launches down (`_unblocked`)."""
+    its asking Triton launches down (`_unblocked`). A relowering that launches every refused config again
+    is the program just compiled: it is kept as compiled, its spills misses not stepped, each refusal that
+    did not take named (`_untaken`)."""
     if first.error is not None:
         asked = shared_asked(first.error)
         if asked is None:
@@ -589,7 +596,7 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
         return _unblocked(lowered, options, relower, asked, first.error)
     executable = first.executable
     assert executable is not None
-    found = _misses_of(_spilling(lowered, executable))
+    found = _misses_of(_spilling(lowered, executable, read))
     while True:
         # Each step refuses a config no step refused before, of the finitely many its launches derive.
         held = _registry().refused
@@ -600,12 +607,18 @@ def settled(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | N
         try:
             with _proposing(refusals) as proposal:
                 program, alone = _stepped_alone(relower, options, {identity for (identity, _), _ in refusals})
-                replacement, spilling = _compiled_reported(program, options)
+                # A relowering that launches every refused config again is the program just compiled: it is
+                # kept, not compiled again (a B200's 4B step compiled the same jit_step twice, 150 s, PF03).
+                untaken = _untaken(program, refusals)
+                replacement, spilling = ((None, []) if len(untaken) == len(refusals)
+                                         else _compiled_reported(program, options, read))
         except Exhausted as failed:
             _recorded(found, stepped=False)
             kernels = ", ".join(sorted({report.kernel for _, report, _ in found}))
             raise Exhausted(f"kernels {kernels} spill and their launches have no config left: {failed}"
                             ) from failed
+        if replacement is None:
+            break
         _commit(proposal)
         for refusal, kernel in [*refusals, *((refusal, report.kernel) for refusal, report, _ in alone)]:
             _record(refusal, None, frozenset({kernel}))
@@ -753,6 +766,23 @@ def _stepped_alone(relower: Callable[[], jax.stages.Lowered], options: jax.stage
         missed += found
 
 
+def _untaken(program: jax.stages.Lowered, refusals: list[tuple[tuple[str, Hashable], str]]
+             ) -> list[tuple[tuple[str, Hashable], str]]:
+    """Each of `refusals` (a launch's identity and config, and its spilling kernel's name) that `program`,
+    relowered under them, launches again: its launch's derivation did not read the refusal. Each is logged,
+    so the launch whose rule ignores its refusals is named."""
+    from dew.nn.kernels.lowered import kernel_calls
+
+    # Every call JAX compiles, a branch's no run takes among them (a forward's scaled op's).
+    launched = {(launch.identity, launch.config) for call in kernel_calls(program, unrun=True)
+                if (launch := traced(call.launch or kernel_of(call.name)[1] or "")) is not None}
+    untaken = [(refusal, kernel) for refusal, kernel in refusals if refusal in launched]
+    for (_, config), kernel in untaken:
+        _log.warning("kernel %s's refusal at %s did not take: the program relowered under it launches it "
+                     "again, its launch's derivation not reading it", kernel, config)
+    return untaken
+
+
 def _unblocked(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
                relower: Callable[[], jax.stages.Lowered], asked: int,
                error: Exception) -> jax.stages.Compiled:
@@ -823,18 +853,20 @@ def _recorded(found: list, *, stepped: bool) -> None:
                      "its launch steps down" if miss.stepped else "no step-down")
 
 
-def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None
+def _compiled_reported(lowered: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
+                       read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None
                        ) -> tuple[jax.stages.Compiled, list["Binary"]]:
     executable = lowered.compile(targeted(lowered, options))
-    return executable, _spilling(lowered, executable)
+    return executable, _spilling(lowered, executable, read)
 
 
-def _spilling(lowered: jax.stages.Lowered, executable: jax.stages.Compiled) -> list["Binary"]:
-    """The kernels of `executable`, `lowered` compiled, that spill, where it runs a template's
-    (`reads_binaries`)."""
+def _spilling(lowered: jax.stages.Lowered, executable: jax.stages.Compiled,
+              read: Callable[[jax.stages.Compiled], list["Binary"]] | None = None) -> list["Binary"]:
+    """The kernels of `executable`, `lowered` compiled, that spill, read by `read` (`binaries` where None),
+    where it runs a template's (`reads_binaries`)."""
     if not reads_binaries(lowered):
         return []
-    return [found for found in binaries(executable) if found.frame]
+    return [found for found in (read or binaries)(executable) if found.frame]
 
 
 @dataclasses.dataclass(frozen=True)

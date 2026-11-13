@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from attention_oracle import attention_terms
 from float64_terms import float64_terms
-from generation_support import INTERPRETS, lowers
+from generation_support import COMPILES_ON_CPU, INTERPRETS, lowers
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import assert_as_exact, widened
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
@@ -1002,6 +1002,59 @@ def _forward_call(shape, width: int, value_width: int, residuals: template.Kept)
     op = attention_mosaic.MosaicForward(form="causal", keys=tokens, scale=width ** -0.5)
     return op, _bound(op, query, key, value, spans.start, spans.end, None, None, (), (), None,
                       residuals=residuals)
+
+
+@pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
+def test_a_refused_forward_config_is_derived_no_more(residuals):
+    """A B200's forward of Qwen3.5-4B's attention (16 heads over 4, width 256, a 12,288-token causal row):
+    its derived config refused as a compile refuses a spilling launch (`report.refuse_launch`, at the config
+    the launch traced, its natural rewalk's tiles named) is derived no more, the derivation taking another
+    legal one or none (PF03: read at the config's own tiles alone, the refusal reached nothing, and a B200
+    compiled the same step twice)."""
+    from dew.nn.kernels.templates import report
+
+    with generation.assumed("sm100"), report.refusals():
+        target = generation.gpu_target()
+        op, ba = _forward_call((1, 12288, 16, 4), 256, 256, residuals)
+        first = op.derived(ba, target)
+        assert first is not None
+        report.refuse_launch(op, ba, first, {"attention_forward"})
+        again = op.derived(ba, target)
+        assert again != first
+        assert again is None or op.legal(ba, again, target)
+
+
+@COMPILES_ON_CPU
+def test_a_relowering_that_launches_its_refused_config_again_keeps_the_program():
+    """A run's compile (`report.kept`) whose kernel spills, and whose relowering launches the refused config
+    again (a derivation that does not read its refusal), keeps the program it compiled: no second compile
+    of the same program, the spill recorded as a miss not stepped down and no refusal committed (PF03: a
+    B200's 4B step compiled the same program twice, 150 s)."""
+    import kernel_compile
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.nn.kernels.lowered import kernel_calls
+    from dew.nn.kernels.templates import report
+
+    mesh = kernel_compile._device("sm100")
+    spans = template.spans(512, 512, 1, causal=True)
+    shape = jax.ShapeDtypeStruct((1, 512, 2, 128), jnp.bfloat16,
+                                 sharding=NamedSharding(mesh, PartitionSpec()))
+
+    def forward(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, None)
+
+    with generation.assumed("sm100"), jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, "sm100")):
+        first = jax.jit(forward).trace(shape, shape, shape).lower()
+    calls = [call for call in kernel_calls(first, unrun=True) if call.kind == "mosaic_gpu" and call.launch]
+    assert calls
+    # Every compile's kernels read as spilling, as a B200's ptxas read the 4B forward's.
+    spilled = [report.Binary(report.kernel_of(call.name)[0], call.launch, 255, 8) for call in calls]
+    with generation.assumed("sm100"), report.refusals():
+        report.kept(first, relower=lambda: first, read=lambda executable: spilled)
+        misses = report.misses()
+        assert misses and not any(miss.stepped for miss in misses), misses
+        assert report.refused_launches() == ()
 
 
 @pytest.mark.parametrize("residuals", [template.Kept.NONE, template.Kept.SPLIT], ids=["forward", "training"])
