@@ -207,6 +207,20 @@ def local(path, root: Path = REPO_ROOT) -> Path:
     return stored
 
 
+def provenance(reference: str, revision: str, device: str, command: str, **details):
+    """A recording's reference, its revision, the device and the public command that reproduces it,
+    as a JSON string array to save beside the recorded arrays (`save`). The command is published with the
+    recording: a path of the recording machine's own (from the root or the home, but a directory under
+    /tmp the command makes itself) is refused, the argument's name standing in its place."""
+    import numpy as np
+
+    if any(part.startswith(("/", "~")) and not part.startswith("/tmp/")
+           for word in command.split() for part in word.split("=")[-1].split(":")):
+        raise ValueError(f"a recording's command is public, its machine's paths named, not given: {command}")
+    return np.asarray(json.dumps({"reference": reference, "revision": revision, "device": device,
+                                  "command": command, **details}))
+
+
 def save(path, arrays: dict, *, reference: str, license: str, root: Path = REPO_ROOT) -> Path:
     """Write a recording compressed: at `path`, under tests/fixtures/, to commit, where it is at most
     IN_GIT bytes; larger, to the local store under its sha256, pinned with no revision until `upload`,
