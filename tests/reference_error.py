@@ -210,59 +210,55 @@ def as_given(fn):
 
 class Rounded(NamedTuple):
     """An arm's result at a site of followed roundings (`assert_as_exact`'s `followed`): the leaves check 1
-    judges (`judged`), every rounding's input among them, the decisions its roundings made (`decisions`,
-    each rounding's output as the arm computed it), which its own truth follows, and the values they
-    rounded (`rounded`, a tree as `decisions` is), by which the gate holds each decision to the site's own
-    rounding of it (`Followed.rounds`); a recording's arm states none, its decisions the reference's."""
+    judges (`judged`), every rounding's input among them, and the decisions its roundings made
+    (`decisions`, each rounding's output as the arm computed it), which its own truth follows and the
+    gate holds to the site's rounding of the judged inputs (`Followed.rounds`)."""
 
     judged: Any
     decisions: Any
-    rounded: Any = None
+
+
+class _RecordedRounded(Rounded):
+    """A recording's arm at a site of followed roundings (`indexed_recording`): its decisions the
+    reference's own, which its recorded truth followed (`_recorded_following`); no live arm's."""
 
 
 class Followed(NamedTuple):
     """A quantized computation's truth (`assert_as_exact`'s `followed`, docs/design/testing.md): `truth`,
     the float64 computation that rounds where an arm rounded, of its decisions and the draw's inputs; and
-    `rounds`, the site's roundings of the values an arm rounded (`Rounded.rounded`), which each of a live
-    arm's decisions must equal bit for bit, so no arm's truth follows a decision its roundings did not
-    make (a zeroed or a moved one)."""
+    `rounds`, the site's roundings of an arm's judged leaves (the values its roundings rounded, judged by
+    check 1 against the truth), which every live arm's decisions must equal in structure, shape, dtype
+    and bits, so no arm's truth follows a decision its roundings did not make."""
 
     truth: Callable
     rounds: Callable
 
 
 class UnroundedDecisions(AssertionError):
-    """A live arm's decisions at a site of followed roundings that the site's roundings of the values it
-    rounded do not make (`Followed.rounds`)."""
+    """A live arm's decisions at a site of followed roundings that the site's roundings of its judged
+    leaves do not make (`Followed.rounds`)."""
 
 
 def _legal(rounds, result: Rounded, label: str) -> None:
-    """`result`'s decisions held, leaf by leaf and bit for bit, to `rounds` of the values it rounded."""
-    if result.rounded is None:
-        raise UnroundedDecisions(f"{label}: a live arm states the values its decisions rounded (`Rounded`)")
-    made = jax.device_get(rounds(result.rounded))
-    given = jax.device_get(result.decisions)
-    if jax.tree.structure(made) != jax.tree.structure(given):
-        raise UnroundedDecisions(f"{label}: the decisions are not the site's roundings' tree")
-    for (path, decided), held in zip(jax.tree_util.tree_flatten_with_path(made)[0], jax.tree.leaves(given),
-                                     strict=True):
-        moved = np.asarray(decided) != np.asarray(held)
-        if np.any(moved):
-            raise UnroundedDecisions(f"{label}: {int(np.sum(moved))} of {moved.size} decisions at "
-                                     f"{jax.tree_util.keystr(path)} are not the site's rounding of the "
-                                     f"values the arm rounded")
+    """`result`'s decisions held, in structure, shape, dtype and bits (`_same_bits`), to `rounds` of its
+    judged leaves: one source of the values it rounded, which check 1 judges."""
+    made = jax.device_get(rounds(result.judged))
+    where = _same_bits(made, jax.device_get(result.decisions))
+    if where is not None:
+        raise UnroundedDecisions(f"{label}: the decisions at {where} are not the site's rounding of the "
+                                 f"values the arm rounded")
 
 
-def _followed_truth(prepared, followed: Followed, result, inputs, *, recorded: bool = False):
+def _followed_truth(prepared, followed: Followed, result, inputs):
     """An arm's own truth at a site of followed roundings: the site's truth, as the gate runs a truth
     (`_truth_program`, `prepared`), of the arm's decisions (`Rounded`) and the draw's `inputs` widened to
     float64, the float64 computation that rounds where that arm rounded, each of a live arm's decisions
-    first held to the site's rounding of the value it rounded (`_legal`); a recording's were the
-    reference's own (`recorded`)."""
+    first held to the site's rounding of what it rounded (`_legal`); a recording's arm's are the
+    reference's own (`_RecordedRounded`)."""
     if not isinstance(result, Rounded):
         raise AssertionError("an arm at a site of followed roundings returns its judged leaves and its "
                              "roundings' decisions (`Rounded`)")
-    if not recorded:
+    if not isinstance(result, _RecordedRounded):
         _legal(followed.rounds, result, "a followed arm")
     with jax.enable_x64(new_val=True):
         return prepared(jax.device_get(result.decisions), *widened(inputs))
@@ -278,14 +274,12 @@ def _truth_read(truth_fn, followed, result):
     return _truth_program(as_given(bound) if _given(followed.truth) else bound)
 
 
-def _own_truth(prepared, followed, result, inputs, truth, arm):
+def _own_truth(prepared, followed, result, inputs, truth):
     """An arm's result and its truth on `inputs`: at a site of followed roundings (`result` a `Rounded`)
-    its judged leaves and the truth of its own decisions (`_followed_truth`; a recording's, `arm`'s, the
-    reference's own), else the two as given."""
+    its judged leaves and the truth of its own decisions (`_followed_truth`), else the two as given."""
     if not isinstance(result, Rounded):
         return result, truth
-    return result.judged, _followed_truth(prepared, followed, result, inputs,
-                                          recorded=getattr(arm, "recorded", False))
+    return result.judged, _followed_truth(prepared, followed, result, inputs)
 
 
 def dew_programs(fn):
@@ -1222,7 +1216,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                     if not at and arm is not dew_fn and mine_at is ordered[0][0]:
                         _of_its_inputs(label, _arm_name(arm, reference_fn, library_fn, at_arm), arm, here,
                                        other)
-                other, true_here = _own_truth(prepared_followed, followed, other, here, true_here, arm)
+                other, true_here = _own_truth(prepared_followed, followed, other, here, true_here)
                 shared = true_here is truth
                 if weighed is not None:
                     terms_here = weighed[id(true_here)].ones
@@ -2275,7 +2269,7 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     def reference(index, inputs):
         evidence, _, row = held(int(index))
         leaves = {name: _recorded_leaf(evidence, str(dtypes[name]), name, row) for name in mse}
-        return Rounded(leaves, decisions_at(int(index))) if decided else leaves
+        return _RecordedRounded(leaves, decisions_at(int(index))) if decided else leaves
 
     reference.recorded = True
     if pilots:

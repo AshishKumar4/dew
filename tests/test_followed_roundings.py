@@ -50,7 +50,7 @@ def layer(first, *, split: bool = False, decided=None):
         half = DEPTH // 2
         h = (first(x[:, :half], w1[:half]) + first(x[:, half:], w1[half:])) if split else first(x, w1)
         q = rounded(h) if decided is None else decided(rounded(h))
-        return Rounded({"output": q @ w2, "rounded": h}, {"q": q}, {"q": h})
+        return Rounded({"output": q @ w2, "rounded": h}, {"q": q})
     return run
 
 
@@ -60,9 +60,9 @@ def followed_truth(decisions, x, w1, w2):
     return {"output": jnp.asarray(decisions["q"], jnp.float64) @ w2, "rounded": x @ w1}
 
 
-def rounds(held):
-    """The site's rounding of the values an arm rounded (`Rounded.rounded`)."""
-    return {"q": rounded(held["q"])}
+def rounds(judged):
+    """The site's rounding of the values an arm rounded, its judged leaf `rounded`."""
+    return {"q": rounded(judged["rounded"])}
 
 
 followed = Followed(followed_truth, rounds)
@@ -95,20 +95,51 @@ def test_arms_that_round_apart_pass_against_the_truths_of_their_own_roundings():
                     also={"whole again": layer(product)})
 
 
-@pytest.mark.parametrize("fault", ["zeroed", "moved four quanta"])
-def test_a_decision_its_rounding_did_not_make_is_refused(fault):
-    """A decision is followed only where the arm's rounding made it: an arm whose decisions are zeroed, or
-    moved four quanta up the grid from the rounding of its own values, computes every value as the
-    reference does and its truth would follow it exactly, so the gate holds each decision to the site's
-    rounding of the value the arm rounded (`Followed.rounds`) and refuses it."""
-    def moved(q):
-        for _ in range(4):
-            q = jnp.nextafter(q.astype(jnp.bfloat16), jnp.asarray(jnp.inf, jnp.bfloat16)).astype(q.dtype)
-        return q
+def moved(q):
+    """`q` four quanta up `rounded`'s grid (bfloat16's)."""
+    for _ in range(4):
+        q = jnp.nextafter(q.astype(jnp.bfloat16), jnp.asarray(jnp.inf, jnp.bfloat16)).astype(q.dtype)
+    return q
 
-    faulty = layer(product, decided=jnp.zeros_like if fault == "zeroed" else moved)
+
+FAULTS = {"zeroed": jnp.zeros_like, "moved four quanta": moved,
+          "of another dtype": lambda q: q.astype(jnp.bfloat16)}
+"""Decisions an arm's rounding did not make, equal in value or not: their bits are not its rounding's."""
+
+
+@pytest.mark.parametrize("fault", FAULTS)
+def test_a_decision_its_rounding_did_not_make_is_refused(fault):
+    """A decision is followed only where the arm's rounding made it: an arm whose decisions are zeroed,
+    moved four quanta up the grid, or held at another dtype, computes every other value as the reference
+    does and its truth would follow it exactly, so the gate holds each decision, in structure, shape, dtype
+    and bits, to the site's rounding of the values the arm rounded, its judged leaf (`Followed.rounds`),
+    and refuses it."""
     with pytest.raises(UnroundedDecisions):
-        assert_as_exact(faulty, layer(product), draw, f"a decision {fault}", seeds=SEEDS, followed=followed)
+        assert_as_exact(layer(product, decided=FAULTS[fault]), layer(product), draw, f"a decision {fault}",
+                        seeds=SEEDS, followed=followed)
+
+
+def test_values_rounded_that_are_not_the_arms_are_charged():
+    """The values a decision is held to are the arm's judged leaf, which check 1 holds to the truth: an arm
+    stating it rounded zeros, and so deciding zeros, is legal to the site's rounding and charged on the
+    values it rounded."""
+    def forged(x, w1, w2):
+        h = jnp.zeros((x.shape[0], w1.shape[1]), x.dtype)
+        return Rounded({"output": rounded(h) @ w2, "rounded": h}, {"q": rounded(h)})
+
+    with pytest.raises(GateFailure) as failed:
+        assert_as_exact(forged, layer(product), draw, "forged values rounded", seeds=SEEDS, followed=followed)
+    assert not isinstance(failed.value, (Inconclusive, UnroundedDecisions))
+
+
+def test_a_live_arm_marked_as_a_recording_is_held_as_any_live_arm():
+    """A recording's decisions are the reference's own (`indexed_recording`'s arm); a live reference that
+    marks itself as recorded is still a live arm, its zeroed decisions refused."""
+    zeroed = layer(product, decided=jnp.zeros_like)
+    zeroed.recorded = True
+    with pytest.raises(UnroundedDecisions):
+        assert_as_exact(layer(product), zeroed, draw, "a live arm marked recorded", seeds=SEEDS,
+                        followed=followed)
 
 
 def test_an_error_before_a_rounding_is_charged_though_its_decision_is_followed():
@@ -191,7 +222,7 @@ def excess(*, raised: bool):
         if raised:
             up = jnp.nextafter(q[0].astype(jnp.bfloat16), jnp.asarray(jnp.inf, jnp.bfloat16)).astype(q.dtype)
             q = q.at[0].set(up)
-        return Rounded({"excess": q - 1, "output": q @ w2, "rounded": h}, {"q": q}, {"q": h})
+        return Rounded({"excess": q - 1, "output": q @ w2, "rounded": h}, {"q": q})
     return run
 
 
