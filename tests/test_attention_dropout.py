@@ -6,7 +6,6 @@ entries; the overflow witnesses stay finite where the reference does, and the re
 in bf16.
 """
 
-import dataclasses
 import functools
 
 import jax
@@ -503,33 +502,58 @@ def a_dropping_route_call_on_a_gpu_runs_finite():
     assert bool(jnp.all(jnp.isfinite(call())))
 
 
-def test_the_gpu_mainloops_refuse_the_draws_they_do_not_take_at_every_entry():
-    """The Pallas-Triton mainloop takes no probability dropout, and Mosaic's none drawn at a sequence
-    exchange's global places (`template.DropPlaces`, a table gather a tile): each entry point, the forward
-    and the backward called directly, refuses such a call before any launch rather than run it undropped,
-    and so does each legality rule (ledger rows 1521 and 1303)."""
+def test_the_triton_mainloop_refuses_a_dropping_call_at_every_entry():
+    """The Pallas-Triton mainloop takes no probability dropout: each entry point, the forward and the backward
+    called directly, refuses such a call before any launch rather than run it undropped, and so does its
+    legality rule (ledger row 1521)."""
     query, key, value = (jnp.ones((ROWS, 8, HEADS, WIDTH), jnp.bfloat16) for _ in range(3))
     spans = template.spans(8, 8, ROWS)
     hooks = hooked(seed_words(0), ROWS, HEADS)
-    placed = template.Hooks(drop=dataclasses.replace(hooks.drop, queries=jnp.arange(8, dtype=jnp.int32),
-                                                     keys=jnp.arange(8, dtype=jnp.int32)))
     stats = jnp.zeros((ROWS, HEADS, 8), jnp.float32)
     residuals = (stats, stats, jnp.zeros((ROWS, HEADS, 8), jnp.int32),
                  template.Split(jnp.zeros((ROWS, HEADS, 8, WIDTH), jnp.float32), stats, stats, stats))
-    for backward in (False, True):
-        assert attention_mosaic.refused(jnp.bfloat16, WIDTH, WIDTH, placed, backward=backward,
-                                        family=mosaic_sm90.WGMMA) is not None
     assert attention_triton.refused(spans, hooks) is not None
-    with generation.assumed("sm90"):
-        with pytest.raises(NotImplementedError):
-            attention_mosaic.forward(query, key, value, spans, placed, interpret=True)
-        with pytest.raises(NotImplementedError):
-            attention_mosaic.backward(query, key, value, spans, placed, query, residuals=residuals,
-                                      interpret=True)
     with pytest.raises(NotImplementedError):
         attention_triton.forward(query, key, value, spans, hooks, interpret=True)
     with pytest.raises(NotImplementedError):
         attention_triton.backward(query, key, value, spans, hooks, query, residuals=residuals, interpret=True)
+
+
+@pytest.mark.parametrize("sliced", ["queries-and-keys", "keys"])
+@pytest.mark.parametrize("training", [template.Kept.NONE, template.Kept.SPLIT], ids=["inference", "training"])
+def test_the_mosaic_walk_drops_a_slice_at_its_global_places(training, sliced):
+    """A Mosaic call drawing at a sequence exchange slice's global places (`template.DropPlaces`: its keys the
+    last 32 of 64, and its queries the second eight of sixteen, or its own where it holds them whole, a
+    gathered-keys exchange's), interpreted for an H100, drops exactly the entries `dropout_keep` keeps there
+    at a rate of 1/2, its launches' tiles past the call's eight queries reading padded places. Its logits all
+    zero and its values the identity, each output entry is its query's and key's multiplier over the keys'
+    count, 2 / 32 kept and 0 dropped, exact in bf16; under training the first key is each row's anchor,
+    whose multiplier the walk takes after it (`algebra.anchor_multipliers`), and the backward under a
+    cotangent of the identity gives each value's gradient the same entries transposed (the dK/dV launch's
+    own draw)."""
+    queries, keys, rate = 8, WIDTH, 0.5
+    rows, heads = jnp.arange(ROWS, dtype=jnp.int32), jnp.arange(HEADS, dtype=jnp.int32)
+    sliced_queries = None if sliced == "keys" else jnp.arange(8, 16, dtype=jnp.int32)
+    places = template.DropPlaces(rows, heads, sliced_queries, jnp.arange(32, 32 + keys, dtype=jnp.int32))
+    words = seed_words(0)
+    hooks = template.Hooks(drop=template.Dropout(words, rows, heads, rate, places.queries, places.keys))
+    spans = template.spans(queries, keys, ROWS)
+    query = jnp.zeros((ROWS, queries, HEADS, WIDTH), jnp.bfloat16)
+    key = jnp.zeros((ROWS, keys, HEADS, WIDTH), jnp.bfloat16)
+    value = jnp.broadcast_to(jnp.eye(keys, WIDTH, dtype=jnp.bfloat16)[None, :, None], key.shape)
+    kept = np.asarray(dropout_keep(words, rate, (ROWS, HEADS, queries, keys), places))
+    expected = np.where(kept, 1 / (1 - rate) / keys, 0.0).astype(np.float32)
+    dout = jnp.broadcast_to(jnp.eye(queries, WIDTH, dtype=jnp.bfloat16)[None, :, None], query.shape)
+    with generation.assumed("sm90", interpreted=True):
+        found = attention_mosaic.forward(query, key, value, spans, hooks, residuals=training, interpret=True)
+        trained = training != template.Kept.NONE
+        out = found[0] if trained else found
+        grads = (attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=found[1:],
+                                           interpret=True) if trained else None)
+    np.testing.assert_array_equal(np.asarray(out, np.float32).transpose(0, 2, 1, 3), expected)
+    if grads is not None:
+        value_grads = np.asarray(grads.value, np.float32)[..., :queries]
+        np.testing.assert_array_equal(value_grads.transpose(0, 2, 3, 1), expected)
 
 
 def three_identical_keys():

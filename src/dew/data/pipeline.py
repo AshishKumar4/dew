@@ -9,12 +9,21 @@ import math
 import time
 import types
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, overload, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    ClassVar,
+    Concatenate,
+    Literal,
+    Protocol,
+    TypeGuard,
+    overload,
+    runtime_checkable,
+)
 
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import ADDED, JSON, integer, record, text
+from dew._records import ADDED, JSON, integer, json_value, record, text
 from dew.batch import Batch
 from dew.data.dataset import WORKER_BUFFER, Records, phase_ends
 
@@ -40,6 +49,12 @@ class Rejected:
     the refusal (`dew.data.mixing.CorpusCounts.dropped`)."""
     member: str | None = None
     """The mixture member the rejected row was drawn from (`MEMBER`), which its refusal is counted under."""
+    members: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    """The source examples by mixture member a rejected row holding several members' was the last of
+    (`MEMBERS`, a window of several members' documents), each member counting the refusal (row 5716)."""
+    drawn: Drawn = ()
+    """The draws of a phase's shared corpora the rejected row was the last of (`DRAWN`), carried on with
+    `consumed`."""
 
 
 CONSUMED = "_dew_consumed"
@@ -53,6 +68,19 @@ REFUSED = "_dew_refused"
 """The part of a row's `CONSUMED` that are source examples a step rejected or made no row of, which the row
 carries on (`Owed`): consumed, and none of them trained. It travels with `CONSUMED` through every step, so a
 count of the examples delivered rows complete takes their difference (`dew.data.mixing.CorpusCounts`)."""
+
+DRAWN = "_dew_drawn"
+"""The draws of a mix's corpora that phases share a row is the last of, each `(node, member, pull)`: the mix
+read it was drawn by (its node, `dew.data.mixing.Stamping`), the member's key and its pull's number there.
+Set with its `CONSUMED` where the mix draws it, and carried wherever that count goes, so the batch says the
+draws its step trains (`dew.batch.DRAWS`): a phase on its own stream continues each shared corpus from them
+(`dew.data.dataset.StepPhases`)."""
+
+type Draw = tuple[str, str, int, JSON]
+"""A draw of a phase's shared corpus (`DRAWN`): its mix read's node, the member's key, its pull, and the
+member's position after it, which a phase continuing the member past the draw starts it at."""
+
+type Drawn = tuple[Draw, ...]
 
 ACCOUNTS = (CONSUMED, REFUSED)
 """A row's two counts of source examples, which every step carries together, as integers no batch stacks."""
@@ -70,7 +98,7 @@ and carried wherever its counts go, so a mixture counts each member's examples w
 (`dew.data.mixing.CorpusCounts`). Examples a step refused are carried on as refused (`Owed`) and complete
 no member's: what is refused of a member is counted where it is refused (`Rejected.member`)."""
 
-COUNTING = (*ACCOUNTS, MEMBER, MEMBERS)
+COUNTING = (*ACCOUNTS, MEMBER, MEMBERS, DRAWN)
 """A row's fields the run counts it by, which every step carries out of its sight."""
 
 type Members = Mapping[str, int]
@@ -108,22 +136,29 @@ id negated at the document's last token, so a window says which documents it hol
 @dataclasses.dataclass
 class Documents:
     """The documents a layout lays out of a mixture's rows, each under the id its tokens carry (`DOCUMENT`):
-    the member it was drawn from (`MEMBER`, none for one of several members' rows) and the examples it
-    completes by member (`MEMBERS`), until the window that holds its last token takes them."""
+    the member it was drawn from (`MEMBER`, none for one of several members' rows), the examples it
+    completes by member (`MEMBERS`) and the draws of shared corpora it is the last of (`DRAWN`), until the
+    window that holds its last token takes them."""
 
     next: int = 1
-    held: dict[int, tuple[str | None, dict[str, int]]] = dataclasses.field(default_factory=dict)
+    held: dict[int, tuple[str | None, dict[str, int], Drawn]] = dataclasses.field(default_factory=dict)
 
-    def laid(self, member: str | None, members: Members) -> int:
-        """The id of a document of `member` that completes `members`."""
+    def laid(self, member: str | None, members: Members, drawn: Drawn = ()) -> int:
+        """The id of a document of `member` that completes `members` and is the last of `drawn`."""
         document, self.next = self.next, self.next + 1
-        self.held[document] = (member, dict(members))
+        self.held[document] = (member, dict(members), drawn)
         return document
 
     def saved(self, documents: Iterable[int]) -> dict[str, JSON]:
-        """`documents`' members and examples as a saved position holds them, by id."""
-        return {str(document): [self.held[document][0], dict(self.held[document][1])]
-                for document in sorted(set(documents)) if document in self.held}
+        """`documents`' members, examples and draws as a saved position holds them, by id: the draws only
+        where it holds any, so a position of a run that draws none reads as before."""
+        saved: dict[str, JSON] = {}
+        for document in sorted(set(documents)):
+            if document in self.held:
+                member, members, drawn = self.held[document]
+                saved[str(document)] = [member, dict(members), *([[list(draw) for draw in drawn]] if drawn
+                                                                 else [])]
+        return saved
 
     def restore(self, saved: JSON) -> None:
         """Hold the documents a saved position held (`saved`) again."""
@@ -131,12 +166,29 @@ class Documents:
             if not document.isdecimal():
                 raise ValueError(f"a held document's id is a whole number, got {document!r}")
             match entry:
-                case [member, {**members}] if member is None or isinstance(member, str):
+                # A position saved before documents held draws holds none.
+                case [member, {**members}, *drawn] if (member is None or isinstance(member, str)) and len(
+                        drawn) <= 1:
                     examples = {str(key): integer(count, "a held document's examples")
                                 for key, count in members.items()}
-                    self.held[int(document)] = (member, examples)
+                    draws = drawn_of({DRAWN: drawn[0]}) if drawn else ()
+                    self.held[int(document)] = (member, examples, draws)
                 case _:
-                    raise ValueError(f"a held document is its member and examples by member, got {entry!r}")
+                    raise ValueError(f"a held document is its member, examples by member and draws, got "
+                                     f"{entry!r}")
+
+
+def drawn_of(row: Batch | Rejected) -> Drawn:
+    """The draws `row` is the last of (`DRAWN`), none where it holds none."""
+    if isinstance(row, Rejected):
+        return row.drawn
+    held = row.get(DRAWN, ())
+    if not isinstance(held, (list, tuple)):
+        raise ValueError(f"a row's draws are a list of (node, member, pull, position), got "
+                         f"{type(held).__name__}")
+    return tuple((text(node, "a draw's node"), text(member, "a draw's member"),
+                  integer(pull, "a draw's pull"), json_value(position, "a draw's position"))
+                 for node, member, pull, position in held)
 
 
 def accounts(row: Batch | Rejected) -> tuple[int, int]:
@@ -161,22 +213,36 @@ class MarkConsumed:
 class Owed:
     """The source examples rows a step dropped or made none of were the last of (`Rejected.consumed`),
     owed to the next row kept: the one carrier the reading process's (`dew.data.mixing.Accepted`), a
-    batched step's (`dew.data.mixing.Carried`) and a loading worker's group (`dew.data.lowering`) use."""
+    batched step's (`BatchedGroups`, its counter's) and a loading worker's group (`dew.data.lowering`) use."""
 
     examples: int = 0
+    drawn: Drawn = ()
+    """The draws the dropped rows were the last of (`DRAWN`), owed with their examples."""
 
-    def owe(self, consumed: int) -> None:
-        """Owe `consumed` more examples to the next row kept."""
+    @classmethod
+    def restored(cls, examples: int, saved: JSON | None) -> Owed:
+        """Examples owed and the draws a position saved beside them (`saved_draws`), none where it saved
+        none, as a position saved before draws were owed does."""
+        return cls(examples, drawn_of({DRAWN: saved}) if saved is not None else ())
+
+    def saved_draws(self) -> dict[str, JSON]:
+        """The draws owed as a position saves them, under `drawn`, nothing where it owes none."""
+        return {"drawn": [list(draw) for draw in self.drawn]} if self.drawn else {}
+
+    def owe(self, consumed: int, drawn: Drawn = ()) -> None:
+        """Owe `consumed` more examples, and the draws `drawn`, to the next row kept."""
         self.examples += consumed
+        self.drawn = (*self.drawn, *drawn)
 
     def paid(self, row: Batch) -> Batch:
-        """`row`, kept, taking the examples owed (`CONSUMED`), every one refused (`REFUSED`), none owed
-        after it."""
-        owed, self.examples = self.examples, 0
-        if not owed:
+        """`row`, kept, taking the examples owed (`CONSUMED`), every one refused (`REFUSED`), and the draws
+        owed (`DRAWN`), none owed after it."""
+        owed, drawn, self.examples, self.drawn = self.examples, self.drawn, 0, ()
+        if not owed and not drawn:
             return row
         consumed, refused = accounts(row)
-        return {**row, CONSUMED: owed + consumed, REFUSED: owed + refused}
+        paid = {**row, CONSUMED: owed + consumed, REFUSED: owed + refused}
+        return {**paid, DRAWN: (*drawn, *drawn_of(row))} if drawn else paid
 
 
 def consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) -> tuple[Record, ...]:
@@ -198,15 +264,23 @@ def consumed_by(given: Record, step: Callable[[Record], tuple[Record, ...]]) -> 
     consumed, refused = accounts(given)
     members = members_held(given, member)
     split = {MEMBERS: {}} if MEMBERS in given else {}
+    drawn = drawn_of(given)
+    none = {DRAWN: ()} if DRAWN in given else {}
     *rest, last = outputs
-    rest = [{CONSUMED: 0, REFUSED: 0, **split, **row} if isinstance(row, Mapping) else row for row in rest]
+    rest = [{CONSUMED: 0, REFUSED: 0, **split, **none, **row} if isinstance(row, Mapping) else row
+            for row in rest]
     if isinstance(last, Rejected):
-        carried: Record = dataclasses.replace(last, consumed=last.consumed + consumed)
+        # A row of several members' (no `MEMBER`) leaves its refusal to each member it completes examples of.
+        held = {} if last.member is not None else joined(last.members, members)
+        carried: Record = dataclasses.replace(last, consumed=last.consumed + consumed, members=held,
+                                              drawn=(*last.drawn, *drawn))
     elif isinstance(last, Mapping):
         own, owned = accounts(last)
         carried = {**last, CONSUMED: consumed + own, REFUSED: refused + owned}
         if split or MEMBERS in last:
             carried[MEMBERS] = joined(members_of(last), members)
+        if none or DRAWN in last:
+            carried[DRAWN] = (*drawn_of(last), *drawn)
     else:
         raise ValueError(f"a row of a run bounded in examples became {type(last).__name__}, which carries no "
                          "count of the examples it consumes; a step after the bound returns records")
@@ -264,6 +338,84 @@ def members_held(row: Batch, member: str | None) -> dict[str, int]:
     return {} if member is None else joined({member: consumed - refused})
 
 
+@dataclasses.dataclass(frozen=True)
+class BatchedGroups:
+    """A `map_batches` step over one group: its records, as Grain's flat map takes them, the run's counts of
+    them carried out of the step's sight as `consumed_by` carries a record's (`dew.data.lowering`), and a
+    group it makes no rows of refused (`REFUSALS`)."""
+
+    REFUSALS: ClassVar[str] = "counted"
+    """The `batched` rule a plan of a read through a batched step records (docs/design/data.md, the rules):
+    a group the step makes no rows of is refused as an empty expansion and counted where the step stands
+    (row 5717), which a reader's position holds; a position of a read before it holds no such count."""
+
+    stage: Batched
+    refusing: bool = True
+    """Whether a group it makes no rows of is refused (`REFUSALS`), as a plan of 14 or later reads it; a
+    plan of 13 left it on a marker only where it held examples, carried uncounted (`dew.data.mixing.Carried`),
+    and reads so still."""
+    max_fan_out: int = 1 << 20
+
+    def flat_map(self, group: list[Record]) -> Sequence[Record]:
+        rows = [record(value, "batched input") for value in group]
+        # The source examples the group's rows consume are the run's accounting, out of the step's sight:
+        # a step that keeps its rows keeps each row's, and one that makes others gives their sum to its
+        # last row, as a record step's expansion does (`consumed_by`).
+        counted = [row for row in rows if CONSUMED in row]
+        held = [accounts(row) for row in counted]
+        consumed, refused = [count for count, _ in held], [part for _, part in held]
+        # The draws of a phase's shared corpora (`DRAWN`), which go where the counts go.
+        drawn = [drawn_of(row) for row in counted]
+        drawing = any(DRAWN in row for row in counted)
+        # Each row's mixture member and its counts by member (`MEMBERS`), and the member every output is
+        # of where the group's rows are all one member's.
+        tags = [member_of(row) for row in rows]
+        members = [members_held(row, tag) for row, tag in zip(rows, tags, strict=True) if CONSUMED in row]
+        alike = bool(tags) and tags[0] is not None and len(set(tags)) == 1
+        common = tags[0] if alike else None
+        counted_by = any(MEMBERS in row or MEMBER in row for row in rows if CONSUMED in row)
+        rows = [{name: value for name, value in row.items() if name not in COUNTING} for row in rows]
+        columns = {name: [row[name] for row in rows] for name in rows[0]}
+        made = dict(self.stage.step(columns))
+        counts = {len(values) for values in made.values()}
+        if len(counts) > 1:
+            raise ValueError(f"a batched step returned columns of different lengths, {sorted(counts)}")
+        count = counts.pop() if counts else 0
+        if self.stage.same_rows:
+            if count != len(rows):
+                raise ValueError(f"map(batched=True) keeps the {len(rows)} rows it reads, and its step "
+                                 f"returned {count}; flat_map(batched=True) changes the count")
+            kept = [{**row, **{name: values[index] for name, values in made.items()},
+                     **({} if tag is None else {MEMBER: tag})}
+                    for index, (row, tag) in enumerate(zip(rows, tags, strict=True))]
+            return kept if not consumed else [
+                {**row, CONSUMED: held, REFUSED: carried, **({MEMBERS: split} if counted_by else {}),
+                 **({DRAWN: draws} if drawing else {})}
+                for row, held, carried, split, draws in zip(kept, consumed, refused, members, drawn,
+                                                            strict=True)]
+        outputs = [{name: values[index] for name, values in made.items()} for index in range(count)]
+        if common is not None:
+            outputs = [{**row, MEMBER: common} for row in outputs]
+        if not outputs and not self.refusing:
+            held = sum(consumed)
+            return [Rejected("empty_expansion", consumed=held, member=common,
+                             drawn=tuple(itertools.chain.from_iterable(drawn)))] if held else []
+        if not outputs:
+            # A group it makes no rows of is refused as an empty expansion, as a record step's is, counted
+            # where the step stands under each member it held (`dew.data.mixing.Accepted`), its examples on
+            # the marker for the next row kept to carry on, completing no member's.
+            return [Rejected("empty_expansion", consumed=sum(consumed), member=common,
+                             members=joined(*members) if common is None and counted_by else {},
+                             drawn=tuple(itertools.chain.from_iterable(drawn)))]
+        if not consumed:
+            return outputs
+        none, last = ({MEMBERS: {}}, {MEMBERS: joined(*members)}) if counted_by else ({}, {})
+        if drawing:
+            none, last = {**none, DRAWN: ()}, {**last, DRAWN: tuple(itertools.chain.from_iterable(drawn))}
+        return [*({**row, CONSUMED: 0, REFUSED: 0, **none} for row in outputs[:-1]),
+                {**outputs[-1], CONSUMED: sum(consumed), REFUSED: sum(refused), **last}]
+
+
 def consumed_forward(elements: Sequence[Record]) -> list[Record]:
     """`elements` in their order, each rejected row's consumed examples (`Rejected.consumed`) carried on
     to the next row kept after it, as the corpus's reading carries them (`Accepted`), so a group that
@@ -274,15 +426,15 @@ def consumed_forward(elements: Sequence[Record]) -> list[Record]:
     markers: list[int] = []
     owed = Owed()
     for element in elements:
-        if isinstance(element, Rejected) and element.consumed:
+        if isinstance(element, Rejected) and (element.consumed or element.drawn):
             markers.append(len(carried))
-            owed.owe(element.consumed)
+            owed.owe(element.consumed, element.drawn)
         elif markers and isinstance(element, Mapping) and CONSUMED in element:
             # The markers' counts move to this row; none follows them in the group otherwise.
             for at in markers:
                 marker = carried[at]
                 assert isinstance(marker, Rejected)
-                carried[at] = dataclasses.replace(marker, consumed=0)
+                carried[at] = dataclasses.replace(marker, consumed=0, drawn=())
             element, markers = owed.paid(element), []
         carried.append(element)
     return carried
@@ -1404,43 +1556,6 @@ class Piped:
     input: Pipeline | None = None
 
 
-_EARLIER: dict[int, tuple[Callable[..., Dataset], list[tuple[int, tuple[tuple[str, JSON], ...]]]]] = {}
-"""The settings each function chains are piped through was read at by data plans before a version, where
-a call states none of them (`earlier`), by the function's `id`: a chain is piped through any callable, one
-that does not hash among them."""
-
-
-def earlier[Function: Callable[..., Dataset]](before: int, **settings: JSON
-                                              ) -> Callable[[Function], Function]:
-    """Declare, on a function chains are piped through (`Dataset.pipe`), that data plans before version
-    `before` read a call that states none of `settings` at these values: what the function did before it
-    took them, or before their default changed. A chain compiled under such a plan makes the call again
-    with them (`Pipeline.at`), so a run saved then reads on by the stages it saved, whether its chain
-    comes from its record or its script builds it again."""
-    def declared(function: Function) -> Function:
-        _EARLIER.setdefault(id(function), (function, []))[1].append((before, tuple(settings.items())))
-        return function
-
-    return declared
-
-
-def _called(entry: Piped) -> str:
-    """A `pipe` call's function, as a plan names what a stage runs (`StepIdentity`) and a refusal it."""
-    from dew.data.plan import StepIdentity
-
-    return StepIdentity.of(entry.function).name
-
-
-def _earlier_settings(entry: Piped, version: int) -> dict[str, JSON]:
-    """The settings data plan `version` read `entry`'s call at that the call states none of (`earlier`)."""
-    declared = _EARLIER.get(id(entry.function))
-    if declared is None or declared[0] is not entry.function:
-        return {}
-    stated = dict(entry.settings)
-    return {name: value for before, settings in declared[1] if version < before
-            for name, value in settings if name not in stated}
-
-
 @dataclasses.dataclass(frozen=True)
 class Pipeline(Dataset):
     """A dataset's store and the stages its verbs added; what every verb returns."""
@@ -1453,87 +1568,11 @@ class Pipeline(Dataset):
     _elastic: bool = False
     """Whether a training run reads it elastically (`Dataset.elastic`)."""
     piped: tuple[Piped, ...] = dataclasses.field(default=(), compare=False, repr=False)
-    """The calls of `pipe` that made its stages (`Piped`), outermost last. No plan's identity holds them;
-    a plan of an earlier version makes again the ones it read otherwise (`at`)."""
+    """The calls of `pipe` that made its stages (`Piped`), outermost last, which a run's record writes. No
+    plan's identity holds them."""
 
     def _then(self, *stages: Stage) -> Pipeline:
         return dataclasses.replace(self, stages=(*self.stages, *stages))
-
-    def at(self, version: int) -> Pipeline:
-        """The chain as data plan `version` read it, beside `ObjectiveData.at`: each call of `pipe` whose
-        function declares that plans before a version read a setting otherwise (`earlier`), and which
-        states none of it, made again with it in its place in the chain (`_remade`); a mix's or phases'
-        members each so. Itself where no plan before `version` read a call of it otherwise. A call that
-        made another store of a chain such a plan read otherwise is refused by name: the store it made
-        is of the chain as it stands.
-
-        Every compile reads its chains so first (`dew.data.compile.compile`). The chain it returns is for
-        a plan to read; the run's record writes the one it was given."""
-        return self._at(version, {})
-
-    def _at(self, version: int, read: dict[int, tuple[Pipeline, Pipeline]]) -> Pipeline:
-        """`at`, each chain of the traversal read once (`read`, by its identity, the chain held beside
-        what it reads as): a chain's calls keep the chains they made stores of, and those keep theirs, so
-        a walk that read each again where it met it would read a chain of thirty such calls two to the
-        thirtieth times."""
-        found = read.get(id(self))
-        if found is not None and found[0] is self:
-            return found[1]
-        chain = with_children(self, lambda member: member._at(version, read))
-        for entry in chain.piped:
-            if entry.input is not None and entry.input._at(version, read) is not entry.input:
-                raise ValueError(f"data plan {version} read the chain {_called(entry)} made a store of "
-                                 "otherwise than it stands; state its calls' settings as that plan read "
-                                 "them")
-        while (remade := next(((index, settings) for index, entry in enumerate(chain.piped)
-                               if (settings := _earlier_settings(entry, version))), None)) is not None:
-            chain = chain._remade(*remade, version)
-        read[id(self)] = (self, chain)
-        return chain
-
-    def _remade(self, index: int, read: Mapping[str, JSON], version: int) -> Pipeline:
-        """The chain with its `index`-th call of `pipe` made again with the settings `read`, as data plan
-        `version` read it: the call's stages replaced where they stand, its source, the stages before and
-        after and what later verbs set kept. The call is first made as it states itself, on the chain
-        before it, and must make the stages the chain holds, each the same stage
-        (`dew.data.analysis.same_stage`): a call that made another store of its input, or whose stages
-        were rewritten or would be made otherwise now, cannot be put back where it stood, and is refused
-        by name with the settings to state."""
-        from dew.data.analysis import same_stage
-
-        entry, stated = self.piped[index], dict(self.piped[index].settings)
-        refusal = (f"data plan {version} read {_called(entry)}'s call at {dict(read)}, and the call cannot "
-                   f"be made again where it stands in {self.name or 'the chain'}: state them in the call")
-        before = dataclasses.replace(self, stages=self.stages[:entry.start], piped=())
-
-        def extends(each: Dataset) -> TypeGuard[Pipeline]:
-            """Whether a call's result is the chain before it with stages after: no other store."""
-            return (isinstance(each, Pipeline) and each.source is self.source
-                    and len(each.stages) >= entry.start
-                    and all(now is was for now, was in zip(each.stages, before.stages, strict=False)))
-
-        as_stated, as_read = (before.pipe(entry.function, *entry.args, **settings)
-                              for settings in (stated, {**stated, **read}))
-        # What the call sets beside its stages (its mode, its loading) is the chain's as it stands, so a
-        # setting that changed any of it has no place to be put back in.
-        if entry.input is not None or not extends(as_stated) or not extends(as_read):
-            raise ValueError(refusal)
-        made, held = as_stated.stages[entry.start:], self.stages[entry.start:entry.end]
-        if len(made) != len(held) or not all(map(same_stage, made, held)) or dataclasses.replace(
-                as_stated, stages=(), piped=()) != dataclasses.replace(as_read, stages=(), piped=()):
-            raise ValueError(refusal)
-        stages = as_read.stages[entry.start:]
-        moved = len(stages) - (entry.end - entry.start)
-
-        def placed(other: Piped) -> Piped:
-            """A call that stood after the remade one, or around it, by its place in the new chain."""
-            after = other.start >= entry.end
-            return dataclasses.replace(other, start=other.start + moved * after, end=other.end + moved)
-
-        piped = (*(other for other in self.piped[:index] if other.end <= entry.start), *as_read.piped,
-                 *(placed(other) for other in self.piped[index + 1:]))
-        return dataclasses.replace(self, stages=(*self.stages[:entry.start], *stages,
-                                                 *self.stages[entry.end:]), piped=piped)
 
     def _chain(self) -> Pipeline:
         return self
@@ -1635,16 +1674,6 @@ class ObjectiveData:
     """The rows the objective reads where a chain lays out none of its own, after its other record
     steps; rows a chain packs or cuts into windows (`Pack`, `Windows`) keep the length it gives them, as
     a schedule's stages each give theirs (`dew.data.compile.objective_steps`)."""
-    earlier: ObjectiveData | None = None
-    """The objective's data as a plan before `dew.data.plan.SHARED_STATE` reads it, where it reads
-    otherwise since (a decision request's questions over one copy of their state), so a run saved under
-    such a plan resumes reading as it was written (`at`); None where it reads alike."""
-
-    def at(self, version: int) -> ObjectiveData:
-        """This data as plan `version` reads it: `earlier` before `SHARED_STATE`, itself otherwise."""
-        from dew.data.plan import SHARED_STATE
-
-        return self.earlier if self.earlier is not None and version < SHARED_STATE else self
 
 
 type _Step = RecordStep | RandomStep | HostStep | Configured | ExpandStep | ColumnStep

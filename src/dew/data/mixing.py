@@ -19,11 +19,24 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
-from dew._records import boolean, integer, record, text
+from dew._records import JSON, boolean, integer, integers, json_value, record, text
 from dew.batch import Batch
 from dew.data.dataset import LONG_RUN, logged_run
-from dew.data.pipeline import Owed, Record, Rejected, accounts, member_of, members_of
+from dew.data.pipeline import (
+    CONSUMED,
+    DRAWN,
+    REFUSED,
+    Drawn,
+    Owed,
+    Record,
+    Rejected,
+    accounts,
+    drawn_of,
+    member_of,
+    members_of,
+)
 from dew.data.shared import SharedMapping
+from dew.data.storage import without_mirrors
 
 _log = logging.getLogger(__name__)
 
@@ -245,6 +258,13 @@ class _KeepAccepted:
         self._touched.add(member)
         return self.members[member]
 
+    def _refusing(self, member: str | None, members: Mapping[str, int]) -> list[CorpusCounts]:
+        """The counts a refused row is counted under: its member's (`MEMBER`), or, a row of several members'
+        examples (`MEMBERS`), each of theirs (row 5716), else the counter's own."""
+        if member is not None or not members or not self.members:
+            return [self._of(member)]
+        return [self._of(key) for key in sorted(members)]
+
     def member_states(self) -> SharedMapping[Mapping[str, object]]:
         """Each member's counts as they stand, by member key (`MEMBERS`): the states captured before, the
         members' that moved since made again, the rest shared with them (`SharedMapping`), so a capture before
@@ -255,20 +275,23 @@ class _KeepAccepted:
         self._touched.clear()
         return self._states
 
-    def restored(self) -> None:
+    def restored(self, rejections: int | None) -> None:
         """Every member's counts and the rejections as a restore left them: each member's state made again
-        at its next capture, the rejections counted afresh."""
+        at its next capture, the rejected rows as the position saved them, or, of a position that holds
+        none, counted afresh, one a refusal, as each was before a row of several members' was refused under
+        each (row 5716)."""
         self._touched = set(self.members)
-        self.rejections = sum(sum(counts.rejected.values())
-                              for counts in (self.counts, *self.members.values()))
+        self.rejections = rejections if rejections is not None else sum(
+            sum(counts.rejected.values()) for counts in (self.counts, *self.members.values()))
 
     def __call__(self, element: Batch | Rejected) -> TypeGuard[Batch]:
         self.counts.attempted += 1
         if isinstance(element, Rejected):
-            self.rejections += 1
             reason = element.reason
-            self.owed.owe(element.consumed)
-            self._of(element.member).dropped(element)
+            self.owed.owe(element.consumed, element.drawn)
+            self.rejections += 1
+            for counts in self._refusing(element.member, element.members):
+                counts.dropped(element)
         else:
             count = None if self.tokens is None else self.tokens(element)
             if count is not None and count < 0:
@@ -278,9 +301,10 @@ class _KeepAccepted:
                 self.consecutive = 0
                 return True
             reason = "zero_targets"
+            self.owed.owe(accounts(element)[0], drawn_of(element))
             self.rejections += 1
-            self.owed.owe(accounts(element)[0])
-            self._of(member_of(element)).rejected[reason] += 1
+            for counts in self._refusing(member_of(element), members_of(element)):
+                counts.rejected[reason] += 1
         self.consecutive += 1
         if not self.warned and self.rejections / self.counts.attempted > _WARN_OVER:
             _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
@@ -335,9 +359,6 @@ def counters() -> tuple[dataclasses.Field, ...]:
     return tuple(field for field in dataclasses.fields(CorpusCounts) if field.metadata in (COUNT, KINDS))
 
 
-CUT_COUNTS = tuple(field.name for field in counters() if field.metadata == KINDS and field.name != "rejected")
-"""A corpus's counts by kind but its rejections, which a position version 7 saved kept alone
-(`dew.data.plan.earlier_position`)."""
 """Where a counting iterator's position keeps its corpus's counts, beside its parent's position:
 a key of Dew's own, which `state_counts` and `rewound` find and no Grain position holds."""
 
@@ -401,25 +422,28 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         # A mixture's counter keeps its members' counts beside its own, by member key (`MEMBERS`).
         return {**super()._counted(), "consecutive": self._predicate.consecutive,
                 "warned": self._predicate.warned, "consumed": self._predicate.owed.examples,
-                "members": self._predicate.member_states()}
+                "rejections": self._predicate.rejections,
+                **self._predicate.owed.saved_draws(), "members": self._predicate.member_states()}
 
     def _restore(self, counted: Mapping[str, object]) -> None:
         super()._restore(counted)
         self._predicate.consecutive = integer(counted["consecutive"], "consecutive")
         self._predicate.warned = boolean(counted["warned"], "warned")
-        self._predicate.owed = Owed(integer(counted["consumed"], "consumed examples pending"))
+        self._predicate.owed = Owed.restored(integer(counted["consumed"], "consumed examples pending"),
+                                             json_value(counted.get("drawn"), "draws pending"))
         # A member that joined since starts its counts; one that left takes its counts with it.
         members = record(counted["members"], "a mixture counter's members")
         for key, counts in self._predicate.members.items():
             if key in members:
                 counts.restore(record(record(members[key], "member counter")["counts"], "member counts"))
-        self._predicate.restored()
+        held = counted.get("rejections")
+        self._predicate.restored(None if held is None else integer(held, "rejected rows"))
 
 
 class Carried(pygrain.IterDataset[Batch]):
     """`parent`'s rows, each marker's source examples (`Rejected.consumed`) carried on to the next row and
-    the markers dropped, counting nothing: the carrier after a step whose markers no corpus's count
-    follows, a batched map's group it makes no rows of (`dew.data.lowering._Groups`). The examples it
+    the markers dropped, counting nothing: the carrier after a batched map's group it makes no rows of
+    (`dew.data.pipeline.BatchedGroups`) where a plan of 13 reads, whose positions hold it. The examples it
     owes are checkpointed with its parent's position; those the stream ends owing are its end's
     (`dew.training._fit.drained`)."""
 
@@ -440,16 +464,17 @@ class _CarriedIterator(pygrain.DatasetIterator[Batch]):
         while True:
             element = next(self._read)
             if isinstance(element, Rejected):
-                self._owed.owe(element.consumed)
+                self._owed.owe(element.consumed, element.drawn)
                 continue
             return self._owed.paid(element)
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._read.get_state(), "owed": self._owed.examples}
+        return {"parent": self._read.get_state(), "owed": self._owed.examples, **self._owed.saved_draws()}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self._read.set_state(record(state["parent"], "carried parent"))
-        self._owed = Owed(integer(state["owed"], "examples owed"))
+        self._owed = Owed.restored(integer(state["owed"], "examples owed"),
+                                   json_value(state.get("drawn"), "draws owed"))
 
     def close(self) -> None:
         self._read.close()
@@ -518,9 +543,11 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         weights: tuple[int, ...],
         tokens: Callable[[Batch], int],
         keys: tuple[str, ...],
+        stamping: Stamping | None = None,
     ):
         super().__init__(reads)
         self._reads, self._weights, self._tokens, self._keys = tuple(reads), weights, tokens, keys
+        self._stamping = stamping
         self._delivered = [0] * len(reads)
         # The targets each corpus delivered as a position holds them, the one corpus a row read replaced.
         self._sent: SharedMapping[int] = SharedMapping(keys, self._delivered)
@@ -545,7 +572,8 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         return value
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parents": self._positions.captured(), "delivered": self._sent}
+        stamped = {} if self._stamping is None else {STAMPING: self._stamping.state()}
+        return {"parents": self._positions.captured(), "delivered": self._sent, **stamped}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         """Restore each corpus the state keeps by its key, and start one it keeps none of where its
@@ -569,10 +597,17 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         self._delivered = [delivered[key] if held else (w * total // weight if weight else 0)
                            for key, w, held in zip(self._keys, self._weights, kept, strict=True)]
         self._sent = SharedMapping(self._keys, self._delivered)
+        restamped(self._stamping, state)
 
     def close(self) -> None:
         for read in self._reads:
             read.close()
+
+
+MIX = "declared-order"
+"""The `mix` rule a plan of a weighted mix records (`Proportions`): Grain's whole proportions of its weights,
+its members in the order the mix declares them, each window's choices permuted by its seed. A behaviour
+change of it is a new value (docs/design/data.md, the rules)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -772,7 +807,10 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
         tokens: Callable[[Batch], int],
         names: Sequence[str],
         labels: Sequence[str],
+        stamped: frozenset[str] = frozenset(),
     ):
+        self._stamped: frozenset[str] = stamped
+        self._slice: slice | None = None
         filtered = tuple(
             Accepted(parent, name, label, tokens=tokens)
             for parent, name, label in zip(parents, names, labels, strict=True)
@@ -787,10 +825,16 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
             tuple(keys),
         )
 
+    def set_slice(self, selection: slice, sequential_slice: bool = False) -> None:
+        # The worker's slice names its mix read's draws (`node_of`); its corpora take it as before.
+        self._slice = selection
+        super().set_slice(selection, sequential_slice)
+
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         group = _MixReads(self._corpora)
-        reads = [_MixRead(group, index) for index in range(len(self._corpora))]
-        return _DeficitIterator(reads, self._weights, self._tokens, self._keys)
+        stamping = Stamping(self._stamped & set(self._keys), node_of(self._slice)) if self._stamped else None
+        reads = [_MixRead(group, index, self._keys[index], stamping) for index in range(len(self._corpora))]
+        return _DeficitIterator(reads, self._weights, self._tokens, self._keys, stamping)
 
 
 _UNOPENED = "unopened"
@@ -861,18 +905,217 @@ class _MixReads:
             opened.close()
 
 
+class Stamping:
+    """A mix read's draws of the members other phases read on (`keys`), each stamped as it is drawn
+    (`DRAWN`): the read's `node` (its loading worker's slice, `node_of`), the member's key, its pull's
+    number (`pulled` counting each member's pulls) and the member's position after it. A phase that
+    continues a member from an earlier one (`dew.data.dataset.StepPhases`) starts it at the position
+    after the last pull the run trained before an untrained one, its counter there, and draws past the
+    pulls past it the run trained already (`skips`), stamping each it passes on the next row it hands on.
+    Saved and restored with the mix's position, so a position the mix restores draws its pulls again under
+    their numbers."""
+
+    def __init__(self, keys: Iterable[str], node: str):
+        self.keys = frozenset(keys)
+        self.node = node
+        self.pulled = dict.fromkeys(self.keys, 0)
+        self.skips: dict[str, set[int]] = {key: set() for key in self.keys}
+        # The skips as a position holds them, made again only where a draw moves past one.
+        self._held: dict[str, list[int]] = {key: [] for key in self.keys}
+
+    def read(self, key: str, pull: Callable[[], Batch], position: Callable[[], JSON]) -> Batch:
+        """Member `key`'s next draw by `pull`, one consumed source example (`CONSUMED`), stamped where it is
+        a member other phases read on (`DRAWN`), with each pull it drew past before it, each beside the
+        member's `position` after it: every row of the mix holds the same counting fields."""
+        if key not in self.keys:
+            return _marked(key, pull(), ())
+        skips, passed = self.skips[key], []
+        while self.pulled[key] in skips:
+            # A pull an earlier phase's step trained: drawn past, never handed on again. The skips a position
+            # holds are its own: a new mapping each time one is passed.
+            pull()
+            passed.append((self.node, key, self.pulled[key], position()))
+            skips.discard(self.pulled[key])
+            self._held = {**self._held, key: sorted(skips)}
+            self.pulled[key] += 1
+        row = pull()
+        draw = (self.node, key, self.pulled[key], position())
+        self.pulled[key] += 1
+        return _marked(key, row, (*passed, draw))
+
+    def state(self) -> Mapping[str, object]:
+        return {"node": self.node, "pulled": dict(self.pulled), "skips": self._held}
+
+    def restore(self, state: Mapping[str, object]) -> None:
+        """The draws as `state` held them (`state`): its node, each member's pulls and skips."""
+        self.node = text(state["node"], "a mix's node")
+        pulled = record(state["pulled"], "a mix's pulls")
+        skips = record(state["skips"], "a mix's skipped pulls")
+        self.pulled = {key: integer(pulled.get(key, 0), f"member {key}'s pulls") for key in self.keys}
+        self.skips = {key: set(integers(skips.get(key, []), f"member {key}'s skipped pulls"))
+                      for key in self.keys}
+        self._held = {key: sorted(held) for key, held in self.skips.items()}
+
+
+def node_of(selection: slice | None) -> str:
+    """A mix read's node (`Stamping.node`): the slice of the order its loading worker reads (Grain's
+    `set_slice`), the whole order's where it reads in no worker, so every reader of an elastic read, and a
+    read restored, names its mix reads alike."""
+    if selection is None:
+        return "0:1"
+    return f"{selection.start or 0}:{selection.step or 1}"
+
+
+def _marked(key: str, row: object, drawn: Drawn) -> Batch:
+    """A mix's draw of member `key` as one consumed source example, its draws `drawn`."""
+    if not isinstance(row, Mapping):
+        raise TypeError(f"mixture member {key!r} gives {type(row).__name__} records, which carry no draw; "
+                        "a member of a mix other phases read on gives records")
+    return {**row, CONSUMED: 1, REFUSED: 0, DRAWN: drawn}
+
+
+STAMPING = "stamping"
+"""The key a mix that stamps its draws saves them under in its position (`Stamping.state`)."""
+
+
+def restamped(stamping: Stamping | None, state: Mapping[str, object]) -> None:
+    """`stamping` as the mix position `state` saved it, where it saved any: a mix that stamps nothing, or a
+    position saved before it stamped, starts its draws' numbers afresh."""
+    if stamping is not None and STAMPING in state:
+        stamping.restore(record(state[STAMPING], "a mix's draws"))
+
+
+@dataclasses.dataclass(frozen=True)
+class Left:
+    """Where the run left a member of a mix, one mix read's: the member's `position` after the last pull the
+    run trained before one it did not, the `low` pull there, and the pulls past it the run trained
+    (`past`), which a phase that continues the member draws past (`dew.data.dataset.StepPhases`). A saved
+    position holds its record, the registry's (`dew.registry.to_record`)."""
+
+    position: JSON
+    low: int
+    past: tuple[int, ...]
+
+
+def _stamped_mixes(state: JSON) -> list[dict[str, JSON]]:
+    """Every saved position of a mix that stamps its draws in `state`, a reader's position: each mix read's
+    own (a loading worker's slice's, `node_of`), and the copies of it a stage downstream keeps to replay from
+    (a packer's open group's start, a shuffle's window's), in the order a walk meets them."""
+    found: list[dict[str, JSON]] = []
+    stack: list[JSON] = [state]
+    while stack:
+        match stack.pop():
+            case dict() as node:
+                if STAMPING in node and "parents" in node:
+                    found.append(node)
+                stack.extend(reversed(list(node.values())))
+            case list() as nodes:
+                stack.extend(reversed(nodes))
+    return found
+
+
+def _drawing(mix: Mapping[str, JSON]) -> tuple[str, dict[str, JSON], dict[str, JSON]]:
+    """A mix position's node, its pulls by member and its skips by member (`Stamping.state`)."""
+    stamping = record(mix[STAMPING], "a mix's draws")
+    pulled = record(stamping["pulled"], "a mix's pulls")
+    skips = record(stamping["skips"], "a mix's skipped pulls")
+    return (text(stamping["node"], "a mix's node"),
+            {member: json_value(count, f"member {member}'s pulls") for member, count in pulled.items()},
+            {member: json_value(held, f"member {member}'s skips") for member, held in skips.items()})
+
+
+def mix_reads(state: JSON, members: Mapping[str, str]) -> dict[str, dict[str, Left]]:
+    """Where each mix read in `state`, a phase's position, stands on each of `members` (mix member key:
+    corpus), by node (`Stamping.node`) in the order the position names them: the member's position, its
+    pulls, and the pulls past them it is yet to draw past (`Stamping.skips`). Read where a phase opens, the
+    start its draws continue from (`dew.data.dataset.StepPhases`)."""
+    reads: dict[str, dict[str, Left]] = {}
+    for mix in _stamped_mixes(state):
+        node, pulled, skips = _drawing(mix)
+        if node in reads:
+            continue
+        parents = record(mix["parents"], "a mix's corpora")
+        reads[node] = {member: Left(json_value(parents[member], f"member {member}'s position"),
+                                    integer(pulled[member], f"member {member}'s pulls"),
+                                    tuple(integers(skips.get(member, []),
+                                                   f"member {member}'s skipped pulls")))
+                       for member in members}
+    return reads
+
+
+def continued(state: JSON, members: Mapping[str, str], left: Mapping[str, Sequence[Left]]) -> JSON:
+    """`state`, a fresh phase's saved position, with each of its `members` (mix member key: corpus) that
+    `left` holds at where the run left it (`dew.data.dataset.StepPhases`), in every copy of each mix read,
+    the i-th mix read taking the corpus's i-th: its position, its pulls counted from the low pull and drawn
+    past the trained ones, its counts its own from here (`uncounted`). Refused where the phase reads the
+    corpus in another count of mix reads than the phase that left it."""
+    mixes = _stamped_mixes(state)
+    nodes = list(dict.fromkeys(_drawing(mix)[0] for mix in mixes))
+    for corpus, held in left.items():
+        if corpus in members.values() and len(held) != len(nodes):
+            raise ValueError(f"this phase reads its shared corpora in {len(nodes)} mix reads and the phase "
+                             f"that left corpus {corpus} read it in {len(held)}: read the phases that "
+                             "share a corpus in the same loading workers")
+    for mix in mixes:
+        node, pulled, skips = _drawing(mix)
+        at = nodes.index(node)
+        parents = {member: json_value(position, f"member {member}'s position")
+                   for member, position in record(mix["parents"], "a mix's corpora").items()}
+        for member, corpus in members.items():
+            if corpus in left:
+                where = left[corpus][at]
+                parents[member] = uncounted(where.position)
+                pulled[member], skips[member] = where.low, list(where.past)
+        mix["parents"] = parents
+        mix[STAMPING] = {"node": node, "pulled": pulled, "skips": skips}
+    return state
+
+
+def unmirrored(position: JSON) -> JSON:
+    """`position`, a corpus's, without the mirror counters its loading workers' positions carry by process
+    (`dew.data.storage.without_mirrors`): a draw's position names where the corpus stands, alike on
+    every share of an elastic read, and a phase continuing it counts its own mirrors."""
+    match position:
+        case list():
+            return [unmirrored(part) for part in position]
+        case dict():
+            return {key: unmirrored(json_value(part, key)) for key, part in without_mirrors(position).items()}
+    return position
+
+
+def uncounted(position: JSON) -> JSON:
+    """`position`, a corpus's, with every counter it keeps (`COUNTER`) at no counts: a corpus a later phase
+    reads on from an earlier phase's position counts what that phase reads of it, the earlier's counts
+    being the earlier phase's own."""
+    match position:
+        case list():
+            return [uncounted(part) for part in position]
+        case dict():
+            held: dict[str, JSON] = {key: uncounted(part) for key, part in position.items()}
+            match held.get(COUNTER):
+                case {"corpus": str(corpus), "label": str(label), "counts": _} as counter:
+                    held[COUNTER] = {**counter, "counts": json_value(CorpusCounts(corpus, label).state(),
+                                                                     "no counts")}
+            return held
+    return position
+
+
 class _MixRead(pygrain.DatasetIterator[Batch]):
     """One corpus of a mix (`_MixReads`): its parent's position, or, unopened, the counters it carries
     (`_UNOPENED`). A position a mix saved while it read each corpus's first row ahead holds the
     corpus before that row, which a restore reads next; one that held a corpus's counts alone in its
     parent's place is a corpus at its start carrying them."""
 
-    def __init__(self, group: _MixReads, index: int):
+    def __init__(self, group: _MixReads, index: int, key: str = "", stamping: Stamping | None = None):
         super().__init__()
-        self._group, self._index = group, index
+        self._group, self._index, self._key, self._stamping = group, index, key, stamping
 
     def __next__(self) -> Batch:
-        return self._group.read(self._index)
+        if self._stamping is None:
+            return self._group.read(self._index)
+        return self._stamping.read(self._key, lambda: self._group.read(self._index),
+                                   lambda: unmirrored(json_value(copy.deepcopy(self.get_state()),
+                                                                 "a corpus's position")))
 
     def get_state(self) -> Mapping[str, object]:
         state = self._group.state(self._index)
@@ -902,24 +1145,25 @@ class KeyedMix(pygrain.IterDataset[Batch]):
     dropped while the others resume where they were. The corpus each position reads is
     `Proportions(seed=...)`'s (`_ProportionalMix`), its windows' choices permuted where a `seed` is
     given, over the members in the order the mix declares them, the order a phase's prefix counts them in
-    (`dew.data.compile._delivered`). A read of a plan before `dew.data.plan.DECLARED_MIX` reads an unseeded
-    mix's members in their keys' sorted order (`declared` false), as Grain's mix of a mapping read them,
-    so a position it saved resumes as it read."""
+    (`dew.data.compile._delivered`)."""
 
     def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float],
-                 keys: Sequence[str], seed: int | None = None, *, declared: bool = True):
+                 keys: Sequence[str], seed: int | None = None, *, stamped: frozenset[str] = frozenset()):
         super().__init__(parents)
         self._corpora, self._weights, self._keys = tuple(parents), tuple(weights), tuple(keys)
-        self._seed = seed
-        order = range(len(self._keys))
-        self._order = tuple(order if declared or seed is not None
-                            else sorted(order, key=self._keys.__getitem__))
+        self._seed, self._stamped = seed, stamped
+        self._slice: slice | None = None
+
+    def set_slice(self, selection: slice, sequential_slice: bool = False) -> None:
+        # The worker's slice names its mix read's draws (`node_of`); its corpora take it as before.
+        self._slice = selection
+        super().set_slice(selection, sequential_slice)
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         group = _MixReads(self._corpora)
-        reads = {self._keys[index]: _MixRead(group, index) for index in self._order}
-        weights = [self._weights[index] for index in self._order]
-        return _ProportionalMix(reads, Proportions.of(weights, self._seed))
+        stamping = Stamping(self._stamped & set(self._keys), node_of(self._slice)) if self._stamped else None
+        reads = {key: _MixRead(group, index, key, stamping) for index, key in enumerate(self._keys)}
+        return _ProportionalMix(reads, Proportions.of(self._weights, self._seed), stamping)
 
 
 class _Captured:
@@ -955,11 +1199,13 @@ class _ProportionalMix(pygrain.DatasetIterator[Batch]):
     its position saved as Grain saves its own mix's: each corpus's under its key, the positions read
     and whether a corpus ended the mix, so a restore finds the corpora it holds and starts the rest."""
 
-    def __init__(self, reads: Mapping[str, _MixRead], proportions: Proportions):
+    def __init__(self, reads: Mapping[str, _MixRead], proportions: Proportions,
+                 stamping: Stamping | None = None):
         super().__init__()
         self._reads, self._keys, self._proportions = dict(reads), tuple(reads), proportions
         self._index, self._stop = 0, False
         self._positions = _Captured(self._reads)
+        self._stamping = stamping
 
     def __next__(self) -> Batch:
         if self._stop:
@@ -975,7 +1221,8 @@ class _ProportionalMix(pygrain.DatasetIterator[Batch]):
             raise
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parents": self._positions.captured(), "index": self._index, "stop": self._stop}
+        stamped = {} if self._stamping is None else {STAMPING: self._stamping.state()}
+        return {"parents": self._positions.captured(), "index": self._index, "stop": self._stop, **stamped}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         parents = record(state["parents"], "seeded mix")
@@ -985,6 +1232,7 @@ class _ProportionalMix(pygrain.DatasetIterator[Batch]):
                 read.set_state(record(held, "mixed corpus"))
         self._index = integer(state["index"], "seeded mix index")
         self._stop = boolean(state["stop"], "seeded mix stop")
+        restamped(self._stamping, state)
 
     def close(self) -> None:
         for read in self._reads.values():

@@ -440,7 +440,8 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
     """A decision run over a mixture records its chain (row 3874): read back from its run.json
     (`RunConfig.load`), it resumes its checkpoint and trains on (row 3882). Its command run again with the
     mixture's order changed is refused that position by its plan, naming the record route first, as the
-    run it resumes recorded its chain (`PlanOrderChanged.routes`, row 3881), and the saved schedule's route
+    run it resumes recorded its chain (`PlanOrderChanged.routes`, row 3881), where it resumes its data
+    exactly (`data_resume="exact"`; relaxed, its default, restarts the data), and the saved schedule's route
     as a decision run reads its mixture, not the data layer's mix (row 3976), before it writes its own
     record: the one it resumes is left byte for byte as it was, and resumes."""
     from run_kinds import trained
@@ -457,7 +458,8 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
     saved = directory / "run.json"
     record, written = saved.read_bytes(), saved.stat()
     with pytest.raises(PlanOrderChanged) as refused:
-        trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 3})
+        trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed",
+                trainer={"name": "mixed", "steps": 3, "data_resume": "exact"})
     routes = refused.value.routes
     assert len(routes) == 3 and (routes[0], routes[-1]) == (RECORD, REBUILD) and SCHEDULE not in routes
     assert routes[1] == DecisionRunConfig.UNSEEDED
@@ -473,8 +475,8 @@ def test_a_decision_run_over_a_mixture_resumes_from_its_record_and_its_changed_c
 @pytest.mark.mesh(devices=8)
 def test_a_changed_command_names_no_record_route_where_the_record_would_not_rebuild_its_chains(tmp_path):
     """A decision run whose record would not rebuild its chains, its validation built in Python, is
-    refused its changed mixture order without the record route, which would refuse it again
-    (`_read_chain`), where it records its data alone (row 3913)."""
+    refused its changed mixture order, resuming its data exactly, without the record route, which would
+    refuse it again (`_read_chain`), where it records its data alone (row 3913)."""
     from run_kinds import trained
 
     from dew.data.plan import RECORD, PlanOrderChanged
@@ -487,7 +489,8 @@ def test_a_changed_command_names_no_record_route_where_the_record_would_not_rebu
     unrebuilt["fields"]["validation"] = {"unrecorded": "built in Python"}
     saved.write_text(json.dumps(unrebuilt))
     with pytest.raises(PlanOrderChanged) as refused:
-        trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed", trainer={"name": "mixed", "steps": 2})
+        trained(mixed_run(tmp_path, root, "seeded"), tmp_path, "mixed",
+                trainer={"name": "mixed", "steps": 2, "data_resume": "exact"})
     assert RECORD not in refused.value.routes
 
 
@@ -748,25 +751,6 @@ def test_a_decision_run_refuses_memory_options_without_their_backbone(fields, ch
         DecisionRunConfig(pretrained=str(checkpoint), data=TICKETS, **fields).prepare()
 
 
-def test_a_decision_release_takes_its_backbones_layer_recomputation():
-    """`--remat` chooses a decision release's backbone layer policy as a fresh backbone's: the
-    prepared objective's backbone recomputes its layers under that policy, under the release's own
-    head and layout."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.backbones.decoder_block import remat_policy
-
-    default = Fitted(data=TICKETS)
-    objective, _ = dataclasses.replace(default, pretrained=str(TINY), remat="full",
-                                       trainer=dataclasses.replace(default.trainer, multi_host=False,
-                                                                   compilation_cache_dir=None)).prepare().train("x")
-    released = Decide.from_pretrained(TINY, attention_impl="xla")
-    backbone = objective.model.backbone
-    assert isinstance(backbone, CausalTransformer) and backbone.remat == remat_policy("full")
-    assert released.model.backbone.remat != backbone.remat
-    assert type(objective.model.head) is type(released.model.head)
-    assert type(objective.layout) is type(released.layout)
-
-
 class Started(DecisionRunConfig):
     """A decision run that hands back the objective it would train, rather than training it."""
 
@@ -781,112 +765,136 @@ class Fitted(DecisionRunConfig):
         return objective, dataset
 
 
-def test_a_decision_run_builds_its_source_as_its_source_options_say():
-    """A decision run's `--source.text-only` and `--source.prediction-depths` reach its source's load:
-    over Qwen3.5, a wrapper with a vision tower and a prediction depth, the run's backbone is the
-    language model alone, with no tower and no depth, where by default it builds both."""
+def answered(run: Path) -> Decide:
+    """The task `run` saved, loaded as its users load it, having answered one request over options it
+    states (`run_kinds.requested`) with one of them."""
+    from run_kinds import requested
+
+    task = Decide.from_run(str(run))
+    [answer] = requested(task)
+    assert answer["team"].choice in ("billing", "technical", "sales")
+    return task
+
+
+def test_a_decision_release_compiles_its_step_under_the_layer_recomputation_its_run_asks(tmp_path):
+    """`--remat` chooses a decision release's backbone layer policy as a fresh backbone's: the release
+    declares another, and a run over it asking 'full' compiles its step at that rung (its `StepCompiled`
+    record), saves, and its task answers."""
+    from run_kinds import decision, trained_by_cli
+    from test_run_option_matrix import recorded
+
+    from dew.nn.backbones.decoder_block import remat_policy
+
+    assert Decide.from_pretrained(TINY, attention_impl="xla").model.backbone.remat != remat_policy("full")
+    run = trained_by_cli(dataclasses.replace(decision(tmp_path, drawn=False), remat="full"), tmp_path,
+                         "remat", {})
+    assert [compiled["remat"] for compiled in recorded(run, "StepCompiled")] == [["full", None]]
+    answered(run)
+
+
+def test_a_decision_run_trains_and_serves_the_part_of_its_source_its_source_options_say(tmp_path):
+    """Qwen3.5's tiny wrapper loads with a vision tower and a prediction depth; a decision run's
+    `--source.text-only` and `--source.prediction-depths 0` train the language model alone: its saved task
+    is a causal decoder of no prediction depth whose weights hold no tower and no depth, and it answers."""
+    import jax
+    from run_kinds import decision, trained_by_cli
+
     from dew.config import SourceOptions
+    from dew.interop import Pretrained
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
-    default = Fitted(data=TICKETS)
-    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
-
-    def backbone(options: SourceOptions):
-        run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, source=options)
-        objective, _ = run.prepare().train("x")
-        return objective.model.backbone, objective.variables
-
-    whole, _ = backbone(SourceOptions())
+    whole = Pretrained.load(str(QWEN), dtype="float32").model
     assert not isinstance(whole, CausalTransformer) and whole.language_model.num_nextn_predict_layers == 1
-    text, variables = backbone(SourceOptions(text_only=True, prediction_depths=0))
-    assert isinstance(text, CausalTransformer) and text.num_nextn_predict_layers == 0
-    import jax
-
-    paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_flatten_with_path(variables)[0]]
+    run = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(QWEN),
+                              source=SourceOptions(text_only=True, prediction_depths=0))
+    task = answered(trained_by_cli(run, tmp_path, "text", {}))
+    backbone = task.model.backbone
+    assert isinstance(backbone, CausalTransformer) and backbone.num_nextn_predict_layers == 0
+    paths = [jax.tree_util.keystr(path)
+             for path, _ in jax.tree_util.tree_flatten_with_path(task.variables)[0]]
     assert paths and not any("mtp_" in path or "vision" in path or "visual" in path for path in paths)
 
 
-def test_a_decision_run_reads_letters_as_its_letter_readout():
-    """`head:letters` reads each option as the fresh backbone's own logit at its label's token, at the
-    answer cue of a row lettered as its labels letter it, as a slot release reads it: the run's head
-    is the letter readout of its labels' token ids under the objective's tokenizer, and its rows a
-    question to a row, lettered by those labels alone, each bare letter one token of the fixture's
-    byte-level vocabulary. A question of more options than the head holds labels is refused."""
-    from dew.data.dataset import DataPartition
-    from dew.decision.config import Letters
-    from dew.decision.head import LabelReadout
-    from dew.decision.layout import (
-        AnswerCue,
-        Instructions,
-        Labels,
-        OptionLines,
-        QuestionLayout,
-        RowSegment,
-        State,
-        Text,
-    )
-    from dew.decision.objective import tokenizer_of
-    from dew.interop import Pretrained
-    from dew.registry import from_record, to_record
+def context_run() -> DecisionRunConfig:
+    """A run of a fresh head over Qwen3.5's tiny text decoder with a context layer, its tickets each beside
+    its account's context, which the layer reads (`Fitted`)."""
+    from dew.config import SourceOptions
 
-    default = Fitted(data=TICKETS)
-    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
-    labels = Labels(variants=("{}",))
-    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer,
-                              head=Letters(labels=labels, count=4))
-    objective, _ = run.prepare().train("x")
-    head, layout = objective.model.head, objective.layout
-    tokenizer = tokenizer_of(Pretrained.load(str(QWEN), dtype="float32").text_processor)
-    assert tokenizer is not None
-    assert isinstance(head, LabelReadout) and head.label_ids == labels.ids(tokenizer, 4)
-    assert isinstance(layout, QuestionLayout)
-    assert layout.labels == labels.spelled(tokenizer, 4)
-    with pytest.raises(ValueError):
-        _, few = dataclasses.replace(run, head=Letters(labels=labels, count=2)).prepare().train("x")
-        next(iter(few.train(DataPartition())))
-    # The run names the row's segments: the question first, the state after it.
-    question_first = (Instructions({"choice": "Question: {}", "noul": "Question: {}", "score": "Rate: {}"}),
-                      Text("\nOptions:\n"), OptionLines(), Text("\n<state>\n"), State(render="state"),
-                      Text("\n</state>\n"), AnswerCue())
-    ordered, _ = dataclasses.replace(run, segments=question_first).prepare().train("x")
-    assert isinstance(ordered.layout, QuestionLayout) and ordered.layout.segments == question_first
-    assert from_record(tuple[RowSegment, ...], json.loads(json.dumps(
-        to_record(question_first, tuple[RowSegment, ...]))), dtypes=False) == question_first
+    team = Choice("Which team?", ["billing", "technical", "sales"])
+    tickets = [("charged twice", "billing", "basic"), ("site down", "technical", "pro"),
+               ("pro price", "sales", "team")] * 4
+    contexted = Memory([{"state": text, "questions": {"team": team.wire()}, "answers": {"team": label},
+                         "context": {"plan": plan}} for text, label, plan in tickets]
+                       ).pipe(decisions).read("memory").batch(8).loading(Loading(workers=0))
+    return Fitted(data=contexted, pretrained=str(QWEN), source=SourceOptions(text_only=True),
+                  context_layers=(0,), context_length=64)
 
 
-def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_where_asked():
-    """`--no-context-frozen` trains the backbone whole beside its context layers' blocks, a full
-    fine-tune, where by default it holds frozen and the blocks train alone: the objective's held tree
-    then splits off no frozen backbone, every backbone weight trained. With LoRA the adapter trains
-    beside the blocks over its frozen base; without context layers the flag is refused."""
-    from model_support import flat_tree
-
-    from dew.decision.objective import DecisionObjective
-    from dew.lora import LoRA
+def test_a_decision_run_holds_its_backbone_frozen_beside_its_context_layers_by_default(tmp_path):
+    """By default a run with context layers holds its backbone frozen and trains the layers' blocks alone: a
+    step moves the blocks and leaves the backbone, and the saved run loads back as a task answering with
+    its trained probabilities. Without context layers `--no-context-frozen` is refused."""
+    from dew.batch import FROZEN
     from dew.nn.cross_attention import crossing
-    from dew.objectives.base import FROZEN
 
-    default = Fitted(data=TICKETS)
-    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
-    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, context_layers=(0,),
-                              context_length=16)
-    frozen, _ = run.prepare().train("x")
-    assert isinstance(frozen, DecisionObjective) and frozen.variables is not None
-    assert all(crossing(path) for path in flat_tree(frozen.variables["params"]["backbone"]))
-    assert "backbone" in frozen.variables[FROZEN]
-    whole, _ = dataclasses.replace(run, context_frozen=False).prepare().train("x")
-    assert isinstance(whole, DecisionObjective) and whole.variables is not None
-    assert FROZEN not in whole.variables
-    trained = flat_tree(whole.variables["params"]["backbone"])
-    assert any(crossing(path) for path in trained) and any(not crossing(path) for path in trained)
-    adapted, _ = dataclasses.replace(run, context_frozen=False,
-                                     lora=LoRA(rank=2, modules=("q_proj",))).prepare().train("x")
-    assert isinstance(adapted, DecisionObjective) and adapted.variables is not None
-    held = flat_tree(adapted.variables["params"]["backbone"])
-    assert any(crossing(path) for path in held) and any("lora_A" in path for path in held)
-    assert "backbone" in adapted.variables[FROZEN]
+    run = context_run()
+    frozen = stepped_once(tmp_path / "frozen", run, reloaded=True)
+    assert any(path.startswith(FROZEN) for path in frozen)
+    assert not any(moved for path, moved in frozen.items() if path.startswith(FROZEN))
+    assert any(moved for path, moved in frozen.items() if crossing(path))
     with pytest.raises(ValueError):
         dataclasses.replace(run, context_frozen=False, context_layers=None).prepare()
+
+
+@pytest.mark.parametrize("adapter", [None, "lora"])
+def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_where_asked(tmp_path, adapter):
+    """`--no-context-frozen` trains the backbone whole beside the context layers' blocks, a full fine-tune,
+    its weights in one collection, a step moving the backbone too; with LoRA the adapter trains beside the
+    blocks over its frozen base."""
+    from dew.batch import FROZEN
+    from dew.lora import LoRA
+    from dew.nn.cross_attention import crossing
+
+    lora = None if adapter is None else LoRA(rank=2, modules=("q_proj",))
+    run = dataclasses.replace(context_run(), context_frozen=False, lora=lora)
+    moved = stepped_once(tmp_path / "whole", run)
+    if lora is None:
+        assert not any(path.startswith(FROZEN) for path in moved)
+        assert any(step for path, step in moved.items() if "backbone" in path and not crossing(path))
+        return
+    assert any(path.startswith(FROZEN) for path in moved)
+    assert not any(step for path, step in moved.items() if path.startswith(FROZEN))
+    assert any(step for path, step in moved.items() if "lora_A" in path or "lora_B" in path)
+    assert any(step for path, step in moved.items() if crossing(path) and not path.startswith(FROZEN))
+
+
+def stepped_once(root: Path, run: DecisionRunConfig, *, reloaded: bool = False) -> dict[str, bool]:
+    """Whether each of the run's variables, by its path, moved over one step of its prepared objective
+    (`Fitted`) and dataset; `reloaded`, the run saved and loaded back as a task answering with the live
+    objective's probabilities, beside a context its layers read."""
+    import jax
+    import optax
+    from model_support import flat_tree
+
+    from dew.checkpoints import Checkpoints
+    from dew.training import Trainer
+
+    trainer = dataclasses.replace(run.trainer, multi_host=False, compilation_cache_dir=None)
+    objective, dataset = dataclasses.replace(run, trainer=trainer).prepare().train(root.name)
+    start = {path: np.asarray(leaf) for path, leaf in flat_tree(objective.init(jax.random.key(0))).items()}
+    checkpoints = Checkpoints(str(root), keep=1) if reloaded else None
+    state = Trainer(objective, optax.adam(1e-2), key=0, checkpoints=checkpoints).fit(
+        dataset, steps=1, log_every=100, checkpoint_every=1 if reloaded else None)
+    if checkpoints is not None:
+        checkpoints.wait()
+    trained = {path: np.asarray(leaf) for path, leaf in flat_tree(state.variables).items()}
+    if reloaded:
+        question = {"team": Choice("Which team?", ["billing", "technical", "sales"])}
+        asked = {"context": {"plan": "pro"}}
+        np.testing.assert_array_equal(
+            objective.pipeline(state)("charged twice", question, **asked)["team"].probabilities,
+            Decide.from_run(str(root))("charged twice", question, **asked)["team"].probabilities)
+    return {path: not np.array_equal(start[path], trained[path]) for path in start}
 
 
 def test_a_joint_run_refuses_a_cue_its_rows_cannot_render():
@@ -908,7 +916,8 @@ def test_a_joint_run_refuses_a_cue_its_rows_cannot_render():
 def test_a_backbone_reading_its_own_media_in_blocks_keeps_a_joint_layout():
     """Gemma 4 Unified reads its vision tokens' blocks whole, as its checkpoint states: that asks no
     block of the run's rows, so a fresh joint head over it keeps the joint layout, a row of every
-    question, as a run that asks for no block-bidirectional attention."""
+    question, as a run that asks for no block-bidirectional attention. A loader check of the source the
+    run derives its layout from: a run of it trains past a CPU task's memory (11.5 GiB, armada mc-cuts3)."""
     from dew.decision.config import JointShape
     from dew.decision.layout import JointLayout
 
@@ -921,82 +930,74 @@ def test_a_backbone_reading_its_own_media_in_blocks_keeps_a_joint_layout():
     assert isinstance(objective.layout, JointLayout)
 
 
-@pytest.mark.parametrize("scope", ["wrapper", "text_config", "beside-another-kind"])
-def test_a_checkpoint_declaring_block_attention_lays_a_fresh_heads_rows_in_blocks(tmp_path, scope):
+def test_a_checkpoint_declaring_block_attention_trains_and_serves_a_fresh_heads_rows_in_blocks(tmp_path):
     """A checkpoint whose own config declares its full-attention layers block-bidirectional
     (`modeling_overrides`), at the wrapper's scope or its `text_config`'s, there beside a wrapper scope
-    naming another kind, lays a fresh head's rows in blocks for them, with no run option asking it,
-    as the run's `--source.attention` would."""
+    naming another kind, loads them reading blocks, and a fresh head's run over it lays its rows in blocks
+    for them with no run option asking it, as the run's `--source.attention` would: its saved task's rows
+    lie in blocks, and it answers."""
     import shutil
 
-    declared = tmp_path / "declared"
-    shutil.copytree(QWEN, declared)
-    config = json.loads((declared / "config.json").read_text())
-    stated = config if scope == "wrapper" else config["text_config"]
-    stated["modeling_overrides"] = {"attention": {"full_attention": "block_bidirectional"}}
-    if scope == "beside-another-kind":
-        config["modeling_overrides"] = {"attention": {"linear_attention": "causal"}}
-    (declared / "config.json").write_text(json.dumps(config))
-    default = Fitted(data=TICKETS)
-    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
-    run = dataclasses.replace(default, pretrained=str(declared), trainer=trainer)
-    objective, _ = run.prepare().train("x")
-    assert objective.layout.blocks
+    from run_kinds import decision, trained_by_cli
 
-
-def test_a_decision_run_lays_its_rows_in_blocks_its_source_reads_whole():
-    """`--source.attention full_attention block_bidirectional` loads the backbone's full-attention
-    layers reading blocks (`Pretrained.load`'s `modeling_overrides`), and the run's rows lie in blocks
-    for them to read; a joint row of every question lies in none, and is refused."""
     from dew.config import SourceOptions
-    from dew.decision.config import JointShape
-    from dew.interop import Pretrained
 
+    def declared(scope: str) -> Path:
+        directory = tmp_path / scope
+        shutil.copytree(QWEN, directory)
+        config = json.loads((directory / "config.json").read_text())
+        stated = config if scope == "wrapper" else config["text_config"]
+        stated["modeling_overrides"] = {"attention": {"full_attention": "block_bidirectional"}}
+        if scope == "beside-another-kind":
+            config["modeling_overrides"] = {"attention": {"linear_attention": "causal"}}
+        (directory / "config.json").write_text(json.dumps(config))
+        return directory
+
+    sources = {scope: declared(scope) for scope in ("wrapper", "text_config", "beside-another-kind")}
     default = Fitted(data=TICKETS)
     trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
-    source = SourceOptions(text_only=True, attention={"full_attention": "block_bidirectional"})
-    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, source=source)
-    objective, _ = run.prepare().train("x")
-    assert objective.model.backbone.kind_of("full_attention").mixer.bidirectional_blocks
-    assert objective.layout.blocks
-    plain, _ = dataclasses.replace(run, source=SourceOptions(text_only=True)).prepare().train("x")
-    release = Pretrained.load(str(QWEN), dtype="float32", text_only=True).model
-    assert plain.model.backbone.kind_of("full_attention") == release.kind_of("full_attention")
-    assert not plain.layout.blocks
-    with pytest.raises(ValueError):
-        dataclasses.replace(run, head=JointShape()).prepare()
+    for source in sources.values():
+        prepared = dataclasses.replace(default, pretrained=str(source), trainer=trainer).prepare()
+        objective, _ = prepared.train("x")
+        assert objective.layout.blocks
+    run = dataclasses.replace(decision(tmp_path, drawn=False), pretrained=str(sources["text_config"]),
+                              source=SourceOptions(text_only=True))
+    assert answered(trained_by_cli(run, tmp_path, "declared", {})).layout.blocks
 
 
-def test_a_decision_run_writes_its_rows_in_the_order_and_blocks_it_names():
-    """`--order` writes a fresh head's rows in its order and `--split` splits them where it says, the
-    whole row one block where its source reads blocks; a split of rows its source reads in order is
-    refused, a run of the rows' own segments and an order beside them too, and a framing of the
-    layout's own row, which is written unframed."""
+def test_a_decision_runs_rows_its_head_or_source_cannot_hold_are_refused():
+    """A fresh head's rows the run cannot lay are refused as it is prepared or first read, never trained
+    on: a question of more options than a letter readout holds labels; a joint row of every question over
+    a source reading blocks; a split of rows its source reads in order, a run of the rows' own segments and
+    an order beside them, and a framing of the layout's own row, which is written unframed. The options
+    themselves reach a saved task through `dew train` in the option witness (test_run_options.py,
+    `WITNESSED_ON`'s `layout.order`, `layout.split`, `layout.blocks`, `layout.segments` and
+    `layout.labels`)."""
     from dew.config import SourceOptions
-    from dew.decision.layout import AnswerCue, Framing, Instructions, OptionLines, QuestionLayout, State
+    from dew.data.dataset import DataPartition
+    from dew.decision.config import JointShape, Letters
+    from dew.decision.layout import AnswerCue, Framing, Instructions, Labels, OptionLines, State
 
     default = Fitted(data=TICKETS)
     trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
-    source = SourceOptions(text_only=True, attention={"full_attention": "block_bidirectional"})
-    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, source=source,
-                              order="re_read", split="whole")
-    objective, _ = run.prepare().train("x")
-    layout = objective.layout
-    assert isinstance(layout, QuestionLayout)
-    assert (layout.order, layout.split, layout.blocks) == ("re_read", "whole", True)
-    [row] = layout.rows(objective.tokenizer, objective.specials, "my card is lost",
-                        {"q": Choice("Which?", ["a", "b"])})
-    assert row.blocks == (0,) * len(row.tokens)
-    plain = dataclasses.replace(run, source=SourceOptions(text_only=True))
+    lettered = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer,
+                                   head=Letters(labels=Labels(variants=("{}",)), count=2))
     with pytest.raises(ValueError):
-        plain.prepare()
-    ordered, _ = dataclasses.replace(plain, split=None, order="question_first").prepare().train("x")
-    assert isinstance(ordered.layout, QuestionLayout) and ordered.layout.order == "question_first"
+        _, few = lettered.prepare().train("x")
+        next(iter(few.train(DataPartition())))
+    blocks = SourceOptions(text_only=True, attention={"full_attention": "block_bidirectional"})
     with pytest.raises(ValueError):
-        dataclasses.replace(plain, split=None, segments=(Instructions({"choice": "{}"}), OptionLines(),
-                                                         State(), AnswerCue())).prepare()
+        dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, source=blocks,
+                            head=JointShape()).prepare()
+    plain = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer,
+                                source=SourceOptions(text_only=True))
     with pytest.raises(ValueError):
-        dataclasses.replace(plain, split=None, framing=Framing()).prepare()
+        dataclasses.replace(plain, order="re_read", split="whole").prepare()
+    with pytest.raises(ValueError):
+        dataclasses.replace(plain, order="re_read", segments=(Instructions({"choice": "{}"}), OptionLines(),
+                                                              State(), AnswerCue())).prepare()
+    with pytest.raises(ValueError):
+        dataclasses.replace(plain, order="re_read", framing=Framing()).prepare()
 
 
 def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():

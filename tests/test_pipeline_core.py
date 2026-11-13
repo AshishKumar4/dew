@@ -26,7 +26,7 @@ from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
 from dew.data.dataset import DataPartition, Loading
 from dew.data.mixing import TokenDeficit, token_weights
-from dew.data.pipeline import Configured, Pipeline, Rejected, mix
+from dew.data.pipeline import Configured, Pack, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources import Files, Memory
 
@@ -1447,12 +1447,12 @@ def test_an_exact_resume_refuses_a_rewritten_file_whose_token_split_keeps_its_sp
         rewritten.close()
 
 
-def test_lambda_identity_requires_explicit_non_exact_resume():
+def test_lambda_identity_requires_a_relaxed_resume():
     identity = StepIdentity.of(lambda row: row)
     plan = Plan("global", Manifest({}, (identity,)), {"seed": 0})
     with pytest.raises(ValueError):
         plan.check(plan.record())
-    assert plan.check(plan.record(), resume="non-exact") == ()
+    assert plan.check(plan.record(), resume="relaxed") == ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1464,9 +1464,9 @@ class Shifting:
 
 
 @pytest.mark.parametrize("read", ["indexed", "memory"])
-def test_a_lambda_step_needs_a_non_exact_resume_whether_or_not_memory_ran_it(read):
+def test_a_lambda_step_needs_a_relaxed_resume_whether_or_not_memory_ran_it(read):
     """A lambda has no stable identity, so a plan that runs one is not exact
-    and resumes only with resume='non-exact'. Read into memory beside a
+    and resumes only with resume='relaxed'. Read into memory beside a
     configured step, the lambda is one of the steps the memory read already
     ran into the rows it holds, which the plan counts as it counts its own."""
     def compiled(resume):
@@ -1488,7 +1488,7 @@ def test_a_lambda_step_needs_a_non_exact_resume_whether_or_not_memory_ran_it(rea
             again.set_state(state)
     finally:
         again.close()
-    resumed = compiled("non-exact").train(DataPartition())
+    resumed = compiled("relaxed").train(DataPartition())
     try:
         resumed.set_state(state)
     finally:
@@ -2014,7 +2014,7 @@ def test_a_resume_is_refused_where_the_same_token_split_keeps_other_documents(gr
     tokens and on documents 1-3, so a resume after one row would read
     document 1 again. The first document grows in the source, which keeps its
     name and row count, or in a step without a stable identity, which a
-    non-exact resume cannot check; the split's spans in the derived order
+    relaxed resume cannot check; the split's spans in the derived order
     refuse both."""
     def reader(first):
         sizes = (first if grown == "in the source" else 4, 4, 4, 4)
@@ -2026,7 +2026,7 @@ def test_a_resume_is_refused_where_the_same_token_split_keeps_other_documents(gr
                 lambda row: {"text": np.resize(row["text"], first) if row["text"][0] == 0 else row["text"]},
             )
         split = pipeline.holdout(tokens=0.25)[0].batch(1)
-        resume = "exact" if grown == "in the source" else "non-exact"
+        resume = "exact" if grown == "in the source" else "relaxed"
         return compile(split, read="indexed", loading=READ, resume=resume).train(DataPartition())
 
     four = reader(4)
@@ -2162,7 +2162,7 @@ def test_the_saved_order_names_the_stages_a_memory_read_ran_as_an_indexed_read_d
     documents = [{"text": np.arange(size, dtype=np.int32)} for size in (8, 1, 8)]
     packed = Pipeline(Memory(documents)).pack(8, bins=1).shuffle(0, window=2).repeat().batch(1)
     orders = [compile(packed, read=read, loading=READ).plan.order["stages"] for read in ("memory", "indexed")]
-    assert orders[0] == orders[1] and orders[0][0].startswith("Pack(")
+    assert orders[0] == orders[1] and isinstance(orders[0][0], Pack)
 
 
 def test_an_indexed_pack_over_a_token_store_reads_its_planned_global_windows(tmp_path):

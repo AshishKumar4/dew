@@ -54,7 +54,7 @@
    "lane": "Kernels"
   },
   "tests/test_audio.py": {
-   "comparisons": 8,
+   "comparisons": 7,
    "lane": "Models, Serving & RL"
   },
   "tests/test_audio_condition.py": {
@@ -265,10 +265,6 @@
    "comparisons": 1,
    "lane": "Training"
   },
-  "tests/test_guided_decoding.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_hf_classic_gpt.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
@@ -307,10 +303,6 @@
   },
   "tests/test_inference_sampling.py": {
    "comparisons": 10,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_inference_tasks.py": {
-   "comparisons": 5,
    "lane": "Models, Serving & RL"
   },
   "tests/test_instrumentation.py": {
@@ -502,7 +494,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_quantized.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_qwen_image_vae.py": {
@@ -542,7 +534,7 @@
    "lane": "Training"
   },
   "tests/test_samplers.py": {
-   "comparisons": 9,
+   "comparisons": 8,
    "lane": "Models, Serving & RL"
   },
   "tests/test_sd3_source.py": {
@@ -552,10 +544,6 @@
   "tests/test_sequence_parallel.py": {
    "comparisons": 6,
    "lane": "Kernels"
-  },
-  "tests/test_serving.py": {
-   "comparisons": 3,
-   "lane": "Models, Serving & RL"
   },
   "tests/test_source_schedulers.py": {
    "comparisons": 5,

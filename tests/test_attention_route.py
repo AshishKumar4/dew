@@ -505,9 +505,10 @@ def test_the_reference_filling_with_minus_infinity_is_the_written_out_program(he
 
 
 def _documents(rows: int, queries: int) -> jax.Array:
-    """`[rows, queries]` documents: two a row, of 40 and the rest, beside padding (id 0) at queries 3 and 7,
-    which under causality see no key, every other query a key of its own document's before it."""
-    ids = np.where(np.arange(queries) < 40, 1, 2)
+    """`[rows, queries]` documents: two a row, of 40 and the rest, ids 2^24 and 2^24 + 1, which float32 does
+    not tell apart, beside padding (id 0) at queries 3 and 7, which under causality see no key, every other
+    query a key of its own document's before it."""
+    ids = np.where(np.arange(queries) < 40, 2 ** 24, 2 ** 24 + 1)
     ids[[3, 7]] = 0
     return jnp.asarray(np.broadcast_to(ids, (rows, queries)))
 
@@ -1104,20 +1105,42 @@ def test_a_cpu_call_whose_xla_scores_pass_its_devices_memory_holds_temporaries_l
 
 @pytest.mark.parametrize(("generation_name", "tokens", "width", "declared"), [
     ("sm80", 4096, 128, True), ("sm90", 32768, 64, True), ("sm80", 256, 128, True), ("sm80", 4096, 256, True),
-    ("sm90", 65536, 128, False), ("sm80", 65536, 64, False)],
-    ids=["a100-measured", "h100-longest", "shorter", "wider", "longer", "longer-narrower"])
+    ("sm90", 65536, 128, False), ("sm80", 65536, 64, False), ("sm100", 4096, 256, True),
+    ("sm100", 32768, 128, True), ("sm100", 256, 64, True), ("sm100", 128, 128, False),
+    ("sm100", 4096, 32, False), ("sm100", 65536, 256, False)],
+    ids=["a100-measured", "h100-longest", "shorter", "wider", "longer", "longer-narrower", "b200-measured",
+         "b200-longest", "b200-shortest", "b200-shorter", "b200-narrower", "b200-longer"])
 def test_a_16_bit_calls_declared_cell_holds_only_within_its_receipts_shapes(generation_name, tokens, width,
                                                                              declared):
     """A bf16 causal call over 8 key heads on an A100 or an H100, whose declared cell names FlashAttention
     (`attention_kernels.DECLARED`), its receipts holding up to 32768 tokens (`MEASURED`: their lead growing
     as the calls shorten): a call within them, a shorter or a wider one among them, is in that cell; a
-    longer one is a cell none declares, which takes the template (row 5285)."""
+    longer one is a cell none declares, which takes the template (row 5285). On a B200, whose cell names
+    cuDNN, its receipts' shapes alone: 256 to 32768 tokens at widths 64, 128 and 256, four query heads a key
+    head."""
     from dew.nn import attention_kernels
     from dew.nn.attention import attention_case
 
     query = jax.ShapeDtypeStruct((1, tokens, 32, width), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((1, tokens, 8, width), jnp.bfloat16)
     with generation.assumed(generation_name):
+        cell = attention_case(query, key, causal=True).cell
+    assert (cell in attention_kernels.DECLARED) == declared
+
+
+@pytest.mark.parametrize(("heads", "kv_heads", "declared"), [
+    (32, 8, True), (16, 4, True), (32, 32, False), (64, 8, False)], ids=["32/8", "16/4", "mha", "8-group"])
+def test_a_b200s_declared_cell_holds_only_its_receipts_head_layouts(heads, kv_heads, declared):
+    """A bf16 causal call of 4096 tokens, 128 wide, on a B200, whose cell names cuDNN at the head layouts its
+    receipts timed (`attention_kernels.MEASURED`: four query heads a key head): a call of those is in that
+    cell; one whose key heads serve one query head or eight is a cell none declares, which takes the
+    template."""
+    from dew.nn import attention_kernels
+    from dew.nn.attention import attention_case
+
+    query = jax.ShapeDtypeStruct((1, 4096, heads, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, 4096, kv_heads, 128), jnp.bfloat16)
+    with generation.assumed("sm100"):
         cell = attention_case(query, key, causal=True).cell
     assert (cell in attention_kernels.DECLARED) == declared
 
@@ -1143,22 +1166,25 @@ def test_a_process_is_held_to_its_control_groups_least_memory_limit(tmp_path, gr
     assert min(generation.cgroup_memory_limits(str(tmp_path))) == least
 
 
+@pytest.mark.parametrize("filled", [False, True], ids=["blocks", "filled"])
 @pytest.mark.parametrize("differentiated", [False, True], ids=["inference", "training"])
-def test_a_call_only_spans_express_holds_no_dense_mask(differentiated):
+def test_a_call_whose_visibility_spans_express_holds_no_dense_mask(differentiated, filled):
     """A causal call of block groups (Gemma 4's images, a decision row's blocks), which only spans express
-    (`AttentionCase.spans_only`), runs on the template where its visibility stays spans, its forward and its
-    training alike: its compiled program's temporaries grow with its tokens, not their square, twice the
-    tokens taking under three times the bytes, where a dense `[S, S]` mask or the reference path's `B H S S`
-    logits take four times (rows 1495, 1953)."""
+    (`AttentionCase.spans_only`), or one whose hidden keys take a logit within its logits' reach
+    (`mask_fill`), which the template weighs by a score hook over its spans (`template.Filled`), runs on the
+    template where its visibility stays spans, its forward and its training alike: its compiled program's
+    temporaries grow with its tokens, not their square, twice the tokens taking under three times the bytes,
+    where a dense `[S, S]` mask or the reference path's `B H S S` logits take four times (rows 1495, 1953)."""
     heads, width = 4, 64
 
     def temporaries(tokens: int) -> int:
         query, key, value = (jnp.ones((1, tokens, h, width), jnp.bfloat16) for h in (heads, 2, 2))
         groups = jnp.repeat(jnp.arange(tokens // 128, dtype=jnp.int32), 128)[None]
+        visibility = {"mask_fill": -2.0} if filled else {"block_groups": groups}
 
         def attended(query, key, value):
-            return scaled_dot_product_attention(query, key, value, causal=True, block_groups=groups,
-                                                implementation="template")
+            return scaled_dot_product_attention(query, key, value, causal=True, implementation="template",
+                                                **visibility)
 
         step = jax.grad(lambda *operands: attended(*operands).astype(jnp.float32).sum(),
                         argnums=(0, 1, 2)) if differentiated else attended

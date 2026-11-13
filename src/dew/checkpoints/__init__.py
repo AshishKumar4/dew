@@ -64,11 +64,10 @@ from __future__ import annotations
 import copy
 import dataclasses
 import datetime
-import functools
 import json
 import math
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence, Set
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, TypedDict, overload
 
@@ -133,7 +132,6 @@ from dew.checkpoints.averaging import (
     averaged as averaged,
     averaged_pinned as averaged_pinned,
 )
-from dew.checkpoints.served import unpacked
 from dew.mesh import LogicalAxes
 from dew.nn import sharding
 from dew.nn.precision import at_least_fp32
@@ -145,7 +143,6 @@ if TYPE_CHECKING:
     from flax.training.dynamic_scale import DynamicScale
 
     from dew.data.dataset import DataPartition
-    from dew.nn.protocols import ProjectionGroup
     from dew.state import Accumulation, TrainState
 
 # One field of the train state as a checkpoint holds it: a scalar array, a
@@ -487,8 +484,11 @@ def _placed(tree, template, keys: Mapping[str, str]):
             return _keyed(leaf, want, keys)
         if leaf is want or (isinstance(leaf, jax.Array) and leaf.dtype == want.dtype):
             return leaf
-        value = jnp.asarray(leaf).astype(want.dtype)
         sharding = getattr(want, 'sharding', None)
+        if isinstance(leaf, np.ndarray) and sharding is not None:
+            # A host leaf cast on the host and put where it is wanted, no other device holding it on the way.
+            return jax.device_put(leaf.astype(want.dtype), sharding)
+        value = jnp.asarray(leaf).astype(want.dtype)
         return value if sharding is None else jax.device_put(value, sharding)
     return jax.tree.map(placed, tree, template)
 
@@ -521,16 +521,22 @@ def _paths(tree) -> set[str]:
             for path, _ in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
 
-def _refuse_lacking(lacking: set[str], where: str) -> None:
-    """Refuse a template whose leaves `lacking` the checkpoint at `where` does not hold."""
+def _refuse_lacking(lacking: set[str], where: str, unread: Set[str] = frozenset()) -> None:
+    """Refuse a template whose leaves `lacking` the checkpoint at `where` does not hold, naming what it
+    holds in their place: its `unread` leaves, those the template does not ask, beside a lacking one (a
+    layout another model or an earlier Dew wrote, a projection group's members stored packed among them).
+    Paths are `_paths`'."""
     if lacking:
         names = sorted(lacking)
+        beside = {name.rsplit("/", 2)[0] for name in names}
+        instead = sorted(name for name in unread if name.rsplit("/", 2)[0] in beside)
+        more = " and more" if len(instead) > 4 else ""
+        held = f" It holds {', '.join(instead[:4])}{more} in their place." if instead else ""
         raise ValueError(
             f"The checkpoint at {where} holds no {', '.join(names[:6])}"
-            f"{f' or {len(names) - 6} more leaves' if len(names) > 6 else ''}, "
-            f"which this run's state has: the checkpoint was written by a model "
-            f"or objective without them. Restore it with the model it was "
-            f"written with.")
+            f"{f' or {len(names) - 6} more leaves' if len(names) > 6 else ''}, which this run's state has: "
+            f"another model or objective wrote it, or an earlier Dew that laid them out otherwise.{held} "
+            f"Restore it with the model and the Dew that wrote it, or start a fresh run from its weights.")
 
 
 RETIRED_RATE = ("learning_rate_scale", "learning_rate_shape")
@@ -584,6 +590,26 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
         raise ValueError("checkpoint dynamic-scaler configuration differs from this run")
     if (metadata["ema"] is None) != (template.ema is None):
         raise ValueError("checkpoint EMA configuration differs from this run")
+
+
+def _host_devices() -> list:
+    """This process's first CPU device, which a read onto the host restores onto (`Checkpoints.variables`'
+    `on_host`); refused where the process opened no CPU backend."""
+    try:
+        return jax.local_devices(backend="cpu")[:1]
+    except RuntimeError as error:
+        raise ValueError("a read onto the host restores onto this process's CPU device, and it opened none; "
+                         "launch with JAX_PLATFORMS=cuda,cpu (or your accelerator,cpu) before JAX "
+                         "initializes, or load onto the accelerator") from error
+
+
+def host_or_placed(on_host: bool, mesh, layout) -> None:
+    """Refuse a read onto the host (`on_host`) beside a `mesh` or `layout`, which place what it reads: every
+    load that takes both checks them here (`Checkpoints.variables`, `dew.inference.models.ReleasedRun`,
+    `dew.interop.Pretrained.load`)."""
+    if on_host and (mesh is not None or layout is not None):
+        raise ValueError("on_host reads the variables into host arrays, and mesh and layout place them; "
+                         "pass one")
 
 
 def _host_read(*, from_local: bool) -> ocp.ArrayRestoreArgs:
@@ -1738,8 +1764,11 @@ class Checkpoints:
     def variables(self, *, step: int | str | None = None, ema: bool | None = None,
                   mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None,
                   parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS,
-                  unread: tuple[tuple[str, ...], ...] = ()) -> Variables:
-        """Read the selected step's live or averaged variables onto the requested layout.
+                  unread: tuple[tuple[str, ...], ...] = (), on_host: bool = False) -> Variables:
+        """Read the selected step's live or averaged variables onto the requested layout, or with
+        `on_host` into host arrays, restored onto this process's CPU device and fetched, no accelerator
+        holding them on the way (no `mesh` or `layout` beside it); a local step, which knows the devices
+        it was written on alone, is refused it.
 
         Parameter storage conversion applies only to the owner's parameter
         roots; other collections retain their recorded dtypes and placement.
@@ -1765,7 +1794,15 @@ class Checkpoints:
         with_ema = stored.get("ema") is not None if ema is None else ema
         if with_ema:
             template["ema"] = without(stored["ema"], unread)
-        device_mesh = resolve_mesh(DefaultMesh() if mesh is None else mesh)
+        host_or_placed(on_host, mesh, layout)
+        if on_host and step == self._local_latest():
+            raise ValueError(f"step {step} is held locally, on the devices that wrote it, which its read "
+                             "places it on (`_check_placement`), so it reads onto no host; read a persistent "
+                             "step, or read this one without on_host")
+        # On the host, restored onto this process's CPU device, every collection as a placed read restores
+        # it, then fetched as host arrays: no accelerator holds them on the way.
+        device_mesh = resolve_mesh(DefaultMesh().build(_host_devices()) if on_host
+                                   else DefaultMesh() if mesh is None else mesh)
         chosen_layout = DefaultLayout() if layout is None else layout
         # A CPU-owned run stores its frozen collection banked; the layout places
         # its layers, and each bank reads onto its first layer's placement.
@@ -1782,7 +1819,7 @@ class Checkpoints:
                                    parameter_roots=parameter_roots)
         if frozen is not None:
             params = {**params, FROZEN: spread(params[FROZEN], placed_rows)}
-        return params
+        return jax.device_get(params) if on_host else params
 
     def materialized(self, template: Mapping[str, Variables], placement: Mapping[str, Variables], *,
                      step: int, param_dtype: jax.typing.DTypeLike | None = None,
@@ -1906,16 +1943,14 @@ class Checkpoints:
 
     @overload
     def restore[StateT](self, template: StateT, step: int | str | None = None, *,
-                        share: DataPartition | None = None,
-                        served: Sequence[ProjectionGroup] = ()) -> tuple[StateT, bytes | None]: ...
+                        share: DataPartition | None = None) -> tuple[StateT, bytes | None]: ...
 
     @overload
     def restore(self, template: None = None, step: int | str | None = None, *,
-                share: DataPartition | None = None,
-                served: Sequence[ProjectionGroup] = ()) -> tuple[Variables, bytes | None]: ...
+                share: DataPartition | None = None) -> tuple[Variables, bytes | None]: ...
 
     def restore(self, template=None, step: int | str | None = None, *,
-                share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ()):
+                share: DataPartition | None = None):
         """Restore the state at `step` and the data position of `share`.
 
         `template` is a pytree of `jax.ShapeDtypeStruct` naming the state
@@ -1931,12 +1966,6 @@ class Checkpoints:
         returned as the bytes the reader of `share` resumes from (see
         `read_position`). Without a share, as for a caller that reads weights
         and no data, it is None.
-
-        `served` names the projection groups a step may hold packed where the
-        template holds their members (`Objective.served_groups`): each such
-        leaf, in any of the state's trees, is read packed and split back into
-        its members (`dew.checkpoints.served.unpacked`). Carried to 1.0, when it is deleted (ledger
-        1552).
         """
         resumes = template is not None and not isinstance(template, Mapping)
         step = self._pinned(step, RESUME if resumes else MODEL)
@@ -2014,11 +2043,10 @@ class Checkpoints:
                     f"and the gradient accumulation it was written with. Resume it "
                     f"with those, or start a fresh run in a directory of its own."
                 ) from mismatch
-            restored = unpacked(functools.partial(self._restored, step, local=from_local), metadata,
-                                dict(restored), served)
-            _refuse_lacking({jax.tree_util.keystr(path) for path, leaf
+            _refuse_lacking({jax.tree_util.keystr(path, simple=True, separator="/") for path, leaf
                              in jax.tree_util.tree_flatten_with_path(dict(restored))[0]
-                             if isinstance(leaf, jax.ShapeDtypeStruct)}, where)
+                             if isinstance(leaf, jax.ShapeDtypeStruct)}, where,
+                            _paths(dict(metadata)) - _paths(state_tree))
             keys = _keys(snapshot)
             restored = {name: value if name == 'position' else _placed(value, state_tree[name], keys)
                         for name, value in restored.items()}

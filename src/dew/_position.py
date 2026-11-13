@@ -65,19 +65,30 @@ class Global:
     `records` counts every record of the run, the completed phases' too."""
 
     plan: Mapping[str, object] | None = None
-    tokens: tuple[int, ...] | None = ()
+    tokens: tuple[int, ...] = ()
     """The committed tokens each phase of `completed` ended at, for a run on the committed-token clock
-    (`dew.data.pipeline.schedule`), which no record count of a phase states; empty on the record clock,
-    None in a position written before positions held them."""
+    (`dew.data.pipeline.schedule`), which no record count of a phase states; empty on the record clock."""
+    origin: int = 0
+    """How many of `records` the current order's own reader had not read when it was opened: the run's
+    count less its phase's start, less the order's own records, so a stream opened at its own start
+    partway through a phase (a resume that starts its data again) keeps the run's count; 0 for one opened
+    where its phase starts, as every stream opens but a restart's."""
 
 
 def encode(place: Global) -> bytes:
     """`place` as the bytes a checkpoint stores for it."""
-    held = dataclasses.asdict(place)
-    if place.tokens is None:
-        # A position read from before positions held stage tokens records none, as it was written.
-        del held["tokens"]
-    return json.dumps({ENVELOPE: held}).encode()
+    return json.dumps({ENVELOPE: dataclasses.asdict(place)}).encode()
+
+
+class PlanChanged(ValueError):
+    """A saved data position whose plan this read does not make again: each part that differs by name
+    (`differs`: "version", "rules.mix", "derived.0/shards", "manifest.steps", "order.seed", "topology"),
+    which a relaxed resume names where it starts the data again and an exact one refuses by
+    (`dew.training.TrainerConfig.data_resume`); `dew.data.plan` names it."""
+
+    def __init__(self, differs: tuple[str, ...], message: str):
+        self.differs = differs
+        super().__init__(message)
 
 
 def decode(position: bytes) -> Global | None:
@@ -95,11 +106,29 @@ def decode(position: bytes) -> Global | None:
         raise ValueError(
             f"a saved global data position is missing {sorted(fields - set(envelope))}; "
             f"the checkpoint's position was written by dew and is damaged")
+    if "tokens" not in envelope:
+        from dew.data.plan import PLAN_VERSIONS
+
+        # Every position of a plan this Dew reads holds them; one whose plan is of another version, or
+        # names none (before plans were saved in positions), an earlier Dew wrote.
+        plan = envelope.get("plan")
+        version = plan.get("version") if isinstance(plan, dict) else None
+        if version in PLAN_VERSIONS:
+            raise ValueError("a saved global data position of this Dew's data plan holds no committed "
+                             "tokens its phases ended at; the checkpoint's position was written by dew "
+                             "and is damaged")
+        raise PlanChanged(("version",), f"the saved global data position was written under data plan "
+                                        f"version {version}, by an earlier Dew: resume it with the Dew that "
+                                        "wrote it, or relaxed (`data_resume='relaxed'`), its data started "
+                                        "again")
     completed = tuple((str(order), int(end)) for order, end in envelope["completed"])
     plan = envelope.get("plan")
+    # A position of plan 13, which knew no restart, holds no origin: its streams opened where their phases
+    # start.
     return Global(records=int(envelope["records"]), order=str(envelope["order"]),
                   completed=completed, plan=None if plan is None else record(plan, "data plan"),
-                  tokens=None if "tokens" not in envelope else tuple(int(end) for end in envelope["tokens"]))
+                  tokens=tuple(int(end) for end in envelope["tokens"]),
+                  origin=int(envelope.get("origin", 0)))
 
 
 def read(position: bytes) -> Global:
@@ -249,4 +278,6 @@ def translates(position: bytes) -> bool:
     own reader's (`phase_position`)."""
     if (phased := phase_position(position)) is not None:
         return translates(phased)
-    return decode(position) is not None or replicated(position) is not None or ramped(position) is not None
+    # A global position by its envelope alone: one a reader refuses (`decode`) still translates.
+    return (_enveloped(position, ENVELOPE) is not None or replicated(position) is not None
+            or ramped(position) is not None)

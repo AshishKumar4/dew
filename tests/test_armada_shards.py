@@ -266,6 +266,58 @@ def test_a_sites_cost_counts_what_its_map_tasks_paid_between_draws_and_their_wei
     assert found == {"task.setup": 60.0, "task.unit": 5.0, "task.weighed_unit": 15.0}
 
 
+def test_a_sites_cost_counts_what_its_draws_paid_once_with_its_setup(ci):
+    """A site's arms compile at their first call, inside its first draw: a map task's record says that
+    draw's seconds, the backend compiles JAX reported within it and its weighed check's weighing, and the
+    site's cost counts what the draws paid once with the task's setup, a unit's seconds being a later
+    draw's (`costs.timed`). Read as draws, a task of 2 units with a 300 s compile cost 155 s a unit, the
+    plan cut it to the fewest units a task, and each finer task paid the compile again (row 5492). A task of
+    one unit has no later draw, and tells its draw from JAX's own compile seconds; one whose compiles are
+    reported at its whole draw tells nothing, and keeps its draw's seconds as its unit, never none."""
+    def drawn(task: tuple[int, int], before: float, draws: float, **once: float) -> dict:
+        return {"task_start": task[0], "task_stop": task[1], "before": before, "draws": draws, **once}
+
+    found = ci.costs.timed("task", [
+        # Five units: a first draw of 300 s and four later of 10 s each.
+        drawn((0, 5), 60.0, 340.0, first=300.0, compiled=280.0, weighing=0.0),
+        # One unit: its 310 s draw held 300 s of compiles.
+        drawn((5, 6), 60.0, 310.0, first=310.0, compiled=300.0, weighing=0.0),
+        # A weighed task of four units: 30 s of weighing, a first draw of 40 s and three later of 10 s.
+        drawn((20, 24), 50.0, 100.0, first=40.0, compiled=25.0, weighing=30.0)], units=20)
+    assert found == {"task.setup": 350.0, "task.unit": 10.0, "task.weighed_unit": 10.0}
+    alone = ci.costs.timed("task", [drawn((0, 1), 60.0, 310.0, first=310.0, compiled=310.0, weighing=0.0)],
+                           units=20)
+    assert alone == {"task.setup": 60.0, "task.unit": 310.0}
+
+
+def test_a_map_tasks_record_says_its_first_draw_and_the_compiles_within_it(monkeypatch, tmp_path):
+    """A check-1 site run as a map task (tests/reference_error.py) writes, beside its draws, its first
+    draw's seconds and the backend compiles JAX reported within it: its arms, compiled here by their first
+    call, are compiled in that draw and no later one, so the site's cost from the record
+    (`costs.timed`, as CI's judge reads it) charges a unit less than the draws' seconds over its units."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from check1_wire import DRAWS, RECORDS
+    from reference_error import assert_as_exact
+    from tool_support import load
+
+    def draw(seed):
+        rng = np.random.default_rng([0x5492, seed])
+        return rng.standard_normal((4, 16)).astype(np.float32), rng.standard_normal(16).astype(np.float32)
+
+    monkeypatch.setenv(DRAWS, "0:8")
+    monkeypatch.setenv(RECORDS, str(tmp_path))
+    assert_as_exact(jax.jit(lambda x, w: jnp.tanh(x) @ w), jax.jit(lambda x, w: jnp.dot(jnp.tanh(x), w)),
+                    draw, "a site compiled in its first draw", seeds=8)
+    (record,) = (json.loads(path.read_text()) for path in tmp_path.rglob("*.seconds.json"))
+    assert 0 < record["compiled"] <= record["first"] <= record["draws"]
+    costs = load("costs", "tools/armada")
+    found = costs.timed("task", [costs.Drawn(**{word: record[word] for word in costs.Drawn.__annotations__
+                                                if word in record})], units=8)
+    assert found["task.unit"] < record["draws"] / 8
+
+
 def test_a_site_whose_map_tasks_armada_has_no_measure_of_weighs_the_target_not_its_judges_record(
         ci, tmp_path):
     """A site the last run reused ran no map task, so armada keeps no measure of any (it keeps what a run

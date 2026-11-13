@@ -199,6 +199,16 @@ def l2_normalized(x, eps: float = 1e-12):
     return x / jnp.maximum(norm, eps)
 
 
+def cosine(a: jax.Array, b: jax.Array, eps: float = 1e-12) -> jax.Array:
+    """The cosine of `a` and `b` over their last axis, at least fp32 wide from the operands on
+    (`at_least_fp32`), their norms and the sum of their product both: each over its L2 norm held at
+    `eps` (`l2_normalized`), summed. Normalized in bfloat16, XLA's CPU compiler fused the two norms and the
+    sum into one YNNPACK reduction, which came back different in each process, NaNs among them; at fp32
+    the same fusion is right (row 5495)."""
+    wide = at_least_fp32(jnp.result_type(a, b))
+    return jnp.sum(l2_normalized(a.astype(wide), eps) * l2_normalized(b.astype(wide), eps), axis=-1)
+
+
 def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
     """Normalize the last axis by its root mean square, with no learned weight.
 

@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, get_args, runtime_checkable
 
 import grain.python as pygrain
 
-from dew._records import json_value, record
+from dew._records import JSON, json_value, record
 from dew.data.completion import cuts
 from dew.data.dataset import Records
 from dew.data.pipeline import (
@@ -78,12 +78,13 @@ from dew.data.pipeline import (
     with_children,
 )
 from dew.data.plan import (
-    FILE_SHARDS,
+    DECLARED_MIX,
+    PLAN_VERSIONS,
+    STRUCTURED,
     Manifest,
     StepIdentity,
     _changed,
     _semantic,
-    filled_version,
     identified,
     streams_parquet,
 )
@@ -271,11 +272,12 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     if unkeyed:
         return None, (f"steps ({', '.join(unkeyed)} bind to one run's facts or have no "
                       "identity='name@version', which no generation holds)",)
-    # Keyed as the fill was, by the shards it numbered its rows by (`filled_version`).
-    version = filled_version(fill)
-    changed = _changed(_semantic(dependency), _prefix_manifest(stored, prefix, read, version).semantic())
-    if changed:
-        return None, changed
+    # Keyed as its fill spelled its steps, by a plan version this Dew reads (`PLAN_VERSIONS`), the latest
+    # first: a generation published under the one before names its steps otherwise.
+    changes = [_changed(_semantic(dependency), _prefix_manifest(stored, prefix, read, version).semantic())
+               for version in reversed(PLAN_VERSIONS)]
+    if all(changes):
+        return None, changes[0]
     if not selections:
         return generation.source(), ()
     if any(isinstance(stage, MapWithIndex) for stage in prefix):
@@ -289,7 +291,7 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     placing: Read = ("streamed" if read == "streamed"
                      else "indexed" if placed.supports("indexed") else "memory")
     if (placing == "streamed" and any(isinstance(selection, RecordSlice) for selection in selections)
-            and not placed.manifest(version).index_ordered):
+            and not placed.manifest().index_ordered):
         raise ValueError(
             f"a records holdout numbers its inputs by index, and generation {generation.url} numbers them by "
             f"the shards a stream of {placed.describe()} read, which it doesn't state is the index order; "
@@ -545,6 +547,15 @@ def same_stage(made: Stage, held: Stage) -> bool:
                for field in dataclasses.fields(made))
 
 
+def _described(config: str) -> JSON:
+    """A step's configuration as a structured plan nests it: its structure where it is one (`structured`),
+    the name it is given otherwise (a function's, a declared identity)."""
+    try:
+        return json_value(json.loads(config), "configuration")
+    except ValueError:
+        return config
+
+
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
     """What a stage runs, as the plan's manifest and a cache's key record it,
     refused for a cache's key where none can key it (`StepIdentity.of`). A
@@ -562,13 +573,24 @@ def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
     if ran.configured is not None:
         bound = ran.configured
         factory = _identity(bound.step)
-        binding = {"factory": factory.semantic(), "scope": bound.step.scope, "values": bound.values}
+
+        def configured(step: JSON, version: int) -> str:
+            binding = {"factory": factory.semantic(version), "scope": bound.step.scope,
+                       "values": bound.values}
+            return json.dumps({"step": step, "configured": binding}, sort_keys=True)
+
+        # A structured plan holds the step's configuration as its structure, an earlier one as its text.
         identity = identity.composed(
-            factory, json.dumps({"step": identity.config, "configured": binding}, sort_keys=True))
+            factory, configured(_described(identity.config), STRUCTURED),
+            None if identity.printed is None and factory.printed is None
+            else configured(identity.printed or identity.config, DECLARED_MIX))
     if isinstance(stage, Batched):
         # The group size and whether the rows keep their count decide what a resume reads.
         shape = f"[batched {stage.size}, {'same rows' if stage.same_rows else 'any rows'}]"
-        identity = dataclasses.replace(identity, name=identity.name + shape, config=identity.config + shape)
+        grouped = json.dumps({"step": _described(identity.config),
+                              "batched": {"size": stage.size, "same_rows": stage.same_rows}}, sort_keys=True)
+        identity = dataclasses.replace(identity, name=identity.name + shape, config=grouped,
+                                       printed=(identity.printed or identity.config) + shape)
     return identity
 
 
@@ -642,12 +664,14 @@ def _manifest(
     steps: Sequence[StepIdentity],
     *,
     fill: Mapping[str, object] | None = None,
+    version: int | None = None,
 ) -> Manifest:
     """The manifest of the rows `sources` hold, named by `snapshot`, through
-    `steps`. A source a memory read made (`materialized`) names the steps it already
-    ran by what they compute; their modules join the environment here."""
+    `steps`, recorded as plan `version` spells it (the latest by default). A source a memory read made
+    (`materialized`) names the steps it already ran by what they compute; their modules join the environment
+    here."""
     ran = tuple(_identity(stage) for source in sources for stage in _written(source, ()))
-    return Manifest.of(snapshot, steps, ran=ran, fill=fill)
+    return Manifest.of(snapshot, steps, ran=ran, fill=fill, version=version)
 
 
 def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read, version: int) -> Manifest:
@@ -665,8 +689,7 @@ def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read, version
 
 def _cache_key(source: Source, prefix: Sequence[Stage], read: Read, version: int) -> Manifest | None:
     """`_cache_manifest`, or None where `source` states no content of its own to key. A stream's fill
-    numbers its rows by its shards, which a Parquet store's are its files from `FILE_SHARDS` and its row
-    groups before (`filled_version`), so the two fill caches of their own."""
+    numbers its rows by its shards, which a Parquet store's are its files (`shards`)."""
     stated = source.fingerprint()
     if not identified(json_value(stated, "source")):
         return None
@@ -675,8 +698,9 @@ def _cache_key(source: Source, prefix: Sequence[Stage], read: Read, version: int
         (source,),
         tuple(_identity(stage, cache=True) for stage in _cache_steps(prefix)),
         fill={"read": read, "row_ids": "sharded" if read == "streamed" else "indexed",
-              **({"shards": "files"} if read == "streamed" and version >= FILE_SHARDS
+              **({"shards": "files"} if read == "streamed"
                  and streams_parquet(json_value(stated, "source")) else {})},
+        version=version,
     )
 
 
@@ -1012,8 +1036,10 @@ def _analyzed(
                 if isinstance(source, Mixture)
                 else {"source": source.describe()}
             ),
+            # The stages themselves, which a plan records as its version spells them
+            # (`dew.data.plan.spelled`).
             "stages": [
-                repr(stage)
+                stage
                 for stage in written
                 if isinstance(stage, (Shuffle, Repeat, Slice, Limit, TokenSplit, Pack, Windows, BatchStage))
             ],

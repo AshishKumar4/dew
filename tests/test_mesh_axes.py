@@ -787,10 +787,15 @@ def test_a_convolution_whose_kernel_splits_its_input_channels_computes_one_devic
                                  terms * np.finfo(np.float32).eps * np.asarray(magnitude))
 
 
-def test_a_layout_pass_at_a_kernel_calls_edge_is_found_through_views_and_fusion_bodies():
-    """`sharded.boundary_copies` finds a copy feeding a Triton call through a bitcast, and a fusion
+@pytest.mark.parametrize("kernel", ["TRITON", "MOSAIC_GPU", "TPU_CUSTOM_CALL"])
+def test_a_layout_pass_at_a_kernel_calls_edge_is_found_through_views_and_fusion_bodies(kernel):
+    """`sharded.boundary_copies` finds a copy feeding a Pallas call through a bitcast, and a fusion
     whose body only transposes reading its result through a tuple element, whatever its name; a
-    fusion that computes beside its transpose writes its result once and is not a layout pass."""
+    fusion that computes beside its transpose writes its result once and is not a layout pass. A call
+    of each kind a Pallas kernel lowers to is read, by the target JAX names it (`custom_call_targets`):
+    a Mosaic kernel's edge was not, so its boundary copy passed the per-shard gate."""
+    from jax.extend import custom_call_targets
+
     text = """HloModule module
 
 %only_moves (p.0: bf16[8,64]) -> bf16[64,8] {
@@ -809,13 +814,14 @@ ENTRY %main (x: bf16[8,64]) -> (bf16[64,8], bf16[64,8]) {
   %copy.1 = bf16[8,64]{0,1} copy(bf16[8,64]{1,0} %x)
   %view = bf16[8,64]{1,0} bitcast(bf16[8,64]{0,1} %copy.1)
   %kernel = (bf16[8,64]{1,0}, f32[8]{0}) custom-call(bf16[8,64]{1,0} %view), \
-custom_call_target="__gpu$xla.gpu.triton"
+custom_call_target="TARGET"
   %result = bf16[8,64]{1,0} get-tuple-element((bf16[8,64]{1,0}, f32[8]{0}) %kernel), index=0
   %fusion.7 = bf16[64,8]{1,0} fusion(bf16[8,64]{1,0} %result), kind=kLoop, calls=%only_moves
   %fusion.8 = bf16[64,8]{1,0} fusion(bf16[8,64]{1,0} %result), kind=kLoop, calls=%computes
   ROOT %out = (bf16[64,8]{1,0}, bf16[64,8]{1,0}) tuple(bf16[64,8]{1,0} %fusion.7, bf16[64,8]{1,0} %fusion.8)
 }
 """
+    text = text.replace("TARGET", getattr(custom_call_targets, kernel))
     assert sharded.boundary_copies(text) == ["copy.1 -> kernel", "kernel -> fusion.7"]
 
 

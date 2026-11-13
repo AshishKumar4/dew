@@ -190,7 +190,7 @@ def test_a_projected_decoders_prediction_depth_and_table_context_read_the_stream
             oracle = scored(twin.clone(dtype=jnp.float64), twinned)
             expected = jax.device_get(oracle(wide, ids, context))
             roundings = chain_roundings(jax.make_jaxpr(dew)(wide, ids, context))
-    for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(found), jax.tree.leaves(expected),
+        for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(found), jax.tree.leaves(expected),
                                         strict=True):
             assert_computes_the_oracle(np.asarray(mine), np.asarray(theirs),
                                        f"draw {seed} {jax.tree_util.keystr(path)}", roundings=roundings)

@@ -307,8 +307,9 @@ class GatedMLP(nn.Module):
             if self.packed_order[0] != 'gate_proj':
                 return None
             return self.gate_up_proj(x).reshape(*x.shape[:-1], 2, self.hidden_features)
-        if joins(Choice.GATE_UP, (self.gate_proj, self.up_proj)):
-            return joined_dense(x, (self.gate_proj, self.up_proj), axis=-2)
+        projections = (self.gate_proj, self.up_proj)
+        if joins(projections, Choice.GATE_UP):
+            return joined_dense(x, projections, axis=-2)
         return None
 
     def _activation(self) -> GatedActivation | Activation:

@@ -31,3 +31,11 @@ docs/design/testing.md, "the YNNPACK switch")."""
 STAGES = "DEW_CHECK1_STAGES"
 """The file check 1 appends each judgement it completes to, its stage among it (`reference_error._logged`),
 which the plan reads to draw a site's later map tasks in its first wave."""
+
+QUALIFY = "DEW_CHECK1_QUALIFY"
+"""The environment variable that makes each check-1 site size itself before its verdict
+(`reference_error._qualified`) and fail where the count it sizes is above the count it declares: a file,
+to which each site appends what it sized, a line of JSON. A declared count is a fact of the site, of the
+arithmetic at the commit that sized it and of the host level, so a head that changes how an arm rounds runs
+the sites its diff reaches so, and main's daily whole run does (docs/design/testing.md, "a declared
+count")."""

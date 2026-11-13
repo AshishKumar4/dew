@@ -192,12 +192,12 @@ def test_a_runs_recorded_forms_are_the_forms_it_trains_in(tmp_path):
 @pytest.mark.mesh(devices=8)
 def test_a_saved_run_is_served_scored_and_loaded_in_the_form_it_trained_in(tmp_path):
     """A run recorded "accurate" records its form with its checkpoints (`Objective.inference_record`), and
-    every way a saved run is loaded runs its attention in it, with no form chosen around the call
-    (row 2255), as its routes say (`attention_forms`): its task from the run
-    (`TextGeneration.from_run`) and from `dew.pipeline` generate, a harness over it scores, and a server
-    of it steps, each attention call in the accurate form; a run recorded with none scores in the fast
-    one, and a task built in a block that chooses the accurate form, as a run's previews are, takes
-    that form."""
+    every way a saved run is loaded answers as the same weights do in a block that chooses the accurate
+    form, with no form chosen around the call (row 2255): its task from the run
+    (`TextGeneration.from_run`) and from `dew.pipeline` generate and score what a task built in that block
+    generates and scores, bit for bit, the scoring's attention in the accurate form as its routes say
+    (`attention_forms`), and a server of the loaded task draws the tokens the task draws; a run recorded
+    with none scores in the fast form."""
     import dew
     from dew.eval.harness import DewLM
     from dew.inference.serving import Server
@@ -210,56 +210,74 @@ def test_a_saved_run_is_served_scored_and_loaded_in_the_form_it_trained_in(tmp_p
     accurate, fast = (str(tmp_path / "runs" / name) for name in ("accurate", "fast"))
     loaded = TextGeneration.from_run(accurate)
 
-    def scored(task) -> set[str]:
-        return attention_forms(lambda: DewLM(task).loglikelihood([instance("a", "b")]))
+    def scores(task) -> list:
+        return DewLM(task).loglikelihood([instance("a", "b")])
 
-    def served():
-        server = Server.from_task(loaded, slots=8, capacity=64, admission=8)
-        drawn = server.submit("ab", max_new_tokens=1, key=0)
-        while not drawn.done():
-            server.step()
+    def generated(task) -> dict[str, np.ndarray]:
+        drawn = task("ab", max_new_tokens=1, key=0).host()
+        return {name: np.asarray(getattr(drawn, name))
+                for name in ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs")}
 
-    assert scored(loaded) == {"accurate"}
-    assert attention_forms(lambda: loaded("ab", max_new_tokens=1, key=0)) <= {"accurate"}
-    assert attention_forms(lambda: dew.pipeline(accurate)("ab", max_new_tokens=1, key=0)) <= {"accurate"}
-    assert attention_forms(served) <= {"accurate"}
-    assert scored(TextGeneration.from_run(fast)) == {"fast"}
     with generation.run_precision(Numerics(forms="accurate")):
         built = TextGeneration(loaded.model, loaded.variables, loaded.processor, sampling=loaded.sampling)
-        assert scored(built) == {"accurate"}
+        expected_scores, expected = scores(built), generated(built)
+    piped = dew.pipeline(accurate)
+    assert scores(loaded) == scores(piped) == expected_scores
+    for task in (loaded, piped):
+        assert_tree_equal(generated(task), expected)
+    server = Server.from_task(loaded, slots=8, capacity=64, admission=8)
+    drawn = server.submit("ab", max_new_tokens=1, key=0)
+    server.run()
+    np.testing.assert_array_equal(drawn.result().host().tokens, expected["tokens"])
+    assert attention_forms(lambda: scores(loaded)) == {"accurate"}
+    assert attention_forms(lambda: scores(TextGeneration.from_run(fast))) == {"fast"}
 
 
 def attention_forms(call) -> set[str]:
     """The form each attention call of `call` ran in, as its route says (`generation.routes`, every
     program traced afresh): on a CPU, the preferred route xla computes the fast form alone and refuses
-    the accurate one, which runs on the reference path (`attention_kernels`' `_FAST_HANDOFF`)."""
+    the accurate one by its form (`attention_kernels`' `_FAST_HANDOFF`, code 'form'), which runs on the
+    reference path."""
     from dew.nn.kernels import generation
 
     with generation.routes() as found:
         call()
-    return {"accurate" if route.refusal is not None and "no accurate form" in route.refusal.detail else "fast"
+    return {"accurate" if route.refusal is not None and route.refusal.code == "form" else "fast"
             for route in found if route.choice == "attention"}
 
 
 @pytest.mark.mesh(devices=8)
-def test_a_saved_decision_and_image_run_trace_their_helpers_in_their_form(tmp_path):
-    """A decision run recorded "accurate" scores a call's requests in the accurate attention form
-    (`Decide`'s call over a sequence of requests), and an image run's prepared denoising inputs
-    encode their conditions in it (`TextToImage.prepare`), each through a numerical helper its call
-    shares (row 2255's review), as their routes say (`attention_forms`)."""
+def test_a_saved_decision_and_image_run_answer_in_their_form(tmp_path):
+    """A decision run recorded "accurate" scores a call's requests (`Decide`'s call over a sequence of
+    requests) as its task does in a block that chooses the accurate form, its attention in that form as
+    its routes say (`attention_forms`), and an image run's prepared denoising inputs
+    (`TextToImage.prepare`) are the ones that block prepares, bit for bit: each through a numerical helper
+    its call shares (row 2255's review)."""
     from dew.decision import Choice
     from dew.decision.task import Decide
     from dew.inference.images import TextToImage
+    from dew.nn.kernels import generation
 
     for kind, build in (("decision", decision), ("diffusion", diffusion)):
         (tmp_path / kind).mkdir()
         trained(build(tmp_path / kind, drawn=False), tmp_path, kind,
                 trainer={"precision": ACCURATE_FORMS, "checkpoint_final": True})
     decide = Decide.from_run(str(tmp_path / "runs" / "decision"))
-    question = {"team": Choice("which team", ["billing", "technical", "sales"])}
-    assert attention_forms(lambda: decide([({"text": "the site is down"}, question)])) == {"accurate"}
     images = TextToImage.from_run(str(tmp_path / "runs" / "diffusion"))
-    assert attention_forms(lambda: images.prepare(["a cat"], steps=2, key=5)) <= {"accurate"}
+    question = {"team": Choice("which team", ["billing", "technical", "sales"])}
+
+    def decided():
+        [answer] = decide([({"text": "the site is down"}, question)])
+        return np.asarray(answer["team"].probabilities)
+
+    def prepared():
+        return jax.tree.map(np.asarray, images.prepare(["a cat"], steps=2, key=5))
+
+    with generation.run_precision(Numerics(forms="accurate")):
+        expected_decision, expected_inputs = decided(), prepared()
+    assert decided().tobytes() == expected_decision.tobytes()
+    assert_tree_equal(prepared(), expected_inputs)
+    assert attention_forms(decided) == {"accurate"}
 
 
 def test_a_record_naming_a_function_for_its_optimizer_is_refused_before_it_is_called(tmp_path):

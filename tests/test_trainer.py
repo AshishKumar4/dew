@@ -189,9 +189,12 @@ def test_a_runs_start_reports_each_phase_it_took_once():
     assert sorted(started) == ["startup/compile_seconds", "startup/data_seconds", "startup/warm_seconds"]
 
 
-def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
-    state = make_trainer(objective=TokenRegression()).fit(dataset(), steps=2, tokens=30)
-    assert int(state.step) == 2
+def test_a_run_given_steps_and_tokens_is_refused_as_a_budget_named_twice():
+    """One budget (row 5725): a fit given both `steps` and `tokens` is refused before it reads, as one given
+    steps and epochs is; tokens alone bound it."""
+    with pytest.raises(ValueError):
+        make_trainer(objective=TokenRegression()).fit(dataset(), steps=2, tokens=30)
+    assert int(make_trainer(objective=TokenRegression()).fit(dataset(), tokens=24).step) == 2
 
 
 @pytest.mark.parametrize("schedule", [None, Power(peak_value=.1, warmup_steps=2, a=.1, b=0),
@@ -204,7 +207,7 @@ def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
 
 def test_a_token_budget_resumes_its_count_from_the_checkpoint(tmp_path):
     first = make_trainer(tmp_path, objective=TokenRegression())
-    assert int(first.fit(dataset(), steps=2, tokens=30, log_every=1).step) == 2
+    assert int(first.fit(dataset(), tokens=24, log_every=1).step) == 2
     assert first.checkpoints.control(2)["committed_tokens"] == 24
     resumed = make_trainer(tmp_path, objective=TokenRegression())
     assert int(resumed.fit(dataset(), tokens=30, log_every=1).step) == 3
@@ -296,7 +299,7 @@ def test_a_run_no_record_describes_checkpoints_its_reason_and_a_records_own_erro
 
 
 def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
-    make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), steps=2, tokens=30)
+    make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=24)
     trainer = make_trainer(tmp_path, objective=TokenRegression())
     state = trainer.initial_state()
     assert int(trainer.fit(dataset(), tokens=30, state=state).step) == 3
@@ -357,6 +360,35 @@ def budget_lm_trainer(tmp_path=None, **kwargs) -> Trainer:
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
                               mlp_features=32, max_seq_len=12, dtype="float32")
     return make_trainer(tmp_path, objective=LMObjective(model, seq_len=LM_CONTEXT), **kwargs)
+
+
+def test_a_batch_of_other_rows_than_its_loader_states_is_refused_before_it_is_placed():
+    """A loader that states batches of BATCH rows and hands its third step twice as many (a step after the
+    batch that joined two) is refused at that batch, before it is placed (row 5724), where it once compiled
+    another step for it; one that hands what it states trains on."""
+    def stream():
+        for index, batch in enumerate(itertools.islice(Counting(), 4)):
+            joined = {name: np.concatenate([value, value]) for name, value in batch.items()}
+            yield joined if index == 2 else batch
+
+    with pytest.raises(ValueError):
+        make_trainer().fit(dataset(stream), steps=4)
+    assert int(make_trainer().fit(dataset(), steps=4).step) == 4
+
+
+def test_a_direct_resume_into_another_models_computation_is_refused_and_its_own_resumes(tmp_path):
+    """A trainer built directly over a checkpoint directory whose run trained another computation of the same
+    shapes (its feed-forward's gating geglu, the run's swiglu) refuses to resume, as a configured run's
+    record refuses it (row 5723); the model that trained it resumes."""
+    def trainer(mlp: str) -> Trainer:
+        model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                                  mlp_features=32, max_seq_len=12, dtype="float32", mlp=mlp)
+        return make_trainer(tmp_path, objective=LMObjective(model, seq_len=LM_CONTEXT))
+
+    trainer("swiglu").fit(lm_data(), steps=1)
+    with pytest.raises(ValueError):
+        trainer("geglu").fit(lm_data(), steps=2)
+    assert int(trainer("swiglu").fit(lm_data(), steps=2).step) == 2
 
 
 @pytest.mark.parametrize("accumulation", [1, 2], ids=["one-step-updates", "two-step-windows"])
@@ -1927,62 +1959,6 @@ class Counted(Objective):
         return loss, Aux({}, variables={"stats": {"seen": variables["stats"]["seen"] + 1}})
 
 
-class FrozenCounted(Counted):
-    """`Counted`, its collection written back in a Flax `FrozenDict`, as Flax's `apply` writes one
-    under `flax_return_frozendict`."""
-
-    def loss(self, variables, batch, step):
-        loss = jnp.sum(variables["params"]["w"] ** 2)
-        return loss, Aux({}, variables=frozen_dict({"stats": {"seen": variables["stats"]["seen"] + 1}}))
-
-
-class ListedCounted(Counted):
-    """`Counted`, its count held in a list, which the loss writes back as a Flax `FrozenDict`."""
-
-    def fresh_variables(self, key, held):
-        return {"params": {"w": jnp.ones((2,))}, "stats": {"seen": [{"count": jnp.zeros(())}]}}
-
-    def loss(self, variables, batch, step):
-        loss = jnp.sum(variables["params"]["w"] ** 2)
-        count = variables["stats"]["seen"][0]["count"] + 1
-        return loss, Aux({}, variables={"stats": {"seen": [frozen_dict({"count": count})]}})
-
-
-class FrozenListedCounted(Counted):
-    """`ListedCounted`, its count starting in a Flax `FrozenDict` in its list, which the loss writes back
-    as a dict."""
-
-    def fresh_variables(self, key, held):
-        return {"params": {"w": jnp.ones((2,))}, "stats": {"seen": [frozen_dict({"count": jnp.zeros(())})]}}
-
-    def loss(self, variables, batch, step):
-        loss = jnp.sum(variables["params"]["w"] ** 2)
-        count = variables["stats"]["seen"][0]["count"] + 1
-        return loss, Aux({}, variables={"stats": {"seen": [{"count": count}]}})
-
-
-def seen(stats) -> float:
-    """How many steps a `Counted` collection counted, held as `Counted` or `ListedCounted` holds it."""
-    held = stats["seen"]
-    return float(held[0]["count"] if isinstance(held, list) else held)
-
-
-@pytest.mark.parametrize("objective", [Counted, FrozenCounted, ListedCounted, FrozenListedCounted],
-                         ids=["dict", "frozen", "listed", "frozen-listed"])
-def test_aux_variables_are_written_back_into_the_state_and_checkpointed(tmp_path, objective):
-    """A collection the loss writes back replaces the state's, in the state's dicts whichever Flax
-    container it comes in, under a mapping or a list."""
-    trainer = make_trainer(tmp_path, objective=objective(), optimizer=optax.adamw(1e-2, weight_decay=1.0))
-    state = trainer.fit(dataset(), steps=3, log_every=1)
-    nodes = jax.tree.leaves(state.variables, is_leaf=lambda node: isinstance(node, FrozenDict))
-    assert not any(isinstance(node, FrozenDict) for node in nodes)
-    assert seen(state.variables["stats"]) == 3.0
-    assert set(state.opt_state[0].mu) == {"w"}
-
-    restored, _ = trainer.checkpoints.restore()
-    assert seen(restored["variables"]["stats"]) == 3.0
-
-
 class ListedParameters(Objective):
     """Parameters held in a list, as a stack of layers can be."""
 
@@ -2036,10 +2012,11 @@ def test_a_tree_of_any_kind_of_mapping_is_held_as_dicts_where_it_enters(tmp_path
     """A tree a run is handed holds its collections in any kind of mapping (a dict, a Flax
     `FrozenDict`, an `OrderedDict`), under a list or a tuple too: where the objective's init returns
     it, where a supplied state holds it and where the loss writes it back, the state holds it as
-    dicts, so every step's tree has one structure and the run counts every step."""
+    dicts, so every step's tree has one structure and the run counts every step; the collection is no
+    parameter the optimizer holds moments of, and its checkpoint restores its count."""
     objective = Kinded(kind if entry == "init" else "dict", kind if entry == "write-back" else "dict",
                        container)
-    trainer = make_trainer(tmp_path, objective=objective, optimizer=optax.sgd(1e-2))
+    trainer = make_trainer(tmp_path, objective=objective, optimizer=optax.adamw(1e-2, weight_decay=1.0))
     supplied = None
     if entry == "supplied":
         initial = trainer.initial_state()
@@ -2050,6 +2027,10 @@ def test_a_tree_of_any_kind_of_mapping_is_held_as_dicts_where_it_enters(tmp_path
         state, is_leaf=lambda node: isinstance(node, Mapping) and type(node) is not dict)
         if isinstance(node, Mapping)]
     assert not others and float(counted(state.variables["stats"])) == 3.0
+    assert set(state.opt_state[0].mu) == {"w"}
+    trainer.checkpoints.wait()
+    restored, _ = trainer.checkpoints.restore()
+    assert float(counted(restored["variables"]["stats"])) == 3.0
 
 
 @jax.tree_util.register_pytree_node_class
@@ -2111,17 +2092,6 @@ def test_a_supplied_state_whose_parameters_and_moments_hold_a_frozen_dict_in_a_l
     state = trainer.fit(dataset(), steps=2, log_every=1, state=supplied)
     nodes = jax.tree.leaves(state, is_leaf=lambda node: isinstance(node, FrozenDict))
     assert int(state.step) == 2 and not any(isinstance(node, FrozenDict) for node in nodes)
-
-
-def test_a_supplied_state_holding_a_frozen_dict_in_a_list_trains_as_its_dicts_do(tmp_path):
-    """A state handed to fit holds its trees as dicts of its own, a Flax `FrozenDict` in a list
-    included, so the collection its loss writes back keeps the state's structure."""
-    trainer = make_trainer(tmp_path, objective=ListedCounted(), optimizer=optax.adamw(1e-2, weight_decay=1.0))
-    initial = trainer.initial_state()
-    stats = {"seen": [frozen_dict({"count": initial.variables["stats"]["seen"][0]["count"]})]}
-    state = trainer.fit(dataset(), steps=3, log_every=1,
-                        state=dataclasses.replace(initial, variables={**initial.variables, "stats": stats}))
-    assert seen(state.variables["stats"]) == 3.0
 
 
 # --------------------------------------------------------------------------

@@ -18,6 +18,17 @@ the kernel driver's major gives. docs/installation.md, "Which CUDA build",
 states the rule; site/scripts/gen_install.py generates the standalone install
 script's minima from this table."""
 
+TENSOR_MEMORY_SMS = (10, 11)
+"""The SM majors whose GPUs hold tensor memory (PTX ISA, tcgen05: sm_100a and sm_103a, a B200 and B300, and
+sm_110a): Dew's Blackwell kernels allocate it."""
+
+LEAST_CUBLAS_BESIDE_TENSOR_MEMORY = (13, 2)
+"""The least cuBLAS a GPU holding tensor memory runs Dew under: below it many cuBLAS kernels free their tensor
+memory twice, so a kernel beside one, as a Mosaic launch overlaps the kernel before it (programmatic dependent
+launch, its tensor memory allocated before its wait), can have its tensor memory taken or its allocation
+stranded: a silent wrong result or a hang (JAX's CUDA plugin warns of it at start). cuBLAS's major is its
+CUDA build's, so no cuda12 build runs on one."""
+
 PACKAGE_INDEX = "https://pypi.dewml.dev/simple"
 """Dew's package index, the one place Dew's JAX build (pyproject.toml's jax
 requirement) is served; every install names it as an extra index beside
@@ -45,11 +56,21 @@ def runs_on(build: str, driver: str, sm: tuple[int, int], cuda: int | None = Non
     """Whether JAX's `build` runs on a driver of version `driver` (`580.82.07`)
     and GPUs whose least SM is `sm` (`CUDA_BUILDS`): by the CUDA version the
     user-mode driver reports (`cuda`), where the caller can ask it, else by the
-    kernel driver's major."""
+    kernel driver's major; on a GPU holding tensor memory, only a build whose
+    cuBLAS can be 13.2 or newer (`LEAST_CUBLAS_BESIDE_TENSOR_MEMORY`). The least
+    SM is the GPUs' oldest, but a machine's GPUs are one model."""
     least, least_sm, least_cuda = next((major, s, version) for name, major, s, version in CUDA_BUILDS
                                        if name == build)
     supported = int(driver.split(".")[0]) >= least if cuda is None else cuda >= least_cuda
-    return supported and sm >= least_sm
+    return supported and _builds_for(least_sm, least_cuda, sm)
+
+
+def _builds_for(least_sm: tuple[int, int], least_cuda: int, sm: tuple[int, int]) -> bool:
+    """Whether a CUDA build of least SM `least_sm` and CUDA version `least_cuda` builds for a GPU of `sm`:
+    one its SM meets, and for a GPU holding tensor memory (`TENSOR_MEMORY_SMS`) one whose cuBLAS is 13.2
+    or newer (`LEAST_CUBLAS_BESIDE_TENSOR_MEMORY`), its CUDA major's."""
+    cublas = least_cuda // 1000 >= LEAST_CUBLAS_BESIDE_TENSOR_MEMORY[0] or sm[0] not in TENSOR_MEMORY_SMS
+    return sm >= least_sm and cublas
 
 
 def newest_build(gpus: tuple[str, tuple[int, int]] | None, cuda: int | None = None) -> str | None:
@@ -59,6 +80,18 @@ def newest_build(gpus: tuple[str, tuple[int, int]] | None, cuda: int | None = No
     if gpus is None:
         return None
     return next((name for name, _, _, _ in CUDA_BUILDS if runs_on(name, *gpus, cuda)), None)
+
+
+def generation_builds(generation: str) -> tuple[str, ...]:
+    """JAX's CUDA builds a GPU of the CUDA `generation` (`sm90`, `sm100`) runs, newest first: each that builds
+    for its SM (`_builds_for`), a GPU holding tensor memory the cuda13 build alone. A step compiled for such a
+    GPU is compiled by one of them, as its kernels and spills are that toolchain's."""
+    found = re.fullmatch(r"sm_?(\d+)(\d)a?", generation)
+    if found is None:
+        raise ValueError(f"{generation!r} names no CUDA generation; name one as sm80 or sm100")
+    sm = (int(found.group(1)), int(found.group(2)))
+    return tuple(name for name, _, least_sm, least_cuda in CUDA_BUILDS
+                 if _builds_for(least_sm, least_cuda, sm))
 
 
 def dew_cache_dir() -> str:

@@ -832,10 +832,10 @@ def _relayed_products(q, k, v, *, interpret):
 
             def relay(index):
                 del index
-                plgpu.barrier_wait(scored.barriers.at[0], parity=0)
+                plgpu.barrier_wait(scored.barriers.at[0], phase=0)
                 family.write(p, family.read(s) * 2)
                 weighed.published(first)
-                plgpu.barrier_wait(summed.barriers.at[0], parity=0)
+                plgpu.barrier_wait(summed.barriers.at[0], phase=0)
                 o_smem[...] = family.read(o)
                 plgpu.wait_load_tmem()
                 plgpu.commit_smem()
@@ -848,10 +848,10 @@ def _relayed_products(q, k, v, *, interpret):
 
             def products():
                 for at in range(3):
-                    plgpu.barrier_wait(loaded.at[at], parity=0)
+                    plgpu.barrier_wait(loaded.at[at], phase=0)
                 family.products(s, q_smem, k_smem)
                 scored.committed(first)
-                plgpu.barrier_wait(weighed.barriers.at[0], parity=0)
+                plgpu.barrier_wait(weighed.barriers.at[0], phase=0)
                 family.products(o, p, v_smem)
                 summed.committed(first)
 

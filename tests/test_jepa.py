@@ -641,7 +641,12 @@ def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_bl
     else:
         trainer = make_jepa_trainer(mask, learning_rate=3e-3, momentum=(0.9, 0.99), momentum_steps=150)
         objective, initial = trainer.objective, trainer.initial_state()
-        params, averaged = initial.variables, initial.averaged
+        step_batch = next(image_batches(batch=8))
+        stepped, *_ = trainer.compile(initial, step_batch)(initial, step_batch)
+        params, averaged = stepped.variables, stepped.averaged
+        assert any(not np.array_equal(np.asarray(a), np.asarray(b))
+                   for a, b in zip(jax.tree.leaves(params["params"]["context_encoder"]),
+                                   jax.tree.leaves(averaged["params"]["context_encoder"]), strict=True))
     blocks = mask.num_targets
     # The modules computing at float64, for the truth.
     wide = JepaObjective(objective.encoder.clone(dtype=jnp.float64),

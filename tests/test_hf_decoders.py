@@ -557,6 +557,10 @@ _YARN_SOURCES = (
     # sliding rotary at 1e4 for an absent or null record, and GELU by default.
     ("gemma4-moe-tiny", _without("rope_parameters", "hidden_activation")),
     ("gemma4-moe-tiny", lambda config: {**config, "rope_parameters": None}),
+    # A whole-head factor of 1 on the sliding layers' plain record, which the family reads.
+    ("gemma4-moe-tiny", lambda config: {**config, "rope_parameters": {
+        **config["rope_parameters"], "sliding_attention": {
+            **config["rope_parameters"]["sliding_attention"], "partial_rotary_factor": 1.0}}}),
     # Phi3Config replaces rope_parameters with a legacy rope_scaling whole, and
     # its own original_max_position_embeddings replaces the record's.
     ("phi3-tiny", lambda config: {**config, "rope_parameters": {"rope_type": "default", "rope_theta": 500.0},
@@ -1328,7 +1332,6 @@ def test_llada22_block_routing_is_each_packed_documents_own():
 def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, derived):
     name, source, ids, fields, _ = llada_moe_source
     model, variables = source.model, source.variables
-    draws = np.stack([llada_draw(seed, model.vocab_size)['ids'] for seed in range(40)])
     loss, gradients = jax.value_and_grad(lambda params: jnp.mean(model.apply(
         {**variables, 'params': params}, ids, **fields) ** 2))(variables['params'])
     assert np.isfinite(loss) and all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(gradients))
@@ -1346,11 +1349,13 @@ def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, de
     reloaded = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
     actual = jax.jit(lambda tokens: reloaded.model.apply(reloaded.variables, tokens, **fields))
     expected = jax.jit(lambda tokens: model.apply(trained, tokens, **fields))
-    # Saving and loading is an identity, so the reference is exact at every draw.
-    assert_as_exact(as_given(lambda seed: actual(draws[int(seed)])),
-                    as_given(lambda seed: expected(draws[int(seed)])),
-                    lambda seed: (np.asarray(seed, np.int32),), name + ' trained export', seeds=8,
-                    truth_fn=as_given(lambda seed: np.asarray(expected(draws[int(seed)]), np.float64)))
+    # Saving and loading is an identity, so the reference is exact at every draw: each its seed's own
+    # (`llada_draw`), so a sizing's seeds draw too.
+    def drawn(seed):
+        return (llada_draw(seed, model.vocab_size)['ids'],)
+
+    assert_as_exact(as_given(actual), as_given(expected), drawn, name + ' trained export', seeds=8,
+                    truth_fn=as_given(lambda tokens: np.asarray(expected(tokens), np.float64)))
     prompt = ids[:1, :4]
     generated = reloaded.text_generation()(prompt, 4, key=7, steps=3).host().tokens
     np.testing.assert_array_equal(generated[:, :4], prompt)

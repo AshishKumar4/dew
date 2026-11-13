@@ -350,7 +350,14 @@ def test_a_tree_block_carries_the_targets_state_at_each_rows_last_token(case):
         return (rng.integers(1, model.vocab_size, (2, width)).astype(np.int32),)
 
     ours, reference = stepped(model, params), walk(model, params)
-    error = checkify.checkify(ours, errors=checkify.user_checks)
-    assert_as_exact(as_given(lambda prompts: np.asarray(error(jnp.asarray(prompts))[1])),
+    checked = jax.jit(checkify.checkify(ours, errors=checkify.user_checks))
+
+    @as_given
+    def checked_ours(prompts):
+        err, state = checked(jnp.asarray(prompts))
+        err.throw()
+        return np.asarray(state)
+
+    assert_as_exact(checked_ours,
                     as_given(lambda prompts: np.asarray(reference(jnp.asarray(prompts)))), draw,
                     f"a tree block's carried state, {case}", seeds=SEEDS, truth_fn=truth)

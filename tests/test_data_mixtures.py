@@ -20,7 +20,6 @@ import contextlib
 import dataclasses
 import itertools
 import json
-import operator
 from pathlib import Path
 
 import grain.python as pygrain
@@ -140,15 +139,13 @@ def test_a_mixture_is_the_same_order_from_the_same_seed_and_another_from_another
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_a_mixtures_corpora_shuffled_by_one_seed_read_in_orders_of_their_own(read):
-    """Corpora of one length, each shuffled by one seed, read in orders of their own in a mix from data
-    plan version 9, each by its seed and its key in the mixture, so a corpus keeps its order whichever
-    others the mix holds; version 8, which a run saved under it reads by (`compile`'s `plan_version`),
-    read them in one permutation (row 3840)."""
-    def orders(names: tuple[str, ...], version: int | None = None) -> list[list[int]]:
+    """Corpora of one length, each shuffled by one seed, read in orders of their own in a mix, each by its
+    seed and its key in the mixture, so a corpus keeps its order whichever others the mix holds (row
+    3840)."""
+    def orders(names: tuple[str, ...]) -> list[list[int]]:
         corpora = [Pipeline(Memory(Indexed(tag, 16)), name=name).shuffle(5, **(
             {"window": 16} if read == "streamed" else {})).repeat() for tag, name in enumerate(names, 1)]
-        stated = {} if version is None else {"plan_version": version}
-        stream = compile(mix(corpora).batch(4), read=read, loading=READ, **stated).train(DataPartition())
+        stream = compile(mix(corpora).batch(4), read=read, loading=READ).train(DataPartition())
         try:
             seen = [value for step in taken(stream, 8) for value in step]
         finally:
@@ -160,73 +157,11 @@ def test_a_mixtures_corpora_shuffled_by_one_seed_read_in_orders_of_their_own(rea
     wiki, code = orders(("wiki", "code"))
     assert wiki != code
     assert orders(("wiki", "news"))[0] == wiki
-    assert operator.eq(*orders(("wiki", "code"), 8))
-
-
-def test_a_position_saved_under_plan_version_8_resumes_by_8_or_by_9_where_9_reads_it_alike():
-    """A position a version 8 read saved of a mix whose corpora shuffle, which version 9 reads in other
-    orders, resumes where 8 compiles the chain (`plan_version=8`) and is refused where 9 does, naming the
-    version to compile it by; one of a read whose order 9 reads alike, a mix of corpora that keep their
-    order, resumes under 9 (`dew.data.plan.read_otherwise_at_9`, row 3840)."""
-    def chain(shuffled: bool) -> Pipeline:
-        corpora = [Pipeline(Memory(Indexed(tag, 16)), name=name) for tag, name in ((1, "wiki"), (2, "code"))]
-        return mix([corpus.shuffle(5).repeat() if shuffled else corpus.repeat()
-                    for corpus in corpora]).batch(4)
-
-    for shuffled in (True, False):
-        saving = compile(chain(shuffled), read="indexed", loading=READ,
-                         plan_version=8).train(DataPartition())
-        try:
-            taken(saving, 2)
-            saved = saving.get_state()
-            expected = taken(saving, 2)
-        finally:
-            saving.close()
-        for version in (8, 9):
-            resumed = compile(chain(shuffled), read="indexed", loading=READ,
-                              plan_version=version).train(DataPartition())
-            try:
-                if shuffled and version == 9:
-                    with pytest.raises(ValueError):
-                        resumed.set_state(saved)
-                    continue
-                resumed.set_state(saved)
-                assert taken(resumed, 2) == expected
-            finally:
-                resumed.close()
-
-
-def test_an_unnamed_chains_shuffled_position_of_plan_version_8_resumes_under_9():
-    """A chain given no name shuffles by its seed alone under data plan version 9, as 8 shuffled it, so a
-    position 8 saved of it resumes under 9; a named chain's, which 9 shuffles by its name too, is refused
-    there, naming the version to read it by (rows 3840, 4063)."""
-    def opened(version: int, name: str | None = None):
-        chain = Pipeline(Memory(Indexed(1, 16)), name=name).shuffle(5).repeat().batch(4)
-        return compile(chain, read="indexed", loading=READ, plan_version=version).train(DataPartition())
-
-    for name in (None, "wiki"):
-        saving = opened(8, name)
-        try:
-            taken(saving, 1)
-            saved = saving.get_state()
-            expected = taken(saving, 1)
-        finally:
-            saving.close()
-        resumed = opened(9, name)
-        try:
-            if name is not None:
-                with pytest.raises(ValueError):
-                    resumed.set_state(saved)
-                continue
-            resumed.set_state(saved)
-            assert taken(resumed, 1) == expected
-        finally:
-            resumed.close()
 
 
 def test_a_named_chains_order_is_its_names_and_a_position_of_another_name_is_refused():
-    """A named chain read alone shuffles by its name from data plan version 9, as a mixture reads it as its
-    member, so its plan records the name: a position it saved is refused by the chain under another name,
+    """A named chain read alone shuffles by its name, as a mixture reads it as its member, so its plan
+    records the name: a position it saved is refused by the chain under another name,
     which reads another permutation of the same records, and resumes under its own (row 3840)."""
     def opened(name: str):
         chain = Pipeline(Memory(Indexed(1, 16)), name=name).shuffle(5).repeat().batch(4)
@@ -406,19 +341,6 @@ def test_a_mixed_validation_pass_ends_before_any_source_repeats(two_splits):
     scored = [value for batch in actual for value in batch]
     assert len(scored) == len(set(scored)) == 32
     assert all(sum(value >= 2000 for value in batch) == 1 for batch in actual)
-
-
-def test_a_mixture_written_in_either_order_is_the_same_run(two_splits):
-    big, small = two_splits
-    first, other = row_mix({big: 0.75, small: 0.25}), row_mix({small: 0.25, big: 0.75})
-    left, right = first.train(DataPartition()), other.train(DataPartition())
-    try:
-        assert taken(left, 4) == taken(right, 4)
-        assert left.get_state() == right.get_state()
-        assert taken(left, 3) == taken(right, 3)
-    finally:
-        left.close()
-        right.close()
 
 
 def test_sources_from_different_stores_mix_before_the_share_cut(two_splits):
@@ -919,32 +841,6 @@ def test_a_schedules_position_holds_the_tokens_its_finished_stages_ended_at(tmp_
     assert read[0] == read[1]
     with pytest.raises(ValueError):
         scheduled_packed((first, 5000), (both, None)).train(DataPartition()).set_state(ended)
-
-
-def test_a_schedules_position_saved_before_it_held_stage_tokens_resumes_only_in_its_first_stage(tmp_path):
-    """A schedule's position written before positions held the tokens its finished stages ended at (no
-    `tokens` in its envelope) records none: one standing in its first stage, which finished none, resumes;
-    one past it is refused, as nothing says where its finished stage ended in tokens (row 2862)."""
-    _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
-    both = {first: 1.0, second: 1.0}
-
-    def unrecorded(state: bytes) -> bytes:
-        held = json.loads(state)
-        held["dew_global_position"].pop("tokens")
-        return json.dumps(held).encode()
-
-    stream = scheduled_packed((first, 1000), (both, None)).train(DataPartition())
-    packed_rows(stream, 3)
-    early = unrecorded(stream.get_state())
-    opened = scheduled_packed((first, 1000), (both, None)).train(DataPartition())
-    assert isinstance(opened, PhasedStream)
-    past = unrecorded(opened.ending(stream.get_state()))
-    assert _position.read(early).tokens is None and _position.read(past).tokens is None
-    # Saved again as it was read, it still records none.
-    assert _position.read(_position.encode(_position.read(past))).tokens is None
-    scheduled_packed((first, 1000), (both, None)).train(DataPartition()).set_state(early)
-    with pytest.raises(ValueError):
-        scheduled_packed((first, 1000), (both, None)).train(DataPartition()).set_state(past)
 
 
 def test_a_schedule_counts_the_tokens_of_every_stage_but_its_last(tmp_path):
@@ -1928,6 +1824,125 @@ def test_corpora_recurring_across_phases_continue_where_grains_weighted_mix_left
         assert mine == [step[0] for step in taken(alone.train(DataPartition()), len(mine))]
 
 
+def _ided(tag: int, *, endless: bool = True, text: bool = False) -> Pipeline:
+    """Corpus `tag`'s 400 records, each its id (and three tokens of `text`, where asked), read on past its
+    end where `endless`."""
+    rows = (Indexed(tag, 400) if not text else
+            [{"id": np.int32(1000 * tag + index), "text": np.full(3, 3, np.int32)} for index in range(400)])
+    chain = Pipeline(Memory(rows), name=f"corpus-{tag}")
+    return chain.repeat() if endless else chain
+
+
+REORDERED = {
+    # A shuffle of the whole mix of finite corpora, its first phase's records scattered over every one of
+    # them.
+    "whole": lambda: (mix([_ided(1, endless=False), _ided(2, endless=False)]).shuffle(5).batch(8),
+                      mix([_ided(1), _ided(3)], weights=(0.25, 0.75)).batch(8)),
+    "window": lambda: (mix([_ided(1), _ided(2)]).shuffle(5, window=16).batch(8),
+                       mix([_ided(1), _ided(3)]).batch(8)),
+    "seeded": lambda: (mix([_ided(1), _ided(2)], seed=3).shuffle(5, window=16).batch(8),
+                       mix([_ided(1), _ided(3)]).batch(8)),
+    "both": lambda: (mix([_ided(1), _ided(2)]).shuffle(5, window=16).batch(8),
+                     mix([_ided(1), _ided(3)]).shuffle(6, window=8).batch(8)),
+    "alone": lambda: (mix([_ided(1), _ided(2)]).shuffle(5, window=16).batch(8), _ided(1).batch(8)),
+    "member": lambda: (mix([_ided(1).shuffle(2, window=8), _ided(2)]).batch(8),
+                       mix([_ided(1), _ided(3)]).batch(8)),
+    # Its batches shuffled within windows of four, of which the first phase trains three.
+    "batches": lambda: (mix([_ided(1), _ided(2)]).batch(8).shuffle(5, window=4),
+                        mix([_ided(1), _ided(3)]).batch(8)),
+}
+
+
+def _trained_across(steps: list[list[int]], switch: int) -> tuple[list[int], list[int]]:
+    """The records of corpus 1 the steps before and from `switch` train, in order."""
+    def own(held: list[list[int]]) -> list[int]:
+        return [value % 1000 for step in held for value in step if value // 1000 == 1]
+    return own(steps[:switch]), own(steps[switch:])
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+@pytest.mark.parametrize("case", sorted(REORDERED))
+def test_a_corpus_a_phase_shuffled_after_its_mix_continues_in_the_next_with_each_record_trained_once(case,
+                                                                                                    read):
+    """Row 5522: phases of one global order sharing a corpus, the first moving its rows after the corpus is
+    drawn (a shuffle of its mix, whole or within windows the boundary cuts through, of a seeded mix, or of
+    the corpus after it repeats) and so training some records past the count its mix drew and leaving some
+    before it untrained: the next phase starts at the first it left and draws past those it trained, so no
+    record is trained twice or lost, the next phase's records the first places it left in order (in the
+    windows of its own shuffle, which its steps read whole); and a read stopped in either phase resumed reads
+    what the read never stopped reads. Its batches shuffled after its batch, the same."""
+    first, second = REORDERED[case]()
+    loader = compile(phases((first, 3), (second, None)), read=read, loading=READ)
+    steps = taken(loader.train(DataPartition()), 12)
+    before, after = _trained_across(steps, 3)
+    assert before != sorted(before), "the first phase trains its draws out of order"
+    assert len(set(before + after)) == len(before) + len(after)
+    left = [place for place in range(len(before) + len(after) + 400) if place not in set(before)]
+    assert sorted(after) == left[:len(after)]
+    for stop in (2, 5):
+        stopped = loader.train(DataPartition())
+        head = taken(stopped, stop)
+        state = stopped.get_state()
+        stopped.close()
+        resumed = loader.train(DataPartition())
+        resumed.set_state(state)
+        assert head + taken(resumed, 12 - stop) == steps, stop
+        resumed.close()
+
+
+def test_a_schedules_stage_shuffled_after_its_mix_continues_its_corpus_where_the_run_ended_it():
+    """The token clock (row 5522): a stage that shuffles its mix's draws within windows, ended by the run
+    where its commits reached its tokens, three steps in, through a window: the next stage continues the
+    corpus they share from the first record it left, drawing past those it trained, as phases ending at that
+    step do."""
+    def stages(ending):
+        first = mix([_ided(1, text=True), _ided(2, text=True)]).shuffle(5, window=16).batch(8)
+        return ending(first, mix([_ided(1, text=True), _ided(3, text=True)]).batch(8))
+
+    by_steps = taken(compile(stages(lambda first, second: phases((first, 3), (second, None))), read="memory",
+                             loading=READ).train(DataPartition()), 12)
+    loader = compile(stages(lambda first, second: schedule([(first, 1e9), (second, None)])), read="memory",
+                     loading=READ)
+    stream = loader.train(DataPartition())
+    assert isinstance(stream, PhasedStream)
+    head = taken(stream, 3)
+    ended = stream.ending(stream.get_state())
+    stream.close()
+    resumed = loader.train(DataPartition())
+    resumed.set_state(ended)
+    assert head + taken(resumed, 9) == by_steps
+    resumed.close()
+    before, after = _trained_across(by_steps, 3)
+    assert len(set(before + after)) == len(before) + len(after) and before != sorted(before)
+
+
+def test_a_schedules_third_stage_continues_its_corpus_past_what_a_shuffled_second_trained():
+    """Three stages sharing a corpus on the token clock, the second shuffling its mix's draws within windows
+    the run's end cuts through: the third continues the corpus past what the second trained, from where the
+    first left it, as phases ending at those steps do, each record trained once."""
+    def stages(ending):
+        return ending(mix([_ided(1, text=True), _ided(2, text=True)]).batch(8),
+                      mix([_ided(1, text=True), _ided(3, text=True)]).shuffle(5, window=16).batch(8),
+                      mix([_ided(1, text=True), _ided(4, text=True)]).batch(8))
+
+    by_steps = taken(compile(stages(lambda *chains: phases(*zip(chains, (2, 5, None), strict=True))),
+                             read="memory", loading=READ).train(DataPartition()), 12)
+    loader = compile(stages(lambda *chains: schedule(list(zip(chains, (1e9, 1e9, None), strict=True)))),
+                     read="memory", loading=READ)
+    read: list[list[int]] = []
+    state = None
+    for steps in (2, 3, 7):
+        stream = loader.train(DataPartition())
+        if state is not None:
+            stream.set_state(state)
+        read += taken(stream, steps)
+        state = stream.ending(stream.get_state()) if len(read) < 12 else None
+        stream.close()
+    assert read == by_steps
+    ones = [value % 1000 for step in by_steps for value in step if value // 1000 == 1]
+    assert len(ones) == len(set(ones))
+
+
 @pytest.mark.parametrize("weights, lengths", [((1, 10, 15), (300, 40, 900)), ((0.3, 0.7), (300, 300)),
                                               ((71, 20, 9), (50, 800, 7)), ((1.0,), (12,))])
 def test_dews_weighted_selection_reads_the_records_grains_mix_reads(weights, lengths):
@@ -2053,26 +2068,53 @@ def test_phases_that_end_in_other_device_steps_are_refused():
                 read="memory", loading=READ)
 
 
-def test_a_token_mixture_of_published_generations_weighs_the_rows_and_targets_each_states(tmp_path):
-    """Published generations mix by tokens from the rows and valid targets each states, where
-    the weighting once looked for a windows count no generation states."""
+def test_a_token_mixture_of_published_generations_weighs_the_targets_each_states(tmp_path):
+    """Published generations of unequal valid targets a row mix by tokens from the targets each states
+    (`CountTargets`, read off the generation where the weighting once looked for a windows count none
+    states): no member is drawn while it leads the other by more of the targets drawn than one of the
+    other's rows, each row weighing its own targets (its tokens less one), through a saved position and
+    its resume, which reads on as an uninterrupted read does."""
     from dew.data.cache import Cache
     from dew.data.steps.text import CountTargets
     from dew.data.text import Tokenize
 
-    def published(name: str, documents: int) -> Pipeline:
-        texts = Memory([{"text": f"{name} {index:03d}"[-8:]} for index in range(documents)], identity=name)
-        generation = publish(Pipeline(texts).map(Tokenize()).filter_map(CountTargets()),
+    texts = {"short": " ".join(["short"] * 3), "long": " ".join(["long"] * 10)}
+
+    def published(name: str, tag: int) -> Pipeline:
+        rows = Memory([{"text": texts[name], "id": tag * 1000 + index} for index in range(16)], identity=name)
+        generation = publish(Pipeline(rows).map(Tokenize()).filter_map(CountTargets()),
                              Cache(str(tmp_path / name)), read="indexed", loading=READ)
         return Pipeline(generation.source(), name=name)
 
-    data = compile(mix([published("short", 4), published("long", 8)], by="tokens").repeat().batch(2),
+    data = compile(mix([published("short", 1), published("long", 2)], by="tokens").repeat().batch(1),
                    read="indexed", loading=READ)
-    stream = data.train(DataPartition())
-    try:
-        assert len(list(itertools.islice(stream, 4))) == 4
-    finally:
-        stream.close()
+
+    def read(count: int, state=None):
+        reader = data.train(DataPartition())
+        try:
+            if state is not None:
+                reader.set_state(state)
+            return [int(identity) for batch in itertools.islice(reader, count) for identity in batch["id"]], \
+                reader.get_state()
+        finally:
+            reader.close()
+
+    # Stopped within a cycle of the two members' shares, and resumed.
+    ids, state = read(23)
+    ids += read(21, state)[0]
+    assert ids == read(44)[0] and len(ids) == 44
+    # Each member's targets a row, its tokens less the one no target follows.
+    each = {name: len(Tokenize().map({"text": text})["text"]) - 1 for name, text in texts.items()}
+    assert each["short"] < each["long"]
+    # A member is drawn only while it leads the other by no more of their targets than one of the other's
+    # rows: its targets held to its half however its rows' lengths differ, where a mix by rows would
+    # draw short and long rows alike and fall a long row behind at once.
+    drawn = {"short": 0, "long": 0}
+    for identity in ids:
+        name, other = ("short", "long") if identity // 1000 == 1 else ("long", "short")
+        assert drawn[name] <= drawn[other] + each[other], (identity, drawn)
+        drawn[name] += each[name]
+    assert drawn["short"] > 0 and drawn["long"] > 0
 
 
 def _short_and_long() -> Pipeline:
@@ -2089,15 +2131,18 @@ def _token_rows(name: str, tag: int, tokens: int, count: int = 200) -> Pipeline:
     return Pipeline(Memory(rows), name=name).filter_map(CountTargets())
 
 
-def test_a_token_mixture_recurring_in_a_later_phase_continues_each_member_where_it_stopped():
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_token_mixture_recurring_in_a_later_phase_continues_each_member_where_it_stopped(read):
     """Members weighted alike by tokens, one target a row against nine, read nine rows of the
     first for each of the second; a later phase that mixes them again reads each member on from
-    the rows the first phase took, so no row repeats and none is skipped."""
+    the rows the first phase took, so no row repeats and none is skipped: read from memory in one global
+    order, and indexed or streamed, where the step that counts each row's targets cuts the order per share
+    and each phase reads its own stream (row 5475: such a phase once read its members' stated target counts
+    to continue them, which these rows do not state)."""
     from dew.data.pipeline import Phases
 
     members = _short_and_long
-    data = compile(Pipeline(Phases((members(), members()), (10, None))).batch(1), read="memory",
-                   loading=READ)
+    data = compile(Pipeline(Phases((members(), members()), (10, None))).batch(1), read=read, loading=READ)
     read = [int(batch["id"][0]) for batch in itertools.islice(data.train(DataPartition()), 40)]
     assert sum(value // 1000 == 1 for value in read[:10]) == 9
     for tag in (1, 2):
@@ -2238,20 +2283,13 @@ def _named(name: str, tag: int) -> Pipeline:
 @pytest.mark.parametrize("read", ["streamed", "indexed"])
 def test_an_unseeded_mix_reads_its_members_in_the_order_it_declares_them(read):
     """A mix of no seed reads its members in the order it declares them, 'z' before 'a', streamed as it
-    is read by index and as every prefix of it is counted (`Proportions`); a plan of version 12 streamed
-    them in their keys' sorted order, as Grain's mix of a mapping does, and a run it saved reads so still."""
+    is read by index and as every prefix of it is counted (`Proportions`)."""
     chain = mix([_named("z", 1).repeat(), _named("a", 2).repeat()]).batch(4)
     first = compile(chain, read=read, loading=READ).train(DataPartition())
     try:
         assert ids(itertools.islice(first, 2)) == [[1000, 2000, 1001, 2001], [1002, 2002, 1003, 2003]]
     finally:
         first.close()
-    if read == "streamed":
-        earlier = compile(chain, read=read, loading=READ, plan_version=12).train(DataPartition())
-        try:
-            assert ids(itertools.islice(earlier, 1)) == [[2000, 1000, 2001, 1001]]
-        finally:
-            earlier.close()
 
 
 def test_a_phased_runs_statistics_count_each_phase_it_reached(tmp_path):
@@ -2272,39 +2310,6 @@ def test_a_phased_runs_statistics_count_each_phase_it_reached(tmp_path):
     assert len(rows) == 2 and counted in rows.values() and all(count > 0 for count in rows.values()), rows
 
 
-@pytest.mark.parametrize(("read", "version"), [("indexed", 13), ("streamed", 12)])
-def test_a_mix_saved_under_plan_version_12_resumes_as_12_read_it(read, version):
-    """A mix of no seed whose members are named out of their sorted order, saved under plan version 12,
-    resumes under this Dew's on the batches 12's read goes on to: read by index, its order the same at
-    both, its position goes on as 13's; streamed, which 12 mixed in its keys' sorted order, as 12's."""
-    chain = mix([_named("z", 1).repeat(), _named("a", 2).repeat()]).batch(4)
-    earlier = compile(chain, read=read, loading=READ, plan_version=12)
-    now = compile(chain, read=read, loading=READ)
-
-    def listed(stream, count):
-        return ids(itertools.islice(stream, count))
-
-    reader = earlier.train(DataPartition())
-    try:
-        whole = listed(reader, 6)
-    finally:
-        reader.close()
-    reader = earlier.train(DataPartition())
-    try:
-        head, saved = listed(reader, 3), reader.get_state()
-    finally:
-        reader.close()
-    resumed = now.train(DataPartition())
-    try:
-        resumed.set_state(saved)
-        assert head + listed(resumed, 3) == whole
-        state = resumed.get_state()
-        plan = _position.read(state).plan if read == "indexed" else json.loads(state)["dew_data_plan"]
-        assert plan["version"] == version
-    finally:
-        resumed.close()
-
-
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
 def test_a_phase_on_the_token_clock_of_a_mix_weighed_by_tokens_streamed_is_refused_as_one(read):
     """Phases on the token clock continue each corpus past what the phases before read of it, by their
@@ -2318,13 +2323,12 @@ def test_a_phase_on_the_token_clock_of_a_mix_weighed_by_tokens_streamed_is_refus
         compile(chain, read=read, loading=READ)
 
 
-def _endless_ids(chain, count: int, plan_version: int | None = None) -> list[list[int]]:
+def _endless_ids(chain, count: int) -> list[list[int]]:
     """The ids of the first `count` batches a run reads of `chain`, read on past its end (`fitted`)."""
     from dew.data.compile import fitted
     from dew.data.pipeline import ObjectiveData
 
-    versions = {} if plan_version is None else {"plan_version": plan_version}
-    loader, _ = fitted(chain, None, objective=ObjectiveData(), **versions)
+    loader, _ = fitted(chain, None, objective=ObjectiveData())
     stream = loader.train(DataPartition())
     try:
         return ids(itertools.islice(stream, count))
@@ -2379,11 +2383,3 @@ def test_phases_batched_outside_themselves_read_as_they_did():
                   (Pipeline(Memory(Indexed(2, 16))).batch(8), None))
     assert _endless_ids(once.repeat(1), 4) == [list(range(1000, 1008)), list(range(2000, 2008)),
                                                list(range(2008, 2016))]
-
-
-def test_a_phase_batched_inside_itself_saved_under_plan_12_reads_as_12_did():
-    """A run whose data plan is version 12, as a run saved under it resumes, reads a phase batched inside
-    itself with its repeat after its batch, as 12 did."""
-    first, second = Memory(Indexed(1, 12)), Memory(Indexed(2, 12))
-    phased = phases((Pipeline(first).batch(8), 2), (Pipeline(second).batch(8), None))
-    assert _endless_ids(phased, 2, plan_version=12)[1] == list(range(1000, 1008))

@@ -3,9 +3,8 @@
 Each family's site (its fixture directory's name) draws two rows of 16 token ids a seed
 (tests/model_support.py's `llada_draw`, which its test draws again) and records the release's fp32
 forward's evidence against the release run in float64 (`record_case(..., summary=True)`): kilobytes,
-committed as `released.npz` beside the fixture. Dew's own fp32 forward plans the seed count, and the
-recorded release confirms it. LLaDA2's forwards run under its explicit block-causal mask of 4-token
-blocks (`llada_fields`), which its 2.0 forward requires. Sampling-recipe parity is separate.
+committed as `released.npz` beside the fixture. LLaDA2's forwards run under its explicit block-causal
+mask of 4-token blocks (`llada_fields`), which its 2.0 forward requires. Sampling-recipe parity is separate.
 
 The releases' code reads its own transformers, LLaDA-MoE's, v2's and 2.0's 4.57.1 (which refuses the
 huggingface_hub Dew reads) and 2.1's and 2.2's 5.16.1, so the release runs in a process of its own
@@ -107,12 +106,10 @@ def serve(name: str) -> None:
 
 def record(name: str, release_python: str) -> None:
     """`name`'s recording (`record_case`), the release served by `release_python`."""
-    import jax.numpy as jnp
     from recorded_references import provenance, record_case, save
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tests'))
     from model_support import llada_draw, llada_fields
-    from reference_error import widened
 
     from dew.interop import Pretrained
 
@@ -121,20 +118,12 @@ def record(name: str, release_python: str) -> None:
     mask = {} if not fields else {'visible': np.asarray(fields['attention_pairwise_mask'])[0]}
     source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
 
-    def forward(inputs):
-        return {'logits': source.model.apply(source.variables, inputs['ids'], **fields)}
-
-    wide_model, wide_variables = source.model.clone(dtype=jnp.float64), widened(source.variables)
-
-    def wide_forward(inputs):
-        return {'logits': wide_model.apply(wide_variables, inputs['ids'], **fields)}
-
     with reference_worker.session([release_python, __file__, '--serve', name]) as worker:
         def evaluate(inputs):
             return reference_worker.arms(worker.ask({'ids': inputs['ids'], **mask}))
 
-        arrays = record_case(name, lambda seed: llada_draw(seed, source.model.vocab_size), evaluate, forward,
-                             truth_proxy=wide_forward, store_inputs=False, summary=True)
+        arrays = record_case(name, lambda seed: llada_draw(seed, source.model.vocab_size), evaluate,
+                             store_inputs=False, summary=True)
     versions = subprocess.run([release_python, '-c', 'import torch, transformers; '
                                'print(transformers.__version__, torch.__version__)'],
                               capture_output=True, text=True, check=True).stdout.split()

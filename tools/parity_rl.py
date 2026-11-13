@@ -195,8 +195,8 @@ def tunix_advantages(tunix, inputs: dict[str, np.ndarray], dtype) -> dict[str, n
 
 
 def dew_estimators(inputs: dict) -> dict:
-    """Dew's estimators on a draw (`advantage_inputs`), by the recording's leaf names: the count the
-    recording plans on, and the test's arm and, in float64, its truth."""
+    """Dew's estimators on a draw (`advantage_inputs`), by the recording's leaf names: the test's
+    arm and, in float64, its truth."""
     import jax
     import jax.numpy as jnp
 
@@ -215,8 +215,7 @@ def dew_estimators(inputs: dict) -> dict:
 def write_advantage_recording(verl, tunix, command: str, out: Path) -> None:
     """recorded_advantage_<reference>.npz: each reference's estimators recorded over check 1's seeds
     (`record_case`'s summary), its float32 run's evidence from verl's float64 run, which keeps float64
-    through every estimator, and that run's sketch, the count planned on Dew's own estimators
-    (`dew_estimators`)."""
+    through every estimator, and that run's sketch."""
     import jax
     import jax.numpy as jnp
     import torch
@@ -236,9 +235,7 @@ def write_advantage_recording(verl, tunix, command: str, out: Path) -> None:
                    "tunix": lambda inputs: (tunix_float32(inputs), truth(inputs))}
     for name, evaluate in evaluations.items():
         with jax.enable_x64(new_val=True):
-            recorded = record_case(name, advantage_inputs, evaluate, dew_estimators,
-                                   truth_proxy=dew_estimators,
-                                   store_inputs=False, summary=True)
+            recorded = record_case(name, advantage_inputs, evaluate, store_inputs=False, summary=True)
         commit = {"verl": "896a9bb", "tunix": "b9f5e65"}[name]
         recorded[f"{name}.provenance"] = provenance(name, commit, "cpu", command, torch=torch.__version__,
                                                     truth="verl float64")

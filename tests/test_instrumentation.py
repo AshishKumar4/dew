@@ -492,8 +492,9 @@ class TickGatedTracker(RecordingTracker):
 
 def test_fit_reports_the_wait_on_input_and_a_later_compile():
     """An input slower than the step shows as train/data_wait_ms, and a batch
-    of a shape the loop has not met compiles inside its tick, which reports the
-    compile as train/compile_s; the ticks that compiled nothing report none.
+    of a shape the loop has not met, a later phase's its loader states
+    (`Loader.batches`), compiles inside its tick, which reports the compile as
+    train/compile_s; the ticks that compiled nothing report none.
 
     Each batch's 100 ms delay starts at the tick of the step two before the
     one it feeds, read as the step before is dispatched, when the loop is
@@ -514,7 +515,8 @@ def test_fit_reports_the_wait_on_input_and_a_later_compile():
             yield {"x": x, "y": 2 * x[:, :2]}
 
     make_trainer(tracker=tracker).fit(
-        Loader(lambda partition: slow(), None, batch=BATCH, records=None), steps=steps, log_every=1)
+        Loader(lambda partition: slow(), None, batch=BATCH, records=None, batches=(BATCH, 2 * BATCH)),
+        steps=steps, log_every=1)
 
     ticks = [p for _, p in tracker.scalars if "train/step_time_ms" in p]
     assert len(ticks) == 10

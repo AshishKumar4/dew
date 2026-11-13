@@ -17,7 +17,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from reference_error import as_given, assert_as_exact, seeds_for
+from reference_error import as_given, assert_as_exact
 
 from dew.data import Memory
 from dew.gauss_newton import gauss_newton
@@ -27,6 +27,22 @@ from dew.objectives.residuals import Residuals
 from dew.training import Checkpoints, Layout, Trainer
 
 LAYOUT = Layout(min_shard=1, tolerance=1.0)
+
+
+SIZED: dict[str, int] = {
+    "pyramid level values": 8, "pyramid level slopes": 8, "pyramid at its grid points": 64,
+    "gauss-newton 64x8": 128, "gauss-newton 8x64": 256,
+    **{f"masked gauss-newton {shape} damping {damping}": 256
+       for shape in ("64x8", "8x64") for damping in (0.0, 0.001)},
+    **{f"grouped gauss-newton {named}": 256 for named in ("gauss_newton", "dew.gauss_newton:gauss_newton")},
+    "configured whole gauss-newton step clip 0.0": 128, "configured whole gauss-newton step clip 0.05": 128,
+    "configured gauss-newton": 8,
+    "accumulated gauss-newton dual": 8, "accumulated gauss-newton primal": 256,
+    "accumulated gauss-newton short-microbatches": 128,
+}
+"""Each site's declared check-1 seeds, by its label: `seeds_for` as each site calls it (paired where it
+judges Dew's arm against a reference of its own), on armada's CPU (mc-sizing at dde08fb8d, 11-12), the largest
+where a second sizing of a site read more (the accumulated primal update: 256 at 0aed05577, eg-sized2)."""
 
 
 def spectral(grid: np.ndarray, x: np.ndarray, derivative: int) -> np.ndarray:
@@ -60,7 +76,7 @@ def test_a_pyramid_level_reads_its_grid_by_its_interpolant_and_its_slope_by_its_
     numpy = as_given(lambda grid, x: spectral(grid, x, derivative))
     exact = as_given(lambda grid, x: spectral(grid.astype(np.float64), x.astype(np.float64), derivative))
     label = f"pyramid level {('values', 'slopes')[derivative]}"
-    assert_as_exact(jax.jit(dews), numpy, draw, label, seeds=seeds_for(numpy, draw, label, truth_fn=exact),
+    assert_as_exact(jax.jit(dews), numpy, draw, label, seeds=SIZED[label],
                     truth_fn=exact)
 
 
@@ -89,7 +105,7 @@ def test_a_pyramid_reads_each_grid_at_its_own_points_and_scales_its_levels():
     exact = as_given(lambda coarse, fine: np.concatenate(
         [coarse.astype(np.float64) * 1000, fine[::2].astype(np.float64) * 1000 * 0.3], axis=-1))
     label = "pyramid at its grid points"
-    assert_as_exact(jax.jit(dews), numpy, draw, label, seeds=seeds_for(numpy, draw, label, truth_fn=exact),
+    assert_as_exact(jax.jit(dews), numpy, draw, label, seeds=SIZED[label],
                     truth_fn=exact)
 
 
@@ -171,7 +187,7 @@ def test_a_damped_gauss_newton_step_is_the_normal_equations_solve(rows, features
     numpy = as_given(lambda x, y: solved(x, y, 1e-3))
     exact = as_given(lambda x, y: solved(x.astype(np.float64), y.astype(np.float64), 1e-3))
     label = f"gauss-newton {rows}x{features}"
-    assert_as_exact(jax.jit(dews), numpy, draw, label, seeds=seeds_for(numpy, draw, label, truth_fn=exact),
+    assert_as_exact(jax.jit(dews), numpy, draw, label, seeds=SIZED[label],
                     truth_fn=exact)
 
 
@@ -202,7 +218,7 @@ def test_a_gauss_newton_step_solves_only_its_real_rows(rows, features, damping):
     numpy = as_given(lambda x, y: solved(x[real], y[real], damping))
     exact = as_given(lambda x, y: solved(x[real].astype(np.float64), y[real].astype(np.float64), damping))
     label = f"masked gauss-newton {rows}x{features} damping {damping}"
-    assert_as_exact(jax.jit(dews), numpy, draw, label, seeds=seeds_for(numpy, draw, label, truth_fn=exact),
+    assert_as_exact(jax.jit(dews), numpy, draw, label, seeds=SIZED[label],
                     truth_fn=exact)
 
 
@@ -262,7 +278,7 @@ def test_a_grouped_gauss_newton_run_scales_each_groups_leaves_of_one_solve(named
     grouped = gauss_newton_arm(rows, features, 1, config.build(1), bias=True)
     label = f"grouped gauss-newton {named}"
     assert_as_exact(grouped, numpy, draw, label, truth_fn=exact,
-                    seeds=seeds_for(numpy, draw, label, truth_fn=exact, dew_fn=grouped))
+                    seeds=SIZED[label])
 
 
 @pytest.mark.parametrize("clip", [0.0, 0.05])
@@ -295,7 +311,7 @@ def test_a_run_that_names_gauss_newton_and_sets_no_rate_takes_its_whole_damped_s
     configured = gauss_newton_arm(rows, features, 1, config.optim.build(1))
     label = f"configured whole gauss-newton step clip {clip}"
     assert_as_exact(configured, numpy, draw, label, truth_fn=exact,
-                    seeds=seeds_for(numpy, draw, label, truth_fn=exact, dew_fn=configured))
+                    seeds=SIZED[label])
     x, y = draw(0)
     state = config.train(LeastSquares(features), Pipeline(Memory({"x": x, "y": y})).batch(rows), name="run")
     assert int(state.updates) == 1 and solves_equations(state.opt_state)
@@ -375,7 +391,7 @@ def test_a_run_configured_for_gauss_newton_steps_its_rate_times_the_damped_solve
     halved = gauss_newton_arm(rows, features, 1, gauss_newton(0.5, damping=1e-3))
     label = "configured gauss-newton"
     assert_as_exact(configured, halved, draw, label, truth_fn=exact,
-                    seeds=seeds_for(halved, draw, label, truth_fn=exact, dew_fn=configured))
+                    seeds=SIZED[label])
 
 
 @pytest.mark.parametrize("update", sorted(UPDATES))
@@ -395,7 +411,7 @@ def test_an_accumulated_gauss_newton_update_solves_its_whole_batch_once(update):
     pooled, whole = gauss_newton_arm(rows, features, parts), gauss_newton_arm(rows, features, 1)
     label = f"accumulated gauss-newton {update}"
     assert_as_exact(pooled, whole, draw, label, truth_fn=exact,
-                    seeds=seeds_for(whole, draw, label, truth_fn=exact, dew_fn=pooled))
+                    seeds=SIZED[label])
 
 
 def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoints(tmp_path):
@@ -426,6 +442,28 @@ def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoi
             np.testing.assert_array_equal(left, np.asarray(right))
     finally:
         jax.config.update("jax_enable_x64", val=False)
+
+
+@pytest.mark.parametrize("features", [64, 4], ids=["dual", "primal"])
+def test_a_gauss_newton_window_the_stream_ends_inside_commits_a_solve_of_the_rows_it_holds(features):
+    """Gauss-Newton read eight rows a microbatch in windows of four, over five microbatches: the run's last
+    window, which the stream ends inside, holding its fifth microbatch alone, commits a solve of those rows
+    (row 5722), its rows fewer than the weights (the dual's) or more (the normal equations'): its weights
+    move past the first window's, where they once stayed and the update was counted all the same."""
+    generator = np.random.default_rng(5)
+    x = generator.normal(size=(40, features)).astype(np.float32)
+    y = generator.normal(size=40).astype(np.float32)
+
+    def trained(count: int) -> np.ndarray:
+        rows = Memory([{"x": row, "y": target} for row, target in zip(x[:count], y[:count], strict=True)])
+        trainer = Trainer(LeastSquares(features), gauss_newton(damping=1e-6), key=0, layout=LAYOUT,
+                          accumulation=4)
+        # A run of its `count` examples, streamed: its stream ends inside the second window, holding a fifth.
+        state = trainer.fit(rows.read("streamed").batch(8), examples=count)
+        assert int(state.updates) == -(-count // 32)
+        return np.asarray(state.variables["params"]["Dense_0"]["kernel"])[:, 0]
+
+    assert not np.array_equal(trained(40), trained(32))
 
 
 def test_a_gauss_newton_update_held_by_a_wrapper_that_drops_its_statistics_is_refused():

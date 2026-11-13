@@ -113,12 +113,17 @@ def analysed[C](code: str, analysis: Callable[[C], Refusal | None], row: str,
 class Kernel[C]:
     """A kernel an op may run: `supports`, its requirements in the order a refusal names them, whether
     it is `generic`, a path that takes what the others turn down, and the `upstream` library whose kernels
-    it reproduces where it is a port (its contract: 'fla', 'mamba_ssm'), None for Dew's own."""
+    it reproduces where it is a port (its contract: 'fla', 'mamba_ssm'), None for Dew's own, and whether it
+    is `reverse_only`: it defines its reverse-mode derivative alone (a `jax.custom_vjp`), its backward traced
+    after the call, so forward mode takes its tangents from another path computing the same function
+    (`dew.nn.attention.forward_differentiable`); the others are JAX's own products, or state their own
+    tangents, which forward mode differentiates as written."""
 
     name: str
     supports: tuple[Requirement[C], ...]
     generic: bool = False
     upstream: str | None = None
+    reverse_only: bool = False
 
     def refusals(self, case: C, forced: bool = False) -> Iterator[Refusal]:
         """The refusals `case` gets of the kernel's requirements, in their order, each requirement evaluated

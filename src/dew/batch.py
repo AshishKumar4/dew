@@ -13,12 +13,15 @@ import dataclasses
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from types import MappingProxyType
-from typing import Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct, traverse_util
+
+if TYPE_CHECKING:
+    from dew._records import JSON
 from flax.core import FrozenDict, meta
 
 type Variables = Mapping[str, Any]
@@ -112,6 +115,20 @@ PHASE = "data_phase"
 """A training batch's host field of the data phase it was read in (`Phase`), which a phased stream sets on
 every batch it delivers (`dew.data.dataset.PhasedStream`), so a step knows its phase on the host whoever
 read the batch ahead of it; a batch of a run in no phases holds none, its phase the first."""
+
+
+DRAWS = "data_draws"
+"""A training batch's host field of the draws of corpora phases share that it trains (`Draws`), which a
+phase on its own stream reads off each batch and drops before the run sees it
+(`dew.data.dataset.StepPhases`), so the next phase continues each shared corpus from them."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Draws:
+    """The draws of a phase's shared corpora a batch trains (`DRAWS`), each `(node, member, pull,
+    position)` (`dew.data.pipeline.Draw`): an object no device holds."""
+
+    draws: tuple[tuple[str, str, int, JSON], ...]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1069,6 +1086,12 @@ PROBES = "cotangent_probes"
 """The collection a step's cotangent probes ride in, laid out by the model calls that read them
 (`dew.nn.inspection.tapped`)."""
 
+PARTS = "__parts__"
+"""The key under which a step's observations and probes of a model applied in parts (a decision run's backbone
+and head, a PPO run's policy and critic) hold each part's tree by its name in the model's variables
+(`dew.nn.inspection.in_parts`): a key of those trees' own, as their summaries' (`dew.nn.inspection.SOWN`)
+and probes' (`PROBE`) are, which names no module."""
+
 
 def part(variables: Variables, name: str) -> Variables:
     """Cut the `name` subtree out of every collection that holds one: one
@@ -1084,14 +1107,17 @@ def part(variables: Variables, name: str) -> Variables:
 
 def probed(variables: Variables, name: str | None) -> Variables:
     """`variables` with a step's cotangent probes cut to those its objective nests under `name`, what one
-    of its model calls sows (`dew.nn.inspection.probes_of`), all of them where it nests none there; none
-    with `name` None, for a call whose cotangent the step does not summarize (a pass under no gradient)."""
+    of its model calls sows (`dew.nn.inspection.probes_of`), a part's of a model applied in parts
+    (`PARTS`), all of them where it nests none there; none with `name` None, for a call whose cotangent
+    the step does not summarize (a pass under no gradient)."""
     if PROBES not in variables:
         return variables
     rest = {collection: tree for collection, tree in variables.items() if collection != PROBES}
     if name is None:
         return rest
-    return {**rest, PROBES: variables[PROBES].get(name, variables[PROBES])}
+    # A model applied in parts holds each part's probes under its name (`PARTS`).
+    probes = variables[PROBES].get(PARTS, variables[PROBES])
+    return {**rest, PROBES: probes.get(name, probes)}
 
 
 def leaves_by_path(tree: Variables) -> dict[tuple[str, ...], jax.Array]:

@@ -98,7 +98,8 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     daily run (DEW_WHOLE_SUITE) runs every file on both, with nothing only
     collected. Every row is named once, test_gen_api never."""
     for name in ("test_heavy", "test_light", "test_new", "test_measured", "test_gen_api", "test_config"):
-        (tmp_path / "tests" / f"{name}.py").write_text("")
+        (tmp_path / "tests" / f"{name}.py").write_text(
+            "".join(f"def test_{each}(): pass\n" for each in "abcde"))
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0,
          "tests/test_light.py::test_c": 30.0, "tests/test_measured.py::test_d": 25.0,
@@ -1747,9 +1748,10 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
     package no test imported, or a module of another name beside one a file's tests executed, added or
     taken away runs no other file again (train 668: a module added to nn/backbones re-keyed 589 rows).
     A module of a name an import the file's run tried and failed looks for runs it again, as the import
-    now finds it, and only it, and so does its removal; so does a package of the name of a module it
-    executed, which shadows it, and an __init__.py added to, or taken from, a namespace package on the
-    way to one; a top-level package added under src/, which may shadow any import, runs every file."""
+    now finds it, and only it; so does a package of the name of a module it executed, which shadows it, and an
+    __init__.py added to a namespace package on the way to one; each taken away again returns the file to
+    inputs it ran green on, whose run is reused (the row keeps each green run's executed set); a top-level
+    package added under src/, which may shadow any import, runs every file."""
     # src/pkg/space is a namespace package on the way to pkg.space.sub.used: its import executes no file.
     for name, source in {"src/pkg/__init__.py": "", "src/pkg/space/sub/__init__.py": "",
                          "src/pkg/space/sub/used.py": "def value(): return 1\n",
@@ -1783,11 +1785,15 @@ def test_a_row_runs_again_only_where_a_module_comes_or_goes_beside_one_its_tests
                ("src/idle/new.py", "def value(): return 3\n", [1, 1]),
                ("src/other/extra.py", "def value(): return 4\n", [1, 1]),
                ("src/other/extra.py", None, [1, 1]),
-               ("src/other/optional.py", "VALUE = 1\n", [1, 2]), ("src/other/optional.py", None, [1, 3]),
-               ("src/other/lone/__init__.py", "def value(): return 5\n", [1, 4]),
-               ("src/other/lone/__init__.py", None, [1, 5]), ("tests/test_added.py", None, [1, 5]),
-               ("src/pkg/space/__init__.py", "", [2, 5]), ("src/pkg/space/__init__.py", None, [3, 5]),
-               ("src/top/__init__.py", "", [4, 6])]
+               # Taken away again, the tree is one the file ran green on: that run is reused.
+               ("src/other/optional.py", "VALUE = 1\n", [1, 2]), ("src/other/optional.py", None, [1, 2]),
+               ("src/other/lone/__init__.py", "def value(): return 5\n", [1, 3]),
+               ("src/other/lone/__init__.py", None, [1, 3]), ("tests/test_added.py", None, [1, 3]),
+               # test_lone's green run kept since its first, which ran in one process with test_uses,
+               # holds the package lookups that process made: they changed, it runs too, as a key reads
+               # what its run read.
+               ("src/pkg/space/__init__.py", "", [2, 4]), ("src/pkg/space/__init__.py", None, [2, 4]),
+               ("src/top/__init__.py", "", [3, 5])]
     for path, source, runs in changes:
         if path and source is None:
             (tmp_path / path).unlink()
@@ -1805,7 +1811,8 @@ def test_a_tools_init_added_or_a_helper_of_a_shadowing_name_reruns_the_rows_whos
         ci, tmp_path, monkeypatch, cache_worker):
     """tools/ is a namespace package, which a test imports from (`from tools import x`): an __init__.py added
     to it, which runs on every such import and makes it a regular package, reruns each row that imported
-    from it, and its removal again (train 672's review: no row's key held tools' own lookup); a helper
+    from it (train 672's review: no row's key held tools' own lookup), and its removal returns the row to
+    inputs it ran green on, whose run is reused (the row keeps each green run's executed set); a helper
     under tests/ of a module's name, which shadows it as tests/ leads sys.path, reruns each row that imported
     that name, and one of another name reruns none."""
     (tmp_path / "tools").mkdir(exist_ok=True)
@@ -1828,9 +1835,9 @@ def test_a_tools_init_added_or_a_helper_of_a_shadowing_name_reruns_the_rows_whos
         return len((tmp_path / "runs").read_text())
 
     assert run() == 1
-    for path, source, runs in (("tools/__init__.py", "", 2), ("tools/__init__.py", None, 3),
-                               ("tests/unrelated_helper.py", "VALUE = 1\n", 3),
-                               ("tests/json.py", "def dumps(value): return str(value)\n", 4)):
+    for path, source, runs in (("tools/__init__.py", "", 2), ("tools/__init__.py", None, 2),
+                               ("tests/unrelated_helper.py", "VALUE = 1\n", 2),
+                               ("tests/json.py", "def dumps(value): return str(value)\n", 3)):
         if source is None:
             (tmp_path / path).unlink()
         else:
@@ -2058,15 +2065,18 @@ def run_options(tmp_path: Path, ref: str, policy: str, option: str, whole: bool 
     return [word for word in run if word.startswith(option)]
 
 
-def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priority(tmp_path):
-    """A push to base/kernels runs its suite at a lane's whole-suite priority, -10 as verdict.sh's, so it
-    never takes containers from a lane's precheck or targeted run (0), and a lane's branch at the default
-    (the maintainer, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger); a train's CI is the
-    queue's gates on the hub, which set its own (runbooks/hub.md)."""
+def test_a_base_push_runs_at_a_targeted_runs_priority_and_the_background_suite_below_every_lanes(tmp_path):
+    """A push to base/kernels runs its suite at a targeted run's priority, 0, with the suite's ordinary
+    deadline, so it is graded: at a lane's whole-suite priority (-10) with the background deadline it waited
+    behind every train, precheck and lane run and ran out its 6,000 s ungraded, every one of the eleven runs
+    that started from 2026-11-09 to 11-12, each about 115 tasks after reuse, all queued (the owner's rule,
+    2026-11-01: every push to base is graded, a red its committer's the same day). Trains keep their own
+    priority above it; a lane's branch runs at the default; a train's CI is the queue's gates on the hub,
+    which set its own (runbooks/hub.md)."""
     def priority(ref: str) -> list[str]:
         return run_options(tmp_path, ref, "off", "--priority")
 
-    assert priority("base/kernels") == ["--priority=-10"]
+    assert priority("base/kernels") == ["--priority=0"]
     assert priority("fix/lane") == []
     # Main's whole run (the schedule's, the queue's whole dispatch) is background work, below every lane's run
     # at a head (verdict.sh's -10), so no head waits behind it (Main, 2026-11-06); a push to main stays its
@@ -2078,8 +2088,8 @@ def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priorit
     calls = suite_step(tmp_path / "whole-deadlines", "main", "", "off", 2, whole=True)
     assert {word for call in calls for word in call if word.startswith(("--deadline", "--pool=48"))} == {
         "--deadline=6000", "--pool=48"}
-    # A base push, below lanes too and on the pool armada gives it, keeps the background deadline.
-    assert run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline") == ["--deadline=6000"]
+    # A base push, no background run now, on the pool armada gives it, has the suite's ordinary deadline.
+    assert run_options(tmp_path / "base-deadline", "base/kernels", "on", "--deadline") == ["--deadline=2700"]
     assert run_options(tmp_path / "base-pool", "base/kernels", "on", "--pool") == []
 
 

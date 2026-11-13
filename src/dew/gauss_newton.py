@@ -46,9 +46,18 @@ class NormalEquations:
     update: int = struct.field(pytree_node=False)
 
     def solved(self, damping: float) -> jax.Array:
-        """The normal equations' damped solve against J^T r, flat."""
-        eye = jnp.eye(self.normal.shape[0], dtype=self.normal.dtype)
-        return cho_solve(cho_factor(self.normal + damping * eye), self.pulled)
+        """The normal equations' damped solve against J^T r, flat. Undamped, an update that holds fewer rows
+        than it has (a run's last, whose stream ended inside its window) solves the rows it holds in the least
+        squares, the least change that fits them where they are fewer than the weights (row 5722); damped, its
+        system is positive definite whatever rows it holds."""
+        system = self.normal + damping * jnp.eye(self.normal.shape[0], dtype=self.normal.dtype)
+
+        def factored() -> jax.Array:
+            return cho_solve(cho_factor(system), self.pulled)
+        if damping > 0:
+            return factored()
+        return jax.lax.cond(self.rows >= self.update, factored,
+                            lambda: jnp.linalg.lstsq(system, self.pulled)[0])
 
 
 @struct.dataclass
@@ -93,8 +102,8 @@ def solved_directions(damping: float = 0.0,
     """The damped Gauss-Newton solve of an update's system (the module's docstring) as a descent direction,
     in the parameters' tree and each in its own dtype, the gradient it is handed aside: the direction a
     rate's transform then scales and negates (`gauss_newton`, or a param group's own rate). An update whose
-    statistics hold fewer rows than it has (a run's last, whose stream ended inside its window) moves
-    nothing, as a solve of part of the system is no update's. Where `clip` is set, a direction longer
+    statistics hold fewer rows than it has (a run's last, whose stream ended inside its window) solves the
+    rows it holds (row 5722). Where `clip` is set, a direction longer
     than it is scaled to that norm (`OptimConfig.clip_grads`, as a clip caps a gradient's). Its objective
     states the system, which `Residuals` does; any other's statistics are refused."""
     if damping < 0:
@@ -116,9 +125,7 @@ def solved_directions(damping: float = 0.0,
                              "RowEquations, dew.objectives.Step.equations), which this run's statistics are "
                              f"not ({type(statistics).__name__}): train a Residuals objective")
         flat, unravel = ravel_pytree(updates)
-        solved = jax.eval_shape(statistics.solved, damping)
-        step = jax.lax.cond(statistics.rows >= statistics.update, statistics.solved,
-                            lambda _: jnp.zeros(solved.shape, solved.dtype), damping)
+        step = statistics.solved(damping)
         if clip is not None:
             # Optax's own cap of a global norm, which divides by the norm before it scales.
             capped, _ = optax.clip_by_global_norm(clip).update(step, optax.EmptyState())

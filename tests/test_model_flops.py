@@ -1026,8 +1026,10 @@ def test_decision_heads_match_every_forward_product_including_pooling(kind):
     table = jnp.ones((16, 8)) if kind == "joint" else None
     variables = model.init(jax.random.key(205), states, inputs, table)
     count = model.decision_flops(np.array([4]), np.array([1]), np.array([2]))
-    # The joint head writes its field/option cosine as multiply+reduce, not dot_general.
-    scalar_cosine = 2 * 8 * 2 if kind == "joint" else 0
+    # The joint head writes its two cosines (`dew.nn.norms.cosine`), its fields' against its options' and
+    # its prior's lexical against its anchors', as multiply+reduce, not dot_general: each 2 * 8 FLOPs a slot,
+    # over its 2 option slots.
+    scalar_cosine = 2 * (2 * 8 * 2) if kind == "joint" else 0
     assert count == forward_products(model.apply, variables, states, inputs, table) + scalar_cosine
 
 

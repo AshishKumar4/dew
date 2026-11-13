@@ -93,10 +93,11 @@ STAND_INS = {
 }
 
 
-def installed(root: Path, answer: str, *options: str, uv: str = "99.0.0") -> tuple[list[str], list[str]]:
-    """What the standalone installer, run with `options` on a machine whose nvidia-smi answers `answer`
-    and whose uv is release `uv`, asks: the uv install it runs, the release that ran it first, and the URLs
-    it fetched. uv, curl, nvidia-smi and the environment's Python stand in, so nothing is installed."""
+def run_installer(root: Path, answer: str, *options: str,
+                  uv: str = "99.0.0") -> subprocess.CompletedProcess:
+    """The standalone installer run with `options` on a machine whose nvidia-smi answers `answer` and whose
+    uv is release `uv`. uv, curl, nvidia-smi and the environment's Python stand in (root/bin), so nothing is
+    installed."""
     stand_ins = root / "bin"
     stand_ins.mkdir(exist_ok=True)
     scripts = {**STAND_INS, "nvidia-smi": f"printf '%s\\n' '{answer}'"}
@@ -106,11 +107,17 @@ def installed(root: Path, answer: str, *options: str, uv: str = "99.0.0") -> tup
     (stand_ins / "uv.template").write_text(UV)
     (stand_ins / "uv").write_text(UV.replace("@VERSION@", uv))
     (stand_ins / "uv").chmod(0o755)
-    script = root / "site/public/install.sh"
-    done = subprocess.run(["sh", str(script), "-y", "--venv", str(root / "env"), *options], cwd=root,
-                          env={"PATH": f"{stand_ins}:/usr/bin:/bin", "HOME": str(root),
-                               "STAND_INS": str(stand_ins)},
-                          capture_output=True, text=True, timeout=60)
+    return subprocess.run(
+        ["sh", str(root / "site/public/install.sh"), "-y", "--venv", str(root / "env"), *options], cwd=root,
+        capture_output=True, text=True, timeout=60,
+        env={"PATH": f"{stand_ins}:/usr/bin:/bin", "HOME": str(root), "STAND_INS": str(stand_ins)})
+
+
+def installed(root: Path, answer: str, *options: str, uv: str = "99.0.0") -> tuple[list[str], list[str]]:
+    """What the standalone installer (`run_installer`) asks: the uv install it runs, the release that ran it
+    first, and the URLs it fetched."""
+    stand_ins = root / "bin"
+    done = run_installer(root, answer, *options, uv=uv)
     assert done.returncode == 0, done.stderr
     fetched = stand_ins / "curl.log"
     return ((stand_ins / "uv.log").read_text().splitlines()[-1].split(),
@@ -118,12 +125,28 @@ def installed(root: Path, answer: str, *options: str, uv: str = "99.0.0") -> tup
 
 
 @pytest.mark.parametrize("answer", ["NVIDIA L4, 580.82.07, 8.9", "NVIDIA T4, 560.35.03, 7.5",
-                                    "NVIDIA K80, 470.82.01, 3.7", "NVIDIA V100, 520.61.05, 7.0"])
+                                    "NVIDIA K80, 470.82.01, 3.7", "NVIDIA V100, 520.61.05, 7.0",
+                                    # A GPU holding tensor memory: JAX's cuda13 build or none (ledger 5671).
+                                    "NVIDIA B200, 570.86.10, 10.0", "NVIDIA B200, 580.82.07, 10.0",
+                                    "NVIDIA B300, 570.86.10, 10.3", "NVIDIA H100, 570.86.10, 9.0"])
 def test_the_installer_installs_the_build_the_driver_and_gpus_run(tmp_path, answer):
     root = scratch(tmp_path)
     _, driver, sm = (field.strip() for field in answer.split(","))
     build = _builds.newest_build((driver, tuple(map(int, sm.split(".")))))
     assert installed(root, answer)[0][-1] == (f"dewml[{build}]" if build else "dewml")
+
+
+def test_a_gpu_holding_tensor_memory_is_refused_an_older_build_named_for_it(tmp_path):
+    """On a B200 the installer refuses `--cuda 12` outright, at any driver, and installs nothing: JAX's cuda12
+    build's cuBLAS frees a kernel's tensor memory twice beside Dew's Blackwell kernels, a hang or a silent
+    wrong result (ledger 5671), whatever the driver says. `--cuda 13` there, and `--cuda 12` on an H100, are
+    taken as named."""
+    root = scratch(tmp_path)
+    for driver in ("570.86.10", "580.82.07"):
+        refused = run_installer(root, f"NVIDIA B200, {driver}, 10.0", "--cuda", "12")
+        assert refused.returncode != 0 and not (root / "bin/uv.log").exists(), refused.stdout + refused.stderr
+    assert installed(root, "NVIDIA H100, 570.86.10, 9.0", "--cuda", "12")[0][-1] == "dewml[cuda12]"
+    assert installed(root, "NVIDIA B200, 580.82.07, 10.0", "--cuda", "13")[0][-1] == "dewml[cuda13]"
 
 
 def test_a_build_the_table_adds_is_the_installers_too(tmp_path):
@@ -153,3 +176,19 @@ def floored(root: Path, least: str) -> Path:
 def test_an_older_uv_is_replaced_by_the_least_one_which_runs_the_install(tmp_path, have, fetched, running):
     command, asked = installed(floored(tmp_path, "0.14.2"), "NVIDIA L4, 580.82.07, 8.9", uv=have)
     assert asked == fetched and command[:3] == [running, "pip", "install"]
+
+
+def test_a_generation_runs_the_builds_its_sm_meets_and_a_tensor_memory_gpu_cuda13_alone():
+    """A GPU generation runs each CUDA build whose least SM it meets, newest first, and one holding tensor
+    memory (`TENSOR_MEMORY_SMS`: a B200, a B300) the cuda13 build alone, whose cuBLAS its kernels need
+    (`generation_builds`); a consumer Blackwell (sm120), which holds none, runs either; a name that is no
+    generation is refused."""
+    generation_builds = _builds.generation_builds
+    newest_first = tuple(name for name, *_ in _builds.CUDA_BUILDS)
+    assert generation_builds("sm90") == generation_builds("sm_90a") == newest_first
+    assert generation_builds("sm120") == newest_first
+    assert generation_builds("sm100") == generation_builds("sm103") == ("cuda13",)
+    assert generation_builds("sm110") == ("cuda13",)
+    assert generation_builds("sm52") == ("cuda12",)
+    with pytest.raises(ValueError):
+        generation_builds("hopper")

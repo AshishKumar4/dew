@@ -10,8 +10,13 @@ import functools
 import hashlib
 import importlib.util
 import json
+import os
 import types
 from pathlib import Path
+
+MISSING = b"missing"
+"""An input's part of a key where the checkout has none: a file, a module or a unit of it (`contents`,
+`unit`)."""
 
 
 def _loaded(path: Path, name: str) -> types.ModuleType:
@@ -29,9 +34,9 @@ fetched = _loaded(Path(__file__).resolve().parents[1] / "fetched_fixtures.py", "
 
 
 def code_of(name: str) -> bytes:
-    """The hash of Python file `name`'s code (`code_digest`), or b"missing"."""
+    """The hash of Python file `name`'s code (`code_digest`), or `MISSING`."""
     path = Path(name)
-    return code_digest(path.read_bytes(), name) if path.is_file() else b"missing"
+    return code_digest(path.read_bytes(), name) if path.is_file() else MISSING
 
 
 def code_digest(data: bytes, name: str) -> bytes:
@@ -63,9 +68,9 @@ def unit(path: str, name: str) -> bytes:
     whole, which keys it whole, and one that takes a function's code (`__code__`) records its unit; a test
     asserting a source position it never read is out of contract (the owner's test rules ban pinning source
     text or positions). A module that does not compile is its text in every unit, and a unit it no longer
-    holds is b"missing"."""
+    holds is `MISSING`."""
     found = units(path)
-    return found.get(name, b"missing") if isinstance(found, dict) else found
+    return found.get(name, MISSING) if isinstance(found, dict) else found
 
 
 UNITS: dict[bytes, dict[str, bytes] | bytes] = {}
@@ -168,7 +173,7 @@ def built(path: Path) -> bool:
 
 def contents(name: str) -> bytes:
     """The hash of file `name`'s bytes, of directory `name`'s entries' names but its hidden ones and a
-    build's (`built`), or b"missing". A fetched fixture's payload is the digest its manifest pins, whether
+    build's (`built`), or `MISSING`. A fetched fixture's payload is the digest its manifest pins, whether
     it is downloaded here or not, so a planner that never fetches it keys it as a task does. An execution
     limit a run read (followed.py's `LIMITS`: "limit:cpu", "limit:memory") is the one binding this process
     (host.py's `limit`): a row green on 4 vCPUs is not reused on 8, nor on a planner, which reads its own (row
@@ -184,7 +189,7 @@ def contents(name: str) -> bytes:
     if followed.CODE in name:
         path, _, executed = name.partition(followed.CODE)
         if not Path(path).is_file():
-            return b"missing"
+            return MISSING
         return code_of(path) if executed == followed.WHOLE else unit(path, executed)
     path = Path(name)
     manifest = fetched.manifest(path) if path.name else None
@@ -196,7 +201,7 @@ def contents(name: str) -> bytes:
         entries = sorted(entry.name for entry in path.iterdir()
                          if not entry.name.startswith(".") and not built(entry))
         return hashlib.sha256("\n".join(entries).encode()).digest()
-    return b"missing"
+    return MISSING
 
 
 def probed(path: Path) -> bytes:
@@ -206,7 +211,7 @@ def probed(path: Path) -> bytes:
     if path.is_dir():
         return b"directory"
     if not path.is_file():
-        return b"missing"
+        return MISSING
     stat = path.stat()
     size = "" if path.suffix == ".py" else f" {stat.st_size}"
     return f"file{size} {int(bool(stat.st_mode & 0o111))}".encode()
@@ -219,9 +224,14 @@ def looked_up(looked: Path) -> bytes:
     name (train 668: a module added under nn/backbones re-keyed the 589 rows that imported its siblings)."""
     directory = looked.parent
     if not directory.is_dir():
-        return b"missing"
-    found = sorted(entry.name for entry in directory.iterdir() if not built(entry) and (
-        entry.name == looked.name or entry.name.startswith(f"{looked.name}.")))
+        return MISSING
+    # The name first: whether an entry is a build's output walks into a directory, and a search's directory
+    # holds hundreds of other names (2026-11-12: 47 million entries examined for a task's 156,000 lookups).
+    # Its names are read as text: a path made of each was most of what the name-first search still took (284
+    # of a test's 336 s under a profile, 165 s of them making the paths).
+    name, dotted = looked.name, f"{looked.name}."
+    found = sorted(entry for entry in os.listdir(directory)
+                   if (entry == name or entry.startswith(dotted)) and not built(directory / entry))
     if looked.is_dir() and not looked.is_symlink():
         found += sorted(f"{looked.name}/{entry.name}" for entry in looked.iterdir()
                         if entry.name.partition(".")[0] == "__init__" and not built(entry))
