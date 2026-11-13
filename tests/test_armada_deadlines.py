@@ -285,13 +285,13 @@ def test_a_worker_a_signal_ends_keeps_its_native_stacks_though_pytest_exits_red(
 
 
 def test_a_thread_with_no_python_state_that_aborts_keeps_its_own_native_stack(ci, tmp_path):
-    """A native thread Python never knew (a C library's worker, as XLA's) that aborts keeps its own stack among
-    the native stacks, read from outside the process by an unwinder of every OS thread (review, 2026-11-13:
-    py-spy's native mode reads only the threads Python knows)."""
+    """A native thread Python never knew (a C library's worker, as XLA's) that aborts keeps its own stack
+    among the native stacks, read from outside the process by an unwinder of every OS thread (review,
+    2026-11-13: py-spy's native mode reads only the threads Python knows)."""
     interpreter(tmp_path, "3.12")
     (tmp_path / "aborting.c").write_text(
         "#include <pthread.h>\n#include <stdlib.h>\n#include <unistd.h>\n"
-        "static void *aborting_worker(void *x) { usleep(200000); abort(); return x; }\n"
+        "void *aborting_worker(void *x) { usleep(200000); abort(); return x; }\n"
         "void start(void) { pthread_t t; pthread_create(&t, 0, aborting_worker, 0); }\n")
     subprocess.run(["cc", "-shared", "-fPIC", "-g", "-o", str(tmp_path / "aborting.so"),
                     str(tmp_path / "aborting.c"), "-lpthread"], check=True)
