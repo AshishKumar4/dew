@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Protocol
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import struct
 from flax.training.dynamic_scale import DynamicScale
@@ -83,13 +84,25 @@ def occupancy(window: Accumulation | None) -> jax.Array:
     return window.fill
 
 
+def occupied(window: Accumulation | None, phase: str = "accumulation occupancy") -> int:
+    """The most microbatches any group of `window` holds (`occupancy`), read on the host through the
+    pool's agreement (`collective_host`, every process calling it, `phase` naming the read): a reduction on
+    the devices compiled a program of the occupancy's placement, a restored window's another than a fresh
+    one's, which a resume compiled anew. Every read of whether a window holds microbatches is this one."""
+    if window is None:
+        return 0
+    from dew._coordination import collective_host
+
+    return int(np.max(collective_host(occupancy(window), phase=phase)))
+
+
 def kept_window(held: Accumulation | None, pending: Accumulation, read: bool) -> bool:
     """Whether a state's window (`held`) is the one a step compiled for `pending`'s shapes reads.
     One that replays other shapes is replaced by an empty one where its `fill`, read only then (`read`,
     not for a step's shapes alone), is 0 in every group, and refused while it holds any."""
     if held is None or held.replays(pending):
         return held is not None
-    if read and held.fill is not None and (count := int(jnp.max(held.fill))):
+    if read and held.fill is not None and (count := occupied(held)):
         raise ValueError(f"the state's part-filled accumulation window ({count} in) holds batches of "
                          f"other shapes than the step's, which it cannot replay")
     return False
@@ -225,11 +238,8 @@ def without_empty_window(state: TrainState) -> TrainState:
     A window part filled is saved whole."""
     if state.window is None:
         return state
-    from dew._coordination import collective_host
-
     # The groups' windows are stacked over the groups, which a pool's processes split.
-    filled = collective_host(occupancy(state.window), phase="checkpoint window")
-    return state.with_window(None) if int(jnp.max(jnp.asarray(filled))) == 0 else state
+    return state.with_window(None) if occupied(state.window, phase="checkpoint window") == 0 else state
 
 
 CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
