@@ -273,9 +273,9 @@ def test_a_dpo_accuracy_is_the_real_rows_whatever_the_repeats_hold(windows):
     with jax.enable_x64(new_val=True):
         variables = moved(objective.init(jax.random.key(0)), 3)
         step = Step(jnp.asarray(0), jax.random.key(1), moved(objective.init(jax.random.key(0)), 13))
-        alone = float(objective._loss(variables, stacked(records), step)[1].metrics["accuracy"].mean()[0])
+        alone = float(objective._loss(variables, stacked(records), step)[1].metrics["accuracy"])
         padded = {**stacked(records + swapped), VALID_ROWS: np.arange(ROWS) < 5}
-        reported = float(objective._loss(variables, padded, step)[1].metrics["accuracy"].mean()[0])
+        reported = float(objective._loss(variables, padded, step)[1].metrics["accuracy"])
     assert alone == 1.0 and reported == alone
 
 

@@ -159,8 +159,17 @@ class Exponentiated(Ratio):
     """A metric that is the exponential of a pooled mean: a perplexity, `exp` of its cross entropy's
     `Ratio`, pooled as that ratio is (`Aux.metrics`)."""
 
+    def mean(self) -> tuple[jax.Array, jax.Array]:
+        value, active = super().mean()
+        return jnp.where(active, jnp.exp(value), 0), active
+
     def held(self) -> float:
         return math.exp(super().held()) if float(np.asarray(self.mass)) > 0 else 0.0
+
+
+def held_metric(value: jax.Array | np.ndarray | Ratio | float) -> float:
+    """A step's metric (`Aux.metrics`) read on the host: a `Ratio`'s mean, anything else as a number."""
+    return value.held() if isinstance(value, Ratio) else float(value)
 
 
 @struct.dataclass
@@ -2062,6 +2071,7 @@ __all__ = [
     "Step",
     "TrainingScalar",
     "TrainingScalars",
+    "held_metric",
     "joined",
     "model_rngs",
     "traced_update_flops",

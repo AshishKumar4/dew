@@ -46,7 +46,18 @@ from dew.distributed.batches import (
 from dew.distributed.placement import Layout, MeshSpec, Placement
 from dew.nn.kernels.options import program, shapes_of
 from dew.nn.sharding import Link, measured_links, pipeline_microbatches
-from dew.objectives.base import Effects, Loss, Metric, Objective, Ratio, Shown, Step, TrainingScalar, Weighted
+from dew.objectives.base import (
+    Effects,
+    Loss,
+    Metric,
+    Objective,
+    Ratio,
+    Shown,
+    Step,
+    TrainingScalar,
+    Weighted,
+    held_metric,
+)
 from dew.objectives.passes import PassReports
 from dew.telemetry.profile import region
 from dew.training.cadence import Counted
@@ -288,7 +299,7 @@ class Evaluation:
             step: int | jax.Array = 0, averaged: Variables | None = None,
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
             schedule_step: int | jax.Array | np.ndarray | None = None, loss: bool = False,
-            training: Mapping[str, jax.Array] | None = None, warm: bool = False,
+            training: Mapping[str, jax.Array | Ratio] | None = None, warm: bool = False,
             updates: int | jax.Array | None = None,
             scored_to: str | os.PathLike[str] | None = None) -> Evaluation:
         """Evaluate `variables` on the batches every process can read, without an optimizer or a tracker.
@@ -378,7 +389,7 @@ class Evaluation:
     def _episodes(cls, episodes: Episodes, variables: Variables, *, key: jax.Array, step: int | jax.Array,
                   schedule_step: int | jax.Array | np.ndarray | None, updates: int | jax.Array | None,
                   split: str,
-                  warm: bool, metrics: Sequence[Metric], training: Mapping[str, jax.Array] | None
+                  warm: bool, metrics: Sequence[Metric], training: Mapping[str, jax.Array | Ratio] | None
                   ) -> Evaluation:
         """`run`'s evaluation of a split scored by its episodes: its metrics checked and agreed as a data
         split's are (`_agree_configuration`), each one reading the flight's scores (`Flown`), its clocks,
@@ -515,7 +526,7 @@ def _agree_configuration(
 
 
 def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array | np.ndarray | None,
-           averaged: Variables | None, training: Mapping[str, jax.Array] | None = None,
+           averaged: Variables | None, training: Mapping[str, jax.Array | Ratio] | None = None,
            updates: int | jax.Array | None = None) -> tuple[int, Step, tuple[int, ...], dict[str, float]]:
     """Draw the event's clocks and RNG, and the identity every rank reports.
 
@@ -547,7 +558,7 @@ def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array
     context, event_data = agreed("evaluation context", event)
     event_words = agreed_same("evaluation key", lambda: [int(word) for word in np.asarray(collective_host(
         event_data, phase="event identity"))])
-    return at, context, tuple(event_words), {name: float(value) for name, value in reports.items()}
+    return at, context, tuple(event_words), {name: held_metric(value) for name, value in reports.items()}
 
 
 _EVENT, _SCORE, _PREVIEW = 0x4556414C, 0x53434F52, 0x50524556
@@ -1189,7 +1200,7 @@ class Evaluator[L, E]:
             yield
 
     def evaluation(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState],
-                   links: Mapping[str, Link], training: Mapping[str, jax.Array],
+                   links: Mapping[str, Link], training: Mapping[str, jax.Array | Ratio],
                    names: Sequence[str] | None = None, *, warm: bool = False,
                    joined: Mapping[str, float] | None = None, examples: int | None = None,
                    cooled: bool = False) -> Evaluation:
@@ -1223,7 +1234,8 @@ class Evaluator[L, E]:
 
     def evaluate(self, state: TrainState, shardings: Placement[TrainState], links: Mapping[str, Link],
                  reader: Split | None, metrics: Sequence[Metric], preview: bool, *, loss: bool = False,
-                 split: str = "val", training: Mapping[str, jax.Array] | None = None, warm: bool = False,
+                 split: str = "val", training: Mapping[str, jax.Array | Ratio] | None = None,
+                 warm: bool = False,
                  scored_to: str | None = None, examples: int | None = None,
                  cooled: bool = False) -> Evaluation:
         """Score the validation split with this state's variables and report

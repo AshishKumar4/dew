@@ -233,7 +233,7 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]]):
         owns = [part.own for part in committed]
         # Pooled as a window pools them (`Transaction.prepare_attempt`): a loss stated as one scalar as the
         # mean of its equal microbatches', statistics by their sums.
-        scalar = all(not isinstance(part, Ratio) and jnp.ndim(part) == 0 for part in owns)
+        scalar = all(isinstance(part, jax.Array) and part.ndim == 0 for part in owns)
         own = reduce(jax.tree.map(lambda *values: sum(values), *owns))[0]
         own = own / len(owns) if scalar else own
         loss = jnp.where(committed[-1].count > 0, loss, own.astype(loss.dtype))
