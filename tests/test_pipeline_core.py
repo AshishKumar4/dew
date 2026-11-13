@@ -12,6 +12,7 @@ import weakref
 from uuid import uuid4
 
 import grain.python as grain
+import jax
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -2248,6 +2249,24 @@ def test_a_window_holding_more_documents_than_its_read_declares_is_refused():
     assert Coordinated(("text",), 3).map(window)["text_coordinates"].max_segments == 3
     with pytest.raises(ValueError):
         Coordinated(("text",), 2).map(window)
+
+
+def test_rows_split_from_a_laid_batch_batch_back_to_its_tree():
+    """A laid batch's rows, each a record holding its row of the batch's `Coordinates`, batch back to the
+    batch's own tree, the `Coordinates` stacked leaf by leaf as Grain batches any pytree (`record_batch`):
+    a split pass's rows read so (row 5916)."""
+    from dew.data.dataset import record_batch
+    from dew.data.steps.generic import Coordinated
+
+    window = {"text": np.arange(12, dtype=np.int32).reshape(2, 6),
+              "text_segment_ids": np.asarray([[1, 1, 2, 2, 0, 0], [1, 1, 1, 0, 0, 0]], np.int32),
+              "text_positions": np.asarray([[0, 1, 0, 1, 0, 0], [0, 1, 2, 0, 0, 0]], np.int32)}
+    laid = Coordinated(("text",), 2).map(window)
+    rows = [jax.tree.map(lambda leaf, at=at: leaf[at], laid) for at in range(2)]
+    again = record_batch(rows)
+    assert jax.tree.structure(again) == jax.tree.structure(laid)
+    assert all(np.array_equal(left, right) for left, right in zip(jax.tree.leaves(again),
+                                                                  jax.tree.leaves(laid), strict=True))
 
 
 def test_a_worker_batch_shares_its_large_columns_and_pickles_the_small_ones():
