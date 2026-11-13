@@ -72,6 +72,7 @@ import shutil
 import time
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -204,6 +205,44 @@ def as_given(fn):
         return fn(*inputs, **options)
     given.as_given = True
     return given
+
+
+class Rounded(NamedTuple):
+    """An arm's result at a site of followed roundings (`assert_as_exact`'s `followed`): the leaves check 1
+    judges (`judged`), every rounding's input among them, and the decisions its roundings made
+    (`decisions`, each rounding's output as the arm computed it), which its own truth follows."""
+
+    judged: Any
+    decisions: Any
+
+
+def _followed_truth(prepared, result, inputs):
+    """An arm's own truth at a site of followed roundings: the site's `followed`, as the gate runs a truth
+    (`_truth_program`, `prepared`), of the arm's decisions (`Rounded`) and the draw's `inputs` widened to
+    float64, the float64 computation that rounds where that arm rounded."""
+    if not isinstance(result, Rounded):
+        raise AssertionError("an arm at a site of followed roundings returns its judged leaves and its "
+                             "roundings' decisions (`Rounded`)")
+    with jax.enable_x64(new_val=True):
+        return prepared(jax.device_get(result.decisions), *widened(inputs))
+
+
+def _truth_read(truth_fn, followed, result):
+    """The truth `_of_float64` reads a site's program of: `truth_fn`, or at a site of followed roundings
+    (`result` Dew's `Rounded`) `followed` bound to Dew's decisions, as the gate runs a truth
+    (`_truth_program`), as given where `followed` runs on the host (a recording's, `indexed_recording`)."""
+    if result is None:
+        return truth_fn
+    bound = functools.partial(followed, jax.device_get(result.decisions))
+    return _truth_program(as_given(bound) if _given(followed) else bound)
+
+
+def _own_truth(prepared, result, inputs, truth):
+    """An arm's result and its truth on `inputs`: at a site of followed roundings (`result` a `Rounded`)
+    its judged leaves and the truth of its own decisions (`_followed_truth`), else the two as given."""
+    if not isinstance(result, Rounded):
+        return result, truth
+    return result.judged, _followed_truth(prepared, result, inputs)
 
 
 def dew_programs(fn):
@@ -1023,9 +1062,22 @@ def _truth_and_terms(truth_fn, terms_fn, inputs):
         return terms_fn(*widened(inputs))
 
 
+def _draw_truth(truth_and_terms, prepared, dew_fn, inputs):
+    """A draw's truth and its terms, and where the site follows roundings (`prepared`, its `followed` as
+    the gate runs a truth) Dew's result (`Rounded`, else None): run first, its truth its own decisions'
+    (`_followed_truth`), with no terms. Each reference's truth is then its own decisions' too, a recorded
+    one's the recording's (`indexed_recording`), paired with Dew's rows only where the two are the same
+    values."""
+    if prepared is None:
+        return (*truth_and_terms(inputs), None)
+    with summed_as_run():
+        ran = dew_fn(*inputs)
+    return _followed_truth(prepared, ran, inputs), None, ran
+
+
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
            library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = (), terms_fn=None,
-           label: str = "", examples: bool = False, conditioning=None):
+           label: str = "", examples: bool = False, conditioning=None, followed=None):
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
@@ -1042,7 +1094,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     every row sized by the larger of its own RMS and its terms' (`_LaidTruths.of`); with a site's own
     terms program (`_SiteTerms`), the truth is as without and its terms that program's, on the same
     widened inputs. With `conditioning` (dew.parity's `Conditioning`), every arm's leaves are read as
-    residuals in units of the reference's rounding at its truth's inputs (`Weighed.weighed`)."""
+    residuals in units of the reference's rounding at its truth's inputs (`Weighed.weighed`). With
+    `followed`, each arm is held to the truth of its own decisions (`_draw_truth`, `_followed_truth`)."""
     if orders is not None and any(getattr(fn, "recorded", False) for fn in (reference_fn, *also)):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
     arms = [reference_fn] + ([] if library_fn is None else [library_fn]) + list(also)
@@ -1057,6 +1110,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     def truth_and_terms(inputs):
         return _truth_and_terms(truth_fn or reference_fn, terms_fn, inputs)
 
+    prepared_followed = None if followed is None else _truth_program(followed)
+
     def rows_at(at, seed):
         """Every arm's evidence on the draw at `seed`, the `at`th, its orders' worst rows the larger."""
         nonlocal names, widths
@@ -1067,14 +1122,14 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         # on the programs the arms run (their scope, `summed_as_run`).
         with summed_as_run():
             _ynn_decided(label, [dew_fn, *arms], inputs)
-        truth, terms = truth_and_terms(inputs)
+        truth, terms, ran = _draw_truth(truth_and_terms, prepared_followed, dew_fn, inputs)
         if not at:
-            _of_float64(label, truth_fn or reference_fn, inputs, truth)
+            _of_float64(label, _truth_read(truth_fn or reference_fn, followed, ran), inputs, truth)
         if reference_seeds is None:
             their_inputs, their_truth, their_terms = inputs, truth, terms
         else:
             their_inputs = draw(reference_seeds[at])
-            their_truth, their_terms = truth_and_terms(their_inputs)
+            their_truth, their_terms = (None, None) if followed else truth_and_terms(their_inputs)
         # Each arm in units of the reference's rounding at its truth's inputs, the truth ones.
         weighed = None if conditioning is None else conditioning.at(
             ((truth, inputs, seed), (their_truth, their_inputs, seed if reference_seeds is None
@@ -1091,9 +1146,10 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         for mine_at, theirs_at in ordered:
             # Each arm, and its replay on the same inputs, in the arithmetic arms run in (`summed_as_run`).
             with summed_as_run():
-                dew = dew_fn(*mine_at)
+                dew = dew_fn(*mine_at) if ran is None else ran
                 if not at and mine_at is ordered[0][0]:
                     _of_its_inputs(label, "Dew's arm", dew_fn, mine_at, dew)
+            dew = dew if ran is None else ran.judged
             # The leaves judged: a weighed arm's split into its heavy and light classes (`Weighed.classed`).
             if names is None:
                 names, widths = _judged_leaves(dew, None if weighed is None else weighed[id(truth)])
@@ -1112,6 +1168,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                     if not at and arm is not dew_fn and mine_at is ordered[0][0]:
                         _of_its_inputs(label, _arm_name(arm, reference_fn, library_fn, at_arm), arm, here,
                                        other)
+                other, true_here = _own_truth(prepared_followed, other, here, true_here)
                 shared = true_here is truth
                 if weighed is not None:
                     terms_here = weighed[id(true_here)].ones
@@ -1123,7 +1180,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                         (_example_ratios(prepared.leaves, held_here, prepared.truths),
                          _example_worst_rows(prepared.leaves, held_here, prepared.truths))
                         if shared else ([None] * len(prepared.leaves),) * 2)
-                evidence = _evidence(prepared, other, true_here, shared=shared, their_terms=terms_here)
+                evidence = _evidence(prepared, other, true_here, shared=shared, their_terms=terms_here,
+                                     own=followed is not None)
                 rows[at_arm] = evidence if rows[at_arm] is None else _over_orders(rows[at_arm], evidence)
         return rows
 
@@ -1288,7 +1346,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                     orders=None, library_fn=None, library_row: int | None = None,
                     library_leaves: Sequence[str] = (), also: Mapping[str, Callable] | None = None,
                     terms: bool | Callable | None = None, examples: bool = False,
-                    conditioning: int | None = None, conditioning_scale: Callable | None = None) -> None:
+                    conditioning: int | None = None, conditioning_scale: Callable | None = None,
+                    followed: Callable | None = None) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1371,11 +1430,14 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     the reference program's rounding; a reference whose program is not one here (a recorded one) gives its
     own (`conditioning_scale(inputs, seed)`), its upstream computation's, read from its float64 twin with
     every operation tapped (`_dew_torch.rounding.rounding_scale`) and recorded beside its outputs,
-    never Dew's arm's, whose own forms would weigh its own amplified errors down.
+    never Dew's arm's, whose own forms would weigh its own amplified errors down. `followed(decisions,
+    *inputs)` is a quantized computation's truth, each arm's own (`_followed_site`).
 
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/certified.py)."""
+    terms = terms if followed is None else _followed_site(label, truth_fn, orders, library_fn, terms,
+                                                          conditioning, examples)
     if (store := STORE.get()) is not None:
         if conditioning is not None or library_fn is not None:
             raise ValueError(f"{label}: a weighed or library site reads its reference's own rounding and "
@@ -1387,7 +1449,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         truth_fn, terms = store.site(label)
     elif os.environ.get(QUALIFY) and not (drawing() or judging()):
         _qualified(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
-                   examples=examples, plain=not (library_fn or also or terms or conditioning))
+                   examples=examples, plain=not (library_fn or also or terms or conditioning),
+                   followed=followed)
     if conditioning is not None:
         _deferred(dew_fn, reference_fn, draw, label, seeds=seeds, conditioning=conditioning,
                   truth_fn=truth_fn, orders=orders, library_fn=library_fn, library_row=library_row,
@@ -1398,7 +1461,25 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     # own, the shards cut at the most of them, and a recording holds no more.
     _site_judged(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, orders=orders,
                  library_fn=library_fn, library_row=library_row, library_leaves=library_leaves, also=also,
-                 terms=terms, examples=examples, weighing=None, upto=staged_units(seeds))
+                 terms=terms, examples=examples, weighing=None, upto=staged_units(seeds), followed=followed)
+
+
+def _followed_site(label: str, truth_fn, orders, library_fn, terms, conditioning, examples) -> bool:
+    """The terms of a site of followed roundings, none (`assert_as_exact`'s `followed`, testing.md): each
+    arm, further references too, returns its leaves, every rounding's input among them, and its roundings'
+    decisions (`Rounded`), and is held to the float64 computation that rounds where it rounded. A decision
+    is no arm's error, but each rounding's input is a leaf held to the float64 value it rounds, so an
+    arithmetic error before a rounding is charged where the decision it led to is followed. Refused with
+    anything that reads one truth for every arm (a `truth_fn`, `orders`, a library arm, `terms`,
+    `conditioning`, `examples`) or a prepared truth."""
+    if (truth_fn is not None or orders is not None or library_fn is not None or terms
+            or conditioning is not None or examples):
+        raise ValueError(f"{label}: a site of followed roundings holds each arm to the truth of its own "
+                         f"decisions, with none of truth_fn, orders, a library arm, terms, conditioning or "
+                         f"examples")
+    if STORE.get() is not None:
+        raise ValueError(f"{label}: a followed truth is the arm's own, which no prepared truth holds")
+    return False
 
 
 def _deferred(dew_fn, reference_fn, draw, label: str, *, seeds: int, conditioning: int, truth_fn, orders,
@@ -1436,7 +1517,7 @@ class StaleSeeds(AssertionError):
 
 
 def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, examples: bool,
-               plain: bool) -> None:
+               plain: bool, followed=None) -> None:
     """A qualification run's sizing of one site (`QUALIFY`) before its verdict: the count `seeds_for` sizes
     here, Dew paired with its reference as the verdict pairs them, on sizing seeds no verdict draws, as every
     site's count is sized (without its terms: `seeds_for` reads none); above the site's declared `seeds` it
@@ -1456,7 +1537,7 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
         record["unsized"] = "its verdict is not the plain pair's" if not plain else "a recording's count"
     else:
         record["sized"] = seeds_for(reference_fn, draw, label, truth_fn=truth_fn, dew_fn=dew_fn,
-                                    orders=orders, examples=examples)
+                                    orders=orders, examples=examples, followed=followed)
     with open(os.environ[QUALIFY], "a", encoding="utf-8") as log:
         log.write(json.dumps(record) + "\n")
     if (sized := record.get("sized", 0)) > seeds:
@@ -1466,7 +1547,7 @@ def _qualified(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, 
 
 def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn, orders, library_fn,
                  library_row, library_leaves, also, terms, examples: bool, weighing, upto: int | None = None,
-                 offset: int = 0) -> None:
+                 offset: int = 0, followed=None) -> None:
     """`assert_as_exact`'s judgment of one site under `label`, weighed where `weighing` is given (dew.parity's
     `Conditioning`: built of the site's compiled reference and truth where it draws, never in its judge), a
     map task recording its range's draws up to `upto` where given, its classes' digest beside them."""
@@ -1502,7 +1583,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
                 draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
                                library_fn=library_fn, library_leaves=library_leaves, also=further,
                                terms_fn=terms_fn, label=label, examples=examples,
-                               conditioning=conditioning_now())
+                               conditioning=conditioning_now(), followed=followed)
                 ranges[start, stop] = draws if further else [draws]
                 narrow_leaves[:] = _narrow(ranges[start, stop][0])
             return ranges[start, stop][index]
@@ -1706,7 +1787,7 @@ def recorded_pilots(reference_fn, draw, count: int):
 
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
               truth_fn=None, dew_fn=None, orders=None, examples: bool = False,
-              conditioning: bool = False, conditioning_scale=None) -> int:
+              conditioning: bool = False, conditioning_scale=None, followed=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
     interval is no wider than PARITY in every leaf, on the count's own draws and again on as many more
     (`_confirmed`): a doubling stops at the first count whose draws resolve, and where a leaf's errors
@@ -1760,7 +1841,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     def drawn(start_at: int, stop: int):
         return _drawn(dew_fn or reference_fn, reference_fn, draw, range(first + start_at, first + stop),
                       truth_fn, orders=orders, label=label, examples=examples and dew_fn is not None,
-                      conditioning=weighing)
+                      conditioning=weighing, followed=followed)
 
     return _sized_count(drawn, label, start=start, most=most, paired=dew_fn is not None)
 
@@ -1918,6 +1999,11 @@ def recorded_weighing(stored, site: str) -> dict:
     return {"conditioning": declared, "conditioning_scale": Conditioning(scale, heavy, recorded_of)}
 
 
+class UnrecordedTruth(AssertionError):
+    """A float64 path a summarized recording's truth is recomputed by (`indexed_recording`'s `truth_fn`) that
+    does not compute the recorded truth at a seed: its sketch past float64's rounding of the computation."""
+
+
 def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn=None, leaves=None):
     """`assert_as_exact`'s draw, reference and truth for a reference recorded over seeds, where it cannot
     run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.reference.<name>` and
@@ -1943,10 +2029,15 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     `truth_fn`'s program, `chain_roundings`): a truth recomputed wrong moves its sketch by far more, so
     check 1 never judges Dew against its own float64 path where that path is not the reference's, as
     far as a wrong truth's move is independent of the sketch's signs (SKETCH). A seed whose recomputed
-    truth has a row of float64 zero the recording's had not is refused. Its reference and truth are
-    host functions, called as check 1 calls them, not traced. Where it holds pilots (`<site>.pilot.`,
-    `merge_shards`), seeds from SIZING_FROM on read them, and its reference carries them
-    (`recorded_pilots`'s `.pilots`), so a paired sizing of it takes those draws alone (`seeds_for`).
+    truth has a row of float64 zero the recording's had not is refused. A recording of a followed site
+    (`record_case(..., followed=True)`) holds the reference's decisions too, `<site>.decisions.<name>`,
+    each verdict seed's: its `truth_fn(decisions, inputs)` follows the decisions it is given, and the
+    third value returned is the site's `followed` (`assert_as_exact`'s), which holds Dew's float64 path,
+    following the recorded decisions, to the recorded truth at each seed before it follows an arm's. Its
+    reference and truth are host functions, called as check 1 calls them, not traced. Where it holds
+    pilots (`<site>.pilot.`, `merge_shards`), seeds from SIZING_FROM on read them, and its reference
+    carries them (`recorded_pilots`'s `.pilots`), so a paired sizing of it takes those draws alone
+    (`seeds_for`).
 
     With `leaves`, the recording is read for those leaves alone (`_of_leaves`): a site whose leaves are
     judged in groups, each its own test, reads each group so, its Dew arm and truth giving that group's
@@ -2046,6 +2137,35 @@ def _recorded_leaf(evidence, dtype: str, name: str, row: int) -> RecordedLeaf:
                            for field, value in examples.items()})
 
 
+def _recorded_decisions(site: str, decided: dict[str, np.ndarray], pilots: int):
+    """A followed recording's decisions (`<site>.decisions.<name>`, `decided`) at a verdict seed: none past
+    them, so a followed recording holds no pilots."""
+    if decided and pilots:
+        raise AssertionError(f"{site}: a followed recording holds no pilots, its decisions its verdict "
+                             f"seeds'")
+
+    def at(index: int) -> dict[str, np.ndarray]:
+        if index >= SIZING_FROM:
+            raise AssertionError(f"{site}: a followed recording holds its verdict seeds' decisions alone")
+        return {name: value[index] for name, value in decided.items()}
+    return at
+
+
+def _recorded_following(decisions_at, certified, live):
+    """A followed recording's truth (`assert_as_exact`'s `followed`): Dew's float64 path (`live`) following
+    an arm's decisions, the path held first, at the seed, to the recorded truth by following the reference's
+    own (`certified`), which it is where the two arms decided alike."""
+    @as_given
+    def followed(decisions, index, inputs):
+        recorded = decisions_at(int(index))
+        held_truth = certified(int(index), recorded, inputs)
+        if decisions.keys() == recorded.keys() and all(
+                np.array_equal(np.asarray(decisions[name]), recorded[name]) for name in recorded):
+            return held_truth
+        return live(decisions, inputs)
+    return followed
+
+
 def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     """`indexed_recording` of a recording of the reference's evidence alone."""
     def tree(kind):
@@ -2086,9 +2206,17 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
                                  f"digest differs); the generator's draw changed since the recording")
         return np.int32(seed), drawn
 
+    # A followed site's recording holds the reference's decisions (`<site>.decisions.<name>`), each verdict
+    # seed's, which its truth followed: the recorded reference is an arm of them (`Rounded`), its truth Dew's
+    # float64 path following them, held to the recorded truth (`certified`), and Dew's arm's the same path
+    # following its own (`assert_as_exact`'s `followed`).
+    decided = tree("decisions")
+    decisions_at = _recorded_decisions(site, decided, pilots)
+
     def reference(index, inputs):
         evidence, _, row = held(int(index))
-        return {name: _recorded_leaf(evidence, str(dtypes[name]), name, row) for name in mse}
+        leaves = {name: _recorded_leaf(evidence, str(dtypes[name]), name, row) for name in mse}
+        return Rounded(leaves, decisions_at(int(index))) if decided else leaves
 
     reference.recorded = True
     if pilots:
@@ -2097,14 +2225,14 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     # The truth recomputed, compiled as the gate compiles a truth; its roundings are counted on its trace.
     live = _truth_program(truth_fn)
 
-    @as_given
-    def truth(index, inputs):
-        index = int(index)
-        computed = live(inputs)
+    def certified(index: int, *arguments):
+        """`truth_fn` on `arguments` (a seed's inputs, a followed site's recorded decisions before them),
+        held to the recorded truth's sketch at seed `index`."""
+        computed = live(*arguments)
         if not roundings:
             # One draw's roundings, a window loop's its window's: each window is a draw of its own.
-            program, arguments = _one_draws_program(truth_fn, (inputs,))
-            roundings["count"] = chain_roundings(jax.make_jaxpr(program)(*arguments))
+            program, traced = _one_draws_program(truth_fn, arguments)
+            roundings["count"] = chain_roundings(jax.make_jaxpr(program)(*traced))
         eps = float(np.finfo(np.float64).eps)
         if set(computed) != set(sketch):
             raise AssertionError(f"{site}: `truth_fn` gives the leaves {sorted(computed)}, the recording "
@@ -2133,13 +2261,20 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
             away = (widest * float(np.sqrt(np.mean(np.square(apart / widest)))) if 0 < widest < np.inf
                     else widest)
             if not (np.isfinite(bound) and away <= bound):
-                raise AssertionError(
+                raise UnrecordedTruth(
                     f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not the recorded "
                     f"reference's: its sketch is {away:.3e} away (root mean square), past float64's "
                     f"rounding of the computation "
                     f"({roundings['count']} roundings); `truth_fn` does not compute what the reference's "
                     f"truth did")
         return computed
+
+    if decided:
+        return draw, reference, _recorded_following(decisions_at, certified, live)
+
+    @as_given
+    def truth(index, inputs):
+        return certified(int(index), inputs)
 
     return draw, reference, truth
 
