@@ -9,7 +9,7 @@ call, small beside the activations, and their gradients unstack the same way.
 """
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import TypeGuard
 
 import jax
@@ -25,17 +25,58 @@ from .kernels.selection import Kernel, Op, Requirement, select
 
 
 @dataclasses.dataclass(frozen=True)
-class JoinCase:
-    """The projections of one input as the join's selector reads them (`joins`): whether each is a plain Dense
-    (`dense`) on the join's dot_general (`dot_general`), whether they agree in width, bias, dtype, precision,
-    promotion and product (`uniform`: the join takes the first's product for all), whether a wrapper
-    intercepts their own calls (`intercepted`), and whether each holds its own kernel (`held`)."""
+class Projections:
+    """A layer's projections as a selector that stands in for their own calls reads them (the join's, the
+    fused gated MLP's, `dew.nn.gated_mlp`): whether each is a plain Dense (`dense`) on the default product
+    (`dot_general`), whether a wrapper intercepts their own calls (`intercepted`), and whether each holds
+    its own kernel (`held`)."""
 
     dense: bool
     dot_general: bool
-    uniform: bool
     intercepted: bool
     held: bool
+
+
+def projections_of(projections: Sequence[nn.Module]) -> Projections:
+    """The `Projections` of `projections`: whether a wrapper owns their products each asks within its own
+    scope (`Dense.product_owned`), a rule over its module path matching it there."""
+    dense = all(_plain_dense(projection) for projection in projections)
+    return Projections(
+        dense=dense,
+        dot_general=all(projection.dot_general in (None, float32_dot_general)
+                        and projection.dot_general_cls is None for projection in projections),
+        intercepted=(any(projection.product_owned() for projection in projections) if dense
+                     else intercepted()),
+        held=all(projection.has_variable('params', 'kernel') for projection in projections))
+
+
+def projection_requirements[C](of: Callable[[C], Projections], stands_in: str) -> tuple[Requirement[C], ...]:
+    """What a kernel that `stands_in` for projections' own calls needs of them (`of(case)`'s
+    `Projections`): each a handoff, so a call outside them runs its projections apart even where the kernel
+    is chosen, as a wrapped model's projections keep their own calls (`selection.Requirement`)."""
+    return (
+        Requirement('dense', lambda case: of(case).dense,
+                    f"a projection is not a plain Dense, whose call {stands_in} reproduces", row=INHERENT,
+                    kind='handoff'),
+        Requirement('dot_general', lambda case: of(case).dot_general,
+                    f"a projection takes a dot_general other than {stands_in}'s (`float32_dot_general`)",
+                    row=INHERENT, kind='handoff'),
+        Requirement('intercepted', lambda case: not of(case).intercepted,
+                    "the model computes under a wrapper (an adapter, a quantization) that intercepts each "
+                    "projection's own call", row=INHERENT, kind='handoff'),
+        Requirement('kernel', lambda case: of(case).held, "a projection holds no kernel of its own",
+                    row=INHERENT, kind='handoff'),
+    )
+
+
+@dataclasses.dataclass(frozen=True)
+class JoinCase:
+    """The projections of one input as the join's selector reads them (`joins`): their `Projections`, and
+    whether they agree in width, bias, dtype, precision, promotion and product (`uniform`: the join takes the
+    first's product for all)."""
+
+    projections: Projections
+    uniform: bool
 
     @property
     def cell(self) -> tuple[str, str]:
@@ -45,39 +86,21 @@ class JoinCase:
 
 
 JOIN_SUPPORTS: tuple[Requirement[JoinCase], ...] = (
-    Requirement('dense', lambda case: case.dense,
-                "a projection is not a plain Dense, whose call the join reproduces", row=INHERENT,
-                kind='handoff'),
-    Requirement('dot_general', lambda case: case.dot_general,
-                "a projection takes a dot_general other than the join's (`float32_dot_general`)",
-                row=INHERENT, kind='handoff'),
+    *projection_requirements(lambda case: case.projections, "the join"),
     Requirement('uniform', lambda case: case.uniform,
                 "the projections differ in width, bias, dtype, precision, promotion or product", row=INHERENT,
                 kind='handoff'),
-    Requirement('intercepted', lambda case: not case.intercepted,
-                "the model computes under a wrapper (an adapter, a quantization) that intercepts each "
-                "projection's own call", row=INHERENT, kind='handoff'),
-    Requirement('kernel', lambda case: case.held, "a projection holds no kernel of its own", row=INHERENT,
-                kind='handoff'),
 )
-"""What one GEMM needs to stand in for the projections' own calls: each a handoff, so a call outside
-them runs its projections apart even where the join is chosen, as a wrapped model's projections keep their
-own calls (`selection.Requirement`)."""
+"""What one GEMM needs to stand in for the projections' own calls (`projection_requirements`), and their
+agreement in what one GEMM's columns share."""
 
 
 def join_case(projections: Sequence[nn.Module]) -> JoinCase:
-    """The `JoinCase` of `projections`: whether a wrapper owns their products each asks within its own
-    scope (`Dense.product_owned`), a rule over its module path matching it there."""
-    dense = all(_plain_dense(projection) for projection in projections)
+    """The `JoinCase` of `projections`."""
     return JoinCase(
-        dense=dense,
-        dot_general=all(projection.dot_general in (None, float32_dot_general)
-                        and projection.dot_general_cls is None for projection in projections),
+        projections=projections_of(projections),
         uniform=len({(projection.features, projection.use_bias, projection.dtype, projection.precision,
-                      projection.promote_dtype, projection.dot_general) for projection in projections}) == 1,
-        intercepted=(any(projection.product_owned() for projection in projections) if dense
-                     else intercepted()),
-        held=all(projection.has_variable('params', 'kernel') for projection in projections))
+                      projection.promote_dtype, projection.dot_general) for projection in projections}) == 1)
 
 
 DELTA_GATES_FASTER = ("e5198da4e: a gated delta net's b and a, 24,576 tokens, forward and backward 5.44 -> "

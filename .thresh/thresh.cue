@@ -192,6 +192,14 @@ seams: "join-cells": {
 	}
 }
 
+seams: "gated-mlp-cells": {
+	kind:    "declared-set"
+	purpose: "each cell runs a gated MLP's three products fused on a device whose receipt shows the fused MLP faster"
+	paths:   ["src/dew/nn/gated_mlp.py"]
+	entries: "FUSED_CELLS"
+	declared: {}
+}
+
 seams: "nvfp4-cells": {
 	kind:    "declared-set"
 	purpose: "each cell runs an NVFP4 product's packed kernel on a receipt that shows it faster than decoding the matrix once a call"
@@ -242,6 +250,7 @@ seams: "kernel-choices": {
 		delta_decode:       "the delta_decode kernel, a choice a dispatch reports"
 		delta_gates:        "the delta_gates kernel, a choice a dispatch reports"
 		gate_up:            "the gate_up kernel, a choice a dispatch reports"
+		gated_mlp:          "the gated_mlp kernel, a choice a dispatch reports"
 		gated_delta_rule:   "the gated_delta_rule kernel, a choice a dispatch reports"
 		gemm_epilogue:      "the gemm_epilogue kernel, a choice a dispatch reports"
 		gemm_prologue:      "the gemm_prologue kernel, a choice a dispatch reports"
