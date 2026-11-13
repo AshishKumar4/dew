@@ -1,29 +1,14 @@
 """Gated DeltaNet against the transformers 5.16.1 reference, at fp32.
 
-tools/qwen_linear_reference.py runs `torch_chunk_gated_delta_rule`,
-`torch_recurrent_gated_delta_rule`, `F.conv1d` and one `Qwen3_5GatedDeltaNet`
-layer (modeling_qwen3_5.py) on fixed-seed operands and writes what they
-produced; the tests here run dew's forms on the same operands and the same
-weights and hold them to the reference.
+Dew's forms of the rule (chunked and recurrent, from a zero memory or a given one, a sequence cut in two),
+its causal conv and one whole layer are held by check 1 to transformers' own code run live
+(`torch_chunk_gated_delta_rule`, `torch_recurrent_gated_delta_rule`, `F.conv1d`, `Qwen3_5GatedDeltaNet`,
+modeling_qwen3_5.py) on drawn operands of the fixture's geometry, the truth each computation in float64.
+tests/fixtures/linear_attention (tools/qwen_linear_reference.py) holds that geometry and the layer's weights.
 
-Tolerances and the differences actually observed, fp32 on CPU:
-
-- chunked rule           : output 4.5e-07, state 1.2e-07, tolerance 1e-5
-- recurrent rule         : output 8.9e-08, state 6.0e-08, tolerance 1e-5
-- carried initial state  : the same numbers for both forms, tolerance 1e-5
-- chunked vs recurrent   : output 4.2e-07, state 7.5e-08, tolerance 1e-5
-- a sequence cut at 30   : output 4.7e-07, state 5.7e-07, tolerance 1e-5
-- causal conv            : 2.4e-07, tolerance 1e-5
-- the whole layer        : 6.8e-05 on outputs of magnitude up to 9.9 over
-  70 tokens (key heads 2, value heads 4, key dim 12, value dim 16),
-  tolerance 5e-4; its decode path 3.4e-05 against its parallel forward
-
-The two bugs the port hit on the way are the mutations these tests are known
-to catch, each measured by applying it and reading the assertion: an
-inclusive instead of a strictly lower triangle in the in-chunk operator (the
-reference's masked_fill zeroes the diagonal) and reading the memory as `S q`
-instead of `q^T S` in the recurrent form; the numbers are in the tests that
-catch them.
+The two bugs the port hit on the way, an inclusive instead of a strictly lower triangle in the in-chunk
+operator (the reference's masked_fill zeroes the diagonal) and the memory read as `S q` instead of `q^T S` in
+the recurrent form, moved the output by 1.5e-1 and 4.7e-1, far past the reference's own error (about 1e-7).
 """
 
 import functools
@@ -40,7 +25,7 @@ from flax import linen as nn
 from forks_support import LAYOUTS, assert_forks_as_own_rows
 from kernel_compile import gate_generations
 from model_support import as_stepped, decode_through, float64_twin
-from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, widened, without_ynn
+from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, widened, with_gradients, without_ynn
 
 from dew.algebra.scan import _decays_of
 from dew.batch import coordinates
@@ -75,28 +60,6 @@ def geometry():
     return json.loads((FIXTURES / "config.json").read_text())
 
 
-def operands(reference, normalised: bool = True):
-    """The rule's operands as the module hands them to the rule: the reference
-    normalises q and k inside the rule (use_qk_l2norm_in_kernel=True), dew
-    normalises them before it."""
-    query, key = reference["rule.query"], reference["rule.key"]
-    if normalised:
-        query, key = l2norm(query), l2norm(key)
-    return (jnp.asarray(query), jnp.asarray(key), jnp.asarray(reference["rule.value"]),
-            jnp.asarray(reference["rule.g"]), jnp.asarray(reference["rule.beta"]))
-
-
-def largest(left, right) -> float:
-    return float(np.max(np.abs(np.asarray(left) - np.asarray(right))))
-
-
-def assert_matches(outputs, reference, name: str):
-    """A form's output and final state within 1e-5 of the reference's recording `name`."""
-    out, state = outputs
-    assert largest(out, reference[f"{name}.output"]) < 1e-5
-    assert largest(state, reference[f"{name}.state"]) < 1e-5
-
-
 def decode_operands(rng, rows: int, heads: int, width: int, held=jnp.float32):
     """A decode token's operands from `rng`: unit queries and keys, values, a log decay in (-3, 0], a
     write gate in [0, 1), each fp32, and a memory of scale 0.1 held in `held`."""
@@ -107,17 +70,6 @@ def decode_operands(rng, rows: int, heads: int, width: int, held=jnp.float32):
     beta = jnp.asarray(rng.random((rows, 1, heads)), jnp.float32)
     state = jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, held)
     return query, key, value, g, beta, state
-
-
-def test_the_chunked_rule_matches_the_reference(reference):
-    """`torch_chunk_gated_delta_rule` on 70 tokens: a full chunk and a padded
-    one, so both the in-chunk operator and the cross-chunk memory are read.
-    Largest observed difference 4.5e-07 on the output, 1.2e-07 on the state.
-    With the in-chunk triangle made inclusive (`tril(..., 0)` in place of
-    `tril(..., -1)`) the output moves by 1.5e-01."""
-    out, state = chunk_gated_delta_rule(*operands(reference))
-
-    assert_matches((out, state), reference, "chunk")
 
 
 def portable(query, key, value, g, beta, state=None, starts=None, chunk: int = CHUNK_SIZE):
@@ -132,72 +84,106 @@ def portable(query, key, value, g, beta, state=None, starts=None, chunk: int = C
                         delta=True, dtype=work)
 
 
-CHUNKED_SEEDS = 16
-"""The chunked rule's declared draws against `torch_chunk_gated_delta_rule` (check 1), sized by `seeds_for`
-paired with the portable rule on armada."""
+RULE_SEEDS = {("chunked", False): 8, ("chunked", True): 8, ("portable", False): 8, ("portable", True): 8,
+              ("recurrent", False): 8, ("recurrent", True): 8}
+"""Each form's declared draws against its transformers form (check 1), from a zero memory or a drawn one,
+sized by `seeds_for` paired with Dew's form on armada."""
 
 
-def rule_draw(reference, seed: int):
+def rule_draw(reference, seed: int, *, carried: bool = False):
     """The fixture's operands of the rule drawn anew (tools/qwen_linear_reference.py's rule fixture, its
     geometry and laws): normal queries, keys and values, a log decay `-softplus(N(0, 1))` and a write gate
-    `sigmoid(N(0, 1))`, fp32, the queries and keys as the reference takes them, unnormalised."""
+    `sigmoid(N(0, 1))`, fp32, the queries and keys as the reference takes them, unnormalised; `carried`, a
+    memory to start from after them, `0.5 N(0, 1)` as the fixture's initial state."""
     rng = np.random.default_rng([755, seed])
     shape = reference["rule.g"].shape
     query, key, value = (rng.normal(size=reference[f"rule.{name}"].shape)
                          for name in ("query", "key", "value"))
     g, beta = -np.logaddexp(0, rng.normal(size=shape)), 1 / (1 + np.exp(-rng.normal(size=shape)))
-    return tuple(jnp.asarray(x, jnp.float32) for x in (query, key, value, g, beta))
+    memory = (0.5 * rng.normal(size=reference["rule.initial_state"].shape),) if carried else ()
+    return tuple(jnp.asarray(x, jnp.float32) for x in (query, key, value, g, beta, *memory))
 
 
-@as_given
-def torch_chunked(query, key, value, g, beta):
-    """`torch_chunk_gated_delta_rule` from a zero state, normalising the queries and keys in the rule, as
-    tools/qwen_linear_reference.py records it: its output and final state, fp32."""
+def _torch_rule(rule, query, key, value, g, beta, state):
+    """transformers' `rule` from `state` (a zero one where None), normalising the queries and keys in the
+    rule as Qwen3_5GatedDeltaNet calls it: its output and final state, at the operands' width."""
     import torch
+
+    return rule(*(torch.as_tensor(np.asarray(x)) for x in (query, key, value, g, beta)),
+                initial_state=None if state is None else torch.as_tensor(np.asarray(state)),
+                output_final_state=True, use_qk_l2norm_in_kernel=True)
+
+
+def torch_chunked(query, key, value, g, beta, state=None):
+    """`torch_chunk_gated_delta_rule` (`_torch_rule`)."""
     from transformers.models.qwen3_5.modeling_qwen3_5 import torch_chunk_gated_delta_rule
 
-    with torch.no_grad():
-        out, state = torch_chunk_gated_delta_rule(
-            *(torch.as_tensor(np.asarray(x)) for x in (query, key, value, g, beta)), initial_state=None,
-            output_final_state=True, use_qk_l2norm_in_kernel=True)
-    return out.numpy(), state.numpy()
+    return _torch_rule(torch_chunk_gated_delta_rule, query, key, value, g, beta, state)
 
 
-def normalised_portable(query, key, value, g, beta):
+def torch_recurrent(query, key, value, g, beta, state=None):
+    """`torch_recurrent_gated_delta_rule` (`_torch_rule`)."""
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_recurrent_gated_delta_rule
+
+    return _torch_rule(torch_recurrent_gated_delta_rule, query, key, value, g, beta, state)
+
+
+def normalised_chunked(query, key, value, g, beta, state=None):
+    """The public chunked rule (`chunk_gated_delta_rule`, which picks its implementation and its chunk) of
+    the queries and keys normalised before it, as the layer hands them over, at fp32 products (the
+    reference's)."""
+    with jax.default_matmul_precision("highest"):
+        return chunk_gated_delta_rule(l2norm(query), l2norm(key), value, g, beta, state)
+
+
+def normalised_portable(query, key, value, g, beta, state=None):
     """The portable rule (`portable`) of the queries and keys normalised before it, as the layer hands them
     over, at fp32 products (the reference's)."""
     with jax.default_matmul_precision("highest"):
-        return portable(l2norm(query), l2norm(key), value, g, beta)
+        return portable(l2norm(query), l2norm(key), value, g, beta, state)
 
 
-def test_the_chunked_rule_rounds_as_close_to_float64_as_the_reference(reference):
-    """The fixture's 70 tokens (a full chunk and a padded one) drawn anew: Dew's fp32 output and final state
-    on par from float64 with `torch_chunk_gated_delta_rule`'s own fp32 ones (check 1), the truth the same
-    rule in float64, at fp32 products, as the reference's were."""
-    assert_as_exact(normalised_portable, torch_chunked, functools.partial(rule_draw, reference),
-                    "the chunked rule", seeds=CHUNKED_SEEDS, truth_fn=normalised_portable)
+def normalised_recurrent(query, key, value, g, beta, state=None):
+    """The recurrent rule (`recurrent_gated_delta_rule`, a token at a time) of the queries and keys normalised
+    before it, at fp32 products (the reference's)."""
+    with jax.default_matmul_precision("highest"):
+        return recurrent_gated_delta_rule(l2norm(query), l2norm(key), value, g, beta, state)
 
 
-def test_the_recurrent_rule_matches_the_reference(reference):
-    """`torch_recurrent_gated_delta_rule`, one token at a time. Largest
-    observed difference 8.9e-08 on the output, 6.0e-08 on the state. With
-    the memory read as `S q` (q contracted against the value axis) instead
-    of `q^T S` the output moves by 4.7e-01."""
-    out, state = recurrent_gated_delta_rule(*operands(reference))
+FORMS = {"chunked": (normalised_chunked, torch_chunked), "portable": (normalised_portable, torch_chunked),
+         "recurrent": (normalised_recurrent, torch_recurrent)}
+"""Each of Dew's forms of the rule and the transformers form it ports: the public chunked rule, the portable
+math it runs where no kernel takes it (at the upstream's chunk of 64), and the recurrent rule."""
 
-    assert_matches((out, state), reference, "recurrent")
+
+@pytest.mark.parametrize("carried", [False, True], ids=["from zero", "from a memory"])
+@pytest.mark.parametrize("form", FORMS)
+def test_each_form_of_the_rule_rounds_as_close_to_float64_as_the_reference(reference, form, carried):
+    """The fixture's 70 tokens (a full chunk and a padded one) drawn anew, from a zero memory or a drawn
+    one, as every decode step past the first starts: Dew's fp32 output and final state of each form on par
+    with its transformers form's own fp32 ones (check 1), the truth that transformers form in float64
+    (`interop_support.torch_arms`), so a form that computes another function than the release's fails."""
+    from interop_support import torch_arms
+
+    dew, theirs = FORMS[form]
+    reference_arm, truth = torch_arms(theirs, theirs)
+    assert_as_exact(dew, reference_arm, functools.partial(rule_draw, reference, carried=carried),
+                    f"the {form} rule {'from a memory' if carried else 'from zero'}",
+                    seeds=RULE_SEEDS[form, carried], truth_fn=truth)
+
+
+AGREEING_SEEDS = 8
+"""The chunked form's declared draws against the recurrent one (check 1), sized by `seeds_for` on armada."""
 
 
 def test_the_chunked_and_recurrent_forms_agree(reference):
-    """The two forms are one computation: a model trains with the first and
-    decodes with the second, so they have to produce the same numbers and
-    leave the same memory behind. Largest observed difference 4.2e-07 on
-    the output, 7.5e-08 on the state."""
-    chunked, chunked_state = chunk_gated_delta_rule(*operands(reference))
-    recurrent, recurrent_state = recurrent_gated_delta_rule(*operands(reference))
-
-    assert largest(chunked, recurrent) < 1e-5
-    assert largest(chunked_state, recurrent_state) < 1e-5
+    """The two forms are one computation: a model trains with the first and decodes with the second, so
+    from the same memory they leave the same output and memory, the chunked form on par with the recurrent
+    one from the rule in float64 (check 1, two programs of Dew's)."""
+    assert_as_exact(normalised_chunked, normalised_recurrent,
+                    functools.partial(rule_draw, reference, carried=True),
+                    "the chunked rule against the recurrent one", seeds=AGREEING_SEEDS,
+                    truth_fn=normalised_recurrent)
 
 
 PACKED_RULE_SEEDS = {(1, False): 32, (1, True): 128, (8, False): 16, (8, True): 128}
@@ -354,74 +340,102 @@ def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound()
     assert_as_exact(packed, alone, draw, "packed rows on the port", seeds=8, truth_fn=truth)
 
 
-def test_strong_decay_has_the_same_finite_gradient_in_both_forms():
-    """Masked positive log differences must never reach exp in the chunk rule.
+STRONG_DECAY_SEEDS = 32
+"""The strong decay's declared draws of the chunked rule against the recurrent one (check 1), sized by
+`seeds_for` on armada."""
 
-    At g=-4 a 64-token chunk has finite outputs but exp of its unused upper
-    triangle overflows; masking afterwards leaves a 0*inf NaN in backward.
-    The recurrent form stays finite and supplies the behavioral reference.
-    """
-    query = jnp.asarray(np.random.default_rng(99).normal(size=(1, 64, 1, 4)) * .1, jnp.float32)
-    key, value = query * .7, query * .3
+
+def test_strong_decay_has_the_same_finite_gradient_in_both_forms():
+    """Masked positive log differences must never reach exp in the chunk rule: at g = -4 a 64-token chunk has
+    finite outputs but exp of its unused upper triangle overflows, and masking afterwards would leave a
+    0 * inf NaN in the backward. Over drawn queries (keys and values their multiples, a write gate of 0.2),
+    the chunked rule's output and its gradient into the decay are finite and on par with the recurrent
+    form's, which stays finite, from it in float64 (check 1, two programs of Dew's)."""
     beta, decay = jnp.full((1, 64, 1), .2), jnp.full((1, 64, 1), -4.)
 
-    def differentiate(rule):
-        return jax.jit(jax.value_and_grad(lambda g: rule(query, key, value, g, beta)[0].sum()))(decay)
+    def draw(seed):
+        rng = np.random.default_rng([0x5DEC, seed])
+        return (jnp.asarray(rng.normal(size=(1, 64, 1, 4)) * .1, jnp.float32),
+                jnp.asarray(rng.normal(size=(1, 64, 1, 4)), jnp.float32))
 
-    expected, expected_grad = differentiate(recurrent_gated_delta_rule)
-    actual, actual_grad = differentiate(chunk_gated_delta_rule)
-    np.testing.assert_allclose(actual, expected, atol=1e-7, rtol=1e-5)
-    np.testing.assert_allclose(actual_grad, expected_grad, atol=1e-7, rtol=1e-5)
+    def differentiated(rule):
+        def run(query, cotangent):
+            out, pull = jax.vjp(lambda g: rule(query, query * .7, query * .3, g, beta.astype(query.dtype))[0],
+                                decay.astype(query.dtype))
+            return out, *pull(cotangent)
+        return run
+
+    out, gradient = differentiated(chunk_gated_delta_rule)(*draw(0))
+    assert np.isfinite(np.asarray(out)).all() and np.isfinite(np.asarray(gradient)).all()
+    assert_as_exact(differentiated(chunk_gated_delta_rule), differentiated(recurrent_gated_delta_rule), draw,
+                    "the strong decay's output and decay gradient", seeds=STRONG_DECAY_SEEDS)
 
 
 
-def test_an_initial_state_is_carried_by_both_forms(reference):
-    """Starting from a memory, as every decode step past the first does,
-    matches the reference started from the same memory: 4.5e-07 chunked,
-    8.9e-08 recurrent on the output."""
-    initial = jnp.asarray(reference["rule.initial_state"])
+CUT = 30
+"""Where a sequence is cut: inside the first chunk, so the carried state and the padding are what is read,
+not a chunk boundary."""
+CUT_SEEDS = 8
+"""The cut sequence's declared draws against the whole one (check 1), sized by `seeds_for` on armada."""
 
-    out, state = chunk_gated_delta_rule(*operands(reference), initial)
-    assert_matches((out, state), reference, "chunk_carried")
 
-    out, state = recurrent_gated_delta_rule(*operands(reference), initial)
-    assert_matches((out, state), reference, "recurrent_carried")
+def cut_in_two(query, key, value, g, beta):
+    """The public chunked rule (`normalised_chunked`) over the first `CUT` tokens, then over the rest from
+    the memory they leave: the outputs joined and the last memory, as a prefill and its continuation run."""
+    head, memory = normalised_chunked(*(x[:, :CUT] for x in (query, key, value, g, beta)))
+    tail, final = normalised_chunked(*(x[:, CUT:] for x in (query, key, value, g, beta)), memory)
+    return jnp.concatenate([head, tail], axis=1), final
 
 
 def test_a_sequence_split_in_two_carries_its_memory_across_the_cut(reference):
-    """The property a prefill followed by a continuation depends on: the
-    state the first 30 tokens leave, fed to the last 40, gives the numbers
-    the whole 70 give at once. The cut is inside a chunk, so it is the
-    carried state and the padding that are tested, not a chunk boundary.
-    Largest observed difference 4.7e-07 on the output, 5.7e-07 on the
-    state."""
-    query, key, value, g, beta = operands(reference)
-    whole, whole_state = chunk_gated_delta_rule(query, key, value, g, beta)
-
-    cut = 30
-    head, state = chunk_gated_delta_rule(
-        query[:, :cut], key[:, :cut], value[:, :cut], g[:, :cut], beta[:, :cut])
-    tail, final = chunk_gated_delta_rule(
-        query[:, cut:], key[:, cut:], value[:, cut:], g[:, cut:], beta[:, cut:], state)
-
-    assert largest(jnp.concatenate([head, tail], axis=1), whole) < 1e-5
-    assert largest(final, whole_state) < 1e-5
+    """The property a prefill followed by a continuation depends on: the memory the first `CUT` tokens
+    leave, fed to the rest, gives what the whole sequence gives at once, the cut on par with the whole from
+    the rule in float64 (check 1, two programs of Dew's)."""
+    assert_as_exact(cut_in_two, normalised_chunked, functools.partial(rule_draw, reference),
+                    f"the rule cut at {CUT}", seeds=CUT_SEEDS)
 
 
-def test_the_causal_conv_matches_f_conv1d(reference):
-    """`F.conv1d(padding=K - 1, groups=D)[..., :S]` then silu, the reference's
-    short mixer (modeling_qwen3_next.py:345-365): position s reads s-K+1..s.
-    Largest observed difference 2.4e-07."""
-    taps = jnp.asarray(reference["conv.weight"][:, 0, :])
-    # The reference's tensors are channel-major, [B, D, S]; Dew's time-major.
-    x = jnp.swapaxes(jnp.asarray(reference["conv.input"]), 1, 2)
-    out = causal_conv1d(x, taps)
+CONV_SEEDS = 8
+"""The causal conv's declared draws against `F.conv1d` (check 1), sized by `seeds_for` on armada."""
 
-    assert largest(jnp.swapaxes(out, 1, 2), reference["conv.output"]) < 1e-5
-    moved = x.at[:, -1].set(x[:, -1] + 3.0)
-    changed = causal_conv1d(moved, taps)
-    assert jnp.array_equal(out[:, :-1], changed[:, :-1])
-    assert not jnp.allclose(out[:, -1], changed[:, -1])
+
+def conv_draw(reference, seed: int):
+    """The fixture's conv drawn anew (tools/qwen_linear_reference.py's conv fixture, its geometry and
+    laws): a normal input `[B, D, S]`, channel-major as the reference takes it, and taps `[D, 1, K]` of
+    `0.3 N(0, 1)`, fp32."""
+    rng = np.random.default_rng([757, seed])
+    return tuple(jnp.asarray(scale * rng.normal(size=reference[f"conv.{name}"].shape), jnp.float32)
+                 for name, scale in (("input", 1.0), ("weight", 0.3)))
+
+
+def dew_conv(x, weight):
+    """`causal_conv1d` of the reference's channel-major input and depthwise taps, Dew's being time-major."""
+    return jnp.swapaxes(causal_conv1d(jnp.swapaxes(x, 1, 2), weight[:, 0, :]), 1, 2)
+
+
+def torch_conv(x, weight):
+    """`F.conv1d(padding=K - 1, groups=D)[..., :S]` then silu, the reference's short mixer
+    (modeling_qwen3_next.py:345-365): position s reads s-K+1..s."""
+    import torch
+    import torch.nn.functional as F
+
+    x, weight = torch.as_tensor(np.asarray(x)), torch.as_tensor(np.asarray(weight))
+    return F.silu(F.conv1d(x, weight, padding=weight.shape[-1] - 1, groups=x.shape[1])[..., :x.shape[-1]])
+
+
+def test_the_causal_conv_rounds_as_close_to_float64_as_f_conv1d(reference):
+    """Dew's causal conv on par with `F.conv1d`'s from float64 (check 1), and causal: moving the last
+    position's input leaves every earlier output's bits as they were, the same program on the same values."""
+    from interop_support import torch_arms
+
+    reference_arm, truth = torch_arms(torch_conv, torch_conv)
+    assert_as_exact(dew_conv, reference_arm, functools.partial(conv_draw, reference), "the causal conv",
+                    seeds=CONV_SEEDS, truth_fn=truth)
+    x, weight = conv_draw(reference, 0)
+    out = dew_conv(x, weight)
+    changed = dew_conv(x.at[..., -1].add(3.0), weight)
+    assert jnp.array_equal(out[..., :-1], changed[..., :-1])
+    assert not jnp.array_equal(out[..., -1], changed[..., -1])
 
 
 def layer_params(reference):
@@ -453,22 +467,46 @@ def layer(geometry) -> GatedDeltaNet:
         norm_eps=geometry["rms_norm_eps"])
 
 
-def test_the_layer_matches_qwen3_5_gated_delta_net(reference, geometry):
-    """The whole mixer on the reference's own weights: projections, the
-    conv, the gates, the rule with value heads outnumbering key heads, the
-    gated norm and the output projection. Largest observed difference
-    6.8e-05 over 70 tokens, on outputs of magnitude up to 9.9; the bare
-    rule above holds to 1e-5, so the residue is fp32 accumulation through
-    the projections and the norm."""
+LAYER_SEEDS = 32
+"""The layer's declared draws against `Qwen3_5GatedDeltaNet` (check 1), sized by `seeds_for` on armada."""
+
+
+def torch_layer(reference, geometry):
+    """Check 1's reference and float64 truth over transformers' `Qwen3_5GatedDeltaNet` built from the
+    fixture's geometry and holding its weights, as tools/qwen_linear_reference.py runs it, its twin built
+    at float64 (`interop_support.transformers_arms`, `_dew_torch.precision.float64_twin`)."""
+    import torch
+    from interop_support import transformers_arms
+    from transformers import Qwen3_5TextConfig
+    from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5GatedDeltaNet
+
+    from _dew_torch.precision import float64_twin as torch_twin
+
+    def built():
+        return Qwen3_5GatedDeltaNet(Qwen3_5TextConfig(**geometry), layer_idx=0)
+
+    module = built()
+    module.load_state_dict({name.removeprefix("layer."): torch.as_tensor(value)
+                            for name, value in reference.items()
+                            if name.startswith("layer.") and name != "layer.hidden"})
+    module.eval()
+    return transformers_arms(module, lambda layer, hidden: layer(hidden, attention_mask=None),
+                             twin=torch_twin(module, build=built))
+
+
+def test_the_layer_rounds_as_close_to_float64_as_qwen3_5_gated_delta_net(reference, geometry):
+    """The whole mixer on the reference's own weights: projections, the conv, the gates, the rule with value
+    heads outnumbering key heads, the gated norm and the output projection, over drawn hidden states of the
+    fixture's 70 tokens, on par with transformers' layer from the float64 layer's forward (check 1)."""
     module = layer(geometry)
     variables = layer_params(reference)
     sample = jnp.zeros((1, 4, geometry["hidden_size"]))
     template = nn.unbox(jax.eval_shape(module.init, jax.random.key(0), sample))
     assert jax.tree.map(jnp.shape, variables) == jax.tree.map(jnp.shape, template)
-
-    out = module.apply(variables, jnp.asarray(reference["layer.hidden"]))
-
-    assert largest(out, reference["layer.output"]) < 5e-4
+    reference_arm, truth = torch_layer(reference, geometry)
+    assert_as_exact(lambda hidden: module.apply(variables, hidden), reference_arm,
+                    decoded_draw(reference["layer.hidden"], positions=reference["layer.hidden"].shape[1]),
+                    "the gated delta net layer", seeds=LAYER_SEEDS, truth_fn=truth)
 
 
 DECODE_SEEDS = 8
@@ -482,11 +520,12 @@ whose compile sets the test's time: over the recording's 70 positions, 66 of the
 in map tasks of 4 seeds 140 to 330 s a task under CI's load."""
 
 
-def decoded_draw(recorded: np.ndarray):
-    """A decode check's draw: inputs `DECODED` positions long, of `recorded`'s rows, width and scale."""
+def decoded_draw(recorded: np.ndarray, positions: int = DECODED):
+    """A check's draw of hidden states: inputs `positions` long (a decode check's `DECODED`), of `recorded`'s
+    rows, width and scale."""
     def draw(seed):
         rng = np.random.default_rng([0x2739, seed])
-        shape = (*recorded.shape[:1], DECODED, *recorded.shape[2:])
+        shape = (*recorded.shape[:1], positions, *recorded.shape[2:])
         return (jnp.asarray(rng.standard_normal(shape) * recorded.std(), jnp.float32),)
     return draw
 
@@ -576,17 +615,38 @@ def scan_masked_conv1d(x, kernel, valid, state=None):
     return jnp.moveaxis(output, 0, 1), state
 
 
-def masked_operands(rows, kernel_width, *, channels=3, history=True, seed=0):
-    """Input, taps, initial history, validity and a cotangent for one case."""
-    valid = np.asarray(rows, bool)
-    batch, length = valid.shape
-    keys = jax.random.split(jax.random.key(seed), 4)
-    x = jax.random.normal(keys[0], (batch, length, channels), jnp.float32)
-    kernel = jax.random.normal(keys[1], (channels, kernel_width), jnp.float32)
-    state = (jax.random.normal(keys[2], (batch, kernel_width - 1, channels), jnp.float32)
-             if history else None)
-    cotangent = jax.random.normal(keys[3], (batch, length, channels), jnp.float32)
-    return x, kernel, state, jnp.asarray(valid), cotangent
+MASKED_CHANNELS = 32
+"""A masked conv check's channels: each channel convolves apart, so every leaf of a case holds this many
+times its slots' values, over which a draw's error pools (at 3, a kernel's gradient over a few real tokens
+needed up to 512 draws to resolve)."""
+
+
+def masked_draw(rows, kernel_width: int, *, history: bool, differentiated: bool = True,
+                channels: int = MASKED_CHANNELS):
+    """A masked conv check's draw for a case's `rows` (each slot real or not): a normal input `[B, S, D]`
+    and taps `[D, W]`, with `history` an incoming history `[B, W - 1, D]`, and where `differentiated` a
+    cotangent of the outputs and of the history carried, fp32."""
+    batch, length = np.asarray(rows).shape
+
+    def draw(seed):
+        rng = np.random.default_rng([0x5CA9, seed])
+        held = (batch, kernel_width - 1, channels)
+        drawn = [rng.normal(size=(batch, length, channels)), rng.normal(size=(channels, kernel_width)),
+                 *([rng.normal(size=held)] if history else [])]
+        cotangent = (rng.normal(size=(batch, length, channels)), rng.normal(size=held))
+        arrays = tuple(jnp.asarray(x, jnp.float32) for x in drawn)
+        return (*arrays, tuple(jnp.asarray(x, jnp.float32) for x in cotangent)) if differentiated else arrays
+    return draw
+
+
+def masked_arm(implementation, rows, *, history: bool):
+    """`implementation(x, kernel, valid, state)` over a case's `rows`: its outputs and the history it
+    carries, and their gradients into the input, the taps and, with `history`, the incoming history under
+    the draw's cotangent (`with_gradients`)."""
+    valid = jnp.asarray(np.asarray(rows, bool))
+    if history:
+        return with_gradients(lambda x, kernel, state: implementation(x, kernel, valid, state))
+    return with_gradients(lambda x, kernel: implementation(x, kernel, valid))
 
 
 MASKED_ROWS = {
@@ -602,106 +662,155 @@ MASKED_ROWS = {
 }
 
 
+MASKED_SEEDS = {
+    ("right padding", False): 8, ("right padding", True): 8,
+    ("left padding", False): 8, ("left padding", True): 8,
+    ("interior holes", False): 16, ("interior holes", True): 16,
+    ("alternating slots", False): 8, ("alternating slots", True): 8,
+    ("a paused row beside a full one", False): 8, ("a paused row beside a full one", True): 8,
+    ("kernel 2", False): 16, ("kernel 2", True): 32,
+    ("kernel 8", False): 8, ("kernel 8", True): 8,
+    ("the kernel's own length", False): 16, ("the kernel's own length", True): 16,
+    ("one token past a chunk", False): 8, ("one token past a chunk", True): 8,
+}
+"""Each masked conv case's declared draws against the token scan (check 1), with its history and without,
+sized by `seeds_for` on armada."""
+
+
 @pytest.mark.parametrize("case", list(MASKED_ROWS))
 @pytest.mark.parametrize("history", [False, True])
 def test_the_masked_conv_matches_the_token_scan(case, history):
-    """The compacted convolution is the scan it replaced: the same outputs,
-    the same history to carry, and the same gradients into the input, the
-    taps and the incoming history.
-
-    Largest difference observed over these cases, fp32 on CPU: 4.8e-07,
-    tolerance 1e-5, which is the tolerance the rest of this file holds
-    fp32 agreement to.
-    """
-    x, kernel, state, valid, cotangent = masked_operands(*MASKED_ROWS[case], history=history)
-
-    def scored(implementation):
-        def inner(x, kernel, state):
-            out, carried = implementation(x, kernel, valid, state)
-            return jnp.sum(out * cotangent) + jnp.sum(carried ** 2), (out, carried)
-        return jax.value_and_grad(inner, argnums=(0, 1, 2), has_aux=True)
-
-    (_, (out, carried)), grads = scored(_masked_conv1d)(x, kernel, state)
-    (_, (want_out, want_carried)), want_grads = scored(scan_masked_conv1d)(x, kernel, state)
-
-    assert largest(out, want_out) < 1e-5
-    assert largest(carried, want_carried) < 1e-5
-    for gradient, wanted in zip(grads, want_grads, strict=True):
-        if wanted is not None:
-            assert largest(gradient, wanted) < 1e-5
-
+    """The compacted convolution is the scan it replaced: its outputs, the history it carries and their
+    gradients into the input, the taps and the incoming history on par with the scan's from the scan in
+    float64 (check 1, two programs of Dew's); and on every draw a slot that holds no token outputs and passes
+    back exactly zero, and a row of none carries its history unchanged, bit for bit."""
+    rows, width = MASKED_ROWS[case]
+    draw = masked_draw(rows, width, history=history)
+    assert_as_exact(masked_arm(_masked_conv1d, rows, history=history),
+                    masked_arm(scan_masked_conv1d, rows, history=history), draw,
+                    f"the masked conv, {case}{', from a history' if history else ''}",
+                    seeds=MASKED_SEEDS[case, history])
+    *inputs, cotangent = draw(0)
+    valid = jnp.asarray(np.asarray(rows, bool))
+    (out, carried), dx, *_ = masked_arm(_masked_conv1d, rows, history=history)(*inputs, cotangent)
     assert jnp.array_equal(jnp.where(valid[:, :, None], 0.0, out), jnp.zeros_like(out))
-    assert jnp.array_equal(jnp.where(valid[:, :, None], 0.0, grads[0]), jnp.zeros_like(grads[0]))
-    if state is not None:
+    assert jnp.array_equal(jnp.where(valid[:, :, None], 0.0, dx), jnp.zeros_like(dx))
+    if history:
         paused = ~jnp.any(valid, axis=1)
-        assert jnp.array_equal(carried[paused], state[paused])
-    if case == "interior holes" and not history:
-        rows, width = MASKED_ROWS[case]
-        gap_x, gap_kernel, _state, gap_valid, _ = masked_operands(rows, width, history=False, seed=3)
-        gap_out, _ = _masked_conv1d(gap_x, gap_kernel, gap_valid)
-        for row in range(gap_x.shape[0]):
-            kept = np.flatnonzero(np.asarray(gap_valid[row]))
-            compacted = causal_conv1d(gap_x[row:row + 1, kept], gap_kernel)
-            assert largest(gap_out[row:row + 1, kept], compacted) < 1e-5
-        physical = jnp.where(gap_valid[:, :, None], causal_conv1d(
-            jnp.where(gap_valid[:, :, None], gap_x, 0), gap_kernel), 0)
-        assert largest(physical, gap_out) > 1.0
+        assert jnp.array_equal(carried[paused], inputs[2][paused])
+
+
+HOLED_SEEDS = 8
+"""A holed row's declared draws against its real tokens alone (check 1), sized by `seeds_for` on armada."""
+
+
+def test_a_holed_rows_masked_conv_is_the_conv_of_its_real_tokens_alone():
+    """Each row of interior holes convolves its real tokens as one stream: at those tokens, the masked
+    conv's outputs on par with `causal_conv1d` of the real tokens alone from it in float64 (check 1, two
+    programs of Dew's). A conv over the row with its holes zero-filled reads the holes, an error near the
+    outputs' own size, which no rounding reaches."""
+    rows, width = MASKED_ROWS["interior holes"]
+    kept = [np.flatnonzero(row).tolist() for row in np.asarray(rows, bool)]
+
+    def holed(x, kernel):
+        out, _ = _masked_conv1d(x, kernel, jnp.asarray(np.asarray(rows, bool)))
+        return [out[row, real] for row, real in enumerate(kept)]
+
+    def alone(x, kernel):
+        return [causal_conv1d(x[row:row + 1, real], kernel)[0] for row, real in enumerate(kept)]
+
+    assert_as_exact(holed, alone, masked_draw(rows, width, history=False, differentiated=False),
+                    "a holed row's real tokens", seeds=HOLED_SEEDS)
+
+
+CUT_CONV_SEEDS = 8
+"""A masked conv cut at a call boundary's declared draws against one call (check 1), sized by `seeds_for`
+on armada."""
 
 
 def test_the_masked_conv_splits_at_a_call_boundary():
-    """A prefill and a continuation see one stream of real tokens: the
-    history the first call leaves is what makes the second one agree with a
-    single call over the whole row, with the cut falling inside a gap."""
+    """A prefill and a continuation see one stream of real tokens: the history the first call leaves makes
+    the second one's outputs and its history on par with a single call over the whole row from that call in
+    float64 (check 1, two programs of Dew's), the cut falling inside a gap."""
     rows, width = MASKED_ROWS["interior holes"]
-    x, kernel, state, valid, _ = masked_operands(rows, width, seed=11)
-    whole, carried = _masked_conv1d(x, kernel, valid, state)
+    valid, cut = jnp.asarray(np.asarray(rows, bool)), 6
 
-    cut = 6
-    head, history = _masked_conv1d(x[:, :cut], kernel, valid[:, :cut], state)
-    tail, final = _masked_conv1d(x[:, cut:], kernel, valid[:, cut:], history)
+    def whole(x, kernel, state):
+        return _masked_conv1d(x, kernel, valid, state)
 
-    assert largest(jnp.concatenate([head, tail], axis=1), whole) < 1e-5
-    assert largest(final, carried) < 1e-5
+    def split(x, kernel, state):
+        head, history = _masked_conv1d(x[:, :cut], kernel, valid[:, :cut], state)
+        tail, final = _masked_conv1d(x[:, cut:], kernel, valid[:, cut:], history)
+        return jnp.concatenate([head, tail], axis=1), final
+
+    assert_as_exact(split, whole, masked_draw(rows, width, history=True, differentiated=False),
+                    f"the masked conv cut at {cut}", seeds=CUT_CONV_SEEDS)
+
+
+PACKED_HISTORY_SEEDS = 8
+"""A packed prefill's continuation's declared draws against its last document run alone (check 1), sized
+by `seeds_for` on armada."""
 
 
 def test_a_packed_prefill_leaves_only_its_last_documents_conv_history():
-    """A row packing two documents, the last two tokens long, leaves the history its continuation
-    reads: the last document's two tokens and zeros where the first document's would be, so the
-    next call's tokens convolve as that document's would on its own."""
-    kernel = jnp.asarray(np.random.default_rng(3).normal(size=(6, 4)), jnp.float32)
-    x = jnp.asarray(np.random.default_rng(4).normal(size=(1, 7, 6)), jnp.float32)
+    """A row packing two documents, the last two tokens long, leaves the history its continuation reads: the
+    last document's two tokens, moved bit for bit, and zeros where the first document's would be; so the next
+    call's tokens convolve as that document's would on its own, the continuation on par with the last
+    document and the next tokens in one call from it in float64 (check 1, two programs of Dew's)."""
     segments = jnp.asarray([[1, 1, 1, 1, 1, 2, 2]])
-    valid = jnp.ones((1, 7), bool)
-    _, history = _masked_conv1d(x, kernel, valid, segments=segments)
+
+    def draw(seed):
+        rng = np.random.default_rng([0x9AC4, seed])
+        return tuple(jnp.asarray(rng.normal(size=shape), jnp.float32)
+                     for shape in ((6, 4), (1, 7, 6), (1, 3, 6)))
+
+    def continued(kernel, x, following):
+        _, history = _masked_conv1d(x, kernel, jnp.ones((1, 7), bool), segments=segments)
+        return _masked_conv1d(following, kernel, jnp.ones((1, 3), bool), history)[0]
+
+    def alone(kernel, x, following):
+        joined = jnp.concatenate([x[:, 5:], following], axis=1)
+        return _masked_conv1d(joined, kernel, jnp.ones((1, 5), bool))[0][:, 2:]
+
+    kernel, x, _ = draw(0)
+    _, history = _masked_conv1d(x, kernel, jnp.ones((1, 7), bool), segments=segments)
     np.testing.assert_array_equal(np.asarray(history[:, 0]), 0)
     np.testing.assert_array_equal(np.asarray(history[:, 1:]), np.asarray(x[:, 5:]))
-    following = jnp.asarray(np.random.default_rng(5).normal(size=(1, 3, 6)), jnp.float32)
-    continued, _ = _masked_conv1d(following, kernel, jnp.ones((1, 3), bool), history)
-    alone, _ = _masked_conv1d(jnp.concatenate([x[:, 5:], following], axis=1), kernel, jnp.ones((1, 5), bool))
-    np.testing.assert_allclose(np.asarray(continued), np.asarray(alone[:, 2:]), rtol=0, atol=1e-6)
+    assert_as_exact(continued, alone, draw, "a packed prefill's continuation", seeds=PACKED_HISTORY_SEEDS)
+
+
+HOLED_LAYER_SEEDS = 8
+"""The layer's holed row's declared draws against its real tokens alone (check 1), sized by `seeds_for` on
+armada."""
 
 
 def test_the_layer_reads_a_holed_row_as_the_row_without_its_holes(reference, geometry):
-    """The mixer's own contract, through its public call: the states of the
-    real tokens of a row with padded slots between them are the states of
-    those tokens on their own. Observed difference 0.0, and the padded slots
-    themselves come back zero."""
+    """The mixer's own contract, through its public call: the states of the real tokens of a row with padded
+    slots between them, whatever the slots hold, on par with those tokens' states on their own from them in
+    float64 (check 1, two programs of Dew's), and the padded slots themselves exactly zero."""
     module = layer(geometry)
     variables = layer_params(reference)
-    hidden = jnp.asarray(reference["layer.hidden"])[:, :6]
-    kept = jnp.asarray([0, 1, 4, 5, 7, 8])
-    spread = jnp.zeros((hidden.shape[0], 9, hidden.shape[2]), hidden.dtype).at[:, kept].set(hidden)
-    spread = spread.at[:, jnp.asarray([2, 3, 6])].set(
-        jax.random.normal(jax.random.key(5), (hidden.shape[0], 3, hidden.shape[2])))
-    valid = jnp.zeros((hidden.shape[0], 9), bool).at[:, kept].set(True)
+    rows, width = reference["layer.hidden"].shape[0], reference["layer.hidden"].shape[2]
+    kept, holes = jnp.asarray([0, 1, 4, 5, 7, 8]), jnp.asarray([2, 3, 6])
+    valid = jnp.zeros((rows, 9), bool).at[:, kept].set(True)
+    holed_call = MixerCall(AttentionMetadata(coordinates=coordinates(valid=valid)))
 
-    alone = module.apply(variables, hidden)
-    holed = module.apply(variables, spread,
-                         MixerCall(AttentionMetadata(coordinates=coordinates(valid=valid))))
+    def draw(seed):
+        rng = np.random.default_rng([0x401E, seed])
+        return tuple(jnp.asarray(rng.standard_normal((rows, length, width)), jnp.float32)
+                     for length in (6, 3))
 
-    assert largest(holed[:, kept], alone) < 1e-5
-    assert jnp.array_equal(holed[:, jnp.asarray([2, 3, 6])],
-                           jnp.zeros_like(holed[:, jnp.asarray([2, 3, 6])]))
+    def holed(hidden, filling):
+        spread = jnp.zeros((rows, 9, width), hidden.dtype).at[:, kept].set(hidden).at[:, holes].set(filling)
+        return module.apply(variables, spread, holed_call)
+
+    wide = float64_twin(module)
+    out = holed(*draw(0))
+    assert jnp.array_equal(out[:, holes], jnp.zeros_like(out[:, holes]))
+    assert_as_exact(lambda hidden, filling: holed(hidden, filling)[:, kept],
+                    lambda hidden, filling: module.apply(variables, hidden), draw,
+                    "a holed row's real tokens through the layer", seeds=HOLED_LAYER_SEEDS,
+                    truth_fn=lambda hidden, filling: wide.apply(widened(variables), hidden))
 
 
 RIGHT_PADDED = {
@@ -711,33 +820,32 @@ RIGHT_PADDED = {
 }
 
 
+RIGHT_PADDED_CONV_SEEDS = 8
+"""Each right-padded case's declared draws against the masked conv (check 1), sized by `seeds_for` on
+armada."""
+
+
 @pytest.mark.parametrize("case", list(RIGHT_PADDED))
 @pytest.mark.parametrize("history", [False, True])
 @pytest.mark.parametrize("packed", [False, True])
 def test_a_right_padded_row_convolves_as_the_masked_conv(case, history, packed):
-    """Declared right-padded, a row convolves as it stands, with no gather:
-    the masked conv's outputs, padding zeroed, the history it carries and
-    the gradients into the input, the taps and the incoming history, with
-    its real tokens one document or packed as two, the second from the
-    third token on, the padding a document of its own."""
-    x, kernel, state, valid, cotangent = masked_operands(RIGHT_PADDED[case], 4, history=history, seed=3)
+    """Declared right-padded, a row convolves as it stands, with no gather: its outputs, padding zeroed, the
+    history it carries and their gradients into the input, the taps and the incoming history on par with the
+    masked conv's from it in float64 (check 1, two programs of Dew's), with its real tokens one document or
+    packed as two, the second from the third token on, the padding a document of its own."""
+    rows = RIGHT_PADDED[case]
+    valid = jnp.asarray(np.asarray(rows, bool))
     segments = (jnp.where(valid, 1 + (jnp.arange(valid.shape[1]) >= 2), 0).astype(jnp.int32) if packed
                 else None)
 
-    def scored(*, right_padded):
-        def inner(x, kernel, state):
-            out, carried = held_conv1d(x, kernel, valid, state, segments=segments, right_padded=right_padded)
-            return jnp.sum(out * cotangent) + jnp.sum(carried ** 2), (out, carried)
-        return jax.value_and_grad(inner, argnums=(0, 1, 2), has_aux=True)
+    def held(*, right_padded):
+        def implementation(x, kernel, valid, state=None):
+            return held_conv1d(x, kernel, valid, state, segments=segments, right_padded=right_padded)
+        return masked_arm(implementation, rows, history=history)
 
-    (_, (out, carried)), grads = scored(right_padded=True)(x, kernel, state)
-    (_, (want_out, want_carried)), want_grads = scored(right_padded=False)(x, kernel, state)
-
-    assert largest(out, want_out) < 1e-6
-    assert largest(carried, want_carried) < 1e-6
-    for gradient, wanted in zip(grads, want_grads, strict=True):
-        if wanted is not None:
-            assert largest(gradient, wanted) < 1e-6
+    label = f"a right-padded conv, {case}{', packed' if packed else ''}{', from a history' * history}"
+    assert_as_exact(held(right_padded=True), held(right_padded=False), masked_draw(rows, 4, history=history),
+                    label, seeds=RIGHT_PADDED_CONV_SEEDS)
 
 
 RIGHT_PADDED_SEEDS = 8
@@ -816,8 +924,7 @@ def test_the_decay_gradient_sums_only_the_pairs_spanning_each_position():
     """The decay's gradient, `sum_{s >= i > t} cotangent[s, t] decay[s, t]` at position i, as exact
     as the sum of those pairs alone: within two sequential sums' rounding of their magnitudes
     against float64, where the prefix difference's gradient summed every pair after i into it
-    with opposite signs and cancelled. Forward mode takes the same tangent: its pairing with a
-    cotangent is the gradient's."""
+    with opposite signs and cancelled."""
     rng = np.random.default_rng(11)
     g = rng.uniform(-3, -1, (2, 64, 4)).astype(np.float32)
     cotangent = rng.standard_normal((2, 64, 64, 4)).astype(np.float32)
@@ -834,31 +941,81 @@ def test_the_decay_gradient_sums_only_the_pairs_spanning_each_position():
     spans = np.array([weighed[:, i:, :i].sum((1, 2)) for i in range(64)]).transpose(1, 0, 2)
     bound = 2 * 64 * (np.finfo(np.float32).eps / 2) * spans
     assert np.all(np.abs(got - want) <= bound), float(np.max(np.abs(got - want) / np.maximum(bound, 1e-30)))
-    tangent = rng.standard_normal(g.shape).astype(np.float32)
-    _, forward = jax.jvp(between, (jnp.asarray(g),), (jnp.asarray(tangent),))
-    paired = float(jnp.vdot(forward, cotangent))
-    np.testing.assert_allclose(paired, float(np.vdot(tangent, got)), rtol=1e-5)
 
 
-def test_the_chunked_rule_holds_with_aligned_keys():
-    """Keys nearly aligned within a chunk, beta near one and slow decay, the
-    case real checkpoints reach: the chunked math still gives the
-    token-by-token recurrence's output."""
-    rng = np.random.default_rng(0)
-    B, S, H, D = 1, 128, 2, 16
-    base = rng.normal(size=(1, 1, H, D))
-    key = base + 0.05 * rng.normal(size=(B, S, H, D))
-    key = key / np.linalg.norm(key, axis=-1, keepdims=True)
-    query = rng.normal(size=(B, S, H, D))
-    query = query / np.linalg.norm(query, axis=-1, keepdims=True)
-    value = rng.normal(size=(B, S, H, D))
-    g = -0.01 * rng.random((B, S, H))
-    beta = 0.99 + 0.01 * rng.random((B, S, H))
-    query, key, value, g, beta = (jnp.asarray(x, jnp.float32) for x in (query, key, value, g, beta))
-    want, want_state = recurrent_gated_delta_rule(query, key, value, g, beta)
-    got, state = portable(query, key, value, g, beta)
-    np.testing.assert_allclose(got, want, atol=2e-4)
-    np.testing.assert_allclose(state, want_state, atol=2e-4)
+PAIRING_SEEDS = 8
+"""The decays' pairings' declared draws against the plain decays' (check 1), sized by `seeds_for` on
+armada."""
+
+
+def plain_between(g):
+    """`between` as its declaration states it, with no compensation: `exp(G_s - G_t)` of the plain prefix
+    sums `G` of each chunk's log decays `g` `[..., C, K]`, on and below the diagonal."""
+    prefix = jnp.cumsum(g, axis=1)
+    below = jnp.tril(jnp.ones((g.shape[1], g.shape[1]), bool))[None, :, :, None]
+    return jnp.where(below, jnp.exp(jnp.where(below, prefix[:, :, None] - prefix[:, None, :], 0.0)), 0.0)
+
+
+def test_the_decay_takes_the_same_tangent_forward_as_backward():
+    """Forward mode takes the decay gradient's tangent: a drawn tangent's forward-mode decays paired with a
+    drawn cotangent, and the cotangent's gradient paired with the tangent, each on par with JAX's own
+    derivatives of the plain decays (`plain_between`) from them in float64 (check 1), each batch row's and key
+    dimension's pairing a value of its own (each walks its own decays). The two pairings are not held to
+    each other: the forward one sums 64 x 64 products in float32 where the reverse one sums 64, and measured
+    2.4 times its error for that alone; the tangent itself is on par with each span's own sums
+    (tests/test_algebra_decays.py, row 5858)."""
+    rows, keys = 4, 16
+
+    def draw(seed):
+        rng = np.random.default_rng([0x7A9E, seed])
+        return tuple(jnp.asarray(x, jnp.float32) for x in (
+            rng.uniform(-3, -1, (rows, 64, keys)), rng.standard_normal((rows, 64, keys)),
+            rng.standard_normal((rows, 64, 64, keys))))
+
+    def paired(decays):
+        def run(g, tangent, cotangent):
+            forward = jnp.sum(jax.jvp(decays, (g,), (tangent,))[1] * cotangent, axis=(1, 2))
+            backward = jnp.sum(tangent * jax.vjp(decays, g)[1](cotangent)[0], axis=1)
+            return {"forward": forward, "backward": backward}
+        return run
+
+    assert_as_exact(paired(between), paired(plain_between), draw, "the decays' tangent paired",
+                    seeds=PAIRING_SEEDS)
+
+
+ALIGNED_SEEDS = {"chunked": 8, "portable": 8}
+"""The aligned keys' declared draws of each chunked form against `torch_chunk_gated_delta_rule` (check 1),
+sized by `seeds_for` on armada."""
+
+
+def aligned_draw(seed: int):
+    """Keys nearly aligned within a chunk (a shared direction plus 0.05 of noise, normalised), unit queries,
+    normal values, a slow decay (`-0.01 U(0, 1)`) and a write gate near one (`0.99 + 0.01 U(0, 1)`), fp32: the
+    case real checkpoints reach."""
+    rng = np.random.default_rng([0xA119, seed])
+    batch, length, heads, width = 1, 128, 2, 16
+    key = rng.normal(size=(1, 1, heads, width)) + 0.05 * rng.normal(size=(batch, length, heads, width))
+    query = rng.normal(size=(batch, length, heads, width))
+    value = rng.normal(size=(batch, length, heads, width))
+    g = -0.01 * rng.random((batch, length, heads))
+    beta = 0.99 + 0.01 * rng.random((batch, length, heads))
+    query, key = (x / np.linalg.norm(x, axis=-1, keepdims=True) for x in (query, key))
+    return tuple(jnp.asarray(x, jnp.float32) for x in (query, key, value, g, beta))
+
+
+@pytest.mark.parametrize("form", ALIGNED_SEEDS)
+def test_the_chunked_rule_holds_with_aligned_keys(form):
+    """Keys nearly aligned within a chunk, the write gate near one and a slow decay: each chunked form's
+    output and memory (the public rule, at its own chunk, and the portable math at the upstream's 64) on
+    par with `torch_chunk_gated_delta_rule`'s, the chunked form they port, from that form in float64 (check
+    1). Held to the token-by-token recurrence instead, the portable form measured 2.4 times the recurrent
+    form's error at these draws (40 seeds), and it is on par with the upstream chunked form's there."""
+    from interop_support import torch_arms
+
+    reference_arm, truth = torch_arms(torch_chunked, torch_chunked)
+    dew, _ = FORMS[form]
+    assert_as_exact(dew, reference_arm, aligned_draw, f"the {form} rule at aligned keys",
+                    seeds=ALIGNED_SEEDS[form], truth_fn=truth)
 
 
 @pytest.mark.check1_shards(seeds=128, per_task=16)
