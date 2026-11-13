@@ -268,13 +268,15 @@ def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci,
 
 
 def test_a_worker_a_signal_ends_keeps_its_native_stacks_though_pytest_exits_red(ci, tmp_path):
-    """A process a test starts (a worker, here in another directory) that a signal ends keeps its native stacks
-    with the run's whole output, though pytest itself exits red rather than by the signal (review, 2026-11-13: the
-    capture kept a signal-ended pytest's alone, and a worker's paths were relative to where it ran)."""
+    """A process a test starts (a worker, here in another directory) that a signal ends keeps its native
+    stacks with the run's whole output, though pytest itself exits red rather than by the signal (review,
+    2026-11-13: the capture kept a signal-ended pytest's alone, and a worker's paths were relative to where it
+    ran)."""
     interpreter(tmp_path, "3.12")
     written(tmp_path, {"test_any.py": "import subprocess\nimport sys\n\n\ndef test_worker_aborts():\n"
-                                      "    done = subprocess.run([sys.executable, '-c', 'import os; os.abort()'],"
-                                      " cwd='/')\n    assert done.returncode == 0\n"})
+                                      "    done = subprocess.run([sys.executable, '-c',"
+                                      " 'import os; os.abort()'], cwd='/')\n"
+                                      "    assert done.returncode == 0\n"})
     ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "worker.json", 30.0, cache="off")
     [red] = json.loads((tmp_path / "worker.json").read_text())["rows"]
     assert red["exitCode"] == 1 and "signal" not in red
