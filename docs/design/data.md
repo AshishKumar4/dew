@@ -514,6 +514,7 @@ this Dew still reads that value (the version before, 13, below).
 | `grain` | Grain's version | `dew.data.readers.GRAIN` | The Grain whose iterator states a per-share position holds. Another Grain's position is restored at once through the iterators that own its state, and refused, naming both versions, where they cannot read it. |
 | `phases` | `stamped` | `dew.data.dataset.StepPhases.CONTINUES` | How a phase on its own stream continues a corpus an earlier phase shared: from the draws the run trained. Recorded in a read of phases' position. |
 | `batched` | `counted` | `dew.data.pipeline.BatchedGroups.REFUSALS` | How a batched step's group it makes no rows of is treated: refused as an empty expansion and counted where the step stands, its examples carried to the next row. Recorded in the plan of a read through a batched step. |
+| `expanded_draws` | `row-place` | `dew.data.handoff.EXPANDED_DRAWS` | How a random step after an expansion draws in a read in its inputs' order: by the row's place among the rows handed on, as every read keys a draw (Grain's `random_map`), whatever its count of workers. Recorded in the plan of such a read. |
 | `phases` | `drawn` | `dew.data.lowering._Build.DRAWN` | How a phase of one global order continues a corpus an earlier phase read out of order: past the places its order's twin of draws says the run trained. Recorded in the plan of a phase that draws past any. |
 
 A streamed source's shards, the ids it reads in turn, are recorded as a fact of the plan (`{source}/shards`,
