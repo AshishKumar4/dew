@@ -426,6 +426,38 @@ def test_pack_quantized_compressed_tensors_loads_shapes_without_downloading_weig
     assert "refused" in partial, partial
 
 
+def test_a_hub_autoencoder_resolves_its_release_once(tmp_path: Path) -> None:
+    """A published DC-AE loaded from a Hub (on the loopback) by `load_autoencoder` asks the Hub's API no
+    more than fetching its snapshot with its weights does (`sources.snapshot`): its release is resolved and
+    its metadata fetched once, by its dispatch, and its loader fetches the weights from that release, where
+    it resolved the release again and fetched its metadata a third time (audit3 families F4). Its
+    parameters are the ones a load of the same directory holds, and it loads again with the Hub gone from
+    what the first load fetched."""
+    from local_hub import LocalHub
+
+    from dew.interop.autoencoders.pretrained import load_autoencoder
+
+    with tarfile.open(FIXTURES / "dc_ae.tar.xz") as archive:
+        archive.extractall(tmp_path / "dc-ae", filter="data")
+    directory = tmp_path / "dc-ae" / "plain"
+    expected = _shapes_and_dtypes(load_autoencoder(str(directory), revision="main", dtype="float32").params)
+    repo, options = "acme/dc-ae", {"revision": "main", "dtype": "float32"}
+
+    def api_asked(hub) -> int:
+        return sum(served.repo == repo and served.file is None for served in hub.served)
+
+    with LocalHub({repo: _files(directory)}) as hub:
+        _hub_loaded(tmp_path / "snapshot", hub, repo, "snapshot", call="snapshot", options=options)
+        fetched = api_asked(hub)
+        loaded = _hub_loaded(tmp_path / "load", hub, repo, "load", call="autoencoder", options=options)
+        asked = api_asked(hub) - fetched
+    assert 0 < asked <= fetched, (asked, fetched)
+    assert loaded["shapes"] == expected
+    offline = _hub_loaded(tmp_path / "load", None, repo, "offline", offline=True, call="autoencoder",
+                          options=options)
+    assert offline.get("shapes") == expected, offline
+
+
 def test_sampling_override_governs_beam_admission(tmp_path: Path) -> None:
     stochastic_beam_dir = tmp_path / "stochastic_beam"
     shutil.copytree(QWEN_TINY, stochastic_beam_dir)
