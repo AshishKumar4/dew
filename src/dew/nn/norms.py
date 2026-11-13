@@ -394,7 +394,13 @@ class LayerNorm(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_sa
     """flax's `nn.LayerNorm`, rematerialized saving nothing: its backward pass keeps the input as
     it arrived and its parameters, not the two fp32 copies flax's own differentiation keeps
     (2.35 GiB of them on one SimpleDiT step). The parameter tree, the arithmetic
-    and the module's name are flax's, so checkpoints and scopes move both ways."""
+    and the module's name are flax's, so checkpoints and scopes move both ways, but its variance:
+    the centered mean square, E[(x - E[x])^2], as torch's LayerNorm takes it, where flax's default
+    E[x^2] - E[x]^2 cancels in fp32 wherever a row's mean dwarfs its spread (row 5907: Gemma 4's
+    audio subsampling, whose norm reads a ReLU's output, sat 1.58 times Transformers' distance from
+    float64 on a GH200). A caller that takes the one-pass form states it (`use_fast_variance`)."""
+
+    use_fast_variance: bool = False
 
     def spread(self, x: jax.Array) -> jax.Array:
         """Per row, the root mean square of `x` centered, its statistic (`dew.nn.protocols.BoundedNorm`),
@@ -431,8 +437,8 @@ class OffsetLayerNorm(nn.Module):
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        normed = LayerNorm(epsilon=self.epsilon, use_scale=False, use_bias=False, use_fast_variance=False,
-                           dtype=self.dtype, name="normalized")(x)
+        normed = LayerNorm(epsilon=self.epsilon, use_scale=False, use_bias=False, dtype=self.dtype,
+                           name="normalized")(x)
         scale = self.param("scale", nn.initializers.zeros, (x.shape[-1],), jnp.float32)
         y = normed * (1 + scale.astype(normed.dtype))
         if self.use_bias:
