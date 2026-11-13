@@ -110,8 +110,9 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     """A language model run whose decoder no family's layout holds (GPT-J's parallel layout under a gated
     MLP, its positions a learned table) exports as its native release, and loads (`Pretrained.load(run)`,
     at the attention a run asks and twice the context, its learned table keeping its rows, as every
-    task resizes a cache) as its model in Dew's own layout, its parameters the run's final ones, whose own
-    export refuses, stating why; asked no weights, it reads their shapes and dtypes alone; on the host, its
+    task resizes a cache) as its model in Dew's own layout on JAX's default device, its parameters the
+    run's final ones, whose own export refuses, stating why; asked no weights, it reads their shapes and
+    dtypes alone; on the host, its
     weights as host arrays read from storage, nothing transferred to a device on the way; a second run
     naming it (`--pretrained <run>`) starts from it and trains its step (row 4785: a token run's native
     release declared no task a run starts from)."""
@@ -134,6 +135,10 @@ def test_a_language_model_run_starts_from_a_saved_run_no_familys_layout_writes(t
     assert not source_layout(saved_model(SavedRun.pinned(str(source)).record, None).build())
     loaded = Pretrained.load(str(source), max_seq_len=2 * SEQ, attention_impl="xla")
     assert (loaded.model.max_seq_len, loaded.model.attention_impl) == (2 * SEQ, "xla")
+    # Asked no mesh, its weights lie on JAX's default device, as a family's load places them, not on
+    # every device of a default mesh (ledger 4798).
+    assert {frozenset(leaf.sharding.device_set) for leaf in jax.tree.leaves(loaded.variables)} == {
+        frozenset({jax.devices()[0]})}
     leaves_alike(loaded.variables["params"], state.variables["params"])
     # The model built at the larger context holds the parameters the run trained, its table's rows kept.
     ids = jax.ShapeDtypeStruct((1, 2), "int32")
