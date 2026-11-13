@@ -240,8 +240,8 @@ def test_a_validation_token_accuracy_is_the_unpadded_one_and_at_most_one():
               VALID_ROWS: np.arange(len(tokens) + 3) < len(tokens)}
     _, aux = objective.loss(variables, padded, step)
     expected = int(reference["1/correct"]) / int(reference["1/total"])
-    assert float(aux.metrics["token_accuracy"]) == pytest.approx(expected, rel=1e-6)
-    assert float(aux.metrics["token_accuracy"]) <= 1.0
+    assert float(aux.metrics["token_accuracy"].mean()[0]) == pytest.approx(expected, rel=1e-6)
+    assert float(aux.metrics["token_accuracy"].mean()[0]) <= 1.0
 
 
 def test_a_masked_diffusion_accuracy_leaves_its_repeat_rows_out(windows):
@@ -273,9 +273,9 @@ def test_a_dpo_accuracy_is_the_real_rows_whatever_the_repeats_hold(windows):
     with jax.enable_x64(new_val=True):
         variables = moved(objective.init(jax.random.key(0)), 3)
         step = Step(jnp.asarray(0), jax.random.key(1), moved(objective.init(jax.random.key(0)), 13))
-        alone = float(objective._loss(variables, stacked(records), step)[1].metrics["accuracy"])
+        alone = float(objective._loss(variables, stacked(records), step)[1].metrics["accuracy"].mean()[0])
         padded = {**stacked(records + swapped), VALID_ROWS: np.arange(ROWS) < 5}
-        reported = float(objective._loss(variables, padded, step)[1].metrics["accuracy"])
+        reported = float(objective._loss(variables, padded, step)[1].metrics["accuracy"].mean()[0])
     assert alone == 1.0 and reported == alone
 
 

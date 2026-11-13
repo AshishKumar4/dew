@@ -365,7 +365,7 @@ def test_the_worlds_kl_losses_are_the_codes_and_the_representation_one_spares_th
         def kls(prior_head):
             params = {**variables["params"], "prior_logits": prior_head}
             metrics = objective.loss({**variables, "params": params}, windows, step)[1].metrics
-            return jnp.stack([metrics["loss_dynamics"], metrics["loss_representation"]])
+            return jnp.stack([metrics["loss_dynamics"].mean()[0], metrics["loss_representation"].mean()[0]])
 
         head = variables["params"]["prior_logits"]
         found, moved = np.asarray(kls(head)), jax.jacrev(kls)(head)

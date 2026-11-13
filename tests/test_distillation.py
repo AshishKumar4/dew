@@ -552,7 +552,7 @@ def test_the_student_tree_is_what_a_plain_student_run_reads():
     batch = fixture_batch(arrays)
     _, aux = objective.scalar_loss(params, batch, step_at())
     loss, _ = objective.student.scalar_loss(own, batch, step_at())
-    assert float(loss) == pytest.approx(float(aux.metrics["ce"]), rel=1e-6)
+    assert float(loss) == pytest.approx(float(aux.metrics["ce"].mean()[0]), rel=1e-6)
     assert objective.ema is None
 
 

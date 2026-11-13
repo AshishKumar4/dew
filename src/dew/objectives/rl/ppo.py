@@ -315,7 +315,7 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         old_values = jnp.where(real, jnp.asarray(batch[OLD_VALUES_KEY], values.dtype), 0)
         terms = clipped_value_loss_terms(values, returns, old_values, self.value_clip)
         critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), jnp.sum(mask))
-        metrics = {**aux.metrics, "critic/loss": critic.mean()[0]}
+        metrics = {**aux.metrics, "critic/loss": critic}
         qk = None if aux.qk_stats is None else {"policy": aux.qk_stats}
         if critic_qk is not None:
             qk = {**(qk or {}), "critic": critic_qk}

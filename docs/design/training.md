@@ -194,8 +194,10 @@ A run inspects what its training does where `TrainerConfig.inspection` names it 
 
 A step's logged loss (`train/loss`) is the loss of the rows that step consumed, whatever the split it is
 read in: at a step whose update commits, the update's loss, its window of accumulated microbatches pooled;
-at any other, its own batch's, its microbatches pooled. A run read in two microbatches a step logs the
-numbers it logs read whole. Its other metrics are its last microbatch's.
+at any other, its own batch's, its microbatches pooled. Its logged metrics are its own batch's too: each
+states how it pools (`Aux.metrics`: a `Ratio` of its numerator and its mass, which the step's microbatches
+sum), so a run read in two microbatches a step logs the numbers it logs read whole. A metric that states no
+pooling is one microbatch's, logged at a split step as its last microbatch's under `<name>/last_microbatch`.
 
 ## 8. After training
 

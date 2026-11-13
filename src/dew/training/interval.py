@@ -28,6 +28,7 @@ from dew.batch import CONSUMED_COUNT, Batch, ConsumedCount
 from dew.data.dataset import rows_of
 from dew.nn.kernels.options import program
 from dew.nn.precision import at_least_fp32
+from dew.objectives.base import Ratio
 from dew.optim import learning_rate
 from dew.state import TrainState
 from dew.telemetry.instrumentation import (
@@ -454,7 +455,7 @@ class Reading(NamedTuple):
     statistics, already on the host."""
 
     loss: Number
-    aux: Mapping[str, Number]
+    aux: Mapping[str, Number | Ratio]
     accepted: Number
     streak: Number | None
     rate: Number | None
@@ -536,7 +537,9 @@ def logged_scalars(read: Reading, counts: Interval, elapsed: float, devices: int
 
     # A work count a process refused (`_counted_batch`) is NaN here, and train/mfu absent.
     work = None if read.training is None else float(read.training)
-    scalars = {"train/loss": float(read.loss), **{f"train/{k}": float(v) for k, v in read.aux.items()},
+    scalars = {"train/loss": float(read.loss),
+               **{f"train/{k}": v.held() if isinstance(v, Ratio) else float(v)
+                  for k, v in read.aux.items()},
                **throughput(elapsed, counts.since_log, counts.samples, counts.flops, devices,
                             waited=counts.waited, compiling=counts.compiling, training_flops=work,
                             tokens=None if read.scored is None else _TokenCount.host(read.scored)),

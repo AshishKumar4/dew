@@ -66,6 +66,7 @@ from dew.training.memory import (
     step_fits,
     temporaries_factor,
 )
+from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
 from dew.training.profiling import PGLE_CAPTURE
 
 if TYPE_CHECKING:
@@ -221,9 +222,12 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]]):
     microbatch was; and the commits summed, their statistics let go. A pure function, which a step compiles
     as a program of its own (`dew.training.compiler`) or traces within its own (`dew.training.ahead`)."""
     losses, metrics, finite, accepted, committed = zip(*outputs, strict=True)
-    # A recording step's evaluations are every microbatch's, in the order they ran (`RECORD`).
-    report = {name: jnp.concatenate([part[name] for part in metrics]) if name.startswith(RECORD) else value
-              for name, value in metrics[-1].items()}
+    report = {name: _pooled(name, [part[name] for part in metrics]) for name in metrics[-1]}
+    if len(metrics) > 1:
+        # A metric that states no pooling is one microbatch's, named so (`Aux.metrics`).
+        report = {(name if name.startswith(RECORD) or name in (TRAINING_FLOPS, TOKENS)
+                   or isinstance(value, Ratio) else f"{name}/last_microbatch"): value
+                  for name, value in report.items()}
     loss = losses[-1]
     if committed[-1] is not None and committed[-1].own is not None:
         owns = [part.own for part in committed]
@@ -236,6 +240,19 @@ def whole_step[L](outputs, reduce: Callable[[L], tuple[jax.Array, jax.Array]]):
     summed = jax.tree.map(lambda *values: sum(values), *(
         part if part is None else dataclasses.replace(part, own=None) for part in committed))
     return (loss, report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)), summed)
+
+
+def _pooled(name: str, values: list):
+    """A step's metric `name` from its microbatches' `values`: a recording step's evaluations every
+    microbatch's in the order they ran (`RECORD`); the model FLOPs and tokens counted, summed; a `Ratio`
+    by its parts' sums; any other its last microbatch's (`Aux.metrics`)."""
+    if name.startswith(RECORD):
+        return jnp.concatenate(values)
+    if name == TOKENS:
+        return functools.reduce(_TokenCount.add, values)
+    if name == TRAINING_FLOPS or isinstance(values[-1], Ratio):
+        return jax.tree.map(lambda *parts: sum(parts), *values)
+    return values[-1]
 
 
 TRACING_COLLECTIONS = 50_000

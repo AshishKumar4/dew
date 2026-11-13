@@ -122,7 +122,7 @@ def test_an_agent_trained_to_imitate_labels_learns_the_labels_not_the_actions_ta
     def imitation(state, field):
         batch = {**windows, LABEL: windows[field]}
         _, aux = objective.loss(state.variables, batch, Step(state.microstep, jax.random.key(9), state.ema))
-        return float(aux.metrics["loss_imitation"])
+        return float(aux.metrics["loss_imitation"].mean()[0])
 
     assert imitation(final, LABEL) < imitation(initial, LABEL)
     assert imitation(final, LABEL) < imitation(final, "action")

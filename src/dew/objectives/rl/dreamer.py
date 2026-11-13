@@ -841,7 +841,7 @@ class DreamerV3Objective(ReleasesModel, Objective[Ratio, Variables]):
         wide = at_least_fp32(self.model.dtype)
         terms = {name: self.row_mean(jnp.mean(value, tuple(range(1, value.ndim))), batch)
                  for name, value in losses.items()}
-        metrics = {f"loss_{name}": term.mean()[0] for name, term in terms.items()}
+        metrics: dict[str, jax.Array | Ratio] = {f"loss_{name}": term for name, term in terms.items()}
         if not any(self.scales[name] for name in terms):
             zero = jnp.zeros((), wide)
             return Ratio(zero, zero), metrics

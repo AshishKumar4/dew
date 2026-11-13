@@ -147,6 +147,21 @@ class Ratio:
         value = self.total.astype(dtype) / jnp.where(active, mass.astype(dtype), 1)
         return jnp.where(active, value, 0), active
 
+    def held(self) -> float:
+        """`mean`'s value read on the host from the parts a step returned, as its log reads a metric
+        (`Aux.metrics`): zero where the mass is."""
+        mass = float(np.asarray(self.mass))
+        return float(np.asarray(self.total)) / mass if mass > 0 else 0.0
+
+
+@struct.dataclass
+class Exponentiated(Ratio):
+    """A metric that is the exponential of a pooled mean: a perplexity, `exp` of its cross entropy's
+    `Ratio`, pooled as that ratio is (`Aux.metrics`)."""
+
+    def held(self) -> float:
+        return math.exp(super().held()) if float(np.asarray(self.mass)) > 0 else 0.0
+
 
 @struct.dataclass
 class Weighted:
@@ -501,7 +516,11 @@ class Aux(Generic[Effects]):
     collections. `effects` are additive observations that the optimizer
     applies once per committed update, not once per microbatch.
     """
-    metrics: dict[str, jax.Array]
+    metrics: dict[str, jax.Array | Ratio]
+    """The step's metrics, each the loss's own report. A `Ratio` (its numerator and its mass; an
+    `Exponentiated` one, its exponential) pools over the microbatches a step is read in by its sums, so the
+    step logs it as the step read whole would (docs/design/training.md, the logged metrics); an array is
+    one microbatch's, which a step read in several logs as its last's, under `<name>/last_microbatch`."""
     variables: Variables | None = None
     """Whole nonparameter collections from one accepted microbatch, such as BatchNorm statistics.
 
@@ -2030,6 +2049,7 @@ __all__ = [
     "OMITTED",
     "Aux",
     "EMASpec",
+    "Exponentiated",
     "Metric",
     "Objective",
     "Omitted",

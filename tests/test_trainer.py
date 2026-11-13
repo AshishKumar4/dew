@@ -210,6 +210,35 @@ def test_a_steps_logged_loss_is_its_rows_whatever_its_split(split):
     assert_fp32_reduction_bound(logged(split=split), whole, np.abs(whole), terms=BATCH)
 
 
+def test_a_steps_logged_metrics_are_its_rows_whatever_its_split():
+    """A language model's run over rows that hold other counts of targets, split in two microbatches a step,
+    logs each step's cross entropy, perplexity and token accuracy as the step read whole logs them, each
+    pooled by its targets (`Ratio`, docs/design/training.md, the logged metrics), where a split step logged
+    its last microbatch's; its logged scalars are the whole step's by name, none its last microbatch's."""
+    from reference_error import assert_fp32_reduction_bound
+
+    rows = (np.arange(2 * LM_ROWS * (LM_CONTEXT + 1), dtype=np.int32) % 12 + 1).reshape(-1, LM_CONTEXT + 1)
+    # The second half of each batch's rows hold two targets, the first half six: microbatches of unequal mass.
+    rows[np.arange(len(rows)) % LM_ROWS >= LM_ROWS // 2, 3:] = 0
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=12, dtype="float32")
+    names = ("train/loss", "train/ce", "train/perplexity", "train/token_accuracy")
+
+    def logged(split: int) -> dict[str, np.ndarray]:
+        tracker = RecordingTracker()
+        trainer = make_trainer(tracker=tracker, accumulation=2, split=split,
+                               objective=LMObjective(model, seq_len=LM_CONTEXT, pad_id=0))
+        trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+        trainer.fit(Pipeline(Memory({"text": rows})).repeat().batch(LM_ROWS), steps=4, log_every=1)
+        steps = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
+        assert not any(name.endswith("/last_microbatch") for scalars in steps for name in scalars)
+        return {name: np.asarray([scalars[name] for scalars in steps]) for name in names}
+
+    whole, split = logged(1), logged(2)
+    for name in names:
+        assert_fp32_reduction_bound(split[name], whole[name], np.abs(whole[name]), terms=LM_ROWS * LM_CONTEXT)
+
+
 def test_a_run_given_steps_and_tokens_is_refused_as_a_budget_named_twice():
     """One budget (row 5725): a fit given both `steps` and `tokens` is refused before it reads, as one given
     steps and epochs is; tokens alone bound it."""
