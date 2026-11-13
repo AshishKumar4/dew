@@ -39,6 +39,9 @@ from dew.nn.precision import accumulated
 from dew.parity import MOST_SEEDS
 from dew.parity_stages import staged_units
 
+pytestmark = pytest.mark.usefixtures("unqualified")
+"""The gate's own tests: their sites are its subjects, declared at the counts they test it at."""
+
 
 @pytest.fixture
 def switched(monkeypatch):
