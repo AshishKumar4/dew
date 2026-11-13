@@ -991,11 +991,14 @@ def test_assembling_a_model_imports_the_modeling_code_its_matching_reaches_alone
     role's candidates in `KNOWN`'s order), so a Llama, whose tree asks no routed experts, leaves the modeling
     code of Qwen3-MoE, whose parts only those roles list, unimported, where the first match imported every
     known part's module. In a process of its own, as an import is the process's."""
+    import os
     import subprocess
     import sys
 
-    done = subprocess.run([sys.executable, "-c", _ASSEMBLED, json.dumps(TINY)], capture_output=True,
-                          text=True, check=False)
+    # The tree under test's sources, as this process reads them.
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join(path for path in sys.path if path)}
+    done = subprocess.run([sys.executable, "-c", _ASSEMBLED, json.dumps(TINY)], env=environment,
+                          capture_output=True, text=True, check=False)
     assert done.returncode == 0, done.stderr[-4000:]
     held = set(json.loads(done.stdout.splitlines()[-1]))
     assert "transformers.models.llama.modeling_llama" in held
