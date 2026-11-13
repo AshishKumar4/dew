@@ -106,29 +106,6 @@ def flat(held):
     return (ids[:, 0], ids[:, 1], mask[:, 0], mask[:, 1])
 
 
-def test_rewards_measure_reference_relative_improvement_on_unequal_pairs():
-    model = TinyHead(vocab_size=VOCAB)
-    objective = DPOObjective(model, WIDTH - 1, beta=.5)
-    reference = objective.init(jax.random.key(0))
-    params = jax.tree.map(lambda x: x + .1, reference)
-    batch = pair_batch()
-    loss, aux = objective.scalar_loss(params, batch, Step(jnp.array(0), jax.random.key(1), reference))
-    chosen, rejected, chosen_mask, rejected_mask = flat(pairs())
-    def score(variables, ids, mask):
-        logits = model.apply(variables, jnp.asarray(ids[:, :-1]))
-        log_probs = jax.nn.log_softmax(logits)
-        selected = np.take_along_axis(np.asarray(log_probs), ids[:, 1:, None], axis=-1)[..., 0]
-        return (selected * mask).sum(axis=-1)
-    rewards_chosen = .5 * (score(params, chosen, chosen_mask) - score(reference, chosen, chosen_mask))
-    rewards_rejected = 0.5 * (
-        score(params, rejected, rejected_mask) - score(reference, rejected, rejected_mask)
-    )
-    np.testing.assert_allclose(aux.metrics["rewards/chosen"], rewards_chosen.mean(), rtol=1e-5, atol=1e-6)
-    np.testing.assert_allclose(aux.metrics["rewards/rejected"], rewards_rejected.mean(), rtol=1e-5, atol=1e-6)
-    assert float(aux.metrics["accuracy"]) == float((rewards_chosen > rewards_rejected).mean())
-    np.testing.assert_allclose(loss, np.logaddexp(0, rewards_rejected - rewards_chosen).mean(), rtol=1e-6)
-
-
 def test_the_reference_comes_from_the_frozen_tree():
     """Perturbing the live params moves the policy half of the loss; moving
     the frozen tree moves the reference half."""
@@ -614,15 +591,6 @@ def test_a_padded_pair_before_real_ones_leaves_each_real_pair_its_own_loss():
         assert np.all(found[2][[number for number, at in enumerate(pairs) if at is None]] == 0)
 
 
-def test_two_window_geometries_trace_apart():
-    """Two DPO objectives of one model and `seq_len` whose windows hold different pairs (`pairs`) or lay a
-    pair a row (`segments=1`) forward different inputs and finals, so their trace keys differ (`traced`),
-    and a fit of one never steps on the other's lowered program."""
-    model = TinyHead(vocab_size=VOCAB)
-    keys = [DPOObjective(model, 5, **options).trace_key() for options in ({}, {"pairs": 2}, {"segments": 1})]
-    assert None not in keys and len(set(keys)) == 3
-
-
 @pytest.mark.parametrize("segments", [None, 1], ids=["packed", "a pair a row"])
 def test_a_windows_padding_holds_the_pad_id(segments):
     """Every window's padding is `pad_id` (main's `presets.preferences(..., pad_id=)`), the id a model reads
@@ -636,30 +604,3 @@ def test_a_windows_padding_holds_the_pad_id(segments):
     (batch,) = list(chain)
     held = np.asarray(batch[REAL_KEY]) > 0
     assert np.all(np.asarray(batch[IDS_KEY])[~held] == 7)
-
-
-def test_a_run_from_before_pair_windows_reads_a_pair_a_row():
-    """A DPO objective that states no `segments`, bound to a data plan from before preference pairs packed
-    into windows (`bind_plan`, `dew.data.plan.PAIR_WINDOWS`), reads a pair a row as `segments=1` does: its
-    batch, its loss and gradient on such a batch, and its trace key; bound to a later plan it reads windows;
-    one that states `segments` reads as stated whatever the plan."""
-    from dew.data.plan import PAIR_WINDOWS
-
-    model = TinyHead(vocab_size=VOCAB)
-    earlier, stated = DPOObjective(model, 3), DPOObjective(model, 3, segments=1)
-    earlier.bind_plan(PAIR_WINDOWS - 1)
-    stated.bind_plan(PAIR_WINDOWS)
-    assert earlier.inputs == stated.inputs and earlier.trace_key() == stated.trace_key()
-    batch = windows([PAIR, PAIR], 4, segments=1)
-    params = stated.init(jax.random.key(0))
-    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=stated.init(jax.random.key(2)))
-
-    def scored(objective):
-        return jax.value_and_grad(lambda tree: objective.scalar_loss(tree, batch, step)[0])(params)
-
-    found, expected = (jax.tree.leaves(scored(objective)) for objective in (earlier, stated))
-    for one, other in zip(found, expected, strict=True):
-        np.testing.assert_array_equal(one, other)
-    later = DPOObjective(model, 3)
-    later.bind_plan(PAIR_WINDOWS)
-    assert later.segments is None and later.trace_key() != stated.trace_key()

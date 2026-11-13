@@ -261,13 +261,11 @@ class DecideSettings:
     context_encoder: ContextEncoder = "table"
     """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
     the choice existed embedded it by its token table."""
-    questions: int | None = field(default=None, metadata={"derived": "data"})
-    """The most questions a row of the run's data holds (`Layout.row_questions`), as the run recorded
-    it; a pass's question slots are its windows' (`Decide.pass_shapes`), so no task reads it. None where
-    the run recorded none, as before it did."""
     options: int | None = field(default=None, metadata={"derived": "data"})
     """The most options a question of the run's data lays out, a "none of the above" it adds included,
-    which a pass of its task pads each question to (`Budget.options`); None as `questions`."""
+    which a pass of its task pads each question to (`Budget.options`); None where the run recorded
+    none, as before it did. A pass's question slots are its windows' (`Decide.pass_shapes`), so the
+    run records no count of questions (an earlier run's `questions` is read past, `saved_settings`)."""
 
 
 CALIBRATIONS = "calibrations"
@@ -465,7 +463,7 @@ class Decide(SavedRunTask, InItsForm):
         # Its passes pad to the options the run trained at, so a server compiles their programs up front.
         budget = Budget(options=settings.options)
         # Its rows laid out as the run recorded them: a layout that states no sharing, from a run saved
-        # before rows shared a state (`dew.data.plan.SHARED_STATE`), a question a row as it trained. One
+        # before rows shared a state (data plan version 9), a question a row as it trained. One
         # that states its sharing, saved under such a plan, trained its rows in streams
         # (`QuestionLayout.streamed`, which the plan's version states and no record holds) and is laid
         # here as documents continuing the shared part: the same tokens at the same positions, each

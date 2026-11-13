@@ -309,7 +309,8 @@ def scheduled(sessions, tasks, objective, further=None, **settings):
     state = trainer.initial_state()
     scheduler = RolloutScheduler(Synchronous(Scripted(sessions)), **settings)
     drawing = {} if further is None else {"further": further}
-    return (scheduler(state, {"task_id": np.asarray(tasks, np.int32)}, jax.random.key(0), **drawing),
+    return (scheduler(state, {"task_id": np.asarray(tasks, np.int32)}, jax.random.key(0), **drawing,
+                      objective=objective),
             scheduler, state)
 
 
@@ -488,7 +489,7 @@ def test_rloo_pays_its_reference_penalty_in_the_reward_before_the_baseline():
     sessions = {str(task): [session(task, sample, rewards[task, sample], (3, 2), raw=raws[task, sample])
                             for sample in range(3)] for task in range(2)}
     objective, rollout = composed("rloo", TinyHead(vocab_size=VOCAB), 15, reward_kl=weight)
-    packed, _, state = scheduled(sessions, [0, 1], objective, groups=3, reference=objective, **rollout)
+    packed, _, state = scheduled(sessions, [0, 1], objective, groups=3, penalized=True, **rollout)
     # The reference's likelihood of each sampled id as the step scores the packed rows, and the
     # proximal policy's as they hold it (the calls' raw likelihoods).
     reference = np.asarray(scored_rows(objective, with_ema(state.variables, state.ema), packed,

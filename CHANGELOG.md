@@ -7,11 +7,34 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
 
 ## Unreleased
 
+- Dew requires its JAX build 0.12.0.1.post83 (Python alone; the CUDA and PJRT plugins stay post81's): a
+  Pallas interpreter's thread map runs its threads on a CPU client of its own, so an interpreted kernel
+  inside a host callback no longer deadlocks when the calling computation's client has a full device queue.
+- Dew requires its JAX build 0.12.0.1.post82 (Python alone; the CUDA and PJRT plugins stay post81's): a
+  Mosaic GPU kernel over operands on a concrete mesh lowers a reshard of a literal, so a bf16 template
+  decode on an Ampere or Ada GPU whose operands sit on a `NamedSharding` lowers, where it failed with
+  "Shaped arrays must be represented by ir.Values, got: 0".
+- Data plan version 14, the last global one: a plan describes each step by its structure (its class and
+  fields, a callable by its own identity, an array by its fingerprint, a mapping in its order) and records,
+  by name, the rules its read takes its next rows by (`identity`, `shuffle`, `mix`, `dealing`, `grain`,
+  `phases`) and the shards a stream reads, each one value beside the code that implements it
+  (docs/design/data.md, the rules). A resume compares them and refuses a differing one by its name; a Grain
+  upgrade refuses only a position whose iterator state its iterators cannot restore. Phases that share a
+  corpus continue it from the draws the run trained. This Dew reads plans of 13 exactly (a run's resume
+  compiles its data at 13, and a per-share position of 13 resumes in a read compiled at 14 as 13 read it)
+  and refuses 8 to 12, naming both ways on: resume with the Dew that wrote it, or go on from its weights as
+  a new run that reads its data afresh. `Objective.bind_plan`, `dew.data.pipeline.earlier`, `Pipeline.at`
+  and `ObjectiveData.earlier` are gone, and `Source.manifest` takes no version.
+
 - A run's fit plan judges a head that keeps its whole logits by their fp32 bytes before it traces the step's
   gradient (`Objective.whole_head_table` names the head's table), and bounds the rung after a traced one
   from that trace, so a step whose whole logits leave no room is planned from one gradient trace and
   compiled once (on Qwen3.5-4B, 4 x 12,288 tokens on one 80 GB GPU: one trace where three ran). Each probe
   in a compiled step's plan records its candidate's traced, lowered and compiled seconds (`spent`).
+
+- `GRPOObjective`, `PPOObjective`, `FlowGRPOObjective` and `DiffusionNFTObjective` mask repeated filler rows
+  (`VALID_ROWS`) out of their losses, weights, critic terms and reported metrics, leaving an all-invalid
+  batch with zero mass.
 
 - An fp32 call that runs on the gated delta rule's, Kimi delta attention's or the SSD's port on a GPU (Dew's
   ports of fla's and mamba_ssm's kernels; the SSD's training takes its port on an A100 and an H100) under the
@@ -19,6 +42,11 @@ tools/changelog_releases.json, and a new entry goes under `## Unreleased`.
   took an fp32 product's accuracy (BF16x6): its state is about 2^13 further from float64 than before, as its
   upstream's is. A run whose configured precision is above the default (`dew.nn.precision.ACCURATE`'s
   'highest') is declined by the ports and trains on the portable math in IEEE float32, as before.
+
+- `ControlPPOObjective` and `DreamerV3Objective` ignore repeated filler rows (`VALID_ROWS`), draw entropy,
+  posterior and imagination noise from `Step`'s per-example update streams, and compute minibatch-wide
+  advantage moments and return percentiles once across a split step's microbatches
+  (`Objective.batch_statistics`, `Step.batch_statistics`, `Objective.real_rows`).
 
 - A paged `Server` keeps a prefix cache by default (`prefix_cache=None` derives it on wherever the layout pages,
   the rows sample a token a step on the server's own mesh and the model computes a split prompt as a whole

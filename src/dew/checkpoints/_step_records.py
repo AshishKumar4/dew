@@ -90,6 +90,9 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
     A global position is a record count over an order that is the same at
     any partition, so every row is a valid position for every reader;
     `dew._position` declares that property and `read_position` relies on it.
+    Its rows agree where they name one place (`dew._position.place`): the
+    bytes of processes that mounted the data at different paths differ in
+    the paths alone.
     A share's own offset resumes only readers of that same share, whichever
     processes they are, and any other reader is refused with the shares named.
     """
@@ -98,7 +101,7 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
     # which of the refusals below a broken checkpoint gets is a diagnostic.
     rows = [_row(table, index) for index in range(written)]
     if _position.translates(rows[0]):
-        if any(row != rows[0] for row in rows[1:]):
+        if any(_position.place(row) != _position.place(rows[0]) for row in rows[1:]):
             raise ValueError(
                 f"The checkpoint at {where} holds a global data position that "
                 f"differs between the {counted_processes(written)} that wrote it. A global "

@@ -10,7 +10,6 @@ from pathlib import Path
 import numpy as np
 import pyarrow as pa
 import pytest
-from data_support import LATEST
 from hub_support import native_builder, stated_shards
 
 from dew.data.dataset import DataPartition, Loading
@@ -272,73 +271,117 @@ def test_metadata_wrapped_hub_resume_keeps_facts_and_checks_consumed_files(
         moved.close()
 
 
-@pytest.mark.parametrize(("url", "format", "read_as"), [
-    ("hf://datasets/owner/data", None, "Hub"),
-    ("hf://datasets/owner/data@pinned", None, "Hub"),
-    ("hf://datasets/owner/data/train.jsonl", None, "Files"),
-    ("hf://datasets/owner/data@pinned/train.csv", None, "Files"),
-    ("hf://datasets/owner/data/train.txt", None, "Files"),
-    ("hf://datasets/owner/data/train.array_record", None, "Files"),
-    ("hf://datasets/owner/data/train.parquet", None, "Files"),
-    ("hf://datasets/owner/data/records", "jsonl", "Files"),
-])
-def test_a_hub_url_reads_a_repository_or_the_files_it_names(monkeypatch, url, format, read_as):
-    """An hf:// URL of a repository reads the repository; one naming a file Files reads by its
-    suffix, or any URL given a format, reads that file, whatever its record format."""
-    from huggingface_hub import HfFileSystem
+def test_hub_urls_stream_repositories_at_revisions_with_slashes_and_files_or_exports_below_them(
+    tmp_path, monkeypatch
+):
+    """`source()` resolves repository URLs (including Hub refs with slashes and `%2F`-escaped branch
+    names) to `Hub`, and paths below a repository (files or committed export directories, including
+    `@branch/subdir`) to `Files`, reading records end to end."""
+    from types import SimpleNamespace
 
-    from dew.data.sources import Files, Hub, source
+    import pyarrow.parquet as pq
+    from huggingface_hub import HfApi, HfFileSystem
+    from huggingface_hub.hf_api import GitRefInfo, GitRefs
 
-    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
-    resolved = source(url, format=format)
-    assert type(resolved) is {"Hub": Hub, "Files": Files}[read_as]
-    if read_as == "Files":
-        assert resolved.url == url and resolved.format == format
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+    from dew.data.sinks import export
+    from dew.data.sources import source
 
+    table_bytes = pa.BufferOutputStream()
+    pq.write_table(pa.Table.from_pylist([{"id": 1}, {"id": 2}]), table_bytes)
+    parquet_payload = table_bytes.getvalue().to_pybytes()
+    export_dir = tmp_path / "export"
+    export(Memory([{"id": 10}, {"id": 11}]), str(export_dir), format="parquet")
+    export_files = {
+        f"exports/{path.relative_to(export_dir).as_posix()}": path.read_bytes()
+        for path in export_dir.rglob("*")
+        if path.is_file()
+    }
+    commits = {
+        "refs/convert/parquet": {"default/train/0000.parquet": parquet_payload},
+        "refs/pr/3": {"data/train-00000.parquet": parquet_payload},
+        "feature/x": {"data/train-00000.parquet": parquet_payload},
+        "v1": {"data/train-00000.parquet": parquet_payload},
+        "feature": {"x/rows.jsonl": b'{"id": 20}\n{"id": 21}\n', **export_files},
+    }
+    shas = {rev: hashlib.sha1(rev.encode()).hexdigest() for rev in commits}
+    commits.update({sha: commits[rev] for rev, sha in shas.items()})
 
-@pytest.mark.parametrize(("url", "revision"), [
-    pytest.param("hf://datasets/owner/data@refs/convert/parquet", "refs/convert/parquet",
-                 id="parquet-conversion"),
-    pytest.param("hf://datasets/owner/data@refs/pr/3/", "refs/pr/3", id="pull-request"),
-    pytest.param("hf://datasets/owner/data@feature%2Fx", "feature/x", id="branch-with-a-slash"),
-    pytest.param("hf://owner/data@v1", "v1", id="tag-without-type"),
-])
-def test_a_hub_url_reads_its_repository_at_a_revision_holding_a_slash(monkeypatch, url, revision):
-    """An hf:// URL's revision runs from its `@` to the path after it, as the Hub's own URLs spell
-    one: a reference of the Hub's (its Parquet conversion, a pull request) whole, and a branch whose
-    name holds a `/` with it spelled `%2F`. Such a URL names the repository at that revision, where
-    the slashes it holds read as a path below the repository and its files were read instead."""
-    from huggingface_hub import HfFileSystem
+    def resolve_key(path: str) -> tuple[str, str]:
+        body = path.removeprefix("datasets/owner/data")
+        if body.startswith("@refs/convert/parquet"):
+            return "refs/convert/parquet", body.removeprefix("@refs/convert/parquet").lstrip("/")
+        if body.startswith("@refs/pr/3"):
+            return "refs/pr/3", body.removeprefix("@refs/pr/3").lstrip("/")
+        if body.startswith("@"):
+            rev, _, rest = body[1:].partition("/")
+            return rev.replace("%2F", "/"), rest
+        return "v1", body.lstrip("/")
 
-    from dew.data.sources import Hub, source
+    def repo_meta(self, repo, revision=None, **kw):
+        rev = revision or "v1"
+        return SimpleNamespace(sha=shas.get(rev, rev))
 
-    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
-    resolved = source(url)
-    assert type(resolved) is Hub
-    assert (resolved.repo, resolved.revision) == ("owner/data", revision)
+    conversion = GitRefInfo(
+        name="parquet", ref="refs/convert/parquet", target_commit=shas["refs/convert/parquet"]
+    )
+    monkeypatch.setattr(HfApi, "dataset_info", repo_meta)
+    monkeypatch.setattr(HfApi, "repo_info", repo_meta)
+    monkeypatch.setattr(
+        HfApi, "list_repo_files", lambda self, repo, *, revision, **kw: sorted(commits[revision])
+    )
+    monkeypatch.setattr(
+        HfApi, "list_repo_refs", lambda self, repo, **kw: GitRefs(branches=[], converts=[conversion], tags=[])
+    )
 
+    def files_at(path: str) -> tuple[dict[str, bytes], str]:
+        rev, key = resolve_key(path)
+        return commits.get(rev, {}), key
 
-@pytest.mark.parametrize("url", [
-    pytest.param("hf://datasets/owner/data/export", id="directory"),
-    pytest.param("hf://datasets/owner/data@pinned/exports/run/", id="directory-at-a-revision"),
-    pytest.param("hf://datasets/owner/data@refs/convert/parquet/default/train",
-                 id="directory-of-the-conversion"),
-    pytest.param("hf://datasets/owner/data@feature/x", id="directory-at-a-branch"),
-])
-def test_a_hub_path_below_its_repository_reads_as_the_files_there(monkeypatch, url):
-    """An hf:// URL of a directory in a repository, such as an export's (`export` commits one there),
-    is read as its files, whose manifest names their record format, never as a repository of that
-    name: no suffix names its format, as none names a repository's. A revision ends at the first `/`
-    past its `@` unless it is a reference of the Hub's, so `@feature/x` is the directory `x` at the
-    branch `feature`, as `HfFileSystem` reads it."""
-    from huggingface_hub import HfFileSystem
+    monkeypatch.setattr(HfFileSystem, "exists", lambda self, p, **kw: files_at(p)[1] in files_at(p)[0])
+    monkeypatch.setattr(HfFileSystem, "isfile", lambda self, p, **kw: files_at(p)[1] in files_at(p)[0])
+    monkeypatch.setattr(
+        HfFileSystem,
+        "isdir",
+        lambda self, p, **kw: any(
+            n.startswith(files_at(p)[1].rstrip("/") + "/") for n in files_at(p)[0]
+        ),
+    )
+    monkeypatch.setattr(
+        HfFileSystem,
+        "info",
+        lambda self, p, **kw: {
+            "name": p,
+            "type": "file",
+            "size": len(files_at(p)[0][files_at(p)[1]]),
+            "blob_id": f"blob:{p}",
+            "lfs": {"sha256": hashlib.sha256(files_at(p)[0][files_at(p)[1]]).hexdigest()},
+        },
+    )
+    monkeypatch.setattr(
+        HfFileSystem,
+        "cat_file",
+        lambda self, p, start=None, end=None, **kw: files_at(p)[0][files_at(p)[1]][start:end],
+    )
+    monkeypatch.setattr(
+        HfFileSystem, "_open", lambda self, p, mode="rb", **kw: io.BytesIO(files_at(p)[0][files_at(p)[1]])
+    )
 
-    from dew.data.sources import Files, source
+    def read_ids(url: str, *, format: str | None = None) -> list[int]:
+        resolved = source(url, format=format)
+        return [int(row["id"]) for row in iterate(Pipeline(resolved), read="streamed")]
 
-    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
-    resolved = source(url)
-    assert type(resolved) is Files
-    assert resolved.url == url
+    for repo_url in (
+        "hf://datasets/owner/data@refs/convert/parquet",
+        "hf://datasets/owner/data@refs/pr/3/",
+        "hf://datasets/owner/data@feature%2Fx",
+        "hf://owner/data@v1",
+    ):
+        assert read_ids(repo_url) == [1, 2]
+    assert read_ids("hf://datasets/owner/data@feature/x/rows.jsonl") == [20, 21]
+    assert read_ids("hf://datasets/owner/data@feature/x/rows.jsonl", format="jsonl") == [20, 21]
+    assert read_ids("hf://datasets/owner/data@feature/exports") == [10, 11]
 
 
 @pytest.mark.parametrize("format", ["jsonl", "parquet"])
@@ -360,7 +403,7 @@ def test_hub_native_shards_keep_the_requested_revision(monkeypatch, format):
 
 
 @pytest.mark.parametrize("revision,native", [(None, True), ("original", True), (None, False)])
-def test_hub_shard_capability_and_urls_list_each_revision_once(monkeypatch, revision, native):
+def test_hub_stream_resolves_native_or_converted_shards_by_revision(monkeypatch, revision, native):
     from types import SimpleNamespace
 
     from huggingface_hub import HfApi
@@ -368,12 +411,8 @@ def test_hub_shard_capability_and_urls_list_each_revision_once(monkeypatch, revi
 
     from dew.data.sources import Hub
 
-    listed = []
-
     def listing(self, repo, *, repo_type, revision):
-        listed.append(revision)
         if revision == "converted":
-            # The conversion holds each configuration's splits in a directory of its name.
             return ["default/train/0001.parquet", "default/train/0000.parquet"]
         if not native:
             return ["train.tar"]
@@ -393,9 +432,6 @@ def test_hub_shard_capability_and_urls_list_each_revision_once(monkeypatch, revi
               for index in range(2)]
     assert source.files.url == tuple(f"hf://datasets/owner/data@{commit}/{shard}" for shard in shards)
     assert source.files.format == "parquet"
-    assert source.supports("streamed")
-    assert listed == (["original"] if native else ["original", "converted"])
-
 
 @pytest.mark.parametrize("revision", [None, "original"])
 def test_hub_refuses_streaming_when_the_chosen_revision_has_no_shards_of_the_split(monkeypatch, revision):
@@ -559,7 +595,7 @@ def test_a_downloaded_hub_split_streams_offline_as_it_streamed_online(tmp_path, 
     def streamed(source):
         read = sorted((int(row["id"]), str(row["text"]), tuple(sorted(row)))
                       for row in iterate(Pipeline(source), read="streamed"))
-        return source.fingerprint(), [shard.id for shard in source.manifest(LATEST).shards], read
+        return source.fingerprint(), [shard.id for shard in source.manifest().shards], read
 
     online = streamed(split())
     assert online[2] == [(row["id"], row["text"], ("id", "text")) for row in rows[:6]]

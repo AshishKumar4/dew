@@ -12,6 +12,7 @@ import logging
 import platform
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
@@ -20,8 +21,8 @@ import numpy as np
 
 from dew import _checkout
 from dew._hashing import array_header
-from dew._position import PER_SHARE
-from dew._records import ADDED, JSON, integer, json_value, listed, record, set_added, strings, without_removed
+from dew._position import PER_SHARE, unplaced
+from dew._records import ADDED, JSON, json_value, listed, record, set_added
 from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 
@@ -31,7 +32,6 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
     from dew.batch import Batch
-    from dew.data.sources.tokens import TokenFiles
 
 _RESUMED = ("resume with the Dew that wrote it, or go on from its weights as a new run that reads its data "
             "afresh: `--pretrained <run directory>` on the command line or in run.json, or its state "
@@ -161,6 +161,22 @@ def callable_name(step: Callable[..., Batch]) -> str:
     return f"{kind.__module__}.{kind.__qualname__}"
 
 
+def reader_name(reader: Callable[..., Batch], declared: str | None) -> str | None:
+    """What the reader a batch encoder runs computes, as the encoder's identity states it: `declared`
+    where the encoder is given it, else a module function's qualified name (`callable_name`), or a
+    configured object's method's, whose object's dependencies the encoder's identity records
+    (`_dependencies`). Any other reader, a partial, a lambda, a function defined in another, another
+    object's method or callable, computes what its binding says, which no name holds: None, an encoder
+    of it a step of no stable identity (`StepIdentity.of`), which trains as any step does and which an
+    exact resume or a cache refuses until the encoder is given what it computes (`declared`)."""
+    if declared is not None:
+        return declared
+    named = inspect.isfunction(reader) and "<" not in reader.__qualname__
+    if named or (inspect.ismethod(reader) and isinstance(reader.__self__, _Dependencies)):
+        return callable_name(reader)
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class StepIdentity:
     """What a step computes (`semantic`), and the bytes of each external
@@ -176,19 +192,26 @@ class StepIdentity:
     declared: str | None = None
     dependencies: Mapping[str, object] = dataclasses.field(default_factory=dict)
     code: tuple[int, ...] = ()
+    printed: str | None = dataclasses.field(default=None, compare=False)
+    """The configuration as plans before `STRUCTURED` spelled it (`_printed_config`), which a plan of an
+    earlier version records instead (`record`), None where it is `config`'s spelling."""
 
     @classmethod
     def of(cls, step: object, identity: str | None = None, *, cache: bool = False) -> StepIdentity:
         """`step`'s identity, refused where a cache keys it (`cache`) and
-        cannot (`keyable`)."""
+        cannot (`keyable`): its configuration described once, field by field (`structured`), and spelled
+        as earlier plans spelled it beside it (`printed`)."""
         kind = step if inspect.isfunction(step) else type(step)
         module = kind.__module__
         name = f"{module}.{kind.__qualname__}"
         frozen = dataclasses.is_dataclass(step) and not isinstance(step, type)
+        # A step that declares its identity and states none (a batch encoder of a reader no name holds,
+        # `reader_name`) computes what no record holds.
+        stating = identity is None and isinstance(step, _DeclaredIdentity)
         declared = identity or (step.identity if isinstance(step, _DeclaredIdentity) else None)
         config = repr(step) if frozen else declared or name
         unstable = any(marker in name or marker in config for marker in ("<lambda>", "<locals>", " at 0x"))
-        exact = bool(declared) or (not unstable and (frozen or inspect.isfunction(step)))
+        exact = bool(declared) or (not stating and not unstable and (frozen or inspect.isfunction(step)))
         external = not module.startswith("dew.")
         path = (
             None if inspect.isbuiltin(step) or kind.__module__ == "builtins" else inspect.getsourcefile(kind)
@@ -206,25 +229,32 @@ class StepIdentity:
             if dataclasses.is_dataclass(step) and not isinstance(step, type)
             else {}
         )
-        if dataclasses.is_dataclass(step) and not isinstance(step, type) and (
-                dependencies or _holds_arrays(step) or set_added(step)):
-            config = json.dumps(_configuration(step), sort_keys=True)
+        printed = None
+        if frozen and dataclasses.is_dataclass(step) and not isinstance(step, type):
+            printed = _printed_config(step, config, bool(dependencies))
+            config = json.dumps(structured(step), sort_keys=True)
         code = (0,) if inspect.isfunction(step) and declared is None and modules else ()
-        named = cls(name, config, exact, modules, declared, dependencies, code)
+        named = cls(name, config, exact, modules, declared, dependencies, code, printed)
         if cache and not named.keyable(function=inspect.isfunction(step), external=external):
             raise ValueError(f"cache prefix step {name} needs identity='name@version'")
         return named
 
-    def record(self) -> dict[str, JSON]:
-        """The identity as a manifest records it: every field but `code`, which its modules' places say."""
-        return {field.name: json_value(getattr(self, field.name), field.name)
-                for field in dataclasses.fields(self) if field.name != "code"}
+    def record(self, version: int | None = None) -> dict[str, JSON]:
+        """The identity as a manifest of plan `version` (the latest by default) records it: every field but
+        `code`, which its modules' places say, and `printed`, which is its configuration in a plan before
+        `STRUCTURED`."""
+        recorded = {field.name: json_value(getattr(self, field.name), field.name)
+                    for field in dataclasses.fields(self) if field.name not in ("code", "printed")}
+        if version is not None and version < STRUCTURED and self.printed is not None:
+            recorded["config"] = self.printed
+        return recorded
 
-    def composed(self, factory: StepIdentity, config: str) -> StepIdentity:
-        """This step's identity as the `Configured` stage `factory` resolved it, under `config`: the
-        factory's modules after its own, and their places of code (`code`) with them."""
+    def composed(self, factory: StepIdentity, config: str, printed: str | None = None) -> StepIdentity:
+        """This step's identity as the `Configured` stage `factory` resolved it, under `config` (and
+        `printed`, its earlier spelling): the factory's modules after its own, and their places of code
+        (`code`) with them."""
         return dataclasses.replace(
-            self, config=config, modules=(*self.modules, *factory.modules),
+            self, config=config, printed=printed, modules=(*self.modules, *factory.modules),
             code=(*self.code, *(len(self.modules) + place for place in factory.code)))
 
     def keyable(self, *, function: bool, external: bool) -> bool:
@@ -233,15 +263,15 @@ class StepIdentity:
         which Dew's revision does not name."""
         return self.exact and not ((external or function) and self.declared is None)
 
-    def semantic(self) -> dict[str, JSON]:
+    def semantic(self, version: int | None = None) -> dict[str, JSON]:
         """What the step computes, on any host: its identity without its
-        modules' bytes, which only a manifest's environment records."""
-        return {name: value for name, value in self.record().items() if name != "modules"}
+        modules' bytes, which only a manifest's environment records, as plan `version` records it."""
+        return {name: value for name, value in self.record(version).items() if name != "modules"}
 
 
 @runtime_checkable
 class _DeclaredIdentity(Protocol):
-    identity: str
+    identity: str | None
 
 
 @runtime_checkable
@@ -264,6 +294,69 @@ def _dependencies(step: DataclassInstance) -> Mapping[str, object]:
             if nested:
                 dependencies[field.name] = nested
     return dependencies
+
+
+IDENTITY = "structured"
+"""The `identity` rule a plan records (`StepIdentity`, `structured`): each step's configuration described by
+its structure. A plan of 13 printed it (`StepIdentity.printed`), which this Dew reads; a behaviour change of
+it is a new value (docs/design/data.md, the rules)."""
+
+
+def structured(value) -> JSON:
+    """`value`, a step or any part of one, described by its structure, the one description a plan of version
+    `STRUCTURED` or later records: a dataclass by its class and each field it records (`repr=True`, and an
+    added one where set, `dew._records.ADDED`), whatever it computes from beside (`dependencies`, which its
+    identity records apart), another configured object by what it computes, a container entry by entry (a
+    mapping's in its order), an array by its fingerprint, a callable by its own identity (`StepIdentity`), a
+    scalar as JSON holds it, and anything else by its text, without addresses."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        kind = type(value)
+        described: dict[str, JSON] = {"class": f"{kind.__module__}.{kind.__qualname__}"}
+        for field in dataclasses.fields(value):
+            held = getattr(value, field.name)
+            if field.repr or (field.metadata.get(ADDED) and held != field.default):
+                described[field.name] = structured(held)
+        return described
+    if isinstance(value, _Dependencies):
+        return json_value(value.dependencies(), type(value).__qualname__)
+    match value:
+        case None | bool() | int() | str():
+            return value
+        case float():
+            return value if np.isfinite(value) else {"float": value.hex()}
+        case Enum():
+            return {"enum": f"{type(value).__module__}.{type(value).__qualname__}", "name": value.name}
+        case list() | tuple():
+            return [structured(entry) for entry in value]
+        case Mapping():
+            # In its order, which a reader of it may take (a chat template's labels, rendered in turn).
+            return {"mapping": [[name if isinstance(name, str) else repr(name), structured(entry)]
+                                for name, entry in value.items()]}
+        case np.ndarray() | jax.Array():
+            return {"array": content_fingerprint(np.asarray(value)).hex()}
+        case np.generic():
+            return structured(value.item())
+        case np.dtype():
+            return {"dtype": str(value)}
+    if isinstance(value, type):
+        return {"class": f"{value.__module__}.{value.__qualname__}"}
+    if inspect.ismethod(value):
+        # A bound method computes what its object's configuration says.
+        return {"method": callable_name(value), "of": structured(value.__self__)}
+    if inspect.isfunction(value):
+        return {"function": StepIdentity.of(value).semantic()}
+    if inspect.isbuiltin(value):
+        return {"function": f"{value.__module__}.{value.__qualname__}"}
+    return {"text": re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))}
+
+
+def _printed_config(step: DataclassInstance, config: str, dependent: bool) -> str:
+    """A dataclass step's configuration as plans before `STRUCTURED` spelled it (`StepIdentity.printed`):
+    its repr, or, where it calls a configured object, holds an array or sets an added field, the JSON of its
+    fields (`_configuration`). Read only where a plan of an earlier version is compared."""
+    if dependent or _holds_arrays(step) or set_added(step):
+        return json.dumps(_configuration(step), sort_keys=True)
+    return config
 
 
 def _configuration(step: DataclassInstance) -> dict[str, JSON]:
@@ -396,6 +489,9 @@ class Manifest:
     codec: int = 1
     schema: int = 1
     clean: bool = True
+    version: int | None = dataclasses.field(default=None, compare=False)
+    """The plan version whose spelling its steps are recorded in (`StepIdentity.record`): a cache's key's,
+    the version that fills it; None for the latest."""
 
     @classmethod
     def of(
@@ -405,6 +501,7 @@ class Manifest:
         *,
         ran: Sequence[StepIdentity] = (),
         fill: Mapping[str, object] | None = None,
+        version: int | None = None,
     ) -> Manifest:
         (revision, clean), lock = checkout_now(), _locked()
         return cls(
@@ -420,20 +517,24 @@ class Manifest:
                 if step.dependencies
             },
             clean=clean,
+            version=version,
         )
 
-    def record(self) -> dict[str, JSON]:
+    def record(self, version: int | None = None) -> dict[str, JSON]:
+        """The manifest as a plan of `version` (its own, `version`, by default) records it: each step's
+        identity as that version spells it (`StepIdentity.record`)."""
+        version = self.version if version is None else version
         recorded: dict[str, JSON] = {
             field.name: json_value(getattr(self, field.name), field.name)
             for field in dataclasses.fields(self)
-            if field.name not in ("steps", "ran")
+            if field.name not in ("steps", "ran", "version")
         }
-        recorded["steps"] = [step.record() for step in self.steps]
-        recorded["ran"] = [step.record() for step in self.ran]
+        recorded["steps"] = [step.record(version) for step in self.steps]
+        recorded["ran"] = [step.record(version) for step in self.ran]
         return recorded
 
-    def semantic(self) -> dict[str, JSON]:
-        return _semantic(self.record())
+    def semantic(self, version: int | None = None) -> dict[str, JSON]:
+        return _semantic(self.record(version))
 
     def environment(self) -> dict[str, JSON]:
         return _environment(self.record())
@@ -471,462 +572,34 @@ def same_order(saved: str, current: str) -> bool:
     return unplaced(json.loads(saved)) == unplaced(json.loads(current))
 
 
-def unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
-    """`order` without its sources' descriptions, which name where a host
-    mounted them, its corpora's and phases' included."""
-    if isinstance(order, dict):
-        return {name: unplaced(value) for name, value in order.items() if name != "source"}
-    if isinstance(order, list):
-        return [unplaced(value) for value in order]
-    return order
+def spelled(order, version: int) -> JSON:
+    """`order`, an analysis's (`dew.data.analysis._analyzed`), as a plan of `version` records it: each of
+    its stages, the stage the analysis read, described by its structure (`structured`) from `STRUCTURED`,
+    printed (its repr) before it, every other entry as JSON holds it."""
+    match order:
+        case Mapping():
+            return {name: [_spelled_stage(stage, version) for stage in part]
+                    if name == "stages" and isinstance(part, list | tuple) else spelled(part, version)
+                    for name, part in order.items()}
+        case list() | tuple():
+            return [spelled(part, version) for part in order]
+    return json_value(order, "order")
+
+
+def _spelled_stage(stage, version: int) -> JSON:
+    """An order's stage as plan `version` records it (`spelled`)."""
+    if isinstance(stage, str):
+        return stage
+    return structured(stage) if version >= STRUCTURED else repr(stage)
 
 
 _LIMIT = re.compile(r"Limit\(count=(\d+)\)")
-"""A limit's record in an order's stages (`Limit`'s repr)."""
-
-
-def earlier_position(saved: Mapping[str, object], plan: Plan) -> tuple[Mapping[str, object], JSON]:
-    """A per-share read's saved position (its data plan and its Grain iterator's state) as `plan`, this
-    run's, reads it: the plan as `earlier_plan` translates it, and the iterator's state, where the plan
-    was written before version 8, with the counts version 8 keeps that a Dew of version 7 may not have:
-    of what a read delivered (each corpus's `delivered_rows`, which one that counted each row as one
-    example held as `accepted`), of its cuts by kind (`CUT_COUNTS`, none), of the examples its filter
-    held pending (`consumed`, none), and of the examples refused past a held row and those a causal
-    window credited (its carry of `_dew_refused`, none, beside its `_dew_consumed`, and `credited`,
-    none). The position's one translation; carried to 1.0 (ledger 1552)."""
-    from dew.data.mixing import COUNTER, CUT_COUNTS
-    from dew.data.pipeline import CONSUMED, REFUSED
-
-    written = record(saved.get("dew_data_plan"), "saved data plan")
-    iterator = json_value(saved.get("iterator"), "saved Grain iterator")
-
-    def counted(branch: JSON) -> JSON:
-        match branch:
-            case list():
-                return [counted(child) for child in branch]
-            case dict():
-                node = {name: counted(child) for name, child in branch.items()}
-            case _:
-                return branch
-        match node.get(COUNTER):
-            case {"counts": {**counts}} as counter:
-                cut: dict[str, JSON] = {name: {} for name in CUT_COUNTS}
-                kept: dict[str, JSON] = {"delivered_rows": counts.get("accepted", 0), **cut, **counts}
-                pending: dict[str, JSON] = {"consumed": 0} if "consecutive" in counter else {}
-                node[COUNTER] = {**pending, **counter, "counts": kept}
-        match node:
-            case {"parent": _, "skip": _, "held": _} if "credited" not in node:
-                node["credited"] = 0
-        match node:
-            case {"parent": _, "skip": _, "held": {**held}} if CONSUMED in held and REFUSED not in held:
-                match held[CONSUMED]:
-                    case {"dtype": dtype, "tokens": list(tokens)}:
-                        zeros: list[JSON] = [0] * len(tokens)
-                        none: dict[str, JSON] = {"dtype": dtype, "tokens": zeros}
-                        carried: dict[str, JSON] = {**held, REFUSED: none}
-                        node["held"] = carried
-        return node
-
-    if written.get("version") == 7:
-        iterator = counted(iterator)
-    counters = integer(saved.get("counters", 1), "a position's counters format")
-    if counters < 2:
-        iterator = _by_member(iterator, plan)
-    if counters < 3:
-        iterator = _tokens_counted(iterator)
-    return earlier_plan(written, plan), iterator
+"""A printed limit in an order's stages before `STRUCTURED` (`Limit`'s repr)."""
 
 
 COUNTERS = 3
-"""The format of a per-share position's counters (`dew.data.readers`): 2 counts a mixture a run bounds in
-examples by member where its rows are delivered (row 3312), which a position of an earlier format, holding
-no `counters`, does not (`_by_member`); 3 counts the valid target tokens each corpus and member delivered
-(row 4119), which a position of format 2 does not (`_tokens_counted`)."""
-
-
-def _tokens_counted(iterator: JSON) -> JSON:
-    """A per-share position of the counters' format 2 as format 3 holds it (`COUNTERS`): each corpus's and
-    member's counts with the valid target tokens they delivered, none, so a resumed run counts them afresh
-    from the resume. Carried to 1.0 (ledger 1552)."""
-    from dew.data.mixing import COUNTER
-
-    def counted(counts: dict[str, JSON]) -> dict[str, JSON]:
-        return counts if "tokens" in counts else {**counts, "tokens": 0}
-
-    def filled(branch: JSON) -> JSON:
-        match branch:
-            case list():
-                return [filled(child) for child in branch]
-            case dict():
-                node = {name: filled(child) for name, child in branch.items()}
-            case _:
-                return branch
-        match node.get(COUNTER):
-            case {"counts": {**counts}, "members": {**members}} as counter:
-                held: dict[str, JSON] = {}
-                for key, member in members.items():
-                    match member:
-                        case {"counts": {**counted_member}}:
-                            held[key] = {**member, "counts": counted(counted_member)}
-                        case _:
-                            held[key] = member
-                node[COUNTER] = {**counter, "counts": counted(counts), "members": held}
-            case {"counts": {**counts}} as counter:
-                node[COUNTER] = {**counter, "counts": counted(counts)}
-        return node
-
-    return filled(iterator)
-
-_PLACED = frozenset({"dew.data.pipeline.Shuffle", "dew.data.pipeline.Repeat", "dew.data.pipeline.Limit",
-                     "dew.data.pipeline.Slice"})
-"""Steps after a batch with positions of their own around the rows (`_by_member`); a map of batches, a
-prefetch or the workers hold none."""
-
-
-def _by_member(iterator: JSON, plan: Plan) -> JSON:
-    """A per-share position of the counters' format 1 as format 2 holds it (`COUNTERS`). Each counter holds
-    its members' counts, none (the members of a mixture's counter past its mix count afresh), as does each
-    held count of a completion (`dew.data.completion`). A mixture a run bounds in examples counts its
-    members where its rows are delivered, a counter of its own above the rows, which counts each member
-    afresh from the resume (its draws counted each example as the mix drew it, a refused one too), and its
-    layouts say which document each token is of (`DOCUMENT`): the tokens a causal window held are of no
-    document, and a pack's remainder, which it reads again, is cut as its counts are. What a position held
-    in flight by member, it held as no member's: the examples a counter, a window or a completion held count
-    in the run's total and on its clock as they did, and complete no member's; a document a pack or a draw
-    reads again completes its member's."""
-    from dew.data.mixing import COUNTER, CorpusCounts
-    from dew.data.pipeline import CONSUMED, DOCUMENT
-
-    def filled(branch: JSON) -> JSON:
-        match branch:
-            case list():
-                return [filled(child) for child in branch]
-            case dict():
-                node = {name: filled(child) for name, child in branch.items()}
-            case _:
-                return branch
-        match node.get(COUNTER):
-            case {"consecutive": _} as counter if "members" not in counter:
-                node[COUNTER] = {**counter, "members": {}}
-        match node:
-            case {"parent": _, "floor": _, "drawn": _, "held": list(held)}:
-                node["held"] = [[*entry, {}] if isinstance(entry, list) and len(entry) == 4 else entry
-                                for entry in held]
-        return node
-
-    iterator = filled(iterator)
-    steps = record(plan.manifest.semantic(), "data manifest").get("steps", [])
-    names = [record(step, "manifest step").get("name") for step in (steps if isinstance(steps, list) else [])]
-    mixed = plan.order.get("members")
-    if plan.lowering != "per-share" or not mixed or "dew.data.pipeline.MarkConsumed" not in names:
-        return iterator
-    batch = "dew.data.pipeline.BatchStage"
-    batched = names.index(batch) if batch in names else len(names)
-    if any(name in _PLACED for name in names[batched + 1:]):
-        raise ValueError(
-            "this run's mixture is bounded in examples and its position was saved before Dew counted a "
-            "mixture's members where their rows are delivered, under a shuffle, repeat or take of batches, "
-            f"whose position the translation does not place the members' counter beneath; {_RESUMED}")
-
-    def laid(branch: JSON) -> JSON:
-        """The mixture's layouts past its mix, each document a token is of (`DOCUMENT`): none of the tokens
-        a causal window held, a pack's remainder cut as its counts; the members' own beneath the mix as
-        they were."""
-        match branch:
-            case {"parents": dict(), "index": _}:
-                return branch
-            case list():
-                return [laid(child) for child in branch]
-            case dict():
-                node = {name: laid(child) for name, child in branch.items()}
-            case _:
-                return branch
-        match node:
-            case {"windows": _, "rule": _} if "documents" not in node:
-                node["documents"] = 1
-            case {"parent": _, "skip": _, "credited": _, "held": {**held}} if (
-                    CONSUMED in held and DOCUMENT not in held):
-                tokens = record(held[CONSUMED], "held counts").get("tokens", [])
-                none: list[JSON] = [0] * (len(tokens) if isinstance(tokens, list) else 0)
-                node["held"] = {**held, DOCUMENT: {"dtype": "<i8", "tokens": none}}
-                node["documents"] = {}
-            case {"remainder_slices": {**slices}} if CONSUMED in slices and DOCUMENT not in slices:
-                node["remainder_slices"] = {**slices, DOCUMENT: slices[CONSUMED]}
-        return node
-
-    def counter(rows: JSON) -> JSON:
-        """`rows`, the mixture's rows as format 1 saved them, beneath its members' counter, which counts
-        each member afresh: its draws counted each example as the mix drew it, a refused one too."""
-        own = json_value(CorpusCounts("mixture", "mixture", rows=False).state(), "mixture counts")
-        node: dict[str, JSON] = {"corpus": "mixture", "label": "mixture", "counts": own, "rows": False,
-                                 "consecutive": 0, "warned": False, "consumed": 0, "members": {}}
-        return {"parent": laid(rows), COUNTER: node}
-
-    match iterator:
-        case {"workers_state": {**workers}} as pooled:
-            return {**pooled, "workers_state": {name: counter(state) for name, state in workers.items()}}
-    return counter(iterator)
-
-
-def read_otherwise_at_8(saved: Mapping[str, object]) -> str | None:
-    """Why version 8 reads a version 7 data plan's streamed order otherwise, None where it reads it alike:
-    where its read is not streamed, one reader reads it, no take reads its order (no `Limit` among its stages,
-    its mixed corpora's orders within it), or its takes are no bound in examples and no loading workers read
-    them, a corpus's own pool among them (`pools`). Version 7 read a take before its loading workers (a
-    `.take`) on each of them, and a run's bound in examples (its manifest's `MarkConsumed` step) whole on each
-    of a pool's shares and their workers; version 8 takes the one across them and deals the other to them. So
-    a position 7 wrote of such a read can go on only as 7 read it, which reads the bound once a reader: the
-    over-read 8 ended."""
-    order, topology = record(saved.get("order", {}), "saved order"), saved.get("topology")
-    readers = topology if isinstance(topology, Mapping) else {}
-    pools = readers.get("pools", {})
-    workers = max([readers.get("workers", 0), *(pools.values() if isinstance(pools, Mapping) else ())])
-    shares = readers.get("shares", 1)
-    steps = json.dumps(record(saved.get("manifest", {}), "saved data manifest").get("steps", []))
-    bounded = "MarkConsumed" in steps
-    if (order.get("read") != "streamed" or (shares == 1 and workers < 2)
-            or not _LIMIT.search(json.dumps(order)) or (not bounded and workers < 2)):
-        return None
-    if bounded:
-        return (f"version 7 read the run's bound in examples whole on each of its {shares} shares' "
-                f"{max(workers, 1)} loading workers, and version 8 deals the bound across them, so this "
-                "position goes on only as 7 read it, the bound once a reader")
-    return (f"version 7 took the order's `.take` on each of its {workers} loading workers, and version 8 "
-            "takes it across them, so this position goes on only as 7 read it, the take once a worker")
-
-
-def read_otherwise_at_9(saved: Mapping[str, object], plan: Plan) -> str | None:
-    """Why version 9 reads a version 8 data plan's order otherwise, None where it reads it alike: where a
-    mixture's corpus its order holds shuffles its records, at any depth, which version 9 draws by the
-    corpus's key in the mixture too, or where its chain read alone shuffles and `plan`, the chain as this
-    run reads it, keys that shuffle by the chain's name (`named` in its order), or a phase's chain shuffles,
-    which its own name may key; an unnamed chain's shuffle alone draws by its seed alone, as 8 drew it
-    (`dew.data.lowering._Build.ordered`, rows 3840, 4063)."""
-    def shuffles(node: dict[str, JSON] | list[JSON] | str | int | float | bool | None, *,
-                 mixed: bool) -> bool:
-        if isinstance(node, list):
-            return any(shuffles(child, mixed=mixed) for child in node)
-        if not isinstance(node, dict):
-            return False
-        stages = node.get("stages")
-        if mixed and isinstance(stages, list) and any(
-                isinstance(stage, str) and stage.startswith("Shuffle(") for stage in stages):
-            return True
-        # A mixture's corpora, and a phase's chain, which a phased run may name, are keyed.
-        return any(shuffles(child, mixed=mixed or key in ("corpora", "phases"))
-                   for key, child in node.items())
-
-    order = json_value(saved.get("order", {}), "saved order")
-    if not shuffles(order, mixed="named" in plan.order):
-        return None
-    return ("version 8 shuffled each corpus by its seed alone, and version 9 by its key too, so this "
-            "position goes on only as 8 read it")
-
-
-def read_otherwise_at_10(saved: Mapping[str, object]) -> str | None:
-    """Why version 10 reads a version 9 data plan's order otherwise, None where it reads it alike: where its
-    read streams a Parquet store (`streams_parquet`), whose shards 9 made of its row groups and 10 makes of
-    its files (`FILE_SHARDS`), so its shards' order, and the places a position names, are others."""
-    order = record(saved.get("order", {}), "saved order")
-    manifest = record(saved.get("manifest", {}), "saved data manifest")
-    if order.get("read") != "streamed" or not streams_parquet(json_value(manifest.get("source"), "source")):
-        return None
-    return ("version 9 streamed a Parquet store by its row groups, and version 10 by its files, so this "
-            "position goes on only as 9 read it")
-
-
-def read_otherwise_at_11(saved: Mapping[str, object]) -> str | None:
-    """Why version 11 reads a version 10 data plan's order otherwise, None where it reads it alike: where its
-    read is cut per share of indexed inputs, which 10 read where they were, every W-th in each loading worker
-    or inline in none, and 11 reads in their order in groups (`IN_ORDER`), a position of another form; a
-    stream reads alike."""
-    order = record(saved.get("order", {}), "saved order")
-    if saved.get("lowering") != "per-share" or order.get("read") == "streamed":
-        return None
-    return ("version 10 read this share's inputs where its workers took them, and version 11 reads them in "
-            "their order, so this position goes on only as 10 read it")
-
-
-def read_otherwise_at_13(saved: Mapping[str, object]) -> str | None:
-    """Why version 13 reads a version 12 data plan's order otherwise, None where it reads it alike: where it
-    holds a mixture of no seed whose members' keys (`dew.data.analysis._member_keys`) are not in their sorted
-    order, which 12's iterator mixes read them in and 13's in the order the mixture declares them
-    (`DECLARED_MIX`). Any read's, nested ones too: a streamed read mixes by iterator, and so does an indexed
-    per-share read of members that reject rows (`Accepted`); a global read by index mixes its members by
-    Grain's selection over their records in their declared order at both, so it reads alike."""
-    from dew.data.analysis import _member_keys
-
-    order = record(saved.get("order", {}), "saved order")
-    if saved.get("lowering") == "global" and order.get("read") in ("indexed", "memory"):
-        return None
-
-    def mixes(node: JSON) -> Iterator[dict[str, JSON]]:
-        match node:
-            case dict():
-                if "corpora" in node and "members" in node:
-                    yield node
-                for value in node.values():
-                    yield from mixes(value)
-            case list():
-                for value in node:
-                    yield from mixes(value)
-
-    for mix in mixes(json_value(order, "saved order")):
-        keys = _member_keys(strings(mix["members"], "a saved mix's members"))
-        if mix.get("shares") == "accepted rows" and "selection_seed" not in mix and keys != sorted(keys):
-            return ("version 12 read this streamed mix's members in their keys' sorted order, and version 13 "
-                    "in the order it declares them, so this position goes on only as 12 read it")
-    return None
-
-
-def earlier_plan(saved: Mapping[str, object], plan: Plan) -> Mapping[str, object]:
-    """`saved`, a data plan a saved position records, as `plan`, this run's, reads it (`Plan.check`): the
-    position's one translation, where a reader's `set_state` decodes it. A plan of version 7 reads as 8, one
-    of 8 as 9, one of 9 as 10 and one of 10 as 11, where the later reads its order alike
-    (`read_otherwise_at_8`, `read_otherwise_at_9`, `read_otherwise_at_10`, `read_otherwise_at_11`), and one
-    of 11 as 12, which reads every plan as 11 does (`SHARED_STATE`), and one of 12 as 13 where it reads
-    its mixes alike (`read_otherwise_at_13`). A
-    token store a Dew before row 3028
-    named without saying how its documents are read is named as today's names it where that Dew read the
-    same documents of it (`_named_as_today`); its derived order holds today's lengths (`plan`'s) of each
-    source that Dew stated none for (`_unstated_lengths`), where the plan names the source as today's does;
-    the saved and current manifests' sources are numbered as their derived facts number them. Carried to
-    1.0 (ledger 1552)."""
-    if saved.get("version") == 7 and plan.version >= 8 and read_otherwise_at_8(saved) is None:
-        saved = {**saved, "version": 8}
-    if saved.get("version") == 8 and plan.version >= 9 and read_otherwise_at_9(saved, plan) is None:
-        saved = {**saved, "version": 9}
-    if saved.get("version") == 9 and plan.version >= FILE_SHARDS and read_otherwise_at_10(saved) is None:
-        saved = {**saved, "version": FILE_SHARDS}
-    if (saved.get("version") == FILE_SHARDS and plan.version >= IN_ORDER
-            and read_otherwise_at_11(saved) is None):
-        saved = {**saved, "version": IN_ORDER}
-    # 12 reads every plan as 11 does: what it changed is the steps a decision objective and the
-    # preference preset hand a plan (`SHARED_STATE`, `PAIR_WINDOWS`), and a plan of other steps is another
-    # plan, refused by its steps (`Plan.check`).
-    if saved.get("version") == IN_ORDER and plan.version >= SHARED_STATE:
-        saved = {**saved, "version": SHARED_STATE}
-    if (saved.get("version") == SHARED_STATE and plan.version >= DECLARED_MIX
-            and read_otherwise_at_13(saved) is None):
-        saved = {**saved, "version": DECLARED_MIX}
-    # A plan of another version is refused as it is (`Plan.check`), so nothing of it is read here.
-    if saved.get("version") != plan.version:
-        return saved
-    manifest = record(saved.get("manifest", {}), "saved data manifest")
-    named = _named_as_today(json_value(manifest.get("source", {}), "saved data source"), plan.stores)
-    saved = {**saved, "manifest": {**manifest, "source": named}, **_members_as_today(saved, plan)}
-    saved_sources = record(named, "saved data source").get("sources")
-    sources = record(plan.manifest.semantic().get("source", {}), "data source").get("sources")
-    if not isinstance(saved_sources, list) or not isinstance(sources, list):
-        return saved
-    held = dict(record(saved.get("derived", {}), "saved derived order"))
-    for index, (store, today) in enumerate(zip(saved_sources, sources, strict=False)):
-        name = f"{index}/lengths"
-        if (name not in held and name in plan.derived and store == today and isinstance(today, Mapping)
-                and _unstated_lengths(today)):
-            held[name] = plan.derived[name]
-    return {**saved, "derived": held}
-
-
-def _members_as_today(saved: Mapping[str, object], plan: Plan) -> dict[str, JSON]:
-    """`saved`'s member digests (`Plan.members`), a saved record read at its boundary, each an earlier Dew
-    made of a member `plan` keeps as today's makes it, where it is a digest that Dew made of today's
-    member (`_earlier_digests`); none where `saved` keeps no members."""
-    members = saved.get("members")
-    if not isinstance(members, dict):
-        return {}
-    held: dict[str, JSON] = {}
-    for key, digest in members.items():
-        today = plan.members.get(key)
-        if digest != today and key in plan.earlier_members and digest in _earlier_digests(
-                *plan.earlier_members[key]):
-            digest = today
-        held[key] = digest
-    return {"members": held}
-
-
-def _earlier_digests(manifest: JSON, stores: Sequence[TokenFiles]) -> Iterator[str]:
-    """The digests earlier Dews made of a member whose manifest today is `manifest`, reading `stores`, each
-    only where that Dew read the stores' documents as today's does: one that named a store's reading
-    (`documents`) only where it read others of it, alike ones without (`TokenFiles.read_alike`); and one
-    before row 3028, which named none and stated no lengths of a store without an EOS, where it read
-    every store alike (`_unstated_lengths`)."""
-    yield fingerprint(_documents_where(manifest, stores, lambda store: not store.read_alike()))
-    if all(store.read_alike() for store in stores):
-        named = record(_without_documents(manifest), "member manifest")
-        sources, derived = named.get("sources"), named.get("derived")
-        if isinstance(sources, list) and isinstance(derived, dict):
-            unstated = {f"{index}/lengths" for index, source in enumerate(sources)
-                        if isinstance(source, dict) and _unstated_lengths(source)}
-            named = {**named, "derived": {name: value for name, value in derived.items()
-                                          if name not in unstated}}
-        yield fingerprint(named)
-
-
-def _documents_where(value: JSON, stores: Sequence[TokenFiles], kept: Callable[[TokenFiles], bool]) -> JSON:
-    """`value`, a fingerprint of sources or a manifest holding them, a saved record's form made at its
-    boundary: each token store in it that is one of `stores` named with `documents` only where `kept`
-    holds of it."""
-    if isinstance(value, list):
-        return [_documents_where(part, stores, kept) for part in value]
-    if not isinstance(value, dict):
-        return value
-    if value.get("store") == "tokens" and "documents" in value:
-        bare = {name: part for name, part in value.items() if name != "documents"}
-        for store in stores:
-            before = record(json_value({name: part for name, part in store.fingerprint().items()
-                                        if name != "documents"}, "token store fingerprint"), "token store")
-            if all(bare.get(name) == part for name, part in before.items()):
-                return value if kept(store) else bare
-        return value
-    return {name: _documents_where(part, stores, kept) for name, part in value.items()}
-
-
-def _without_documents(value: JSON) -> JSON:
-    """`value`, a fingerprint of sources or a manifest holding them, a saved record's form made at its
-    boundary: each token store in it named as a Dew before row 3028 named it, without `documents`
-    (`earlier_plan`)."""
-    if isinstance(value, list):
-        return [_without_documents(part) for part in value]
-    if not isinstance(value, dict):
-        return value
-    return {name: _without_documents(part) for name, part in value.items()
-            if not (name == "documents" and value.get("store") == "tokens")}
-
-
-def _named_as_today(value: JSON, stores: Sequence[TokenFiles]) -> JSON:
-    """`value`, a saved plan's fingerprint of its sources or a part of one, a saved record read at its
-    boundary: each token store in it a Dew before row 3028 named without `documents` named with it, as
-    today's names it, where it is one of `stores` and that Dew read its documents as today's does
-    (`TokenFiles.read_alike`, a scan of its tokens only here); a fingerprint that extends a store's with
-    keys of its own (its windows') too. Anything else as it is."""
-    if isinstance(value, list):
-        return [_named_as_today(part, stores) for part in value]
-    if not isinstance(value, dict):
-        return value
-    if value.get("store") == "tokens" and "documents" not in value:
-        for store in stores:
-            before = record(json_value({name: part for name, part in store.fingerprint().items()
-                                        if name != "documents"}, "token store fingerprint"), "token store")
-            if all(value.get(name) == part for name, part in before.items()) and store.read_alike():
-                return {**value, "documents": "records"}
-        return value
-    return {name: _named_as_today(part, stores) for name, part in value.items()}
-
-
-def _unstated_lengths(source: Mapping[str, object]) -> bool:
-    """Whether a Dew before row 3028 stated no lengths for the source fingerprinted `source`: a token store
-    stating no EOS, which it read as one stream, a concatenation holding one, whose lengths are its parts'
-    together, or a slice of records of either, whose lengths are its source's sliced."""
-    if source.get("store") == "tokens":
-        stated = source.get("metadata")
-        return isinstance(stated, Mapping) and stated.get("eos_id") is None
-    sliced = source.get("of")
-    if source.get("selection") == "slice" and isinstance(sliced, Mapping):
-        return _unstated_lengths(sliced)
-    parts = source.get("concatenate")
-    return isinstance(parts, list) and any(isinstance(part, Mapping) and _unstated_lengths(part)
-                                           for part in parts)
+"""The format of a per-share position's counters (`dew.data.readers`): each corpus's and member's
+delivered examples and valid target tokens (rows 3312, 4119), which every plan this Dew reads saved."""
 
 
 def grown_limits(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
@@ -949,19 +622,51 @@ def grown_limits(saved: dict[str, JSON] | list[JSON] | str | int | float | bool 
 def _grown_stages(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
                   current: dict[str, JSON] | list[JSON] | str | int | float | bool | None
                   ) -> frozenset[tuple[str, str]] | None:
-    """`grown_limits` of the run's chain's stages (their records, in order)."""
+    """`grown_limits` of the run's chain's stages (their records, in order): each limit the current order
+    grew past the saved one's, every stage after it a batch, by the spelling its manifest's step records
+    (`_canonical`)."""
     if not (isinstance(saved, list) and isinstance(current, list)) or len(saved) != len(current):
         return frozenset() if saved == current else None
     found = set()
     for at, (before, after) in enumerate(zip(saved, current, strict=True)):
         if before == after:
             continue
-        held, now = _LIMIT.fullmatch(str(before)), _LIMIT.fullmatch(str(after))
-        if (held is None or now is None or int(now.group(1)) < int(held.group(1))
-                or not all(str(stage).startswith("BatchStage(") for stage in saved[at + 1:])):
+        held, now = _limit_count(before), _limit_count(after)
+        if (held is None or now is None or now < held
+                or not all(_is_stage(stage, "BatchStage") for stage in saved[at + 1:])):
             return None
-        found.add((str(before), str(after)))
+        found.add((_stage_text(before), _stage_text(after)))
     return frozenset(found)
+
+
+def _limit_count(stage: JSON) -> int | None:
+    """The count of an order's limit, as a plan of any version records it (`spelled`): structurally from
+    `STRUCTURED`, printed before it (`_LIMIT`); None for any other stage."""
+    match stage:
+        case {"class": "dew.data.pipeline.Limit", "count": int(count), "passes": None}:
+            return count
+        case str(printed) if (limit := _LIMIT.fullmatch(printed)) is not None:
+            return int(limit.group(1))
+    return None
+
+
+def _is_stage(stage: JSON, kind: str) -> bool:
+    """Whether an order's stage, as a plan of any version records it, is of the stage class `kind`."""
+    match stage:
+        case {"class": str(named)}:
+            return named == f"dew.data.pipeline.{kind}"
+        case str(printed):
+            return printed.startswith(f"{kind}(")
+    return False
+
+
+def _stage_text(stage: JSON) -> str:
+    """An order's stage as its manifest's step records its configuration: a structured one's canonical
+    JSON, a printed one as printed."""
+    match stage:
+        case str(printed):
+            return printed
+    return json.dumps(stage, sort_keys=True)
 
 
 def _steps_grown(saved: dict[str, JSON] | list[JSON] | str | int | float | bool | None,
@@ -977,77 +682,37 @@ def _steps_grown(saved: dict[str, JSON] | list[JSON] | str | int | float | bool 
         for before, after in zip(saved, current, strict=True))
 
 
-FILE_SHARDS = 10
-"""The plan version from which a streamed Parquet store's shards are its files, each file's row groups read
-as its reader reaches them and its footer read as it opens, cut into its row groups only where readers and
-workers outnumber its files (`dew.data.sources.files.Files.manifest`): 9's shards were its row groups,
-numbered across every file, so a stream read every file's footer before its first record (FineWeb-Edu's
-default configuration's 2410 files, 196 s, row 4131)."""
-
-IN_ORDER = 11
-"""The plan version from which a training read cut per share of indexed inputs reads them in their order in
-any count of loading workers (`dew.data.lowering._Build.in_order`): its workers read whole groups of
-consecutive inputs by index and hand them on in turn (`dew.data.elastic_order._InputOrder`), so its batches
-are those it reads in none and its position names no count of them. 10's workers each read every W-th input
-and batched its own, so its batches and its position were its count's (row 4862). A stream reads alike."""
-
-SHARED_STATE = 12
-"""The plan version from which a decision run's requests ask their questions over one copy of their state,
-where its backbone and head read each question as its own row does (`dew.decision.shared_state.shared_for`):
-11's runs asked a row a question, and resume so (row 14d24faa6's forks). It changes the steps such a run's
-objective hands its plan and no reading of a plan: a position 11 saved of any other chain goes on under 12
-(`earlier_plan`), and one of a decision chain whose steps 12 lays out otherwise is another plan's
-(`Plan.check`), which a run config's resume reads by 11."""
-PAIR_WINDOWS = 12
-"""The plan version from which the preference preset packs its pairs into windows
-(`dew.data.presets.preferences`): 11's laid a pair a row, which a chain compiled under it lays again
-(the preset's `dew.data.pipeline.earlier`, `Pipeline.at`) and its objective scores
-(`dew.objectives.base.Objective.bind_plan`). The same version as `SHARED_STATE`, each naming what it
-changed: no Dew published one without the other."""
-
 DECLARED_MIX = 13
-"""The plan version from which a streamed mixture's unseeded mix (`dew.data.mixing.KeyedMix`) reads its
-members in the order the mixture declares them, the order its every prefix is counted in
-(`dew.data.mixing.Proportions`; a later phase's continuation, `dew.data.compile._delivered`): 12's read
-them in their keys' sorted order, as Grain's mix of a mapping does, so where the two orders differ
-(members named out of sorted order, or more than ten unnamed) a later phase read on past records the
-mix had not given and gave again ones it had. A position 12 saved goes on under 13 where its mixes'
-orders are one (`read_otherwise_at_13`). From 13 too, a chain of phases each batched inside itself and read
-endlessly repeats each phase before its own batch, as a single stream's repeat is
-(`dew.data.compile._endless`), where 12 repeated it after the batch: a pass holding less than a batch
-never yielded one."""
+"""The plan version before `STRUCTURED`, which this Dew reads too: a plan that printed its order's stages
+and its steps' configurations (their reprs). Every plan this Dew reads reads a streamed mixture's unseeded
+mix in the order it declares its members (`dew.data.mixing.KeyedMix`) and repeats a phase batched inside
+itself before its own batch (`dew.data.compile._endless`), as 13 did; earlier plans are refused."""
 
-PLAN_VERSIONS = (8, 9, FILE_SHARDS, IN_ORDER, SHARED_STATE, DECLARED_MIX)
-"""The versions this Dew reads a plan into rows by, the latest a new run's: 9 folds a corpus's key, its name
-in the mixture that reads it or a named chain's own, into each shuffle of its own, so corpora of one length
-shuffled by one seed read in orders of their own and a named corpus reads one order mixed or alone (row
-3840), where 8 read them in one permutation; 10 streams a Parquet store by its files (`FILE_SHARDS`); 11
-reads a per-share read's inputs in their order in its workers (`IN_ORDER`); 12 asks a decision request's
-questions over one copy of its state (`SHARED_STATE`). A run saved under an earlier version reads by it
-(carried to 1.0, ledger 1552)."""
+STRUCTURED = 14
+"""The plan version from which a plan describes each stage and each step's configuration once, by its
+structure (`structured`): its class and fields, a callable by its own identity, an array by its fingerprint.
+A chain compiled at 13 is recorded in its printed spelling (`StepIdentity.printed`, `spelled`), so a
+position saved under it resumes compiled there."""
+
+PLAN_VERSIONS = (DECLARED_MIX, STRUCTURED)
+"""The versions this Dew reads a plan into rows by, the latest a new run's: the current one and the one
+before it. A run saved under an earlier version resumes with the Dew that wrote it, or goes on from its
+weights as a new run that reads its data afresh."""
 
 
 def read_by(version: int) -> int:
     """`version`, refused where this Dew reads by none of it (`PLAN_VERSIONS`): what every read
-    (`dew.data.compile`'s `compile`, `iterate` and `publish`) asks before it prepares anything, where
-    another would read as the version it falls among (11 as 10, 5 as 8)."""
+    (`dew.data.compile`'s `compile`, `iterate` and `publish`) asks before it prepares anything."""
     if version not in PLAN_VERSIONS:
         raise ValueError(f"this Dew reads data plans by version {', '.join(map(str, PLAN_VERSIONS))}, not "
-                         f"{version}: resume a run saved under another with the Dew that wrote it")
+                         f"{version}: {_RESUMED}")
     return version
-
-
-def filled_version(fill: Mapping[str, object]) -> int:
-    """The plan version whose shards a streamed fill numbers its rows by, from its cache key's `fill`
-    (`Manifest.fill`): `FILE_SHARDS` where it names a Parquet store's shards its files, the version before it
-    otherwise, as every other store's shards are alike at both (`dew.data.sources.files.Files.manifest`)."""
-    return FILE_SHARDS if fill.get("shards") == "files" else FILE_SHARDS - 1
 
 
 def streams_parquet(source: JSON) -> bool:
     """Whether `source`, a store's fingerprint as a plan records it (`Manifest.semantic`'s `source`), names
     a Parquet store at any depth (a selection's, a concatenation's part, a mixture's corpus): the stores
-    whose streamed shards a plan version decides (`FILE_SHARDS`)."""
+    a stream reads by its files as its shards."""
     match source:
         case list():
             return any(map(streams_parquet, source))
@@ -1077,24 +742,24 @@ class Plan:
     """A mixture's members, each what it reads and runs as one digest under its key, and its own
     stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
     resume reads of a member that joined or left (`check`)."""
-    stores: tuple[TokenFiles, ...] = dataclasses.field(default=(), compare=False, repr=False)
-    """The token stores beneath the plan's sources, which a plan a Dew before row 3028 saved names
-    otherwise (`earlier_plan`); no part of the plan's record."""
-    earlier_members: Mapping[str, tuple[JSON, tuple[TokenFiles, ...]]] = dataclasses.field(
-        default_factory=dict, compare=False, repr=False)
-    """Each of `members`' manifests, undigested, with the token stores the member reads, from which a
-    resume makes the digests an earlier Dew made of it (`earlier_plan`); no part of the plan's record."""
+    rules: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    """The rules deciding which rows come next that its read reads by, by name, each its owner's value
+    (`dew.data.lowering._Build.rules`, and `grain` for a per-share read's Grain-owned state,
+    `dew.data.readers.GRAIN`): recorded from `STRUCTURED` on, as 13 read by rules of its own its version
+    names, and compared by name where a position resumes (`check`)."""
     version: int = PLAN_VERSIONS[-1]
     """The version the plan is read into rows by (`PLAN_VERSIONS`): this Dew's, or the one a run saved
     under, which reads it as it did (`dew.data.compile.compile`'s `plan_version`)."""
 
     def record(self) -> dict[str, JSON]:
+        rules: dict[str, JSON] = {} if self.version < STRUCTURED else {"rules": dict(self.rules)}
         return {
+            **rules,
             "version": self.version,
             "lowering": self.lowering,
-            "manifest": self.manifest.semantic(),
+            "manifest": self.manifest.semantic(self.version),
             "environment": self.manifest.environment(),
-            "order": json_value(self.order, "order"),
+            "order": self.spelled_order(),
             "derived": json_value(self.derived, "derived"),
             "topology": json_value(self.topology, "topology"),
             "rejections": self.rejections,
@@ -1111,8 +776,13 @@ class Plan:
         which part differs. The order's sources are named by the manifest's
         content, not by their descriptions: hosts that mount one dataset at
         different paths read the same records."""
-        order = unplaced(json_value(self.order, "order"))
+        order = unplaced(self.spelled_order())
         return f"{json.dumps(order, sort_keys=True)} under plan {json.dumps(self.parts(), sort_keys=True)}"
+
+    def spelled_order(self) -> JSON:
+        """The order as this plan's version records it (`spelled`): its stages, each the stage object the
+        analysis read, described structurally (`structured`), or printed as before `STRUCTURED`."""
+        return spelled(self.order, self.version)
 
     def parts(self) -> dict[str, JSON]:
         """A digest of each part of the plan but its order, its environment and
@@ -1126,7 +796,8 @@ class Plan:
             {name: value for name, value in self.topology.items() if name != "share"}, "topology"
         )
         return {**{name: _digests(value) for name, value in recorded.items()},
-                **{f"manifest {name}": _digests(value) for name, value in self.manifest.semantic().items()}}
+                **{f"manifest {name}": _digests(value)
+                   for name, value in self.manifest.semantic(self.version).items()}}
 
     def check(
         self, saved: Mapping[str, object], *, resume: Literal["exact", "non-exact"] = "exact"
@@ -1139,16 +810,16 @@ class Plan:
         per-share plan."""
         current = self.record()
         if current["version"] != saved.get("version"):
-            otherwise = (read_otherwise_at_8(saved) if saved.get("version") == 7 else
-                         read_otherwise_at_9(saved, self) if saved.get("version") == 8 else
-                         read_otherwise_at_10(saved) if saved.get("version") == 9 else None)
+            written = saved.get("version")
+            route = (f"compile the chain with plan_version={written!r}, as a run config's resume does, or "
+                     if written in PLAN_VERSIONS
+                     else f"this Dew reads versions {', '.join(map(str, PLAN_VERSIONS))} alone: ")
             raise ValueError(
-                f"the saved data position was written under data plan version {saved.get('version')!r}, "
-                f"and this read is of version {current['version']!r}, which makes other rows or "
-                f"draws from the same plan{f' ({otherwise})' if otherwise else ''}; compile the chain with "
-                f"plan_version={saved.get('version')!r} where this Dew reads it (versions "
-                f"{', '.join(map(str, PLAN_VERSIONS))}), as a run config's resume does, or {_RESUMED}"
-            )
+                f"the saved data position was written under data plan version {written!r}, and this read is "
+                f"of version {current['version']!r}, which makes other rows or draws from the same plan; "
+                f"{route}{_RESUMED}")
+        if self.version >= STRUCTURED:
+            self._rules_alike(record(saved.get("rules", {}), "saved data plan rules"))
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(
                 "data plan contains a step without stable identity or a store given no name "
@@ -1170,8 +841,11 @@ class Plan:
             raise PlanOrderChanged.between(record(saved.get("order"), "saved order"),
                                            record(current["order"], "order"))
         previous = record(saved.get("derived", {}), "saved derived order")
-        for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
-            if previous.get(name) != self.derived.get(name):
+        # A plan of 13 recorded no stream's shards (`STRUCTURED`'s `shards` fact).
+        derived = (self.derived if self.version >= STRUCTURED
+                   else {name: value for name, value in self.derived.items() if not name.endswith("/shards")})
+        for name in sorted(set(previous) | set(derived)) if edited is None else ():
+            if previous.get(name) != derived.get(name):
                 raise ValueError(f"saved data plan derived order {name} changed")
         if self.lowering == "per-share":
             topology = record(current["topology"], "data plan topology")
@@ -1185,10 +859,8 @@ class Plan:
                     or any(pools.get(name) != saved_pools.get(name) for name in compared)):
                 raise ValueError(f"saved per-share data plan topology changed (shares, workers or cycle "
                                  f"length): {PER_SHARE}")
-        # Each identity without the fields its configurations lost since runs were saved (`without_removed`).
-        manifest, semantic = (record(without_removed(found), "data manifest") for found in (
-            json_value(record(saved.get("manifest"), "saved data manifest"), "saved data manifest"),
-            json_value(self.manifest.semantic(), "data manifest")))
+        manifest = record(saved.get("manifest"), "saved data manifest")
+        semantic = self.manifest.semantic(self.version)
         # A bound the order grew is its steps' limit too.
         changed = tuple(name for name in _changed(manifest, semantic)
                         if not (name == "steps" and _steps_grown(json_value(manifest[name], "saved steps"),
@@ -1232,6 +904,17 @@ class Plan:
             _log.warning("resuming a mixture whose members changed: %s", ", ".join(edited))
         return changes + (edited or ())
 
+    def _rules_alike(self, saved: Mapping[str, object]) -> None:
+        """Refuse a saved plan that read by a rule (`rules`) whose value is not this Dew's, naming the rule:
+        its rows come next by another rule than this read's. Grain's, whose iterator state a reader
+        compares itself (`dew.data.readers._PerShare.set_state`), is not compared here."""
+        for name in sorted((set(saved) | set(self.rules)) - {"grain"}):
+            if saved.get(name) != self.rules.get(name):
+                raise ValueError(
+                    f"the saved data position read by the {name} rule {saved.get(name)!r}, and this Dew "
+                    f"reads by {self.rules.get(name)!r}, which decides other rows next (docs/design/data.md, "
+                    f"the rules): {_RESUMED}")
+
     def _edited_members(self, saved: Mapping[str, object]) -> tuple[str, ...] | None:
         """How a streamed mix's members changed from `saved`'s, which a resume takes: members that
         joined, which start, members that left, which are dropped, and weights that changed; None
@@ -1252,7 +935,10 @@ class Plan:
             if before[key] != self.members[key]:
                 raise ValueError(f"saved data plan member {key} changed what it reads or runs")
         mixture = ("corpora", "members", "weights")
-        current = {name: json_value(value, name) for name, value in self.order.items() if name not in mixture}
+        spelled_order = json_value(self.spelled_order(), "order")
+        if not isinstance(spelled_order, dict):
+            raise TypeError("a plan's order is a record of its fields")
+        current = {name: value for name, value in spelled_order.items() if name not in mixture}
         before_order = {name: value for name, value in order.items() if name not in mixture}
         if unplaced(before_order) != unplaced(current):
             raise PlanOrderChanged.between(before_order, current)

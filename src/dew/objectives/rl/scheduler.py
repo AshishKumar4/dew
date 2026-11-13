@@ -154,7 +154,7 @@ from dew.distributed.batches import first_reader_batch, shard_batch
 from dew.nn.inputs import local_rows, mesh_of
 from dew.nn.precision import at_least_fp32
 from dew.nn.progress import Progress
-from dew.objectives.base import Shown
+from dew.objectives.base import Objective, Shown, own_objective
 from dew.sampling.text import Sampling
 from dew.state import TrainState
 
@@ -329,14 +329,14 @@ class Synchronous:
 
     lag = 0
 
-    def __init__(self, collector: Collector, rescoring: GRPOObjective | None = None):
-        """`rescoring` is the objective whose proximal policy differs from the collected calls' raw
-        likelihoods (one reading its ratio at another `sampling_temperature`), which the packed rows are
-        rescored under at the step's weights (`rescore`); None where those likelihoods are the proximal
-        policy's, drawn from the variables the step trains, so `old_log_probs` are those and no rescoring
-        forward runs."""
+    def __init__(self, collector: Collector, rescores: bool = False):
+        """`rescores` where the step's objective reads its proximal policy elsewhere than the collected
+        calls' raw likelihoods (its ratio at another `sampling_temperature`), so the packed rows are
+        rescored under it at the step's weights (`scored_rows`); False where those likelihoods are the
+        proximal policy's, drawn from the variables and the objective the step trains, so
+        `old_log_probs` are those and no rescoring forward runs."""
         self.collector = collector
-        self.rescore = None if rescoring is None else functools.partial(scored_rows, rescoring)
+        self.rescores = rescores
         self._serial = 0
 
     @property
@@ -560,16 +560,9 @@ class Asynchronous:
         while live := pending():
             wait(live, return_when=FIRST_COMPLETED)
 
-    def rescore(self, variables: Variables, packed: Mapping[str, np.ndarray], progress: Progress
-                ) -> np.ndarray:
-        """The packed ids' proximal log-probabilities under `variables`, the trainer's weights, at the
-        run's `progress` the step's loss reads (`GRPOObjective.loss`), so the two policies agree where
-        their weights do.
-
-        Over a mesh the rows are placed as the step places the batch, every
-        process's rows together, so the rescoring runs once over the pool's
-        batch and each process reads its own rows back."""
-        return scored_rows(self.objective, variables, packed, progress)
+    rescores = True
+    """The packed rows are rescored under the step's objective at its weights (`scored_rows`): a lagged
+    collection's calls drew from earlier weights, so their likelihoods are the behavior policy's."""
 
 
 def scored_rows(objective: GRPOObjective, variables: Variables, packed: Mapping[str, np.ndarray],
@@ -617,16 +610,14 @@ class RolloutScheduler:
       (`sessions.overlong_penalty`). `generation_batches` is the most data
       batches a call admits groups from, its step's and those it draws
       further (`further`, the trainer's read of its stream).
-    - `reference` is the objective whose reward-side reference penalty
-      (`GRPOObjective.reward_kl`) each call's reward pays before the
-      estimator compares returns: the packed rows are scored under its
-      reference, the state's frozen starting policy, and repacked with
-      `sessions.reference_penalties`.
+    - `penalized` says each call's reward pays the step's objective's reward-side
+      reference penalty (`GRPOObjective.reward_kl`) before the estimator compares
+      returns: the packed rows are scored under its reference, the state's frozen
+      starting policy, and repacked with `sessions.reference_penalties`.
     - `scorer` is the objective that trains on the packed rows: where its model computes a shared prefix
-      as each chain's own, as each call packs them (`shares_prefixes(train=True)`, its run's plan bound
-      by then, `TokenScorer.bind_plan`), the prompt a group's chains begin with is packed once (`pack`'s
-      `share`); None packs each chain whole. `sampled`, `served` and `episodes` name their objective,
-      `PPORollout` its own.
+      as each chain's own, as each call packs them (`shares_prefixes(train=True)`), the prompt a group's
+      chains begin with is packed once (`pack`'s `share`); None packs each chain whole. `sampled`,
+      `served` and `episodes` name their objective, `PPORollout` its own.
 
     `metrics` holds the latest call's numbers, which the trainer logs as
     `rollout/<name>`.
@@ -644,7 +635,7 @@ class RolloutScheduler:
                  admit: int | None = None, estimator: str = "group", truncation: str = "mask",
                  credit: str = "session", support_capacity: int | None = None,
                  log: Callable[[SchedulerRecord], None] | None = None, varied: bool = False,
-                 overlong: tuple[int, int] | None = None, reference: GRPOObjective | None = None,
+                 overlong: tuple[int, int] | None = None, penalized: bool = False,
                  generation_batches: int = 1, scorer: Scorer | None = None):
         for name, value, least in (("groups", groups, 2), ("oversample", oversample, 0),
                                    ("generation_batches", generation_batches, 1)):
@@ -663,16 +654,31 @@ class RolloutScheduler:
         if overlong is not None and not (len(overlong) == 2 and 0 < overlong[1] <= overlong[0]):
             raise ValueError("overlong is (L_max, L_cache), a positive cache within the budget")
         self.overlong = overlong
-        if reference is not None and not reference.reward_kl > 0:
-            raise ValueError("reference names the objective whose reward-side penalty (reward_kl) the "
-                             "rewards pay, and this one's is 0")
-        self.reference = reference
+        self.penalized = penalized
         self.generation_batches = generation_batches
+        if (isinstance(acquisition, Synchronous) and isinstance(acquisition.collector, EpisodeCollector)
+                and scorer is None):
+            raise ValueError("an episode collector draws from a policy bound when it was built; name the "
+                             "objective that policy was made for (scorer=), which a step training another is "
+                             "refused against, or collect through a PolicyCollector, which draws from each "
+                             "step's own")
         self.scorer = scorer
         self.metrics: dict[str, float] = {}
         self._branch: str | None = None
         self._owned: tuple[Callable[[], None], ...] = ()
         """What it built itself and closes at its end (`served`'s source and server)."""
+
+    def _own_policy[LossT, EffectsT](self, objective: Objective[LossT, EffectsT]) -> None:
+        """Refuse a step's `objective` other than the one the acquisition's policy was made for, where that
+        policy is its own, fixed when it was built: an asynchronous source's server's
+        (`Asynchronous.objective`), or an episode collector's bound one (`scorer`, which such a scheduler
+        names, `EpisodeCollector.policy`). A `PolicyCollector` draws from each call's objective, and a
+        scripted collector from none. Its rows would otherwise train under a policy that did not draw them
+        (`own_objective`)."""
+        if isinstance(self.acquisition, Asynchronous):
+            own_objective(type(self).__name__, self.acquisition.objective, objective)
+        elif isinstance(self.acquisition.collector, EpisodeCollector):
+            own_objective(type(self).__name__, self.scorer, objective)
 
     @property
     def draws_further(self) -> bool:
@@ -695,17 +701,15 @@ class RolloutScheduler:
 
         The calls' raw likelihoods are the proximal policy's, the policy at temperature 1 over the whole
         vocabulary; a GRPO objective whose ratio reads its policy at another `sampling_temperature` has
-        its packed rows rescored at the step's weights (`Synchronous`'s `rescoring`), as an asynchronous
+        its packed rows rescored at the step's weights (`Synchronous`'s `rescores`), as an asynchronous
         collection's are, so its unchanged weights give a ratio of 1."""
         collector = PolicyCollector(objective, reward, decode, max_new_tokens,
                                     Sampling() if sampling is None else sampling)
-        rescoring = (objective if isinstance(objective, GRPOObjective)
-                     and objective.sampling_temperature != 1.0 else None)
-        return cls(Synchronous(collector, rescoring), tasks=prompt_tasks, groups=groups, estimator=estimator,
-                   truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
-                   reference=objective if isinstance(objective, GRPOObjective) and objective.reward_kl > 0
-                   else None, generation_batches=generation_batches,
-                   scorer=objective)
+        grpo = isinstance(objective, GRPOObjective)
+        return cls(Synchronous(collector, rescores=grpo and objective.sampling_temperature != 1.0),
+                   tasks=prompt_tasks, groups=groups, estimator=estimator, truncation=truncation, log=log,
+                   varied=varied, overlong=overlong, admit=admit, penalized=grpo and objective.reward_kl > 0,
+                   generation_batches=generation_batches, scorer=objective)
 
     @classmethod
     def served(cls, objective: GRPOObjective, reward: Reward, *, tasks: int, slots: int,
@@ -757,8 +761,8 @@ class RolloutScheduler:
                                    max_lag=max_lag, sync_every=sync_every)
         scheduler = cls(acquisition, tasks=prompt_tasks, groups=groups, estimator=estimator,
                         truncation=truncation, log=log, varied=varied, overlong=overlong, admit=admit,
-                        reference=objective if objective.reward_kl > 0 else None,
-                        generation_batches=generation_batches, scorer=objective)
+                        penalized=objective.reward_kl > 0, generation_batches=generation_batches,
+                        scorer=objective)
         # The source and the server it built end with it: the reward pool, then the engine.
         scheduler._owned = (source.close, server.close)
         return scheduler
@@ -966,14 +970,28 @@ class RolloutScheduler:
             raise RuntimeError(f"no group of batch {home.serial} completed: every one was abandoned")
         return home.complete[:self._target(home)]
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array,
-                 further: Callable[[], Batch | None] | None = None) -> dict[str, np.ndarray]:
+    def __call__[LossT, EffectsT](self, state: TrainState, batch: Batch, key: jax.Array,
+                                  further: Callable[[], Batch | None] | None = None, *,
+                                  objective: Objective[LossT, EffectsT]) -> dict[str, np.ndarray]:
+        """The call's packed rollouts, drawn from `objective`, the one the step trains (its phase's,
+        `dew.training.phase_passes`), which every use of a policy in the call reads: the collection, the
+        proximal rescoring and the reward-side penalty, both a GRPO objective's. One update's further
+        draws (`further`) read it too, the first read's phase."""
         if self.draws_further and further is None:
             raise ValueError("generation_batches above 1 draws further batches through the trainer's read of "
                              "its stream (further=), and this call was handed none")
+        self._own_policy(objective)
+        grpo = objective if isinstance(objective, GRPOObjective) else None
+        if (self.acquisition.rescores or self.penalized) and grpo is None:
+            raise TypeError("the call rescores its rows or pays a reward-side penalty, a GRPO objective's, "
+                            f"and the step trains a {type(objective).__name__}")
+        if self.penalized and not (grpo is not None and grpo.reward_kl > 0):
+            raise ValueError("the rewards pay the step's objective's reward-side penalty (penalized), and "
+                             "its reward_kl is 0")
         mesh = mesh_of(state.variables)
         partition = DataPartition() if mesh is None else DataPartition.of(mesh)
-        snapshot = Snapshot(state.variables, int(state.step), int(state.updates), key, self._branch)
+        snapshot = Snapshot(state.variables, int(state.step), int(state.updates), key, self._branch,
+                            objective)
         self.acquisition.begin(snapshot, partition)
         entries = _within(mesh, "rollout preparation", lambda: self.acquisition.entries(batch, self.tasks_of))
         acquiring = self.acquisition.acquires(partition)
@@ -983,18 +1001,17 @@ class RolloutScheduler:
         mine = rollouts if sampling else []
         # Rewards that pay the reference penalty are known once the packed rows are scored (`_penalized`).
         whitening = (self._whitening(mesh, mine, None)
-                     if self.estimator == "global" and self.reference is None else None)
+                     if self.estimator == "global" and not self.penalized else None)
         # A share's packing that fails (a support past its capacity) fails every process, not one.
         packed = _within(mesh, "rollout packing",
                          lambda: self._packed(entries[0], rollouts, whitening=whitening) if sampling else {})
         if mesh is not None:
             packed = first_reader_batch(mesh, agreed_records(packed, self.support_capacity))
-        if self.acquisition.rescore is not None:
+        if self.acquisition.rescores and grpo is not None:
             # At the updates the step's loss reads its policy at (`Objective.progress`).
-            packed[OLD_LOG_PROBS_KEY] = self.acquisition.rescore(state.variables, packed,
-                                                                 Progress(state.updates))
-        if self.reference is not None:
-            packed = self._penalized(state, mesh, entries[0], mine if sampling else None, packed)
+            packed[OLD_LOG_PROBS_KEY] = scored_rows(grpo, state.variables, packed, Progress(state.updates))
+        if self.penalized and grpo is not None:
+            packed = self._penalized(state, mesh, entries[0], mine if sampling else None, packed, grpo)
         if sampling:
             updates = snapshot.updates
             versions = [call.version for rollout in rollouts for call in rollout.calls]
@@ -1080,20 +1097,19 @@ class RolloutScheduler:
         return pooled([Moments(**share) for share in from_every_process(dataclasses.asdict(moments))])
 
     def _penalized(self, state: TrainState, mesh, entry: _Entry, rollouts: Sequence[Session] | None,
-                   packed: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """`packed` with the advantages of rewards that pay `reference`'s reward-side penalty: its rows
-        scored under the reference, the state's frozen starting policy, once over the pool's rows, and
-        each first reader's rollouts repacked with each call's penalty (`reference_penalties`), which
-        its share's later readers take from it. `rollouts` is None on a later reader."""
-        assert self.reference is not None
+                   packed: dict[str, np.ndarray], objective: GRPOObjective) -> dict[str, np.ndarray]:
+        """`packed` with the advantages of rewards that pay the step's `objective`'s reward-side penalty:
+        its rows scored under it at the state's frozen starting policy, the reference, once over the pool's
+        rows, and each first reader's rollouts repacked with each call's penalty (`reference_penalties`),
+        which its share's later readers take from it. `rollouts` is None on a later reader."""
         if state.ema is None:
             raise ValueError("the rewards' reference penalty reads the frozen starting policy, and the "
                              "state holds none; build it from the objective that names the penalty")
         frozen = state.averaged
         # At the progress the proximal column is read at, so the penalty is nil where the weights are alike.
-        reference = scored_rows(self.reference, frozen, packed, Progress(state.updates))
+        reference = scored_rows(objective, frozen, packed, Progress(state.updates))
         shaping = (None if rollouts is None else
-                   reference_penalties(rollouts, packed, reference, self.reference.reward_kl))
+                   reference_penalties(rollouts, packed, reference, objective.reward_kl))
         whitening = self._whitening(mesh, rollouts or [], shaping) if self.estimator == "global" else None
 
         def repacked() -> dict[str, np.ndarray]:
@@ -1115,7 +1131,7 @@ class RolloutScheduler:
                       estimator=self.estimator, truncation=self.truncation, credit=self.credit,
                       support_capacity=self.support_capacity, overlong=self.overlong, shaping=shaping,
                       whitening=whitening, share=self.share)
-        if self.acquisition.rescore is None:
+        if not self.acquisition.rescores:
             packed[OLD_LOG_PROBS_KEY] = sampled_values(
                 packed, lambda index, call: _recorded(rollouts[index], call))
         return packed

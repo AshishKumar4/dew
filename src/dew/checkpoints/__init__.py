@@ -64,11 +64,10 @@ from __future__ import annotations
 import copy
 import dataclasses
 import datetime
-import functools
 import json
 import math
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence, Set
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, TypedDict, overload
 
@@ -104,6 +103,7 @@ from dew.checkpoints._payloads import (
     _profile_path,
     _refuse_cut_resume,
     _refuse_profiles_alone,
+    _refuse_whole_item,
     _StepFacts,
 )
 from dew.checkpoints._replicas import Grid, _covered, _from_replicas, _zeros
@@ -111,7 +111,6 @@ from dew.checkpoints._state_trees import (
     TreePath,
     _at,
     _averaged,
-    _averages_of,
     _by_path,
     _decode_delta,
     _ema_deltas,
@@ -120,13 +119,11 @@ from dew.checkpoints._state_trees import (
     _item_metadata,
     _named,
     _plane_template,
-    _power_profiles,
     _profile_record,
     _profiles_at,
     _snapshot_weights,
     _variable_trees,
     _with,
-    _with_averages,
     _with_ema_deltas,
 )
 from dew.checkpoints._step_records import counted_processes, gather_positions, read_position, step_record
@@ -135,7 +132,6 @@ from dew.checkpoints.averaging import (
     averaged as averaged,
     averaged_pinned as averaged_pinned,
 )
-from dew.checkpoints.served import unpacked
 from dew.mesh import LogicalAxes
 from dew.nn import sharding
 from dew.nn.precision import at_least_fp32
@@ -147,7 +143,6 @@ if TYPE_CHECKING:
     from flax.training.dynamic_scale import DynamicScale
 
     from dew.data.dataset import DataPartition
-    from dew.nn.protocols import ProjectionGroup
     from dew.state import Accumulation, TrainState
 
 # One field of the train state as a checkpoint holds it: a scalar array, a
@@ -523,16 +518,22 @@ def _paths(tree) -> set[str]:
             for path, _ in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
 
-def _refuse_lacking(lacking: set[str], where: str) -> None:
-    """Refuse a template whose leaves `lacking` the checkpoint at `where` does not hold."""
+def _refuse_lacking(lacking: set[str], where: str, unread: Set[str] = frozenset()) -> None:
+    """Refuse a template whose leaves `lacking` the checkpoint at `where` does not hold, naming what it
+    holds in their place: its `unread` leaves, those the template does not ask, beside a lacking one (a
+    layout another model or an earlier Dew wrote, a projection group's members stored packed among them).
+    Paths are `_paths`'."""
     if lacking:
         names = sorted(lacking)
+        beside = {name.rsplit("/", 2)[0] for name in names}
+        instead = sorted(name for name in unread if name.rsplit("/", 2)[0] in beside)
+        more = " and more" if len(instead) > 4 else ""
+        held = f" It holds {', '.join(instead[:4])}{more} in their place." if instead else ""
         raise ValueError(
             f"The checkpoint at {where} holds no {', '.join(names[:6])}"
-            f"{f' or {len(names) - 6} more leaves' if len(names) > 6 else ''}, "
-            f"which this run's state has: the checkpoint was written by a model "
-            f"or objective without them. Restore it with the model it was "
-            f"written with.")
+            f"{f' or {len(names) - 6} more leaves' if len(names) > 6 else ''}, which this run's state has: "
+            f"another model or objective wrote it, or an earlier Dew that laid them out otherwise.{held} "
+            f"Restore it with the model and the Dew that wrote it, or start a fresh run from its weights.")
 
 
 RETIRED_RATE = ("learning_rate_scale", "learning_rate_shape")
@@ -1586,16 +1587,8 @@ class Checkpoints:
             restored = self._restored(step, None, {PROFILES: jax.tree.map(lambda _: host, held)}, local=False,
                                       partial=False, by_payload=True)
             return tuple(restored[PROFILES]['averages'])
-        # A step of one item, as an earlier Dew wrote it: its averages where its optimizer state keeps them.
-        metadata = _item_metadata(facts)
-        found = _profiles_at(metadata)
-        if found is None:
-            raise ValueError(f"the checkpoint at step {step} holds no post-hoc EMA profiles")
-        path, profiles = found
-        wanted = _with({}, path, _with_averages(jax.tree.map(lambda _: ocp.PLACEHOLDER, _at(metadata, path)),
-                                                tuple(_averages_of(profiles))))
-        restored = self._restored(step, wanted, jax.tree.map(lambda _: host, wanted), local=False)
-        return tuple(_averages_of(_power_profiles(_at(restored, path))))
+        raise ValueError(f"the checkpoint at step {step} holds its post-hoc EMA profiles in its optimizer's "
+                         "state, one item, as an earlier Dew wrote it: read them with the Dew that wrote it")
 
     def posthoc_ema(self, std: float, step: int | None = None) -> Variables:
         """Return the post-hoc EMA with relative standard deviation `std` at checkpoint `step`.
@@ -1870,6 +1863,10 @@ class Checkpoints:
         arrays = jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), dict(pending))
         arrays["statistics"] = tuple(arrays["statistics"])
         arrays["effects"] = tuple(arrays["effects"])
+        if arrays.get("batch_statistics") is not None:
+            arrays["batch_statistics"] = tuple(arrays["batch_statistics"])
+        if arrays.get("replayed_statistics") is not None:
+            arrays["replayed_statistics"] = tuple(arrays["replayed_statistics"])
         return Accumulation(**arrays)
 
     def position(self, step: int, share: DataPartition) -> bytes | None:
@@ -1912,16 +1909,14 @@ class Checkpoints:
 
     @overload
     def restore[StateT](self, template: StateT, step: int | str | None = None, *,
-                        share: DataPartition | None = None,
-                        served: Sequence[ProjectionGroup] = ()) -> tuple[StateT, bytes | None]: ...
+                        share: DataPartition | None = None) -> tuple[StateT, bytes | None]: ...
 
     @overload
     def restore(self, template: None = None, step: int | str | None = None, *,
-                share: DataPartition | None = None,
-                served: Sequence[ProjectionGroup] = ()) -> tuple[Variables, bytes | None]: ...
+                share: DataPartition | None = None) -> tuple[Variables, bytes | None]: ...
 
     def restore(self, template=None, step: int | str | None = None, *,
-                share: DataPartition | None = None, served: Sequence[ProjectionGroup] = ()):
+                share: DataPartition | None = None):
         """Restore the state at `step` and the data position of `share`.
 
         `template` is a pytree of `jax.ShapeDtypeStruct` naming the state
@@ -1937,12 +1932,6 @@ class Checkpoints:
         returned as the bytes the reader of `share` resumes from (see
         `read_position`). Without a share, as for a caller that reads weights
         and no data, it is None.
-
-        `served` names the projection groups a step may hold packed where the
-        template holds their members (`Objective.served_groups`): each such
-        leaf, in any of the state's trees, is read packed and split back into
-        its members (`dew.checkpoints.served.unpacked`). Carried to 1.0, when it is deleted (ledger
-        1552).
         """
         resumes = template is not None and not isinstance(template, Mapping)
         step = self._pinned(step, RESUME if resumes else MODEL)
@@ -1960,6 +1949,8 @@ class Checkpoints:
             raise ValueError(f"step {step} of {self.directory} holds {_payload(self._payloads(step))} alone: "
                              "a weights-only snapshot, or a step kept for its weights or profiles, resumes "
                              "nothing; resume a whole checkpoint")
+        if resumes and not from_local:
+            _refuse_whole_item(step, snapshot, self.directory)
         _refuse_profiles_alone(step, snapshot)
         metadata = _item_metadata(snapshot)
         stored = metadata.keys()
@@ -2018,11 +2009,10 @@ class Checkpoints:
                     f"and the gradient accumulation it was written with. Resume it "
                     f"with those, or start a fresh run in a directory of its own."
                 ) from mismatch
-            restored = unpacked(functools.partial(self._restored, step, local=from_local), metadata,
-                                dict(restored), served)
-            _refuse_lacking({jax.tree_util.keystr(path) for path, leaf
+            _refuse_lacking({jax.tree_util.keystr(path, simple=True, separator="/") for path, leaf
                              in jax.tree_util.tree_flatten_with_path(dict(restored))[0]
-                             if isinstance(leaf, jax.ShapeDtypeStruct)}, where)
+                             if isinstance(leaf, jax.ShapeDtypeStruct)}, where,
+                            _paths(dict(metadata)) - _paths(state_tree))
             keys = _keys(snapshot)
             restored = {name: value if name == 'position' else _placed(value, state_tree[name], keys)
                         for name, value in restored.items()}

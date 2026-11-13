@@ -14,13 +14,13 @@ import grain.python as grain
 import numpy as np
 from numpy.typing import ArrayLike
 
-from dew._records import record
+from dew._records import ADDED, record
 from dew.batch import Batch
 from dew.data.facts import resized, shaped, unshaped
 from dew.data.image_augmentation import AUGMENTATION_KEYS, JITTER
 from dew.data.image_codec import as_rgb, decode_image
 from dew.data.pipeline import DeviceStep, Rejected
-from dew.data.plan import callable_name
+from dew.data.plan import reader_name
 
 if TYPE_CHECKING:
     import jax
@@ -649,17 +649,21 @@ class EncodeCaptions:
     """Each batch's captions encoded by `reader` for the conditions that read them, or dropped without
     one; `keep` names a field to hold them beside as host text, which a metric reads against its own
     tokenizer (`dew.eval.images.CLIPScore`) and no compiled step takes (`split_fields`). A reader that
-    encodes a field of that name too is refused (ValueError), rather than one overwriting the other."""
+    encodes a field of that name too is refused (ValueError), rather than one overwriting the other.
+    The run's plan holds what the reader computes (`reader_name`), `declared` where no name of it
+    does; an encoder of a reader no name holds is a step of no stable identity."""
 
     reader: Callable[[Sequence[str]], Batch] | None = dataclasses.field(default=None, repr=False)
     keep: str | None = None
+    declared: str | None = dataclasses.field(default=None, repr=False, metadata={ADDED: True})
 
     @property
-    def identity(self) -> str:
+    def identity(self) -> str | None:
         kept = "" if self.keep is None else f"+keep={self.keep}"
         if self.reader is None:
             return "dew.drop-captions@1" if self.keep is None else f"dew.keep-captions@1:{self.keep}"
-        return f"dew.encode-captions{kept}:{callable_name(self.reader)}"
+        named = reader_name(self.reader, self.declared)
+        return None if named is None else f"dew.encode-captions{kept}:{named}"
 
     def __call__(self, batch: Batch) -> Batch:
         held = dict(batch)
@@ -678,13 +682,15 @@ class EncodeCaptions:
 @dataclasses.dataclass(frozen=True)
 class EncodeFields:
     """Each batch with the fields `reader` encodes from it (`InputSpec.encode_fields`), as
-    `EncodeCaptions` does its captions."""
+    `EncodeCaptions` does its captions, and named in the run's plan as it names its reader."""
 
     reader: Callable[[Batch], Batch] = dataclasses.field(repr=False)
+    declared: str | None = dataclasses.field(default=None, repr=False, metadata={ADDED: True})
 
     @property
-    def identity(self) -> str:
-        return f"dew.encode-fields:{callable_name(self.reader)}"
+    def identity(self) -> str | None:
+        named = reader_name(self.reader, self.declared)
+        return None if named is None else f"dew.encode-fields:{named}"
 
     def __call__(self, batch: Batch) -> Batch:
         return {**batch, **self.reader(batch)}

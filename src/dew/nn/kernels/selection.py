@@ -113,12 +113,17 @@ def analysed[C](code: str, analysis: Callable[[C], Refusal | None], row: str,
 class Kernel[C]:
     """A kernel an op may run: `supports`, its requirements in the order a refusal names them, whether
     it is `generic`, a path that takes what the others turn down, and the `upstream` library whose kernels
-    it reproduces where it is a port (its contract: 'fla', 'mamba_ssm'), None for Dew's own."""
+    it reproduces where it is a port (its contract: 'fla', 'mamba_ssm'), None for Dew's own, and whether it
+    is `reverse_only`: it defines its reverse-mode derivative alone (a `jax.custom_vjp`), its backward traced
+    after the call, so forward mode takes its tangents from another path computing the same function
+    (`dew.nn.attention.forward_differentiable`); the others are JAX's own products, or state their own
+    tangents, which forward mode differentiates as written."""
 
     name: str
     supports: tuple[Requirement[C], ...]
     generic: bool = False
     upstream: str | None = None
+    reverse_only: bool = False
 
     def refusals(self, case: C, forced: bool = False) -> Iterator[Refusal]:
         """The refusals `case` gets of the kernel's requirements, in their order, each requirement evaluated
@@ -174,6 +179,17 @@ class Op[C]:
         default_factory=dict, compare=False, hash=False)
     """Another op's named choice that names this one's kernel, unless this call or op names its own.
     Entries are ordered, as the op's requirements and candidates are."""
+
+    def __post_init__(self) -> None:
+        # Each declared cell runs one of the op's kernels, in a scope a device generation or its instruction
+        # family states: one that names another, or no scope, matches no call.
+        from . import generation
+
+        scopes = {*generation.TARGETS, *map(generation.family, generation.TARGETS)}
+        for (scope, _), (kernel, _) in self.declared.items():
+            if kernel not in self.kernels or scope not in scopes:
+                raise ValueError(f"{self.choice} declares {kernel.name!r} in {scope!r}, which matches no "
+                                 f"call: its kernels are {', '.join(each.name for each in self.kernels)}")
 
     def kernel(self, name: str) -> Kernel[C]:
         for kernel in self.kernels:

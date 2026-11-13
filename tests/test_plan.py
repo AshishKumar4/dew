@@ -9,6 +9,7 @@ import contextlib
 import dataclasses
 import functools
 import gc
+import itertools
 import json
 import struct
 import weakref
@@ -407,6 +408,7 @@ def test_a_plan_search_keeps_the_freeze_a_process_made_before_it():
     review)."""
     assert_exits_cleanly("""
 import gc
+import itertools
 
 touched = []
 freeze, unfreeze = gc.freeze, gc.unfreeze
@@ -768,6 +770,62 @@ def regression_steps(x, *, pgle: bool):
     return {"loss": jnp.stack(losses), "params": state.variables["params"]}
 
 
+def regression_fit(x, directory, split: int, steps: int):
+    """`regression_steps`' run as a fit over `x`'s rows, eight a step in order, read in `split` microbatches
+    and checkpointed every two steps in `directory`, resumed there where it holds a checkpoint: its weights
+    after `steps` steps."""
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+
+    rows = [{"x": row, "y": 2 * row[:2]} for row in x]
+    data = compile(Pipeline(Memory(rows)).batch(8), read="memory", seed=0,
+                   loading=Loading(workers=0, threads=1, read_buffer=1))
+    trainer = one_device(Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0), split=split,
+                                 checkpoints=Checkpoints(str(directory))))
+    return trainer.fit(data, steps=steps, checkpoint_every=2).variables["params"]
+
+
+def test_a_step_handed_a_state_another_split_left_at_an_updates_end_reads_it_in_its_own():
+    """A compiled step is handed a state another step of another split returned at an update's end (a
+    phase's, a cooldown's restored, a caller's): it lays the state out for its own window first, its count
+    of accepted microbatches read in its own, so each update is one step; handed one inside an update, it
+    refuses it (row 5558)."""
+    halves = trained(lm(split=2), steps=2)
+    quarters = lm(split=4)
+    step = quarters.compile(halves, BATCH)
+    state, *_ = step(halves, BATCH)
+    assert (int(state.step), int(state.microstep), int(state.window_size)) == (3, 3 * 4, 4)
+    pooled = trained(lm(split=2, accumulation=2), steps=1)
+    with pytest.raises(ValueError):
+        lm(split=4, accumulation=2).compile(pooled, BATCH)(pooled, BATCH)
+
+
+def test_a_run_resumed_at_a_finer_split_lands_where_the_uninterrupted_run_does(tmp_path):
+    """A run saved at an update's end in two microbatches a step and resumed in four, a memory setting
+    alone, lands where the run nobody stopped lands: its weights as exact as that run's (check 1), from
+    the float64 run of its steps (`regression_truth`)."""
+    runs = itertools.count()
+
+    @as_given
+    def resumed(x):
+        directory = tmp_path / f"resumed-{next(runs)}"
+        regression_fit(x, directory, 2, 2)
+        return {"params": regression_fit(x, directory, 4, 4)}
+
+    @as_given
+    def uninterrupted(x):
+        return {"params": regression_fit(x, tmp_path / f"whole-{next(runs)}", 2, 4)}
+
+    truthful = regression_truth()
+
+    def truth(x):
+        return {"params": truthful(x)["params"]}
+
+    label = "a run resumed at a finer split"
+    assert_as_exact(resumed, uninterrupted, regression_rows, label, truth_fn=truth,
+                    seeds=seeds_for(uninterrupted, regression_rows, label, dew_fn=resumed, truth_fn=truth))
+
+
 def regression_truth() -> Callable:
     """`regression_steps`' run in float64, a function of its rows: from the weights its trainer draws, held
     in float64 here, each step's affine map, squared error and SGD step at 0.1 over its eight rows computed
@@ -882,19 +940,21 @@ def windows(corpus):
                    loading=Loading(workers=0, threads=1, read_buffer=1))
 
 
-def windowed(directory, split, remat=None, objective=LMObjective):
+def windowed(directory, split, remat=None, objective=LMObjective, accumulation=1):
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=1, mlp_features=16,
                               max_seq_len=8, remat=remat)
     return one_device(Trainer(objective(model, seq_len=4), optax.adam(1e-2), key=jax.random.key(0),
-                              split=split, layout=Layout(min_shard=1, tolerance=1.0),
+                              split=split, accumulation=accumulation,
+                              layout=Layout(min_shard=1, tolerance=1.0),
                               checkpoints=Checkpoints(str(directory / "run"))))
 
 
 def test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trained_on(tmp_path):
-    """The split is part of what a run resumes: the state's window holds
-    that many microbatches. A resumed run that leaves it open takes the
-    checkpoint's and trains bit for bit as the uninterrupted run; one that
-    pins another is refused."""
+    """A resumed run that leaves its split open takes the checkpoint's and trains bit for bit as the
+    uninterrupted run. Saved at an update's end, where its checkpoint holds no window, it may state a finer
+    split, a memory setting alone: its window is laid out afresh, and it lands where the uninterrupted run
+    does, within the reductions' rounding. Saved inside an update, its window holds that many microbatches,
+    and a resume that states another split is refused."""
     corpus = token_files(tmp_path)
     expected = windowed(tmp_path / "whole", 2).fit(windows(corpus), steps=4, checkpoint_every=2)
     windowed(tmp_path / "split", 2).fit(windows(corpus), steps=2, checkpoint_every=2)
@@ -903,8 +963,14 @@ def test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trai
     assert resumed.plan["split"] == 2
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         assert raw(left).tobytes() == raw(right).tobytes()
+    windowed(tmp_path / "finer", 2).fit(windows(corpus), steps=2, checkpoint_every=2)
+    finer = windowed(tmp_path / "finer", 4)
+    landed = finer.fit(windows(corpus), steps=4, checkpoint_every=2)
+    # Its accepted microbatches read in the finer window's: the same steps and updates.
+    assert finer.plan["split"] == 4 and (int(landed.step), int(landed.microstep)) == (4, 4 * 4)
+    windowed(tmp_path / "inside", 2, accumulation=2).fit(windows(corpus), steps=3, checkpoint_every=3)
     with pytest.raises(ValueError):
-        windowed(tmp_path / "split", 4).fit(windows(corpus), steps=6, checkpoint_every=2)
+        windowed(tmp_path / "inside", 4, accumulation=2).fit(windows(corpus), steps=4, checkpoint_every=4)
 
 
 @pytest.mark.mesh(devices=2)

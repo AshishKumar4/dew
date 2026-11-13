@@ -351,26 +351,6 @@ def test_a_shuffle_of_windows_cutting_documents_counts_each_once_its_every_windo
         assert all(sum(held == {share} for held in owners.values()) >= 3 for share in range(shares))
 
 
-def test_a_counted_read_of_overlapping_windows_resumes_a_position_that_credited_each_token_to_its_first():
-    """A streamed read of twelve documents in windows of 4 tokens 2 apart, bounded to all twelve, its
-    position saved by main 91527d9fe, which credited each token to the first window holding it, where it
-    had credited a document's last token the next window holds too (tests/fixtures/
-    overlapping_windows_position.json): restored where each token goes to the last window holding it, it
-    credits none twice, the read consuming the 11 examples whose last tokens a window holds, as the saving
-    read did (review of row 1902)."""
-    fixture = Path(__file__).with_name("fixtures") / "overlapping_windows_position.json"
-    recorded = json.loads(fixture.read_text())
-    chain = Pipeline(Memory(_pieces(), shard_rows=3)).windows(4, stride=2, fields=("id",))
-    chain = chain.read("streamed").batch(1)
-    stream = compile(chain, read="streamed", examples=len(_LENGTHS)).train(DataPartition())
-    try:
-        stream.set_state(recorded["state"].encode())
-        after = [int(np.sum(batch[EXAMPLES_CONSUMED])) for batch in stream]
-    finally:
-        stream.close()
-    assert sum(recorded["before"]) + sum(after) == sum(recorded["before"]) + sum(recorded["after"]) == 11
-
-
 _MAPPED = {
     "concat mapped": (lambda chain: chain.pack(8, fields=("id",), policy="concat").map(_kept)
                       .shuffle(seed=1, window=4), "streamed"),
@@ -1045,8 +1025,8 @@ def test_a_rollout_run_bounded_in_examples_steps_as_the_run_without_it_and_ends_
     alone = Trainer(Thin(), optim, key=0, accumulation=2, tracker=plain).fit(
         clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
     handed = Trainer(Thin(), optim, key=0, accumulation=2, tracker=rolled,
-                     rollout=lambda state, batch, key: batch).fit(clocked_chain(x), examples=CLOCKED_RECORDS,
-                                                                  log_every=1)
+                     rollout=lambda state, batch, key, *, objective: batch).fit(
+        clocked_chain(x), examples=CLOCKED_RECORDS, log_every=1)
     assert int(handed.consumed) == int(alone.consumed) == CLOCKED_RECORDS
     np.testing.assert_array_equal(np.asarray(handed.variables["params"]["w"]),
                                   np.asarray(alone.variables["params"]["w"]))
@@ -1059,7 +1039,7 @@ class DrawingFurther:
 
     draws_further = True
 
-    def __call__(self, state, batch, key, further):
+    def __call__(self, state, batch, key, further, *, objective):
         from dew.nn.inputs import local_rows
 
         drawn = further()

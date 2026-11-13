@@ -67,3 +67,14 @@ def test_a_forced_kernel_hands_on_a_call_its_first_refusal_hands_off():
     with pytest.raises(KernelRefused) as refused:
         select(op(handoff, WIDE), Call(2), named='template')
     assert refused.value.first.code == 'wide'
+
+
+@pytest.mark.parametrize(("scope", "own"), [("mma.sync", False), ("a100", True)],
+                         ids=["another-ops-kernel", "no-devices-scope"])
+def test_an_op_refuses_a_declared_cell_that_matches_no_call(scope, own):
+    """A declared cell (`Op.declared`) whose kernel is not one of the op's, or whose scope no device
+    generation or instruction family names, is refused as the op is built, where it would match no call."""
+    template, fused = Kernel[Call]('template', ()), Kernel[Call]('fused', ())
+    with pytest.raises(ValueError):
+        Op(generation.Choice.RMS_NORM, (template, Kernel('xla', (), generic=True)),
+           declared={(scope, 'rows'): (template if own else fused, "a receipt")})

@@ -146,6 +146,14 @@ def _refuse_profiles_alone(step: int, facts: _StepFacts) -> None:
                          "for; its profiles' averages are read by Checkpoints.restore_profiles")
 
 
+def _refuse_whole_item(step: int, facts: _StepFacts, where: str) -> None:
+    """Refuse a train state's resume from a step that holds its whole state as one item (`ONE_ITEM`) and
+    is no mapping saved in a train state's place, as an earlier Dew wrote it; its model reads on."""
+    if ONE_ITEM in facts.payloads and not (facts.custom_metadata or {}).get('tree'):
+        raise ValueError(f"step {step} of {where} holds its whole state as one item, as an earlier Dew wrote "
+                         "it: resume it with the Dew that wrote it, or start a fresh run from its weights")
+
+
 def _refuse_cut_resume(step: int, facts: _StepFacts, field: str) -> None:
     """Refuse a read of `field`, state only a resume reads (its data position, its rollout), at a step its
     retention cut to its model or its profiles, which held it once and holds it no longer: so a cut step

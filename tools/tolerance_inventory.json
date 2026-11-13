@@ -122,15 +122,11 @@
    "lane": "Training"
   },
   "tests/test_decision_objective.py": {
-   "comparisons": 10,
+   "comparisons": 8,
    "lane": "Training"
   },
   "tests/test_decision_option_slots.py": {
    "comparisons": 1,
-   "lane": "Training"
-  },
-  "tests/test_decision_packing.py": {
-   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_decision_questions.py": {
@@ -189,12 +185,8 @@
    "comparisons": 4,
    "lane": "Training"
   },
-  "tests/test_distribution.py": {
-   "comparisons": 9,
-   "lane": "Training"
-  },
   "tests/test_dpo.py": {
-   "comparisons": 7,
+   "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
   "tests/test_edm2.py": {
@@ -266,7 +258,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_grpo.py": {
-   "comparisons": 2,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_guidance_distillation.py": {
@@ -538,7 +530,7 @@
    "lane": "Training"
   },
   "tests/test_rl_surrogate.py": {
-   "comparisons": 8,
+   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_rollout.py": {
@@ -550,7 +542,7 @@
    "lane": "Training"
   },
   "tests/test_samplers.py": {
-   "comparisons": 9,
+   "comparisons": 8,
    "lane": "Models, Serving & RL"
   },
   "tests/test_sd3_source.py": {

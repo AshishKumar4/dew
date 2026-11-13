@@ -59,7 +59,7 @@ class Iterated(Dataset):
     def records(self, read: Read) -> Records:
         raise ValueError(f"{self.describe()} is an iterator, read only as a stream")
 
-    def manifest(self, version: int) -> ShardManifest:
+    def manifest(self) -> ShardManifest:
         return ShardManifest((Shard(self.describe(), self.describe()),), self._read_shard)
 
     def _read_shard(self, shard: Shard, options: grain.ReadOptions | None = None) -> grain.IterDataset:
@@ -127,7 +127,7 @@ class _StreamIterator[Rows: Iterator[Batch]](grain.DatasetIterator):
                 f"resume; pass replay=True if it reads the same records each time it opens, or "
                 f"state= and load_state=")
         read, saved = state.get("read"), state.get("state")
-        if not isinstance(read, int) or read < 0:
+        if isinstance(read, bool) or not isinstance(read, int) or read < 0:
             raise ValueError(f"an iterator's position is the count of records it read, not {read!r}")
         if not isinstance(saved, str):
             raise ValueError("this iterator resumes through load_state, and its position holds no state")

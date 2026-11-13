@@ -4,6 +4,7 @@ lookups over tasks of the target's, and a task reuses each kept row it finds fre
 inputs a row is keyed by, which a planner's clean checkout and a task's carried one read alike."""
 
 import hashlib
+import io
 import json
 import os
 import re
@@ -488,3 +489,205 @@ def test_a_task_on_another_pinned_class_reuses_the_rows_its_plan_kept(
     rows = armada_task(ci, monkeypatch, verdict)
     assert len(rows) == 3 and all(row["exitCode"] == 0 for row in rows)
     assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [1, 1, 2]
+
+
+def test_a_row_green_on_a_tree_is_reused_there_after_another_tree_ran_it_executing_another_set(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A row run green on a tree is reused when that tree is planned again, though a run of another tree came
+    after it and executed another set of inputs (a helper its test called there): the row's list keeps each
+    green run's executed set, and the plan keys this tree's inputs with its own set (2026-11-12: keyed with
+    the last run's set alone, train 781's CI kept 2 of 4,180 tasks, and a reach of a comment's change planned
+    7,161 rows)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    armada_task(ci, monkeypatch, verdict)
+    test_a = tmp_path / "tests/test_a.py"
+    main = test_a.read_text()
+    # Another tree: test_a calls a helper of its own, so its run executes a set this tree's never did.
+    helper = tmp_path / "tests/helper_other.py"
+    helper.write_text("def value():\n    return 1\n")
+    test_a.write_text("from helper_other import value\n"
+                      + main.replace("def test_a():\n", "def test_a():\n    assert value() == 1\n"))
+    armada_task(ci, monkeypatch, verdict)
+    helper.unlink()
+    test_a.write_text(main)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    rows = armada_task(ci, monkeypatch, verdict)
+    assert sorted((row["name"], row["exitCode"]) for row in rows) == [
+        (f"3.12:tests/test_{name}.py", 0) for name in "abc"]
+    assert [len((tmp_path / f"runs-{name}").read_text()) for name in "abc"] == [2, 1, 1]
+
+
+def test_two_trees_alternating_each_reuse_their_rows_and_a_changed_unit_of_a_set_runs_its_row(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Two trees whose runs of a row execute different sets, planned in turn, each reuse their own green rows
+    (main's and base's, a train's and a lane's); a unit of a recorded set changed in the tree runs the row
+    again: a set is a hit only where every input it names holds what it held."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    test_a = tmp_path / "tests/test_a.py"
+    plain = test_a.read_text()
+    helper = tmp_path / "tests/helper_other.py"
+    calling = "from helper_other import value\n" + plain.replace("def test_a():\n",
+                                                                 "def test_a():\n    assert value() == 1\n")
+
+    def tree(*, other: bool, body: str = "def value():\n    return 1\n") -> None:
+        if other:
+            helper.write_text(body)
+            test_a.write_text(calling)
+        else:
+            helper.unlink(missing_ok=True)
+            test_a.write_text(plain)
+
+    for other in (False, True):
+        tree(other=other)
+        armada_task(ci, monkeypatch, verdict)
+    for other in (False, True, False, True):
+        tree(other=other)
+        assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"], other
+    # The other tree's helper changed in the unit test_a ran: its row runs, the rest reused.
+    tree(other=True, body="def value():\n    return 2 - 1\n")
+    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
+
+
+def flaky_row(root: Path) -> tuple[Path, str]:
+    """tests/test_a.py made flaky: red where FAIL is set, its red run executing a unit its green runs never do
+    (src/flaky.py's `failing`), so the red's executed set, and key, are its own: the file and its text."""
+    (root / "src").mkdir(exist_ok=True)
+    (root / "src/flaky.py").write_text("def failing():\n    raise AssertionError('flaky')\n")
+    flaky = ("import os, sys\nfrom pathlib import Path\nsys.path.insert(0, 'src')\nimport flaky\n"
+             "def test_a():\n"
+             "    with Path('runs-a').open('a') as runs: runs.write('x')\n"
+             "    if os.environ.get('FAIL'):\n        flaky.failing()\n")
+    (root / "tests/test_a.py").write_text(flaky)
+    return root / "tests/test_a.py", flaky
+
+
+def test_a_red_run_of_a_row_revokes_its_earlier_green_runs_by_any_set_token_or_tree(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A red run of a row (a flaky one on the very inputs a green run recorded) revokes every green run of it
+    recorded before it, on that class and those shared inputs: a plan finds none by any executed set, a task
+    handed a plan's kept token from before the red runs the row, and a green run of another tree after the red
+    brings back none of this tree's earlier green runs (review, 2026-11-12: a red that executed another set
+    revoked nothing by its own key)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    test_a, flaky = flaky_row(tmp_path)
+    armada_task(ci, monkeypatch, verdict)
+    entries = [entry for entry in ci.plan(300.0, {}) if entry["python"] == "3.12"]
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"] and len(entries) == 1
+    # The flaky red, on these very inputs.
+    monkeypatch.setenv("FAIL", "1")
+    assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict, policy="off")] == [1, 0, 0]
+    monkeypatch.delenv("FAIL")
+    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
+    # Another tree's green run after the red, then this tree again: it brings back none of this tree's green
+    # runs from before the red.
+    test_a.write_text(flaky + "\nOTHER_TREE = 1\n")
+    armada_task(ci, monkeypatch, verdict)
+    test_a.write_text(flaky)
+    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
+    # The kept token the plan made before the red, handed to its task now: the row runs, and its green run,
+    # after the red, is reused from then on.
+    command = json.loads((ROOT / ".armada.json").read_text())["task"]["command"]
+    values = {**entries[0], "out": verdict}
+    filled = [re.sub(r"\{(\w+)\}", lambda field: str(values[field[1]]), word) for word in command]
+    monkeypatch.setattr(sys, "argv", ["ci.py", *filled[2:]])
+    before = len((tmp_path / "runs-a").read_text())
+    assert ci.main() == 0
+    assert len((tmp_path / "runs-a").read_text()) == before + 1
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+
+
+def test_a_red_that_read_the_rows_state_before_another_red_still_revokes_the_green_between_them(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """Two red runs of a row at once, the second having read the row's revocation state before the first wrote
+    it, and a green run recorded between their writes: after the second red the green stands no more. A red
+    begins a fresh epoch, whatever it read; a count the second red read stale would write the first's number
+    again and let the green stand (review, 2026-11-12)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    flaky_row(tmp_path)
+    sender = ci.SEND
+
+    def red(stale: bool = False) -> None:
+        read = []
+
+        def send(method: str, url: str, headers, body, timeout: float):
+            # Its first read of the row's state as before the other red's write: the row had none then.
+            if stale and method == "GET" and ("-reds/" in url or "-epochs/" in url) and "test_a" in url \
+                    and not read:
+                read.append(url)
+                return 404, {}, io.BytesIO(b"")
+            return sender(method, url, headers, body, timeout)
+
+        with monkeypatch.context() as patched:
+            patched.setattr(ci, "SEND", send)
+            patched.setenv("FAIL", "1")
+            rows = armada_task(ci, monkeypatch, verdict, policy="off")
+        assert [row["exitCode"] for row in rows] == [1, 0, 0]
+
+    armada_task(ci, monkeypatch, verdict)
+    red()
+    armada_task(ci, monkeypatch, verdict)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    red(stale=True)
+    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]
+
+
+def test_a_lookup_whose_epoch_is_unread_or_gone_reuses_nothing(ci, tmp_path, monkeypatch, cache_worker):
+    """Where the Worker gives no answer for a row's last red, no green run of the row stands: the plan keeps
+    none, as an unread red may revoke any of them (review, 2026-11-12: an unread record read as none)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    armada_task(ci, monkeypatch, verdict)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+
+    # The Worker unavailable for the rows' epochs alone.
+    sender = ci.SEND
+
+    def send(method: str, url: str, headers, body, timeout: float):
+        if "-epochs/" in url:
+            raise ConnectionResetError("the connection to the Worker was reset")
+        return sender(method, url, headers, body, timeout)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(ci, "SEND", send)
+        assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+    # Its epochs gone (the bucket's expiry), every green run recorded in them stands no more: a green written
+    # after a red it read nothing of, kept past that red's epoch, is never reused (review, 2026-11-12).
+    stored = cache_worker[1]
+    for key in [key for key in stored if "-epochs/" in key]:
+        del stored[key]
+    assert planned() == ["tests/test_a.py", "tests/test_b.py", "tests/test_c.py"]
+
+
+def test_a_red_runs_epoch_write_sent_again_after_a_later_one_never_puts_it_back(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """An epoch's write sent again after a later epoch replaced it (a retry of a write the Worker took but
+    whose answer was lost; a kept connection replaying its request) changes nothing, so the green run recorded
+    in the epoch between stays revoked by the red that began the later one (review, 2026-11-12)."""
+    verdict, planned = planned_checkout(ci, tmp_path, monkeypatch, cache_worker, "GenuineIntel-6-143")
+    flaky_row(tmp_path)
+    sent: list[tuple] = []
+    sender = ci.SEND
+
+    def keeping(method: str, url: str, headers, body, timeout: float):
+        if method == "PUT" and "-epochs/" in url and "test_a" in url:
+            sent.append((method, url, dict(headers), body, timeout))
+        return sender(method, url, headers, body, timeout)
+
+    def red() -> None:
+        with monkeypatch.context() as patched:
+            patched.setenv("FAIL", "1")
+            rows = armada_task(ci, monkeypatch, verdict, policy="off")
+        assert [row["exitCode"] for row in rows] == [1, 0, 0]
+
+    armada_task(ci, monkeypatch, verdict)
+    with monkeypatch.context() as patched:
+        patched.setattr(ci, "SEND", keeping)
+        red()
+    first_red = sent[-1]
+    armada_task(ci, monkeypatch, verdict)
+    assert planned() == ["tests/test_a.py tests/test_b.py tests/test_c.py"]
+    red()
+    # The first red's epoch write, sent again as it was sent.
+    status, _, answer = sender(*first_red)
+    answer.close()
+    assert status in (204, 412)
+    assert planned() == ["tests/test_a.py", "tests/test_b.py tests/test_c.py"]

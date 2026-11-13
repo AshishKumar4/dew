@@ -53,12 +53,13 @@ def this_gpus(count: int = 1) -> tuple:
 
 
 def fine_tune(mesh, *, ahead=None, width: int | None = None, xla: bool = False, split=1, remat=None,
-              inspection=None):
+              inspection=None, tracker=None):
     fields = {**TINY_DECODER, **({} if width is None else {"emb_features": width}),
               **({"attention_impl": "xla"} if xla else {}), **({} if remat is None else {"remat": remat})}
     model = models.build("causal_transformer", vocab_size=VOCAB, **fields, num_kv_heads=2)
     return Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
-                   layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead, inspection=inspection)
+                   layout=Layout(min_shard=TINY_SHARD), split=split, ahead=ahead, inspection=inspection,
+                   tracker=tracker)
 
 
 def test_a_program_compiled_ahead_runs_in_place_of_compiling():
@@ -195,10 +196,13 @@ def test_a_program_one_process_kept_runs_in_another_that_traces_nothing(tmp_path
     call made inside one of Dew's own contexts, have no identity a file can state and are named as not
     kept (row 5265: a warm scoring server paid its programs' traces)."""
     saved = kept_in(tmp_path / "kept")
-    assert saved["refused"] == ["__main__.<lambda> (0)", "kept_module.scaled (1)"], saved["reasons"]
-    assert saved["kept"] == 9
-    assert (saved["cpu"] is not None) == (jax.default_backend() == "cpu")
     answers = saved["answers"]
+    # Every answered call kept, and the calls of no identity the worker makes besides, those alone, named
+    # as not.
+    assert saved["kept"] == len(answers)
+    refused = sorted(name.rsplit(" (", 1)[0] for name in saved["refused"])
+    assert refused == saved["unidentified"], saved["reasons"]
+    assert (saved["cpu"] is not None) == (jax.default_backend() == "cpu")
     assert answers["none"] != answers["empty"] and answers["one"] != answers["two"]
     assert kept_answer(kept_worker(tmp_path / "kept", "take")) == {"answers": answers, "needed": []}
     assert kept_answer(kept_worker(tmp_path / "kept", "verify"))["answers"] == answers
@@ -239,6 +243,71 @@ def test_programs_kept_under_other_code_settings_or_target_are_refused_by_name(t
     assert kept_worker(tmp_path, "take", environment=environment).returncode != 0
     assert kept_answer(kept_worker(tmp_path, "differences", environment=environment)) == {
         "process": process, "target": target}
+
+
+CHECKED_MODULE = '''
+import jax.numpy as jnp
+from jax.experimental import checkify
+
+
+def _doubled(values):
+    checkify.check(jnp.all(values > 0), "the values must be positive")
+    return values * 2
+
+
+def checked(values):
+    return checkify.checkify(_doubled)(values)
+'''
+"""A program whose check a run keeps (`checked`): its error tree holds the check's traceback."""
+
+CHECKED_RUN = """
+import json, sys
+import jax.numpy as jnp
+from jax.experimental import checkify
+import checked_module
+from dew.nn.kernels.options import owned_program
+from dew.training.ahead import keeping, kept
+
+mode, path = sys.argv[1], sys.argv[2]
+program = owned_program(checked_module.checked)
+
+
+def refused():
+    error, _ = program(-jnp.ones(3))
+    try:
+        error.throw()
+    except checkify.JaxRuntimeError as raised:
+        return [type(raised).__name__, str(raised)]
+    return None
+
+
+if mode == "keep":
+    with keeping() as programs:
+        program(jnp.ones(3))
+    programs.save(path)
+    print(json.dumps({"refused": refused(), "kept": len(programs.kept)}))
+else:
+    with kept(path):
+        print(json.dumps({"refused": refused()}))
+"""
+"""A process that keeps a checked program, or is handed it, and reports what its failed check raises."""
+
+
+def test_a_kept_programs_failed_check_raises_where_handed_as_where_kept(tmp_path):
+    """A checked program kept by one process (its error tree's tracebacks held as their frames,
+    `HeldTraceback`) and handed to another raises its failed check there as the keeping process does, the
+    check's own error and message, not an error of the held traceback's."""
+    import process_support
+
+    (tmp_path / "checked_module.py").write_text(CHECKED_MODULE)
+    path = str(tmp_path / "checked.dew-aot")
+    # The module beside the file, on the path as a user's own.
+    found = {"PYTHONPATH": os.pathsep.join((str(tmp_path), str(process_support.REPO_ROOT / "src"),
+                                            str(process_support.REPO_ROOT / "tests")))}
+    keep = process_support.fresh(CHECKED_RUN, "keep", path, variables=found)
+    take = process_support.fresh(CHECKED_RUN, "take", path, variables=found)
+    assert keep["kept"] == 1 and keep["refused"] is not None
+    assert take["refused"] == keep["refused"]
 
 
 def test_a_kept_program_that_is_not_its_calls_is_found_by_verifying(tmp_path):
@@ -288,11 +357,14 @@ def test_a_runs_evaluations_called_over_its_first_states_shapes_are_the_programs
     """A run's evaluations' programs, called over its first state's shapes where a run compiled ahead
     collects them (`Evaluator.warmed_ahead`, `dew.training.evaluation.warmed_ahead`), are the ones its fit
     compiles: a fit evaluating midway, at its end alone, or writing what it scores (`scored_to`, which
-    reports its artifacts beside its loss) compiles each (its event's and scoring's keys, its loss or
-    report, the loss's sum and reduction), and a fit handed the collection (`taking`) takes every program
-    in it and compiles none of them, each fit in a process whose programs hold no executable before
-    it (`release`). Which executables it ran is counted where they are handed, as XLA's persistent cache
-    would hand the second fit what the first compiled, which compiles nothing either (row 4752)."""
+    reports its artifacts beside its loss) compiles them, and a fit handed the collection (`taking`) takes
+    every program in it and compiles none of what the first fit compiled but its step's own, each fit in a
+    process whose programs hold no executable before it (`release`), and scores and ends on what the
+    first fit scored and ended on, bit for bit. Which executables it ran is counted where they are handed,
+    as XLA's persistent cache would hand the second fit what the first compiled, which compiles nothing
+    either (row 4752)."""
+    from recording import RecordingTracker
+
     from dew.data import Memory
     from dew.distributed.placement import placed_shapes
     from dew.nn.kernels.options import collecting, release, taking
@@ -305,26 +377,25 @@ def test_a_runs_evaluations_called_over_its_first_states_shapes_are_the_programs
     fit = {"steps": 4, "log_every": 2, "validation": validation,
            **{"midway": {"eval_every": 2}, "at its end": {},
               "scored to": {"eval_every": 2, "scored_to": str(tmp_path / "scores")}}[asked]}
-    # The run warms each split midway (its loss alone), and its evaluations score the loss with what they
-    # write (`_validation_scores`).
-    scored = {"validated_loss", *(("_validation_scores",) if asked == "scored to" else ())}
-    functions = {"_fold", *scored, "_summed", "reduce_loss"}
-    evaluations = {f"jit({function})" for function in functions}
-
-    def compiled(handed) -> set[str]:
+    def compiled(handed) -> tuple[set[str], list, list]:
+        """The programs the fit compiled, the validation scores it logged and the weights it ended on."""
         release()
         jax.clear_caches()
         written = tmp_path / "scores"
         if written.exists():
             shutil.rmtree(written)
-        run = fine_tune(MeshSpec().build(jax.devices()[:1]), xla=True)
+        tracker = RecordingTracker()
+        run = fine_tune(MeshSpec().build(jax.devices()[:1]), xla=True, tracker=tracker)
         with taking(handed), Compiles(None) as compiles:
-            run.fit(batch, **fit)
+            state = run.fit(batch, **fit)
         # A fit asked to write what it scores writes it, handed its programs or not.
         assert (asked == "scored to") == any(written.rglob("*"))
-        return {program.name for program in compiles.programs if program.kind == "compiled"}
+        scores = [(step, {name: value for name, value in scalars.items() if name.startswith("val/")})
+                  for step, scalars in tracker.scalars if any(name.startswith("val/") for name in scalars)]
+        return ({program.name for program in compiles.programs if program.kind == "compiled"}, scores,
+                [np.asarray(leaf) for leaf in jax.tree.leaves(state.variables)])
 
-    assert evaluations <= compiled({})
+    alone, scored, ended = compiled({})
     ahead = fine_tune(MeshSpec().build(jax.devices()[:1]), xla=True)
     plan = fit_plan(ahead, batch, fit)
     start = ahead._started()
@@ -339,9 +410,14 @@ def test_a_runs_evaluations_called_over_its_first_states_shapes_are_the_programs
 
     handed = {digest: functools.partial(serving, digest, executable)
               for digest, executable in collected.items()}
-    assert not evaluations & compiled(handed)
-    # Every program the run collected ahead is one its fit took, and it compiled as many as the fit runs.
-    assert served == set(collected) and len(collected) >= len(evaluations)
+    taken, rescored, reended = compiled(handed)
+    # Every program the run collected ahead is one its fit took, and none it took is one it compiled: what
+    # the first fit compiled beside its step's own programs, the second compiled none of; its scores and
+    # weights are the first fit's.
+    assert served == set(collected) and served
+    assert len(alone - taken) >= len(collected) and taken < alone
+    assert scored and rescored == scored
+    assert all(np.array_equal(left, right) for left, right in zip(reended, ended, strict=True))
 
 
 def test_two_calls_whose_texts_agree_as_jax_prunes_an_unread_argument_each_take_their_own_executable():

@@ -101,7 +101,7 @@ def test_episodes_collect_through_subprocess_workers():
     episodes = []
     trainer, collector = build(harness, record=episodes.append)
     state = trainer.initial_state()
-    batch = trained_batch(collector, state)
+    batch = trained_batch(collector, state, trainer.objective)
     assert len(episodes) == GROUPS
     assert {episode.status for episode in episodes} <= {EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED}
     assert {verify(episode) for episode in episodes} <= {-1., 0., 1.}
@@ -122,7 +122,7 @@ def test_a_harness_s_requests_and_compaction_reach_each_call_s_transcript(mode):
 
     episodes = []
     trainer, collector = build(environment(mode), record=episodes.append)
-    trained_batch(collector, trainer.initial_state())
+    trained_batch(collector, trainer.initial_state(), trainer.objective)
     assert len(episodes) == GROUPS
     for episode in episodes:
         assert episode_from_record(json.loads(record_json(episode))) == episode

@@ -63,6 +63,7 @@ from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
 
 if TYPE_CHECKING:
+    from dew.objectives.base import Objective
     from dew.training.startup import Startup
 
 _log = logging.getLogger(__name__)
@@ -614,14 +615,19 @@ def restored(state: TrainState, resume: int, examples: int | None) -> TrainState
     """`state`, restored from step `resume`'s checkpoint, as the run reads on from it. A run on the
     examples clock (`examples`) refuses a checkpoint of a run on another clock, which kept no examples
     consumed (`TrainState.consumed`) for its schedule to read on from. A checkpoint that kept no tokens
-    waiting for an update its optimizer holds back (`TrainState.deferred`), as one written before they
-    waited, holds none: each call's tokens were committed with it."""
+    waiting for an update its optimizer holds back (`TrainState.deferred`), as an earlier Dew wrote it
+    before they waited, is refused."""
     if examples is not None and state.consumed is None:
         raise ValueError(
             f"step {resume}'s checkpoint is of a run counted in steps or tokens, which kept no examples "
             "consumed, and this run reads its schedule off them: resume it on the clock it was written "
             "on, or start a fresh run from its weights")
-    return dataclasses.replace(state, deferred=waiting(state.opt_state)) if state.deferred is None else state
+    if state.deferred is None and waiting(state.opt_state) is not None:
+        raise ValueError(
+            f"step {resume}'s checkpoint keeps no tokens waiting for the update its optimizer holds back, as "
+            "an earlier Dew wrote it: resume it with the Dew that wrote it, or start a fresh run from its "
+            "weights")
+    return state
 
 
 def afresh(initial: TrainState, made: optax.OptState, examples: int | None) -> TrainState:
@@ -798,18 +804,22 @@ def emptied(batch: Batch) -> Batch:
             CONSUMED_COUNT: ConsumedCount(0)}
 
 
-def read_batch(run: FitRun, interval: Interval, state: TrainState, rollout: Rollout | None, mesh: Mesh,
-               marked, examples: int | None, *, agree: bool, phase: str = "training read",
-               branch: bool = False) -> tuple[Batch, Batch, bytes | None] | None:
+def read_batch[LossT, EffectsT](run: FitRun, interval: Interval, state: TrainState, rollout: Rollout | None,
+                                mesh: Mesh, marked, examples: int | None, *, agree: bool,
+                                phase: str = "training read", branch: bool = False,
+                                objective: Callable[[Batch], Objective[LossT, EffectsT]] | None = None
+                                ) -> tuple[Batch, Batch, bytes | None] | None:
     """The one way a training loop's next batch becomes its step's input, the run's and a cooldown
     branch's alike (row 4125): read (`waited_read`), drawn past the rollout (`rolled_out`) and its device
     fields apart (`split_fields`), a run on the examples clock closing its update window where its batch
     does (the run's step at its bound, `FitRun.closing`; a `branch`'s every step, `closes_window`). Returns
-    the batch, its device fields and the position a rollout read ahead to; None where the stream ran out."""
+    the batch, its device fields and the position a rollout read ahead to; None where the stream ran out.
+    A rollout draws for `objective(batch)`, the objective the read batch's step trains (`Rollout`)."""
     batch = waited_read(run, interval, agree=agree, phase=phase)
     if batch is None:
         return None
-    batch, ahead = rolled_out(rollout, state, batch, mesh, marked, interval, run,
+    trains = None if rollout is None or objective is None else objective(batch)
+    batch, ahead = rolled_out(rollout, state, batch, mesh, marked, interval, run, objective=trains,
                               examples=None if branch else examples, closes=not branch)
     device, _ = split_fields(batch)
     return batch, closes_window(device, examples) if branch else device, ahead

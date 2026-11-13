@@ -155,3 +155,35 @@ def pooled_rollout() -> tuple:
     rows = len(batch["prompt"]) // processes
     local = {name: value[rank * rows:(rank + 1) * rows] for name, value in batch.items()}
     return model, params, batch, local
+
+
+def assert_filled_batch_invariants(objective, filled, corrupted, repeats) -> None:
+    """Assert through `Trainer.compile` that `filled` and `corrupted` (differing only in `VALID_ROWS=False`
+    rows) produce bit-identical learned state, loss and metrics, and `repeats` (`VALID_ROWS` all False)
+    commits no update."""
+    import optax
+    from recording import bits
+
+    from dew.distributed.placement import MeshSpec
+    from dew.training import Trainer
+
+    def snapshot(state):
+        checked = bits((state.variables, state.opt_state, state.ema, state.updates))
+        assert all(not jnp.issubdtype(leaf.dtype, jnp.inexact) or bool(jnp.all(jnp.isfinite(leaf)))
+                   for leaf in checked)
+        return checked
+
+    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(3), checkpoints=None, tracker=None)
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    initial = trainer.initial_state()
+    step = trainer.compile(initial, filled)
+    first_state, first_loss, first_metrics, *_ = step(jax.tree.map(jnp.copy, initial), filled)
+    other_state, other_loss, other_metrics, *_ = step(jax.tree.map(jnp.copy, initial), corrupted)
+    for left, right in zip(snapshot(first_state), snapshot(other_state), strict=True):
+        np.testing.assert_array_equal(left, right)
+    np.testing.assert_array_equal(np.asarray(first_loss), np.asarray(other_loss))
+    jax.tree.map(np.testing.assert_array_equal, jax.device_get(first_metrics), jax.device_get(other_metrics))
+    idle_state, idle_loss, *_ = step(jax.tree.map(jnp.copy, initial), repeats)
+    assert int(idle_state.updates) == 0 and float(idle_loss) == 0.0
+    for left, right in zip(snapshot(idle_state), snapshot(initial), strict=True):
+        np.testing.assert_array_equal(left, right)

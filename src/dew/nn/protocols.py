@@ -579,11 +579,13 @@ class MediaWrapper(Protocol):
 
 @runtime_checkable
 class ReplacesTokens(Protocol):
-    """A model that replaces the embeddings of its media placeholder tokens before its table reads them
-    (`dew.nn.multimodal.MultimodalTransformer`): those ids hold no row of the table of their own."""
+    """A model that replaces some of its token ids before its embedding table reads them, as it states
+    (`dew.nn.multimodal.MultimodalTransformer`): the ids it replaces wherever they occur (`replaced_ids`),
+    and the id at each slot a call's media fill (`dew.nn.inputs.media_slots`), whose embedding its towers
+    give; every other id reads its table."""
 
-    image_token_id: int | None
-    extra_placeholder_ids: tuple[int, ...]
+    @property
+    def replaced_ids(self) -> frozenset[int]: ...
 
 
 @runtime_checkable
@@ -904,9 +906,8 @@ class ProjectionGroup:
         `projections()`, `{name: (inputs, outputs)}`, the geometry its setup builds."""
         return cls(path, packed, members, tuple(projections[name][1] for name in members))
 
-    def split[ArrayT: (jax.Array, np.ndarray)](self, out: ArrayT) -> tuple[ArrayT, ...]:
-        """The members' outputs from the packed projection's `out`, in member order: a traced array's or a
-        host array's (a served checkpoint's stored projection, `dew.checkpoints.served`), each its slice."""
+    def split(self, out: jax.Array) -> tuple[jax.Array, ...]:
+        """The members' outputs from the packed projection's `out`, in member order, each its slice."""
         ends = np.cumsum(self.widths)
         return tuple(out[..., int(end - width):int(end)]
                      for end, width in zip(ends, self.widths, strict=True))

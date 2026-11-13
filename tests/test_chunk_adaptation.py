@@ -77,9 +77,7 @@ within 512 seeds: each seed pools this many independent draws. The corner's one-
 to 10^13 over eleven steps) and its outer gradient do not narrow by pooling (at 128 draws a seed the
 documents gradient's interval still spans [0.45, 1.95] around a ratio below 1): their error is the
 amplified rows', so their sites weigh each element's error by the loop's own rounding there
-(`assert_as_exact`'s `conditioning`, `CORNER_SEEDS`), and the one-token window's error each window
-adds is held from the level the window starts at
-(`test_each_window_steps_from_its_level_as_the_literal_loop`)."""
+(`assert_as_exact`'s `conditioning`, `CORNER_SEEDS`)."""
 
 
 CORNER_SEEDS = {("forward", "documents"): 256, ("forward", "packed"): 128, ("forward", "padded"): 16,
@@ -175,15 +173,15 @@ def literal_damped_rate(params, adaptation: ChunkAdaptation, parts: list[str], l
 
 
 def equation_71(model, variables, hidden, targets, weights, fields, adaptation: ChunkAdaptation, *,
-                levels: bool = False, truth: bool = False, finals: bool = False):
+                truth: bool = False, finals: bool = False):
     """Equation 71 read literally, token by token along each row: a run of a document's real tokens
     starts from the level's start; each real token reads its window's level, and at the first real
     token of the run's next window the level steps by `rate` times the summed gradient of the window's
     weighted next-token losses; a padding slot reads the level open at it and weighs nothing. A slot is
-    real where the mask marks it and its document is not 0, as every reader of rows takes it. With
-    `levels`, also the level each token reads. The losses are each token's log-softmax, apart from
-    Dew's own cross entropy. A damped step steps its parts' kernels (`up`'s, `down`'s or both) at the rate
-    `literal_damped_rate` writes from the window's terms at its own level.
+    real where the mask marks it and its document is not 0, as every reader of rows takes it. The losses
+    are each token's log-softmax, apart from Dew's own cross entropy. A damped step steps its parts'
+    kernels (`up`'s, `down`'s or both) at the rate `literal_damped_rate` writes from the window's terms at
+    its own level.
 
     A level a run carries (`ChunkAdaptation.carry`, "run") starts at the trained level plus the carried
     collection's, and runs through the row's documents in turn: a run is the row's real tokens. With
@@ -255,8 +253,7 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
         squares, fed = jnp.sum(jnp.square(state)), jnp.sum(jnp.square(inputs))
         terms = jnp.stack([squares, fed, jnp.sqrt(fed * squares), jnp.sqrt(squares)])
         energy = energy + weighed * jax.lax.stop_gradient(terms)
-        read = (loss, level) if levels else loss
-        return (level, summed, energy, count + here_real, opened, document, begun), read
+        return (level, summed, energy, count + here_real, opened, document, begun), loss
 
     def row_losses(row_hidden, row_targets, row_weights, row_real, row_documents):
         first = (start, zeros, jnp.zeros((4,), hidden.dtype), jnp.int32(0), jnp.int32(-1), jnp.int32(0),
@@ -266,31 +263,6 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
         return (losses, stepped(level, summed, energy)) if finals else losses
 
     return jax.vmap(row_losses)(hidden, targets, weights, real, documents)
-
-
-LOCAL_SEEDS = 8
-"""Check 1's declared seeds for the windows started from their float64 levels (`seeds_for`, paired)."""
-
-
-def local_segments(seed: int, window: int, rate: float, scale: float = 0.5):
-    """A draw's windows each started where the literal loop in float64 stands (`equation_71`'s levels),
-    rounded to float32: every window of a one-document row with one after it, its tokens and the next
-    window's, each its own row with its own level, so a window's error starts from no other window's."""
-    variables, hidden, targets, weights = draw(seed, scale=scale)
-    adaptation = ChunkAdaptation(window=window, rate=rate)
-    with jax.enable_x64(new_val=True):
-        loop = jax.jit(lambda *inputs: equation_71(MODEL, *inputs, {}, adaptation, levels=True)[1])
-        levels = jax.device_get(loop(*widened((variables, hidden, targets, weights))))
-    picked = [(row, first) for row in range(len(targets)) for first in range(0, LENGTH - window, window)]
-
-    def segment(value, row, first):
-        return value[row, first:first + 2 * window]
-
-    each = jax.tree.map(lambda leaf: np.broadcast_to(leaf, (len(picked), *leaf.shape)).copy(), variables)
-    each["params"]["continuum"] = jax.tree.map(
-        lambda leaf: np.stack([np.asarray(leaf[row, first], np.float32) for row, first in picked]), levels)
-    return (each, *(np.stack([segment(value, row, first) for row, first in picked])
-                    for value in (hidden, targets, weights)))
 
 
 LAYOUTS = ("documents", "packed", "padded")
@@ -1199,142 +1171,6 @@ def test_training_differentiates_through_every_step(kind, rate, scale, damped):
     site(differentiated(dew), reference, gradient_draw, rate, scale, 3,
          f"the gradient through the windows' {label}steps over {kind}, rate {rate}, scale {scale}", seeds,
          damped=damped is not None)
-
-
-def test_each_window_steps_from_its_level_as_the_literal_loop():
-    """At the corner's one-token window (0.5 N(0, 1) weights stepped by a half), each window and the
-    next, started from the level the literal loop in float64 stands at there rounded to float32
-    (`local_segments`), on par with the literal loop from the same level (check 1): the error a window
-    and its step add, the amplification across windows cancelled. Supplemental evidence; ledger 1714
-    holds the corner's end-to-end and outer-gradient contracts open. Validated over 12 runs of 16 seeds:
-    a logsumexp twin of the loop passed 11, Dew 12, and a Dew 1.6 times the loop's error or stepping 2^-10
-    off its rate failed all 12."""
-    adaptation = ChunkAdaptation(window=1, rate=0.5)
-
-    def scored(scores):
-        def one(variables, hidden, targets, weights):
-            return scores(variables, hidden[None], targets[None], weights[None])[0]
-        return jax.jit(jax.vmap(one))
-
-    def dew(variables, hidden, targets, weights):
-        return adapted_scores(MODEL, variables, hidden, targets, weights, {}, adaptation, predict=False,
-                              logits=False).losses
-
-    def reference(truth):
-        return lambda variables, hidden, targets, weights: equation_71(
-            MODEL, variables, hidden, targets, weights, {}, adaptation, truth=truth)
-
-    assert_as_exact(scored(dew), scored(reference(truth=False)), lambda seed: local_segments(seed, 1, 0.5),
-                    "each one-token window from its float64 level at the corner", seeds=LOCAL_SEEDS,
-                    truth_fn=scored(reference(truth=True)))
-
-
-WINDOW_GRADIENT_SEEDS = 512
-"""Check 1's declared seeds for each window's gradient from its float64 level, sized paired by
-`seeds_for` on armada over draws of `WINDOW_STACKED` (packed at 512, sf-size-2469 at 8faa6186d; documents
-the same count, the most a site declares), drawn as armada's map tasks and judged pooled
-(`reference_error.DRAWS`, ledger 2469). At 8 draws of one window set (the gate's validation: a paired null
-passed 24 runs of 24, Dew 1.6 times as far failed 24 of 24) it resolved before FP32 sums."""
-
-
-WINDOW_STACKED = 16
-"""The draws of windows each draw of their gradients stacks (`stacked_windows`): an embedding row or a
-level's column a draw's few windows touch is hit by a token or two, its error one Gaussian or two a draw,
-heavy-tailed past the pooled interval's reach (ledger 2469: 6.5 at `embed_tokens` and `continuum.up`).
-Stacked, a draw holds 16 draws' windows, paired window by window (`assert_as_exact`'s `examples`), each
-window's geometry its own."""
-
-
-def stacked_windows(kind: str, seed: int) -> tuple:
-    """`WINDOW_STACKED` draws of windows (`window_segments`), each a draw of its own and one example on a new
-    leading axis: a draw's rows share its windows, so they are one example, not many."""
-    parts = [window_segments(kind, seed * WINDOW_STACKED + index) for index in range(WINDOW_STACKED)]
-    return jax.tree.map(lambda *leaves: np.stack([np.asarray(leaf) for leaf in leaves]), *parts)
-
-
-@functools.cache
-def float64_levels(kind: str, window: int):
-    """The literal loop's levels in float64 over a `kind` row's fields (`equation_71`), one program a kind
-    and window: every draw's windows read it (`window_segments`), a stacked draw 32 times, so none
-    traces or compiles it again."""
-    fields = fields_of(kind)
-    adaptation = ChunkAdaptation(window=window, rate=0.5)
-    return jax.jit(lambda *inputs: equation_71(
-        MODEL, *inputs, {name: jnp.asarray(value) for name, value in fields.items()}, adaptation,
-        levels=True, truth=True)[1])
-
-
-def window_segments(kind: str, seed: int, window: int = 3):
-    """A draw's windows each alone, at the corner (0.5 N(0, 1) weights stepped by a half), each started
-    where the literal loop in float64 stands at it, rounded to float32: every window of every document
-    run of a `kind` row ('documents' or 'packed'), padded to a window by document 0 and weight 0, each
-    its own row with its own level and documents."""
-    variables, hidden, targets, weights = draw(seed, scale=0.5)
-    fields = fields_of(kind)
-    with jax.enable_x64(new_val=True):
-        levels = jax.device_get(float64_levels(kind, window)(*widened((variables, hidden, targets,
-                                                                       weights))))
-    documents = fields.get("segment_ids", np.ones((len(targets), LENGTH), np.int32))
-    picked = []
-    for row in range(len(targets)):
-        start = 0
-        while start < LENGTH:
-            stop = start
-            while stop < LENGTH and documents[row, stop] == documents[row, start]:
-                stop += 1
-            picked += [(row, first, min(first + window, stop)) for first in range(start, stop, window)]
-            start = stop
-
-    def held(value, row, first, last):
-        segment = np.zeros((window, *value.shape[2:]), value.dtype)
-        segment[:last - first] = value[row, first:last]
-        return segment
-
-    each = jax.tree.map(lambda leaf: np.broadcast_to(leaf, (len(picked), *leaf.shape)).copy(), variables)
-    each["params"]["continuum"] = jax.tree.map(
-        lambda leaf: np.stack([np.asarray(leaf[row, first], np.float32) for row, first, _ in picked]), levels)
-    ids = np.stack([np.where(np.arange(window) < last - first, 1, 0).astype(np.int32)
-                    for _, first, last in picked])
-    return (each, *(np.stack([held(value, *where) for where in picked])
-                    for value in (hidden, targets, weights)), ids)
-
-
-@pytest.mark.parametrize("kind", ["documents", "packed"])
-@pytest.mark.check1_shards(seeds=512, per_task=24)
-def test_each_windows_gradient_from_its_level_is_the_literal_loops(kind):
-    """At the corner, each window's gradient alone, by the variables and the states, started from the
-    level the literal loop in float64 stands at there rounded to float32 (`window_segments`), on par
-    with the loop's from the same level (check 1), one document a row and packed rows padded by
-    document 0: the error a window's gradient adds, the steps before it cancelled. Supplemental
-    evidence; ledger 1714 holds the corner's end-to-end and outer-gradient contracts open. A target
-    the level saturates (logits 40 above the rest) has a derivative of about -4e-17, which the loop's
-    log-softmax cancels to 0 in any precision and Dew's cross entropy keeps, so the truth is the loop's
-    non-cancelling form (`equation_71`'s `truth`)."""
-    adaptation = ChunkAdaptation(window=3, rate=0.5)
-
-    def arm(scores):
-        def one(variables, hidden, targets, weights, ids):
-            fields = {} if kind == "documents" else {"segment_ids": ids[None]}
-
-            def loss(variables, hidden):
-                return jnp.sum(weights * scores(variables, hidden[None], targets[None], weights[None],
-                                                fields)[0])
-            return with_gradients(loss)(variables, hidden, jnp.ones((), hidden.dtype))
-        # Each example a draw of windows (`stacked_windows`), each window a row of it; the draws one at a
-        # time, so one draw's intermediates are held at once, as one draw's were before they were stacked.
-        return jax.jit(lambda *drawn: jax.lax.map(lambda example: jax.vmap(one)(*example), drawn))
-
-    def dew(variables, hidden, targets, weights, fields):
-        return adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation, predict=False,
-                              logits=False).losses
-
-    def reference(truth):
-        return lambda variables, hidden, targets, weights, fields: equation_71(
-            MODEL, variables, hidden, targets, weights, fields, adaptation, truth=truth)
-
-    assert_as_exact(arm(dew), arm(reference(truth=False)), lambda seed: stacked_windows(kind, seed),
-                    f"each window's gradient from its float64 level over {kind}", seeds=WINDOW_GRADIENT_SEEDS,
-                    truth_fn=arm(reference(truth=True)), examples=True)
 
 
 def test_a_level_at_its_start_is_the_identity():

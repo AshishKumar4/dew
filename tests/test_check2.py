@@ -16,6 +16,27 @@ import pytest
 import recurrence_witness as rw
 from generation_support import INTERPRETS
 from jax.ad_checkpoint import checkpoint_name
+from jax.extend import core as jcore
+from jax.extend.core import primitives
+
+from dew.nn.precision import correctly_rounded_divide_p
+
+
+def _named(value):
+    """A parametrized primitive's id, its own name; any other argument's as pytest names it."""
+    return value.name if isinstance(value, jcore.Primitive) else None
+
+
+def test_an_operation_is_its_primitive_and_another_bearing_its_name_is_refused():
+    """Check 2 knows an operation by its primitive object: one of another library's or a user's that bears
+    the name of JAX's `add`, and here even computes a sum, has no contract and is refused, where a lookup by
+    name certified it by JAX's sum's contract; JAX's own add of the same operands certifies."""
+    named = jcore.Primitive("add")
+    named.def_impl(lambda a, b: np.add(a, b))
+    named.def_abstract_eval(lambda a, b: a)
+    operands = np.float32([1.5, 2.25]), np.float32([3.0, -4.5])
+    assert len(ct.certified(lambda a, b: named.bind(a, b), *operands)[1]) == 1
+    assert ct.certified(jnp.add, *operands)[1] == []
 
 
 @pytest.mark.parametrize("dtype, subnormal, halves", [
@@ -34,12 +55,13 @@ def test_the_lane_flushes_operands_and_results_alike_however_it_compiles(dtype, 
         assert bool(run(jnp.equal)(tiny, dtype(0))) == flushes
 
 
-@pytest.mark.parametrize("name, fn, operands", [
-    ("add", jnp.add, 2), ("add_any", jnp.add, 2), ("sub", jnp.subtract, 2), ("mul", jnp.multiply, 2),
-    ("div", jnp.divide, 2), ("sqrt", jnp.sqrt, 1), ("rsqrt", jax.lax.rsqrt, 1), ("log", jnp.log, 1),
-    ("exp", jnp.exp, 1), ("logistic", jax.lax.logistic, 1), ("log1p", jnp.log1p, 1), ("expm1", jnp.expm1, 1),
-    ("sin", jnp.sin, 1), ("cos", jnp.cos, 1)])
-def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(name, fn, operands):
+@pytest.mark.parametrize("primitive, fn, operands", [
+    (jax.lax.add_p, jnp.add, 2), (primitives.add_jaxvals_p, jnp.add, 2), (jax.lax.sub_p, jnp.subtract, 2),
+    (jax.lax.mul_p, jnp.multiply, 2), (jax.lax.div_p, jnp.divide, 2), (jax.lax.sqrt_p, jnp.sqrt, 1),
+    (jax.lax.rsqrt_p, jax.lax.rsqrt, 1), (jax.lax.log_p, jnp.log, 1), (jax.lax.exp_p, jnp.exp, 1),
+    (jax.lax.logistic_p, jax.lax.logistic, 1), (jax.lax.log1p_p, jnp.log1p, 1),
+    (jax.lax.expm1_p, jnp.expm1, 1), (jax.lax.sin_p, jnp.sin, 1), (jax.lax.cos_p, jnp.cos, 1)], ids=_named)
+def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(primitive, fn, operands):
     """The lane's own result of each operation on random float32 operands, subnormal products and
     quotients included, holds its contract at the lane's measured reach; the same result moved past
     that reach at an element (twice the reach's steps, past both neighbours of the exact value and every
@@ -48,13 +70,13 @@ def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(n
     rng = np.random.default_rng(1)
     values = [np.float32(rng.uniform(0.01, 4, 256) * rng.choice([1, 2.0 ** -70], 256))
               for _ in range(operands)]
-    if name in ("sqrt", "rsqrt", "log"):
+    if primitive in (jax.lax.sqrt_p, jax.lax.rsqrt_p, jax.lax.log_p):
         values = [np.abs(values[0])]
     result = np.asarray(jax.jit(fn)(*values))
-    contract = ct.CONTRACTS[name]
+    contract = ct.CONTRACTS[primitive]
     assert np.all(contract({}, values, result, oc.FLOAT32))
     # A cotangents' sum is held at add's reach, as it lowers as add does.
-    reach = ct.lane().reach["add" if name == "add_any" else name, "float32"]
+    reach = ct.lane().reach[jax.lax.add_p if primitive is primitives.add_jaxvals_p else primitive, "float32"]
     stepped = result.copy()
     stepped[3] = np.nextafter(stepped[3], np.float32(np.inf)) if stepped[3] else np.float32(1e-30)
     for _ in range(2 * max(reach, 1)):
@@ -65,18 +87,19 @@ def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(n
         assert not held[3]
 
 
-@pytest.mark.parametrize("name, fn", [("expm1", jnp.expm1), ("log1p", jnp.log1p)])
-def test_a_primitive_keeping_a_subnormal_its_lanes_multiply_flushes_is_held_as_it_computes(name, fn):
+@pytest.mark.parametrize("primitive, fn", [(jax.lax.expm1_p, jnp.expm1), (jax.lax.log1p_p, jnp.log1p)],
+                         ids=_named)
+def test_a_primitive_keeping_a_subnormal_its_lanes_multiply_flushes_is_held_as_it_computes(primitive, fn):
     """A lane flushes per primitive (ledger 4023): XLA's CPU multiply reads a subnormal as zero, its expm1
     and log1p return one as it is. Each holds its contract at subnormal arguments of either sign, as the lane
     computes it, and a result moved a step off it breaks it there."""
     x = np.float32([-(2.0 ** -148), 2.0 ** -140, -(2.0 ** -130), 2.0 ** -127, 2.0 ** -149])
-    ct.assert_certified(fn, lambda seed: (x,), name, seeds=1)
+    ct.assert_certified(fn, lambda seed: (x,), primitive, seeds=1)
     result = np.asarray(fn(x))
     stepped = result.copy()
-    for _ in range(2 * max(ct.lane().reach[name, "float32"], 1)):
+    for _ in range(2 * max(ct.lane().reach[primitive, "float32"], 1)):
         stepped[1] = np.nextafter(stepped[1], np.float32(np.inf))
-    held = ct.CONTRACTS[name]({}, [x], stepped, oc.FLOAT32)
+    held = ct.CONTRACTS[primitive]({}, [x], stepped, oc.FLOAT32)
     assert not held[1] and np.all(np.delete(held, 1))
 
 
@@ -89,9 +112,9 @@ def test_a_division_by_a_broadcast_divisor_is_held_at_its_own_forms_reach():
     dividend = np.float32(rng.uniform(0.01, 4, (16, 64)))
     divisor = np.float32(rng.uniform(0.01, 4, (16, 1)))
     result = np.asarray(jax.jit(jnp.divide)(dividend, divisor))
-    contract = ct.CONTRACTS["div"]
+    contract = ct.CONTRACTS[jax.lax.div_p]
     assert np.all(contract({}, [dividend, divisor], result, oc.FLOAT32))
-    reach = ct.lane().reach["div" + ct.BROADCAST, "float32"]
+    reach = ct.lane().reach[(jax.lax.div_p, ct.BROADCAST), "float32"]
     stepped = result.copy()
     for _ in range(2 * max(reach, 1)):
         stepped[0, 7] = np.nextafter(stepped[0, 7], np.float32(-np.inf))
@@ -112,7 +135,7 @@ def test_a_correctly_rounded_division_is_held_at_its_exact_quotient():
     dividend, weights = (np.float32(rng.uniform(-4, 4, 256)) for _ in range(2))
     divisor = np.float32(rng.uniform(0.01, 4, 256))
     result = np.asarray(jax.jit(precision.correctly_rounded_divide)(dividend, divisor))
-    contract = ct.CONTRACTS["correctly_rounded_divide"]
+    contract = ct.CONTRACTS[correctly_rounded_divide_p]
     assert np.all(contract({}, [dividend, divisor], result, oc.FLOAT32))
     stepped = result.copy()
     stepped[7] = np.nextafter(stepped[7], np.float32(np.inf))
@@ -132,10 +155,10 @@ def test_a_sum_holds_in_any_order_and_a_lost_term_breaks_it():
     sequential = np.array([np.float32(0) + np.cumsum(row, dtype=np.float32)[-1] for row in terms])
     for native in (np.asarray(jnp.sum(jnp.asarray(terms), 1)), sequential,
                    np.float32(terms.reshape(64, 2, 256).sum(2, dtype=np.float32).sum(1, dtype=np.float32))):
-        assert np.all(ct.CONTRACTS["reduce_sum"](params, [terms], native, oc.FLOAT32))
+        assert np.all(ct.CONTRACTS[jax.lax.reduce_sum_p](params, [terms], native, oc.FLOAT32))
     lost = sequential.copy()
     lost[0] = np.float32(0.0)
-    assert not ct.CONTRACTS["reduce_sum"](params, [terms], lost, oc.FLOAT32)[0]
+    assert not ct.CONTRACTS[jax.lax.reduce_sum_p](params, [terms], lost, oc.FLOAT32)[0]
 
 
 @pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reversed"])
@@ -147,15 +170,15 @@ def test_a_cumulative_sum_holds_each_prefixs_bound_and_a_lost_term_breaks_it(rev
     terms = np.float32(rng.normal(size=(3, 17)) * 2.0 ** rng.integers(-3, 4, (3, 17)))
     native = np.asarray(jax.lax.cumsum(terms, axis=1, reverse=reverse))
     params = {"axis": 1, "reverse": reverse}
-    assert np.all(ct.CONTRACTS["cumsum"](params, [terms], native, oc.FLOAT32))
+    assert np.all(ct.CONTRACTS[jax.lax.cumsum_p](params, [terms], native, oc.FLOAT32))
     taken = np.arange(8, 17) if reverse else np.arange(0, 9)
     lost = native.copy()
     lost[1, 8] -= terms[1, taken[np.argmax(np.abs(terms[1, taken]))]]
-    assert not ct.CONTRACTS["cumsum"](params, [terms], lost, oc.FLOAT32)[1, 8]
+    assert not ct.CONTRACTS[jax.lax.cumsum_p](params, [terms], lost, oc.FLOAT32)[1, 8]
     ints = np.int32([[2 ** 31 - 1, 1, 5], [-7, 3, 2]])
     native = np.asarray(jax.lax.cumsum(ints, axis=1, reverse=reverse))
-    assert np.all(ct.CONTRACTS["cumsum"](params, [ints], native, None))
-    assert not np.all(ct.CONTRACTS["cumsum"](params, [ints], native + np.int32(1), None))
+    assert np.all(ct.CONTRACTS[jax.lax.cumsum_p](params, [ints], native, None))
+    assert not np.all(ct.CONTRACTS[jax.lax.cumsum_p](params, [ints], native + np.int32(1), None))
 
 
 def test_a_dot_holds_its_bound_and_an_element_twice_past_it_breaks_it():
@@ -163,10 +186,10 @@ def test_a_dot_holds_its_bound_and_an_element_twice_past_it_breaks_it():
     a, b = np.float32(rng.standard_normal((5, 300))), np.float32(rng.standard_normal((300, 4)))
     params = {"dimension_numbers": (((1,), (0,)), ((), ()))}
     native = np.asarray(jax.jit(lambda a, b: jnp.dot(a, b, precision="highest"))(a, b))
-    assert np.all(ct.CONTRACTS["dot_general"](params, [a, b], native, oc.FLOAT32))
+    assert np.all(ct.CONTRACTS[jax.lax.dot_general_p](params, [a, b], native, oc.FLOAT32))
     off = native.copy()
     off[1, 2] += 2 * oc.gamma(300, oc.FLOAT32) * float(np.abs(a[1]) @ np.abs(b[:, 2]))
-    held = ct.CONTRACTS["dot_general"](params, [a, b], off, oc.FLOAT32)
+    held = ct.CONTRACTS[jax.lax.dot_general_p](params, [a, b], off, oc.FLOAT32)
     assert not held[1, 2] and held.sum() == held.size - 1
 
 
@@ -182,16 +205,17 @@ def test_a_scatter_add_holds_its_bound_and_a_lost_update_breaks_it():
     def added(operand, indices, updates):
         return operand.at[indices[:, 0]].add(updates, mode="drop")
 
-    params, given, (native,) = _first_equation(added, [operand, indices, updates], "scatter-add")
+    params, given, (native,) = _first_equation(added, [operand, indices, updates], jax.lax.scatter_add_p)
     native = np.asarray(native)
-    contract = ct.CONTRACTS["scatter-add"]
+    contract = ct.CONTRACTS[jax.lax.scatter_add_p]
     assert np.all(contract(params, given, native, oc.FLOAT32))
     lost = native.copy()
     lost[1, 0] -= updates[[0, 2, 3], 0][np.argmax(np.abs(updates[[0, 2, 3], 0]))]
     held = contract(params, given, lost, oc.FLOAT32)
     assert not held[1, 0] and held.sum() == held.size - 1
     ints = [np.int32([[2 ** 31 - 1], [0]]), np.int32([[0], [0]]), np.int32([[1], [5]])]
-    params, given, (native,) = _first_equation(lambda o, i, u: o.at[i[:, 0]].add(u), ints, "scatter-add")
+    params, given, (native,) = _first_equation(lambda o, i, u: o.at[i[:, 0]].add(u), ints,
+                                               jax.lax.scatter_add_p)
     assert np.all(contract(params, given, np.asarray(native), None))
     assert not np.all(contract(params, given, np.asarray(native) + np.int32(1), None))
 
@@ -218,9 +242,9 @@ def test_a_ragged_dot_holds_each_groups_bound_and_an_element_twice_past_it_break
         def product(lhs, rhs, sizes):
             return jax.lax.ragged_dot_general(lhs, rhs, sizes, numbers, precision="highest")
 
-    params, given, (native,) = _first_equation(product, [lhs, rhs, sizes], "ragged_dot_general")
+    params, given, (native,) = _first_equation(product, [lhs, rhs, sizes], primitives.ragged_dot_general_p)
     native = np.asarray(native)
-    contract = ct.CONTRACTS["ragged_dot_general"]
+    contract = ct.CONTRACTS[primitives.ragged_dot_general_p]
     assert np.all(contract(params, given, native, oc.FLOAT32))
     off = native.copy()
     at = (1, 2) if ragged == "rows" else (2, 1, 2)
@@ -239,7 +263,7 @@ def test_an_integer_power_holds_its_chain_of_roundings_and_a_value_twice_past_it
     x = np.float32(rng.uniform(0.25, 4, 64) * rng.choice([-1, 1], 64))
     x[:3] = np.float32([0.0, np.inf, -0.0])
     native = np.asarray(jax.lax.integer_pow(x, power))
-    contract = ct.CONTRACTS["integer_pow"]
+    contract = ct.CONTRACTS[jax.lax.integer_pow_p]
     params = {"y": power}
     assert np.all(contract(params, [x], native, oc.FLOAT32))
     off = native.copy()
@@ -261,7 +285,7 @@ def test_an_integer_power_is_held_through_its_squarings_and_its_reciprocal():
     made, so it follows the chain out of the range: of a square past the format's largest, a zero, where
     the exact power is a small number; of a square below the normal range, whatever that square's own loss
     makes of it."""
-    contract = ct.CONTRACTS["integer_pow"]
+    contract = ct.CONTRACTS[jax.lax.integer_pow_p]
     x = np.float32([1.2637746334075928])
     native = np.asarray(jax.lax.integer_pow(x, 8))
     assert contract({"y": 8}, [x], native, oc.FLOAT32).all()
@@ -309,8 +333,8 @@ def test_an_equation_past_the_lanes_reach_is_a_finding_by_its_path():
     lane's own division and holds."""
     x = np.float32(np.random.default_rng(4).uniform(0.1, 3, 512))
     outputs, findings = ct.certified(lambda x: x / 3, x)
-    levels = ct.LEVELS["div"]([x, np.float32(3)], outputs, oc.FLOAT32, ct.lane().flushes)
-    past = int(np.count_nonzero(levels > ct.lane().reach["div", "float32"]))
+    levels = ct.LEVELS[jax.lax.div_p]([x, np.float32(3)], outputs, oc.FLOAT32, ct.lane().flushes)
+    past = int(np.count_nonzero(levels > ct.lane().reach[jax.lax.div_p, "float32"]))
     assert len(findings) == (1 if past else 0)
     named = f"div#0: {past} of 512 elements break the contract"
     assert all(finding.startswith(named) for finding in findings)
@@ -322,9 +346,9 @@ def test_a_sum_loses_a_subnormal_only_where_the_lane_flushes_it():
     reads as zero) and breaks it where the lane keeps subnormals, whose sums lose nothing to underflow;
     the lane's own sum holds either way."""
     terms, params = np.float32([2.0 ** -140]), {"axes": (0,)}
-    lost = ct.CONTRACTS["reduce_sum"](params, [terms], np.float32(0), oc.FLOAT32)
+    lost = ct.CONTRACTS[jax.lax.reduce_sum_p](params, [terms], np.float32(0), oc.FLOAT32)
     assert bool(lost) == ct.lane().flushes
-    assert ct.CONTRACTS["reduce_sum"](params, [terms], np.asarray(jnp.sum(terms)), oc.FLOAT32)
+    assert ct.CONTRACTS[jax.lax.reduce_sum_p](params, [terms], np.asarray(jnp.sum(terms)), oc.FLOAT32)
 
 
 def test_the_lane_detects_tininess_after_rounding_and_keeps_subnormals_in_moves_and_casts():
@@ -336,16 +360,16 @@ def test_the_lane_detects_tininess_after_rounding_and_keeps_subnormals_in_moves_
     a, b = np.float32(1 - 2.0 ** -23), np.float32(2.0 ** -126 + 2.0 ** -149)
     native = np.asarray(jax.jit(jnp.multiply)(a, b))
     assert float(native) == 2.0 ** -126
-    assert np.all(ct.CONTRACTS["mul"]({}, [a, b], native, oc.FLOAT32))
-    assert not np.all(ct.CONTRACTS["mul"]({}, [a, b], np.float32(0), oc.FLOAT32))
+    assert np.all(ct.CONTRACTS[jax.lax.mul_p]({}, [a, b], native, oc.FLOAT32))
+    assert not np.all(ct.CONTRACTS[jax.lax.mul_p]({}, [a, b], np.float32(0), oc.FLOAT32))
     tiny_product = [np.float32(2.0 ** -70)] * 2
     flushed, kept = np.float32(0), np.float32(2.0 ** -140)
     own, other = (flushed, kept) if ct.lane().flushes else (kept, flushed)
-    assert np.all(ct.CONTRACTS["mul"]({}, tiny_product, own, oc.FLOAT32))
-    assert not np.any(ct.CONTRACTS["mul"]({}, tiny_product, other, oc.FLOAT32))
+    assert np.all(ct.CONTRACTS[jax.lax.mul_p]({}, tiny_product, own, oc.FLOAT32))
+    assert not np.any(ct.CONTRACTS[jax.lax.mul_p]({}, tiny_product, other, oc.FLOAT32))
     tiny = np.float32([2.0 ** -140, -(2.0 ** -130)])
     assert np.array_equal(np.asarray(jax.jit(lambda x: -x.reshape(2, 1))(tiny)).ravel(), -tiny)
-    assert np.all(ct.CONTRACTS["neg"]({}, [tiny], -tiny, oc.FLOAT32))
+    assert np.all(ct.CONTRACTS[jax.lax.neg_p]({}, [tiny], -tiny, oc.FLOAT32))
     narrow = np.array([2.0 ** -130], ml_dtypes.bfloat16)
     assert float(jax.jit(lambda x: x.astype(jnp.float32))(narrow)[0]) == 2.0 ** -130
     assert float(jax.jit(lambda x: x.astype(jnp.bfloat16))(np.float32(2.0 ** -130))) == 2.0 ** -130
@@ -361,7 +385,7 @@ def test_a_results_level_counts_its_grid_steps_past_the_exact_values_neighbours(
     below, is level 2, on either grid; exp(-100)'s neighbours are zero and the least normal on the
     flushing grid, and two subnormals on the gradual one, where zero is a step past for each subnormal
     below them; a special at its limit is level 0 and at any other value no reach admits it."""
-    exp = ct.LEVELS["exp"]
+    exp = ct.LEVELS[jax.lax.exp_p]
     x = np.float32([-(2.0 ** -25)] * 3)
     around = np.float32([1 - 2.0 ** -24, 1.0, 1 - 2.0 ** -23])
     assert exp([x], around, oc.FLOAT32, flushes).tolist() == [1, 1, 2]
@@ -374,10 +398,11 @@ def test_a_results_level_counts_its_grid_steps_past_the_exact_values_neighbours(
     assert exp([specials], np.float32([np.inf, 0.0, np.nan]), oc.FLOAT32, flushes).tolist() == [0, 0, 0]
     assert np.all(exp([specials], np.float32([0.0, np.inf, 1.0]), oc.FLOAT32, flushes) == ct.UNREACHED)
     limits = np.float32([-np.inf, np.inf, np.nan])
-    log = ct.LEVELS["log"]([np.float32([0.0, np.inf, -1.0])], limits, oc.FLOAT32, flushes)
+    log = ct.LEVELS[jax.lax.log_p]([np.float32([0.0, np.inf, -1.0])], limits, oc.FLOAT32, flushes)
     assert log.tolist() == [0, 0, 0]
     poles = np.float32([np.inf, -np.inf])
-    assert ct.LEVELS["erf_inv"]([np.float32([1.0, -1.0])], poles, oc.FLOAT32, flushes).tolist() == [0, 0]
+    erf_inv = ct.LEVELS[jax.lax.erf_inv_p]
+    assert erf_inv([np.float32([1.0, -1.0])], poles, oc.FLOAT32, flushes).tolist() == [0, 0]
 
 
 @pytest.mark.parametrize("flushes", [True, False])
@@ -391,7 +416,7 @@ def test_a_zero_of_the_wrong_sign_or_a_missed_exact_value_is_no_rounding(flushes
     def at(values):
         return np.asarray(values, np.float64).astype(dtype)
 
-    exp, log, sqrt = ct.LEVELS["exp"], ct.LEVELS["log"], ct.LEVELS["sqrt"]
+    exp, log, sqrt = ct.LEVELS[jax.lax.exp_p], ct.LEVELS[jax.lax.log_p], ct.LEVELS[jax.lax.sqrt_p]
     assert exp([at([-1000.0, -1000.0])], at([0.0, -0.0]), fmt, flushes).tolist() == [1, ct.UNREACHED]
     assert sqrt([at([-0.0, -0.0])], at([-0.0, 0.0]), fmt, flushes).tolist() == [0, ct.UNREACHED]
     above_one = float(np.nextafter(dtype(1), dtype(2)))
@@ -422,9 +447,9 @@ def test_moves_keep_their_bits_and_integer_operations_wrap():
     payload = np.uint32([0x7FC00001])
     native = np.asarray(jax.lax.bitcast_convert_type(payload, jnp.float32))
     params = {"new_dtype": np.float32}
-    assert np.all(ct.CONTRACTS["bitcast_convert_type"](params, [payload], native, oc.FLOAT32))
+    assert np.all(ct.CONTRACTS[jax.lax.bitcast_convert_type_p](params, [payload], native, oc.FLOAT32))
     other = np.uint32([0x7FC00002]).view(np.float32)
-    assert not np.any(ct.CONTRACTS["bitcast_convert_type"](params, [payload], other, oc.FLOAT32))
+    assert not np.any(ct.CONTRACTS[jax.lax.bitcast_convert_type_p](params, [payload], other, oc.FLOAT32))
     ints = np.int32([[-1, 2 ** 31 - 1], [5, -7]])
     for fn in (lambda a: jax.lax.reshape(a, (4,), dimensions=(1, 0)),
                lambda a: jax.lax.shift_right_logical(a, np.int32(1)),
@@ -453,14 +478,16 @@ def test_an_integer_division_is_held_at_every_64_bit_magnitude():
     assert ct.certified(lambda total, n: jnp.where(n > 0, total // n, 0), totals, counts)[1] == []
 
 
-def _first_equation(fn, operands, name):
-    """The first `name` equation check 2 holds running `fn` on `operands` (`certified.observing`): its
-    params, the operands its contract was given and its results."""
+def _first_equation(fn, operands, primitive):
+    """The first equation binding `primitive` check 2 holds running `fn` on `operands`
+    (`certified.observing`): its params, the operands its contract was given and its results."""
     with ct.observing() as seen:
         ct.certified(fn, *operands)
-    found = next(((params, given, results) for held, params, given, results in seen if held == name), None)
-    assert found is not None, f"no {name} equation"
+    found = next(((params, given, results) for held, params, given, results in seen if held is primitive),
+                 None)
+    assert found is not None, f"no {primitive.name} equation"
     return found
+
 
 
 def _off_by_one_element(result):
@@ -477,68 +504,71 @@ def _off_by_one_element(result):
     return wrong
 
 
-@pytest.mark.parametrize("name, fn, operands", [
-    ("pad", lambda a: jax.lax.pad(a, np.float32(-3), ((1, 2, 0), (-1, 1, 2))),
+@pytest.mark.parametrize("primitive, fn, operands", [
+    (jax.lax.pad_p, lambda a: jax.lax.pad(a, np.float32(-3), ((1, 2, 0), (-1, 1, 2))),
      [np.float32(np.arange(12).reshape(3, 4))]),
-    ("iota", lambda: jax.lax.broadcasted_iota(jnp.int32, (3, 5), 1), []),
-    ("gather", lambda a, i: a[i], [np.float32(np.arange(20).reshape(5, 4)), np.int32([[4], [0], [2]])]),
-    ("gather", lambda a, i: jnp.take_along_axis(a, i, axis=1, mode="clip"),
+    (jax.lax.iota_p, lambda: jax.lax.broadcasted_iota(jnp.int32, (3, 5), 1), []),
+    (jax.lax.gather_p, lambda a, i: a[i],
+     [np.float32(np.arange(20).reshape(5, 4)), np.int32([[4], [0], [2]])]),
+    (jax.lax.gather_p, lambda a, i: jnp.take_along_axis(a, i, axis=1, mode="clip"),
      [np.float32(np.arange(20).reshape(5, 4)), np.int32([[0, 9], [3, -2], [1, 1], [2, 0], [3, 3]])]),
-    ("gather", lambda a, i: jnp.take(a, i, axis=0, mode="fill", fill_value=-1.0),
+    (jax.lax.gather_p, lambda a, i: jnp.take(a, i, axis=0, mode="fill", fill_value=-1.0),
      [np.float32(np.arange(20).reshape(5, 4)), np.int32([1, 7, -1, 4])]),
-    ("gather", lambda a, i: jax.vmap(lambda row, at: row[at])(a, i),
+    (jax.lax.gather_p, lambda a, i: jax.vmap(lambda row, at: row[at])(a, i),
      [np.float32(np.arange(20).reshape(5, 4)), np.int32([3, 0, 1, 2, 3])]),
-    ("gather", lambda a, i: jnp.take_along_axis(a, i, axis=1, mode="clip"),
+    (jax.lax.gather_p, lambda a, i: jnp.take_along_axis(a, i, axis=1, mode="clip"),
      [np.arange(20).reshape(5, 4).astype(ml_dtypes.bfloat16),
       np.int32([[0, 9], [3, -2], [1, 1], [2, 0], [3, 3]])]),
-    ("gather", lambda a, i: a[i],
+    (jax.lax.gather_p, lambda a, i: a[i],
      [np.arange(20).reshape(5, 4).astype(ml_dtypes.bfloat16), np.int32([[4], [0], [2]])]),
-    ("stack", lambda a, b: jnp.stack([a, b], axis=1), [np.float32([1, 2, 3]), np.float32([4, 5, 6])]),
-    ("optimization_barrier", lambda a, b: jax.lax.optimization_barrier((a, b)),
+    (jax.lax.stack_p, lambda a, b: jnp.stack([a, b], axis=1), [np.float32([1, 2, 3]), np.float32([4, 5, 6])]),
+    (jax.lax.optimization_barrier_p, lambda a, b: jax.lax.optimization_barrier((a, b)),
      [np.float32([1, 2]), np.float32([[3, 4, 5]])]),
-    ("rev", lambda a: jax.lax.rev(a, (0, 1)), [np.float32(np.arange(12).reshape(3, 4))]),
-    ("split", lambda a: jax.lax.split(a, (1, 3), axis=1), [np.float32(np.arange(12).reshape(3, 4))]),
-    ("name", lambda a: checkpoint_name(a, "held"), [np.float32([1, 2, 3])]),
-    ("dynamic_slice", lambda a, i: jax.lax.dynamic_slice(a, (i, 1), (2, 2)),
+    (jax.lax.rev_p, lambda a: jax.lax.rev(a, (0, 1)), [np.float32(np.arange(12).reshape(3, 4))]),
+    (jax.lax.split_p, lambda a: jax.lax.split(a, (1, 3), axis=1), [np.float32(np.arange(12).reshape(3, 4))]),
+    (primitives.name_p, lambda a: checkpoint_name(a, "held"), [np.float32([1, 2, 3])]),
+    (jax.lax.dynamic_slice_p, lambda a, i: jax.lax.dynamic_slice(a, (i, 1), (2, 2)),
      [np.float32(np.arange(12).reshape(4, 3)), np.int32(3)]),
-    ("sort", jax.lax.sort, [np.float32([2, -0.0, 0.0, np.nan, -np.inf, 1, 1, -1])]),
-    ("sort", lambda k, v: jax.lax.sort((k, v), num_keys=1, is_stable=True),
+    (jax.lax.sort_p, jax.lax.sort, [np.float32([2, -0.0, 0.0, np.nan, -np.inf, 1, 1, -1])]),
+    (jax.lax.sort_p, lambda k, v: jax.lax.sort((k, v), num_keys=1, is_stable=True),
      [np.int32([3, 1, 3, 0, 1]), np.int32([0, 1, 2, 3, 4])]),
-    ("sort", lambda k, v: jax.lax.sort((k, v), num_keys=1, is_stable=True),
+    (jax.lax.sort_p, lambda k, v: jax.lax.sort((k, v), num_keys=1, is_stable=True),
      [np.float32([0.0, -np.nan, -0.0, 1, np.nan]), np.int32([0, 1, 2, 3, 4])]),
-    ("top_k", lambda a: jax.lax.top_k(a, 3), [np.float32([[1, np.nan, -0.0, 0.0, 2], [1, 1, 1, -1, 0]])]),
-    ("unstack", lambda a: jnp.unstack(a, axis=1), [np.float32(np.arange(12).reshape(3, 4))]),
-    ("tile", lambda a: jnp.tile(a, 3), [np.int32([1, 2])]),
-    ("stop_gradient", jax.lax.stop_gradient, [np.float32([1, -0.0, 3])]),
-    ("xor", jnp.bitwise_xor, [np.uint32([1, 5, 2 ** 31]), np.uint32([3, 3, 1])]),
-    ("shift_right_arithmetic", jax.lax.shift_right_arithmetic,
+    (jax.lax.top_k_p, lambda a: jax.lax.top_k(a, 3),
+     [np.float32([[1, np.nan, -0.0, 0.0, 2], [1, 1, 1, -1, 0]])]),
+    (jax.lax.unstack_p, lambda a: jnp.unstack(a, axis=1), [np.float32(np.arange(12).reshape(3, 4))]),
+    (jax.lax.tile_p, lambda a: jnp.tile(a, 3), [np.int32([1, 2])]),
+    (jax.lax.stop_gradient_p, jax.lax.stop_gradient, [np.float32([1, -0.0, 3])]),
+    (jax.lax.xor_p, jnp.bitwise_xor, [np.uint32([1, 5, 2 ** 31]), np.uint32([3, 3, 1])]),
+    (jax.lax.shift_right_arithmetic_p, jax.lax.shift_right_arithmetic,
      [np.int32([-8, 8, -1, 5]), np.int32([1, 2, 40, -1])]),
-    ("rem", jax.lax.rem, [np.int32([-7, 7, -7, 9]), np.int32([3, -3, -3, 4])]),
-    ("rem", jax.lax.rem, [np.float32([-7.5, 7.25, 1e10, -0.0]), np.float32([2, -3, 3, 5])]),
-    ("sign", jax.lax.sign, [np.float32([-0.0, 0.0, -2.5, np.nan, np.inf])]),
-    ("sign", jax.lax.sign, [np.int32([-5, 0, 7])]),
-    ("round", lambda a: jax.lax.round(a, jax.lax.RoundingMethod.TO_NEAREST_EVEN),
+    (jax.lax.rem_p, jax.lax.rem, [np.int32([-7, 7, -7, 9]), np.int32([3, -3, -3, 4])]),
+    (jax.lax.rem_p, jax.lax.rem, [np.float32([-7.5, 7.25, 1e10, -0.0]), np.float32([2, -3, 3, 5])]),
+    (jax.lax.sign_p, jax.lax.sign, [np.float32([-0.0, 0.0, -2.5, np.nan, np.inf])]),
+    (jax.lax.sign_p, jax.lax.sign, [np.int32([-5, 0, 7])]),
+    (jax.lax.round_p, lambda a: jax.lax.round(a, jax.lax.RoundingMethod.TO_NEAREST_EVEN),
      [np.float32([0.5, 1.5, 2.5, -0.5, -2.5, 0.49999997, 1e10])]),
-    ("round", lambda a: jax.lax.round(a, jax.lax.RoundingMethod.AWAY_FROM_ZERO),
+    (jax.lax.round_p, lambda a: jax.lax.round(a, jax.lax.RoundingMethod.AWAY_FROM_ZERO),
      [np.float32([0.5, 1.5, 2.5, -0.5, -2.5, 0.49999997, 1e10])]),
-    ("reduce_precision", lambda a: jax.lax.reduce_precision(a, exponent_bits=8, mantissa_bits=7),
+    (jax.lax.reduce_precision_p, lambda a: jax.lax.reduce_precision(a, exponent_bits=8, mantissa_bits=7),
      [np.float32([2.0 ** -130, 2.0 ** -140, 1 + 2.0 ** -8, 1 + 3 * 2.0 ** -8, 3.4e38, np.nan])]),
-    ("reduce_precision", lambda a: jax.lax.reduce_precision(a, exponent_bits=4, mantissa_bits=3),
+    (jax.lax.reduce_precision_p, lambda a: jax.lax.reduce_precision(a, exponent_bits=4, mantissa_bits=3),
      [np.float32([2.0 ** -9, 2.0 ** -12, 1 + 2.0 ** -4, 1 + 3 * 2.0 ** -4, 250.0, -248.0])]),
-    ("scatter", lambda a, i, u: a.at[i[:, 0]].set(u, mode="drop"),
+    (jax.lax.scatter_p, lambda a, i, u: a.at[i[:, 0]].set(u, mode="drop"),
      [np.float32(np.arange(12).reshape(4, 3)), np.int32([[2], [0], [7]]),
       np.float32(-np.arange(9).reshape(3, 3))]),
-    ("scatter", lambda a, i, u: a.at[i[:, 0]].set(u),
+    (jax.lax.scatter_p, lambda a, i, u: a.at[i[:, 0]].set(u),
      [np.zeros((4, 2), bool), np.int32([[3], [1]]), np.ones((2, 2), bool)]),
 ], ids=["pad", "iota", "gather", "gather clipped", "gather filled", "gather batched", "gather clipped bf16",
         "gather bf16", "stack", "barrier", "rev", "split", "name", "dynamic slice clamped", "sort",
         "sort keyed", "sort keyed zeros and nans", "top_k", "unstack",
         "tile", "stop_gradient", "xor", "shift", "rem", "rem float", "sign", "sign int", "round even",
         "round away", "reduce to bf16", "reduce to e4m3", "scatter", "scatter bool"])
-def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(name, fn, operands):
+def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(primitive, fn, operands):
     """Every move check 2 certifies by a numpy oracle of XLA's semantics (`CONTRACTS`), padding with
     interior and negative edges, an iota, a gather in each mode and batched, a stack, an optimization
-    barrier of two operands, a reversal, a split in two, a checkpoint name, a dynamic slice clamped to fit,
+    barrier of two operands, a reversal, a split in two, a checkpoint primitive, a dynamic slice clamped to
+    fit,
     a sort in the total order (its zeros and NaNs placed) and keyed (its zeros tied and its NaNs, either
     sign, last), a top_k, an unstack, a tile, a
     stop_gradient, the integer bit operations, a remainder, a sign, a rounding to an integral value either
@@ -547,14 +577,15 @@ def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(name, fn,
     its contract holding the lane's own result at every element, and the contract refuses that result
     with one element a step off."""
     assert ct.certified(fn, *operands)[1] == []
-    params, given, results = _first_equation(fn, operands, name)
-    contract = ct.CONTRACTS[name]
+    params, given, results = _first_equation(fn, operands, primitive)
+    contract = ct.CONTRACTS[primitive]
     for index, result in enumerate(results):
         native = np.asarray(result)
         # As `_held` hands it: a result of its own position reads its own part of the operands alone.
-        operands = ct.RESULT_OPERANDS[name](params, given, index) if name in ct.RESULT_OPERANDS else given
-        assert np.all(contract(params, operands, native, None)), name
-        assert not np.all(contract(params, operands, _off_by_one_element(native), None)), name
+        operands = (ct.RESULT_OPERANDS[primitive](params, given, index) if primitive in ct.RESULT_OPERANDS
+                    else given)
+        assert np.all(contract(params, operands, native, None)), primitive
+        assert not np.all(contract(params, operands, _off_by_one_element(native), None)), primitive
 
 
 def test_a_move_of_keys_holds_their_data_and_a_word_off_breaks_it():
@@ -567,8 +598,8 @@ def test_a_move_of_keys_holds_their_data_and_a_word_off_breaks_it():
 
     assert ct.certified(broadcast, keys)[1] == []
     params, given, (result,) = _first_equation(lambda keys: jax.lax.broadcast_in_dim(keys, (3, 2), (1,)),
-                                               [keys], "broadcast_in_dim")
-    contract = ct.CONTRACTS["broadcast_in_dim"]
+                                               [keys], jax.lax.broadcast_in_dim_p)
+    contract = ct.CONTRACTS[jax.lax.broadcast_in_dim_p]
     assert np.all(contract(params, given, result, None))
     words = np.array(jax.random.key_data(result))
     words[1, 0, 0] ^= 1
@@ -586,7 +617,7 @@ def test_a_compensated_sum_holds_its_pairs_and_a_pair_a_step_off_breaks():
     rng = np.random.default_rng(10)
     values = np.float32(rng.standard_normal((3, 64)) * 2.0 ** rng.integers(-8, 8, (3, 64)))
     assert ct.certified(lambda x: compensated_sum(x, (1,)), values)[1] == []
-    params, given, results = _first_equation(lambda x: compensated_sum(x, (1,)), [values], "reduce")
+    params, given, results = _first_equation(lambda x: compensated_sum(x, (1,)), [values], jax.lax.reduce_p)
     held = ct._pair_held(params, given, [np.asarray(result) for result in results], oc.FLOAT32)
     assert all(np.all(ok) for ok in held)
     high = _off_by_one_element(np.asarray(results[0]))
@@ -596,7 +627,7 @@ def test_a_compensated_sum_holds_its_pairs_and_a_pair_a_step_off_breaks():
     # them: a non-finite `hi` breaks each.
     largest = np.finfo(np.float32).max
     top = np.float32([[2.0 ** 127, 0], [largest, 0], [largest / 2, largest / 2]])
-    params, given, results = _first_equation(lambda x: compensated_sum(x, (1,)), [top], "reduce")
+    params, given, results = _first_equation(lambda x: compensated_sum(x, (1,)), [top], jax.lax.reduce_p)
     native = [np.asarray(result) for result in results]
     assert all(np.all(ok) for ok in ct._pair_held(params, given, native, oc.FLOAT32))
     for wrong in (np.nan, np.inf, -np.inf):
@@ -606,7 +637,7 @@ def test_a_compensated_sum_holds_its_pairs_and_a_pair_a_step_off_breaks():
     # Two largest values overflow in every order, a TwoSum of an infinite sum making both halves NaN: the
     # lane's NaN pair holds, an infinity of either sign breaks it.
     twice = np.float32([[largest, largest]])
-    params, given, results = _first_equation(lambda x: compensated_sum(x, (1,)), [twice], "reduce")
+    params, given, results = _first_equation(lambda x: compensated_sum(x, (1,)), [twice], jax.lax.reduce_p)
     native = [np.asarray(result) for result in results]
     assert np.isnan(native[0]).all()
     assert all(np.all(ok) for ok in ct._pair_held(params, given, native, oc.FLOAT32))
@@ -652,7 +683,7 @@ def test_a_rows_online_softmax_holds_its_terms_and_a_sum_or_column_off_breaks(pr
         return _row_terms(logits, predict, labels)
 
     assert ct.certified(terms, logits, labels)[1] == []
-    params, given, results = _first_equation(terms, [logits, labels], "reduce")
+    params, given, results = _first_equation(terms, [logits, labels], jax.lax.reduce_p)
     native = [np.asarray(result) for result in results]
     assert all(np.all(ok) for ok in ct._softmax_held(params, given, native, oc.FLOAT32))
     wrong = [value.copy() for value in native]
@@ -690,13 +721,13 @@ def test_a_key_made_and_folded_holds_its_bits_and_one_off_breaks():
         return jax.random.key_data(jax.random.fold_in(jax.random.key(seed), data))
 
     assert ct.certified(keyed, seed, data)[1] == []
-    for name in ("random_seed", "random_fold_in"):
-        params, given, (result,) = _first_equation(keyed, [seed, data], name)
-        contract = ct.CONTRACTS[name]
-        assert np.all(contract(params, given, result, None)), name
+    for primitive in (primitives.random_seed_p, primitives.random_fold_in_p):
+        params, given, (result,) = _first_equation(keyed, [seed, data], primitive)
+        contract = ct.CONTRACTS[primitive]
+        assert np.all(contract(params, given, result, None)), primitive
         data_of = np.array(jax.random.key_data(result))
         data_of.reshape(-1)[0] ^= 1
-        assert not np.all(contract(params, given, jax.random.wrap_key_data(data_of), None)), name
+        assert not np.all(contract(params, given, jax.random.wrap_key_data(data_of), None)), primitive
 
 
 def test_an_integer_division_truncates_wraps_and_refuses_one_off():
@@ -705,7 +736,7 @@ def test_an_integer_division_truncates_wraps_and_refuses_one_off():
     a = np.int32([-7, 7, -7, 9, -(2 ** 31)])
     b = np.int32([2, -2, -2, 4, -1])
     native = np.asarray(jax.lax.div(a, b))
-    contract = ct.CONTRACTS["div"]
+    contract = ct.CONTRACTS[jax.lax.div_p]
     assert np.all(contract({}, [a, b], native, None))
     assert not np.all(contract({}, [a, b], native + np.int32(1), None))
     # At a width past int64's magnitudes: the most negative int64 halved, an unsigned value past int64.
@@ -723,7 +754,7 @@ def test_a_split_holds_each_piece_to_its_own_run():
     def split(a):
         return jax.lax.split(a, (2, 2), axis=1)
 
-    _, given, results = _first_equation(split, [a], "split")
+    _, given, results = _first_equation(split, [a], jax.lax.split_p)
     eqn = jax.make_jaxpr(split)(a).jaxpr.eqns[0]
     findings = []
     ct._held(eqn, given, results, findings, "split")
@@ -738,15 +769,16 @@ def test_rsqrt_and_logistic_name_their_exact_values():
     # Normal operands: a lane that flushes reads a subnormal one as zero, whose rsqrt is the pole.
     fours = np.float32([1.0, 4.0, 0.25, 2.0 ** -126, 2.0 ** 126])
     roots = np.float32([1.0, 0.5, 2.0, 2.0 ** 63, 2.0 ** -63])
-    assert np.all(ct.CONTRACTS["rsqrt"]({}, [fours], roots, oc.FLOAT32))
+    assert np.all(ct.CONTRACTS[jax.lax.rsqrt_p]({}, [fours], roots, oc.FLOAT32))
     off = np.nextafter(roots, np.float32(np.inf))
-    assert not np.any(ct.CONTRACTS["rsqrt"]({}, [fours], off, oc.FLOAT32))
+    assert not np.any(ct.CONTRACTS[jax.lax.rsqrt_p]({}, [fours], off, oc.FLOAT32))
     poles = np.float32([0.0, -0.0, np.inf])
-    assert np.all(ct.CONTRACTS["rsqrt"]({}, [poles], np.float32([np.inf, -np.inf, 0.0]), oc.FLOAT32))
-    assert not np.any(ct.CONTRACTS["rsqrt"]({}, [poles], np.float32([-np.inf, np.inf, 1e-30]), oc.FLOAT32))
+    assert np.all(ct.CONTRACTS[jax.lax.rsqrt_p]({}, [poles], np.float32([np.inf, -np.inf, 0.0]), oc.FLOAT32))
+    flipped = np.float32([-np.inf, np.inf, 1e-30])
+    assert not np.any(ct.CONTRACTS[jax.lax.rsqrt_p]({}, [poles], flipped, oc.FLOAT32))
     limits = np.float32([0.0, np.inf, -np.inf])
-    assert np.all(ct.CONTRACTS["logistic"]({}, [limits], np.float32([0.5, 1.0, 0.0]), oc.FLOAT32))
-    assert not np.any(ct.CONTRACTS["logistic"]({}, [limits],
+    assert np.all(ct.CONTRACTS[jax.lax.logistic_p]({}, [limits], np.float32([0.5, 1.0, 0.0]), oc.FLOAT32))
+    assert not np.any(ct.CONTRACTS[jax.lax.logistic_p]({}, [limits],
                                                np.nextafter(np.float32([0.5, 1.0, 0.0]), np.float32(0.25)),
                                                oc.FLOAT32))
 
@@ -756,7 +788,7 @@ def test_a_barrier_holds_each_result_to_its_own_operand():
     break, though each is one of its operands."""
     a, b = np.float32([1, 2]), np.float32([3, 4])
     _, given, results = _first_equation(lambda a, b: jax.lax.optimization_barrier((a, b)), [a, b],
-                                        "optimization_barrier")
+                                        jax.lax.optimization_barrier_p)
     eqn = jax.make_jaxpr(lambda a, b: jax.lax.optimization_barrier((a, b)))(a, b).jaxpr.eqns[0]
     findings = []
     ct._held(eqn, given, results, findings, "barrier")
@@ -823,7 +855,7 @@ def test_extrema_order_zeros_and_propagate_nan_as_the_lane_does():
     boolean reductions, a scalar log, erf_inv's zero and an overflowing exp are each their own results."""
     zeros = np.float32([0.0, -0.0, -0.0])
     others = np.float32([-0.0, 0.0, -0.0])
-    for name, fn in (("max", jnp.maximum), ("min", jnp.minimum)):
+    for name, fn in ((jax.lax.max_p, jnp.maximum), (jax.lax.min_p, jnp.minimum)):
         native = np.asarray(jax.jit(fn)(zeros, others))
         assert np.all(ct.CONTRACTS[name]({}, [zeros, others], native, oc.FLOAT32))
         assert not np.any(ct.CONTRACTS[name]({}, [zeros, others], -native, oc.FLOAT32))
@@ -833,7 +865,8 @@ def test_extrema_order_zeros_and_propagate_nan_as_the_lane_does():
         assert ct.certified(fn, rows)[1] == [], fn
     assert ct.certified(jnp.log, np.float32(2.0))[1] == []
     assert ct.certified(jax.lax.erf_inv, np.float32([0.0, -0.0, 2.0 ** -140]))[1] == []
-    assert not np.any(ct.CONTRACTS["erf_inv"]({}, [np.float32([0.0])], np.float32([2.0 ** -126]), oc.FLOAT32))
+    tiny = np.float32([2.0 ** -126])
+    assert not np.any(ct.CONTRACTS[jax.lax.erf_inv_p]({}, [np.float32([0.0])], tiny, oc.FLOAT32))
     assert ct.certified(jnp.exp, np.float32([1000.0, 88.0, 89.0]))[1] == []
 
 
@@ -847,8 +880,8 @@ def test_an_exp_past_its_range_is_held_at_its_neighbours_however_far():
     biggest = np.finfo(np.float32).max
     for flushes, least in ((True, np.finfo(np.float32).tiny), (False, np.float32(2.0 ** -149))):
         for native in (np.float32([np.inf, 0.0] * 3), np.float32([biggest, least] * 3)):
-            assert ct.LEVELS["exp"]([far], native, oc.FLOAT32, flushes).tolist() == [1] * 6
-    assert not np.any(ct.CONTRACTS["exp"]({}, [far], np.float32([1.0] * 6), oc.FLOAT32))
+            assert ct.LEVELS[jax.lax.exp_p]([far], native, oc.FLOAT32, flushes).tolist() == [1] * 6
+    assert not np.any(ct.CONTRACTS[jax.lax.exp_p]({}, [far], np.float32([1.0] * 6), oc.FLOAT32))
 
 
 def _truncating_sum(values: np.ndarray) -> np.float32:

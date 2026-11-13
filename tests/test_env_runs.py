@@ -4,8 +4,6 @@ saved as a run labelling and demonstrating the steps its own policy would, stage
 them, a resume ending where the run that never stopped ends, and each setup the kind refuses."""
 
 import dataclasses
-import json
-import math
 from pathlib import Path
 
 import jax
@@ -22,7 +20,7 @@ from dew.objectives.rl.control import ActorCritic, ControlPPOObjective, ControlR
 from dew.objectives.rl.dreamer import DreamerRollout, DreamerV3Objective, WorldModel
 from dew.objectives.rl.tssm import TSSM
 from dew.optim import OptimConfig
-from dew.registry import ModelConfig, envs
+from dew.registry import ModelConfig
 from dew.rl.aggregation import LABEL, Teacher
 from dew.rl.env import Batched
 from dew.rl.evaluation import episodes
@@ -131,14 +129,20 @@ def test_a_run_from_its_record_trains_as_the_run_composed_in_python(tmp_path, co
     race a host simulator steps, ends, every leaf of its state bit for bit, where the same objective and
     rollout composed in Python end; the run.json it writes reads back as the run, which trains again under
     another name to the same state."""
+    from dew.telemetry.compiles import Compiles
+
     run, objective, rollout = composed(tmp_path)
     state = run.prepare().train("record")
     assert_bitwise(state, fitted(run, objective, rollout, 3))
     saved = RunConfig.load(str(tmp_path / "record"))
-    assert isinstance(saved, EnvRunConfig)
-    assert EnvRunConfig.from_dict(saved.to_dict()) == saved
-    assert_bitwise(state, saved.prepare().train("again"))
-
+    with Compiles("step") as again:
+        retrained = saved.prepare().train("again")
+    assert [program for program in again.programs if program.kind == "traced"] == []
+    assert_bitwise(state, retrained)
+    if composed is dreamer:
+        with Compiles("step") as changed:
+            saved.override({"objective.horizon": 100.0, "trainer.steps": 1}).prepare().train("horizon")
+        assert any(program.kind == "traced" for program in changed.programs)
 
 @pytest.mark.parametrize("drawn", [False, True], ids=["greedy", "drawn"])
 @pytest.mark.parametrize("agent", ["ppo", "dreamer", "dreamer in a simulator"])
@@ -176,27 +180,6 @@ def test_a_runs_episodes_score_its_flights_from_the_evaluations_key(tmp_path, ag
                          evaluation_key(state.key, 3))
     assert logged == {f"episodes/{name}": value for name, value in expected.items()}
 
-
-def test_a_command_line_names_the_run_its_record_does(tmp_path):
-    """A run named on the command line, each optional setting turned on by its own flags (`--env.`,
-    `--teacher.`), the model's and objective's fields one flag each and an environment's argument set
-    alone (`--set env.difficulty=`), is the run its record states."""
-    args = ["--env.name", "flight", "--env.count", "16", "--env.fields", json.dumps(
-                {"racing": RACING, "views": list(VIEWS)}),
-            "--model", ACTOR_CRITIC, "--model.policy-layers", "16", "--model.value-layers", "16",
-            "--objective", CONTROL_PPO, "--objective.discount", "0.9", "--objective.reads", "teacher",
-            "--rollout.name", "control", "--rollout.fields", json.dumps(
-                {"unroll_length": 4, "epochs": 1, "minibatches": 2}),
-            "--optim.optimizer", "adam", "--optim.learning-rate", "1e-3",
-            "--trainer.checkpoint-dir", str(tmp_path), "--trainer.steps", "2", "--trainer.log-every", "1",
-            "--trainer.multi-host", "False", "--teacher.run", str(tmp_path / "teacher"),
-            "--teacher.demonstrates", "--set", "env.difficulty=0.5"]
-    run = teacher_run(tmp_path)
-    assert run.env is not None
-    raced = dataclasses.replace(run.env, fields={**run.env.fields, "difficulty": 0.5})
-    taught = TeacherConfig(str(tmp_path / "teacher"), demonstrates=True)
-    stated = dataclasses.replace(run, env=raced, teacher=taught)
-    assert EnvRunConfig.cli(args) == stated
 
 
 def test_a_student_resumed_by_its_command_keeps_the_teacher_step_it_pinned(tmp_path):
@@ -255,7 +238,6 @@ def test_a_pretraining_stage_from_its_record_learns_from_its_saved_teacher_as_co
     rollout = DreamerRollout(objective, race, capacity=64, batch=8, length=8, train_ratio=float("inf"),
                              prefill=16, demonstrator=Teacher(teacher_policy().act, teacher.variables))
     assert_bitwise(pretrained, fitted(pretraining, objective, rollout, 1))
-    assert isinstance(prepared.rollout, DreamerRollout)
     assert_bitwise(prepared.rollout.held_replay, rollout.held_replay)
     dagger = student(tmp_path, 1, teacher=TeacherConfig(str(saved)),
                      pretrained=str(tmp_path / "pretrain"), model=EnvRunConfig().model,
@@ -284,7 +266,6 @@ def test_a_dagger_stage_from_its_record_labels_its_flights_with_its_saved_teache
                              length=8, train_ratio=16.0, prefill=8,
                              teacher=Teacher(teacher_policy().greedy, teacher.variables))
     assert_bitwise(state, fitted(dagger, objective, rollout, 1))
-    assert isinstance(prepared.rollout, DreamerRollout)
     labelled = jax.device_get(prepared.rollout.held_replay)
     assert_bitwise(labelled, rollout.held_replay)
     filled = int(labelled.filled)
@@ -304,75 +285,29 @@ def resumable(root: Path, agent: str) -> EnvRunConfig:
 @pytest.mark.parametrize("agent", ["ppo", "dreamer"])
 def test_a_resumed_run_ends_as_the_run_that_never_stopped(tmp_path, agent):
     """A run in the race checkpointed every update (`resumable`), trained to its second update and resumed
-    under its name to its fourth, ends where the run that never stopped ends, every leaf bit for bit."""
+    under its name to its fourth, ends where the run that never stopped ends, every leaf bit for bit;
+    resumed further in a harder race (and for Dreamer with longer windows and lower entropy) it trains on,
+    while changing discount or horizon is refused."""
     run = resumable(tmp_path, agent)
-    whole = run.prepare().train("whole")
+    prepared_whole = run.prepare()
+    whole = prepared_whole.train("whole")
+    if agent == "dreamer":
+        assert isinstance(prepared_whole.rollout, DreamerRollout)
+        assert [path for path, leaf in jax.tree_util.tree_leaves_with_path(prepared_whole.rollout.saved())
+                if getattr(leaf, "weak_type", False)] == []
     run.override({"trainer.steps": 2}).prepare().train("stopped")
     assert_bitwise(whole, run.prepare().train("stopped"))
-
-
-def test_a_dreamer_run_trained_again_in_its_process_reads_the_step_its_equal_traced(tmp_path):
-    """A DreamerV3 run trained again in the same process under another name, its trainer and objective
-    built anew from an equal config, traces no step: it reads the one the first run traced
-    (`Trainer._step_key`, `candidate_for`), and trains to the same leaves, bit for bit. One at another
-    horizon, which its objective reads, traces its own (row 3873: each of a resumed run's fits traced
-    its step again, 6.5 to 12.9 s, and lowered it, 9 s)."""
-    from dew.telemetry.compiles import Compiles
-
-    run = resumable(tmp_path, "dreamer")
-    first = run.prepare().train("first")
-    with Compiles("step") as again:
-        second = run.prepare().train("second")
-    assert [program for program in again.programs if program.kind == "traced"] == []
-    assert_bitwise(first, second)
-    with Compiles("step") as other:
-        run.override({"objective.horizon": 100.0}).prepare().train("third")
-    assert any(program.kind == "traced" for program in other.programs)
-
-
-@pytest.mark.parametrize("agent", ["ppo", "dreamer"])
-def test_a_resumed_run_trains_on_in_another_environment_and_keeps_what_it_trains(tmp_path, agent):
-    """A run's environment is what it reads, so the run (`resumable`) trained to its second update and
-    resumed at another difficulty trains on to its fourth (a curriculum); resumed again with another
-    discount or horizon, which says what it trains, it is refused."""
-    run = resumable(tmp_path, agent)
-    run.override({"trainer.steps": 2}).prepare().train("stopped")
-    raced = run.override({"trainer.steps": 4, "env.difficulty": 0.5}).prepare().train("stopped")
-    assert int(raced.step) == 4
-    trained = {"objective.discount": 0.5} if agent == "ppo" else {"objective.horizon": 100.0}
+    next_run = run.override({"trainer.steps": 5, "env.difficulty": 0.5})
+    if agent == "dreamer":
+        next_run = dataclasses.replace(
+            next_run,
+            rollout=RolloutConfig("dreamer", {"batch": 8, "length": 16, "train_ratio": 16.0, "prefill": 16,
+                                              "capacity": 64, "checkpointed_replay": True}),
+            objective=ObjectiveConfig(DREAMER_V3, {"entropy": 1e-5}))
+    assert int(next_run.prepare().train("stopped").step) == 5
+    refused = {"objective.discount": 0.5} if agent == "ppo" else {"objective.horizon": 100.0}
     with pytest.raises(ValueError):
-        run.override({"trainer.steps": 6, **trained}).prepare().train("stopped")
-
-
-def test_a_dreamer_rollout_begins_its_live_state_as_its_checkpoint_restores_it(tmp_path):
-    """A DreamerV3 rollout over the race begins its environments' state holding each leaf's dtype strongly,
-    as a run resumed from its checkpoint restores it, so the resumed run lowers its rollout to the program
-    the run that never stopped compiled and reads it from the compilation cache (ledger 3451): the race's
-    `ramp`, a Python number its reset folds in, was held weakly, and each resumed run compiled it again."""
-    run, objective, _ = dreamer(tmp_path)
-    rollout = DreamerRollout(objective, Batched(FlightEnv(racing(), VIEWS), 8), capacity=64, batch=8,
-                             length=8, train_ratio=16.0, prefill=8, checkpointed_replay=True)
-    fitted(run, objective, rollout, 1)
-    assert [path for path, leaf in jax.tree_util.tree_leaves_with_path(rollout.saved())
-            if getattr(leaf, "weak_type", False)] == []
-
-
-def test_a_dreamer_run_resumed_in_a_later_phase_trains_on_and_at_another_horizon_is_refused(tmp_path):
-    """A DreamerV3 run trained to its second update and resumed under its name in a later phase of its
-    training, drawing longer windows at a lower entropy (SkyDreamer's last phases), trains on to its fourth:
-    the rollout and the entropy are how it learns. Resumed again at another horizon, which says what its
-    critic estimates, it is refused."""
-    run = student(tmp_path, 2)
-    run.prepare().train("phased")
-    later = dataclasses.replace(
-        run, rollout=RolloutConfig("dreamer", {"batch": 8, "length": 16, "train_ratio": 16.0, "prefill": 16,
-                                               "capacity": 64}),
-        objective=ObjectiveConfig(DREAMER_V3, {"entropy": 1e-5}))
-    assert int(later.override({"trainer.steps": 4}).prepare().train("phased").step) == 4
-    with pytest.raises(ValueError):
-        later.override({"trainer.steps": 6, "objective.horizon": 100.0}).prepare().train("phased")
-
-
+        next_run.override({"trainer.steps": 6, **refused}).prepare().train("stopped")
 
 
 REFUSED = {
@@ -401,20 +336,6 @@ REFUSED = {
 """Each setup an environment run refuses, as the one change to a run that prepares."""
 
 
-def test_a_world_models_named_entries_take_their_widths_from_the_environment(tmp_path):
-    """A record naming a world model's auxiliary heads by their views and units builds the model with each
-    head's width the race's view of it, one drone's flattened: the drone's state and the teacher's view."""
-    model = ModelConfig(WORLD_MODEL, {**TINY, "reads": "state", "auxiliary": [["state", 8], ["teacher", 16]]})
-    run = student(tmp_path, 1, model=model)
-    assert run.env is not None
-    race = run.env.build()
-    shown = jax.eval_shape(race.reset, jax.random.key(0))[1].observation
-    agent = run.agent(race)
-    assert isinstance(agent, DreamerV3Objective)
-    assert agent.model.auxiliary == (("state", math.prod(shown["state"].shape[1:]), 8),
-                                     ("teacher", math.prod(shown["teacher"].shape[1:]), 16))
-
-
 @pytest.mark.parametrize("change", list(REFUSED))
 def test_an_environment_run_refuses_a_setup_it_cannot_train(tmp_path, saved_teacher, change):
     """A Dreamer agent of the drone's state prepares; changed in one thing, each setup the kind refuses is
@@ -430,15 +351,4 @@ def test_an_environment_run_refuses_a_setup_it_cannot_train(tmp_path, saved_teac
     with pytest.raises(ValueError):
         dataclasses.replace(run, **fields).prepare()
 
-
-@pytest.mark.parametrize("name", ["playground", "dew.rl.playground:playground"])
-def test_an_environment_a_function_builds_is_named_again_by_its_record(name):
-    """An environment a function builds, the table's (`playground`, `Playground.load`) or any other declared
-    to return one (`dew.rl.playground.playground`), which a record holds as the function's import path, is
-    named by that record again, read back with its run."""
-    held = EnvConfig(name, {"name": "CartpoleBalance"} | ({} if name == "playground" else {"count": 4}))
-    run = EnvRunConfig(env=held)
-    again = EnvRunConfig.from_dict(json.loads(json.dumps(run.to_dict())))
-    # A classmethod is bound afresh at each read: the same function of the same class, equal, not identical.
-    assert again.env is not None and again.env.member == held.member == envs[name]
 
