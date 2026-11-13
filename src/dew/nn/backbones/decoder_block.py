@@ -119,9 +119,9 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float 
     `norm_gated` says: a layer's on the layers it names, the `routed` layer's
     among them or not, and a norm outside the layers (`routed` None) wherever
     it runs, its gate's maps at the model's `precision`. 'layer' keeps torch's
-    exact variance, the reference decoders' formula; 'fast_layer' is flax's
-    E[x^2] - E[x]^2 (`dew.nn.norms.LayerNorm`), whose mean and square reduce
-    in one pass, which the vision towers run. An `epsilon` of None is an RMS
+    exact variance, the reference decoders' formula (`dew.nn.norms.LayerNorm`'s);
+    'fast_layer' is flax's E[x^2] - E[x]^2 (`use_fast_variance`), whose mean
+    and square reduce in one pass, which the vision towers run. An `epsilon` of None is an RMS
     norm's input dtype's (`RMSNorm.epsilon`); a layer norm states its own."""
 
     def build(*, name: str) -> nn.Module:
@@ -147,11 +147,8 @@ def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float 
                              f"weight offset from one only as a scaled 'layer' norm, not {spec}")
         if kind == 'layer' and offset:
             return OffsetLayerNorm(epsilon=eps, use_bias=bias, dtype=dtype, name=name)
-        if kind == 'layer':
-            # Torch's exact variance, rematerialized as every Dew LayerNorm is (ledger 3010).
-            return LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, use_fast_variance=False,
-                             dtype=dtype, name=name)
-        return LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale, dtype=dtype, name=name)
+        return LayerNorm(epsilon=eps, use_bias=bias, use_scale=spec.scale,
+                         use_fast_variance=kind == 'fast_layer', dtype=dtype, name=name)
 
     return build
 

@@ -21,7 +21,7 @@ from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding
 
 from dew import communicators
-from dew._devices import COMPILE_ONLY_MEMORY, allocator_limit, gpu_free_bytes, xla_flag
+from dew._devices import device_memory, gpu_free_bytes, xla_flag
 from dew._records import JSON, integer, integers, json_value, listed, record
 from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
@@ -418,22 +418,6 @@ def stranding(device, memory: Mapping[str, int]) -> int:
     """How many times its temporaries a step needs room for on `device`, its allocator stating `memory`:
     2 where it can strand them (`strands_temporaries`), else 1."""
     return 2 if strands_temporaries(device.platform, memory) else 1
-
-
-def device_memory(device, arguments: int = 0) -> Mapping[str, int]:
-    """What `device`'s allocator states (`Device.memory_stats`), empty where it states nothing: a CPU's,
-    or a compile-only GPU's whose memory no one stated. A compile-only GPU's stated memory
-    (`COMPILE_ONLY_MEMORY`) models a fresh BFC pool at its allocator's limit (`allocator_limit`), with
-    `arguments` resident: its free block and temporary-stranding policy are read exactly as for that
-    allocator."""
-    if device in jax.local_devices():
-        return device.memory_stats() or {}
-    memory = COMPILE_ONLY_MEMORY.get(device)
-    if memory is None:
-        return {}
-    limit = allocator_limit(memory)
-    return {'bytes_limit': limit, 'bytes_in_use': arguments, 'pool_bytes': limit,
-            'largest_free_block_bytes': limit - arguments}
 
 
 def local_devices(mesh: Mesh) -> list:

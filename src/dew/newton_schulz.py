@@ -179,18 +179,6 @@ def spread_stacks(stacks: Sequence[jax.Array | jax.ShapeDtypeStruct], group: int
             for start in range(0, len(members), group or len(members))]
 
 
-def spread_matrices(stacks: Sequence[jax.Array | jax.ShapeDtypeStruct], devices: int, group: int | None
-                    ) -> list[tuple[int, int, int]]:
-    """Each stack `orthogonalized` iterates of `stacks` (`spread_stacks`), as its matrices, padding among
-    them, and their rows and columns."""
-    joined = []
-    for members in spread_stacks(stacks, group):
-        count = sum(stacks[index].shape[0] for index in members)
-        _, rows, columns = stacks[members[0]].shape
-        joined.append((count + -count % devices, rows, columns))
-    return joined
-
-
 def newton_schulz_flops(matrices: int, rows: int, columns: int, steps: int) -> float:
     """The FLOPs of `steps` iterations of `newton_schulz` over `matrices` matrices of `rows` by `columns`, its
     products' (each multiply and add two): of a short side m and a long side n, the Gram product `2 m² n`, its
@@ -299,5 +287,4 @@ def ns_operands(dtype, preconditioning: Preconditioning = "frobenius",
 
 
 __all__ = ["NEWTON_SCHULZ", "POLAR_EXPRESS_TABLE", "Preconditioning", "newton_schulz", "newton_schulz_flops",
-           "ns_operands", "orthogonalized", "polar_express", "spread_matrices",
-           "spread_stacks"]
+           "ns_operands", "orthogonalized", "polar_express", "spread_stacks"]
