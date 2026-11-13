@@ -16,6 +16,7 @@ import numpy as np
 from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+from dew._coordination import collective_host
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import CLOSES_WINDOW, Batch
 from dew.distributed.batches import batch_layout, batch_shardings
@@ -280,8 +281,9 @@ class StepCompiler[L, E]:
             raise Lowered(target, *routed(lambda: lowered_for(stepping, state, batch, target, self.narrow)))
         split, unaligned = divmod(int(state.window_size), settings.accumulation)
         # A state pools its window's microbatches where it holds one part filled: the window, laid out for
-        # its split, binds it.
-        pools = bool(int(jnp.max(occupancy(state.window))))
+        # its split, binds it. Read on the host: a reduction on the devices compiles a program of the
+        # occupancy's placement, a restored one's another than a fresh one's, which a resume compiles anew.
+        pools = bool(np.max(collective_host(occupancy(state.window), phase="accumulation occupancy")))
         held = state.window is not None or split > 1
         # DiLoCo's replicas, once they have stepped, each count their microbatches in their split's windows,
         # which no other split reads: it binds the split, a stated other refused.
