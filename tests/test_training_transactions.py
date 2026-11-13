@@ -583,16 +583,19 @@ def test_a_local_step_one_process_wrote_reads_onto_the_host_and_onto_any_mesh(tm
     no mesh named (the default mesh over every device, not the two it was written on), each as the step
     holds them, bit for bit, where both were refused for its placement (row 5667). A pool's local step,
     each process holding its own shards, still reads onto the placement it was written with alone."""
-    from dew.training import MeshSpec
+    from dew.training import Layout, MeshSpec
 
     persistent, local = str(tmp_path / "persistent"), str(tmp_path / "local")
     mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
-    train = Trainer(Matrix(), optax.sgd(.1), key=jax.random.PRNGKey(3), mesh=mesh,
+    # Every leaf split, however small (`Layout.min_shard`), so the matrix lies as two slices.
+    train = Trainer(Matrix(), optax.sgd(.1), key=jax.random.PRNGKey(3), mesh=mesh, layout=Layout(min_shard=1),
                     checkpoints=Checkpoints(persistent, local_directory=local, local_every=1))
     initial = train.initial_state()
     data = {"y": jnp.ones(2 * jax.device_count(), jnp.float32)}
     state, *_ = train.compile(initial, data)(initial, data)
-    written = np.asarray(state.variables["params"]["w"])
+    matrix = state.variables["params"]["w"]
+    assert len({str(index) for index in matrix.sharding.devices_indices_map(matrix.shape).values()}) == 2
+    written = np.asarray(matrix)
     train.checkpoints.save_local(1, state, b"1", share=DataPartition())
     train.checkpoints.wait()
     host = Checkpoints(persistent, local_directory=local, local_every=1).variables(ema=False, on_host=True)

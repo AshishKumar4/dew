@@ -827,9 +827,9 @@ class Checkpoints:
     subdirectory, so the same path works for a pod and for one host running
     several processes. `latest` is the newest step every process can
     read, local or persistent, and `restore` reads it from wherever it is. A
-    local checkpoint restores onto the placement it was written with, because
-    no process holds another process's shards; the persistent checkpoint
-    restores onto any mesh.
+    pool's local checkpoint restores onto the placement it was written with,
+    because no process holds another process's shards (`_check_placement`);
+    one process's, and the persistent checkpoint, restore onto any mesh.
     """
 
     def __init__(self, directory: str, *, keep: int | Keep = Keep.latest,
@@ -1681,10 +1681,8 @@ class Checkpoints:
 
         The new step replaces the previous local step. As with `save`, a state
         with arrays in pinned host memory is written before this returns. The
-        placement is saved with the state, so a resume onto a different
-        placement raises before it reads shards from directories that do not
-        hold them.
-        """
+        placement is saved with the state, which a pool's resume is held to
+        (`_check_placement`)."""
         state_tree = self._item(state, saved, share, rollout)
         written = placement(state_tree)
         grid = Grid.of({name: leaf for name, leaf in state_tree.items() if name != 'position'})
