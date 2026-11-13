@@ -27,6 +27,7 @@ from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
 from dew.distributed.placement import parameter_axes
 from dew.mesh import batch_axes, mesh_axes
+from dew.nn.backbones.layer_names import StoredRow, group_layers, stored_layers
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.kernels.templates import report
@@ -51,17 +52,77 @@ COLLECTIVES = {
 }
 """NVIDIA JAX-Toolbox's collective options for a GPU step over several devices: the scheduler overlaps
 each collective with compute, and the collectives combine into few large ones. Measured in
-docs/performance.md, "Collectives over several GPUs"."""
+docs/performance.md, "Collectives over several GPUs". A step that gathers its layers' parameters combines
+its all-gathers up to one layer's instead (`gathered_layer_bytes`)."""
+
+GATHER_THRESHOLD = 'xla_gpu_all_gather_combine_threshold_bytes'
+"""The bytes XLA combines a step's all-gathers up to (`COLLECTIVES`, `step_compiler_options`)."""
+
+def gathered_layer_bytes(objective, variables: Variables) -> int | None:
+    """The bytes a device gathers for the largest layer's split parameters (`splits_parameter`), every
+    collection's (a frozen split's too), each gathered whole in the dtype it is stored in: what a layer's
+    gathers move at most, whatever narrower dtype its step converts a shard to first (a bf16 step over fp32
+    parameters gathers half), so no layer's gathers are split, and at most two of a bf16 step's are held
+    ahead. A layer is a stack module's `layers_N`, every run the objective's networks store stacked (a
+    stage-local or periodic run, a host-owned state's bank of its frozen trees, a distillation teacher's
+    among them) read back onto its layers first (`stored_layers`, the networks' own views, as their exports
+    read them); None where no layer's leaf is split. A step whose all-gathers
+    combine up to one layer's gathers each layer at once (`step_compiler_options`): on 2 x H100 at fsdp 2,
+    Qwen3.5-4B's 1 GiB combined about 4.7 layers' 215 MiB each in its forward and held 5 GiB more at its
+    peak than 128 MiB did, in the same time (IG-SCALING-2XH100), and a Llama-3.1-8B's 128 MiB split its 0.44
+    GB layers and lost 2.6% (docs/performance.md)."""
+    def layered(tree):
+        # A bank's rows are read where they lie (`StoredRow`): their shapes and dtypes are what is sized.
+        return jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype) if isinstance(leaf, StoredRow)
+                            else leaf, stored_layers(objective, tree, banks=True))
+
+    # Two trees cut alike: the leaves' own dtypes, and a mark of which a parameter axis splits.
+    sized = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), variables)
+    marks = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(
+        leaf.shape, jnp.int8 if splits_parameter(leaf) else jnp.uint8), variables)
+    sized, marks = jax.eval_shape(lambda sized, marks: (layered(sized), layered(marks)), sized, marks)
+    layers: dict[tuple[str, ...], int] = {}
+    for (path, leaf), mark in zip(jax.tree_util.tree_flatten_with_path(sized)[0], jax.tree.leaves(marks),
+                                  strict=True):
+        names = [str(key.key) for key in path[1:] if isinstance(key, jax.tree_util.DictKey)]
+        found = [index for index, name in enumerate(names) if group_layers(name) is not None]
+        if found and mark.dtype == jnp.int8:
+            layer = tuple(names[:found[-1] + 1])
+            layers[layer] = layers.get(layer, 0) + leaf.size * jnp.dtype(leaf.dtype).itemsize
+    return max(layers.values(), default=None)
 
 
-def step_compiler_options(objective, tokens: float, frozen: bool,
-                          devices: int) -> jax.stages.CompilerOptions | None:
+def splits_parameter(leaf) -> bool:
+    """Whether a parameter axis splits `leaf`, a placed array (`parameter_axes`): a step gathers it whole
+    for its use."""
+    sharding = leaf.sharding
+    return isinstance(sharding, NamedSharding) and any(
+        sharding.mesh.shape[axis] > 1 for assignment in sharding.spec
+        for axis in parameter_axes(mesh_axes(assignment)))
+
+
+def layer_gathers(objective, variables: Variables, devices: int) -> int | None:
+    """The bytes a step over `devices` combines its all-gathers up to (`gathered_layer_bytes`) where it
+    takes the collective options (`collects`), None elsewhere: a fact of the run's plan, which its compiles'
+    options read (`step_compiler_options`)."""
+    return gathered_layer_bytes(objective, variables) if collects(devices) else None
+
+
+def collects(devices: int) -> bool:
+    """Whether a step over `devices` takes the collective options (`COLLECTIVES`): a GPU's over several."""
+    return backend() == 'gpu' and devices > 1
+
+
+def step_compiler_options(objective, tokens: float, frozen: bool, devices: int, *,
+                          gathered: int | None = None) -> jax.stages.CompilerOptions | None:
     """Return the XLA options for this objective's training step on this device.
 
     Each option applies unless the run set that flag itself. `tokens` is the
     number of tokens one device steps (`device_tokens`), `frozen` says
     whether the step trains next to frozen weights, and `devices` is how
-    many the step spans: over several GPUs it takes `COLLECTIVES`.
+    many the step spans: over several GPUs it takes `COLLECTIVES`, its
+    all-gathers combined up to the `gathered` bytes of its largest layer in
+    whole MiB where it gathers its layers (`layer_gathers`, the plan's).
 
     On a GPU, dots that share an input (q, k and v; gate and up) run separately.
     XLA's dot merger would run them as one GEMM over their weights, concatenated
@@ -93,8 +154,10 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     """
     generation = device_generation()
     options: dict[str, Option] = {}
-    if backend() == 'gpu' and devices > 1:
+    if collects(devices):
         options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
+        if gathered and xla_flag(GATHER_THRESHOLD) is None:
+            options[GATHER_THRESHOLD] = -(-gathered // 2 ** 20) * 2 ** 20
     small = tokens <= 128
     if (backend() == 'gpu' and xla_flag('xla_gpu_dot_merger_threshold_mb') is None
             and not (frozen and small)):
@@ -168,22 +231,21 @@ def split_share(params: Variables) -> float:
     total = split = 0
     for leaf in jax.tree.leaves(params):
         total += leaf.nbytes
-        sharding = leaf.sharding
-        if isinstance(sharding, NamedSharding) and any(
-                sharding.mesh.shape[axis] > 1 for assignment in sharding.spec
-                for axis in parameter_axes(mesh_axes(assignment))):
+        if splits_parameter(leaf):
             split += leaf.nbytes
     return split / total if total else 0.0
 
 
 def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: Batch, variables: Variables,
-                                  mesh: Mesh) -> jax.stages.CompilerOptions | None:
+                                  mesh: Mesh, gathered: int | None = None
+                                  ) -> jax.stages.CompilerOptions | None:
     """The options a step over microbatches of `micro` on `mesh` compiles with
     (`step_compiler_options`): by the tokens one device steps of a microbatch split over the
-    mesh's batch axes, and whether `variables` hold frozen weights it trains beside."""
+    mesh's batch axes, whether `variables` hold frozen weights it trains beside, and the plan's
+    `gathered` bytes (`layer_gathers`)."""
     shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
     return step_compiler_options(objective, device_tokens(objective, micro, shards), FROZEN in variables,
-                                 mesh.devices.size)
+                                 mesh.devices.size, gathered=gathered)
 
 
 def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch: Batch, shards: int) -> float:
