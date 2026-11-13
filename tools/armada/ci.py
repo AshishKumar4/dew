@@ -84,7 +84,8 @@ its own processes wrote, or where it is a group of a file the record its groups
 are cut by does not wholly name (`record`). The records live in the dew-xla-cache Worker
 under `CACHE_PREFIX`. With DEW_TEST_CACHE=off where the plan runs, which its
 entries carry to their tasks (`--cache`), or without the Worker's URL and
-token, a task runs every file.
+token, a task runs every file; with 'cold', it looks rows up as with 'on',
+its plan weighing every task it runs cold (`policy`).
 
 A row's record also says where its tests read the backend and which are
 marked to run on a GPU (`gpu-tier --evidence` reports it); `gpu-tier` names the
@@ -181,6 +182,7 @@ partition = _loaded(HERE / "partition.py")
 command_line = _loaded(HERE / "arguments.py")
 rows = _loaded(HERE / "rows.py")
 row, parsed_row, row_place, key_parts = rows.row, rows.parsed_row, rows.row_place, rows.key_parts
+grouped_rows = rows.grouped_rows
 # The test cache's records (records.py), by the names this file and its tests read them.
 (store, record_key, green_key, sets_key, set_key, epoch_key, Unread, UNREAD, epoch, begun, standing,
  executed_set, set_digest, remembered, recorded, record_of, written, listed, CACHE_PREFIX, RECORD_TRIES) = (
@@ -782,24 +784,6 @@ def measured_cut(timings: dict, python: str, name: str) -> tuple[float, int] | N
     return cuts.measured_cut(grouped_rows(timings.get("rows", {})).get((python, name), {}))
 
 
-GROUPED: list = [None, {}]
-"""The rows `grouped_rows` last grouped, and their groups: a plan asks of one run's timings for every file."""
-
-
-def grouped_rows(measured: Mapping[str, float]) -> dict[tuple[str, str], dict[str, float]]:
-    """Armada's row timings `measured` by their Python and file, each row's seconds under its group; a map
-    task's seconds are kept under its task's name, no row's. Grouped once for the rows it was last asked
-    of."""
-    if GROUPED[0] is not measured:
-        found: dict[tuple[str, str], dict[str, float]] = {}
-        for row_name, seconds in measured.items():
-            if ":" in row_name:
-                python, name, group = parsed_row(row_name)
-                found.setdefault((python, name), {})[group] = seconds
-        GROUPED[:] = [measured, found]
-    return GROUPED[1]
-
-
 APART = re.compile(r"\bpytest\.mark\.torchax\b")
 """A file marked `torchax` imports torchax, which renames torch's privateuse1 backend to "jax" for
 the whole process, so a torch.compile in a later file of its task fails (test_reference_helpers'
@@ -835,12 +819,15 @@ round (train 149: 30 task-hours, twice)."""
 
 def policy(base: str) -> str:
     """The test cache's policy (DEW_TEST_CACHE) for this checkout's change from `base`: 'off', every file run,
-    for a change to what every test process runs or reads (`SHARED`, a Python module of it by its code, as
-    `shared` keys it; a lock, the environment's files) or to a file the records do not place (`PLACED`); else
-    'on', each file run where its inputs changed. A tool is such an input of each file whose run executed or
-    read it, which its key hashes, so a changed tool runs those files again and no other (train 115 reran its
-    whole suite for five tools no pulled head had touched, under a policy that reran every file that read any
-    tool)."""
+    for a change to a file the records do not place (`PLACED`), which no key covers; 'cold' for a change to
+    what every test process runs or reads (`SHARED`, a Python module of it by its code; a lock, the
+    environment's files), which every key covers (`shared`), so no row of main's is found and every file runs,
+    the plan weighing each task cold, while a train composed again on the same inputs, and the next on them,
+    finds the rows the first ran green (owner, 2026-11-13: train 793's second round reran all 4,113 tasks its
+    first had run under the same inputs); else 'on', each file run where its inputs changed. A tool is such an
+    input of each file whose run executed or read it, which its key hashes, so a changed tool runs those files
+    again and no other (train 115 reran its whole suite for five tools no pulled head had touched, under a
+    policy that reran every file that read any tool)."""
     changed = subprocess.run(["git", "diff", "--name-only", "--no-renames", f"{base}...HEAD"], check=True,
                              capture_output=True, text=True).stdout.split()
     if ".armada.json" in changed:
@@ -856,9 +843,9 @@ def policy(base: str) -> str:
     # train runs ran cold on harness edits).
     changed = [name for name in changed
                if not (name in SHARED and name.endswith(".py") and same_code(base, name))]
-    if any(name in whole or not (name.startswith(PLACED) or name in PLACED_FILES) for name in changed):
+    if any(not (name.startswith(PLACED) or name in PLACED_FILES) for name in changed if name not in whole):
         return "off"
-    return "on"
+    return "cold" if any(name in whole for name in changed) else "on"
 
 
 def same_code(base: str, name: str) -> bool:
@@ -893,9 +880,10 @@ def borrowed(timings: dict, python: str) -> dict:
 
 
 COLD_SECONDS = 360.0
-"""What a task adds to its estimate when it runs cold, the test cache's policy off (a lock, JAX's build or
-the recorder changed): the compiles and imports no warm run paid. Train 254's cold suite ran about 470 s a
-task where its plan estimated about 120 (1,389 tasks in 2,700 s on 242 containers, 2026-10-28)."""
+"""What a task that runs a file adds to its estimate when it runs cold, the test cache's policy off or cold (a
+lock, JAX's build or the recorder changed): the compiles and imports no warm run paid. Train 254's cold suite
+ran about 470 s a task where its plan estimated about 120 (1,389 tasks in 2,700 s on 242 containers,
+2026-10-28)."""
 
 SITE_MARK = re.compile(r"\bmark\.(?:" + "|".join(session.SHARDS) + r")\b")
 """A site's mark as a test file's source spells it (`sites`), which a file that holds none never parses."""
@@ -1130,16 +1118,16 @@ def site_entries(python: str, marked: Mapping[str, Mapping[str, Mark]],
 
 
 def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
-    """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
-    timed runs alone, so however long it takes it holds up no other file, and its time is known from
-    then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
-    the test cache's policy, DEW_TEST_CACHE here (`policy`), to its task. Under the policy "on", the files
-    whose rows the cache holds for exactly these inputs (`reusable`) share tasks of the target's lookups each,
-    which look each up again in their containers, so the verdict names every file and containers scale with
-    the change. Under the policy "off" every task's weight carries COLD_SECONDS, so armada sizes the pool by
-    the work, not the longest task, as warm estimates did. A site marked one of `session.SHARDS` runs as
-    armada's map and judge, apart from its file's tasks (`site_entries`). The `census` (check 1's CENSUS) is
-    the whole suite with the cache off, whatever this environment says, each entry carrying it to its task."""
+    """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has timed
+    runs alone, so however long it takes it holds up no other file, and its time is known from then on. Files
+    marked `torchax` (`APART`) share tasks only with one another. Each entry carries the test cache's policy,
+    DEW_TEST_CACHE here (`policy`), to its task. Under the policy "on", the files whose rows the cache holds
+    for exactly these inputs (`reusable`) share tasks of the target's lookups each, which look each up again
+    in their containers, so the verdict names every file and containers scale with the change. Under the
+    policy "off" or "cold" every task that runs a file carries COLD_SECONDS, so armada sizes the pool by the
+    work, not the longest task, as warm estimates did. A site marked one of `session.SHARDS` runs as armada's
+    map and judge, apart from its file's tasks (`site_entries`). The `census` (check 1's CENSUS) is the whole
+    suite with the cache off, whatever this environment says, each entry carrying it to its task."""
     cache = "off" if census else os.environ.get("DEW_TEST_CACHE") or "on"
     # The whole suite's run alone (DEW_WHOLE_SUITE: the daily run's and the whole dispatch's, and the census)
     # runs whole_suite cells (`selected`) and every file on the newest Python.
@@ -1203,12 +1191,13 @@ def plan(target: float, timings: dict, census: bool = False) -> list[dict]:
                       for name, group in held_rows]
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(tokens),
                             "split": alone, "rows": [row(python, name, group) for name, group in held_rows],
-                            "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), **stamped})
+                            "weight": weight + (COLD_SECONDS if cache != "on" and any(
+                                each not in found for each in held_rows) else 0.0), **stamped})
         # The sites to run whose judge's last run needed its later map tasks draw them at once
         # (`eager_sites`).
         eager = eager_sites(python, [(name, test) for name, held in marked.items() for test in held
                                      if (name, test) not in found])
-        entries += [{**entry, "weight": entry["weight"] + (COLD_SECONDS if cache == "off" else 0.0),
+        entries += [{**entry, "weight": entry["weight"] + (COLD_SECONDS if cache != "on" else 0.0),
                      **stamped}
                     for entry in site_entries(python, marked, found, timings, target, eager)]
     # What the newest Python runs no test of, it imports (`COLLECT`): on a pushed run, every file but its own.

@@ -903,9 +903,9 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
 @pytest.mark.parametrize(("changed", "policy"), [
     ({"src/pkg/mod.py": "VALUE = 2\n"}, "on"), ({"docs/page.md": "page\n"}, "on"),
     ({"tutorials/notes.ipynb": "{}\n"}, "on"), ({"tools/tool.py": "VALUE = 2\n"}, "on"),
-    ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "off"), ({"locks/cpu.txt": "jax==9\n"}, "off"),
-    ({"tools/armada/session.py": "# the session\n"}, "off"),
-    ({"tools/armada/executed.py": "# the recorder\n"}, "off"),
+    ({"pyproject.toml": "[project]\nname = 'changed'\n"}, "cold"), ({"locks/cpu.txt": "jax==9\n"}, "cold"),
+    ({"tools/armada/session.py": "# the session\n"}, "cold"),
+    ({"tools/armada/executed.py": "# the recorder\n"}, "cold"),
     ({".github/workflows/ci.yml": "on: []\n"}, "on"),
     ({"Makefile": "all:\n"}, "off"),
     ({"CHANGELOG.md": "# Changes\n\n- an entry\n"}, "on"),
@@ -913,10 +913,10 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({"stubs/pkg/__init__.pyi": "VALUE: int\n"}, "on"), ({"licenses/NOTICE": "notice\n"}, "on"),
     ({".thresh/seams.toml": "[seam]\n"}, "on"), ({"MANIFEST.in": "include LICENSE\n"}, "on"),
     ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 400}\n'}, "on"),
-    ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "2"}, "pool": 160}\n'}, "off"),
+    ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "2"}, "pool": 160}\n'}, "cold"),
     ({"tools/armada/followed.py": '"""Followed, as each run reads."""\n\n\n# A note.\ndef read(path):\n'
                                   '    return path\n'}, "on"),
-    ({"tools/armada/followed.py": '"""Followed."""\n\n\ndef read(path):\n    return [path]\n'}, "off"),
+    ({"tools/armada/followed.py": '"""Followed."""\n\n\ndef read(path):\n    return [path]\n'}, "cold"),
 ], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
         "the test session", "the recorder", "a workflow", "a file no record places", "the changelog",
         "a native kernel package's wrapper", "a type stub", "a license", "thresh's annotations",
@@ -925,14 +925,15 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
 def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(
         ci, tmp_path, changed, policy):
     """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records
-    place what changed, a tool and a workflow among them, and every file runs ('off') for a change to what
-    every test process runs or reads, or to a file the records do not place. .armada.json's pool decides
-    where tasks run, not what a test sees (owner, 2026-10-27: a pool change reran every file), and a workflow
-    is an input of the files that read it alone (the maintainer, 2026-10-28: 5 of 10 trains ran with the cache
-    off, and 0.75% of rows were reused). The recorder (executed.py, followed.py, watched.py) stays every
-    file's input: an old record may lack a dependency a new recorder finds, by its code alone, so an edit of
-    what it says of itself keeps the cache on (Main, 2026-11-07: 12 of 20 trains ran cold on harness
-    edits)."""
+    place what changed, a tool and a workflow among them; every file runs ('off') for a change to a file the
+    records do not place; and for a change to what every test process runs or reads, which every key covers,
+    every file runs cold with its rows looked up ('cold'), so a round on the same inputs finds the first's.
+    .armada.json's pool decides where tasks run, not what a test sees (owner, 2026-10-27: a pool change reran
+    every file), and a workflow is an input of the files that read it alone (the maintainer, 2026-10-28: 5 of
+    10 trains ran with the cache off, and 0.75% of rows were reused). The recorder (executed.py, followed.py,
+    watched.py) stays every file's input: an old record may lack a dependency a new recorder finds, by its
+    code alone, so an edit of what it says of itself keeps the cache on (Main, 2026-11-07: 12 of 20 trains ran
+    cold on harness edits)."""
     armada = '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}\n'
     for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
                        "locks/cpu.txt": "jax==1\n", ".armada.json": armada,
@@ -1398,8 +1399,12 @@ def test_a_changed_workflow_reruns_only_the_files_that_read_it(ci, tmp_path, mon
     (tmp_path / "tools/armada/executed.py").write_text("# the recorder, as it records now\n")
     git(tmp_path, "add", "tools/armada/executed.py")
     commit(tmp_path, "the recorder changes")
-    assert ci.policy(base) == "off"
-    assert run("on") == [3, 2]
+    assert ci.policy(base) == "cold"
+    assert run() == [3, 2]
+    # A round on the same inputs, a train composed again, finds the rows the first ran green under them: the
+    # policy 'cold' looks rows up, every key holding the recorder (owner, 2026-11-13: train 793's second round
+    # reran all 4,113 tasks its first had run under the same inputs).
+    assert run() == [3, 2]
 
 
 def test_a_run_that_read_its_limits_runs_again_where_they_change(ci, tmp_path, monkeypatch, cache_worker):

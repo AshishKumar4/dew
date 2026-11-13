@@ -3,6 +3,8 @@
 (`<file>#G/N@users`), and its record's place on a device class, in the cache Worker's key alphabet (no colon,
 no hash)."""
 
+from collections.abc import Mapping
+
 
 def row(python: str, name: str, split: str) -> str:
     return f"{python}:{name}" + (f"#{split}" if split else "")
@@ -13,6 +15,24 @@ def parsed_row(row_name: str) -> tuple[str, str, str]:
     python, rest = row_name.split(":", 1)
     name, _, split = rest.partition("#")
     return python, name, split
+
+
+GROUPED: list = [None, {}]
+"""The rows `grouped_rows` last grouped, and their groups: a plan asks of one run's timings for every file."""
+
+
+def grouped_rows(measured: Mapping[str, float]) -> dict[tuple[str, str], dict[str, float]]:
+    """Armada's row timings `measured` by their Python and file, each row's seconds under its group; a map
+    task's seconds are kept under its task's name, no row's. Grouped once for the rows it was last asked
+    of."""
+    if GROUPED[0] is not measured:
+        found: dict[tuple[str, str], dict[str, float]] = {}
+        for row_name, seconds in measured.items():
+            if ":" in row_name:
+                python, name, group = parsed_row(row_name)
+                found.setdefault((python, name), {})[group] = seconds
+        GROUPED[:] = [measured, found]
+    return GROUPED[1]
 
 
 VARIED = "@"

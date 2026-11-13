@@ -252,7 +252,7 @@ jobs:
     # Main's daily whole run, below every lane's, waits for capacity within its suite's and then its release
     # checks' 6000 s deadlines, one after the other: 210 minutes.
     timeout-minutes: ${{ ((github.event_name == 'schedule' || inputs.whole) && 210)
-      || ((github.ref_name == 'base/kernels' || needs.scope.outputs.policy == 'off') && 110) || 60 }}
+      || ((github.ref_name == 'base/kernels' || needs.scope.outputs.policy != 'on') && 110) || 60 }}
     steps:
     - uses: actions/checkout@v4
       with:
