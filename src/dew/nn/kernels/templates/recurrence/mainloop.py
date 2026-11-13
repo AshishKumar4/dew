@@ -591,6 +591,25 @@ class Launch:
     producer: int | None = None
     """The registers its producer role is lowered to (`resources.Launch.producer`), which its register model
     reads (the gate holds the split its schedule runs)."""
+    ring: resources.Launch | None = dataclasses.field(default=None, compare=False)
+    """What its plan read (`resources.plan`'s launch: its streams scoped at each depth, its registers and
+    roles) where its ring's depth is its tiles' (`Tiles.stages`, `launch_kernel`'s `ringed`), which
+    `deepened` plans at another depth; None for every other launch, whose plan no depth of the tiles moves."""
+
+    def deepened(self, stages: int, target: generation.GpuTarget) -> "Launch":
+        """This launch as a trace at tiles `stages` deep on `target` records it: its plan at that depth
+        (`resources.plan` under `target`, whose facts it reads, its ring `stages` deep, its residency the most
+        that depth holds, none where none holds it); itself where its ring is not its tiles' (`ring`)."""
+        if self.ring is None or self.ring.floor == stages:
+            return self
+        ring = dataclasses.replace(self.ring, floor=stages, most=stages)
+        family = self.family
+        assert family is not None, "a ringed launch records its bundle"
+        with generation.assumed(target):
+            found = resources.plan([ring], family, target)
+        plan = found[0] if found else None
+        return dataclasses.replace(self, shared=plan.shared if plan else resources.shared_bytes(
+            family, ring.scope(stages)), stages=stages, resident=plan.programs if plan else 0, ring=ring)
 
 
 PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned", default=None)
@@ -712,22 +731,20 @@ def _landed(landing: dict, family: mosaic.Family) -> dict:
     return {keys[name]: plgpu.SMEM(shape, dtype) for name, (shape, dtype) in landing.items()}
 
 
-def _planned_launch(call: Call, scope: Callable[[int], resources.Scope], registers: int, *, floor: int,
-                    most: int, consumers: int = 1, producer: int | None = None,
-                    entry: int = 0) -> resources.LaunchPlan | None:
-    """A launch's ring depth and the programs a multiprocessor holds of it (`resources.plan`, at its stated
-    `registers` and its streams `scope`d at each depth from `floor` to `most`), None where it holds at none: a
-    config past the device, whose record says so (`Launch.resident` zero) and `template.Mosaic.legal`
-    refuses. Its programs launch with `entry` registers a thread at least (`resources.Launch.entry`)."""
-    found = resources.plan([resources.Launch(scope, consumers, registers, floor=floor, most=most,
-                                             producer=producer, entry=entry)], call.family, call.target)
+def _planned_launch(call: Call, launch: resources.Launch) -> resources.LaunchPlan | None:
+    """A launch's ring depth and the programs a multiprocessor holds of it (`resources.plan` of `launch`: its
+    stated registers and its streams scoped at each depth from its floor to its most), None where it holds at
+    none: a config past the device, whose record says so (`Launch.resident` zero) and
+    `template.Mosaic.legal` refuses."""
+    found = resources.plan([launch], call.family, call.target)
     return found[0] if found else None
 
 
 def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, tiles: int, *,
           stages: int | tuple[int, int] | None, consumers: int = 1, producer: int | None = None,
-          entry: int = 0) -> tuple[resources.LaunchPlan | None, int]:
-    """A launch's plan and its programs: a persistent launch's (`stages` None) as many as a multiprocessor
+          entry: int = 0) -> tuple[resources.LaunchPlan | None, int, resources.Launch]:
+    """A launch's plan, its programs and what its plan read (`resources.Launch`, its streams `scope`d at each
+    depth and its stated `registers`): a persistent launch's (`stages` None) as many as a multiprocessor
     holds at once, at most its `tiles`, its rings up to two deep where they run on across its tiles (a
     family's whose walks do not scope their streams apart, `Family.walks_scoped`), at the plan that hides the
     most latency (`resources.hidden`), so a tile's loads go out under the last tile's work: a launch of
@@ -740,11 +757,14 @@ def _laid(call: Call, scope: Callable[[int], resources.Scope], registers: int, t
     launching with `entry` registers a thread at least (`resources.Launch.entry`)."""
     if stages is None:
         most = 1 if call.family.walks_scoped else 2
-        found = _planned_launch(call, scope, registers, floor=1, most=most, producer=producer, entry=entry)
-        return found, min(tiles, (call.target.multiprocessors or 1) * (found.programs if found else 1))
+        launch = resources.Launch(scope, 1, registers, floor=1, most=most, producer=producer, entry=entry)
+        found = _planned_launch(call, launch)
+        held = (call.target.multiprocessors or 1) * (found.programs if found else 1)
+        return found, min(tiles, held), launch
     floor, most = stages if isinstance(stages, tuple) else (stages, stages)
-    return _planned_launch(call, scope, registers, floor=floor, most=most, consumers=consumers,
-                           producer=producer, entry=entry), tiles
+    launch = resources.Launch(scope, consumers, registers, floor=floor, most=most, producer=producer,
+                              entry=entry)
+    return _planned_launch(call, launch), tiles, launch
 
 
 def _stated(work: Work, tiles: int, hardware: float, arrays, out_type) -> pl.CostEstimate:
@@ -780,7 +800,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
                   landing: dict | None = None, persistent: bool = False, reduces: bool = True,
                   after: tuple = (), consumers: int = 1, swizzles: dict[str, int] | None = None,
                   name: str | None = None, hardware: float | None = None, issues: bool = True,
-                  producer: int | None = None):
+                  producer: int | None = None, ringed: bool = False):
     """`program(at, *refs, streams, staging, landing)` as a kernel over `grid`, `at` a tile's indices by the
     grid's axis names, run where `live(at, refs)` holds (a laid call's chunks and sequences are as many as its
     worst case, most of them empty): its streams' allocations (of `blocks`, `stages` deep, and of `once`'s
@@ -802,9 +822,11 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     reduction scratch (`_scope`; the compile gate holds its plan's shared memory to at least the compiled
     kernel's).
     `after` are the `(shape, dtype)` tiles its program scopes after its walks (`final_memory_landing`), which
-    its plan counts beside them as its family scopes them. A program of `consumers` consumer roles (a walk's,
-    `Tiles.walkers`) holds each staging and landing tile once a role, along a leading axis a role indexes
-    (`role_tiles`): one role's products' tiles are no other's to write while its products read them."""
+    its plan counts beside them as its family scopes them. A `ringed` launch's `stages` are its tiles' ring
+    (`Tiles.stages`), its record its plan's input (`Launch.ring`), which a plan at other tiles' depth reads.
+    A program of `consumers` consumer roles (a walk's, `Tiles.walkers`) holds each staging and landing tile
+    once a role, along a leading axis a role indexes (`role_tiles`): one role's products' tiles are no other's
+    to write while its products read them."""
     family = call.family
     if persistent and producer is None:
         producer = stated_producer(call, PERSISTENT_PRODUCER)
@@ -817,8 +839,8 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
     hardware = issued_flops(call, work.flops) if hardware is None else hardware
     threads = 128 * family.warpgroups(consumers)
 
-    found, programs = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
-                            consumers=consumers, producer=producer, entry=held.entry(family))
+    found, programs, planning = _laid(call, scope, registers, tiles, stages=None if persistent else stages,
+                                      consumers=consumers, producer=producer, entry=held.entry(family))
     # Where no multiprocessor holds the launch, its record says so (`Launch.resident` zero), which the
     # template's legality refuses, and it builds at its shallowest depth, as a probe of the config compiles
     # it.
@@ -838,7 +860,7 @@ def launch_kernel(program, call: Call, *, out_type, grid, grid_names, blocks: di
             collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
                                     registers, work.span * each, stages, stepped, flops,
                                     work.exponentials * each, moved, found.programs if found else 0,
-                                    consumers, family, producer))
+                                    consumers, family, producer, planning if ringed else None))
             return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
 
         return recorded
@@ -1148,7 +1170,7 @@ def _resident(call: Call, held: Callable[[int], Held], staged: Callable[[int], t
     if registers > family.registers(1):
         return 0
     _, scope, _, _ = shared_allocation(call, streamed(block), staging, landing)
-    found = _planned_launch(call, scope, registers, floor=1, most=1)
+    found = _planned_launch(call, resources.Launch(scope, 1, registers, floor=1, most=1))
     return found.programs if found else 0
 
 
@@ -2209,6 +2231,7 @@ def _states_launched(program, call: Call, tiles: Tiles, delta: bool, keys: Opera
     return launch_kernel(program, call, out_type=out_type, grid=(value_width // walked_width, sequences,
                                                                  call.heads),
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
+                         ringed=True,
                          live=sequence_live(7),
                          work=Work(flops=4 * chunk * width * walked_width * steps, span=steps),
                          consumers=tiles.walkers, staging=staging,
@@ -2446,6 +2469,7 @@ def _scan_launched(program, call: Call, tiles: Tiles, out_dtype, *, sequences: i
     return launch_kernel(program, call, out_type=out_type,
                          grid=(call.value_width // walked_width, sequences, call.heads),
                          grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
+                         ringed=True,
                          live=sequence_live(8),
                          work=work,
                          consumers=walkers, staging=staging,

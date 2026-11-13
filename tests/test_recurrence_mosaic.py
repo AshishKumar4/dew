@@ -961,6 +961,31 @@ def test_two_launches_whose_padded_lengths_meet_name_their_own_kernels():
     assert all(len(found) == 2 for found in named.values()), named
 
 
+@pytest.mark.parametrize('target', ['sm90', 'sm100'])
+@pytest.mark.parametrize('name', ['qwen3.5-27b-gdn', 'kimi-linear-kda'])
+def test_a_plan_at_a_rings_depth_is_the_trace_at_that_depth(target, name):
+    """The template's plan of a call at tiles some stages deep (`Tiles.stages`), the call traced at one stage
+    and the launches whose ring is the tiles' planned again at that depth (`template._planned`,
+    `mainloop.Launch.deepened`), is the plan a trace at that depth records, every launch's shared memory,
+    ring, residency and registers among it: a forward's, a training forward's and a backward's, asked under
+    another target than the plan's (an A100's), whose facts a plan for this one reads none of."""
+    facts, ambient = generation.gpu_target(target), generation.gpu_target('sm80')
+    family = template.bundle(facts)
+    q, k, v, g, beta, _ = resource_operands(name, jnp.bfloat16, 1, 1024)
+    formed = {'rounded': False, 'wide': False, 'ranged': template.ranged(jnp.bfloat16, delta=True, bound=1.0)}
+    kinds = [{'backward': False, 'training_forward': False}, {'backward': False, 'training_forward': True},
+             {'backward': True, 'training_forward': False}]
+    for stages in (2, 3, 5):
+        tiles = mainloop.Tiles(32, stages, 128, chunk=64)
+        for kind in kinds:
+            with generation.assumed(ambient):
+                deepened = template._planned((q, k, v, g, beta, None, None), tiles, family, facts,
+                                             max_segments=None, delta=True, **formed, **kind)
+            traced = template.planned(q, k, v, g, beta, None, tiles=tiles, family=family, target=facts,
+                                      **formed, **kind)
+            assert deepened == traced, (stages, kind)
+
+
 @pytest.mark.parametrize('kernel', ['recurrence_scan', 'recurrence_states', 'recurrence_reverse'],
                          ids=['forward', 'training forward', 'backward'])
 def test_a_compile_refusing_the_joined_tiles_steps_the_derivation_down(kernel):

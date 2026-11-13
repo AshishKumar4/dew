@@ -169,25 +169,31 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
              ) -> tuple[mainloop.Launch, ...]:
     """`planned` of a call over `shapes` (`jax.ShapeDtypeStruct`s or None) by `family`'s
     bundle on `target`, cached by the facts a plan reads of it (two targets of one family share no plan: an
-    sm87's and an sm80's multiprocessors and shared memory differ), `PLANS_KEPT` of them."""
+    sm87's and an sm80's multiprocessors and shared memory differ), `PLANS_KEPT` of them. A ring's depth
+    (`Tiles.stages`) moves only the launches whose ring is the tiles' (`mainloop.Launch.ring`): the call is
+    traced once at one stage and those launches planned at the tiles' depth (`Launch.deepened`). Traced at
+    each depth, the derivation took 2.0 s of a CPU's time for Kimi Linear's delta attention on sm100, 30
+    traces of 66 ms (jsf-dtime at 0cbc7f8f1d9)."""
     facts = (target.generation, target.device_kind, target.shared_limit, target.multiprocessors)
     # A backward's plan holds the training call's forward: one key for it.
     training_forward = training_forward and not backward
-    key = (shapes, tiles, family, facts, max_segments, delta, backward, training_forward, rounded, wide,
+    traced = dataclasses.replace(tiles, stages=1)
+    key = (shapes, traced, family, facts, max_segments, delta, backward, training_forward, rounded, wide,
            ranged, skip, forked)
     with _PLANNING:
-        if key in _PLANS:
+        found = _PLANS.get(key)
+        if found is not None:
             _PLANS.move_to_end(key)
-            return _PLANS[key]
-    *operands, starts = shapes
-    found = planned(*operands, tiles=tiles, family=family, starts=starts, max_segments=max_segments,
-                    delta=delta, backward=backward, training_forward=training_forward, target=target,
-                    rounded=rounded, wide=wide, ranged=ranged, skip=skip, forked=forked)
-    with _PLANNING:
-        _PLANS[key] = found
-        while len(_PLANS) > PLANS_KEPT:
-            _PLANS.popitem(last=False)
-    return found
+    if found is None:
+        *operands, starts = shapes
+        found = planned(*operands, tiles=traced, family=family, starts=starts, max_segments=max_segments,
+                        delta=delta, backward=backward, training_forward=training_forward, target=target,
+                        rounded=rounded, wide=wide, ranged=ranged, skip=skip, forked=forked)
+        with _PLANNING:
+            _PLANS[key] = found
+            while len(_PLANS) > PLANS_KEPT:
+                _PLANS.popitem(last=False)
+    return tuple(launch.deepened(tiles.stages, target) for launch in found)
 
 
 def _shaped(forked: chunk_forward.ForkedTable | None) -> chunk_forward.ForkedTable | None:
