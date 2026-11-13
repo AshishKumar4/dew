@@ -14,7 +14,6 @@ tests run the encoder over DeepSeek's own shipped bytes.
 
 import json
 import os
-import shutil
 import struct
 from pathlib import Path
 
@@ -24,7 +23,8 @@ import ml_dtypes
 import numpy as np
 import pytest
 from interop_support import fetch, respelled
-from model_support import encoded_form
+from model_support import float64_twin
+from reference_error import assert_as_exact, widened
 
 from dew.interop import Pretrained
 from dew.interop.codecs import (
@@ -355,13 +355,22 @@ def reexport(request, tmp_path_factory):
     loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
     values = one_training_step(loaded.variables)
     dense = source_tensors(loaded, values)
-    written = encoded_form(fp8_blocks(REEXPORT_BLOCK, ue8m0=ue8m0), dense, names)
-    shutil.copytree(directory, destination)
-    write_safetensors(destination / "model.safetensors", written)
+    loaded.save(destination, variables=values)
+    written = dict(read_file(destination / "model.safetensors")[0])
     reloaded = Pretrained.load(str(destination), dtype="float32", attention_impl="reference")
+    dense_dir = respelled(FIXTURE, root / "expected_dense",
+                          lambda cfg: {k: v for k, v in cfg.items() if k != "quantization_config"})
+    expected_tensors = {
+        **dense,
+        **{name: dequantize_fp8_blocks(*quantize_fp8_blocks(dense[name], REEXPORT_BLOCK, ue8m0=ue8m0),
+                                       REEXPORT_BLOCK)
+           for name in names},
+    }
+    write_safetensors(dense_dir / "model.safetensors", expected_tensors)
+    expected_dense = Pretrained.load(str(dense_dir), dtype="float32", attention_impl="reference")
     return {"ue8m0": ue8m0, "names": names, "dense": dense, "written": written,
             "loaded": loaded, "values": values, "reloaded": reloaded,
-            "destination": destination}
+            "expected_dense": expected_dense, "destination": destination}
 
 
 def test_a_trained_source_writes_the_cast_of_its_trained_weights(reexport):
@@ -436,21 +445,32 @@ def test_the_re_export_loses_only_what_the_format_rounds(reexport):
     assert 0.0 < worst <= 2.0 ** -4
 
 
-def test_the_re_exported_model_tracks_the_trained_model(reexport):
-    """What that loss costs the model, which is a third claim again. The
-    re-export is not the trained model: four of its projections keep four
-    mantissa bits of the trained values. On the fixture's own prompts the
-    logits move by 0.41 at most against a logit range of +/- 4.1, and 95.8%
-    of the argmax choices are unchanged."""
-    ids = np.asarray(np.load(FIXTURE / "input_ids.npy"), np.int32)
+REEXPORT_FORWARD_SEEDS = 8
+"""Check 1's declared seeds for the reloaded FP8 model against an independent dequantized-weight forward."""
 
-    trained = np.asarray(reexport["loaded"].model.apply(reexport["values"], ids))
-    recovered = np.asarray(
-        reexport["reloaded"].model.apply(reexport["reloaded"].variables, ids))
 
-    assert 0.0 < np.max(np.abs(trained - recovered)) < 1.0
-    assert np.mean(trained.argmax(-1) == recovered.argmax(-1)) >= 0.9
+def test_the_re_exported_model_computes_the_dequantized_blocks_forward(reexport):
+    """The reloaded FP8 model evaluates its recovered weights on par with an independent unquantized
+    float32 build over independently quantized-then-dequantized trained weights from its float64 twin
+    (check 1), while differing from the unquantized trained weights (`values`)."""
+    reloaded = reexport["reloaded"]
+    expected_dense = reexport["expected_dense"]
+    model = reloaded.model
+    vocab = model.vocab_size
+    ids0 = jnp.asarray(np.load(FIXTURE / "input_ids.npy"), jnp.int32)
+    assert not np.array_equal(np.asarray(reexport["loaded"].model.apply(reexport["values"], ids0)),
+                              np.asarray(model.apply(reloaded.variables, ids0)))
+    wide = float64_twin(expected_dense.model)
+    wide_vars = widened(expected_dense.variables)
+    loaded_fwd = jax.jit(lambda ids: model.apply(reloaded.variables, ids))
+    ref_fwd = jax.jit(lambda ids: expected_dense.model.apply(expected_dense.variables, ids))
+    truth_fwd = jax.jit(lambda ids: wide.apply(wide_vars, ids))
 
+    def draw(seed: int):
+        return (np.random.default_rng([0xF8, seed]).integers(0, vocab, size=(4, 16), dtype=np.int32),)
+
+    assert_as_exact(loaded_fwd, ref_fwd, draw, "reloaded FP8 model forward",
+                    seeds=REEXPORT_FORWARD_SEEDS, truth_fn=truth_fwd)
 
 # --------------------------------------------------------------------------
 # The real checkpoint

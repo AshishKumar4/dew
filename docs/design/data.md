@@ -82,7 +82,7 @@ Library stages are values of these shapes. `images.Resize(256)` is a `RecordFn` 
 | `from_iter(factory, identity=None, state=, load_state=)` | Any resumable iterator: WebDataset, torchdata, Mosaic Streaming, Ray | the library's own state |
 | `from_iter(factory, replay=True)` | An iterator that reads the same records each time `factory()` opens it | replay to the count read, guarded by the last batch's digest |
 
-A torch, Grain or iterator source holds no content version of its own. Given `identity=`, its content version, its plan names it, an exact resume finds the same records, and a cache keys it. Given none, it trains as well, but nothing says a later run reads the same records: resuming its position takes `resume="non-exact"`, and a cache of it is refused.
+A torch, Grain or iterator source holds no content version of its own. Given `identity=`, its content version, its plan names it, an exact resume finds the same records, and a cache keys it. Given none, it trains as well, but nothing says a later run reads the same records: a relaxed resume (the default, below) reads on from its position, an exact one refuses it, and a cache of it is refused.
 
 Preparing a Hub dataset happens on first use, with one log line naming what is prepared and its size. `.read("memory" | "indexed" | "streamed")` overrides how it is read.
 
@@ -215,10 +215,16 @@ trainer.fit(prep(train).shuffle(seed=0, window=200_000).batch(1024),
 
 A schedule's stages switch on the run's committed-token clock; `phases` switch at the training steps they name.
 
+Each member is tokenized and packed before the mix weighs it by its tokens (the order rule, and packing
+per source).
+
 ```python
-pretrain = mix(sources, weights=[.75, .12, .05, .05, .03], by="tokens").map(text.tokenize(tok)).pack(seq_len=8192)
-anneal   = mix(high_quality, weights=[.40, .25, .15, .15, .05], by="tokens").map(text.tokenize(tok)).pack(seq_len=8192)
-longdocs = long_docs.map(text.tokenize(tok)).pack(seq_len=8192)
+def packed(corpus):
+    return corpus.map(text.tokenize(tok)).pack(seq_len=8192)
+
+pretrain = mix([packed(source) for source in sources], weights=[.75, .12, .05, .05, .03], by="tokens")
+anneal   = mix([packed(source) for source in high_quality], weights=[.40, .25, .15, .15, .05], by="tokens")
+longdocs = packed(long_docs)
 
 data = schedule([
     (pretrain.shuffle(seed=0, window=10**6).batch(1024), 13e12),
@@ -506,16 +512,51 @@ this Dew still reads that value (the version before, 13, below).
 | `dealing` | `input-order-groups` | `dew.data.elastic_order.DEALING` | How loading workers that read inputs in their order are dealt them: consecutive groups in turn. |
 | `grain` | Grain's version | `dew.data.readers.GRAIN` | The Grain whose iterator states a per-share position holds. Another Grain's position is restored at once through the iterators that own its state, and refused, naming both versions, where they cannot read it. |
 | `phases` | `stamped` | `dew.data.dataset.StepPhases.CONTINUES` | How a phase on its own stream continues a corpus an earlier phase shared: from the draws the run trained. Recorded in a read of phases' position. |
+| `batched` | `counted` | `dew.data.pipeline.BatchedGroups.REFUSALS` | How a batched step's group it makes no rows of is treated: refused as an empty expansion and counted where the step stands, its examples carried to the next row. Recorded in the plan of a read through a batched step. |
+| `phases` | `drawn` | `dew.data.lowering._Build.DRAWN` | How a phase of one global order continues a corpus an earlier phase read out of order: past the places its order's twin of draws says the run trained. Recorded in the plan of a phase that draws past any. |
 
 A streamed source's shards, the ids it reads in turn, are recorded as a fact of the plan (`{source}/shards`,
-`ShardManifest.digest`), compared as every derived fact is. A read in one global order needs no rule for how
-its phases continue a corpus: the offset each continues from is part of its recorded order.
+`ShardManifest.digest`), compared as every derived fact is. A phase of one global order continues each corpus
+from the first place the run did not train of it, a slice of its recorded order; where it reads on in order,
+that place is the count of records the earlier phases' mixes drew of it, and it needs no rule. Where an
+earlier phase moved its rows after its mix (a shuffle there, or a slice, take or repeat), its first records
+are no prefix of each corpus's draws: the earlier phase's order is traced once more over each corpus's places
+(the same mix, shuffles and slices, over the place each record is drawn at, where the corpus's chain first
+repeats), and the later phase starts past the first place it did not train and draws past those after it
+that it did. Each record is then trained once across the boundary, none lost. The trace costs one lookup a
+record the earlier phase read, once as the later phase is compiled or, on the token clock, opened.
 
-A plan of 13 records no rules, and reads by 13's: steps named by their printing, and phases that each read
-their corpora from their start. A run's resume compiles its data at the version it saved (its record's
-`data_plan_version`), and a per-share position of 13 resumes in a read compiled at 14 as 13 read it.
+A plan of 13 records no rules, and reads by 13's: steps named by their printing. No Dew of 13 read phases
+on their own streams that share a corpus, which a plan of 13 refuses. A run's resume compiles its data at
+the version it saved (its record's `data_plan_version`).
 
-A callable without a stable identity makes exact replay unavailable. A declared identity is required at a persistent cache boundary; opting into non-exact resume is explicit. A newly completed cache never changes a stopped run's saved lowering or order. Reading its generation is a new run's choice.
+#### Resuming data: relaxed or exact
+
+A run chooses how its resume treats its data (`TrainerConfig.data_resume`; on the command line
+`--set trainer.data_resume=exact`). Either way its
+parameters, optimizer state, step, schedule and random state resume as they were saved; the choice is the
+data's alone.
+
+- `relaxed`, the default: the data goes on at its saved position where its plan still makes the same rows
+  (a source or step with no identity is taken as unchanged). Where the plan differs (a rule, a fact, the
+  order, the sources or steps, the topology, or a version this Dew does not read), the stream starts again
+  from the beginning of its order, and the run says so: a warning names each part that differs, and the
+  run's records hold it (`DataRestarted`). It guarantees the model's state, not which rows come next. Data
+  read in stages starts again at the stage the run's progress stands in, opened at that stage's own start,
+  every boundary still where the run's progress places it: phases on the step clock at the run's step,
+  phases of one global order and a batch ramp at the records the run read, a token schedule's at the
+  committed tokens (a global position's `origin` holds how far into its phase the stage's reader opened).
+  A run bounded in examples ends at the step its own count reaches the bound, that step's rows trained whole,
+  so it may count past the bound by part of its last batch.
+- `exact`: any difference refuses the resume, naming it, and a source or step with no identity is refused
+  too, since nothing checks it. It guarantees the rows that come next are the ones the saved run would have
+  read.
+
+`compile(..., resume=)` takes the same two values for a loader compiled by hand: `relaxed` reads on from a
+source with no identity, and a differing plan raises `PlanChanged`, naming what differs, which a run's
+relaxed resume catches.
+
+A callable without a stable identity makes exact replay unavailable. A declared identity is required at a persistent cache boundary. A newly completed cache never changes a stopped run's saved lowering or order. Reading its generation is a new run's choice.
 
 ### Rejection and accounting
 

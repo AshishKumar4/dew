@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import functools
 import json
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
@@ -29,6 +29,7 @@ from dew._coordination import agreed
 from dew._records import JSON
 from dew.batch import token_id, token_ids
 from dew.nn.protocols import Bounded, Layered, Predicting
+from dew.registry import from_record
 from dew.sampling import decoding
 from dew.sampling.strategies import Beam, Speculative, Strategy
 from dew.sampling.text import Sampling, ordered_transforms, with_ids_of
@@ -62,11 +63,19 @@ def _generation_value(config: Mapping[str, object], generation_config: Mapping[s
     return _records.json_value(generation_config.get(name, config.get(name, text.get(name, default))), name)
 
 
-def eos_ids(config: Mapping[str, object], generation_config: Mapping[str, object]) -> tuple[int, ...]:
-    value = _generation_value(config, generation_config, "eos_token_id")
+def _parse_eos(raw: JSON, name: str) -> tuple[int, ...]:
     # None and an empty list both state no EOS id; the ids themselves are read by the one law of ids.
-    values = () if value is None else value if isinstance(value, (list, tuple)) else [value]
-    return tuple(token_ids(values, where="eos_token_id")) if values else ()
+    match raw:
+        case None:
+            values: Sequence[JSON] = ()
+        case list() as entries:
+            values = entries
+        case single:
+            values = (single,)
+    return tuple(token_ids(values, where=name)) if values else ()
+
+def eos_ids(config: Mapping[str, object], generation_config: Mapping[str, object]) -> tuple[int, ...]:
+    return _parse_eos(_generation_value(config, generation_config, "eos_token_id"), "eos_token_id")
 
 
 def pad_id(config: Mapping[str, object], generation_config: Mapping[str, object]) -> int:
@@ -95,11 +104,6 @@ def return_sequences(config: Mapping[str, object], generation_config: Mapping[st
         raise ValueError("num_return_sequences must be a positive integer")
     return value
 
-def _probability_control(config: Mapping[str, object], generation_config: Mapping[str, object],
-                         name: str, default: float) -> float:
-    value = _generation_value(config, generation_config, name, default)
-    return default if value is None else _records.number(value, name)
-
 
 @dataclass(frozen=True)
 class _Control:
@@ -113,11 +117,128 @@ class _Control:
     masked_neutral: tuple[JSON, ...] | None = None
 
 
+@dataclass(frozen=True)
+class _PolicyField[T]:
+    """One common control shared between Hugging Face's generation config (`hf_name`), `_CONTROLS`
+    (`control`), `Sampling` (`field`), `_source_sampling` (`read`) and `generation_config_of` (`write`)."""
+
+    hf_name: str
+    field: str
+    control: _Control
+    read: Callable[[JSON, str, bool, bool], T]
+    write: Callable[[T, bool], tuple[bool, JSON]]
+
+
+def _write_eos(eos_token_ids: int | tuple[int, ...] | None, sample: bool) -> tuple[bool, JSON]:
+    if eos_token_ids is None:
+        return False, None
+    value: JSON = eos_token_ids if isinstance(eos_token_ids, int) else list(eos_token_ids)
+    return True, value
+
+
+_POLICY_FIELDS: tuple[_PolicyField, ...] = (
+    _PolicyField(
+        "temperature",
+        "temperature",
+        _Control("policy", masked_neutral=(1.0,)),
+        lambda raw, name, do_sample, has_eos: (
+            (Sampling.temperature if raw is None else _records.number(raw, name)) if do_sample else 0.0
+        ),
+        lambda value, sample: (sample, value),
+    ),
+    _PolicyField[int | None](
+        "top_k",
+        "top_k",
+        _Control("policy", masked_neutral=(0,)),
+        lambda raw, name, do_sample, has_eos: (
+            None
+            if not do_sample
+            else TRANSFORMERS_TOP_K
+            if raw is None
+            else (_records.integer(raw, name) or None)
+        ),
+        lambda value, sample: (sample, value or 0),
+    ),
+    _PolicyField[int | tuple[int, ...] | None](
+        "eos_token_id",
+        "eos_token_ids",
+        _Control("task"),
+        lambda raw, name, do_sample, has_eos: ids if (ids := _parse_eos(raw, name)) else None,
+        _write_eos,
+    ),
+    _PolicyField[int | None](
+        "pad_token_id",
+        "pad_token_id",
+        _Control("task"),
+        lambda raw, name, do_sample, has_eos: token_id(0 if raw is None else raw, where=name),
+        lambda value, sample: (value is not None, value),
+    ),
+    _PolicyField(
+        "top_p",
+        "top_p",
+        _Control("policy", mode="sampling", masked_neutral=(1.0,)),
+        lambda raw, name, do_sample, has_eos: (
+            Sampling.top_p if not do_sample or raw is None else _records.number(raw, name)
+        ),
+        lambda value, sample: (sample, value),
+    ),
+    _PolicyField(
+        "min_p",
+        "min_p",
+        _Control("policy", mode="sampling", masked_neutral=(0.0,)),
+        lambda raw, name, do_sample, has_eos: (
+            Sampling.min_p if not do_sample or raw is None else _records.number(raw, name)
+        ),
+        lambda value, sample: (sample, value),
+    ),
+    _PolicyField(
+        "repetition_penalty",
+        "repetition_penalty",
+        _Control("policy", neutral=(1.0,)),
+        lambda raw, name, do_sample, has_eos: (
+            Sampling.repetition_penalty if raw is None else _records.number(raw, name)
+        ),
+        lambda value, sample: (True, value),
+    ),
+    _PolicyField(
+        "no_repeat_ngram_size",
+        "no_repeat_ngram_size",
+        _Control("policy", neutral=(0,)),
+        lambda raw, name, do_sample, has_eos: 0 if raw is None else _records.integer(raw, name),
+        lambda value, sample: (True, value),
+    ),
+    _PolicyField(
+        "min_new_tokens",
+        "min_new_tokens",
+        _Control("policy", neutral=(0,)),
+        lambda raw, name, do_sample, has_eos: (
+            0 if not has_eos or raw is None else _records.integer(raw, name)
+        ),
+        lambda value, sample: (True, value),
+    ),
+    _PolicyField(
+        "typical_p",
+        "typical_p",
+        _Control("policy", neutral=(1.0,), mode="sampling"),
+        lambda raw, name, do_sample, has_eos: (
+            Sampling.typical_p if not do_sample or raw is None else _records.number(raw, name)
+        ),
+        lambda value, sample: (sample, value),
+    ),
+    _PolicyField[tuple[str, ...]](
+        "stop_strings",
+        "stop",
+        _Control("policy"),
+        lambda raw, name, do_sample, has_eos: () if raw is None else _as_strings(raw),
+        lambda value, sample: (bool(value), list(value)),
+    ),
+)
+
+
 # GenerationConfig is external data. Keep each control's disposition and
-# neutral values together; the native component constructors own their defaults.
-# Supplied-input causal tasks do not synthesize BOS/decoder-start tokens or
-# switch their native result type through return_dict_in_generate.
-_CONTROLS = {
+# neutral values together; policy/id entries come from `_POLICY_FIELDS`.
+_CONTROLS: dict[str, _Control] = {
+    **{entry.hf_name: entry.control for entry in _POLICY_FIELDS},
     "_commit_hash": _Control("metadata"),
     "_from_model_config": _Control("metadata"),
     "assistant_confidence_threshold": _Control("strategy"),
@@ -156,7 +277,6 @@ _CONTROLS = {
     "early_stopping": _Control("strategy", neutral=(False,), mode="beam"),
     "encoder_no_repeat_ngram_size": _Control("transform", neutral=(0,)),
     "encoder_repetition_penalty": _Control("transform", neutral=(1.0,)),
-    "eos_token_id": _Control("task"),
     "epsilon_cutoff": _Control("transform", neutral=(0.0,), mode="sampling"),
     "eta_cutoff": _Control("transform", neutral=(0.0,), mode="sampling"),
     "exponential_decay_length_penalty": _Control("transform"),
@@ -187,9 +307,6 @@ _CONTROLS = {
     "max_new_tokens": _Control("task"),
     "max_time": _Control("unsupported", refusal="a host clock cannot stop a coordinated device loop"),
     "min_length": _Control("transform", neutral=(0,)),
-    "min_new_tokens": _Control("policy", neutral=(0,)),
-    "min_p": _Control("policy", mode="sampling", masked_neutral=(0.0,)),
-    "no_repeat_ngram_size": _Control("policy", neutral=(0,)),
     "num_assistant_tokens": _Control("strategy"),
     "num_assistant_tokens_schedule": _Control(
         "unsupported",
@@ -215,7 +332,6 @@ _CONTROLS = {
     "output_scores": _Control(
         "unsupported", neutral=(False,), refusal="generation does not return per-step distributions"
     ),
-    "pad_token_id": _Control("task"),
     "penalty_alpha": _Control(
         "unsupported",
         neutral=(0.0,),
@@ -227,16 +343,13 @@ _CONTROLS = {
     "prompt_lookup_num_tokens": _Control("unsupported", refusal="prompt lookup proposal is not implemented"),
     "remove_invalid_values": _Control("transform", neutral=(False,)),
     "renormalize_logits": _Control("transform", neutral=(False,)),
-    "repetition_penalty": _Control("policy", neutral=(1.0,)),
     "return_dict_in_generate": _Control("inapplicable"),
     "sequence_bias": _Control("transform"),
     "speculation_type": _Control("strategy"),
-    "stop_strings": _Control("policy"),
     "suppress_tokens": _Control("transform"),
     "target_lookbehind": _Control(
         "unsupported", refusal="translating between two tokenizers' token spaces is not implemented"
     ),
-    "temperature": _Control("policy", masked_neutral=(1.0,)),
     "token_healing": _Control(
         "unsupported",
         neutral=(False,),
@@ -244,10 +357,7 @@ _CONTROLS = {
     ),
     "tokenizer_name": _Control("metadata"),
     "top_h": _Control("transform", mode="sampling"),
-    "top_k": _Control("policy", masked_neutral=(0,)),
-    "top_p": _Control("policy", mode="sampling", masked_neutral=(1.0,)),
     "transformers_version": _Control("metadata"),
-    "typical_p": _Control("policy", neutral=(1.0,), mode="sampling"),
     "use_cache": _Control(
         "unsupported",
         neutral=(True,),
@@ -356,35 +466,17 @@ as a `TopKLogitsWarper`. A stated 0 asks for no cut."""
 
 def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object],
                      do_sample: bool) -> Sampling:
-    """Return the policy a source declares, every common control in it."""
-    read = functools.partial(_active, config, generation_config)
-    temperature = _generation_value(config, generation_config, "temperature", Sampling.temperature)
-    if temperature is None:
-        temperature = Sampling.temperature
-    top_k = _generation_value(config, generation_config, "top_k")
-    eos = eos_ids(config, generation_config) or None
-    penalty = read("repetition_penalty")
-    ngram = read("no_repeat_ngram_size")
-    # Without an EOS id there is nothing for min_new_tokens to hold back.
-    floor = read("min_new_tokens") if eos is not None else None
-    typical = read("typical_p") if do_sample else None
-    stop = read("stop_strings")
-    return Sampling(
-        temperature=_records.number(temperature, "temperature") if do_sample else 0.0,
-        top_k=((TRANSFORMERS_TOP_K if top_k is None else _records.integer(top_k, "top_k") or None)
-               if do_sample else None),
-        eos_token_ids=eos,
-        pad_token_id=pad_id(config, generation_config),
-        top_p=_probability_control(config, generation_config, "top_p", Sampling.top_p)
-        if do_sample else Sampling.top_p,
-        min_p=_probability_control(config, generation_config, "min_p", Sampling.min_p)
-        if do_sample else Sampling.min_p,
-        repetition_penalty=Sampling.repetition_penalty if penalty is None
-        else _records.number(penalty, "repetition_penalty"),
-        no_repeat_ngram_size=0 if ngram is None else _records.integer(ngram, "no_repeat_ngram_size"),
-        min_new_tokens=0 if floor is None else _records.integer(floor, "min_new_tokens"),
-        typical_p=Sampling.typical_p if typical is None else _records.number(typical, "typical_p"),
-        stop=() if stop is None else _as_strings(stop))
+    """Return the policy a source declares, every common control read from `_POLICY_FIELDS`."""
+    has_eos = bool(eos_ids(config, generation_config))
+    return from_record(
+        Sampling,
+        {
+            entry.field: entry.read(
+                _active(config, generation_config, entry.hf_name), entry.hf_name, do_sample, has_eos
+            )
+            for entry in _POLICY_FIELDS
+        },
+    )
 
 
 def _token_list(value: _records.JSON, name: str) -> list[int]:
@@ -550,18 +642,10 @@ def generation_config_of(sampling: Sampling, max_new_tokens: int | None = None) 
                          "export a policy without it")
     sample = sampling.temperature > 0
     values: dict[str, JSON] = {"do_sample": sample, "use_cache": True}
-    if sample:
-        values.update(temperature=sampling.temperature, top_k=sampling.top_k or 0, top_p=sampling.top_p,
-                      min_p=sampling.min_p, typical_p=sampling.typical_p)
-    values.update(repetition_penalty=sampling.repetition_penalty,
-                  no_repeat_ngram_size=sampling.no_repeat_ngram_size, min_new_tokens=sampling.min_new_tokens)
-    if sampling.eos_token_ids is not None:
-        values["eos_token_id"] = (sampling.eos_token_ids if isinstance(sampling.eos_token_ids, int)
-                                  else list(sampling.eos_token_ids))
-    if sampling.pad_token_id is not None:
-        values["pad_token_id"] = sampling.pad_token_id
-    if sampling.stop:
-        values["stop_strings"] = list(sampling.stop)
+    for entry in _POLICY_FIELDS:
+        include, encoded = entry.write(getattr(sampling, entry.field), sample)
+        if include:
+            values[entry.hf_name] = encoded
     if max_new_tokens:
         values["max_new_tokens"] = max_new_tokens
     return values
@@ -622,7 +706,7 @@ def source_decoding(config: Mapping[str, object], generation_config: Mapping[str
     requested_mode = _generation_value(config, generation_config, "do_sample")
     if override is None and requested_mode is not None and type(requested_mode) is not bool:
         raise ValueError("do_sample must be a boolean")
-    do_sample = requested_mode is True
+    do_sample = requested_mode is True if override is None else override.temperature > 0
     _audit(config, generation_config, model, do_sample,
            _generation_value(config, generation_config, "num_beams"), override is not None)
     strategy = _source_strategy(config, generation_config, model, do_sample, rows)

@@ -145,12 +145,10 @@ def audited(event, args):
     """A read the audit names, kept as the run's input; a process start, kept as how its owner's child ran."""
     if event in followed.READS:
         kept(followed.read(event, args, root))
-        return
-    if (taken := followed.coded(event, args, root)) is not None:
-        write(owner(), taken)
-        return
-    kind = followed.start(event, args, children)
-    if kind is not None:
+    elif event == followed.TAKEN:
+        if (taken := followed.coded(event, args, root)) is not None:
+            write(owner(), taken)
+    elif event in followed.SPAWNS and (kind := followed.start(event, args, children)) is not None:
         write(owner(), f"{STARTED}{kind}")
 
 

@@ -1073,29 +1073,42 @@ class TextGeneration(_NativeTextTask):
     progress: Progress = END
     """The run's progress a model that reads one draws at (`dew.nn.progress`): a run's collection's, the
     updates it committed before its step (`LMObjective.policy`); a finished run's end otherwise."""
-    _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
-
     def __post_init__(self) -> None:
         super().__post_init__()
         refuse_prefix(self.model, self.prefix, longest=cache_ceiling(self.model))
-        object.__setattr__(self, "_stops", self._stop_criteria(self.sampling.stop))
+        if self.sampling.stop:
+            self._listing()
+
+    def _listing(self) -> vocabulary.Referencing | vocabulary.Tokenizing | vocabulary.Vocabulary:
+        """The processor stop strings compile against, refused where it lists no vocabulary."""
+        if not isinstance(
+                self.processor, (vocabulary.Referencing, vocabulary.Tokenizing, vocabulary.Vocabulary)):
+            raise ValueError("stop strings compile against the task's processor, and this task has none "
+                             "that lists its vocabulary; pass processor=")
+        return self.processor
 
     def _stop_criteria(self, strings: tuple[str, ...]) -> tuple[Stopping, ...]:
         """Compile stop strings against the processor's vocabulary, sized for the model's head."""
         if not strings:
             return ()
-        if not isinstance(
-                self.processor, (vocabulary.Referencing, vocabulary.Tokenizing, vocabulary.Vocabulary)):
-            raise ValueError("stop strings compile against the task's processor, and this task has none "
-                             "that lists its vocabulary; pass processor=")
-        return (decoding.stop_strings(self.processor, strings,
+        return (decoding.stop_strings(self._listing(), strings,
                                       self.model.vocab_size if isinstance(self.model, Bounded) else None),)
+
+    @functools.cached_property
+    def _stops(self) -> tuple[Stopping, ...]:
+        """The policy's stop strings compiled (`_stop_criteria`), once a task's first draw or binding reads
+        them, and handed on to every task `bind` gives over other weights or progress, which changes none
+        of what they compile from: the processor, the strings and the model's head."""
+        return self._stop_criteria(self.sampling.stop)
 
     def bind(self, variables: Variables, progress: Progress | None = None) -> Self:
         """This task over `variables` (`_NativeTextTask.bind`), drawing at the run's `progress` where one
-        is given, a collection's step's (`EpisodeInference.bind`), else at its own."""
-        bound = super().bind(variables)
-        return bound if progress is None else dataclasses.replace(bound, progress=progress)
+        is given, a collection's step's (`EpisodeInference.bind`), else at its own: one task, carrying this
+        one's stop strings' criteria (`_stops`), so a collection that binds its policy at every snapshot
+        compiles them once."""
+        bound = replace(self, variables=variables, **({} if progress is None else {"progress": progress}))
+        bound.__dict__["_stops"] = self._stops
+        return bound
 
     def _controls(self, sampling: Sampling | None, logits: Transforms | None, stopping: Criteria | None
                   ) -> tuple[Sampling, Transforms | None, tuple[Stopping, ...]]:

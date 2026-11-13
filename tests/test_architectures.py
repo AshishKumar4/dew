@@ -39,13 +39,11 @@ from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import MetricConfig, ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
-from dew.data.images import CAPTIONS
 from dew.diffusion import presets
 from dew.distributed.batches import shard_batch
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention_blocks import Stage
 from dew.nn.sharding import boxed_axes
-from dew.nn.text_checkpoints import DEFAULT_MODEL as CLIP_CHECKPOINT
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.jepa import JepaObjective
 from dew.objectives.lm import LMObjective
@@ -665,13 +663,18 @@ def unet_run(fields):
 
 
 def test_a_unet_from_a_json_record_generates_what_its_value_twin_does():
-    """JSON reconstruction preserves sampling with the same weights and key."""
+    """JSON reconstruction preserves sampling with the same weights, key and `MetricConfig` validation
+    metrics, while unknown metric names and unparsed string metric lists are refused."""
     value_unet = {**JSON_UNET, "feature_depths": (8, 16),
                   "attention_configs": (None, Stage(heads=2, use_projection=True))}
-
-    record = json.loads(json.dumps(unet_run(JSON_UNET).to_dict()))
-    from_json = DiffusionRunConfig.from_dict(record).build()
-    from_values = unet_run(value_unet).build()
+    clip = MetricConfig("clip")
+    assert from_record(MetricConfig, to_record(clip, MetricConfig)) == clip
+    run = replace(unet_run(JSON_UNET), val_metrics=(clip,))
+    record = json.loads(json.dumps(run.to_dict()))
+    reloaded = DiffusionRunConfig.from_dict(record)
+    assert reloaded.val_metrics == (clip,)
+    from_json = reloaded.build()
+    from_values = replace(unet_run(value_unet), val_metrics=(clip,)).build()
 
     state = Trainer(from_json, optax.adam(1e-3), key=jax.random.key(0)).initial_state()
     key = jax.random.key(3)
@@ -682,28 +685,13 @@ def test_a_unet_from_a_json_record_generates_what_its_value_twin_does():
         drawn, from_values.pipeline(state, ema=False)(
             prompts, steps=SAMPLER_STEPS, key=key).host().images)
 
-
-def test_a_val_metric_no_registry_knows_is_refused():
-    """A run's metric names the metrics registry, so an unknown name is
-    refused where it is written, and every registered one is held as its
-    import path."""
+    for name in sorted(metrics):
+        metric_cfg = MetricConfig(name)
+        roundtripped = DiffusionRunConfig.from_dict(
+            json.loads(json.dumps(replace(unet_run(JSON_UNET), val_metrics=(metric_cfg,)).to_dict())))
+        assert roundtripped.val_metrics == (metric_cfg,)
     with pytest.raises(KeyError):
         MetricConfig("fid_score")
-
-    for name in sorted(metrics):
-        (held,) = replace(unet_run(JSON_UNET), val_metrics=(MetricConfig(name),)).val_metrics
-        assert metrics[held.name] is metrics[name]
-
-
-def test_a_val_metric_records_its_own_constructors_defaults():
-    """A metric whose class has a constructor of its own over its base's fields, as CLIP's has,
-    records that constructor's defaults, so a run holds the CLIP it scored with and reads it
-    back. A run's metrics are such records, so a bare alias in their place is refused where the
-    run is written: in its record, on its command line and in its fields."""
-    clip = MetricConfig("clip")
-    assert clip.defaults == {"modelname": CLIP_CHECKPOINT, "field": CAPTIONS}
-    assert from_record(MetricConfig, to_record(clip, MetricConfig)) == clip
-    run = unet_run(JSON_UNET)
     with pytest.raises(TypeError):
         DiffusionRunConfig.from_dict({**run.to_dict(), "val_metrics": ["psnr"]})
     with pytest.raises(TypeError):

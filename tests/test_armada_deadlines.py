@@ -247,3 +247,61 @@ def test_a_task_says_each_red_row_last_where_armada_keeps_its_tail(ci, tmp_path,
     said = capsys.readouterr().out.rstrip().splitlines()
     red = said.index("RED 3.12:tests/test_any.py")
     assert "the sum is wrong" in said[red + 1] and "  | ..." in said[red:]
+
+
+def test_a_pytest_a_signal_ends_keeps_its_whole_output_and_its_native_stacks(ci, tmp_path):
+    """A pytest an abort ends (a native library's, here os.abort) keeps its whole output and its processes'
+    native stacks among the task's artifacts, named on its red row, so the cause is read from what it left
+    (row 5801: train 788's abort left faulthandler's Python stacks and no native frame; owner, 2026-11-13)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_any.py": "import os\n\n\ndef test_aborts():\n    print('before the abort')\n"
+                                      "    os.abort()\n"})
+    ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "aborted.json", 30.0, cache="off")
+    [aborted] = json.loads((tmp_path / "aborted.json").read_text())["rows"]
+    assert (aborted["exitCode"], aborted.get("signal")) == (1, 6)
+    [kept] = aborted["artifacts"]
+    record = (tmp_path / "artifacts" / kept).read_text()
+    # pytest's own output whole (its capture of the test's prints dies with the process): its Python stacks,
+    # then every signalled process's native stacks, read from outside it.
+    assert "Fatal Python error: Aborted" in record and "test_any.py" in record
+    assert "ended by signal 6" in record.split("== native stacks", 1)[1]
+
+
+def test_a_worker_a_signal_ends_keeps_its_native_stacks_though_pytest_exits_red(ci, tmp_path):
+    """A process a test starts (a worker, here in another directory) that a signal ends keeps its native
+    stacks with the run's whole output, though pytest itself exits red rather than by the signal (review,
+    2026-11-13: the capture kept a signal-ended pytest's alone, and a worker's paths were relative to where it
+    ran)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_any.py": "import subprocess\nimport sys\n\n\ndef test_worker_aborts():\n"
+                                      "    done = subprocess.run([sys.executable, '-c',"
+                                      " 'import os; os.abort()'], cwd='/')\n"
+                                      "    assert done.returncode == 0\n"})
+    ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "worker.json", 30.0, cache="off")
+    [red] = json.loads((tmp_path / "worker.json").read_text())["rows"]
+    assert red["exitCode"] == 1 and "signal" not in red
+    [kept] = red["artifacts"]
+    assert "ended by signal 6" in (tmp_path / "artifacts" / kept).read_text().split("== native stacks", 1)[1]
+
+
+def test_a_thread_with_no_python_state_that_aborts_keeps_its_own_native_stack(ci, tmp_path):
+    """A native thread Python never knew (a C library's worker, as XLA's) that aborts keeps its own stack
+    among the native stacks, read from outside the process by an unwinder of every OS thread (review,
+    2026-11-13: py-spy's native mode reads only the threads Python knows)."""
+    interpreter(tmp_path, "3.12")
+    (tmp_path / "aborting.c").write_text(
+        "#include <pthread.h>\n#include <stdlib.h>\n#include <unistd.h>\n"
+        "void *aborting_worker(void *x) { usleep(200000); abort(); return x; }\n"
+        "void start(void) { pthread_t t; pthread_create(&t, 0, aborting_worker, 0); }\n")
+    subprocess.run(["cc", "-shared", "-fPIC", "-g", "-o", str(tmp_path / "aborting.so"),
+                    str(tmp_path / "aborting.c"), "-lpthread"], check=True)
+    written(tmp_path, {"test_any.py": "import ctypes\nimport time\n\n\ndef test_native_abort():\n"
+                                      f"    ctypes.CDLL({str(tmp_path / 'aborting.so')!r}).start()\n"
+                                      "    time.sleep(30)\n"})
+    ci.task("3.12", ["tests/test_any.py"], "", tmp_path / "native.json", 60.0, cache="off")
+    [red] = json.loads((tmp_path / "native.json").read_text())["rows"]
+    [kept] = red["artifacts"]
+    # The worker's own frame, by its source line (the unwinder names a frame by its debug line where the
+    # library's symbols are sparse): line 4, the worker's abort.
+    record = (tmp_path / "artifacts" / kept).read_text()
+    assert 'aborting.c", line 4' in record.split("== native stacks", 1)[1]

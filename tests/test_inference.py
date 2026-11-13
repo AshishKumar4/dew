@@ -889,6 +889,17 @@ def test_a_run_record_holding_a_field_its_objective_does_not_write_is_refused(tm
 
 
 
+@pytest.mark.parametrize("selection", [{"ema": True}, {"ema": False}, {"step": 2}], ids=str)
+def test_a_step_or_an_ema_choice_beside_a_source_is_refused(selection):
+    """`dew.pipeline` of a source checkpoint, which holds one set of weights and no average, refuses a step
+    or an EMA choice, either of which selects nothing of it, and loads it given neither (audit3 inference
+    F4: an ordinary source's load took `ema=True` and `ema=False` as no choice at all)."""
+    source = str(Path(__file__).parent / "fixtures/hf/phi-tiny")
+    with pytest.raises(ValueError):
+        dew.pipeline(source, **selection)
+    assert isinstance(dew.pipeline(source), TextGeneration)
+
+
 def test_pipeline_loads_a_run_published_to_the_hub_at_the_commit_it_resolved(tmp_path, monkeypatch):
     """A Hub repository holding a run, as `HfApi().upload_folder` publishes
     it, loads as that run: pulled whole at the commit its metadata resolved

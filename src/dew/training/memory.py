@@ -296,22 +296,27 @@ def peak_memory_gib() -> float | None:
     return max(peaks) / 1024 ** 3 if peaks else None
 
 
-def derived_headroom(footprint: Footprint, devices: Sequence, capacity: int | None = None,
-                     built: int = 0) -> int | None:
-    """The bytes a step whose derived footprint is `footprint` would leave free on its tightest device, as
-    `step_headroom` reads a compiled step's: its temporaries the derivation names, the most its gradient
-    program holds at once (`Footprint.peak`), its GEMMs' workspace among them, or its commit's gradient
-    and the host-resident fields it stages where they are more (`Footprint.temporaries`), in one block
-    beside what it holds (`Footprint.held`), twice where the allocator strands them; None where
-    the derivation names no peak or a device states no memory. The resident state is in use already,
-    or, on a stated device, its arguments but the `built` bytes its first call builds, which `held`
-    counts. What else XLA's buffer assignment and scheduling make of the program is no term of it
-    (`dew.training.footprint`): a compile confirms, and a miss is the derivation's to fix."""
-    temporaries = footprint.temporaries
-    if temporaries is None:
-        return None
-    resident = sum(footprint.resident.values()) - built
-    return admitted(devices, capacity, resident, footprint.held, temporaries)
+def derived_headroom(footprint: Footprint | None, devices: Sequence, capacity: int | None = None,
+                     built: int = 0) -> tuple[int, int] | None:
+    """The least and most bytes the step would leave free, pooled over processes: its upper and lower
+    temporary bounds admitted beside its resident and held bytes by the same allocator rule as a
+    compiled step (`admitted`). One memory reading serves both bounds. None where no process can judge
+    a footprint. A nonnegative least fits; a negative most refuses; an interval spanning zero leaves the
+    compile to decide. A footprint with one bound keeps the previous single judgment."""
+    from dew._coordination import from_every_process
+
+    bounds: tuple[int, int] | None = None
+    if footprint is not None and (upper := footprint.temporaries) is not None:
+        lower = footprint.lower_temporaries
+        assert lower is not None
+        resident = sum(footprint.resident.values()) - built
+        memory = [device_memory(device, capacity, resident) for device in devices]
+        least = _admitted(devices, memory, footprint.held, upper)
+        most = least if lower == upper else _admitted(devices, memory, footprint.held, lower)
+        if least is not None and most is not None:
+            bounds = least, most
+    pooled = [value for value in from_every_process(bounds) if value is not None]
+    return None if not pooled else (min(value[0] for value in pooled), min(value[1] for value in pooled))
 
 
 def admitted(devices: Sequence, capacity: int | None, resident: int, beside: int,
@@ -322,6 +327,12 @@ def admitted(devices: Sequence, capacity: int | None, resident: int, beside: int
     in use already; None where a device states no memory. A device that states none, one compiled for and
     absent (`compile_only_gpus`), holds the `capacity` it is stated to, `resident` in it as it would be."""
     memory = [device_memory(device, capacity, resident) for device in devices]
+    return _admitted(devices, memory, beside, temporaries)
+
+
+def _admitted(devices: Sequence, memory: Sequence[Mapping[str, int]], beside: int,
+              temporaries: int) -> int | None:
+    """The headroom at a fixed reading of the allocators, shared by both ends of a derived interval."""
     if not stated(memory):
         return None
     return min(placeable(m, unclaimed(d, m)) - beside - temporaries * stranding(d, m)

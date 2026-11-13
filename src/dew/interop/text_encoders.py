@@ -16,7 +16,8 @@ from flax.typing import Dtype
 from dew import _records
 from dew.interop.components import bind_component, component_source
 from dew.interop.config_records import NativeFields, native_fields
-from dew.interop.weights import ParamTree, translate_parameters
+from dew.interop.unread import Stored
+from dew.interop.weights import ParamTree, equal, translate_parameters
 from dew.nn.kernels.options import owned_program
 from dew.nn.text_checkpoints import DEFAULT_MODEL
 from dew.nn.text_encoders import CLIP, CLIPTextTransformer, CLIPVisionTransformer, T5EncoderTransformer
@@ -225,7 +226,7 @@ def bind_text_tower[Tower: nn.Module](
     name: str, translate: Callable[[Mapping[str, object]], NativeFields[Tower]],
     path_of: Callable[[str], tuple[str, ...] | None], name_or_dir: str, revision: str | None,
     variables: Mapping[str, object] | None, dtype: Dtype | None, param_dtype: str, *,
-    validate: Callable[[Mapping[str, np.ndarray]], None] | None = None,
+    validate: Callable[[Mapping[str, Stored]], None] | None = None,
 ) -> tuple[Tower, Mapping[str, object]]:
     """A text tower at `dtype` and the variables it accepts: those supplied,
     bound unchanged with only the configuration read, or the checkpoint's at
@@ -366,7 +367,7 @@ def _t5_path(hf_name: str) -> tuple[str, ...] | None:
     raise ValueError(f"unknown tensor name {hf_name!r}")
 
 
-def t5_embedding(hf_tensors: Mapping[str, np.ndarray]) -> None:
+def t5_embedding(hf_tensors: Mapping[str, Stored]) -> None:
     """Check the token embedding a T5 encoder stores under its two names.
 
     Both names are the same tied tensor, and a checkpoint may ship either or
@@ -378,11 +379,9 @@ def t5_embedding(hf_tensors: Mapping[str, np.ndarray]) -> None:
     if not present:
         raise ValueError("A T5 encoder stores its token embedding as "
                          + " or ".join(_T5_EMBEDDING))
-    if len(present) == 2 and not np.array_equal(np.asarray(hf_tensors[present[0]]),
-                                                np.asarray(hf_tensors[present[1]])):
+    if len(present) == 2 and not equal(hf_tensors[present[0]], hf_tensors[present[1]]):
         raise ValueError(f"{present[0]} and {present[1]} are one tied embedding, and this "
                          f"checkpoint's two copies differ")
-
 
 def translate_t5_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"

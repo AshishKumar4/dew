@@ -76,10 +76,11 @@ def resumed_by_its_format(run: Path, objective, resume: Callable[[], object]) ->
     return True
 
 
-def refused_by_its_plan(run: Path, train: Callable[[], object]) -> bool:
+def refused_by_its_plan(run: Path, train: Callable[[], object], *, exact: bool) -> bool:
     """Whether this Dew reads none of the data plan version `run` was saved under
-    (`dew.data.plan.PLAN_VERSIONS`), `train`, which prepares it and trains, refused then before a step."""
-    if RunConfig.load(str(run)).data_plan_version in PLAN_VERSIONS:
+    (`dew.data.plan.PLAN_VERSIONS`) and `train`, which prepares it and trains, resumes it `exact`ly,
+    refused then before a step; a relaxed resume starts that data again (`TrainerConfig.data_resume`)."""
+    if not exact or RunConfig.load(str(run)).data_plan_version in PLAN_VERSIONS:
         return False
     with pytest.raises(ValueError):
         train()
@@ -87,11 +88,9 @@ def refused_by_its_plan(run: Path, train: Callable[[], object]) -> bool:
 
 
 def resumes_one_step(run: Path, last: int, built, kind: str) -> None:
-    """`built`, `run`'s run built again, prepared and trained: refused before a step where this Dew reads none
-    of its plan or its checkpoint's format (`refused_by_its_plan`, `resumed_by_its_format`), else its fit
-    started at `last`, from that step's checkpoint."""
-    if refused_by_its_plan(run, lambda: built.prepare().train(kind)):
-        return
+    """`built`, `run`'s run built again, prepared and trained relaxed, the default: refused before a step
+    where this Dew reads none of its checkpoint's format (`resumed_by_its_format`), else its fit started at
+    `last`, from that step's checkpoint, whatever data plan it was saved under."""
     prepared = built.prepare()
     if not resumed_by_its_format(run, prepared.objective, lambda: prepared.train(kind)):
         return
@@ -290,19 +289,15 @@ def test_a_run_an_earlier_main_saved_exports_and_loads_back_answering_as_its_run
     assert main(["export", str(run), str(release)]) == 0
     assert answered_alike(answers(pipeline(str(release))), answers(task.from_run(str(run))))
 
+
 @pytest.mark.parametrize(("recorded", "kind"), SAVED, ids=IDS)
-def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monkeypatch, recorded, kind):
-    """A kind's run saved at an earlier main resumes from its last checkpoint for one step more, in the
-    compute it trained in (a main that recorded no evidence: every corpus run's model draws fresh or loads
-    a decision backbone, in float32 unless its model names a dtype; train 328's review of ledger 2500):
-    the fit starts at that step, from that checkpoint, and trains the one step past it. Where its main
-    recorded what it serialized (`evidence`), the resumed run holds its parameters in the dtypes it
-    stored them in, scales its loss as it did, its count of finite steps going on, counts on from the
-    examples it consumed (a run on the examples clock paused before its bound trains on to it), and
-    compiles its step at the rung it was admitted at. A decision run's new step lays a request's rows out
-    as the step it resumed does, whatever a later plan's layout derives. A run whose checkpoint is of an
-    older format than the one before the current, or whose data plan version this Dew reads none of
-    (`dew.data.plan.PLAN_VERSIONS`), is refused instead before it trains a step."""
+@pytest.mark.parametrize("data_resume", ["exact", "relaxed"])
+def test_an_earlier_mains_run_resumes_its_state_and_its_data_by_its_mode(
+        tmp_path, monkeypatch, recorded, kind, data_resume):
+    """A kind's run saved at an earlier main resumes from its last checkpoint where this Dew reads its
+    checkpoint's format (`resumed_by_its_format`): relaxed (the default) whatever data plan wrote its
+    position, its data started again where this Dew reads none of it, and exactly only where it reads its
+    plan, refused before it trains a step otherwise."""
     run = extracted(tmp_path, recorded, kind)
     recorded_run = RunConfig.load(str(run))
     with Checkpoints(str(run)) as checkpoints:
@@ -314,10 +309,11 @@ def test_a_run_an_earlier_main_saved_resumes_from_its_checkpoint(tmp_path, monke
     # A run counted in examples reads on to its bound; one counted in steps, one step more.
     steps = {} if recorded_run.trainer.examples is not None else {"steps": last + 1}
     trainer = dataclasses.replace(recorded_run.trainer, checkpoint_dir=str(tmp_path / "runs"), stop=None,
-                                  resume="require", compilation_cache_dir=None, multi_host=False, **steps)
+                                  resume="require", compilation_cache_dir=None, multi_host=False,
+                                  data_resume=data_resume, **steps)
     sources = {"data": here.data, "validation": here.validation}
     if refused_by_its_plan(run, lambda: dataclasses.replace(
-            recorded_run, trainer=trainer, **sources).prepare().train(kind)):
+            recorded_run, trainer=trainer, **sources).prepare().train(kind), exact=data_resume == "exact"):
         stepped = [step for step, _ in LocalTracker(run / "tracking").scalars()]
         assert max(stepped) <= last
         return
@@ -356,8 +352,9 @@ def test_a_run_an_earlier_main_saved_resumes_when_its_command_runs_again(tmp_pat
     built again from its command (`rebuilt`): every field it leaves for its build to resolve takes the
     saved run's value (`RunConfig.BUILT`: a decision run's option text, its rows' writing, row 3848, and
     its source's storage), so the resume compares alike and fits the one step past its checkpoint. A run
-    whose checkpoint is of an older format than the one before the current, or whose data plan version this
-    Dew reads none of, is refused instead (`resumed_by_its_format`, `refused_by_its_plan`)."""
+    whose checkpoint is of an older format than the one before the current is refused instead
+    (`resumed_by_its_format`); one whose data plan version this Dew reads none of resumes relaxed, the
+    default, its data started again."""
     run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
     resumes_one_step(run, last, built, kind)
 
@@ -390,14 +387,14 @@ def test_a_run_an_earlier_main_saved_resumes_through_its_python_train(tmp_path, 
         python.train(prepared.objective, data, name=kind, metrics=prepared.metrics, rollout=prepared.rollout,
                      summary=prepared.summary, validation=validation, after=prepared.after)
 
-    if refused_by_its_plan(run, train):
-        return
     if not resumed_by_its_format(run, built.prepare().objective, train):
         return
     records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
     started = [row["value"] for row in records if row["type"] == "FitStarted"][-1]
     assert (started["start_step"], started["resumed_from"] is not None) == (last, True)
-    assert RunConfig.load(str(run)).data_plan_version == stated
+    # A plan version this Dew reads none of is read by its own where the run resumes relaxed (`resumed`).
+    readable = stated if stated in PLAN_VERSIONS else PLAN_VERSIONS[-1]
+    assert RunConfig.load(str(run)).data_plan_version == readable
 
 
 @pytest.mark.parametrize(("landed", "version"), [(9, 9), (None, 9)])
@@ -406,7 +403,8 @@ def test_a_run_saved_while_its_version_was_data_plan_loads_and_resumes_by_it(tmp
     """A run a Dew saved while a run's data plan version was its field `data_plan` (main 1af304d0, before
     the field was `data_plan_version`, train 589's review) records the version it compiled at, or None
     where it was trained in Python, which that Dew compiled at this Dew's, 9: it loads by that version,
-    which this Dew reads none of, so its command run again is refused before a step (row 4107)."""
+    which this Dew reads none of, so its command run again resumes relaxed, the default, its data started
+    again (row 4107)."""
     recorded, kind = next((recorded, kind) for recorded, kind in SAVED if kind == "lm")
     run, last, built = rebuilt(tmp_path, monkeypatch, recorded, kind)
     record = json.loads((run / "run.json").read_text())

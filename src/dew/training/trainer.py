@@ -39,6 +39,7 @@ from dew.batch import FROZEN, Batch, at_path, owned_dicts, placed_at, select, un
 from dew.checkpoints import Checkpoints, Envelope, Ranking, Resume
 from dew.data.compile import Handed
 from dew.data.dataset import (
+    Checkpointable,
     Closeable,
     DataPartition,
     Loader,
@@ -48,6 +49,7 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.data.pipeline import Dataset
+from dew.data.plan import DataResume, PlanChanged
 from dew.distributed.batches import (
     PREFETCH_DEPTH,
     DevicePrefetchIterator,
@@ -94,7 +96,15 @@ from dew.state import MODEL_STATE, Accumulation, TrainState, apart, drawn_in, ke
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops
 from dew.telemetry.profile import region
-from dew.telemetry.records import AxisLink, CheckpointRequested, FitEnded, FitStarted, Record, StepCompiled
+from dew.telemetry.records import (
+    AxisLink,
+    CheckpointRequested,
+    DataRestarted,
+    FitEnded,
+    FitStarted,
+    Record,
+    StepCompiled,
+)
 from dew.training._candidates import RunShape, Stepping, StepSettings, prepared_for
 from dew.training._fit import (
     Emptied,
@@ -117,7 +127,10 @@ from dew.training._fit import (
     handed_splits,
     pooled_first,
     read_batch,
+    restarted,
     restored,
+    restored_or_restarted,
+    resumed_on,
     stage_reached,
     unrecorded_parts,
     validation_read,
@@ -131,6 +144,7 @@ from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, res
 from dew.training.diloco import DiLoCo, dropped, grouped, rated, rates_set, windowed
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
+    Produced,
     check_batch,
     check_stream,
     marked,
@@ -156,7 +170,7 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process, sig
 from dew.training.selection import Best, rankings
 from dew.training.stages import StageLocal
 from dew.training.staging import fetched_state
-from dew.training.startup import Startup, run_data
+from dew.training.startup import Startup, computation_differs, run_data
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
     PassesProgress,
@@ -173,7 +187,7 @@ _log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from dew.optim import OptimConfig
     from dew.telemetry.profile import Profiler
-    from dew.training.ahead import AheadOfTime
+    from dew.training.ahead import AheadOfTime, LaterPhases
 
 StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
 """A compiled step's body: the state and the global batch in, the new state,
@@ -217,6 +231,7 @@ class Trainer(Generic[Loss, Effects]):
         param_dtype: str | None = None,
         diloco: DiLoCo | None = None,
         phase_passes: Sequence[int] | None = None,
+        data_resume: DataResume = "relaxed",
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -262,6 +277,8 @@ class Trainer(Generic[Loss, Effects]):
         self.layout = layout
         self.accumulation = accumulation
         self.split = split
+        # How a resume treats its data (`DataResume`): relaxed starts it again where its plan differs.
+        self.data_resume: DataResume = data_resume
         self._microbatches, self._loss_scale = microbatches, loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         # A loss scale stated by a flag alone is a value a step's trace can be kept by (`_step_key`).
@@ -280,6 +297,9 @@ class Trainer(Generic[Loss, Effects]):
         self.lower_for, self.tune_kernels = lower_for, tune_kernels
         self.inspection, self.param_dtype, self.diloco = inspection, param_dtype, diloco
         self.phase_passes = PhasePasses.of(objective, phase_passes)
+        # A configured run trained again to compile its later phases' steps ahead (`LaterPhases`, set by
+        # `dew.config.RunConfig.train`); none for a trainer used directly.
+        self.later_phases: LaterPhases | None = None
         if diloco is not None:
             diloco.admits(self.layout.host, record)
         # Where the fit ladder stands and the links its traces read (`StepCompiler`), and what the last
@@ -688,6 +708,12 @@ class Trainer(Generic[Loss, Effects]):
             state = rates_set(state, lambda held: with_bounds(with_rates(held, config.rates()),
                                                               config.bounds()))
         self._compiler.resume_rung(checkpoints.rung(resume))
+        # At the rung it trained on, the run's computation is the checkpoint's or the resume is refused.
+        differs = computation_differs(checkpoints.artifact(resume), self._artifact())
+        if differs:
+            raise ValueError(f"the checkpoint at step {resume} in {checkpoints.directory} trained another "
+                             f"computation ({', '.join(differs)}); resume it with the objective and model "
+                             "it recorded, or train in another directory")
         # A step an earlier Dew wrote records no key's implementation (`key_record`): its key data is the
         # run's own key's.
         key = state.key if jnp.issubdtype(state.key.dtype, jax.dtypes.prng_key) else (
@@ -867,6 +893,22 @@ class Trainer(Generic[Loss, Effects]):
             return advanced, loss, aux, None
         return run
 
+    def _warmed(self, plan: FitPlan, run: FitRun, state: TrainState, shardings: Placement[TrainState], *,
+                first: bool) -> None:
+        """The evaluations' programs warmed beside a step's compile (`Evaluator.warm`): the run's first, and
+        one at another rung than they were last warmed at (`FitRun.warmed`)."""
+        if not first and self._compiler.rung() == run.warmed:
+            return
+        with run.startup.phase("warm", "warming the evaluations", when=first), run.held():
+            self._evaluator().warm(plan, state, shardings, self._compiler.links(self.device_mesh),
+                                   first=first)
+        run.warmed = self._compiler.rung()
+
+    def _planned_afresh(self) -> None:
+        """The step planned afresh, as where a phase of other passes begins at an update's end: at the split
+        the run was given, or the planner's for its own passes."""
+        self._shape = dataclasses.replace(self._shape, split=self._given_split)
+
     @ruled
     def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None, *,
                 capacity: int | None = None) -> CompiledStep:
@@ -1027,6 +1069,8 @@ class Trainer(Generic[Loss, Effects]):
                 if plan.restore_best and run.preempted is None:
                     trained = self._best_model(trained, run)
             finally:
+                if self.later_phases is not None:
+                    self.later_phases.stopped()
                 primary = sys.exception()
                 error = self._closed(run, primary, profiler)
                 if primary is None and error is not None:
@@ -1068,7 +1112,7 @@ class Trainer(Generic[Loss, Effects]):
         startup = Startup()
         loader, held, tokens, steps, examples = run_data(
             self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
-            examples=examples, accumulation=self.accumulation, startup=startup)
+            examples=examples, accumulation=self.accumulation, startup=startup, resume=self.data_resume)
         self.reading(loader, device_prefetch, examples=examples, steps=steps)
         self.scheduled(None if steps is None else steps // self.accumulation)
         # Its cadences resolved against the run's length, its scores declared, its best and stop policies,
@@ -1165,9 +1209,7 @@ class Trainer(Generic[Loss, Effects]):
                     run.reads[signature] = step_reads(self.executable, signature)
                 interval.compiles = len(compiled)
                 if len(compiled) > known:
-                    with run.startup.phase("warm", "warming the evaluations", when=not known), run.held():
-                        self._evaluator().warm(plan, state, shardings, self._compiler.links(self.device_mesh),
-                                               first=not known)
+                    self._warmed(plan, run, state, shardings, first=not known)
                 if not known:
                     # Rebound once the step is compiled, so the first tick measures steps, not the compile.
                     interval.last_log_time = time.time()
@@ -1180,6 +1222,9 @@ class Trainer(Generic[Loss, Effects]):
                     state, loss, aux, finite, accepted, committed = train_step(
                         state, device, sampled=self.inspection is not None and self.inspection.samples(
                             run.current + 1, self.accumulation))
+                if not seen and self.later_phases is not None:
+                    # Once the first step is dispatched, its later phases' steps compile ahead off the run.
+                    self.later_phases.started(self, batch)
                 # Written off the loop, which never waits on it (row 2313), its clock the step it sees done.
                 interval.seen()
                 self._read_taken(run, wait=False)
@@ -1289,8 +1334,16 @@ class Trainer(Generic[Loss, Effects]):
             run.stop_control = checkpoints.control(checkpoints.latest)
         if checkpoints is None or start.resume is None:
             return 0, None, lambda: self._placed(start, positioned=False)[:2], start.abstract
-        return (start.resume, checkpoints.position(start.resume, DataPartition.of(self.device_mesh)),
-                lambda: self._placed(start, positioned=False)[:2], start.abstract)
+        # Its saved position, which the stream the run opens restores, or starts again where its plan
+        # changed (`_prefetched`); a position saved for other shares is none of this run's to read.
+        try:
+            position = checkpoints.position(start.resume, DataPartition.of(self.device_mesh))
+        except PlanChanged as changed:
+            if self.data_resume == "exact":
+                raise
+            position = None
+            self._restarting(run, tuple(changed.differs))
+        return start.resume, position, lambda: self._placed(start, positioned=False)[:2], start.abstract
 
     def _stream_partition(self) -> DataPartition:
         """The share of the run's data this process's training stream reads: the mesh's, its ramp's stages
@@ -1325,6 +1378,9 @@ class Trainer(Generic[Loss, Effects]):
         mesh, checkpoints, steps = self.device_mesh, self.checkpoints, plan.steps
         if steps is not None and current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
+        bound = self._shape.examples
+        if bound is not None and interval.consumed > bound:
+            raise ValueError(f"the run consumed {interval.consumed} examples, past the {bound} asked for")
         if plan.checkpoint_every and checkpoints is None:
             raise ValueError(
                 "checkpoint_every asks for checkpoints and this trainer has no "
@@ -1345,7 +1401,7 @@ class Trainer(Generic[Loss, Effects]):
             partition = self._stream_partition()
             run.source = plan.dataset.train(partition)
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
-                         resumed=current if resumed and position is None else None)
+                         resumed=current if resumed and position is None and run.restarted is None else None)
             source = run.source
             stages = source.stages if isinstance(source, RampedStream | PhasedStream | StepPhases) else ()
             ramp = stages if isinstance(source, RampedStream) else ()
@@ -1371,6 +1427,10 @@ class Trainer(Generic[Loss, Effects]):
                     # a compile refuses it, before the state it would check is traced from that batch.
                     agreed_same("training batch layout", lambda: batch_layout(split_fields(placed_first)[0]))
                     self._fitting(abstract, placed_first)
+            elif position is not None:
+                # Its first batch read, so its worker has restored the stream or started it again
+                # (`_prefetched`), which the run reports as it starts (`DataRestarted`).
+                waited_read(run, interval, agree=True, peek=True)
         state, shardings = placed()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
@@ -1384,6 +1444,10 @@ class Trainer(Generic[Loss, Effects]):
             cadences=plan.recorded(self._config, self.accumulation, clocked=self._shape.examples is not None),
             groups=self._groups(state))
         self._report(started, current)
+        if run.restarted is not None:
+            self._report(DataRestarted(current, run.restarted), current)
+            self._display.note(f"Data starts again at step {current}: its saved plan differs in "
+                               f"{', '.join(run.restarted)}")
         if plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
         if plan.observe:
@@ -1432,9 +1496,21 @@ class Trainer(Generic[Loss, Effects]):
         """`source`'s batches placed ahead of the step by the prefetch worker, which restores it to
         `position` first, once a pool's processes agree their streams read the same records."""
         assert run.partition is not None
-        if position is not None and isinstance(source, PhasedStream):
-            # A schedule's stage opens where the position stands: the pool agrees on the one it reads.
-            source.set_state(position)
+        if position is None and run.restarted is not None and isinstance(
+                source, StepPhases | RampedStream | PhasedStream):
+            # Started again where its saved position was none of this run's: at the stage its step is in.
+            position = restarted(source, None, None, run.current, run.restarted)
+        elif position is not None and isinstance(source, PhasedStream):
+            # A schedule's stage opens where the position stands, or where it starts again: the pool
+            # agrees on the one it reads.
+            position, differs = resumed_on(source, lambda: position, resume=self.data_resume,
+                                           step=run.current)
+            self._restarting(run, differs)
+
+        def restore(stream: Checkpointable, saved: bytes) -> None:
+            # On the worker that reads the stream, which it opens once (row 5577).
+            self._restarting(run, restored_or_restarted(stream, saved, resume=self.data_resume,
+                                                        step=run.current))
         if jax.process_count() > 1:
             # Each process opened its own stream over its own copy of the
             # corpus, and none reads a record before all agree it is one.
@@ -1445,10 +1521,15 @@ class Trainer(Generic[Loss, Effects]):
         counted = run.marked if self.rollout is None else functools.partial(
             consumption_counted, clocked=self._shape.examples is not None, marks_rows=False)
         inputs = self.objective.inputs
+        # What the stream states it hands each step, a rollout's batches aside, which make their own rows.
+        produced = None if self.rollout is not None else Produced.of(plan.dataset, run.partition)
 
         def prepare(batch: Batch) -> Batch:
-            # Every batch's token ids within its model's table, on the prefetch worker before it is placed
-            # (`InputSpec.bounded`): an id past the table reads no row, and its gather fills NaN.
+            # Every batch as its loader states it, before it is placed (`Produced`), and its token ids within
+            # its model's table (`InputSpec.bounded`): an id past the table reads no row, and its gather
+            # fills NaN.
+            if produced is not None:
+                produced.checked(batch)
             if inputs is not None:
                 inputs.bounded(batch)
             return counted(batch)
@@ -1456,7 +1537,17 @@ class Trainer(Generic[Loss, Effects]):
             run.emptied = Emptied(functools.partial(pooled_first, plan.dataset, run.partition), run.marked,
                                   functools.partial(shard_batch, self.device_mesh, reads=run.reads))
         return DevicePrefetchIterator(source, self.device_mesh, self._shape.prefetch, source_state=position,
-                                      reads=run.reads, prepare=prepare)
+                                      reads=run.reads, prepare=prepare, restore=restore)
+
+    @staticmethod
+    def _restarting(run: FitRun, differs: tuple[str, ...]) -> None:
+        """Note a resume whose data starts again, its saved plan differing in `differs` (`DataRestarted`)."""
+        if not differs:
+            return
+        run.restarted = differs
+        _log.warning("the saved data position's plan differs from this run's in %s, so its data starts "
+                     "again from the beginning of its order while its state resumes (data_resume='relaxed'; "
+                     "'exact' refuses it)", ", ".join(differs))
 
     def _scheduled(self, plan: FitPlan, run: FitRun) -> None:
         """Open the next stage of a schedule where the run's commits reached the one it stands in
@@ -1511,7 +1602,7 @@ class Trainer(Generic[Loss, Effects]):
         # once, by `_wind_down`, with every suite: never here before a rarer suite has. Only a step that
         # evaluates or pauses could save first (a ranked save scores every suite), so only there is the stream
         # read ahead (`FitRun.ends_here`): no other step's save waits on a batch a stream has yet to make.
-        ending = plan.finished(current, real) or (
+        ending = plan.finished(current, real, interval.consumed) or (
             (evaluation_due or plan.paused(current, real, interval.consumed)) and run.ends_here(interval))
         paused = not ending and plan.paused(current, real, interval.consumed)
         ranked = bool((plan.validation or plan.best or plan.stop) and run.checkpoint_due)
@@ -1882,7 +1973,7 @@ class Trainer(Generic[Loss, Effects]):
             # the run was given or the planner's for its own passes, over the state as a fresh state holds
             # it, no window laid out; one that begins inside an update keeps the run's, the one its open
             # window is laid out for.
-            self._shape = dataclasses.replace(self._shape, split=self._given_split)
+            self._planned_afresh()
             if state.inner is None:
                 state = laid_out(state, self.accumulation)
         # Trials here serve only explicitly enabled AutoPGLE, never frontier timing.

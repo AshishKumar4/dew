@@ -135,10 +135,12 @@ from dew.parity import (
     recorded_kinds,
 )
 from dew.parity_stages import REDRAW, staged_units
+from dew.telemetry.compiles import Compiles
 from dew.training.compiled_program import lowering_platform
 
 PRECISION = "precision"
 """The entry of a reference's array file that records the precision its generator's matmuls took."""
+
 
 
 def ieee_fixture(path) -> dict[str, np.ndarray]:
@@ -149,14 +151,33 @@ def ieee_fixture(path) -> dict[str, np.ndarray]:
     regenerated with TF32 matmuls, ten mantissa bits, sits farther from
     float64 and so widens the budget to fit a coarser Dew, and the float32
     arrays it stores look the same; only the generator's record tells."""
-    with np.load(path) as stored:
-        arrays = {name: stored[name] for name in stored.files}
-    recorded = str(arrays.pop(PRECISION)) if PRECISION in arrays else "no precision"
+    arrays, recorded = _stored_precision(path)
     if recorded != "ieee":
         raise ValueError(f"{path} records {recorded!r} for its matmuls, not 'ieee'; regenerate it "
                          f"with IEEE matmuls")
     return arrays
 
+
+def upstream_fixture(path) -> dict[str, np.ndarray]:
+    """The arrays of a port's upstream recording, refused unless its generator recorded the upstream at its
+    own default precision (`_dew_torch.precision.UPSTREAM_DEFAULT`): a port multiplies as its upstream does
+    at the default precision (fla's Triton dots an fp32 product as one TF32), so its reference is the
+    upstream's own arithmetic, like with like, never one a switch made IEEE (`ieee_fixture`'s, every other
+    reference's)."""
+    from _dew_torch.precision import UPSTREAM_DEFAULT
+
+    arrays, recorded = _stored_precision(path)
+    if not recorded.startswith(UPSTREAM_DEFAULT):
+        raise ValueError(f"{path} records {recorded!r} for its matmuls, not its upstream at its own default "
+                         "precision; regenerate it with no precision switch set")
+    return arrays
+
+
+def _stored_precision(path) -> tuple[dict[str, np.ndarray], str]:
+    """A reference's array file's arrays and what its generator recorded of its matmuls (`PRECISION`)."""
+    with np.load(path) as stored:
+        arrays = {name: stored[name] for name in stored.files}
+    return arrays, str(arrays.pop(PRECISION)) if PRECISION in arrays else "no precision"
 
 
 WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
@@ -169,6 +190,7 @@ of different instruction sets, though the bits still part with the host (docs/pe
 SSD kernel's host check 1 without YNNPACK"); and XLA:CPU's fusion choices are not Dew's (rows 4520, 4522).
 The empty list, not the documented `-individual_dot`, because compiler options take no such spelling and
 that one leaves a scan's reductions fused. The census (`CENSUS`) compiles without it (`switched_off`)."""
+
 
 
 def switched_off() -> dict:
@@ -1023,9 +1045,20 @@ def _truth_and_terms(truth_fn, terms_fn, inputs):
         return terms_fn(*widened(inputs))
 
 
+def _first_timed(timed: dict, rows_at: Callable, seed):
+    """The first draw's rows (`rows_at(0, seed)`), its seconds and the backend compiles JAX reports within
+    it written to `timed` (a jit compiles at its first call): what the process pays once, whatever it goes
+    on to draw."""
+    began = time.perf_counter()
+    with Compiles(None) as compiles:
+        rows = rows_at(0, seed)
+    timed.update(first=time.perf_counter() - began, compiled=sum(compiles.seconds))
+    return rows
+
+
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
            library_fn=None, library_leaves: Sequence[str] = (), also: Sequence = (), terms_fn=None,
-           label: str = "", examples: bool = False, conditioning=None):
+           label: str = "", examples: bool = False, conditioning=None, timed: dict | None = None):
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
@@ -1128,7 +1161,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         return rows
 
     for at, seed in enumerate(seeds):
-        rows = rows_at(at, seed)
+        rows = rows_at(at, seed) if timed is None or at else _first_timed(timed, rows_at, seed)
         for at_arm, row in enumerate(rows):
             evidence[at_arm].append(row)
             per_example[at_arm].append(stacked[at_arm])
@@ -1232,17 +1265,20 @@ def _site(dew_fn, reference_fn, label: str, *, seeds: int, truth_fn, library_fn,
 
 
 def _recorded(label: str, drawn_for, references: int, arms, upto: int | None = None,
-              weighed: dict | None = None, offset: int = 0) -> bool:
+              weighed: dict | None = None, offset: int = 0, first: dict | None = None) -> bool:
     """A map task's draws (`record_units`): each of a site's `references` draws over its range, up to
     `upto` where given, with its arms' YNNPACK mode (`_mode_of`) and, weighed, its classes' digest
-    (`Conditioning.digest`), the seconds its weighing took beside its draws'. False where the process is
-    no map task."""
+    (`Conditioning.digest`), the seconds its weighing took beside its draws', and those of its first draw
+    with the backend compiles JAX reported within it (`first`, `compiled`, `_drawn`'s): a site's arms
+    compile at their first call, so a task's first draw holds its compiles, a cost it pays once whatever
+    it draws, which the plan must not read as each draw's (tools/armada/costs.py's `timed`; a site cut to
+    two draws a task paid its compiles 128 times, row 5492). False where the process is no map task."""
     def payload(start, stop):
         draws = [drawn_for(index)(start, stop) for index in range(references)]
         held = (weighed or {}).get("of")
         return {"draws": draws, "refused": _mode_of(arms), "heavy": None if held is None else held.digest()}
     return record_units(label, payload, upto=upto, offset=offset,
-                        phases=lambda: {"weighing": (weighed or {}).get("seconds", 0.0)})
+                        phases=lambda: {"weighing": (weighed or {}).get("seconds", 0.0), **(first or {})})
 
 
 def _pooled_draws(label: str, references: int, arms):
@@ -1487,6 +1523,8 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
     ranges: dict[tuple[int, int], list[_Draws]] = {}
     # The site's weighing where it draws (`weighing`), built once, and the seconds that took.
     weighed: dict[str, object] = {}
+    # The seconds of the first draw this process takes of the site and of its compiles (`_drawn`'s `timed`).
+    first: dict[str, float] = {}
 
     def conditioning_now():
         if weighing is not None and "of" not in weighed:
@@ -1502,7 +1540,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
                 draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
                                library_fn=library_fn, library_leaves=library_leaves, also=further,
                                terms_fn=terms_fn, label=label, examples=examples,
-                               conditioning=conditioning_now())
+                               conditioning=conditioning_now(), timed=first)
                 ranges[start, stop] = draws if further else [draws]
                 narrow_leaves[:] = _narrow(ranges[start, stop][0])
             return ranges[start, stop][index]
@@ -1510,7 +1548,7 @@ def _site_judged(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn
 
     arms = [dew_fn, reference_fn, *([] if library_fn is None else [library_fn]), *further]
     # A map task of the site's draws, or their judge (DRAWS, POOL).
-    if _recorded(label, drawn_for, 1 + len(further), arms, upto, weighed, offset):
+    if _recorded(label, drawn_for, 1 + len(further), arms, upto, weighed, offset, first):
         return
     pooled = _pooled_draws(label, 1 + len(further), arms)
     if pooled is not None:

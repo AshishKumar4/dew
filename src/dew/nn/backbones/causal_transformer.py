@@ -64,6 +64,7 @@ from dew.nn.continuum import (
 )
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
+from dew.nn.inspection import current_positions, watched_positions
 from dew.quantization import LinearProducts
 
 from ..activations import _SLOPES, UNGATED, GatedActivation, ungated_activation
@@ -1315,8 +1316,7 @@ class CausalTransformer(LinearProducts):
         # fp32 logits whose product follows the compute dtype
         # (`dew.nn.precision.head_product`, the chunked loss's arithmetic).
         if self.tie_embeddings:
-            logits = head_product('...d,vd->...v', x, self.embed_tokens.embedding,
-                                  self.precision)
+            logits = head_product('...d,vd->...v', x, self.embed_tokens.embedding, self.precision)
         else:
             logits = self.lm_head(x)
         # The head's own dtype stands for the compute's where the model states none (a float64 truth's).
@@ -1331,20 +1331,18 @@ class CausalTransformer(LinearProducts):
         """nGPT's fp32 per-token gain on the logits, past the head's product; None without one."""
         return None if self.ngpt is None else gain(self.logit_scale, self.ngpt.logits, self.dtype)
 
-    def mtp_hidden_states(self, hidden, tokens, train: bool = False, input_embeddings=None,
-                          image_groups=None, block_groups=None, rotary_positions=None,
-                          coordinates: Coordinates | None = None,
+    def mtp_hidden_states(self, hidden, tokens, train: bool = False, input_embeddings=None, image_groups=None,
+                          block_groups=None, rotary_positions=None, coordinates: Coordinates | None = None,
                           conditioning: Mapping[str, jax.Array] | None = None):
         """Return one final-normed state array per shifted prediction depth.
 
-        Each depth combines the preceding hidden state with the next token's
-        embedding, including any media replacement, and uses the next token's
-        positions. A pair counts only when both of its positions are valid and
-        belong to the same packed document, so padded positions in between
-        never become keys. A sequence no longer than the number of depths
-        raises `ValueError`. The depths keep no cross-attention: `hidden`, the
-        trunk's states, already read the call's `conditioning`, which they take
-        as the trunk does and leave unread.
+        Each depth combines the preceding hidden state with the next token's embedding, including any media
+        replacement, and uses the next token's positions. A pair counts only when both of its positions are
+        valid and belong to the same packed document, so padded positions in between never become keys; a
+        watched depth's summary reads the positions its caller names (`watched_positions`) carried alike. A
+        sequence no longer than the number of depths raises `ValueError`. The depths keep no
+        cross-attention: `hidden`, the trunk's states, already read the call's `conditioning`, which they
+        take as the trunk does and leave unread.
         """
         del conditioning
         if self.mtp and tokens.shape[1] <= len(self.mtp):
@@ -1352,18 +1350,19 @@ class CausalTransformer(LinearProducts):
         documents, given, given_valid = ((None, None, None) if coordinates is None else
                                          (coordinates.segments, coordinates.positions, coordinates.valid))
         embeds = self._prepared(self.stream_embeddings(tokens), input_embeddings)
-        # A depth restricts its keys only where the caller's validity or a
-        # document boundary does. With neither, every shifted pair is real,
-        # and no validity says that: an all-true array would make the depth
-        # build a mask and drop off the fused kernel.
+        # A depth restricts its keys only where the caller's validity or a document boundary does. With
+        # neither, every shifted pair is real, and no validity says that: an all-true array would make the
+        # depth build a mask and drop off the fused kernel.
         valid = None
         if documents is not None or given_valid is not None:
             valid = jnp.ones(tokens.shape, bool) if given_valid is None else given_valid
         states = []
+        named = held if (held := current_positions()) is not None and held.shape == hidden.shape[:2] else None
         for depth, block in enumerate(self.mtp, start=1):
+            within = None if documents is None else documents[:, depth - 1:]
             if valid is not None:
-                valid = shifted_span(valid.shape, 1, valid=valid,
-                                     segments=None if documents is None else documents[:, depth - 1:])
+                valid = shifted_span(valid.shape, 1, valid=valid, segments=within)
+            named = None if named is None else shifted_span(named.shape, 1, valid=named, segments=within)
             segments, places = (None if field is None else field[:, depth:] for field in (documents, given))
             metadata = AttentionMetadata(
                 # Cross-document pairs leave holes even when the token rows were right-padded.
@@ -1373,7 +1372,8 @@ class CausalTransformer(LinearProducts):
                 image_groups=None if image_groups is None else image_groups[:, depth:],
                 block_groups=None if block_groups is None else block_groups[:, depth:],
                 rotary_positions=None if rotary_positions is None else rotary_positions[:, depth:])
-            hidden = block(hidden[:, :-1], embeds[:, depth:], train=train, attention_metadata=metadata)
+            with watched_positions(named):
+                hidden = block(hidden[:, :-1], embeds[:, depth:], train=train, attention_metadata=metadata)
             states.append(hidden)
         return states
 

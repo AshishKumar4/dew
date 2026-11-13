@@ -326,6 +326,24 @@ def test_a_source_noise_sampler_seed_pins_the_brownian_path():
     np.testing.assert_array_equal(walked(pinned), run(pinned, 0))
 
 
+def test_a_brownian_walk_over_a_repeated_level_stays_put_there():
+    """`DPMSolverSDE` takes an interval of no length, a grid repeating a sigma, as staying where it is, as
+    Euler's step does: the walk over the source's grid with its first time repeated ends on the walk over
+    the grid itself, bit for bit, where the bridge's increment over the empty interval divided zero by zero
+    and carried NaN into every later step (audit3 inference F3)."""
+    _, process, times, x_T = source_case("dpm_sde.default")
+    model = SourceOracle()
+    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
+    denoise = process.denoiser(model, params, {})
+    times = jnp.asarray(times)
+
+    def run(grid):
+        return sample(denoise, x_T, solver=DPMSolverSDE(seed=7), key=jax.random.PRNGKey(0), times=grid,
+                      final_denoise=False)
+
+    np.testing.assert_array_equal(run(jnp.concatenate([times[:1], times])), run(times))
+
+
 BROWNIAN_SEEDS = 8
 """Check 1's declared seeds for the Brownian walk against Levy's construction unrolled (`seeds_for`)."""
 

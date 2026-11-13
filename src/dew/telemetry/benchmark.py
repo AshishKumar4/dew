@@ -209,20 +209,66 @@ def eviction() -> jax.Array:
     return jnp.zeros(EVICTION_BYTES // 4, jnp.float32)
 
 
+EVICTION_KERNEL = "dew_eviction"
+"""The name of the one kernel an eviction reads its buffer by (`evicting_read`), which no call's kernel takes,
+so a timing leaves it out by name (`DeviceTime.behind`): a call's own sum is named as an XLA sum of the buffer
+would be (a B200's read of 512 MiB timed at 4.9 us, its own sum's kernel left out with the eviction's)."""
+
+EVICTION_BLOCK = 4096
+"""The elements of the buffer each program of the eviction's kernel reads (`evicting_read`)."""
+
+
+def evicting_read(evicting: jax.Array) -> jax.Array:
+    """Every element of `evicting` read by one kernel of its own name (`EVICTION_KERNEL`), each of its
+    programs summing its block into its element of the result."""
+    from jax.experimental import pallas as pl
+
+    from dew.nn.kernels.launches import pallas_call
+
+    def summed(block, total):
+        total[...] = jnp.sum(block[...], keepdims=True)
+
+    blocks = evicting.size // EVICTION_BLOCK
+    return pallas_call(summed, out_shape=jax.ShapeDtypeStruct((blocks,), jnp.float32), grid=(blocks,),
+                       in_specs=[pl.BlockSpec((EVICTION_BLOCK,), lambda i: (i,))],
+                       out_specs=pl.BlockSpec((1,), lambda i: (i,)), name=EVICTION_KERNEL)(evicting)
+
+
 def behind(call: Callable) -> Callable:
-    """The program that runs `call(*args)` behind an eviction, a read of `evicting` (`eviction`): called
-    as `(evicting, args)`, the call waits for the read (an optimization barrier) and both outputs are
-    returned, so the compiler keeps it. A timing that needs its operands out of the cache times this
-    program and leaves the read's kernels out (`DeviceTime.behind`): CUPTI reads a call after an untimed
-    run of it, which refills a cache an eviction run before the call emptied."""
+    """The program that runs `call(*args)` behind an eviction, a read of `evicting` (`eviction`,
+    `evicting_read`): called as `(evicting, args)`, the call waits for the read (an optimization barrier)
+    and both outputs are returned, so the compiler keeps it. A timing that needs its operands out of the
+    cache times this program and leaves the read's kernel out (`DeviceTime.behind`): CUPTI reads a call
+    after an untimed run of it, which refills a cache an eviction run before the call emptied."""
     def run(evicting, args):
-        evicted, args = jax.lax.optimization_barrier((jnp.sum(evicting), args))
+        evicted, args = jax.lax.optimization_barrier((evicting_read(evicting), args))
         return evicted, call(*args)
     return run
 
 
 class NoKernels(ValueError):
     """A call CUPTI read none of its own kernels of (`DeviceTime`), whose time would read as zero."""
+
+
+class Ungraphed(ValueError):
+    """A call whose program holds a conditional XLA:GPU may run as a command buffer's conditional node,
+    whose taken branch's kernels CUPTI does not record (`DeviceTime.kernels`): a B32 decode's attention on an
+    RTX PRO 6000 read 1.47 ms with command buffers, its reduces alone, and 4.27 ms without, the kernel's 2.81
+    ms among them (G4-LF-2). Its process keeps conditionals out of command buffers (`UNGRAPHED`)."""
+
+
+UNGRAPHED = "FUSION,CUBLAS,CUBLASLT,CUSTOM_CALL,CUDNN"
+"""The command buffer kinds a timing process's XLA_FLAGS name (`--xla_gpu_enable_command_buffer`), every
+default's but the conditional and the loop, whose kernels CUPTI reads only as plain launches (`Ungraphed`)."""
+
+
+def graphs_conditionals() -> bool:
+    """Whether this process's XLA:GPU may run a conditional as a command buffer's node: its XLA_FLAGS name
+    no command buffer kinds, or name CONDITIONAL among them."""
+    from dew._devices import xla_flag
+
+    kinds = xla_flag("xla_gpu_enable_command_buffer")
+    return kinds is None or "CONDITIONAL" in kinds.upper().split(",")
 
 
 class DeviceTime:
@@ -238,13 +284,18 @@ class DeviceTime:
         self._subscribed = False
         self._joined: dict[Callable, Callable] = {}
         self._evicting: jax.Array | None = None
-        self._evicted: frozenset[str] | None = None
+        self._branched: dict[int, tuple[object, bool]] = {}
 
     def kernels(self, fn: Callable, *args, evicted: bool = False) -> tuple[KernelTime, ...]:
         """Each kernel one call of `fn(*args)` launched, in launch order, with its device milliseconds,
         once its output is ready. A call that launched none is refused (`NoKernels`): its time would read
-        as zero. `evicted` runs the call behind the session's eviction in one program (`behind`), its
-        kernels left out, so its operands are read from memory, not the cache."""
+        as zero; so is a jitted call holding a conditional in a process that graphs them (`Ungraphed`),
+        whose branch CUPTI may not read. `evicted` runs the call behind the session's eviction in one
+        program (`behind`), its kernels left out, so its operands are read from memory, not the cache."""
+        if graphs_conditionals() and isinstance(fn, jax.stages.Wrapped) and self._conditional(fn, args):
+            raise Ungraphed(f"{fn} holds a conditional, which this process's XLA may graph as a command "
+                            f"buffer's node whose branch CUPTI does not record: set XLA_FLAGS="
+                            f"--xla_gpu_enable_command_buffer={UNGRAPHED} before JAX starts")
         if not evicted:
             return self._read(fn, *args)
         if fn not in self._joined:
@@ -257,17 +308,24 @@ class DeviceTime:
 
     def behind(self, program: Callable, evicting: jax.Array, *args) -> tuple[KernelTime, ...]:
         """The kernels of one call of `program`, a call run behind a read of `evicting` (`behind`,
-        compiled by its caller: the kernel tuner compiles one a config), but the read's own, which a read
-        alone names once. A call none of whose own CUPTI read is refused (`NoKernels`)."""
-        if self._evicted is None:
-            from dew.nn.kernels.options import owned_program
-
-            self._evicted = frozenset(kernel.name for kernel in self._read(owned_program(jnp.sum), evicting))
+        compiled by its caller: the kernel tuner compiles one a config), but the read's own, which its name
+        gives (`EVICTION_KERNEL`). A call none of whose own CUPTI read is refused (`NoKernels`)."""
         timed = tuple(kernel for kernel in self._read(program, evicting, args)
-                      if kernel.name not in self._evicted)
+                      if EVICTION_KERNEL not in kernel.name)
         if not timed:
             raise NoKernels(f"{program} launched no kernel CUPTI timed apart from its eviction's")
         return timed
+
+    def _conditional(self, fn: jax.stages.Wrapped, args: tuple) -> bool:
+        """Whether `fn` compiled for `args` holds a conditional (`Ungraphed`), read once for each of its
+        specializations a session times: the program JAX traces for them (its static arguments' values among
+        what it is traced for), which JAX's cache gives again for the same ones."""
+        traced = fn.trace(*args)
+        found = self._branched.get(id(traced.jaxpr))
+        if found is None or found[0] is not traced.jaxpr:
+            found = traced.jaxpr, " conditional(" in (traced.lower().compile().as_text() or "")
+            self._branched[id(traced.jaxpr)] = found
+        return found[1]
 
     def seconds(self, fn: Callable, *args, evicted: bool = False) -> float:
         """One call's device seconds, its kernels' summed (`kernels`)."""

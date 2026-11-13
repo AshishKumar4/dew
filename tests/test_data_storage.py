@@ -809,7 +809,7 @@ def test_a_reader_restored_mid_read_counts_its_own_workers_mirror_reads_alone(tm
     chain = _mirrored_store(tmp_path).repeat(1).batch(1)
     loading = Loading(workers=2, threads=1, read_buffer=1, worker_buffer=1, cache=False)
     # The observing step names no identity, so the read resumes where it left off without proving it.
-    first = compile(chain, read="streamed", loading=loading, resume="non-exact").train(DataPartition())
+    first = compile(chain, read="streamed", loading=loading, resume="relaxed").train(DataPartition())
     try:
         # One row left, which one worker reads: the other is spent, and Grain keeps the position the
         # restore handed it.
@@ -821,7 +821,7 @@ def test_a_reader_restored_mid_read_counts_its_own_workers_mirror_reads_alone(tm
     for path in (tmp_path / "observed").glob("*.json"):
         path.unlink()
     since = Mirrored.now()
-    loader = compile(chain, read="streamed", loading=loading, resume="non-exact")
+    loader = compile(chain, read="streamed", loading=loading, resume="relaxed")
     reader = loader.train(DataPartition())
     try:
         reader.set_state(saved)

@@ -38,10 +38,10 @@ from dew.data.lowering import (
     _fill,
     _Locality,
     _outputs,
-    _packed,
     _TokenSplit,
 )
 from dew.data.mixing import CorpusCounts
+from dew.data.packing import packed_documents
 from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
@@ -335,8 +335,8 @@ def _memory_pack(stage: Pack, rows: list[tuple[tuple[int, ...], Record]], source
                                    for index in range(len(packed))], counter, stage.fields[0], rule)
     else:
         # Only first-fit of tokens alone has an indexed plan; the rest is packed once over
-        # the corpus as an indexed read streams it (`_packed`).
-        packed = list(_packed(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
+        # the corpus as an indexed read streams it (`packed_documents`).
+        packed = list(packed_documents(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
         derived["packing"] = fingerprint(sizes)
         rows, targets = _targeted([((index,), value) for index, value in enumerate(packed)], counter,
                                   stage.fields[0], rule)

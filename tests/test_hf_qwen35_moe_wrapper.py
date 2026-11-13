@@ -36,6 +36,19 @@ def test_qwen35_moe_text_and_images_match_the_conditional_reference():
     np.testing.assert_array_equal(generated.tokens[:, -3:], np.load(DIRECTORY / 'continuation.npy'))
 
 
+def test_qwen35_moe_images_are_laid_out_on_the_host_and_placed_once():
+    """Qwen 3.5's processor lays a prompt's images out on the host, their rows aligned to their placeholders
+    and the rotary positions computed from those host arrays, and places the model's inputs once
+    (`Processor.from_hf`): no array is read back from a device on the way, where the image groups and
+    grids were placed and then read back for the positions."""
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    images = np.load(DIRECTORY / 'raw_images.npy')
+    with jax.transfer_guard_device_to_host('disallow'):
+        inputs = loaded.processor(json.loads((DIRECTORY / 'prompts.json').read_text()),
+                                  images=[[images[0]], [images[1], images[2]]])
+    assert 'rotary_positions' in inputs.token_fields
+
+
 def test_advertised_mtp_without_weights_loads_the_actual_conditional_trunk(tmp_path):
     from interop_support import respelled
 

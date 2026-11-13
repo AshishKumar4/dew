@@ -2461,3 +2461,18 @@ def test_a_float64_truth_takes_a_tensors_float32_softmax_in_float64():
                    "function": torch.nn.functional.softmax(logits, dim=-1, dtype=torch.float32)}
     for name, softmax in widened.items():
         np.testing.assert_array_equal(softmax.numpy(), logits.softmax(dim=-1).numpy(), err_msg=name)
+
+
+# tools/kernel_routes.py
+
+
+def test_the_route_census_reports_a_route_its_host_cannot_lower_and_a_trace_that_failed():
+    """A cell whose target route takes a kernel its host cannot lower is reported and explained (the route is
+    the target's answer); one whose trace met a defect is reported and left unexplained, its failure named."""
+    tool = load("kernel_routes")
+    unlowerable = {"family": "qwen3", "target": "sm100", "mode": "decode",
+                   "unlowerable": {"choice": "attention", "kernel": "cudnn", "why": "no cuDNN on this host"}}
+    failed = {"family": "llama", "target": "sm90", "mode": "prefill", "failed": "KeyError: 'rope'"}
+    text = tool.report([unlowerable, failed])
+    assert "no cuDNN on this host" in text and "KeyError: 'rope'" in text
+    assert tool.unexplained(unlowerable) == [] and tool.unexplained(failed) == ["KeyError: 'rope'"]

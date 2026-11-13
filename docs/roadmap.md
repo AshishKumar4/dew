@@ -63,7 +63,6 @@ This page is generated from the maintainers' findings ledger as each change land
 - RL: lossless records, composed methods and real publication. [533, 579, 886, 729, 605]
 - Dory: the release qualified and its tests' oracles. [596]
 - Training and serving efficiency. [3330, 1880, 5292]
-- Watched summaries and cotangent probes of a model applied apart. [5697]
 
 ## Algebra
 

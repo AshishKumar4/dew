@@ -27,6 +27,7 @@ from dew.batch import EXAMPLE_ROWS, Batch, Variables
 from dew.data.dataset import (
     Checkpointable,
     DataPartition,
+    Loader,
     PhasedStream,
     RampedStream,
     StepPhases,
@@ -286,6 +287,36 @@ def step_reads(executable: jax.stages.Compiled, signature: Signature) -> tuple[b
     arguments, _ = executable.input_shardings
     tree, _ = signature
     return tuple(sharding is not None for sharding in tree.flatten_up_to(arguments[STEP_BATCH]))
+
+
+@dataclasses.dataclass
+class Produced:
+    """What a training stream declares it hands each step, checked on each batch before its transfer
+    (docs/design/training.md, the producer's contract; row 5724): its share's rows of a step, one of the
+    global batches its loader states (`Loader.batch`, a schedule's phases' `Loader.batches`, a ramp's
+    stages'). A batch of other rows is refused naming both, where it would compile as another step; its
+    fields' dtypes may change, each its own step's (a mixed-precision stream's). A batch measured in tokens
+    (`Loader.batch_tokens`) holds rows as its tokens fit, and states none."""
+
+    rows: frozenset[int] | None
+
+    @classmethod
+    def of(cls, loader: Loader, partition: DataPartition) -> Produced:
+        if loader.batch_tokens is not None or any(tokens is not None for tokens in loader.token_batches):
+            return cls(None)
+        ramp = loader.ramp
+        ramped = () if ramp is None else tuple(
+            stage.batch for stage in ramp.stages(loader.batch, partition.window))
+        batches = {loader.batch, *loader.batches, *ramped}
+        return cls(frozenset(partition.rows(batch) for batch in batches))
+
+    def checked(self, batch: Batch) -> Batch:
+        rows = rows_of(batch)
+        if self.rows is not None and rows not in self.rows:
+            raise ValueError(f"the training stream handed a step {rows} rows on this share, where its loader "
+                             f"states {sorted(self.rows)}: a step after the batch changed its rows, which "
+                             "would compile another step; batch where the rows are made")
+        return batch
 
 
 def marked(partition: DataPartition, prepare: Callable[[Batch], Batch] | None = None

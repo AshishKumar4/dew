@@ -258,6 +258,13 @@ class _KeepAccepted:
         self._touched.add(member)
         return self.members[member]
 
+    def _refusing(self, member: str | None, members: Mapping[str, int]) -> list[CorpusCounts]:
+        """The counts a refused row is counted under: its member's (`MEMBER`), or, a row of several members'
+        examples (`MEMBERS`), each of theirs (row 5716), else the counter's own."""
+        if member is not None or not members or not self.members:
+            return [self._of(member)]
+        return [self._of(key) for key in sorted(members)]
+
     def member_states(self) -> SharedMapping[Mapping[str, object]]:
         """Each member's counts as they stand, by member key (`MEMBERS`): the states captured before, the
         members' that moved since made again, the rest shared with them (`SharedMapping`), so a capture before
@@ -268,20 +275,23 @@ class _KeepAccepted:
         self._touched.clear()
         return self._states
 
-    def restored(self) -> None:
+    def restored(self, rejections: int | None) -> None:
         """Every member's counts and the rejections as a restore left them: each member's state made again
-        at its next capture, the rejections counted afresh."""
+        at its next capture, the rejected rows as the position saved them, or, of a position that holds
+        none, counted afresh, one a refusal, as each was before a row of several members' was refused under
+        each (row 5716)."""
         self._touched = set(self.members)
-        self.rejections = sum(sum(counts.rejected.values())
-                              for counts in (self.counts, *self.members.values()))
+        self.rejections = rejections if rejections is not None else sum(
+            sum(counts.rejected.values()) for counts in (self.counts, *self.members.values()))
 
     def __call__(self, element: Batch | Rejected) -> TypeGuard[Batch]:
         self.counts.attempted += 1
         if isinstance(element, Rejected):
-            self.rejections += 1
             reason = element.reason
             self.owed.owe(element.consumed, element.drawn)
-            self._of(element.member).dropped(element)
+            self.rejections += 1
+            for counts in self._refusing(element.member, element.members):
+                counts.dropped(element)
         else:
             count = None if self.tokens is None else self.tokens(element)
             if count is not None and count < 0:
@@ -291,9 +301,10 @@ class _KeepAccepted:
                 self.consecutive = 0
                 return True
             reason = "zero_targets"
-            self.rejections += 1
             self.owed.owe(accounts(element)[0], drawn_of(element))
-            self._of(member_of(element)).rejected[reason] += 1
+            self.rejections += 1
+            for counts in self._refusing(member_of(element), members_of(element)):
+                counts.rejected[reason] += 1
         self.consecutive += 1
         if not self.warned and self.rejections / self.counts.attempted > _WARN_OVER:
             _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
@@ -411,6 +422,7 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         # A mixture's counter keeps its members' counts beside its own, by member key (`MEMBERS`).
         return {**super()._counted(), "consecutive": self._predicate.consecutive,
                 "warned": self._predicate.warned, "consumed": self._predicate.owed.examples,
+                "rejections": self._predicate.rejections,
                 **self._predicate.owed.saved_draws(), "members": self._predicate.member_states()}
 
     def _restore(self, counted: Mapping[str, object]) -> None:
@@ -424,13 +436,14 @@ class _AcceptedIterator(_CountedIterator[Batch]):
         for key, counts in self._predicate.members.items():
             if key in members:
                 counts.restore(record(record(members[key], "member counter")["counts"], "member counts"))
-        self._predicate.restored()
+        held = counted.get("rejections")
+        self._predicate.restored(None if held is None else integer(held, "rejected rows"))
 
 
 class Carried(pygrain.IterDataset[Batch]):
     """`parent`'s rows, each marker's source examples (`Rejected.consumed`) carried on to the next row and
-    the markers dropped, counting nothing: the carrier after a step whose markers no corpus's count
-    follows, a batched map's group it makes no rows of (`dew.data.pipeline.BatchedGroups`). The examples it
+    the markers dropped, counting nothing: the carrier after a batched map's group it makes no rows of
+    (`dew.data.pipeline.BatchedGroups`) where a plan of 13 reads, whose positions hold it. The examples it
     owes are checkpointed with its parent's position; those the stream ends owing are its end's
     (`dew.training._fit.drained`)."""
 

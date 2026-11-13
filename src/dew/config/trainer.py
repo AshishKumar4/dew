@@ -19,6 +19,7 @@ from dew._builds import dew_cache_dir
 from dew._records import duration, is_share, recorded_duration
 from dew.checkpoints import Checkpoints, Keep, Resume
 from dew.data.dataset import Loader, Ramp, ramped
+from dew.data.plan import DataResume
 from dew.distributed.placement import Layout, MeshSpec
 from dew.nn.dex import DifferentialExtension
 from dew.nn.precision import Numerics, numerics_of
@@ -216,6 +217,10 @@ class TrainerConfig:
     resume: Resume = "auto"
     """Whether the run continues its directory's latest checkpoint: where there is one, "require" for a
     job that must not start afresh, or "never" for one that must not continue another (`Trainer.fit`)."""
+    data_resume: DataResume = "relaxed"
+    """How a resume treats the data (docs/design/data.md, resuming data): "relaxed" reads on at its saved
+    position where its plan still makes the same rows and otherwise starts it again, naming what differs in
+    the log and the run's records, its state resuming either way; "exact" refuses any difference."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """The metric name and ranking policy; None selects validation loss or training loss."""
     update_tokens: int | None = None

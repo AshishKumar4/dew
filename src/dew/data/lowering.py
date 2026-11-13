@@ -3,8 +3,8 @@
 Each stage kind has one definition here, which every read applies and the
 memory executor (`dew.data.materialize`) calls for the stages it runs over
 the whole source: `_outputs` for a record step, `_reordered` for an order
-stage over indexed rows, `_TokenSplit` for a token split, `_packed` for
-a pack's packer, and `_fill` with `_CachedOutputs` for opening a cache and
+stage over indexed rows, `_TokenSplit` for a token split, `dew.data.packing.packed_documents`
+for a pack's packer, and `_fill` with `_CachedOutputs` for opening a cache and
 reading what it holds.
 
 `_Build` lowers a pipeline's stages in the order they are written, as the
@@ -79,7 +79,6 @@ from dew.data.handoff import (
     _Ended,
     _Grouped,
     _handoff,
-    _input_draws,
     _Spread,
     _threads,
     _Ungrouped,
@@ -98,7 +97,8 @@ from dew.data.mixing import (
     rewound,
     token_weights,
 )
-from dew.data.packing import FirstFitPacked, _Concatenated, _OverlappedCuts, window_fields
+from dew.data.ordering import Skipping, place_of
+from dew.data.packing import packed_documents
 from dew.data.pipeline import (
     ACCOUNTS,
     CONSUMED,
@@ -147,7 +147,7 @@ from dew.data.pipeline import (
     member_record,
     members_held,
 )
-from dew.data.plan import PLAN_VERSIONS, Manifest
+from dew.data.plan import PLAN_VERSIONS, STRUCTURED, Manifest
 from dew.data.readers import WorkerMirrors, _FillShare
 from dew.data.shards import bounded as shards_bounded, bounded_places, cut, streamed
 from dew.data.sources.base import Read, Shard, ShardManifest, ShardOpener, Source, materialized
@@ -580,23 +580,22 @@ def _through(rows: Rows, run: tuple[RecordStage, ...], name: str, label: str, lo
 
 @dataclasses.dataclass(frozen=True)
 class _PerInput:
-    """A run of record stages from an expansion over one input, by its index among the inputs (`index`), in a
-    read's workers (`_Build.spreads`): `_chained`'s rows and markers, each random stage drawing for each row
-    from its seed, the input's index and the row's place among the input's rows there, the same in any count
-    of workers. A marker of an input dropped before the run goes on as it is."""
+    """A run of record stages from an expansion over one input in a read's workers (`_Build.spreads`):
+    `_chained`'s rows and markers. It holds no random stage: one after the expansion draws in the reading
+    process by the row's place among the rows handed on, Grain's draw (`_handoff`). A marker of an input
+    dropped before the run goes on as it is."""
 
     stages: tuple[RecordStage, ...]
-    seeds: tuple[int | None, ...]
     unplaced: bool = False
 
-    def __call__(self, index: int, element: Record) -> Record | _Spread:
+    def __call__(self, element: Record) -> Record | _Spread:
         if isinstance(element, Rejected):
             return element
         position = _position(element)
         held: tuple[Record, ...] = (element if position is None else _unplaced(element),)
-        for stage, seed in zip(self.stages, self.seeds, strict=True):
-            held = tuple(made for row, given in enumerate(held) for made in consumed_by(
-                given, functools.partial(_outputs, stage, position, rng=_input_draws(seed, index, row))))
+        for stage in self.stages:
+            made = functools.partial(_outputs, stage, position, rng=None)
+            held = tuple(output for given in held for output in consumed_by(given, made))
         if position is not None and not self.unplaced:
             held = tuple(_placed(output, position) for output in held)
         return _Spread(held)
@@ -879,22 +878,6 @@ class _Inputs(pygrain.MapDataset):
         return outputs[0] if self._single and isinstance(outputs, tuple) else outputs
 
 
-def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
-    """`documents` packed for the stage's policy: first-fit as an indexed read's plan places them
-    (`FirstFitPacked`), the rest by Grain's own packers."""
-    if stage.policy == "first-fit":
-        return FirstFitPacked(documents, stage)
-    sizes, _ = window_fields(stage)
-    if stage.policy == "concat":
-        cut = _OverlappedCuts(documents, stage) if stage.overlap else documents
-        return _Concatenated(gx.ConcatThenSplitIterDataset(cut, length_struct=sizes))
-    # Fields cut alike with the first share its segments and positions, as the indexed planner's
-    # windows do (`packed_window`), so Grain writes no copy of them for the rest.
-    return gx.BestFitPackIterDataset(documents, length_struct=sizes, num_packing_bins=stage.bins,
-                                     shuffle_bins=False, max_sequences_per_bin=stage.segments,
-                                     meta_features=stage.fields[1:])
-
-
 class _Ruled(pygrain.IterDataset):
     """The windows a pack or windows stage makes of `documents`, each counted by the one rule its
     documents' targets were counted by (`counted_window`), as a memory read counts them
@@ -921,7 +904,7 @@ class _Ruled(pygrain.IterDataset):
             documents = documents.map(_ConsumedAt(stage.fields[0], held))
             laid = (*ACCOUNTS, *(() if held is None else (DOCUMENT,)))
             stage = dataclasses.replace(stage, fields=(*stage.fields, *laid))
-        windows = (_packed(documents.map(stage.document), stage)
+        windows = (packed_documents(documents.map(stage.document), stage, consumed=self._consumed)
                    if isinstance(stage, Pack) else CausalWindows(documents, stage, held))
         return _RuledIterator(iter(windows), seen, stage.fields[0], consumed=self._consumed, documents=held,
                               drawn=self._drawn)
@@ -1257,13 +1240,25 @@ class _Build:
     """The keys of its mix's members that later phases read on, read on their own streams (`StepPhases`):
     each draw of them says which it is (`DRAWN`, `dew.data.mixing.Stamping`), so the phase that reads one
     next continues it from the draws the run trained. Empty for any other read."""
+    skipped: Mapping[str, tuple[int, ...]] = dataclasses.field(default_factory=dict)
+    """A phase of a global order's corpora, each by the name its chain goes by, it continues from where an
+    earlier phase read it out of order (a shuffle after its mix: `dew.data.compile`'s continuation): the
+    places past where it starts its corpus (the slice written after the chain's first repeat) the run trained
+    already, sorted, which it draws past (`dew.data.ordering.Skipping`). Empty for any other read."""
+    DRAWN: ClassVar[str] = "drawn"
+    """The `phases` rule a phase of a global order records where it continues a corpus past places the run
+    trained out of order (`skipped`): where an earlier phase read it, as the order's twin of draws traces
+    (docs/design/data.md, the rules). A phase that skips none records no rule, where it reads on from the
+    count of records its mix drew, as every phase did before (a plan of 13 still does)."""
 
     def rules(self, pipeline: Pipeline) -> dict[str, str]:
         """The rules deciding which rows come next that a read of `pipeline` by this build reads by, each
         its owner's one statement (docs/design/data.md, the rules): how its steps are named
         (`dew.data.plan.IDENTITY`), a shuffle's key (`SHUFFLE`), a mix's schedule (`dew.data.mixing.MIX`),
-        and, where its loading workers read its inputs in their order, how they are dealt
-        (`dew.data.elastic_order.DEALING`); only those the read uses. A plan records them
+        where its loading workers read its inputs in their order, how they are dealt
+        (`dew.data.elastic_order.DEALING`), how a phase continues a corpus an earlier phase read out of
+        order (`DRAWN`) and how a batched step's empty groups are refused
+        (`dew.data.pipeline.BatchedGroups.REFUSALS`); only those the read uses. A plan records them
         (`dew.data.plan.Plan.rules`) and a resume compares them."""
         from dew.data.elastic_order import DEALING
         from dew.data.mixing import MIX
@@ -1271,8 +1266,11 @@ class _Build:
 
         mixed = any(isinstance(chain.source, Mixture) for chain in chains(pipeline))
         shuffled = any(isinstance(stage, Shuffle) for stage in _steps(pipeline))
+        batched = any(isinstance(stage, Batched) for stage in _steps(pipeline))
         return {"identity": IDENTITY, **({"shuffle": self.SHUFFLE} if shuffled else {}),
-                **({"mix": MIX} if mixed else {}), **({"dealing": DEALING} if self.in_order else {})}
+                **({"mix": MIX} if mixed else {}), **({"dealing": DEALING} if self.in_order else {}),
+                **({"phases": self.DRAWN} if self.skipped else {}),
+                **({"batched": BatchedGroups.REFUSALS} if batched else {})}
 
     def counting(self, pipeline: Pipeline) -> bool:
         """Whether `pipeline`'s rows carry the source examples they consume (`CONSUMED`): a run bounded in
@@ -1402,9 +1400,7 @@ class _Build:
             mapped = [parent.map(functools.partial(member_record, member=key)) if tagged else parent
                       for key, parent in zip(keys, parents, strict=True)
                       if isinstance(parent, pygrain.MapDataset)]
-            selection = ProportionalSelection([len(parent) for parent in mapped], _weights(source),
-                                              source.seed)
-            return pygrain.MapDataset.select_from_datasets(mapped, selection)
+            return mixed_indexed(mapped, source)
         streams = [
             Accepted(_as_iter(parent, build.loading), _name(child), _label(child))
             for parent, build, child in zip(parents, builds, source.pipelines, strict=True)
@@ -1709,7 +1705,7 @@ class _Build:
                 # The expansion and the record steps after it, to the hand-off, over each input in the
                 # workers; the reading process counts what they hand on (`unspread`).
                 rows, spread, examples, counting, ran = self.spread(
-                    rows, pipeline, partition, index, carried, last, examples=examples, counting=counting)
+                    rows, pipeline, index, carried, last, examples=examples, counting=counting)
                 continue
             if isinstance(stage, FlatMap) and stage.examples and not self.global_order and counting:
                 # The corpus's counts are of its source examples (`FlatMap.examples`): a run bounded in
@@ -1756,6 +1752,13 @@ class _Build:
                                   certain_after=_barren_bound(pipeline.stages, passes, carried))
         return self.delivered(rows, pipeline, counting=counting, examples=examples)
 
+    def skipping(self, rows: pygrain.MapDataset, pipeline: Pipeline, at: int) -> pygrain.MapDataset:
+        """`rows` at `pipeline`'s stage `at`, past the places of its corpus the run trained already where the
+        stage is the slice a phase continues it from (`skipped`, written after its first repeat)."""
+        skips = self.skipped.get(_name(pipeline), ())
+        repeat = place_of(pipeline) if skips else None
+        return Skipping(rows, skips) if repeat is not None and at == repeat + 1 else rows
+
     def hand_off(self, pipeline: Pipeline, consumed: int, carried: int, rows: Rows, *,
                  marked: bool) -> tuple[int, bool]:
         """Where a pooled read's workers hand its rows on, `carried` (`_carried`) at the latest, an in-order
@@ -1769,12 +1772,11 @@ class _Build:
                                             spread=spreading))
         return carried, spreading
 
-    def spread(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, at: int, carried: int,
-               last: int, *, examples: bool,
+    def spread(self, rows: Rows, pipeline: Pipeline, at: int, carried: int, last: int, *, examples: bool,
                counting: bool) -> tuple[Rows, tuple[int, bool], bool, bool, int]:
         """`rows` through the record stages from the expansion at `at` to the hand-off at `carried`, over
-        each input in its workers (`_PerInput`), each random stage's seed its own (`stage_seed`); the
-        spread `handed_on` reads, whether the read counts its examples and its rows (`records`), an
+        each input in its workers (`_PerInput`), none of them drawing (`_handoff`); the spread `handed_on`
+        reads, whether the read counts its examples and its rows (`records`), an
         objective's expansion counting the source examples it makes rows of (`FlatMap.examples`), and the
         stage the read goes on from."""
         stage = pipeline.stages[at]
@@ -1783,10 +1785,8 @@ class _Build:
         # The hand-off ends a spread at its first stage that is no record step (`_handoff`).
         run = tuple(stage for stage in pipeline.stages[at:carried] if record_stage_of(stage))
         assert len(run) == carried - at, "a spread runs record steps alone"
-        seeds = tuple(self.stage_seed(pipeline, index, partition) if isinstance(step, RandomMap) else None
-                      for index, step in enumerate(run, start=at))
         assert isinstance(rows, pygrain.MapDataset), "a spread read's rows are indexed to its expansion"
-        spread = rows.map_with_index(_PerInput(run, seeds, unplaced=at <= last < carried))
+        spread = rows.map(_PerInput(run, unplaced=at <= last < carried))
         return spread, (at, counted and not counting), examples, counting, carried
 
     def handed_on(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, pool: Workers, carried: int,
@@ -1870,7 +1870,7 @@ class _Build:
                 drawn = WindowShuffle(units, window=stage.window, seed=stage.seed)
                 return Completed(drawn)
         if isinstance(stage, (Shuffle, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):
-            return _reordered(stage, rows)
+            return self.skipping(_reordered(stage, rows), pipeline, at)
         if isinstance(stage, Shuffle) and stage.window is not None:
             rows = WindowShuffle(_as_iter(rows, self.loading), window=stage.window, seed=stage.seed)
         elif isinstance(stage, (Shuffle, Slice)):
@@ -1898,8 +1898,14 @@ class _Build:
             rows = stage.function(given.seed(self.stage_seed(pipeline, at, partition)))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
-            rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage))
-            if self.counting(pipeline):
+            refusing = self.version >= STRUCTURED
+            rows = gx.FlatMapIterDataset(groups, BatchedGroups(stage, refusing=refusing))
+            # A group it makes no rows of is refused and counted here, its examples carried to the next row;
+            # a plan of 13 carried them uncounted, as its positions hold.
+            if refusing:
+                rows = Accepted(rows, _name(pipeline), _label(pipeline), rows=False,
+                                members=self.counted_members(pipeline))
+            elif self.counting(pipeline):
                 rows = Carried(rows)
         else:
             return self.layout_stage(rows, stage, pipeline, at)
@@ -2372,6 +2378,13 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
             with _closing(rows) as read:
                 spans = _TokenSplit(read, split).spans
             yield spans
+
+
+def mixed_indexed(members: Sequence[pygrain.MapDataset], mixture: Mixture) -> pygrain.MapDataset:
+    """`members`, `mixture`'s indexed corpora, drawn from as its weights and seed say
+    (`ProportionalSelection`): its read's mix, and its twin of draws' (`dew.data.compile`)."""
+    selection = ProportionalSelection([len(member) for member in members], _weights(mixture), mixture.seed)
+    return pygrain.MapDataset.select_from_datasets(members, selection)
 
 
 def _weights(mixture: Mixture) -> Sequence[float]:

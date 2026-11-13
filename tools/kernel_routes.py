@@ -256,6 +256,7 @@ def cells(names: Iterable[str], targets: Iterable[str] | None = None,
     """One record per family, device (every audited one where None) and mode: its routes,
     deduplicated; the mixer's refusal of the mode's cache layout, with its row; or why none was
     traced."""
+    from dew.nn.kernels.selection import Unlowerable
     from dew.nn.mixer_base import MixerRefused
 
     present = fixtures()
@@ -288,9 +289,22 @@ def cells(names: Iterable[str], targets: Iterable[str] | None = None,
                                        else None, "why": refusal.why}
                     yield cell
                     continue
+                except Unlowerable as refusal:
+                    # The target's route takes a kernel this host cannot lower (a cuDNN decode on a host
+                    # without cuDNN): the route is the cell's answer, its lowering left to the target.
+                    cell["unlowerable"] = {"choice": str(refusal.choice), "kernel": refusal.kernel,
+                                           "why": refusal.why}
+                    yield cell
+                    continue
                 except ValueError as refusal:
                     # Any other refusal of the mode is the cell's answer as Dew states it, unexplained.
                     cell["error"] = f"{type(refusal).__name__}: {refusal}"
+                    yield cell
+                    continue
+                except Exception as failure:
+                    # A defect the trace met (not a refusal Dew states): the report names it beside the cell,
+                    # and the family's other cells still trace.
+                    cell["failed"] = f"{type(failure).__name__}: {str(failure)[:400]}"
                     yield cell
                     continue
                 cell["routes"] = [{**dataclasses.asdict(r), "verdict": verdict(r)}
@@ -315,8 +329,7 @@ def report(records: list[dict]) -> str:
                              f"`{route['site']}` | {route['kernel']} | {route['preferred']} | "
                              f"{route['verdict']} | {refusal.get('code', '')}: {refusal.get('detail', '')} |")
     lines += ["", "## Not traced", "", "| Family | Target | Mode | Why |", "|---|---|---|---|"]
-    lines += [f"| {c['family']} | {c.get('target', '')} | {c.get('mode', '')} | "
-              f"{c.get('error') or c.get('absent') or refused(c['refused'])} |"
+    lines += [f"| {c['family']} | {c.get('target', '')} | {c.get('mode', '')} | {untraced(c)} |"
               for c in records if "routes" not in c]
     lines += ["", "## Every cell", "", "| Family | Widths | Target | Mode | Kernels |",
               "|---|---|---|---|---|"]
@@ -329,6 +342,16 @@ def report(records: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def untraced(cell: dict) -> str:
+    """Why `cell` holds no routes, as the report states it: a defect its trace met, its mode's refusal, a
+    target route this host cannot lower, a mode the family rules out, or a mixer's refusal of its layout."""
+    if "unlowerable" in cell:
+        found = cell["unlowerable"]
+        return (f"the target's {found['choice']} route takes {found['kernel']}, unlowerable here: "
+                f"{found['why']}")
+    return cell.get("failed") or cell.get("error") or cell.get("absent") or refused(cell["refused"])
+
+
 def refused(refusal: dict) -> str:
     """A mixer's refusal of a cell's cache layout as the report states it."""
     return (f"the {refusal['mixer']} mixer takes no {', '.join(refusal['fields'])} "
@@ -338,7 +361,8 @@ def refused(refusal: dict) -> str:
 def unexplained(cell: dict) -> list[str]:
     """What of `cell` no row or reason explains: a route off its kernel with no row or inherent
     refusal, a trace that took no kernel choice at all, a mixer's refusal no `LAYOUT_GAPS` row names, a mode
-    refused otherwise, no fixture; a mode the family's layers rule out (`absent`) is explained."""
+    refused otherwise, a defect its trace met, no fixture; a mode the family's layers rule out (`absent`)
+    and a target route this host cannot lower (`unlowerable`) are explained."""
     if "routes" in cell:
         if not cell["routes"]:
             return [f"{cell.get('family')} on {cell.get('target')} ({cell.get('mode')}): its trace took no "
@@ -348,7 +372,8 @@ def unexplained(cell: dict) -> list[str]:
                 if route["verdict"] == "undeclared"]
     if "refused" in cell:
         return [] if cell["refused"]["row"] else [refused(cell["refused"])]
-    return [] if "absent" in cell else [cell["error"]]
+    # A route this host cannot lower is the target's answer; a defect the trace met is no answer.
+    return [] if "absent" in cell or "unlowerable" in cell else [cell.get("failed") or cell["error"]]
 
 
 def main(argv: list[str]) -> None:

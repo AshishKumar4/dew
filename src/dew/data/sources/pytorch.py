@@ -127,5 +127,5 @@ def from_torch(dataset: TorchDataset, fields: tuple[str, ...] | None = None, *,
                identity: str | None = None) -> Torch:
     """A map-style `torch.utils.data.Dataset` as a Dew dataset, its samples
     named by `fields` where they are tuples. Plans and artifacts require a
-    versioned content `identity`, including non-exact resumes (`Torch`)."""
+    versioned content `identity`, including relaxed resumes (`Torch`)."""
     return Torch(dataset, fields, identity=identity)

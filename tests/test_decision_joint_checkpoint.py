@@ -19,7 +19,7 @@ from decision_support import decision_rows
 from interop_support import allocated_bytes, written_tensors
 from one_draw import assert_as_exact_as_the_reference
 from PIL import Image
-from reference_error import ieee_fixture
+from reference_error import upstream_fixture
 from safetensors.numpy import load_file
 from steady_state import guarded
 
@@ -44,7 +44,7 @@ from dew.decision.calibration import softmax
 from dew.decision.images import Images
 from dew.decision.layout import JOINT_SEGMENTS
 from dew.interop import Pretrained
-from dew.nn.kernels.generation import triton_runs
+from dew.nn.kernels import generation
 from dew.training.trainer import Trainer
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -220,10 +220,10 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path):
     probability), gives each option the probability the release's fp32
     logits give it, within the fourth decimal both round to.
 
-    Where the device's target row names the delta rule's port, Dew's Gated
-    DeltaNet runs fla's algorithm, one plain fp32 decay prefix per chunk, not
-    the release's torch math: there the reference is the same release with
-    HF's Qwen 3.5 on fla's own kernels (logits_fla.npz,
+    Where the delta rule's selector gives Dew's Gated DeltaNet its port, it
+    runs fla's algorithm, one plain fp32 decay prefix per chunk, not the
+    release's torch math: there the reference is the same release with HF's
+    Qwen 3.5 on fla's own kernels at their default precision (logits_fla.npz,
     tools/joint_checkpoint_reference.py --fla)."""
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (tmp_path / source.name).symlink_to(source.resolve())
@@ -248,11 +248,16 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path):
                     assert abs(value - expected[option]) <= 1e-4, (case, laid.name, option)
                 if answer["type"] != "noul":
                     assert answer["confidence"] == max(given.values())
-    # The delta rule's forward runs on the port wherever Dew's Triton kernels run (`GATED_DELTA`).
-    if triton_runs():
-        on_fla = ieee_fixture(TINY / "logits_fla.npz")
+    with generation.routes() as taken:
+        found = joint_logits(decide)
+    kernels = {route.kernel for route in taken if route.choice == generation.Choice.GATED_DELTA_RULE}
+    assert len(kernels) == 1, kernels
+    # Where the delta rule's selector gave its layers the port (`GATED_DELTA`), the reference is fla's own
+    # kernels at their default precision, as the port multiplies.
+    if kernels == {"fla"}:
+        on_fla = upstream_fixture(TINY / "logits_fla.npz")
         reference = [on_fla[key] for key in keys]
-    assert_as_exact_as_the_reference(joint_logits(decide), np.concatenate(reference), np.concatenate(truth),
+    assert_as_exact_as_the_reference(found, np.concatenate(reference), np.concatenate(truth),
                                      "the joint head over Dew's Qwen 3.5")
 
 
