@@ -239,7 +239,9 @@ def test_a_gpu_step_over_fsdp_combines_its_parameter_gathers_a_layer_at_a_time()
                                             gathered=gathered)
             compiled = jax.jit(step, out_shardings=shardings["params"]).trace(placed, batch).lower().compile(
                 compiler_options=options)
-        return max(sum(instruction.buffers) for instruction in hlo_instructions(compiled.as_text()).values()
+        # The executable's own module: its text, printed from a step whose memory is stated, carries
+        # attributes (an all-reduce's output_to_operand_aliasing) XLA's text parser refuses.
+        return max(sum(instruction.buffers) for instruction in hlo_instructions(compiled).values()
                    if collective(instruction.op) == "all-gather" and not instruction.op.endswith("-start"))
 
     assert largest_gather(layer) <= -(-layer // 2 ** 20) * 2 ** 20 < largest_gather(None)
