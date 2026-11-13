@@ -897,6 +897,13 @@ class PackedRows(pygrain.MapTransform):
             laid["context"] = element["context"]
             laid["context_segments"] = contexts
             laid["context_lengths"] = np.int32(np.count_nonzero(contexts))
+        if "row" not in element:
+            # Its rows are the packer's documents as it wrote them: the read's coordinates step lays them out
+            # (`dew.data.steps.generic.Coordinated`, `tokens_coordinates`), declaring the most a window
+            # holds, which the read measured, and refusing a window past it. A unit of rows packs as one
+            # document, so a grouped window's rows keep the objective's own bound.
+            laid["tokens_segment_ids"] = units
+            laid["tokens_positions"] = np.asarray(element["tokens_positions"])
         if self.option_slots is not None:
             laid["option_slots"], laid["slotted"] = compacted(options, self.option_slots)
         return laid

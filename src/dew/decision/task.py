@@ -1730,7 +1730,9 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
              attention: tuple[tuple[tuple[int, ...], ...], int] | None = None,
              fork_depth: int = 1, joint_forks: bool = False) -> DecisionInputs:
     """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
-    holding at most `max_segments` rows, the questions' spans in each row's context where
+    holding at most the rows its read declares (`tokens_coordinates`'s `max_segments`, the most a window
+    of the read holds, which it measured), else `max_segments` (the objective's bound), the questions'
+    spans in each row's context where
     `spans_in_context` (`JointLayout.spans_in_context`), each row's block the whole row where
     `whole_blocks` (`whole_blocks_of`), its rows read in their streams as their layout's `attention`
     says (`Layout.attention`), its documents' chains at most `fork_depth` long and each row's read
@@ -1743,6 +1745,9 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
 
     questions: dict[str, Any] = {field.name: array(field.name) if field.when == "always"
                                  else given(field.name) for field in QUESTION_FIELDS}
+    declared = batch.get("tokens_coordinates")
+    if declared is not None and declared.max_segments is not None:
+        max_segments = declared.max_segments
     return DecisionInputs(tokens=array("tokens"), segments=array("segments"), **questions,
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
