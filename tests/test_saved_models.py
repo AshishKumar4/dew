@@ -140,6 +140,43 @@ def test_a_native_release_loads_in_the_dtype_asked_and_refuses_a_source_it_is_no
 
 
 
+def test_a_native_release_is_cast_a_leaf_at_a_time_as_it_is_placed(tmp_path):
+    """A native release loaded in another `param_dtype` is read memory-mapped and cast a leaf at a time as
+    it is placed, never whole in host memory (ledger 4789): a policy of ten 512-wide matrices loaded in
+    bfloat16 holds less than half its parameters' bfloat16 bytes in host arrays beyond what its load in the
+    stored dtype holds, its largest leaf a tenth of them; the leaves are the stored ones, cast."""
+    import tracemalloc
+    from dataclasses import replace
+
+    from test_env_runs import ACTOR_CRITIC
+
+    from dew.registry import ModelConfig
+
+    wide = {"policy_layers": [512] * 6, "value_layers": [512] * 6}
+    run = replace(teacher_run(tmp_path), model=ModelConfig(ACTOR_CRITIC, wide))
+    run.prepare().train("teacher")
+    export_run(SavedRun.pinned(str(tmp_path / "teacher")), tmp_path / "policy", ema=False)
+
+    def peak(**options):
+        tracemalloc.start()
+        try:
+            loaded = pipeline(str(tmp_path / "policy"), **options)
+            return tracemalloc.get_traced_memory()[1], loaded
+        finally:
+            tracemalloc.stop()
+
+    plain, stored_ = peak()
+    cast, half = peak(param_dtype="bfloat16")
+    halves = jax.tree.leaves(half.variables["params"])
+    assert {leaf.dtype for leaf in halves} == {jnp.dtype(jnp.bfloat16)}
+    total = sum(leaf.size * 2 for leaf in halves)
+    assert max(leaf.size * 2 for leaf in halves) < total / 8
+    assert cast - plain < total / 2, (cast - plain, total)
+    for one, other in zip(jax.tree.leaves(half.variables["params"]),
+                          jax.tree.leaves(stored_.variables["params"]), strict=True):
+        np.testing.assert_array_equal(np.asarray(one), np.asarray(other).astype(jnp.bfloat16))
+
+
 def test_a_run_whose_average_is_its_reference_never_reads_as_averaged():
     """An objective whose average is its frozen reference (DPO's) releases its live weights whatever `ema`
     asks (`SavedRun.variables`), so its run's `averaged` says so: never the average, asked or stored, which a
