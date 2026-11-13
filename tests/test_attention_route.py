@@ -1177,8 +1177,8 @@ def test_a_b200s_packed_documents_take_cudnn_only_where_its_receipt_timed_them(t
     ids = jax.ShapeDtypeStruct((1, tokens), jnp.int32)
     with generation.assumed("sm100"):
         case = attention_case(query, key, causal=True, segment_ids=ids, max_segments=16)
-        taken = attention_kernels.CUDNN.refused(case) is None
-    assert (case.cell in attention_kernels.DECLARED and taken) == declared
+        routed = case.cell in attention_kernels.DECLARED and attention_kernels.CUDNN.refused(case) is None
+    assert routed == declared
 
 
 @pytest.mark.parametrize(("groups", "limits", "least"), [

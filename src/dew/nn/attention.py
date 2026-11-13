@@ -162,6 +162,7 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
     sequence), as FlashAttention runs them, the padded row in none.
     """
     if segment_ids is not None:
+        assert max_segments is not None, "cuDNN packs a call's documents bounded alone (`cudnn_packs`)"
         return _cudnn_packed(query, key, value, causal, sliding_window, segment_ids, max_segments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
     # jax's cudnn call takes a mask or bias only at the full [.., Q, K]
@@ -208,11 +209,13 @@ def _cudnn_packed(query, key, value, causal: bool, sliding_window, segment_ids, 
     behind = None if sliding_window is None else window_sides(causal, sliding_window)[0] + 1
 
     def local(query, key, value, offsets, lengths):
-        return cudnn.dot_product_attention(
+        out = cudnn.dot_product_attention(
             query, key, value, None, None, lengths, lengths, offsets, offsets,
             scale=1.0 / math.sqrt(query.shape[-1]),
             mask_type=cudnn.MaskType.PADDING_CAUSAL if causal else cudnn.MaskType.PADDING,
             sliding_window_length=behind)
+        assert isinstance(out, jax.Array), "its FP8 path alone returns the amaxes beside the output"
+        return out
 
     out = on_attention_shards(local, query, key, value, offsets=(offsets, ("activation_batch", None)),
                               lengths=(lengths, ("activation_batch", None)))
