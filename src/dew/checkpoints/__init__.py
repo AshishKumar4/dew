@@ -484,8 +484,11 @@ def _placed(tree, template, keys: Mapping[str, str]):
             return _keyed(leaf, want, keys)
         if leaf is want or (isinstance(leaf, jax.Array) and leaf.dtype == want.dtype):
             return leaf
-        value = jnp.asarray(leaf).astype(want.dtype)
         sharding = getattr(want, 'sharding', None)
+        if isinstance(leaf, np.ndarray) and sharding is not None:
+            # A host leaf cast on the host and put where it is wanted, no other device holding it on the way.
+            return jax.device_put(leaf.astype(want.dtype), sharding)
+        value = jnp.asarray(leaf).astype(want.dtype)
         return value if sharding is None else jax.device_put(value, sharding)
     return jax.tree.map(placed, tree, template)
 
@@ -587,6 +590,26 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
         raise ValueError("checkpoint dynamic-scaler configuration differs from this run")
     if (metadata["ema"] is None) != (template.ema is None):
         raise ValueError("checkpoint EMA configuration differs from this run")
+
+
+def _host_devices() -> list:
+    """This process's first CPU device, which a read onto the host restores onto (`Checkpoints.variables`'
+    `on_host`); refused where the process opened no CPU backend."""
+    try:
+        return jax.local_devices(backend="cpu")[:1]
+    except RuntimeError as error:
+        raise ValueError("a read onto the host restores onto this process's CPU device, and it opened none; "
+                         "launch with JAX_PLATFORMS=cuda,cpu (or your accelerator,cpu) before JAX "
+                         "initializes, or load onto the accelerator") from error
+
+
+def host_or_placed(on_host: bool, mesh, layout) -> None:
+    """Refuse a read onto the host (`on_host`) beside a `mesh` or `layout`, which place what it reads: every
+    load that takes both checks them here (`Checkpoints.variables`, `dew.inference.models.ReleasedRun`,
+    `dew.interop.Pretrained.load`)."""
+    if on_host and (mesh is not None or layout is not None):
+        raise ValueError("on_host reads the variables into host arrays, and mesh and layout place them; "
+                         "pass one")
 
 
 def _host_read(*, from_local: bool) -> ocp.ArrayRestoreArgs:
@@ -1741,8 +1764,11 @@ class Checkpoints:
     def variables(self, *, step: int | str | None = None, ema: bool | None = None,
                   mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None,
                   parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS,
-                  unread: tuple[tuple[str, ...], ...] = ()) -> Variables:
-        """Read the selected step's live or averaged variables onto the requested layout.
+                  unread: tuple[tuple[str, ...], ...] = (), on_host: bool = False) -> Variables:
+        """Read the selected step's live or averaged variables onto the requested layout, or with
+        `on_host` into host arrays, restored onto this process's CPU device and fetched, no accelerator
+        holding them on the way (no `mesh` or `layout` beside it); a local step, which knows the devices
+        it was written on alone, is refused it.
 
         Parameter storage conversion applies only to the owner's parameter
         roots; other collections retain their recorded dtypes and placement.
@@ -1768,7 +1794,15 @@ class Checkpoints:
         with_ema = stored.get("ema") is not None if ema is None else ema
         if with_ema:
             template["ema"] = without(stored["ema"], unread)
-        device_mesh = resolve_mesh(DefaultMesh() if mesh is None else mesh)
+        host_or_placed(on_host, mesh, layout)
+        if on_host and step == self._local_latest():
+            raise ValueError(f"step {step} is held locally, on the devices that wrote it, which its read "
+                             "places it on (`_check_placement`), so it reads onto no host; read a persistent "
+                             "step, or read this one without on_host")
+        # On the host, restored onto this process's CPU device, every collection as a placed read restores
+        # it, then fetched as host arrays: no accelerator holds them on the way.
+        device_mesh = resolve_mesh(DefaultMesh().build(_host_devices()) if on_host
+                                   else DefaultMesh() if mesh is None else mesh)
         chosen_layout = DefaultLayout() if layout is None else layout
         # A CPU-owned run stores its frozen collection banked; the layout places
         # its layers, and each bank reads onto its first layer's placement.
@@ -1785,7 +1819,7 @@ class Checkpoints:
                                    parameter_roots=parameter_roots)
         if frozen is not None:
             params = {**params, FROZEN: spread(params[FROZEN], placed_rows)}
-        return params
+        return jax.device_get(params) if on_host else params
 
     def materialized(self, template: Mapping[str, Variables], placement: Mapping[str, Variables], *,
                      step: int, param_dtype: jax.typing.DTypeLike | None = None,

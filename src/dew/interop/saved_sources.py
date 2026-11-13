@@ -361,7 +361,8 @@ def native_source[Loaded: Pretrained](kind: type[Loaded], source: str | Path, *,
             model = ModelConfig.from_model(cache_sized(model.build(), max_seq_len))
         run = replace(run, record={**run.record, "model": to_record(model, ModelConfig)})
     task = run.objective.saved_task
-    placed = {"mesh": mesh, "layout": layout, "dtype": dtype,
+    # On the host, read into host arrays from storage, so no accelerator holds the weights on the way.
+    placed = {"mesh": mesh, "layout": layout, "dtype": dtype, "on_host": on_host and weights,
               "param_dtype": None if param_dtype == "auto" else param_dtype}
     if task is not None and issubclass(task, ReleasedTask):
         bundle = task.source_of(run, **placed)
@@ -373,7 +374,7 @@ def native_source[Loaded: Pretrained](kind: type[Loaded], source: str | Path, *,
     if not isinstance(bundle, kind):
         raise TypeError(f"{source} is a {type(bundle).__name__} source, not a {kind.__name__}; load it with "
                         f"{type(bundle).__name__}.load or Pretrained.load")
-    return bundle.map_variables(jax.device_get) if on_host and weights else bundle
+    return bundle
 
 
 def released_source(name_or_dir: str | Path, asked: bool | None, **release) -> tuple[str | Path, bool]:

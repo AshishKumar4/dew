@@ -415,7 +415,8 @@ class SavedRun:
 
     def variables(self, *, ema: bool | None, mesh: MeshSpec | Mesh | None = None,
                   layout: Layout | None = None, param_dtype: DTypeLike | None = None,
-                  parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS) -> Variables:
+                  parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS,
+                  on_host: bool = False) -> Variables:
         """The model's variables at this step, as every run loader reads them: an objective whose
         average is its frozen reference gives the trained weights whatever `ema` asks
         (`Objective.ema_is_reference`), and one that nests the model beside other networks gives the
@@ -432,7 +433,7 @@ class SavedRun:
             variables = checkpoints.variables(
                 step=self.step, ema=False if objective.ema_is_reference else ema, mesh=mesh, layout=layout,
                 param_dtype=param_dtype, parameter_roots=parameter_roots,
-                unread=tuple(strings(path, UNREAD) for path in unread))
+                unread=tuple(strings(path, UNREAD) for path in unread), on_host=on_host)
         return objective.model_tree(variables)
 
 

@@ -105,3 +105,9 @@ def test_a_cpu_owned_run_reads_its_frozen_banks_into_rows_again_on_the_programs_
                                 jax.tree.leaves(second[FROZEN]), strict=True):
         np.testing.assert_array_equal(np.asarray(got), want)
         np.testing.assert_array_equal(np.asarray(again), want)
+    # Read onto the host, its banks cut into the same rows, as host arrays.
+    host = Checkpoints(str(tmp_path / "run")).variables(ema=False, on_host=True)
+    assert sorted(host[FROZEN]) == sorted(expected)
+    for want, got in zip(jax.tree.leaves(expected), jax.tree.leaves(host[FROZEN]), strict=True):
+        assert isinstance(got, np.ndarray)
+        np.testing.assert_array_equal(got, want)
