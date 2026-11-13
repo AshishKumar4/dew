@@ -182,6 +182,8 @@ def test_a_step_read_in_two_microbatches_trains_and_logs_its_reward():
     tracker = RecordingTracker()
     trainer = Trainer(nft, optax.sgd(1e-2), key=jax.random.key(21), split=2, tracker=tracker)
     rows = len(batch["rewards"])
+    # The images the objective's inputs declare, which a step of sampled rows reads none of.
+    batch = {**batch, "image": np.zeros((rows, 4, 4, 1), np.float32)}
     data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=rows, batch=rows)
     final = trainer.fit(data, steps=1, log_every=1)
     assert int(final.updates) == 1

@@ -939,6 +939,8 @@ def test_a_step_read_in_two_microbatches_trains_and_logs_its_reward_and_policy_t
     tracker = RecordingTracker()
     trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(93), split=2, tracker=tracker)
     rows = len(collected["rewards"])
+    # The images the objective's inputs declare, which a step of collected trajectories reads none of.
+    collected = {**collected, "image": np.zeros((rows, 4, 4, 1), np.uint8)}
     data = Loader(train=lambda partition: itertools.repeat(collected), val=None, records=rows, batch=rows)
     final = trainer.fit(data, steps=1, log_every=1)
     assert int(final.updates) == 1
