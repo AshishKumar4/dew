@@ -105,6 +105,13 @@ def _transformed(ordinal: int, value: Record, transform: Transform | None) -> Ou
     return outputs
 
 
+def _projected(outputs: Outputs, transform: Transform | None) -> CachedValue:
+    """A row's outputs as a cached read hands them on: the tuple its `transform` made, or, where it
+    caches records as they are, its one record. Its fills and replays keep the tuple (`Outputs`) and
+    each read projects it once, here."""
+    return outputs if transform is not None else outputs[0]
+
+
 def _volatile(transform: Transform) -> bool:
     return isinstance(transform, Volatile) and transform.volatile
 
@@ -321,29 +328,28 @@ class _Published:
     """The inputs by index a replay by index computes a record from where it reads on."""
 
     def __call__(self, row_id: RowId) -> CachedValue:
-        outputs = self.generation.outputs(row_id)
-        return outputs if self.transform is not None else outputs[0]
+        """The record at `row_id`, as a replay by index reads it."""
+        return _projected(self.generation.outputs(row_id), self.transform)
 
     def at(self, index: int) -> CachedValue:
         """The record at `index` of its inputs, as a replay by index reads it: computed from that
         input where an optional cache's generation cannot give it (`Cache.read_on`)."""
         try:
-            return self(index)
+            outputs = self.generation.outputs(index)
         except (OSError, sqlite3.Error, ValueError) as error:
             if (self.inputs is None or self.optional is None
                     or not self.optional.read_on(error, "replays nothing")):
                 raise
             outputs = _transformed(index, self.inputs[index], self.transform)
-            return outputs if self.transform is not None else outputs[0]
+        return _projected(outputs, self.transform)
 
-    def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
+    def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> Outputs:
         try:
-            return self(row_id)
+            return self.generation.outputs(row_id)
         except (OSError, sqlite3.Error, ValueError) as error:
             if self.optional is None or not self.optional.read_on(error, "replays nothing"):
                 raise
-            outputs = _transformed(ordinal, value, transform)
-            return outputs if transform is not None else outputs[0]
+            return _transformed(ordinal, value, transform)
 
     def finish(self) -> None:
         pass
@@ -365,7 +371,7 @@ class _Parted:
     """The parts' records, one part's after another's."""
     ids: tuple[str, ...]
 
-    def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
+    def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> Outputs:
         part, place = self.parts.locate(ordinal)
         return self.published.process((self.ids[part], place), place, value, transform)
 
@@ -382,9 +388,8 @@ class _Parted:
 class _Computed:
     """Rows computed and kept nowhere: the inputs of a key published under other IDs."""
 
-    def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
-        outputs = _transformed(ordinal, value, transform)
-        return outputs if transform is not None else outputs[0]
+    def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> Outputs:
+        return _transformed(ordinal, value, transform)
 
     def finish(self) -> None:
         pass
@@ -444,7 +449,9 @@ class _Writer:
         store = Store(self.root.child(declaration["path"]).url, self.cache._mirror_options())
         return ArrayRecords((store.url,), store.storage_options, declared=(Declared(store, declaration),))
 
-    def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
+    def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> Outputs:
+        """The outputs of row `row_id`: those it pends or completed, or `value` transformed, admitted to
+        the fill where the fill still admits and they are no transient rejection."""
         self._completed()
         row_key = _row_key(row_id)
         with self.lock:
@@ -457,19 +464,17 @@ class _Writer:
                 ).fetchone()
             )
         if existing is not None:
-            values = _decode_outputs(existing)
-            return values if transform is not None else values[0]
+            return _decode_outputs(existing)
         if completed is not None and self.futures[completed[0]].done():
             uploaded = self.futures[completed[0]]
             if uploaded.exception() is None:
                 payload = self.uploaded.read(completed[0], completed[1])
                 if not isinstance(payload, bytes) or _hash(payload) != completed[2]:
                     raise ValueError(f"cache writer record is corrupt for row {row_key}")
-                values = _decode_outputs(payload)
-                return values if transform is not None else values[0]
+                return _decode_outputs(payload)
         outputs = _transformed(ordinal, value, transform)
         if self.closing:
-            return outputs if transform is not None else outputs[0]
+            return outputs
         try:
             payload = encode(outputs)
         except Unencodable as error:
@@ -480,24 +485,23 @@ class _Writer:
                     if not self.cache.read_on(error, "stopped admission"):
                         raise
                     self._stopped()
-            return outputs if transform is not None else outputs[0]
+            return outputs
         transient = any(isinstance(output, Rejected) and not output.permanent for output in outputs)
         with self.lock:
             if self.closing:
-                return outputs if transform is not None else outputs[0]
+                return outputs
             existing = self.pending.get(row_key)
             if existing is not None:
                 if existing != payload:
                     raise ValueError(f"conflicting cache duplicate for row {row_key}")
-                cached = _decode_outputs(existing)
-                return cached if transform is not None else cached[0]
+                return _decode_outputs(existing)
             completed = self.index.execute(
                 "SELECT shard, offset, digest FROM inputs WHERE id=?", (row_key,)
             ).fetchone()
             if completed is not None:
                 if _hash(payload) != completed[2]:
                     raise ValueError(f"conflicting cache duplicate for row {row_key}")
-                return outputs if transform is not None else outputs[0]
+                return outputs
             if not transient and self.admitting:
                 try:
                     self._admit(row_key, payload)
@@ -507,7 +511,7 @@ class _Writer:
                     if not self.cache.read_on(error, "stopped admission"):
                         raise
                     self._stopped()
-        return outputs if transform is not None else outputs[0]
+        return outputs
 
     def _stopped(self) -> None:
         """Stop admitting for good, under the lock: what the writer held unwritten is dropped, and the
@@ -843,9 +847,9 @@ class _CachedMap(_Mapped):
         return writer
 
     def record(self, index: int) -> CachedValue:
-        return self.writer.process(
+        return _projected(self.writer.process(
             index % len(self), index % len(self), self.input_parent[index], self.transform
-        )
+        ), self.transform)
 
     def start(self) -> None:
         for position in self.missing:
@@ -1009,7 +1013,8 @@ class _CachedIterator(grain.DatasetIterator):
             self.writer.finish()
             raise
         ordinal = 0 if self.ordinal is None else self.ordinal
-        value = self.writer.process((self.shard.id, ordinal), ordinal, value, self.transform)
+        value = _projected(self.writer.process((self.shard.id, ordinal), ordinal, value, self.transform),
+                           self.transform)
         if self.ordinal is not None:
             self.ordinal += 1
         return value
