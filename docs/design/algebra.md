@@ -511,9 +511,9 @@ constants, its declared ranges and its equations, or none. The region states it 
 constant's bound is its largest element's magnitude (a complex one's modulus), and a declared operand's is its
 range (`scan.Scan.ranges`, `derive.Reduction.ranges`, by input, the program's constants apart: l2-normalised
 keys 1, a sigmoid's gate 1, a recurrence's decays 1). An operand with no declared range, and an equation
-outside the language, has none. Each equation in the language composes its operands' bounds (today those whose transfer is stated here do; a
-quotient, a logarithm and a general power prove none whatever their operands, and a comparison or a bounded
-function proves its own): sums take twice
+outside the language, has none. Each equation in the language composes its operands' bounds (today those whose
+transfer is stated here do, `terms._real_bound`; the others prove none, and a comparison or a bounded function
+proves its own): sums take twice
 the larger, products add their powers, contractions and sums along an axis add their length's, and a bounded
 function (`tanh`, `sin`, `logistic` of a real operand) is 2, one power past the reals' 1 because no native
 implementation is certified within its range, a comparison or `sign` 1, a complex operand's sine
@@ -522,9 +522,39 @@ operand's or 1 (`ceil(2**-126)` is 1). Each bound is its output dtype's too: a b
 made it (a tiny float converted is 1); an integer at most its dtype's range, within which a sum or a product
 wraps, and at that range for a bitwise operation and where an unsigned result may wrap from below zero
 (`uint32(0) - 1`, a negation, int32's -1 converted: `2**32 - 1`). A conversion keeps a value at most 0 only
-into a floating dtype from a floating or signed one, or between signed integers no narrower. An exponential of
-an operand with neither a bound nor a sign, or a quotient, has no
-bound; an exponential of an operand at most 0 is at most 2, its native implementation's rounding given one
+into a floating dtype from a floating or signed one, or between signed integers no narrower.
+
+A quotient, a root, a logarithm and a power are bounded where the operand they need away from zero is held
+there (`terms.Apart`). Beside each value's bound the region carries four facts, each proven from the program's
+inputs taken as finite reals within their declared ranges: a floor `2**l <= |x|`, the side of zero `x` lies
+on, that `x` is no NaN, and that it is finite. They come from a constant's elements, a declared interval that
+holds no zero, and each equation's own (`terms._apart`): a sum of values on one side of zero keeps the largest
+floor, a product adds them, a quotient takes its divisor's bound from its dividend's floor, a square and an
+absolute value are at least 0, an exponential of a bounded value is at least its reciprocal bound, a layout, a
+conversion between floats and a maximum or minimum along an axis of at least one element keep theirs. Each
+floor is a normal power of its dtype, which rounding to nearest keeps, and the powers are exact: a constant's
+and a declared interval's are read from the float's exponent, not a rounded logarithm. A zero of either sign
+is at least 0 and at most 0, so a reciprocal's sign is read only of an operand with a floor. A side and a floor
+are stated of a number alone (a maximum with a positive constant is not at least 0 where its other operand may
+be a NaN), and a value is a number where its operands are and its operation makes no NaN of them (an infinity
+less an infinity, a zero times one, a root of a value that may be negative). A value is finite where its
+operands are and its own bound is under its dtype's largest power; one that may have overflowed is not, nor
+is a value an equation makes by keeping or scaling it, a conversion to a wider float or to an integer among
+them (XLA saturates an infinity to an integer its bound says nothing of), whatever its bound reads there; a
+value is finite again where its operation bounds it whatever its operand is (a comparison, a logistic, a
+zeroth power) or makes a zero of an infinity.
+The bounds these facts prove read an operand's magnitude of a finite one alone, and a divisor, a reciprocal
+root's operand and a negative power's base by their floor, which an infinite one holds too, its result a zero
+(`terms._apart_bound`): `x / y` is at most
+`2**(a - l)`, `sqrt` at most `2**ceil(a / 2)`, `rsqrt` at most `2**(1 - l // 2)`, a logarithm of
+`2**l <= x <= 2**a` at most `max(|l|, |a|)` and a power more, a power `x**y` at most
+`2**(2**b max(|l|, |a|) + 1)`, and an integer power of a negative exponent `2**(y l)` where the positive power
+is a float: a normalization's `x * rsqrt(mean(x**2) + eps)` is bounded by its `eps`. The bounds that read no
+floor are stated over the reals, every value taken as finite: a product of a value that overflowed its dtype
+reads the bound its real factors have.
+
+An exponential of an operand with neither a bound nor a sign, and a quotient by a value nothing holds apart
+from zero, has no bound; an exponential of an operand at most 0 is at most 2, its native implementation's rounding given one
 power past 1 (`ex2.approx`'s error is more than an ulp of 1). Every bound holds under its arithmetic's
 contract: IEEE rounding to nearest, a contraction's mode one that rounds each operand once (its real bound)
 or splits it into parts (bf16 x3 to x9, TF32 x3, `Precision.HIGH`: one more power), and none for a mode
