@@ -371,7 +371,6 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         # distillation_utils.py:492-547 and :562-566).
         weights = student.weights.astype(dtype)
         mass = statistics.mass
-        counted = jnp.where(mass > 0, mass, 1)
         # A position where anything the teacher gives is non-finite, its scores or a paired layer's
         # states, is left out of every term, each made finite before any arithmetic so no NaN reaches a
         # gradient through the masked branch.

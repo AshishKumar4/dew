@@ -177,12 +177,8 @@ class Exponentiated(Ratio):
         return jnp.where(active, jnp.exp(value), 0), active
 
 
-type Moment = jax.Array | float
-"""A count, a mean or a summed squared deviation: an array of them by feature, or one number."""
-
-
-def joined_moments(count: Moment, center: Moment, squares: Moment, later_count: Moment, later_center: Moment,
-                   later_squares: Moment) -> tuple[Moment, Moment, Moment, Moment, Moment]:
+def joined_moments[M: (jax.Array, float)](count: M, center: M, squares: M, later_count: M, later_center: M,
+                                          later_squares: M) -> tuple[M, M, M, M, M]:
     """Two parts' row counts, means and summed squared deviations from them (by feature, arrays or floats)
     as the whole's, by Chan, Golub and LeVeque's pairwise update, which no part's sum of squares cancels
     against its mean in; and the means' difference and the weight their outer product joins the parts'
@@ -203,7 +199,7 @@ class Summed(Pooled):
 
     def mean(self) -> tuple[jax.Array, jax.Array]:
         values, active = zip(*(part.mean() for part in self.parts), strict=True)
-        return sum(values), functools.reduce(jnp.logical_or, active)
+        return functools.reduce(jnp.add, values), functools.reduce(jnp.logical_or, active)
 
 
 @struct.dataclass

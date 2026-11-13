@@ -28,7 +28,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.inputs import rotate_rows
 from dew.nn.precision import at_least_fp32, compensated_sum, weighted_total
 from dew.nn.progress import END, Progress
-from dew.objectives.base import Aux, EMASpec, Ratio, Shown
+from dew.objectives.base import Aux, EMASpec, Pooled, Ratio, Shown
 from dew.objectives.lm.chunked import final_read
 from dew.objectives.routing import ExpertBalance
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
@@ -355,7 +355,7 @@ class GRPOObjective(TokenScorer):
         # and the corrections compare the detached current policy with behavior,
         # as verl's compute_policy_loss_bypass_mode does.
         proximal = terms.old if terms.proximal else jax.lax.stop_gradient(terms.policy)
-        metrics: dict[str, jax.Array] = {}
+        metrics: dict[str, jax.Array | Pooled] = {}
         keep = jnp.ones_like(mask)
         for name, band, geometric in (("sequence", self.sequence_mask, False),
                                       ("geometric", self.geometric_mask, True)):

@@ -115,7 +115,7 @@ class ExpertBalance:
 
     def terms(self, prediction: Ratio, routing: Variables, batch: Batch, queries: jax.Array,
               fields: Mapping[str, jax.Array | Coordinates]
-              ) -> tuple[Ratio | RoutedStatistics, dict[str, jax.Array]]:
+              ) -> tuple[Ratio | RoutedStatistics, dict[str, jax.Array | Pooled]]:
         """The statistics the balance loss and the z-loss add to `prediction`, and the metrics they report.
 
         `routing` is what the routers sowed, `queries` marks the router
@@ -145,7 +145,7 @@ class ExpertBalance:
 
     def compose(self, params: Variables, prediction: Ratio, routing: Variables, batch: Batch,
                 queries: jax.Array, fields: Mapping[str, jax.Array | Coordinates]
-                ) -> tuple[Ratio | RoutedStatistics, Variables | None, dict[str, jax.Array]]:
+                ) -> tuple[Ratio | RoutedStatistics, Variables | None, dict[str, jax.Array | Pooled]]:
         """The statistics an objective's `prediction` takes from this policy, the router counts its commit
         applies (None where `balance_rate` is unset), and the metrics both report.
 

@@ -140,7 +140,7 @@ class Moments:
 def pooled(shares: Sequence[Moments]) -> tuple[float, float]:
     """The mean and (population) deviation of the members of every share together, joined pairwise in
     float64 (`dew.objectives.base.joined_moments`), so no share's sum of squares cancels against its mean."""
-    count, mean, m2 = 0, 0.0, 0.0
+    count, mean, m2 = 0.0, 0.0, 0.0
     for share in shares:
         if share.count:
             count, mean, m2, _, _ = joined_moments(count, mean, m2, share.count, share.mean, share.m2)
