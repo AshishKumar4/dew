@@ -6,6 +6,7 @@ entries; the overflow witnesses stay finite where the reference does, and the re
 in bf16.
 """
 
+import dataclasses
 import functools
 
 import jax
